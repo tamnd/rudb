@@ -103,7 +103,11 @@ for attempt in $(seq 1 "$attempts"); do
     echo "attempt $attempt: $up of $total up, $remaining to go, all of them existing crates"
   fi
 
-  if cargo publish --workspace --locked "${exclude[@]}" 2>&1 | tee /tmp/publish.log; then
+  # `${x[@]+"${x[@]}"}` rather than `"${x[@]}"` because on the first attempt nothing is excluded and
+  # the array is empty, and bash 3.2 under `set -u` calls an empty array unbound and dies. bash 5 on
+  # the runner does not, so this only ever fails when someone runs the release by hand on a Mac,
+  # which is exactly when it is being run because the runner is not cooperating.
+  if cargo publish --workspace --locked ${exclude[@]+"${exclude[@]}"} 2>&1 | tee /tmp/publish.log; then
     echo "published $remaining crates at $version"
     exit 0
   fi
