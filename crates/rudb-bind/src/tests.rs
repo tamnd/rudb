@@ -1,0 +1,355 @@
+//! What the binder produces, checked against the plan's textual form.
+//!
+//! The assertions are on the printed plan rather than on the arenas, because the printed plan is
+//! what a person reads when a query does the wrong thing, and a test that reads what a person
+//! reads fails in a way that says what went wrong.
+
+use rudb_catalog::{Catalog, QualifiedName};
+use rudb_common::{Field, LogicalType};
+
+use crate::bind_sql;
+
+/// A catalog with two tables in it, which is enough for a join and for every name rule.
+fn catalog() -> Catalog {
+    let mut catalog = Catalog::new();
+    catalog
+        .create_table(
+            QualifiedName::new("memory", "main", "hits"),
+            vec![
+                Field::new("UserID", LogicalType::BigInt),
+                Field::new("url", LogicalType::Varchar),
+                Field::new("counter", LogicalType::Integer),
+            ],
+        )
+        .expect("a table nothing else has created");
+    catalog
+        .create_table(
+            QualifiedName::new("memory", "main", "visits"),
+            vec![
+                Field::new("UserID", LogicalType::BigInt),
+                Field::new("duration", LogicalType::Integer),
+            ],
+        )
+        .expect("a table nothing else has created");
+    catalog
+}
+
+/// The printed plan for a query that is expected to bind.
+fn plan(query: &str) -> String {
+    bind_sql(query, &catalog())
+        .unwrap_or_else(|error| panic!("{query} should bind: {error}"))
+        .to_string()
+}
+
+/// The message for a query that is expected not to bind.
+fn failure(query: &str) -> String {
+    match bind_sql(query, &catalog()) {
+        Ok(plan) => panic!("{query} should not bind, it produced\n{plan}"),
+        Err(error) => error.message().to_string(),
+    }
+}
+
+#[test]
+fn a_scan_projects_what_the_query_asked_for() {
+    assert_eq!(
+        plan("SELECT url FROM hits"),
+        "Project #1 [#0.1::VARCHAR AS url]\n  \
+         Get memory.main.hits AS hits #0 [UserID::BIGINT, url::VARCHAR, counter::INTEGER]\n"
+    );
+}
+
+#[test]
+fn a_star_expands_in_the_order_the_table_has() {
+    assert_eq!(
+        plan("SELECT * FROM hits"),
+        "Project #1 [#0.0::BIGINT AS UserID, #0.1::VARCHAR AS url, #0.2::INTEGER AS counter]\n  \
+         Get memory.main.hits AS hits #0 [UserID::BIGINT, url::VARCHAR, counter::INTEGER]\n"
+    );
+}
+
+#[test]
+fn a_query_with_no_from_clause_sits_on_one_row() {
+    assert_eq!(plan("SELECT 1"), "Project #0 [1::INTEGER AS \"1\"]\n  Dummy\n");
+}
+
+#[test]
+fn a_where_clause_becomes_a_filter_under_the_projection() {
+    assert_eq!(
+        plan("SELECT url FROM hits WHERE counter > 5"),
+        "Project #1 [#0.1::VARCHAR AS url]\n  \
+         Filter (#0.2::INTEGER > 5::INTEGER)::BOOLEAN\n    \
+         Get memory.main.hits AS hits #0 [UserID::BIGINT, url::VARCHAR, counter::INTEGER]\n"
+    );
+}
+
+#[test]
+fn a_comparison_brings_both_sides_to_the_type_they_meet_at() {
+    // The literal is an INTEGER and the column is a BIGINT, so the literal is the one that moves.
+    let text = plan("SELECT url FROM hits WHERE UserID = 7");
+    assert!(text.contains("(#0.0::BIGINT = CAST(7::INTEGER)::BIGINT)::BOOLEAN"), "{text}");
+}
+
+#[test]
+fn an_alias_names_the_output_column_and_the_expression_names_it_otherwise() {
+    let text = plan("SELECT counter + 1 AS bumped, counter * 2 FROM hits");
+    assert!(text.contains("AS bumped"), "{text}");
+    assert!(text.contains("AS \"(counter * 2)\""), "{text}");
+}
+
+#[test]
+fn an_and_of_three_things_is_one_flat_conjunction() {
+    let text = plan("SELECT url FROM hits WHERE counter > 1 AND counter < 9 AND url = 'a'");
+    assert_eq!(
+        text.matches(" AND ").count(),
+        2,
+        "one conjunction of three, not two of two: {text}"
+    );
+}
+
+#[test]
+fn between_becomes_the_pair_of_comparisons_it_means() {
+    let text = plan("SELECT url FROM hits WHERE counter BETWEEN 1 AND 9");
+    assert!(text.contains("(#0.2::INTEGER >= 1::INTEGER)"), "{text}");
+    assert!(text.contains("(#0.2::INTEGER <= 9::INTEGER)"), "{text}");
+    let negated = plan("SELECT url FROM hits WHERE counter NOT BETWEEN 1 AND 9");
+    assert!(negated.contains(" OR "), "{negated}");
+}
+
+#[test]
+fn in_becomes_a_disjunction_of_equalities() {
+    let text = plan("SELECT url FROM hits WHERE counter IN (1, 2, 3)");
+    assert_eq!(text.matches(" OR ").count(), 2, "{text}");
+    let negated = plan("SELECT url FROM hits WHERE counter NOT IN (1, 2)");
+    assert!(negated.contains(" AND "), "{negated}");
+    assert!(negated.contains("<>"), "{negated}");
+}
+
+#[test]
+fn is_null_is_the_null_safe_comparison_against_a_null() {
+    let text = plan("SELECT url FROM hits WHERE url IS NULL");
+    assert!(text.contains("IS NOT DISTINCT FROM"), "{text}");
+    let negated = plan("SELECT url FROM hits WHERE url IS NOT NULL");
+    assert!(negated.contains("IS DISTINCT FROM"), "{negated}");
+}
+
+#[test]
+fn a_simple_case_is_bound_as_the_searched_one_it_means() {
+    let text = plan("SELECT CASE counter WHEN 1 THEN 'one' ELSE 'many' END AS which FROM hits");
+    assert!(text.contains("CASE WHEN"), "{text}");
+    assert!(text.contains("(#0.2::INTEGER = 1::INTEGER)"), "{text}");
+}
+
+#[test]
+fn a_group_by_puts_the_groups_first_and_the_aggregates_after() {
+    assert_eq!(
+        plan("SELECT url, count(*) FROM hits GROUP BY url"),
+        "Project #2 [#1.0::VARCHAR AS url, #1.1::BIGINT AS \"count_star()\"]\n  \
+         Aggregate #1 groups=[#0.1::VARCHAR] aggregates=[count_star()::BIGINT]\n    \
+         Get memory.main.hits AS hits #0 [UserID::BIGINT, url::VARCHAR, counter::INTEGER]\n"
+    );
+}
+
+#[test]
+fn an_aggregate_with_no_group_by_still_aggregates() {
+    let text = plan("SELECT sum(counter) FROM hits");
+    assert!(
+        text.contains("Aggregate #1 groups=[] aggregates=[sum(#0.2::INTEGER)::HUGEINT]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_same_aggregate_written_twice_is_computed_once() {
+    let text = plan("SELECT sum(counter), sum(counter) + 1 FROM hits");
+    assert_eq!(text.matches("sum(#").count(), 1, "{text}");
+}
+
+#[test]
+fn a_column_that_is_neither_grouped_nor_aggregated_is_refused() {
+    let message = failure("SELECT url, count(*) FROM hits GROUP BY counter");
+    assert!(message.contains("must appear in the GROUP BY clause"), "{message}");
+    assert!(message.contains("url"), "the message should name the column: {message}");
+}
+
+#[test]
+fn a_grouped_expression_is_recognised_wherever_it_is_written_again() {
+    let text = plan("SELECT counter + 1, count(*) FROM hits GROUP BY counter + 1");
+    assert!(text.contains("groups=[\"+\"(#0.2::INTEGER, 1::INTEGER)::INTEGER]"), "{text}");
+    assert!(text.contains("[#1.0::INTEGER AS \"(counter + 1)\""), "{text}");
+}
+
+#[test]
+fn group_by_can_name_a_target_by_position_or_by_alias() {
+    let by_position = plan("SELECT url, count(*) FROM hits GROUP BY 1");
+    let by_alias = plan("SELECT url AS u, count(*) FROM hits GROUP BY u");
+    assert!(by_position.contains("groups=[#0.1::VARCHAR]"), "{by_position}");
+    assert!(by_alias.contains("groups=[#0.1::VARCHAR]"), "{by_alias}");
+}
+
+#[test]
+fn group_by_all_groups_everything_that_is_not_an_aggregate() {
+    let text = plan("SELECT url, counter, count(*) FROM hits GROUP BY ALL");
+    assert!(text.contains("groups=[#0.1::VARCHAR, #0.2::INTEGER]"), "{text}");
+}
+
+#[test]
+fn having_filters_above_the_aggregate_and_where_filters_below_it() {
+    let text = plan("SELECT url FROM hits WHERE counter > 1 GROUP BY url HAVING count(*) > 2");
+    let filter_above = text.find("Filter (#1.1").expect("the HAVING filter");
+    let aggregate = text.find("Aggregate").expect("the aggregate");
+    let filter_below = text.find("Filter (#0.2").expect("the WHERE filter");
+    assert!(filter_above < aggregate && aggregate < filter_below, "{text}");
+}
+
+#[test]
+fn an_aggregate_in_a_where_clause_says_where_it_cannot_go() {
+    let message = failure("SELECT url FROM hits WHERE count(*) > 1");
+    assert!(message.contains("WHERE clause"), "{message}");
+}
+
+#[test]
+fn an_order_by_sorts_the_projection_and_takes_the_defaults_sql_gives_it() {
+    let text = plan("SELECT url FROM hits ORDER BY url");
+    assert!(text.contains("Sort [#1.0::VARCHAR ASC NULLS LAST]"), "{text}");
+    let descending = plan("SELECT url FROM hits ORDER BY url DESC");
+    assert!(descending.contains("DESC NULLS FIRST"), "{descending}");
+}
+
+#[test]
+fn an_order_by_on_something_not_selected_projects_it_and_then_drops_it() {
+    let text = plan("SELECT url FROM hits ORDER BY counter");
+    assert!(text.contains("#1 [#0.1::VARCHAR AS url, #0.2::INTEGER AS counter]"), "{text}");
+    assert!(text.starts_with("Project #2 [#1.0::VARCHAR AS url]\n"), "{text}");
+}
+
+#[test]
+fn an_order_by_position_names_the_output_column() {
+    let text = plan("SELECT url, counter FROM hits ORDER BY 2 DESC");
+    assert!(text.contains("Sort [#1.1::INTEGER DESC"), "{text}");
+    let out_of_range = failure("SELECT url FROM hits ORDER BY 4");
+    assert!(out_of_range.contains("out of range"), "{out_of_range}");
+}
+
+#[test]
+fn a_limit_and_an_offset_are_constants_by_the_time_they_are_here() {
+    let text = plan("SELECT url FROM hits LIMIT 10 OFFSET 5");
+    assert!(text.contains("Limit 10 offset 5"), "{text}");
+    let offset_only = plan("SELECT url FROM hits OFFSET 5");
+    assert!(offset_only.contains("Limit ALL offset 5"), "{offset_only}");
+}
+
+#[test]
+fn distinct_sits_above_the_projection() {
+    let text = plan("SELECT DISTINCT url FROM hits");
+    assert!(text.starts_with("Distinct on=[]\n  Project"), "{text}");
+}
+
+#[test]
+fn distinct_cannot_order_by_something_it_does_not_select() {
+    let message = failure("SELECT DISTINCT url FROM hits ORDER BY counter");
+    assert!(message.contains("must appear in the select list"), "{message}");
+}
+
+#[test]
+fn two_tables_in_a_from_clause_are_a_cross_product() {
+    let text = plan("SELECT hits.url, visits.duration FROM hits, visits");
+    assert!(text.contains("CrossProduct"), "{text}");
+}
+
+#[test]
+fn a_join_condition_binds_against_both_sides() {
+    let text = plan("SELECT url FROM hits JOIN visits ON hits.UserID = visits.UserID");
+    assert!(text.contains("Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]"), "{text}");
+}
+
+#[test]
+fn using_makes_the_equality_and_leaves_one_copy_of_the_column() {
+    let text = plan("SELECT UserID, url, duration FROM hits JOIN visits USING (UserID)");
+    assert!(text.contains("on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]"), "{text}");
+    assert!(text.contains("[#0.0::BIGINT AS UserID"), "{text}");
+}
+
+#[test]
+fn natural_joins_on_whatever_both_sides_call_the_same_thing() {
+    let text = plan("SELECT url FROM hits NATURAL JOIN visits");
+    assert!(text.contains("Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]"), "{text}");
+}
+
+#[test]
+fn an_alias_replaces_the_table_name_rather_than_adding_to_it() {
+    let text = plan("SELECT h.url FROM hits AS h");
+    assert!(text.contains("AS h #0"), "{text}");
+    let message = failure("SELECT hits.url FROM hits AS h");
+    assert!(message.contains("Referenced table \"hits\" not found"), "{message}");
+}
+
+#[test]
+fn a_subquery_in_the_from_clause_is_bound_and_then_named() {
+    let text = plan("SELECT sub.url FROM (SELECT url FROM hits) AS sub");
+    assert!(text.contains("Project #2 [#1.0::VARCHAR AS url]"), "{text}");
+}
+
+#[test]
+fn a_union_lines_the_two_sides_up_and_sorts_above_both() {
+    let text = plan("SELECT counter FROM hits UNION SELECT duration FROM visits ORDER BY 1");
+    assert!(text.contains("SetOp UNION DISTINCT"), "{text}");
+    assert!(text.starts_with("Sort [#4.0::INTEGER ASC"), "{text}");
+    let all = plan("SELECT counter FROM hits UNION ALL SELECT duration FROM visits");
+    assert!(all.contains("SetOp UNION ALL"), "{all}");
+}
+
+#[test]
+fn a_union_of_different_widths_says_so() {
+    let message = failure("SELECT url FROM hits UNION SELECT UserID, duration FROM visits");
+    assert!(message.contains("same number of result columns"), "{message}");
+}
+
+#[test]
+fn a_union_of_two_types_casts_the_narrower_side() {
+    let text = plan("SELECT UserID FROM hits UNION ALL SELECT duration FROM visits");
+    assert!(text.contains("CAST(#3.0::INTEGER)::BIGINT"), "{text}");
+}
+
+#[test]
+fn a_name_that_is_not_a_table_is_reported_the_way_duckdb_reports_it() {
+    let message = failure("SELECT * FROM nope");
+    assert!(message.contains("Table with name nope does not exist!"), "{message}");
+}
+
+#[test]
+fn a_name_that_is_not_a_function_is_reported_the_way_duckdb_reports_it() {
+    let message = failure("SELECT nope(url) FROM hits");
+    assert!(message.contains("Scalar Function with name nope does not exist!"), "{message}");
+}
+
+#[test]
+fn arithmetic_on_a_string_is_refused_before_anything_runs() {
+    let message = failure("SELECT url + 1 FROM hits");
+    assert!(message.contains("No function matches the given name"), "{message}");
+}
+
+#[test]
+fn a_qualified_table_name_resolves_and_prints_all_three_parts() {
+    let text = plan("SELECT url FROM memory.main.hits");
+    assert!(text.contains("Get memory.main.hits AS hits"), "{text}");
+}
+
+#[test]
+fn identifiers_match_without_regard_to_case_and_keep_the_case_they_were_created_with() {
+    let text = plan("SELECT USERID FROM HITS");
+    assert!(text.contains("AS UserID"), "{text}");
+    assert!(text.contains("Get memory.main.hits AS hits"), "{text}");
+}
+
+#[test]
+fn what_is_not_bound_yet_says_what_was_written_rather_than_producing_a_wrong_plan() {
+    for query in [
+        "SELECT url FROM hits WHERE counter = (SELECT max(counter) FROM hits)",
+        "SELECT counter ** 2 FROM hits",
+        "SELECT url FROM hits UNION BY NAME SELECT url FROM hits",
+        "SELECT url FROM hits LIMIT 10 PERCENT",
+    ] {
+        let message = failure(query);
+        assert!(!message.is_empty(), "{query} should say what it cannot do");
+    }
+}
