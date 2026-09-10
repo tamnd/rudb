@@ -258,5 +258,7 @@ dependencies = [
 name = "xtask"
 version = "0.0.2"
 dependencies = [
+ "rudb",
+ "rudb-common",
  "rudb-parse",
 ]
