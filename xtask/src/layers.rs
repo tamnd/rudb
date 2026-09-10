@@ -64,7 +64,7 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     }
 }
 
-fn read_ranks(root: &Path) -> Result<BTreeMap<String, u32>, String> {
+pub(crate) fn read_ranks(root: &Path) -> Result<BTreeMap<String, u32>, String> {
     let path = root.join("xtask/layers.toml");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
@@ -92,7 +92,7 @@ fn read_ranks(root: &Path) -> Result<BTreeMap<String, u32>, String> {
 
 /// The workspace crates a manifest depends on. Anything that is not one of ours is not this
 /// check's business, so the filter is on the name prefix.
-fn dependencies(manifest: &str) -> Vec<String> {
+pub(crate) fn dependencies(manifest: &str) -> Vec<String> {
     let mut deps = Vec::new();
     let mut inside = false;
     for line in manifest.lines() {
