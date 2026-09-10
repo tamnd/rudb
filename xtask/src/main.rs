@@ -12,6 +12,7 @@ use std::process::{Command, ExitCode};
 
 mod bench;
 mod codegen;
+mod focus;
 mod grammar;
 mod layers;
 mod ruletable;
@@ -35,7 +36,7 @@ fn main() -> ExitCode {
         Some("version") => version::set(&root(), std::env::args().nth(2).as_deref()),
         Some("bench") => bench::run(&root()),
         Some("smoke") => smoke::run(),
-        Some("ci") => ci(),
+        Some("ci") => ci(std::env::args().nth(2).as_deref() == Some("--full")),
         Some("help" | "--help" | "-h") | None => {
             usage();
             return ExitCode::SUCCESS;
@@ -62,7 +63,10 @@ fn usage() {
         "  gen-grammar [--check]  regenerate crates/rudb-parse/src/generated from that grammar"
     );
     println!("  smoke    the query in M0's exit criterion, run on this host, answers checked");
-    println!("  ci       everything the per-commit gate runs, in the order it runs it");
+    println!("  ci       the per-commit gate, narrowed to the crates the change can have broken");
+    println!("           it prints what it skipped and why, every time");
+    println!("  ci --full              the same list with nothing narrowed, which is what the");
+    println!("                         workflow runs and what a release runs");
     println!("  version <x.y.z>        set the workspace version and every internal pin");
     println!();
     println!("  bench    the front end against a frozen workload, as a table");
@@ -83,17 +87,51 @@ fn root() -> PathBuf {
 
 /// The same list the `ci` workflow runs, so that a contributor finds out on their own machine
 /// rather than on a pull request. The order is cheapest first for the same reason it is there.
-fn ci() -> Result<(), String> {
+///
+/// By default it is focused: `focus::detect` works out which crates the change can have broken and
+/// only those are compiled, and the parts of the gate whose inputs did not change are skipped and
+/// say so. `--full` runs everything regardless, which is what the workflow runs and what a release
+/// runs. The reason the focused one is the default is that a gate nobody waits for is a gate
+/// nobody runs, and the twentieth edit of an afternoon is usually one crate.
+fn ci(full: bool) -> Result<(), String> {
     let root = root();
+    let focus =
+        if full { focus::Focus::everything("--full was asked for") } else { focus::detect(&root) };
+    focus.report();
+
     layers::check(&root)?;
-    style::check(&root)?;
-    vendor::verify()?;
-    codegen::generate(true)?;
+    if focus.prose {
+        style::check(&root)?;
+    }
+    if focus.grammar {
+        vendor::verify()?;
+        codegen::generate(true)?;
+    }
     cargo(&["fmt", "--all", "--check"])?;
-    cargo(&["clippy", "--workspace", "--all-targets", "--all-features"])?;
-    cargo(&["test", "--workspace", "--all-features"])?;
-    cargo(&["doc", "--workspace", "--all-features", "--no-deps"])?;
-    msrv()?;
+
+    if focus.no_code() {
+        println!("nothing to compile, the gate is green on what changed");
+        return Ok(());
+    }
+
+    let scope: Vec<String> =
+        if focus.everything { vec!["--workspace".to_string()] } else { focus.packages(&root) };
+    let mut clippy = vec!["clippy"];
+    clippy.extend(scope.iter().map(String::as_str));
+    clippy.extend(["--all-targets", "--all-features"]);
+    cargo(&clippy)?;
+
+    let mut test = vec!["test"];
+    test.extend(scope.iter().map(String::as_str));
+    test.push("--all-features");
+    cargo(&test)?;
+
+    let mut doc = vec!["doc"];
+    doc.extend(scope.iter().map(String::as_str));
+    doc.extend(["--all-features", "--no-deps"]);
+    cargo(&doc)?;
+
+    msrv_scoped(&scope)?;
     println!("everything the gate runs is green");
     Ok(())
 }
@@ -109,6 +147,16 @@ fn ci() -> Result<(), String> {
 /// The version is read out of `Cargo.toml` rather than written here twice, the same way the
 /// workflow reads it.
 fn msrv() -> Result<(), String> {
+    msrv_scoped(&["--workspace".to_string()])
+}
+
+/// The floor check, over whichever packages the gate is looking at.
+///
+/// Narrowing this one is safe for the thing it catches. A language feature newer than the floor can
+/// only appear in a file that changed, and a file that changed is in a crate the focus already
+/// picked, so checking that crate catches it. What narrowing loses is a dependency of it that was
+/// already broken, and that was already broken before this change.
+fn msrv_scoped(scope: &[String]) -> Result<(), String> {
     let root = root();
     let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
         .map_err(|e| format!("could not read the workspace manifest: {e}"))?;
@@ -137,9 +185,12 @@ fn msrv() -> Result<(), String> {
 
     // Through `rustup run` rather than `cargo +1.85.0`, because `cargo xtask` sets `CARGO` to a
     // real binary and the `+toolchain` syntax is a rustup shim thing that a real binary rejects.
-    println!("rustup run {version} cargo check --workspace --all-features");
+    let mut args = vec!["run".to_string(), version.clone(), "cargo".into(), "check".into()];
+    args.extend(scope.iter().cloned());
+    args.push("--all-features".into());
+    println!("rustup {}", args.join(" "));
     let status = Command::new("rustup")
-        .args(["run", &version, "cargo", "check", "--workspace", "--all-features"])
+        .args(&args)
         .env("RUSTFLAGS", std::env::var("RUSTFLAGS").unwrap_or_else(|_| "-D warnings".into()))
         // Its own target directory, or every run of this task invalidates the artifacts the
         // other tasks just built and the gate takes twice as long for no reason.
