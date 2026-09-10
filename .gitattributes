@@ -11,6 +11,10 @@ tests/**/*.ir -text
 crates/rudb-parse/grammar/** -text linguist-vendored
 
 *.duckdb binary
+# Not a database file. The same name collision the ignore rules had: this is upstream's license
+# text sitting next to upstream's grammar. It keeps -text so the bytes are the bytes VENDOR
+# recorded, and it gets diff back so a license change is readable rather than "Bin 1072 bytes".
+LICENSE.duckdb -text diff
 *.parquet binary
 *.rudb binary
 *.bin binary

@@ -172,6 +172,7 @@ pub(crate) fn verify() -> Result<(), String> {
             problems.push(format!("{name} is in the tree and not in VENDOR"));
         }
     }
+    problems.extend(untracked(&root, &recorded));
 
     if problems.is_empty() {
         println!("the vendored grammar matches VENDOR across {} files", recorded.len());
@@ -346,6 +347,39 @@ fn manifest(dir: &Path) -> Result<BTreeMap<String, String>, String> {
         }
     }
     Ok(out)
+}
+
+/// The recorded files that git is not carrying.
+///
+/// Checksums are computed from the working directory, so a file that exists on this machine and is
+/// not in the repository passes every other check here and fails on a fresh clone. That is not
+/// hypothetical: `.gitignore` had `*.duckdb` for database files, which also matched the vendored
+/// `LICENSE.duckdb`, so the 0.0.2 tag was cut from a tree that could not run its own gate while
+/// the gate was green on the machine that cut it. The whole point of this task is that the
+/// vendored grammar is what everybody gets, so it has to ask what everybody gets.
+///
+/// Silent when there is no repository, because a source archive is a legitimate way to build and
+/// has nothing to ask.
+fn untracked(root: &Path, recorded: &BTreeMap<String, String>) -> Vec<String> {
+    if !root.join(".git").exists() {
+        return Vec::new();
+    }
+    let Ok(listed) = git_output(&["-C", &root.to_string_lossy(), "ls-files", "--", DEST]) else {
+        return Vec::new();
+    };
+    let prefix = format!("{DEST}/");
+    let tracked: std::collections::BTreeSet<&str> =
+        listed.lines().filter_map(|line| line.strip_prefix(&prefix)).collect();
+    recorded
+        .keys()
+        .filter(|name| !tracked.contains(name.as_str()))
+        .map(|name| {
+            format!(
+                "{name} is recorded in VENDOR and git is not tracking it, \
+                 which usually means a line in .gitignore matches it"
+            )
+        })
+        .collect()
 }
 
 fn relative(base: &Path, path: &Path) -> String {

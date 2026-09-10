@@ -188,10 +188,10 @@ jobs:
           files: dist/*
           body_path: notes.md
           generate_release_notes: true
-          # Pre-1.0 carries no compatibility promise, and neither does the storage format before
-          # the format version is frozen at M8, per spec/18-package-layout.md. Marking the release
-          # accordingly is the honest way to say so.
-          prerelease: ${{ !startsWith(github.ref_name, 'v1.') && !startsWith(github.ref_name, 'v2.') }}
+          # Not marked as a pre-release. Every one of these is a finished release of the code that
+          # exists at the tag, and what pre-1.0 means for compatibility is said in CHANGELOG.md and
+          # in spec/18-package-layout.md rather than by a label that also keeps the release off the
+          # repository front page and out of what `gh release view` answers with.
           fail_on_unmatched_files: true
 
   # Every crate in the workspace goes to crates.io, in dependency order, which cargo works out for
