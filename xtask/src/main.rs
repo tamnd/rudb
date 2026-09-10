@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod bench;
 mod codegen;
 mod grammar;
 mod layers;
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
         }
         Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
         Some("version") => version::set(&root(), std::env::args().nth(2).as_deref()),
+        Some("bench") => bench::run(&root()),
         Some("ci") => ci(),
         Some("help" | "--help" | "-h") | None => {
             usage();
@@ -59,6 +61,10 @@ fn usage() {
     );
     println!("  ci       everything the per-commit gate runs, in the order it runs it");
     println!("  version <x.y.z>        set the workspace version and every internal pin");
+    println!();
+    println!("  bench    the front end against a frozen workload, as a table");
+    println!("           rebuilds itself under the bench profile, because a debug number is not");
+    println!("           a number, and it is not the benchmark: that is tamnd/rudb-bench");
     println!();
     println!(
         "  vendor-grammar [ref]   refetch DuckDB's PEG grammar, writing crates/rudb-parse/grammar"

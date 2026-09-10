@@ -1,9 +1,14 @@
 # The per-commit gate. Everything here is required to merge.
 #
 # The matrix is the first rows of the table in spec/16-testing.md section 16.7. The differential
-# against a real DuckDB arrives with the harness in tamnd/rudb-compat, at M2, and the benchmark
-# jobs arrive with tamnd/rudb-bench at M1. Neither is listed here yet, because a job that is red
-# because the thing it calls does not exist teaches everyone to ignore a red run.
+# against a real DuckDB arrives with the harness in tamnd/rudb-compat, at M2, and it is not listed
+# here yet, because a job that is red because the thing it calls does not exist teaches everyone to
+# ignore a red run.
+#
+# The bench job below is not a benchmark. A timing taken on a shared runner is not a timing and the
+# numbers it prints are thrown away. What it checks is that the apparatus still produces a table,
+# which is a different question from what the table says and is the one that decides whether this
+# still works in six months.
 #
 # Actions are pinned to a patch version rather than a major tag. A major tag is a moving reference,
 # and a database that cannot reproduce its own CI run has given up something it needs.
@@ -154,6 +159,21 @@ jobs:
           diff <(cut -d' ' -f1 first.sha256) <(cut -d' ' -f1 second.sha256)
           echo "the binary builds reproducibly"
 
+  bench:
+    name: the front end table still prints
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: bench
+      # The task rebuilds itself under the bench profile before it measures anything, so this also
+      # covers the one code path a unit test cannot reach, which is the re-exec. Read nothing into
+      # the numbers: this is two vCPUs shared with whoever else is on the host.
+      - name: cargo xtask bench
+        run: cargo xtask bench
+
   audit:
     name: supply chain
     needs: quick
@@ -185,7 +205,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [quick, test, docs, msrv, determinism, audit]
+    needs: [quick, test, docs, msrv, determinism, bench, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: fail if anything upstream failed
