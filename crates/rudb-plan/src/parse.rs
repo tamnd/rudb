@@ -170,6 +170,15 @@ impl Reader<'_> {
                 let rows = plan.add_rows(&rows);
                 Ok(Built::leaf(Node::Values { index, columns, rows }))
             }
+            "TableFunction" => {
+                let function = read_name(plan, c)?;
+                c.expect_word("args")?;
+                c.expect("=")?;
+                let args = read_expr_list(plan, c)?;
+                let index = read_table_index(c)?;
+                let columns = read_schema(plan, c)?;
+                Ok(Built::leaf(Node::TableFunction { index, function, args, columns }))
+            }
             "Filter" => {
                 let predicate = read_expr(plan, c)?;
                 Ok(Built::unary(move |input| Node::Filter { input, predicate }))

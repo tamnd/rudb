@@ -57,6 +57,26 @@ pub enum Node {
         /// The rows, into the row pool, each row a slice of the expression list pool.
         rows: Slice,
     },
+    /// A function call where a table goes, such as `range(10)`.
+    ///
+    /// The arguments are expressions rather than numbers, because `range(2 + 3)` is a legal call
+    /// and folding it here would mean the plan could not be printed back as what was written. They
+    /// cannot refer to a column: a table function that sees the row on its left is `LATERAL`, which
+    /// is a different node and is not here yet.
+    ///
+    /// A separate node from [`Node::Values`] even though `range(3)` and `VALUES (0), (1), (2)`
+    /// produce the same rows, because the one that produces three million rows should be three
+    /// numbers in the plan rather than three million expressions in it.
+    TableFunction {
+        /// The table index that this call's columns bind against.
+        index: u32,
+        /// Which function, as its own canonical name.
+        function: StrRef,
+        /// The arguments, into the expression list pool.
+        args: Slice,
+        /// The produced columns with their types, into the field pool.
+        columns: Slice,
+    },
     /// A predicate over the input, keeping the rows where it is true.
     ///
     /// True, not "not false". A null predicate drops the row, which is SQL's rule and is the
@@ -173,6 +193,7 @@ impl Node {
             Self::Get { .. } => "Get",
             Self::Dummy => "Dummy",
             Self::Values { .. } => "Values",
+            Self::TableFunction { .. } => "TableFunction",
             Self::Filter { .. } => "Filter",
             Self::Project { .. } => "Project",
             Self::Aggregate { .. } => "Aggregate",
@@ -193,7 +214,9 @@ impl Node {
     #[must_use]
     pub fn children(&self) -> [Option<NodeRef>; 2] {
         match *self {
-            Self::Get { .. } | Self::Dummy | Self::Values { .. } => [None, None],
+            Self::Get { .. } | Self::Dummy | Self::Values { .. } | Self::TableFunction { .. } => {
+                [None, None]
+            }
             Self::Filter { input, .. }
             | Self::Project { input, .. }
             | Self::Aggregate { input, .. }
@@ -218,6 +241,7 @@ impl Node {
         match *self {
             Self::Get { index, .. }
             | Self::Values { index, .. }
+            | Self::TableFunction { index, .. }
             | Self::Project { index, .. }
             | Self::Aggregate { index, .. }
             | Self::SetOp { index, .. } => Some(index),
@@ -327,6 +351,12 @@ mod tests {
             },
             Node::Dummy,
             Node::Values { index: 0, columns: Slice::EMPTY, rows: Slice::EMPTY },
+            Node::TableFunction {
+                index: 0,
+                function: 0,
+                args: Slice::EMPTY,
+                columns: Slice::EMPTY,
+            },
             Node::Filter { input: 0, predicate: 0 },
             Node::Project { input: 0, index: 0, exprs: Slice::EMPTY, names: Slice::EMPTY },
             Node::Aggregate { input: 0, index: 0, groups: Slice::EMPTY, aggregates: Slice::EMPTY },
@@ -377,6 +407,7 @@ mod tests {
                 node,
                 Node::Get { .. }
                     | Node::Values { .. }
+                    | Node::TableFunction { .. }
                     | Node::Project { .. }
                     | Node::Aggregate { .. }
                     | Node::SetOp { .. }

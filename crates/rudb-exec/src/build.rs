@@ -20,7 +20,7 @@ use crate::join::{CrossProduct, Join};
 use crate::operator::Operator;
 use crate::setop::SetOp;
 use crate::sort::Sort;
-use crate::source::{Dummy, Scan, Values};
+use crate::source::{Dummy, Scan, Series, Values};
 use crate::stream::{Filter, Limit, Project};
 
 /// Builds the operator tree for a plan's root.
@@ -46,6 +46,9 @@ fn node<'a>(
         }
         Node::Dummy => Box::new(Dummy::new()),
         Node::Values { index, columns, rows } => Box::new(Values::new(plan, index, columns, rows)?),
+        Node::TableFunction { index, function, args, .. } => {
+            Box::new(Series::new(plan, index, plan.string(function), args)?)
+        }
         Node::Filter { input, predicate } => {
             Box::new(Filter::new(plan, node(plan, catalog, input)?, predicate))
         }

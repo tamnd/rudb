@@ -14,7 +14,7 @@
 
 use rudb_catalog::{Catalog, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_functions::resolve;
+use rudb_functions::{resolve, resolve_table};
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, parse_ast};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey};
@@ -760,6 +760,9 @@ impl<'a> Binder<'a> {
             ast::Source::Table { name, alias, columns } => {
                 self.bind_table(ast, name, alias, columns)
             }
+            ast::Source::Function { name, args, alias, columns } => {
+                self.bind_table_function(ast, name, args, alias, columns)
+            }
             ast::Source::Subquery { query, alias, columns } => {
                 let (node, mut scope) = self.bind_query(ast, query)?;
                 let label = if alias == NONE {
@@ -833,6 +836,77 @@ impl<'a> Binder<'a> {
             index,
             columns,
         });
+        Ok((node, scope))
+    }
+
+    /// A function call where a table goes, such as `range(10)`.
+    ///
+    /// The arguments are bound against an empty scope. A table function that can see the row on its
+    /// left is `LATERAL`, and this is not it, so a column name in here is not resolved against
+    /// whatever happens to be to the left in the `FROM` list. Letting it would mean `FROM t,
+    /// range(t.n)` quietly binding to something whose meaning depends on the order the sources were
+    /// written in.
+    fn bind_table_function(
+        &mut self,
+        ast: &Ast,
+        name: ast::Slice,
+        args: ast::Slice,
+        alias: ast::StrRef,
+        columns: ast::Slice,
+    ) -> Result<(NodeRef, Scope)> {
+        let parts: Vec<&str> = ast.name(name).collect();
+        // A qualified call names a schema, and the two schemas that exist are the ones every
+        // built-in lives in. Anything else is a name that has to fail rather than fall through to
+        // the unqualified lookup and be found somewhere it was not asked for.
+        let function_name = *parts.last().unwrap_or(&"");
+        if let Some(schema) = parts.iter().rev().nth(1) {
+            if !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("system") {
+                return Err(Error::catalog(format!(
+                    "Table Function with name {} does not exist!",
+                    parts.join(".")
+                )));
+            }
+        }
+        let written = ast.expr_list(args).to_vec();
+        let resolved = resolve_table(function_name, written.len())?;
+
+        let empty = Scope::empty();
+        let previous = std::mem::replace(&mut self.clause, "table function arguments");
+        let mut bound = Vec::with_capacity(written.len());
+        for expr in written {
+            bound.push(self.bind_expr(ast, expr, &empty)?);
+        }
+        self.clause = previous;
+        let cast: Vec<ExprRef> = bound
+            .iter()
+            .zip(&resolved.arguments)
+            .map(|(&expr, ty)| self.cast_to(expr, ty))
+            .collect();
+
+        let label = if alias == NONE {
+            resolved.function.name().to_string()
+        } else {
+            ast.string(alias).to_string()
+        };
+        let index = self.fresh_index();
+        let mut scope = Scope::empty();
+        for (at, field) in resolved.columns.iter().enumerate() {
+            scope.push(Visible {
+                table: label.clone(),
+                name: field.name.clone(),
+                binding: ColumnBinding::new(index, at as u32),
+                ty: field.ty.clone(),
+            });
+        }
+        if !columns.is_empty() {
+            let names: Vec<&str> = ast.name(columns).collect();
+            scope.rename(&names, &label)?;
+        }
+        let function = self.plan.intern(resolved.function.name());
+        let args = self.plan.add_expr_list(&cast);
+        let fields = self.plan.add_fields(&resolved.columns);
+        let node =
+            self.plan.add_node(Node::TableFunction { index, function, args, columns: fields });
         Ok((node, scope))
     }
 

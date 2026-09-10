@@ -337,6 +337,21 @@ pub enum Source {
         /// Column aliases, as a run of [`StrRef`].
         columns: Slice,
     },
+    /// A function call where a table goes, such as `range(10)`.
+    ///
+    /// Held with the name as a qualified run rather than a single string, because `main.range(10)`
+    /// is legal and a function in a schema that does not exist has to say so rather than being
+    /// looked up unqualified and found.
+    Function {
+        /// The name, as a run of [`StrRef`] in `Ast::parts`, outermost first.
+        name: Slice,
+        /// The arguments, as a run of [`ExprRef`] in `Ast::expr_lists`.
+        args: Slice,
+        /// The alias, or `NONE`.
+        alias: StrRef,
+        /// Column aliases from `AS t(a, b)`, as a run of [`StrRef`].
+        columns: Slice,
+    },
     /// A `VALUES` in the `FROM` clause.
     Values {
         /// The rows, as a run of [`Slice`] in `Ast::rows`.

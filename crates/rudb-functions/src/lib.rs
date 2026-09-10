@@ -9,5 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod signature;
+pub mod table;
 
 pub use signature::{FunctionKind, Resolved, kind_of, resolve};
+pub use table::{ResolvedTable, TableFunction, resolve_table, series, series_length};
