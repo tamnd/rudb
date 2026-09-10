@@ -6,10 +6,19 @@ The version number says how far through the plan we are. **The minor version is 
 
 ## Unreleased
 
+## 0.0.2
+
+Still no database and still no query. What this release settles is where the SQL dialect comes from, and the answer is that it comes from DuckDB rather than from us reading DuckDB. The grammar is vendored verbatim and everything derived from it is generated, so a bump is a diff to read rather than a transcription to redo. The other thing it settles is that every byte the engine will ever write goes through one place, which is a week of work now and a rewrite later.
+
+- The I/O interception shim, `rudb-io`, from `spec/16-testing.md` section 16.5. Every read, write, fsync, rename and truncate goes through one interface, with two implementations behind it: `RealFilesystem` is `std::fs` with positional reads and writes, and `SimFilesystem` is memory that records everything, can be told to fail at a chosen point, and can reorder writes that were not separated by an fsync. It is here rather than at M6, where the crash tests that drive it live, because retrofitting interception into a storage layer written without it means rewriting the storage layer.
 - DuckDB's PEG grammar is vendored, at `crates/rudb-parse/grammar`. In v2.0 DuckDB replaced its bison parser with a PEG parser whose grammar ships as 61 KB of declarative text with no semantic actions in it, MIT licensed, and that text is the definition of the dialect this project claims compatibility with. Vendoring it removes 1,086 chances to reject valid DuckDB SQL by hand, and removes them again on every upstream release. `cargo xtask vendor-grammar` is the only thing that writes there, `cargo xtask grammar` fails the build if anything else did, and a nightly job reopens the question when upstream moves. `spec/20-the-grammar.md` is the argument, the measurements, and the three places fidelity still leaks.
 - The tokenizer, in `rudb-parse`. It is a port of DuckDB's `base_tokenizer.cpp` rather than an interpretation of it, because the grammar says nothing about string literals, dollar quoting, numeric literal forms, comments or the operator rules, and all of that is 613 lines of hand written C++ with no declarative artifact behind it. Nine states, nine token kinds, twelve bytes a token, no allocation and no decoding. Reading the source rather than the documentation falsified two things `spec/20-the-grammar.md` had said about it, both now corrected: DuckDB does not fold identifier case at any point, including for quoted identifiers, and `SELECT 1e` is one number token rather than `1` aliased `e`.
 - `cargo xtask gen-grammar`, which writes the keyword table out of the vendored grammar, and runs in the gate with `--check` so the checked in table and the grammar cannot drift apart. The table is 514 words rather than the 499 in the five class lists, because 15 more are spelled by a rule and are in no class at all. Those get a mask of zero, which makes them matchable as a literal and transparent everywhere else, so `ORDER BY x ASCENDING` works without `SELECT ascending FROM t` becoming a syntax error.
 - `spec/04-architecture.md` section 4.5 said hand-written recursive descent and that we start where DuckDB ended up minus the generator. Where they ended up is the generator, so that is corrected. Error recovery moves off the query path in the same edit: a PEG matcher that resynchronizes past an error accepts strings DuckDB rejects, so the strict parse is what a query gets and recovery is a second entry point over the same rule table for tooling.
+
+Known gap: everything about the tokenizer is checked against a careful reading of one C++ file, because the differential harness that would check it against a running DuckDB is still an open box on M0. Three claims in the specification were wrong for exactly that reason and were only caught by reading the source. The harness is next.
+
+Storage format version: none written yet.
 
 ## 0.0.1
 
