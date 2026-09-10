@@ -98,6 +98,8 @@ The honest counterweight: `std::simd` is [still nightly only](https://github.com
 
 Read 02 first, then 03, then 01. Document 02 decides whether the project is honest, document 03 is the measurement it rests on, and document 01 is the literature that says the measurement is reachable.
 
+`spec/engine/` is a second pass over documents 04 through 09, written after the first six months of building, because the way the M2 work was being picked turned out to be wrong. It ordered the work by how many `sqllogictest` records each missing feature would unlock, which is a measure of surface area and not a measure of the engine, and the result was a database that parses a great deal of SQL and executes all of it through a nested loop join with no filter pushdown. `spec/engine/00-README.md` is the layered replacement, `spec/engine/01-survey.md` re-checks the state of the art as of September 2026 and names the three places this specification is now out of date, and `spec/engine/14-plan.md` is the thirteen sub-milestones with a benchmark gate on each. Where the two disagree, `spec/engine/` is newer and wins, and every disagreement is stated in its text rather than left to be found.
+
 ## What this is not
 
 Not a transactional database. rudb has MVCC and ACID because DuckDB does and compatibility requires it, but it is tuned for one writer and many readers over columnar data, and document 11 is explicit that OLTP throughput is not an axis.
