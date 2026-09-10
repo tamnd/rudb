@@ -13,10 +13,17 @@
 //! other two have to beat, and it is what a group falls back to when they do not.
 //!
 //! `SHARED_TABLE` is one FSST symbol table trained on a sample of all the columns, with every
-//! column compressed against it. Storing one 255 symbol table rather than six saves almost nothing
-//! by itself. The effect that matters is that a table trained on the union has more evidence per
-//! symbol, so it compresses each column better than a table trained on that column alone would,
-//! and the columns that gain most are the small ones that never had enough bytes to train on.
+//! column front coded and the leftovers compressed against it. Storing one 255 symbol table rather
+//! than six saves almost nothing by itself. The effect that matters is that a table trained on the
+//! union has more evidence per symbol, so it compresses each column better than a table trained on
+//! that column alone would, and the columns that gain most are the small ones that never had enough
+//! bytes to train on.
+//!
+//! The front coding is there because `INDEPENDENT` is the baseline and `INDEPENDENT` can front
+//! code, so a shared table that could not would be losing to a baseline it was never measured
+//! against. On the generated URLs in the tests here that gap was a factor of two. Front coding a
+//! column whose neighbours share nothing costs a run of zeros, which the integer chunk stores in a
+//! few bytes, so nothing has to decide whether to do it.
 //!
 //! `SHARED_DICT` is one dictionary holding the union of the values, with every column becoming an
 //! array of codes into it. A value that appears in three columns is stored once rather than three
@@ -230,16 +237,30 @@ fn encode_as(strategy: Strategy, columns: &[&[&[u8]]]) -> Result<Option<Vec<u8>>
             if columns.len() < 2 {
                 return Ok(None);
             }
-            let table = SymbolTable::train(&shared_sample(columns));
+            // Front coded first, and the table trained on what is left. A shared table has to beat
+            // encoding the columns apart, and encoding a column apart can front code it, so a
+            // shared table that cannot is comparing itself against a better baseline than the one
+            // it was written for. On the generated URLs in the tests here that gap was a factor of
+            // two. Front coding a column with nothing to share costs a run of zeros, which the
+            // integer chunk stores in a few bytes, so this is not a decision anything has to make.
+            let coded: Vec<(Vec<i64>, Vec<&[u8]>)> =
+                columns.iter().map(|column| string::front_code(column)).collect();
+            let suffixes: Vec<&[&[u8]]> =
+                coded.iter().map(|(_, suffixes)| suffixes.as_slice()).collect();
+            let table = SymbolTable::train(&shared_sample(&suffixes));
             if table.is_empty() {
                 return Ok(None);
             }
             table.serialize(&mut out);
-            for column in columns {
-                put_u32(&mut out, u32::try_from(column.len()).map_err(|_| too_many(column.len()))?);
+            for (prefixes, suffixes) in &coded {
+                put_u32(
+                    &mut out,
+                    u32::try_from(prefixes.len()).map_err(|_| too_many(prefixes.len()))?,
+                );
+                out.extend_from_slice(&integer::encode(prefixes)?);
                 let mut compressed = Vec::new();
-                let mut lengths = Vec::with_capacity(column.len());
-                for value in *column {
+                let mut lengths = Vec::with_capacity(suffixes.len());
+                for value in suffixes {
                     let before = compressed.len();
                     table.compress(value, &mut compressed);
                     lengths.push((compressed.len() - before) as i64);
@@ -287,24 +308,27 @@ fn decode_at(reader: &mut Reader<'_>) -> Result<Vec<Vec<Vec<u8>>>> {
             reader.skip(used)?;
             for _ in 0..count {
                 let rows = reader.u32()? as usize;
+                let (prefixes, used) = integer::decode_prefix(reader.rest())?;
+                reader.skip(used)?;
                 let (lengths, used) = integer::decode_prefix(reader.rest())?;
                 reader.skip(used)?;
-                if lengths.len() != rows {
+                if lengths.len() != rows || prefixes.len() != rows {
                     return Err(Error::internal(format!(
-                        "a column says it holds {rows} values and has {} lengths",
+                        "a column says it holds {rows} values and has {} prefixes and {} lengths",
+                        prefixes.len(),
                         lengths.len()
                     )));
                 }
-                let mut values = Vec::with_capacity(rows);
+                let mut suffixes = Vec::with_capacity(rows);
                 for length in lengths {
                     let length = usize::try_from(length)
                         .map_err(|_| Error::internal("a negative compressed length"))?;
                     let compressed = reader.bytes(length)?;
                     let mut value = Vec::new();
                     table.decompress(compressed, &mut value)?;
-                    values.push(value);
+                    suffixes.push(value);
                 }
-                columns.push(values);
+                columns.push(string::front_decode(&prefixes, suffixes)?);
             }
         }
         Strategy::SharedDict => {
@@ -348,6 +372,8 @@ fn describe_at(reader: &mut Reader<'_>) -> Result<String> {
             reader.skip(used)?;
             for _ in 0..count {
                 let rows = reader.u32()? as usize;
+                let (prefixes, used) = integer::describe_prefix(reader.rest())?;
+                reader.skip(used)?;
                 // The same chunk twice, once for its shape and once for the lengths themselves,
                 // which is how the describe knows how far past the payload to step.
                 let (text, _) = integer::describe_prefix(reader.rest())?;
@@ -360,7 +386,7 @@ fn describe_at(reader: &mut Reader<'_>) -> Result<String> {
                 reader.skip(usize::try_from(bytes).map_err(|_| {
                     Error::internal("a column group has a negative compressed size")
                 })?)?;
-                parts.push(text);
+                parts.push(format!("FRONT({prefixes}, {text})"));
             }
             format!("SHARED_TABLE[{}]", table.len())
         }
@@ -512,8 +538,16 @@ mod tests {
     fn two_columns_of_the_same_alphabet_share_a_symbol_table() {
         // No value appears in both columns, so a dictionary has nothing to share. The alphabet is
         // the same, which is what a symbol table can still share.
-        let left = urls("www.example.com", 8_000, 0);
-        let right = urls("news.other.example.org", 8_000, 500_000);
+        //
+        // A thousand values a column, and that number is doing work. Sharing wins here because a
+        // 255 symbol table is a fixed cost and two columns of this size pay it twice. It stops
+        // winning once each column is big enough to train a table of its own that fits it better
+        // than a joint one does, and on this data the crossover is between two and four thousand
+        // values a column: 21,319 shared against 22,223 apart at two thousand, and 41,002 against
+        // 39,750 at four. The gain from sharing a table is a small column's gain, which is what
+        // the next test is about.
+        let left = urls("www.example.com", 1_000, 0);
+        let right = urls("news.other.example.org", 1_000, 500_000);
         let columns = [borrow(&left), borrow(&right)];
         let group = group(&columns);
         let bytes = round_trip(&group);

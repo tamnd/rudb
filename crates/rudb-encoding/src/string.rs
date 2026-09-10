@@ -5,17 +5,40 @@
 //! the referer derived columns are most of the 20.46 GB DuckDB writes for it, so most of what
 //! `spec/02-the-goal.md` promises on the resource axis has to come out of this file.
 //!
-//! ## The four shapes
+//! ## The five shapes
 //!
 //! `CONSTANT` when every value is the same. `PLAIN`, which is lengths and raw bytes and is the
 //! baseline the others have to beat. `FSST`, which is a symbol table and the same lengths over
-//! compressed bytes. `DICT`, which is the distinct values and an array of codes.
+//! compressed bytes. `DICT`, which is the distinct values and an array of codes. `FRONT`, which is
+//! the length of the prefix each value shares with the one before it and the rest of the value.
 //!
-//! `DICT_FSST` from the section 6.2 table is not a fifth shape. A dictionary's entries are a string
+//! `DICT_FSST` from the section 6.2 table is not a sixth shape. A dictionary's entries are a string
 //! column, and encoding them goes back through the same chooser, so a dictionary whose entries are
 //! FSST compressed is what the chooser produces on its own whenever that is smaller. The same
 //! recursion gives run length encoding of strings for free, because the codes are an integer chunk
 //! and `crate::integer` already knows what to do with a column of long runs.
+//!
+//! ## Why front coding is here
+//!
+//! The whole file measurement in M1 says the chooser produces 11.65 GB for `hits` against Parquet's
+//! 13.76 GB, and that `URL`, `Referer` and `OriginalURL` are 6.11 GB of it, and that on those three
+//! the chooser loses to Parquet's Snappy. The shape it picked on all three was `DICT(FSST[255])`,
+//! so the cascade was working and FSST was still losing.
+//!
+//! The reason is structural. FSST compresses each value on its own against a 255 symbol table, and
+//! a block compressor has the previous few kilobytes of the page to point back into. Two URLs that
+//! share a host and half a path are most of a back reference to each other and are nothing at all
+//! to a symbol table, which can only spend eight bytes of a symbol on the part they share and has
+//! to spend it again on every value. On a sorted dictionary of URLs the value before is the closest
+//! thing in the column to the value in hand, and the bytes they share are the redundancy Snappy was
+//! finding. Front coding is what reaches those bytes, and it composes with everything else here:
+//! the suffixes it leaves behind are a string column and go back through the chooser, so
+//! `DICT(FRONT(FSST))` is a shape the chooser can arrive at without anyone naming it.
+//!
+//! The chain has no restarts, so reading entry `n` means walking from entry zero. That is the right
+//! trade while a dictionary is decoded whole, which is what `decode` does. When something wants one
+//! entry out of a dictionary without materialising the rest, the answer is a restart every so many
+//! entries, and it costs one full value per block.
 //!
 //! ## Lengths, not offsets
 //!
@@ -48,6 +71,11 @@ use crate::reader::Reader;
 /// stop the dictionary's own entries from being dictionary encoded again.
 const MAX_DEPTH: u8 = 2;
 
+/// How little sharing between neighbours is still worth offering front coding for, as one over
+/// this. A twentieth of the column is around where the prefix lengths start paying for themselves,
+/// and below it the candidate is an encode of the whole column that loses.
+const SHARE_DIVISOR: usize = 20;
+
 /// How many bytes of a column the symbol table is trained on.
 ///
 /// The paper trains on about 16 KB. This is four times that, because training happens once per
@@ -66,6 +94,8 @@ pub enum Kind {
     Fsst = 2,
     /// The distinct values as a string chunk of their own, and codes into it as an integer chunk.
     Dict = 3,
+    /// Shared prefix lengths as an integer chunk, and what is left of each value as a string chunk.
+    Front = 4,
 }
 
 impl Kind {
@@ -79,6 +109,7 @@ impl Kind {
             1 => Ok(Self::Plain),
             2 => Ok(Self::Fsst),
             3 => Ok(Self::Dict),
+            4 => Ok(Self::Front),
             other => Err(Error::internal(format!("unknown string encoding tag {other}"))),
         }
     }
@@ -91,6 +122,7 @@ impl Kind {
             Self::Plain => "PLAIN",
             Self::Fsst => "FSST",
             Self::Dict => "DICT",
+            Self::Front => "FRONT",
         }
     }
 }
@@ -198,7 +230,82 @@ fn candidates(values: &[&[u8]], depth: u8) -> Vec<Kind> {
     if depth < MAX_DEPTH && distinct_values(values).len() < values.len() {
         kinds.push(Kind::Dict);
     }
+    if depth < MAX_DEPTH && sharing_of(values) >= total_len(values) / SHARE_DIVISOR {
+        kinds.push(Kind::Front);
+    }
     kinds
+}
+
+/// How many bytes each value shares with the value before it, added up.
+///
+/// This is a full pass over the column, and it is here rather than on a sample because it is byte
+/// comparisons that stop at the first difference, which on a column with nothing to share stops
+/// immediately. Against training a symbol table and compressing the whole column, which is what
+/// offering the candidate would cost, it is not worth sampling.
+fn sharing_of(values: &[&[u8]]) -> usize {
+    let mut shared = 0;
+    for pair in values.windows(2) {
+        shared += shared_prefix(pair[0], pair[1]);
+    }
+    shared
+}
+
+/// Every value split into the bytes it shares with the value before it and the bytes it does not.
+///
+/// The suffixes point into the values, so this costs the prefix lengths and nothing else. It is
+/// shared with [`crate::multi`], which front codes a column before compressing it against a symbol
+/// table that belongs to the whole group.
+pub(crate) fn front_code<'a>(values: &[&'a [u8]]) -> (Vec<i64>, Vec<&'a [u8]>) {
+    let mut prefixes = Vec::with_capacity(values.len());
+    let mut suffixes: Vec<&'a [u8]> = Vec::with_capacity(values.len());
+    let mut previous: &[u8] = b"";
+    for value in values {
+        let value: &'a [u8] = value;
+        let shared = shared_prefix(previous, value);
+        prefixes.push(shared as i64);
+        suffixes.push(&value[shared..]);
+        previous = value;
+    }
+    (prefixes, suffixes)
+}
+
+/// The other half. The suffixes are consumed because the values are built out of them.
+///
+/// # Errors
+///
+/// If a prefix is negative or is longer than the value it is a prefix of, which is what a corrupt
+/// or hand written chunk looks like from here.
+pub(crate) fn front_decode(prefixes: &[i64], suffixes: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
+    let mut values: Vec<Vec<u8>> = Vec::with_capacity(suffixes.len());
+    for (index, suffix) in suffixes.into_iter().enumerate() {
+        let shared = usize::try_from(prefixes[index])
+            .map_err(|_| Error::internal("a negative shared prefix length"))?;
+        let previous: &[u8] = if index == 0 { b"" } else { &values[index - 1] };
+        if shared > previous.len() {
+            return Err(Error::internal(format!(
+                "a value shares {shared} bytes with a value {} bytes long",
+                previous.len()
+            )));
+        }
+        let mut value = Vec::with_capacity(shared + suffix.len());
+        value.extend_from_slice(&previous[..shared]);
+        value.extend_from_slice(&suffix);
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn shared_prefix(previous: &[u8], value: &[u8]) -> usize {
+    let limit = previous.len().min(value.len());
+    let mut shared = 0;
+    while shared < limit && previous[shared] == value[shared] {
+        shared += 1;
+    }
+    shared
+}
+
+fn total_len(values: &[&[u8]]) -> usize {
+    values.iter().map(|value| value.len()).sum()
 }
 
 fn encode_as(kind: Kind, values: &[&[u8]], depth: u8) -> Result<Option<Vec<u8>>> {
@@ -247,6 +354,11 @@ fn encode_as(kind: Kind, values: &[&[u8]], depth: u8) -> Result<Option<Vec<u8>>>
             let entries: Vec<&[u8]> = dictionary.iter().map(Vec::as_slice).collect();
             out.extend_from_slice(&encode_at(&entries, depth + 1)?);
             out.extend_from_slice(&integer::encode(&codes)?);
+        }
+        Kind::Front => {
+            let (prefixes, suffixes) = front_code(values);
+            out.extend_from_slice(&integer::encode(&prefixes)?);
+            out.extend_from_slice(&encode_at(&suffixes, depth + 1)?);
         }
     }
     Ok(Some(out))
@@ -301,6 +413,18 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<Vec<u8>>> {
             }
             Ok(values)
         }
+        Kind::Front => {
+            let prefixes = decode_integers(reader)?;
+            let suffixes = decode_chunk(reader)?;
+            if prefixes.len() != count || suffixes.len() != count {
+                return Err(Error::internal(format!(
+                    "a front coded chunk says it holds {count} values and has {} prefixes and {} suffixes",
+                    prefixes.len(),
+                    suffixes.len()
+                )));
+            }
+            front_decode(&prefixes, suffixes)
+        }
     }
 }
 
@@ -329,6 +453,11 @@ fn describe_chunk(reader: &mut Reader<'_>) -> Result<String> {
             let entries = describe_chunk(reader)?;
             let codes = describe_integers(reader)?;
             format!("DICT({entries}, {codes})")
+        }
+        Kind::Front => {
+            let prefixes = describe_integers(reader)?;
+            let suffixes = describe_chunk(reader)?;
+            format!("FRONT({prefixes}, {suffixes})")
         }
     })
 }
@@ -467,6 +596,22 @@ mod tests {
             .collect()
     }
 
+    /// The same values with a scrambled identifier stuck on the front of each, for the tests that
+    /// need neighbouring values to have nothing in common. Shuffling the order is not enough,
+    /// because two URLs picked at random still agree on a scheme and often on a host.
+    fn keyed(values: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let key = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) % 1_000_000_007;
+                let mut out = format!("{key:010}/").into_bytes();
+                out.extend_from_slice(&value);
+                out
+            })
+            .collect()
+    }
+
     fn borrow(values: &[Vec<u8>]) -> Vec<&[u8]> {
         values.iter().map(Vec::as_slice).collect()
     }
@@ -503,14 +648,18 @@ mod tests {
 
     #[test]
     fn a_url_column_of_unique_values_uses_fsst() {
-        // Every value distinct, so a dictionary is the values plus an index and cannot win. This is
-        // the shape of `WatchID` and of the high cardinality end of `URL`, which section 6.5 says
-        // falls back to FSST only.
-        let values = urls(20_000);
+        // Every value distinct, so a dictionary is the values plus an index and cannot win, and
+        // every value starts with an identifier of its own, so neighbours share nothing and front
+        // coding cannot win either. What is left is a column with a lot of repeated vocabulary in
+        // it and no structure that anything but a symbol table can reach. Section 6.5 says the high
+        // cardinality end of `URL` falls back to FSST only and this is that case.
+        let values = keyed(urls(20_000));
         let bytes = round_trip(&values);
         assert_eq!(kind_of(&bytes), Kind::Fsst);
+        // Eleven bytes of every value are the identifier and a separator and nothing compresses
+        // them, so the ratio here is lower than the one FSST gets on the URLs on their own.
         let ratio = raw_size(&values) as f64 / bytes.len() as f64;
-        assert!(ratio > 5.0, "{ratio:.2}x");
+        assert!(ratio > 4.0, "{ratio:.2}x");
     }
 
     #[test]
@@ -554,15 +703,18 @@ mod tests {
 
     #[test]
     fn a_repeating_column_becomes_a_dictionary_of_compressed_entries() {
-        // The DICT_FSST row of the section 6.2 table, which is not a fifth encoding here: it is a
-        // dictionary whose entries went back through the chooser and came out as FSST.
+        // The DICT_FSST row of the section 6.2 table, which is not an encoding of its own here: it
+        // is a dictionary whose entries went back through the chooser. A dictionary sorts its
+        // entries, so what comes back on anything URL shaped is front coding with the leftovers
+        // FSST compressed, and nobody had to name that shape for the chooser to arrive at it.
         let distinct = urls(500);
         let values: Vec<Vec<u8>> =
             (0..50_000).map(|index| distinct[index * 7919 % distinct.len()].clone()).collect();
         let bytes = round_trip(&values);
         assert_eq!(kind_of(&bytes), Kind::Dict);
         let shape = describe(&bytes).unwrap();
-        assert!(shape.starts_with("DICT(FSST"), "{shape}");
+        assert!(shape.starts_with("DICT(FRONT("), "{shape}");
+        assert!(shape.contains("FSST"), "{shape}");
         let ratio = raw_size(&values) as f64 / bytes.len() as f64;
         assert!(ratio > 20.0, "{ratio:.2}x, {shape}");
     }
@@ -678,6 +830,68 @@ mod tests {
         bytes.extend_from_slice(&integer::encode(&[9]).unwrap());
         let error = decode(&bytes).unwrap_err();
         assert!(error.message().contains("not in the dictionary"), "{error}");
+    }
+
+    #[test]
+    fn a_sorted_column_of_urls_is_front_coded() {
+        // The M1 finding, in a test. Sorted URLs share a host and most of a path with the URL next
+        // to them, FSST cannot reach those bytes because it compresses each value on its own, and
+        // front coding is the shape that reaches them.
+        let mut values = urls(20_000);
+        values.sort();
+        let bytes = round_trip(&values);
+        assert_eq!(kind_of(&bytes), Kind::Front);
+        let shape = describe(&bytes).unwrap();
+        let mut plain = Vec::new();
+        let borrowed = borrow(&values);
+        for (kind, size) in candidate_sizes(&borrowed).unwrap() {
+            if kind == Kind::Fsst {
+                plain.push(size);
+            }
+        }
+        let fsst = plain[0];
+        assert!(bytes.len() * 2 < fsst, "{} against FSST {fsst}: {shape}", bytes.len());
+    }
+
+    #[test]
+    fn a_column_with_nothing_to_share_is_not_offered_front_coding() {
+        // The candidate costs an encode of the whole column, so a column whose neighbours have
+        // nothing in common must not be paying for it.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let values: Vec<Vec<u8>> = (0..2000)
+            .map(|_| {
+                (0..24)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (state % 251) as u8
+                    })
+                    .collect()
+            })
+            .collect();
+        let borrowed = borrow(&values);
+        assert!(!candidates(&borrowed, 0).contains(&Kind::Front));
+    }
+
+    #[test]
+    fn a_prefix_longer_than_the_value_before_it_is_an_error() {
+        let mut bytes = vec![Kind::Front.tag()];
+        put_u32(&mut bytes, 2);
+        bytes.extend_from_slice(&integer::encode(&[0, 9]).unwrap());
+        bytes.extend_from_slice(&encode(&[b"one".as_slice(), b"two".as_slice()]).unwrap());
+        let error = decode(&bytes).unwrap_err();
+        assert!(error.message().contains("shares 9 bytes"), "{error}");
+    }
+
+    #[test]
+    fn a_negative_prefix_is_an_error() {
+        let mut bytes = vec![Kind::Front.tag()];
+        put_u32(&mut bytes, 1);
+        bytes.extend_from_slice(&integer::encode(&[-1]).unwrap());
+        bytes.extend_from_slice(&encode(&[b"one".as_slice()]).unwrap());
+        let error = decode(&bytes).unwrap_err();
+        assert!(error.message().contains("negative shared prefix"), "{error}");
     }
 
     #[test]
