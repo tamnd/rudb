@@ -38,7 +38,8 @@ All counts are from the vendored tree at `v2.0-cyanoptera`, commit `cc7e7bac7fcb
 | column name keywords | 54 |
 | function name keywords | 29 |
 | type name keywords | 31 |
-| distinct keywords across all five | 498, so 30 words are in more than one class |
+| distinct keywords across all five | 499, so 29 words are in more than one class |
+| words used as a literal in the grammar and in none of the five lists | 15 |
 
 Sixty one kilobytes is the entire syntax of the dialect that won on PostgreSQL compatibility. For scale in the other direction, upstream's transformer, which is the layer after the parser and the one we still write ourselves, is 46 files and 2,650,053 bytes, most of it generated serialization and copy boilerplate. The grammar is about two per cent of the front end by size and it is the two per cent that defines what compiles.
 
@@ -80,7 +81,11 @@ Four decisions, written down because they will otherwise be relitigated.
 
 **Parameterized rules are expanded at generation time.** The grammar has two macro forms, `List(D) <- D (',' D)* ','?` and `Parens(D) <- '(' D ')'`, and they are most of why 1,086 rules fit in 1,421 lines. Expanding `Parens(List(Expression))` into a concrete rule with a synthesized name costs a few hundred extra table entries and buys a matcher with no environment to thread through it. Note in passing that the trailing comma in `List` is where DuckDB's most used piece of friendly SQL comes from, and that it arrives for free.
 
-**The keyword table is one sorted list with a class mask, not five tables.** The five classes are not disjoint, 30 of the 498 words are in more than one, so five tables means storing those words more than once and then deciding which answer wins. Worse, most words in a query are not keywords at all and the common case with five tables is five misses. One binary search over 498 words answers the whole question and the class is a bit mask, so asking whether a word is acceptable in a position is an `and`.
+**The keyword table is one sorted list with a class mask, not five tables.** The five classes are not disjoint, 29 of the 499 words are in more than one, so five tables means storing those words more than once and then deciding which answer wins. Worse, most words in a query are not keywords at all and the common case with five tables is five misses. One binary search answers the whole question and the class is a bit mask, so asking whether a word is acceptable in a position is an `and`.
+
+**The table is the union of the keyword lists and the grammar's own literals, and the difference between those two sets is not an error.** 330 distinct words appear as a quoted literal somewhere in the grammar and 15 of them are in none of the five lists: `ALIAS`, `ASCENDING`, `DATABASES`, `DESCENDING`, `DESTROY`, `GEOMETRY`, `KEYS`, `PREFIX`, `PUBLIC`, `REGISTER`, `REPOSITORY`, `RESOURCES`, `TRY`, `VARIABLES` and `VARIANT`. These are soft words. `ORDER BY x ASCENDING` parses because a rule spells that literal, and `SELECT ascending FROM t` is still a column reference because the word is in no class and therefore never blocks an identifier. So a word being absent from all five lists is a fourth state and not a missing entry, and a generator that treats the lists as the authority on what a keyword is will silently make all 15 of these reserved. The bit mask has room for it: no class bits set means the word is matchable as a literal and transparent everywhere else. The table is 514 words, being the 499 listed plus those 15.
+
+Going the other way, 184 of the listed words never appear as a literal in any rule. That is expected rather than suspicious. Their entire job is to be in a class, so that they are or are not usable as a bare name in a position, which is a fact about identifiers rather than about any rule that mentions them.
 
 **The generated files are checked in.** A contributor with no network builds rudb. This is the same rule the vendored tree lives under and for the same reason.
 
