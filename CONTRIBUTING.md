@@ -8,6 +8,14 @@ The project is at M0. There is a lot of design written down and very little code
 
 If you want to write code, take a milestone issue or a piece of one, and say so on the issue first. The milestones are ordered so that the parts which could kill the project come first, and work on M4 before M2 exists is work that gets thrown away.
 
+## Versions and releases
+
+The minor version is the number of milestones finished. Work inside M0 is tagged 0.0.1, 0.0.2 and so on, the release where M0's exit criterion passes is 0.1.0, work inside M1 is 0.1.1 upwards, and M1 closing is 0.2.0. When M10 closes the version is 1.0.0 rather than 0.11.0, because that milestone is named 1.0.
+
+A patch release goes out whenever enough has landed to be worth a tag. There is no schedule and no release branch. Tagging is the whole process: push a tag that matches the version in `Cargo.toml`, and the release workflow checks the tag against the manifest, checks that CHANGELOG.md has a section for it, runs the full gate, builds the five targets, and publishes. If any of those fail there is no release, which is the point of doing it that way rather than by hand.
+
+Every release states its storage format version, including the releases that do not write files, where it states that it does not write files. A database file outlives the build that wrote it and the release notes are where somebody finds out whether their file is still readable.
+
 ## Running the checks
 
 ```
