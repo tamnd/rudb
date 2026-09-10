@@ -11,9 +11,11 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod settings;
 pub mod types;
 pub mod value;
 
 pub use error::{Error, ErrorCode, Result, Span};
+pub use settings::{DefaultOrder, NullOrder, Settings};
 pub use types::{Field, LogicalType, MAX_DECIMAL_WIDTH, PhysicalType};
 pub use value::{Value, civil_from_days, days_from_civil};
