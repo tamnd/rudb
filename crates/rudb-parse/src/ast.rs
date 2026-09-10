@@ -1,0 +1,657 @@
+//! rudb's abstract syntax tree.
+//!
+//! The parse tree the matcher produces is DuckDB's grammar, faithfully. That is the point of it and
+//! it is also why nothing downstream should read it: a bump of the vendored grammar is allowed to
+//! rename `BetweenInLikeExpression`, and if the binder is matching on that name then the bump is a
+//! rewrite. This module is the boundary. It is ours, it changes when we decide it changes, and
+//! `transform` is the one place that knows both shapes.
+//!
+//! Everything is an arena with `u32` indices, per `spec/04-architecture.md` section 4.5. There is
+//! no `Box` and no `Vec` inside a node. A list of children is a [`Slice`] into a side vector, which
+//! means a node is a fixed size, the whole tree is a handful of allocations, and walking it is a
+//! sequential read rather than a pointer chase per node. It also means an `Ast` is `Clone` and
+//! `Send` without any thought, and that a subtree can be addressed by a `u32` in a plan or an
+//! error without borrowing anything.
+//!
+//! The one cost is that you cannot hold a reference to a node and index the arena at the same time,
+//! so the code reads a node out by value first. Nodes are small and `Copy`, so that is a register
+//! move.
+
+use crate::matcher::NONE;
+
+/// A run of items in one of the side vectors.
+///
+/// Empty is `len == 0`, and `start` is then meaningless rather than wrong. There is no `Option`
+/// wrapper because an absent list and an empty list are the same thing everywhere this is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Slice {
+    /// The first item.
+    pub start: u32,
+    /// How many items.
+    pub len: u32,
+}
+
+impl Slice {
+    /// Whether the run is empty.
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// The run as a range, for indexing the backing vector.
+    pub const fn range(self) -> std::ops::Range<usize> {
+        self.start as usize..(self.start + self.len) as usize
+    }
+}
+
+/// An index into `Ast::strings`.
+pub type StrRef = u32;
+/// An index into `Ast::exprs`.
+pub type ExprRef = u32;
+/// An index into `Ast::sources`.
+pub type SourceRef = u32;
+/// An index into `Ast::queries`.
+pub type QueryRef = u32;
+/// An index into `Ast::selects`.
+pub type SelectRef = u32;
+
+/// One statement.
+///
+/// Only `SELECT` is here, which is what M0 needs. The other twenty six statement kinds the grammar
+/// reaches are a transform error naming the rule rather than a variant that nothing fills in, so
+/// that adding one is a compile error somewhere useful rather than a silent `todo!()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Statement {
+    /// A query, meaning a `SELECT` or a set operation over two of them.
+    Query(QueryRef),
+}
+
+/// A query: a body, plus the modifiers that apply to whatever the body produced.
+///
+/// The split is the grammar's, not an invention. `SelectStatementInternal <- WithClause?
+/// SelectSetOpChain ResultModifiers?` puts `ORDER BY` and `LIMIT` outside the set operator chain,
+/// which is the only place they can go and be right: `a UNION b ORDER BY x` sorts the union and not
+/// the second half of it. Hanging them off `Select` instead would have made that unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Query {
+    /// What produces the rows.
+    pub body: QueryBody,
+    /// The `ORDER BY` list, as a run of [`OrderItem`].
+    pub order_by: Slice,
+    /// Whether the clause was `ORDER BY ALL`.
+    pub order_by_all: bool,
+    /// The `LIMIT` expression, or `NONE`.
+    pub limit: ExprRef,
+    /// Whether the limit was a percentage rather than a row count.
+    pub limit_percent: bool,
+    /// The `OFFSET` expression, or `NONE`.
+    pub offset: ExprRef,
+}
+
+impl Query {
+    /// A query with no modifiers on it.
+    pub const fn bare(body: QueryBody) -> Self {
+        Self {
+            body,
+            order_by: Slice { start: 0, len: 0 },
+            order_by_all: false,
+            limit: NONE,
+            limit_percent: false,
+            offset: NONE,
+        }
+    }
+}
+
+/// What produces the rows of a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryBody {
+    /// One `SELECT ... FROM ... WHERE ...` block.
+    Select(SelectRef),
+    /// `UNION`, `EXCEPT` or `INTERSECT` over two queries.
+    SetOp {
+        /// Which operator.
+        op: SetOp,
+        /// Whether duplicates survive.
+        quantifier: Quantifier,
+        /// Whether the columns are matched up by name rather than by position.
+        by_name: bool,
+        /// The query on the left.
+        left: QueryRef,
+        /// The query on the right.
+        right: QueryRef,
+    },
+}
+
+/// Which set operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    /// `UNION`.
+    Union,
+    /// `EXCEPT`.
+    Except,
+    /// `INTERSECT`.
+    Intersect,
+}
+
+/// Whether a set operator or an aggregate keeps duplicates.
+///
+/// `Unstated` is not the same as `All` even though the two agree for `UNION`, because they disagree
+/// for `INTERSECT` in some dialects and because an error message that says what was written is
+/// better than one that says what it was taken to mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quantifier {
+    /// Neither word was written.
+    Unstated,
+    /// `ALL`.
+    All,
+    /// `DISTINCT`.
+    Distinct,
+}
+
+/// What the `DISTINCT` clause of a select said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Distinct {
+    /// No clause, or the no-op `SELECT ALL`.
+    No,
+    /// `SELECT DISTINCT`.
+    Yes,
+    /// `SELECT DISTINCT ON (a, b)`, holding the expressions in the parentheses.
+    On(Slice),
+}
+
+/// One select block.
+///
+/// Every optional expression is `NONE` when it is absent rather than an `Option<u32>`, which keeps
+/// the struct at forty bytes and keeps the absent case spelled the same way it is spelled in the
+/// parse tree arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Select {
+    /// The `DISTINCT` clause.
+    pub distinct: Distinct,
+    /// The target list, as a run of [`Target`].
+    pub targets: Slice,
+    /// The `FROM` list, as a run of [`SourceRef`]. Several entries mean a cross product.
+    pub from: Slice,
+    /// The `WHERE` expression, or `NONE`.
+    pub filter: ExprRef,
+    /// The `GROUP BY` list, as a run of [`ExprRef`].
+    pub group_by: Slice,
+    /// Whether the clause was `GROUP BY ALL`.
+    pub group_by_all: bool,
+    /// The `HAVING` expression, or `NONE`.
+    pub having: ExprRef,
+}
+
+impl Select {
+    /// An empty select, which is what the transformer fills in from.
+    pub const fn empty() -> Self {
+        Self {
+            distinct: Distinct::No,
+            targets: Slice { start: 0, len: 0 },
+            from: Slice { start: 0, len: 0 },
+            filter: NONE,
+            group_by: Slice { start: 0, len: 0 },
+            group_by_all: false,
+            having: NONE,
+        }
+    }
+}
+
+/// One entry of a target list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Target {
+    /// What is being selected.
+    pub expr: ExprRef,
+    /// The alias, or `NONE`. The binder invents one when there is none, because what it invents
+    /// depends on the expression and that is a binder question rather than a parser question.
+    pub alias: StrRef,
+}
+
+/// One entry of an order by list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderItem {
+    /// What to sort on.
+    pub expr: ExprRef,
+    /// The direction.
+    pub order: Order,
+    /// Where nulls go.
+    pub nulls: Nulls,
+}
+
+/// Sort direction, with the unwritten case kept apart from the default it resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    /// Nothing was written.
+    Unstated,
+    /// `ASC` or `ASCENDING`.
+    Ascending,
+    /// `DESC` or `DESCENDING`.
+    Descending,
+}
+
+/// Null placement in a sort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nulls {
+    /// Nothing was written, so the session default applies.
+    Unstated,
+    /// `NULLS FIRST`.
+    First,
+    /// `NULLS LAST`.
+    Last,
+}
+
+/// One entry in a `FROM` clause, which is a tree because joins nest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A named table, possibly qualified by schema and catalog.
+    Table {
+        /// The name, as a run of [`StrRef`] in `Ast::parts`, outermost first.
+        name: Slice,
+        /// The alias, or `NONE`.
+        alias: StrRef,
+        /// Column aliases from `AS t(a, b)`, as a run of [`StrRef`].
+        columns: Slice,
+    },
+    /// A parenthesised query in the `FROM` clause.
+    Subquery {
+        /// The query.
+        query: QueryRef,
+        /// The alias, or `NONE`.
+        alias: StrRef,
+        /// Column aliases, as a run of [`StrRef`].
+        columns: Slice,
+    },
+    /// Two sources joined.
+    Join {
+        /// The left side.
+        left: SourceRef,
+        /// The right side.
+        right: SourceRef,
+        /// Which join.
+        kind: JoinKind,
+        /// Whether it was written `NATURAL`.
+        natural: bool,
+        /// The `ON` expression, or `NONE`.
+        on: ExprRef,
+        /// The `USING` column list, as a run of [`StrRef`].
+        using: Slice,
+    },
+}
+
+/// Which join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// `[INNER] JOIN`.
+    Inner,
+    /// `LEFT [OUTER] JOIN`.
+    Left,
+    /// `RIGHT [OUTER] JOIN`.
+    Right,
+    /// `FULL [OUTER] JOIN`.
+    Full,
+    /// `SEMI JOIN`.
+    Semi,
+    /// `ANTI JOIN`.
+    Anti,
+    /// `CROSS JOIN`.
+    Cross,
+    /// `POSITIONAL JOIN`, which is DuckDB's own and pairs rows by ordinal.
+    Positional,
+}
+
+/// One expression.
+///
+/// Twenty four bytes, which is the widest variant rounded up. The precedence chain in the grammar
+/// does not survive into here: twenty levels of `X <- Y Tail*` become one [`Expr::Binary`] tree,
+/// because the levels exist to make the grammar unambiguous and mean nothing afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expr {
+    /// `*`, or `t.*` with a qualifier.
+    Star {
+        /// The qualifier, as a run of [`StrRef`], empty for a bare star.
+        qualifier: Slice,
+    },
+    /// A column reference, qualified or not.
+    Column {
+        /// The name, as a run of [`StrRef`], outermost first, so `s.t.a` is three parts.
+        name: Slice,
+    },
+    /// A literal, kept as the text that was written.
+    Literal {
+        /// Which kind.
+        kind: LiteralKind,
+        /// The text, with quotes stripped and escapes resolved for a string, `NONE` for a keyword
+        /// literal like `NULL` where the kind already says everything.
+        text: StrRef,
+    },
+    /// A prefix or postfix operator.
+    Unary {
+        /// Which operator.
+        op: UnaryOp,
+        /// What it applies to.
+        operand: ExprRef,
+    },
+    /// An infix operator.
+    Binary {
+        /// Which operator.
+        op: BinaryOp,
+        /// The left operand.
+        left: ExprRef,
+        /// The right operand.
+        right: ExprRef,
+    },
+    /// A function call.
+    Function {
+        /// The name, as a run of [`StrRef`], so `main.count` is two parts.
+        name: Slice,
+        /// The arguments, as a run of [`ExprRef`].
+        args: Slice,
+        /// Whether the call said `DISTINCT`.
+        distinct: bool,
+    },
+    /// `CAST(x AS t)` or `TRY_CAST(x AS t)`.
+    Cast {
+        /// What is being cast.
+        operand: ExprRef,
+        /// The target type, as the text it was written with. Parsing it is `rudb-common`'s job and
+        /// doing it here would put the type system in the parser.
+        ty: StrRef,
+        /// Whether a failure yields null rather than an error.
+        try_cast: bool,
+    },
+    /// `CASE`, searched or simple.
+    Case {
+        /// The operand of a simple `CASE x WHEN`, or `NONE` for a searched one.
+        operand: ExprRef,
+        /// The arms, as a run of [`CaseArm`].
+        arms: Slice,
+        /// The `ELSE`, or `NONE`.
+        otherwise: ExprRef,
+    },
+    /// `x BETWEEN a AND b`.
+    Between {
+        /// What is being tested.
+        operand: ExprRef,
+        /// The lower bound.
+        low: ExprRef,
+        /// The upper bound.
+        high: ExprRef,
+        /// Whether it was written `NOT BETWEEN`.
+        negated: bool,
+    },
+    /// `x IN (a, b, c)`.
+    In {
+        /// What is being tested.
+        operand: ExprRef,
+        /// The list, as a run of [`ExprRef`].
+        list: Slice,
+        /// Whether it was written `NOT IN`.
+        negated: bool,
+    },
+    /// A parenthesised list of more than one expression, which is a row value.
+    Row {
+        /// The items, as a run of [`ExprRef`].
+        items: Slice,
+    },
+    /// A scalar subquery, `(SELECT ...)` where an expression is expected.
+    Subquery {
+        /// The query.
+        query: QueryRef,
+    },
+}
+
+/// One `WHEN a THEN b`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaseArm {
+    /// The `WHEN`.
+    pub when: ExprRef,
+    /// The `THEN`.
+    pub then: ExprRef,
+}
+
+/// Which literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiteralKind {
+    /// A number, kept as text because the width it wants depends on where it lands.
+    Number,
+    /// A string.
+    String,
+    /// `NULL`.
+    Null,
+    /// `TRUE`.
+    True,
+    /// `FALSE`.
+    False,
+}
+
+/// A prefix or postfix operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// `NOT x`.
+    Not,
+    /// `-x`.
+    Negate,
+    /// `+x`, which is a no-op that still has to survive to the binder so that `+'a'` errors.
+    Plus,
+    /// `~x`.
+    BitNot,
+    /// `x!`.
+    Factorial,
+    /// `x IS NULL` or `x ISNULL`.
+    IsNull,
+    /// `x IS NOT NULL` or `x NOTNULL`.
+    IsNotNull,
+    /// `x IS TRUE`.
+    IsTrue,
+    /// `x IS NOT TRUE`.
+    IsNotTrue,
+    /// `x IS FALSE`.
+    IsFalse,
+    /// `x IS NOT FALSE`.
+    IsNotFalse,
+    /// `x IS UNKNOWN`.
+    IsUnknown,
+    /// `x IS NOT UNKNOWN`.
+    IsNotUnknown,
+}
+
+/// An infix operator.
+///
+/// The list is the dialect and not a general idea of what operators are. `Named` is the one open
+/// door, because `OperatorLiteral` in the grammar takes any run of operator characters that is not
+/// already a token, and rejecting that here would reject SQL DuckDB accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    /// `OR`.
+    Or,
+    /// `AND`.
+    And,
+    /// `=` or `==`.
+    Eq,
+    /// `!=` or `<>`.
+    NotEq,
+    /// `<`.
+    Lt,
+    /// `>`.
+    Gt,
+    /// `<=`.
+    LtEq,
+    /// `>=`.
+    GtEq,
+    /// `IS DISTINCT FROM`.
+    IsDistinctFrom,
+    /// `IS NOT DISTINCT FROM`.
+    IsNotDistinctFrom,
+    /// `+`.
+    Add,
+    /// `-`.
+    Subtract,
+    /// `*`.
+    Multiply,
+    /// `/`.
+    Divide,
+    /// `//`, integer division.
+    IntegerDivide,
+    /// `%`.
+    Modulo,
+    /// `^` or `**`.
+    Power,
+    /// `&`.
+    BitAnd,
+    /// `|`.
+    BitOr,
+    /// `<<`.
+    ShiftLeft,
+    /// `>>`.
+    ShiftRight,
+    /// `||`.
+    Concat,
+    /// `LIKE` or `~~`.
+    Like,
+    /// `NOT LIKE` or `!~~`.
+    NotLike,
+    /// `ILIKE` or `~~*`.
+    ILike,
+    /// `NOT ILIKE` or `!~~*`.
+    NotILike,
+    /// `GLOB` or `~~~`.
+    Glob,
+    /// `SIMILAR TO`.
+    SimilarTo,
+    /// `!~`, which the grammar calls the not-similar-to operator.
+    NotSimilarTo,
+    /// `~`, a regex match.
+    Regex,
+    /// `~*`, a case insensitive regex match.
+    RegexInsensitive,
+    /// `!~*`, a negated case insensitive regex match.
+    NotRegexInsensitive,
+    /// `COLLATE`.
+    Collate,
+    /// `AT TIME ZONE`.
+    AtTimeZone,
+    /// `->`.
+    Arrow,
+    /// `->>`.
+    LongArrow,
+    /// `@>`, contains.
+    Contains,
+    /// `<@`, contained by.
+    ContainedBy,
+    /// `&&`, overlaps.
+    Overlaps,
+    /// `^@`, starts with.
+    StartsWith,
+    /// `<<=`, an inet operator.
+    InetContainedByOrEq,
+    /// `>>=`, an inet operator.
+    InetContainsOrEq,
+    /// An operator the dialect does not name, which DuckDB resolves as a binary function of that
+    /// name. `a <=> b` is the shape.
+    Named(StrRef),
+}
+
+/// A parsed statement or script, with every arena it points into.
+///
+/// Cheap to clone, cheap to send, and self contained: no index in here refers to anything outside
+/// it, and nothing in here borrows the query text. The text is copied into `strings` on the way in,
+/// which costs one allocation per distinct identifier and buys an `Ast` that outlives the string it
+/// came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ast {
+    /// The statements in the script, in order.
+    pub statements: Vec<Statement>,
+    /// The query arena.
+    pub queries: Vec<Query>,
+    /// The select arena.
+    pub selects: Vec<Select>,
+    /// The expression arena.
+    pub exprs: Vec<Expr>,
+    /// The from-item arena.
+    pub sources: Vec<Source>,
+    /// Interned text. Identifiers keep the case they were written in, because DuckDB does not fold
+    /// it at any point, including for quoted identifiers.
+    pub strings: Vec<String>,
+    /// Backing store for every [`Slice`] of names.
+    pub parts: Vec<StrRef>,
+    /// Backing store for every [`Slice`] of expressions.
+    pub expr_lists: Vec<ExprRef>,
+    /// Backing store for every [`Slice`] of from items.
+    pub source_lists: Vec<SourceRef>,
+    /// Backing store for every [`Slice`] of target list entries.
+    pub targets: Vec<Target>,
+    /// Backing store for every [`Slice`] of order by entries.
+    pub order_items: Vec<OrderItem>,
+    /// Backing store for every [`Slice`] of case arms.
+    pub case_arms: Vec<CaseArm>,
+}
+
+impl Ast {
+    /// The text behind a [`StrRef`], or the empty string for `NONE`.
+    pub fn string(&self, index: StrRef) -> &str {
+        if index == NONE { "" } else { &self.strings[index as usize] }
+    }
+
+    /// The parts of a name, outermost first.
+    pub fn name(&self, slice: Slice) -> impl Iterator<Item = &str> {
+        self.parts[slice.range()].iter().map(|&part| self.string(part))
+    }
+
+    /// A name written back out with dots between the parts, for error messages and tests.
+    pub fn name_text(&self, slice: Slice) -> String {
+        self.name(slice).collect::<Vec<_>>().join(".")
+    }
+
+    /// One expression.
+    pub fn expr(&self, index: ExprRef) -> Expr {
+        self.exprs[index as usize]
+    }
+
+    /// One from item.
+    pub fn source(&self, index: SourceRef) -> Source {
+        self.sources[index as usize]
+    }
+
+    /// One query.
+    pub fn query(&self, index: QueryRef) -> Query {
+        self.queries[index as usize]
+    }
+
+    /// One select block.
+    pub fn select(&self, index: SelectRef) -> Select {
+        self.selects[index as usize]
+    }
+
+    /// The expressions of a list.
+    pub fn expr_list(&self, slice: Slice) -> &[ExprRef] {
+        &self.expr_lists[slice.range()]
+    }
+
+    /// The from items of a list.
+    pub fn source_list(&self, slice: Slice) -> &[SourceRef] {
+        &self.source_lists[slice.range()]
+    }
+
+    /// The entries of a target list.
+    pub fn target_list(&self, slice: Slice) -> &[Target] {
+        &self.targets[slice.range()]
+    }
+
+    /// The entries of an order by list.
+    pub fn order_list(&self, slice: Slice) -> &[OrderItem] {
+        &self.order_items[slice.range()]
+    }
+
+    /// The arms of a case.
+    pub fn arm_list(&self, slice: Slice) -> &[CaseArm] {
+        &self.case_arms[slice.range()]
+    }
+
+    /// How many nodes the whole tree is, across every arena.
+    ///
+    /// The number to watch when the transformer changes. A parse tree of five thousand nodes that
+    /// becomes an AST of thirty is the twenty precedence levels being thrown away, which is the
+    /// whole reason this module exists.
+    pub fn node_count(&self) -> usize {
+        self.queries.len() + self.selects.len() + self.exprs.len() + self.sources.len()
+    }
+}
