@@ -1,6 +1,6 @@
 # Spec 2140: rudb
 
-An embedded analytical database written in Rust. Its own storage format, its own compression layer, its own vectorized execution engine, its own planner, its own JIT backend. Binary compatible with DuckDB on three surfaces: the on-disk file format, the extension C ABI, and the SQL dialect. The performance target is an order of magnitude past DuckDB on published benchmarks and an order of magnitude under it on resource consumption. Single node, no cluster, no external runtime.
+An embedded analytical database written in Rust. Its own storage format, its own compression layer, its own vectorized execution engine, its own planner, its own JIT backend. Binary compatible with DuckDB on three surfaces: the on-disk file format, the extension C ABI, and the SQL dialect. The performance target is an order of magnitude past DuckDB on published benchmarks and an order of magnitude under it on resource consumption, with the on-disk part of the resource target amended to 2.1x by the M1 measurement in document 02 section 2.6.1. Single node, no cluster, no external runtime.
 
 Repo: `github.com/tamnd/rudb`. Sibling repos: `github.com/tamnd/rudb-compat` for compatibility, `github.com/tamnd/rudb-bench` for measurement. All three GitHub names and all the `rudb-*` crate names in document 18 were confirmed free on crates.io on 10 September 2026 by direct API query rather than assumed. Written 10 September 2026.
 
@@ -32,7 +32,7 @@ Four axes, each with a number, each measured by the methodology in document 15. 
 
 **Per-query floor.** No query slower than DuckDB, ever, on any suite. 10x or better on every query where DuckDB is more than 3x away from the hardware bound for that query's shape. On the queries where DuckDB is already within 2x of the bound, parity plus whatever the compression layer gives for free. Document 03 identifies which ClickBench queries fall in each bucket, by measurement.
 
-**Resource.** 10x smaller on-disk footprint than DuckDB on the same data, which on ClickBench hits means 20.46 GB down to roughly 2 GB. 10x lower peak resident set on the same query at the same thread count. 10x fewer total CPU-seconds. This axis is the one nobody publishes and it is the one that decides whether the engine is actually better or merely trading memory for time.
+**Resource.** 2.1x smaller on-disk footprint than DuckDB on the same data, which on ClickBench hits means 20.46 GB down to a measured 9.65 GB. 10x lower peak resident set on the same query at the same thread count. 10x fewer total CPU-seconds. This axis is the one nobody publishes and it is the one that decides whether the engine is actually better or merely trading memory for time. The disk number said 10x and roughly 2 GB until M1 measured it, and document 02 section 2.6.1 is the measurement and what it cost the thesis. The other two numbers on this axis were not measured by M1 and are still claims.
 
 ## Why Rust, concretely
 
@@ -50,7 +50,7 @@ The honest counterweight: `std::simd` is [still nightly only](https://github.com
 
 ## Settled decisions
 
-**Our own storage format, and DuckDB's format as an import and export path.** rudb's native format is described in documents 05 and 06 and is designed for the resource axis, which DuckDB's format cannot reach. DuckDB v2.0 files are a first-class attachable format, read and written losslessly, not a migration tool. A user with a 200 GB DuckDB file gets full compatibility on day one and the 10x resource win only after `CHECKPOINT INTO` rewrites it. Document 12 covers both directions.
+**Our own storage format, and DuckDB's format as an import and export path.** rudb's native format is described in documents 05 and 06 and is designed for the resource axis, which DuckDB's format cannot reach. DuckDB v2.0 files are a first-class attachable format, read and written losslessly, not a migration tool. A user with a 200 GB DuckDB file gets full compatibility on day one and the resource win, measured at 2.1x on ClickBench hits, only after `CHECKPOINT INTO` rewrites it. Document 12 covers both directions.
 
 **Physical layout is chosen at runtime and re-chosen over time, not fixed at write time.** This is the project thesis and it is where the order of magnitude comes from. Each column has a physical representation drawn from a small closed set, selected by a sampling-based encoder at write time and revised by a background recompressor based on observed query behavior. Documents 05 and 06.
 
@@ -119,6 +119,8 @@ The two things that actually kill projects like this:
 **The compatibility surface has no bottom.** DuckDB's dialect is deliberately large and growing, v2.0 alone adds triggers, `NEAREST` joins, DML inside CTEs, nested schemas, and a shredded end-to-end `VARIANT` type. Chasing it feature by feature is a losing race against a well funded team. The defence is document 14's inversion: we do not implement features from a list, we run their test corpus and their extension binaries against us continuously from M2 and let their tests define the list.
 
 **The resource axis is the one that will not close by grinding.** The other three axes respond to effort. Getting ClickBench hits from 20.46 GB to 2 GB does not, because it requires the multi-column compression in document 06 to actually find and exploit the correlations in that dataset, and if the correlations are not there the number is not reachable at any amount of engineering. Document 19 makes this open question one and document 17 puts the experiment in M1, before anything depends on it, precisely because it is the assumption most likely to be false.
+
+**M1 ran and the correlations are not there.** The measured number is 9.65 GB, which is 0.47 of DuckDB and 0.70 of Parquet with Snappy, against a target of 2.05 GB and a stated wrong-at line of 6 GB. Of 5,460 column pairs in hits, one is worth a shared dictionary and it saves four kilobytes. Of eight named functional dependencies, one holds without violations and it saves 18 MB. The thing that moved the number was front coding a sorted dictionary, which is an ordinary single-column encoding. So the risk named in the paragraph above is not a risk any more, it is a result, and the disk claim in this document is now 2.1x rather than 10x. Document 02 section 2.6.1 is the full measurement and document 17 section 5 says that amending the specification is the success case for that milestone rather than the failure case.
 
 The riskiest technical assumption is that a general purpose engine can capture most of Bespoke OLAP's layout specialization win through runtime adaptation. Their result is for a fixed, known workload with unlimited synthesis time. Ours has to decide on the fly, from samples, with a background thread and a budget. If runtime adaptation captures only a third of the win the aggregate axis becomes 4x rather than 10x, which is a good database and not the one specified. Document 19 open question two, experiment in M3.
 
