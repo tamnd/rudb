@@ -461,3 +461,91 @@ fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
     }
     assert!(db.catalog().tables().all(|table| table.name().table != "u"));
 }
+
+#[test]
+fn a_table_function_produces_rows_where_a_table_would() {
+    let db = Database::new();
+    assert_eq!(
+        rows(&db, "SELECT * FROM range(3)"),
+        vec![vec![Value::BigInt(0)], vec![Value::BigInt(1)], vec![Value::BigInt(2)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT * FROM generate_series(3)"),
+        vec![
+            vec![Value::BigInt(0)],
+            vec![Value::BigInt(1)],
+            vec![Value::BigInt(2)],
+            vec![Value::BigInt(3)],
+        ]
+    );
+}
+
+#[test]
+fn the_column_is_called_what_the_function_is_called_until_it_is_aliased() {
+    let db = Database::new();
+    let result = db.query("SELECT * FROM range(2)").unwrap();
+    assert_eq!(result.names()[0], "range");
+    let result = db.query("SELECT i FROM range(2) t(i)").unwrap();
+    assert_eq!(result.names()[0], "i");
+    // The table alias without a column list renames the table and not the column, which is what
+    // makes t.range legal here and t.i not.
+    let result = db.query("SELECT t.range FROM range(2) t").unwrap();
+    assert_eq!(result.names()[0], "range");
+}
+
+#[test]
+fn a_table_function_joins_and_aggregates_like_anything_else_in_a_from_clause() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT count(*) FROM range(10)"), vec![vec![Value::BigInt(10)]]);
+    assert_eq!(rows(&db, "SELECT sum(range) FROM range(1, 5)"), vec![vec![Value::HugeInt(10)]]);
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM t, range(3)"),
+        vec![vec![Value::BigInt(12)]],
+        "four rows against three is twelve"
+    );
+    assert_eq!(
+        rows(&db, "SELECT x FROM t JOIN range(2) ON t.x = range ORDER BY x"),
+        vec![vec![integer(1)], vec![integer(1)]]
+    );
+}
+
+#[test]
+fn the_arguments_are_expressions_and_they_cannot_see_a_column() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT count(*) FROM range(2 + 3)"), vec![vec![Value::BigInt(5)]]);
+    // `FROM t, range(t.x)` is LATERAL, which is a different node and is not bound yet. Resolving
+    // the name against whatever is to the left would make the answer depend on the order the two
+    // sources were written in.
+    let message = failure(&db, "SELECT count(*) FROM t, range(t.x)");
+    assert!(message.contains("not found in FROM clause"), "{message}");
+}
+
+#[test]
+fn a_table_function_that_does_not_exist_says_so_rather_than_being_read_as_a_table() {
+    let db = Database::new();
+    let message = failure(&db, "SELECT * FROM read_parquet('x.parquet')");
+    assert!(message.contains("read_parquet"), "{message}");
+    let message = failure(&db, "SELECT * FROM nowhere.range(3)");
+    assert!(message.contains("nowhere"), "{message}");
+    let message = failure(&db, "SELECT * FROM range(1, 2, 3, 4)");
+    assert!(message.contains("range"), "{message}");
+}
+
+#[test]
+fn a_step_of_zero_is_the_one_call_that_is_an_error_rather_than_an_empty_result() {
+    let db = Database::new();
+    let message = failure(&db, "SELECT * FROM range(1, 5, 0)");
+    assert!(message.contains("interval cannot be 0"), "{message}");
+    assert!(rows(&db, "SELECT * FROM range(5, 1)").is_empty());
+    assert!(rows(&db, "SELECT * FROM range(NULL)").is_empty());
+}
+
+#[test]
+fn a_range_wider_than_one_chunk_comes_out_whole_and_in_order() {
+    // Three thousand crosses the vector boundary, so this is the test that the chunking does not
+    // repeat a value or drop one at the seam.
+    let db = Database::new();
+    let result = db.query("SELECT count(*), min(range), max(range) FROM range(3000)").unwrap();
+    let row = result.rows().next().unwrap();
+    assert_eq!(row, vec![Value::BigInt(3000), Value::BigInt(0), Value::BigInt(2999)]);
+}

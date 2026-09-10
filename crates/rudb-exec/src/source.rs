@@ -1,7 +1,8 @@
 //! The operators that produce rows without an input: the scan, the dummy and the literal rows.
 
 use rudb_catalog::Table;
-use rudb_common::{Error, Result};
+use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_functions::{TableFunction, series_length};
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
@@ -153,6 +154,99 @@ impl Values {
             start = end;
         }
         Ok(Self { schema, chunks, at: 0 })
+    }
+}
+
+/// A table function that produces a run of integers.
+///
+/// The arguments are evaluated once when the operator is built, the same way a `VALUES` row is and
+/// for the same reason: they are constants by the time they are here, since a table function that
+/// can see a row is `LATERAL` and does not bind to this node.
+///
+/// The values are produced a chunk at a time rather than all at once. `range(100000000)` is a
+/// hundred million rows and a corpus that writes it means it, so materializing the whole run into
+/// a `Vec` before the first chunk comes out would be eight hundred megabytes for a query whose
+/// answer is one number.
+#[derive(Debug)]
+pub(crate) struct Series {
+    schema: Schema,
+    at: i64,
+    step: i64,
+    left: usize,
+}
+
+impl Series {
+    /// The rows of a [`Node::TableFunction`](rudb_plan::Node::TableFunction).
+    ///
+    /// A null in any argument gives no rows at all, which is DuckDB's answer and is not the same
+    /// as an error. The three defaults are the three that make a one argument call mean what
+    /// everybody writes it to mean, which is zero up to the number.
+    ///
+    /// # Errors
+    ///
+    /// Whatever evaluating an argument reports, and a step of zero.
+    pub(crate) fn new(plan: &Plan, index: u32, function: &str, args: Slice) -> Result<Self> {
+        let Some(function) = TableFunction::lookup(function) else {
+            return Err(Error::internal(format!("a plan with a table function called {function}")));
+        };
+        let fields = vec![Field::new(function.name(), LogicalType::BigInt)];
+        let schema = Schema::numbered(fields, index);
+
+        let exprs: Vec<ExprRef> = plan.expr_list(args).to_vec();
+        let source = Schema::empty();
+        let one = Chunk::with_rows(Vec::new(), 1)?;
+        let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
+        let mut given = Vec::with_capacity(evaluated.len());
+        for vector in &evaluated {
+            match vector.value_at(0) {
+                rudb_common::Value::Null => return Ok(Self::empty(schema)),
+                rudb_common::Value::BigInt(n) => given.push(n),
+                other => {
+                    return Err(Error::internal(format!(
+                        "a table function argument bound as BIGINT arrived as {other}"
+                    )));
+                }
+            }
+        }
+        let (start, stop, step) = match given.as_slice() {
+            [stop] => (0, *stop, 1),
+            [start, stop] => (*start, *stop, 1),
+            [start, stop, step] => (*start, *stop, *step),
+            _ => {
+                return Err(Error::internal(format!(
+                    "{}() bound with {} arguments",
+                    function.name(),
+                    given.len()
+                )));
+            }
+        };
+        let left = series_length(function, start, stop, step)?;
+        Ok(Self { schema, at: start, step, left })
+    }
+
+    fn empty(schema: Schema) -> Self {
+        Self { schema, at: 0, step: 1, left: 0 }
+    }
+}
+
+impl Operator for Series {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        let count = self.left.min(VECTOR_SIZE);
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            values.push(rudb_common::Value::BigInt(self.at));
+            self.at = self.at.saturating_add(self.step);
+        }
+        self.left -= count;
+        let vector = Vector::from_values(LogicalType::BigInt, &values)?;
+        Ok(Some(Chunk::with_rows(vec![vector], count)?))
     }
 }
 
