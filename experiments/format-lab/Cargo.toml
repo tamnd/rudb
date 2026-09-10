@@ -1,0 +1,32 @@
+# Its own workspace on purpose. The lab reads real Parquet, which means arrow-rs, and the published
+# workspace has no external dependencies at all. Keeping the lab out of `members` keeps that true,
+# keeps the root Cargo.lock free of a hundred crates we do not ship, and keeps `cargo xtask ci` fast.
+# The cost is that the lab is not in the gate. It is a measuring instrument for M1, not a product.
+[workspace]
+
+[package]
+name = "format-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+arrow-array = "59.3.0"
+arrow-schema = "59.3.0"
+# Every codec a Parquet file in the wild might use, and no default features, so that the lab does
+# not drag in async, object store or serde. The gzip backend is spelled out because parquet takes
+# flate2 with its default features off and picking one is the caller's job.
+parquet = { version = "59.3.0", default-features = false, features = [
+    "arrow",
+    "snap",
+    "zstd",
+    "lz4",
+    "brotli",
+    "flate2-rust_backend",
+] }
+rudb-common = { path = "../../crates/rudb-common" }
+rudb-encoding = { path = "../../crates/rudb-encoding" }
+
+[profile.release]
+debug = 1
