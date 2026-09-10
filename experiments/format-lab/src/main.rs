@@ -8,6 +8,7 @@
 //! Run it as `cargo run --release -- stats hits.parquet`.
 
 mod column;
+mod groups;
 mod ingest;
 mod mem;
 mod pairs;
@@ -25,6 +26,7 @@ format-lab, the M1 measuring instrument
 usage:
   format-lab stats <file.parquet> [options]
   format-lab pairs <file.parquet> [options]
+  format-lab groups <file.parquet> [options]
 
 stats reads the file a chunk at a time, encodes every column with the rudb chooser, decodes it
 again and checks it, and prints one row per column with the distinct count, the size against what
@@ -34,7 +36,11 @@ pairs reads the same way and answers the two questions that are about two column
 column is determined by which other column, and which string columns overlap enough to be worth one
 dictionary between them.
 
-options for both:
+groups encodes the columns that overlap both apart and sharing one dictionary or one symbol table
+and subtracts, and prices a dependency found by pairs by storing the determined column as a mapping
+off the determining column instead of as itself.
+
+options for all three:
   --chunk-rows N   rows per chunk, default 122880, which is DuckDB's row group
   --rows N         stop after N rows, for a quick pass over a big file
   --columns a,b,c  only these columns, default all of them
@@ -45,11 +51,16 @@ options for stats:
   --sketch-k N     bottom-k sketch size, default 4096
   --no-verify      skip the decode and the comparison, which roughly halves the run
 
+options for pairs and groups:
+  --jaccard F      group or report columns overlapping this much, default 0.05
+
 options for pairs:
   --sketch-k N     bottom-k sketch size, default 1024, and there are one of these per pair
   --top N          how many rows of each table to print, default 40
   --dependence F   report a dependency at this score or better, default 0.98
-  --jaccard F      report an overlap at this score or better, default 0.05
+
+options for groups:
+  --rules a:b,c:d  price these dependencies, where a determines b, default none
 ";
 
 fn main() -> ExitCode {
@@ -79,6 +90,11 @@ fn run() -> Result<()> {
             let options = pairs_options(&flags)?;
             pairs::run(&flags.path, &options)
         }
+        "groups" => {
+            let flags = Flags::of(&args[1..], "groups")?;
+            let options = groups_options(&flags)?;
+            groups::run(&flags.path, &options)
+        }
         other => Err(Error::invalid_input(format!("{other} is not a command, try --help"))),
     }
 }
@@ -94,7 +110,7 @@ struct Flags {
     switches: Vec<String>,
 }
 
-const TAKES_A_VALUE: [&str; 8] = [
+const TAKES_A_VALUE: [&str; 9] = [
     "--chunk-rows",
     "--rows",
     "--columns",
@@ -103,6 +119,7 @@ const TAKES_A_VALUE: [&str; 8] = [
     "--top",
     "--dependence",
     "--jaccard",
+    "--rules",
 ];
 
 impl Flags {
@@ -262,4 +279,52 @@ fn pairs_options(flags: &Flags) -> Result<pairs::Options> {
         return Err(Error::invalid_input("a chunk of zero rows reads nothing"));
     }
     Ok(options)
+}
+
+fn groups_options(flags: &Flags) -> Result<groups::Options> {
+    flags.known(&[
+        "--chunk-rows",
+        "--rows",
+        "--columns",
+        "--threads",
+        "--sketch-k",
+        "--jaccard",
+        "--rules",
+        "--markdown",
+    ])?;
+    let mut options = groups::Options {
+        columns: flags.names("--columns"),
+        limit: flags.number("--rows")?,
+        markdown: flags.set("--markdown"),
+        rules: rules_of(flags.text("--rules").unwrap_or_default())?,
+        ..groups::Options::default()
+    };
+    if let Some(rows) = flags.number("--chunk-rows")? {
+        options.chunk_rows = rows;
+    }
+    if let Some(k) = flags.number("--sketch-k")? {
+        options.k = k;
+    }
+    if let Some(threads) = flags.number("--threads")? {
+        options.threads = threads;
+    }
+    if let Some(score) = flags.fraction("--jaccard")? {
+        options.jaccard_min = score;
+    }
+    if options.chunk_rows == 0 {
+        return Err(Error::invalid_input("a chunk of zero rows reads nothing"));
+    }
+    Ok(options)
+}
+
+/// `URL:URLHash,Referer:RefererHash` becomes the pairs to price, left determining right.
+fn rules_of(text: &str) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for rule in text.split(',').map(str::trim).filter(|rule| !rule.is_empty()) {
+        let (left, right) = rule
+            .split_once(':')
+            .ok_or_else(|| Error::invalid_input(format!("{rule} is not a pair of names")))?;
+        out.push((left.trim().to_string(), right.trim().to_string()));
+    }
+    Ok(out)
 }
