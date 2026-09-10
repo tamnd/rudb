@@ -1,0 +1,52 @@
+name: Bug
+description: A crash, a hang, an error on valid SQL, or anything else that is not a wrong answer.
+title: "bug: "
+labels: ["kind/bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If a query returned the wrong result rather than failing, please use the wrong-answer template instead. That one is triaged first and it asks for different things.
+
+        If the database file will not open after a crash or a power loss, say so in the title. Durability bugs are p0 regardless of how rare the trigger is.
+  - type: textarea
+    id: repro
+    attributes:
+      label: The reproduction
+      description: The smallest sequence of statements that shows it, schema included.
+      render: sql
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened
+      description: Paste the error message in full, including the backtrace if there is one.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Which mode
+      options:
+        - Native rudb format
+        - Attached DuckDB file
+        - Parquet in place
+        - In memory, no file
+        - Something else, described above
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `rudb --version`, or the commit.
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: The machine
+      description: CPU, core count, memory, operating system, and the filesystem if a database file is involved.
+    validations:
+      required: true

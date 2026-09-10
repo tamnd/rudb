@@ -1,0 +1,22 @@
+[package]
+name = "rudb-parquet"
+description = "The Parquet reader and writer, with page skipping and dictionary passthrough."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+rudb-common.workspace = true
+rudb-io.workspace = true
+rudb-vector.workspace = true
+rudb-encoding.workspace = true
+
+[lints]
+workspace = true

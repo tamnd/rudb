@@ -1,0 +1,58 @@
+name: DuckDB compatibility gap
+description: Something DuckDB does that we do not, or do differently.
+title: "compat: "
+labels: ["kind/compat", "area/duckdb-compat"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `spec/12-duckdb-compat.md` section 12.8 splits compatibility into four levels rather than one binary claim, and each level has its own published coverage. Saying which surface a gap is on decides which level it counts against and how urgent it is.
+
+        A missing function that nobody calls and a missing function in the top hundred by usage are the same size of code and very different sizes of problem, so section 12.2 weights the coverage by usage. If you hit this in real code, saying so is the most useful thing in the report.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface
+      options:
+        - SQL dialect, meaning syntax, a function, a type or a statement
+        - Storage format, meaning a DuckDB file we cannot read or a file DuckDB cannot read
+        - The C API
+        - An extension that does not load or does not work
+        - Behaviour, meaning same query, same data, different answer or different error
+        - The wire protocol
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: What DuckDB does
+      description: The statement, and what a real DuckDB returns for it. Give the DuckDB version, because the surface moves between releases.
+      render: sql
+    validations:
+      required: true
+  - type: textarea
+    id: ours
+    attributes:
+      label: What we do
+      description: The error, or the different result.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Where you hit it
+      description: Real code, a tutorial, a test suite, or reading the DuckDB documentation. This is what decides the priority, so it is worth a sentence.
+  - type: input
+    id: duckdb-version
+    attributes:
+      label: DuckDB version
+      placeholder: v2.0.0
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Our version
+      description: The output of `rudb --version`, or the commit.
+    validations:
+      required: true
