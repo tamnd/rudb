@@ -6,6 +6,14 @@ The version number says how far through the plan we are. **The minor version is 
 
 ## Unreleased
 
+## 0.1.0
+
+M0 is finished. Its exit criterion was `cargo test` running, `cargo xtask bench` producing a table, and a trivial query executing end to end on all three hosts, and all three clauses now hold: 502 tests green on macOS aarch64, Linux x86_64 and Windows x86_64, a front end table on each of them, and `SELECT * FROM t WHERE x > 5` answering correctly on every one.
+
+This is the first release with a database in it. There is a parser for `SELECT`, a binder, a logical plan with a textual form that reads back into the same plan, a catalog, an in-memory table, the tier 0 kernels and a tier 0 interpreter, and an embedding API over the top of them. What is not here is most of a database: no storage format, no optimizer, no transactions, no `CREATE TABLE`, and every join is a nested loop. Those are M1 and M2 and they are on the milestone issues rather than in a wish list.
+
+The reason to tag it is that a query running end to end is the thing that makes every later number mean something. Until this release there was nothing to measure, and a project aiming at an order of magnitude that cannot yet produce a row is a project whose claims cannot be checked. Now they can be, on the slowest possible implementation, which is exactly where a differential test wants to start.
+
 - `SELECT * FROM t WHERE x > 5` runs end to end. That is the second line of M0's exit criterion and it is the first query this project has ever answered. Text goes to tokens, tokens to a parse tree, the parse tree to a bound plan, the plan to a tree of operators, and the operators to rows, with no step of that pipeline missing and nothing stubbed in the middle of it.
 - The compute kernels, in `crates/rudb-kernels`. Casting between every pair of scalar types, the six comparisons plus the two null safe ones, the arithmetic with its overflow checks, three-valued logic, the string functions the binder can already resolve, and the six aggregates. Everything takes vectors and values and knows nothing about plans, operators or catalogs, which is what makes the same function callable from the interpreter, from the fused kernels of tier 1 when they exist, and from a test that wants to check one conversion in isolation.
 - The comparison enum here is this crate's own rather than the plan's. `rudb-kernels` is rank 3 and `rudb-plan` is rank 9, so a kernel cannot name a plan type, and the cost of that separation turned out to be two eight line translation functions in the evaluator. That is the layer rule doing exactly what it was put in for: the price of keeping compute independent of representation is visible, small, and in one place.
@@ -71,6 +79,10 @@ The version number says how far through the plan we are. **The minor version is 
 - The thirty odd grammar rules for a qualified name collapse into one walk rather than thirty match arms. `NestedSchemaTableColumnName` and `CatalogReservedSchemaTableColumnName` and the rest exist because whether a part may be a reserved word depends on how many parts there are, which the matcher has to know and the AST does not, so the transformer collects the leaf tokens in order, unquotes and interns. Field access, method call and subscript become `struct_extract`, an ordinary call and `array_extract`, which is what DuckDB does and keeps three sets of type rules out of the binder.
 - `.github/publish-crates.sh` no longer dies on the first attempt when run by hand on a Mac. Nothing is excluded on that attempt, so the exclude array is empty, and bash 3.2 under `set -u` calls an empty array unbound where the runner's bash 5 does not. It only ever fails on a machine that is not the runner, which is exactly the machine it gets run on when the runner is the problem.
 - The release checks the shape of the crates.io token rather than asking crates.io about it. The 0.0.2 run failed with a 401 saying the token did not match the format the registry uses, so a check went in that called `/api/v1/me`, and that endpoint is session only and answers 403 to a live token and a dead one alike. There is no read only endpoint that takes an API token, so the check is `cio` and 32 characters, which is what the 401 was complaining about, and publishing stays the only thing that knows whether a well formed token is live.
+
+Known gap: the differential harness in `tamnd/rudb-compat` can run a query against two engines and compare result sets, and nothing in this release has been run through it against a real DuckDB. Every claim here about matching DuckDB's behaviour, meaning the null placement in a sort, the multiset semantics of `EXCEPT ALL`, the padding in a positional join and the catalog error text, comes from reading the documentation and the source rather than from a diff against a running instance. That is the first thing M1 fixes and it is the reason the harness was built before the engine.
+
+Storage format version: none written yet.
 
 ## 0.0.2
 
