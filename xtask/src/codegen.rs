@@ -10,12 +10,15 @@
 //! builds rudb, and a build script that reads forty files also runs on every rebuild for the
 //! benefit of nobody. It is the same rule the vendored tree lives under.
 //!
-//! Today this emits the keyword table. `spec/20-the-grammar.md` section 5 has the rest, being the
-//! rule table and the first token filter, and that needs the token keys the tokenizer defines, so
-//! it lands after the tokenizer rather than before it.
+//! Two files come out of here. `keywords.rs` is every word the grammar knows and which classes it
+//! is in. `rules.rs` is the grammar itself, compiled to a flat node table with a FIRST set beside
+//! every node. They are generated in one run from one read of the vendored tree, which is what
+//! lets a `Keyword` node in the rule table carry a bare index into the keyword table.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+
+use crate::ruletable::{self, Op, Table};
 
 /// Where the generated files go. One directory so that `@generated` is a property of a path
 /// rather than a thing you have to check per file.
@@ -38,30 +41,100 @@ pub(crate) fn generate(check: bool) -> Result<(), String> {
     let dest = root.join(DEST);
 
     let keywords = keyword_table(&grammar)?;
-    let written = emit_keywords(&keywords);
+    let parsed = crate::grammar::parse_dir(&grammar.join("statements"))?;
+    let table =
+        ruletable::compile(&parsed, &keywords, &overrides(&grammar)?, &memoized(&grammar)?)?;
 
-    let path = dest.join("keywords.rs");
+    let files = [("keywords.rs", emit_keywords(&keywords)), ("rules.rs", emit_rules(&table))];
+
     if check {
-        let found = std::fs::read_to_string(&path)
-            .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-        if found.replace("\r\n", "\n") != written {
-            return Err(format!(
-                "{DEST}/keywords.rs is not what the grammar generates\n  \
-                 run `cargo xtask gen-grammar` and commit the result\n  \
-                 it is generated from the vendored grammar and editing it by hand puts the \
-                 parser and the dialect it claims to implement out of step"
-            ));
+        for (name, written) in &files {
+            let path = dest.join(name);
+            let found = std::fs::read_to_string(&path)
+                .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+            if found.replace("\r\n", "\n") != *written {
+                return Err(format!(
+                    "{DEST}/{name} is not what the grammar generates\n  \
+                     run `cargo xtask gen-grammar` and commit the result\n  \
+                     it is generated from the vendored grammar and editing it by hand puts the \
+                     parser and the dialect it claims to implement out of step"
+                ));
+            }
         }
-        println!("the generated keyword table matches the grammar, {} words", keywords.len());
+        println!(
+            "the generated tables match the grammar, {} words and {} rules in {} nodes",
+            keywords.len(),
+            table.rules.len(),
+            table.nodes.len()
+        );
         return Ok(());
     }
 
     std::fs::create_dir_all(&dest)
         .map_err(|e| format!("could not make {}: {e}", dest.display()))?;
-    std::fs::write(&path, &written)
-        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
-    println!("wrote {DEST}/keywords.rs, {} words", keywords.len());
+    for (name, written) in &files {
+        let path = dest.join(name);
+        std::fs::write(&path, written)
+            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    }
+    println!(
+        "wrote {DEST}/keywords.rs with {} words and {DEST}/rules.rs with {} rules in {} nodes",
+        keywords.len(),
+        table.rules.len(),
+        table.nodes.len()
+    );
     Ok(())
+}
+
+/// The rules the matcher does not walk, from the vendored list.
+///
+/// Three tab separated fields, and the third is empty for the three matchers that take no
+/// suggestion. Split with a limit rather than by filtering empties, so a line that has grown a
+/// field is an error here rather than a silently shifted column.
+pub(crate) fn overrides(grammar: &Path) -> Result<Vec<(String, String, String)>, String> {
+    let path = grammar.join("matcher_overrides.list");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let (name, class, suggestion) = match fields.as_slice() {
+            [name, class] => (*name, *class, ""),
+            [name, class, suggestion] => (*name, *class, *suggestion),
+            _ => {
+                return Err(format!(
+                    "{}:{}: expected a rule, a matcher class and a suggestion separated by tabs",
+                    path.display(),
+                    number + 1
+                ));
+            }
+        };
+        out.push((name.to_string(), class.to_string(), suggestion.to_string()));
+    }
+    if out.is_empty() {
+        return Err(format!("{} lists no overrides", path.display()));
+    }
+    Ok(out)
+}
+
+/// The rules upstream memoizes, from the vendored list.
+pub(crate) fn memoized(grammar: &Path) -> Result<BTreeSet<String>, String> {
+    let path = grammar.join("memoized_rules.list");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let out: BTreeSet<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    if out.is_empty() {
+        return Err(format!("{} lists no rules", path.display()));
+    }
+    Ok(out)
 }
 
 /// Every word the parser has to recognize, with the classes it belongs to.
@@ -77,7 +150,7 @@ pub(crate) fn generate(check: bool) -> Result<(), String> {
 /// took the lists as the authority on what a keyword is would reserve all 15 of them, and nothing
 /// would catch it except a user with a column called `prefix`. So a mask of zero is a real state
 /// and not a missing entry. `spec/20-the-grammar.md` section 5.
-fn keyword_table(grammar: &Path) -> Result<Vec<(String, u8)>, String> {
+pub(crate) fn keyword_table(grammar: &Path) -> Result<Vec<(String, u8)>, String> {
     let mut table: BTreeMap<String, u8> = BTreeMap::new();
 
     for (index, (file, _)) in CLASSES.iter().enumerate() {
@@ -211,6 +284,128 @@ fn emit_keywords(table: &[(String, u8)]) -> String {
         }
         let mask = if classes.is_empty() { "0".to_string() } else { classes.join(" | ") };
         out.push_str(&format!("    (\"{word}\", {mask}),\n"));
+    }
+    out.push_str("];\n");
+    out
+}
+
+fn emit_rules(table: &Table) -> String {
+    let mut out = String::with_capacity(table.nodes.len() * 64);
+
+    out.push_str(
+        "//! DuckDB's grammar, compiled to a table the matcher walks.\n\
+         //!\n\
+         //! @generated by `cargo xtask gen-grammar` from the vendored grammar. Do not edit.\n\
+         //! `cargo xtask gen-grammar --check` runs in the gate and fails if this file and the\n\
+         //! grammar disagree.\n\
+         //!\n\
+         //! `NODES` and `FIRST` are parallel. A node is twelve bytes and its FIRST set is eight\n\
+         //! bytes at the same index, so deciding whether an alternative can match the token in\n\
+         //! hand reads only `FIRST` and never loads the node. `CHILDREN` holds the child lists of\n\
+         //! sequences and choices, contiguous per node, so a sequence is a slice rather than a\n\
+         //! chase. Rules are the only nodes that are not expanded in place, which is what keeps\n\
+         //! the table finite in the face of a recursive grammar.\n\
+         //!\n\
+         //! Every table carries `#[rustfmt::skip]`, because the generator and rustfmt disagree\n\
+         //! about `NULLABLE`, `CHILDREN` and `SYMBOLS` and something has to win. rustfmt packs an\n\
+         //! array whose elements are short onto as many per line as fit, so `cargo fmt` rewrote\n\
+         //! this file and then `gen-grammar --check` failed on it, with both halves of the gate\n\
+         //! correct and the working tree unable to satisfy them at once. One element a line is the\n\
+         //! better answer anyway: a packed array reflows a whole block of lines when one entry\n\
+         //! changes, and the point of checking this file in is that a grammar bump is a diff\n\
+         //! somebody reads. The attribute is on all six rather than the three, so that a change to\n\
+         //! rustfmt's width threshold cannot bring the disagreement back.\n\n\
+         use crate::rules::{Node, Op, Rule, Suggestion};\n\n",
+    );
+
+    out.push_str(&format!(
+        "/// The root. `Program` is what a whole script parses as.\n\
+         pub const PROGRAM: u32 = {};\n\n\
+         /// The other root upstream requires, for parsing one statement rather than a script.\n\
+         pub const TOP_LEVEL_STATEMENT: u32 = {};\n\n",
+        table.program, table.top_level
+    ));
+
+    out.push_str(&format!(
+        "/// The nodes.\n#[rustfmt::skip]\n\
+         pub static NODES: [Node; {}] = [\n",
+        table.nodes.len()
+    ));
+    for node in &table.nodes {
+        let argument = match node.op {
+            Op::Identifier => {
+                format!("Suggestion::{} as u32", ruletable::suggestion_name(node.a))
+            }
+            _ => node.a.to_string(),
+        };
+        out.push_str(&format!(
+            "    Node {{ op: Op::{}, flags: {}, a: {argument}, b: {} }},\n",
+            ruletable::op_name(node.op),
+            node.flags,
+            node.b
+        ));
+    }
+    out.push_str("];\n\n");
+
+    out.push_str(&format!(
+        "/// What each node can start with, as a set of token keys. A superset, always: a bit that\n\
+         /// is set may still fail to match, and a bit that is clear cannot possibly match, which\n\
+         /// is the only direction a filter is allowed to be wrong in.\n\
+         #[rustfmt::skip]\n\
+         pub static FIRST: [u64; {}] = [\n",
+        table.first.len()
+    ));
+    for set in &table.first {
+        out.push_str(&format!("    0x{set:016x},\n"));
+    }
+    out.push_str("];\n\n");
+
+    out.push_str(&format!(
+        "/// Whether each node can match without consuming a token.\n\
+         #[rustfmt::skip]\n\
+         pub static NULLABLE: [bool; {}] = [\n",
+        table.nullable.len()
+    ));
+    for value in &table.nullable {
+        out.push_str(&format!("    {value},\n"));
+    }
+    out.push_str("];\n\n");
+
+    out.push_str(&format!(
+        "/// The child lists of every sequence and choice, contiguous per node.\n\
+         #[rustfmt::skip]\n\
+         pub static CHILDREN: [u32; {}] = [\n",
+        table.children.len()
+    ));
+    for child in &table.children {
+        out.push_str(&format!("    {child},\n"));
+    }
+    out.push_str("];\n\n");
+
+    out.push_str(&format!(
+        "/// The rules, sorted by name so a lookup by name is a binary search and the table does\n\
+         /// not depend on the order the generator happened to walk the grammar.\n\
+         #[rustfmt::skip]\n\
+         pub static RULES: [Rule; {}] = [\n",
+        table.rules.len()
+    ));
+    for rule in &table.rules {
+        out.push_str(&format!(
+            "    Rule {{ name: \"{}\", root: {}, memoized: {} }},\n",
+            rule.name, rule.root, rule.memoized
+        ));
+    }
+    out.push_str("];\n\n");
+
+    out.push_str(&format!(
+        "/// Every literal that is not a word. Punctuation and operator spellings, matched against\n\
+         /// the token text, which is the only place the matcher looks at the query again.\n\
+         #[rustfmt::skip]\n\
+         pub static SYMBOLS: [&str; {}] = [\n",
+        table.symbols.len()
+    ));
+    for symbol in &table.symbols {
+        out.push_str(&format!("    {symbol:?},\n"));
     }
     out.push_str("];\n");
     out
