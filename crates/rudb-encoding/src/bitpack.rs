@@ -25,6 +25,16 @@
 //! [`unpack_transposed`] so that the engine can keep data permuted through a whole pipeline and
 //! pay for the reordering once at the end rather than twice per operator.
 //!
+//! There is a second layout in here, in [`pack_tail`], and it is the sequential one this module
+//! opens by arguing against. The transposed layout is all or nothing: a value lives at a row and a
+//! lane, the lanes are interleaved through the whole buffer, and no prefix of a packed unit holds a
+//! prefix of the values. So a unit holding 3 values costs exactly what a unit holding 1024 costs,
+//! and a cascade is full of short arrays. A five entry dictionary, a run length array, an exception
+//! list. Storing three numbers in 5 KB is not a compressed format. The tail packer handles anything
+//! shorter than a unit, it has the dependency chain the transposed layout exists to avoid, and that
+//! is affordable there and nowhere else, because a tail is at most 1023 values and is decoded once
+//! while a full unit is on the hot path of every scan in the system.
+//!
 //! The permutation itself is a fixed shuffle of the eight bit groups of a row index, in the order
 //! 0, 4, 2, 6, 1, 5, 3, 7. That order is not arbitrary. It is the one that makes an eight way
 //! interleave of the rows land back in sequence under the pairwise unpacking pattern the paper
@@ -299,6 +309,105 @@ pub fn unpack<T: Packable>(input: &[T], width: usize, output: &mut [T]) -> Resul
     untranspose(&transposed, output)
 }
 
+/// How many bytes [`pack_tail`] writes for `count` values at `width` bits.
+#[must_use]
+pub fn tail_len(count: usize, width: usize) -> usize {
+    (count * width).div_ceil(8)
+}
+
+/// Packs fewer than [`VALUES`] values, sequentially and to a byte boundary.
+///
+/// The transposed layout is all or nothing. A value lives at a row and a lane, the lanes are
+/// interleaved through the whole buffer, and there is no prefix of a packed unit that holds a
+/// prefix of the values. So a unit holding 3 values costs the same as a unit holding 1024, which is
+/// 5 KB to store three numbers, and every nested array in a cascade is short: a dictionary of five
+/// entries, a run length array, an exception list.
+///
+/// This is the other layout for exactly those. It is the obvious sequential one, value 0 in the low
+/// bits, and it has the dependency chain the transposed layout was chosen to avoid. That is
+/// affordable here and only here: a tail is at most 1023 values and is decoded once, so the chain
+/// is bounded by a number that does not grow with the data, while a full unit is on the hot path of
+/// every scan in the system.
+///
+/// # Errors
+///
+/// If `count` is not below [`VALUES`], if `width` exceeds 64, or if a value does not fit.
+pub fn pack_tail(values: &[u64], width: usize, output: &mut Vec<u8>) -> Result<()> {
+    check_tail(values.len(), width)?;
+    if width == 0 {
+        return check_all_zero(values);
+    }
+    let mask = low_mask(width);
+    // 128 bits, because the accumulator holds up to 7 bits left over from the previous value plus a
+    // whole 64 bit one.
+    let mut accumulator: u128 = 0;
+    let mut filled = 0usize;
+    for value in values {
+        if value & !mask != 0 {
+            return Err(Error::internal(format!("value {value} does not fit in {width} bits")));
+        }
+        accumulator |= u128::from(*value) << filled;
+        filled += width;
+        while filled >= 8 {
+            output.push((accumulator & 0xff) as u8);
+            accumulator >>= 8;
+            filled -= 8;
+        }
+    }
+    if filled > 0 {
+        output.push((accumulator & 0xff) as u8);
+    }
+    Ok(())
+}
+
+/// Unpacks what [`pack_tail`] wrote.
+///
+/// # Errors
+///
+/// If `count` is not below [`VALUES`], if `width` exceeds 64, or if the input is shorter than
+/// [`tail_len`].
+pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>> {
+    check_tail(count, width)?;
+    if width == 0 {
+        return Ok(vec![0; count]);
+    }
+    if input.len() < tail_len(count, width) {
+        return Err(Error::internal(format!(
+            "{count} values at {width} bits need {} bytes and there are {}",
+            tail_len(count, width),
+            input.len()
+        )));
+    }
+    let mask = u128::from(low_mask(width));
+    let mut values = Vec::with_capacity(count);
+    let mut accumulator: u128 = 0;
+    let mut available = 0usize;
+    let mut at = 0usize;
+    for _ in 0..count {
+        while available < width {
+            accumulator |= u128::from(input[at]) << available;
+            at += 1;
+            available += 8;
+        }
+        values.push((accumulator & mask) as u64);
+        accumulator >>= width;
+        available -= width;
+    }
+    Ok(values)
+}
+
+fn check_tail(count: usize, width: usize) -> Result<()> {
+    if count >= VALUES {
+        return Err(Error::internal(format!(
+            "{count} values is a whole unit and belongs in the transposed layout"
+        )));
+    }
+    if width > 64 {
+        return Err(Error::internal(format!("{width} bits does not fit in 64")));
+    }
+    Ok(())
+}
+
 fn check_vector_len(len: usize, what: &str) -> Result<()> {
     if len == VALUES {
         Ok(())
@@ -495,6 +604,44 @@ mod tests {
         let mut packed = vec![0u16; 17 * 64];
         let error = pack(&values, 17, &mut packed).unwrap_err();
         assert!(error.message().contains("16 bit type"), "{error}");
+    }
+
+    #[test]
+    fn a_tail_round_trips_at_every_width_and_every_length() {
+        let mut random = Random::new();
+        for width in [0usize, 1, 3, 7, 8, 13, 31, 32, 33, 63, 64] {
+            for count in [0usize, 1, 2, 7, 8, 9, 100, 1023] {
+                let values: Vec<u64> =
+                    (0..count).map(|_| random.next() & low_mask(width)).collect();
+                let mut bytes = Vec::new();
+                pack_tail(&values, width, &mut bytes).unwrap();
+                assert_eq!(bytes.len(), tail_len(count, width), "{count} at {width}");
+                assert_eq!(unpack_tail(&bytes, width, count).unwrap(), values);
+            }
+        }
+    }
+
+    #[test]
+    fn a_tail_costs_its_own_values_and_not_a_whole_unit() {
+        // The reason it exists. Three 40 bit values in the transposed layout is a 5 KB buffer.
+        let values = vec![(1u64 << 39) + 1; 3];
+        let mut bytes = Vec::new();
+        pack_tail(&values, 40, &mut bytes).unwrap();
+        assert_eq!(bytes.len(), 15);
+        assert_eq!(packed_len::<u64>(40) * 8, 5120);
+    }
+
+    #[test]
+    fn a_whole_unit_is_refused_by_the_tail_packer() {
+        let values = vec![0u64; VALUES];
+        let error = pack_tail(&values, 4, &mut Vec::new()).unwrap_err();
+        assert!(error.message().contains("whole unit"), "{error}");
+    }
+
+    #[test]
+    fn a_short_tail_buffer_is_an_error() {
+        let error = unpack_tail(&[0, 0], 8, 5).unwrap_err();
+        assert!(error.message().contains("need 5 bytes"), "{error}");
     }
 
     #[test]
