@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) fn check(root: &Path) -> Result<(), String> {
     let mut files = Vec::new();
-    collect(root, root, &mut files)?;
+    collect(root, &mut files)?;
     files.sort();
 
     let mut problems = Vec::new();
@@ -93,7 +93,7 @@ fn continues(next: Option<&str>) -> bool {
     first.is_lowercase() || first == ',' || first == ')'
 }
 
-fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("could not read {}: {e}", dir.display()))?;
     for entry in entries.filter_map(Result::ok) {
@@ -103,7 +103,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String
             continue;
         }
         if path.is_dir() {
-            collect(root, &path, out)?;
+            collect(&path, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
             out.push(path);
         }

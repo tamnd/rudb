@@ -62,9 +62,22 @@ fn ci() -> Result<(), String> {
     Ok(())
 }
 
+/// Runs cargo the way CI runs it, which means with warnings denied.
+///
+/// Without this the local gate is weaker than the remote one: `cargo clippy` exits zero on a
+/// warning, CI sets `RUSTFLAGS: -D warnings` and does not, and the difference is discovered on a
+/// pull request instead of on the machine that made it. Both are overridable from the environment
+/// for the case where somebody genuinely wants to build through a warning while debugging.
 fn cargo(args: &[&str]) -> Result<(), String> {
     println!("cargo {}", args.join(" "));
-    let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+    let mut command = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    if std::env::var_os("RUSTFLAGS").is_none() {
+        command.env("RUSTFLAGS", "-D warnings");
+    }
+    if std::env::var_os("RUSTDOCFLAGS").is_none() {
+        command.env("RUSTDOCFLAGS", "-D warnings");
+    }
+    let status = command
         .args(args)
         .current_dir(root())
         .status()
