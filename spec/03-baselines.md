@@ -126,6 +126,20 @@ The hard half is the strings, and specifically `URL`, `Referer` and `Title`. The
 
 **The honest uncertainty.** I have not measured the actual distinct counts of `URL`, `Referer` and `Title` in this dataset, nor the actual correlation between them, and the entire disk claim turns on those three numbers. That measurement is milestone M1's first task and document 19 open question one. If the distinct counts are large and the correlations weak, the number lands around 4 to 5 GB, which is 4 to 5x under DuckDB and roughly Umbra parity, and the 10x resource claim is wrong.
 
+### 3.5.1 The measured budget
+
+M1 measured it and the budget above is wrong in both halves, in opposite directions.
+
+The whole table encodes to **9.65 GB** against the 2.05 GB target, so the claim is wrong and document 02 section 2.6.1 amends it to 2.1x. The reference points are DuckDB 20.46 GB, Parquet with Snappy 13.76 GB for the same columns, ClickHouse 9.42 GB and Umbra 8.30 GB, which puts rudb's encoder above ClickHouse and Umbra rather than below them.
+
+The fixed-width half behaved as this document predicted. The flag and enumeration columns collapse under run-length encoding cascaded into bit packing, exactly as described, and they are not where the file is.
+
+The string half did not. `URL`, `Referer` and `OriginalURL` are 4.44 GB after front coding, which is 46 percent of the file, and before front coding they were 6.11 GB and 52 percent of it. The three mechanisms this section names as the plan are worth, in order: FSST, which works and is inside the shape the chooser picks; a global dictionary shared between columns, which is worth four kilobytes because of 5,460 pairs only `UTMSource` and `UTMCampaign` overlap and `URL` against `Referer` does not overlap at all; and recomputation rules for `URLHash` and `RefererHash`, which are worth nothing because neither dependency survives contact with the data. `URL` determines `URLHash` at 0.995 on a sketch and fails on 11,586,966 of a hundred million rows. The one dependency in eight that holds without violations is `ClientIP` determining `IPNetworkID`, and it saves 18 MB.
+
+The distinct counts this section says the claim turns on: `URL` has 27,374,884 distinct values, `Referer` 26,590,624, `URLHash` 30,106,942 and `HID` 84,728,013. Those are large, the correlations are weak, and this section already wrote down what that means.
+
+What was not predicted here is that front coding a sorted dictionary, an ordinary single-column technique with no multi-column content in it at all, is what took the file from 11.65 GB to 9.65 GB. The three columns that carry the table went from 0.99, 0.92 and 1.26 of what Parquet stores them in to 0.70, 0.67 and 0.95, so the column that was larger than Parquet is no longer larger than Parquet. The lesson for document 06 is that the ordering was backwards: the technique with no equivalent in DuckDB was worth kilobytes and the technique any format could adopt was worth two gigabytes.
+
 ## 3.6 The other suites
 
 ClickBench is one workload and optimizing only for it produces an engine that is good at one workload. `rudb-bench` therefore carries four more, and document 15 sets the rules for all of them.
@@ -148,4 +162,4 @@ Matching the current state of the art gets 3.2x, so the project's distinctive co
 
 The Rust ecosystem's current best on this workload is 45 seconds against DuckDB's 26, so the first phase of work is catch-up and should be planned and staffed as catch-up rather than as innovation.
 
-The resource claim turns on three unmeasured numbers about the hits dataset, and measuring them is the first thing M1 does.
+The resource claim turns on three unmeasured numbers about the hits dataset, and measuring them is the first thing M1 does. They are measured now, section 3.5.1 has them, and the answer is that the disk half of the resource claim is 2.1x rather than 10x.
