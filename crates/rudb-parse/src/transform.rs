@@ -26,14 +26,19 @@ use crate::ast::{
     OrderItem, Quantifier, Query, QueryBody, QueryRef, Select, SelectRef, SetOp, Slice, Source,
     SourceRef, Statement, StrRef, Target, UnaryOp,
 };
-use crate::matcher::{NONE, Tree, parse};
+use crate::generated::rules::PROGRAM;
+use crate::matcher::{NONE, Tree, parse_tokens};
 use crate::token::{Kind, Token};
 use crate::tokenize::tokenize;
 
 /// Parse a script and transform it into the AST.
+///
+/// The tokens are produced once and handed to both halves. Calling [`crate::parse`] here instead
+/// would be shorter and would tokenize the query a second time, which `cargo xtask bench` prices
+/// at about a tenth of the whole front end.
 pub fn parse_ast(query: &str) -> Result<Ast> {
     let tokens = tokenize(query)?;
-    let tree = parse(query)?;
+    let tree = parse_tokens(query, &tokens, PROGRAM, true)?;
     transform(query, &tokens, &tree)
 }
 
@@ -1310,6 +1315,7 @@ fn unquote(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::corpus::CORPUS;
+    use crate::matcher::parse;
 
     /// The AST written back out as text, which is what the assertions below read.
     ///

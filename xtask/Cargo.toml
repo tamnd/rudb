@@ -7,5 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+# The one dependency, and it is there for `cargo xtask bench`, which cannot time a parser it cannot
+# call. Everything else in this crate reads files and shells out on purpose, because a task runner
+# that fails to build is a task runner that cannot tell you why the build failed.
+[dependencies]
+rudb-parse.workspace = true
+
 [lints]
 workspace = true

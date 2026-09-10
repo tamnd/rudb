@@ -76,6 +76,7 @@ That is the whole of it, on Linux, macOS and Windows. No CMake, no Python in the
 ```
 cargo xtask layers    # check the dependency graph against xtask/layers.toml
 cargo xtask style     # check the prose against the house rules
+cargo xtask bench     # time the front end against a frozen workload, as a table
 cargo xtask ci        # run what CI runs, in the order CI runs it
 ```
 
