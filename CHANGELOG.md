@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 ## Unreleased
 
+## 0.1.1
+
+The encodings M1 needs, and nothing that reads a real file yet.
+
+Six pull requests, all of them inside `crates/rudb-encoding`: bit packing, the integer encodings and the cascade over them, FSST, the string column, a bottom-k sketch, and multi-column compression. That is the machinery `spec/06-compression.md` sections 6.2 to 6.5 describe, with the parts of 6.4 that are correlation encodings and the whole of 6.5 still missing.
+
+None of it has seen real data. Every number below is from a synthetic corpus that is more repetitive than a real URL column, which makes them useful for saying which mechanism beats which and useless for saying what `hits` will come out at. The milestone's exit criterion is a report on real files and this release is the thing that will produce it, not the thing that answers it.
+
+One result is worth pulling out of the list because it changes what to build next. On these columns a shared dictionary saves a third and a shared symbol table saves under 3 percent, so the two forms of sharing in section 6.4 are not comparable in value and only one of them is obviously worth a storage engine.
+
 - Multi-column compression, in `crates/rudb-encoding`. A group of string columns encoded together, choosing between encoding them independently, one FSST symbol table trained over all of them, and one dictionary holding the union of their values with every column becoming codes into it. Section 6.4 calls this the mechanism that has no equivalent in DuckDB, and on ClickBench `hits` the case it exists for is `URL` and `Referer`, which are the same universe twice.
 - The numbers from the tests, and they do not say the same thing about the two forms of sharing. Two columns of 20,000 URLs with three quarters of their values in common are 433,162 bytes encoded independently and 295,585 sharing a dictionary, which is a saving of a third. Two columns of 8,000 URLs from different hosts with no values in common are 196,132 independently and 190,817 sharing a symbol table, which is 2.7 percent. Sharing a dictionary is where the money is on this data and sharing a table is a rounding error next to it, which is worth knowing before any of this is built into a storage engine.
 - Splitting the training sample evenly between the columns of a group is wrong and there is a measurement rather than an argument for it. A group of one column of 20,000 values and one of 40 is dominated by the first, and giving the first half the budget costs it more than the second gains: on exactly that pair an even split made the shared table 220,755 bytes against 218,099 for the two columns encoded independently, so sharing lost. The budget is now shared out in proportion to column size with a 2 KB floor, and the same pair comes out at 217,333.
