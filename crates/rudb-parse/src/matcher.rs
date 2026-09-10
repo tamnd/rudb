@@ -412,8 +412,15 @@ impl<'a> Matcher<'a> {
                 Ok(Action::Enter(CHILDREN[node.a as usize]))
             }
             Op::Choice => {
-                self.push(self.frame(FrameOp::Choice, node.a, node.b))?;
-                Ok(Action::Enter(CHILDREN[node.a as usize]))
+                let step = self.viable(node.a, node.b, 0);
+                if step == node.b {
+                    self.reached(self.pos);
+                    return Ok(Action::Fail);
+                }
+                let mut frame = self.frame(FrameOp::Choice, node.a, node.b);
+                frame.step = step;
+                self.push(frame)?;
+                Ok(Action::Enter(CHILDREN[(node.a + step) as usize]))
             }
             Op::Optional => {
                 self.push(self.frame(FrameOp::Optional, node.a, 0))?;
@@ -425,6 +432,24 @@ impl<'a> Matcher<'a> {
             }
             _ => Ok(self.terminal(node)),
         }
+    }
+
+    /// The first alternative at or after `step` that could match the token in hand.
+    ///
+    /// A choice used to enter every alternative in turn and let the guard at the top of `enter`
+    /// reject it, and `Statement` has thirty six of them. That costs a step, a stack push and a
+    /// stack pop per rejection, for a test that is a load and an AND. Doing the test here means an
+    /// alternative that cannot match never becomes a step at all, which is why the step counts in
+    /// the bench moved and not only the times.
+    fn viable(&self, a: u32, b: u32, mut step: u32) -> u32 {
+        if !self.filter {
+            return step;
+        }
+        let key = self.key(self.pos);
+        while step < b && !NODES[CHILDREN[(a + step) as usize] as usize].can_start(key) {
+            step += 1;
+        }
+        step
     }
 
     fn frame(&self, op: FrameOp, a: u32, b: u32) -> Frame {
@@ -538,8 +563,8 @@ impl<'a> Matcher<'a> {
                 Action::Fail
             }
             FrameOp::Choice => {
-                frame.step += 1;
                 self.pos = frame.start;
+                frame.step = self.viable(frame.a, frame.b, frame.step + 1);
                 if frame.step == frame.b {
                     Action::Fail
                 } else {
@@ -976,7 +1001,7 @@ mod tests {
             let tree = parse(query).expect("parses");
             let tokens = tokenize(query).expect("tokenizes").len() as u64;
             let per_token = tree.steps() / tokens;
-            assert!(per_token < 400, "{query} took {per_token} steps a token");
+            assert!(per_token < 200, "{query} took {per_token} steps a token");
         }
     }
 
