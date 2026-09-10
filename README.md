@@ -89,9 +89,12 @@ That is the whole of it, on Linux, macOS and Windows. No CMake, no Python in the
 cargo xtask layers    # check the dependency graph against xtask/layers.toml
 cargo xtask style     # check the prose against the house rules
 cargo xtask bench     # time the front end against a frozen workload, as a table
+cargo xtask bench smoke  # the whole comparison, against every engine on this machine
 cargo xtask smoke     # run a query end to end on this host and check the answers
 cargo xtask ci        # run what CI runs, in the order CI runs it
 ```
+
+`cargo xtask bench <suite>` is the one that produces a table with somebody else in it. It builds rudb and it builds [rudb-bench](https://github.com/tamnd/rudb-bench), which it expects to find checked out beside this repository or wherever `RUDB_BENCH_REPO` says, and then runs the suite against every engine the machine has. DuckDB, ClickHouse, DataFusion and Polars are each a row if they are installed and a line saying they are not if they are not. `smoke` generates its own data and is not comparable to anything. The suites that are comparable need a download or a generator, and `rudb-bench suites` says which.
 
 ## Repository layout
 

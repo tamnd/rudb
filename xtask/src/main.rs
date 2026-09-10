@@ -12,6 +12,7 @@ use std::process::{Command, ExitCode};
 
 mod bench;
 mod codegen;
+mod compare;
 mod focus;
 mod grammar;
 mod layers;
@@ -34,7 +35,14 @@ fn main() -> ExitCode {
         }
         Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
         Some("version") => version::set(&root(), std::env::args().nth(2).as_deref()),
-        Some("bench") => bench::run(&root()),
+        // With a suite name it is the whole comparison against every engine on the machine, which
+        // is what `spec/engine/13-measurement.md` section 13.8 asks for. Without one it is the
+        // front end table, which is what it has always been and what CI runs, and which measures
+        // this repository against itself rather than against anybody.
+        Some("bench") => match std::env::args().nth(2) {
+            Some(suite) => compare::run(&root(), &suite),
+            None => bench::run(&root()),
+        },
         Some("smoke") => smoke::run(),
         Some("ci") => ci(std::env::args().nth(2).as_deref() == Some("--full")),
         Some("help" | "--help" | "-h") | None => {
@@ -72,6 +80,10 @@ fn usage() {
     println!("  bench    the front end against a frozen workload, as a table");
     println!("           rebuilds itself under the bench profile, because a debug number is not");
     println!("           a number, and it is not the benchmark: that is tamnd/rudb-bench");
+    println!("  bench <suite>          the whole comparison, against every engine on this machine");
+    println!("                         builds rudb and the harness, then runs the suite. needs a");
+    println!("                         tamnd/rudb-bench checkout beside this one, or");
+    println!("                         RUDB_BENCH_REPO, and the suite's data on the machine");
     println!();
     println!(
         "  vendor-grammar [ref]   refetch DuckDB's PEG grammar, writing crates/rudb-parse/grammar"
