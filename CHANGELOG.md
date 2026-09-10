@@ -6,6 +6,13 @@ The version number says how far through the plan we are. **The minor version is 
 
 ## Unreleased
 
+- The format lab, in `experiments/format-lab`, which is the first thing in this repository to read a real file. It streams Parquet a chunk at a time, runs every column through the chooser, decodes it again and checks it, and prints per column what Parquet stored the column in against what rudb produced. It is a separate workspace with its own lock file so that linking arrow-rs does not put an external dependency anywhere near a published crate, and it is not in the gate.
+- The first numbers off ClickBench `hits`, from the first million rows on a four core machine. Parquet with Snappy holds those rows in 140.91 MB of column data and the chooser produces 89.89 MB, which is 0.64 of Parquet and puts the whole file somewhere near 9 GB against DuckDB's 20.46 GB. The milestone wants under 4 GB, so this says the encodings are worth having and are not yet the answer.
+- All 945 column chunks in that pass decoded back to exactly what went in, which is the first time any of this has seen values it did not generate itself.
+- `URL` comes out at 0.81 of Parquet and `Referer` at 0.84, and the chooser picks a dictionary for both on every chunk. Those two columns are a third of what Parquet stores and 43 percent of what rudb stores, so they are where the remaining size is and the answer to what to work on next is not a general one.
+- The chooser costs 150 CPU seconds a gigabyte of values, so a pass over `hits` is around four CPU hours, and decode runs at 133 MB/s a core against encode at 7. A write path cannot be twenty times slower than a read path and the number is in here rather than in a footnote because M1 is supposed to find things like it.
+- Peak resident size for a 105 column pass at DuckDB's row group of 122,880 rows is 441 MB, which is what makes the streaming design worth the trouble on a five gigabyte machine.
+
 ## 0.1.1
 
 The encodings M1 needs, and nothing that reads a real file yet.

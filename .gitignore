@@ -1,4 +1,6 @@
 /target
+# The lab under experiments is its own workspace, so it has its own build directory.
+/experiments/*/target
 **/*.rs.bk
 *.pdb
 
