@@ -353,11 +353,15 @@ impl Vector {
         if let Body::Flat(_) = self.body {
             return Ok(self.clone());
         }
+        let values: Vec<Value> = self.iter().collect();
         let mut data = empty_data_for(&self.ty)?;
-        for index in 0..self.len {
-            push_value(&mut data, &self.value_at(index))?;
+        for value in &values {
+            push_value(&mut data, value)?;
         }
-        let validity = Validity::from_iter(self.len, |index| self.validity.is_valid(index));
+        // Taken from the values rather than from `self.validity`, because a dictionary keeps its
+        // nulls in the vector it points at and its own validity says nothing about them. Reading it
+        // instead of them is how a null survives being selected and then comes out as a zero.
+        let validity = Validity::from_iter(self.len, |index| !values[index].is_null());
         Ok(Self { ty: self.ty.clone(), len: self.len, validity, body: Body::Flat(data) })
     }
 }
@@ -723,6 +727,21 @@ mod tests {
         assert_eq!(flat.value_at(1), Value::Null);
         assert_eq!(flat.value_at(2), Value::BigInt(2));
         assert_eq!(flat.value_at(3), Value::BigInt(3));
+    }
+
+    /// A dictionary holds its nulls in the vector it points at, so its own validity is all valid
+    /// and reading that instead of the values turns a null into whatever zero means for the type.
+    /// A filter over a nullable column produces exactly this vector, so the bug reaches a result
+    /// set as `LEFT JOIN` padding that comes back as zeros.
+    #[test]
+    fn a_null_behind_a_dictionary_survives_flattening() {
+        let values =
+            Vector::from_values(LogicalType::Integer, &[Value::Integer(3), Value::Null]).unwrap();
+        let dictionary = Vector::dictionary(vec![1, 0, 1], values).unwrap();
+        let flat = dictionary.flatten().unwrap();
+        assert_eq!(flat.value_at(0), Value::Null);
+        assert_eq!(flat.value_at(1), Value::Integer(3));
+        assert_eq!(flat.value_at(2), Value::Null);
     }
 
     #[test]
