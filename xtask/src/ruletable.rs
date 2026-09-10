@@ -538,13 +538,37 @@ fn solve(
         let mut changed = false;
         for (index, node) in nodes.iter().enumerate() {
             let (is_nullable, set) = match node.op {
-                Op::Keyword => {
-                    let _ = keyword_classes;
-                    (false, bucket(node.a))
-                }
+                // Which bit a keyword node waits for is decided by the tokenizer, not by this
+                // node. A word in at least one class arrives as a keyword token and carries its
+                // bucket. A word in no class arrives as an identifier token, because that is what
+                // makes `SELECT ascending FROM t` a column reference, and its bucket bit is
+                // therefore never set on anything. Fifteen words are in that state and every one
+                // of them is spelled by some rule, so a bucket here would filter out the only
+                // token that could ever match, and `ORDER BY x ASCENDING` would stop parsing.
+                Op::Keyword => (
+                    false,
+                    if keyword_classes[node.a as usize] == 0 {
+                        FIRST_IDENT
+                    } else {
+                        bucket(node.a)
+                    },
+                ),
+                // Which kind of token a piece of punctuation arrives as is the tokenizer's
+                // business and it is not always the obvious one. A `;` is its own kind, because a
+                // statement boundary is decided before the grammar sees it. A `.` is a number,
+                // because `.5` is a number and the scan cannot know which it has until it has read
+                // the next byte, so `a.b` hands the matcher a number token whose text is `.`, and
+                // upstream's own `NumberLiteralMatcher` carries a rule rejecting a lone dot for
+                // exactly that reason. Both bits are set for it rather than just the number one, so
+                // that a tokenizer that later decides a trailing dot is punctuation does not
+                // silently take `DotColLabel` out of the grammar.
                 Op::Symbol => (
                     false,
-                    if symbols[node.a as usize] == ";" { FIRST_TERMINATOR } else { FIRST_OPERATOR },
+                    match symbols[node.a as usize].as_str() {
+                        ";" => FIRST_TERMINATOR,
+                        "." => FIRST_NUMBER | FIRST_OPERATOR,
+                        _ => FIRST_OPERATOR,
+                    },
                 ),
                 Op::Rule => {
                     let root = rules[node.a as usize].root as usize;

@@ -126,7 +126,11 @@ impl Suggestion {
     /// Type name positions allow the type name class, both function name positions allow the
     /// combined type and function class, and everything else allows the column name class. That
     /// `TypeFuncKeyword <- TypeNameKeyword / FuncNameKeyword` is a rule in the grammar and also a
-    /// category in the matcher is not a coincidence, it is the same union written twice.
+    /// category in the matcher is not a coincidence, it is the same union written once.
+    /// `ParsedGrammarKeywordHelper`'s constructor holds a table of five rule names against five
+    /// keyword sets, and the entry for `typefunc_keyword_map` names that rule, which it then walks
+    /// through its references to collect the words. So the category is not a sixth list somebody
+    /// has to keep in step with the other five, it is what that one line of the grammar says.
     pub const fn allowed_class(self) -> u8 {
         use crate::generated::keywords::{COLUMN_NAME, FUNC_NAME, TYPE_NAME};
         match self {
