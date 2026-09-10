@@ -9,4 +9,5 @@
 #![forbid(unsafe_code)]
 
 pub mod bitpack;
+pub mod fsst;
 pub mod integer;
