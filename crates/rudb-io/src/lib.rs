@@ -1,11 +1,200 @@
-//! Files, direct I/O, io_uring, object storage, and the interception shim the crash tests drive.
+//! Files, and the interception shim the crash tests drive.
 //!
 //! Rank 1 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! This crate is allowed `unsafe`, per `spec/16-testing.md` section 16.7. Every block carries
-//! the invariant that makes it sound, and the lint in the workspace manifest is what turns that
-//! into a build failure rather than a habit.
+//! Everything that touches a file in this project goes through [`Filesystem`] and [`File`]. Not
+//! most things, everything. `spec/16-testing.md` section 16.5 is explicit about why the shim is
+//! scheduled at M0 and not at M6, where the crash tests that use it live: retrofitting an
+//! interception layer into a codebase that has been calling `File::write` directly for two years is
+//! a much larger job than building against it from the start. So the shim goes in before there is
+//! anything to intercept, and the rule that nothing bypasses it is cheap to keep now and expensive
+//! to establish later.
+//!
+//! # What is here
+//!
+//! [`RealFilesystem`], which is `std::fs` and positional reads and writes.
+//!
+//! [`SimFilesystem`], which is memory, and which records every operation, can be told to fail at a
+//! chosen point, and models the thing that actually happens on a crash: writes that were not
+//! separated by an `fsync` can land in any combination.
+//!
+//! # What is not here yet
+//!
+//! Direct I/O, io_uring, the thread pool backend and object storage. `spec/05-storage.md` sections
+//! on I/O say the layer has two backends chosen by measurement at startup, and that decision needs
+//! a buffer manager to measure and a workload to measure it on. Both arrive at M2. What matters now
+//! is that the interface they will implement exists and that nothing is written against `std::fs`
+//! directly in the meantime.
+//!
+//! # Why the methods take `&self`
+//!
+//! Positional I/O does not need exclusive access and the buffer manager is going to want many
+//! readers at once. `read_at` and `write_at` are the whole interface for a reason: a seek plus a
+//! read is two operations with shared state between them, and shared mutable state in the I/O layer
+//! is how a database gets a bug that only appears at sixteen threads.
 
-/// The crate this rank belongs to, so that the layer check has something to read and the
-/// scaffold compiles. Replaced by the first real item.
-pub const RANK: u8 = 1;
+#![deny(unsafe_code)]
+
+pub mod real;
+pub mod sim;
+
+use std::fmt::Debug;
+use std::path::Path;
+
+use rudb_common::Result;
+
+pub use real::RealFilesystem;
+pub use sim::{Crash, Op, SimFilesystem};
+
+/// How a file is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Must exist. Reads only, and a write is an error.
+    Read,
+    /// Must exist. Reads and writes.
+    ReadWrite,
+    /// Created if it does not exist, opened if it does.
+    Create,
+    /// Created, and an error if it already exists.
+    ///
+    /// The one that matters for a database file, because "create the database" and "open the
+    /// database that is already there" are different intentions and collapsing them is how a
+    /// process ends up writing a header over somebody's data.
+    CreateNew,
+}
+
+impl OpenMode {
+    /// Whether a write through a handle opened this way is allowed.
+    #[must_use]
+    pub fn writable(self) -> bool {
+        !matches!(self, Self::Read)
+    }
+}
+
+/// An open file, addressed by offset rather than by a cursor.
+///
+/// Implementors are shared across threads, which is why every method takes `&self`. A `File` here
+/// is closer to a block device with a name than to `std::fs::File`.
+pub trait File: Debug + Send + Sync {
+    /// Reads into `buf` starting at `offset` and returns how many bytes were read.
+    ///
+    /// A short read at the end of the file is not an error, it is a short read. The caller knows
+    /// how long the file is and what it expected.
+    ///
+    /// # Errors
+    ///
+    /// If the underlying read fails.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
+
+    /// Reads exactly `buf.len()` bytes starting at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// If the read fails, or if the file ends first. The second case is a real error here, unlike
+    /// in [`Self::read_at`], because a caller who asked for an exact read said it knew the length.
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let read = self.read_at(offset, buf)?;
+        if read == buf.len() {
+            Ok(())
+        } else {
+            Err(rudb_common::Error::io(format!(
+                "wanted {} bytes at offset {offset} and the file had {read}",
+                buf.len()
+            )))
+        }
+    }
+
+    /// Writes all of `data` starting at `offset`, extending the file if it has to.
+    ///
+    /// This does not make the write durable. Nothing is durable until [`Self::sync`] returns, and
+    /// a write that has not been synced can be present, absent or reordered against another
+    /// unsynced write after a crash. That is not a quirk of the simulation, it is what the
+    /// hardware does, and it is the reason the simulation models it.
+    ///
+    /// # Errors
+    ///
+    /// If the underlying write fails, or if the file was not opened for writing.
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<()>;
+
+    /// Makes every write issued before this call durable.
+    ///
+    /// # Errors
+    ///
+    /// If the underlying sync fails. An error here is not recoverable by retrying, per the write
+    /// handling discussion in `spec/11-transactions.md`: a failed `fsync` on Linux can drop the
+    /// dirty pages, so a second call may return success while the data is gone.
+    fn sync(&self) -> Result<()>;
+
+    /// Cuts the file to `len` bytes, or extends it with zeroes.
+    ///
+    /// # Errors
+    ///
+    /// If the underlying truncate fails.
+    fn truncate(&self, len: u64) -> Result<()>;
+
+    /// How many bytes long the file currently is.
+    ///
+    /// # Errors
+    ///
+    /// If the length cannot be determined.
+    fn len(&self) -> Result<u64>;
+
+    /// Whether the file has no bytes in it.
+    ///
+    /// # Errors
+    ///
+    /// If the length cannot be determined.
+    fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+}
+
+/// A place files live.
+///
+/// Object stores will implement this too, which is why there is no method that assumes a mutable
+/// hierarchy beyond what a database actually needs. Rename is here because the atomic rename is how
+/// a file gets replaced without a window where it is neither, and because an object store that
+/// cannot do it needs to say so rather than have callers assume.
+pub trait Filesystem: Debug + Send + Sync {
+    /// Opens a file.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be opened in the requested mode.
+    fn open(&self, path: &Path, mode: OpenMode) -> Result<Box<dyn File>>;
+
+    /// Whether a path exists.
+    fn exists(&self, path: &Path) -> bool;
+
+    /// Deletes a file.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be deleted.
+    fn remove(&self, path: &Path) -> Result<()>;
+
+    /// Moves a file, replacing the destination if it exists.
+    ///
+    /// # Errors
+    ///
+    /// If the rename fails.
+    fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+
+    /// Creates a directory and any missing parents.
+    ///
+    /// # Errors
+    ///
+    /// If the directory cannot be created.
+    fn create_dir_all(&self, path: &Path) -> Result<()>;
+
+    /// Makes a directory entry durable, which is what a rename needs before it counts.
+    ///
+    /// Easy to forget and it is the difference between a crash-safe atomic replace and one that
+    /// works on every test and fails on a power cut. The rename itself being atomic says nothing
+    /// about the directory entry having reached the disk.
+    ///
+    /// # Errors
+    ///
+    /// If the directory cannot be synced.
+    fn sync_dir(&self, path: &Path) -> Result<()>;
+}
