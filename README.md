@@ -45,7 +45,7 @@ rudb is aiming at four things at once, stated as falsifiable claims rather than 
 
 ## Status
 
-M0, with everything on the list built and the exit criterion the only thing left. There is a parser for `SELECT`, a binder, a logical plan with a textual form that reads back, an in-memory table, a catalog, the tier 0 kernels and a tier 0 interpreter, so a query now runs end to end:
+M0 is finished, as of v0.1.0. There is a parser for `SELECT`, a binder, a logical plan with a textual form that reads back, a catalog, an in-memory table, the tier 0 kernels and a tier 0 interpreter, so a query runs end to end:
 
 ```
 $ cargo xtask smoke
@@ -57,11 +57,11 @@ SELECT * FROM t WHERE x > 5
   10, row 10
 ```
 
-That is the query M0 exists to produce and it is the whole of what works. No storage format, no optimizer, no transactions, no `CREATE TABLE`, and every join is a nested loop. The shell is still an argument parser rather than a shell.
+That is the query M0 exists to produce and it is the whole of what works, checked on macOS, Linux and Windows with 502 tests green on each. No storage format, no optimizer, no transactions, no `CREATE TABLE`, and every join is a nested loop. The shell is still an argument parser rather than a shell. M1 is next and it is the format experiment.
 
 ```
 $ rudb --print-config
-version: 0.0.2
+version: 0.1.0
 vector-size: 1024
 row-group-size: 122880
 storage-format: native (rudb v1), DuckDB import and export
