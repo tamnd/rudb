@@ -133,6 +133,32 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i64>> {
     Ok(values)
 }
 
+/// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
+///
+/// A string column holds integer chunks inside its own body, and the reader on that side cannot
+/// know where the nested chunk ends until it has been read. A chunk is self delimiting, so this is
+/// the same work [`decode`] does without the check that nothing follows.
+///
+/// # Errors
+///
+/// As [`decode`], except that trailing bytes are what the caller asked about rather than an error.
+pub fn decode_prefix(bytes: &[u8]) -> Result<(Vec<i64>, usize)> {
+    let mut reader = Reader::new(bytes);
+    let values = decode_chunk(&mut reader)?;
+    Ok((values, reader.used()))
+}
+
+/// [`describe`] over a chunk at the front of a longer buffer, and how many bytes it took.
+///
+/// # Errors
+///
+/// As [`decode_prefix`].
+pub fn describe_prefix(bytes: &[u8]) -> Result<(String, usize)> {
+    let mut reader = Reader::new(bytes);
+    let text = describe_chunk(&mut reader)?;
+    Ok((text, reader.used()))
+}
+
 /// The size in bytes of every candidate, for a report that wants to say what the cascade was
 /// chosen over rather than only what it chose. A candidate that does not apply is absent.
 ///
@@ -607,6 +633,10 @@ impl<'a> Reader<'a> {
         self.bytes.len() - self.at
     }
 
+    fn used(&self) -> usize {
+        self.at
+    }
+
     fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
         let end = self.at + N;
         if end > self.bytes.len() {
@@ -923,5 +953,36 @@ mod tests {
         assert!(sizes.iter().any(|(kind, _)| *kind == Kind::Dict));
         assert!(sizes.iter().any(|(kind, _)| *kind == Kind::Packed));
         assert!(sizes.iter().all(|(_, size)| *size > 0));
+    }
+
+    #[test]
+    fn a_chunk_can_be_read_from_the_front_of_a_longer_buffer() {
+        // What a string column does. It writes an integer chunk of lengths into the middle of its
+        // own body and has to find the end of it again on the way back.
+        let first = encode(&[1, 2, 3]).unwrap();
+        let second: Vec<i64> = (0..3000).map(|index| index % 11).collect();
+        let second_bytes = encode(&second).unwrap();
+        let mut joined = first.clone();
+        joined.extend_from_slice(&second_bytes);
+        joined.extend_from_slice(b"and then something else");
+
+        let (values, used) = decode_prefix(&joined).unwrap();
+        assert_eq!(values, vec![1, 2, 3]);
+        assert_eq!(used, first.len());
+        let (more, used_again) = decode_prefix(&joined[used..]).unwrap();
+        assert_eq!(more, second);
+        assert_eq!(used_again, second_bytes.len());
+
+        let (text, described) = describe_prefix(&joined).unwrap();
+        assert_eq!(described, first.len());
+        assert_eq!(text, describe(&first).unwrap());
+    }
+
+    #[test]
+    fn a_truncated_chunk_is_still_an_error_when_read_as_a_prefix() {
+        let bytes = encode(&(0..2000).collect::<Vec<i64>>()).unwrap();
+        for len in 0..bytes.len() {
+            assert!(decode_prefix(&bytes[..len]).is_err(), "{len} bytes decoded");
+        }
     }
 }
