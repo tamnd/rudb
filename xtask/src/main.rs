@@ -16,6 +16,7 @@ mod grammar;
 mod layers;
 mod ruletable;
 mod sha256;
+mod smoke;
 mod style;
 mod vendor;
 mod version;
@@ -33,6 +34,7 @@ fn main() -> ExitCode {
         Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
         Some("version") => version::set(&root(), std::env::args().nth(2).as_deref()),
         Some("bench") => bench::run(&root()),
+        Some("smoke") => smoke::run(),
         Some("ci") => ci(),
         Some("help" | "--help" | "-h") | None => {
             usage();
@@ -59,6 +61,7 @@ fn usage() {
     println!(
         "  gen-grammar [--check]  regenerate crates/rudb-parse/src/generated from that grammar"
     );
+    println!("  smoke    the query in M0's exit criterion, run on this host, answers checked");
     println!("  ci       everything the per-commit gate runs, in the order it runs it");
     println!("  version <x.y.z>        set the workspace version and every internal pin");
     println!();

@@ -45,11 +45,23 @@ rudb is aiming at four things at once, stated as falsifiable claims rather than 
 
 ## Status
 
-M0, and not finished. The workspace, the crate tree, the layer rule, the prose check, the shell's argument handling, and CI on three hosts. No parser, no storage, no execution. `rudb` prints what it is and then tells you so.
+M0, with everything on the list built and the exit criterion the only thing left. There is a parser for `SELECT`, a binder, a logical plan with a textual form that reads back, an in-memory table, a catalog, the tier 0 kernels and a tier 0 interpreter, so a query now runs end to end:
+
+```
+$ cargo xtask smoke
+SELECT * FROM t WHERE x > 5
+  6, row 6
+  7, row 7
+  8, row 8
+  9, row 9
+  10, row 10
+```
+
+That is the query M0 exists to produce and it is the whole of what works. No storage format, no optimizer, no transactions, no `CREATE TABLE`, and every join is a nested loop. The shell is still an argument parser rather than a shell.
 
 ```
 $ rudb --print-config
-version: 0.1.0
+version: 0.0.2
 vector-size: 1024
 row-group-size: 122880
 storage-format: native (rudb v1), DuckDB import and export
@@ -77,6 +89,7 @@ That is the whole of it, on Linux, macOS and Windows. No CMake, no Python in the
 cargo xtask layers    # check the dependency graph against xtask/layers.toml
 cargo xtask style     # check the prose against the house rules
 cargo xtask bench     # time the front end against a frozen workload, as a table
+cargo xtask smoke     # run a query end to end on this host and check the answers
 cargo xtask ci        # run what CI runs, in the order CI runs it
 ```
 

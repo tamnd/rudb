@@ -16,11 +16,12 @@
 //! printed next to it rather than left out.
 //!
 //! Rule ten says a micro-benchmark number never appears without the end-to-end number it is
-//! supposed to explain. rudb cannot run a query yet, so there is no query time to put underneath
-//! this table, and the honest thing is to say so in the output every time rather than to let a
-//! parser number stand on its own and start sounding like a result. The end-to-end column here is
-//! the whole front end, and it is measured rather than summed from the three stage columns, so the
-//! stages are an explanation of a number rather than its definition.
+//! supposed to explain. rudb runs a query now, but nothing here times one, so there is still no
+//! query time to put underneath this table, and the honest thing is to say so in the output every
+//! time rather than to let a parser number stand on its own and start sounding like a result. The
+//! query times live in `tamnd/rudb-bench` against whole engines, which is where they belong. The
+//! end-to-end column here is the whole front end, and it is measured rather than summed from the
+//! three stage columns, so the stages are an explanation of a number rather than its definition.
 
 use std::hint::black_box;
 use std::path::Path;
@@ -216,7 +217,7 @@ fn caveats() -> Vec<String> {
         "    busy and the run should be taken again.".to_string(),
         "  rule ten: a micro number never appears without the end-to-end number it explains,"
             .to_string(),
-        "    and rudb cannot run a query yet. So the total column here is the front end and"
+        "    and nothing here times a query. So the total column here is the front end and"
             .to_string(),
         "    not a query time, and a win in it is worth nothing until there is a query time"
             .to_string(),
