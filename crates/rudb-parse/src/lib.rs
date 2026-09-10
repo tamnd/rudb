@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod generated;
+pub mod matcher;
 pub mod rules;
 pub mod token;
 pub mod tokenize;
@@ -17,6 +18,7 @@ pub mod tokenize;
 pub use generated::keywords::{
     COLUMN_NAME, FUNC_NAME, KEYWORDS, LONGEST, RESERVED, TYPE_NAME, UNRESERVED,
 };
+pub use matcher::{NONE, ParseNode, Tree, parse, parse_from, parse_tokens};
 pub use rules::{Node, Op, Rule, Suggestion, can_start, rule, token_key};
 pub use token::{Flags, Kind, NOT_A_KEYWORD, Token};
 pub use tokenize::{classes, lookup, tokenize};
