@@ -32,6 +32,17 @@ cargo run --release -- pairs hits.parquet --markdown
 `pairs` hashes every column once a row and combines the hashes, so all 5,460 pairs of a 105 column table cost a multiply and a compare each per row rather than a pass over the file each.
 It prints which column determines which other column, which is what section 6.6 needs before it can drop a column and recompute it, and how much two string columns overlap, which is what section 6.4 needs before it can put them in one dictionary.
 
+A count of distinct values is not a saving, so the third command takes the two pairwise answers and prices them in bytes:
+
+```
+cargo run --release -- groups hits.parquet --rules URL:URLHash --markdown
+```
+
+It groups the string columns that overlap, encodes each group apart and then sharing one dictionary and then sharing one symbol table, and prints the difference and which of the three won each chunk.
+For each rule given on the command line it builds the mapping from the determining column's values to the determined column's, in the order that column's dictionary would be in, and prints what the mapping costs against what the column costs, with and without the keys, plus the number of rows where the rule did not hold.
+A rule with any violations at all is not a rule.
+The rules have to be named rather than discovered because `pairs` finds them on a sketch, and a dependency that holds on a sketch is a candidate and not a fact.
+
 `--help` lists the rest.
 The ones that matter are `--rows` to cut the run short, `--columns` to look at one column, `--threads` to match the machine, and `--no-verify` to skip the decode pass when you only want sizes.
 
