@@ -64,6 +64,14 @@ struct Work {
     strings: bool,
     hashes: Vec<u64>,
     sketch: Sketch,
+    /// The same sketch with the empty value left out, for the overlap question only.
+    ///
+    /// This lab stores a null as an empty string, and on `hits` most of the string columns are
+    /// mostly null, so `sketch` says that sixteen columns which share nothing at all overlap. The
+    /// dependency question wants the nulls counted, because a column that is always null really is
+    /// determined by everything and the point is to notice that. The overlap question does not,
+    /// because a shared dictionary is about shared vocabulary and the empty string is not any.
+    without_empty: Sketch,
 }
 
 pub fn run(path: &Path, options: &Options) -> Result<()> {
@@ -91,6 +99,7 @@ pub fn run(path: &Path, options: &Options) -> Result<()> {
             strings: matches!(Column::for_type(field.data_type()), Column::Bytes(_)),
             hashes: Vec::new(),
             sketch: Sketch::new(options.k)?,
+            without_empty: Sketch::new(options.k)?,
         });
     }
 
@@ -183,7 +192,11 @@ fn hash_all(columns: &[Column], work: &mut [Work], threads: usize) {
                     match &columns[index] {
                         Column::Bytes(bytes) => {
                             for value in bytes.values() {
-                                work.hashes.push(sketch::hash64(value));
+                                let hash = sketch::hash64(value);
+                                work.hashes.push(hash);
+                                if !value.is_empty() {
+                                    work.without_empty.add_hash(hash);
+                                }
                             }
                         }
                         Column::Ints(ints) => {
@@ -264,7 +277,7 @@ fn report(
             rules.push((right, left, backward));
         }
         if work[left].strings && work[right].strings {
-            let overlap = work[left].sketch.jaccard(&work[right].sketch)?;
+            let overlap = work[left].without_empty.jaccard(&work[right].without_empty)?;
             if overlap >= options.jaccard_min {
                 overlaps.push((left, right, overlap));
             }
@@ -305,13 +318,14 @@ fn report(
         let mut table =
             Table::new(&["left", "distinct", "right", "distinct", "jaccard", "union saves"]);
         for (left, right, overlap) in overlaps.iter().take(options.top) {
-            let union = work[*left].sketch.union(&work[*right].sketch)?.distinct();
-            let apart = distinct[*left] + distinct[*right];
+            let union = work[*left].without_empty.union(&work[*right].without_empty)?.distinct();
+            let apart =
+                work[*left].without_empty.distinct() + work[*right].without_empty.distinct();
             table.row(&[
                 work[*left].name.clone(),
-                text::count(distinct[*left] as usize),
+                text::count(work[*left].without_empty.distinct() as usize),
                 work[*right].name.clone(),
-                text::count(distinct[*right] as usize),
+                text::count(work[*right].without_empty.distinct() as usize),
                 format!("{overlap:.3}"),
                 format!("{:.1}%", (apart - union) / apart * 100.0),
             ]);

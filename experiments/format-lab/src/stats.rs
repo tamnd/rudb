@@ -60,6 +60,12 @@ struct ColumnStats {
     sketch: Sketch,
     /// Chunk counts per top level shape, in the order first seen.
     shapes: Vec<(String, usize)>,
+    /// The whole shape of the first chunk, brackets and all. The table has room for the head of it
+    /// and the head is what says which shape won, but the head is not what says why a column came
+    /// out the size it did. `DICT` on a column of nineteen million URLs is the same word whether
+    /// the dictionary went back through the chooser and came out FSST or whether it is sitting
+    /// there as plain bytes, and those two are a gigabyte apart.
+    first_shape: String,
     encode_nanos: u128,
     decode_nanos: u128,
     mismatches: usize,
@@ -76,6 +82,7 @@ impl ColumnStats {
             encoded: 0,
             sketch: Sketch::new(k)?,
             shapes: Vec::new(),
+            first_shape: String::new(),
             encode_nanos: 0,
             decode_nanos: 0,
             mismatches: 0,
@@ -84,6 +91,9 @@ impl ColumnStats {
     }
 
     fn saw(&mut self, shape: &str) {
+        if self.first_shape.is_empty() {
+            self.first_shape = shape.to_string();
+        }
         let head = head_of(shape);
         match self.shapes.iter_mut().find(|(name, _)| name == &head) {
             Some((_, count)) => *count += 1,
@@ -371,6 +381,15 @@ fn report(
         String::new(),
     ]);
     table.print(options.markdown);
+
+    println!();
+    println!("the whole shape of the first chunk, for the columns that carry the file");
+    let mut biggest: Vec<&ColumnStats> =
+        stats.iter().filter(|stats| !stats.skipped && stats.encoded > 0).collect();
+    biggest.sort_by_key(|stats| std::cmp::Reverse(stats.encoded));
+    for stats in biggest.iter().take(12) {
+        println!("  {:22} {}", stats.name, stats.first_shape);
+    }
 
     println!();
     println!(
