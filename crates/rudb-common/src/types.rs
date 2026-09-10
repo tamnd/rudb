@@ -292,6 +292,48 @@ impl LogicalType {
         )
     }
 
+    /// The type both of these can be cast to without losing a value, if there is one.
+    ///
+    /// This is DuckDB's `MaxLogicalType` and it is what decides the type of `a + b`, of the arms of
+    /// a `CASE`, and of the columns of a `UNION`. The rule is a total order over the numeric types
+    /// with everything else absorbing into `VARCHAR` only when it is asked to, and `NULL` absorbing
+    /// into anything, which is what makes `CASE WHEN c THEN NULL ELSE 1 END` an integer.
+    ///
+    /// Mixing signed and unsigned widens rather than reinterprets, so `INTEGER` and `UINTEGER`
+    /// promote to `BIGINT` and not to either of themselves. That costs a byte per value on a case
+    /// that is rare and it is the only version that never silently changes a number, which matters
+    /// more here than the byte does: a wrong answer that is off by 4,294,967,296 is the worst kind
+    /// of bug this engine can have.
+    ///
+    /// Returns `None` when there is no such type, which is the binder's cue to raise rather than to
+    /// guess. Two different structs are `None` and not a struct of promoted fields, because field
+    /// order and field names would have to match and a rule that sometimes works is worse here than
+    /// one that never does.
+    #[must_use]
+    pub fn promote(&self, other: &Self) -> Option<Self> {
+        if self == other {
+            return Some(self.clone());
+        }
+        match (self, other) {
+            (Self::Null, ty) | (ty, Self::Null) => Some(ty.clone()),
+            (Self::List(left), Self::List(right)) => Some(Self::list(left.promote(right)?)),
+            _ if self.is_numeric() && other.is_numeric() => {
+                Some(promote_numeric(self.clone(), other.clone()))
+            }
+            // A date and a timestamp meet at the wider one, which is the timestamp, and the same
+            // holds for the timestamp units. `rank_temporal` is what says which is wider.
+            _ if self.is_temporal() && other.is_temporal() => {
+                match (rank_temporal(self), rank_temporal(other)) {
+                    (Some(left), Some(right)) => {
+                        Some(if left >= right { self.clone() } else { other.clone() })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The types this one contains, in child column order, or empty for a scalar type.
     #[must_use]
     pub fn children(&self) -> Vec<Self> {
@@ -363,6 +405,148 @@ impl fmt::Display for LogicalType {
             Self::Struct(fields) => write_fields(f, "STRUCT", fields),
             Self::Union(fields) => write_fields(f, "UNION", fields),
         }
+    }
+}
+
+/// Where a numeric type sits in the widening order.
+///
+/// The integers are ordered by how many values they hold, which is why an unsigned type ranks
+/// above the signed type of the same width. That order alone is not enough to promote a signed
+/// type with an unsigned one, since neither holds the other, and [`promote_integers`] is what
+/// handles that case before this function is reached.
+fn rank_numeric(ty: &LogicalType) -> u8 {
+    match ty {
+        LogicalType::TinyInt => 1,
+        LogicalType::UTinyInt => 2,
+        LogicalType::SmallInt => 3,
+        LogicalType::USmallInt => 4,
+        LogicalType::Integer => 5,
+        LogicalType::UInteger => 6,
+        LogicalType::BigInt => 7,
+        LogicalType::UBigInt => 8,
+        LogicalType::HugeInt => 9,
+        LogicalType::UHugeInt => 10,
+        LogicalType::Decimal { .. } => 11,
+        LogicalType::Float => 12,
+        LogicalType::Double => 13,
+        _ => 0,
+    }
+}
+
+/// Whether an integer type is signed, and how many bits it is.
+fn integer_shape(ty: &LogicalType) -> (bool, u8) {
+    match ty {
+        LogicalType::TinyInt => (true, 8),
+        LogicalType::SmallInt => (true, 16),
+        LogicalType::Integer => (true, 32),
+        LogicalType::BigInt => (true, 64),
+        LogicalType::HugeInt => (true, 128),
+        LogicalType::UTinyInt => (false, 8),
+        LogicalType::USmallInt => (false, 16),
+        LogicalType::UInteger => (false, 32),
+        LogicalType::UBigInt => (false, 64),
+        _ => (false, 128),
+    }
+}
+
+/// The integer type of that many bits and that signedness.
+fn integer_of(signed: bool, bits: u8) -> Option<LogicalType> {
+    Some(match (signed, bits) {
+        (true, 8) => LogicalType::TinyInt,
+        (true, 16) => LogicalType::SmallInt,
+        (true, 32) => LogicalType::Integer,
+        (true, 64) => LogicalType::BigInt,
+        (true, 128) => LogicalType::HugeInt,
+        (false, 8) => LogicalType::UTinyInt,
+        (false, 16) => LogicalType::USmallInt,
+        (false, 32) => LogicalType::UInteger,
+        (false, 64) => LogicalType::UBigInt,
+        (false, 128) => LogicalType::UHugeInt,
+        _ => return None,
+    })
+}
+
+/// The narrowest integer type that holds every value of both.
+///
+/// Two of the same signedness are just the wider one. A signed and an unsigned need a signed type
+/// strictly wider than the unsigned one, because a `UBIGINT` of 2^63 does not fit in a `BIGINT`
+/// and a `BIGINT` of -1 does not fit in a `UBIGINT`. When that runs off the end of the integer
+/// types, which is only `UHUGEINT` against a signed type, the answer is `DOUBLE`: it loses
+/// precision past 2^53 and it is the only thing left, and DuckDB does the same.
+fn promote_integers(left: &LogicalType, right: &LogicalType) -> LogicalType {
+    let (left_signed, left_bits) = integer_shape(left);
+    let (right_signed, right_bits) = integer_shape(right);
+    if left_signed == right_signed {
+        return if left_bits >= right_bits { left.clone() } else { right.clone() };
+    }
+    let (signed_bits, unsigned_bits) =
+        if left_signed { (left_bits, right_bits) } else { (right_bits, left_bits) };
+    let wanted = signed_bits.max(unsigned_bits.saturating_mul(2));
+    integer_of(true, wanted).unwrap_or(LogicalType::Double)
+}
+
+/// The narrowest numeric type that holds every value of both.
+fn promote_numeric(left: LogicalType, right: LogicalType) -> LogicalType {
+    // A decimal and a float meet at the float, since the ranks already say so, but two decimals
+    // meet at one wide enough for both the integer part and the fraction of each, which the ranks
+    // cannot express.
+    if let (
+        LogicalType::Decimal { width: left_width, scale: left_scale },
+        LogicalType::Decimal { width: right_width, scale: right_scale },
+    ) = (&left, &right)
+    {
+        let scale = (*left_scale).max(*right_scale);
+        let integral =
+            left_width.saturating_sub(*left_scale).max(right_width.saturating_sub(*right_scale));
+        let width = integral.saturating_add(scale).min(MAX_DECIMAL_WIDTH);
+        return LogicalType::Decimal { width, scale: scale.min(width) };
+    }
+    // An integer and a decimal have to leave room for the integer's digits to the left of the
+    // point, so the decimal widens rather than the integer simply casting into it.
+    let widened = match (&left, &right) {
+        (LogicalType::Decimal { width, scale }, other)
+        | (other, LogicalType::Decimal { width, scale })
+            if other.is_integer() =>
+        {
+            let needed = decimal_digits(other).saturating_add(*scale).min(MAX_DECIMAL_WIDTH);
+            Some(LogicalType::Decimal { width: (*width).max(needed), scale: *scale })
+        }
+        _ => None,
+    };
+    if let Some(ty) = widened {
+        return ty;
+    }
+    if left.is_integer() && right.is_integer() {
+        return promote_integers(&left, &right);
+    }
+    if rank_numeric(&left) >= rank_numeric(&right) { left } else { right }
+}
+
+/// How many decimal digits an integer type needs, which is what a decimal has to leave room for.
+fn decimal_digits(ty: &LogicalType) -> u8 {
+    match ty {
+        LogicalType::TinyInt | LogicalType::UTinyInt => 3,
+        LogicalType::SmallInt | LogicalType::USmallInt => 5,
+        LogicalType::Integer | LogicalType::UInteger => 10,
+        LogicalType::BigInt | LogicalType::UBigInt => 20,
+        _ => MAX_DECIMAL_WIDTH,
+    }
+}
+
+/// Where a temporal type sits in the widening order, or `None` if it does not widen into another.
+///
+/// An interval is a duration and not a point in time, so it has no rank and never promotes with a
+/// timestamp. That is the difference between `t + INTERVAL 1 DAY`, which is a function call the
+/// binder resolves, and `CASE WHEN c THEN t ELSE INTERVAL 1 DAY END`, which has no type.
+fn rank_temporal(ty: &LogicalType) -> Option<u8> {
+    match ty {
+        LogicalType::Date => Some(1),
+        LogicalType::TimestampS => Some(2),
+        LogicalType::TimestampMs => Some(3),
+        LogicalType::Timestamp => Some(4),
+        LogicalType::TimestampNs => Some(5),
+        LogicalType::TimestampTz => Some(6),
+        _ => None,
     }
 }
 
@@ -701,6 +885,121 @@ fn alias(upper: &str) -> Option<LogicalType> {
         "INTERVAL" => LogicalType::Interval,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod promotion_tests {
+    use super::LogicalType;
+
+    #[test]
+    fn a_type_promotes_with_itself_to_itself() {
+        for ty in [
+            LogicalType::Integer,
+            LogicalType::Varchar,
+            LogicalType::Boolean,
+            LogicalType::Struct(vec![]),
+        ] {
+            assert_eq!(ty.promote(&ty), Some(ty.clone()), "{ty} does not promote with itself");
+        }
+    }
+
+    #[test]
+    fn null_takes_the_other_type() {
+        assert_eq!(LogicalType::Null.promote(&LogicalType::Varchar), Some(LogicalType::Varchar));
+        assert_eq!(LogicalType::Date.promote(&LogicalType::Null), Some(LogicalType::Date));
+        assert_eq!(LogicalType::Null.promote(&LogicalType::Null), Some(LogicalType::Null));
+    }
+
+    #[test]
+    fn the_wider_number_wins() {
+        assert_eq!(
+            LogicalType::Integer.promote(&LogicalType::SmallInt),
+            Some(LogicalType::Integer)
+        );
+        assert_eq!(LogicalType::Integer.promote(&LogicalType::Double), Some(LogicalType::Double));
+        assert_eq!(LogicalType::Float.promote(&LogicalType::Double), Some(LogicalType::Double));
+    }
+
+    /// The one that is worth a test of its own, because reinterpreting instead of widening here is
+    /// a wrong answer off by four billion rather than a crash.
+    #[test]
+    fn signed_and_unsigned_widen_rather_than_reinterpret() {
+        assert_eq!(LogicalType::Integer.promote(&LogicalType::UInteger), Some(LogicalType::BigInt));
+        assert_eq!(
+            LogicalType::TinyInt.promote(&LogicalType::UTinyInt),
+            Some(LogicalType::SmallInt)
+        );
+        assert_eq!(LogicalType::BigInt.promote(&LogicalType::UBigInt), Some(LogicalType::HugeInt));
+    }
+
+    #[test]
+    fn promotion_does_not_care_which_side_a_type_is_on() {
+        let types = [
+            LogicalType::TinyInt,
+            LogicalType::UInteger,
+            LogicalType::BigInt,
+            LogicalType::Double,
+            LogicalType::Decimal { width: 10, scale: 2 },
+            LogicalType::Null,
+            LogicalType::Varchar,
+            LogicalType::Date,
+            LogicalType::Timestamp,
+        ];
+        for left in &types {
+            for right in &types {
+                assert_eq!(
+                    left.promote(right),
+                    right.promote(left),
+                    "{left} and {right} promote differently depending on the order"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_decimal_keeps_room_for_both_halves() {
+        let left = LogicalType::Decimal { width: 5, scale: 4 };
+        let right = LogicalType::Decimal { width: 5, scale: 1 };
+        assert_eq!(left.promote(&right), Some(LogicalType::Decimal { width: 8, scale: 4 }));
+    }
+
+    #[test]
+    fn an_integer_next_to_a_decimal_widens_the_decimal() {
+        let decimal = LogicalType::Decimal { width: 5, scale: 2 };
+        assert_eq!(
+            decimal.promote(&LogicalType::Integer),
+            Some(LogicalType::Decimal { width: 12, scale: 2 })
+        );
+    }
+
+    #[test]
+    fn a_date_and_a_timestamp_meet_at_the_timestamp() {
+        assert_eq!(
+            LogicalType::Date.promote(&LogicalType::Timestamp),
+            Some(LogicalType::Timestamp)
+        );
+        assert_eq!(
+            LogicalType::TimestampS.promote(&LogicalType::TimestampNs),
+            Some(LogicalType::TimestampNs)
+        );
+    }
+
+    /// An interval is a duration and a timestamp is a point, so there is no type that holds both
+    /// and saying so is the binder's cue to raise instead of guessing.
+    #[test]
+    fn types_that_do_not_meet_say_so() {
+        assert_eq!(LogicalType::Timestamp.promote(&LogicalType::Interval), None);
+        assert_eq!(LogicalType::Integer.promote(&LogicalType::Varchar), None);
+        assert_eq!(LogicalType::Boolean.promote(&LogicalType::Integer), None);
+    }
+
+    #[test]
+    fn a_list_promotes_by_its_element() {
+        let left = LogicalType::list(LogicalType::Integer);
+        let right = LogicalType::list(LogicalType::BigInt);
+        assert_eq!(left.promote(&right), Some(LogicalType::list(LogicalType::BigInt)));
+        assert_eq!(left.promote(&LogicalType::list(LogicalType::Varchar)), None);
+    }
 }
 
 #[cfg(test)]
