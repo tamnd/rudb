@@ -721,4 +721,3 @@ mod tests {
         assert!(ratio > 4.0, "{ratio:.2}x");
     }
 }
-
