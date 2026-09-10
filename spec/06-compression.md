@@ -26,6 +26,7 @@ Single-column encodings, all of which operate on units of 1024 values so that th
 | `DICT` | any | code array plus dictionary, codes then bit-packed |
 | `FSST` | strings | 255-symbol table, byte-level, random access preserved |
 | `DICT_FSST` | strings | dictionary whose entries are FSST-compressed |
+| `FRONT` | strings | shared prefix length per value, then the rest of the value |
 | `ALP` | floats | adaptive lossless floating point, exact |
 | `ALP-RD` | floats | real-double variant for high-entropy mantissas |
 | `ROARING` | booleans, validity | bitmap with run and array containers |
@@ -36,6 +37,14 @@ Single-column encodings, all of which operate on units of 1024 values so that th
 **ALP is the right float encoding and it is not a compromise.** It finds a decimal representation of a double where one exists, encodes the resulting integers with FOR and bit-packing, and keeps exceptions in a patch list. It is exact, it is fast in both directions, and Parquet is standardizing it alongside FSST in 2026, which means the format we build and the format the ecosystem converges on will agree.
 
 **FSST's property that matters most is not its ratio.** It compresses text about 2x, which is worse than a general-purpose compressor. What it gives that a general-purpose compressor does not is random access to any string without decompressing its neighbours, and the ability to run a substring search against the compressed bytes by compressing the needle with the same symbol table. That second property is what turns `URL LIKE '%google%'` from a decompress-and-scan into a scan, and it is worth more on this workload than any ratio improvement.
+
+**FRONT is in this table because the M1 measurement put it there.** The first whole-file pass over `hits` produced 11.65 GB against Parquet's 13.76 GB, and `URL`, `Referer` and `OriginalURL` were 6.11 GB of that and lost to Snappy on all three. The shape the chooser picked on each was `DICT(FSST[255])`, so the cascade was working and FSST was still losing, and the reason is structural rather than a matter of tuning. FSST compresses each value against a 255 symbol table with no knowledge of the value next to it, and a block compressor has the previous few kilobytes of the page to point back into. Two URLs that share a host and half a path are most of a back reference to each other and are nothing at all to a symbol table, which can spend at most eight bytes of one symbol on the part they have in common and has to spend it again on every value.
+
+A dictionary sorts its entries, so the entries of a `DICT` on anything URL shaped are a sorted list of URLs and the value before each one is the closest thing in the column to it. Storing the length of the prefix shared with that value, and only the bytes after it, reaches exactly the redundancy Snappy was finding. It cascades like everything else here: the leftovers are a string column and go back through the chooser, so `DICT(FRONT(FSST))` is a shape the chooser arrives at without anyone naming it, and `DICT_FSST` above is now most often that.
+
+Measured on the first five million rows of `hits` on server1, against the same slice on the same machine before the change: `URL` 129.68 MB to 83.78 MB, `Referer` 176.52 MB to 131.14 MB, `OriginalURL` 66.34 MB to 43.89 MB, `Title` 108.99 MB to 84.52 MB. The four together go from 1.15 times what Parquet stores them in to 0.82, and `Referer` is the only one still above 1.0. The cost is encode time, because it is another candidate and the chooser prices every candidate that applies: 203 CPU seconds to 418 for those four columns.
+
+The chain has no restart points, so reading entry `n` of a front coded run means walking from entry zero, and the module says so. That is the right trade while a dictionary is decoded whole. The moment something wants one entry out of a dictionary without materializing the rest, which is what late materialization in section 6.6 wants, the answer is a restart every so many entries at a cost of one full value per block.
 
 ## 6.3 Cascading
 
