@@ -299,21 +299,23 @@ fn emit_rules(table: &Table) -> String {
          //! `cargo xtask gen-grammar --check` runs in the gate and fails if this file and the\n\
          //! grammar disagree.\n\
          //!\n\
-         //! `NODES` and `FIRST` are parallel. A node is twelve bytes and its FIRST set is eight\n\
-         //! bytes at the same index, so deciding whether an alternative can match the token in\n\
-         //! hand reads only `FIRST` and never loads the node. `CHILDREN` holds the child lists of\n\
-         //! sequences and choices, contiguous per node, so a sequence is a slice rather than a\n\
-         //! chase. Rules are the only nodes that are not expanded in place, which is what keeps\n\
-         //! the table finite in the face of a recursive grammar.\n\
+         //! `NODES` is the whole grammar. A node is twenty four bytes and carries its FIRST set\n\
+         //! and its nullable bit, so deciding whether an alternative can match the token in hand\n\
+         //! and then walking it read the same twenty four bytes. A `Rule` node carries the index\n\
+         //! of its body as well as the index of the rule, so entering a rule never reads `RULES`.\n\
+         //! `CHILDREN` holds the child lists of sequences and choices, contiguous per node, so a\n\
+         //! sequence is a slice rather than a chase. Rules are the only nodes that are not\n\
+         //! expanded in place, which is what keeps the table finite in the face of a recursive\n\
+         //! grammar.\n\
          //!\n\
          //! Every table carries `#[rustfmt::skip]`, because the generator and rustfmt disagree\n\
-         //! about `NULLABLE`, `CHILDREN` and `SYMBOLS` and something has to win. rustfmt packs an\n\
+         //! about `CHILDREN` and `SYMBOLS` and something has to win. rustfmt packs an\n\
          //! array whose elements are short onto as many per line as fit, so `cargo fmt` rewrote\n\
          //! this file and then `gen-grammar --check` failed on it, with both halves of the gate\n\
          //! correct and the working tree unable to satisfy them at once. One element a line is the\n\
          //! better answer anyway: a packed array reflows a whole block of lines when one entry\n\
          //! changes, and the point of checking this file in is that a grammar bump is a diff\n\
-         //! somebody reads. The attribute is on all six rather than the three, so that a change to\n\
+         //! somebody reads. The attribute is on all four rather than the two, so that a change to\n\
          //! rustfmt's width threshold cannot bring the disagreement back.\n\n\
          use crate::rules::{Node, Op, Rule, Suggestion};\n\n",
     );
@@ -327,47 +329,34 @@ fn emit_rules(table: &Table) -> String {
     ));
 
     out.push_str(&format!(
-        "/// The nodes.\n#[rustfmt::skip]\n\
+        "/// The nodes. Each one carries what it can start with, as a set of token keys, and that\n\
+         /// set is a superset always: a bit that is set may still fail to match, and a bit that is\n\
+         /// clear cannot possibly match, which is the only direction a filter is allowed to be\n\
+         /// wrong in. `Node::NULLABLE` in `flags` says the node can match nothing at all, and a\n\
+         /// node like that is never filtered out.\n\
+         #[rustfmt::skip]\n\
          pub static NODES: [Node; {}] = [\n",
         table.nodes.len()
     ));
-    for node in &table.nodes {
+    for (index, node) in table.nodes.iter().enumerate() {
         let argument = match node.op {
             Op::Identifier => {
                 format!("Suggestion::{} as u32", ruletable::suggestion_name(node.a))
             }
             _ => node.a.to_string(),
         };
+        // A `Rule` node's `b` is unused by the compiler, so it carries the rule's body here and
+        // the matcher enters a rule without a second lookup. Every other op uses `b` for itself.
+        let b = match node.op {
+            Op::Rule => table.rules[node.a as usize].root,
+            _ => node.b,
+        };
+        let flags = node.flags | if table.nullable[index] { 1 << 1 } else { 0 };
         out.push_str(&format!(
-            "    Node {{ op: Op::{}, flags: {}, a: {argument}, b: {} }},\n",
+            "    Node {{ op: Op::{}, flags: {flags}, a: {argument}, b: {b}, first: 0x{:016x} }},\n",
             ruletable::op_name(node.op),
-            node.flags,
-            node.b
+            table.first[index],
         ));
-    }
-    out.push_str("];\n\n");
-
-    out.push_str(&format!(
-        "/// What each node can start with, as a set of token keys. A superset, always: a bit that\n\
-         /// is set may still fail to match, and a bit that is clear cannot possibly match, which\n\
-         /// is the only direction a filter is allowed to be wrong in.\n\
-         #[rustfmt::skip]\n\
-         pub static FIRST: [u64; {}] = [\n",
-        table.first.len()
-    ));
-    for set in &table.first {
-        out.push_str(&format!("    0x{set:016x},\n"));
-    }
-    out.push_str("];\n\n");
-
-    out.push_str(&format!(
-        "/// Whether each node can match without consuming a token.\n\
-         #[rustfmt::skip]\n\
-         pub static NULLABLE: [bool; {}] = [\n",
-        table.nullable.len()
-    ));
-    for value in &table.nullable {
-        out.push_str(&format!("    {value},\n"));
     }
     out.push_str("];\n\n");
 

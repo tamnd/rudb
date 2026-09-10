@@ -63,14 +63,24 @@ pub enum Op {
     KeywordClass = 12,
 }
 
-/// One node. Twelve bytes.
+/// One node. Twenty four bytes, and everything the matcher needs to decide what to do with it.
+///
+/// The FIRST set and the nullable bit live in here rather than in two arrays beside it. They used
+/// to be parallel tables, on the theory that the filter could read eight bytes of `FIRST` and skip
+/// the node entirely, and that theory was wrong in the case that matters. A node that survives the
+/// filter is loaded immediately afterwards, and surviving is the common case: the filter is there
+/// to cut the thirty six alternatives of `Statement` down, and the one that matches still has to be
+/// walked. So the old layout paid three cache lines on every node it did not reject and saved two
+/// on every node it did, and the walk visits far more of the first kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Node {
-    pub op: Op,
-    /// Per op. Only `Identifier` uses it today, for `RESERVED`.
-    pub flags: u8,
+    /// What this node can start with, as a set of token keys. A superset, always.
+    pub first: u64,
     pub a: u32,
     pub b: u32,
+    pub op: Op,
+    /// Per op, plus `NULLABLE`, which every op can carry.
+    pub flags: u8,
 }
 
 impl Node {
@@ -82,6 +92,18 @@ impl Node {
     /// at all. Reading the grammar text alone would get that backwards.
     pub const RESERVED: u8 = 1 << 0;
 
+    /// This node can match without consuming a token, so its FIRST set says nothing about whether
+    /// it applies and the filter has to let it through.
+    pub const NULLABLE: u8 = 1 << 1;
+
+    /// Whether a node could possibly begin with this token.
+    ///
+    /// False means it cannot, and that is the only answer the caller may act on. True means try it.
+    /// A nullable node always answers true.
+    pub fn can_start(self, key: u64) -> bool {
+        self.flags & Self::NULLABLE != 0 || self.first & key != 0
+    }
+
     /// The children of a sequence or a choice.
     pub fn children(self) -> &'static [u32] {
         &crate::generated::rules::CHILDREN[self.a as usize..(self.a + self.b) as usize]
@@ -92,7 +114,9 @@ impl Node {
 #[derive(Debug, Clone, Copy)]
 pub struct Rule {
     pub name: &'static str,
-    /// The node its body compiled to.
+    /// The node its body compiled to. The matcher does not read this. A `Rule` node carries the
+    /// same number in its `b`, so entering a rule is a field of a node already in a register rather
+    /// than an index into a second table. This is here for the name lookup and for the tests.
     pub root: u32,
     /// Whether upstream memoizes it. Twenty two rules do, and they are the ones deep in the
     /// expression grammar that a failing alternative re-enters at the same position over and over.
@@ -177,7 +201,7 @@ pub const fn bucket(index: u32) -> u64 {
 
 /// The one FIRST bit this token sets.
 ///
-/// Exactly one bit, so the filter is `FIRST[node] & key(token) != 0` with no loop and no branch.
+/// Exactly one bit, so the filter is one AND against the node's set, with no loop and no branch.
 pub fn token_key(token: Token) -> u64 {
     match token.kind {
         Kind::Identifier | Kind::QuotedIdentifier => FIRST_IDENT,
@@ -198,13 +222,6 @@ pub fn token_key(token: Token) -> u64 {
     }
 }
 
-/// Whether a node could possibly begin with this token.
-///
-/// False means it cannot, and that is the only answer the caller may act on. True means try it.
-pub fn can_start(node: u32, key: u64) -> bool {
-    crate::generated::rules::FIRST[node as usize] & key != 0
-}
-
 /// The rule with this name, if there is one.
 pub fn rule(name: &str) -> Option<&'static Rule> {
     crate::generated::rules::RULES
@@ -215,8 +232,8 @@ pub fn rule(name: &str) -> Option<&'static Rule> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, Op, Suggestion, bucket, can_start, rule, token_key};
-    use crate::generated::rules::{CHILDREN, FIRST, NODES, NULLABLE, PROGRAM, RULES, SYMBOLS};
+    use super::{Node, Op, Suggestion, bucket, rule, token_key};
+    use crate::generated::rules::{CHILDREN, NODES, PROGRAM, RULES, SYMBOLS};
     use crate::token::{Flags, Kind, Token};
 
     fn token(kind: Kind, keyword: u16) -> Token {
@@ -224,14 +241,12 @@ mod tests {
     }
 
     #[test]
-    fn a_node_is_twelve_bytes() {
-        assert_eq!(size_of::<Node>(), 12);
+    fn a_node_is_twenty_four_bytes() {
+        assert_eq!(size_of::<Node>(), 24);
     }
 
     #[test]
-    fn the_tables_are_parallel_and_in_range() {
-        assert_eq!(NODES.len(), FIRST.len());
-        assert_eq!(NODES.len(), NULLABLE.len());
+    fn the_tables_are_in_range() {
         for node in &NODES {
             match node.op {
                 Op::Sequence | Op::Choice => {
@@ -243,7 +258,12 @@ mod tests {
                     }
                 }
                 Op::Optional | Op::Repeat => assert!((node.a as usize) < NODES.len()),
-                Op::Rule => assert!((node.a as usize) < RULES.len()),
+                Op::Rule => {
+                    assert!((node.a as usize) < RULES.len());
+                    // The body index the matcher actually jumps to, which is the one thing in the
+                    // table that is written twice and so is the one thing that can disagree.
+                    assert_eq!(node.b, RULES[node.a as usize].root);
+                }
                 Op::Symbol => assert!((node.a as usize) < SYMBOLS.len()),
                 Op::Keyword => {
                     assert!((node.a as usize) < crate::generated::keywords::KEYWORDS.len())
@@ -275,7 +295,7 @@ mod tests {
         // terminates and one that does not.
         for node in &NODES {
             if node.op == Op::Repeat {
-                assert!(!NULLABLE[node.a as usize]);
+                assert_eq!(NODES[node.a as usize].flags & Node::NULLABLE, 0);
             }
         }
     }
@@ -287,14 +307,14 @@ mod tests {
             .binary_search_by(|(word, _)| (*word).cmp("select"))
             .expect("select is a keyword");
         let key = token_key(token(Kind::Keyword, select as u16));
-        assert!(can_start(RULES[PROGRAM as usize].root, key));
+        assert!(NODES[RULES[PROGRAM as usize].root as usize].can_start(key));
 
         // A number does not start a statement, and the root is nullable through
         // `Statement? (';'+ / EndOfInput)`, so this is about the FIRST set and not about whether
         // the parse eventually succeeds on an empty script.
         let number = token_key(token(Kind::Number, u16::MAX));
         let select_rule = rule("SelectStatement").expect("SelectStatement is a rule");
-        assert!(!can_start(select_rule.root, number));
+        assert!(!NODES[select_rule.root as usize].can_start(number));
     }
 
     #[test]
