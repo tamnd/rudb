@@ -10,6 +10,11 @@
 *.duckdb.wal
 *.rudb
 *.rudb-wal
+# Not a database file. The vendored grammar carries DuckDB's license next to it under the name
+# LICENSE.duckdb, and the glob above swallowed it, so the 0.0.2 tag shipped a tree that failed its
+# own `cargo xtask grammar` check on a fresh clone while passing on every machine that had run
+# `cargo xtask vendor-grammar` and had the file sitting there untracked.
+!LICENSE.duckdb
 perf.data
 perf.data.old
 *.profraw
