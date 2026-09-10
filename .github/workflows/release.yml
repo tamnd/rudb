@@ -59,6 +59,20 @@ jobs:
             echo "CHANGELOG.md has no section for ${tag#v}"
             exit 1
           }
+      # Asked here rather than three jobs later, because this is how 0.0.1 failed. The secret was
+      # never set, the binaries built and were attested and shipped, and the last job died on
+      # "please provide a non-empty token" after twenty three minutes with a GitHub release
+      # already published and nothing on crates.io. Nothing is printed but whether it is empty.
+      - name: the crates.io token exists
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not set on this repository"
+            echo "set it at https://github.com/tamnd/rudb/settings/secrets/actions"
+            exit 1
+          fi
+          echo "the token is set"
       - run: cargo xtask ci
       # The storage format version a release writes is part of what the release is. It goes into
       # the run log so that a file found in the wild years from now can be traced back to the
@@ -190,11 +204,18 @@ jobs:
   #
   # This does not run for a workflow_dispatch dry run. A dry run is for checking that the binaries
   # build, and an upload to crates.io cannot be undone.
+  #
+  # The timeout is five and a half hours because the first release is 27 crates that crates.io has
+  # never seen, and a new crate is limited to one every ten minutes after a burst of five. That is
+  # about three and a half hours of a job doing nothing but sleeping, once, and a couple of minutes
+  # on every release after it. If it does run out, nothing is lost: the script asks the index what
+  # is already up and re-running the job carries on from there.
   crates-io:
     name: publish to crates.io
     needs: publish
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
+    timeout-minutes: 330
     permissions:
       contents: read
     steps:
