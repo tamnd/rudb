@@ -35,6 +35,8 @@ cargo clippy --workspace --all-targets --all-features
 cargo test --workspace --all-features
 ```
 
+`cargo xtask bench` is not in that list, because it takes about ten seconds of measuring on top of a `bench` profile build and the local gate is meant to be cheap. Run it by hand when you touch the tokenizer, the matcher, the transformer or the generated table, and put the before and after in the pull request. It rebuilds itself under the `bench` profile first, because `cargo xtask` is an alias for a debug `cargo run` and a debug number is not a number. CI runs it too and throws the numbers away, since a timing from a shared runner is not a timing and the only question there is whether the table still prints. It is not the benchmark: whole queries against whole engines are [rudb-bench](https://github.com/tamnd/rudb-bench), and that is where any number anybody quotes comes from.
+
 The minimum supported Rust version check needs that toolchain installed, which is `rustup toolchain install 1.85.0 --profile minimal`. If it is not installed the task says so and continues rather than failing, because CI runs it either way and the point is to find out sooner, not to make a fresh clone unbuildable. It catches one thing that nothing else catches: a language feature newer than the floor, which does not announce itself, it just compiles on whatever toolchain is in front of you.
 
 ## What a change has to come with
