@@ -75,6 +75,14 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             }
             out.write_char(']')
         }
+        Node::TableFunction { index, function, args, columns } => {
+            out.write_char(' ')?;
+            write_identifier(out, plan.string(function))?;
+            out.write_str(" args=")?;
+            write_expr_list(plan, out, args)?;
+            write!(out, " #{index} ")?;
+            write_schema(plan, out, columns)
+        }
         Node::Filter { predicate, .. } => {
             out.write_char(' ')?;
             write_expr(plan, out, predicate)

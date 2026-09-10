@@ -451,6 +451,13 @@ impl Plan {
                     }
                 }
             }
+            Node::TableFunction { function, args, columns, .. } => {
+                if function as usize >= self.strings.len() {
+                    return fail("names a string that is not in the table");
+                }
+                self.checked_field_list(columns, reference)?;
+                self.checked_expr_list(args, reference)?;
+            }
             Node::Filter { predicate, .. } => {
                 self.checked_expr(predicate, reference)?;
                 if *self.expr_type(predicate) != LogicalType::Boolean {
@@ -555,6 +562,7 @@ impl Plan {
             Node::Values { rows, .. } => {
                 self.row_list(rows).iter().flat_map(|row| plain(self.expr_list(*row))).collect()
             }
+            Node::TableFunction { args, .. } => plain(self.expr_list(args)),
             Node::Filter { predicate, .. } => vec![(predicate, false)],
             Node::Project { exprs, .. } => plain(self.expr_list(exprs)),
             Node::Aggregate { groups, aggregates, .. } => {

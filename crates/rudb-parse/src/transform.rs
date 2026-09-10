@@ -919,6 +919,30 @@ impl<'a> Transform<'a> {
                 let (alias, columns) = self.table_alias(self.find(inner, "TableAlias"));
                 Ok(self.push_source(Source::Subquery { query, alias, columns }))
             }
+            // `TableFunction <- TableFunctionLateralOpt / TableFunctionAliasColon`, and
+            // `TableFunctionLateralOpt <- Lateral? QualifiedTableFunction TableFunctionArguments
+            // WithOrdinality? TableAlias?`. The colon form and `LATERAL` are their own work, and
+            // `WITH ORDINALITY` adds a column, so all three are turned away rather than dropped.
+            "TableFunction" => {
+                let form = self.first(inner);
+                for name in ["TableAliasColon", "Lateral", "WithOrdinality", "SampleClause"] {
+                    let clause = self.find(form, name);
+                    if clause != NONE {
+                        return self.unsupported(clause);
+                    }
+                }
+                let name = self.name_parts(self.find(form, "QualifiedTableFunction"));
+                let mut args = Vec::new();
+                // `TableFunctionArguments <- Parens(List(FunctionArgument)?)`, so a call with no
+                // arguments has the wrapper and no list under it.
+                let list = self.find(form, "TableFunctionArguments");
+                for kid in self.kids(list) {
+                    args.push(self.argument(kid)?);
+                }
+                let args = self.expr_slice(args);
+                let (alias, columns) = self.table_alias(self.find(form, "TableAlias"));
+                Ok(self.push_source(Source::Function { name, args, alias, columns }))
+            }
             "ValuesRef" => {
                 if self.find(inner, "TableAliasColon") != NONE {
                     return self.unsupported(inner);
@@ -1641,6 +1665,15 @@ mod tests {
             Source::Table { name, alias: name_alias, .. } => {
                 format!("{}{}", ast.name_text(name), alias(name_alias))
             }
+            Source::Function { name, args, alias: call_alias, .. } => {
+                let args = ast
+                    .expr_list(args)
+                    .iter()
+                    .map(|&item| show(ast, item))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}({args}){}", ast.name_text(name), alias(call_alias))
+            }
             Source::Subquery { query, alias: query_alias, .. } => {
                 format!("({}){}", show_query(ast, query), alias(query_alias))
             }
@@ -2283,6 +2316,29 @@ mod tests {
                     "{query} failed with {message}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_function_call_in_a_from_clause_is_a_source_and_not_an_expression() {
+        assert_eq!(round("SELECT * FROM range(3)"), "SELECT * FROM range(3)");
+        assert_eq!(round("SELECT * FROM range(1, 10, 2)"), "SELECT * FROM range(1, 10, 2)");
+        assert_eq!(round("SELECT * FROM main.range(3)"), "SELECT * FROM main.range(3)");
+        assert_eq!(round("SELECT * FROM range(3) AS t"), "SELECT * FROM range(3) AS t");
+        // The grammar allows a call with no arguments here and the transformer keeps it, because
+        // whether a particular function takes none is the binder's question and not this one's.
+        assert_eq!(round("SELECT * FROM some_function()"), "SELECT * FROM some_function()");
+    }
+
+    #[test]
+    fn the_forms_of_a_table_function_this_does_not_cover_are_turned_away_by_name() {
+        for query in [
+            "SELECT * FROM range(3) WITH ORDINALITY",
+            "SELECT * FROM LATERAL range(3)",
+            "SELECT * FROM t: range(3)",
+        ] {
+            let error = parse_ast(query).unwrap_err().to_string();
+            assert!(error.contains("grammar rule"), "{query} failed with {error}");
         }
     }
 

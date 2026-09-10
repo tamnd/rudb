@@ -458,3 +458,41 @@ fn values_binds_to_a_values_node_with_the_types_the_rows_agree_on() {
     assert!(statement_failure("VALUES (1), (2, 3)").contains("same length"));
     assert!(statement_failure("VALUES (1), ('a')").contains("Cannot combine"));
 }
+
+#[test]
+fn a_table_function_binds_to_its_own_node_and_not_to_a_scan() {
+    let printed = plan("SELECT * FROM range(3)");
+    assert!(printed.contains("TableFunction range"), "{printed}");
+    // The argument is in the plan as an expression and the rows are not, which is the whole reason
+    // this is not a Values. A three million row range should be three numbers in a plan dump.
+    assert!(printed.contains("args="), "{printed}");
+    assert!(!printed.contains("Get"), "{printed}");
+}
+
+#[test]
+fn an_argument_is_cast_to_the_type_the_function_takes() {
+    // `range` takes BIGINT and the literal is an INTEGER, so the cast is written into the plan
+    // here rather than decided by the operator at run time.
+    let printed = plan("SELECT * FROM range(3)");
+    assert!(printed.contains("CAST"), "{printed}");
+}
+
+#[test]
+fn a_table_function_can_be_aliased_the_same_ways_a_table_can() {
+    assert!(plan("SELECT i FROM range(3) t(i)").contains("AS i"));
+    assert!(plan("SELECT t.range FROM range(3) t").contains("AS range"));
+    // More aliases than columns is the one rule here that does not match DuckDB. DuckDB takes
+    // `range(3) t(i, j)` and ignores the second name, and this rejects it, because the check is
+    // the same one a table alias goes through and loosening it for one source would be loosening
+    // it for all of them. It is written down here rather than left to be found later.
+    assert!(failure("SELECT i FROM range(3) t(i, j)").contains("2 columns specified"));
+}
+
+#[test]
+fn a_name_that_is_not_a_table_function_does_not_fall_through_to_the_table_lookup() {
+    // `hits` is a real table in this catalog, so `hits(1)` finding it would be the worst version
+    // of this bug rather than the most obvious one.
+    assert!(failure("SELECT * FROM hits(1)").contains("hits"));
+    assert!(failure("SELECT * FROM nowhere.range(3)").contains("nowhere"));
+    assert!(failure("SELECT * FROM range()").contains("range"));
+}
