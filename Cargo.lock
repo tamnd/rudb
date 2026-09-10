@@ -225,10 +225,7 @@ dependencies = [
 name = "rudb-plan"
 version = "0.0.2"
 dependencies = [
- "rudb-catalog",
  "rudb-common",
- "rudb-ir",
- "rudb-vector",
 ]
 
 [[package]]
