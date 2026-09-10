@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod codegen;
+mod grammar;
 mod layers;
+mod ruletable;
 mod sha256;
 mod style;
 mod vendor;

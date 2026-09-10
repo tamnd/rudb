@@ -7,3 +7,4 @@
 //! point of pinning it. `spec/20-the-grammar.md` section 5.
 
 pub mod keywords;
+pub mod rules;
