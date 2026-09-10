@@ -173,12 +173,15 @@ impl Bitmap {
             count += word.count_ones() as usize;
         }
         let tail = len % 64;
-        if tail > 0
-            && let Some(word) = self.words.get(full_words)
-        {
-            // Mask off the bits past the end, which are whatever the last resize left there.
-            let keep = u64::MAX >> (64 - tail);
-            count += (word & keep).count_ones() as usize;
+        if tail > 0 {
+            // A let chain would read better here, but let chains want Rust 1.88 and the declared
+            // minimum in the manifest is 1.85.0. Written the long way rather than moving the
+            // minimum, since nothing about this needs a newer compiler.
+            if let Some(word) = self.words.get(full_words) {
+                // Mask off the bits past the end, which are whatever the last resize left there.
+                let keep = u64::MAX >> (64 - tail);
+                count += (word & keep).count_ones() as usize;
+            }
         }
         count
     }
