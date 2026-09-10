@@ -147,7 +147,7 @@ pub(crate) fn detect(root: &Path) -> Focus {
             return Focus {
                 base,
                 paths,
-                crates: all_crates(root),
+                crates: members(root),
                 prose: true,
                 grammar: true,
                 everything: false,
@@ -170,9 +170,8 @@ fn closure(root: &Path, seeds: &BTreeSet<String>) -> BTreeSet<String> {
         return BTreeSet::new();
     }
     let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for name in all_crates(root) {
-        let manifest = root.join("crates").join(&name).join("Cargo.toml");
-        let Ok(text) = std::fs::read_to_string(&manifest) else { continue };
+    for name in members(root) {
+        let Ok(text) = std::fs::read_to_string(manifest_of(root, &name)) else { continue };
         for dep in crate::layers::dependencies(&text) {
             dependents.entry(dep).or_default().push(name.clone());
         }
@@ -187,6 +186,29 @@ fn closure(root: &Path, seeds: &BTreeSet<String>) -> BTreeSet<String> {
         }
     }
     reached
+}
+
+/// Every package the gate can pass to `cargo -p`, which is the library crates and the task runner.
+///
+/// `xtask` is not under `crates/` and it is not a layer, so it is invisible to `layers.toml` and to
+/// [`all_crates`], and for a long time it was invisible to the focused gate as well. That meant its
+/// own tests only ran under `--full`, which is the one mode nobody uses while they are working, and
+/// a change to the task runner was the exact change least likely to be tested before it landed.
+fn members(root: &Path) -> BTreeSet<String> {
+    let mut names = all_crates(root);
+    if root.join("xtask").join("Cargo.toml").is_file() {
+        names.insert("xtask".to_string());
+    }
+    names
+}
+
+/// Where a member's manifest is, which is one directory up for the task runner.
+fn manifest_of(root: &Path, name: &str) -> std::path::PathBuf {
+    if name == "xtask" {
+        root.join("xtask").join("Cargo.toml")
+    } else {
+        root.join("crates").join(name).join("Cargo.toml")
+    }
 }
 
 fn all_crates(root: &Path) -> BTreeSet<String> {
@@ -228,5 +250,50 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{closure, manifest_of, members};
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// The workspace root, which is the parent of the directory this crate lives in.
+    fn root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask is at the root").to_path_buf()
+    }
+
+    #[test]
+    fn the_task_runner_is_something_the_gate_can_compile() {
+        // The bug this is here for: a change to xtask focused the gate onto every library crate
+        // and onto none of xtask, so the task runner's own tests only ran under --full.
+        assert!(members(&root()).contains("xtask"), "the gate cannot name the task runner");
+        assert!(members(&root()).contains("rudb-parse"));
+    }
+
+    #[test]
+    fn the_task_runner_lives_one_directory_up_from_everything_else() {
+        let root = root();
+        assert_eq!(manifest_of(&root, "xtask"), root.join("xtask").join("Cargo.toml"));
+        assert_eq!(
+            manifest_of(&root, "rudb-parse"),
+            root.join("crates").join("rudb-parse").join("Cargo.toml")
+        );
+        assert!(manifest_of(&root, "xtask").is_file());
+    }
+
+    #[test]
+    fn a_change_to_the_parser_reaches_the_task_runner_that_links_it() {
+        // `bench` times the parser and `smoke` runs a query, so a parser change can break the task
+        // runner's build, and before this the focused gate would not have found out.
+        let seeds: BTreeSet<String> = ["rudb-parse".to_string()].into_iter().collect();
+        let reached = closure(&root(), &seeds);
+        assert!(reached.contains("xtask"), "reached {reached:?}");
+    }
+
+    #[test]
+    fn a_change_to_nothing_reaches_nothing() {
+        assert!(closure(&root(), &BTreeSet::new()).is_empty());
     }
 }
