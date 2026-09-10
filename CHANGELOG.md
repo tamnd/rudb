@@ -2,11 +2,13 @@
 
 Notable changes, newest first. This project is pre-1.0 and follows no compatibility promise until it has one, per `spec/18-package-layout.md`. The storage format version is stated in every release, because a file outlives the build that wrote it.
 
+The version number says how far through the plan we are. **The minor version is the number of milestones finished**, so 0.0.y is work inside M0, 0.1.0 is the release where M0's exit criterion passed, 0.1.y is work inside M1, and so on. Patch releases happen whenever enough has landed to be worth a tag, which in practice is every few pull requests. The one exception is at the end: when M10 closes the version is 1.0.0 rather than 0.11.0, because that milestone is named 1.0 and pretending otherwise would be silly. The milestones are the issues at https://github.com/tamnd/rudb/issues.
+
 ## Unreleased
 
 Nothing yet.
 
-## 0.1.0
+## 0.0.1
 
 The skeleton. There is no database here, and the point of tagging it is that the apparatus which measures the database exists before the database does.
 
