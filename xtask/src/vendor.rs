@@ -96,6 +96,24 @@ pub(crate) fn vendor(reference: Option<&str>) -> Result<(), String> {
     write(&staged.join("matcher_overrides.list"), &overrides)?;
 
     let manifest = manifest(&staged)?;
+
+    // If every checksum is what it already was, the grammar did not move and neither does the
+    // pin. DuckDB lands several commits a day and almost none of them touch these forty files,
+    // so rewriting the commit and the date every time would put a diff in the working tree on
+    // every refetch, which trains everyone to ignore the one that means something. The pin stays
+    // at the commit where the content was last actually different, which is the commit worth
+    // recording anyway.
+    if manifest == read_manifest(&dest.join("VENDOR")) {
+        let _ = std::fs::remove_dir_all(&work);
+        println!(
+            "the grammar at {reference} is unchanged, still pinned at {}",
+            read_field(&dest.join("VENDOR"), "commit")
+                .map(|c| c[..12.min(c.len())].to_string())
+                .unwrap_or_default()
+        );
+        return Ok(());
+    }
+
     write(&staged.join("VENDOR"), &vendor_file(&reference, &commit, &manifest))?;
 
     // Replace rather than merge. A file upstream deleted has to disappear here too, and a merge
@@ -135,18 +153,7 @@ pub(crate) fn verify() -> Result<(), String> {
              run `cargo xtask vendor-grammar` to fetch it"
         ));
     }
-    let text = std::fs::read_to_string(&vendor)
-        .map_err(|e| format!("could not read {}: {e}", vendor.display()))?;
-
-    let mut recorded = BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.contains(": ") {
-            continue;
-        }
-        let Some((sum, name)) = line.split_once("  ") else { continue };
-        recorded.insert(name.to_string(), sum.to_string());
-    }
+    let recorded = read_manifest(&vendor);
     if recorded.is_empty() {
         return Err(format!("{DEST}/VENDOR records no checksums"));
     }
@@ -180,6 +187,28 @@ pub(crate) fn verify() -> Result<(), String> {
             problems.len()
         ))
     }
+}
+
+/// The checksums a VENDOR file records, keyed by path relative to the vendored root.
+///
+/// Empty for a file that is missing or has none, which both callers treat as a reason to write a
+/// new one rather than as an error, because the alternative is refusing to vendor a grammar on
+/// the grounds that there is no grammar yet.
+fn read_manifest(vendor: &Path) -> BTreeMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(vendor) else { return BTreeMap::new() };
+    let mut recorded = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        // Comments and the `field: value` header. Two spaces is the separator, which is the
+        // shasum format, so a file name containing two spaces would break this. None do, and
+        // upstream naming a grammar file that way is a thing we would want to hear about.
+        if line.is_empty() || line.starts_with('#') || line.contains(": ") {
+            continue;
+        }
+        let Some((sum, name)) = line.split_once("  ") else { continue };
+        recorded.insert(name.to_string(), sum.to_string());
+    }
+    recorded
 }
 
 /// The twenty two rules DuckDB memoizes, out of `scripts/parser/grammar_types.yml`.
@@ -434,7 +463,7 @@ fn git_output(args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{between, matcher_overrides, memoized_rules, today};
+    use super::{between, matcher_overrides, memoized_rules, read_manifest, today};
 
     fn write_temp(name: &str, text: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
@@ -518,5 +547,36 @@ mod tests {
         assert!((2026..2100).contains(&year), "{today}");
         assert!((1..=12).contains(&month), "{today}");
         assert!((1..=31).contains(&day), "{today}");
+    }
+
+    #[test]
+    fn the_manifest_reader_skips_the_header_and_keeps_the_checksums() {
+        // The point of this one is the `commit:` line. Two manifests compare equal when the
+        // grammar is the same and only the pin moved, which is what stops a refetch from putting
+        // a diff in the working tree every time DuckDB lands an unrelated commit.
+        let a = write_temp(
+            "vendor-a",
+            "# a comment, with: a colon in it\n\n\
+             upstream: https://github.com/duckdb/duckdb.git\n\
+             ref: v2.0-cyanoptera\n\
+             commit: aaaaaaaaaaaa\n\
+             retrieved: 2026-09-10\n\n\
+             1111  statements/select.gram\n\
+             2222  keywords/reserved_keyword.list\n",
+        );
+        let b = write_temp(
+            "vendor-b",
+            "commit: bbbbbbbbbbbb\n\
+             retrieved: 2027-01-01\n\n\
+             1111  statements/select.gram\n\
+             2222  keywords/reserved_keyword.list\n",
+        );
+        let read = read_manifest(&a);
+        assert_eq!(read.len(), 2);
+        assert_eq!(read.get("statements/select.gram").map(String::as_str), Some("1111"));
+        assert_eq!(read, read_manifest(&b));
+
+        let missing = std::env::temp_dir().join("rudb-vendor-no-such-file");
+        assert!(read_manifest(&missing).is_empty());
     }
 }

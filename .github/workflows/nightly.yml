@@ -121,10 +121,17 @@ jobs:
           key: grammar-upstream
       - name: refetch at the recorded ref
         run: cargo run -q -p xtask -- vendor-grammar
+      # The question is whether the grammar moved, not whether DuckDB did. `commit` and
+      # `retrieved` in VENDOR change on every upstream commit to any file in the repository,
+      # which is several a day, and none of that is a grammar change. So those two lines are
+      # excluded and everything else is compared, which includes the per file checksums, so a
+      # changed byte anywhere still shows up here even if the file listing is identical.
       - name: has it moved
         id: moved
         run: |
-          if git diff --quiet -- crates/rudb-parse/grammar; then
+          drift=$(git diff -U0 -- crates/rudb-parse/grammar \
+            | grep -E '^[+-][^+-]' | grep -vE '^[+-](commit|retrieved):' || true)
+          if [ -z "$drift" ]; then
             echo "moved=no" >> "$GITHUB_OUTPUT"
           else
             echo "moved=yes" >> "$GITHUB_OUTPUT"
