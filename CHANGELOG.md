@@ -6,6 +6,9 @@ The version number says how far through the plan we are. **The minor version is 
 
 ## Unreleased
 
+- `.github/publish-crates.sh` no longer dies on the first attempt when run by hand on a Mac. Nothing is excluded on that attempt, so the exclude array is empty, and bash 3.2 under `set -u` calls an empty array unbound where the runner's bash 5 does not. It only ever fails on a machine that is not the runner, which is exactly the machine it gets run on when the runner is the problem.
+- The release checks the shape of the crates.io token rather than asking crates.io about it. The 0.0.2 run failed with a 401 saying the token did not match the format the registry uses, so a check went in that called `/api/v1/me`, and that endpoint is session only and answers 403 to a live token and a dead one alike. There is no read only endpoint that takes an API token, so the check is `cio` and 32 characters, which is what the 401 was complaining about, and publishing stays the only thing that knows whether a well formed token is live.
+
 ## 0.0.2
 
 Still no database and still no query. What this release settles is where the SQL dialect comes from, and the answer is that it comes from DuckDB rather than from us reading DuckDB. The grammar is vendored verbatim and everything derived from it is generated, so a bump is a diff to read rather than a transcription to redo. The other thing it settles is that every byte the engine will ever write goes through one place, which is a week of work now and a rewrite later.

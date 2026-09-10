@@ -64,20 +64,43 @@ jobs:
             echo "CHANGELOG.md has no section for ${tag#v}"
             exit 1
           }
-      # Asked here rather than three jobs later, because this is how 0.0.1 failed. The secret was
-      # never set, the binaries built and were attested and shipped, and the last job died on
-      # "please provide a non-empty token" after twenty three minutes with a GitHub release
-      # already published and nothing on crates.io. Nothing is printed but whether it is empty.
-      - name: the crates.io token exists
+      # Asked here rather than three jobs later, because this is how both of the first two releases
+      # failed. On 0.0.1 the secret was never set, the binaries built and were attested and were
+      # shipped, and the last job died on "please provide a non-empty token" with a GitHub release
+      # already published and nothing on crates.io. So a check went in and it asked only whether the
+      # string was empty. On 0.0.2 the string was not empty and crates.io answered 401 saying the
+      # token did not match the format it uses, because every token issued before 2020-07-14 was
+      # revoked after the RNG advisory and the one on the repository was older than that.
+      #
+      # There is no endpoint to ask instead. crates.io accepts an API token on publish, yank and
+      # owner changes, and on nothing that is safe to run for a check. `/api/v1/me` looks like the
+      # answer and is not: it is session only and replies 403 to a live token and a dead one alike,
+      # which is a check that fails every release forever. So this checks the shape, which is what
+      # the 401 was complaining about anyway, and it stays out of the business of guessing whether a
+      # well formed token is live. Only publishing knows that. Nothing is printed but the verdict.
+      - name: the crates.io token is shaped like a token
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          set -uo pipefail
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
             echo "CARGO_REGISTRY_TOKEN is not set on this repository"
             echo "set it at https://github.com/tamnd/rudb/settings/secrets/actions"
             exit 1
           fi
-          echo "the token is set"
+          # Current tokens are `cio` and 32 characters. Ones issued between the 2020 advisory and
+          # the prefix are the same 32 without it and are still accepted, so both pass. Anything
+          # else is a token from before the advisory, or a value that picked up a quote or a newline
+          # on the way into the secret, and both of those are worth catching now rather than after
+          # the binaries are attested and published.
+          if ! printf '%s' "$CARGO_REGISTRY_TOKEN" | grep -Eq '^(cio)?[A-Za-z0-9]{32}$'; then
+            echo "CARGO_REGISTRY_TOKEN is not shaped like a crates.io token"
+            echo "it should be cio followed by 32 characters, with no quotes and no newline"
+            echo "generate a new one at https://crates.io/me and set it at"
+            echo "https://github.com/tamnd/rudb/settings/secrets/actions"
+            exit 1
+          fi
+          echo "the token is well formed"
       - run: cargo xtask ci
       # The storage format version a release writes is part of what the release is. It goes into
       # the run log so that a file found in the wild years from now can be traced back to the
