@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+# Golden files and format fixtures are compared byte for byte, so git must not rewrite them.
+tests/**/*.expected -text
+tests/**/*.slt -text
+tests/**/*.plan -text
+tests/**/*.ir -text
+*.duckdb binary
+*.parquet binary
+*.rudb binary
+*.bin binary

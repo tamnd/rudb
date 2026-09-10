@@ -1,0 +1,23 @@
+[package]
+name = "rudb-bind"
+description = "Name, type and overload resolution, subquery binding, and the bound logical plan."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+rudb-common.workspace = true
+rudb-parse.workspace = true
+rudb-plan.workspace = true
+rudb-catalog.workspace = true
+rudb-functions.workspace = true
+
+[lints]
+workspace = true

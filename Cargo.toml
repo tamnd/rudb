@@ -1,0 +1,87 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "Apache-2.0"
+repository = "https://github.com/tamnd/rudb"
+homepage = "https://github.com/tamnd/rudb"
+authors = ["tamnd <tamnd87@gmail.com>"]
+keywords = ["database", "olap", "analytics", "sql", "duckdb"]
+categories = ["database-implementations", "database"]
+# Inherited paths resolve from the workspace root, so one line here gives every published crate a
+# page on crates.io instead of a blank one.
+readme = "README.md"
+
+# One version number for the whole workspace, bumped together, per spec/18-package-layout.md
+# section 18.3. Internal crates are pinned exactly so that a partial publish cannot produce a
+# mixed-version build.
+[workspace.dependencies]
+rudb = { version = "=0.1.0", path = "crates/rudb" }
+rudb-arrow = { version = "=0.1.0", path = "crates/rudb-arrow" }
+rudb-bind = { version = "=0.1.0", path = "crates/rudb-bind" }
+rudb-c-api = { version = "=0.1.0", path = "crates/rudb-c-api" }
+rudb-catalog = { version = "=0.1.0", path = "crates/rudb-catalog" }
+rudb-cli = { version = "=0.1.0", path = "crates/rudb-cli" }
+rudb-common = { version = "=0.1.0", path = "crates/rudb-common" }
+rudb-csv = { version = "=0.1.0", path = "crates/rudb-csv" }
+rudb-delta = { version = "=0.1.0", path = "crates/rudb-delta" }
+rudb-duckdb-format = { version = "=0.1.0", path = "crates/rudb-duckdb-format" }
+rudb-encoding = { version = "=0.1.0", path = "crates/rudb-encoding" }
+rudb-exec = { version = "=0.1.0", path = "crates/rudb-exec" }
+rudb-extension = { version = "=0.1.0", path = "crates/rudb-extension" }
+rudb-functions = { version = "=0.1.0", path = "crates/rudb-functions" }
+rudb-iceberg = { version = "=0.1.0", path = "crates/rudb-iceberg" }
+rudb-io = { version = "=0.1.0", path = "crates/rudb-io" }
+rudb-ir = { version = "=0.1.0", path = "crates/rudb-ir" }
+rudb-jit = { version = "=0.1.0", path = "crates/rudb-jit" }
+rudb-json = { version = "=0.1.0", path = "crates/rudb-json" }
+rudb-kernels = { version = "=0.1.0", path = "crates/rudb-kernels" }
+rudb-opt = { version = "=0.1.0", path = "crates/rudb-opt" }
+rudb-parquet = { version = "=0.1.0", path = "crates/rudb-parquet" }
+rudb-parse = { version = "=0.1.0", path = "crates/rudb-parse" }
+rudb-plan = { version = "=0.1.0", path = "crates/rudb-plan" }
+rudb-storage = { version = "=0.1.0", path = "crates/rudb-storage" }
+rudb-txn = { version = "=0.1.0", path = "crates/rudb-txn" }
+rudb-vector = { version = "=0.1.0", path = "crates/rudb-vector" }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# The buffer manager, the encoding kernels and the FFI boundary are where our unsafe lives, and
+# spec/16-testing.md section 16.7 requires every block of it to carry the invariant that makes it
+# sound. The lint is what turns that requirement into a build failure rather than a habit.
+undocumented_unsafe_blocks = "warn"
+doc_markdown = "allow"
+missing_panics_doc = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+# No `panic = "abort"`. spec/04-architecture.md section 4.9 catches at the FFI boundary and
+# converts to an error code, and that needs an unwinder.
+
+# A database is profiled far more often than it is shipped, so the release profile we actually
+# develop against keeps frame pointers and debug info.
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"
+
+[profile.bench]
+inherits = "profiling"
+
+# Tests run with the plan verifier and the pin accounting on, which makes an unoptimized test
+# binary painfully slow on anything at benchmark scale. Optimizing dependencies only keeps our own
+# code debuggable while making the run bearable.
+[profile.dev.package."*"]
+opt-level = 2

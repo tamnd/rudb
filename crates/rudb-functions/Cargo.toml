@@ -1,0 +1,22 @@
+[package]
+name = "rudb-functions"
+description = "The scalar, aggregate and window function library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+rudb-common.workspace = true
+rudb-vector.workspace = true
+rudb-kernels.workspace = true
+rudb-ir.workspace = true
+
+[lints]
+workspace = true

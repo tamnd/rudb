@@ -1,0 +1,28 @@
+name: Feature
+description: Something the database should do and does not, that is not a DuckDB compatibility gap.
+title: "feat: "
+labels: ["kind/feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If DuckDB already does it, the compatibility template is the right one, because the answer there is decided by the coverage tables rather than by a discussion.
+
+        The schedule in `spec/17-milestones.md` is deliberately ordered so that the parts that could kill the project come first. A good feature request that lands in the wrong milestone still waits, so it is worth saying which milestone you think it belongs to and why.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what stops you. The problem first, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you think should happen
+      description: If there is prior art in another engine, name it and say what it gets right.
+  - type: textarea
+    id: cost
+    attributes:
+      label: What it would cost
+      description: If it touches the storage format, the plan representation or the C API, say so. Those three are the expensive places and knowing early changes the answer.

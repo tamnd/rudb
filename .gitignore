@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Benchmark, corpus and dataset output. Large, machine specific, and regenerable.
+/bench-results
+/corpus-out
+/data
+*.duckdb
+*.duckdb.wal
+*.rudb
+*.rudb-wal
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+flamegraph.svg
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

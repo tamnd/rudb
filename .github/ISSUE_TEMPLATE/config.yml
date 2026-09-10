@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question about the design
+    url: https://github.com/tamnd/rudb/discussions
+    about: The specification under spec/ is the design. If something in it does not hold up, a discussion is the right place to say so.
+  - name: Security report
+    url: https://github.com/tamnd/rudb/security/advisories/new
+    about: Memory unsafety, a crash on a malformed database file, or anything that reads memory a query should not reach. Please do not open a public issue.

@@ -1,0 +1,49 @@
+# The layer rule, per spec/18-package-layout.md section 18.2.
+#
+# Every crate has a rank. A crate may depend only on crates of strictly lower rank. `cargo xtask
+# layers` checks it on every commit, which is what makes "the encoding layer cannot see the
+# execution engine" a fact about the build rather than a claim in a document.
+#
+# Adding a crate means picking a rank, and picking a rank is a design decision that should show up
+# in review as one. That is the whole reason this file is a file rather than an inference from the
+# dependency graph.
+
+[ranks]
+# Foundation.
+rudb-common = 0
+rudb-io = 1
+rudb-vector = 1
+rudb-parse = 1
+
+# Data representation. The encoding layer sits above vectors and below everything that consumes
+# them, so a new encoding from a paper is a module here and nothing above changes.
+rudb-encoding = 2
+rudb-ir = 2
+rudb-kernels = 3
+rudb-jit = 4
+
+# Storage and the format readers. None of these depends on the execution engine, which is what
+# keeps each of them usable and testable on its own.
+rudb-storage = 5
+rudb-arrow = 5
+rudb-csv = 5
+rudb-json = 5
+rudb-parquet = 5
+rudb-duckdb-format = 5
+rudb-txn = 6
+rudb-iceberg = 6
+rudb-delta = 6
+
+# Catalog, planning and execution.
+rudb-functions = 7
+rudb-catalog = 8
+rudb-plan = 9
+rudb-bind = 10
+rudb-opt = 11
+rudb-exec = 12
+
+# The surfaces people actually touch.
+rudb = 13
+rudb-extension = 14
+rudb-c-api = 15
+rudb-cli = 15
