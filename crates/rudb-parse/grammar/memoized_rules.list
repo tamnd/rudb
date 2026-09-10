@@ -1,0 +1,24 @@
+# packrat_memoized_rules, extracted from scripts/parser/grammar_types.yml.
+# One rule name per line. See spec/20-the-grammar.md section 4.
+Expression
+LambdaArrowExpression
+LogicalOrExpression
+LogicalAndExpression
+LogicalNotExpression
+IsExpression
+ComparisonExpression
+BitwiseExpression
+AdditiveExpression
+MultiplicativeExpression
+ExponentiationExpression
+PrefixExpression
+CollateExpression
+AtTimeZoneExpression
+SingleExpression
+BaseExpression
+ParensExpression
+ParenthesisExpression
+Identifier
+ColId
+ColumnReference
+FunctionExpression
