@@ -23,6 +23,15 @@ For a first look, read a slice of it:
 cargo run --release -- stats hits.parquet --rows 5_000_000 --markdown
 ```
 
+The pairwise questions are a separate command, because they are about two columns at once and the answers do not fit in the same table:
+
+```
+cargo run --release -- pairs hits.parquet --markdown
+```
+
+`pairs` hashes every column once a row and combines the hashes, so all 5,460 pairs of a 105 column table cost a multiply and a compare each per row rather than a pass over the file each.
+It prints which column determines which other column, which is what section 6.6 needs before it can drop a column and recompute it, and how much two string columns overlap, which is what section 6.4 needs before it can put them in one dictionary.
+
 `--help` lists the rest.
 The ones that matter are `--rows` to cut the run short, `--columns` to look at one column, `--threads` to match the machine, and `--no-verify` to skip the decode pass when you only want sizes.
 

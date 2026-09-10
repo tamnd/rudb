@@ -154,10 +154,10 @@ pub fn run(path: &Path, options: &Options) -> Result<()> {
             if chunks.is_multiple_of(10) {
                 let elapsed = started.elapsed().as_secs_f64();
                 println!(
-                    "  {} rows in {:.0}s, {:.1}M rows/s",
+                    "  {} rows in {:.0}s, {} rows/s",
                     text::count(rows),
                     elapsed,
-                    rows as f64 / elapsed / 1e6
+                    text::count((rows as f64 / elapsed) as usize)
                 );
             }
             Ok(())

@@ -10,6 +10,7 @@
 mod column;
 mod ingest;
 mod mem;
+mod pairs;
 mod stats;
 mod text;
 
@@ -23,19 +24,32 @@ format-lab, the M1 measuring instrument
 
 usage:
   format-lab stats <file.parquet> [options]
+  format-lab pairs <file.parquet> [options]
 
 stats reads the file a chunk at a time, encodes every column with the rudb chooser, decodes it
 again and checks it, and prints one row per column with the distinct count, the size against what
 Parquet stored, and which shape the chooser picked.
 
-options:
+pairs reads the same way and answers the two questions that are about two columns at once: which
+column is determined by which other column, and which string columns overlap enough to be worth one
+dictionary between them.
+
+options for both:
   --chunk-rows N   rows per chunk, default 122880, which is DuckDB's row group
   --rows N         stop after N rows, for a quick pass over a big file
   --columns a,b,c  only these columns, default all of them
-  --sketch-k N     bottom-k sketch size, default 4096
   --threads N      worker threads, default the core count
+  --markdown       print the tables as markdown, for pasting into the report
+
+options for stats:
+  --sketch-k N     bottom-k sketch size, default 4096
   --no-verify      skip the decode and the comparison, which roughly halves the run
-  --markdown       print the table as markdown, for pasting into the report
+
+options for pairs:
+  --sketch-k N     bottom-k sketch size, default 1024, and there are one of these per pair
+  --top N          how many rows of each table to print, default 40
+  --dependence F   report a dependency at this score or better, default 0.98
+  --jaccard F      report an overlap at this score or better, default 0.05
 ";
 
 fn main() -> ExitCode {
@@ -56,55 +70,196 @@ fn run() -> Result<()> {
     }
     match args[0].as_str() {
         "stats" => {
-            let (path, options) = parse(&args[1..])?;
-            stats::run(&path, &options)
+            let flags = Flags::of(&args[1..], "stats")?;
+            let options = stats_options(&flags)?;
+            stats::run(&flags.path, &options)
+        }
+        "pairs" => {
+            let flags = Flags::of(&args[1..], "pairs")?;
+            let options = pairs_options(&flags)?;
+            pairs::run(&flags.path, &options)
         }
         other => Err(Error::invalid_input(format!("{other} is not a command, try --help"))),
     }
 }
 
-fn parse(args: &[String]) -> Result<(PathBuf, stats::Options)> {
-    let mut path: Option<PathBuf> = None;
-    let mut options = stats::Options::default();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        let mut value = || -> Result<String> {
+/// The command line, split into the file and the named things, with nothing interpreted yet.
+///
+/// Which options take a value is the only thing a parser has to know that it cannot see, so it is
+/// written down once here rather than being implied by the order of a match.
+#[derive(Debug)]
+struct Flags {
+    path: PathBuf,
+    values: Vec<(String, String)>,
+    switches: Vec<String>,
+}
+
+const TAKES_A_VALUE: [&str; 8] = [
+    "--chunk-rows",
+    "--rows",
+    "--columns",
+    "--threads",
+    "--sketch-k",
+    "--top",
+    "--dependence",
+    "--jaccard",
+];
+
+impl Flags {
+    fn of(args: &[String], command: &str) -> Result<Self> {
+        let mut path: Option<PathBuf> = None;
+        let mut values = Vec::new();
+        let mut switches = Vec::new();
+        let mut index = 0;
+        while index < args.len() {
+            let arg = args[index].as_str();
+            if TAKES_A_VALUE.contains(&arg) {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| Error::invalid_input(format!("{arg} wants a value")))?;
+                values.push((arg.to_string(), value.clone()));
+            } else if arg.starts_with('-') {
+                switches.push(arg.to_string());
+            } else {
+                path = Some(PathBuf::from(arg));
+            }
             index += 1;
-            args.get(index)
-                .cloned()
-                .ok_or_else(|| Error::invalid_input(format!("{arg} wants a value")))
-        };
-        match arg {
-            "--chunk-rows" => options.chunk_rows = number(&value()?, arg)?,
-            "--rows" => options.limit = Some(number(&value()?, arg)?),
-            "--sketch-k" => options.sketch_k = number(&value()?, arg)?,
-            "--threads" => options.threads = number(&value()?, arg)?,
-            "--columns" => {
-                options.columns = value()?
-                    .split(',')
+        }
+        Ok(Self {
+            path: path
+                .ok_or_else(|| Error::invalid_input(format!("{command} wants a parquet file")))?,
+            values,
+            switches,
+        })
+    }
+
+    fn text(&self, name: &str) -> Option<&str> {
+        self.values.iter().rev().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    }
+
+    fn number(&self, name: &str) -> Result<Option<usize>> {
+        match self.text(name) {
+            None => Ok(None),
+            Some(text) => text
+                .replace('_', "")
+                .parse()
+                .map(Some)
+                .map_err(|_| Error::invalid_input(format!("{name} wants a number, not {text}"))),
+        }
+    }
+
+    fn fraction(&self, name: &str) -> Result<Option<f64>> {
+        match self.text(name) {
+            None => Ok(None),
+            Some(text) => text
+                .parse()
+                .map(Some)
+                .map_err(|_| Error::invalid_input(format!("{name} wants a number, not {text}"))),
+        }
+    }
+
+    fn names(&self, name: &str) -> Vec<String> {
+        self.text(name)
+            .map(|text| {
+                text.split(',')
                     .map(|name| name.trim().to_string())
                     .filter(|name| !name.is_empty())
-                    .collect();
-            }
-            "--no-verify" => options.verify = false,
-            "--markdown" => options.markdown = true,
-            other if other.starts_with('-') => {
-                return Err(Error::invalid_input(format!("{other} is not an option")));
-            }
-            other => path = Some(PathBuf::from(other)),
-        }
-        index += 1;
+                    .collect()
+            })
+            .unwrap_or_default()
     }
-    let path = path.ok_or_else(|| Error::invalid_input("stats wants a parquet file"))?;
+
+    fn set(&self, name: &str) -> bool {
+        self.switches.iter().any(|switch| switch == name)
+    }
+
+    /// Anything left over is a typo, and a typo that is silently ignored costs a run of an hour.
+    fn known(&self, allowed: &[&str]) -> Result<()> {
+        for switch in &self.switches {
+            if !allowed.contains(&switch.as_str()) {
+                return Err(Error::invalid_input(format!("{switch} is not an option here")));
+            }
+        }
+        for (key, _) in &self.values {
+            if !allowed.contains(&key.as_str()) {
+                return Err(Error::invalid_input(format!("{key} is not an option here")));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn stats_options(flags: &Flags) -> Result<stats::Options> {
+    flags.known(&[
+        "--chunk-rows",
+        "--rows",
+        "--columns",
+        "--threads",
+        "--sketch-k",
+        "--no-verify",
+        "--markdown",
+    ])?;
+    let mut options = stats::Options {
+        columns: flags.names("--columns"),
+        limit: flags.number("--rows")?,
+        verify: !flags.set("--no-verify"),
+        markdown: flags.set("--markdown"),
+        ..stats::Options::default()
+    };
+    if let Some(rows) = flags.number("--chunk-rows")? {
+        options.chunk_rows = rows;
+    }
+    if let Some(k) = flags.number("--sketch-k")? {
+        options.sketch_k = k;
+    }
+    if let Some(threads) = flags.number("--threads")? {
+        options.threads = threads;
+    }
     if options.chunk_rows == 0 {
         return Err(Error::invalid_input("a chunk of zero rows reads nothing"));
     }
-    Ok((path, options))
+    Ok(options)
 }
 
-fn number(text: &str, arg: &str) -> Result<usize> {
-    text.replace('_', "")
-        .parse()
-        .map_err(|_| Error::invalid_input(format!("{arg} wants a number, not {text}")))
+fn pairs_options(flags: &Flags) -> Result<pairs::Options> {
+    flags.known(&[
+        "--chunk-rows",
+        "--rows",
+        "--columns",
+        "--threads",
+        "--sketch-k",
+        "--top",
+        "--dependence",
+        "--jaccard",
+        "--markdown",
+    ])?;
+    let mut options = pairs::Options {
+        columns: flags.names("--columns"),
+        limit: flags.number("--rows")?,
+        markdown: flags.set("--markdown"),
+        ..pairs::Options::default()
+    };
+    if let Some(rows) = flags.number("--chunk-rows")? {
+        options.chunk_rows = rows;
+    }
+    if let Some(k) = flags.number("--sketch-k")? {
+        options.k = k;
+    }
+    if let Some(threads) = flags.number("--threads")? {
+        options.threads = threads;
+    }
+    if let Some(top) = flags.number("--top")? {
+        options.top = top;
+    }
+    if let Some(score) = flags.fraction("--dependence")? {
+        options.dependence_min = score;
+    }
+    if let Some(score) = flags.fraction("--jaccard")? {
+        options.jaccard_min = score;
+    }
+    if options.chunk_rows == 0 {
+        return Err(Error::invalid_input("a chunk of zero rows reads nothing"));
+    }
+    Ok(options)
 }

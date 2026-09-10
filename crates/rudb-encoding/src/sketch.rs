@@ -248,7 +248,18 @@ pub fn dependence(left: &Sketch, pairs: &Sketch) -> Result<f64> {
 /// hash the same as the pair of `a` and `bc`.
 #[must_use]
 pub fn pair_hash(left: &[u8], right: &[u8]) -> u64 {
-    mix(hash64(left) ^ SEEDS[3], hash64(right).wrapping_add(SEEDS[2]))
+    pair_of(hash64(left), hash64(right))
+}
+
+/// The same pair hash for two values whose hashes are already known.
+///
+/// Testing every pair of a 105 column table is 5,460 pairs, and hashing the two values again for
+/// each of them would hash every value of every column 104 times over. Hashing each column once a
+/// row and combining the results here is the same answer for a hundredth of the work, and it is the
+/// only way a pass over `hits` that tests all the pairs finishes in an afternoon.
+#[must_use]
+pub fn pair_of(left: u64, right: u64) -> u64 {
+    mix(left ^ SEEDS[3], right.wrapping_add(SEEDS[2]))
 }
 
 /// The constants are odd 64 bit values with about half their bits set, which is what a multiply
@@ -435,6 +446,21 @@ mod tests {
     fn the_pair_hash_does_not_ignore_where_the_boundary_is() {
         assert_ne!(pair_hash(b"ab", b"c"), pair_hash(b"a", b"bc"));
         assert_ne!(pair_hash(b"a", b"b"), pair_hash(b"b", b"a"));
+    }
+
+    #[test]
+    fn combining_two_hashes_is_the_same_as_hashing_the_pair() {
+        // The lab hashes each column once a row and combines, and that has to be the same answer as
+        // hashing the two values together, or a dependency measured the fast way is not the
+        // dependency the slow way would have found.
+        for left in ["", "a", "http://example.com/one"] {
+            for right in ["", "b", "http://example.com/two"] {
+                assert_eq!(
+                    pair_hash(left.as_bytes(), right.as_bytes()),
+                    pair_of(hash64(left.as_bytes()), hash64(right.as_bytes()))
+                );
+            }
+        }
     }
 
     #[test]
