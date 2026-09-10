@@ -173,7 +173,16 @@ fn choose_groups(columns: &[Column], options: &Options) -> Result<Vec<Vec<usize>
         let mut sketch = Sketch::new(options.k)?;
         if let Column::Bytes(bytes) = column {
             for value in bytes.values() {
-                sketch.add(value);
+                // The empty value is skipped, and it is the difference between a real answer and a
+                // useless one. This lab stores a null as an empty string, so every column with a
+                // null has the empty value in it, and on `hits` most of the string columns are
+                // mostly null. Left in, the grouping puts all sixteen of them in one group because
+                // they all contain the empty string, which says nothing about whether they share
+                // any vocabulary. A genuinely empty string is worth nothing to a shared dictionary
+                // either, so nothing is lost by not being able to tell the two apart here.
+                if !value.is_empty() {
+                    sketch.add(value);
+                }
             }
         }
         sketches.push(sketch);
