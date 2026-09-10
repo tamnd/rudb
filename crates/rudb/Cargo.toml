@@ -16,6 +16,7 @@ readme.workspace = true
 rudb-common.workspace = true
 rudb-parse.workspace = true
 rudb-bind.workspace = true
+rudb-plan.workspace = true
 rudb-opt.workspace = true
 rudb-exec.workspace = true
 rudb-catalog.workspace = true

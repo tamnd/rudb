@@ -498,19 +498,44 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
             }
         };
     }
+    // A decimal is stored as its unscaled integer in whatever width its precision needs, which
+    // `LogicalType::physical` decides and which is why the same `Value::Decimal` is at home in four
+    // different runs. The narrowing cannot fail for a value the binder produced, because the width
+    // that chose the run is the width in the value, but it is checked rather than assumed because
+    // an unchecked cast here would silently store a different number.
+    macro_rules! decimal {
+        ($vec:expr, $ty:ty, $unscaled:expr) => {
+            match <$ty>::try_from(*$unscaled) {
+                Ok(x) => $vec.push(x),
+                Err(_) => {
+                    return Err(Error::internal(format!(
+                        "an unscaled decimal of {} does not fit the run its precision chose",
+                        $unscaled
+                    )));
+                }
+            }
+        };
+    }
     match data {
         Data::Empty => {}
         Data::Bool(v) => push!(v, Value::Boolean, false),
         Data::Int8(v) => push!(v, Value::TinyInt, 0),
-        Data::Int16(v) => push!(v, Value::SmallInt, 0),
+        Data::Int16(v) => match value {
+            Value::Null => v.push(0),
+            Value::SmallInt(x) => v.push(*x),
+            Value::Decimal { unscaled, .. } => decimal!(v, i16, unscaled),
+            other => return Err(Error::internal(format!("{other:?} is not a 16 bit value"))),
+        },
         Data::Int32(v) => match value {
             Value::Null => v.push(0),
             Value::Integer(x) | Value::Date(x) => v.push(*x),
+            Value::Decimal { unscaled, .. } => decimal!(v, i32, unscaled),
             other => return Err(Error::internal(format!("{other:?} is not a 32 bit value"))),
         },
         Data::Int64(v) => match value {
             Value::Null => v.push(0),
             Value::BigInt(x) | Value::Time(x) | Value::Timestamp(x) => v.push(*x),
+            Value::Decimal { unscaled, .. } => decimal!(v, i64, unscaled),
             other => return Err(Error::internal(format!("{other:?} is not a 64 bit value"))),
         },
         Data::Int128(v) => match value {
@@ -756,5 +781,30 @@ mod tests {
         let vector = Vector::flat(ty, Data::Int32(vec![1234])).unwrap();
         assert_eq!(vector.value_at(0), Value::Decimal { unscaled: 1234, width: 9, scale: 2 });
         assert_eq!(vector.value_at(0).to_string(), "12.34");
+    }
+
+    #[test]
+    fn a_decimal_writes_into_whichever_of_the_four_runs_its_precision_chose() {
+        // The read path worked at every width and the write path only accepted the 128 bit run, so
+        // `SELECT 2.5` produced a value nothing could store. All four widths round trip now.
+        for (width, scale, unscaled) in
+            [(4u8, 1u8, 25i128), (9, 2, 1234), (18, 3, 123_456), (38, 4, 1_234_567)]
+        {
+            let ty = LogicalType::decimal(width, scale).unwrap();
+            let value = Value::Decimal { unscaled, width, scale };
+            let vector = Vector::from_values(ty, &[value.clone(), Value::Null]).unwrap();
+            assert_eq!(vector.value_at(0), value, "a decimal of width {width}");
+            assert_eq!(vector.value_at(1), Value::Null, "a null decimal of width {width}");
+        }
+    }
+
+    #[test]
+    fn a_decimal_too_wide_for_the_run_its_type_chose_is_an_error_and_not_a_wrong_number() {
+        // Only reachable by hand, since a value's width is what picked the run. Truncating here
+        // would store a different number and say nothing about it.
+        let ty = LogicalType::decimal(4, 1).unwrap();
+        let value = Value::Decimal { unscaled: 1_000_000, width: 4, scale: 1 };
+        let error = Vector::from_values(ty, &[value]).unwrap_err();
+        assert!(error.to_string().contains("does not fit"), "{error}");
     }
 }

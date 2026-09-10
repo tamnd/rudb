@@ -298,3 +298,166 @@ fn a_table_can_be_named_with_its_schema_and_its_catalog() {
     assert_eq!(db.value("SELECT count(*) FROM memory.main.t").unwrap(), Value::BigInt(4));
     assert_eq!(db.table_len("main.t").unwrap(), 4);
 }
+
+// The statements that write. Everything above builds its tables through the Rust API, which is
+// still the way a program embedded in something else does it. These build them through SQL, which
+// is what the sqllogictest corpus needs and what a person at a prompt does.
+
+/// A database built entirely out of SQL.
+fn scripted(statements: &[&str]) -> Database {
+    let mut db = Database::new();
+    for statement in statements {
+        db.execute(statement).unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    db
+}
+
+/// The message a statement fails with.
+fn refusal(db: &mut Database, sql: &str) -> String {
+    db.execute(sql).unwrap_err().message().to_string()
+}
+
+#[test]
+fn a_table_can_be_created_filled_and_read_without_leaving_sql() {
+    let db = scripted(&[
+        "CREATE TABLE t (a INTEGER, b VARCHAR)",
+        "INSERT INTO t VALUES (1, 'one'), (2, 'two')",
+    ]);
+    assert_eq!(
+        rows(&db, "SELECT a, b FROM t"),
+        vec![vec![integer(1), text("one")], vec![integer(2), text("two")],]
+    );
+}
+
+#[test]
+fn a_value_is_cast_to_the_column_it_lands_in() {
+    // The literal is a `TINYINT` the way it is written and the column is a `BIGINT`, and the cast
+    // that reconciles them is in the plan rather than in the append, so the column holds one type.
+    let db = scripted(&["CREATE TABLE t (a BIGINT, b DOUBLE)", "INSERT INTO t VALUES (1, 2)"]);
+    assert_eq!(rows(&db, "SELECT a, b FROM t"), vec![vec![Value::BigInt(1), Value::Double(2.0)]]);
+}
+
+#[test]
+fn a_column_the_insert_did_not_name_is_null() {
+    let db = scripted(&[
+        "CREATE TABLE t (a INTEGER, b VARCHAR, c INTEGER)",
+        "INSERT INTO t (c, a) VALUES (30, 10)",
+    ]);
+    // The list also says the order, so the thirty is in `c` and the ten is in `a`.
+    assert_eq!(
+        rows(&db, "SELECT a, b, c FROM t"),
+        vec![vec![integer(10), Value::Null, integer(30)]]
+    );
+}
+
+#[test]
+fn an_insert_that_reads_its_own_target_sees_the_rows_that_were_there_when_it_started() {
+    let db = scripted(&[
+        "CREATE TABLE t (a INTEGER)",
+        "INSERT INTO t VALUES (1), (2)",
+        "INSERT INTO t SELECT a + 10 FROM t",
+    ]);
+    assert_eq!(
+        rows(&db, "SELECT a FROM t"),
+        vec![vec![integer(1)], vec![integer(2)], vec![integer(11)], vec![integer(12)],]
+    );
+}
+
+#[test]
+fn create_table_as_takes_its_types_from_the_query() {
+    let db = scripted(&[
+        "CREATE TABLE t (a INTEGER)",
+        "INSERT INTO t VALUES (1), (2), (3)",
+        "CREATE TABLE counted AS SELECT count(*) AS n, sum(a) AS total FROM t",
+    ]);
+    assert_eq!(
+        db.query("SELECT n, total FROM counted").unwrap().types(),
+        &[LogicalType::BigInt, LogicalType::HugeInt]
+    );
+    assert_eq!(
+        rows(&db, "SELECT n, total FROM counted"),
+        vec![vec![Value::BigInt(3), Value::HugeInt(6)]]
+    );
+}
+
+#[test]
+fn a_create_table_as_can_rename_the_query_s_columns() {
+    let db = scripted(&["CREATE TABLE t (x, y) AS SELECT 1, 'a'"]);
+    assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["x", "y"]);
+}
+
+#[test]
+fn if_not_exists_leaves_the_table_and_its_rows_alone() {
+    let mut db = scripted(&[
+        "CREATE TABLE t (a INTEGER)",
+        "INSERT INTO t VALUES (1)",
+        "CREATE TABLE IF NOT EXISTS t (b VARCHAR, c VARCHAR)",
+    ]);
+    assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["a"]);
+    assert_eq!(db.table_len("t").unwrap(), 1);
+    // Without it, the second create is an error and the table is still the first one.
+    assert!(refusal(&mut db, "CREATE TABLE t (b VARCHAR)").contains("already exists"));
+    assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["a"]);
+}
+
+#[test]
+fn or_replace_runs_the_query_against_the_table_it_is_about_to_replace() {
+    let db = scripted(&[
+        "CREATE TABLE t (a INTEGER)",
+        "INSERT INTO t VALUES (1), (2), (3)",
+        "CREATE OR REPLACE TABLE t AS SELECT a * 2 AS a FROM t",
+    ]);
+    assert_eq!(
+        rows(&db, "SELECT a FROM t"),
+        vec![vec![integer(2)], vec![integer(4)], vec![integer(6)],]
+    );
+}
+
+#[test]
+fn dropping_takes_a_list_and_if_exists_forgives_a_name_that_is_not_there() {
+    let mut db = scripted(&[
+        "CREATE TABLE a (x INTEGER)",
+        "CREATE TABLE b (x INTEGER)",
+        "DROP TABLE a, b",
+        "DROP TABLE IF EXISTS a",
+    ]);
+    assert!(db.catalog().tables().next().is_none());
+    assert!(refusal(&mut db, "DROP TABLE a").contains("does not exist"));
+}
+
+#[test]
+fn values_is_a_query_and_the_columns_take_the_type_every_row_agrees_on() {
+    let db = Database::new();
+    let result = db.query("VALUES (1, 'a'), (2.5, 'b')").unwrap();
+    assert_eq!(result.names(), &["col0", "col1"]);
+    // The integer column widens to hold the integer's digits as well as the fraction, which is
+    // `promote_numeric`'s rule and the reason it is eleven wide and not two.
+    assert_eq!(
+        result.types(),
+        &[LogicalType::Decimal { width: 11, scale: 1 }, LogicalType::Varchar]
+    );
+    assert_eq!(result.len(), 2);
+    assert_eq!(
+        rows(&db, "SELECT col0 FROM (VALUES (3), (1), (2)) ORDER BY col0"),
+        vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]]
+    );
+}
+
+#[test]
+fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
+    // Each of these parses and each of them would be a wrong answer if it were accepted and the
+    // clause ignored, which is the rule the front end follows everywhere else.
+    let mut db = scripted(&["CREATE TABLE t (a INTEGER)"]);
+    for statement in [
+        "CREATE TEMPORARY TABLE u (a INTEGER)",
+        "CREATE TABLE u (a INTEGER NOT NULL)",
+        "CREATE TABLE u (a INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES (1) RETURNING a",
+        "INSERT INTO t (a, a) VALUES (1, 2)",
+        "CREATE TABLE u (a INTEGER, a VARCHAR)",
+    ] {
+        let message = refusal(&mut db, statement);
+        assert!(!message.is_empty(), "{statement} was accepted");
+    }
+    assert!(db.catalog().tables().all(|table| table.name().table != "u"));
+}

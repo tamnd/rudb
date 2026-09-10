@@ -31,6 +31,17 @@ impl QueryResult {
         Self { names, types, chunks, rows }
     }
 
+    /// A result of no columns and no rows, which is what a statement that writes hands back.
+    ///
+    /// Distinct from a query that produced no rows only by its width. DuckDB answers a `CREATE
+    /// TABLE` with a `Count` column holding zero, and copying that would mean every caller checking
+    /// whether a column is the real answer or the acknowledgement. `RETURNING` is the shape that
+    /// makes a writing statement produce rows, and when it lands it produces them here.
+    #[must_use]
+    pub(crate) fn empty() -> Self {
+        Self::new(Vec::new(), Vec::new(), Vec::new())
+    }
+
     /// The column names, in order.
     #[must_use]
     pub fn names(&self) -> &[String] {

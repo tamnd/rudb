@@ -22,9 +22,9 @@ use std::collections::HashMap;
 use rudb_common::{Error, Result};
 
 use crate::ast::{
-    Ast, BinaryOp, CaseArm, Distinct, Expr, ExprRef, JoinKind, LiteralKind, Nulls, Order,
-    OrderItem, Quantifier, Query, QueryBody, QueryRef, Select, SelectRef, SetOp, Slice, Source,
-    SourceRef, Statement, StrRef, Target, UnaryOp,
+    Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, Distinct, DropTable, Expr, ExprRef, Insert,
+    JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Select,
+    SelectRef, SetOp, Slice, Source, SourceRef, Statement, StrRef, Target, UnaryOp,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -180,6 +180,20 @@ impl<'a> Transform<'a> {
         Slice { start, len: self.ast.parts.len() as u32 - start }
     }
 
+    /// Turn a vector of column definitions into a slice of the column arena.
+    fn column_def_slice(&mut self, items: Vec<ColumnDef>) -> Slice {
+        let start = self.ast.column_defs.len() as u32;
+        self.ast.column_defs.extend(items);
+        Slice { start, len: self.ast.column_defs.len() as u32 - start }
+    }
+
+    /// Turn a vector of qualified names into a slice of the name list arena.
+    fn name_list_slice(&mut self, items: Vec<Slice>) -> Slice {
+        let start = self.ast.name_lists.len() as u32;
+        self.ast.name_lists.extend(items);
+        Slice { start, len: self.ast.name_lists.len() as u32 - start }
+    }
+
     /// The error for a construct the transformer does not cover yet.
     ///
     /// Both halves matter. The text is what the user wrote, which is the only part they can act on,
@@ -246,7 +260,7 @@ impl<'a> Transform<'a> {
         Ok(())
     }
 
-    /// `Statement <- SelectStatement / ...`, twenty seven alternatives of which one is done.
+    /// `Statement <- SelectStatement / ...`, twenty seven alternatives of which four are done.
     fn statement(&mut self, node: u32) -> Result<Statement> {
         let inner = self.first(node);
         match self.name(inner) {
@@ -254,8 +268,207 @@ impl<'a> Transform<'a> {
                 let query = self.query(self.first(inner))?;
                 Ok(Statement::Query(query))
             }
+            "CreateStatement" => self.create_statement(inner),
+            "DropStatement" => self.drop_statement(inner),
+            "InsertStatement" => self.insert_statement(inner),
             _ => self.unsupported(inner),
         }
+    }
+
+    /// `CreateStatement <- 'CREATE' OrReplace? Temporary? CreateStatementVariation`.
+    ///
+    /// Of the nine variations, `CreateTableStmt` is the one that is done. The other eight are a
+    /// view, a macro, a sequence, a type, a schema, an index, a secret and a trigger, and each of
+    /// them is a catalog entry this database has no room for yet.
+    fn create_statement(&mut self, node: u32) -> Result<Statement> {
+        let or_replace = self.find(node, "OrReplace") != NONE;
+        let temporary = self.find(node, "Temporary") != NONE;
+        let variation = self.find(node, "CreateStatementVariation");
+        let inner = self.first(variation);
+        if self.name(inner) != "CreateTableStmt" {
+            return self.unsupported(inner);
+        }
+        let name = self.name_parts(self.find(inner, "QualifiedName"));
+        let if_not_exists = self.find(inner, "IfNotExists") != NONE;
+        let definition = self.find(inner, "CreateTableDefinition");
+        let body = self.first(definition);
+        let (columns, query) = match self.name(body) {
+            "CreateColumnList" => (self.column_list(body)?, NONE),
+            "CreateTableAs" => self.create_table_as(body)?,
+            _ => return self.unsupported(body),
+        };
+        let index = self.ast.create_tables.len() as u32;
+        self.ast.create_tables.push(CreateTable {
+            name,
+            columns,
+            query,
+            if_not_exists,
+            or_replace,
+            temporary,
+        });
+        Ok(Statement::CreateTable(index))
+    }
+
+    /// `CreateColumnList <- Parens(CreateTableColumnList?) PartitionSortedOptions? WithList?`.
+    fn column_list(&mut self, node: u32) -> Result<Slice> {
+        for kid in self.kids(node) {
+            if matches!(self.name(kid), "PartitionOptions" | "SortedOptions" | "WithList") {
+                return self.unsupported(kid);
+            }
+        }
+        let list = self.find(node, "CreateTableColumnList");
+        if list == NONE {
+            // `CREATE TABLE t ()` parses. It is a table of no columns, and the catalog is entitled
+            // to refuse it, but that is not this layer's refusal to make.
+            return Ok(Slice::default());
+        }
+        let mut defs = Vec::new();
+        for element in self.kids(list) {
+            let inner = self.first(element);
+            if self.name(inner) != "CreateTableColumnDefinition" {
+                // A table level `PRIMARY KEY`, `UNIQUE`, `CHECK` or `FOREIGN KEY`. Constraints are
+                // not enforced anywhere yet and silently dropping one is a wrong answer waiting to
+                // happen, so it is refused instead.
+                return self.unsupported(inner);
+            }
+            defs.push(self.column_definition(self.first(inner))?);
+        }
+        Ok(self.column_def_slice(defs))
+    }
+
+    /// `ColumnDefinition <- DottedIdentifier Type? GeneratedColumn? ConstraintNameClause?
+    /// ColumnConstraint*`.
+    fn column_definition(&mut self, node: u32) -> Result<ColumnDef> {
+        let name = self.identifier(self.find(node, "DottedIdentifier"));
+        let type_node = self.find(node, "Type");
+        let ty = if type_node == NONE {
+            NONE
+        } else {
+            let text = self.text(type_node).to_string();
+            self.intern(&text)
+        };
+        if self.find(node, "GeneratedColumn") != NONE {
+            return self.unsupported(self.find(node, "GeneratedColumn"));
+        }
+        let mut not_null = false;
+        for kid in self.kids(node) {
+            if self.name(kid) != "ColumnConstraint" {
+                continue;
+            }
+            let constraint = self.first(kid);
+            match self.name(constraint) {
+                "NotNullConstraint" => {
+                    not_null = self.name(self.first(constraint)) == "NotNullColumnConstraint";
+                }
+                _ => return self.unsupported(constraint),
+            }
+        }
+        Ok(ColumnDef { name, ty, not_null })
+    }
+
+    /// `CreateTableAs <- IdentifierList? PartitionSortedOptions? WithList? 'AS' Statement
+    /// WithData?`.
+    ///
+    /// The names in the `IdentifierList` become column definitions with no type, because the types
+    /// are the query's and only the names are the syntax's to say.
+    fn create_table_as(&mut self, node: u32) -> Result<(Slice, QueryRef)> {
+        for kid in self.kids(node) {
+            if matches!(
+                self.name(kid),
+                "PartitionOptions" | "SortedOptions" | "WithList" | "WithData"
+            ) {
+                return self.unsupported(kid);
+            }
+        }
+        let names = self.find(node, "IdentifierList");
+        let columns = if names == NONE {
+            Slice::default()
+        } else {
+            let mut defs = Vec::new();
+            for kid in self.kids(names) {
+                let name = self.identifier(kid);
+                defs.push(ColumnDef { name, ty: NONE, not_null: false });
+            }
+            self.column_def_slice(defs)
+        };
+        let statement = self.find(node, "Statement");
+        let inner = self.first(statement);
+        if self.name(inner) != "SelectStatement" {
+            return self.unsupported(inner);
+        }
+        let query = self.query(self.first(inner))?;
+        Ok((columns, query))
+    }
+
+    /// `DropStatement <- 'DROP' DropEntries DropBehavior?`.
+    ///
+    /// `DropTable <- TableOrView IfExists? List(BaseTableName)`, and `TableOrView` covers `VIEW`
+    /// and `MATERIALIZED VIEW` as well as `TABLE`, so it is checked rather than assumed.
+    fn drop_statement(&mut self, node: u32) -> Result<Statement> {
+        if self.find(node, "DropBehavior") != NONE {
+            return self.unsupported(self.find(node, "DropBehavior"));
+        }
+        let entries = self.find(node, "DropEntries");
+        let inner = self.first(entries);
+        if self.name(inner) != "DropTable" {
+            return self.unsupported(inner);
+        }
+        let kind = self.find(inner, "TableOrView");
+        if self.name(self.first(kind)) != "CommentTable" {
+            return self.unsupported(kind);
+        }
+        let if_exists = self.find(inner, "IfExists") != NONE;
+        let mut names = Vec::new();
+        for kid in self.kids(inner) {
+            if self.name(kid) == "BaseTableName" {
+                names.push(self.name_parts(kid));
+            }
+        }
+        let names = self.name_list_slice(names);
+        let index = self.ast.drop_tables.len() as u32;
+        self.ast.drop_tables.push(DropTable { names, if_exists });
+        Ok(Statement::DropTable(index))
+    }
+
+    /// `InsertStatement <- ... InsertTarget InsertColumnList? InsertValues ...`.
+    ///
+    /// `ON CONFLICT`, `RETURNING`, `BY NAME`, `BY POSITION`, `OR REPLACE` and the rest of the
+    /// clauses the grammar hangs off this are each a refusal, because every one of them changes
+    /// what the statement means and none of them changes it in a way anything downstream would
+    /// notice if it were dropped.
+    fn insert_statement(&mut self, node: u32) -> Result<Statement> {
+        for kid in self.kids(node) {
+            if matches!(
+                self.name(kid),
+                "InsertTarget" | "InsertColumnList" | "InsertValues" | "WithClause"
+            ) {
+                continue;
+            }
+            return self.unsupported(kid);
+        }
+        if self.find(node, "WithClause") != NONE {
+            return self.unsupported(self.find(node, "WithClause"));
+        }
+        let name = self.name_parts(self.find(self.find(node, "InsertTarget"), "BaseTableName"));
+        let list = self.find(node, "InsertColumnList");
+        let columns = if list == NONE {
+            Slice::default()
+        } else {
+            let mut parts = Vec::new();
+            for kid in self.kids(self.find(list, "ColumnList")) {
+                parts.push(self.identifier(kid));
+            }
+            self.part_slice(parts)
+        };
+        let values = self.find(node, "InsertValues");
+        let inner = self.first(values);
+        if self.name(inner) != "SelectInsertValues" {
+            return self.unsupported(inner);
+        }
+        let source = self.query(self.find(inner, "SelectStatementInternal"))?;
+        let index = self.ast.inserts.len() as u32;
+        self.ast.inserts.push(Insert { name, columns, source });
+        Ok(Statement::Insert(index))
     }
 
     /// `SelectStatementInternal <- WithClause? SelectSetOpChain ResultModifiers?`.
@@ -355,11 +568,38 @@ impl<'a> Transform<'a> {
                         let select = self.simple_select(self.unwrap_parens(kind))?;
                         Ok(self.push_query(Query::bare(QueryBody::Select(select))))
                     }
+                    "ValuesClause" => {
+                        let rows = self.values_clause(kind)?;
+                        Ok(self.push_query(Query::bare(QueryBody::Values(rows))))
+                    }
                     _ => self.unsupported(kind),
                 }
             }
             _ => self.unsupported(inner),
         }
+    }
+
+    /// `ValuesClause <- 'VALUES' List(ValuesExpressions)`, each of which is `Parens(List(Expression))`.
+    ///
+    /// The rows are not checked against each other for width here. Two rows of different widths
+    /// parse, and saying so is the binder's job, because the message wants to name the column count
+    /// it expected and the parser does not know it for `INSERT` where the table decides.
+    fn values_clause(&mut self, node: u32) -> Result<Slice> {
+        let mut rows = Vec::new();
+        for kid in self.kids(node) {
+            if self.name(kid) != "ValuesExpressions" {
+                continue;
+            }
+            let mut items = Vec::new();
+            for expr in self.kids(kid) {
+                items.push(self.expr(expr)?);
+            }
+            let slice = self.expr_slice(items);
+            rows.push(slice);
+        }
+        let start = self.ast.rows.len() as u32;
+        self.ast.rows.extend(rows);
+        Ok(Slice { start, len: self.ast.rows.len() as u32 - start })
     }
 
     /// `OptionalParensSimpleSelect <- SimpleSelectParens / SimpleSelect`, down to the select.
@@ -678,6 +918,14 @@ impl<'a> Transform<'a> {
                 let query = self.query(self.first(reference))?;
                 let (alias, columns) = self.table_alias(self.find(inner, "TableAlias"));
                 Ok(self.push_source(Source::Subquery { query, alias, columns }))
+            }
+            "ValuesRef" => {
+                if self.find(inner, "TableAliasColon") != NONE {
+                    return self.unsupported(inner);
+                }
+                let rows = self.values_clause(self.find(inner, "ValuesClause"))?;
+                let (alias, columns) = self.table_alias(self.find(inner, "TableAlias"));
+                Ok(self.push_source(Source::Values { rows, alias, columns }))
             }
             "ParensTableRef" => {
                 if self.find(inner, "TableAliasColon") != NONE
@@ -1396,6 +1644,9 @@ mod tests {
             Source::Subquery { query, alias: query_alias, .. } => {
                 format!("({}){}", show_query(ast, query), alias(query_alias))
             }
+            Source::Values { rows, alias: values_alias, .. } => {
+                format!("{}{}", show_rows(ast, rows), alias(values_alias))
+            }
             Source::Join { left, right, kind, natural, on, using } => {
                 let natural = if natural { "NATURAL " } else { "" };
                 let on = if on == NONE { String::new() } else { format!(" ON {}", show(ast, on)) };
@@ -1411,6 +1662,25 @@ mod tests {
                 )
             }
         }
+    }
+
+    /// The rows of a `VALUES` written back out.
+    fn show_rows(ast: &Ast, rows: Slice) -> String {
+        let rows = ast
+            .rows(rows)
+            .iter()
+            .map(|&row| {
+                let items = ast
+                    .expr_list(row)
+                    .iter()
+                    .map(|&item| show(ast, item))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({items})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("VALUES {rows}")
     }
 
     /// One query written back out.
@@ -1467,6 +1737,7 @@ mod tests {
                 }
                 out
             }
+            QueryBody::Values(rows) => show_rows(ast, rows),
         };
         if query.order_by_all {
             out += " ORDER BY ALL";
@@ -1493,13 +1764,196 @@ mod tests {
     fn round(query: &str) -> String {
         let ast = parse_ast(query).unwrap_or_else(|error| panic!("{query}: {error}"));
         assert_eq!(ast.statements.len(), 1, "{query} is one statement");
-        let Statement::Query(index) = ast.statements[0];
+        let Statement::Query(index) = ast.statements[0] else {
+            panic!("{query} is not a query");
+        };
         show_query(&ast, index)
+    }
+
+    /// One statement, transformed and written back out as the DDL and DML shape it is.
+    fn round_statement(query: &str) -> String {
+        let ast = parse_ast(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+        assert_eq!(ast.statements.len(), 1, "{query} is one statement");
+        match ast.statements[0] {
+            Statement::Query(index) => show_query(&ast, index),
+            Statement::CreateTable(index) => {
+                let create = ast.create_table(index);
+                let mut out = "CREATE".to_string();
+                if create.or_replace {
+                    out += " OR REPLACE";
+                }
+                if create.temporary {
+                    out += " TEMPORARY";
+                }
+                out += " TABLE";
+                if create.if_not_exists {
+                    out += " IF NOT EXISTS";
+                }
+                out += &format!(" {}", ast.name_text(create.name));
+                let columns = ast
+                    .column_defs(create.columns)
+                    .iter()
+                    .map(|def| {
+                        let ty = match def.ty {
+                            NONE => String::new(),
+                            other => format!(" {}", ast.string(other)),
+                        };
+                        let null = if def.not_null { " NOT NULL" } else { "" };
+                        format!("{}{ty}{null}", ast.string(def.name))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !columns.is_empty() || create.query == NONE {
+                    out += &format!(" ({columns})");
+                }
+                if create.query != NONE {
+                    out += &format!(" AS {}", show_query(&ast, create.query));
+                }
+                out
+            }
+            Statement::DropTable(index) => {
+                let drop = ast.drop_table(index);
+                let mut out = "DROP TABLE".to_string();
+                if drop.if_exists {
+                    out += " IF EXISTS";
+                }
+                let names = ast
+                    .name_list(drop.names)
+                    .iter()
+                    .map(|&name| ast.name_text(name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out + &format!(" {names}")
+            }
+            Statement::Insert(index) => {
+                let insert = ast.insert(index);
+                let mut out = format!("INSERT INTO {}", ast.name_text(insert.name));
+                if !insert.columns.is_empty() {
+                    let columns = ast.name(insert.columns).collect::<Vec<_>>().join(", ");
+                    out += &format!(" ({columns})");
+                }
+                out + &format!(" {}", show_query(&ast, insert.source))
+            }
+        }
     }
 
     #[test]
     fn the_query_m0_has_to_run_transforms() {
         assert_eq!(round("SELECT * FROM t WHERE x > 5"), "SELECT * FROM t WHERE (x Gt 5)");
+    }
+
+    #[test]
+    fn a_create_table_keeps_its_types_as_text() {
+        assert_eq!(
+            round_statement("CREATE TABLE t (a INTEGER, b VARCHAR NOT NULL)"),
+            "CREATE TABLE t (a INTEGER, b VARCHAR NOT NULL)"
+        );
+        // The type is the text between the identifier and whatever follows it, parentheses and
+        // all, because resolving `DECIMAL(18, 3)` into a width and a scale is the binder's job and
+        // doing it here would mean two places that know the type table.
+        assert_eq!(
+            round_statement("CREATE TABLE t (a DECIMAL(18, 3), b STRUCT(x INT))"),
+            "CREATE TABLE t (a DECIMAL(18, 3), b STRUCT(x INT))"
+        );
+    }
+
+    #[test]
+    fn the_three_modifiers_on_a_create_table_survive() {
+        assert_eq!(
+            round_statement("CREATE OR REPLACE TEMPORARY TABLE IF NOT EXISTS s.t (a INT)"),
+            "CREATE OR REPLACE TEMPORARY TABLE IF NOT EXISTS s.t (a INT)"
+        );
+    }
+
+    #[test]
+    fn a_create_table_as_carries_the_query_and_not_the_types() {
+        assert_eq!(
+            round_statement("CREATE TABLE t AS SELECT a FROM u"),
+            "CREATE TABLE t AS SELECT a FROM u"
+        );
+        // The names are the syntax's to say and the types are the query's, so the column
+        // definitions here have names and no types.
+        assert_eq!(
+            round_statement("CREATE TABLE t (x, y) AS SELECT a, b FROM u"),
+            "CREATE TABLE t (x, y) AS SELECT a, b FROM u"
+        );
+    }
+
+    #[test]
+    fn a_drop_table_is_a_list_of_qualified_names() {
+        assert_eq!(round_statement("DROP TABLE t"), "DROP TABLE t");
+        assert_eq!(round_statement("DROP TABLE IF EXISTS a, b.c"), "DROP TABLE IF EXISTS a, b.c");
+    }
+
+    #[test]
+    fn dropping_something_that_is_not_a_table_is_refused() {
+        // `TableOrView` covers `VIEW` and `MATERIALIZED VIEW` as well, and a view dropped as if it
+        // were a table is a wrong answer rather than a missing feature.
+        let error = parse_ast("DROP VIEW v").unwrap_err().to_string();
+        assert!(error.starts_with("Not implemented Error"), "{error}");
+    }
+
+    #[test]
+    fn both_spellings_of_insert_arrive_at_a_query() {
+        assert_eq!(
+            round_statement("INSERT INTO t VALUES (1, 'a'), (2, 'b')"),
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
+        );
+        assert_eq!(
+            round_statement("INSERT INTO t (a, b) SELECT x, y FROM u"),
+            "INSERT INTO t (a, b) SELECT x, y FROM u"
+        );
+    }
+
+    #[test]
+    fn an_insert_clause_that_changes_the_answer_is_refused() {
+        for query in [
+            "INSERT INTO t VALUES (1) RETURNING *",
+            "INSERT OR REPLACE INTO t VALUES (1)",
+            "INSERT INTO t BY NAME SELECT 1 AS a",
+            "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+            "INSERT INTO t DEFAULT VALUES",
+        ] {
+            let error = parse_ast(query).unwrap_err().to_string();
+            assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");
+        }
+    }
+
+    #[test]
+    fn a_column_constraint_that_is_not_not_null_is_refused() {
+        // Nothing enforces a constraint yet. Accepting one and not enforcing it is the wrong
+        // answer, so `NOT NULL` is kept because the column already has a nullability and the rest
+        // are refused until there is somewhere to put them.
+        for query in [
+            "CREATE TABLE t (a INT PRIMARY KEY)",
+            "CREATE TABLE t (a INT UNIQUE)",
+            "CREATE TABLE t (a INT CHECK (a > 0))",
+            "CREATE TABLE t (a INT DEFAULT 1)",
+            "CREATE TABLE t (a INT REFERENCES u (b))",
+            "CREATE TABLE t (a INT, PRIMARY KEY (a))",
+        ] {
+            let error = parse_ast(query).unwrap_err().to_string();
+            assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");
+        }
+    }
+
+    #[test]
+    fn values_is_a_query_on_its_own_and_in_a_from() {
+        assert_eq!(round("VALUES (1), (2)"), "VALUES (1), (2)");
+        // Parenthesised it is a subquery whose body is the values, and bare it is a `ValuesRef`.
+        // Two rules and one meaning, which is the grammar's doing and not something to flatten
+        // here, because the parenthesised form can carry an order by and the bare one cannot.
+        assert_eq!(
+            round("SELECT * FROM (VALUES (1, 2), (3, 4)) t(a, b)"),
+            "SELECT * FROM (VALUES (1, 2), (3, 4)) AS t"
+        );
+        assert_eq!(
+            round("SELECT * FROM VALUES (1, 2), (3, 4) AS t(a, b)"),
+            "SELECT * FROM VALUES (1, 2), (3, 4) AS t"
+        );
+        // Rows of different widths parse. Saying so wants the column count, which for an insert is
+        // the table's, so the check belongs to the binder and not here.
+        assert_eq!(round("VALUES (1), (2, 3)"), "VALUES (1), (2, 3)");
     }
 
     #[test]
@@ -1526,7 +1980,7 @@ mod tests {
         }
         // Not an assertion about the right number. It is a ratchet: this only moves up, and the
         // day it moves down somebody has taken a construct out without meaning to.
-        assert!(done >= 19, "only {done} of the corpus transforms, which is fewer than it was");
+        assert!(done >= 22, "only {done} of the corpus transforms, which is fewer than it was");
     }
 
     #[test]
@@ -1786,22 +2240,23 @@ mod tests {
         // A trailing semicolon makes an empty top level statement in the parse tree, because the
         // grammar's `Statement? (';'+ / EndOfInput)` is happy with nothing on both sides. It is
         // dropped here rather than pretended away in the matcher.
-        let Statement::Query(second) = ast.statements[1];
+        let Statement::Query(second) = ast.statements[1] else {
+            panic!("the second statement is a query");
+        };
         assert_eq!(show_query(&ast, second), "SELECT 2");
     }
 
     #[test]
     fn an_unsupported_construct_names_itself_and_what_was_written() {
-        let error = parse_ast("CREATE TABLE t (a INTEGER)").unwrap_err().to_string();
+        let error = parse_ast("ALTER TABLE t ADD COLUMN a INTEGER").unwrap_err().to_string();
         assert!(error.starts_with("Not implemented Error"), "{error}");
-        assert!(error.contains("CREATE TABLE t (a INTEGER)"), "{error}");
-        assert!(error.contains("CreateStatement"), "{error}");
+        assert!(error.contains("ALTER TABLE t ADD COLUMN a INTEGER"), "{error}");
+        assert!(error.contains("AlterStatement"), "{error}");
     }
 
     #[test]
     fn a_long_construct_is_cut_short_in_the_message() {
-        let query =
-            format!("CREATE TABLE t AS SELECT {} FROM u", "averylongcolumnname, ".repeat(8));
+        let query = format!("ALTER TABLE t ADD COLUMN {} INTEGER", "a".repeat(80));
         let error = parse_ast(&query).unwrap_err().to_string();
         assert!(error.contains("..."), "{error}");
         assert!(error.len() < 200, "{error}");

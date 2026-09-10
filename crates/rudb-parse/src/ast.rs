@@ -53,16 +53,86 @@ pub type SourceRef = u32;
 pub type QueryRef = u32;
 /// An index into `Ast::selects`.
 pub type SelectRef = u32;
+/// An index into `Ast::create_tables`.
+pub type CreateTableRef = u32;
+/// An index into `Ast::drop_tables`.
+pub type DropTableRef = u32;
+/// An index into `Ast::inserts`.
+pub type InsertRef = u32;
 
 /// One statement.
 ///
-/// Only `SELECT` is here, which is what M0 needs. The other twenty six statement kinds the grammar
-/// reaches are a transform error naming the rule rather than a variant that nothing fills in, so
-/// that adding one is a compile error somewhere useful rather than a silent `todo!()`.
+/// Four of the twenty seven the grammar reaches. The rest are a transform error naming the rule
+/// rather than a variant that nothing fills in, so that adding one is a compile error somewhere
+/// useful rather than a silent `todo!()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Statement {
     /// A query, meaning a `SELECT` or a set operation over two of them.
     Query(QueryRef),
+    /// `CREATE TABLE`.
+    CreateTable(CreateTableRef),
+    /// `DROP TABLE`.
+    DropTable(DropTableRef),
+    /// `INSERT INTO`.
+    Insert(InsertRef),
+}
+
+/// `CREATE TABLE name (columns)` or `CREATE TABLE name AS query`.
+///
+/// Exactly one of `columns` and `query` says what the table is. A column list is the ordinary form
+/// and `query` is `CREATE TABLE AS`, where the columns come from what the query produced and the
+/// only thing the syntax contributes is optionally renaming them, which is `columns` with the types
+/// left as `NONE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTable {
+    /// The table name, as a run of [`Slice`] parts, outermost first.
+    pub name: Slice,
+    /// The column definitions, as a run of [`ColumnDef`].
+    pub columns: Slice,
+    /// The `AS` query, or `NONE`.
+    pub query: QueryRef,
+    /// Whether `IF NOT EXISTS` was written.
+    pub if_not_exists: bool,
+    /// Whether `OR REPLACE` was written.
+    pub or_replace: bool,
+    /// Whether `TEMP` or `TEMPORARY` was written.
+    pub temporary: bool,
+}
+
+/// One column of a `CREATE TABLE`.
+///
+/// The type is the text as written rather than a resolved type, because resolving a type is the
+/// binder's job and this crate is syntax. `VARCHAR(10)` and `STRUCT(a INTEGER)` reach the binder
+/// as themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnDef {
+    /// The column name.
+    pub name: StrRef,
+    /// The type as written, or `NONE` when the definition had none, which only `CREATE TABLE AS`
+    /// allows.
+    pub ty: StrRef,
+    /// Whether `NOT NULL` was written.
+    pub not_null: bool,
+}
+
+/// `DROP TABLE a, b`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTable {
+    /// The names, as a run of [`Slice`] into `Ast::name_lists`, each of which is a run of parts.
+    pub names: Slice,
+    /// Whether `IF EXISTS` was written.
+    pub if_exists: bool,
+}
+
+/// `INSERT INTO name (columns) query`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Insert {
+    /// The table name, as a run of parts, outermost first.
+    pub name: Slice,
+    /// The column list, as a run of parts, empty when the statement did not write one.
+    pub columns: Slice,
+    /// What produces the rows, which is a `VALUES` clause or any other query.
+    pub source: QueryRef,
 }
 
 /// A query: a body, plus the modifiers that apply to whatever the body produced.
@@ -119,6 +189,13 @@ pub enum QueryBody {
         /// The query on the right.
         right: QueryRef,
     },
+    /// `VALUES (1, 'a'), (2, 'b')`, as a run of [`Slice`] in `Ast::rows`.
+    ///
+    /// A row count and a column count and nothing else, so it is a query body rather than a
+    /// statement of its own. That is also what makes `INSERT INTO t VALUES (1)` and
+    /// `INSERT INTO t SELECT 1` the same shape by the time anything downstream sees them, which is
+    /// the reason the insert walker does not have two arms.
+    Values(Slice),
 }
 
 /// Which set operator.
@@ -255,6 +332,15 @@ pub enum Source {
     Subquery {
         /// The query.
         query: QueryRef,
+        /// The alias, or `NONE`.
+        alias: StrRef,
+        /// Column aliases, as a run of [`StrRef`].
+        columns: Slice,
+    },
+    /// A `VALUES` in the `FROM` clause.
+    Values {
+        /// The rows, as a run of [`Slice`] in `Ast::rows`.
+        rows: Slice,
         /// The alias, or `NONE`.
         alias: StrRef,
         /// Column aliases, as a run of [`StrRef`].
@@ -583,6 +669,18 @@ pub struct Ast {
     pub order_items: Vec<OrderItem>,
     /// Backing store for every [`Slice`] of case arms.
     pub case_arms: Vec<CaseArm>,
+    /// The `CREATE TABLE` arena.
+    pub create_tables: Vec<CreateTable>,
+    /// The `DROP TABLE` arena.
+    pub drop_tables: Vec<DropTable>,
+    /// The `INSERT` arena.
+    pub inserts: Vec<Insert>,
+    /// Backing store for every [`Slice`] of column definitions.
+    pub column_defs: Vec<ColumnDef>,
+    /// Backing store for every [`Slice`] of names, which is a name list rather than a name.
+    pub name_lists: Vec<Slice>,
+    /// Backing store for the rows of a `VALUES`, each of which is a run of expressions.
+    pub rows: Vec<Slice>,
 }
 
 impl Ast {
@@ -644,6 +742,36 @@ impl Ast {
     /// The arms of a case.
     pub fn arm_list(&self, slice: Slice) -> &[CaseArm] {
         &self.case_arms[slice.range()]
+    }
+
+    /// One `CREATE TABLE`.
+    pub fn create_table(&self, index: CreateTableRef) -> CreateTable {
+        self.create_tables[index as usize]
+    }
+
+    /// One `DROP TABLE`.
+    pub fn drop_table(&self, index: DropTableRef) -> DropTable {
+        self.drop_tables[index as usize]
+    }
+
+    /// One `INSERT`.
+    pub fn insert(&self, index: InsertRef) -> Insert {
+        self.inserts[index as usize]
+    }
+
+    /// The column definitions of a `CREATE TABLE`.
+    pub fn column_defs(&self, slice: Slice) -> &[ColumnDef] {
+        &self.column_defs[slice.range()]
+    }
+
+    /// The names of a name list, each of which is itself a run of parts.
+    pub fn name_list(&self, slice: Slice) -> &[Slice] {
+        &self.name_lists[slice.range()]
+    }
+
+    /// The rows of a `VALUES`, each of which is itself a run of expressions.
+    pub fn rows(&self, slice: Slice) -> &[Slice] {
+        &self.rows[slice.range()]
     }
 
     /// How many nodes the whole tree is, across every arena.

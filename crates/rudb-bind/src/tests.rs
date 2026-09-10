@@ -353,3 +353,108 @@ fn what_is_not_bound_yet_says_what_was_written_rather_than_producing_a_wrong_pla
         assert!(!message.is_empty(), "{query} should say what it cannot do");
     }
 }
+
+// The statements that are not queries. What is worth asserting here is the resolution: which table
+// the name landed on, which column each value goes into, and which type each one arrives as. What
+// happens to the catalog afterwards is `rudb`'s test to write, because the binder never touches it.
+
+use crate::{Bound, bind_statement_sql};
+
+/// One statement, bound against the two table catalog.
+fn bound(sql: &str) -> Bound {
+    bind_statement_sql(sql, &catalog()).unwrap_or_else(|error| panic!("{sql} should bind: {error}"))
+}
+
+/// The message for a statement that is expected not to bind.
+fn statement_failure(sql: &str) -> String {
+    match bind_statement_sql(sql, &catalog()) {
+        Ok(_) => panic!("{sql} should not bind"),
+        Err(error) => error.message().to_string(),
+    }
+}
+
+#[test]
+fn a_create_table_resolves_its_name_and_its_types_before_anything_is_created() {
+    let Bound::CreateTable(create) = bound("CREATE TABLE s (a DECIMAL(18, 3), b VARCHAR)") else {
+        panic!("a create table");
+    };
+    assert_eq!(create.name, QualifiedName::new("memory", "main", "s"));
+    assert_eq!(
+        create.columns,
+        vec![
+            Field::new("a", LogicalType::decimal(18, 3).unwrap()),
+            Field::new("b", LogicalType::Varchar),
+        ]
+    );
+    assert!(create.source.is_none());
+}
+
+#[test]
+fn a_create_table_as_takes_the_query_s_types_and_the_statement_s_names() {
+    let Bound::CreateTable(create) = bound("CREATE TABLE s (id) AS SELECT UserID FROM hits") else {
+        panic!("a create table");
+    };
+    assert_eq!(create.columns, vec![Field::new("id", LogicalType::BigInt)]);
+    let source = create.source.expect("a create table as has a query");
+    assert!(source.to_string().contains("Get"), "{source}");
+}
+
+#[test]
+fn a_create_table_that_cannot_work_says_so_before_it_is_run() {
+    assert!(statement_failure("CREATE TABLE s (a INTEGER, A VARCHAR)").contains("Duplicate"));
+    assert!(statement_failure("CREATE TABLE s (a, b) AS SELECT UserID FROM hits").contains("2"));
+    assert!(statement_failure("CREATE TABLE s (a NOSUCHTYPE)").contains("NOSUCHTYPE"));
+}
+
+#[test]
+fn an_insert_projects_the_source_into_the_target_s_shape() {
+    let Bound::Insert(insert) = bound("INSERT INTO visits (duration) VALUES (1)") else {
+        panic!("an insert");
+    };
+    assert_eq!(insert.name, QualifiedName::new("memory", "main", "visits"));
+    // Two columns out, in the table's order, with the unnamed one a null of the table's own type
+    // rather than an untyped null, so the append never has to ask what type the hole is.
+    let printed = insert.source.to_string();
+    assert!(printed.contains("NULL::BIGINT AS UserID"), "{printed}");
+    assert!(printed.contains("AS duration"), "{printed}");
+
+    // And the cast when the source type is not the column's. The literal is an `INTEGER` and
+    // `UserID` is a `BIGINT`, so the widening is in the plan and not in the append.
+    let Bound::Insert(insert) = bound("INSERT INTO visits (UserID) VALUES (1)") else {
+        panic!("an insert");
+    };
+    let printed = insert.source.to_string();
+    assert!(printed.contains("::BIGINT AS UserID"), "{printed}");
+}
+
+#[test]
+fn an_insert_checks_the_width_and_the_column_names_against_the_table() {
+    assert!(statement_failure("INSERT INTO visits VALUES (1)").contains("2 columns"));
+    assert!(statement_failure("INSERT INTO visits (nope) VALUES (1)").contains("nope"));
+    assert!(
+        statement_failure("INSERT INTO visits (duration, duration) VALUES (1, 2)")
+            .contains("twice")
+    );
+    assert!(statement_failure("INSERT INTO nope VALUES (1)").contains("nope"));
+}
+
+#[test]
+fn a_drop_of_a_name_that_is_not_there_depends_on_if_exists() {
+    let Bound::DropTable(drop) = bound("DROP TABLE hits, visits") else { panic!("a drop") };
+    assert_eq!(drop.names.len(), 2);
+    // With `IF EXISTS` the name that does not resolve is left out rather than kept and forgiven
+    // later, so what comes back is a list of drops that all succeed.
+    let Bound::DropTable(drop) = bound("DROP TABLE IF EXISTS hits, nope") else { panic!("a drop") };
+    assert_eq!(drop.names, vec![QualifiedName::new("memory", "main", "hits")]);
+    assert!(statement_failure("DROP TABLE nope").contains("nope"));
+}
+
+#[test]
+fn values_binds_to_a_values_node_with_the_types_the_rows_agree_on() {
+    let Bound::Query(plan) = bound("VALUES (1, 'a'), (2, 'b')") else { panic!("a query") };
+    let printed = plan.to_string();
+    assert!(printed.starts_with("Values"), "{printed}");
+    assert!(printed.contains("col0"), "{printed}");
+    assert!(statement_failure("VALUES (1), (2, 3)").contains("same length"));
+    assert!(statement_failure("VALUES (1), ('a')").contains("Cannot combine"));
+}
