@@ -6,6 +6,9 @@
 //! the invariant that makes it sound, and the lint in the workspace manifest is what turns that
 //! into a build failure rather than a habit.
 
-/// The crate this rank belongs to, so that the layer check has something to read and the
-/// scaffold compiles. Replaced by the first real item.
-pub const RANK: u8 = 5;
+//! What is here today is [`MemoryTable`], which is the M0 answer to where rows live. The format
+//! itself is M2 work and it replaces the inside of that type rather than the shape of it.
+
+pub mod memory;
+
+pub use memory::MemoryTable;
