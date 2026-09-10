@@ -1,9 +1,10 @@
 //! Every encoding, the cascade machinery, the cost model and multi-column detection.
 //!
 //! Rank 2 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
+//!
+//! What exists so far is [`bitpack`], which is the bottom of every integer encoding in
+//! `spec/06-compression.md` section 6.2 and the thing FOR, DELTA and DICT all end in.
 
 #![forbid(unsafe_code)]
 
-/// The crate this rank belongs to, so that the layer check has something to read and the
-/// scaffold compiles. Replaced by the first real item.
-pub const RANK: u8 = 2;
+pub mod bitpack;
