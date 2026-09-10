@@ -42,6 +42,7 @@ use rudb_common::{Error, Result};
 
 use crate::fsst::SymbolTable;
 use crate::integer;
+use crate::reader::Reader;
 
 /// How deep the recursion goes. A dictionary of a dictionary is not a thing, so this only has to
 /// stop the dictionary's own entries from being dictionary encoded again.
@@ -52,7 +53,7 @@ const MAX_DEPTH: u8 = 2;
 /// The paper trains on about 16 KB. This is four times that, because training happens once per
 /// chunk here rather than once per block, and because the cost of a symbol that is only in the
 /// sample by accident is paid on every value in the chunk.
-const SAMPLE_BYTES: usize = 64 * 1024;
+pub(crate) const SAMPLE_BYTES: usize = 64 * 1024;
 
 /// What a string chunk is encoded as. The discriminant is the tag byte and is part of the format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,31 @@ impl Kind {
 /// decoder would not accept.
 pub fn encode(values: &[&[u8]]) -> Result<Vec<u8>> {
     encode_at(values, 0)
+}
+
+/// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
+///
+/// A column group holds one of these per column, and the decoder on that side cannot know where
+/// one ends until it has been read.
+///
+/// # Errors
+///
+/// As [`decode`], except that trailing bytes are what the caller asked about rather than an error.
+pub fn decode_prefix(bytes: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
+    let mut reader = Reader::new(bytes);
+    let values = decode_chunk(&mut reader)?;
+    Ok((values, reader.used()))
+}
+
+/// [`describe`] over a chunk at the front of a longer buffer, and how many bytes it took.
+///
+/// # Errors
+///
+/// As [`decode_prefix`].
+pub fn describe_prefix(bytes: &[u8]) -> Result<(String, usize)> {
+    let mut reader = Reader::new(bytes);
+    let text = describe_chunk(&mut reader)?;
+    Ok((text, reader.used()))
 }
 
 /// Decodes a chunk written by [`encode`].
@@ -370,12 +396,19 @@ fn describe_integers(reader: &mut Reader<'_>) -> Result<String> {
 ///
 /// The generator is a fixed seed xorshift, so the sample is a function of the column and encoding
 /// the same values twice produces the same bytes.
-fn sample_of<'a>(values: &[&'a [u8]]) -> Vec<&'a [u8]> {
+pub(crate) fn sample_of<'a>(values: &[&'a [u8]]) -> Vec<&'a [u8]> {
+    sample_bytes_of(values, SAMPLE_BYTES)
+}
+
+/// [`sample_of`] with the byte budget spelled out, for a caller training one table over several
+/// columns that has to split the budget between them.
+pub(crate) fn sample_bytes_of<'a>(values: &[&'a [u8]], budget: usize) -> Vec<&'a [u8]> {
+    let budget = budget.max(1);
     let total: usize = values.iter().map(|value| value.len()).sum();
-    if total <= SAMPLE_BYTES {
+    if total <= budget {
         return values.to_vec();
     }
-    let stride = total.div_ceil(SAMPLE_BYTES).max(1);
+    let stride = total.div_ceil(budget).max(1);
     let span = (stride * 2 - 1).max(1) as u64;
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut sample = Vec::with_capacity(values.len() / stride + 1);
@@ -416,52 +449,6 @@ fn too_long(len: usize) -> Error {
 
 fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
-}
-
-/// A cursor over a chunk, checked at every read for the same reason the integer one is.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len() - self.at
-    }
-
-    fn rest(&self) -> &'a [u8] {
-        &self.bytes[self.at..]
-    }
-
-    fn skip(&mut self, len: usize) -> Result<()> {
-        self.bytes(len).map(|_| ())
-    }
-
-    fn bytes(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self.at.checked_add(len).ok_or_else(|| truncated(len))?;
-        if end > self.bytes.len() {
-            return Err(truncated(len));
-        }
-        let out = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(out)
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.bytes(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().expect("four bytes were checked")))
-    }
-}
-
-fn truncated(len: usize) -> Error {
-    Error::internal(format!("a string chunk ended with {len} more bytes wanted"))
 }
 
 #[cfg(test)]

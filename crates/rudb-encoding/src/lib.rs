@@ -14,5 +14,7 @@
 pub mod bitpack;
 pub mod fsst;
 pub mod integer;
+pub mod multi;
+mod reader;
 pub mod sketch;
 pub mod string;

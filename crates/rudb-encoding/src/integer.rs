@@ -43,6 +43,8 @@
 
 use rudb_common::{Error, Result};
 
+use crate::reader::Reader;
+
 use crate::bitpack::{self, VALUES};
 
 /// How deep a cascade is allowed to go.
@@ -615,70 +617,6 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 
 fn put_i64(out: &mut Vec<u8>, value: i64) {
     out.extend_from_slice(&value.to_le_bytes());
-}
-
-/// A cursor over a chunk. Every read is checked, because these bytes come off a disk that has been
-/// there longer than the process has.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len() - self.at
-    }
-
-    fn used(&self) -> usize {
-        self.at
-    }
-
-    fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
-        let end = self.at + N;
-        if end > self.bytes.len() {
-            return Err(Error::internal(format!(
-                "a chunk ended after {} bytes with {N} more wanted",
-                self.bytes.len()
-            )));
-        }
-        let mut out = [0u8; N];
-        out.copy_from_slice(&self.bytes[self.at..end]);
-        self.at = end;
-        Ok(out)
-    }
-
-    fn bytes(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self.at + len;
-        if end > self.bytes.len() {
-            return Err(Error::internal(format!(
-                "a chunk ended after {} bytes with {len} more wanted",
-                self.bytes.len()
-            )));
-        }
-        let out = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(out)
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take::<1>()?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.take::<4>()?))
-    }
-
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.take::<8>()?))
-    }
-
-    fn i64(&mut self) -> Result<i64> {
-        Ok(i64::from_le_bytes(self.take::<8>()?))
-    }
 }
 
 #[cfg(test)]
