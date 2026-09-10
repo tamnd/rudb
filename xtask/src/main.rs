@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod codegen;
 mod layers;
 mod sha256;
 mod style;
@@ -22,6 +23,9 @@ fn main() -> ExitCode {
         Some("style") => style::check(&root()),
         Some("msrv") => msrv(),
         Some("grammar") => vendor::verify(),
+        Some("gen-grammar") => {
+            codegen::generate(std::env::args().nth(2).as_deref() == Some("--check"))
+        }
         Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
         Some("ci") => ci(),
         Some("help" | "--help" | "-h") | None => {
@@ -46,6 +50,9 @@ fn usage() {
     println!("  style    the prose rules for markdown in this repository");
     println!("  msrv     the workspace still builds on the oldest Rust the manifest claims");
     println!("  grammar  the vendored DuckDB grammar is byte for byte what VENDOR recorded");
+    println!(
+        "  gen-grammar [--check]  regenerate crates/rudb-parse/src/generated from that grammar"
+    );
     println!("  ci       everything the per-commit gate runs, in the order it runs it");
     println!();
     println!(
@@ -67,6 +74,7 @@ fn ci() -> Result<(), String> {
     layers::check(&root)?;
     style::check(&root)?;
     vendor::verify()?;
+    codegen::generate(true)?;
     cargo(&["fmt", "--all", "--check"])?;
     cargo(&["clippy", "--workspace", "--all-targets", "--all-features"])?;
     cargo(&["test", "--workspace", "--all-features"])?;
