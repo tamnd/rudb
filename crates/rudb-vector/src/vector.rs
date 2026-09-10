@@ -191,6 +191,26 @@ impl Vector {
         Ok(Self { ty, len, validity: Validity::AllValid, body: Body::Flat(data) })
     }
 
+    /// A flat vector built from single values, with the nulls among them turning into validity.
+    ///
+    /// The slow way in, and the only way in that anything outside this crate has. It is what an
+    /// `INSERT`, a `VALUES` clause and a test build a column with, all of which arrive holding
+    /// values rather than a run of `i32`. Nothing on a scan path calls it: a scan produces a run of
+    /// data directly and hands it to [`Self::flat`].
+    ///
+    /// # Errors
+    ///
+    /// If a value is not one the type can hold, or if the type is one that cannot be stored flat
+    /// yet, which today means the nested types.
+    pub fn from_values(ty: LogicalType, values: &[Value]) -> Result<Self> {
+        let mut data = empty_data_for(&ty)?;
+        for value in values {
+            push_value(&mut data, value)?;
+        }
+        let validity = Validity::from_iter(values.len(), |index| !values[index].is_null());
+        Ok(Self { ty, len: values.len(), validity, body: Body::Flat(data) })
+    }
+
     /// A vector of `len` copies of one value.
     ///
     /// Costs one value regardless of the length, which is what makes a literal in a predicate free
@@ -563,6 +583,45 @@ mod tests {
             vector.iter().collect::<Vec<_>>(),
             vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
         );
+    }
+
+    #[test]
+    fn a_vector_built_from_values_reads_the_same_values_back() {
+        let vector = Vector::from_values(
+            LogicalType::Varchar,
+            &[
+                Value::Varchar("a".to_string()),
+                Value::Null,
+                Value::Varchar("a string too long to sit inside a view".to_string()),
+            ],
+        )
+        .expect("strings and a null");
+        assert_eq!(vector.len(), 3);
+        assert_eq!(vector.value_at(0), Value::Varchar("a".to_string()));
+        assert_eq!(vector.value_at(1), Value::Null);
+        assert_eq!(
+            vector.value_at(2),
+            Value::Varchar("a string too long to sit inside a view".to_string())
+        );
+    }
+
+    /// A null still occupies a position. If it did not then every value after it would read back
+    /// one place to the left, which is the kind of bug that looks like a storage bug for a week.
+    #[test]
+    fn a_null_in_the_middle_does_not_move_the_values_after_it() {
+        let vector = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(1), Value::Null, Value::Integer(3)],
+        )
+        .expect("integers and a null");
+        assert_eq!(vector.value_at(2), Value::Integer(3));
+        assert!(vector.validity().has_nulls(3), "the middle one is null");
+    }
+
+    #[test]
+    fn a_value_the_type_cannot_hold_is_refused() {
+        let wrong = Vector::from_values(LogicalType::Integer, &[Value::Varchar("x".to_string())]);
+        assert!(wrong.is_err(), "a string is not an integer");
     }
 
     #[test]
