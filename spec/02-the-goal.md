@@ -105,7 +105,7 @@ The rule that falls out and that document 15 enforces: **a per-query claim is al
 
 ## 2.6 Axis 4: resource
 
-**The claim.** 10x smaller on disk, 10x lower peak resident set at the same thread count, 10x fewer total CPU-seconds. This is the axis nobody publishes and it is the one that decides whether we built a better engine or just traded memory for time.
+**The claim, amended after M1.** 2.1x smaller on disk, 10x lower peak resident set at the same thread count, 10x fewer total CPU-seconds. This is the axis nobody publishes and it is the one that decides whether we built a better engine or just traded memory for time. The disk half of it said 10x when this document was written, M1 was the experiment built to find out, and section 2.6.1 is what the experiment said. The paragraphs immediately below are left as they were written because the reasoning in them is what was tested, and a specification that quietly replaces a prediction with its outcome is a specification nobody can check.
 
 **On disk.** ClickBench hits at 20.46 GB in DuckDB, 9.42 in ClickHouse, 8.30 in Umbra, 14.78 as Parquet. The 10x target is 2.05 GB, which is 4.0x under Umbra and 7.2x under Parquet. That is the hardest number in the specification.
 
@@ -115,6 +115,20 @@ That last technique, storing a derived column as a recomputation rule rather tha
 
 **If multi-column compression does not deliver on this dataset, the disk number lands around 4 to 5 GB, which is 4 to 5x under DuckDB and roughly at parity with Umbra.** That is the failure mode and document 19 open question one is designed to find out in M1, before the rest of the system depends on it.
 
+### 2.6.1 What M1 measured
+
+M1 ran a standalone encoder over all 99,997,497 rows and 105 columns of ClickBench hits, encoded every column with the full chooser, decoded every chunk back and compared it, and the answer is **9.65 GB**. That is 0.47 of DuckDB's 20.46 GB and 0.70 of the 13.76 GB the same columns take as Parquet with Snappy. The target in this section was 2.05 GB and the line at which the claim was declared wrong was 6 GB, so the claim is wrong by a factor of 4.7 against the target and by 1.6 against the line.
+
+The failure mode predicted two paragraphs above is not the failure mode that happened, and the difference matters. The prediction was that the number lands at 4 to 5 GB because multi-column compression does not deliver. What actually happened is that multi-column compression does not deliver **and** the number is 9.65 GB rather than 4 to 5 GB, so single-column encoding is also further from the target than this document assumed.
+
+The two mechanisms document 06 calls the ones with no equivalent in DuckDB are worth almost nothing on this dataset. Shared dictionaries and shared symbol tables, section 6.4: of 5,460 column pairs, exactly one overlaps enough to be worth one dictionary, `UTMSource` with `UTMCampaign`, and sharing saves 0.1 percent of a 4.17 MB pair, which is four kilobytes of a ten gigabyte file. The obvious candidate was `URL` against `Referer` and it does not overlap, because on a log of one site the page someone came from and the page they landed on are different sets of strings. Recomputation rules, section 6.6: eight named dependencies priced over every chunk with violations counted while the mapping was built, and one of the eight is a rule. `ClientIP` determines `IPNetworkID` with zero violations in a hundred million rows and saves 18 MB. `URL` determines `URLHash` on a sketch at 0.995 and fails on 11,586,966 actual rows, which is the difference between a dependency that holds on an estimate and one that holds on the data.
+
+What did move the number was a single-column encoding. Front coding a sorted dictionary took the three columns that are 52 percent of the file from 6.11 GB to 4.44 GB and the whole file from 11.65 GB to 9.65 GB. The shape the chooser picked for `URL`, unprompted and six levels deep, is `DICT(FRONT(DICT(DELTA(RLE(FOR+BITPACK, FOR+BITPACK))), FSST[255](DICT(DELTA(RLE(...))))), RLE(...))`.
+
+Two of the three sub-claims on this axis survive and one does not, and they are now stated separately rather than as one number. On disk it is 2.1x and the ceiling on this dataset is not known to be much better. Peak resident set and CPU-seconds were not measured by M1 and keep their 10x claims, which M2 and later have to defend on their own.
+
+Open question five is answered on the way past. Streaming 105 columns of a 14 GB file through the chooser, building every dictionary in it, peaked at 1002 MB resident. The memory is not what makes a global dictionary impractical. The encode throughput is: 5 MB/s of values a core, which is 5.6 CPU hours for this file, roughly twenty times slower than the read path, and that is a finding of the milestone rather than an implementation detail. `spec/engine/14-plan.md` section 14.4 schedules the fix.
+
 **Peak resident set.** The measurement is peak RSS during a single query at a fixed thread count, reported per query. DuckDB's high-cardinality aggregations build hash tables proportional to the distinct count, which on Q32 is roughly 100 million entries. The heavy-hitter mechanism in 2.4 replaces that with a fixed-size sketch, so 10x on those queries is not incremental, it is structural. On queries where the working set is genuinely proportional to the data, 10x is not available and we report parity.
 
 **CPU-seconds.** Total across all threads, which catches the engine that gets a good wall-clock number by burning sixteen cores on work one core should have done. This is the metric most likely to expose a bad parallel design and it is the reason it is on the axis at all.
@@ -123,7 +137,7 @@ That last technique, storing a derived column as a recomputation rule rather tha
 
 Stated in advance so it is not rationalized away later. Document 17 attaches each of these to a milestone gate.
 
-**If M1 shows that ClickBench hits compresses to no better than 6 GB under the full encoding set including multi-column compression**, then the resource axis is a 3x project and not a 10x project, and the interesting part of the thesis is wrong.
+**If M1 shows that ClickBench hits compresses to no better than 6 GB under the full encoding set including multi-column compression**, then the resource axis is a 3x project and not a 10x project, and the interesting part of the thesis is wrong. **This happened.** M1 measured 9.65 GB, section 2.6.1 has the numbers, and the disk half of the resource axis is a 2.1x result. The rest of this document is what decides whether the project is still worth doing, and the answer written down here is that it is, because the other three axes are untouched by it and because the two 10x claims on this axis that M1 did not measure are still open. What is not allowed is to keep saying 10x on disk, and this section is why.
 
 **If M3 shows that runtime layout adaptation captures less than half of the win that offline layout specialization gets on TPC-H**, then the general-engine version of the Bespoke OLAP result does not exist, the aggregate axis lands at 4x, and the honest thing is to say so and ship a 4x engine.
 
