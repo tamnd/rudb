@@ -25,7 +25,7 @@
 //! the rename is atomic but the directory entry reaching the disk is a separate question that
 //! [`Filesystem::sync_dir`] answers. Modelling that means a pending list per directory as well as
 //! per file, and it is the difference between testing the atomic replace pattern properly and
-//! testing most of it. It is tracked as an issue rather than left as a surprise, and it is needed
+//! testing most of it. It is tracked as issue #19 rather than left as a surprise, and it is needed
 //! before the M6 crash tests can claim to cover the header swap in `spec/05-storage.md`.
 //!
 //! Torn writes within a single `write_at` are not modelled either. A 4 KiB write is atomic on
