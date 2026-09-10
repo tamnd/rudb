@@ -103,6 +103,61 @@ jobs:
           key: nightly-release
       - run: cargo test --workspace --all-features --release
 
+  # "100% compatible with DuckDB" is a claim about a moving target, and the difference between a
+  # maintained property and a sentence that was true once is whether something notices when the
+  # target moves. This is that something. It refetches the grammar at the ref VENDOR records and
+  # opens an issue if the bytes changed. See spec/20-the-grammar.md section 9 for what to do with
+  # the issue, which is mostly reading a diff.
+  grammar-upstream:
+    name: upstream grammar
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: grammar-upstream
+      - name: refetch at the recorded ref
+        run: cargo run -q -p xtask -- vendor-grammar
+      - name: has it moved
+        id: moved
+        run: |
+          if git diff --quiet -- crates/rudb-parse/grammar; then
+            echo "moved=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "moved=yes" >> "$GITHUB_OUTPUT"
+            {
+              echo "commit=$(sed -n 's/^commit: //p' crates/rudb-parse/grammar/VENDOR)"
+              echo "ref=$(sed -n 's/^ref: //p' crates/rudb-parse/grammar/VENDOR)"
+            } >> "$GITHUB_OUTPUT"
+            git diff --stat -- crates/rudb-parse/grammar
+          fi
+      # One open issue at a time. A grammar that moves on three consecutive nights is one piece of
+      # work, and three identical issues is how a useful signal becomes something people filter.
+      - name: open an issue
+        if: steps.moved.outputs.moved == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT: ${{ steps.moved.outputs.commit }}
+          REF: ${{ steps.moved.outputs.ref }}
+        run: |
+          open=$(gh issue list --label area/parser --label kind/compat \
+            --search "in:title upstream grammar moved" --state open --json number --jq length)
+          if [ "$open" != "0" ]; then
+            echo "already tracked, nothing to do"
+            exit 0
+          fi
+          gh issue create \
+            --title "upstream grammar moved at $REF" \
+            --label area/parser --label kind/compat --label priority/p2 \
+            --body "DuckDB's PEG grammar changed at \`$REF\`, now \`$COMMIT\`.
+
+          Run \`cargo xtask vendor-grammar\` locally and read \`git diff crates/rudb-parse/grammar\`. That diff is the complete syntactic change in the release. Then \`cargo xtask gen-grammar\` and the differential parse harness, which is the procedure in \`spec/20-the-grammar.md\` section 9.
+
+          New rules with no transformer case get a refusal naming the rule and an issue each. They must never come back as a syntax error."
+
   # Named so the gap is visible rather than implicit. Each of these turns into a real job at the
   # milestone that makes it possible, per spec/16-testing.md section 16.7.
   planned:

@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod layers;
+mod sha256;
 mod style;
+mod vendor;
 
 fn main() -> ExitCode {
     let task = std::env::args().nth(1);
@@ -19,6 +21,8 @@ fn main() -> ExitCode {
         Some("layers") => layers::check(&root()),
         Some("style") => style::check(&root()),
         Some("msrv") => msrv(),
+        Some("grammar") => vendor::verify(),
+        Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
         Some("ci") => ci(),
         Some("help" | "--help" | "-h") | None => {
             usage();
@@ -41,7 +45,13 @@ fn usage() {
     println!("  layers   every crate depends only on crates of strictly lower rank");
     println!("  style    the prose rules for markdown in this repository");
     println!("  msrv     the workspace still builds on the oldest Rust the manifest claims");
+    println!("  grammar  the vendored DuckDB grammar is byte for byte what VENDOR recorded");
     println!("  ci       everything the per-commit gate runs, in the order it runs it");
+    println!();
+    println!(
+        "  vendor-grammar [ref]   refetch DuckDB's PEG grammar, writing crates/rudb-parse/grammar"
+    );
+    println!("                         not part of the gate, because it needs the network");
 }
 
 /// The workspace root, which is the parent of the directory this crate lives in.
@@ -56,6 +66,7 @@ fn ci() -> Result<(), String> {
     let root = root();
     layers::check(&root)?;
     style::check(&root)?;
+    vendor::verify()?;
     cargo(&["fmt", "--all", "--check"])?;
     cargo(&["clippy", "--workspace", "--all-targets", "--all-features"])?;
     cargo(&["test", "--workspace", "--all-features"])?;

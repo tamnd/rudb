@@ -50,6 +50,8 @@ The implicit cast lattice and the function overload resolution rules are a compa
 
 **Friendly SQL.** DuckDB's dialect extensions, which are a large part of why people use it: trailing commas, `FROM`-first syntax, list comprehensions, lambda functions in `list_transform` and friends, the `->>` JSON operators, string slicing with `[a:b]`, `COLUMNS(*)` expressions with regex, `PIVOT` and `UNPIVOT`, `ASOF` joins, positional joins, and now `NEAREST` joins in v2.0. These are not optional; they are a large fraction of what a DuckDB user's queries contain.
 
+**None of the syntax above is transcribed by hand.** Everything in this section is a set of rules in DuckDB's PEG grammar, which we vendor verbatim and generate a rule table from, so the question of whether rudb parses `SELECT * EXCLUDE (a, b)` or a trailing comma or `USING KEY` is settled by construction rather than by a checklist. Document 20 is the argument and the procedure. What remains work in this document is everything downstream of the parse: the transformer case for each rule, the binder, and the semantics. A rule the grammar has and the transformer does not yet handle is refused by name, never reported as a syntax error, which is the distinction document 14 measures per stage.
+
 ## 10.4 Functions
 
 DuckDB ships on the order of a thousand scalar functions, a few hundred aggregates, and several dozen table functions. That count is the actual scope of this document.

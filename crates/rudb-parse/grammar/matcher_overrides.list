@@ -1,0 +1,28 @@
+# The rules whose bodies the matcher does not walk, extracted from the generated block
+# in src/parser/peg/compiled_grammar.cpp. Three tab separated fields: the rule, the
+# matcher class, and the suggestion the matcher was built with. See
+# spec/20-the-grammar.md section 3.
+Identifier	IdentifierMatcher	SUGGEST_VARIABLE
+ReservedIdentifier	ReservedIdentifierMatcher	SUGGEST_VARIABLE
+CatalogName	IdentifierMatcher	SUGGEST_CATALOG_NAME
+SchemaName	IdentifierMatcher	SUGGEST_SCHEMA_NAME
+ReservedSchemaName	ReservedIdentifierMatcher	SUGGEST_SCHEMA_NAME
+TableName	IdentifierMatcher	SUGGEST_TABLE_NAME
+ReservedTableName	ReservedIdentifierMatcher	SUGGEST_TABLE_NAME
+ColumnName	IdentifierMatcher	SUGGEST_COLUMN_NAME
+ReservedColumnName	ReservedIdentifierMatcher	SUGGEST_COLUMN_NAME
+IndexName	IdentifierMatcher	SUGGEST_VARIABLE
+ReservedIndexName	ReservedIdentifierMatcher	SUGGEST_VARIABLE
+SequenceName	IdentifierMatcher	SUGGEST_VARIABLE
+FunctionName	IdentifierMatcher	SUGGEST_SCALAR_FUNCTION_NAME
+ReservedFunctionName	ReservedIdentifierMatcher	SUGGEST_SCALAR_FUNCTION_NAME
+ReservedKeyword	ReservedIdentifierMatcher	SUGGEST_VARIABLE
+TableFunctionName	IdentifierMatcher	SUGGEST_TABLE_FUNCTION_NAME
+TypeName	IdentifierMatcher	SUGGEST_TYPE_NAME
+ReservedTypeName	ReservedIdentifierMatcher	SUGGEST_TYPE_NAME
+PragmaName	IdentifierMatcher	SUGGEST_PRAGMA_NAME
+SettingName	IdentifierMatcher	SUGGEST_SETTING_NAME
+CopyOptionName	ReservedIdentifierMatcher	SUGGEST_VARIABLE
+NumberLiteral	NumberLiteralMatcher	
+StringLiteral	StringLiteralMatcher	
+OperatorLiteral	OperatorMatcher	
