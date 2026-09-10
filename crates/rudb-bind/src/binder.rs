@@ -102,7 +102,7 @@ impl<'a> Binder<'a> {
     }
 
     /// A table index nothing else has.
-    fn fresh_index(&mut self) -> u32 {
+    pub(crate) fn fresh_index(&mut self) -> u32 {
         let index = self.next_index;
         self.next_index += 1;
         index
@@ -130,7 +130,93 @@ impl<'a> Binder<'a> {
                 }
                 self.bind_set_op(ast, &written, op, quantifier, left, right)
             }
+            ast::QueryBody::Values(rows) => self.bind_values(ast, &written, rows),
         }
+    }
+
+    /// `VALUES (1, 'a'), (2, 'b')`, as a query in its own right.
+    ///
+    /// The column names are `col0`, `col1` and so on, which is what DuckDB calls them, and the
+    /// column types are what every row in that position promotes to. Promotion is the same rule a
+    /// set operation uses, and for the same reason: a column has one type and the rows have to
+    /// agree on it before anything downstream can read the column.
+    fn bind_values(
+        &mut self,
+        ast: &Ast,
+        query: &ast::Query,
+        rows: ast::Slice,
+    ) -> Result<(NodeRef, Scope)> {
+        let written = ast.rows(rows).to_vec();
+        let Some(first) = written.first() else {
+            return Err(Error::binder("VALUES needs at least one row"));
+        };
+        let width = first.len as usize;
+        for (at, row) in written.iter().enumerate() {
+            if row.len as usize != width {
+                return Err(Error::binder(format!(
+                    "VALUES lists must all be the same length, expected {width} columns but row {} has {}",
+                    at + 1,
+                    row.len
+                )));
+            }
+        }
+        // A row of a `VALUES` cannot see a column, because there is nothing under it to see.
+        let empty = Scope::empty();
+        let previous = std::mem::replace(&mut self.clause, "VALUES clause");
+        let mut bound: Vec<Vec<ExprRef>> = Vec::with_capacity(written.len());
+        for row in &written {
+            let mut items = Vec::with_capacity(width);
+            for &expr in ast.expr_list(*row) {
+                items.push(self.bind_expr(ast, expr, &empty)?);
+            }
+            bound.push(items);
+        }
+        self.clause = previous;
+        let mut types = Vec::with_capacity(width);
+        for at in 0..width {
+            let mut ty = self.plan.expr_type(bound[0][at]).clone();
+            for row in &bound[1..] {
+                let other = self.plan.expr_type(row[at]).clone();
+                ty = ty.promote(&other).ok_or_else(|| {
+                    Error::binder(format!(
+                        "Cannot combine a value of type {ty} with a value of type {other} in column {} of a VALUES",
+                        at + 1
+                    ))
+                })?;
+            }
+            types.push(ty);
+        }
+        let mut slices = Vec::with_capacity(bound.len());
+        for row in &bound {
+            let items: Vec<ExprRef> =
+                row.iter().zip(&types).map(|(&expr, ty)| self.cast_to(expr, ty)).collect();
+            slices.push(self.plan.add_expr_list(&items));
+        }
+        let rows = self.plan.add_rows(&slices);
+        let fields: Vec<Field> = types
+            .iter()
+            .enumerate()
+            .map(|(at, ty)| Field::new(format!("col{at}"), ty.clone()))
+            .collect();
+        let columns = self.plan.add_fields(&fields);
+        let index = self.fresh_index();
+        let mut node = self.plan.add_node(Node::Values { index, columns, rows });
+        let mut scope = Scope::empty();
+        for (at, field) in fields.iter().enumerate() {
+            scope.push(Visible {
+                table: String::new(),
+                name: field.name.clone(),
+                binding: ColumnBinding::new(index, at as u32),
+                ty: field.ty.clone(),
+            });
+        }
+        let keys = self.sort_keys(ast, query, &scope, &[])?;
+        if !keys.is_empty() {
+            let keys = self.plan.add_sort_keys(&keys);
+            node = self.plan.add_node(Node::Sort { input: node, keys });
+        }
+        node = self.apply_limit(ast, query, node)?;
+        Ok((node, scope))
     }
 
     fn bind_set_op(
@@ -681,6 +767,18 @@ impl<'a> Binder<'a> {
                 } else {
                     ast.string(alias).to_string()
                 };
+                scope.relabel(&label);
+                if !columns.is_empty() {
+                    let names: Vec<&str> = ast.name(columns).collect();
+                    scope.rename(&names, &label)?;
+                }
+                Ok((node, scope))
+            }
+            ast::Source::Values { rows, alias, columns } => {
+                let bare = ast::Query::bare(ast::QueryBody::Values(rows));
+                let (node, mut scope) = self.bind_values(ast, &bare, rows)?;
+                let label =
+                    if alias == NONE { String::new() } else { ast.string(alias).to_string() };
                 scope.relabel(&label);
                 if !columns.is_empty() {
                     let names: Vec<&str> = ast.name(columns).collect();

@@ -1,5 +1,6 @@
 //! The handle everything else hangs off.
 
+use rudb_bind::Bound;
 use rudb_catalog::Catalog;
 use rudb_common::{Error, Field, Result, Value};
 
@@ -116,7 +117,75 @@ impl Database {
     /// mostly cast failures and arithmetic that leaves the range of its type.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         let plan = rudb_bind::bind_sql(sql, &self.catalog)?;
-        let mut root = rudb_exec::build(&plan, &self.catalog)?;
+        self.run(&plan)
+    }
+
+    /// Runs one statement, which may change the database.
+    ///
+    /// This is [`Database::query`] plus the statements that write. A `SELECT` returns its rows, and
+    /// a `CREATE TABLE`, a `DROP TABLE` or an `INSERT` returns an empty result, which is what
+    /// DuckDB's own C API does for them. `INSERT` does not report a row count yet, because a row
+    /// count wants a `Count` column in the result and that is the same shape as `RETURNING`, which
+    /// is not bound yet either.
+    ///
+    /// # Errors
+    ///
+    /// A parse error, a binder error, a catalog error, or anything the operators raise.
+    pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
+        match rudb_bind::bind_statement_sql(sql, &self.catalog)? {
+            Bound::Query(plan) => self.run(&plan),
+            Bound::CreateTable(create) => {
+                self.run_create_table(create)?;
+                Ok(QueryResult::empty())
+            }
+            Bound::DropTable(drop) => {
+                for name in &drop.names {
+                    self.catalog.drop_table(name)?;
+                }
+                Ok(QueryResult::empty())
+            }
+            Bound::Insert(insert) => {
+                // The source runs to completion before anything is appended, which is not an
+                // implementation detail. `INSERT INTO t SELECT * FROM t` reads the table it writes,
+                // and a version of this that appended chunk by chunk would either read its own
+                // output forever or depend on how the scan holds its chunks.
+                let result = self.run(&insert.source)?;
+                let table = self.catalog.table_mut(&insert.name)?;
+                for chunk in result.chunks() {
+                    table.rows_mut().append(chunk.clone())?;
+                }
+                Ok(QueryResult::empty())
+            }
+        }
+    }
+
+    /// The `CREATE TABLE` half of [`Database::execute`].
+    fn run_create_table(&mut self, create: rudb_bind::CreateTable) -> Result<()> {
+        if create.if_not_exists && self.catalog.table(&create.name).is_ok() {
+            return Ok(());
+        }
+        // The query runs before the old table is dropped, so `CREATE OR REPLACE TABLE t AS SELECT
+        // * FROM t` reads the table it is about to replace rather than the empty new one.
+        let rows = match &create.source {
+            Some(plan) => Some(self.run(plan)?),
+            None => None,
+        };
+        if create.or_replace && self.catalog.table(&create.name).is_ok() {
+            self.catalog.drop_table(&create.name)?;
+        }
+        self.catalog.create_table(create.name.clone(), create.columns)?;
+        if let Some(rows) = rows {
+            let table = self.catalog.table_mut(&create.name)?;
+            for chunk in rows.chunks() {
+                table.rows_mut().append(chunk.clone())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds and drains one plan.
+    fn run(&self, plan: &rudb_plan::Plan) -> Result<QueryResult> {
+        let mut root = rudb_exec::build(plan, &self.catalog)?;
         let names = root.schema().names();
         let types = root.schema().types();
         let mut chunks = Vec::new();
