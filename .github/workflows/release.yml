@@ -6,8 +6,13 @@
 # two extra targets people actually deploy on, and a host that fails to build blocks the release
 # rather than being dropped from it.
 #
-# crates.io comes last on purpose. A version there cannot be taken back, only yanked, so nothing
-# is uploaded until the tag has passed the gate and built everywhere.
+# A version on crates.io cannot be taken back, only yanked, so nothing is uploaded until the tag
+# has passed the gate. It does not wait for the binary matrix. What goes to the registry is source
+# that `cargo publish` compiles and verifies for itself on a Linux runner, so a cross build for a
+# host nobody is installing from cargo on cannot make that upload any more correct. It can and did
+# make it never happen: the 0.0.2 tag had both macOS jobs sit unassigned in GitHub's hosted queue
+# for half an hour with every other job green, and the registry has no reason to be downstream of
+# that.
 
 name: release
 
@@ -212,7 +217,7 @@ jobs:
   # is already up and re-running the job carries on from there.
   crates-io:
     name: publish to crates.io
-    needs: publish
+    needs: verify
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 330
