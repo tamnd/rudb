@@ -153,7 +153,7 @@ The cost of memoizing successes is that a failed attempt must not truncate the n
 
 Written down because it will be run by somebody who has not read this document.
 
-1. `cargo xtask vendor-grammar <ref>` fetches the grammar at the ref, resolves it to a commit SHA, rewrites `VENDOR`, and refuses to write anything if the upstream layout has moved. With no argument it re-fetches the ref already recorded, which is how you find out whether upstream has moved without deciding to move with it.
+1. `cargo xtask vendor-grammar <ref>` fetches the grammar at the ref, resolves it to a commit SHA, rewrites `VENDOR`, and refuses to write anything if the upstream layout has moved. With no argument it re-fetches the ref already recorded, which is how you find out whether upstream has moved without deciding to move with it. If every checksum comes back the same it writes nothing at all and says so, leaving the pin at the commit where the content was last actually different. DuckDB lands several commits a day and almost none of them touch these forty files, so a tool that rewrote the pin and the date on every run would put a diff in the working tree every time and train everybody to ignore the one that means something.
 2. `git diff crates/rudb-parse/grammar` is the complete syntactic change in that release. Read it. For a patch release it is tens of lines.
 3. `cargo xtask gen-grammar`. The table diff should be proportionate to the grammar diff. If it is not, the generator has a bug and that is the finding.
 4. Run the differential parse harness from document 14 against the new DuckDB build. Accept and reject must agree across the whole corpus. New syntax that we now parse and cannot yet transform shows up here as a refusal by name, never as a syntax error.
@@ -174,7 +174,7 @@ The shape is the useful part. Within a release series the grammar is nearly stat
 
 So the recurring cost of staying current is a day for a patch series and a week for a major, and almost none of that week is the grammar. It is the transformer catching up with whatever the new rules mean.
 
-CI runs step one once a week against the upstream default branch and opens an issue when the SHA moves. That mechanism is the difference between "100% compatible with DuckDB" being a maintained property and being a claim that was true on the day somebody wrote it down.
+CI runs step one nightly against the recorded ref and opens one issue when the grammar moves, deduplicated on the open issue, because a grammar that moves on three consecutive nights is one piece of work. That mechanism is the difference between "100% compatible with DuckDB" being a maintained property and being a claim that was true on the day somebody wrote it down. It is worth only as much as its false alarm rate, which is why it asks whether the grammar moved rather than whether DuckDB did.
 
 ## 20.10 Where fidelity actually leaks
 
