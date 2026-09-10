@@ -112,6 +112,16 @@ for attempt in $(seq 1 "$attempts"); do
     exit 0
   fi
 
+  # Somebody else got there first. The release workflow publishes and so does this script when it is
+  # run by hand because the workflow is stuck behind a runner queue, and the two of them racing is
+  # the normal case rather than the odd one. The index is read fresh at the top of every attempt, so
+  # the answer is to go around again and let that read decide, not to fail on a crate that is up.
+  if grep -q "already exists on crates.io index" /tmp/publish.log; then
+    echo "something else published a crate while this ran, re-reading the index in 10s"
+    sleep 10
+    continue
+  fi
+
   if ! grep -q "429 Too Many Requests" /tmp/publish.log; then
     echo "the publish failed for a reason that waiting will not fix" >&2
     exit 1
