@@ -6,7 +6,8 @@ The version number says how far through the plan we are. **The minor version is 
 
 ## Unreleased
 
-Nothing yet.
+- DuckDB's PEG grammar is vendored, at `crates/rudb-parse/grammar`. In v2.0 DuckDB replaced its bison parser with a PEG parser whose grammar ships as 61 KB of declarative text with no semantic actions in it, MIT licensed, and that text is the definition of the dialect this project claims compatibility with. Vendoring it removes 1,086 chances to reject valid DuckDB SQL by hand, and removes them again on every upstream release. `cargo xtask vendor-grammar` is the only thing that writes there, `cargo xtask grammar` fails the build if anything else did, and a nightly job reopens the question when upstream moves. `spec/20-the-grammar.md` is the argument, the measurements, and the three places fidelity still leaks.
+- `spec/04-architecture.md` section 4.5 said hand-written recursive descent and that we start where DuckDB ended up minus the generator. Where they ended up is the generator, so that is corrected. Error recovery moves off the query path in the same edit: a PEG matcher that resynchronizes past an error accepts strings DuckDB rejects, so the strict parse is what a query gets and recovery is a second entry point over the same rule table for tooling.
 
 ## 0.0.1
 

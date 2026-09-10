@@ -66,6 +66,8 @@ The honest counterweight: `std::simd` is [still nightly only](https://github.com
 
 **No distributed execution.** rudb speaks the Quack wire protocol for compatibility with DuckDB 2.0 clients and it does not shard. The [Cloudspecs analysis](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/cloudspecs-final.pdf) (Steinert, Kuschewski and Leis, CIDR 2026) is the argument: over 2015 to 2025 maximum instance core count grew by an order of magnitude to 448 cores on `u7in`, network bandwidth per dollar improved by an order of magnitude, but per-core CPU and DRAM gains were much smaller and NVMe performance per dollar has been flat since 2016. The 2026 answer to a large analytical workload is one very large machine.
 
+**DuckDB's PEG grammar is vendored verbatim rather than transcribed.** In v2.0 DuckDB replaced its bison parser with a PEG parser whose grammar ships as sixty one kilobytes of declarative text with no semantic actions in it, MIT licensed. That text is the definition of the dialect we claim compatibility with, so we take the file rather than retyping 1,086 rules and then retyping their diff on every release. A generator turns it into a Rust rule table, the matcher interprets that table, and `cargo xtask grammar` fails the build if anybody edits the vendored tree. The tokenizer, the transformer and the binder are still ours, and document 20 is explicit about which parts of compatibility this buys and which three it does not.
+
 **Every layer has a textual form and a round-trip parser.** Logical plan, physical plan, encoded chunk metadata, the compiled pipeline IR. Every stage can be dumped, diffed, fuzzed and bisected in isolation. This is what "modular" cashes out to, and it is the mechanism by which a new result from the literature can be dropped into one crate and measured without touching the others. Documents 04 and 16.
 
 ## The documents
@@ -92,6 +94,7 @@ The honest counterweight: `std::simd` is [still nightly only](https://github.com
 | 17 | `17-milestones.md` | M0 to M11, exit criteria, and the three places it is sane to stop |
 | 18 | `18-package-layout.md` | the crate tree, dependency rules, stability tiers |
 | 19 | `19-open-questions.md` | the ranked list that has to be answered, and by when |
+| 20 | `20-the-grammar.md` | why DuckDB's PEG grammar is vendored, what it does and does not buy |
 
 Read 02 first, then 03, then 01. Document 02 decides whether the project is honest, document 03 is the measurement it rests on, and document 01 is the literature that says the measurement is reachable.
 

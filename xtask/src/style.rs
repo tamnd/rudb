@@ -102,6 +102,14 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
         if name.starts_with('.') || name == "target" {
             continue;
         }
+        // A directory with a VENDOR file in it is somebody else's tree and its prose is not ours
+        // to have opinions about. `cargo xtask grammar` checks it is byte for byte upstream's,
+        // which is the opposite requirement to this check, so running both on it means one of them
+        // has to lose. Today the only such tree is the DuckDB grammar and it has no markdown in
+        // it, which is exactly why this belongs here now rather than after the day it does.
+        if path.is_dir() && path.join("VENDOR").is_file() {
+            continue;
+        }
         if path.is_dir() {
             collect(&path, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
