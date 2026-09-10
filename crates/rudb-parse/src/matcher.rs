@@ -24,14 +24,15 @@
 //! choice of thirty six alternatives and upstream descends into each one far enough to fail. Here
 //! an alternative whose FIRST set does not contain the token in hand is skipped on one AND. A
 //! nullable node is never skipped, because it can match without looking at the token at all, which
-//! is why the guard reads `NULLABLE` before it reads `FIRST`.
+//! is why the guard tests the nullable bit before it tests the set. Both live in the node, so the
+//! guard and the work it guards read the same twenty four bytes.
 //!
 //! `spec/20-the-grammar.md` sections 3, 5 and 6.
 
 use rudb_common::{Error, Result};
 
 use crate::generated::keywords::{KEYWORDS, UNRESERVED};
-use crate::generated::rules::{CHILDREN, FIRST, NODES, NULLABLE, PROGRAM, RULES, SYMBOLS};
+use crate::generated::rules::{CHILDREN, NODES, PROGRAM, RULES, SYMBOLS};
 use crate::rules::{Node, Op, Suggestion};
 use crate::token::{Flags, Kind, Token};
 use crate::tokenize::tokenize;
@@ -395,20 +396,17 @@ impl<'a> Matcher<'a> {
     /// Handle one node.
     fn enter(&mut self, index: u32) -> Result<Action> {
         self.steps += 1;
+        let node = NODES[index as usize];
         // The superset test, and only its no. A nullable node can match without reading a token at
         // all, so its FIRST set says nothing about whether it applies and asking would reject the
         // empty match that is the whole point of it.
-        if self.filter
-            && !NULLABLE[index as usize]
-            && FIRST[index as usize] & self.key(self.pos) == 0
-        {
+        if self.filter && !node.can_start(self.key(self.pos)) {
             self.reached(self.pos);
             return Ok(Action::Fail);
         }
 
-        let node = NODES[index as usize];
         match node.op {
-            Op::Rule => self.enter_rule(node.a),
+            Op::Rule => self.enter_rule(node.a, node.b),
             Op::Sequence => {
                 self.push(self.frame(FrameOp::Sequence, node.a, node.b))?;
                 Ok(Action::Enter(CHILDREN[node.a as usize]))
@@ -434,7 +432,7 @@ impl<'a> Matcher<'a> {
     }
 
     /// A reference to a rule, which is the only thing that makes a tree node.
-    fn enter_rule(&mut self, rule: u32) -> Result<Action> {
+    fn enter_rule(&mut self, rule: u32, root: u32) -> Result<Action> {
         let slot = self.slot_of[rule as usize];
         if slot != NONE {
             match self.memo[self.memo_index(slot)] {
@@ -453,7 +451,7 @@ impl<'a> Matcher<'a> {
             }
         }
         self.push(self.frame(FrameOp::Rule, rule, 0))?;
-        Ok(Action::Enter(RULES[rule as usize].root))
+        Ok(Action::Enter(root))
     }
 
     fn memo_index(&self, slot: u32) -> usize {
