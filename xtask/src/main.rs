@@ -15,6 +15,7 @@ mod layers;
 mod sha256;
 mod style;
 mod vendor;
+mod version;
 
 fn main() -> ExitCode {
     let task = std::env::args().nth(1);
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
             codegen::generate(std::env::args().nth(2).as_deref() == Some("--check"))
         }
         Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
+        Some("version") => version::set(&root(), std::env::args().nth(2).as_deref()),
         Some("ci") => ci(),
         Some("help" | "--help" | "-h") | None => {
             usage();
@@ -54,6 +56,7 @@ fn usage() {
         "  gen-grammar [--check]  regenerate crates/rudb-parse/src/generated from that grammar"
     );
     println!("  ci       everything the per-commit gate runs, in the order it runs it");
+    println!("  version <x.y.z>        set the workspace version and every internal pin");
     println!();
     println!(
         "  vendor-grammar [ref]   refetch DuckDB's PEG grammar, writing crates/rudb-parse/grammar"
