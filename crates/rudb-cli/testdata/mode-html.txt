@@ -1,0 +1,16 @@
+<tr><th>a</th>
+<th>b</th>
+<th>c</th>
+</tr>
+<tr><td>1</td>
+<td>one</td>
+<td>1.5</td>
+</tr>
+<tr><td>2</td>
+<td>two</td>
+<td>2.25</td>
+</tr>
+<tr><td>30</td>
+<td>a longer one</td>
+<td>-3.0</td>
+</tr>

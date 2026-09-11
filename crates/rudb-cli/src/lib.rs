@@ -1,9 +1,110 @@
 //! The command line shell.
 //!
 //! Rank 15 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
+//!
+//! The binary is a few lines over this, so that the shell can be driven from a test without
+//! spawning a process and so that `rudb-compat` can drive it as a target the same way it drives the
+//! library. Everything the shell does goes through [`rudb::Database`], which means the shell has no
+//! way to reach anything the embedding API cannot, which is the point: if the prompt can do it, a
+//! program can do it.
+//!
+//! The command line and the dot commands are DuckDB's, down to the single dash long options it
+//! inherits from SQLite. The output modes are DuckDB's too, byte for byte, because the reason
+//! anybody pipes a shell into another program is that they already know what comes out.
 
 #![forbid(unsafe_code)]
 
-/// The crate this rank belongs to, so that the layer check has something to read and the
-/// scaffold compiles. Replaced by the first real item.
-pub const RANK: u8 = 15;
+pub mod args;
+pub mod format;
+pub mod help;
+pub mod shell;
+
+use std::io::{IsTerminal, Read, Write};
+use std::process::ExitCode;
+
+pub use args::{Action, Command, Options, parse};
+pub use format::{Format, Settings};
+pub use shell::{Shell, Stop};
+
+/// The version, which `-version` prints and which the greeting carries.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The whole program, minus the process it runs in.
+///
+/// `out` and `err` are handed in rather than taken from the process so that a test can read what
+/// came out of each without a pipe and without a temporary file.
+pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> ExitCode {
+    let mut err = err;
+    match parse(arguments) {
+        Action::Version => {
+            let mut out = out;
+            let _ = writeln!(out, "rudb {VERSION}");
+            ExitCode::SUCCESS
+        }
+        Action::Help => {
+            let mut out = out;
+            let _ = write!(out, "{}", help::USAGE);
+            ExitCode::SUCCESS
+        }
+        Action::Config => {
+            let mut out = out;
+            print_config(&mut out);
+            ExitCode::SUCCESS
+        }
+        Action::Wrong(why) => {
+            let _ = writeln!(err, "rudb: {why}");
+            let _ = writeln!(err, "rudb: try `rudb -help`");
+            ExitCode::FAILURE
+        }
+        Action::Run(options) => {
+            if options.database != ":memory:" {
+                let _ = writeln!(
+                    err,
+                    "rudb: cannot open {}, because there is no storage format yet. See https://github.com/tamnd/rudb/issues/103",
+                    options.database
+                );
+                return ExitCode::FAILURE;
+            }
+            let mut shell = Shell::new(&options, out, err);
+            let mut stop = shell.run_commands(&options.commands);
+            if stop == Stop::Done && !options.stop_after_commands {
+                stop = read_input(&mut shell, &options);
+            }
+            let _ = stop;
+            if shell.failed() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+        }
+    }
+}
+
+/// Reads whatever is on standard input, with a prompt if that is a terminal.
+///
+/// There is no line editing, so no history, no arrow keys and no completion. That wants a
+/// dependency and the dependency budget in `spec/18-package-layout.md` is a decision to make on
+/// purpose rather than in passing, so it is a separate change. Everything else about the prompt
+/// works, including multi line statements.
+fn read_input(shell: &mut Shell, options: &Options) -> Stop {
+    let stdin = std::io::stdin();
+    let interactive = options.interactive.unwrap_or_else(|| stdin.is_terminal());
+    if !interactive {
+        let mut text = String::new();
+        if stdin.lock().read_to_string(&mut text).is_err() {
+            return Stop::Done;
+        }
+        return shell.run_input(&text);
+    }
+    shell.greet();
+    shell.prompt(&stdin)
+}
+
+/// The settled decisions from `spec/00-README.md` that a reader would otherwise have to take on
+/// trust. Printing them is cheap and it makes a bug report say which build it came from.
+fn print_config(out: &mut dyn Write) {
+    let _ = writeln!(out, "version: {VERSION}");
+    let _ = writeln!(out, "vector-size: 1024");
+    let _ = writeln!(out, "row-group-size: 122880");
+    let _ = writeln!(out, "storage-format: native (rudb v1), DuckDB import and export");
+    let _ = writeln!(out, "execution-tiers: interpreted");
+    let _ = writeln!(out, "duckdb-compat-level: 0 (nothing is implemented yet)");
+    let _ = writeln!(out, "target: {}", std::env::consts::ARCH);
+    let _ = writeln!(out, "os: {}", std::env::consts::OS);
+}

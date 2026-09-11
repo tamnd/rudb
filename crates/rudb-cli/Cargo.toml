@@ -12,6 +12,10 @@ keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
 
+[lib]
+name = "rudb_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rudb"
 path = "src/main.rs"

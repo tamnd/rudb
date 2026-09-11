@@ -106,6 +106,42 @@ impl Database {
         Ok(self.catalog.table(&resolved)?.rows().len())
     }
 
+    /// Every table in the database, unqualified, in creation order.
+    ///
+    /// Unqualified because that is what a person typing `.tables` wants to read and what they would
+    /// then type into a query. Two tables of the same name in different schemas both appear, which
+    /// is the same thing DuckDB's `.tables` does.
+    #[must_use]
+    pub fn table_names(&self) -> Vec<String> {
+        self.catalog.tables().map(|table| table.name().table.clone()).collect()
+    }
+
+    /// The `CREATE TABLE` that would define a table as it stands.
+    ///
+    /// Built from the catalog rather than remembered from the statement that made it, so a table
+    /// defined by [`Database::create_table`] describes itself as well as one defined by SQL. It
+    /// carries the column names, the types and `NOT NULL`, and nothing else, because nothing else
+    /// is in the catalog yet. Defaults, primary keys and check constraints appear here the day the
+    /// catalog holds them.
+    ///
+    /// # Errors
+    ///
+    /// If the name does not resolve or the table does not exist.
+    pub fn table_sql(&self, name: &str) -> Result<String> {
+        let parts: Vec<&str> = name.split('.').collect();
+        let resolved = self.catalog.resolve(&parts)?;
+        let table = self.catalog.table(&resolved)?;
+        let columns: Vec<String> = table
+            .columns()
+            .iter()
+            .map(|field| {
+                let null = if field.not_null { " NOT NULL" } else { "" };
+                format!("{} {}{null}", field.name, field.ty)
+            })
+            .collect();
+        Ok(format!("CREATE TABLE {}({});", resolved.table, columns.join(", ")))
+    }
+
     /// Runs one query and returns every row it produced.
     ///
     /// Takes `&self`, so a query cannot change the database and two of them can run at once. See

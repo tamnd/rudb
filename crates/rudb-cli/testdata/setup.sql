@@ -1,0 +1,2 @@
+CREATE TABLE t(a INTEGER, b VARCHAR, c DOUBLE);
+INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.25), (30, 'a longer one', -3.0);
