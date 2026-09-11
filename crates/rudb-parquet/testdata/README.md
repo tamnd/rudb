@@ -62,3 +62,30 @@ pq.write_table(table.select(["words"]), "lengths.parquet", compression="snappy",
 DuckDB reads `delta.parquet` as n=4096, sum(ints)=23111680, min(ints)=-500, max(ints)=11785, sum(longs)=4095999941294080, count(words)=3640, min(words)='prefix_00000', max(words)='prefix_01023', sum(downs)=4193280.0.
 
 It reads `lengths.parquet` as n=4096, count(words)=3640 with the same bounds.
+
+## bytes.parquet
+
+Written by pyarrow 23.0.1, Snappy, two row groups of 1024 rows, two `binary` columns.
+
+A `binary` column comes out as a `BYTE_ARRAY` with no logical type annotation on it, which is what DuckDB and this reader both call a `BLOB`, and there is no way to get one out of the DuckDB binary because DuckDB annotates everything it writes.
+
+That matters more than a fixture usually does, because every one of the twenty eight byte array columns in the ClickBench file is unannotated in exactly this way.
+
+```python
+import pyarrow as pa, pyarrow.parquet as pq
+
+n = 2048
+words = [None if i % 11 == 0 else b"byte_%04d" % (i // 2) for i in range(n)]
+raw = [bytes([0xff, 0xfe, i % 256]) for i in range(n)]
+table = pa.table({
+    "words": pa.array(words, pa.binary()),
+    "raw": pa.array(raw, pa.binary()),
+})
+pq.write_table(table, "bytes.parquet", compression="snappy", row_group_size=1024)
+```
+
+`words` holds text, so it is the column that has to read, and it repeats each value twice and goes null every eleventh row so that a reader which decoded the values densely and never spread them over the nulls gets the count right and the positions wrong.
+
+`raw` starts every value with `0xff 0xfe`, which is not valid UTF-8 under any reading, so it is the column that has to be refused by name rather than decoded into something.
+
+DuckDB reads both columns as `BLOB` and answers n=2048, count(words)=1861, sum(octet_length(words))=16749, min(words)='byte_0000', max(words)='byte_1023'.
