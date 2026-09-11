@@ -2,11 +2,14 @@
 
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use rudb_bind::Bound;
+use rudb_bind::{Bound, Parameters};
 use rudb_catalog::Catalog;
 use rudb_common::{Error, Field, Result, Value};
 
+use rudb_parse::ast::Ast;
+
 use crate::connection::{Connection, single};
+use crate::prepared::Prepared;
 use crate::result::QueryResult;
 
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
@@ -79,6 +82,18 @@ impl Database {
     #[must_use]
     pub fn connect(&self) -> Connection {
         Connection::new(self.shared.clone())
+    }
+
+    /// Parses a statement so it can be run more than once, with values for its parameters.
+    ///
+    /// The same call as [`Connection::prepare`].
+    ///
+    /// # Errors
+    ///
+    /// A parse error. A name that does not resolve or a type that does not work out is an error at
+    /// execution rather than here, because a parameter has no type until it has a value.
+    pub fn prepare(&self, sql: &str) -> Result<Prepared> {
+        Prepared::new(self.shared.clone(), sql)
     }
 
     /// Reads the catalog.
@@ -278,8 +293,17 @@ impl Shared {
     /// SELECT * FROM t` would otherwise read the table under a read lock, let go, and append to
     /// whatever the table had become in between.
     pub(crate) fn execute(&self, sql: &str) -> Result<QueryResult> {
+        let ast = rudb_parse::parse_ast(sql)?;
+        self.execute_ast(&ast, &Parameters::new())
+    }
+
+    /// Runs one parsed statement, with values for its parameters.
+    ///
+    /// The prepared statement path, and the path an ordinary statement takes once it is parsed, so
+    /// that there is one description of what running a statement does.
+    pub(crate) fn execute_ast(&self, ast: &Ast, parameters: &Parameters) -> Result<QueryResult> {
         let mut catalog = self.write();
-        match rudb_bind::bind_statement_sql(sql, &catalog)? {
+        match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize(&mut plan)?;
                 run(&plan, &catalog)

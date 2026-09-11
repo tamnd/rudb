@@ -3,6 +3,7 @@
 use rudb_common::{Error, Result, Value};
 
 use crate::database::Shared;
+use crate::prepared::Prepared;
 use crate::result::QueryResult;
 
 /// A connection to a database.
@@ -58,6 +59,16 @@ impl Connection {
     /// A parse error or a binder error.
     pub fn plan(&self, sql: &str) -> Result<String> {
         self.shared.plan(sql)
+    }
+
+    /// Parses a statement so it can be run more than once, with values for its parameters.
+    ///
+    /// # Errors
+    ///
+    /// A parse error. A name that does not resolve or a type that does not work out is an error at
+    /// execution rather than here, because a parameter has no type until it has a value.
+    pub fn prepare(&self, sql: &str) -> Result<Prepared> {
+        Prepared::new(self.shared.clone(), sql)
     }
 
     /// Runs a query and returns the single value it produced.

@@ -56,10 +56,31 @@ impl Binder<'_> {
                 Err(Error::not_implemented("a row value outside of a VALUES clause".to_string()))
             }
             ast::Expr::List { items } => self.bind_list(ast, items, scope),
+            ast::Expr::Parameter { name } => self.bind_parameter(ast, name),
             ast::Expr::Subquery { .. } => {
                 Err(Error::not_implemented("a scalar subquery".to_string()))
             }
         }
+    }
+
+    /// `?`, `?1`, `$1` or `$name`, which is the value the statement was prepared with.
+    ///
+    /// A constant, because the value is known by the time this runs. A statement is parsed once and
+    /// bound once per set of values, so the plan a prepared statement runs is an ordinary plan and
+    /// nothing after the binder knows a parameter was ever written. The cost of that is binding
+    /// again for each execution, which is the front end and not the query, and the benefit is that
+    /// the optimizer gets to fold and prune with the values in hand.
+    fn bind_parameter(&mut self, ast: &Ast, name: ast::StrRef) -> Result<ExprRef> {
+        let name = ast.string(name);
+        let Some(value) = self.parameters.get(name) else {
+            // DuckDB's first line, then ours, because the second half of its sentence names PREPARE
+            // and PREPARE is #152. The library route works today.
+            return Err(Error::invalid_input(
+                "Prepared statement parameters cannot be used directly\nTo use prepared statement \
+                 parameters, prepare the statement first, which is Connection::prepare",
+            ));
+        };
+        Ok(self.plan_mut().add_constant(value.clone()))
     }
 
     fn bind_column(&mut self, ast: &Ast, name: ast::Slice, scope: &Scope) -> Result<ExprRef> {
@@ -425,7 +446,10 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
         return false;
     }
     match ast.expr(expr) {
-        ast::Expr::Star { .. } | ast::Expr::Column { .. } | ast::Expr::Literal { .. } => false,
+        ast::Expr::Star { .. }
+        | ast::Expr::Column { .. }
+        | ast::Expr::Literal { .. }
+        | ast::Expr::Parameter { .. } => false,
         ast::Expr::Unary { operand, .. } => has_aggregate(ast, operand),
         ast::Expr::Binary { left, right, .. } => {
             has_aggregate(ast, left) || has_aggregate(ast, right)
@@ -567,6 +591,9 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
                 ast.expr_list(items).iter().map(|&item| describe(ast, item)).collect();
             format!("main.list_value({})", items.join(", "))
         }
+        // DuckDB names the column after the parameter, so `SELECT ?` comes back as `$1` whatever
+        // the value turns out to be.
+        ast::Expr::Parameter { name } => format!("${}", ast.string(name)),
         ast::Expr::Subquery { .. } => "subquery".to_string(),
     }
 }
