@@ -342,7 +342,14 @@ fn sides(
 }
 
 /// Puts `parts` back as one filter over `input`, or hands back `input` when there are none.
+///
+/// A conjunct that is a true constant is not put back, because it keeps every row and the only thing
+/// it would do is be evaluated once per row to say so. `WHERE true` therefore leaves no filter at
+/// all, and `WHERE a AND true` leaves the half that means something. That is where the binary drops
+/// it too: the filter is taken apart and rebuilt on the way down, so the conjunct that decides
+/// nothing simply never goes back in.
 fn filter(plan: &mut Plan, input: NodeRef, parts: Vec<ExprRef>) -> NodeRef {
+    let parts: Vec<ExprRef> = parts.into_iter().filter(|&part| !always(plan, part)).collect();
     let predicate = match parts.len() {
         0 => return input,
         1 => parts[0],
@@ -353,6 +360,18 @@ fn filter(plan: &mut Plan, input: NodeRef, parts: Vec<ExprRef>) -> NodeRef {
         }
     };
     plan.add_node(Node::Filter { input, predicate })
+}
+
+/// Whether a predicate keeps every row it is given.
+///
+/// Only the constant. `a OR NOT a` keeps every row too and is not a constant, and working that out
+/// is the satisfiability question that `crate::nulls` and the binary's filter combiner ask, which is
+/// a different pass from this one.
+fn always(plan: &Plan, predicate: ExprRef) -> bool {
+    let Expr::Constant(value) = *plan.expr(predicate) else {
+        return false;
+    };
+    plan.value(value).as_bool() == Some(true)
 }
 
 /// Adds every conjunct of `predicate` to `into`.

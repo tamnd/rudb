@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Four passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
+//! Five passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
 //! the start of it. Column pruning came first, because it is the pass whose absence is measured in
 //! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod columns;
+pub mod empty;
 pub mod filter;
 pub mod fold;
 pub mod nulls;
@@ -46,11 +47,22 @@ pub const RANK: u8 = 11;
 /// projection reads, and pruning has to see the plan after the move or it drops a column that
 /// something now refers to.
 ///
+/// Empty result pullup is after filter pushdown, because pushdown is what moves an unsatisfiable
+/// predicate down to the scan it should stop and what drops the conjuncts that were always true, so
+/// the pass that looks for a predicate nothing can satisfy should look after that has happened. It
+/// is before pruning for the same reason folding is: the subtrees it removes are subtrees pruning
+/// would otherwise walk and work out column lists for.
+///
 /// Top N is last, because it is the one pass that fuses two operators into one rather than moving
 /// something around. Everything before it is written against a sort and a limit, and a pass that had
 /// to know about both spellings of the same plan is a pass with two of every rule in it.
-pub static PASSES: [&(dyn Pass + Sync); 4] =
-    [&fold::ExpressionRewriter, &filter::FilterPushdown, &columns::UnusedColumns, &topn::TopN];
+pub static PASSES: [&(dyn Pass + Sync); 5] = [
+    &fold::ExpressionRewriter,
+    &filter::FilterPushdown,
+    &empty::EmptyResultPullup,
+    &columns::UnusedColumns,
+    &topn::TopN,
+];
 
 /// Rewrites a bound plan into the plan that runs, with every pass on.
 ///
