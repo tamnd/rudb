@@ -15,6 +15,7 @@ pub mod filter;
 pub mod fold;
 pub mod pass;
 pub mod tables;
+mod transitive;
 mod walk;
 
 use rudb_common::{Error, Result};
@@ -246,8 +247,10 @@ mod tests {
 
     /// A pass that finds the same work every time it looks, which is what the assertion is for.
     #[derive(Debug)]
+    #[cfg(debug_assertions)]
     struct Restless;
 
+    #[cfg(debug_assertions)]
     impl Pass for Restless {
         fn name(&self) -> &'static str {
             "restless"
@@ -264,7 +267,12 @@ mod tests {
         }
     }
 
+    /// The settle check is a debug build check, so the test for it is a debug build test. Without
+    /// this the release profile job runs a test that asserts an error nothing was going to report,
+    /// which is what it had been doing since #196, because the per commit gate runs the tests once
+    /// and runs them in debug.
     #[test]
+    #[cfg(debug_assertions)]
     fn a_pass_that_never_settles_is_a_reported_error_and_not_a_plan() {
         let text = "Limit 1 offset 0\n  Get memory.main.t AS t #0 [a::INTEGER]\n";
         let mut plan = Plan::parse(text).expect("a well formed plan");
