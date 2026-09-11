@@ -168,7 +168,13 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         Engine::Pool { threads: 4, gap: None },
         Engine::Pool { threads: 8, gap: None },
         Engine::Pool { threads: 16, gap: None },
-        Engine::Pool { threads: 8, gap: Some(512 << 10) },
+        // The gap sweep, at the thread count the unmerged rows above are there to pick. Three
+        // sizes rather than one because the gap is what decides which patterns merge at all, and a
+        // gap large enough to help the scattered pages is large enough to merge the column pattern
+        // into a read of everything between the columns.
+        Engine::Pool { threads: 16, gap: Some(16 << 10) },
+        Engine::Pool { threads: 16, gap: Some(64 << 10) },
+        Engine::Pool { threads: 16, gap: Some(512 << 10) },
     ];
 
     let mut rows = Vec::new();
