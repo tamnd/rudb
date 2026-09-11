@@ -263,8 +263,11 @@ where
     L: Fn(usize) -> usize,
     R: Fn(usize) -> usize,
 {
+    // A `Data::Interval` is in the ordered group because it is a tuple of three integers whose
+    // derived order is months, then days, then microseconds, which is exactly what `order` does for
+    // the same value by hand.
     macro_rules! layouts {
-        ($($variant:ident),+ $(,)?) => {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match (left, right) {
                 $(
                     (Data::$variant(one), Data::$variant(other)) => Some(sweep(
@@ -307,11 +310,7 @@ where
             }
         };
     }
-    // A `Data::Interval` is a tuple of three integers whose derived order is months, then days,
-    // then microseconds, which is exactly what `order` does for the same value by hand.
-    layouts!(
-        Bool, Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, UInt128, Interval
-    )
+    rudb_vector::for_each_layout!(ordered, layouts)
 }
 
 /// Two strings in byte order, resolved from the four byte prefix where it can be.

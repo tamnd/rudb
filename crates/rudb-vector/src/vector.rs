@@ -97,26 +97,22 @@ pub enum Data {
 
 impl Data {
     /// How many values are stored.
+    ///
+    /// The match below has no wildcard arm, and that is what makes this function the check that
+    /// keeps [`for_each_layout`](crate::for_each_layout) honest. A variant added to this enum
+    /// without being added to the `all` group fails to compile here, which is a line in a build log
+    /// rather than a layout quietly missing from six kernels.
     #[must_use]
     pub fn len(&self) -> usize {
-        match self {
-            Self::Empty => 0,
-            Self::Bool(v) => v.len(),
-            Self::Int8(v) => v.len(),
-            Self::Int16(v) => v.len(),
-            Self::Int32(v) => v.len(),
-            Self::Int64(v) => v.len(),
-            Self::Int128(v) => v.len(),
-            Self::UInt8(v) => v.len(),
-            Self::UInt16(v) => v.len(),
-            Self::UInt32(v) => v.len(),
-            Self::UInt64(v) => v.len(),
-            Self::UInt128(v) => v.len(),
-            Self::Float32(v) => v.len(),
-            Self::Float64(v) => v.len(),
-            Self::Interval(v) => v.len(),
-            Self::Varlen(v) => v.len(),
+        macro_rules! lengths {
+            ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+                match self {
+                    Self::Empty => 0,
+                    $(Self::$variant(values) => values.len(),)+
+                }
+            };
         }
+        crate::for_each_layout!(all, lengths)
     }
 
     /// Whether there are no values.
@@ -131,27 +127,29 @@ impl Data {
     /// and scale picked, and by anything else that would otherwise repeat the same five arms.
     #[must_use]
     pub fn signed_at(&self, index: usize) -> Option<i128> {
-        match self {
-            Self::Int8(v) => v.get(index).map(|&x| i128::from(x)),
-            Self::Int16(v) => v.get(index).map(|&x| i128::from(x)),
-            Self::Int32(v) => v.get(index).map(|&x| i128::from(x)),
-            Self::Int64(v) => v.get(index).map(|&x| i128::from(x)),
-            Self::Int128(v) => v.get(index).copied(),
-            _ => None,
+        macro_rules! widened {
+            ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+                match self {
+                    $(Self::$variant(v) => v.get(index).map(|&x| i128::from(x)),)+
+                    _ => None,
+                }
+            };
         }
+        crate::for_each_layout!(signed, widened)
     }
 
     /// An unsigned integer at `index`, widened.
     #[must_use]
     pub fn unsigned_at(&self, index: usize) -> Option<u128> {
-        match self {
-            Self::UInt8(v) => v.get(index).map(|&x| u128::from(x)),
-            Self::UInt16(v) => v.get(index).map(|&x| u128::from(x)),
-            Self::UInt32(v) => v.get(index).map(|&x| u128::from(x)),
-            Self::UInt64(v) => v.get(index).map(|&x| u128::from(x)),
-            Self::UInt128(v) => v.get(index).copied(),
-            _ => None,
+        macro_rules! widened {
+            ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+                match self {
+                    $(Self::$variant(v) => v.get(index).map(|&x| u128::from(x)),)+
+                    _ => None,
+                }
+            };
         }
+        crate::for_each_layout!(unsigned, widened)
     }
 
     /// The string at `index`, for a `Varlen`.
@@ -567,77 +565,61 @@ const NOWHERE: usize = usize::MAX;
 /// [`push_value`] follows for a null.
 fn copy_of(data: &Data, at: &[usize]) -> Data {
     macro_rules! copied {
-        ($values:expr, $variant:path, $zero:expr) => {{
-            let values = $values;
-            let mut out = Buffer::with_capacity(at.len());
-            for &index in at {
-                // One bounds check rather than a null test and a bounds check, because `NOWHERE` is
-                // past the end of every slice there can be.
-                out.push(values.get(index).copied().unwrap_or($zero));
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                Data::Empty => Data::Empty,
+                $(Data::$variant(values) => {
+                    let mut out = Buffer::with_capacity(at.len());
+                    for &index in at {
+                        // One bounds check rather than a null test and a bounds check, because
+                        // `NOWHERE` is past the end of every slice there can be.
+                        out.push(values.get(index).copied().unwrap_or($zero));
+                    }
+                    Data::$variant(out)
+                })+
+                // The one layout where a gather is a copy of bytes rather than a copy of fixed
+                // width slots, and the reason compaction is a decision rather than a default on a
+                // string column.
+                Data::Varlen(values) => {
+                    let mut out = StringColumn::with_capacity(at.len());
+                    // The bytes are known before any of them are copied, because a view carries its
+                    // length and the wanted positions are already in hand, so the arena is one
+                    // allocation rather than a run of doublings that each copy what the last one
+                    // copied.
+                    let views = values.views();
+                    out.reserve_bytes(
+                        at.iter()
+                            .filter_map(|&index| views.get(index))
+                            .filter(|view| !view.is_inline())
+                            .map(StringView::len)
+                            .sum(),
+                    );
+                    for &index in at {
+                        out.push(values.get(index).unwrap_or(""));
+                    }
+                    Data::Varlen(out)
+                }
             }
-            $variant(out)
-        }};
+        };
     }
-    match data {
-        Data::Empty => Data::Empty,
-        Data::Bool(values) => copied!(values, Data::Bool, false),
-        Data::Int8(values) => copied!(values, Data::Int8, 0),
-        Data::Int16(values) => copied!(values, Data::Int16, 0),
-        Data::Int32(values) => copied!(values, Data::Int32, 0),
-        Data::Int64(values) => copied!(values, Data::Int64, 0),
-        Data::Int128(values) => copied!(values, Data::Int128, 0),
-        Data::UInt8(values) => copied!(values, Data::UInt8, 0),
-        Data::UInt16(values) => copied!(values, Data::UInt16, 0),
-        Data::UInt32(values) => copied!(values, Data::UInt32, 0),
-        Data::UInt64(values) => copied!(values, Data::UInt64, 0),
-        Data::UInt128(values) => copied!(values, Data::UInt128, 0),
-        Data::Float32(values) => copied!(values, Data::Float32, 0.0),
-        Data::Float64(values) => copied!(values, Data::Float64, 0.0),
-        Data::Interval(values) => copied!(values, Data::Interval, (0, 0, 0)),
-        // The one layout where a gather is a copy of bytes rather than a copy of fixed width slots,
-        // and the reason compaction is a decision rather than a default on a string column.
-        Data::Varlen(values) => {
-            let mut out = StringColumn::with_capacity(at.len());
-            // The bytes are known before any of them are copied, because a view carries its length
-            // and the wanted positions are already in hand, so the arena is one allocation rather
-            // than a run of doublings that each copy what the last one copied.
-            let views = values.views();
-            out.reserve_bytes(
-                at.iter()
-                    .filter_map(|&index| views.get(index))
-                    .filter(|view| !view.is_inline())
-                    .map(StringView::len)
-                    .sum(),
-            );
-            for &index in at {
-                out.push(values.get(index).unwrap_or(""));
-            }
-            Data::Varlen(out)
-        }
-    }
+    crate::for_each_layout!(fixed, copied)
 }
 
 /// The physical layout a run of data is in, for the check that it matches its type.
+///
+/// The two enums name their variants the same way on purpose, so this is one generated arm rather
+/// than sixteen chances to pair the wrong two up.
 fn layout_of(data: &Data) -> rudb_common::PhysicalType {
     use rudb_common::PhysicalType as P;
-    match data {
-        Data::Empty => P::Empty,
-        Data::Bool(_) => P::Bool,
-        Data::Int8(_) => P::Int8,
-        Data::Int16(_) => P::Int16,
-        Data::Int32(_) => P::Int32,
-        Data::Int64(_) => P::Int64,
-        Data::Int128(_) => P::Int128,
-        Data::UInt8(_) => P::UInt8,
-        Data::UInt16(_) => P::UInt16,
-        Data::UInt32(_) => P::UInt32,
-        Data::UInt64(_) => P::UInt64,
-        Data::UInt128(_) => P::UInt128,
-        Data::Float32(_) => P::Float32,
-        Data::Float64(_) => P::Float64,
-        Data::Interval(_) => P::Interval,
-        Data::Varlen(_) => P::Varlen,
+    macro_rules! layouts {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                Data::Empty => P::Empty,
+                $(Data::$variant(_) => P::$variant,)+
+            }
+        };
     }
+    crate::for_each_layout!(all, layouts)
 }
 
 /// One value out of a run of data, given what the run means.
@@ -706,29 +688,21 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
 /// An empty run of data of the right layout for a type.
 fn empty_data_for(ty: &LogicalType) -> Result<Data> {
     use rudb_common::PhysicalType as P;
-    Ok(match ty.physical() {
-        P::Empty => Data::Empty,
-        P::Bool => Data::Bool(Buffer::new()),
-        P::Int8 => Data::Int8(Buffer::new()),
-        P::Int16 => Data::Int16(Buffer::new()),
-        P::Int32 => Data::Int32(Buffer::new()),
-        P::Int64 => Data::Int64(Buffer::new()),
-        P::Int128 => Data::Int128(Buffer::new()),
-        P::UInt8 => Data::UInt8(Buffer::new()),
-        P::UInt16 => Data::UInt16(Buffer::new()),
-        P::UInt32 => Data::UInt32(Buffer::new()),
-        P::UInt64 => Data::UInt64(Buffer::new()),
-        P::UInt128 => Data::UInt128(Buffer::new()),
-        P::Float32 => Data::Float32(Buffer::new()),
-        P::Float64 => Data::Float64(Buffer::new()),
-        P::Interval => Data::Interval(Buffer::new()),
-        P::Varlen => Data::Varlen(StringColumn::new()),
-        other => {
-            return Err(Error::not_implemented(format!(
-                "a flat vector of {other:?} data, which arrives with the storage layer"
-            )));
-        }
-    })
+    macro_rules! empties {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match ty.physical() {
+                P::Empty => Data::Empty,
+                $(P::$variant => Data::$variant(Buffer::new()),)+
+                P::Varlen => Data::Varlen(StringColumn::new()),
+                other => {
+                    return Err(Error::not_implemented(format!(
+                        "a flat vector of {other:?} data, which arrives with the storage layer"
+                    )));
+                }
+            }
+        };
+    }
+    Ok(crate::for_each_layout!(fixed, empties))
 }
 
 /// Appends one value to a run of data, or a zero of the right shape when it is null.

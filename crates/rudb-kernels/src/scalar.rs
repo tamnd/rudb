@@ -209,7 +209,7 @@ fn sign_of(
     // string comparison inside the loop would be most of what the loop costs.
     let negating = name == "-";
     macro_rules! runs {
-        ($($variant:ident),+ $(,)?) => {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match data {
                 $(
                     Data::$variant(held) => {
@@ -254,10 +254,10 @@ fn sign_of(
             }
         };
     }
-    // The unsigned runs are left out on purpose. Negating a `UBIGINT` is an overflow at every row
-    // but zero, so the fallback's error message is the right answer and a loop for it would be a
-    // loop that exists to fail.
-    runs!(Int8, Int16, Int32, Int64, Int128)
+    // The unsigned runs are left out on purpose, which is what the `signed` group is for. Negating
+    // a `UBIGINT` is an overflow at every row but zero, so the fallback's error message is the right
+    // answer and a loop for it would be a loop that exists to fail.
+    rudb_vector::for_each_layout!(signed, runs)
 }
 
 /// `length`, which counts characters rather than bytes.
@@ -514,7 +514,7 @@ where
     R: Fn(usize) -> usize,
 {
     macro_rules! integers {
-        ($($variant:ident => $native:ty),+ $(,)?) => {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             $(
                 if let (Data::$variant(a), Data::$variant(b)) = (one, other) {
                     let mut out = vec![0 as $native; rows];
@@ -570,10 +570,7 @@ where
     // plus a date with a message saying it is not implemented, and that is the answer this path has
     // to leave it room to give.
     if returns.is_integer() {
-        integers!(
-            Int8 => i8, Int16 => i16, Int32 => i32, Int64 => i64, Int128 => i128,
-            UInt8 => u8, UInt16 => u16, UInt32 => u32, UInt64 => u64, UInt128 => u128,
-        );
+        rudb_vector::for_each_layout!(integer, integers);
     }
     floats!(Float64, f64, |x| x, |x| x);
     // Widened, computed and narrowed, which is what the oracle does. For one addition, subtraction
@@ -613,7 +610,7 @@ where
 {
     let rows = left.len();
     macro_rules! integers {
-        ($($variant:ident),+ $(,)?) => {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             $(
                 if let (Data::$variant(a), Data::$variant(b)) = (one, other) {
                     let mut out = vec![0; rows];
@@ -668,7 +665,7 @@ where
     }
 
     if returns.is_integer() {
-        integers!(Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, UInt128);
+        rudb_vector::for_each_layout!(integer, integers);
     }
     floats!(Float64, f64, |x| x, |x| x);
     #[expect(
