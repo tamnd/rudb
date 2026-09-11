@@ -48,3 +48,31 @@ Four lines, tab separated, with a quoted tab, a quoted newline and a doubled quo
 The extension is what sends a file to the CSV reader, and the reader is what works out that this one is tabs. A `.tsv` file full of commas is read as commas in duckdb v1.4.1, which was measured, so the extension picks the reader and nothing more.
 
 DuckDB reads it as `name VARCHAR, note VARCHAR` and three rows, the second of which holds a newline inside a field.
+
+## parts and odd
+
+Two directories of tiny files, for the reads that cover more than one file, written by hand.
+
+```
+parts/a.csv   id,tag    1,x  2,y
+parts/b.csv   id,tag    3,z
+parts/c.csv   id,tag    4.5,w
+odd/one.csv   id        1
+odd/two.csv   other     2
+```
+
+A CSV file states nothing about itself, so a read over several of them cannot take the first file's word the way the Parquet reader does. DuckDB sniffs every file and combines the answers, which is what `parts` is here to pin down: `parts/*.csv` is n=4 and sum(id)=10.5 with `id` typed `DOUBLE`, because `c.csv` has a decimal in a column the other two files fill with whole numbers. `parts/[ab].csv` is n=3 and sum(id)=6 with `id` typed `BIGINT`, the same three files minus the one that widened it.
+
+The header line is skipped in every file and not only in the first, which is the whole reason somebody points a pattern at a directory of daily exports.
+
+`odd/*.csv` is an error, and the CSV reader's wording for it is not the Parquet reader's:
+
+```
+Invalid Input Error: Schema mismatch between globbed files.
+Main file schema: odd/one.csv
+Current file: odd/two.csv
+Column with name: "id" is missing
+Potential Fixes 
+* Consider setting union_by_name=true.
+* Consider setting files_to_sniff to a higher value (e.g., files_to_sniff = -1)
+```

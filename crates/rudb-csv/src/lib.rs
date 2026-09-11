@@ -15,16 +15,23 @@
 //! of types to find the first one every value in a column fits. [`Reader`] is the three of them over
 //! a file, handing back chunks.
 //!
+//! [`combine`] is the fourth, and it is there because a read can cover more than one file.
+//! `read_csv('data/*.csv')` sniffs every file the pattern matched and combines the answers, since a
+//! file that says nothing about itself cannot be the one file whose word is taken the way a Parquet
+//! footer is.
+//!
 //! There is no writer yet. `COPY t TO 'out.csv'` is the statement that wants one and it is not
 //! bound, so a writer here would be a writer nothing calls.
 
 #![forbid(unsafe_code)]
 
+pub mod combine;
 pub mod dialect;
 pub mod infer;
 pub mod reader;
 pub mod scan;
 
+pub use combine::{across, mismatch, widen};
 pub use dialect::Dialect;
 pub use reader::Reader;
 

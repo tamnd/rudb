@@ -3,7 +3,8 @@
 use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_csv::Reader as CsvReader;
-use rudb_functions::{TableFunction, open_csv, open_parquet, series_length};
+use rudb_functions::{TableFunction, files, open_csv, open_parquet, series_length};
+use rudb_kernels::cast;
 use rudb_parquet::Reader;
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
@@ -257,21 +258,34 @@ impl Operator for Series {
     }
 }
 
-/// A scan of a Parquet file.
+/// A scan of the Parquet files one argument names.
 ///
-/// The file is named by the one argument, which the binder already required to be a constant, and
-/// it is opened here rather than being carried from the binder. Binding and running are separated
-/// by however long a prepared statement lives, and a plan that held an open descriptor would hold
-/// it for all of that.
+/// The argument is what the binder already required to be one constant string, and the files it
+/// names are worked out here rather than being carried from the binder. Binding and running are
+/// separated by however long a prepared statement lives, and a plan that held an open descriptor
+/// would hold it for all of that. It also means a pattern is matched again at run time, so a
+/// prepared statement over `data/*.parquet` sees the file that arrived since it was prepared, which
+/// is what DuckDB does.
 ///
-/// The plan's column list is resolved against the file's by name, which is the same thing
+/// Many files are one stream of rows, read in the order [`files`] gives them, and a file is opened
+/// only when the one before it has run out. A hundred file glob is one open at a time rather than a
+/// hundred descriptors held from the first chunk, and the reads that matter are inside a file
+/// anyway.
+///
+/// The plan's column list is resolved against each file's by name, which is the same thing
 /// [`Scan`] does against a catalog table and for the same reason. Today the binder projects every
 /// column in order, so the mapping is the identity, and the moment projection pushdown makes the
 /// plan's list a subset the reader reads a subset. That is the difference `spec/engine/05-scan.md`
 /// section 5.6 describes between reading two columns of ClickBench and reading a hundred and five.
+/// It is also what decides whether a file that disagrees about the schema is an error: the check is
+/// on the columns the query asked for, so `count(*)` over a glob whose files disagree about a
+/// column nobody selected answers rather than failing, which was measured against the binary.
 #[derive(Debug)]
 pub(crate) struct ParquetScan {
+    files: Vec<String>,
+    at: usize,
     reader: Reader,
+    wanted: Vec<Field>,
     schema: Schema,
 }
 
@@ -280,14 +294,17 @@ impl ParquetScan {
     ///
     /// # Errors
     ///
-    /// If the file is gone or unreadable since it was bound, or if it no longer has a column the
-    /// plan asked for, which is what a file replaced between binding and running looks like.
+    /// If nothing matches the path any more, if the first file is unreadable, or if it no longer
+    /// has a column the plan asked for, which is what a file replaced between binding and running
+    /// looks like.
     pub(crate) fn new(plan: &Plan, index: u32, args: Slice, columns: Slice) -> Result<Self> {
         let path = file_argument(plan, args, "read_parquet")?;
-        let mut reader = open_parquet(&path)?;
+        let files = files(&path)?;
         let wanted = plan.field_list(columns).to_vec();
-        reader.project(&positions(&wanted, &reader.fields(), &path)?)?;
-        Ok(Self { reader, schema: Schema::numbered(wanted, index) })
+        let mut reader = open_parquet(&files[0])?;
+        reader.project(&positions(&wanted, &reader.fields(), &files[0])?)?;
+        let schema = Schema::numbered(wanted.clone(), index);
+        Ok(Self { files, at: 0, reader, wanted, schema })
     }
 }
 
@@ -297,23 +314,40 @@ impl Operator for ParquetScan {
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {
-        self.reader.next_chunk()
+        loop {
+            if let Some(chunk) = self.reader.next_chunk()? {
+                return Ok(Some(conform(chunk, &self.wanted, &self.files[self.at])?));
+            }
+            self.at += 1;
+            let Some(path) = self.files.get(self.at) else { return Ok(None) };
+            let mut reader = open_parquet(path)?;
+            let held = reader.fields();
+            reader.project(&parquet_positions(&self.wanted, &held, path, &self.files[0])?)?;
+            self.reader = reader;
+        }
     }
 }
 
-/// A scan of a CSV file.
+/// A scan of the CSV files one argument names.
 ///
 /// The same shape as [`ParquetScan`] and for the same reasons, down to resolving the plan's columns
-/// against the file's by name. What is behind the two is not the same at all: a Parquet file states
-/// its schema and stores each column apart, so reading two of a hundred and five is reading two
-/// stretches of the file, while a CSV file states nothing and interleaves everything, so every byte
-/// is read and parsed whatever the projection is and the projection only saves the conversion and
-/// the copy. That is why the two are separate operators rather than one over a trait: the scan that
-/// wants to grow row group skipping and the scan that wants to grow a parallel split of the byte
-/// range have nothing in the middle worth sharing yet.
+/// against each file's by name and to reading a glob as one stream. What is behind the two is not
+/// the same at all: a Parquet file states its schema and stores each column apart, so reading two of
+/// a hundred and five is reading two stretches of the file, while a CSV file states nothing and
+/// interleaves everything, so every byte is read and parsed whatever the projection is and the
+/// projection only saves the conversion and the copy. That is why the two are separate operators
+/// rather than one over a trait: the scan that wants to grow row group skipping and the scan that
+/// wants to grow a parallel split of the byte range have nothing in the middle worth sharing yet.
+///
+/// Each file is sniffed on its own, which matters more here than it looks. The header decision is
+/// per file, so a directory of files that all carry the same header line gives the rows of all of
+/// them and the header of none, which is the whole reason somebody writes the glob.
 #[derive(Debug)]
 pub(crate) struct CsvScan {
+    files: Vec<String>,
+    at: usize,
     reader: CsvReader,
+    wanted: Vec<Field>,
     schema: Schema,
 }
 
@@ -322,14 +356,18 @@ impl CsvScan {
     ///
     /// # Errors
     ///
-    /// If the file is gone or unreadable since it was bound, or if it no longer has a column the
-    /// plan asked for, which is what a file replaced between binding and running looks like.
+    /// If nothing matches the path any more, if the first file is unreadable, or if it no longer
+    /// has a column the plan asked for, which is what a file replaced between binding and running
+    /// looks like.
     pub(crate) fn new(plan: &Plan, index: u32, args: Slice, columns: Slice) -> Result<Self> {
         let path = file_argument(plan, args, "read_csv")?;
-        let mut reader = open_csv(&path)?;
+        let files = files(&path)?;
         let wanted = plan.field_list(columns).to_vec();
-        reader.project(&positions(&wanted, &reader.fields(), &path)?)?;
-        Ok(Self { reader, schema: Schema::numbered(wanted, index) })
+        let mut reader = open_csv(&files[0])?;
+        reader.project(&positions(&wanted, &reader.fields(), &files[0])?)?;
+        settle(&mut reader, &wanted)?;
+        let schema = Schema::numbered(wanted.clone(), index);
+        Ok(Self { files, at: 0, reader, wanted, schema })
     }
 }
 
@@ -339,7 +377,21 @@ impl Operator for CsvScan {
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {
-        self.reader.next_chunk()
+        loop {
+            if let Some(chunk) = self.reader.next_chunk()? {
+                return Ok(Some(chunk));
+            }
+            self.at += 1;
+            let Some(path) = self.files.get(self.at) else { return Ok(None) };
+            let mut reader = open_csv(path)?;
+            let held = reader.fields();
+            let main = &self.files[0];
+            reader.project(&find(&self.wanted, &held, |name| {
+                rudb_csv::mismatch(main, path, name)
+            })?)?;
+            settle(&mut reader, &self.wanted)?;
+            self.reader = reader;
+        }
     }
 }
 
@@ -360,16 +412,114 @@ fn file_argument(plan: &Plan, args: Slice, function: &str) -> Result<String> {
     }
 }
 
-/// Where in `held` each of `wanted` is, by name.
-fn positions(wanted: &[Field], held: &[Field], path: &str) -> Result<Vec<usize>> {
+/// Where in `held` each of `wanted` is, by name, with `missing` saying what a column that is not
+/// there means.
+///
+/// The three callers all want the same walk and three different sentences. The first file of a read
+/// is a file that changed under a plan bound against it, a later Parquet file is two files
+/// disagreeing, and a later CSV file is the same thing worded differently because the two readers in
+/// DuckDB are two pieces of code that each wrote their own message.
+fn find(wanted: &[Field], held: &[Field], missing: impl Fn(&str) -> Error) -> Result<Vec<usize>> {
     let mut positions = Vec::with_capacity(wanted.len());
     for field in wanted {
-        let at = held.iter().position(|column| column.name == field.name).ok_or_else(|| {
-            Error::io(format!("File \"{path}\" does not have a column named \"{}\"", field.name))
-        })?;
+        let at = held
+            .iter()
+            .position(|column| column.name == field.name)
+            .ok_or_else(|| missing(&field.name))?;
         positions.push(at);
     }
     Ok(positions)
+}
+
+/// A chunk cast to the types the read settled on, which is what a Parquet file after the first
+/// needs when it stores a column as something else.
+///
+/// Measured: a glob whose first file has `a` as INTEGER and whose second has it as DOUBLE answers
+/// INTEGER for both rows, so the later file is cast rather than the stream being widened. A cast
+/// that cannot be done is an error, and DuckDB's wording for it names the file, the column, both
+/// types and the two ways out. The inner sentence is whatever the cast itself said, which is where
+/// the offending value gets named.
+///
+/// The common case is the first file, or a file that agrees, and that is a type comparison per
+/// column per chunk and no copy at all.
+fn conform(chunk: Chunk, wanted: &[Field], path: &str) -> Result<Chunk> {
+    if chunk.types().iter().zip(wanted).all(|(have, field)| *have == field.ty) {
+        return Ok(chunk);
+    }
+    let rows = chunk.len();
+    let mut columns = Vec::with_capacity(wanted.len());
+    for (vector, field) in chunk.into_columns().into_iter().zip(wanted) {
+        if vector.logical_type() == &field.ty {
+            columns.push(vector);
+            continue;
+        }
+        let from = vector.logical_type().clone();
+        let converted = cast(&vector, &field.ty, false).map_err(|error| {
+            let (name, to) = (&field.name, &field.ty);
+            Error::conversion(format!(
+                "Error while reading file \"{path}\": failed to cast column \"{name}\" from type \
+                 {from} to {to}: : {}\n\nIn file \"{path}\" the column \"{name}\" has type {from}, \
+                 but we are trying to read it as type {to}.\nThis can happen when reading multiple \
+                 Parquet files. The schema information is taken from the first Parquet file by \
+                 default. Possible solutions:\n* Enable the union_by_name=True option to combine \
+                 the schema of all Parquet files \
+                 (https://duckdb.org/docs/stable/data/multiple_files/combining_schemas)\n* Use a \
+                 COPY statement to automatically derive types from an existing table.",
+                error.message()
+            ))
+        })?;
+        columns.push(converted);
+    }
+    Chunk::with_rows(columns, rows)
+}
+
+/// Where in `held` each of `wanted` is, for the first file of a read.
+fn positions(wanted: &[Field], held: &[Field], path: &str) -> Result<Vec<usize>> {
+    find(wanted, held, |name| {
+        Error::io(format!("File \"{path}\" does not have a column named \"{name}\""))
+    })
+}
+
+/// Tells a freshly opened CSV file the types the whole read settled on.
+///
+/// Every file a CSV glob names is sniffed on its own and the read's types are all of those answers
+/// combined, so no single file's sniff is the answer, including the first one. A directory where one
+/// file holds 4.5 in a column the others fill with whole numbers is a DOUBLE read, and without this
+/// the files that hold whole numbers would each hand up a BIGINT column into a stream that is
+/// DOUBLE. That is where CSV differs from Parquet, where the first file really does settle it and a
+/// later file is cast to what it said.
+///
+/// This is not a cast. The sniffed type is what the parser was going to convert the text with, and
+/// changing it before any row is read means the text is converted to the right type once rather than
+/// to the wrong one and then again.
+fn settle(reader: &mut CsvReader, wanted: &[Field]) -> Result<()> {
+    let types: Vec<LogicalType> = wanted.iter().map(|field| field.ty.clone()).collect();
+    reader.retype(&types)
+}
+
+/// The same, for a Parquet file after the first, where a missing column is the two files
+/// disagreeing.
+///
+/// DuckDB's message names both files, because knowing that a glob of two hundred files has a
+/// mismatch in it is useless without knowing which two disagreed, and it ends with the way out,
+/// which is `union_by_name`. The wording is the binary's, measured rather than paraphrased, down to
+/// the candidate list that tells somebody who renamed a column what it is called now.
+fn parquet_positions(
+    wanted: &[Field],
+    held: &[Field],
+    path: &str,
+    original: &str,
+) -> Result<Vec<usize>> {
+    find(wanted, held, |name| {
+        let candidates: Vec<&str> = held.iter().map(|column| column.name.as_str()).collect();
+        Error::invalid_input(format!(
+            "Failed to read file \"{path}\": schema mismatch in glob: column \"{name}\" was read \
+             from the original file \"{original}\", but could not be found in file \
+             \"{path}\".\nCandidate names: {}\nIf you are trying to read files with different \
+             schemas, try setting union_by_name=True",
+            candidates.join(", ")
+        ))
+    })
 }
 
 impl Operator for Values {

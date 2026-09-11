@@ -506,6 +506,20 @@ impl Filesystem for SimFilesystem {
         inner.files.contains_key(path) || inner.dirs.contains(path)
     }
 
+    fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        // Not in the operation log, for the same reason reads are not: a test that enumerates
+        // failure points was written against a log of writes, and a listing is not one.
+        let inner = self.lock();
+        if inner.files.contains_key(path) {
+            return Err(Error::io(format!("{} is not a directory", path.display())));
+        }
+        if !inner.dirs.contains(path) {
+            return Err(Error::io(format!("{} does not exist", path.display())));
+        }
+        let held = inner.files.keys().chain(inner.dirs.iter());
+        Ok(held.filter(|held| held.parent() == Some(path)).cloned().collect())
+    }
+
     fn remove(&self, path: &Path) -> Result<()> {
         let mut inner = self.lock();
         inner.record(Op::Remove { path: path.to_path_buf() })?;
@@ -639,6 +653,29 @@ mod tests {
         file.sync().unwrap();
         file.write_at(0, b"BBBB").unwrap();
         file.write_at(4, b"CCCC").unwrap();
+    }
+
+    #[test]
+    fn listing_a_directory_names_the_files_and_the_directories_directly_in_it() {
+        let fs = SimFilesystem::new();
+        fs.create_dir_all(Path::new("/data/sub")).unwrap();
+        fs.open(Path::new("/data/a"), OpenMode::CreateNew).unwrap();
+        fs.open(Path::new("/data/sub/b"), OpenMode::CreateNew).unwrap();
+        let mut found: Vec<String> = fs
+            .read_dir(Path::new("/data"))
+            .unwrap()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        found.sort();
+        assert_eq!(found, ["/data/a", "/data/sub"], "directly in it, and not below it");
+        assert!(fs.read_dir(Path::new("/data/a")).is_err(), "a file is not a directory");
+        assert!(fs.read_dir(Path::new("/nowhere")).is_err());
+        // A listing is not a write, so it stays out of the log and does not move the failure point
+        // indices that a crash test written before any of this enumerates.
+        let before = fs.ops().len();
+        fs.read_dir(Path::new("/data")).unwrap();
+        assert_eq!(fs.ops().len(), before);
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! workload to measure, and both arrive at M2.
 
 use std::fs::{File as StdFile, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rudb_common::{Error, Result};
 
@@ -54,6 +54,18 @@ impl Filesystem for RealFilesystem {
 
     fn exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let entries = std::fs::read_dir(path)
+            .map_err(|e| Error::io(format!("could not list {}: {e}", path.display())))?;
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| Error::io(format!("could not list {}: {e}", path.display())))?;
+            found.push(entry.path());
+        }
+        Ok(found)
     }
 
     fn remove(&self, path: &Path) -> Result<()> {
@@ -276,6 +288,28 @@ mod tests {
         // The last one runs off the end of the file, which is a short read and not an error.
         assert!(responses[2].is_short());
         assert_eq!(responses[2].bytes(), b"mnop");
+    }
+
+    #[test]
+    fn listing_a_directory_names_what_is_in_it_and_listing_a_file_is_an_error() {
+        let dir = TempDir::new("readdir");
+        let fs = RealFilesystem::new();
+        for name in ["b", "a"] {
+            fs.open(&dir.join(name), OpenMode::CreateNew).unwrap();
+        }
+        fs.create_dir_all(&dir.join("sub")).unwrap();
+        let mut found: Vec<String> = fs
+            .read_dir(&dir.0)
+            .unwrap()
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // The listing itself is in whatever order the filesystem hands back, which is why the test
+        // sorts and why `glob` does.
+        found.sort();
+        assert_eq!(found, ["a", "b", "sub"]);
+        assert!(fs.read_dir(&dir.join("a")).is_err(), "a file is not a directory");
+        assert!(fs.read_dir(&dir.join("nothing")).is_err());
     }
 
     #[test]

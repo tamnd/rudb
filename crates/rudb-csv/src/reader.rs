@@ -103,6 +103,31 @@ impl Reader {
         Ok(())
     }
 
+    /// Reads the projected columns as these types rather than as the ones the sample chose.
+    ///
+    /// One file settles the types of a whole glob, because a scan produces one stream and a stream
+    /// has one schema. Every file after the first is sniffed on its own and then told what the
+    /// answer already was, which is the only way a second file whose column happens to hold nothing
+    /// but integers still comes out as the DOUBLE the first file made it. A value that then does not
+    /// fit is the conversion error, named and lined the way any other one is.
+    ///
+    /// # Errors
+    ///
+    /// When the list is not as long as the projection.
+    pub fn retype(&mut self, types: &[LogicalType]) -> Result<()> {
+        if types.len() != self.projection.len() {
+            return Err(Error::io(format!(
+                "{} types for a projection of {} columns",
+                types.len(),
+                self.projection.len()
+            )));
+        }
+        for (&at, ty) in self.projection.iter().zip(types) {
+            self.fields[at].ty = ty.clone();
+        }
+        Ok(())
+    }
+
     /// How this file is punctuated, which is what the sniffer decided.
     #[must_use]
     pub const fn dialect(&self) -> Dialect {

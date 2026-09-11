@@ -42,16 +42,18 @@
 
 #![deny(unsafe_code)]
 
+pub mod glob;
 pub mod pool;
 pub mod real;
 pub mod sim;
 pub mod submit;
 
 use std::fmt::Debug;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rudb_common::Result;
 
+pub use glob::{glob, is_pattern};
 pub use pool::{Config, Pool, Pooled, Stats};
 pub use real::RealFilesystem;
 pub use sim::{Completions, Crash, Op, SimFilesystem};
@@ -201,6 +203,17 @@ pub trait Filesystem: Debug + Send + Sync {
 
     /// Whether a path exists.
     fn exists(&self, path: &Path) -> bool;
+
+    /// What is directly in a directory, as whole paths, in whatever order the place they live in
+    /// gives them.
+    ///
+    /// Order is not promised because an object store does not have one and a directory does not
+    /// either. A caller that wants the same answer twice sorts, which is what [`glob()`] does.
+    ///
+    /// # Errors
+    ///
+    /// If the directory cannot be read, including when it is not a directory.
+    fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
 
     /// Deletes a file.
     ///

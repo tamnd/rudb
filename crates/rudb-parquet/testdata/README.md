@@ -89,3 +89,29 @@ pq.write_table(table, "bytes.parquet", compression="snappy", row_group_size=1024
 `raw` starts every value with `0xff 0xfe`, which is not valid UTF-8 under any reading, so it is the column that has to be refused by name rather than decoded into something.
 
 DuckDB reads both columns as `BLOB` and answers n=2048, count(words)=1861, sum(octet_length(words))=16749, min(words)='byte_0000', max(words)='byte_1023'.
+
+## parts, widened and odd
+
+Three directories of tiny files, for the reads that cover more than one file. `read_parquet` takes a pattern and the files it matches are one stream of rows, so what has to be tested is what happens when they agree and what happens when they do not.
+
+```sql
+COPY (SELECT 1::INTEGER AS id, 'x' AS tag) TO 'parts/one.parquet';
+COPY (SELECT 2::INTEGER AS id, 'y' AS tag) TO 'parts/two.parquet';
+COPY (SELECT 3::INTEGER AS id, 'z' AS tag) TO 'parts/three.parquet';
+COPY (SELECT 1::INTEGER AS id) TO 'widened/one.parquet';
+COPY (SELECT 2.75::DOUBLE AS id) TO 'widened/two.parquet';
+COPY (SELECT 1::INTEGER AS id) TO 'odd/one.parquet';
+COPY (SELECT 2::INTEGER AS other) TO 'odd/two.parquet';
+```
+
+`parts/*.parquet` is n=3 and sum(id)=6 in duckdb v1.4.1, and `parts/t*.parquet` is n=2, which is the two files whose names start with a t and not the three in the directory.
+
+`widened/*.parquet` answers 1 and 3, both `INTEGER`. The schema is taken from the first file, so the second file's `DOUBLE` is cast to it, and 2.75 rounds to 3 rather than truncating to 2. That is the case that says the first file's word is taken rather than the stream being widened to fit everything in it.
+
+`odd/*.parquet` is an error, and the error is worth writing down because it is the one somebody actually hits:
+
+```
+Invalid Input Error: Failed to read file "odd/two.parquet": schema mismatch in glob: column "id" was read from the original file "odd/one.parquet", but could not be found in file "odd/two.parquet".
+Candidate names: other
+If you are trying to read files with different schemas, try setting union_by_name=True
+```
