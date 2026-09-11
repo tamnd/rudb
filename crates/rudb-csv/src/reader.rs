@@ -295,19 +295,39 @@ fn describe(rows: &[Vec<Option<String>>]) -> (bool, Vec<Field>) {
             .collect();
         return (false, fields);
     }
-    let names = &rows[0];
-    let fields = body
-        .into_iter()
-        .enumerate()
-        .map(|(at, ty)| {
-            let name = match names.get(at).and_then(Option::as_deref) {
-                Some(name) => name.to_string(),
-                None => format!("column{at}"),
-            };
-            Field::new(name, ty)
-        })
-        .collect();
+    let names = unique(&rows[0], width);
+    let fields = body.into_iter().zip(names).map(|(ty, name)| Field::new(name, ty)).collect();
     (true, fields)
+}
+
+/// The column names a header row gives, with the collisions resolved the way DuckDB resolves them.
+///
+/// A header is text somebody typed and nothing stops it naming two columns the same thing, so the
+/// second one gets `_1`, and the count goes up until the name is free. It has to count rather than
+/// stop at one, because the suffix can collide too: a file whose header is `a,a,a_1` comes back as
+/// `a`, `a_1`, `a_1_1` from the binary, and it is the second column that took the name the third one
+/// was written with.
+///
+/// The comparison ignores case and the written case is kept, which was measured: `a,a,A` comes back
+/// as `a`, `a_1`, `A_2`, so `A` collided with `a` and then `A_1` collided with `a_1`. An empty
+/// header cell is a column with no name, and it falls back to the generated one rather than to an
+/// empty string that no query could write.
+fn unique(header: &[Option<String>], width: usize) -> Vec<String> {
+    let mut taken: Vec<String> = Vec::with_capacity(width);
+    for at in 0..width {
+        let base = match header.get(at).and_then(Option::as_deref) {
+            Some(written) => written.to_string(),
+            None => format!("column{at}"),
+        };
+        let mut name = base.clone();
+        let mut next = 1;
+        while taken.iter().any(|held| held.eq_ignore_ascii_case(&name)) {
+            name = format!("{base}_{next}");
+            next += 1;
+        }
+        taken.push(name);
+    }
+    taken
 }
 
 /// The type of each of `width` columns, over these rows.
@@ -349,6 +369,16 @@ mod tests {
             }
         }
         rows
+    }
+
+    #[test]
+    fn a_header_that_names_two_columns_the_same_thing_counts_the_second_one_up() {
+        let names: Vec<String> =
+            read("a,a,A,a_1\n1,2,3,4\nx,y,z,w\n").fields().into_iter().map(|f| f.name).collect();
+        // Measured against the binary, all four of them. The last one is the interesting one: the
+        // second column took `a_1`, which is the name the fourth column was written with, so the
+        // fourth has to keep counting from its own name rather than from `a`.
+        assert_eq!(names, ["a", "a_1", "A_2", "a_1_1"]);
     }
 
     #[test]
