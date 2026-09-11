@@ -55,6 +55,14 @@ enum Shape {
     PromotedTo(Fixed),
     /// Every argument is cast to one fixed type and the result is another. `||` over strings.
     FixedTo(Fixed, Fixed),
+    /// Every argument has to be a string already and the result is fixed. `lower`, `length`, `LIKE`.
+    ///
+    /// The difference from [`Shape::FixedTo`] with a VARCHAR argument is the word already. DuckDB
+    /// refuses `lower(123)`, `length(DATE '2020-01-01')` and `123 LIKE '1%'` with a binder error
+    /// naming the overloads it does have, and it refuses a BLOB as well, so the rule is VARCHAR
+    /// rather than anything a cast can reach. `||` is the one string function that really does take
+    /// anything, since `1 || 'a'` is `1a` upstream, and it keeps [`Shape::FixedTo`] for that reason.
+    Text(Fixed),
     /// The arguments are whatever they are and the result is fixed. `count(x)` over anything.
     AnyTo(Fixed),
     /// The first `n` arguments are cast to one fixed type, the rest are left alone, and the result
@@ -185,7 +193,15 @@ const TABLE: &[Entry] = &[
     number("//", Arity::exactly(2), Shape::Promoted),
     number("abs", Arity::exactly(1), Shape::Promoted),
     // Strings.
-    text("||", Arity::exactly(2), Fixed::Varchar),
+    // `||` is the one that takes anything and turns it into a string, which is why it is a
+    // `FixedTo` and everything under it is a `Text`. `1 || 'a'` is `1a` upstream.
+    Entry {
+        name: "||",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::FixedTo(Fixed::Varchar, Fixed::Varchar),
+        numeric_only: false,
+    },
     text("lower", Arity::exactly(1), Fixed::Varchar),
     text("upper", Arity::exactly(1), Fixed::Varchar),
     text("length", Arity::exactly(1), Fixed::BigInt),
@@ -297,7 +313,7 @@ const fn text(name: &'static str, arity: Arity, returns: Fixed) -> Entry {
         name,
         kind: FunctionKind::Scalar,
         arity,
-        shape: Shape::FixedTo(Fixed::Varchar, returns),
+        shape: Shape::Text(returns),
         numeric_only: false,
     }
 }
@@ -327,10 +343,7 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         Error::catalog(format!("Scalar Function with name {name} does not exist!"))
     })?;
     if !entry.arity.accepts(arguments.len()) {
-        return Err(Error::binder(format!(
-            "No function matches the given name and argument types '{name}({})'. You might need to add explicit type casts.",
-            arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-        )));
+        return Err(no_match(entry.name, arguments));
     }
     if entry.numeric_only {
         for ty in arguments {
@@ -353,6 +366,17 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             (vec![common; arguments.len()], fixed.ty())
         }
         Shape::FixedTo(argument, result) => (vec![argument.ty(); arguments.len()], result.ty()),
+        Shape::Text(result) => {
+            for ty in arguments {
+                // An untyped null is accepted the way it is everywhere else here. DuckDB answers
+                // `length(NULL)` with NULL rather than refusing it, because a null has no type to
+                // pick an overload with and every overload would return null anyway.
+                if *ty != LogicalType::Varchar && *ty != LogicalType::Null {
+                    return Err(no_match(entry.name, arguments));
+                }
+            }
+            (vec![LogicalType::Varchar; arguments.len()], result.ty())
+        }
         Shape::AnyTo(result) => (arguments.to_vec(), result.ty()),
         Shape::LeadingFixedTo(count, first, result) => {
             (leading(count, first, arguments), result.ty())
@@ -376,6 +400,81 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     };
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
 }
+
+/// The error for a call that names a real function and does not fit any of its overloads.
+///
+/// The sentence is DuckDB's, and so is the block under it when there is one. A message that says a
+/// call does not match without saying what would match is a message that sends somebody to the
+/// documentation, and the whole argument for copying the reference's errors is that a program
+/// written against one engine should not have to be debugged differently against the other.
+///
+/// The trailing newline is the reference's too. Its message ends after the last candidate with a
+/// line break, which is visible as the second blank line before the shell prints the offending SQL.
+fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
+    let types = arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    let mut message = format!(
+        "No function matches the given name and argument types '{name}({types})'. You might need to add explicit type casts."
+    );
+    if let Some((_, overloads)) = CANDIDATES.iter().find(|(entry, _)| *entry == name) {
+        message.push_str("\n\tCandidate functions:");
+        for overload in *overloads {
+            message.push_str("\n\t");
+            message.push_str(overload);
+        }
+        message.push('\n');
+    }
+    Error::binder(message)
+}
+
+/// What the reference prints under `Candidate functions:`, per function, byte for byte.
+///
+/// Copied off the pinned binary rather than generated from [`TABLE`], because it is not derivable
+/// from what rudb has. The parameters are called `col0` and `col1` for some functions and `string`,
+/// `regex` and a quoted `"options"` for others, an operator is quoted where a plain name is not, and
+/// `length` lists three overloads of which rudb has one. That last one is the argument for copying
+/// rather than deriving: the list is what DuckDB accepts, rudb is meant to accept the same, and a
+/// list that shrank to what is built today would have to be edited every time a gap closes.
+///
+/// A name missing from here gets the sentence with no block under it, which is what every function
+/// outside the string family does today.
+const CANDIDATES: &[(&str, &[&str])] = &[
+    ("lower", &["lower(col0 VARCHAR) -> VARCHAR"]),
+    ("upper", &["upper(col0 VARCHAR) -> VARCHAR"]),
+    (
+        "length",
+        &[
+            "length(col0 VARCHAR) -> BIGINT",
+            "length(col0 BIT) -> BIGINT",
+            "length(col0 ANY[]) -> BIGINT",
+        ],
+    ),
+    ("strlen", &["strlen(col0 VARCHAR) -> BIGINT"]),
+    ("~~", &["\"~~\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("!~~", &["\"!~~\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("~~*", &["\"~~*\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("!~~*", &["\"!~~*\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    (
+        "regexp_replace",
+        &[
+            "regexp_replace(string VARCHAR, regex VARCHAR, replacement VARCHAR) -> VARCHAR",
+            "regexp_replace(string VARCHAR, regex VARCHAR, replacement VARCHAR, \"options\" VARCHAR) -> VARCHAR",
+        ],
+    ),
+    (
+        "regexp_matches",
+        &[
+            "regexp_matches(string VARCHAR, regex VARCHAR) -> BOOLEAN",
+            "regexp_matches(string VARCHAR, regex VARCHAR, \"options\" VARCHAR) -> BOOLEAN",
+        ],
+    ),
+    (
+        "regexp_full_match",
+        &[
+            "regexp_full_match(string VARCHAR, regex VARCHAR) -> BOOLEAN",
+            "regexp_full_match(string VARCHAR, regex VARCHAR, \"options\" VARCHAR) -> BOOLEAN",
+        ],
+    ),
+];
 
 /// The cast list for a shape that fixes the leading arguments and leaves the others as they are.
 fn leading(count: usize, first: Fixed, arguments: &[LogicalType]) -> Vec<LogicalType> {
@@ -509,6 +608,63 @@ mod tests {
                 TABLE.iter().any(|entry| entry.name == *real),
                 "{alias} points at {real}, which is not in the table"
             );
+        }
+    }
+
+    /// DuckDB refuses a string function anything that is not already a string, and the whole point
+    /// of refusing is the message, so the message is what this checks.
+    #[test]
+    fn a_string_function_refuses_a_type_that_is_not_a_string() {
+        let error = resolve("lower", &[LogicalType::Date]).expect_err("lower takes strings");
+        assert_eq!(
+            error.to_string(),
+            "Binder Error: No function matches the given name and argument types 'lower(DATE)'. \
+             You might need to add explicit type casts.\n\tCandidate functions:\n\tlower(col0 \
+             VARCHAR) -> VARCHAR\n"
+        );
+        for name in ["upper", "length", "strlen"] {
+            assert!(resolve(name, &[LogicalType::Integer]).is_err(), "{name} took an integer");
+        }
+        for name in ["~~", "!~~", "~~*", "!~~*"] {
+            let types = [LogicalType::Integer, LogicalType::Varchar];
+            assert!(resolve(name, &types).is_err(), "{name} took an integer");
+        }
+    }
+
+    /// The wrong answer this shape was added for. `length([1,2,3])` used to cast the list to a
+    /// string and count the nine characters of `[1, 2, 3]`, where DuckDB counts three elements.
+    /// rudb has no list type in the executor yet, so refusing is the honest end of it for now.
+    #[test]
+    fn length_of_something_that_is_not_a_string_is_refused_rather_than_stringified() {
+        let error = resolve("length", &[LogicalType::Blob]).expect_err("length takes strings");
+        assert!(error.to_string().contains("length(col0 ANY[]) -> BIGINT"), "{error}");
+    }
+
+    /// `||` is the exception and it has to stay one. `1 || 'a'` is `1a` upstream.
+    #[test]
+    fn concatenation_still_takes_anything_and_makes_a_string_of_it() {
+        let resolved = resolve("||", &[LogicalType::Integer, LogicalType::Varchar])
+            .expect("concatenation takes anything");
+        assert_eq!(resolved.returns, LogicalType::Varchar);
+        assert_eq!(resolved.arguments, vec![LogicalType::Varchar, LogicalType::Varchar]);
+    }
+
+    /// A null literal has no type to pick an overload with, and DuckDB answers `length(NULL)` with
+    /// NULL rather than refusing it.
+    #[test]
+    fn a_string_function_takes_an_untyped_null() {
+        let resolved = resolve("length", &[LogicalType::Null]).expect("length of a null");
+        assert_eq!(resolved.returns, LogicalType::BigInt);
+        assert_eq!(resolved.arguments, vec![LogicalType::Varchar]);
+    }
+
+    /// A candidate block for a name nothing resolves to would be a message about a function that
+    /// does not exist, which is worse than no block at all.
+    #[test]
+    fn every_name_with_candidates_is_a_function_this_engine_has() {
+        for (name, overloads) in CANDIDATES {
+            assert!(TABLE.iter().any(|entry| entry.name == *name), "{name} has no entry");
+            assert!(!overloads.is_empty(), "{name} has an empty candidate list");
         }
     }
 
