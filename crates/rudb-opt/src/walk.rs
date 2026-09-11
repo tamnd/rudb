@@ -1,10 +1,15 @@
-//! Rewriting the operands of one expression, without deciding what the rewrite is.
+//! Walking one expression, without deciding what the walk is for.
 //!
-//! Two passes take an expression apart and put it back with different operands. Folding replaces an
-//! operand with its value where it has one, and filter pushdown replaces a column reference with
-//! whatever the operator below computes that column from. Everything except that one sentence is the
-//! same code in both: visit each operand, and if any of them moved, append a new expression carrying
-//! the operands that moved and the type the plan already recorded.
+//! Four things every pass here ends up needing: rewrite the operands, list the columns, ask whether
+//! asking twice can give two answers, and ask whether two expressions are the same expression. None
+//! of them is interesting and all of them have a match arm per variant, so a variant added to `Expr`
+//! and forgotten about is a compile error in one file instead of four.
+//!
+//! Folding replaces an operand with its value where it has one, filter pushdown replaces a column
+//! reference with whatever the operator below computes that column from, and transitive predicates
+//! replace a column reference with the column an equality says it equals. Everything except that one
+//! sentence is the same code in all three: visit each operand, and if any of them moved, append a new
+//! expression carrying the operands that moved and the type the plan already recorded.
 //!
 //! Appending rather than editing in place is not a style choice. An expression may only refer to an
 //! expression behind it in the arena, which [`Plan::validate`] checks and which is what makes a plan
@@ -13,7 +18,9 @@
 //!
 //! [`Plan::validate`]: rudb_plan::Plan::validate
 
-use rudb_plan::{Arm, Expr, ExprRef, Plan, Slice};
+use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, Plan, Slice};
+
+use crate::fold::VOLATILE;
 
 /// Rewrites the operands of one expression, rebuilding it only if one of them moved.
 ///
@@ -102,4 +109,164 @@ pub(crate) fn list(
     let held = plan.expr_list(slice).to_vec();
     let rewritten: Vec<ExprRef> = held.iter().map(|&expr| child(plan, expr)).collect();
     (rewritten != held).then(|| plan.add_expr_list(&rewritten))
+}
+
+/// Calls `found` for every column `expr` reads.
+pub(crate) fn columns(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ColumnBinding)) {
+    match *plan.expr(expr) {
+        Expr::Column(binding) => found(binding),
+        Expr::Constant(_) => {}
+        Expr::Cast { input, .. } => columns(plan, input, found),
+        Expr::Compare { left, right, .. } => {
+            columns(plan, left, found);
+            columns(plan, right, found);
+        }
+        Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
+            for &child in plan.expr_list(children) {
+                columns(plan, child, found);
+            }
+        }
+        Expr::Aggregate { args, filter, .. } => {
+            for &arg in plan.expr_list(args) {
+                columns(plan, arg, found);
+            }
+            if let Some(inner) = filter {
+                columns(plan, inner, found);
+            }
+        }
+        Expr::Case { arms, otherwise } => {
+            for arm in plan.arm_list(arms) {
+                columns(plan, arm.when, found);
+                columns(plan, arm.then, found);
+            }
+            if let Some(inner) = otherwise {
+                columns(plan, inner, found);
+            }
+        }
+    }
+}
+
+/// Whether asking for this expression twice can give two answers.
+///
+/// The list is [`VOLATILE`], which is the one folding refuses to fold and is read from the pinned
+/// binary's `duckdb_functions()`. rudb answers to none of those names yet, so this is false for
+/// everything today and is here so that the first one to land is refused by a pass that already knew
+/// about it rather than copied by a pass that had never heard of it.
+///
+/// Copying is where it matters. A pass that moves an expression somewhere else is fine either way,
+/// and a pass that writes it down twice has turned one call into two.
+pub(crate) fn volatile(plan: &Plan, expr: ExprRef) -> bool {
+    match *plan.expr(expr) {
+        Expr::Column(_) | Expr::Constant(_) => false,
+        Expr::Cast { input, .. } => volatile(plan, input),
+        Expr::Compare { left, right, .. } => volatile(plan, left) || volatile(plan, right),
+        Expr::Conjunction { children, .. } => any_volatile(plan, children),
+        Expr::Function { name, args } => {
+            VOLATILE.contains(&plan.string(name)) || any_volatile(plan, args)
+        }
+        Expr::Aggregate { args, filter, .. } => {
+            any_volatile(plan, args) || filter.is_some_and(|inner| volatile(plan, inner))
+        }
+        Expr::Case { arms, otherwise } => {
+            plan.arm_list(arms)
+                .iter()
+                .any(|arm| volatile(plan, arm.when) || volatile(plan, arm.then))
+                || otherwise.is_some_and(|inner| volatile(plan, inner))
+        }
+    }
+}
+
+/// Whether any expression in the run is volatile.
+fn any_volatile(plan: &Plan, slice: Slice) -> bool {
+    plan.expr_list(slice).iter().any(|&expr| volatile(plan, expr))
+}
+
+/// Whether two expressions are the same expression written out.
+///
+/// The arena does not share anything, so an expression built twice is two references to two copies
+/// and `one == other` is only true when both came from the same place. Transitive predicates need
+/// the other question, since the predicate it derives is often one the query already had, and adding
+/// a second copy of it would make the pass produce a different plan each time it ran.
+///
+/// A constant compares by value rather than by reference for the same reason, and a function by the
+/// name it resolved to rather than by where that name is interned.
+pub(crate) fn same(plan: &Plan, one: ExprRef, other: ExprRef) -> bool {
+    if one == other {
+        return true;
+    }
+    if plan.expr_type(one) != plan.expr_type(other) {
+        return false;
+    }
+    match (plan.expr(one), plan.expr(other)) {
+        (Expr::Column(left), Expr::Column(right)) => left == right,
+        (Expr::Constant(left), Expr::Constant(right)) => plan.value(*left) == plan.value(*right),
+        (
+            Expr::Cast { input: left, try_cast: left_try },
+            Expr::Cast { input: right, try_cast: right_try },
+        ) => left_try == right_try && same(plan, *left, *right),
+        (
+            Expr::Compare { op: left_op, left: left_one, right: left_other },
+            Expr::Compare { op: right_op, left: right_one, right: right_other },
+        ) => {
+            left_op == right_op
+                && same(plan, *left_one, *right_one)
+                && same(plan, *left_other, *right_other)
+        }
+        (
+            Expr::Conjunction { op: left_op, children: left },
+            Expr::Conjunction { op: right_op, children: right },
+        ) => left_op == right_op && same_list(plan, *left, *right),
+        (
+            Expr::Function { name: left_name, args: left },
+            Expr::Function { name: right_name, args: right },
+        ) => plan.string(*left_name) == plan.string(*right_name) && same_list(plan, *left, *right),
+        (
+            Expr::Aggregate {
+                name: left_name,
+                args: left,
+                distinct: left_distinct,
+                filter: left_filter,
+            },
+            Expr::Aggregate {
+                name: right_name,
+                args: right,
+                distinct: right_distinct,
+                filter: right_filter,
+            },
+        ) => {
+            plan.string(*left_name) == plan.string(*right_name)
+                && left_distinct == right_distinct
+                && same_list(plan, *left, *right)
+                && same_option(plan, *left_filter, *right_filter)
+        }
+        (
+            Expr::Case { arms: left, otherwise: left_otherwise },
+            Expr::Case { arms: right, otherwise: right_otherwise },
+        ) => {
+            let (left, right) = (plan.arm_list(*left).to_vec(), plan.arm_list(*right).to_vec());
+            let (left_otherwise, right_otherwise) = (*left_otherwise, *right_otherwise);
+            left.len() == right.len()
+                && left.iter().zip(&right).all(|(one, other)| {
+                    same(plan, one.when, other.when) && same(plan, one.then, other.then)
+                })
+                && same_option(plan, left_otherwise, right_otherwise)
+        }
+        _ => false,
+    }
+}
+
+/// Whether two runs of expressions are the same run.
+fn same_list(plan: &Plan, one: Slice, other: Slice) -> bool {
+    let (one, other) = (plan.expr_list(one).to_vec(), plan.expr_list(other).to_vec());
+    one.len() == other.len()
+        && one.iter().zip(&other).all(|(&left, &right)| same(plan, left, right))
+}
+
+/// Whether two optional expressions are the same, counting absent as the same as absent.
+fn same_option(plan: &Plan, one: Option<ExprRef>, other: Option<ExprRef>) -> bool {
+    match (one, other) {
+        (None, None) => true,
+        (Some(left), Some(right)) => same(plan, left, right),
+        _ => false,
+    }
 }

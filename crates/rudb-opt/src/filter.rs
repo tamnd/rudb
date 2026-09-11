@@ -60,6 +60,15 @@
 //! it would have thrown away every padded row anyway. That needs the null rejecting analysis, which
 //! is its own item in #102 and its own pull request.
 //!
+//! # Predicates nobody wrote
+//!
+//! A predicate can only be pushed into a side that produces what it reads, so a query that restricts
+//! one table and joins on a key gives the other table nothing at all. `crate::transitive` is what
+//! writes the missing predicate down: an equality between two columns means anything said about one
+//! of them is said about the other. It runs where the predicates are, which is at a filter for the
+//! equalities somebody wrote in a `WHERE` and at a join for the ones in an `ON`, and everything it
+//! produces goes through the rules here like any other predicate.
+//!
 //! # Taking the conjunction apart
 //!
 //! `WHERE a AND b` is two predicates. Splitting them is most of the value of the pass, because the
@@ -77,14 +86,11 @@
 //! few nodes on a plan and is the reason every pass walks from the root rather than over the arena.
 
 use rudb_common::{LogicalType, Result};
-use rudb_plan::{
-    ColumnBinding, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice,
-};
+use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 
-use crate::fold::VOLATILE;
 use crate::pass::{Context, Pass};
-use crate::tables::{Tables, produced};
-use crate::walk;
+use crate::tables::{TableSet, Tables, produced};
+use crate::{transitive, walk};
 
 /// Moves every predicate as far down the plan as it can go.
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +130,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         Node::Filter { input, predicate } => {
             let mut parts = pending;
             split(plan, predicate, &mut parts);
+            transitive::within(plan, &mut parts);
             node(plan, input, parts, tables)
         }
 
@@ -194,7 +201,14 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         // for an inner join a condition and a filter above it mean the same thing, so it becomes a
         // condition and runs while the pairs are being built rather than after.
         Node::Join { left, right, kind, conditions } => {
-            let (to_left, to_right, over) = sides(plan, tables, pending, left, right, kept(kind));
+            let below = (produced(plan, left), produced(plan, right));
+            let held = plan.expr_list(conditions).to_vec();
+            let (extra_left, extra_right) =
+                transitive::across(plan, tables, kind, &held, &pending, (&below.0, &below.1));
+            let (mut to_left, mut to_right, over) =
+                sides(plan, tables, pending, &below, kept(kind));
+            to_left.extend(extra_left);
+            to_right.extend(extra_right);
             let (added, stay) =
                 if kind == JoinKind::Inner { (over, Vec::new()) } else { (Vec::new(), over) };
             let rebuilt_left = node(plan, left, to_left, tables);
@@ -226,7 +240,8 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         // into it. A predicate over both stays above, for the measured reason in this file's
         // opening, and #211 is where that changes.
         Node::CrossProduct { left, right } => {
-            let (to_left, to_right, over) = sides(plan, tables, pending, left, right, (true, true));
+            let below = (produced(plan, left), produced(plan, right));
+            let (to_left, to_right, over) = sides(plan, tables, pending, &below, (true, true));
             let rebuilt_left = node(plan, left, to_left, tables);
             let rebuilt_right = node(plan, right, to_right, tables);
             let above = if rebuilt_left == left && rebuilt_right == right {
@@ -273,7 +288,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
 /// A positional join keeps neither, which is the one entry here that is not about nulls. It pairs
 /// the nth row of one side with the nth row of the other, so removing a row from either side
 /// renumbers everything after it and pairs up rows that were never meant to meet.
-fn kept(kind: JoinKind) -> (bool, bool) {
+pub(crate) fn kept(kind: JoinKind) -> (bool, bool) {
     match kind {
         JoinKind::Inner => (true, true),
         JoinKind::Left | JoinKind::Semi | JoinKind::Anti | JoinKind::Single => (true, false),
@@ -291,22 +306,18 @@ fn sides(
     plan: &Plan,
     tables: &mut Tables,
     pending: Vec<ExprRef>,
-    left: NodeRef,
-    right: NodeRef,
+    below: &(TableSet, TableSet),
     kept: (bool, bool),
 ) -> (Vec<ExprRef>, Vec<ExprRef>, Vec<ExprRef>) {
-    if pending.is_empty() {
-        return (Vec::new(), Vec::new(), Vec::new());
-    }
-    let (below_left, below_right) = (produced(plan, left), produced(plan, right));
+    let (below_left, below_right) = (&below.0, &below.1);
     let mut to_left = Vec::new();
     let mut to_right = Vec::new();
     let mut over = Vec::new();
     for part in pending {
         let read = tables.of(plan, part);
-        if kept.0 && read.is_subset_of(&below_left) {
+        if kept.0 && read.is_subset_of(below_left) {
             to_left.push(part);
-        } else if kept.1 && read.is_subset_of(&below_right) {
+        } else if kept.1 && read.is_subset_of(below_right) {
             to_right.push(part);
         } else {
             over.push(part);
@@ -369,10 +380,10 @@ fn partition(
 /// Whether every column `expr` reads can be replaced by what `held` computes it from.
 fn substitutable(plan: &Plan, expr: ExprRef, index: u32, held: &[ExprRef]) -> bool {
     let mut answer = true;
-    columns(plan, expr, &mut |binding| {
+    walk::columns(plan, expr, &mut |binding| {
         answer &= binding.table == index;
         answer &= match held.get(binding.column as usize) {
-            Some(&source) => !volatile(plan, source),
+            Some(&source) => !walk::volatile(plan, source),
             None => false,
         };
     });
@@ -388,73 +399,6 @@ fn substitute(plan: &mut Plan, expr: ExprRef, index: u32, held: &[ExprRef]) -> E
         return if binding.table == index { held[binding.column as usize] } else { expr };
     }
     walk::rebuild(plan, expr, &mut |plan, child| substitute(plan, child, index, held))
-}
-
-/// Calls `found` for every column `expr` reads.
-fn columns(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ColumnBinding)) {
-    match *plan.expr(expr) {
-        Expr::Column(binding) => found(binding),
-        Expr::Constant(_) => {}
-        Expr::Cast { input, .. } => columns(plan, input, found),
-        Expr::Compare { left, right, .. } => {
-            columns(plan, left, found);
-            columns(plan, right, found);
-        }
-        Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
-            for &child in plan.expr_list(children) {
-                columns(plan, child, found);
-            }
-        }
-        Expr::Aggregate { args, filter, .. } => {
-            for &arg in plan.expr_list(args) {
-                columns(plan, arg, found);
-            }
-            if let Some(inner) = filter {
-                columns(plan, inner, found);
-            }
-        }
-        Expr::Case { arms, otherwise } => {
-            for arm in plan.arm_list(arms) {
-                columns(plan, arm.when, found);
-                columns(plan, arm.then, found);
-            }
-            if let Some(inner) = otherwise {
-                columns(plan, inner, found);
-            }
-        }
-    }
-}
-
-/// Whether asking for this expression twice can give two answers.
-///
-/// The list is [`VOLATILE`], which is the one folding refuses to fold and is read from the pinned
-/// binary's `duckdb_functions()`. rudb answers to none of those names yet, so this is false for
-/// everything today and is here so that the first one to land is refused by a pass that already knew
-/// about it rather than copied by a pass that had never heard of it.
-fn volatile(plan: &Plan, expr: ExprRef) -> bool {
-    match *plan.expr(expr) {
-        Expr::Column(_) | Expr::Constant(_) => false,
-        Expr::Cast { input, .. } => volatile(plan, input),
-        Expr::Compare { left, right, .. } => volatile(plan, left) || volatile(plan, right),
-        Expr::Conjunction { children, .. } => any_volatile(plan, children),
-        Expr::Function { name, args } => {
-            VOLATILE.contains(&plan.string(name)) || any_volatile(plan, args)
-        }
-        Expr::Aggregate { args, filter, .. } => {
-            any_volatile(plan, args) || filter.is_some_and(|inner| volatile(plan, inner))
-        }
-        Expr::Case { arms, otherwise } => {
-            plan.arm_list(arms)
-                .iter()
-                .any(|arm| volatile(plan, arm.when) || volatile(plan, arm.then))
-                || otherwise.is_some_and(|inner| volatile(plan, inner))
-        }
-    }
-}
-
-/// Whether any expression in the run is volatile.
-fn any_volatile(plan: &Plan, slice: Slice) -> bool {
-    plan.expr_list(slice).iter().any(|&expr| volatile(plan, expr))
 }
 
 #[cfg(test)]
@@ -618,11 +562,13 @@ Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::
     Get memory.main.t AS a #0 [a::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER]
 ";
+        // Each side takes the predicate written against it and the copy of the other one that the
+        // join's own equality implies, which is `crate::transitive`.
         let after = "\
 Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
-  Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
+  Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN
     Get memory.main.t AS a #0 [a::INTEGER]
-  Filter (#1.0::INTEGER = 2::INTEGER)::BOOLEAN
+  Filter ((#1.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN
     Get memory.main.t AS b #1 [a::INTEGER]
 ";
         assert_eq!(pushed(before), after);
@@ -654,12 +600,16 @@ Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::
     Get memory.main.t AS a #0 [a::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER]
 ";
+        // The predicate over `b` stays above the join and the one over `a` goes into `a`. The third
+        // filter is the copy of the second that the join's equality implies, which may go into `b`
+        // even though a predicate may not, for the reason `crate::transitive::droppable` gives.
         let after = "\
 Filter (#1.0::INTEGER = 2::INTEGER)::BOOLEAN
   Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
     Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
       Get memory.main.t AS a #0 [a::INTEGER]
-    Get memory.main.t AS b #1 [a::INTEGER]
+    Filter (#1.0::INTEGER = 1::INTEGER)::BOOLEAN
+      Get memory.main.t AS b #1 [a::INTEGER]
 ";
         assert_eq!(pushed(before), after);
     }
@@ -749,7 +699,8 @@ Filter (#2.0::INTEGER > 5::INTEGER)::BOOLEAN
         let after = "\
 Project #2 [#1.0::INTEGER AS x]
   Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
-    Get memory.main.t AS a #0 [a::INTEGER]
+    Filter (#0.0::INTEGER > 5::INTEGER)::BOOLEAN
+      Get memory.main.t AS a #0 [a::INTEGER]
     Filter (#1.0::INTEGER > 5::INTEGER)::BOOLEAN
       Get memory.main.t AS b #1 [a::INTEGER]
 ";
