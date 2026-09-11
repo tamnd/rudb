@@ -27,6 +27,7 @@ rudb-c-api = { version = "=0.2.3", path = "crates/rudb-c-api" }
 rudb-catalog = { version = "=0.2.3", path = "crates/rudb-catalog" }
 rudb-cli = { version = "=0.2.3", path = "crates/rudb-cli" }
 rudb-common = { version = "=0.2.3", path = "crates/rudb-common" }
+rudb-compress = { version = "=0.2.3", path = "crates/rudb-compress" }
 rudb-csv = { version = "=0.2.3", path = "crates/rudb-csv" }
 rudb-delta = { version = "=0.2.3", path = "crates/rudb-delta" }
 rudb-duckdb-format = { version = "=0.2.3", path = "crates/rudb-duckdb-format" }

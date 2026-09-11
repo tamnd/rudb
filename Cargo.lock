@@ -70,6 +70,13 @@ name = "rudb-common"
 version = "0.2.3"
 
 [[package]]
+name = "rudb-compress"
+version = "0.2.3"
+dependencies = [
+ "rudb-common",
+]
+
+[[package]]
 name = "rudb-csv"
 version = "0.2.3"
 dependencies = [
@@ -261,6 +268,7 @@ version = "0.2.3"
 dependencies = [
  "rudb",
  "rudb-common",
+ "rudb-compress",
  "rudb-exec",
  "rudb-io",
  "rudb-kernels",

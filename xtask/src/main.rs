@@ -13,6 +13,7 @@ use std::process::{Command, ExitCode};
 mod bench;
 mod codegen;
 mod compare;
+mod compress;
 mod focus;
 mod grammar;
 mod io;
@@ -57,6 +58,9 @@ fn main() -> ExitCode {
         // `kernels` because it reads a real file off a real disk and so it is the one table here
         // whose answer is a fact about the machine rather than about the code.
         Some("io") => io::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        // What a megabyte of Snappy costs to decompress, which only means anything next to the
+        // read rate in the table above it.
+        Some("compress") => compress::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         Some("smoke") => smoke::run(),
         Some("ci") => ci(std::env::args().nth(2).as_deref() == Some("--full")),
         Some("help" | "--help" | "-h") | None => {
@@ -104,6 +108,8 @@ fn usage() {
     println!("           replaces, per access pattern, per thread count, with the bytes read over");
     println!("           the bytes wanted. --cold drops the page cache and needs Linux and root,");
     println!("           and it is the column that means anything. --bytes <n> sizes the file");
+    println!("  compress what a megabyte of Snappy costs to decompress, per payload shape. The");
+    println!("           number only means anything next to the read rate from `io` above");
     println!("  bench <suite>          the whole comparison, against every engine on this machine");
     println!("                         builds rudb and the harness, then runs the suite. needs a");
     println!("                         tamnd/rudb-bench checkout beside this one, or");

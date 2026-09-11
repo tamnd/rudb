@@ -12,6 +12,8 @@ The failure mode being avoided is a crate tree that looks modular and is not: fo
 
 `rudb-io`, files, direct I/O, io_uring, the thread pool backend, object storage, and the interception shim from document 16.5. Depends on `rudb-common`.
 
+`rudb-compress`, the block compression codecs, written rather than depended on because the zero dependency rule in 18.4 leaves no alternative. Snappy first, since Snappy is what almost every Parquet writer emits. Depends on `rudb-common`. Rank 1 and not higher because a codec turns bytes into bytes and knows nothing about a vector or a page, so everything between it and the format readers that use it is free to not know it exists.
+
 **Data representation.**
 
 `rudb-vector`, vectors, physical forms, validity, selection vectors, string representation, and the type-specific buffers. This is the widest interface in the system per document 7.1 and it is the crate with the strongest stability requirement inside the workspace.
