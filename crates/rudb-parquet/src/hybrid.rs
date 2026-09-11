@@ -198,32 +198,9 @@ impl<'a> Hybrid<'a> {
 
     /// Unpacks `count` values from the run at `start`, skipping the `done` already handed out.
     fn unpack(&mut self, out: &mut Vec<u32>, start: usize, done: usize, count: usize) {
-        if self.width == 0 {
-            // Legal, and it means the maximum value is zero, so the run occupies no bytes at all.
-            // A column that is required has a maximum definition level of zero and every page of
-            // it takes this branch.
-            out.resize(out.len() + count, 0);
-            return;
-        }
-        let width = usize::from(self.width);
-        let mask = if width == 32 { u32::MAX } else { (1u32 << width) - 1 };
-        let mut bit = done * width;
-        for _ in 0..count {
-            let byte = start + bit / 8;
-            let shift = bit % 8;
-            // Up to five bytes, because a 32 bit value starting at bit seven of a byte ends in
-            // the fifth one. Reading them as a u64 and shifting is one branch instead of a loop
-            // with a carry in it. The tail of the last group can ask for a byte past the run, and
-            // those bits are masked off, so a missing byte reads as zero rather than as an error.
-            let mut window = 0u64;
-            for i in 0..5 {
-                if let Some(&b) = self.bytes.get(byte + i) {
-                    window |= u64::from(b) << (8 * i);
-                }
-            }
-            out.push(((window >> shift) as u32) & mask);
-            bit += width;
-        }
+        // Narrowing back to 32 bits loses nothing: `Hybrid::new` refuses a width past 32, so
+        // every value the unpacker produces here already fits.
+        unpack(&self.bytes[start..], self.width, done, count, |value| out.push(value as u32));
     }
 
     /// A little-endian base 128 varint, which is what a run header is.
@@ -244,6 +221,57 @@ impl<'a> Hybrid<'a> {
             }
             shift += 7;
         }
+    }
+}
+
+/// Reads `count` bit packed values of `width` bits each, starting `skip` values into `bytes`.
+///
+/// Little endian at the bit level: the first value is in the low bits of the first byte and a value
+/// that does not fit carries into the low bits of the next one. Parquet uses this same packing in
+/// two places that look unrelated, the hybrid encoding's packed runs and the miniblocks of the
+/// delta encodings, which is why it is a free function rather than a method on either.
+///
+/// The values go to a closure rather than into a vector because the two callers want them in
+/// different widths. Levels and dictionary indices are never wider than 32 bits and are held that
+/// way, and a delta of two 64 bit integers needs all 64.
+///
+/// Bits past the end of `bytes` read as zero rather than as an error. The last group of a run is
+/// padded out to eight values whether or not the file has the bytes for them, and the values the
+/// caller did not ask for are the ones the padding covers.
+pub(crate) fn unpack(
+    bytes: &[u8],
+    width: u8,
+    skip: usize,
+    count: usize,
+    mut push: impl FnMut(u64),
+) {
+    if width == 0 {
+        // Legal, and it means the maximum value is zero, so the run occupies no bytes at all. A
+        // column that is required has a maximum definition level of zero and every page of it takes
+        // this branch. A delta miniblock whose values are all the block minimum takes it too.
+        for _ in 0..count {
+            push(0);
+        }
+        return;
+    }
+    let width = usize::from(width);
+    let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let mut bit = skip * width;
+    for _ in 0..count {
+        let byte = bit / 8;
+        let shift = bit % 8;
+        // Nine bytes at most, because a 64 bit value starting at bit seven of a byte ends in the
+        // ninth one. Reading them into a u128 and shifting is one branch instead of a loop with a
+        // carry in it. A narrower width reads bytes it does not need and masks them off, which is
+        // cheaper than working out how many it needed.
+        let mut window = 0u128;
+        for i in 0..9 {
+            if let Some(&b) = bytes.get(byte + i) {
+                window |= u128::from(b) << (8 * i);
+            }
+        }
+        push(((window >> shift) as u64) & mask);
+        bit += width;
     }
 }
 

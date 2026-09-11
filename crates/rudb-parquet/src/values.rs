@@ -87,6 +87,13 @@ impl Page {
                 Ok(Vector::dictionary(codes, dictionary.clone())?
                     .with_validity(validity(&levels, total)))
             }
+            Encoding::DeltaBinaryPacked
+            | Encoding::DeltaLengthByteArray
+            | Encoding::DeltaByteArray
+            | Encoding::ByteStreamSplit => {
+                let data = delta(column, encoding, self.body, at, valid, &levels, total)?;
+                Ok(Vector::flat(column.ty.clone(), data)?.with_validity(validity(&levels, total)))
+            }
             other => {
                 Err(Error::io(format!("a page in {other:?}, which this reader does not read yet")))
             }
@@ -191,18 +198,7 @@ fn plain(
             Ok(Data::Float64(Buffer::from_vec(spread(dense, levels, total))))
         }
         Physical::ByteArray => {
-            expect(target, PhysicalType::Varlen, &column.ty)?;
-            if column.ty != LogicalType::Varchar {
-                // A byte array with no annotation, or one annotated as `BSON`, is bytes rather than
-                // text, and the string column this would go into validates UTF-8 on the way in.
-                // Reading it needs a seam past that validation, which does not exist yet, and
-                // guessing at the bytes being text would be a wrong answer on the first file where
-                // they are not.
-                return Err(Error::io(format!(
-                    "a {} column, which this reader does not read yet",
-                    column.ty
-                )));
-            }
+            text(column)?;
             strings(body, at, count, levels, total)
         }
         Physical::Int96 => Err(Error::io(
@@ -214,6 +210,124 @@ fn plain(
             "a FIXED_LEN_BYTE_ARRAY column, which this reader does not read yet".to_string(),
         )),
     }
+}
+
+/// Reads one of the delta encodings, or byte stream split, laid out for the column's type.
+fn delta(
+    column: &SchemaColumn,
+    encoding: Encoding,
+    body: Vec<u8>,
+    at: usize,
+    count: usize,
+    levels: &[u32],
+    total: usize,
+) -> Result<Data> {
+    let target = column.ty.physical();
+    match encoding {
+        Encoding::DeltaBinaryPacked => {
+            if !matches!(column.physical, Physical::Int32 | Physical::Int64) {
+                return Err(Error::io(format!(
+                    "a {:?} column delta encoded, which only integers are",
+                    column.physical
+                )));
+            }
+            let (dense, _) = crate::delta::binary_packed(tail(&body, at)?, count)?;
+            narrow(target, dense.into_iter(), levels, total)
+        }
+        Encoding::DeltaLengthByteArray => {
+            text(column)?;
+            let spans = crate::delta::length_byte_array(tail(&body, at)?, count)?;
+            // The spans came back relative to where the values start, and the column's arena is the
+            // whole page, so every offset moves up by that much. Keeping the page whole rather than
+            // slicing it is what lets the levels in front of the values stay where they are.
+            let spans: Vec<(usize, usize)> =
+                spans.into_iter().map(|(start, len)| (start + at, len)).collect();
+            place(body, &spans, levels, total)
+        }
+        Encoding::DeltaByteArray => {
+            text(column)?;
+            let built = crate::delta::byte_array(tail(&body, at)?, count)?;
+            // The one encoding whose strings are not in the page, so this is the one column that
+            // gets a fresh arena. Nothing else in this reader copies a string's bytes.
+            let mut column = StringColumn::with_capacity(total);
+            let mut next = 0;
+            for index in 0..total {
+                if !levels.is_empty() && levels.get(index) != Some(&1) {
+                    column.push("");
+                    continue;
+                }
+                let bytes = built.get(next).ok_or_else(|| {
+                    Error::io(format!(
+                        "a page with {} strings where {total} were wanted",
+                        built.len()
+                    ))
+                })?;
+                let value = std::str::from_utf8(bytes).map_err(|_| {
+                    Error::io("a delta byte array value that is not text".to_string())
+                })?;
+                column.push(value);
+                next += 1;
+            }
+            Ok(Data::Varlen(column))
+        }
+        Encoding::ByteStreamSplit => {
+            let width = match column.physical {
+                Physical::Float | Physical::Int32 => 4,
+                Physical::Double | Physical::Int64 => 8,
+                other => {
+                    return Err(Error::io(format!(
+                        "a {other:?} column byte stream split, which is not a fixed width type \
+                         this reader splits"
+                    )));
+                }
+            };
+            // The transpose puts the bytes back in value order, and after that it is a plain page
+            // that happens to live in a different buffer. Reading it through the plain path rather
+            // than repeating the type switch is the point of doing the transpose first.
+            let flat = crate::delta::stream_split(tail(&body, at)?, width, count)?;
+            plain(column, flat, 0, count, levels, total)
+        }
+        other => Err(Error::io(format!("a page in {other:?}, which is not a delta encoding"))),
+    }
+}
+
+/// Builds a string column over a page from spans that are already inside it.
+///
+/// The empty string stands in for a null, and it costs nothing: a view that short holds its bytes
+/// inside itself and never touches the arena. The validity beside the column is what says it is not
+/// a string at all.
+fn place(body: Vec<u8>, spans: &[(usize, usize)], levels: &[u32], total: usize) -> Result<Data> {
+    let mut column = StringColumn::over(Buffer::from_vec(body));
+    let mut next = 0;
+    for index in 0..total {
+        if !levels.is_empty() && levels.get(index) != Some(&1) {
+            column.push("");
+            continue;
+        }
+        let &(start, len) = spans.get(next).ok_or_else(|| {
+            Error::io(format!("a page with {} strings where {total} were wanted", spans.len()))
+        })?;
+        column.push_in_place(start, len)?;
+        next += 1;
+    }
+    Ok(Data::Varlen(column))
+}
+
+/// Checks that a byte array column holds text, which is the only kind this reader reads.
+///
+/// A byte array with no annotation, or one annotated as `BSON`, is bytes rather than text, and the
+/// string column it would go into validates UTF-8 on the way in. Reading it needs a seam past that
+/// validation, which does not exist yet, and guessing at the bytes being text would be a wrong
+/// answer on the first file where they are not.
+fn text(column: &SchemaColumn) -> Result<()> {
+    expect(column.ty.physical(), PhysicalType::Varlen, &column.ty)?;
+    if column.ty != LogicalType::Varchar {
+        return Err(Error::io(format!(
+            "a {} column, which this reader does not read yet",
+            column.ty
+        )));
+    }
+    Ok(())
 }
 
 /// The bytes of `body` from `at`, or an error naming how far short it fell.
@@ -282,27 +396,7 @@ fn strings(body: Vec<u8>, at: usize, count: usize, levels: &[u32], total: usize)
         spans.push((start, len));
         cursor = end;
     }
-    let mut column = StringColumn::over(Buffer::from_vec(body));
-    if levels.is_empty() || count == total {
-        for &(start, len) in &spans {
-            column.push_in_place(start, len)?;
-        }
-        return Ok(Data::Varlen(column));
-    }
-    // The empty string stands in for a null, and it costs nothing: a view that short holds its
-    // bytes inside itself and never touches the arena. The validity beside the column is what says
-    // it is not a string at all.
-    let mut next = 0;
-    for &level in levels.iter().take(total) {
-        if level == 1 {
-            let (start, len) = spans[next];
-            column.push_in_place(start, len)?;
-            next += 1;
-        } else {
-            column.push("");
-        }
-    }
-    Ok(Data::Varlen(column))
+    place(body, &spans, levels, total)
 }
 
 /// Narrows wire integers into whichever integer layout the column's type calls for.
