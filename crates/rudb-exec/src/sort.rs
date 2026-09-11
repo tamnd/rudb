@@ -77,21 +77,8 @@ impl<'a> Sort<'a> {
             scratch.grow(taken)?;
         }
         let mut failure: Option<Error> = None;
-        sortable.sort_by(|left, right| {
-            for (at, key) in self.keys.iter().enumerate() {
-                let ordering = match rank(&left.0[at], &right.0[at], *key) {
-                    Ok(ordering) => ordering,
-                    Err(error) => {
-                        failure.get_or_insert(error);
-                        Ordering::Equal
-                    }
-                };
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-            }
-            Ordering::Equal
-        });
+        let keys = &self.keys;
+        sortable.sort_by(|left, right| compare(keys, &left.0, &right.0, &mut failure));
         if let Some(error) = failure {
             return Err(error);
         }
@@ -99,6 +86,35 @@ impl<'a> Sort<'a> {
         self.chunks = rows::chunks(&self.schema.types(), &ordered, &mut self.held)?;
         Ok(())
     }
+}
+
+/// Where two rows of keys sit relative to each other, under the whole key list in priority order.
+///
+/// The first key that separates them decides, and rows that agree on every key are equal, which is
+/// where the stability of the sort does the rest.
+///
+/// A comparison that fails is reported as equal and remembered in `failure`, because `sort_by` wants
+/// a total order and has nowhere to put an error. The order that comes out of a run that failed is
+/// not an order anybody looks at, since the caller returns the error instead of the rows.
+pub(crate) fn compare(
+    keys: &[SortKey],
+    left: &[Value],
+    right: &[Value],
+    failure: &mut Option<Error>,
+) -> Ordering {
+    for (at, key) in keys.iter().enumerate() {
+        let ordering = match rank(&left[at], &right[at], *key) {
+            Ok(ordering) => ordering,
+            Err(error) => {
+                failure.get_or_insert(error);
+                Ordering::Equal
+            }
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
 }
 
 /// Where two values sit relative to each other under one sort key.

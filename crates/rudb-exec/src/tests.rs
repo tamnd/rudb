@@ -250,6 +250,45 @@ fn a_sort_breaks_ties_with_the_next_key() {
     assert_eq!(rows[2], vec![integer(2), text("c")]);
 }
 
+/// The same rows a sort with a limit over it produces, which is the whole promise of the operator.
+#[test]
+fn a_top_n_is_a_sort_with_a_limit_over_it() {
+    let keys = "[#0.0::INTEGER ASC NULLS LAST, #0.1::VARCHAR DESC NULLS LAST]";
+    let sorted = run(&format!("Limit 3 offset 0\n  Sort {keys}\n    {SCAN}"));
+    assert_eq!(run(&format!("TopN 3 offset 0 {keys}\n  {SCAN}")), sorted);
+    let skipped = run(&format!("Limit 2 offset 1\n  Sort {keys}\n    {SCAN}"));
+    assert_eq!(run(&format!("TopN 2 offset 1 {keys}\n  {SCAN}")), skipped);
+}
+
+/// The rows that are skipped have to be found before there is anything to skip them from, so the
+/// offset is part of what the operator holds rather than something left above it.
+#[test]
+fn a_top_n_counts_the_offset_into_what_it_keeps() {
+    let rows = run(&format!("TopN 1 offset 2 [#0.0::INTEGER ASC NULLS LAST]\n  {SCAN}"));
+    assert_eq!(rows, vec![vec![integer(2), text("c")]]);
+}
+
+/// Rows that tie on every key come out in the order they went in, on this and on the sort alike.
+#[test]
+fn a_top_n_keeps_the_input_order_of_rows_that_tie() {
+    let rows = run(&format!("TopN 2 offset 0 [#0.0::INTEGER ASC NULLS LAST]\n  {SCAN}"));
+    assert_eq!(rows, vec![vec![integer(1), Value::Null], vec![integer(1), text("a")]]);
+}
+
+#[test]
+fn a_top_n_of_nothing_produces_nothing() {
+    let rows = run(&format!("TopN 0 offset 0 [#0.0::INTEGER ASC NULLS LAST]\n  {SCAN}"));
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn a_top_n_past_the_end_of_the_input_produces_what_there_is() {
+    let rows = run(&format!("TopN 100 offset 0 [#0.0::INTEGER ASC NULLS LAST]\n  {SCAN}"));
+    assert_eq!(rows.len(), 4);
+    let past = run(&format!("TopN 100 offset 100 [#0.0::INTEGER ASC NULLS LAST]\n  {SCAN}"));
+    assert!(past.is_empty());
+}
+
 #[test]
 fn a_distinct_over_the_whole_row_keeps_the_first_of_each() {
     let rows = run(&format!("Distinct on=[]\n  Project #1 [#0.1::VARCHAR AS s]\n    {SCAN}"));

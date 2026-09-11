@@ -165,7 +165,7 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
                 _ => unreachable!("the node was an aggregate a moment ago"),
             }
         }
-        Node::Sort { keys, .. } => {
+        Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
             let held = plan.sort_key_list(keys).to_vec();
             let rewritten: Vec<SortKey> = held
                 .iter()
@@ -174,7 +174,7 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
             if rewritten != held {
                 let keys = plan.add_sort_keys(&rewritten);
                 match plan.node_mut(node) {
-                    Node::Sort { keys: held, .. } => *held = keys,
+                    Node::Sort { keys: held, .. } | Node::TopN { keys: held, .. } => *held = keys,
                     _ => unreachable!("the node was a sort a moment ago"),
                 }
             }

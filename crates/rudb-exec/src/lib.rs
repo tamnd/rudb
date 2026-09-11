@@ -50,6 +50,7 @@ mod setop;
 mod sort;
 mod source;
 mod stream;
+mod topn;
 
 #[cfg(test)]
 mod tests;

@@ -105,24 +105,17 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             out.write_str(" aggregates=")?;
             write_expr_list(plan, out, aggregates)
         }
-        Node::Sort { keys, .. } => {
-            out.write_str(" [")?;
-            for (position, key) in plan.sort_key_list(keys).iter().enumerate() {
-                if position > 0 {
-                    out.write_str(", ")?;
-                }
-                write_expr(plan, out, key.expr)?;
-                out.write_str(if key.descending { " DESC" } else { " ASC" })?;
-                out.write_str(if key.nulls_first { " NULLS FIRST" } else { " NULLS LAST" })?;
-            }
-            out.write_char(']')
-        }
+        Node::Sort { keys, .. } => write_sort_keys(plan, out, keys),
         Node::Limit { count, offset, .. } => {
             match count {
                 Some(count) => write!(out, " {count}")?,
                 None => out.write_str(" ALL")?,
             }
             write!(out, " offset {offset}")
+        }
+        Node::TopN { keys, count, offset, .. } => {
+            write!(out, " {count} offset {offset}")?;
+            write_sort_keys(plan, out, keys)
         }
         Node::Distinct { on, .. } => {
             out.write_str(" on=")?;
@@ -148,6 +141,20 @@ fn write_schema<W: Write>(plan: &Plan, out: &mut W, columns: Slice) -> fmt::Resu
         }
         write_identifier(out, &field.name)?;
         write!(out, "::{}", field.ty)?;
+    }
+    out.write_char(']')
+}
+
+/// The keys of a sort, in priority order, each with its direction and its null placement.
+fn write_sort_keys<W: Write>(plan: &Plan, out: &mut W, keys: Slice) -> fmt::Result {
+    out.write_str(" [")?;
+    for (position, key) in plan.sort_key_list(keys).iter().enumerate() {
+        if position > 0 {
+            out.write_str(", ")?;
+        }
+        write_expr(plan, out, key.expr)?;
+        out.write_str(if key.descending { " DESC" } else { " ASC" })?;
+        out.write_str(if key.nulls_first { " NULLS FIRST" } else { " NULLS LAST" })?;
     }
     out.write_char(']')
 }

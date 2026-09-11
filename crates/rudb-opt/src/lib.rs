@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Three passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
+//! Four passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
 //! the start of it. Column pruning came first, because it is the pass whose absence is measured in
 //! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -16,6 +16,7 @@ pub mod fold;
 pub mod nulls;
 pub mod pass;
 pub mod tables;
+pub mod topn;
 mod transitive;
 mod walk;
 
@@ -44,8 +45,12 @@ pub const RANK: u8 = 11;
 /// Before pruning, because moving a filter below a projection rewrites it in terms of columns the
 /// projection reads, and pruning has to see the plan after the move or it drops a column that
 /// something now refers to.
-pub static PASSES: [&(dyn Pass + Sync); 3] =
-    [&fold::ExpressionRewriter, &filter::FilterPushdown, &columns::UnusedColumns];
+///
+/// Top N is last, because it is the one pass that fuses two operators into one rather than moving
+/// something around. Everything before it is written against a sort and a limit, and a pass that had
+/// to know about both spellings of the same plan is a pass with two of every rule in it.
+pub static PASSES: [&(dyn Pass + Sync); 4] =
+    [&fold::ExpressionRewriter, &filter::FilterPushdown, &columns::UnusedColumns, &topn::TopN];
 
 /// Rewrites a bound plan into the plan that runs, with every pass on.
 ///
@@ -138,6 +143,7 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         Node::Filter { input, .. }
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
+        | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => output_columns(plan, input),
         // A set operation is as wide as either side, since the binder already required the two to
         // agree. A join and a cross product are as wide as the two together.
