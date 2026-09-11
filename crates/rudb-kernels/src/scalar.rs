@@ -531,8 +531,18 @@ fn arithmetic_of(
     returns: &LogicalType,
 ) -> Result<Option<Vector>> {
     // Both sides already the result type is what makes a native operation on the run's own width
-    // exactly the oracle's widen to `i128` and narrow back, rather than nearly it.
-    if left.logical_type() != returns || right.logical_type() != returns {
+    // exactly the oracle's widen to `i128` and narrow back, rather than nearly it. A decimal
+    // product is the exception: its two sides are the answer's width and keep their own scales, so
+    // the runs still line up while the types do not, and what the loop needs is the width.
+    let lined_up = match (returns, left.logical_type(), right.logical_type()) {
+        (
+            LogicalType::Decimal { width, .. },
+            LogicalType::Decimal { width: one, .. },
+            LogicalType::Decimal { width: other, .. },
+        ) => one == width && other == width,
+        (_, one, other) => one == returns && other == returns,
+    };
+    if !lined_up {
         return Ok(None);
     }
     by_form!(left, right, arithmetic_runs, op, left, right, returns)
@@ -609,7 +619,7 @@ where
     // A decimal shares its run with the integer of the same width and the two want different
     // arithmetic, so `returns` and not the run is what decides, and it decides first.
     if matches!(returns, LogicalType::Decimal { .. }) {
-        return decimal_runs(one, at_left, other, at_right, op, &base, left, right);
+        return decimal_runs(one, at_left, other, at_right, op, &base, left, right, returns);
     }
     // Dividing has to look at the divisor before it computes and has to know whether the row was
     // already null before it calls a zero divisor a null, so it keeps the careful loop.
@@ -806,10 +816,16 @@ where
 
 /// Decimal arithmetic, which is integer arithmetic on the unscaled values plus a rescale and a
 /// width check, and is rare enough on a scan to keep the careful loop for all five operators.
+///
+/// A product is the one that does not take its operands at the answer's scale. `DECIMAL(4,2) *
+/// DECIMAL(4,2)` is a `DECIMAL(8,4)` and the two sides arrive holding two decimal places each, so
+/// the unscaled values multiply straight into the answer. Everything else arrives at the answer's
+/// own scale and is added, subtracted or divided there.
 #[expect(
     clippy::too_many_arguments,
-    reason = "two sides with an index each, the operator, the nulls and the two vectors the error \
-              message needs, none of which is worth a struct that exists for three calls"
+    reason = "two sides with an index each, the operator, the nulls, the type of the answer and \
+              the two vectors the error message needs, none of which is worth a struct that \
+              exists for three calls"
 )]
 fn decimal_runs<L, R>(
     one: &Data,
@@ -820,15 +836,26 @@ fn decimal_runs<L, R>(
     base: &Validity,
     left: &Vector,
     right: &Vector,
+    returns: &LogicalType,
 ) -> Result<Option<Vector>>
 where
     L: Fn(usize) -> usize,
     R: Fn(usize) -> usize,
 {
-    let returns = left.logical_type();
     let LogicalType::Decimal { width, scale } = *returns else {
         return Ok(None);
     };
+    let (Some((_, left_scale)), Some((_, right_scale))) =
+        (left.logical_type().decimal_shape(), right.logical_type().decimal_shape())
+    else {
+        return Ok(None);
+    };
+    let held = left_scale.saturating_add(right_scale);
+    // Everything but a product wants both sides at the answer's scale, which is what the binder
+    // casts them to. Anything else goes to the row at a time path, which rescales as it reads.
+    if !matches!(op, Op::Multiply) && (left_scale != scale || right_scale != scale) {
+        return Ok(None);
+    }
     let rows = left.len();
     let guarding = matches!(op, Op::Divide | Op::Modulo);
     macro_rules! runs {
@@ -846,7 +873,7 @@ where
                             Op::Add => x.checked_add(y),
                             Op::Subtract => x.checked_sub(y),
                             Op::Multiply => {
-                                x.checked_mul(y).and_then(|wide| rescale(wide, scale * 2, scale))
+                                x.checked_mul(y).and_then(|wide| rescale(wide, held, scale))
                             }
                             Op::Modulo => x.checked_rem(y),
                             Op::Divide => {
@@ -1365,6 +1392,9 @@ fn float_arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> Re
 
 fn decimal_arithmetic(op: Op, left: &Value, right: &Value, width: u8, scale: u8) -> Result<Value> {
     let ty = LogicalType::Decimal { width, scale };
+    if matches!(op, Op::Multiply) {
+        return decimal_product(left, right, width, scale, &ty);
+    }
     let (a, b) = match (unscaled_at(left, scale), unscaled_at(right, scale)) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -1382,7 +1412,7 @@ fn decimal_arithmetic(op: Op, left: &Value, right: &Value, width: u8, scale: u8)
     let unscaled = match op {
         Op::Add => a.checked_add(b),
         Op::Subtract => a.checked_sub(b),
-        Op::Multiply => a.checked_mul(b).and_then(|wide| rescale(wide, scale * 2, scale)),
+        Op::Multiply => unreachable!("a product is handled above"),
         Op::Modulo => a.checked_rem(b),
         Op::Divide => a.checked_div(b).and_then(|whole| whole.checked_mul(pow10(scale))),
     };
@@ -1391,6 +1421,48 @@ fn decimal_arithmetic(op: Op, left: &Value, right: &Value, width: u8, scale: u8)
         return Err(overflow(op, &ty, left, right));
     }
     Ok(Value::Decimal { unscaled, width, scale })
+}
+
+/// A product, which multiplies the two unscaled values as they are rather than at the same scale.
+///
+/// The answer's scale is the two scales added together, so `1.50 * 1.50` is 150 times 150 written
+/// with four decimal places, which is 2.2500 and is what DuckDB answers. Lifting both sides to the
+/// answer's scale first would multiply the same number by ten thousand and then divide it back,
+/// which is the same answer for small values and an overflow for large ones.
+fn decimal_product(
+    left: &Value,
+    right: &Value,
+    width: u8,
+    scale: u8,
+    ty: &LogicalType,
+) -> Result<Value> {
+    let (a, b) = match (unscaled_and_scale(left), unscaled_and_scale(right)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            return Err(Error::not_implemented(format!(
+                "multiplication on {} and {}",
+                left.logical_type(),
+                right.logical_type()
+            )));
+        }
+    };
+    let held = a.1.saturating_add(b.1);
+    let unscaled =
+        a.0.checked_mul(b.0)
+            .and_then(|wide| rescale(wide, held, scale))
+            .ok_or_else(|| overflow(Op::Multiply, ty, left, right))?;
+    if digits(unscaled) > width {
+        return Err(overflow(Op::Multiply, ty, left, right));
+    }
+    Ok(Value::Decimal { unscaled, width, scale })
+}
+
+/// A value as the integer it is written with and the scale it is written at.
+fn unscaled_and_scale(value: &Value) -> Option<(i128, u8)> {
+    match *value {
+        Value::Decimal { unscaled, scale, .. } => Some((unscaled, scale)),
+        _ => integral(value).map(|whole| (whole, 0)),
+    }
 }
 
 /// A value as an unscaled integer at the given scale, for the decimal path.

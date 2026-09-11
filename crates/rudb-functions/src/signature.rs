@@ -16,7 +16,7 @@
 //! because it carries an implementation per pair. Ours does not carry one yet, and inventing 169
 //! rows before there is a kernel behind any of them would be inventing the wrong 169 rows.
 
-use rudb_common::{Error, LogicalType, Result};
+use rudb_common::{Error, LogicalType, MAX_DECIMAL_WIDTH, Result};
 
 /// Whether a name is a scalar function or an aggregate.
 ///
@@ -49,8 +49,18 @@ pub struct Resolved {
 /// How the argument types decide the return type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
-    /// Every argument promotes to one type and the result is that type. `+` and `min`.
+    /// Every argument promotes to one type and the result is that type. `*` and `min`.
     Promoted,
+    /// Two arguments, and a decimal product is as wide as both operands together. `*`.
+    Multiplied,
+    /// Every argument promotes and a decimal result gains a digit for the carry. `+` and `-`.
+    ///
+    /// Adding two `DECIMAL(18,0)` produces nineteen digits, so a rule that gives the sum eighteen
+    /// of them is a rule that raises an overflow on the largest inputs it accepts. Only a decimal
+    /// moves: an integer result is the promoted type, since promotion already went to a type that
+    /// holds both, and the unary forms of the two operators do not widen because negating a number
+    /// cannot carry.
+    PromotedWithCarry,
     /// Every argument promotes to one type and the result is fixed. `=` over anything is boolean.
     PromotedTo(Fixed),
     /// Every argument is cast to one fixed type and the result is another. `||` over strings.
@@ -182,10 +192,11 @@ struct Entry {
 const TABLE: &[Entry] = &[
     // Arithmetic. The result is what the operands promote to, so `INTEGER + BIGINT` is a `BIGINT`
     // and the executor never has to widen mid expression. `+` and `-` take one argument as well as
-    // two, because the unary forms are the same function and DuckDB names them the same way.
-    number("+", Arity::between(1, 2), Shape::Promoted),
-    number("-", Arity::between(1, 2), Shape::Promoted),
-    number("*", Arity::exactly(2), Shape::Promoted),
+    // two, because the unary forms are the same function and DuckDB names them the same way, and
+    // they are the two that carry: a sum of two decimals needs a digit the operands do not have.
+    number("+", Arity::between(1, 2), Shape::PromotedWithCarry),
+    number("-", Arity::between(1, 2), Shape::PromotedWithCarry),
+    number("*", Arity::exactly(2), Shape::Multiplied),
     number("%", Arity::exactly(2), Shape::Promoted),
     // `/` is the exception and it is DuckDB's exception too: `7 / 2` is 3.5 and not 3, so the
     // result is a double whatever went in, and `//` is the operator that keeps the integer.
@@ -361,6 +372,31 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let common = promote_all(name, arguments)?;
             (vec![common.clone(); arguments.len()], common)
         }
+        Shape::Multiplied => {
+            let common = promote_all(name, arguments)?;
+            match product(arguments)? {
+                // Each side keeps its own scale and takes the answer's width, so the two runs are
+                // the same physical type and the unscaled values multiply into the answer with no
+                // rescaling anywhere. That is what the decimal loop in rudb-kernels expects.
+                Some(LogicalType::Decimal { width, scale }) => {
+                    let cast_to = arguments
+                        .iter()
+                        .map(|ty| match ty.decimal_shape() {
+                            Some((_, held)) => LogicalType::Decimal { width, scale: held },
+                            None => ty.clone(),
+                        })
+                        .collect();
+                    (cast_to, LogicalType::Decimal { width, scale })
+                }
+                _ => (vec![common.clone(); arguments.len()], common),
+            }
+        }
+        Shape::PromotedWithCarry => {
+            let common = promote_all(name, arguments)?;
+            // One argument is a negation or a unary plus, and neither one can carry.
+            let returns = if arguments.len() > 1 { carrying(common) } else { common };
+            (vec![returns.clone(); arguments.len()], returns)
+        }
         Shape::PromotedTo(fixed) => {
             let common = promote_all(name, arguments)?;
             (vec![common; arguments.len()], fixed.ty())
@@ -485,6 +521,76 @@ fn leading(count: usize, first: Fixed, arguments: &[LogicalType]) -> Vec<Logical
     cast_to
 }
 
+/// The type of a decimal product, or `None` when no decimal is involved and promotion decides.
+///
+/// A product of `DECIMAL(a,b)` and `DECIMAL(c,d)` needs `a + c` digits with `b + d` after the
+/// point, because the largest pair of inputs multiplies to exactly that, and an integer counts as
+/// the decimal that holds it. The rest is where upstream stops widening, and both of the places it
+/// stops were read off `v2.0.0-dev84237` across a grid of seventy two pairs rather than reasoned
+/// about:
+///
+/// A product of two operands that each fit in sixty four bits is kept there when it can be. So
+/// `DECIMAL(10,0) * DECIMAL(10,0)` is `DECIMAL(18,0)` rather than `DECIMAL(20,0)`, which is a type
+/// that cannot hold every product of its own inputs and raises an overflow on the ones it cannot,
+/// and `DECIMAL(18,17) * DECIMAL(10,0)` is `DECIMAL(18,17)`. It is kept there only while a digit is
+/// left in front of the point, which is why `DECIMAL(10,9) * DECIMAL(10,9)` is `DECIMAL(20,18)` and
+/// not `DECIMAL(18,18)`: at eighteen decimal places there is no room for the integer part, so the
+/// answer moves to the wider representation instead.
+///
+/// Past that, the width stops at the widest decimal there is and the scale does not, because a
+/// scale that had to shrink would be an answer with digits missing from the end of it rather than a
+/// narrower one. A scale of more than thirty eight is refused at bind time with upstream's own
+/// sentence, since there is no type to put the answer in.
+fn product(arguments: &[LogicalType]) -> Result<Option<LogicalType>> {
+    let mut decimals = false;
+    let (mut width, mut scale, mut widest) = (0u8, 0u8, 0u8);
+    for ty in arguments {
+        decimals |= matches!(ty, LogicalType::Decimal { .. });
+        let Some((one, held)) = ty.decimal_shape() else { return Ok(None) };
+        width = width.saturating_add(one);
+        scale = scale.saturating_add(held);
+        widest = widest.max(one);
+    }
+    if !decimals {
+        return Ok(None);
+    }
+    if scale > MAX_DECIMAL_WIDTH {
+        return Err(Error::out_of_range(format!(
+            "Needed scale {scale} to accurately represent the multiplication result, but this is out of range of the DECIMAL type. Max scale is {MAX_DECIMAL_WIDTH}; could not perform an accurate multiplication. Either add a cast to DOUBLE, or add an explicit cast to a decimal with a lower scale."
+        )));
+    }
+    if widest <= WIDEST_SIXTY_FOUR_BIT
+        && width > WIDEST_SIXTY_FOUR_BIT
+        && scale < WIDEST_SIXTY_FOUR_BIT
+    {
+        width = WIDEST_SIXTY_FOUR_BIT;
+    }
+    Ok(Some(LogicalType::Decimal { width: width.min(MAX_DECIMAL_WIDTH), scale }))
+}
+
+/// The widest decimal that is still eight bytes a value, which is where a product stops widening.
+const WIDEST_SIXTY_FOUR_BIT: u8 = 18;
+
+/// The type an addition or a subtraction produces from what its operands promote to.
+///
+/// A decimal gains the one digit an addition can carry into and everything else is unchanged. At
+/// the maximum width there is nowhere left to widen into, so the type stays where it is and the
+/// overflow is raised on the row that overflows rather than on every query that could.
+///
+/// Measured on `v2.0.0-dev84237`, which is where each of these numbers comes from:
+/// `DECIMAL(18,0) + DECIMAL(18,0)` is `DECIMAL(19,0)`, `DECIMAL(38,0) + DECIMAL(38,0)` is
+/// `DECIMAL(38,0)`, `2.0 + 1::INTEGER` is `DECIMAL(12,1)` and `DECIMAL(18,0) - DECIMAL(4,2)` is
+/// `DECIMAL(21,2)`. A modulo, a negation and `abs` do not widen and keep [`Shape::Promoted`] for
+/// that reason, and a product widens by a rule of its own, which is [`product`].
+fn carrying(common: LogicalType) -> LogicalType {
+    match common {
+        LogicalType::Decimal { width, scale } if width < MAX_DECIMAL_WIDTH => {
+            LogicalType::Decimal { width: width + 1, scale }
+        }
+        other => other,
+    }
+}
+
 /// What a sum of this type accumulates into.
 ///
 /// Summing a column of `INTEGER` overflows an `INTEGER` after 2^31 of them and there is no useful
@@ -572,6 +678,94 @@ mod tests {
             .expect("an integer and a bigint add");
         assert_eq!(resolved.returns, LogicalType::BigInt);
         assert_eq!(resolved.arguments, vec![LogicalType::BigInt, LogicalType::BigInt]);
+    }
+
+    /// Every decimal sum in here was read off `v2.0.0-dev84237` with `typeof`, per #243.
+    ///
+    /// The last one is the case the rule exists for. Two `DECIMAL(18,0)` hold numbers that add to
+    /// nineteen digits, and a result type of eighteen means the largest pair of inputs the operator
+    /// accepts is a pair it cannot answer.
+    #[test]
+    fn a_decimal_sum_is_a_digit_wider_than_what_its_operands_promote_to() {
+        let decimal = |width, scale| LogicalType::Decimal { width, scale };
+        let sum = |left: LogicalType, right: LogicalType| {
+            resolve("+", &[left, right]).expect("adds").returns
+        };
+        assert_eq!(sum(decimal(18, 0), decimal(18, 0)), decimal(19, 0));
+        assert_eq!(sum(decimal(2, 1), LogicalType::Integer), decimal(12, 1));
+        assert_eq!(sum(decimal(18, 0), decimal(4, 2)), decimal(21, 2));
+        assert_eq!(sum(decimal(4, 2), LogicalType::BigInt), decimal(22, 2));
+        assert_eq!(sum(decimal(4, 2), LogicalType::UBigInt), decimal(23, 2));
+        assert_eq!(sum(decimal(4, 2), LogicalType::HugeInt), decimal(38, 2));
+        // Both sides are cast to the answer's type, because the kernel underneath adds two runs of
+        // the same width and the carry digit can move the answer into a wider one.
+        let resolved = resolve("-", &[decimal(18, 0), decimal(18, 0)]).expect("subtracts");
+        assert_eq!(resolved.arguments, vec![decimal(19, 0), decimal(19, 0)]);
+    }
+
+    /// At the maximum width there is nowhere to carry into, so the type stops and the row raises.
+    #[test]
+    fn a_decimal_sum_at_the_widest_decimal_stays_there() {
+        let widest = LogicalType::Decimal { width: MAX_DECIMAL_WIDTH, scale: 0 };
+        let resolved = resolve("+", &[widest.clone(), widest.clone()]).expect("adds");
+        assert_eq!(resolved.returns, widest);
+    }
+
+    /// Negation cannot carry, and neither can anything that is not an addition.
+    ///
+    /// `-1.50` is a `DECIMAL(4,2)` upstream and so is `abs(-1.50)`, and `5.50 % 3` is a
+    /// `DECIMAL(12,2)`, which is the promotion with no digit added to it.
+    #[test]
+    fn nothing_but_a_two_sided_addition_gains_a_digit() {
+        let decimal = |width, scale| LogicalType::Decimal { width, scale };
+        assert_eq!(resolve("-", &[decimal(4, 2)]).expect("negates").returns, decimal(4, 2));
+        assert_eq!(resolve("+", &[decimal(4, 2)]).expect("is unary plus").returns, decimal(4, 2));
+        assert_eq!(resolve("abs", &[decimal(4, 2)]).expect("has a size").returns, decimal(4, 2));
+        assert_eq!(
+            resolve("%", &[decimal(4, 2), LogicalType::Integer]).expect("divides").returns,
+            decimal(12, 2)
+        );
+    }
+
+    /// Every product in here was read off `v2.0.0-dev84237` with `typeof`, per #243.
+    ///
+    /// The first three are the plain rule, the next two are the pair that stays in sixty four bits
+    /// and the pair that does not because it has no digit left in front of the point, and the last
+    /// is the width running into the widest decimal there is while the scale does not move.
+    #[test]
+    fn a_decimal_product_is_as_wide_as_both_of_its_operands_together() {
+        let decimal = |width, scale| LogicalType::Decimal { width, scale };
+        let times = |left: LogicalType, right: LogicalType| {
+            resolve("*", &[left, right]).expect("multiplies").returns
+        };
+        assert_eq!(times(decimal(4, 2), decimal(4, 2)), decimal(8, 4));
+        assert_eq!(times(decimal(4, 2), LogicalType::BigInt), decimal(23, 2));
+        assert_eq!(times(decimal(18, 3), LogicalType::Integer), decimal(18, 3));
+        assert_eq!(times(decimal(12, 6), decimal(12, 6)), decimal(18, 12));
+        assert_eq!(times(decimal(10, 9), decimal(10, 9)), decimal(20, 18));
+        assert_eq!(times(decimal(18, 17), decimal(18, 17)), decimal(36, 34));
+        assert_eq!(times(decimal(20, 10), decimal(20, 10)), decimal(38, 20));
+        // Nothing that is not a decimal goes near any of this.
+        assert_eq!(times(LogicalType::Integer, LogicalType::Integer), LogicalType::Integer);
+    }
+
+    /// Each side takes the answer's width and keeps its own scale, which is what the kernel needs.
+    ///
+    /// The unscaled values then multiply into the answer with nothing rescaled on either side of
+    /// the operator, which a cast of both sides to the answer's scale would not give.
+    #[test]
+    fn a_decimal_product_casts_its_operands_to_the_width_of_the_answer() {
+        let decimal = |width, scale| LogicalType::Decimal { width, scale };
+        let resolved = resolve("*", &[decimal(4, 2), LogicalType::BigInt]).expect("multiplies");
+        assert_eq!(resolved.arguments, vec![decimal(23, 2), decimal(23, 0)]);
+    }
+
+    /// There is no type to put the answer in, so it is refused at bind time rather than truncated.
+    #[test]
+    fn a_product_that_needs_more_than_thirty_eight_decimal_places_is_refused() {
+        let wide = LogicalType::Decimal { width: 30, scale: 30 };
+        let error = resolve("*", &[wide.clone(), wide]).expect_err("has nowhere to put the scale");
+        assert!(error.to_string().contains("Max scale is 38"), "{error}");
     }
 
     /// The one arithmetic result that is not the promotion, and it is DuckDB's rule rather than an
