@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Writes crates/rudb/testdata/clickbench-answers.txt from the duckdb binary.
+
+Run this on a machine that has duckdb on the path, which today means one of the Linux boxes rather
+than a laptop. It takes the queries out of crates/rudb/testdata/clickbench.sql, loads
+crates/rudb/testdata/hits.parquet into a table called hits the same way the test does, and records
+what duckdb answers.
+
+Three of the forty three queries do not have one right answer. A LIMIT over groups that tie, or a
+LIMIT with no ORDER BY at all, leaves the engine free to return any of several results, and two
+correct engines are allowed to disagree. So every query is run three times, once over the file in
+its own order and twice over the same rows shuffled, and what the three runs agree about is what
+goes in the file:
+
+    exact   all three runs matched, so the answer is the answer and the test compares all of it
+    last    the runs disagreed about which rows came back but agreed on the last column, which is
+            the one the ORDER BY sorts on, so the test compares that column and the shape
+    count   the runs disagreed about the last column too, which is what LIMIT with no ORDER BY
+            means, so the test compares the column names, the column types and the row count
+
+Rerun this after changing hits.sql or regenerating hits.parquet. An answers file from one fixture
+and a fixture from another is a test that measures nothing.
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(HERE, os.pardir, "crates", "rudb", "testdata")
+LOAD = "CREATE TABLE hits AS SELECT * FROM 'hits.parquet';\n"
+SHUFFLED = "CREATE TABLE hits AS SELECT * FROM 'hits.parquet' ORDER BY random();\n"
+
+
+def queries():
+    """The DDL's queries, as (name, one line of SQL) in the order the file writes them."""
+    text = open(os.path.join(DATA, "clickbench.sql")).read()
+    found = []
+    for name, body in re.findall(r"\n-- (q\d+)\n(.*?;)", text, re.S):
+        found.append((name, " ".join(body.split())))
+    return found
+
+
+def run(sql):
+    """duckdb's own output, as the rows of its box with the padding taken off.
+
+    The first row is the column names and the second is the column types, which is what duckbox
+    prints above the rule. The count duckdb writes under a table is dropped, because rudb does not
+    write it yet. It is a line of one cell whatever the table is wide, which is not on its own
+    enough to recognise it by since a one column table's rows are also one cell, so the cell has to
+    read as a count as well.
+    """
+    done = subprocess.run(
+        ["duckdb"], input=sql, capture_output=True, text=True, cwd=DATA, check=False
+    )
+    if done.returncode != 0:
+        sys.exit("duckdb failed on\n%s\n%s" % (sql, done.stderr))
+    rows = []
+    for line in done.stdout.splitlines():
+        if not line.startswith("│"):
+            continue
+        cells = [cell.strip() for cell in line.strip("│").split("│")]
+        if len(cells) == 1 and re.match(r"^[\d,]+ rows?\b", cells[0]):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def main():
+    out = [
+        "-- What duckdb answers for every ClickBench query over hits.parquet in this directory.",
+        "--",
+        "-- Written by scripts/clickbench-answers, which says there how it decides what to record.",
+        "-- Do not edit this by hand. A number in here that nothing produced is worse than no",
+        "-- number at all, because the test that reads it will go green on it.",
+        "--",
+        "-- Each query is a line naming it and saying how much of the answer is settled, then the",
+        "-- column names, then the column types as duckdb's shell spells them, then a line per row.",
+        "-- Cells are separated by tabs. A null is the word NULL, which is what both shells print.",
+        "",
+    ]
+    for name, sql in queries():
+        plain = run(LOAD + sql + "\n")
+        first = run(SHUFFLED + sql + "\n")
+        second = run(SHUFFLED + sql + "\n")
+        if plain == first and plain == second:
+            mode = "exact"
+            body = plain[2:]
+        elif [row[-1] for row in first] == [row[-1] for row in plain] and [
+            row[-1] for row in second
+        ] == [row[-1] for row in plain]:
+            mode = "last"
+            body = [[row[-1]] for row in plain[2:]]
+        else:
+            mode = "count"
+            body = []
+        out.append("-- %s %s %d" % (name, mode, len(plain) - 2))
+        out.append("\t".join(plain[0]))
+        out.append("\t".join(plain[1]))
+        out.extend("\t".join(row) for row in body)
+        out.append("")
+    path = os.path.join(DATA, "clickbench-answers.txt")
+    open(path, "w").write("\n".join(out))
+    print("wrote %s" % path)
+
+
+main()

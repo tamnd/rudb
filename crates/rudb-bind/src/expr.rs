@@ -422,6 +422,12 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
 /// DuckDB uses the text the user wrote. The tokens are gone by the time the binder runs, so this
 /// writes the expression back out in a shape close enough to be recognisable, which is what the
 /// name is for.
+///
+/// Close enough is not quite the standard, though. These names are what a client reads back as the
+/// column headings, so a difference here is a difference a caller sees on every query that does not
+/// write `AS`, which is most of ClickBench. The shapes that are known to be exactly DuckDB's are
+/// under test in `crates/rudb/tests/clickbench.rs`, which compares the whole result of all forty
+/// three against the answers duckdb gives for the same file.
 pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
     match ast.expr(expr) {
         ast::Expr::Star { qualifier } => {
@@ -460,7 +466,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
         ast::Expr::Binary { op, left, right } => {
             format!("({} {} {})", describe(ast, left), spelling(ast, op), describe(ast, right))
         }
-        ast::Expr::Function { name, args, .. } => {
+        ast::Expr::Function { name, args, distinct } => {
             let written = ast.name(name).last().unwrap_or_default();
             let starred = ast
                 .expr_list(args)
@@ -469,9 +475,20 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
             if starred && rudb_catalog::same_name(written, "count") {
                 return "count_star()".to_string();
             }
+            // The name goes to lower case, which is the one place a spelling from the query is not
+            // kept. DuckDB's parser folds a function name as it reads it and the name it prints
+            // here is the folded one, so `SELECT SUM(x)` comes back as a column called `sum(x)`.
+            // A column name is not folded, because that one comes from the catalog rather than
+            // from the query, which is why `output_name` asks the scope first and only falls
+            // through to here.
+            let name = written.to_ascii_lowercase();
+            // `DISTINCT` is part of the name because it is part of what was computed.
+            // `count(UserID)` and `count(DISTINCT UserID)` are two different answers and a result
+            // that called them both the first one would be reporting the wrong one.
+            let word = if distinct { "DISTINCT " } else { "" };
             let arguments: Vec<String> =
                 ast.expr_list(args).iter().map(|&arg| describe(ast, arg)).collect();
-            format!("{written}({})", arguments.join(", "))
+            format!("{name}({word}{})", arguments.join(", "))
         }
         ast::Expr::Cast { operand, ty, try_cast } => {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
