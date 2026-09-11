@@ -293,6 +293,14 @@ impl<'a> Transform<'a> {
         let temporary = self.find(node, "Temporary") != NONE;
         let variation = self.find(node, "CreateStatementVariation");
         let inner = self.first(variation);
+        // duckdb refuses this pair in the parser, with a caret under the `NOT`, because none of its
+        // create rules has room for both. The vendored grammar has room for both, so the refusal is
+        // here instead, which is the same stage and therefore the same sentence.
+        if or_replace && self.find(inner, "IfNotExists") != NONE {
+            return Err(Error::parser(
+                "Cannot specify both OR REPLACE and IF NOT EXISTS within single create statement",
+            ));
+        }
         match self.name(inner) {
             "CreateTableStmt" => self.create_table_statement(inner, or_replace, temporary),
             "CreateViewStmt" => self.create_view_statement(inner, or_replace, temporary),
@@ -2061,11 +2069,33 @@ mod tests {
     }
 
     #[test]
-    fn the_three_modifiers_on_a_create_table_survive() {
+    fn the_modifiers_on_a_create_table_survive() {
         assert_eq!(
-            round_statement("CREATE OR REPLACE TEMPORARY TABLE IF NOT EXISTS s.t (a INT)"),
-            "CREATE OR REPLACE TEMPORARY TABLE IF NOT EXISTS s.t (a INT)"
+            round_statement("CREATE OR REPLACE TEMPORARY TABLE s.t (a INT)"),
+            "CREATE OR REPLACE TEMPORARY TABLE s.t (a INT)"
         );
+        assert_eq!(
+            round_statement("CREATE TEMPORARY TABLE IF NOT EXISTS s.t (a INT)"),
+            "CREATE TEMPORARY TABLE IF NOT EXISTS s.t (a INT)"
+        );
+    }
+
+    #[test]
+    fn or_replace_and_if_not_exists_in_one_statement_is_refused_here_and_not_later() {
+        // The grammar has room for both and duckdb's has not, so its refusal is a parser error with
+        // a caret under the `NOT` and this one is a parser error at the same stage. It is the same
+        // sentence whatever is being created.
+        for sql in [
+            "CREATE OR REPLACE TABLE IF NOT EXISTS t (a INT)",
+            "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT 1",
+        ] {
+            let error = parse_ast(sql).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                "Parser Error: Cannot specify both OR REPLACE and IF NOT EXISTS within single \
+                 create statement"
+            );
+        }
     }
 
     #[test]

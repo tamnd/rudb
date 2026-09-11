@@ -168,9 +168,6 @@ fn create_table(
         // never goes away would answer a later `SELECT` with rows DuckDB would not have.
         return Err(Error::not_implemented("CREATE TEMPORARY TABLE"));
     }
-    if written.if_not_exists && written.or_replace {
-        return Err(Error::binder("OR REPLACE cannot be used together with IF NOT EXISTS"));
-    }
     let parts: Vec<&str> = ast.name(written.name).collect();
     let name = catalog.resolve_for_create(&parts)?;
     let defs = ast.column_defs(written.columns);
@@ -273,12 +270,6 @@ fn create_view(
         // for.
         return Err(Error::not_implemented("CREATE TEMPORARY VIEW"));
     }
-    if written.if_not_exists && written.or_replace {
-        // duckdb v1.5.1 refuses this one in the parser, with a caret under the `NOT`, because its
-        // view rule has no room for both. The vendored grammar has room for both, so the refusal
-        // lands here instead and borrows the sentence the table form uses.
-        return Err(Error::binder("OR REPLACE cannot be used together with IF NOT EXISTS"));
-    }
     let parts: Vec<&str> = ast.name(written.name).collect();
     let name = catalog.resolve_for_create(&parts)?;
     let aliases: Vec<String> = ast.name(written.columns).map(str::to_string).collect();
@@ -300,16 +291,18 @@ fn create_view(
 
 fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<Bound> {
     let written = ast.drop_table(index);
+    let kind = if written.view { Entry::View } else { Entry::Table };
     let mut names = Vec::new();
     for &name in ast.name_list(written.names) {
         let parts: Vec<&str> = ast.name(name).collect();
-        match catalog.resolve(&parts) {
+        // The statement said which of the two it meant, so a name that is not there is a missing
+        // one of those and not a missing table.
+        match catalog.resolve_as(&parts, kind) {
             Ok(resolved) => names.push(resolved),
             Err(error) if written.if_exists => drop(error),
             Err(error) => return Err(error),
         }
     }
-    let kind = if written.view { Entry::View } else { Entry::Table };
     Ok(Bound::DropTable(DropTable { names, kind }))
 }
 
