@@ -270,6 +270,53 @@ fn a_timestamp_can_be_taken_apart_and_grouped_by() {
     );
 }
 
+/// The ClickBench entry's own load recipe, over a column that holds what the Parquet holds.
+///
+/// `hits.parquet` stores the day as days since the epoch and the time as seconds since the epoch,
+/// both as integers, and every query in the published set reads a date and a timestamp. DuckDB's
+/// entry closes that with `make_date` and `epoch_ms`, so this is those two over the integers the
+/// real file has in it, followed by the thing the queries then do with them.
+#[test]
+fn the_integers_the_benchmark_stores_become_the_dates_the_benchmark_queries() {
+    let db = Database::new();
+    db.create_table(
+        "hits",
+        vec![
+            Field::new("EventDate", LogicalType::Integer),
+            Field::new("EventTime", LogicalType::BigInt),
+        ],
+    )
+    .unwrap();
+    let day = i64::from(days_from_civil(2013, 7, 15));
+    db.append(
+        "hits",
+        &[
+            vec![
+                Value::Integer(days_from_civil(2013, 7, 15)),
+                Value::BigInt(day * 86_400 + 37_425),
+            ],
+            vec![Value::Integer(days_from_civil(2013, 7, 2)), Value::BigInt(day * 86_400 + 37_387)],
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT make_date(EventDate) AS d FROM hits WHERE make_date(EventDate) >= '2013-07-10' \
+             ORDER BY d"
+        ),
+        vec![vec![Value::Date(days_from_civil(2013, 7, 15))]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT extract(minute FROM epoch_ms(EventTime * 1000)) AS m, COUNT(*) FROM hits \
+             GROUP BY m ORDER BY m"
+        ),
+        vec![vec![Value::BigInt(23), Value::BigInt(2)]]
+    );
+}
+
 /// The part is a string wherever it came from, and a specifier that names nothing is DuckDB's
 /// message rather than a panic in a match arm.
 #[test]

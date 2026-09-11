@@ -46,7 +46,7 @@
 //! a backtracking automaton, and the pattern stops being converted from a `Value` to a `String` to
 //! a `Vec<char>` on every row.
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
 
 use crate::datetime::Part;
@@ -184,8 +184,57 @@ fn unary(name: &str, arg: &Vector, returns: &LogicalType, rows: usize) -> Result
         }
         "length" => length_of(data, base, rows, returns),
         "lower" | "upper" => fold_of(name, data, base, rows, returns),
+        "make_date" => made_date(data, base, rows, returns),
+        "epoch_ms" => made_timestamp(data, base, rows, returns),
         _ => Ok(None),
     }
+}
+
+/// `make_date(days)`, which is the identity on the bytes.
+///
+/// A date is days since the epoch in an `i32` and so is the argument, so the whole function is the
+/// logical type changing and the run of values staying exactly as it was. It is here rather than
+/// left to the row at a time path because the ClickBench entry wraps a hundred million row column in
+/// it, and a copy is the difference between that costing a memcpy and costing a hundred million
+/// boxed values.
+fn made_date(
+    data: &Data,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let (Data::Int32(days), LogicalType::Date) = (data, returns) else {
+        return Ok(None);
+    };
+    finish(returns, Data::Int32(days[..rows].to_vec().into()), base.normalize(rows))
+}
+
+/// `epoch_ms(milliseconds)`, which is one multiply per row.
+fn made_timestamp(
+    data: &Data,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let (Data::Int64(millis), LogicalType::Timestamp) = (data, returns) else {
+        return Ok(None);
+    };
+    let mut out = vec![0i64; rows];
+    let validity = over_valid(rows, base, |index| {
+        out[index] = micros_of_millis(millis[index])?;
+        Ok(true)
+    })?;
+    finish(returns, Data::Int64(out.into()), validity)
+}
+
+/// Milliseconds since the epoch as microseconds since the epoch.
+///
+/// The overflow is upstream's sentence, which names the two units rather than the function, because
+/// upstream reads the argument as a millisecond timestamp and then converts it.
+fn micros_of_millis(millis: i64) -> Result<i64> {
+    millis.checked_mul(1_000).ok_or_else(|| {
+        Error::conversion("Could not convert Timestamp(MS) to Timestamp(US)".to_owned())
+    })
 }
 
 /// `NOT`, which is one pass over a run of bytes.
@@ -1087,6 +1136,51 @@ fn date_value(name: &str, spec: &Value, when: &Value) -> Result<Value> {
     }
 }
 
+/// `make_date(days)` on one row.
+fn made_date_value(days: &Value) -> Result<Value> {
+    let Some(days) = days.as_i64() else {
+        return Err(Error::internal(format!("make_date of a {}", days.logical_type())));
+    };
+    let fitted = i32::try_from(days)
+        .map_err(|_| Error::conversion(format!("Date out of range: {days} days")))?;
+    Ok(Value::Date(fitted))
+}
+
+/// `make_date(year, month, day)` on one row.
+///
+/// The check is a round trip rather than a calendar. Thirty February converts to the second of March
+/// and converts back as the second of March, so a date that does not come back as what went in is a
+/// date that was never there, and that catches the month length and the leap year without a table of
+/// either. The message names the three numbers the way they were written, unpadded, which is what
+/// the binary prints.
+fn made_civil_value(year: &Value, month: &Value, day: &Value) -> Result<Value> {
+    let (Some(year), Some(month), Some(day)) = (year.as_i64(), month.as_i64(), day.as_i64()) else {
+        return Err(Error::internal("make_date of something that is not three numbers"));
+    };
+    let out_of_range = || Error::conversion(format!("Date out of range: {year}-{month}-{day}"));
+    let (fitted, month, day) = match (i32::try_from(year), u32::try_from(month), u32::try_from(day))
+    {
+        (Ok(year), Ok(month), Ok(day)) => (year, month, day),
+        _ => return Err(out_of_range()),
+    };
+    if !(1..=12).contains(&month) || day == 0 {
+        return Err(out_of_range());
+    }
+    let days = days_from_civil(fitted, month, day);
+    if civil_from_days(days) != (fitted, month, day) {
+        return Err(out_of_range());
+    }
+    Ok(Value::Date(days))
+}
+
+/// `epoch_ms(milliseconds)` on one row.
+fn made_timestamp_value(millis: &Value) -> Result<Value> {
+    let Some(millis) = millis.as_i64() else {
+        return Err(Error::internal(format!("epoch_ms of a {}", millis.logical_type())));
+    };
+    micros_of_millis(millis).map(Value::Timestamp)
+}
+
 /// Calls a scalar function on one row.
 ///
 /// # Errors
@@ -1123,6 +1217,9 @@ pub fn call_values(name: &str, args: &[Value], returns: &LogicalType) -> Result<
         ("~~*", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, true))),
         ("!~~*", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, true))),
         ("date_part" | "date_trunc", [spec, when]) => date_value(name, spec, when),
+        ("make_date", [days]) => made_date_value(days),
+        ("make_date", [year, month, day]) => made_civil_value(year, month, day),
+        ("epoch_ms", [millis]) => made_timestamp_value(millis),
         (_, [_, _, ..]) if regexp::is_regexp(name) => regexp::value(name, args),
         _ => Err(Error::not_implemented(format!(
             "the {name} function with {} arguments",
@@ -1865,6 +1962,93 @@ mod tests {
         assert_eq!(sum.value_at(0), Value::Null);
         assert_eq!(sum.value_at(1), Value::Integer(15));
         assert_eq!(sum.value_at(4), Value::Null);
+    }
+
+    /// The two the ClickBench entry is written in terms of. The days are the ones the real data
+    /// holds, since the whole point of these is that the column stores an integer and every query
+    /// in the set reads a date.
+    #[test]
+    fn a_number_becomes_a_date_and_a_timestamp() {
+        assert_eq!(
+            called("make_date", &[Value::Integer(16_000)], &LogicalType::Date),
+            Value::Date(16_000)
+        );
+        assert_eq!(
+            called(
+                "make_date",
+                &[Value::Integer(2013), Value::Integer(7), Value::Integer(1)],
+                &LogicalType::Date
+            ),
+            Value::Date(days_from_civil(2013, 7, 1))
+        );
+        assert_eq!(
+            called("epoch_ms", &[Value::BigInt(1_600_000_000_000)], &LogicalType::Timestamp),
+            Value::Timestamp(1_600_000_000_000_000)
+        );
+        assert_eq!(
+            called("epoch_ms", &[Value::BigInt(-1)], &LogicalType::Timestamp),
+            Value::Timestamp(-1_000)
+        );
+    }
+
+    /// The round trip check, which is the whole of the calendar this function needs. Thirty
+    /// February is the case that a month length table would be written for.
+    #[test]
+    fn a_day_that_is_not_in_its_month_is_a_date_out_of_range() {
+        for (year, month, day, written) in [
+            (2013, 13, 1, "2013-13-1"),
+            (2013, 2, 30, "2013-2-30"),
+            (0, 0, 0, "0-0-0"),
+            (2013, 7, 0, "2013-7-0"),
+        ] {
+            let error = call_values(
+                "make_date",
+                &[Value::Integer(year), Value::Integer(month), Value::Integer(day)],
+                &LogicalType::Date,
+            )
+            .expect_err("a date that is not a date");
+            assert_eq!(error.message(), format!("Date out of range: {written}"));
+        }
+        // The leap day itself is a date, which is the other half of the round trip check.
+        assert_eq!(
+            called(
+                "make_date",
+                &[Value::Integer(2024), Value::Integer(2), Value::Integer(29)],
+                &LogicalType::Date
+            ),
+            Value::Date(days_from_civil(2024, 2, 29))
+        );
+    }
+
+    /// Milliseconds so large that microseconds do not hold them, which is the one way this can fail
+    /// on data that bound.
+    #[test]
+    fn milliseconds_that_do_not_fit_in_microseconds_say_which_two_units_they_are() {
+        let error = call_values("epoch_ms", &[Value::BigInt(i64::MAX)], &LogicalType::Timestamp)
+            .expect_err("that is not a timestamp");
+        assert_eq!(error.message(), "Could not convert Timestamp(MS) to Timestamp(US)");
+    }
+
+    /// The loop and the row at a time path over the same column, including the nulls, since the
+    /// date one hands back the argument's own run of bytes and a mistake there would be invisible
+    /// in the values and wrong in the validity.
+    #[test]
+    fn the_loops_for_the_two_constructors_agree_with_the_row_at_a_time_path() {
+        let days = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(0), Value::Null, Value::Integer(16_000), Value::Integer(-1)],
+        )
+        .expect("four days");
+        agrees("make_date", &[days], &LogicalType::Date);
+        let millis = Vector::from_values(
+            LogicalType::BigInt,
+            &[Value::BigInt(0), Value::Null, Value::BigInt(1_600_000_000_000), Value::BigInt(-1)],
+        )
+        .expect("four stamps");
+        agrees("epoch_ms", &[millis], &LogicalType::Timestamp);
+        let overflowing =
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(i64::MAX)]).expect("one row");
+        agrees("epoch_ms", &[overflowing], &LogicalType::Timestamp);
     }
 
     #[test]
