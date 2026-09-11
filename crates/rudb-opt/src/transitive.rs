@@ -358,8 +358,11 @@ Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#0.0::INTEGER > 5::INTE
 
     #[test]
     fn a_full_join_derives_nothing_because_both_of_its_sides_come_out_padded() {
+        // `a.a IS NULL` rather than a comparison, since a comparison over either side of a full join
+        // is a predicate that makes it a one sided join through `crate::nulls`, and the point here
+        // is the join that stays full.
         let before = "\
-Filter (#0.0::INTEGER > 5::INTEGER)::BOOLEAN
+Filter (#0.0::INTEGER IS NOT DISTINCT FROM NULL::\"NULL\")::BOOLEAN
   Join FULL on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
     Get memory.main.t AS a #0 [a::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER]
