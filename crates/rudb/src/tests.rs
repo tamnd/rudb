@@ -12,7 +12,7 @@ use crate::Database;
 
 /// `t(x INTEGER, s VARCHAR)` with a null in it, plus an empty table to test the degenerate cases.
 fn database() -> Database {
-    let mut db = Database::new();
+    let db = Database::new();
     db.create_table(
         "t",
         vec![Field::new("x", LogicalType::Integer), Field::new("s", LogicalType::Varchar)],
@@ -250,7 +250,7 @@ fn moment(hours: i64, minutes: i64, seconds: i64) -> Value {
 /// type it was given, which is why the second query can sort by it and get times rather than text.
 #[test]
 fn a_timestamp_can_be_taken_apart_and_grouped_by() {
-    let mut db = Database::new();
+    let db = Database::new();
     db.create_table("hits", vec![Field::new("ts", LogicalType::Timestamp)]).unwrap();
     db.append("hits", &[vec![moment(10, 23, 45)], vec![moment(10, 23, 7)], vec![moment(11, 5, 0)]])
         .unwrap();
@@ -293,7 +293,7 @@ fn a_date_part_reads_its_specifier_three_ways_and_refuses_a_fourth() {
 /// rather than dropping the row.
 #[test]
 fn a_referer_can_be_cut_down_to_its_host_and_grouped_by() {
-    let mut db = Database::new();
+    let db = Database::new();
     db.create_table("hits", vec![Field::new("Referer", LogicalType::Varchar)]).unwrap();
     db.append(
         "hits",
@@ -408,7 +408,7 @@ fn a_plan_prints_parent_before_child() {
 
 #[test]
 fn creating_a_table_twice_is_an_error_and_dropping_it_makes_room_again() {
-    let mut db = Database::new();
+    let db = Database::new();
     db.create_table("t", vec![Field::new("x", LogicalType::Integer)]).unwrap();
     assert!(db.create_table("t", vec![Field::new("x", LogicalType::Integer)]).is_err());
     db.drop_table("t").unwrap();
@@ -419,7 +419,7 @@ fn creating_a_table_twice_is_an_error_and_dropping_it_makes_room_again() {
 /// to walk across the boundary.
 #[test]
 fn a_result_wider_than_one_vector_reads_across_chunks() {
-    let mut db = Database::new();
+    let db = Database::new();
     db.create_table("big", vec![Field::new("x", LogicalType::Integer)]).unwrap();
     let mut rows = Vec::new();
     for x in 0..2_500 {
@@ -452,7 +452,7 @@ fn a_table_can_be_named_with_its_schema_and_its_catalog() {
 
 /// A database built entirely out of SQL.
 fn scripted(statements: &[&str]) -> Database {
-    let mut db = Database::new();
+    let db = Database::new();
     for statement in statements {
         db.execute(statement).unwrap_or_else(|error| panic!("{statement}: {error}"));
     }
@@ -460,7 +460,7 @@ fn scripted(statements: &[&str]) -> Database {
 }
 
 /// The message a statement fails with.
-fn refusal(db: &mut Database, sql: &str) -> String {
+fn refusal(db: &Database, sql: &str) -> String {
     db.execute(sql).unwrap_err().message().to_string()
 }
 
@@ -543,9 +543,9 @@ fn a_short_column_list_renames_the_front_and_leaves_the_rest_to_the_query() {
 
 #[test]
 fn a_column_list_longer_than_the_query_is_the_error_duckdb_writes_for_it() {
-    let mut db = Database::new();
+    let db = Database::new();
     assert_eq!(
-        refusal(&mut db, "CREATE TABLE t (a, b, c) AS SELECT 1, 2"),
+        refusal(&db, "CREATE TABLE t (a, b, c) AS SELECT 1, 2"),
         "Target table has more colum names than query result."
     );
 }
@@ -578,30 +578,30 @@ fn a_column_list_turns_the_renaming_off_and_a_repeat_becomes_an_error() {
     // ones written or the ones the query gave, and two the same is a refusal.
     let db = scripted(&["CREATE TABLE t (z) AS SELECT 1 AS a, 2 AS a"]);
     assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["z", "a"]);
-    let mut db = Database::new();
+    let db = Database::new();
     assert_eq!(
-        refusal(&mut db, "CREATE TABLE t (z) AS SELECT 1 AS a, 2 AS a, 3 AS a"),
+        refusal(&db, "CREATE TABLE t (z) AS SELECT 1 AS a, 2 AS a, 3 AS a"),
         "Column with name a already exists!"
     );
-    let mut db = Database::new();
+    let db = Database::new();
     assert_eq!(
-        refusal(&mut db, "CREATE TABLE t (a, a) AS SELECT 1, 2"),
+        refusal(&db, "CREATE TABLE t (a, a) AS SELECT 1, 2"),
         "Column with name a already exists!"
     );
 }
 
 #[test]
 fn two_columns_of_one_name_in_a_plain_create_is_the_same_error() {
-    let mut db = Database::new();
+    let db = Database::new();
     assert_eq!(
-        refusal(&mut db, "CREATE TABLE t (Abc INTEGER, aBC VARCHAR)"),
+        refusal(&db, "CREATE TABLE t (Abc INTEGER, aBC VARCHAR)"),
         "Column with name aBC already exists!"
     );
 }
 
 #[test]
 fn if_not_exists_leaves_the_table_and_its_rows_alone() {
-    let mut db = scripted(&[
+    let db = scripted(&[
         "CREATE TABLE t (a INTEGER)",
         "INSERT INTO t VALUES (1)",
         "CREATE TABLE IF NOT EXISTS t (b VARCHAR, c VARCHAR)",
@@ -609,7 +609,7 @@ fn if_not_exists_leaves_the_table_and_its_rows_alone() {
     assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["a"]);
     assert_eq!(db.table_len("t").unwrap(), 1);
     // Without it, the second create is an error and the table is still the first one.
-    assert!(refusal(&mut db, "CREATE TABLE t (b VARCHAR)").contains("already exists"));
+    assert!(refusal(&db, "CREATE TABLE t (b VARCHAR)").contains("already exists"));
     assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["a"]);
 }
 
@@ -628,14 +628,14 @@ fn or_replace_runs_the_query_against_the_table_it_is_about_to_replace() {
 
 #[test]
 fn dropping_takes_a_list_and_if_exists_forgives_a_name_that_is_not_there() {
-    let mut db = scripted(&[
+    let db = scripted(&[
         "CREATE TABLE a (x INTEGER)",
         "CREATE TABLE b (x INTEGER)",
         "DROP TABLE a, b",
         "DROP TABLE IF EXISTS a",
     ]);
-    assert!(db.catalog().tables().next().is_none());
-    assert!(refusal(&mut db, "DROP TABLE a").contains("does not exist"));
+    assert!(db.with_catalog(|catalog| catalog.tables().next().is_none()));
+    assert!(refusal(&db, "DROP TABLE a").contains("does not exist"));
 }
 
 #[test]
@@ -660,7 +660,7 @@ fn values_is_a_query_and_the_columns_take_the_type_every_row_agrees_on() {
 fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
     // Each of these parses and each of them would be a wrong answer if it were accepted and the
     // clause ignored, which is the rule the front end follows everywhere else.
-    let mut db = scripted(&["CREATE TABLE t (a INTEGER)"]);
+    let db = scripted(&["CREATE TABLE t (a INTEGER)"]);
     for statement in [
         "CREATE TEMPORARY TABLE u (a INTEGER)",
         "CREATE TABLE u (a INTEGER PRIMARY KEY)",
@@ -668,22 +668,19 @@ fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
         "INSERT INTO t (a, a) VALUES (1, 2)",
         "CREATE TABLE u (a INTEGER, a VARCHAR)",
     ] {
-        let message = refusal(&mut db, statement);
+        let message = refusal(&db, statement);
         assert!(!message.is_empty(), "{statement} was accepted");
     }
-    assert!(db.catalog().tables().all(|table| table.name().table != "u"));
+    assert!(db.with_catalog(|catalog| catalog.tables().all(|table| table.name().table != "u")));
 }
 
 #[test]
 fn a_not_null_column_refuses_a_null_and_keeps_what_came_before_it() {
-    let mut db = scripted(&[
+    let db = scripted(&[
         "CREATE TABLE t (a INTEGER NOT NULL, b VARCHAR)",
         "INSERT INTO t VALUES (1, NULL)",
     ]);
-    assert_eq!(
-        refusal(&mut db, "INSERT INTO t VALUES (NULL, 'x')"),
-        "NOT NULL constraint failed: t.a"
-    );
+    assert_eq!(refusal(&db, "INSERT INTO t VALUES (NULL, 'x')"), "NOT NULL constraint failed: t.a");
     // The whole statement is refused rather than the row, so the table is what it was before it.
     assert_eq!(db.table_len("t").unwrap(), 1);
     assert_eq!(rows(&db, "SELECT a, b FROM t"), vec![vec![integer(1), Value::Null]]);

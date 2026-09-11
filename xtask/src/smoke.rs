@@ -23,7 +23,7 @@ pub(crate) fn run() -> Result<(), String> {
     println!("build: {}", if cfg!(debug_assertions) { "debug" } else { "release" });
     println!();
 
-    let mut db = Database::new();
+    let db = Database::new();
     db.create_table(
         "t",
         vec![Field::new("x", LogicalType::Integer), Field::new("label", LogicalType::Varchar)],

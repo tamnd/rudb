@@ -157,7 +157,7 @@ fn is_count(cell: &str) -> bool {
 /// the replacement scan rather than through `read_parquet` because that is the spelling the
 /// benchmark uses everywhere else.
 fn loaded() -> Database {
-    let mut database = Database::new();
+    let database = Database::new();
     let sql = format!("CREATE TABLE hits AS SELECT * FROM '{FIXTURE}'");
     database.execute(&sql).expect("the benchmark fixture loads");
     assert_eq!(database.table_len("hits").expect("hits exists"), 10_000);

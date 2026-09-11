@@ -22,6 +22,8 @@ pub mod shell;
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
+use rudb::Database;
+
 pub use args::{Action, Command, Options, parse};
 pub use format::{Format, Settings};
 pub use shell::{Shell, Stop};
@@ -57,15 +59,16 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
             ExitCode::FAILURE
         }
         Action::Run(options) => {
-            if options.database != ":memory:" {
-                let _ = writeln!(
-                    err,
-                    "rudb: cannot open {}, because there is no storage format yet. See https://github.com/tamnd/rudb/issues/103",
-                    options.database
-                );
-                return ExitCode::FAILURE;
-            }
-            let mut shell = Shell::new(&options, out, err);
+            // The library decides what a database name means, here and behind `.open`, so there is
+            // one rule about it rather than a copy of the rule in the shell.
+            let database = match Database::open(&options.database) {
+                Ok(database) => database,
+                Err(problem) => {
+                    let _ = writeln!(err, "rudb: {}", problem.message());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut shell = Shell::new(&options, database, out, err);
             let mut stop = shell.run_commands(&options.commands);
             if stop == Stop::Done && !options.stop_after_commands {
                 stop = read_input(&mut shell, &options);
