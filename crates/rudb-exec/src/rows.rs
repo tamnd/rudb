@@ -29,6 +29,12 @@ pub(crate) fn footprint(row: &[Value]) -> u64 {
 /// [`capacity`] over the container that holds it, and counting them again here would charge them
 /// twice. Per #227 the containers are now charged for what they took rather than for what they are
 /// using, and the two have to divide the row between them without overlapping.
+///
+/// A string is counted as the room it has and not as the bytes in it, for the same reason, so the
+/// row this is asked about has to be the copy something kept rather than a buffer that is about to
+/// be filled again. Grouping reads a row into one buffer and copies it out only when the group is
+/// new, and that buffer keeps whatever the longest string it has held needed, so asking this about
+/// it charges every row for the longest row.
 pub(crate) fn heap(row: &[Value]) -> u64 {
     let bytes = row.iter().map(Value::footprint).sum::<usize>() + ALLOCATION_USIZE;
     u64::try_from(bytes).unwrap_or(u64::MAX)
