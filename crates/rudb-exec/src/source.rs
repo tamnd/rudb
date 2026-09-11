@@ -3,6 +3,7 @@
 use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_functions::{TableFunction, series_length};
+use rudb_parquet::Reader;
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
@@ -252,6 +253,83 @@ impl Operator for Series {
         self.left -= count;
         let vector = Vector::flat(LogicalType::BigInt, Data::Int64(counted.into()))?;
         Ok(Some(Chunk::with_rows(vec![vector], count)?))
+    }
+}
+
+/// A scan of one Parquet file.
+///
+/// The file is opened when the operator is built and the columns the plan asked for are resolved
+/// against the footer by name, the same way [`Scan`] resolves them against a stored table and for
+/// the same reason: the plan's list is the query's and the file's list is the file's, and they are
+/// in the same order today only because the binder listed every column in order. When projection
+/// pushdown narrows the plan's list, the only thing that changes is which indices come out of this
+/// loop, and [`Reader::project`] already reads exactly those and no other bytes.
+///
+/// Nothing is buffered here. [`Reader::next_chunk`] hands back a chunk at a time, a row group at a
+/// time, so a query over a fourteen gigabyte file holds one row group's worth of pages rather than
+/// the file, which is what makes a scan of `hits.parquet` a thing that runs at all.
+#[derive(Debug)]
+pub(crate) struct ParquetScan {
+    reader: Reader,
+    schema: Schema,
+}
+
+impl ParquetScan {
+    /// The rows of a `read_parquet` [`Node::TableFunction`](rudb_plan::Node::TableFunction).
+    ///
+    /// # Errors
+    ///
+    /// If the path argument is not a constant string, if the file does not open or is not Parquet,
+    /// or if it does not have a column the plan asked for, which means the file changed under a
+    /// plan that was bound against it.
+    pub(crate) fn new(plan: &Plan, index: u32, args: Slice, columns: Slice) -> Result<Self> {
+        let exprs: Vec<ExprRef> = plan.expr_list(args).to_vec();
+        let source = Schema::empty();
+        let one = Chunk::with_rows(Vec::new(), 1)?;
+        let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
+        let path = match evaluated.first().map(|vector| vector.value_at(0)) {
+            Some(rudb_common::Value::Varchar(path)) => path,
+            other => {
+                return Err(Error::internal(format!(
+                    "a read_parquet path bound as VARCHAR arrived as {}",
+                    other.map_or_else(
+                        || "no argument at all".to_string(),
+                        |value| value.to_string()
+                    )
+                )));
+            }
+        };
+
+        let mut reader = rudb_parquet::open_path(&path)?;
+        let fields = plan.field_list(columns).to_vec();
+        let mut wanted = Vec::with_capacity(fields.len());
+        for field in &fields {
+            let position = reader
+                .metadata()
+                .schema
+                .iter()
+                .position(|column| column.name == field.name)
+                .ok_or_else(|| {
+                    Error::io(format!(
+                        "the file \"{path}\" does not have a column named \"{}\"",
+                        field.name
+                    ))
+                })?;
+            wanted.push(position);
+        }
+        reader.project(&wanted)?;
+        let schema = Schema::numbered(fields, index);
+        Ok(Self { reader, schema })
+    }
+}
+
+impl Operator for ParquetScan {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        self.reader.next_chunk()
     }
 }
 

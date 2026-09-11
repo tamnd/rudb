@@ -12,4 +12,6 @@ pub mod signature;
 pub mod table;
 
 pub use signature::{FunctionKind, Resolved, kind_of, resolve};
-pub use table::{ResolvedTable, TableFunction, resolve_table, series, series_length};
+pub use table::{
+    ResolvedTable, TableFunction, check_table_arguments, resolve_table, series, series_length,
+};

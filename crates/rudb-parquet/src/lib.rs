@@ -45,4 +45,4 @@ mod values;
 pub use chunk::{Page, Pages};
 pub use metadata::{ColumnChunk, Encoding, Metadata, Physical, RowGroup, SchemaColumn, Stats};
 pub use page::{Body, DataV1, DataV2, Dictionary, Header};
-pub use reader::{Reader, read};
+pub use reader::{Reader, open_path, read};

@@ -14,12 +14,13 @@
 
 use rudb_catalog::{Catalog, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_functions::{resolve, resolve_table};
+use rudb_functions::{TableFunction, check_table_arguments, resolve, resolve_table};
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, parse_ast};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey};
 
 use crate::expr::{describe, has_aggregate};
+use crate::file::{parquet_fields, replacement_scan, stem};
 use crate::scope::{Scope, Visible};
 
 /// Binds a parsed statement against a catalog.
@@ -804,7 +805,28 @@ impl<'a> Binder<'a> {
     ) -> Result<(NodeRef, Scope)> {
         let parts: Vec<&str> = ast.name(name).collect();
         let catalog = self.catalog;
-        let resolved = catalog.resolve(&parts)?;
+        let resolved = match catalog.resolve(&parts) {
+            Ok(resolved) => resolved,
+            Err(missing) => {
+                // The replacement scan. Only a name written as one part can be a path, because a
+                // name written as two is a schema and a table and saying otherwise would make
+                // `FROM main.hits` depend on whether a directory called `main` happened to exist.
+                match parts.as_slice() {
+                    [single] => match replacement_scan(single)? {
+                        Some(path) => {
+                            let label = if alias == NONE {
+                                stem(&path)
+                            } else {
+                                ast.string(alias).to_string()
+                            };
+                            return self.bind_parquet(ast, &path, label, columns);
+                        }
+                        None => return Err(missing),
+                    },
+                    _ => return Err(missing),
+                }
+            }
+        };
         let table = catalog.table(&resolved)?;
         let fields: Vec<Field> = table.columns().to_vec();
         let label =
@@ -877,6 +899,18 @@ impl<'a> Binder<'a> {
             bound.push(self.bind_expr(ast, expr, &empty)?);
         }
         self.clause = previous;
+        let given: Vec<LogicalType> =
+            bound.iter().map(|&expr| self.plan.expr_type(expr).clone()).collect();
+        check_table_arguments(resolved.function, &given)?;
+        if resolved.function.reads_a_file() {
+            let path = self.constant_path(resolved.function, bound[0])?;
+            let label = if alias == NONE {
+                resolved.function.name().to_string()
+            } else {
+                ast.string(alias).to_string()
+            };
+            return self.bind_parquet(ast, &path, label, columns);
+        }
         let cast: Vec<ExprRef> = bound
             .iter()
             .zip(&resolved.arguments)
@@ -908,6 +942,71 @@ impl<'a> Binder<'a> {
         let node =
             self.plan.add_node(Node::TableFunction { index, function, args, columns: fields });
         Ok((node, scope))
+    }
+
+    /// A scan of one Parquet file, which is where both ways of naming one end up.
+    ///
+    /// The columns are the file's, read out of its footer here, because a query cannot bind
+    /// `SELECT UserID FROM 'hits.parquet'` without knowing that the file has that column and what
+    /// type it is. That is the whole reason the binder opens the file at all.
+    ///
+    /// Every column is listed. Narrowing the list to the ones the query touches is the difference
+    /// between two hundred megabytes and twenty gigabytes on ClickBench, and it is a pass over the
+    /// bound plan rather than a decision the binder can make, since the binder is still in the
+    /// middle of the `FROM` clause and has not seen the `SELECT` list yet. The scan already reads
+    /// exactly what this list says, so pushdown is a change to the list and to nothing else.
+    fn bind_parquet(
+        &mut self,
+        ast: &Ast,
+        path: &str,
+        label: String,
+        columns: ast::Slice,
+    ) -> Result<(NodeRef, Scope)> {
+        let fields = parquet_fields(path)?;
+        let index = self.fresh_index();
+        let mut scope = Scope::empty();
+        for (at, field) in fields.iter().enumerate() {
+            scope.push(Visible {
+                table: label.clone(),
+                name: field.name.clone(),
+                binding: ColumnBinding::new(index, at as u32),
+                ty: field.ty.clone(),
+            });
+        }
+        if !columns.is_empty() {
+            let names: Vec<&str> = ast.name(columns).collect();
+            scope.rename(&names, &label)?;
+        }
+        let value = self.plan.add_value(Value::Varchar(path.to_string()));
+        let argument = self.plan.add_expr(Expr::Constant(value), LogicalType::Varchar);
+        let args = self.plan.add_expr_list(&[argument]);
+        let function = self.plan.intern(TableFunction::ReadParquet.name());
+        let projection = self.plan.add_fields(&fields);
+        let node =
+            self.plan.add_node(Node::TableFunction { index, function, args, columns: projection });
+        Ok((node, scope))
+    }
+
+    /// The path a file reading table function was called with.
+    ///
+    /// It has to be a constant, because the binder opens the file to find the columns and there is
+    /// nothing to evaluate against at bind time. DuckDB folds first, so `read_parquet('a' || 'b')`
+    /// works there and reports a missing file called `ab`. Nothing here folds a concatenation yet,
+    /// so this says what it cannot do rather than pretending the argument was not written.
+    fn constant_path(&self, function: TableFunction, expr: ExprRef) -> Result<String> {
+        let Expr::Constant(value) = *self.plan.expr(expr) else {
+            return Err(Error::not_implemented(format!(
+                "a {}() path that is not a constant string",
+                function.name()
+            )));
+        };
+        match self.plan.value(value) {
+            Value::Varchar(path) => Ok(path.clone()),
+            other => Err(Error::internal(format!(
+                "a {}() path bound as VARCHAR arrived as {other}",
+                function.name()
+            ))),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -22,6 +22,7 @@
 
 mod binder;
 mod expr;
+mod file;
 mod scope;
 mod statement;
 

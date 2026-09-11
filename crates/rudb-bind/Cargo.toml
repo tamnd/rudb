@@ -14,7 +14,9 @@ readme.workspace = true
 
 [dependencies]
 rudb-common.workspace = true
+rudb-io.workspace = true
 rudb-parse.workspace = true
+rudb-parquet.workspace = true
 rudb-plan.workspace = true
 rudb-catalog.workspace = true
 rudb-functions.workspace = true

@@ -13,6 +13,7 @@
 
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::Result;
+use rudb_functions::TableFunction;
 use rudb_plan::{Node, NodeRef, Plan};
 
 use crate::group::{Aggregate, Distinct};
@@ -20,7 +21,7 @@ use crate::join::{CrossProduct, Join};
 use crate::operator::Operator;
 use crate::setop::SetOp;
 use crate::sort::Sort;
-use crate::source::{Dummy, Scan, Series, Values};
+use crate::source::{Dummy, ParquetScan, Scan, Series, Values};
 use crate::stream::{Filter, Limit, Project};
 
 /// Builds the operator tree for a plan's root.
@@ -46,8 +47,17 @@ fn node<'a>(
         }
         Node::Dummy => Box::new(Dummy::new()),
         Node::Values { index, columns, rows } => Box::new(Values::new(plan, index, columns, rows)?),
-        Node::TableFunction { index, function, args, .. } => {
-            Box::new(Series::new(plan, index, plan.string(function), args)?)
+        Node::TableFunction { index, function, args, columns } => {
+            let name = plan.string(function);
+            // Two unrelated operators behind one plan node, which is what the node is: a table
+            // function is a name and a list of arguments, and what it produces is decided by which
+            // function it turned out to be rather than by the shape of the call.
+            match TableFunction::lookup(name) {
+                Some(TableFunction::ReadParquet) => {
+                    Box::new(ParquetScan::new(plan, index, args, columns)?)
+                }
+                _ => Box::new(Series::new(plan, index, name, args)?),
+            }
         }
         Node::Filter { input, predicate } => {
             Box::new(Filter::new(plan, node(plan, catalog, input)?, predicate)?)

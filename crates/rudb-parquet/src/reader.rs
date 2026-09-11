@@ -53,7 +53,7 @@ use std::collections::VecDeque;
 
 use rudb_common::{Error, Field, Result};
 use rudb_compress::Codec;
-use rudb_io::File;
+use rudb_io::{File, Filesystem, OpenMode, RealFilesystem};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::chunk::Pages;
@@ -339,6 +339,40 @@ impl Cursor {
         self.at += rows;
         Ok(piece)
     }
+}
+
+/// Opens a Parquet file by path on the real filesystem.
+///
+/// The binder and the scan both need this. The binder opens the file to find out what columns the
+/// query is allowed to name, and the scan opens it again to read them, so the two have to agree
+/// about what "this path does not work" means or a query can bind against a file and then fail on
+/// a different complaint about the same file.
+///
+/// The three checks here are the three DuckDB words differently when it knows the path, and none of
+/// them can be worded that way inside [`Metadata::read`], which takes a file and not a name. Every
+/// other way a Parquet file can be wrong is about its contents and keeps the reader's own wording.
+///
+/// # Errors
+///
+/// If the path does not exist, if the file is too short to be Parquet, if it does not end in the
+/// magic bytes, or anything opening and reading the footer reports.
+pub fn open_path(path: &str) -> Result<Reader> {
+    let filesystem = RealFilesystem::new();
+    let at = std::path::Path::new(path);
+    if !filesystem.exists(at) {
+        return Err(Error::io(format!("No files found that match the pattern \"{path}\"")));
+    }
+    let file = filesystem.open(at, OpenMode::Read)?;
+    let len = file.len()?;
+    if len < 12 {
+        return Err(Error::invalid_input(format!("File '{path}' too small to be a Parquet file")));
+    }
+    let mut tail = [0_u8; 4];
+    file.read_exact_at(len - 4, &mut tail)?;
+    if &tail != b"PAR1" {
+        return Err(Error::invalid_input(format!("No magic bytes found at end of file '{path}'")));
+    }
+    Reader::open(file)
 }
 
 /// Reads a whole file into chunks, projecting every column.

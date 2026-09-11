@@ -684,8 +684,10 @@ fn the_arguments_are_expressions_and_they_cannot_see_a_column() {
 #[test]
 fn a_table_function_that_does_not_exist_says_so_rather_than_being_read_as_a_table() {
     let db = Database::new();
-    let message = failure(&db, "SELECT * FROM read_parquet('x.parquet')");
-    assert!(message.contains("read_parquet"), "{message}");
+    // `read_parquet` used to be the example here and is a table function now, so this needs a
+    // name that is still not one. `read_json` is the next one to be built and is not built yet.
+    let message = failure(&db, "SELECT * FROM read_json('x.json')");
+    assert!(message.contains("read_json"), "{message}");
     let message = failure(&db, "SELECT * FROM nowhere.range(3)");
     assert!(message.contains("nowhere"), "{message}");
     let message = failure(&db, "SELECT * FROM range(1, 2, 3, 4)");
@@ -709,4 +711,123 @@ fn a_range_wider_than_one_chunk_comes_out_whole_and_in_order() {
     let result = db.query("SELECT count(*), min(range), max(range) FROM range(3000)").unwrap();
     let row = result.rows().next().unwrap();
     assert_eq!(row, vec![Value::BigInt(3000), Value::BigInt(0), Value::BigInt(2999)]);
+}
+
+/// The committed fixture, which DuckDB wrote and whose answers are recorded next to it in
+/// `crates/rudb-parquet/testdata/README.md`. Every number asserted below came off the DuckDB binary
+/// over the same file, which is the only reason any of them counts as a compatibility test.
+const MIXED: &str = "../rudb-parquet/testdata/mixed.parquet";
+
+#[test]
+fn a_parquet_file_is_a_table_without_anything_being_created() {
+    // The replacement scan. Nothing was attached, nothing was created, and the query is the one a
+    // person writes. This is what every ClickBench query needs and the reason it comes before the
+    // kernels: until a file is a table there is no number to make faster.
+    let db = Database::new();
+    assert_eq!(
+        rows(&db, &format!("SELECT count(*) FROM '{MIXED}'")),
+        vec![vec![Value::BigInt(4096)]]
+    );
+    assert_eq!(
+        rows(&db, &format!("SELECT sum(a), count(s), max(s) FROM '{MIXED}'")),
+        vec![vec![Value::HugeInt(195_783), Value::BigInt(3510), text("tag4")]]
+    );
+    assert_eq!(
+        rows(&db, &format!("SELECT min(a), max(a), sum(b) FROM '{MIXED}'")),
+        vec![vec![integer(0), integer(96), Value::HugeInt(2_002_560_000)]]
+    );
+    // The nulls, which are the assertion that found the bug in `nulls_of`. The string column is
+    // dictionary encoded, a Parquet dictionary page holds no nulls, and a kernel that looked for
+    // them in the dictionary rather than on the rows counted all 4096 of these as strings.
+    assert_eq!(
+        rows(&db, &format!("SELECT count(*) FROM '{MIXED}' WHERE s IS NULL")),
+        vec![vec![Value::BigInt(586)]]
+    );
+    assert_eq!(
+        rows(&db, &format!("SELECT sum(d) FROM '{MIXED}'")),
+        vec![vec![Value::Double(193_536.0)]]
+    );
+}
+
+#[test]
+fn the_two_ways_to_name_a_file_produce_the_same_scan() {
+    // `read_parquet` and the bare string are one operator reached by two paths, and the only thing
+    // that differs is what the table ends up called: the function's own name for the call, and the
+    // file's base name for the scan that replaced a table reference.
+    let db = Database::new();
+    let written = format!("SELECT count(*) FROM read_parquet('{MIXED}')");
+    assert_eq!(rows(&db, &written), vec![vec![Value::BigInt(4096)]]);
+    assert_eq!(
+        rows(&db, &format!("SELECT count(mixed.a) FROM '{MIXED}'")),
+        vec![vec![Value::BigInt(4096)]]
+    );
+    assert_eq!(
+        rows(&db, &format!("SELECT count(read_parquet.a) FROM read_parquet('{MIXED}')")),
+        vec![vec![Value::BigInt(4096)]]
+    );
+    assert_eq!(
+        rows(&db, &format!("SELECT count(f.a) FROM '{MIXED}' AS f")),
+        vec![vec![Value::BigInt(4096)]]
+    );
+}
+
+#[test]
+fn a_file_scan_filters_and_groups_like_any_other_table() {
+    let db = Database::new();
+    // Two thousand and forty eight of the four thousand and ninety six rows are true, which is the
+    // fixture alternating, and the group by is over a column that came out of a Parquet page.
+    assert_eq!(
+        rows(&db, &format!("SELECT count(*) FROM '{MIXED}' WHERE flag")),
+        vec![vec![Value::BigInt(2048)]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT s, count(*) AS c FROM '{MIXED}' GROUP BY s ORDER BY c DESC, s LIMIT 2"
+            )
+        ),
+        vec![vec![text("tag0"), Value::BigInt(702)], vec![text("tag1"), Value::BigInt(702)]]
+    );
+}
+
+#[test]
+fn a_name_that_is_a_file_and_a_name_that_is_a_typo_fail_differently() {
+    let db = Database::new();
+    // A name ending in `.parquet` is a file whether or not it is there, so a missing one is a
+    // missing file. Anything else that does not resolve is still a missing table, which is what
+    // every mistyped table name in the world has to keep reporting.
+    assert_eq!(
+        failure(&db, "SELECT * FROM 'nope.parquet'"),
+        "No files found that match the pattern \"nope.parquet\""
+    );
+    assert_eq!(
+        failure(&db, "SELECT * FROM read_parquet('nope.parquet')"),
+        "No files found that match the pattern \"nope.parquet\""
+    );
+    assert!(failure(&db, "SELECT * FROM nope").contains("nope"));
+    assert!(
+        failure(&db, "SELECT * FROM '../rudb-parquet/testdata/README.md'")
+            .contains("No extension found that is capable of reading the file"),
+    );
+}
+
+#[test]
+fn a_column_the_file_does_not_have_is_refused_at_bind_time() {
+    // The point of opening the footer in the binder. Without it this query would plan and then
+    // fail somewhere in the scan, and `SELECT *` would have nothing to expand to.
+    let db = Database::new();
+    assert!(failure(&db, &format!("SELECT nope FROM '{MIXED}'")).contains("nope"));
+}
+
+#[test]
+fn read_parquet_refuses_an_argument_that_is_not_a_path() {
+    let db = Database::new();
+    let number = failure(&db, "SELECT * FROM read_parquet(42)");
+    assert!(number.contains("No function matches the given name"), "{number}");
+    assert!(number.contains("read_parquet(INTEGER)"), "{number}");
+    let two = failure(&db, "SELECT * FROM read_parquet('a.parquet', 'b.parquet')");
+    assert!(two.contains("read_parquet(VARCHAR, VARCHAR)"), "{two}");
+    let null = failure(&db, "SELECT * FROM read_parquet(NULL)");
+    assert_eq!(null, "read_parquet cannot take NULL list as parameter");
 }

@@ -19,6 +19,7 @@ rudb-vector.workspace = true
 rudb-encoding.workspace = true
 rudb-kernels.workspace = true
 rudb-jit.workspace = true
+rudb-parquet.workspace = true
 rudb-storage.workspace = true
 rudb-txn.workspace = true
 rudb-catalog.workspace = true

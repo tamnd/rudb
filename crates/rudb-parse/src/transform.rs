@@ -1608,9 +1608,17 @@ impl<'a> Transform<'a> {
 ///
 /// DuckDB does not fold identifier case at any point, quoted or not, so this only removes the
 /// quotes and resolves the doubled ones. Anything else would be the parser deciding what a name is.
+///
+/// Single quotes come off as well. A `FROM` item is allowed to be a string, which is how everybody
+/// writes `FROM 'hits.parquet'`, and by the time the grammar has put it where a table goes it is a
+/// name rather than a value. DuckDB treats the two quotings identically there: both reach the
+/// replacement scan, and both are reported without their quotes when it does not pick them up.
 fn unquote(text: &str) -> String {
-    match text.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
-        Some(body) => body.replace("\"\"", "\""),
+    if let Some(body) = text.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+        return body.replace("\"\"", "\"");
+    }
+    match text.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')) {
+        Some(body) => body.replace("''", "'"),
         None => text.to_string(),
     }
 }
@@ -2104,6 +2112,17 @@ mod tests {
         // binder never has to know that the clause it is looking at was the one that was missing.
         assert_eq!(round("FROM t"), "SELECT * FROM t");
         assert_eq!(round("FROM t SELECT a"), "SELECT a FROM t");
+    }
+
+    #[test]
+    fn a_from_item_written_as_a_string_is_a_name_with_the_quotes_off() {
+        // `FROM 'hits.parquet'` is how the replacement scan is written, and DuckDB treats the two
+        // quotings identically: both reach the scan, and both are reported without their quotes
+        // when it does not pick them up. Keeping the quotes here would put them in the catalog
+        // error, which is the one place a person sees the name again.
+        assert_eq!(round("SELECT * FROM 'hits.parquet'"), "SELECT * FROM hits.parquet");
+        assert_eq!(round("SELECT * FROM \"hits.parquet\""), "SELECT * FROM hits.parquet");
+        assert_eq!(round("SELECT * FROM 'it''s.parquet'"), "SELECT * FROM it's.parquet");
     }
 
     #[test]

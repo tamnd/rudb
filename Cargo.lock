@@ -33,6 +33,8 @@ dependencies = [
  "rudb-catalog",
  "rudb-common",
  "rudb-functions",
+ "rudb-io",
+ "rudb-parquet",
  "rudb-parse",
  "rudb-plan",
 ]
@@ -124,6 +126,7 @@ dependencies = [
  "rudb-io",
  "rudb-jit",
  "rudb-kernels",
+ "rudb-parquet",
  "rudb-plan",
  "rudb-storage",
  "rudb-txn",
