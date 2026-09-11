@@ -173,6 +173,23 @@ fn distinct_collapses_equal_rows() {
 }
 
 #[test]
+fn counting_a_distinct_counts_the_distinct_values() {
+    // The one wrong answer column pruning can produce. Nothing above the `DISTINCT` names a column,
+    // and a plain `DISTINCT` names none either, so the pass that narrows a projection to what is
+    // read of it used to leave an operator deduplicating rows with nothing in them, and this came
+    // back as 1 on any table with a row in it. `crates/rudb-opt/src/columns.rs` is where it lives.
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM (SELECT DISTINCT x FROM t)"),
+        vec![vec![Value::BigInt(3)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM (SELECT DISTINCT x, s FROM t)"),
+        vec![vec![Value::BigInt(4)]]
+    );
+}
+
+#[test]
 fn a_join_matches_on_its_condition() {
     let db = database();
     assert_eq!(
