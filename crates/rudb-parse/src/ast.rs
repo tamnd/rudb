@@ -488,6 +488,11 @@ pub enum Expr {
         /// Whether it was written `NOT IN`.
         negated: bool,
     },
+    /// A bracketed list of expressions, `[a, b, c]`, which is a LIST value.
+    List {
+        /// The items, as a run of [`ExprRef`], in the order they were written.
+        items: Slice,
+    },
     /// A parenthesised list of more than one expression, which is a row value.
     Row {
         /// The items, as a run of [`ExprRef`].
