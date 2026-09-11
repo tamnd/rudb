@@ -55,6 +55,7 @@ impl Binder<'_> {
             ast::Expr::Row { .. } => {
                 Err(Error::not_implemented("a row value outside of a VALUES clause".to_string()))
             }
+            ast::Expr::List { items } => self.bind_list(ast, items, scope),
             ast::Expr::Subquery { .. } => {
                 Err(Error::not_implemented("a scalar subquery".to_string()))
             }
@@ -77,6 +78,40 @@ impl Binder<'_> {
             LiteralKind::Number => number(ast.string(text), false)?,
         };
         Ok(self.plan_mut().add_constant(value))
+    }
+
+    /// `[a, b, c]`, which is a LIST value.
+    ///
+    /// Constants only, because a list is folded into one `Value` here rather than evaluated. There
+    /// is no LIST vector yet, so a list of column references has nothing to compute into, and the
+    /// one thing a list is for today is the file argument of `read_parquet`, which is constants.
+    ///
+    /// The element type is what the items promote to, and an empty list is `INTEGER[]`, both of
+    /// which are DuckDB's answers and were measured against the binary.
+    fn bind_list(&mut self, ast: &Ast, items: ast::Slice, scope: &Scope) -> Result<ExprRef> {
+        let written = ast.expr_list(items).to_vec();
+        let mut values = Vec::with_capacity(written.len());
+        for item in written {
+            let bound = self.bind_expr(ast, item, scope)?;
+            let Expr::Constant(reference) = *self.plan().expr(bound) else {
+                return Err(Error::not_implemented("a list of anything but constants"));
+            };
+            values.push(self.plan().value(reference).clone());
+        }
+        let mut element = LogicalType::Integer;
+        for (at, value) in values.iter().enumerate() {
+            let ty = value.logical_type();
+            if value.is_null() {
+                continue;
+            }
+            element = if at == 0 { ty } else { mixed(&element, &ty)? };
+        }
+        for value in &values {
+            if !value.is_null() && value.logical_type() != element {
+                return Err(Error::not_implemented("a list whose items are not all one type"));
+            }
+        }
+        Ok(self.plan_mut().add_constant(Value::List { element, values }))
     }
 
     fn bind_unary(
@@ -367,6 +402,13 @@ impl Binder<'_> {
     }
 }
 
+/// The type two items of a list literal meet at.
+fn mixed(left: &LogicalType, right: &LogicalType) -> Result<LogicalType> {
+    left.promote(right).ok_or_else(|| {
+        Error::binder(format!("Cannot mix values of type {left} and type {right} in a list"))
+    })
+}
+
 /// The type two branches of a `CASE` meet at.
 fn meet(left: &LogicalType, right: &LogicalType) -> Result<LogicalType> {
     left.promote(right).ok_or_else(|| {
@@ -410,6 +452,9 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
                 || ast.expr_list(list).iter().any(|&item| has_aggregate(ast, item))
         }
         ast::Expr::Row { items } => {
+            ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
+        }
+        ast::Expr::List { items } => {
             ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
         }
         // A subquery has its own aggregation and does not make the outer block aggregate.
@@ -514,6 +559,13 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
             let items: Vec<String> =
                 ast.expr_list(items).iter().map(|&item| describe(ast, item)).collect();
             format!("ROW({})", items.join(", "))
+        }
+        // DuckDB names a bracketed list after the function it is sugar for, qualified, so
+        // `SELECT [1, 2]` comes back as a column called `main.list_value(1, 2)`.
+        ast::Expr::List { items } => {
+            let items: Vec<String> =
+                ast.expr_list(items).iter().map(|&item| describe(ast, item)).collect();
+            format!("main.list_value({})", items.join(", "))
         }
         ast::Expr::Subquery { .. } => "subquery".to_string(),
     }

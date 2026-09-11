@@ -915,7 +915,7 @@ impl<'a> Binder<'a> {
                 // matched. The executor is handed names rather than a pattern, so it never walks a
                 // directory and the answer cannot change between binding a prepared statement and
                 // running it, which is the same reason the schema is settled here.
-                let paths = files(&self.file_argument(cast[0])?)?;
+                let paths = self.file_paths(cast[0], resolved.function.name())?;
                 let first = paths.first().map_or("", String::as_str);
                 let fields = match columns {
                     Columns::Csv => csv_fields(first)?,
@@ -1053,7 +1053,21 @@ impl<'a> Binder<'a> {
         Ok((node, scope))
     }
 
-    /// The file name a table function argument names, which has to be a constant.
+    /// Every file a table function's file argument names, in the order they were written.
+    ///
+    /// Each pattern has to find at least one file of its own, which is DuckDB's rule and is why
+    /// this expands one at a time rather than gathering everything and looking at the total. A
+    /// list keeps its written order and its duplicates, so a file named twice is read twice, which
+    /// was measured: the sort and the dedup belong to one pattern rather than to the list.
+    fn file_paths(&self, expr: ExprRef, name: &str) -> Result<Vec<String>> {
+        let mut paths = Vec::new();
+        for pattern in self.file_patterns(expr, name)? {
+            paths.extend(files(&pattern)?);
+        }
+        Ok(paths)
+    }
+
+    /// The patterns a table function argument names, which have to be constants.
     ///
     /// A table function that reads a file is resolved by opening the file, and that happens here
     /// rather than when the query runs, because the rest of the statement cannot bind until the
@@ -1061,16 +1075,28 @@ impl<'a> Binder<'a> {
     /// running anything, and a literal is that. DuckDB folds a constant expression first, so
     /// `read_parquet('a' || '.parquet')` works there, and folding is M1 work that this will pick up
     /// for free once the optimizer runs before the plan is finished rather than after.
-    fn file_argument(&self, expr: ExprRef) -> Result<String> {
+    ///
+    /// One string is one pattern and a list is one pattern an item, which is DuckDB's pair of
+    /// overloads. A null is a different sentence in each of them, both of them measured.
+    fn file_patterns(&self, expr: ExprRef, name: &str) -> Result<Vec<String>> {
         let Expr::Constant(reference) = *self.plan.expr(expr) else {
             return Err(Error::not_implemented(
                 "a table function file name that is not a constant",
             ));
         };
         match self.plan.value(reference) {
-            Value::Varchar(path) => Ok(path.clone()),
-            // DuckDB's own wording, which says list because its overload takes one.
-            Value::Null => Err(Error::parser("read_parquet cannot take NULL list as parameter")),
+            Value::Varchar(path) => Ok(vec![path.clone()]),
+            // DuckDB's own wording, which says list because its other overload takes one.
+            Value::Null => Err(Error::parser(format!("{name} cannot take NULL list as parameter"))),
+            Value::List { values, .. } => values
+                .iter()
+                .map(|value| match value {
+                    Value::Varchar(path) => Ok(path.clone()),
+                    _ => Err(Error::parser(format!(
+                        "{name} reader cannot take NULL input as parameter"
+                    ))),
+                })
+                .collect(),
             other => {
                 Err(Error::internal(format!("a file name bound as VARCHAR arrived as {other}")))
             }

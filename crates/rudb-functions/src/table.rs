@@ -128,10 +128,28 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
         return Err(Error::catalog(format!("Table Function with name {name} does not exist!")));
     };
     if let Some(columns) = file_columns(function) {
-        if arguments.len() != 1 || arguments[0] != LogicalType::Varchar {
+        // Two overloads, one path and a list of them, which is DuckDB's pair. The list is where
+        // `read_parquet(['a.parquet', 'b.parquet'])` binds, and an empty list arrives typed
+        // `INTEGER[]` there and here, so it lands on the no overload message rather than on a read
+        // of nothing.
+        let list = LogicalType::list(LogicalType::Varchar);
+        let single = arguments.len() == 1 && arguments[0] == LogicalType::Varchar;
+        let many = arguments.len() == 1 && arguments[0] == list;
+        // A bare null matches, and is a sentence about nulls rather than about overloads, which is
+        // what DuckDB answers `read_parquet(NULL)` with. It is left as a null rather than cast to a
+        // path so that the binder still has a null to recognise when it goes looking for the name.
+        let nothing = arguments.len() == 1 && arguments[0] == LogicalType::Null;
+        if !single && !many && !nothing {
             return Err(no_overload(function, arguments));
         }
-        return Ok(ResolvedTable { function, arguments: vec![LogicalType::Varchar], columns });
+        let wanted = if many {
+            list
+        } else if nothing {
+            LogicalType::Null
+        } else {
+            LogicalType::Varchar
+        };
+        return Ok(ResolvedTable { function, arguments: vec![wanted], columns });
     }
     let arity = arguments.len();
     if !(1..=3).contains(&arity) {
@@ -160,16 +178,15 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
 /// DuckDB's message for a call that matched a name and no overload of it.
 ///
 /// The candidate list it prints carries fifteen named parameters that none of them accept here, so
-/// what is listed is the one overload that exists. The first line is the one a test in the wild
+/// what is listed is the two overloads that exist. The first line is the one a test in the wild
 /// asserts on and it is reproduced exactly.
 fn no_overload(function: TableFunction, arguments: &[LogicalType]) -> Error {
     let written: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+    let name = function.name();
     Error::binder(format!(
-        "No function matches the given name and argument types '{}({})'. You might need to add \
-         explicit type casts.\n\tCandidate functions:\n\t{}(VARCHAR)\n",
-        function.name(),
-        written.join(", "),
-        function.name()
+        "No function matches the given name and argument types '{name}({})'. You might need to \
+         add explicit type casts.\n\tCandidate functions:\n\t{name}(VARCHAR)\n\t{name}(VARCHAR[])\n",
+        written.join(", ")
     ))
 }
 
