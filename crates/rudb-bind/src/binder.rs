@@ -15,8 +15,8 @@
 use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_functions::{
-    Columns, TableFunction, csv_fields, files, is_file, is_pattern, parquet_fields, resolve,
-    resolve_table,
+    Columns, Given, TableFunction, csv_fields, csv_given, files, is_file, is_pattern,
+    parquet_fields, resolve, resolve_table,
 };
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, parse_ast};
@@ -989,16 +989,19 @@ impl<'a> Binder<'a> {
         let empty = Scope::empty();
         let previous = std::mem::replace(&mut self.clause, "table function arguments");
         let mut bound = Vec::new();
-        let mut options = Options::default();
+        let mut written_options = Vec::new();
         for argument in written {
             let expr = self.bind_expr(ast, argument.expr, &empty)?;
             if argument.alias == NONE {
                 bound.push(expr);
             } else {
-                self.named_argument(called, ast.string(argument.alias), expr, &mut options)?;
+                let name = ast.string(argument.alias).to_string();
+                let (parameter, value) = self.named_argument(called, &name, expr)?;
+                written_options.push((parameter, value, expr));
             }
         }
         self.clause = previous;
+        let options = Options::of(&written_options)?;
 
         // The types are what resolve the call, not the count, because `read_parquet(3)` is a
         // different answer from `read_parquet('3')` and only the types tell them apart.
@@ -1023,9 +1026,18 @@ impl<'a> Binder<'a> {
                 let mut fields = match columns {
                     // Parquet takes the first file's footer as the answer and CSV sniffs all of
                     // them, which is not a choice made here. See `csv_fields`.
-                    Columns::Csv => csv_fields(&paths)?,
+                    Columns::Csv => csv_fields(&paths, options.given)?,
                     _ => parquet_fields(first)?,
                 };
+                if options.all_varchar {
+                    // The sniffer still ran, because the names come out of the same pass over the
+                    // front of the file and only the types are being overruled. The executor reads
+                    // the text as VARCHAR because this is the schema it is told to read into, which
+                    // is the same road a file in a glob takes when the set is wider than the file.
+                    for field in &mut fields {
+                        field.ty = LogicalType::Varchar;
+                    }
+                }
                 if options.binary_as_string {
                     // A byte array column with no annotation on it is a BLOB, and this is the caller
                     // saying that the file's writer meant text. The reader already holds both in the
@@ -1047,7 +1059,14 @@ impl<'a> Binder<'a> {
             ast.string(alias).to_string()
         };
         let names: Vec<&str> = ast.name(columns).collect();
-        self.table_function_source(resolved.function, &cast, fields, &label, &names)
+        self.table_function_source(
+            resolved.function,
+            &cast,
+            &written_options,
+            fields,
+            &label,
+            &names,
+        )
     }
 
     /// One named parameter of a table function call, folded into what the call was given.
@@ -1068,8 +1087,7 @@ impl<'a> Binder<'a> {
         function: TableFunction,
         name: &str,
         expr: ExprRef,
-        options: &mut Options,
-    ) -> Result<()> {
+    ) -> Result<(&'static str, Value)> {
         let known = function
             .parameters()
             .iter()
@@ -1078,12 +1096,12 @@ impl<'a> Binder<'a> {
             let candidates: Vec<String> = function
                 .parameters()
                 .iter()
-                .map(|(parameter, ty)| format!("{parameter} {ty}"))
+                .map(|(parameter, ty)| format!("    {parameter} {ty}"))
                 .collect();
             return Err(Error::binder(format!(
-                "Invalid named parameter \"{name}\" for function {} Candidates: {}",
+                "Invalid named parameter \"{name}\" for function {}\nCandidates:\n{}\n",
                 function.name(),
-                candidates.join(", ")
+                candidates.join("\n")
             )));
         };
         let Expr::Constant(reference) = *self.plan.expr(expr) else {
@@ -1093,18 +1111,15 @@ impl<'a> Binder<'a> {
         };
         let value = self.plan.value(reference).clone();
         if value == Value::Null {
-            return Err(Error::binder(format!("Cannot use NULL as argument to \"{parameter}\"")));
+            return Err(Error::binder(null_parameter(function, parameter)));
         }
         let given = self.plan.expr_type(expr).clone();
-        match (*parameter, value) {
-            ("binary_as_string", Value::Boolean(on)) => options.binary_as_string = on,
-            _ => {
-                return Err(Error::not_implemented(format!(
-                    "the named parameter {parameter} given a {given} where a {wanted} was wanted"
-                )));
-            }
+        if given != *wanted {
+            return Err(Error::not_implemented(format!(
+                "the named parameter {parameter} given a {given} where a {wanted} was wanted"
+            )));
         }
-        Ok(())
+        Ok((parameter, value))
     }
 
     /// A file where a table name goes, which is what DuckDB calls a replacement scan.
@@ -1150,7 +1165,7 @@ impl<'a> Binder<'a> {
         let first = paths.first().map_or("", String::as_str);
         let fields = match function {
             TableFunction::ReadParquet => parquet_fields(first)?,
-            _ => csv_fields(&paths)?,
+            _ => csv_fields(&paths, Given::default())?,
         };
         // The name the columns answer to is the file's stem, so `SELECT mixed.a FROM
         // 'data/mixed.parquet'` works. That is DuckDB's choice and it is the useful one, since the
@@ -1169,7 +1184,7 @@ impl<'a> Binder<'a> {
         };
         let arguments: Vec<ExprRef> = paths.iter().map(|path| self.path_constant(path)).collect();
         let names: Vec<&str> = ast.name(columns).collect();
-        self.table_function_source(function, &arguments, fields, &label, &names)
+        self.table_function_source(function, &arguments, &[], fields, &label, &names)
     }
 
     /// One file name, as a constant expression in the plan.
@@ -1202,6 +1217,7 @@ impl<'a> Binder<'a> {
         &mut self,
         function: TableFunction,
         args: &[ExprRef],
+        written: &[(&'static str, Value, ExprRef)],
         fields: Vec<Field>,
         label: &str,
         names: &[&str],
@@ -1221,8 +1237,20 @@ impl<'a> Binder<'a> {
         }
         let function = self.plan.intern(function.name());
         let args = self.plan.add_expr_list(args);
+        let named: Vec<u32> =
+            written.iter().map(|(parameter, _, _)| self.plan.intern(parameter)).collect();
+        let settings: Vec<ExprRef> = written.iter().map(|(_, _, expr)| *expr).collect();
+        let options = self.plan.add_name_list(&named);
+        let settings = self.plan.add_expr_list(&settings);
         let columns = self.plan.add_fields(&fields);
-        let node = self.plan.add_node(Node::TableFunction { index, function, args, columns });
+        let node = self.plan.add_node(Node::TableFunction {
+            index,
+            function,
+            args,
+            options,
+            settings,
+            columns,
+        });
         Ok((node, scope))
     }
 
@@ -1535,14 +1563,61 @@ impl<'a> Binder<'a> {
 
 /// The named parameters a table function call was written with.
 ///
-/// One field so far. It is a struct rather than the one boolean because the seventeen DuckDB has on
-/// `read_parquet` alone are all going to want somewhere to go, and because a call with none of them
+/// A struct rather than the fields loose, because the seventeen DuckDB has on `read_parquet` and the
+/// thirty on `read_csv` are all going to want somewhere to go, and because a call with none of them
 /// written should read as the default of this rather than as a bare false somewhere.
+///
+/// The CSV half goes on to the reader and is opened with, here and again in the executor. The
+/// Parquet half is answered here and nothing downstream sees it, which is what `binary_as_string`
+/// turning a BLOB column into a VARCHAR one is.
 #[derive(Debug, Default)]
 struct Options {
     /// `binary_as_string`, which says an unannotated byte array column in a Parquet file holds
     /// text. The ClickBench file has twenty eight of those and every query reads them as strings.
     binary_as_string: bool,
+    /// `all_varchar`, which reads every column of a CSV file as text rather than sniffing a type.
+    all_varchar: bool,
+    /// `delim`, `sep`, `quote`, `escape` and `header`, which are what the sniffer would decide.
+    given: Given,
+}
+
+impl Options {
+    /// What these named parameters add up to.
+    ///
+    /// Each one was already checked against the function's list, so a name in here is a name that
+    /// function takes and the value is already the type it wants. What is left is reading them, and
+    /// the last one written wins, which is DuckDB's answer to `delim='|', delim=','` and was
+    /// measured rather than assumed.
+    fn of(written: &[(&'static str, Value, ExprRef)]) -> Result<Self> {
+        let mut options = Self::default();
+        for (parameter, value, _) in written {
+            match (*parameter, value) {
+                ("binary_as_string", Value::Boolean(on)) => options.binary_as_string = *on,
+                ("all_varchar", Value::Boolean(on)) => options.all_varchar = *on,
+                _ => {}
+            }
+        }
+        let named: Vec<(&str, Value)> =
+            written.iter().map(|(parameter, value, _)| (*parameter, value.clone())).collect();
+        options.given = csv_given(&named)?;
+        Ok(options)
+    }
+}
+
+/// DuckDB's complaint about a named parameter that was given a null, which is a different sentence
+/// for almost every parameter.
+///
+/// Three of them were measured on `v2.0.0-dev84237` and no two agree: `binary_as_string` is the
+/// first, `all_varchar` is the second and `header` is the third. They read like three people each
+/// writing the message in front of them, which is what they are, and a harness that compares error
+/// text compares all of it. Anything not measured gets the first one, which is the most general of
+/// the three.
+fn null_parameter(function: TableFunction, parameter: &str) -> String {
+    match parameter {
+        "header" => format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)"),
+        "all_varchar" => format!("{} \"{parameter}\" cannot be NULL", function.name()),
+        _ => format!("Cannot use NULL as argument to \"{parameter}\""),
+    }
 }
 
 /// The complaint about a `REPLACE` entry that named a column the star did not stand for.

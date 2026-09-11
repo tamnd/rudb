@@ -175,9 +175,17 @@ impl Reader<'_> {
                 c.expect_word("args")?;
                 c.expect("=")?;
                 let args = read_expr_list(plan, c)?;
+                let (options, settings) = read_options(plan, c)?;
                 let index = read_table_index(c)?;
                 let columns = read_schema(plan, c)?;
-                Ok(Built::leaf(Node::TableFunction { index, function, args, columns }))
+                Ok(Built::leaf(Node::TableFunction {
+                    index,
+                    function,
+                    args,
+                    options,
+                    settings,
+                    columns,
+                }))
             }
             "Filter" => {
                 let predicate = read_expr(plan, c)?;
@@ -364,6 +372,30 @@ fn read_schema(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<Slice> {
         c.expect("]")?;
     }
     Ok(plan.add_fields(&fields))
+}
+
+/// The named parameters a table function call was written with, which most calls have none of.
+///
+/// Nothing is written when there are none, so the whole segment is optional and its absence is two
+/// empty slices rather than an error.
+fn read_options(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<(Slice, Slice)> {
+    if !c.eat_space_then("options=[") {
+        return Ok((Slice::EMPTY, Slice::EMPTY));
+    }
+    let mut names = Vec::new();
+    let mut settings = Vec::new();
+    if !c.eat_space_then("]") {
+        loop {
+            names.push(read_name(plan, c)?);
+            c.expect("=")?;
+            settings.push(read_expr(plan, c)?);
+            if !c.eat_space_then(",") {
+                break;
+            }
+        }
+        c.expect("]")?;
+    }
+    Ok((plan.add_name_list(&names), plan.add_expr_list(&settings)))
 }
 
 fn read_expr_list(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<Slice> {

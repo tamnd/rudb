@@ -89,3 +89,19 @@ Potential Fixes
 ```
 
 The trailing space after `Potential Fixes` is the binary's and is kept. This is a different sentence from the one the Parquet reader gives for the same situation, which is next to the Parquet fixtures, because the two readers in DuckDB are two pieces of code that each wrote their own.
+
+## given
+
+Three small files for the named parameters that overrule the sniffer, written by hand. Each one is written so that the sniffer's answer and the answer the parameter asks for are both whole files rather than one of them being an error, because a parameter that only turns a working read into a failing one does not show that the parameter was used.
+
+```
+given/semicolon.csv     name,x;note,y / a,b;c,d / e,f;g,h
+given/hashquote.csv     name,note / #one#,x / #two#,y
+given/escaped.csv       name,note / #a\#b#,x / #c\#d#,y
+```
+
+Every line of `semicolon.csv` splits into three fields on a comma and into two on a semicolon, so both are consistent and the sniffer has a real choice to make. DuckDB picks the comma and reads it as `name, x;note, y` with rows `a | b;c | d` and `e | f;g | h`. With `delim=';'`, and the same with `sep=';'`, it reads it as `name,x` and `note,y` with rows `a,b | c,d` and `e,f | g,h`.
+
+`hashquote.csv` is quoted with a hash, which is not a quote character DuckDB looks for, so it reads the quotes as part of the value and answers `#one#` and `#two#`. With `quote='#'` it answers `one` and `two`.
+
+`escaped.csv` is the same file with a backslash escaped hash inside each quoted field. With `quote='#', escape='\'` DuckDB answers `a#b` and `c#d`, and without them it answers the whole of the field including its punctuation.

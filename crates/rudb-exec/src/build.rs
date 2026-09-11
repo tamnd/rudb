@@ -75,11 +75,11 @@ fn node<'a>(
         }
         Node::Dummy => Box::new(Dummy::new()),
         Node::Values { index, columns, rows } => Box::new(Values::new(plan, index, columns, rows)?),
-        Node::TableFunction { index, function, args, columns } => {
+        Node::TableFunction { index, function, args, options, settings, columns } => {
             match TableFunction::lookup(plan.string(function)) {
-                Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
-                    Box::new(FileScan::new(plan, index, function, args, columns)?)
-                }
+                Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => Box::new(
+                    FileScan::new(plan, index, function, args, options, settings, columns)?,
+                ),
                 _ => Box::new(Series::new(plan, index, plan.string(function), args)?),
             }
         }

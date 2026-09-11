@@ -482,12 +482,24 @@ impl Plan {
                     }
                 }
             }
-            Node::TableFunction { function, args, columns, .. } => {
+            Node::TableFunction { function, args, options, settings, columns, .. } => {
                 if function as usize >= self.strings.len() {
                     return fail("names a string that is not in the table");
                 }
                 self.checked_field_list(columns, reference)?;
                 self.checked_expr_list(args, reference)?;
+                if self.checked_expr_list(settings, reference)?.len() != options.len as usize {
+                    return fail("has a named parameter with no value or a value with no name");
+                }
+                let end = options.start as usize + options.len as usize;
+                if end > self.name_lists.len() {
+                    return fail("names a name run that is not in the pool");
+                }
+                for &name in self.name_list(options) {
+                    if name as usize >= self.strings.len() {
+                        return fail("names a parameter that is not in the string table");
+                    }
+                }
             }
             Node::Filter { predicate, .. } => {
                 self.checked_expr(predicate, reference)?;
