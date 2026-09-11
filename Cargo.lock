@@ -261,7 +261,9 @@ version = "0.2.3"
 dependencies = [
  "rudb",
  "rudb-common",
+ "rudb-exec",
  "rudb-kernels",
  "rudb-parse",
+ "rudb-plan",
  "rudb-vector",
 ]

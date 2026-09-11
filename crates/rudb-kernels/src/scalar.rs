@@ -63,21 +63,22 @@ use crate::shape::{first, identity, nulls_of, single};
 ///
 /// If the arguments are not all the same length, if the function is not one of the ones written
 /// here, or if the call fails at some row.
-pub fn call(name: &str, args: &[Vector], returns: &LogicalType) -> Result<Vector> {
-    let rows = args.first().map_or(0, Vector::len);
+pub fn call<V: AsRef<Vector>>(name: &str, args: &[V], returns: &LogicalType) -> Result<Vector> {
+    let rows = args.first().map_or(0, |arg| arg.as_ref().len());
     for (at, arg) in args.iter().enumerate() {
-        if arg.len() != rows {
+        if arg.as_ref().len() != rows {
             return Err(Error::internal(format!(
                 "argument {at} of {name} is {} rows and argument 0 is {rows}",
-                arg.len()
+                arg.as_ref().len()
             )));
         }
     }
 
     // Every argument constant is one call rather than 1024 of them. This is `3 * 4` surviving
     // constant folding, and it is also every correlated scalar the optimizer has already evaluated.
-    if rows > 0 && !args.is_empty() && args.iter().all(|arg| arg.form() == Form::Constant) {
-        let row: Vec<Value> = args.iter().map(|arg| arg.value_at(0)).collect();
+    if rows > 0 && !args.is_empty() && args.iter().all(|arg| arg.as_ref().form() == Form::Constant)
+    {
+        let row: Vec<Value> = args.iter().map(|arg| arg.as_ref().value_at(0)).collect();
         return Ok(Vector::constant(returns.clone(), call_values(name, &row, returns)?, rows));
     }
 
@@ -87,8 +88,8 @@ pub fn call(name: &str, args: &[Vector], returns: &LogicalType) -> Result<Vector
 
     // A unary function reports its one form on both sides of the table, because a column for the
     // argument that is not there would be a column of zeros in every row of the report.
-    let left = args.first().map_or(Form::Flat, Vector::form);
-    fallback::record(Kernel::Scalar, left, args.get(1).map_or(left, Vector::form));
+    let left = args.first().map_or(Form::Flat, |arg| arg.as_ref().form());
+    fallback::record(Kernel::Scalar, left, args.get(1).map_or(left, |arg| arg.as_ref().form()));
 
     let mut row = Vec::with_capacity(args.len());
     let mut values = Vec::with_capacity(rows);
@@ -96,22 +97,22 @@ pub fn call(name: &str, args: &[Vector], returns: &LogicalType) -> Result<Vector
     // yet, and counts itself so which functions those are shows up in the report.
     for index in 0..rows {
         row.clear();
-        row.extend(args.iter().map(|arg| arg.value_at(index)));
+        row.extend(args.iter().map(|arg| arg.as_ref().value_at(index)));
         values.push(call_values(name, &row, returns)?);
     }
     Vector::from_values(returns.clone(), &values)
 }
 
 /// The result for a call this file has a loop for, or `None` to say it has not.
-fn specialized(
+fn specialized<V: AsRef<Vector>>(
     name: &str,
-    args: &[Vector],
+    args: &[V],
     returns: &LogicalType,
     rows: usize,
 ) -> Result<Option<Vector>> {
     match args {
-        [only] => unary(name, only, returns, rows),
-        [left, right] => binary(name, left, right, returns, rows),
+        [only] => unary(name, only.as_ref(), returns, rows),
+        [left, right] => binary(name, left.as_ref(), right.as_ref(), returns, rows),
         _ => Ok(None),
     }
 }
