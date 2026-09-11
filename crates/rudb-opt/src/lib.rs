@@ -14,6 +14,7 @@ pub mod columns;
 pub mod filter;
 pub mod fold;
 pub mod pass;
+pub mod tables;
 mod walk;
 
 use rudb_common::{Error, Result};
