@@ -18,15 +18,16 @@
 //!
 //! # The number that matters is not on a warm cache
 //!
-//! `--cold` drops the page cache between samples, which needs Linux and root. Without it every
+//! `--cold` drops the page cache before every sample, which needs Linux and root. Without it every
 //! read after the first is a memcpy out of the page cache, and a table of those says how fast this
 //! machine copies memory. Section 5.3 is explicit that a design validated only on a warm laptop
-//! NVMe gets this wrong, so the cold column is the one to read and the warm one is there because
-//! it is the case a developer runs into.
+//! NVMe gets this wrong, so the cold table is the one to read and the warm one is there because it
+//! is the case a developer runs into.
 //!
-//! A cold row is one sample rather than nine, because the second sample is not cold. Rule two from
-//! `spec/15-rudb-bench.md` asks for the median of nine and a spread, and a cold number cannot have
-//! one, so it is printed with the spread column empty and labelled rather than quietly broken.
+//! Before every sample and not once before the row, which is the difference between a cold table
+//! and a table with one cold sample in it. Rule two from `spec/15-rudb-bench.md` wants a median and
+//! a spread, and on a device whose cold latency varies by a factor of three between runs the spread
+//! is not decoration: without it two rows that do identical work look like a result.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +42,13 @@ use crate::timing::{Number, SAMPLES, build_line, percentile, rebuild, shared_cav
 /// Two hundred and fifty six megabytes is small enough to write in a few seconds and large enough
 /// that a cold read of it is a read of a disk rather than of a readahead window.
 const DEFAULT_BYTES: u64 = 256 << 20;
+
+/// How many samples a cold number is the median of.
+///
+/// Fewer than the warm [`SAMPLES`] because each one costs a cache drop and a read of the whole
+/// pattern off the device, so nine of them across every row is tens of minutes. Five is the floor
+/// rule two sets and it is enough to have a median with three samples around it.
+const COLD_SAMPLES: usize = 5;
 
 /// One access pattern.
 struct Pattern {
@@ -231,26 +239,25 @@ fn measure(file: &Arc<dyn File>, pattern: &Pattern, engine: Engine, cold: bool) 
         _ => (pattern.ranges.len() as u64, wanted),
     };
 
-    let time = if cold {
-        // One sample, because the second one is not cold. Dropping the cache between two samples of
-        // one number would be dropping it between the two halves of that number. The warmup above
-        // is what filled the cache, so the drop goes after it and immediately before the clock.
-        let _ = drop_caches();
+    // A cold sample is still a sample and rule two still applies to it. Dropping the cache before
+    // each one rather than once before the row is what makes that true: every sample then starts
+    // from the same empty cache, so the median of them means something and the spread says whether
+    // to believe it. [`COLD_SAMPLES`] of them rather than [`SAMPLES`] because a cold sample costs
+    // seconds where a warm one costs milliseconds, and five is rule two's floor.
+    let count = if cold { COLD_SAMPLES } else { SAMPLES };
+    let mut samples = Vec::with_capacity(count);
+    for _ in 0..count {
+        if cold {
+            let _ = drop_caches();
+        }
         let start = Instant::now();
         once();
-        Number { median: start.elapsed().as_nanos() as f64, iqr: f64::NAN }
-    } else {
-        let mut samples = Vec::with_capacity(SAMPLES);
-        for _ in 0..SAMPLES {
-            let start = Instant::now();
-            once();
-            samples.push(start.elapsed().as_nanos() as f64);
-        }
-        samples.sort_by(f64::total_cmp);
-        Number {
-            median: percentile(&samples, 50),
-            iqr: percentile(&samples, 75) - percentile(&samples, 25),
-        }
+        samples.push(start.elapsed().as_nanos() as f64);
+    }
+    samples.sort_by(f64::total_cmp);
+    let time = Number {
+        median: percentile(&samples, 50),
+        iqr: percentile(&samples, 75) - percentile(&samples, 25),
     };
 
     Row { pattern: pattern.name, engine: engine.name(), wanted, time, reads, read }
@@ -277,11 +284,7 @@ fn report(rows: &[Row], bytes: u64, cold: bool) {
             }
             last = row.pattern;
         }
-        let iqr = if row.time.iqr.is_nan() {
-            "one".to_string()
-        } else {
-            format!("{:.1}%", row.time.relative() * 100.0)
-        };
+        let iqr = format!("{:.1}%", row.time.relative() * 100.0);
         println!(
             "{:<18} {:<20} {:>10} {:>10.1} {:>7} {:>8} {:>7.2}",
             row.pattern,
@@ -299,8 +302,16 @@ fn report(rows: &[Row], bytes: u64, cold: bool) {
         println!("{line}");
     }
     if cold {
-        println!("  a cold row is one sample and not nine, because the second sample is not cold,");
-        println!("    so its spread column says `one` rather than a percentage nobody can use.");
+        println!(
+            "  a cold row is the median of {COLD_SAMPLES} and not of 9, because a cold sample costs"
+        );
+        println!("    a cache drop and a read of the whole pattern off the device. The cache is");
+        println!(
+            "    dropped before each of them, so every sample is cold and not just the first."
+        );
+        println!("    The spreads here are wide. Two rows whose medians are inside each other's");
+        println!("    spread are one result and not two, and the reads column is the check on");
+        println!("    that: rows doing identical work have identical read counts.");
     } else {
         println!("  this is warm. Every read after the first is a memcpy out of the page cache,");
         println!("    so this table says how fast this machine copies memory as much as it says");
