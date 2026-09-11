@@ -480,18 +480,18 @@ mod tests {
 
     #[test]
     fn a_page_in_a_codec_this_build_cannot_read_says_which_codec() {
-        // The chunk's codec is a lie here, which is exactly what a file in zstd looks like to
-        // this reader, and the answer has to name the codec rather than fail at decompression.
+        // The chunk's codec is a lie here, which is exactly what a file in gzip looks like to this
+        // reader, and the answer has to name the codec rather than fail at decompression.
         let file = open();
         let metadata = Metadata::read(file.as_ref()).expect("the footer reads");
         let chunk = &metadata.row_groups[0].columns[0];
         let mut bytes = vec![0u8; chunk.compressed_size as usize];
         file.read_at(chunk.start(), &mut bytes).expect("the chunk is in the file");
-        let error = Pages::new(&bytes, Codec::Zstd, chunk.values)
+        let error = Pages::new(&bytes, Codec::Gzip, chunk.values)
             .next()
             .expect("a walk that fails yields its error")
             .unwrap_err();
-        assert!(error.message().contains("ZSTD"), "{}", error.message());
+        assert!(error.message().contains("GZIP"), "{}", error.message());
     }
 
     #[test]

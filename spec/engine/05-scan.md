@@ -70,7 +70,7 @@ Page decoding needs the Parquet encodings: plain, dictionary with RLE and bit-pa
 
 Definition and repetition levels have to be decoded even for flat schemas, because that is how Parquet expresses nulls. Nested types can be deferred, and are, because ClickBench and TPC-H have none, but the level decoding for the flat nullable case is required from the start.
 
-Decompression is the part that is easy to underestimate. `hits.parquet` is Snappy. Snappy decompression is a small and well specified algorithm, a few hundred lines, and it goes in a new `rudb-compress` crate at rank 1. Zstd is a much larger job and it is common in the wild, so it is scheduled after the first ClickBench run rather than blocking it, with an explicit unsupported-codec error in the meantime. Gzip, LZ4 and Brotli follow on demand. This is a real cost of the zero-dependency rule and it is being paid knowingly.
+Decompression is the part that is easy to underestimate. `hits.parquet` is Snappy. Snappy decompression is a small and well specified algorithm, a few hundred lines, and it goes in a new `rudb-compress` crate at rank 1. Zstd is a much larger job and it is common in the wild, so it was scheduled after the first ClickBench run rather than blocking it, and it is now there beside Snappy, which is a few thousand lines because zstd carries a Huffman coder and an arithmetic coder and most of the work is in them rather than in the format around them. Gzip, LZ4 and Brotli follow on demand. This is a real cost of the zero-dependency rule and it is being paid knowingly.
 
 The reader is written against the `submit` interface from section 5.3 from the first line, not retrofitted. A row group scan reads the metadata, computes the byte ranges for the projected columns, submits them as one batch, and decodes as they complete.
 
@@ -158,4 +158,4 @@ The load-time number gets its first real measurement here too, and it is expecte
 
 **2e.** The native format reader exists and runs the same forty-three queries, row group and page pruning and Bloom filters are used where present, late materialization is decided at plan time with the encoding-aware cost term, predicates run on dictionary, bit-packed, FSST and run-length data with property tests against their decoded references, and on the scan-and-filter queries rudb reads fewer bytes and spends fewer CPU seconds than DuckDB on the same machine.
 
-Named as deferred: zstd and the other codecs beyond Snappy, nested types in Parquet, `io_uring`, and the write path, which is measured here and fixed later.
+Named as deferred: gzip, LZ4 and Brotli, nested types in Parquet, `io_uring`, and the write path, which is measured here and fixed later. Zstd was on this list and came off it, because the benchmark harness writes its own corpus with it and a decoder that cannot read what the harness wrote is a decoder that gets measured on nothing.
