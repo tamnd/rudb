@@ -235,8 +235,13 @@ mod tests {
     use rudb_common::{Memory, Value};
     use rudb_parse::ast::Scope;
 
+    /// A settings object over a database opened with no limit at all.
+    ///
+    /// `Config::new()` has one now, eighty percent of the machine, so a test about what `RESET`
+    /// goes back to has to say which "back" it means. Here it is no limit, because that is the
+    /// state where a wrong reset is visible rather than being a different large number.
     fn settings() -> (Settings, Memory) {
-        (Settings::new(Config::new()), Memory::unlimited())
+        (Settings::new(Config::new().with_no_memory_limit()), Memory::unlimited())
     }
 
     #[test]
