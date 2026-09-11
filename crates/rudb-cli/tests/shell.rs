@@ -247,6 +247,22 @@ fn tables_and_schema_read_the_catalog() {
     assert_eq!(out, "q\nCREATE TABLE q(x INTEGER, y VARCHAR);\n");
 }
 
+/// Which bytes put quotes around a CSV field.
+///
+/// A separate golden from the mode capture because the mode capture is three tidy rows and none of
+/// the bytes that decide this appear in it. The rule is not RFC 4180 and it is wider than anybody
+/// guesses: an apostrophe, a delete, a tab and every byte in the top half all quote on their own.
+/// That last one is the one that matters, because thirty two of the forty three ClickBench queries
+/// return Russian text and a differential run against DuckDB reports every one of them as different
+/// while the numbers underneath are right.
+#[test]
+fn a_csv_field_is_quoted_on_the_bytes_duckdb_quotes_it_on() {
+    let query = golden("quoting.sql");
+    let (out, err, failed) = run(&["-cmd", ".mode csv", "-c", query.trim_end()]);
+    assert!(!failed, "{err}");
+    assert_eq!(out, golden("quoting.txt"));
+}
+
 #[test]
 fn an_unknown_dot_command_is_an_error_and_the_run_fails() {
     let (_, err, failed) = run(&["-c", ".nonsense"]);

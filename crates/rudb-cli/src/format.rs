@@ -695,14 +695,39 @@ fn separated(result: &QueryResult, cells: &[Vec<String>], settings: &Settings) -
     out
 }
 
-/// One CSV field, quoted when RFC 4180 says it has to be.
+/// One CSV field, quoted when the shell would quote it.
+///
+/// Not RFC 4180, which asks for a quote around a field holding the separator, a quote or a line
+/// break and nothing else. The shell quotes a good deal more than that, and it has to be matched
+/// rather than improved on, because a diff of two CSV files is a byte comparison and a field that
+/// is correct under the standard and different from the reference is still a difference.
+///
+/// What it quotes on top of the separator is in [`AWKWARD`]. The one that matters is the top half
+/// of the byte range, which means every non-ASCII value in the output comes out quoted. Thirty two
+/// of the forty three ClickBench queries return Russian text and every one of them differs from the
+/// reference without this.
 fn csv(text: &str, settings: &Settings) -> String {
-    let awkward = text.contains(&settings.separator)
-        || text.contains('"')
-        || text.contains('\n')
-        || text.contains('\r');
+    let awkward =
+        text.contains(&settings.separator) || text.bytes().any(|byte| AWKWARD[byte as usize]);
     if awkward { format!("\"{}\"", text.replace('"', "\"\"")) } else { text.to_string() }
 }
+
+/// The bytes that put quotes around a CSV field on their own, whatever the separator is.
+///
+/// Every byte under a space, both quote characters, delete, and the whole top half. This is the
+/// table the shell carries, copied because the rule is a table and writing it as a condition is
+/// how the delete and the apostrophe get left out.
+static AWKWARD: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        table[byte] = byte < 0x20 || byte == 0x7f || byte >= 0x80;
+        byte += 1;
+    }
+    table[b'"' as usize] = true;
+    table[b'\'' as usize] = true;
+    table
+};
 
 /// `.mode json` and `.mode jsonlines`.
 fn json(result: &QueryResult, settings: &Settings, array: bool) -> String {
