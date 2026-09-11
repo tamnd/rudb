@@ -21,6 +21,7 @@ mod hybrid;
 mod metadata;
 mod page;
 mod thrift;
+mod values;
 
 pub use chunk::{Page, Pages};
 pub use metadata::{ColumnChunk, Encoding, Metadata, Physical, RowGroup, SchemaColumn, Stats};
