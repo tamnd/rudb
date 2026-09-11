@@ -57,9 +57,10 @@ enum Shape {
     FixedTo(Fixed, Fixed),
     /// The arguments are whatever they are and the result is fixed. `count(x)` over anything.
     AnyTo(Fixed),
-    /// The first argument is cast to one fixed type, the rest are left alone, and the result is
-    /// fixed. `date_part('minute', x)` is a bigint whatever `x` is.
-    LeadingFixedTo(Fixed, Fixed),
+    /// The first `n` arguments are cast to one fixed type, the rest are left alone, and the result
+    /// is fixed. `date_part('minute', x)` is a bigint whatever `x` is, and
+    /// `regexp_extract(s, p, 2)` takes two strings and then a number that has to stay one.
+    LeadingFixedTo(usize, Fixed, Fixed),
     /// The first argument is cast to one fixed type, the rest are left alone, and the result is the
     /// last argument's own type. `date_trunc('month', x)` gives back whatever kind of date `x` was.
     LeadingFixedToLast(Fixed),
@@ -182,7 +183,7 @@ const TABLE: &[Entry] = &[
         name: "date_part",
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(2),
-        shape: Shape::LeadingFixedTo(Fixed::Varchar, Fixed::BigInt),
+        shape: Shape::LeadingFixedTo(1, Fixed::Varchar, Fixed::BigInt),
         numeric_only: false,
     },
     Entry {
@@ -190,6 +191,19 @@ const TABLE: &[Entry] = &[
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(2),
         shape: Shape::LeadingFixedToLast(Fixed::Varchar),
+        numeric_only: false,
+    },
+    // Regular expressions. The pattern is a string like the text is, so three of the four are the
+    // plain string shape. `regexp_extract` is not, because its third argument is the group number
+    // and casting that to a string and reading it back would be a way to accept `'two'`.
+    text("regexp_replace", Arity::between(3, 4), Fixed::Varchar),
+    text("regexp_matches", Arity::between(2, 3), Fixed::Boolean),
+    text("regexp_full_match", Arity::between(2, 3), Fixed::Boolean),
+    Entry {
+        name: "regexp_extract",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 4),
+        shape: Shape::LeadingFixedTo(2, Fixed::Varchar, Fixed::Varchar),
         numeric_only: false,
     },
     // Aggregates.
@@ -269,7 +283,9 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         }
         Shape::FixedTo(argument, result) => (vec![argument.ty(); arguments.len()], result.ty()),
         Shape::AnyTo(result) => (arguments.to_vec(), result.ty()),
-        Shape::LeadingFixedTo(first, result) => (leading(first, arguments), result.ty()),
+        Shape::LeadingFixedTo(count, first, result) => {
+            (leading(count, first, arguments), result.ty())
+        }
         Shape::LeadingFixedToLast(first) => {
             // A null literal has no type and DuckDB refuses `date_trunc('month', NULL)` outright,
             // because it cannot tell the date overload from the interval one. Refusing needs a
@@ -279,7 +295,7 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
                 Some(LogicalType::Null) | None => LogicalType::Timestamp,
                 Some(ty) => ty.clone(),
             };
-            (leading(first, arguments), last)
+            (leading(1, first, arguments), last)
         }
         Shape::Accumulated => {
             let common = promote_all(name, arguments)?;
@@ -290,10 +306,10 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
 }
 
-/// The cast list for a shape that fixes the first argument and leaves the others as they are.
-fn leading(first: Fixed, arguments: &[LogicalType]) -> Vec<LogicalType> {
+/// The cast list for a shape that fixes the leading arguments and leaves the others as they are.
+fn leading(count: usize, first: Fixed, arguments: &[LogicalType]) -> Vec<LogicalType> {
     let mut cast_to = arguments.to_vec();
-    if let Some(head) = cast_to.first_mut() {
+    for head in cast_to.iter_mut().take(count) {
         *head = first.ty();
     }
     cast_to
@@ -412,6 +428,25 @@ mod tests {
         let resolved = resolve("date_part", &[LogicalType::Integer, LogicalType::Date])
             .expect("the part is cast rather than refused");
         assert_eq!(resolved.arguments, vec![LogicalType::Varchar, LogicalType::Date]);
+    }
+
+    /// The group number of an extraction has to arrive as a number, since the kernel tells the
+    /// option string from the group by the type rather than by the position.
+    #[test]
+    fn an_extraction_casts_the_text_and_the_pattern_and_leaves_the_group_alone() {
+        let resolved = resolve(
+            "regexp_extract",
+            &[LogicalType::Varchar, LogicalType::Varchar, LogicalType::Integer],
+        )
+        .expect("an extraction");
+        assert_eq!(resolved.returns, LogicalType::Varchar);
+        assert_eq!(
+            resolved.arguments,
+            vec![LogicalType::Varchar, LogicalType::Varchar, LogicalType::Integer]
+        );
+        let matched = resolve("regexp_matches", &[LogicalType::Varchar, LogicalType::Varchar])
+            .expect("a match");
+        assert_eq!(matched.returns, LogicalType::Boolean);
     }
 
     #[test]

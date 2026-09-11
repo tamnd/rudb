@@ -284,6 +284,73 @@ fn a_date_part_reads_its_specifier_three_ways_and_refuses_a_fourth() {
     assert!(failure(&db, &format!("SELECT date_part('qtr', {stamp})")).contains("qtr"));
 }
 
+/// ClickBench query 29 with the aggregates cut down to one, which is the last of the forty three to
+/// plan and the only one that needs a regular expression.
+///
+/// The pattern and the replacement are the ones the benchmark ships, character for character, which
+/// is the point of the exercise. A referer with no path does not match, and the answer for a row
+/// that does not match is the referer itself, which is what puts a whole URL in the group list
+/// rather than dropping the row.
+#[test]
+fn a_referer_can_be_cut_down_to_its_host_and_grouped_by() {
+    let mut db = Database::new();
+    db.create_table("hits", vec![Field::new("Referer", LogicalType::Varchar)]).unwrap();
+    db.append(
+        "hits",
+        &[
+            vec![text("http://www.example.com/a/b")],
+            vec![text("https://example.com/")],
+            vec![text("http://other.org/x?y=1")],
+            vec![text("")],
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, \
+             COUNT(*) AS c FROM hits WHERE Referer <> '' GROUP BY k ORDER BY c DESC, k"
+        ),
+        vec![
+            vec![text("example.com"), Value::BigInt(2)],
+            vec![text("other.org"), Value::BigInt(1)]
+        ]
+    );
+}
+
+/// The other three, and the two ways a query can get a regular expression wrong. Every answer here
+/// was read off DuckDB before it was written down.
+#[test]
+fn the_regular_expression_functions_answer_the_way_duckdb_does() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT regexp_matches('abc', 'b')"), vec![vec![Value::Boolean(true)]]);
+    assert_eq!(
+        rows(&db, "SELECT regexp_full_match('abc', 'a')"),
+        vec![vec![Value::Boolean(false)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT regexp_extract('abc123', '([a-z]+)([0-9]+)', 2)"),
+        vec![vec![text("123")]]
+    );
+    assert_eq!(rows(&db, "SELECT regexp_extract('abc', 'z')"), vec![vec![text("")]]);
+    assert_eq!(
+        rows(&db, "SELECT regexp_replace('aXbXc', 'X', '-', 'g')"),
+        vec![vec![text("a-b-c")]]
+    );
+    assert_eq!(rows(&db, "SELECT regexp_replace(NULL, 'a', 'b')"), vec![vec![Value::Null]]);
+    // The column is the thing that varies and the pattern is not, which is the shape the kernel
+    // compiles once per vector rather than once per row.
+    assert_eq!(
+        rows(&db, "SELECT s FROM t WHERE regexp_matches(s, '^[ac]$')"),
+        vec![vec![text("a")], vec![text("c")], vec![text("a")]]
+    );
+    assert!(failure(&db, "SELECT regexp_matches('a', '(')").contains("missing )"));
+    assert!(
+        failure(&db, "SELECT regexp_replace('a', 'a', 'b', 'q')")
+            .contains("Unrecognized Regex option q")
+    );
+}
+
 /// A string that will not read as the other type raises, rather than quietly comparing as text and
 /// answering false.
 #[test]
