@@ -74,6 +74,18 @@ enum State {
     Whole { total: i128, seen: bool },
     /// A running total in floating point, and the count `avg` divides by.
     Real { total: f64, seen: i64 },
+    /// A running total for `avg`, exact while every value folded in is a whole number.
+    ///
+    /// `avg` over an integer column has to add the column up exactly and divide once at the end.
+    /// Adding into a double as it goes gives a different number: each addition past `2^53` rounds,
+    /// and the roundings do not cancel. `AVG(UserID)` over ten thousand rows of the benchmark file
+    /// came out `435091026172918.3` that way where duckdb says `435091026172920.25`, which is the
+    /// sum divided once. So the total is an `i128` and the division is the only rounding.
+    ///
+    /// `exact` goes false the first time a value is not a whole number, or the first time the total
+    /// would overflow, and from then on `real` carries it. A column of doubles therefore lands on
+    /// the same additions in the same order as before, which is what the float path has to keep.
+    Mean { whole: i128, real: f64, seen: i64, exact: bool },
     /// A running total at a fixed decimal scale.
     Scaled { total: i128, scale: u8, seen: bool },
     /// The smallest or largest value so far.
@@ -100,7 +112,7 @@ impl Accumulator {
         };
         let state = match kind {
             Kind::CountStar | Kind::Count => State::Counted(0),
-            Kind::Avg => State::Real { total: 0.0, seen: 0 },
+            Kind::Avg => State::Mean { whole: 0, real: 0.0, seen: 0, exact: true },
             Kind::Min | Kind::Max => State::Extreme(None),
             Kind::Sum => match returns {
                 LogicalType::Decimal { scale, .. } => {
@@ -144,6 +156,25 @@ impl Accumulator {
             }
             State::Real { total, seen } => {
                 *total += approximate_or_error(value)?;
+                *seen += 1;
+            }
+            State::Mean { whole, real, seen, exact } => {
+                match integral(value)
+                    .filter(|_| *exact)
+                    .and_then(|number| whole.checked_add(number))
+                {
+                    Some(total) => *whole = total,
+                    None => {
+                        // The first value that is not whole, or the first one that would overflow.
+                        // What was counted exactly so far comes across as one conversion, and the
+                        // rest of the column is added the way it always was.
+                        if *exact {
+                            *real = exactly(*whole);
+                            *exact = false;
+                        }
+                        *real += approximate_or_error(value)?;
+                    }
+                }
                 *seen += 1;
             }
             State::Scaled { total, scale, seen } => {
@@ -238,6 +269,14 @@ impl Accumulator {
             (State::Real { total, .. }, ty) => {
                 Want::Real { scale: decimal_scale(ty), from: *total }
             }
+            // An exact mean over an integer column is read the way a sum is and divided at the end.
+            // Anything else is the float path, carried on from wherever the total is now, which for
+            // a mean that was exact until this vector is the exact total converted once.
+            (State::Mean { exact: true, .. }, ty) if ty.is_integer() => Want::Whole,
+            (State::Mean { whole, real, exact, .. }, ty) => {
+                let from = if *exact { exactly(*whole) } else { *real };
+                Want::Real { scale: decimal_scale(ty), from }
+            }
             // A total at the scale the column is already held at is a sum of the raw unscaled
             // integers and nothing else, which is the case every real query is in, because the sum
             // of a `DECIMAL(15, 2)` column is declared at scale two. An integer summed into a
@@ -267,6 +306,22 @@ impl Accumulator {
             }
             (State::Real { total, seen }, Contribution::Real { total: carried, seen: added }) => {
                 *total = carried;
+                *seen += added;
+            }
+            (State::Mean { whole, seen, .. }, Contribution::Whole(sum)) => {
+                // An overflow here is not an error the way it is for a sum, because the row at a
+                // time loop answers an overflowing mean in floating point rather than raising. So
+                // this hands the vector back and that loop folds it in, state untouched.
+                let Some(total) = whole.checked_add(sum) else { return Ok(false) };
+                *whole = total;
+                *seen += i64::try_from(live).map_err(|_| overlong())?;
+            }
+            (
+                State::Mean { real, seen, exact, .. },
+                Contribution::Real { total: carried, seen: added },
+            ) => {
+                *real = carried;
+                *exact = false;
                 *seen += added;
             }
             (State::Extreme(held), Contribution::Extreme(Some(index))) => {
@@ -329,6 +384,25 @@ impl Accumulator {
                 }
                 Ok(Value::Double(answer))
             }
+            State::Mean { whole, real, seen, exact } => {
+                if *seen == 0 {
+                    return Ok(Value::Null);
+                }
+                let total = if *exact { exactly(*whole) } else { *real };
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "the count of rows in one group is well inside the exact range"
+                )]
+                let answer = total / *seen as f64;
+                if matches!(self.returns, LogicalType::Float) {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a declared FLOAT result is a FLOAT"
+                    )]
+                    return Ok(Value::Float(answer as f32));
+                }
+                Ok(Value::Double(answer))
+            }
             State::Scaled { total, scale, seen } => {
                 if !seen {
                     return Ok(Value::Null);
@@ -346,6 +420,16 @@ impl Accumulator {
 
 fn not_narrow(value: &Value) -> Error {
     Error::not_implemented(format!("summing a {}", value.logical_type()))
+}
+
+/// An exact total as the double a mean divides, which is the one rounding `avg` over whole numbers
+/// is allowed to do and is where duckdb does it too.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a total past 2^53 rounding once here is the definition of a double result"
+)]
+fn exactly(total: i128) -> f64 {
+    total as f64
 }
 
 fn approximate_or_error(value: &Value) -> Result<f64> {
@@ -673,6 +757,57 @@ mod tests {
         let average =
             run("avg", &LogicalType::Double, &[Value::Integer(1), Value::Null, Value::Integer(3)]);
         assert_eq!(average, Value::Double(2.0));
+    }
+
+    /// Four whole numbers that are all past 2^53, so the two ways of averaging them differ.
+    ///
+    /// The last one is what the benchmark's `UserID` column is made of and is the reason this test
+    /// exists: `AVG(UserID)` came out `435091026172918.3` here where duckdb said
+    /// `435091026172920.25`.
+    const WIDE: [i64; 4] = [435090932899640449, 435090932899640450, 1000003, 999999999999999999];
+
+    /// The mean of [`WIDE`] the way duckdb computes it, which is the sum and then one division.
+    fn wide_mean() -> f64 {
+        exactly(WIDE.iter().map(|&number| i128::from(number)).sum()) / 4.0
+    }
+
+    fn wide_values() -> Vec<Value> {
+        WIDE.iter().map(|&number| Value::BigInt(number)).collect()
+    }
+
+    #[test]
+    fn an_average_of_whole_numbers_adds_them_up_exactly_and_divides_once() {
+        // Adding these into a double as they arrive rounds at every step and the roundings do not
+        // cancel, so the running answer is off in the last digit. The assertion that the two ways
+        // disagree is there because without it this test would pass on a build that never fixed
+        // anything.
+        let mut running = 0.0_f64;
+        for value in wide_values() {
+            running += crate::number::approximate(&value).expect("a number");
+        }
+        assert_ne!(running / 4.0, wide_mean(), "the two ways of averaging have to differ here");
+        assert_eq!(run("avg", &LogicalType::Double, &wide_values()), Value::Double(wide_mean()));
+    }
+
+    #[test]
+    fn the_vector_path_averages_whole_numbers_exactly_as_well() {
+        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
+        let values = wide_values();
+        let vector = Vector::from_values(LogicalType::BigInt, &values).expect("a vector of these");
+        let mut accumulator = Accumulator::new("avg", &LogicalType::Double).expect("a known one");
+        accumulator.update_run(std::slice::from_ref(&vector), values.len()).expect("folds them in");
+        assert_eq!(accumulator.finish().expect("finishes"), Value::Double(wide_mean()));
+    }
+
+    /// A column that is not whole numbers is added the way it always was, in order, in a double.
+    #[test]
+    fn an_average_of_doubles_is_the_running_total_the_float_path_produces() {
+        let rows = [Value::Double(1e17), Value::Double(1.0), Value::Double(3.0)];
+        let mut running = 0.0_f64;
+        for value in &rows {
+            running += crate::number::approximate(value).expect("a number");
+        }
+        assert_eq!(run("avg", &LogicalType::Double, &rows), Value::Double(running / 3.0));
     }
 
     #[test]
