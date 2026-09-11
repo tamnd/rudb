@@ -13,31 +13,45 @@
 //! because it is the reference every faster tier is differentially tested against. This crate is
 //! the compute half of tier 0.
 //!
-//! Every kernel here takes a vector and produces a vector, and the body of every one of them is a
-//! scalar loop over [`rudb_vector::Vector::value_at`]. That is slow, it is slow on purpose, and it
-//! is slow in a way that is visible: the interface is already the batch interface, so a generated
-//! specialization that reads a `&[i32]` out of a flat vector replaces a body without touching a
-//! caller. Section 7.3's kernel generator is what fills those in, and it is M1 work rather than M0
-//! work because there is no benchmark to aim it at until there is an executor to run one.
+//! Every kernel here takes a vector and produces a vector. Each of them started as a scalar loop
+//! over [`rudb_vector::Vector::value_at`], which was slow on purpose and slow in a way that was
+//! visible, because the interface was already the batch interface and a specialization that reads a
+//! `&[i32]` out of a flat vector replaces a body without touching a caller. Sub-milestone 2b is
+//! where that replacement happens, one file at a time, each with a microbenchmark next to it.
 //!
-//! The one optimization that is here is the constant fast path: a cast or a comparison where both
-//! sides are constant vectors costs one operation rather than 1024. That one is worth having now
-//! because the binder turns every literal in a predicate into a constant vector, so it is on the
-//! path of the first query anybody runs.
+//! [`compare::compare`] is done. It dispatches once on the form pair and once on the physical layout, hoists
+//! the operator out of the loop, and keeps the old row at a time loop as the oracle its property
+//! test checks against rather than as dead code. The kernels that have not been converted yet still
+//! run the old loop, and they are still correct.
+//!
+//! The other optimization that has been here from the start is the constant fast path: a cast or a
+//! comparison where both sides are constant vectors costs one operation rather than 1024. That one
+//! is worth having because the binder turns every literal in a predicate into a constant vector, so
+//! it is on the path of the first query anybody runs.
+//!
+//! # Knowing what to specialize next
+//!
+//! There are four physical forms and so sixteen form pairs, and a hand written loop for all sixteen
+//! of them in every kernel is both a lot of code and a lot of places for a wrong answer to hide.
+//! The rule this crate follows instead is to specialize the pairs a scan actually produces and to
+//! count the rest. [`fallback`] is the counter. A kernel that falls through to the row at a time
+//! path increments a cell, a harness prints the cells that are not zero at the end of a run, and a
+//! pair worth another loop then arrives as a number rather than as an opinion.
 //!
 //! # What is not here
 //!
-//! Encoded and dictionary specialization, which is M3. SIMD, which is M1 and which the generator
-//! produces rather than a person writing it. Regular expressions, dates arithmetic, the string
-//! functions past the four here, and the statistical aggregates. Each of those is a signature in
-//! `rudb-functions` before it is a kernel here, so the missing ones fail at binding with a message
-//! naming the function rather than here with a message naming a match arm.
+//! Encoded vector specialization, which arrives with the fifth form at layer three. SIMD, which the
+//! generator of section 7.3 produces rather than a person writing it. Regular expressions, date
+//! arithmetic, the string functions past the four here, and the statistical aggregates. Each of
+//! those is a signature in `rudb-functions` before it is a kernel here, so the missing ones fail at
+//! binding with a message naming the function rather than here with a message naming a match arm.
 
 #![forbid(unsafe_code)]
 
 pub mod aggregate;
 pub mod cast;
 pub mod compare;
+pub mod fallback;
 pub mod logic;
 mod number;
 pub mod scalar;
@@ -45,5 +59,6 @@ pub mod scalar;
 pub use aggregate::Accumulator;
 pub use cast::{cast, cast_value};
 pub use compare::{Comparison, compare, compare_values, order, order_with_nulls};
+pub use fallback::Kernel;
 pub use logic::{Connective, combine, is_true};
 pub use scalar::{call, call_values};

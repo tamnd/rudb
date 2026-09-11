@@ -32,7 +32,16 @@ pub const VECTOR_SIZE: usize = 1024;
 ///
 /// An operator asks this once per vector and then takes the path it wants, which is the one branch
 /// per vector that the whole design is willing to spend.
+///
+/// Not exhaustive, and that is a decision rather than an oversight. `Encoded` is the fifth form
+/// and it arrives at layer three with the specialization contract. If this enum were exhaustive,
+/// the day it lands is the day every kernel in the workspace stops compiling, and the pressure at
+/// that moment would be to add an arm to each of them in a hurry rather than to think about what
+/// each one should do with an encoded vector. A required fallback arm means each kernel already
+/// has a correct answer for a form it has never seen, and specializing it is then a change that
+/// can be made one kernel at a time with a benchmark next to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Form {
     /// One value per position.
     Flat,
@@ -309,6 +318,50 @@ impl Vector {
     pub fn data(&self) -> Option<&Data> {
         match &self.body {
             Body::Flat(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// The one value, for a constant vector, and `None` for any other form.
+    ///
+    /// A kernel comparing a column against a literal wants the literal once rather than 1024
+    /// times, and [`Self::value_at`] on a constant clones it on every call because it has to be
+    /// able to hand back a `Value` for any form. This is the accessor that lets the specialized
+    /// path hoist the clone out of the loop.
+    #[must_use]
+    pub fn constant_value(&self) -> Option<&Value> {
+        match &self.body {
+            Body::Constant(value) => Some(value.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// The codes and the values, for a dictionary vector, and `None` for any other form.
+    ///
+    /// The reason a kernel needs this rather than reading the dictionary through
+    /// [`Self::value_at`] is the entire argument for the form existing. A filter against a
+    /// dictionary column of 1024 rows and 40 distinct values is 40 comparisons and 1024 lookups,
+    /// not 1024 comparisons, and there is no way to write that loop without seeing the codes.
+    ///
+    /// Note what the validity of the returned vector means. A dictionary keeps its nulls in the
+    /// vector it points at, and the dictionary's own validity says nothing about them, so a caller
+    /// deciding whether row `i` is null has to ask the value vector about `codes[i]` rather than
+    /// asking this vector about `i`. [`Self::flatten`] has the same note on it for the same
+    /// reason, because getting this wrong is a null that survives being selected and comes out as
+    /// a zero.
+    #[must_use]
+    pub fn dictionary_parts(&self) -> Option<(&[u32], &Self)> {
+        match &self.body {
+            Body::Dictionary { codes, values } => Some((codes, values.as_ref())),
+            _ => None,
+        }
+    }
+
+    /// The start and the step, for a sequence vector, and `None` for any other form.
+    #[must_use]
+    pub fn sequence_parts(&self) -> Option<(i64, i64)> {
+        match self.body {
+            Body::Sequence { start, step } => Some((start, step)),
             _ => None,
         }
     }

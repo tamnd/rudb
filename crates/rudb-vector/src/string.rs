@@ -85,6 +85,16 @@ impl StringView {
         [self.payload[0], self.payload[1], self.payload[2], self.payload[3]]
     }
 
+    /// The bytes, when the whole string is in the view.
+    ///
+    /// A comparison wants bytes rather than a `&str`, because SQL's string order is byte order and
+    /// because [`Self::as_inline_str`] pays for a UTF-8 validation that a comparison has no use
+    /// for. On a filter against a varchar column that validation is the whole cost of the row.
+    #[must_use]
+    pub fn inline_bytes(&self) -> Option<&[u8]> {
+        if self.is_inline() { Some(&self.payload[..self.len()]) } else { None }
+    }
+
     /// The string, when it is short enough to be in the view.
     #[must_use]
     pub fn as_inline_str(&self) -> Option<&str> {
@@ -177,17 +187,28 @@ impl StringColumn {
         self.views.len() - 1
     }
 
+    /// The bytes at `index`, or `None` past the end.
+    ///
+    /// This is what a comparison, a hash and an equality check all actually want, and it is worth
+    /// having separately from [`Self::get`] because that one validates UTF-8 and they do not need
+    /// it. Everything in a column arrived through [`Self::push`], which takes a `&str`, so the
+    /// bytes are valid either way and the validation is a scan of the payload that changes no
+    /// answer. On a varchar filter it was measured at most of the per row cost.
+    #[must_use]
+    pub fn bytes(&self, index: usize) -> Option<&[u8]> {
+        let view = self.views.get(index)?;
+        if let Some(inline) = view.inline_bytes() {
+            return Some(inline);
+        }
+        let block = self.blocks.get(view.block())?;
+        block.get(view.offset()..view.offset() + view.len())
+    }
+
     /// The string at `index`, or `None` past the end.
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&str> {
-        let view = self.views.get(index)?;
-        if let Some(text) = view.as_inline_str() {
-            return Some(text);
-        }
-        let block = self.blocks.get(view.block())?;
-        let bytes = block.get(view.offset()..view.offset() + view.len())?;
         // Written from a `&str` into a block that is append only, so the bytes are the same bytes.
-        std::str::from_utf8(bytes).ok()
+        std::str::from_utf8(self.bytes(index)?).ok()
     }
 
     /// Every string in order.
@@ -327,5 +348,21 @@ mod tests {
         let column: StringColumn = ["a", "b"].into_iter().collect();
         assert_eq!(column.get(2), None);
         assert_eq!(column.len(), 2);
+    }
+
+    /// The bytes and the string have to be the same string on both sides of the inline boundary
+    /// and on multibyte text, because the comparison kernels read the bytes and everything else
+    /// reads the string, and a disagreement between them would be a filter that matched a row the
+    /// projection then printed differently.
+    #[test]
+    fn the_bytes_and_the_string_are_the_same_string() {
+        let long = "x".repeat(9000);
+        let words = ["", "a", "twelve bytes", "thirteen bytes", "π is two bytes", &long];
+        let column: StringColumn = words.into_iter().collect();
+        for (index, text) in words.iter().enumerate() {
+            assert_eq!(column.bytes(index), Some(text.as_bytes()), "at {index}");
+            assert_eq!(column.get(index), Some(*text), "at {index}");
+        }
+        assert_eq!(column.bytes(words.len()), None);
     }
 }
