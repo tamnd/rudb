@@ -101,7 +101,7 @@ fn beside(root: &Path) -> Result<PathBuf, String> {
 /// The front end table measures this repository against itself and wants the profile that gives
 /// the least noise. This one puts rudb in a table next to binaries somebody else built and shipped,
 /// and the honest thing to compare those against is the profile rudb ships too.
-fn build_rudb(root: &Path) -> Result<PathBuf, String> {
+pub(crate) fn build_rudb(root: &Path) -> Result<PathBuf, String> {
     build(root, &["build", "--release", "--package", "rudb-cli"], "rudb")?;
     let path = root.join("target").join("release").join(binary("rudb"));
     if path.is_file() {
@@ -146,7 +146,7 @@ fn build(at: &Path, args: &[&str], what: &str) -> Result<(), String> {
 }
 
 /// An executable's file name on this platform.
-fn binary(name: &str) -> String {
+pub(crate) fn binary(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 

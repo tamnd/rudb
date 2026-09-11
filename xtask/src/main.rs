@@ -14,6 +14,7 @@ mod bench;
 mod codegen;
 mod compare;
 mod compress;
+mod differential;
 mod focus;
 mod grammar;
 mod io;
@@ -49,6 +50,13 @@ fn main() -> ExitCode {
             Some(suite) => compare::run(&root(), &suite),
             None => bench::run(&root()),
         },
+        // The forty three ClickBench queries through both engines over a file somebody downloaded,
+        // which is the only way to check the answers at a size the committed fixture cannot reach.
+        // Not under `bench` above, because that word means a measurement and this is a comparison
+        // of answers that happens to print times as well.
+        Some("differential") => {
+            differential::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>())
+        }
         // The kernel tables, which are the in-process measurement of rank three against itself.
         // Not a suite name under `bench` above, because that word means the whole comparison
         // against every engine on the machine and this one links the kernels rather than running a
@@ -114,6 +122,11 @@ fn usage() {
     println!("                         builds rudb and the harness, then runs the suite. needs a");
     println!("                         tamnd/rudb-bench checkout beside this one, or");
     println!("                         RUDB_BENCH_REPO, and the suite's data on the machine");
+    println!("  differential <file>    the forty three ClickBench queries through rudb and");
+    println!("                         through duckdb over that Parquet file, answers compared");
+    println!("                         byte for byte, times printed beside them. the committed");
+    println!("                         fixture is ten thousand rows and every difference found so");
+    println!("                         far needed a million, so this takes a file you downloaded");
     println!();
     println!(
         "  vendor-grammar [ref]   refetch DuckDB's PEG grammar, writing crates/rudb-parse/grammar"
