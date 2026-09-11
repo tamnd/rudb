@@ -1,7 +1,8 @@
 //! A table: a name, some columns, and the rows.
 
-use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_storage::MemoryTable;
+use rudb_vector::{Chunk, Form};
 
 use crate::name::{QualifiedName, same_name};
 
@@ -70,14 +71,79 @@ impl Table {
     }
 
     /// The rows, to add to.
+    ///
+    /// This is the way past the constraint check, and the two `append` methods here are the way
+    /// through it. A caller that already knows what it is holding, such as the loader that built
+    /// the chunk out of a file the table was declared from, can take this one.
     pub fn rows_mut(&mut self) -> &mut MemoryTable {
         &mut self.rows
+    }
+
+    /// Adds a chunk, refusing a null in a column that said it would not have one.
+    ///
+    /// # Errors
+    ///
+    /// If the chunk does not match the table, or if a `NOT NULL` column is handed a null. DuckDB
+    /// raises a constraint error there and so does this, with the same shape of message, because a
+    /// program that catches one by its text is a program rudb has to not surprise.
+    pub fn append(&mut self, chunk: Chunk) -> Result<()> {
+        self.refuse_nulls(&chunk)?;
+        self.rows.append(chunk)
+    }
+
+    /// Adds rows of single values, refusing a null in a column that said it would not have one.
+    ///
+    /// # Errors
+    ///
+    /// If a row is not as wide as the table, if a value will not convert to its column's type, or
+    /// if a `NOT NULL` column is handed a null.
+    pub fn append_rows(&mut self, rows: &[Vec<Value>]) -> Result<()> {
+        for row in rows {
+            for (at, column) in self.columns.iter().enumerate() {
+                if column.not_null && row.get(at).is_some_and(Value::is_null) {
+                    return Err(self.null_in(&column.name));
+                }
+            }
+        }
+        self.rows.append_rows(rows)
+    }
+
+    /// Checks a chunk against the `NOT NULL` columns before any of it is kept.
+    ///
+    /// A table with no such column pays one walk of the column list and touches no data, which is
+    /// most tables. A column that does refuse nulls is checked through its validity mask when the
+    /// mask is the whole story, which is one word per sixty four rows rather than a read per row.
+    /// A dictionary or a constant can hold the null in the body it points at instead, where the
+    /// mask cannot see it, so those two are asked value by value.
+    fn refuse_nulls(&self, chunk: &Chunk) -> Result<()> {
+        for (at, column) in self.columns.iter().enumerate() {
+            if !column.not_null {
+                continue;
+            }
+            let vector = chunk.column(at)?;
+            let found = match vector.form() {
+                Form::Flat | Form::Sequence => {
+                    vector.validity().has_nulls(vector.len())
+                        && (0..vector.len()).any(|row| !vector.validity().is_valid(row))
+                }
+                _ => (0..vector.len()).any(|row| vector.value_at(row).is_null()),
+            };
+            if found {
+                return Err(self.null_in(&column.name));
+            }
+        }
+        Ok(())
+    }
+
+    /// The error DuckDB raises when a null reaches a column that refuses them.
+    fn null_in(&self, column: &str) -> Error {
+        Error::constraint(format!("NOT NULL constraint failed: {}.{}", self.name.table, column))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::Value;
+    use rudb_vector::Vector;
 
     use super::*;
 
@@ -120,5 +186,68 @@ mod tests {
             .append_rows(&[vec![Value::BigInt(1), Value::Varchar("a".to_string())]])
             .expect("a row of the table's own types");
         assert_eq!(table.rows().len(), 1);
+    }
+
+    /// A table whose first column refuses nulls and whose second does not.
+    fn required() -> Table {
+        Table::new(
+            QualifiedName::new("memory", "main", "hits"),
+            vec![
+                Field::required("UserID", LogicalType::BigInt),
+                Field::new("SearchPhrase", LogicalType::Varchar),
+            ],
+        )
+        .expect("two columns with different names")
+    }
+
+    #[test]
+    fn a_null_in_a_not_null_column_is_refused() {
+        let mut table = required();
+        let error = table
+            .append_rows(&[vec![Value::Null, Value::Varchar("a".to_string())]])
+            .expect_err("a null in UserID");
+        assert_eq!(error.message(), "NOT NULL constraint failed: hits.UserID");
+        assert!(table.rows().is_empty(), "the row was kept anyway");
+    }
+
+    #[test]
+    fn a_null_in_a_column_that_allows_them_is_kept() {
+        let mut table = required();
+        table.append_rows(&[vec![Value::BigInt(7), Value::Null]]).expect("a null in SearchPhrase");
+        assert_eq!(table.rows().len(), 1);
+    }
+
+    #[test]
+    fn a_chunk_is_checked_through_its_mask() {
+        let mut table = required();
+        let phrase = Vector::constant(LogicalType::Varchar, Value::Varchar("a".to_string()), 2);
+        let good = Chunk::new(vec![
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1), Value::BigInt(2)])
+                .expect("two ids"),
+            phrase.clone(),
+        ])
+        .expect("two columns of two rows");
+        table.append(good).expect("no nulls anywhere");
+        let bad = Chunk::new(vec![
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1), Value::Null])
+                .expect("an id and a null"),
+            phrase,
+        ])
+        .expect("two columns of two rows");
+        let error = table.append(bad).expect_err("a null in UserID");
+        assert_eq!(error.message(), "NOT NULL constraint failed: hits.UserID");
+        assert_eq!(table.rows().len(), 2, "the bad chunk was kept anyway");
+    }
+
+    #[test]
+    fn a_null_hiding_in_a_constant_is_found() {
+        let mut table = required();
+        let chunk = Chunk::new(vec![
+            Vector::constant(LogicalType::BigInt, Value::Null, 4),
+            Vector::constant(LogicalType::Varchar, Value::Varchar("a".to_string()), 4),
+        ])
+        .expect("two columns of four rows");
+        let error = table.append(chunk).expect_err("a constant null in UserID");
+        assert_eq!(error.message(), "NOT NULL constraint failed: hits.UserID");
     }
 }
