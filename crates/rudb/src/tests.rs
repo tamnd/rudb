@@ -1367,6 +1367,30 @@ fn every_operator_that_buffers_is_held_to_the_limit() {
     }
 }
 
+/// A group key is charged what the table kept rather than what the buffer it was read into had
+/// room for. Per #269.
+#[test]
+fn one_long_group_key_does_not_charge_every_short_one_for_its_length() {
+    // Four megabytes, where the honest charge for these rows is a few hundred kilobytes and the
+    // charge this is guarding against is two hundred copies of the long key, which is twenty
+    // megabytes.
+    let db = Database::with_config(Config::new().with_memory_limit(4 << 20));
+    db.create_table("k", vec![Field::new("s", LogicalType::Varchar)]).unwrap();
+    // The long one first, because the buffer being reused is what carries its length into every
+    // key after it and a buffer never gives room back.
+    let mut rows = vec![vec![Value::Varchar("x".repeat(100_000))]];
+    rows.extend((0..200).map(|n| vec![Value::Varchar(format!("group {n}"))]));
+    db.append("k", &rows).unwrap();
+    let result = db.query("SELECT s, count(*) FROM k GROUP BY s").expect("the table fits");
+    assert_eq!(result.len(), 201);
+    // And the same query with the limit taken away agrees about the rows, so what is being tested
+    // is the accounting rather than the grouping.
+    let loose = Database::new();
+    loose.create_table("k", vec![Field::new("s", LogicalType::Varchar)]).unwrap();
+    loose.append("k", &rows).unwrap();
+    assert_eq!(loose.query("SELECT s, count(*) FROM k GROUP BY s").unwrap().len(), 201);
+}
+
 #[test]
 fn the_budget_is_given_back_when_the_query_stops() {
     let db = Database::with_config(Config::new().with_memory_limit(SMALL));
