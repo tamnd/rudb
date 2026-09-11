@@ -365,19 +365,32 @@ fn arithmetic_op(name: &str) -> Option<Op> {
     }
 }
 
-/// The three form pairings a binary kernel in this file has a loop for.
+/// The form pairings a binary kernel in this file has a loop for.
 ///
-/// Flat against flat, flat against constant and constant against flat, which is what an expression
-/// over a column and a literal produces and is the overwhelming majority of what an expression tree
-/// contains. A dictionary is not here and is counted instead, because arithmetic over a dictionary
-/// wants to compute once per distinct value rather than once per row, and that is a different loop
-/// rather than a different index mapping.
+/// Flat against flat, flat against constant and constant against flat are what an expression over a
+/// column and a literal produces and are the overwhelming majority of what an expression tree
+/// contains. The four pairings with a dictionary on one side are here because the kernel table
+/// measured what leaving them out cost, which on `server3` was 73 to 105 nanoseconds a row against
+/// 1.2 for the pairings that had a loop.
+///
+/// This file used to argue that a dictionary belongs in a different loop rather than a different
+/// index mapping, because arithmetic over a dictionary wants to compute once per distinct value and
+/// hand back a dictionary over the answers. That is still true and it is still the better loop. It
+/// was an argument for writing it, though, and what it was actually being used for was an argument
+/// for having no loop at all, at forty times the cost of the mapping that was already written.
+///
+/// Computing once per distinct value also has a question in it that the per row mapping does not,
+/// and it is the reason that loop is worth doing carefully rather than quickly. A dictionary's
+/// values can hold an entry no code refers to. Computing over the values array would evaluate that
+/// entry, and if it overflows, a vector that has no overflowing row in it raises. The mapping here
+/// only ever touches an entry some row points at, so it cannot invent an error the row at a time
+/// path would not have produced.
 ///
 /// The mapping is a generic parameter and not a `fn(usize) -> usize` stored in a tuple. That is not
 /// a style choice: a function pointer is an indirect call the compiler cannot see through, and two
 /// of them per row was measured at ten nanoseconds a row on an integer addition, which is twenty
-/// times what the addition costs. As a generic parameter each mapping is a zero sized type, the
-/// call inlines to nothing, and the three pairings become three copies of the loop.
+/// times what the addition costs. As a generic parameter each mapping is a zero sized type and the
+/// call inlines to nothing, at the price of one copy of the loop per pairing.
 macro_rules! by_form {
     ($left:ident, $right:ident, $body:ident, $($rest:expr),* $(,)?) => {{
         if let (Some(one), Some(other)) = ($left.data(), $right.data()) {
@@ -392,6 +405,34 @@ macro_rules! by_form {
             let Some(held) = single($left.logical_type(), value) else { return Ok(None) };
             let Some(one) = held.data() else { return Ok(None) };
             return $body(one, first, other, identity, $($rest),*);
+        }
+        if let (Some((codes, values)), Some(other)) = ($left.dictionary_parts(), $right.data()) {
+            let Some(one) = values.data() else { return Ok(None) };
+            let at = move |index: usize| codes[index] as usize;
+            return $body(one, at, other, identity, $($rest),*);
+        }
+        if let (Some(one), Some((codes, values))) = ($left.data(), $right.dictionary_parts()) {
+            let Some(other) = values.data() else { return Ok(None) };
+            let at = move |index: usize| codes[index] as usize;
+            return $body(one, identity, other, at, $($rest),*);
+        }
+        if let (Some((codes, values)), Some(value)) =
+            ($left.dictionary_parts(), $right.constant_value())
+        {
+            let Some(one) = values.data() else { return Ok(None) };
+            let Some(held) = single($right.logical_type(), value) else { return Ok(None) };
+            let Some(other) = held.data() else { return Ok(None) };
+            let at = move |index: usize| codes[index] as usize;
+            return $body(one, at, other, first, $($rest),*);
+        }
+        if let (Some(value), Some((codes, values))) =
+            ($left.constant_value(), $right.dictionary_parts())
+        {
+            let Some(other) = values.data() else { return Ok(None) };
+            let Some(held) = single($left.logical_type(), value) else { return Ok(None) };
+            let Some(one) = held.data() else { return Ok(None) };
+            let at = move |index: usize| codes[index] as usize;
+            return $body(one, first, other, at, $($rest),*);
         }
         Ok(None)
     }};
@@ -1512,19 +1553,33 @@ mod tests {
         words[rng.below(words.len() as u64) as usize].to_owned()
     }
 
-    /// The three form pairings that have a loop, as a pair of vectors built from one column.
+    /// The form pairings that have a loop, as a pair of vectors built from one column.
     ///
     /// Constant against constant is not here on purpose: that pair returns a constant vector rather
     /// than a flat one, so it is right without being equal, and it has a test of its own below.
+    ///
+    /// The dictionary is built over the column itself with codes that repeat and run backwards, so
+    /// a null in the column is a null under several codes and the loop cannot pass by reading the
+    /// rows in order. Its last entry is deliberately unreferenced, which is the case where computing
+    /// once per distinct value and computing once per row are allowed to disagree about whether
+    /// something overflowed.
     fn pairings(left: &Vector, right: &Vector) -> Vec<(Vector, Vector)> {
         let rows = left.len();
         let as_constant = |vector: &Vector| {
             Vector::constant(vector.logical_type().clone(), vector.value_at(0), rows)
         };
+        let as_dictionary = |vector: &Vector| {
+            let codes: Vec<u32> = (0..rows).map(|index| (rows - 1 - index) as u32 / 2).collect();
+            Vector::dictionary(codes, vector.clone()).expect("codes are in range")
+        };
         vec![
             (left.clone(), right.clone()),
             (left.clone(), as_constant(right)),
             (as_constant(left), right.clone()),
+            (as_dictionary(left), right.clone()),
+            (left.clone(), as_dictionary(right)),
+            (as_dictionary(left), as_constant(right)),
+            (as_constant(left), as_dictionary(right)),
         ]
     }
 
@@ -1621,8 +1676,10 @@ mod tests {
         assert_eq!(sum.value_at(1000), Value::Integer(7));
     }
 
-    /// A dictionary has no loop here yet, and the thing that makes that safe is reading its nulls
-    /// from the vector it points at rather than from its own validity.
+    /// A dictionary's nulls come from the vector it points at rather than from its own validity,
+    /// and the code at a null position still indexes a real entry. This was the property that made
+    /// falling through to the row at a time path safe, and it is the property the loop needs now
+    /// that there is one.
     #[test]
     fn a_dictionary_argument_reads_its_nulls_from_the_values() {
         let values = Vector::from_values(
