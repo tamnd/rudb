@@ -280,6 +280,12 @@ impl Operator for Series {
 /// The first file decides the types and every file after it is cast to them, which is DuckDB's rule
 /// and was measured: a second file holding `'5'` where the first holds an `INTEGER` reads as 5, and
 /// one holding `'txt'` is a conversion error naming the file it came from.
+///
+/// That is the Parquet rule and CSV does not follow it. A Parquet file states its schema, so there
+/// is a first file's word to take, and a CSV file states nothing, so the binder sniffed all of them
+/// and combined the answers. What arrives here is that combined answer, and each CSV file is told it
+/// as it is opened rather than being allowed to use its own sample, which is what keeps a file that
+/// happens to hold nothing but whole numbers from handing up BIGINT into a stream that is DOUBLE.
 #[derive(Debug)]
 pub(crate) struct FileScan {
     function: TableFunction,
@@ -327,7 +333,8 @@ impl FileScan {
         let Some(path) = self.paths.get(self.at) else { return Ok(()) };
         let mut reader = FileReader::open(self.function, path)?;
         let first = if self.at == 0 { None } else { self.paths.first().map(String::as_str) };
-        reader.project(&positions(&self.wanted, &reader.fields(), path, first)?)?;
+        reader.project(&positions(self.function, &self.wanted, &reader.fields(), path, first)?)?;
+        reader.settle(&self.wanted)?;
         self.reader = Some(reader);
         self.at += 1;
         Ok(())
@@ -427,6 +434,23 @@ impl FileReader {
         }
     }
 
+    /// Tells the file the types the whole read settled on, where that is a thing to say.
+    ///
+    /// It is for CSV and it is nothing for Parquet. A Parquet file states its types and the first
+    /// file's are the read's, so a later file that disagrees is read as what it holds and cast by
+    /// [`FileScan::conform`]. A CSV file has no types of its own, only the ones a sample of it
+    /// suggested, and the read's came from combining the samples of every file, so this replaces the
+    /// suggestion before a row is parsed rather than converting twice.
+    fn settle(&mut self, wanted: &[Field]) -> Result<()> {
+        match self {
+            Self::Parquet(_) => Ok(()),
+            Self::Csv(reader) => {
+                let types: Vec<LogicalType> = wanted.iter().map(|field| field.ty.clone()).collect();
+                reader.retype(&types)
+            }
+        }
+    }
+
     /// The next chunk, or `None` at the end of the file.
     fn next_chunk(&mut self) -> Result<Option<Chunk>> {
         match self {
@@ -467,7 +491,13 @@ fn file_arguments(plan: &Plan, args: Slice, function: TableFunction) -> Result<V
 /// different things about a missing column and DuckDB writes both: the first file is the one the
 /// plan was bound against, so a column missing from it means the file was replaced since, while a
 /// column missing from a later one means the files in the set do not agree with each other.
+///
+/// The disagreement is worded by whichever reader found it, because the two readers in DuckDB are
+/// two pieces of code that each wrote their own sentence and a compatibility test that compares
+/// output compares all of it. For CSV this is only reachable when a file changed between binding and
+/// running, since the binder sniffed every file and would have said the same thing first.
 fn positions(
+    function: TableFunction,
     wanted: &[Field],
     held: &[Field],
     path: &str,
@@ -482,6 +512,9 @@ fn positions(
                     field.name
                 ));
             };
+            if matches!(function, TableFunction::ReadCsv) {
+                return rudb_csv::mismatch(first, path, &field.name);
+            }
             let candidates: Vec<&str> = held.iter().map(|column| column.name.as_str()).collect();
             Error::invalid_input(format!(
                 "Failed to read file \"{path}\": schema mismatch in glob: column \"{}\" was read \

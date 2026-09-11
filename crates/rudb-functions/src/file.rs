@@ -4,6 +4,12 @@
 //! are in the file rather than in a table in this crate. So a caller resolves the call, gets
 //! [`Columns::Parquet`] back, and comes here with the path.
 //!
+//! A read can cover more than one file, because the path can be a pattern, and the two formats
+//! settle their schema differently when it does. A Parquet file states its schema in its footer, so
+//! the first file's word is taken and a later file that disagrees is cast to it. A CSV file states
+//! nothing, so [`csv_fields`] sniffs every file the pattern named and combines the answers, which is
+//! what the binary does and is the only way the answer can be right.
+//!
 //! The file is opened twice for a query that runs, once by the binder to read the schema and once
 //! by the executor to read the rows. That is what DuckDB does too and it is not a mistake: the
 //! binder has to know the column names before the rest of the statement can bind, and holding an
@@ -105,13 +111,30 @@ pub fn parquet_fields(path: &str) -> Result<Vec<Field>> {
     Ok(open_parquet(path)?.fields())
 }
 
-/// The columns of the CSV file at `path`, sniffed out of its front.
+/// The columns a `read_csv` of `paths` produces, sniffed out of the front of every one of them.
+///
+/// Every file and not only the first, which is the one place this differs from Parquet and is
+/// DuckDB's rule rather than a choice made here. It was measured at two, three, four and six files:
+/// four files where only the fourth holds a decimal answer DOUBLE, and six where only the sixth
+/// holds text answer VARCHAR. A Parquet file states its schema in its footer, so there is a first
+/// file's word to take. A CSV file states nothing, so there is not, and a directory of daily exports
+/// where one day happens to hold whole numbers in an otherwise decimal column would come out BIGINT
+/// or DOUBLE depending on which day sorted first. So all of them are sniffed and the answers are
+/// combined by [`rudb_csv::across`].
+///
+/// That is an open and one sample read per file at bind time. It is what the binary does, it is the
+/// only way the answer can be right, and it is a sample against a scan that is about to read all of
+/// those files anyway.
 ///
 /// # Errors
 ///
-/// Everything [`open_csv`] reports.
-pub fn csv_fields(path: &str) -> Result<Vec<Field>> {
-    Ok(open_csv(path)?.fields())
+/// Everything [`open_csv`] reports, and a file that is missing a column the first one has.
+pub fn csv_fields(paths: &[String]) -> Result<Vec<Field>> {
+    let mut sniffed = Vec::with_capacity(paths.len());
+    for path in paths {
+        sniffed.push((path.clone(), open_csv(path)?.fields()));
+    }
+    rudb_csv::across(&sniffed)
 }
 
 #[cfg(test)]

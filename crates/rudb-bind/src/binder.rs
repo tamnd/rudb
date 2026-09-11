@@ -918,7 +918,9 @@ impl<'a> Binder<'a> {
                 let paths = self.file_paths(cast[0], resolved.function.name())?;
                 let first = paths.first().map_or("", String::as_str);
                 let fields = match columns {
-                    Columns::Csv => csv_fields(first)?,
+                    // Parquet takes the first file's footer as the answer and CSV sniffs all of
+                    // them, which is not a choice made here. See `csv_fields`.
+                    Columns::Csv => csv_fields(&paths)?,
                     _ => parquet_fields(first)?,
                 };
                 cast = paths.iter().map(|path| self.path_constant(path)).collect();
@@ -977,7 +979,7 @@ impl<'a> Binder<'a> {
         let first = paths.first().map_or("", String::as_str);
         let fields = match function {
             TableFunction::ReadParquet => parquet_fields(first)?,
-            _ => csv_fields(first)?,
+            _ => csv_fields(&paths)?,
         };
         // The name the columns answer to is the file's stem, so `SELECT mixed.a FROM
         // 'data/mixed.parquet'` works. That is DuckDB's choice and it is the useful one, since the
