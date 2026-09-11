@@ -16,8 +16,13 @@
 //!
 //! # What is here
 //!
-//! Snappy, decompression only, in [`snappy`]. Snappy is what almost every Parquet writer emits by
-//! default, so it is the one that unblocks reading other people's files.
+//! Snappy in [`snappy`] and Zstandard in [`zstd`], decompression only. Snappy is what a Parquet
+//! writer emits when nobody chose, and zstd is what somebody chose, which between them is most of
+//! the Parquet anybody has.
+//!
+//! The two are not the same size of problem. Snappy is a few hundred lines of copy instructions and
+//! zstd is a few thousand, because zstd carries a Huffman coder and an arithmetic coder and most of
+//! the work is in them rather than in the format around them.
 //!
 //! Decompression only because reading comes before writing in this project. The write path is M2m
 //! and it is where a compressor belongs, since a compressor that nothing writes with is a
@@ -25,13 +30,13 @@
 //!
 //! # What is not here yet
 //!
-//! zstd, gzip, LZ4 and brotli. `spec/engine/05-scan.md` defers them by name at 2d. Snappy is the
-//! default of every writer that matters for ClickBench, and a file in another codec should say so
-//! clearly rather than be read slowly by an untested decoder.
+//! gzip, LZ4 and brotli. `spec/engine/05-scan.md` defers them by name at 2d. A file in one of them
+//! should say so clearly rather than be read slowly by an untested decoder.
 
 #![deny(unsafe_code)]
 
 pub mod snappy;
+pub mod zstd;
 
 use rudb_common::Result;
 
@@ -55,7 +60,7 @@ pub enum Codec {
     /// LZ4, the pre-2.9.0 framing that turned out to be ambiguous between writers. Not
     /// implemented, and the reason `Lz4Raw` exists.
     Lz4,
-    /// Zstd. Not implemented, and the first one that will be.
+    /// Zstd, which is what a writer emits when somebody chose.
     Zstd,
     /// LZ4 raw blocks, the framing that replaced `Lz4`. Not implemented.
     Lz4Raw,
@@ -102,7 +107,7 @@ impl Codec {
     /// Whether this build can decompress it.
     #[must_use]
     pub fn is_supported(self) -> bool {
-        matches!(self, Self::Uncompressed | Self::Snappy)
+        matches!(self, Self::Uncompressed | Self::Snappy | Self::Zstd)
     }
 
     /// Decompresses `input`, which is expected to produce exactly `expected` bytes.
@@ -120,9 +125,10 @@ impl Codec {
         let out = match self {
             Self::Uncompressed => input.to_vec(),
             Self::Snappy => snappy::decompress(input)?,
+            Self::Zstd => zstd::decompress(input)?,
             other => {
                 return Err(rudb_common::Error::not_implemented(format!(
-                    "the {} codec is not implemented, only UNCOMPRESSED and SNAPPY are",
+                    "the {} codec is not implemented, only UNCOMPRESSED, SNAPPY and ZSTD are",
                     other.name()
                 )));
             }
@@ -159,8 +165,8 @@ mod tests {
 
     #[test]
     fn a_codec_we_cannot_read_says_so_by_name() {
-        let error = Codec::Zstd.decompress(&[0], 1).unwrap_err();
-        assert!(error.message().contains("ZSTD"), "{}", error.message());
+        let error = Codec::Gzip.decompress(&[0], 1).unwrap_err();
+        assert!(error.message().contains("GZIP"), "{}", error.message());
     }
 
     #[test]
@@ -181,6 +187,7 @@ mod tests {
     fn what_this_build_can_read_is_answerable_without_trying_it() {
         assert!(Codec::Snappy.is_supported());
         assert!(Codec::Uncompressed.is_supported());
-        assert!(!Codec::Zstd.is_supported());
+        assert!(Codec::Zstd.is_supported());
+        assert!(!Codec::Gzip.is_supported());
     }
 }

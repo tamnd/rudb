@@ -17,6 +17,13 @@
 //! partition are valid UTF-8. The fixture here has one column like that and one column that is not
 //! text at all, so both the reading and the refusing are tested.
 //!
+//! # The file in the other codec
+//!
+//! `zstd.parquet` is the same shape as `mixed.parquet` written with `COMPRESSION zstd`, which is
+//! what every writer that was configured by somebody rather than left alone produces. It is here
+//! rather than in `rudb-compress` because the codec is only worth anything through the reader, and
+//! a frame that decompresses in a unit test and a page that reads in a scan are not the same claim.
+//!
 //! # The benchmark file itself
 //!
 //! `hits_0.parquet` is 122 MB, which is too big to commit, so the test that reads it runs when
@@ -103,6 +110,65 @@ fn a_blob_that_is_not_text_is_refused_by_name_rather_than_guessed_at() {
     let error = reader.next_chunk().expect_err("bytes that are not text have nowhere to go");
     assert!(error.message().contains("raw"), "{}", error.message());
     assert!(error.message().contains("valid UTF-8"), "{}", error.message());
+}
+
+#[test]
+fn a_file_in_zstd_reads_the_way_the_same_file_in_snappy_would() {
+    // The codec is the one thing in a Parquet file that changes nothing about what the file means
+    // and decides whether it can be read at all. `zstd.parquet` is DuckDB writing the shape
+    // `mixed.parquet` has with the other codec, so this is the reader's whole path over bytes that
+    // came out of `rudb-compress`'s zstd rather than its Snappy.
+    let mut reader = reader(&fixture("zstd.parquet"));
+    assert_eq!(reader.fields().len(), 4);
+    let values = columns(&mut reader, 4);
+    assert_eq!(values[0].len(), 20000);
+
+    // DuckDB's answers for the same file.
+    let ints: Vec<i32> = values[0]
+        .iter()
+        .map(|value| match value {
+            Value::Integer(number) => *number,
+            other => panic!("an integer column produced {other:?}"),
+        })
+        .collect();
+    assert_eq!(ints.iter().map(|&number| i64::from(number)).sum::<i64>(), 959_289);
+    assert_eq!(ints.iter().min(), Some(&0));
+    assert_eq!(ints.iter().max(), Some(&96));
+
+    let longs: i128 = values[1]
+        .iter()
+        .map(|value| match value {
+            Value::BigInt(number) => i128::from(*number),
+            other => panic!("a bigint column produced {other:?}"),
+        })
+        .sum();
+    assert_eq!(longs, 9_990_000_000);
+
+    // The string column is the one the codec matters most for, since it is where the bytes are and
+    // where a wrong copy distance turns into a plausible looking URL rather than an error.
+    let text: Vec<&str> = values[2]
+        .iter()
+        .filter_map(|value| match value {
+            Value::Varchar(text) => Some(text.as_str()),
+            Value::Null => None,
+            other => panic!("a string column produced {other:?}"),
+        })
+        .collect();
+    assert_eq!(text.len(), 17142);
+    assert_eq!(text.iter().copied().min(), Some("https://example.com/page/0"));
+    assert_eq!(text.iter().copied().max(), Some("https://example.com/page/999"));
+    for (at, value) in values[2].iter().enumerate() {
+        assert_eq!(at % 7 == 0, matches!(value, Value::Null), "row {at}");
+    }
+
+    let doubles: f64 = values[3]
+        .iter()
+        .map(|value| match value {
+            Value::Double(number) => *number,
+            other => panic!("a double column produced {other:?}"),
+        })
+        .sum();
+    assert_eq!(doubles, 944_232.0);
 }
 
 #[test]

@@ -27,6 +27,24 @@ COPY (
 
 DuckDB reads it as n=4096, sum(a)=195783, min(a)=0, max(a)=96, sum(b)=2002560000, count(s)=3510, min(s)='tag0', max(s)='tag4', sum(d)=193536.0, 2048 trues, day from 1970-01-01 to 1972-09-26, and t from 2013-07-15 10:00:00 to 2013-07-15 10:14:59, which is 1373882400000000 to 1373883299000000 in the micros the file holds.
 
+## zstd.parquet
+
+Written by duckdb v2.0.0-dev84237, ZSTD, 20000 rows in three row groups of 8192, plain and dictionary pages.
+
+The codec is the only thing this one is about. It is the same shape as `mixed.parquet` with a string column wide enough that a page has something for a Huffman coder to do, because a fixture where every page is a handful of bytes exercises the frame and never the entropy coder inside it.
+
+```sql
+COPY (
+  SELECT (i % 97)::INTEGER AS a,
+         ((i % 1000) * 1000)::BIGINT AS b,
+         CASE WHEN i % 7 = 0 THEN NULL ELSE ('https://example.com/page/' || (i % 3000)::VARCHAR) END AS s,
+         ((i % 64) * 1.5)::DOUBLE AS d
+  FROM range(20000) tbl(i)
+) TO 'zstd.parquet' (FORMAT parquet, ROW_GROUP_SIZE 8192, COMPRESSION zstd);
+```
+
+DuckDB reads it as n=20000, sum(a)=959289, min(a)=0, max(a)=96, sum(b)=9990000000, count(s)=17142, min(s)='https://example.com/page/0', max(s)='https://example.com/page/999', sum(d)=944232.0.
+
 ## delta.parquet and lengths.parquet
 
 Written by pyarrow 23.0.1, Snappy, format version 2.6, two row groups of 2048 rows, dictionaries off so the delta encodings are actually used.
