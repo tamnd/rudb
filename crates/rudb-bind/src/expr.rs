@@ -218,9 +218,13 @@ impl Binder<'_> {
         let arguments = ast.expr_list(args).to_vec();
         // count(*) is a different function from count(x), because one of them counts rows and the
         // other counts the rows where its argument is not null.
-        let starred = arguments.iter().any(
-            |&arg| matches!(ast.expr(arg), ast::Expr::Star { qualifier } if qualifier.is_empty()),
-        );
+        // A replace list on the star is not this, and not anything: upstream's parser refuses
+        // `count(* REPLACE (1 AS a))` outright and the vendored grammar has room for it, so leaving
+        // it out of here sends it to the arm that says a star is not allowed where it was written.
+        let starred = arguments.iter().any(|&arg| {
+            matches!(ast.expr(arg), ast::Expr::Star { qualifier, replacements }
+                if qualifier.is_empty() && replacements.is_empty())
+        });
         if starred {
             if !rudb_catalog::same_name(&written, "count") || arguments.len() != 1 {
                 return Err(Error::binder(format!("* is not allowed in {written}()")));
@@ -499,7 +503,7 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
 /// three against the answers duckdb gives for the same file.
 pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
     match ast.expr(expr) {
-        ast::Expr::Star { qualifier } => {
+        ast::Expr::Star { qualifier, .. } => {
             if qualifier.is_empty() {
                 "*".to_string()
             } else {

@@ -443,6 +443,13 @@ pub enum Expr {
     Star {
         /// The qualifier, as a run of [`StrRef`], empty for a bare star.
         qualifier: Slice,
+        /// `REPLACE (expression AS column)`, as a run of [`Target`] where the alias is the column
+        /// being replaced, empty for a star with no replace list.
+        ///
+        /// A [`Target`] rather than a type of its own because a replacement is an expression and a
+        /// name, which is exactly what a target is, and because that puts it in the arena every
+        /// other expression and name pair already lives in.
+        replacements: Slice,
     },
     /// A column reference, qualified or not.
     Column {

@@ -175,18 +175,24 @@ impl Scope {
             Some(table) => Error::binder(format!(
                 "Referenced column \"{column}\" not found in table \"{table}\"!"
             )),
-            None => {
-                let candidates: Vec<&str> =
-                    self.columns.iter().map(|held| held.name.as_str()).collect();
-                Error::binder(format!(
-                    "Referenced column \"{column}\" not found in FROM clause!{}",
-                    if candidates.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" Candidate bindings: \"{}\"", candidates.join("\", \""))
-                    }
-                ))
-            }
+            None => Error::binder(format!(
+                "Referenced column \"{column}\" not found in FROM clause!{}",
+                self.candidates()
+            )),
+        }
+    }
+
+    /// The `Candidate bindings:` part of a complaint about a name that is not here, empty when
+    /// there is nothing in scope to suggest.
+    ///
+    /// On its own line in the binary and on the same line here, because an error is one line here
+    /// and the sentence before it is the part anybody matches on.
+    pub(crate) fn candidates(&self) -> String {
+        let candidates: Vec<&str> = self.columns.iter().map(|held| held.name.as_str()).collect();
+        if candidates.is_empty() {
+            String::new()
+        } else {
+            format!(" Candidate bindings: \"{}\"", candidates.join("\", \""))
         }
     }
 }

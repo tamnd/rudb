@@ -465,14 +465,41 @@ impl<'a> Binder<'a> {
         let mut exprs = Vec::with_capacity(targets.len());
         let mut names = Vec::with_capacity(targets.len());
         for target in targets {
-            if let ast::Expr::Star { qualifier } = ast.expr(target.expr) {
+            if let ast::Expr::Star { qualifier, replacements } = ast.expr(target.expr) {
                 let table = ast.name(qualifier).last().map(str::to_string);
                 let expanded: Vec<Visible> =
                     input.star(table.as_deref())?.into_iter().cloned().collect();
+                let replacements = ast.target_list(replacements).to_vec();
+                let mut used = vec![false; replacements.len()];
                 for column in expanded {
-                    let expr = self.plan.add_expr(Expr::Column(column.binding), column.ty);
+                    let found = replacements.iter().zip(&mut used).find(|(replacement, _)| {
+                        same_name(ast.string(replacement.alias), &column.name)
+                    });
+                    // The replacement takes the column's place and its position, and it is named the
+                    // way the replace list spells it rather than the way the table does. That only
+                    // shows when the two differ in case, and `AS EventDate` over a column called
+                    // `eventdate` is exactly the case that shows it.
+                    let (expr, name) = match found {
+                        Some((replacement, used)) => {
+                            *used = true;
+                            let expr = self.bind_expr(ast, replacement.expr, input)?;
+                            (expr, ast.string(replacement.alias).to_string())
+                        }
+                        None => (
+                            self.plan.add_expr(Expr::Column(column.binding), column.ty),
+                            column.name,
+                        ),
+                    };
                     exprs.push(self.over_aggregate(expr, input)?);
-                    names.push(column.name);
+                    names.push(name);
+                }
+                // A replace list that named something the star did not stand for is a mistake and
+                // not a no op, and it is caught here because this is the first point at which the
+                // set of names the star stands for is known.
+                if let Some((replacement, _)) =
+                    replacements.iter().zip(&used).find(|(_, used)| !**used)
+                {
+                    return Err(missing_replacement(ast.string(replacement.alias), input));
                 }
                 continue;
             }
@@ -1430,6 +1457,17 @@ impl<'a> Binder<'a> {
     pub(crate) fn same_expr(&self, left: ExprRef, right: ExprRef) -> bool {
         same_expr(&self.plan, left, right)
     }
+}
+
+/// The complaint about a `REPLACE` entry that named a column the star did not stand for.
+///
+/// It reads like the complaint about any other name that is not there, down to the list of names
+/// that are, because from the writer's side it is the same mistake.
+fn missing_replacement(name: &str, input: &Scope) -> Error {
+    Error::binder(format!(
+        "Column \"{name}\" in REPLACE list not found in FROM clause{}",
+        input.candidates()
+    ))
 }
 
 /// A sort key with SQL's defaults filled in.

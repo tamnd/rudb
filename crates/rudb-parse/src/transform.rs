@@ -799,7 +799,8 @@ impl<'a> Transform<'a> {
             // `FROM t` on its own. DuckDB reads it as `SELECT * FROM t`, and inventing the star
             // here rather than in the binder keeps the binder from having to know the shape of the
             // clause that was missing.
-            let star = self.push(Expr::Star { qualifier: Slice::default() });
+            let star = self
+                .push(Expr::Star { qualifier: Slice::default(), replacements: Slice::default() });
             let start = self.ast.targets.len() as u32;
             self.ast.targets.push(Target { expr: star, alias: NONE });
             select.targets = Slice { start, len: 1 };
@@ -1520,16 +1521,51 @@ impl<'a> Transform<'a> {
 
     /// `StarExpression <- StarQualifierList? '*' ExcludeList? ReplaceList? RenameList?`.
     fn star(&mut self, node: u32) -> Result<ExprRef> {
-        for name in ["ExcludeList", "ReplaceList", "RenameList"] {
+        for name in ["ExcludeList", "RenameList"] {
             let list = self.find(node, name);
             if list != NONE {
                 return self.unsupported(list);
             }
         }
+        let replace = self.find(node, "ReplaceList");
+        let replacements =
+            if replace == NONE { Slice::default() } else { self.replacements(replace)? };
         let qualifier = self.find(node, "StarQualifierList");
         let qualifier =
             if qualifier == NONE { Slice::default() } else { self.name_parts(qualifier) };
-        Ok(self.push(Expr::Star { qualifier }))
+        Ok(self.push(Expr::Star { qualifier, replacements }))
+    }
+
+    /// `ReplaceList <- 'REPLACE' ReplaceEntries`, where an entry is `Expression 'AS'
+    /// ColumnReference` and the entries are one bare entry or a parenthesized list of them.
+    ///
+    /// The duplicate check is here rather than in the binder because that is where DuckDB does it:
+    /// naming the same column twice is a Parser Error there, and it is one of the few things about
+    /// a star that can be decided without knowing what the star stands for.
+    fn replacements(&mut self, node: u32) -> Result<Slice> {
+        // `ReplaceEntries <- ReplaceEntrySingle / ReplaceEntryList` and both of those hold the
+        // entries as their own children, so the same walk reads either shape.
+        let entries = self.first(self.first(node));
+        let listed: Vec<u32> =
+            self.kids(entries).filter(|&kid| self.name(kid) == "ReplaceEntry").collect();
+        let mut replacements = Vec::with_capacity(listed.len());
+        for entry in listed {
+            let expr = self.expr(self.first(entry))?;
+            let alias = self.identifier(self.nth(entry, 1));
+            let written = self.ast.string(alias).to_string();
+            if replacements
+                .iter()
+                .any(|held: &Target| self.ast.string(held.alias).eq_ignore_ascii_case(&written))
+            {
+                return Err(Error::parser(format!(
+                    "Duplicate entry \"{written}\" in REPLACE list"
+                )));
+            }
+            replacements.push(Target { expr, alias });
+        }
+        let start = self.ast.targets.len() as u32;
+        self.ast.targets.extend(replacements);
+        Ok(Slice { start, len: self.ast.targets.len() as u32 - start })
     }
 
     /// `FunctionExpression <- FunctionIdentifier FunctionExpressionArguments WithinGroupClause?
@@ -1760,8 +1796,24 @@ mod tests {
             ast.expr_list(slice).iter().map(|&item| show(ast, item)).collect::<Vec<_>>().join(", ")
         };
         match ast.expr(expr) {
-            Expr::Star { qualifier } if qualifier.is_empty() => "*".to_string(),
-            Expr::Star { qualifier } => format!("{}.*", ast.name_text(qualifier)),
+            Expr::Star { qualifier, replacements } => {
+                let star = if qualifier.is_empty() {
+                    "*".to_string()
+                } else {
+                    format!("{}.*", ast.name_text(qualifier))
+                };
+                if replacements.is_empty() {
+                    return star;
+                }
+                let entries: Vec<String> = ast
+                    .target_list(replacements)
+                    .iter()
+                    .map(|target| {
+                        format!("{} AS {}", show(ast, target.expr), ast.string(target.alias))
+                    })
+                    .collect();
+                format!("{star} REPLACE ({})", entries.join(", "))
+            }
             Expr::Column { name } => ast.name_text(name),
             Expr::Literal { kind, text } => match kind {
                 LiteralKind::Number => ast.string(text).to_string(),
@@ -2051,6 +2103,32 @@ mod tests {
     #[test]
     fn the_query_m0_has_to_run_transforms() {
         assert_eq!(round("SELECT * FROM t WHERE x > 5"), "SELECT * FROM t WHERE (x Gt 5)");
+    }
+
+    #[test]
+    fn a_replace_list_rides_on_the_star_it_changes() {
+        // The parentheses are optional around a single entry, which is how the clickbench load
+        // recipe is not written but is how a lot of hand written sql is.
+        assert_eq!(
+            round("SELECT * REPLACE (a + 1 AS a) FROM t"),
+            "SELECT * REPLACE ((a Add 1) AS a) FROM t"
+        );
+        assert_eq!(
+            round("SELECT * REPLACE a + 1 AS a FROM t"),
+            "SELECT * REPLACE ((a Add 1) AS a) FROM t"
+        );
+        assert_eq!(
+            round("SELECT t.* REPLACE (make_date(a) AS a, b * 2 AS b) FROM t"),
+            "SELECT t.* REPLACE (make_date(a) AS a, (b Multiply 2) AS b) FROM t"
+        );
+    }
+
+    #[test]
+    fn one_column_cannot_be_replaced_twice() {
+        // Caught here rather than in the binder because it is a mistake in what was written and
+        // not a mistake about what is in the table, and duckdb reports it the same way.
+        let error = parse_ast("SELECT * REPLACE (a + 1 AS a, a + 2 AS A) FROM t").unwrap_err();
+        assert_eq!(error.to_string(), "Parser Error: Duplicate entry \"A\" in REPLACE list");
     }
 
     #[test]
