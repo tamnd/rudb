@@ -384,12 +384,11 @@ fn row(parts: &[String], vertical: &str) -> String {
 /// The default mode: a box, a type row, and a count under it.
 fn duckbox(result: &QueryResult, cells: &[Vec<String>]) -> String {
     let mut sizes = widths(result, cells, true);
-    let footer = footer_text(result, cells.len());
-    // The table cannot be narrower than the count printed under it, which is the only reason a
-    // one column table of `int32` comes out eight wide rather than seven.
-    if let Some(first) = footer.first() {
-        let total: usize = sizes.iter().map(|size| size + 2).sum::<usize>() + sizes.len() - 1;
-        let needed = width(first) + 2;
+    let counts = Counts::of(result);
+    // The table cannot be narrower than the count that has to appear under it, which is the only
+    // reason a one column table of `int32` holding no rows comes out eight wide rather than seven.
+    if let Some(needed) = counts.minimum_width() {
+        let total = box_width(&sizes);
         if let Some(last) = sizes.last_mut() {
             *last += needed.saturating_sub(total);
         }
@@ -408,29 +407,139 @@ fn duckbox(result: &QueryResult, cells: &[Vec<String>]) -> String {
         write_rows(&mut out, cells, &sizes, &right, BOX_GLYPHS.vertical);
     }
     let _ = writeln!(out, "{}", rule(&sizes, &BOX_GLYPHS.bottom));
-    let total: usize = sizes.iter().map(|size| size + 2).sum::<usize>() + sizes.len() - 1;
-    for text in footer {
-        let left = (total.saturating_sub(width(&text))) / 2 + 1;
-        let _ = writeln!(out, "{}{}", " ".repeat(left), text);
+    for text in counts.footer(box_width(&sizes)) {
+        let _ = writeln!(out, "{text}");
     }
     out
 }
 
-/// The lines printed under a `duckbox` table, which is nothing at all for most results.
+/// How wide the box is across, the two border characters included.
+fn box_width(sizes: &[usize]) -> usize {
+    sizes.iter().map(|size| size + 2).sum::<usize>() + sizes.len() + 1
+}
+
+/// The hint DuckDB drops in the middle of the count line when a table is wide enough to hold it.
+const HINT: &str = "use .last to show entire result";
+
+/// What goes under a `duckbox` table, which is nothing at all for most results.
 ///
-/// A count appears when the result is empty, because an empty box says nothing on its own, and
-/// when rows were left out, because a table that is not all of the answer has to say so. A result
-/// of three rows prints three rows and no commentary.
-fn footer_text(result: &QueryResult, rows: usize) -> Vec<String> {
-    if rows == 0 {
-        return vec!["0 rows".to_string()];
+/// DuckDB prints a count only when the box does not already say what the count is. Three rows are
+/// three rows and get no commentary. Ten or more get a count because at that point nobody is
+/// counting the lines, none at all get one because an empty box says nothing on its own, and a
+/// result that had rows left out gets one because a table that is not all of the answer has to say
+/// so. The column count joins it only when there is more than one column and the box is wide
+/// enough to hold both.
+///
+/// The thresholds and the padding here were read off the duckdb binary rather than guessed, by
+/// sweeping the column count, the row count and the width of the widest heading and diffing every
+/// combination. That is also why the second line is one character longer than the first, which
+/// nobody would write on purpose and which a diff of the two shells would otherwise report forever.
+struct Counts {
+    rows: usize,
+    columns: usize,
+    /// How many rows the box actually shows, when that is fewer than there are.
+    shown: Option<usize>,
+}
+
+impl Counts {
+    fn of(result: &QueryResult) -> Self {
+        let rows = result.len();
+        let shown = shown(rows).map(|(head, tail)| head + tail);
+        Self { rows, columns: result.width(), shown }
     }
-    let Some((head, tail)) = shown(result.len()) else {
-        return Vec::new();
-    };
-    let counted = format!("{} rows", result.len());
-    let elided = format!("({} shown)", head + tail);
-    vec![counted, elided]
+
+    /// `N rows`, and `N rows (M shown)` once the two have been put on one line.
+    fn row_text(&self) -> String {
+        format!("{} rows", self.rows)
+    }
+
+    fn shown_text(&self) -> Option<String> {
+        self.shown.map(|shown| format!("({shown} shown)"))
+    }
+
+    fn column_text(&self) -> String {
+        format!("{} columns", self.columns)
+    }
+
+    /// How wide the box has to be for a count that has to appear to fit under it.
+    ///
+    /// Only a count that carries information the box does not widens the box. A result of ten rows
+    /// in a narrow box simply goes without its count, which looks like an oversight and is what
+    /// DuckDB does.
+    fn minimum_width(&self) -> Option<usize> {
+        if self.rows != 0 && self.shown.is_none() {
+            return None;
+        }
+        let widest = match self.shown_text() {
+            Some(text) => width(&text).max(width(&self.row_text())),
+            None => width(&self.row_text()),
+        };
+        Some(widest + 4)
+    }
+
+    /// The lines to print under a box `total` wide.
+    fn footer(&self, total: usize) -> Vec<String> {
+        if self.rows != 0 && self.rows < 10 {
+            return Vec::new();
+        }
+        let mut rows = self.row_text();
+        let columns = self.column_text();
+        let with_columns =
+            self.rows >= 10 && self.columns > 1 && total >= width(&rows) + width(&columns) + 6;
+        // The two counts share a line as soon as they both fit on it, next to the column count if
+        // that is there as well. They can end up touching it, with no gap at all.
+        let mut separate = self.shown_text();
+        if let Some(shown) = &separate {
+            let taken = if with_columns { width(&columns) } else { 0 };
+            if total.saturating_sub(taken) >= width(&rows) + width(shown) + 5 {
+                rows = format!("{rows} {shown}");
+                separate = None;
+            }
+        }
+        if with_columns {
+            let mut lines = vec![spread(&rows, &columns, total, self.shown.is_some())];
+            if let Some(shown) = separate {
+                lines.push(pad(&format!("  {shown}"), total - 1, false));
+            }
+            return lines;
+        }
+        if total < width(&rows) + 4 {
+            return Vec::new();
+        }
+        let mut lines = vec![middle(&rows, total, total - 2)];
+        if let Some(shown) = separate {
+            lines.push(middle(&shown, total, total - 1));
+        }
+        lines
+    }
+}
+
+/// A count on the left and a count on the right of one line, with the hint between them when rows
+/// were left out and the gap is wide enough to leave five spaces on either side of it.
+fn spread(left: &str, right: &str, total: usize, hint: bool) -> String {
+    let line = total - 2;
+    let gap = line.saturating_sub(2 + width(left) + width(right));
+    if hint && gap >= width(HINT) + 10 {
+        let spare = gap - width(HINT);
+        let before = spare / 2;
+        return format!(
+            "  {left}{}{HINT}{}{right}",
+            " ".repeat(before),
+            " ".repeat(spare - before)
+        );
+    }
+    format!("  {left}{}{right}", " ".repeat(gap))
+}
+
+/// One count centred under a box `total` wide, on a line of `line` characters.
+///
+/// The centring is against the whole box and the trimming is against the line, which is not the
+/// same as centring in the line and is what puts the text one to the right of where centred would
+/// have it. Copied from DuckDB on purpose.
+fn middle(text: &str, total: usize, line: usize) -> String {
+    let left = total.saturating_sub(width(text)) / 2;
+    let right = line.saturating_sub(left + width(text));
+    format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
 }
 
 /// The rows of a box, with the dots in the middle if some were left out.
@@ -445,8 +554,8 @@ fn write_rows(
     for (at, values) in cells.iter().enumerate() {
         if let Some((head, tail)) = dots {
             if at == head {
+                let parts = dot_row(cells, sizes, right, head, tail);
                 for _ in 0..ELIDED {
-                    let parts: Vec<String> = sizes.iter().map(|size| centre("·", *size)).collect();
                     let _ = writeln!(out, "{}", row(&parts, vertical));
                 }
             }
@@ -462,6 +571,40 @@ fn write_rows(
             .collect();
         let _ = writeln!(out, "{}", row(&parts, vertical));
     }
+}
+
+/// One cell per column of the row of dots that stands in for the rows a box left out.
+///
+/// The dot sits where the middle of a value in the column sat, measured from whichever edge that
+/// column is aligned against, and the value it lines up with is the shorter of the two either side
+/// of the gap. Only those two, not the shortest of everything printed, so a column can have one
+/// short value at the top and still have its dots way out to the right. So a column of small
+/// integers has its dots hard against the right edge and a column of `true` and `false` has them one
+/// in from the left, which looks like an accident and is what the duckdb binary prints. Centring
+/// them in the column is tidier and is a difference on every result over forty three rows.
+fn dot_row(
+    cells: &[Vec<String>],
+    sizes: &[usize],
+    right: &[bool],
+    head: usize,
+    tail: usize,
+) -> Vec<String> {
+    let above = cells.get(head.wrapping_sub(1));
+    let below = cells.get(cells.len() - tail);
+    sizes
+        .iter()
+        .zip(right)
+        .enumerate()
+        .map(|(column, (size, right))| {
+            let edge = |row: Option<&Vec<String>>| {
+                row.and_then(|values| values.get(column)).map_or(usize::MAX, |value| width(value))
+            };
+            let shortest = edge(above).min(edge(below));
+            let inset = (shortest.saturating_sub(1) / 2).min(size.saturating_sub(1));
+            let before = if *right { size.saturating_sub(1 + inset) } else { inset };
+            pad(&format!("{}·", " ".repeat(before)), *size, false)
+        })
+        .collect()
 }
 
 /// `.mode box` and `.mode table`, which are the same table without the types and without the count.

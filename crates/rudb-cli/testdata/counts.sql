@@ -1,0 +1,12 @@
+SELECT a FROM range(1) t(a) WHERE a > 9
+SELECT a AS n FROM range(9) t(a)
+SELECT a AS n FROM range(10) t(a)
+SELECT a AS x, a AS y, a AS z FROM range(10) t(a)
+SELECT a AS n FROM range(44) t(a)
+SELECT a AS a_rather_longer_name FROM range(44) t(a)
+SELECT a AS c0, a AS c1 FROM range(1000) t(a)
+SELECT a AS column_one, a AS column_two, a AS column_three, a AS column_four FROM range(100) t(a)
+SELECT a, a::VARCHAR AS s, a % 2 = 0 AS b, a * 1.5 AS d FROM range(44) t(a)
+SELECT a * 100000000 AS big FROM range(44) t(a)
+SELECT a AS first_col, a AS secnd_col FROM range(100) t(a)
+SELECT a AS a_column_with_quite_a_long_name, a AS another_column_with_a_long_name, a AS third_long_column_name FROM range(100) t(a)
