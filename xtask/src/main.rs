@@ -128,6 +128,7 @@ fn ci(full: bool) -> Result<(), String> {
 
     layers::check(&root)?;
     rowloop::check(&root)?;
+    version::locked(&root)?;
     if focus.prose {
         style::check(&root)?;
     }
