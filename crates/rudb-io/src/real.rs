@@ -164,40 +164,10 @@ impl File for RealFile {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::RealFilesystem;
+    use crate::scratch::TempDir;
     use crate::submit::Request;
     use crate::{Filesystem, OpenMode};
-
-    /// A directory under the system temporary directory that removes itself.
-    ///
-    /// Written out rather than pulled in, because a four line struct is cheaper than a dependency
-    /// and `spec/18-package-layout.md` is strict about what the foundation crates are allowed to
-    /// depend on.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!("rudb-io-{tag}-{unique}"));
-            std::fs::create_dir_all(&path).expect("could not make a temporary directory");
-            Self(path)
-        }
-
-        fn join(&self, name: &str) -> PathBuf {
-            self.0.join(name)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     #[test]
     fn a_file_reads_back_what_was_written_at_the_offset_it_was_written_to() {

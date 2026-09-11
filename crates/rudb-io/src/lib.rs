@@ -49,6 +49,9 @@ pub mod real;
 pub mod sim;
 pub mod submit;
 
+#[cfg(test)]
+mod scratch;
+
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
