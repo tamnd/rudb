@@ -61,17 +61,32 @@ impl TableFunction {
     /// The named parameters the call takes, and the type each one wants.
     ///
     /// This is the list rudb acts on and not the list DuckDB prints, and the difference is worth
-    /// being plain about. `read_parquet` there takes seventeen named parameters. One of them is on
-    /// the critical path, since the ClickBench entry reads its file with `binary_as_string=True`
-    /// and without it every string column in `hits.parquet` comes back as `BLOB`, and the other
-    /// sixteen have no caller here yet. A parameter that is listed is one that does something, so
-    /// this list grows as they land rather than accepting names and ignoring them, which is the
-    /// failure mode that makes an option look supported when it is not.
+    /// being plain about. `read_parquet` there takes seventeen named parameters and `read_csv`
+    /// takes around thirty. One of the Parquet ones is on the critical path, since the ClickBench
+    /// entry reads its file with `binary_as_string=True` and without it every string column in
+    /// `hits.parquet` comes back as `BLOB`, and the other sixteen have no caller here yet. A
+    /// parameter that is listed is one that does something, so this list grows as they land rather
+    /// than accepting names and ignoring them, which is the failure mode that makes an option look
+    /// supported when it is not.
+    ///
+    /// The CSV ones here are the ones that say how the file is written, which are the ones where
+    /// guessing wrong changes the answer rather than the speed. `sep` is DuckDB's other name for
+    /// `delim` and is a separate row rather than an alias, because the list is also what the
+    /// candidates on a misspelling are read out of and the binary prints both of them.
     #[must_use]
     pub fn parameters(self) -> &'static [(&'static str, LogicalType)] {
         static READ_PARQUET: &[(&str, LogicalType)] = &[("binary_as_string", LogicalType::Boolean)];
+        static READ_CSV: &[(&str, LogicalType)] = &[
+            ("all_varchar", LogicalType::Boolean),
+            ("delim", LogicalType::Varchar),
+            ("escape", LogicalType::Varchar),
+            ("header", LogicalType::Boolean),
+            ("quote", LogicalType::Varchar),
+            ("sep", LogicalType::Varchar),
+        ];
         match self {
             Self::ReadParquet => READ_PARQUET,
+            Self::ReadCsv => READ_CSV,
             _ => &[],
         }
     }

@@ -210,3 +210,110 @@ fn a_file_can_be_loaded_into_a_table_and_queried_from_there() {
     assert_eq!(database.value("SELECT sum(a) FROM loaded").expect("runs"), Value::HugeInt(195_783));
     assert_eq!(database.value("SELECT count(s) FROM loaded").expect("runs"), Value::BigInt(3510));
 }
+
+#[test]
+fn a_call_that_says_there_is_no_header_reads_the_first_line_as_a_row() {
+    let database = Database::new();
+    let sql = format!("SELECT * FROM read_csv({}, header=false)", fixture("mixed.csv"));
+    let result = database.query(&sql).expect("runs");
+    // 4097 and not 4096, because the line that was the header is a row now, and every column is
+    // VARCHAR because that line holds `a`, `b` and `s` where the numbers were.
+    assert_eq!(result.len(), 4097);
+    assert_eq!(
+        result.names(),
+        ["column0", "column1", "column2", "column3", "column4", "column5", "column6"]
+    );
+    let types: Vec<String> = result.types().iter().map(ToString::to_string).collect();
+    assert_eq!(types, ["VARCHAR"; 7]);
+    assert_eq!(result.value_at(0, 0), Value::Varchar("a".into()));
+    assert_eq!(result.value_at(1, 0), Value::Varchar("0".into()));
+}
+
+#[test]
+fn a_call_that_says_there_is_a_header_takes_the_first_line_for_the_names() {
+    let database = Database::new();
+    let sql = format!("SELECT * FROM read_csv({}, header=true)", fixture("noheader.csv"));
+    let result = database.query(&sql).expect("runs");
+    // The file has no header, so this is the caller being wrong on purpose, and DuckDB does what it
+    // was told: the first line becomes three column names and the two rows left are the read.
+    assert_eq!(result.names(), ["1", "x", "2.5"]);
+    assert_eq!(result.len(), 2);
+    let types: Vec<String> = result.types().iter().map(ToString::to_string).collect();
+    assert_eq!(types, ["BIGINT", "VARCHAR", "DOUBLE"]);
+}
+
+#[test]
+fn a_given_delimiter_is_the_delimiter_the_sniffer_would_not_have_picked() {
+    let database = Database::new();
+    let sniffed = format!("SELECT * FROM read_csv({})", fixture("given/semicolon.csv"));
+    let result = database.query(&sniffed).expect("runs");
+    assert_eq!(result.names(), ["name", "x;note", "y"]);
+    assert_eq!(result.value_at(0, 1), Value::Varchar("b;c".into()));
+    for parameter in ["delim", "sep"] {
+        let sql =
+            format!("SELECT * FROM read_csv({}, {parameter}=';')", fixture("given/semicolon.csv"));
+        let result = database.query(&sql).expect("runs");
+        assert_eq!(result.names(), ["name,x", "note,y"], "{parameter}");
+        assert_eq!(result.len(), 2, "{parameter}");
+        assert_eq!(result.value_at(0, 0), Value::Varchar("a,b".into()), "{parameter}");
+        assert_eq!(result.value_at(1, 1), Value::Varchar("g,h".into()), "{parameter}");
+    }
+}
+
+#[test]
+fn a_given_quote_is_stripped_off_a_value_the_sniffer_would_have_kept() {
+    let database = Database::new();
+    let sniffed = format!("SELECT * FROM read_csv({})", fixture("given/hashquote.csv"));
+    let result = database.query(&sniffed).expect("runs");
+    assert_eq!(result.value_at(0, 0), Value::Varchar("#one#".into()));
+    let sql = format!("SELECT * FROM read_csv({}, quote='#')", fixture("given/hashquote.csv"));
+    let result = database.query(&sql).expect("runs");
+    assert_eq!(result.names(), ["name", "note"]);
+    assert_eq!(result.value_at(0, 0), Value::Varchar("one".into()));
+    assert_eq!(result.value_at(1, 0), Value::Varchar("two".into()));
+}
+
+#[test]
+fn a_given_escape_puts_the_quote_byte_inside_the_value() {
+    let database = Database::new();
+    let sql =
+        format!("SELECT * FROM read_csv({}, quote='#', escape='\\')", fixture("given/escaped.csv"));
+    let result = database.query(&sql).expect("runs");
+    assert_eq!(result.value_at(0, 0), Value::Varchar("a#b".into()));
+    assert_eq!(result.value_at(1, 0), Value::Varchar("c#d".into()));
+    assert_eq!(result.value_at(0, 1), Value::Varchar("x".into()));
+}
+
+#[test]
+fn all_varchar_keeps_the_names_the_sniffer_found_and_throws_away_the_types() {
+    let database = Database::new();
+    let sql = format!("SELECT * FROM read_csv({}, all_varchar=true)", fixture("mixed.csv"));
+    let result = database.query(&sql).expect("runs");
+    assert_eq!(result.len(), 4096);
+    assert_eq!(result.names(), ["a", "b", "s", "d", "flag", "day", "t"]);
+    let types: Vec<String> = result.types().iter().map(ToString::to_string).collect();
+    assert_eq!(types, ["VARCHAR"; 7]);
+    assert_eq!(result.value_at(1, 3), Value::Varchar("1.5".into()));
+    assert_eq!(result.value_at(1, 5), Value::Varchar("1970-01-02".into()));
+}
+
+#[test]
+fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
+    let database = Database::new();
+    let sql = format!("SELECT * FROM read_csv({}, nosuch=1)", fixture("mixed.csv"));
+    let error = database.query(&sql).unwrap_err();
+    // The layout is the binary's: the name on its own line, then one indented `name TYPE` per
+    // candidate in alphabetical order. The list here is shorter than DuckDB's forty seven, because
+    // a parameter that is listed is one that does something.
+    let expected = concat!(
+        "Invalid named parameter \"nosuch\" for function read_csv\n",
+        "Candidates:\n",
+        "    all_varchar BOOLEAN\n",
+        "    delim VARCHAR\n",
+        "    escape VARCHAR\n",
+        "    header BOOLEAN\n",
+        "    quote VARCHAR\n",
+        "    sep VARCHAR\n",
+    );
+    assert_eq!(error.message(), expected);
+}

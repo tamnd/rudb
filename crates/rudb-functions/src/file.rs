@@ -25,8 +25,8 @@
 
 use std::path::Path;
 
-use rudb_common::{Error, Field, Result};
-use rudb_csv::Reader as CsvReader;
+use rudb_common::{Error, Field, Result, Value};
+use rudb_csv::{Given, Reader as CsvReader};
 use rudb_io::glob::has_magic;
 use rudb_io::{File, Filesystem, OpenMode, RealFilesystem, expand};
 use rudb_parquet::Reader;
@@ -43,11 +43,57 @@ pub fn open_parquet(path: &str) -> Result<Reader> {
 /// A reader over the CSV file at `path`, positioned at its first row, with its punctuation and its
 /// column types already worked out.
 ///
+/// `given` is whatever the call said about how the file is written, and what it does not say is
+/// sniffed. The binder and the executor each open the file and both hand the same thing in, which is
+/// what keeps the columns a query was planned against and the columns it reads the same columns.
+///
 /// # Errors
 ///
 /// When the file is not there, with DuckDB's own wording, and whatever sniffing it reports.
-pub fn open_csv(path: &str) -> Result<CsvReader> {
-    CsvReader::open(open_file(path)?, path)
+pub fn open_csv(path: &str, given: Given) -> Result<CsvReader> {
+    CsvReader::open_with(open_file(path)?, path, given)
+}
+
+/// What a call's named parameters say about how a CSV file is written.
+///
+/// The binder works this out to sniff the file with and the executor works it out again to read it
+/// with, both from the list the plan kept, which is what keeps the columns a query was planned
+/// against and the columns it reads the same columns. A name this does not know is a name that says
+/// nothing about punctuation, such as `all_varchar`, and is somebody else's to act on.
+///
+/// # Errors
+///
+/// When a punctuation parameter was given something other than a single byte.
+pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
+    let mut given = Given::default();
+    for (name, value) in options {
+        match (*name, value) {
+            ("header", Value::Boolean(on)) => given.header = Some(*on),
+            ("delim" | "sep", Value::Varchar(text)) => {
+                given.delimiter = Some(one_byte(name, text)?)
+            }
+            ("quote", Value::Varchar(text)) => given.quote = Some(one_byte(name, text)?),
+            ("escape", Value::Varchar(text)) => given.escape = Some(one_byte(name, text)?),
+            _ => {}
+        }
+    }
+    Ok(given)
+}
+
+/// The one byte a punctuation parameter was given.
+///
+/// DuckDB takes a string of any length here and splits on the whole of it, so `delim='||'` is a two
+/// byte delimiter there and `delim=''` is a file of one column. The scanner underneath this compares
+/// one byte, so anything else is turned away rather than quietly read as the first byte of it, which
+/// would be a wrong answer on a file that really is written that way.
+fn one_byte(parameter: &str, text: &str) -> Result<u8> {
+    match *text.as_bytes() {
+        [byte] => Ok(byte),
+        _ => Err(Error::not_implemented(format!(
+            "the named parameter {parameter} given {} bytes rather than one",
+            text.len()
+        ))),
+    }
 }
 
 /// Whether there is a file, rather than a directory, at `path`.
@@ -129,10 +175,10 @@ pub fn parquet_fields(path: &str) -> Result<Vec<Field>> {
 /// # Errors
 ///
 /// Everything [`open_csv`] reports, and a file that is missing a column the first one has.
-pub fn csv_fields(paths: &[String]) -> Result<Vec<Field>> {
+pub fn csv_fields(paths: &[String], given: Given) -> Result<Vec<Field>> {
     let mut sniffed = Vec::with_capacity(paths.len());
     for path in paths {
-        sniffed.push((path.clone(), open_csv(path)?.fields()));
+        sniffed.push((path.clone(), open_csv(path, given)?.fields()));
     }
     rudb_csv::across(&sniffed)
 }

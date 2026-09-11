@@ -32,7 +32,7 @@ pub mod reader;
 pub mod scan;
 
 pub use combine::{across, mismatch, widen};
-pub use dialect::Dialect;
+pub use dialect::{Dialect, Given};
 pub use reader::Reader;
 
 /// The crate this rank belongs to, so that the layer check has something to read.

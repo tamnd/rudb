@@ -35,6 +35,44 @@ pub struct Dialect {
     pub header: bool,
 }
 
+/// What the caller said about how the file is written, where the sniffer would otherwise decide.
+///
+/// Every field is optional and a `None` means nothing was said, which is the common case and is the
+/// one the sniffer is for. What is given is not sniffed: `read_csv('f.csv', delim=';')` does not try
+/// the four candidates and pick one, it uses the semicolon, and a file that is really comma
+/// separated then comes back as one column. That is DuckDB's behaviour and it is the useful one,
+/// since somebody who wrote the delimiter down knows something the first megabyte of the file does
+/// not say.
+///
+/// A given value also changes the block DuckDB prints under a conversion error, where a line reads
+/// `(Set By User)` rather than `(Auto-Detected)`, which is why this is carried into the reader
+/// rather than folded into a [`Dialect`] and forgotten.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Given {
+    /// The byte between two fields.
+    pub delimiter: Option<u8>,
+    /// The byte that opens and closes a field.
+    pub quote: Option<u8>,
+    /// The byte that makes the next quote a literal one.
+    pub escape: Option<u8>,
+    /// Whether the first line names the columns.
+    pub header: Option<bool>,
+}
+
+impl Given {
+    /// How a byte is written in the block under a conversion error, and where it came from.
+    #[must_use]
+    pub fn shown(given: Option<u8>, sniffed: Option<u8>) -> String {
+        format!("{} {}", Dialect::shown(sniffed), Self::source(given.is_some()))
+    }
+
+    /// What the block calls a value the caller gave and one it worked out.
+    #[must_use]
+    pub const fn source(given: bool) -> &'static str {
+        if given { "(Set By User)" } else { "(Auto-Detected)" }
+    }
+}
+
 impl Dialect {
     /// The dialect a file with nothing unusual in it has.
     #[must_use]
