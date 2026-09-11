@@ -140,7 +140,7 @@ pub fn parse(arguments: &[String]) -> Action {
             "-no-init" | "-unsigned" | "-unredacted" | "-safe" => {}
             other if other.starts_with('-') => {
                 match Format::from_name(other.trim_start_matches('-')) {
-                    Some(format) => options.settings.set_format(format),
+                    Some(format) => options.settings.set_format_flag(format),
                     None => return Action::Wrong(format!("unknown option {other}")),
                 }
             }
@@ -216,6 +216,18 @@ mod tests {
         let parsed = options(&["-csv"]);
         assert_eq!(parsed.settings.format, Format::Csv);
         assert_eq!(parsed.settings.separator, ",");
+    }
+
+    /// The row separator is the one thing a mode flag does not set, which is DuckDB's behaviour.
+    ///
+    /// `duckdb -csv` writes `\n` at the end of a row and `duckdb -cmd ".mode csv"` writes `\r\n`,
+    /// on the same build in the same run, and `tests/shell.rs` holds both captures. This is the
+    /// parse side of it.
+    #[test]
+    fn a_mode_flag_leaves_the_row_separator_where_it_was_and_the_dot_command_does_not() {
+        assert_eq!(options(&["-csv"]).settings.newline, "\n");
+        assert_eq!(options(&["-ascii"]).settings.newline, "\n");
+        assert_eq!(options(&["-csv", "-newline", ";"]).settings.newline, ";");
     }
 
     #[test]

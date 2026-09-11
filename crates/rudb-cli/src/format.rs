@@ -172,6 +172,21 @@ impl Settings {
         self.separator = format.separator().to_string();
         self.newline = format.newline().to_string();
     }
+
+    /// Switches mode the way a command line flag does, which is not the way `.mode` does.
+    ///
+    /// A flag sets the column separator and leaves the row separator alone. The difference shows up
+    /// in exactly one place and it is the one people pipe into other programs: `duckdb -csv` ends a
+    /// row with `\n` and `duckdb -cmd ".mode csv"` ends it with `\r\n`, on the same build, in the
+    /// same run. It looks like an oversight upstream and it is not ours to correct, because a script
+    /// written against `duckdb -csv` is a script whose next stage is counting bytes.
+    ///
+    /// Checked against `duckdb v2.0.0-dev84237` for `-list`, `-csv` and `-ascii`, which are the
+    /// flags that name a mode and reach this.
+    pub fn set_format_flag(&mut self, format: Format) {
+        self.format = format;
+        self.separator = format.separator().to_string();
+    }
 }
 
 /// How `.show` spells a separator, which is with the escapes rather than the bytes.
