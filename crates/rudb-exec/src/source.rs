@@ -2,7 +2,8 @@
 
 use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result};
-use rudb_functions::{TableFunction, series_length};
+use rudb_functions::{TableFunction, open_parquet, series_length};
+use rudb_parquet::Reader;
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
@@ -252,6 +253,73 @@ impl Operator for Series {
         self.left -= count;
         let vector = Vector::flat(LogicalType::BigInt, Data::Int64(counted.into()))?;
         Ok(Some(Chunk::with_rows(vec![vector], count)?))
+    }
+}
+
+/// A scan of a Parquet file.
+///
+/// The file is named by the one argument, which the binder already required to be a constant, and
+/// it is opened here rather than being carried from the binder. Binding and running are separated
+/// by however long a prepared statement lives, and a plan that held an open descriptor would hold
+/// it for all of that.
+///
+/// The plan's column list is resolved against the file's by name, which is the same thing
+/// [`Scan`] does against a catalog table and for the same reason. Today the binder projects every
+/// column in order, so the mapping is the identity, and the moment projection pushdown makes the
+/// plan's list a subset the reader reads a subset. That is the difference `spec/engine/05-scan.md`
+/// section 5.6 describes between reading two columns of ClickBench and reading a hundred and five.
+#[derive(Debug)]
+pub(crate) struct ParquetScan {
+    reader: Reader,
+    schema: Schema,
+}
+
+impl ParquetScan {
+    /// The rows of a `read_parquet` call.
+    ///
+    /// # Errors
+    ///
+    /// If the file is gone or unreadable since it was bound, or if it no longer has a column the
+    /// plan asked for, which is what a file replaced between binding and running looks like.
+    pub(crate) fn new(plan: &Plan, index: u32, args: Slice, columns: Slice) -> Result<Self> {
+        let exprs: Vec<ExprRef> = plan.expr_list(args).to_vec();
+        let source = Schema::empty();
+        let one = Chunk::with_rows(Vec::new(), 1)?;
+        let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
+        let path = match evaluated.first().map(|vector| vector.value_at(0)) {
+            Some(rudb_common::Value::Varchar(path)) => path,
+            other => {
+                return Err(Error::internal(format!(
+                    "read_parquet() bound with {other:?} rather than one constant file name"
+                )));
+            }
+        };
+        let mut reader = open_parquet(&path)?;
+
+        let wanted = plan.field_list(columns).to_vec();
+        let held = reader.fields();
+        let mut positions = Vec::with_capacity(wanted.len());
+        for field in &wanted {
+            let at = held.iter().position(|column| column.name == field.name).ok_or_else(|| {
+                Error::io(format!(
+                    "File \"{path}\" does not have a column named \"{}\"",
+                    field.name
+                ))
+            })?;
+            positions.push(at);
+        }
+        reader.project(&positions)?;
+        Ok(Self { reader, schema: Schema::numbered(wanted, index) })
+    }
+}
+
+impl Operator for ParquetScan {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        self.reader.next_chunk()
     }
 }
 

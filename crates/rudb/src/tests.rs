@@ -684,8 +684,8 @@ fn the_arguments_are_expressions_and_they_cannot_see_a_column() {
 #[test]
 fn a_table_function_that_does_not_exist_says_so_rather_than_being_read_as_a_table() {
     let db = Database::new();
-    let message = failure(&db, "SELECT * FROM read_parquet('x.parquet')");
-    assert!(message.contains("read_parquet"), "{message}");
+    let message = failure(&db, "SELECT * FROM read_csv('x.csv')");
+    assert!(message.contains("read_csv"), "{message}");
     let message = failure(&db, "SELECT * FROM nowhere.range(3)");
     assert!(message.contains("nowhere"), "{message}");
     let message = failure(&db, "SELECT * FROM range(1, 2, 3, 4)");

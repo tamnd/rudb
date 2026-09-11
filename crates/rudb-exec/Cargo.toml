@@ -24,6 +24,7 @@ rudb-txn.workspace = true
 rudb-catalog.workspace = true
 rudb-plan.workspace = true
 rudb-functions.workspace = true
+rudb-parquet.workspace = true
 
 [lints]
 workspace = true
