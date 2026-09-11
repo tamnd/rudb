@@ -2,7 +2,8 @@
 
 use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result};
-use rudb_functions::{TableFunction, open_parquet, series_length};
+use rudb_csv::Reader as CsvReader;
+use rudb_functions::{TableFunction, open_csv, open_parquet, series_length};
 use rudb_parquet::Reader;
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
@@ -282,33 +283,10 @@ impl ParquetScan {
     /// If the file is gone or unreadable since it was bound, or if it no longer has a column the
     /// plan asked for, which is what a file replaced between binding and running looks like.
     pub(crate) fn new(plan: &Plan, index: u32, args: Slice, columns: Slice) -> Result<Self> {
-        let exprs: Vec<ExprRef> = plan.expr_list(args).to_vec();
-        let source = Schema::empty();
-        let one = Chunk::with_rows(Vec::new(), 1)?;
-        let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
-        let path = match evaluated.first().map(|vector| vector.value_at(0)) {
-            Some(rudb_common::Value::Varchar(path)) => path,
-            other => {
-                return Err(Error::internal(format!(
-                    "read_parquet() bound with {other:?} rather than one constant file name"
-                )));
-            }
-        };
+        let path = file_argument(plan, args, "read_parquet")?;
         let mut reader = open_parquet(&path)?;
-
         let wanted = plan.field_list(columns).to_vec();
-        let held = reader.fields();
-        let mut positions = Vec::with_capacity(wanted.len());
-        for field in &wanted {
-            let at = held.iter().position(|column| column.name == field.name).ok_or_else(|| {
-                Error::io(format!(
-                    "File \"{path}\" does not have a column named \"{}\"",
-                    field.name
-                ))
-            })?;
-            positions.push(at);
-        }
-        reader.project(&positions)?;
+        reader.project(&positions(&wanted, &reader.fields(), &path)?)?;
         Ok(Self { reader, schema: Schema::numbered(wanted, index) })
     }
 }
@@ -321,6 +299,77 @@ impl Operator for ParquetScan {
     fn next(&mut self) -> Result<Option<Chunk>> {
         self.reader.next_chunk()
     }
+}
+
+/// A scan of a CSV file.
+///
+/// The same shape as [`ParquetScan`] and for the same reasons, down to resolving the plan's columns
+/// against the file's by name. What is behind the two is not the same at all: a Parquet file states
+/// its schema and stores each column apart, so reading two of a hundred and five is reading two
+/// stretches of the file, while a CSV file states nothing and interleaves everything, so every byte
+/// is read and parsed whatever the projection is and the projection only saves the conversion and
+/// the copy. That is why the two are separate operators rather than one over a trait: the scan that
+/// wants to grow row group skipping and the scan that wants to grow a parallel split of the byte
+/// range have nothing in the middle worth sharing yet.
+#[derive(Debug)]
+pub(crate) struct CsvScan {
+    reader: CsvReader,
+    schema: Schema,
+}
+
+impl CsvScan {
+    /// The rows of a `read_csv` call.
+    ///
+    /// # Errors
+    ///
+    /// If the file is gone or unreadable since it was bound, or if it no longer has a column the
+    /// plan asked for, which is what a file replaced between binding and running looks like.
+    pub(crate) fn new(plan: &Plan, index: u32, args: Slice, columns: Slice) -> Result<Self> {
+        let path = file_argument(plan, args, "read_csv")?;
+        let mut reader = open_csv(&path)?;
+        let wanted = plan.field_list(columns).to_vec();
+        reader.project(&positions(&wanted, &reader.fields(), &path)?)?;
+        Ok(Self { reader, schema: Schema::numbered(wanted, index) })
+    }
+}
+
+impl Operator for CsvScan {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        self.reader.next_chunk()
+    }
+}
+
+/// The file name a file reading table function was called with.
+///
+/// The binder already refused anything that is not one constant string, so a failure here is a plan
+/// that was built wrong rather than a statement somebody wrote wrong, and it says so.
+fn file_argument(plan: &Plan, args: Slice, function: &str) -> Result<String> {
+    let exprs: Vec<ExprRef> = plan.expr_list(args).to_vec();
+    let source = Schema::empty();
+    let one = Chunk::with_rows(Vec::new(), 1)?;
+    let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
+    match evaluated.first().map(|vector| vector.value_at(0)) {
+        Some(rudb_common::Value::Varchar(path)) => Ok(path),
+        other => Err(Error::internal(format!(
+            "{function}() bound with {other:?} rather than one constant file name"
+        ))),
+    }
+}
+
+/// Where in `held` each of `wanted` is, by name.
+fn positions(wanted: &[Field], held: &[Field], path: &str) -> Result<Vec<usize>> {
+    let mut positions = Vec::with_capacity(wanted.len());
+    for field in wanted {
+        let at = held.iter().position(|column| column.name == field.name).ok_or_else(|| {
+            Error::io(format!("File \"{path}\" does not have a column named \"{}\"", field.name))
+        })?;
+        positions.push(at);
+    }
+    Ok(positions)
 }
 
 impl Operator for Values {

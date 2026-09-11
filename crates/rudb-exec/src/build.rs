@@ -21,7 +21,7 @@ use crate::join::{CrossProduct, Join};
 use crate::operator::Operator;
 use crate::setop::SetOp;
 use crate::sort::Sort;
-use crate::source::{Dummy, ParquetScan, Scan, Series, Values};
+use crate::source::{CsvScan, Dummy, ParquetScan, Scan, Series, Values};
 use crate::stream::{Filter, Limit, Project};
 
 /// Builds the operator tree for a plan's root.
@@ -52,6 +52,7 @@ fn node<'a>(
                 Some(TableFunction::ReadParquet) => {
                     Box::new(ParquetScan::new(plan, index, args, columns)?)
                 }
+                Some(TableFunction::ReadCsv) => Box::new(CsvScan::new(plan, index, args, columns)?),
                 _ => Box::new(Series::new(plan, index, plan.string(function), args)?),
             }
         }
