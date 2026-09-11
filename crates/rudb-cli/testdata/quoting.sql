@@ -1,0 +1,1 @@
+SELECT 'plain' AS plain, 'a b' AS space, 'a,b' AS comma, 'a"b' AS quote, 'a''b' AS apostrophe, 'ведомо' AS cyrillic, 'é' AS accented, 'a	b' AS tab, 'ab' AS delete, '' AS empty, NULL AS nothing, 'a"b' AS "head,er"
