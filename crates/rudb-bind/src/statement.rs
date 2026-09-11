@@ -14,7 +14,7 @@
 //! types, with the casts and the nulls for unmentioned columns already in it, so appending is a
 //! loop over chunks.
 
-use rudb_catalog::{Catalog, QualifiedName, duplicate_check, same_name};
+use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, parse_ast};
@@ -33,7 +33,9 @@ pub enum Bound {
     Query(Plan),
     /// `CREATE TABLE`.
     CreateTable(CreateTable),
-    /// `DROP TABLE`.
+    /// `CREATE VIEW`.
+    CreateView(CreateView),
+    /// `DROP TABLE` or `DROP VIEW`.
     DropTable(DropTable),
     /// `INSERT INTO`.
     Insert(Insert),
@@ -55,12 +57,36 @@ pub struct CreateTable {
     pub or_replace: bool,
 }
 
-/// A bound `DROP TABLE`.
+/// A bound `CREATE VIEW`.
+///
+/// The body is the text that was written rather than the plan it bound to. It was bound once on the
+/// way through here, which is what refuses a view over a table that is not there, and the plan that
+/// came out of that is then thrown away, because a view follows the tables underneath it and a plan
+/// cannot. See [`rudb_catalog::View`].
+#[derive(Debug)]
+pub struct CreateView {
+    /// The full name the view gets.
+    pub name: QualifiedName,
+    /// The body, as written.
+    pub sql: String,
+    /// The column names the statement gave, which rename a prefix of what the body produces.
+    pub aliases: Vec<String>,
+    /// Whether an existing entry of that name is left alone rather than being an error.
+    pub if_not_exists: bool,
+    /// Whether an existing entry of that name is dropped first.
+    pub or_replace: bool,
+}
+
+/// A bound `DROP TABLE` or `DROP VIEW`.
 #[derive(Debug)]
 pub struct DropTable {
-    /// The tables to drop, already resolved. With `IF EXISTS` a name that does not resolve is not
-    /// in here at all, which is what makes running this a sequence of drops that cannot fail.
+    /// The tables or views to drop, already resolved. With `IF EXISTS` a name that does not resolve
+    /// is not in here at all, which is what makes running this a sequence of drops that cannot
+    /// fail for being missing. Dropping one of these as the wrong type still can, because `DROP
+    /// TABLE IF EXISTS v` where `v` is a view is an error in DuckDB and was measured to be one.
     pub names: Vec<QualifiedName>,
+    /// Which of the two the statement said it was dropping.
+    pub kind: Entry,
 }
 
 /// A bound `INSERT`.
@@ -105,6 +131,7 @@ pub fn bind_statement_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters
             Ok(Bound::Query(finish(binder, root)?))
         }
         ast::Statement::CreateTable(index) => create_table(ast, catalog, parameters, index),
+        ast::Statement::CreateView(index) => create_view(ast, catalog, parameters, index),
         ast::Statement::DropTable(index) => drop_table(ast, catalog, index),
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, index),
     }
@@ -227,6 +254,50 @@ fn deduplicate(columns: &mut [Field]) {
     }
 }
 
+/// Binds a `CREATE VIEW`, which means binding the body and then throwing the plan away.
+///
+/// Throwing it away is the point. The body is bound here so that a view over a table that is not
+/// there is refused now rather than at the first select, and so that the column list can be checked
+/// against what the body actually produces. What the catalog keeps is the text, because a view
+/// follows the tables underneath it and a plan is a photograph of the day it was built.
+fn create_view(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    index: ast::CreateViewRef,
+) -> Result<Bound> {
+    let written = ast.create_view(index);
+    if written.temporary {
+        // Same reason as a temporary table: there is no `temp` catalog and no connection for one to
+        // belong to, and a view in `memory` that never goes away is not the thing that was asked
+        // for.
+        return Err(Error::not_implemented("CREATE TEMPORARY VIEW"));
+    }
+    if written.if_not_exists && written.or_replace {
+        // duckdb v1.5.1 refuses this one in the parser, with a caret under the `NOT`, because its
+        // view rule has no room for both. The vendored grammar has room for both, so the refusal
+        // lands here instead and borrows the sentence the table form uses.
+        return Err(Error::binder("OR REPLACE cannot be used together with IF NOT EXISTS"));
+    }
+    let parts: Vec<&str> = ast.name(written.name).collect();
+    let name = catalog.resolve_for_create(&parts)?;
+    let aliases: Vec<String> = ast.name(written.columns).map(str::to_string).collect();
+
+    let mut binder = Binder::with(catalog, parameters);
+    let (_, scope) = binder.bind_query(ast, written.query)?;
+    if aliases.len() > scope.len() {
+        return Err(Error::binder("More VIEW aliases than columns in query result"));
+    }
+
+    Ok(Bound::CreateView(CreateView {
+        name,
+        sql: ast.string(written.sql).to_string(),
+        aliases,
+        if_not_exists: written.if_not_exists,
+        or_replace: written.or_replace,
+    }))
+}
+
 fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<Bound> {
     let written = ast.drop_table(index);
     let mut names = Vec::new();
@@ -238,7 +309,8 @@ fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<
             Err(error) => return Err(error),
         }
     }
-    Ok(Bound::DropTable(DropTable { names }))
+    let kind = if written.view { Entry::View } else { Entry::Table };
+    Ok(Bound::DropTable(DropTable { names, kind }))
 }
 
 fn insert(
@@ -250,6 +322,11 @@ fn insert(
     let written = ast.insert(index);
     let parts: Vec<&str> = ast.name(written.name).collect();
     let name = catalog.resolve(&parts)?;
+    if catalog.entry(&name)? == Entry::View {
+        // The binary's sentence, article and all. A view has no rows of its own to append to, and
+        // an updatable view is a rule about rewriting the insert that neither database has.
+        return Err(Error::catalog(format!("{} is not an table", name.table)));
+    }
     let fields: Vec<Field> = catalog.table(&name)?.columns().to_vec();
 
     // Which table column each source column lands in. Without a column list that is the first n

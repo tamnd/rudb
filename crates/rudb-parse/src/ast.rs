@@ -55,6 +55,8 @@ pub type QueryRef = u32;
 pub type SelectRef = u32;
 /// An index into `Ast::create_tables`.
 pub type CreateTableRef = u32;
+/// An index into `Ast::create_views`.
+pub type CreateViewRef = u32;
 /// An index into `Ast::drop_tables`.
 pub type DropTableRef = u32;
 /// An index into `Ast::inserts`.
@@ -62,7 +64,7 @@ pub type InsertRef = u32;
 
 /// One statement.
 ///
-/// Four of the twenty seven the grammar reaches. The rest are a transform error naming the rule
+/// Five of the twenty seven the grammar reaches. The rest are a transform error naming the rule
 /// rather than a variant that nothing fills in, so that adding one is a compile error somewhere
 /// useful rather than a silent `todo!()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +73,9 @@ pub enum Statement {
     Query(QueryRef),
     /// `CREATE TABLE`.
     CreateTable(CreateTableRef),
-    /// `DROP TABLE`.
+    /// `CREATE VIEW`.
+    CreateView(CreateViewRef),
+    /// `DROP TABLE` or `DROP VIEW`, which are one rule in the grammar and one statement here.
     DropTable(DropTableRef),
     /// `INSERT INTO`.
     Insert(InsertRef),
@@ -115,13 +119,42 @@ pub struct ColumnDef {
     pub not_null: bool,
 }
 
-/// `DROP TABLE a, b`.
+/// `CREATE VIEW name (columns) AS query`.
+///
+/// The body is kept twice over, as a bound reference into this same arena and as the text that was
+/// written. Both are needed and they are needed for different things. The reference is what binds
+/// the body at creation, which is where a view over a table that is not there is refused. The text
+/// is what the catalog keeps, because a view is bound again at every reference rather than frozen
+/// at creation: a view over `SELECT * FROM t` follows `t` when a column is added to it, which was
+/// measured, and the only way to follow it is to have the query to bind again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateView {
+    /// The view name, as a run of [`Slice`] parts, outermost first.
+    pub name: Slice,
+    /// The column aliases, as a run of parts, empty when the statement wrote no list.
+    pub columns: Slice,
+    /// The body.
+    pub query: QueryRef,
+    /// The body as it was written, which is what the catalog keeps.
+    pub sql: StrRef,
+    /// Whether `IF NOT EXISTS` was written.
+    pub if_not_exists: bool,
+    /// Whether `OR REPLACE` was written.
+    pub or_replace: bool,
+    /// Whether `TEMP` or `TEMPORARY` was written.
+    pub temporary: bool,
+}
+
+/// `DROP TABLE a, b` or `DROP VIEW a, b`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropTable {
     /// The names, as a run of [`Slice`] into `Ast::name_lists`, each of which is a run of parts.
     pub names: Slice,
     /// Whether `IF EXISTS` was written.
     pub if_exists: bool,
+    /// Whether `VIEW` was written where `TABLE` could have been. Dropping one as the other is an
+    /// error rather than a synonym, so which word was written has to survive the transform.
+    pub view: bool,
 }
 
 /// `INSERT INTO name (columns) query`.
@@ -697,6 +730,8 @@ pub struct Ast {
     pub case_arms: Vec<CaseArm>,
     /// The `CREATE TABLE` arena.
     pub create_tables: Vec<CreateTable>,
+    /// The `CREATE VIEW` arena.
+    pub create_views: Vec<CreateView>,
     /// The `DROP TABLE` arena.
     pub drop_tables: Vec<DropTable>,
     /// The `INSERT` arena.
@@ -790,6 +825,11 @@ impl Ast {
     /// One `CREATE TABLE`.
     pub fn create_table(&self, index: CreateTableRef) -> CreateTable {
         self.create_tables[index as usize]
+    }
+
+    /// One `CREATE VIEW`.
+    pub fn create_view(&self, index: CreateViewRef) -> CreateView {
+        self.create_views[index as usize]
     }
 
     /// One `DROP TABLE`.

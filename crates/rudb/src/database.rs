@@ -3,7 +3,7 @@
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rudb_bind::{Bound, Parameters};
-use rudb_catalog::Catalog;
+use rudb_catalog::{Catalog, Entry, View};
 use rudb_common::{Error, Field, Result, Value};
 
 use rudb_parse::ast::Ast;
@@ -338,9 +338,16 @@ impl Shared {
                 create_table(create, &mut catalog)?;
                 Ok(QueryResult::empty())
             }
+            Bound::CreateView(create) => {
+                create_view(create, &mut catalog)?;
+                Ok(QueryResult::empty())
+            }
             Bound::DropTable(drop) => {
                 for name in &drop.names {
-                    catalog.drop_table(name)?;
+                    match drop.kind {
+                        Entry::Table => catalog.drop_table(name)?,
+                        Entry::View => catalog.drop_view(name)?,
+                    }
                 }
                 Ok(QueryResult::empty())
             }
@@ -385,6 +392,20 @@ fn run(plan: &rudb_plan::Plan, catalog: &Catalog) -> Result<QueryResult> {
         chunks.push(chunk.flatten()?);
     }
     Ok(QueryResult::new(names, types, chunks))
+}
+
+/// The `CREATE VIEW` half of a statement.
+///
+/// There is nothing to run. The body was bound by the binder to check that it can be, and what is
+/// kept is the text, so this is the two modifiers and a catalog call.
+fn create_view(create: rudb_bind::CreateView, catalog: &mut Catalog) -> Result<()> {
+    if create.if_not_exists && catalog.entry(&create.name).is_ok() {
+        return Ok(());
+    }
+    if create.or_replace && catalog.view(&create.name).is_ok() {
+        catalog.drop_view(&create.name)?;
+    }
+    catalog.create_view(View::new(create.name, create.sql, create.aliases))
 }
 
 /// The `CREATE TABLE` half of a statement.
