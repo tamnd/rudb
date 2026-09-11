@@ -20,6 +20,16 @@ use crate::binder::Binder;
 use crate::scope::Scope;
 
 impl Binder<'_> {
+    /// Binds the value of a `SET`, which is an expression over nothing.
+    ///
+    /// An empty scope, so a bare word is a column that does not resolve rather than a setting value
+    /// spelled without quotes. `SET disabled_optimizers = expression_rewriter` is a name nobody
+    /// declared and saying so is better than guessing which of the two was meant.
+    pub(crate) fn bind_setting_value(&mut self, ast: &Ast, expr: ast::ExprRef) -> Result<ExprRef> {
+        self.clause = "SET statement";
+        self.bind_expr(ast, expr, &Scope::empty())
+    }
+
     /// Binds one written expression against `scope`.
     pub(crate) fn bind_expr(
         &mut self,

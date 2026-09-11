@@ -40,8 +40,21 @@ pub struct Memory {
 #[derive(Debug)]
 struct Budget {
     used: AtomicU64,
-    limit: Option<u64>,
+    /// The limit, with [`NO_LIMIT`] meaning there is none.
+    ///
+    /// Atomic rather than plain, because `SET memory_limit` changes it while queries are running
+    /// and the budget is shared by every one of them. A query that is already holding more than a
+    /// new limit allows is not stopped: it keeps what it has and is refused the next time it asks
+    /// for more, which is what DuckDB does and is the only behaviour that does not turn a setting
+    /// into a way of killing whatever happens to be running.
+    limit: AtomicU64,
 }
+
+/// What the limit holds when there is no limit.
+///
+/// A sentinel rather than an `Option`, because an `Option<u64>` is not atomic and a lock around the
+/// limit would be a lock taken on every reservation.
+const NO_LIMIT: u64 = u64::MAX;
 
 impl Default for Memory {
     fn default() -> Self {
@@ -69,13 +82,26 @@ impl Memory {
     /// A budget of this many bytes, or no limit at all.
     #[must_use]
     pub fn new(limit: Option<u64>) -> Self {
+        let limit = AtomicU64::new(limit.unwrap_or(NO_LIMIT));
         Self { inner: Arc::new(Budget { used: AtomicU64::new(0), limit }) }
     }
 
     /// The limit, if there is one.
     #[must_use]
     pub fn limit(&self) -> Option<u64> {
-        self.inner.limit
+        match self.inner.limit.load(Ordering::Relaxed) {
+            NO_LIMIT => None,
+            limit => Some(limit),
+        }
+    }
+
+    /// Changes the limit, for every query holding this budget.
+    ///
+    /// A limit below what is already held is allowed and refuses the next reservation rather than
+    /// stopping anything, which is what DuckDB does and is the only behaviour that does not turn a
+    /// setting into a way of killing whatever happens to be running.
+    pub fn set_limit(&self, limit: Option<u64>) {
+        self.inner.limit.store(limit.unwrap_or(NO_LIMIT), Ordering::Relaxed);
     }
 
     /// How many bytes are held right now.
@@ -113,7 +139,7 @@ impl Memory {
     /// because a fetch and add that has to be undone is a window in which another thread sees a
     /// total that was never allowed and refuses a query that would have fit.
     fn take(&self, bytes: u64) -> Result<()> {
-        let Some(limit) = self.inner.limit else {
+        let Some(limit) = self.limit() else {
             self.inner.used.fetch_add(bytes, Ordering::Relaxed);
             return Ok(());
         };
@@ -199,11 +225,11 @@ impl Drop for Reservation {
 /// It rounds, which is why it is not the formatter `--print-config` uses: a configuration dump has
 /// to print a number somebody can compare against what they set, and a message about running out of
 /// memory has to print one somebody can read.
-fn human(bytes: u64) -> String {
+pub fn human(bytes: u64) -> String {
     #[expect(clippy::cast_precision_loss, reason = "a rounded size is the point of this function")]
     let mut size = bytes as f64;
-    for unit in ["bytes", "KiB", "MiB", "GiB", "TiB"] {
-        if size < 1024.0 || unit == "TiB" {
+    for unit in ["bytes", "KiB", "MiB", "GiB", "TiB", "PiB"] {
+        if size < 1024.0 || unit == "PiB" {
             return if unit == "bytes" {
                 format!("{bytes} bytes")
             } else {
@@ -296,6 +322,9 @@ mod tests {
         assert_eq!(human(10 * 1024 * 1024), "10.0 MiB");
         assert_eq!(human(9_751_000), "9.3 MiB");
         assert_eq!(human(3 * 1024 * 1024 * 1024), "3.0 GiB");
-        assert_eq!(human(5 * 1024u64.pow(5)), "5120.0 TiB");
+        assert_eq!(human(5 * 1024u64.pow(5)), "5.0 PiB");
+        // The last unit runs off the end rather than there being a unit past it, because a size
+        // that big is a bug in whatever asked for it and not a number anybody reads.
+        assert_eq!(human(u64::MAX), "16384.0 PiB");
     }
 }

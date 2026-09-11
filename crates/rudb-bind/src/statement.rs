@@ -39,6 +39,29 @@ pub enum Bound {
     DropTable(DropTable),
     /// `INSERT INTO`.
     Insert(Insert),
+    /// `SET name = value`, or `RESET name`, which is the same thing with no value.
+    Setting(Setting),
+}
+
+/// A bound `SET` or `RESET`.
+///
+/// The value is a [`Value`] rather than an expression, because every setting there is takes a
+/// string or a number and nothing that runs one wants a plan. What a setting does with the value it
+/// gets is the setting's own business and is decided a layer up, since the binder has no idea what
+/// settings exist.
+///
+/// The narrow part of that is that the value has to already be a constant. `SET threads = 2 + 2` is
+/// four in DuckDB and is refused here, because folding it needs the expression rewriter and the
+/// rewriter is two layers above the binder. Nothing writes arithmetic in a `SET` and the refusal
+/// says what it is, so this waits for a reason to move.
+#[derive(Debug)]
+pub struct Setting {
+    /// The setting name, as written.
+    pub name: String,
+    /// The scope word, if one was written.
+    pub scope: ast::Scope,
+    /// The value, or `None` for a `RESET`.
+    pub value: Option<Value>,
 }
 
 /// A bound `CREATE TABLE`.
@@ -134,6 +157,9 @@ pub fn bind_statement_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters
         ast::Statement::CreateView(index) => create_view(ast, catalog, parameters, index),
         ast::Statement::DropTable(index) => drop_table(ast, catalog, index),
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, index),
+        ast::Statement::Set(index) | ast::Statement::Reset(index) => {
+            setting(ast, catalog, parameters, index)
+        }
     }
 }
 
@@ -304,6 +330,34 @@ fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<
         }
     }
     Ok(Bound::DropTable(DropTable { names, kind }))
+}
+
+/// Binds a `SET` or a `RESET`, which is resolving its value and nothing else.
+///
+/// The name is not checked here. The binder knows what tables exist and has no idea what settings
+/// exist, since a setting is a knob on the engine rather than an entry in a catalog, and a version
+/// of this that held the list would be the binder holding a copy of something it cannot enforce.
+fn setting(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    index: ast::SettingRef,
+) -> Result<Bound> {
+    let written = ast.setting(index);
+    let name = ast.string(written.name).to_string();
+    let value = if written.value == NONE {
+        None
+    } else {
+        let mut binder = Binder::with(catalog, parameters);
+        let bound = binder.bind_setting_value(ast, written.value)?;
+        let Expr::Constant(value) = *binder.plan().expr(bound) else {
+            return Err(Error::not_implemented(format!(
+                "a value for {name} that is not a constant"
+            )));
+        };
+        Some(binder.plan().value(value).clone())
+    };
+    Ok(Bound::Setting(Setting { name, scope: written.scope, value }))
 }
 
 fn insert(

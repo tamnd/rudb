@@ -61,10 +61,12 @@ pub type CreateViewRef = u32;
 pub type DropTableRef = u32;
 /// An index into `Ast::inserts`.
 pub type InsertRef = u32;
+/// An index into `Ast::settings`.
+pub type SettingRef = u32;
 
 /// One statement.
 ///
-/// Five of the twenty seven the grammar reaches. The rest are a transform error naming the rule
+/// Seven of the twenty seven the grammar reaches. The rest are a transform error naming the rule
 /// rather than a variant that nothing fills in, so that adding one is a compile error somewhere
 /// useful rather than a silent `todo!()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +81,54 @@ pub enum Statement {
     DropTable(DropTableRef),
     /// `INSERT INTO`.
     Insert(InsertRef),
+    /// `SET name = value`.
+    Set(SettingRef),
+    /// `RESET name`, which is the same shape with nothing on the right of it.
+    Reset(SettingRef),
+}
+
+/// `SET name = value` and `RESET name`.
+///
+/// One struct for the two, because `RESET name` is `SET name` with no value and giving it its own
+/// arena would mean two of everything to say the same thing twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Setting {
+    /// The setting name, as written.
+    pub name: StrRef,
+    /// The scope word, if one was written.
+    pub scope: Scope,
+    /// The value, or `NONE` for a `RESET`.
+    ///
+    /// An expression rather than text. `SET memory_limit = '1GB'` writes a string and `SET threads
+    /// = 4` writes a number, and what a setting does with either is the setting's business.
+    pub value: ExprRef,
+}
+
+/// Which copy of a setting a statement means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scope {
+    /// No scope word, which every setting reads as the one it has.
+    #[default]
+    Unwritten,
+    /// `GLOBAL`.
+    Global,
+    /// `SESSION`.
+    Session,
+    /// `LOCAL`.
+    Local,
+}
+
+impl Scope {
+    /// The word that was written, for the sentence an error prints.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Unwritten => "",
+            Self::Global => "GLOBAL",
+            Self::Session => "SESSION",
+            Self::Local => "LOCAL",
+        }
+    }
 }
 
 /// `CREATE TABLE name (columns)` or `CREATE TABLE name AS query`.
@@ -744,6 +794,8 @@ pub struct Ast {
     pub drop_tables: Vec<DropTable>,
     /// The `INSERT` arena.
     pub inserts: Vec<Insert>,
+    /// The `SET` and `RESET` arena.
+    pub settings: Vec<Setting>,
     /// Backing store for every [`Slice`] of column definitions.
     pub column_defs: Vec<ColumnDef>,
     /// Backing store for every [`Slice`] of names, which is a name list rather than a name.
@@ -848,6 +900,11 @@ impl Ast {
     /// One `INSERT`.
     pub fn insert(&self, index: InsertRef) -> Insert {
         self.inserts[index as usize]
+    }
+
+    /// One `SET` or `RESET`.
+    pub fn setting(&self, index: SettingRef) -> Setting {
+        self.settings[index as usize]
     }
 
     /// The column definitions of a `CREATE TABLE`.

@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::connection::{Connection, single};
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
+use crate::settings::Settings;
 
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
 const MEMORY: &str = ":memory:";
@@ -43,7 +44,7 @@ pub(crate) struct Shared {
 #[derive(Debug)]
 struct Inner {
     catalog: RwLock<Catalog>,
-    config: Config,
+    settings: Settings,
     memory: Memory,
 }
 
@@ -64,17 +65,37 @@ impl Database {
     #[must_use]
     pub fn with_config(config: Config) -> Self {
         let memory = Memory::new(config.memory_limit());
-        let inner = Inner { catalog: RwLock::new(Catalog::new()), config, memory };
+        let settings = Settings::new(config);
+        let inner = Inner { catalog: RwLock::new(Catalog::new()), settings, memory };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
 
-    /// What this database was opened with.
+    /// What this database is running with now.
     ///
-    /// Read only, because the settings are set once at open time. See [`Config`] for why that is
-    /// narrower than DuckDB on purpose and what it would take to widen it.
+    /// By value rather than by reference, because `SET` changes it while the database is open and a
+    /// reference into the settings would be a lock held for as long as the caller kept it. A
+    /// `Config` is three numbers, so a copy costs nothing worth avoiding.
     #[must_use]
-    pub fn config(&self) -> &Config {
-        &self.shared.inner.config
+    pub fn config(&self) -> Config {
+        self.shared.inner.settings.config()
+    }
+
+    /// What this database was opened with, which is what `RESET` puts a setting back to.
+    #[must_use]
+    pub fn opened_with(&self) -> Config {
+        self.shared.inner.settings.defaults()
+    }
+
+    /// One setting, by the name `SET` uses for it, in the spelling DuckDB prints.
+    ///
+    /// The Rust side of reading a setting back. `current_setting()` is the SQL side and it is not
+    /// written yet, because a scalar function over engine state is a shape no function in rudb has.
+    ///
+    /// # Errors
+    ///
+    /// For a name that is not a setting, with the names there are.
+    pub fn setting(&self, name: &str) -> Result<String> {
+        self.shared.inner.settings.value(name)
     }
 
     /// The memory budget every query against this database is held to.
@@ -320,13 +341,22 @@ impl Shared {
     /// Runs one query and returns every row it produced.
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let catalog = self.read();
-        let plan = planned(sql, &catalog)?;
+        let plan = planned(sql, &catalog, &self.optimizer()?)?;
         run(&plan, &catalog, cancel, &self.inner.memory)
+    }
+
+    /// The passes this database's queries run, as `SET disabled_optimizers` has left them.
+    ///
+    /// Rebuilt for each statement rather than held, because the statement before this one may have
+    /// been the `SET`. It cannot fail: the names were checked when they were set, and the `?` is
+    /// here because nothing stops a later version from having a pass that goes away.
+    fn optimizer(&self) -> Result<rudb_opt::pass::Context> {
+        rudb_opt::pass::Context::without(&self.inner.settings.disabled_optimizers())
     }
 
     /// The query timeout this database was opened with.
     pub(crate) fn timeout(&self) -> Option<std::time::Duration> {
-        self.inner.config.query_timeout()
+        self.inner.settings.config().query_timeout()
     }
 
     /// The token a statement of this database's runs under, when nobody holds one of their own.
@@ -334,7 +364,7 @@ impl Shared {
     /// It carries the configured query timeout and nothing can interrupt it, because there is
     /// nobody holding the other half. [`Connection`] is where the other half lives.
     pub(crate) fn token(&self) -> Cancel {
-        match self.inner.config.query_timeout() {
+        match self.inner.settings.config().query_timeout() {
             Some(timeout) => Cancel::after(timeout),
             None => Cancel::new(),
         }
@@ -342,7 +372,7 @@ impl Shared {
 
     /// The plan a query runs.
     pub(crate) fn plan(&self, sql: &str) -> Result<String> {
-        Ok(planned(sql, &self.read())?.to_string())
+        Ok(planned(sql, &self.read(), &self.optimizer()?)?.to_string())
     }
 
     /// Runs one statement, which may change the database.
@@ -367,13 +397,24 @@ impl Shared {
         cancel: &Cancel,
     ) -> Result<QueryResult> {
         let mut catalog = self.write();
+        let context = self.optimizer()?;
         match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
             Bound::Query(mut plan) => {
-                rudb_opt::optimize(&mut plan)?;
+                rudb_opt::optimize_with(&mut plan, &context)?;
                 run(&plan, &catalog, cancel, &self.inner.memory)
             }
+            Bound::Setting(setting) => {
+                let value = setting.value.as_ref();
+                self.inner.settings.apply(
+                    &self.inner.memory,
+                    &setting.name,
+                    setting.scope,
+                    value,
+                )?;
+                Ok(QueryResult::empty())
+            }
             Bound::CreateTable(create) => {
-                create_table(create, &mut catalog, cancel, &self.inner.memory)?;
+                create_table(create, &mut catalog, cancel, &self.inner.memory, &context)?;
                 Ok(QueryResult::empty())
             }
             Bound::CreateView(create) => {
@@ -394,7 +435,7 @@ impl Shared {
                 // implementation detail. `INSERT INTO t SELECT * FROM t` reads the table it writes,
                 // and a version of this that appended chunk by chunk would either read its own
                 // output forever or depend on how the scan holds its chunks.
-                rudb_opt::optimize(&mut insert.source)?;
+                rudb_opt::optimize_with(&mut insert.source, &context)?;
                 let result = run(&insert.source, &catalog, cancel, &self.inner.memory)?;
                 let table = catalog.table_mut(&insert.name)?;
                 for chunk in result.into_chunks() {
@@ -411,9 +452,13 @@ impl Shared {
 /// Both of the ways in are through here, so that what a plan dump shows is what the query does. A
 /// dump of the bound plan and a run of the optimized one would make the dump a description of
 /// something nobody executes, which is the one thing a plan dump must not be.
-fn planned(sql: &str, catalog: &Catalog) -> Result<rudb_plan::Plan> {
+fn planned(
+    sql: &str,
+    catalog: &Catalog,
+    context: &rudb_opt::pass::Context,
+) -> Result<rudb_plan::Plan> {
     let mut plan = rudb_bind::bind_sql(sql, catalog)?;
-    rudb_opt::optimize(&mut plan)?;
+    rudb_opt::optimize_with(&mut plan, context)?;
     Ok(plan)
 }
 
@@ -464,6 +509,7 @@ fn create_table(
     catalog: &mut Catalog,
     cancel: &Cancel,
     memory: &Memory,
+    context: &rudb_opt::pass::Context,
 ) -> Result<()> {
     if create.if_not_exists && catalog.table(&create.name).is_ok() {
         return Ok(());
@@ -472,7 +518,7 @@ fn create_table(
     // t` reads the table it is about to replace rather than the empty new one.
     let rows = match &mut create.source {
         Some(plan) => {
-            rudb_opt::optimize(plan)?;
+            rudb_opt::optimize_with(plan, context)?;
             Some(run(plan, catalog, cancel, memory)?)
         }
         None => None,

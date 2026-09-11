@@ -24,7 +24,8 @@ use rudb_common::{Error, Result};
 use crate::ast::{
     Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, CreateView, Distinct, DropTable, Expr, ExprRef,
     Insert, JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef,
-    Select, SelectRef, SetOp, Slice, Source, SourceRef, Statement, StrRef, Target, UnaryOp,
+    Scope, Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement, StrRef, Target,
+    UnaryOp,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -286,8 +287,71 @@ impl<'a> Transform<'a> {
             "CreateStatement" => self.create_statement(inner),
             "DropStatement" => self.drop_statement(inner),
             "InsertStatement" => self.insert_statement(inner),
+            "SetStatement" => self.set_statement(inner),
+            "ResetStatement" => self.reset_statement(inner),
             _ => self.unsupported(inner),
         }
+    }
+
+    /// `SetStatement <- 'SET' SetAssignmentOrTimeZone`.
+    ///
+    /// Of the three assignments, `StandardAssignment` is the one that is done. `SET SCHEMA` and
+    /// `SET TIME ZONE` are each a setting this database has nothing to do with yet, and they are a
+    /// refusal rather than a silent success, because a statement that says where to look for a
+    /// table and is ignored is a statement that changes an answer.
+    fn set_statement(&mut self, node: u32) -> Result<Statement> {
+        let inner = self.first(self.find(node, "SetAssignmentOrTimeZone"));
+        if self.name(inner) != "StandardAssignment" {
+            return self.unsupported(inner);
+        }
+        let (name, scope) = self.setting_name(self.find(inner, "SetVariableOrSetting"))?;
+        let assignment = self.find(inner, "SetAssignment");
+        let list = self.find(assignment, "VariableList");
+        let mut values = Vec::new();
+        for kid in self.kids(list) {
+            values.push(self.expr(kid)?);
+        }
+        // The grammar takes a list because `SET search_path = a, b` is a list in postgres. Nothing
+        // here has a setting that reads one, and taking the first of several would be worse than
+        // saying so.
+        let [value] = values[..] else {
+            return self.unsupported(list);
+        };
+        let index = self.ast.settings.len() as u32;
+        self.ast.settings.push(Setting { name, scope, value });
+        Ok(Statement::Set(index))
+    }
+
+    /// `ResetStatement <- 'RESET' SetVariableOrSetting`.
+    fn reset_statement(&mut self, node: u32) -> Result<Statement> {
+        let (name, scope) = self.setting_name(self.find(node, "SetVariableOrSetting"))?;
+        let index = self.ast.settings.len() as u32;
+        self.ast.settings.push(Setting { name, scope, value: NONE });
+        Ok(Statement::Reset(index))
+    }
+
+    /// `SetVariableOrSetting <- SetVariable / SetSetting`, where the setting carries a scope word.
+    ///
+    /// `SET VARIABLE x = 1` is the other alternative and is a different feature: a variable is a
+    /// value the session holds and `getvariable` reads back, where a setting is a knob on the
+    /// engine. Refused rather than treated as a setting of that name.
+    fn setting_name(&mut self, node: u32) -> Result<(StrRef, Scope)> {
+        let inner = self.first(node);
+        if self.name(inner) != "SetSetting" {
+            return self.unsupported(inner);
+        }
+        let written = self.find(inner, "SettingScope");
+        let scope = if written == NONE {
+            Scope::Unwritten
+        } else {
+            match self.name(self.first(written)) {
+                "GlobalScope" => Scope::Global,
+                "SessionScope" => Scope::Session,
+                "LocalScope" => Scope::Local,
+                _ => return self.unsupported(written),
+            }
+        };
+        Ok((self.identifier(self.find(inner, "SettingName")), scope))
     }
 
     /// `CreateStatement <- 'CREATE' OrReplace? Temporary? CreateStatementVariation`.
@@ -2142,7 +2206,51 @@ mod tests {
                 }
                 out + &format!(" {}", show_query(&ast, insert.source))
             }
+            Statement::Set(index) => {
+                let setting = ast.setting(index);
+                let scope = match setting.scope.keyword() {
+                    "" => String::new(),
+                    word => format!(" {word}"),
+                };
+                format!("SET{scope} {} = {}", ast.string(setting.name), show(&ast, setting.value))
+            }
+            Statement::Reset(index) => {
+                let setting = ast.setting(index);
+                let scope = match setting.scope.keyword() {
+                    "" => String::new(),
+                    word => format!(" {word}"),
+                };
+                format!("RESET{scope} {}", ast.string(setting.name))
+            }
         }
+    }
+
+    #[test]
+    fn a_set_keeps_its_name_its_scope_and_its_value() {
+        assert_eq!(round_statement("SET memory_limit = '1GB'"), "SET memory_limit = '1GB'");
+        assert_eq!(round_statement("set threads=4"), "SET threads = 4");
+        assert_eq!(round_statement("SET GLOBAL threads = 4"), "SET GLOBAL threads = 4");
+        assert_eq!(round_statement("SET SESSION threads = 4"), "SET SESSION threads = 4");
+        assert_eq!(round_statement("SET LOCAL threads = 4"), "SET LOCAL threads = 4");
+        assert_eq!(round_statement("RESET memory_limit"), "RESET memory_limit");
+        assert_eq!(round_statement("RESET GLOBAL memory_limit"), "RESET GLOBAL memory_limit");
+    }
+
+    #[test]
+    fn the_two_other_things_the_word_set_starts_are_refused_rather_than_read_as_settings() {
+        // `SET VARIABLE x = 1` declares a session variable and `SET SCHEMA` picks where an
+        // unqualified name is looked up. Neither is a knob on the engine and reading either as one
+        // would change an answer quietly.
+        for statement in ["SET VARIABLE x = 1", "SET SCHEMA 'main'", "SET TIME ZONE 'UTC'"] {
+            let error = parse_ast(statement).expect_err(statement);
+            assert_eq!(error.code().duckdb_name(), "Not implemented Error", "{statement}");
+        }
+    }
+
+    #[test]
+    fn a_setting_written_with_a_list_of_values_is_refused_rather_than_taking_the_first() {
+        let error = parse_ast("SET search_path = a, b").expect_err("a list of two");
+        assert_eq!(error.code().duckdb_name(), "Not implemented Error");
     }
 
     #[test]
