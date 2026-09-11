@@ -179,6 +179,7 @@ fn collect(plan: &Plan, at: NodeRef, set: &mut TableSet) {
         Node::Filter { input, .. }
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
+        | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => collect(plan, input, set),
         Node::Join { left, right, .. } | Node::CrossProduct { left, right } => {
             collect(plan, left, set);

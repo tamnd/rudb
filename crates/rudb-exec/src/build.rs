@@ -24,6 +24,7 @@ use crate::setop::SetOp;
 use crate::sort::Sort;
 use crate::source::{Dummy, FileScan, Scan, Series, Values};
 use crate::stream::{Filter, Limit, Project};
+use crate::topn::TopN;
 
 /// Builds the operator tree for a plan's root, for a query nothing will stop.
 ///
@@ -106,6 +107,14 @@ fn node<'a>(
         Node::Limit { input, count, offset } => {
             Box::new(Limit::new(node(plan, catalog, cancel, memory, input)?, count, offset))
         }
+        Node::TopN { input, keys, count, offset } => Box::new(TopN::new(
+            plan,
+            node(plan, catalog, cancel, memory, input)?,
+            keys,
+            count,
+            offset,
+            memory,
+        )),
         Node::Distinct { input, on } => {
             Box::new(Distinct::new(plan, node(plan, catalog, cancel, memory, input)?, on, memory))
         }

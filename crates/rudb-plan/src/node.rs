@@ -8,8 +8,9 @@
 //!
 //! Every operator that introduces new columns carries a table index, which is the left half of a
 //! [`ColumnBinding`](crate::ColumnBinding). [`Node::Filter`], [`Node::Sort`], [`Node::Limit`],
-//! [`Node::Distinct`] and [`Node::Join`] do not have one, because they pass their input's columns
-//! through unchanged and a binding that survives a filter should not have to be rewritten by it.
+//! [`Node::TopN`], [`Node::Distinct`] and [`Node::Join`] do not have one, because they pass their
+//! input's columns through unchanged and a binding that survives a filter should not have to be
+//! rewritten by it.
 
 use crate::{ExprRef, NodeRef, Slice, StrRef};
 
@@ -137,6 +138,26 @@ pub enum Node {
         /// How many rows to skip first.
         offset: u64,
     },
+    /// A sort with a limit over it, which never holds more rows than the limit can emit.
+    ///
+    /// The same answer as a [`Node::Limit`] over a [`Node::Sort`] and a different amount of work.
+    /// A sort has to see every row before it can emit the first one, so it holds the whole input;
+    /// this holds the rows that could still come out and throws the rest away as it goes, which on
+    /// `ORDER BY x LIMIT 10` over a hundred million rows is ten rows rather than a hundred million.
+    ///
+    /// `count` is not optional, because `LIMIT ALL` over a sort is a sort and there would be nothing
+    /// to bound. The offset is part of the node rather than left above it, since the rows that are
+    /// skipped still have to be found to be skipped, so what this has to keep is `count + offset`.
+    TopN {
+        /// The input.
+        input: NodeRef,
+        /// The keys in priority order, into the sort key pool.
+        keys: Slice,
+        /// How many rows to emit.
+        count: u64,
+        /// How many rows to skip first.
+        offset: u64,
+    },
     /// Duplicate elimination, over the whole row or over named expressions.
     Distinct {
         /// The input.
@@ -199,6 +220,7 @@ impl Node {
             Self::Aggregate { .. } => "Aggregate",
             Self::Sort { .. } => "Sort",
             Self::Limit { .. } => "Limit",
+            Self::TopN { .. } => "TopN",
             Self::Distinct { .. } => "Distinct",
             Self::Join { .. } => "Join",
             Self::CrossProduct { .. } => "CrossProduct",
@@ -222,6 +244,7 @@ impl Node {
             | Self::Aggregate { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. }
+            | Self::TopN { input, .. }
             | Self::Distinct { input, .. } => [Some(input), None],
             Self::Join { left, right, .. }
             | Self::CrossProduct { left, right }

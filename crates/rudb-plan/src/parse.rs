@@ -214,18 +214,7 @@ impl Reader<'_> {
                 Ok(Built::unary(move |input| Node::Aggregate { input, index, groups, aggregates }))
             }
             "Sort" => {
-                let mut keys = Vec::new();
-                c.expect("[")?;
-                if !c.eat_space_then("]") {
-                    loop {
-                        keys.push(read_sort_key(plan, c)?);
-                        if !c.eat_space_then(",") {
-                            break;
-                        }
-                    }
-                    c.expect("]")?;
-                }
-                let keys = plan.add_sort_keys(&keys);
+                let keys = read_sort_keys(plan, c)?;
                 Ok(Built::unary(move |input| Node::Sort { input, keys }))
             }
             "Limit" => {
@@ -233,6 +222,13 @@ impl Reader<'_> {
                 c.expect_word("offset")?;
                 let offset = read_count(c)?;
                 Ok(Built::unary(move |input| Node::Limit { input, count, offset }))
+            }
+            "TopN" => {
+                let count = read_count(c)?;
+                c.expect_word("offset")?;
+                let offset = read_count(c)?;
+                let keys = read_sort_keys(plan, c)?;
+                Ok(Built::unary(move |input| Node::TopN { input, keys, count, offset }))
             }
             "Distinct" => {
                 c.expect_word("on")?;
@@ -435,6 +431,22 @@ fn read_aggregate(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<ExprRef> {
     let args = plan.add_expr_list(&args);
     let ty = read_annotation(c)?;
     Ok(plan.add_expr(Expr::Aggregate { name, args, distinct, filter }, ty))
+}
+
+/// A bracketed list of sort keys, which is what a sort and a top N both carry.
+fn read_sort_keys(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<Slice> {
+    let mut keys = Vec::new();
+    c.expect("[")?;
+    if !c.eat_space_then("]") {
+        loop {
+            keys.push(read_sort_key(plan, c)?);
+            if !c.eat_space_then(",") {
+                break;
+            }
+        }
+        c.expect("]")?;
+    }
+    Ok(plan.add_sort_keys(&keys))
 }
 
 fn read_sort_key(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<SortKey> {

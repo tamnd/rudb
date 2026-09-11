@@ -524,7 +524,7 @@ impl Plan {
                     }
                 }
             }
-            Node::Sort { keys, .. } => {
+            Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
                 let end = keys.start as usize + keys.len as usize;
                 if end > self.sort_keys.len() {
                     return fail("names a sort key run that is not in the pool");
@@ -601,7 +601,7 @@ impl Plan {
                 all.extend(self.expr_list(aggregates).iter().map(|&expr| (expr, true)));
                 all
             }
-            Node::Sort { keys, .. } => {
+            Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
                 self.sort_key_list(keys).iter().map(|key| (key.expr, false)).collect()
             }
             Node::Distinct { on, .. } => plain(self.expr_list(on)),

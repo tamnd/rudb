@@ -188,13 +188,23 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         }
 
         // Nothing goes through a limit and the recursion happens anyway, because a filter that is
-        // already below the limit still has somewhere to go.
+        // already below the limit still has somewhere to go. A top N is a limit with a sort inside
+        // it, so it holds the same line.
         Node::Limit { input, count, offset } => {
             let rebuilt = node(plan, input, Vec::new(), tables);
             let above = if rebuilt == input {
                 at
             } else {
                 plan.add_node(Node::Limit { input: rebuilt, count, offset })
+            };
+            filter(plan, above, pending)
+        }
+        Node::TopN { input, keys, count, offset } => {
+            let rebuilt = node(plan, input, Vec::new(), tables);
+            let above = if rebuilt == input {
+                at
+            } else {
+                plan.add_node(Node::TopN { input: rebuilt, keys, count, offset })
             };
             filter(plan, above, pending)
         }
