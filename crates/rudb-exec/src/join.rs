@@ -15,7 +15,7 @@
 //! than one right row at a time, which keeps the evaluator on its batch interface and makes the
 //! left side's columns constant vectors that cost one value each.
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Connective, combine, is_true};
 use rudb_plan::{ExprRef, JoinKind, Plan, Slice};
 use rudb_vector::{Chunk, Vector};
@@ -40,6 +40,9 @@ pub(crate) struct Join<'a> {
     built: bool,
     chunks: Vec<Chunk>,
     at: usize,
+    memory: Memory,
+    /// What the joined chunks are charged, held for as long as this operator holds them.
+    held: Reservation,
 }
 
 impl<'a> Join<'a> {
@@ -49,6 +52,7 @@ impl<'a> Join<'a> {
         right: Box<dyn Operator + 'a>,
         kind: JoinKind,
         conditions: Slice,
+        memory: &Memory,
     ) -> Self {
         let left_schema = left.schema().clone();
         let right_schema = right.schema().clone();
@@ -70,25 +74,34 @@ impl<'a> Join<'a> {
             built: false,
             chunks: Vec::new(),
             at: 0,
+            memory: memory.clone(),
+            held: memory.reservation(),
         }
     }
 
     fn build(&mut self) -> Result<()> {
+        // Both sides and the rows being paired up, charged apart from the chunks that come out,
+        // because a nested loop join holds all of it at once and gives back everything but the
+        // output when it is done.
+        let mut scratch = self.memory.reservation();
         let left_types = self.left_schema.types();
         let right_types = self.right_schema.types();
-        let left_rows = rows::collect(self.left.as_mut())?;
-        let right_rows = rows::collect(self.right.as_mut())?;
+        let left_rows = rows::collect(self.left.as_mut(), &mut scratch)?;
+        let right_rows = rows::collect(self.right.as_mut(), &mut scratch)?;
         if self.kind == JoinKind::Positional {
             self.chunks = rows::chunks(
                 &self.schema.types(),
                 &positional(&left_rows, &right_rows, left_types.len(), right_types.len()),
+                &mut self.held,
             )?;
             return Ok(());
         }
-        let right_chunks = rows::chunks(&right_types, &right_rows)?;
+        let right_chunks = rows::chunks(&right_types, &right_rows, &mut scratch)?;
         let mut matched = vec![false; right_rows.len()];
+        scratch.grow(u64::try_from(right_rows.len()).unwrap_or(u64::MAX))?;
         let mut out: Vec<Vec<Value>> = Vec::new();
         for left_row in &left_rows {
+            let before = out.len();
             let hits = self.matching(left_row, &left_types, &right_chunks)?;
             for &hit in &hits {
                 matched[hit] = true;
@@ -125,6 +138,12 @@ impl<'a> Join<'a> {
                     }
                 }
             }
+            // Once per left row rather than once per output row, so the amount a query can pass
+            // its limit by before it is told is one left row's worth of output, which is at most
+            // the right side. That is the granularity the loop gives without a check inside the
+            // inner one, and a join that produces more than the limit from a single left row is a
+            // join whose right side was already over it.
+            scratch.grow(out[before..].iter().map(|row| rows::footprint(row)).sum())?;
         }
         if matches!(self.kind, JoinKind::Right | JoinKind::Full) {
             for (at, seen) in matched.iter().enumerate() {
@@ -133,7 +152,7 @@ impl<'a> Join<'a> {
                 }
             }
         }
-        self.chunks = rows::chunks(&self.schema.types(), &out)?;
+        self.chunks = rows::chunks(&self.schema.types(), &out, &mut self.held)?;
         Ok(())
     }
 
@@ -210,10 +229,17 @@ pub(crate) struct CrossProduct<'a> {
     current: Option<Chunk>,
     left_row: usize,
     right_chunk: usize,
+    /// What the stored right side is charged. The output is not charged, because this operator
+    /// hands each chunk out and forgets it.
+    held: Reservation,
 }
 
 impl<'a> CrossProduct<'a> {
-    pub(crate) fn new(left: Box<dyn Operator + 'a>, right: Box<dyn Operator + 'a>) -> Self {
+    pub(crate) fn new(
+        left: Box<dyn Operator + 'a>,
+        right: Box<dyn Operator + 'a>,
+        memory: &Memory,
+    ) -> Self {
         let left_schema = left.schema().clone();
         let schema = Schema::concat(&left_schema, right.schema());
         Self {
@@ -226,6 +252,7 @@ impl<'a> CrossProduct<'a> {
             current: None,
             left_row: 0,
             right_chunk: 0,
+            held: memory.reservation(),
         }
     }
 }
@@ -239,6 +266,7 @@ impl Operator for CrossProduct<'_> {
         if !self.prepared {
             while let Some(chunk) = self.right.next()? {
                 if !chunk.is_empty() {
+                    self.held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
                     self.stored.push(chunk);
                 }
             }

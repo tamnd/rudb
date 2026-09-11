@@ -96,6 +96,19 @@ impl<T> Buffer<T> {
         Self { store: Store::Owned(values) }
     }
 
+    /// How many bytes of memory this buffer is holding.
+    ///
+    /// Capacity rather than length, because capacity is what was taken from the allocator. The day
+    /// a buffer can be a run inside a pinned page this stops being the whole story, since the page
+    /// is charged once by whoever pinned it and a hundred buffers over it are charged nothing, and
+    /// this is the one function that has to know the difference.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        match &self.store {
+            Store::Owned(values) => values.capacity() * size_of::<T>(),
+        }
+    }
+
     /// The values.
     #[must_use]
     #[inline]

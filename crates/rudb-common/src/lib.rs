@@ -16,10 +16,12 @@
 
 pub mod cancel;
 pub mod error;
+pub mod memory;
 pub mod types;
 pub mod value;
 
 pub use cancel::Cancel;
 pub use error::{Error, ErrorCode, Result, Span};
+pub use memory::{Memory, Reservation};
 pub use types::{Field, LogicalType, MAX_DECIMAL_WIDTH, PhysicalType};
 pub use value::{Value, civil_from_days, days_from_civil};

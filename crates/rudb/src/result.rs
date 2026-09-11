@@ -1,7 +1,9 @@
 //! What a query hands back.
 
+use std::sync::Arc;
+
 use rudb_arrow::{DataType, Field, RecordBatch, Schema};
-use rudb_common::{LogicalType, Result, Value};
+use rudb_common::{LogicalType, Memory, Reservation, Result, Value};
 use rudb_vector::Chunk;
 
 /// The rows a query produced, with the names and types of its columns.
@@ -25,12 +27,26 @@ pub struct QueryResult {
     /// The last entry is the row count, which is what makes the search a plain partition point.
     starts: Vec<usize>,
     rows: usize,
+    /// What these chunks are charged against the database's memory limit, given back when the last
+    /// handle on this result is dropped.
+    ///
+    /// Behind an `Arc` because a result is cloneable and a reservation is not. A clone copies the
+    /// chunks and shares the charge, so two handles on one result are charged once. That under
+    /// counts, and it is the direction to under count in: a program that clones a result to hand it
+    /// to another thread has not doubled its data in any sense it would recognize, and refusing its
+    /// next query because it did would be a worse answer than the one it gets.
+    held: Arc<Reservation>,
 }
 
 impl QueryResult {
     /// A result of the given columns and chunks.
     #[must_use]
-    pub(crate) fn new(names: Vec<String>, types: Vec<LogicalType>, chunks: Vec<Chunk>) -> Self {
+    pub(crate) fn new(
+        names: Vec<String>,
+        types: Vec<LogicalType>,
+        chunks: Vec<Chunk>,
+        held: Reservation,
+    ) -> Self {
         let mut starts = Vec::with_capacity(chunks.len() + 1);
         let mut rows = 0;
         for chunk in &chunks {
@@ -38,7 +54,7 @@ impl QueryResult {
             rows += chunk.len();
         }
         starts.push(rows);
-        Self { names, types, chunks, starts, rows }
+        Self { names, types, chunks, starts, rows, held: Arc::new(held) }
     }
 
     /// A result of no columns and no rows, which is what a statement that writes hands back.
@@ -49,7 +65,7 @@ impl QueryResult {
     /// makes a writing statement produce rows, and when it lands it produces them here.
     #[must_use]
     pub(crate) fn empty() -> Self {
-        Self::new(Vec::new(), Vec::new(), Vec::new())
+        Self::new(Vec::new(), Vec::new(), Vec::new(), Memory::unlimited().reservation())
     }
 
     /// The column names, in order.
@@ -62,6 +78,16 @@ impl QueryResult {
     #[must_use]
     pub fn types(&self) -> &[LogicalType] {
         &self.types
+    }
+
+    /// How many bytes this result is charged against the database's memory limit.
+    ///
+    /// The chunks, not the names and the types, and it is what
+    /// [`rudb_common::Memory::used`] stops counting when this is dropped. Worth reading for a
+    /// program deciding whether to keep a result or re-run the query for it.
+    #[must_use]
+    pub fn footprint(&self) -> u64 {
+        self.held.bytes()
     }
 
     /// How many columns.

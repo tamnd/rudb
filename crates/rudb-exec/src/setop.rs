@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use rudb_common::{Result, Value};
+use rudb_common::{Memory, Reservation, Result, Value};
 use rudb_plan::SetOpKind;
 use rudb_vector::Chunk;
 
@@ -31,6 +31,9 @@ pub(crate) struct SetOp<'a> {
     built: bool,
     chunks: Vec<Chunk>,
     at: usize,
+    memory: Memory,
+    /// What the finished chunks are charged, held for as long as this operator holds them.
+    held: Reservation,
 }
 
 impl<'a> SetOp<'a> {
@@ -40,14 +43,31 @@ impl<'a> SetOp<'a> {
         kind: SetOpKind,
         all: bool,
         index: u32,
+        memory: &Memory,
     ) -> Self {
         let schema = Schema::numbered(left.schema().fields().to_vec(), index);
-        Self { left, right, kind, all, schema, built: false, chunks: Vec::new(), at: 0 }
+        Self {
+            left,
+            right,
+            kind,
+            all,
+            schema,
+            built: false,
+            chunks: Vec::new(),
+            at: 0,
+            memory: memory.clone(),
+            held: memory.reservation(),
+        }
     }
 
     fn build(&mut self) -> Result<()> {
-        let left = rows::collect(self.left.as_mut())?;
-        let right = rows::collect(self.right.as_mut())?;
+        // Both sides at once, which is what every arm below needs, and the counting tables on top
+        // of them. The tables are not charged separately, because a count per distinct row is
+        // bounded by the rows that are already charged and charging it twice would refuse a query
+        // that fits.
+        let mut scratch = self.memory.reservation();
+        let left = rows::collect(self.left.as_mut(), &mut scratch)?;
+        let right = rows::collect(self.right.as_mut(), &mut scratch)?;
         let out = match (self.kind, self.all) {
             (SetOpKind::Union, true) => {
                 let mut out = left;
@@ -74,7 +94,7 @@ impl<'a> SetOp<'a> {
                 )
             }
         };
-        self.chunks = rows::chunks(&self.schema.types(), &out)?;
+        self.chunks = rows::chunks(&self.schema.types(), &out, &mut self.held)?;
         Ok(())
     }
 }

@@ -12,7 +12,7 @@
 //! live in the `rudb` crate, which is where a query is a string.
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Cancel, Field, LogicalType, Value};
+use rudb_common::{Cancel, Field, LogicalType, Memory, Value};
 use rudb_plan::Plan;
 
 use crate::{build, build_with};
@@ -427,7 +427,8 @@ fn a_cancelled_token_stops_the_tree_before_it_produces_a_chunk() {
     let catalog = catalog();
     let plan = Plan::parse(SCAN).expect("a well formed plan");
     let cancel = Cancel::new();
-    let mut operator = build_with(&plan, &catalog, &cancel).expect("the operators build");
+    let mut operator =
+        build_with(&plan, &catalog, &cancel, &Memory::unlimited()).expect("the operators build");
     cancel.cancel();
     let error = operator.next().expect_err("it was cancelled");
     assert_eq!(error.code().duckdb_name(), "Interrupt Error");
@@ -439,7 +440,8 @@ fn a_token_nothing_has_cancelled_leaves_the_answer_alone() {
     // thing worth asserting is that it changes no answer.
     let catalog = catalog();
     let plan = Plan::parse(SCAN).expect("a well formed plan");
-    let mut guarded = build_with(&plan, &catalog, &Cancel::new()).expect("the operators build");
+    let mut guarded = build_with(&plan, &catalog, &Cancel::new(), &Memory::unlimited())
+        .expect("the operators build");
     let mut plain = build(&plan, &catalog).expect("the operators build");
     loop {
         let (left, right) = (guarded.next().expect("runs"), plain.next().expect("runs"));
@@ -449,4 +451,20 @@ fn a_token_nothing_has_cancelled_leaves_the_answer_alone() {
             _ => panic!("one of them finished and the other did not"),
         }
     }
+}
+
+#[test]
+fn a_budget_too_small_for_the_rows_stops_the_operator_that_buffers_them() {
+    // Every pipeline breaker in this crate charges what it holds, and the one thing a test here can
+    // say that `crates/rudb` cannot is that it is the operator refusing rather than the result.
+    let catalog = catalog();
+    let plan = Plan::parse(&format!("Sort [#0.0::INTEGER ASC NULLS LAST]\n  {SCAN}"))
+        .expect("a well formed plan");
+    let memory = Memory::with_limit(1);
+    let mut operator = build_with(&plan, &catalog, &Cancel::new(), &memory)
+        .expect("the operators build, because nothing is held yet");
+    let error = operator.next().expect_err("one byte is not enough for a row");
+    assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
+    drop(operator);
+    assert_eq!(memory.used(), 0, "the failed operator gave everything back");
 }

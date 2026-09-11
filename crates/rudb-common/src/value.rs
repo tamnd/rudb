@@ -93,6 +93,40 @@ pub enum Value {
 }
 
 impl Value {
+    /// How many bytes this value takes, counting what it owns on the heap.
+    ///
+    /// What the memory limit charges for a value held in a buffer. It is the enum itself plus the
+    /// string, the blob, the list or the struct behind it, and it counts capacity rather than
+    /// length, because capacity is what was taken from the allocator and a string built by pushing
+    /// bytes usually has more of it than it needs.
+    ///
+    /// The enum is as wide as its widest arm whatever is in it, so a `BOOLEAN` costs the same as a
+    /// `HUGEINT` here. That is not a rounding error, it is the layout: a row of booleans held as
+    /// values really does cost that.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        size_of::<Self>() + self.heap()
+    }
+
+    /// What this value owns beyond its own bytes.
+    fn heap(&self) -> usize {
+        match self {
+            Self::Varchar(text) => text.capacity(),
+            Self::Blob(bytes) => bytes.capacity(),
+            Self::List { values, .. } => {
+                values.capacity() * size_of::<Self>() + values.iter().map(Self::heap).sum::<usize>()
+            }
+            Self::Struct(fields) => {
+                fields.capacity() * size_of::<(String, Self)>()
+                    + fields
+                        .iter()
+                        .map(|(name, value)| name.capacity() + value.heap())
+                        .sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+
     /// Whether this is `NULL`.
     #[must_use]
     pub fn is_null(&self) -> bool {
@@ -567,5 +601,26 @@ mod tests {
         assert_eq!(Value::Integer(5).as_i64(), Some(5));
         assert_eq!(Value::UBigInt(u64::MAX).as_i64(), None);
         assert_eq!(Value::Varchar("5".into()).as_i64(), None);
+    }
+
+    #[test]
+    fn a_footprint_is_the_value_plus_what_it_owns() {
+        let bare = Value::Integer(1).footprint();
+        assert_eq!(bare, size_of::<Value>(), "a number owns nothing");
+        assert_eq!(
+            Value::Boolean(true).footprint(),
+            bare,
+            "the enum is one width whatever is in it"
+        );
+        let text = "a string long enough to be on the heap in any implementation".to_string();
+        assert_eq!(Value::Varchar(text.clone()).footprint(), bare + text.capacity());
+        let list = Value::List {
+            element: LogicalType::Varchar,
+            values: vec![Value::Varchar(text.clone())],
+        };
+        // The list itself, the one slot in its vector, and the bytes the string in that slot owns.
+        // The slot is counted once: an element does not carry its own enum on top of the slot it
+        // sits in.
+        assert_eq!(list.footprint(), bare + size_of::<Value>() + text.capacity());
     }
 }
