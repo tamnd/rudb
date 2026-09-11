@@ -236,6 +236,21 @@ fn specialized(
         let at = |index: usize| codes[index] as usize;
         return dispatch(op.swapped(), len, other, at, one, first, right_valid, left_valid);
     }
+    // A dictionary against a flat column. This pair had no loop until the kernel table put a number
+    // on what that cost, which on `server3` was 83 nanoseconds a row against 1.2 for the dictionary
+    // against constant pair beside it, on the same data and the same operator. It is not a rare
+    // shape either: it is what a filtered column compared against an unfiltered one is, which is
+    // every conjunct after the first.
+    if let (Some((codes, values)), Some(other)) = (left.dictionary_parts(), right.data()) {
+        let one = values.data()?;
+        let at = |index: usize| codes[index] as usize;
+        return dispatch(op, len, one, at, other, identity, left_valid, right_valid);
+    }
+    if let (Some(one), Some((codes, values))) = (left.data(), right.dictionary_parts()) {
+        let other = values.data()?;
+        let at = |index: usize| codes[index] as usize;
+        return dispatch(op.swapped(), len, other, at, one, identity, right_valid, left_valid);
+    }
     None
 }
 
@@ -765,6 +780,11 @@ mod tests {
                     agrees(op, &null_constant, &left);
                     agrees(op, &dictionary, &constant);
                     agrees(op, &constant, &dictionary);
+                    // The dictionary against a flat column, which reads a null from either side and
+                    // from the dictionary's values as well, so it is the pair with the most ways to
+                    // disagree with the oracle and the one that got a loop last.
+                    agrees(op, &dictionary, &right);
+                    agrees(op, &right, &dictionary);
                 }
             }
         }
