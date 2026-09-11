@@ -22,13 +22,16 @@
 //! instead of one at a time. `spec/engine/05-scan.md` section 5.3 has the argument and
 //! [`submit`] has the details.
 //!
+//! [`Pool`], which is the threads that serve those requests. They are not the execution threads,
+//! which is the whole idea: a thread blocked on a read is not a core lost to execution, because the
+//! thread that blocked was never an execution thread.
+//!
 //! # What is not here yet
 //!
-//! Direct I/O, io_uring, the thread pool backend and object storage. `spec/05-storage.md` sections
-//! on I/O say the layer has two backends chosen by measurement at startup, and that decision needs
-//! a buffer manager to measure and a workload to measure it on. Both arrive at M2. What matters now
-//! is that the interface they will implement exists and that nothing is written against `std::fs`
-//! directly in the meantime.
+//! Direct I/O, io_uring and object storage. `spec/05-storage.md` sections on I/O say the layer ends
+//! up with two backends chosen by measurement at startup, and choosing needs a buffer manager to
+//! generate the depth and a workload to measure. What matters now is that the interface they will
+//! implement exists and that nothing is written against `std::fs` directly in the meantime.
 //!
 //! # Why the methods take `&self`
 //!
@@ -39,6 +42,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod pool;
 pub mod real;
 pub mod sim;
 pub mod submit;
@@ -48,6 +52,7 @@ use std::path::Path;
 
 use rudb_common::Result;
 
+pub use pool::{Config, Pool, Pooled, Stats};
 pub use real::RealFilesystem;
 pub use sim::{Completions, Crash, Op, SimFilesystem};
 pub use submit::{Completion, Filler, Request, Response};
