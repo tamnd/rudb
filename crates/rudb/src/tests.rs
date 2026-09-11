@@ -568,6 +568,58 @@ fn a_plan_prints_parent_before_child() {
     assert!(lines[2].trim_start().starts_with("Get memory.main.t"), "{text}");
 }
 
+/// A predicate nothing can satisfy is answered without reading the table. The plan is the assertion
+/// rather than the timing, because the whole point is that the scan is not in it, and with the pass
+/// turned off the same query has to give the same answer the slow way.
+#[test]
+fn a_query_that_cannot_match_answers_nothing_without_reading_the_table() {
+    let db = database();
+    let text = db.plan("SELECT x FROM t WHERE false").unwrap();
+    assert!(!text.contains("Get memory.main.t"), "{text}");
+    assert_eq!(rows(&db, "SELECT x FROM t WHERE false"), Vec::<Vec<Value>>::new());
+    assert_eq!(rows(&db, "SELECT x FROM t LIMIT 0"), Vec::<Vec<Value>>::new());
+    db.execute("SET disabled_optimizers = 'empty_result_pullup'").unwrap();
+    let text = db.plan("SELECT x FROM t WHERE false").unwrap();
+    assert!(text.contains("Get memory.main.t"), "{text}");
+    assert_eq!(rows(&db, "SELECT x FROM t WHERE false"), Vec::<Vec<Value>>::new());
+    assert_eq!(rows(&db, "SELECT x FROM t LIMIT 0"), Vec::<Vec<Value>>::new());
+}
+
+/// The case the pullup has to stop at. An ungrouped aggregate over no rows produces one row, so
+/// `count(*)` of nothing is zero and not an empty answer, and a `min` of nothing is null.
+#[test]
+fn an_aggregate_over_a_query_that_cannot_match_still_answers_its_row() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT count(*), min(x) FROM t WHERE false"),
+        vec![vec![Value::BigInt(0), Value::Null]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT x, count(*) FROM t WHERE false GROUP BY x"),
+        Vec::<Vec<Value>>::new()
+    );
+    db.execute("SET disabled_optimizers = 'empty_result_pullup'").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT count(*), min(x) FROM t WHERE false"),
+        vec![vec![Value::BigInt(0), Value::Null]]
+    );
+}
+
+/// The other half of constant pruning. A predicate that is always true keeps every row, so the
+/// filter is not rebuilt at all rather than left to be evaluated once per row to say so.
+#[test]
+fn a_predicate_that_is_always_true_leaves_no_filter_behind() {
+    let db = database();
+    let text = db.plan("SELECT x FROM t WHERE true").unwrap();
+    assert!(!text.contains("Filter"), "{text}");
+    let text = db.plan("SELECT x FROM t WHERE true AND x > 1").unwrap();
+    assert!(text.contains("Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN"), "{text}");
+    assert_eq!(
+        rows(&db, "SELECT x FROM t WHERE true AND x > 1"),
+        vec![vec![integer(3)], vec![integer(2)]]
+    );
+}
+
 #[test]
 fn creating_a_table_twice_is_an_error_and_dropping_it_makes_room_again() {
     let db = Database::new();
