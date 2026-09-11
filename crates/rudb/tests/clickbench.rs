@@ -27,13 +27,7 @@ const SQL: &str = include_str!("../testdata/clickbench.sql");
 const GAPS: &[(&str, &str)] = &[
     ("q19", "EXTRACT(minute FROM ts), which the grammar parses and the binder drops"),
     ("q29", "REGEXP_REPLACE, and a regular expression engine to run under it"),
-    ("q37", "a DATE compared against a string literal, which DuckDB casts the literal for"),
-    ("q38", "a DATE compared against a string literal"),
-    ("q39", "a DATE compared against a string literal"),
-    ("q40", "a DATE compared against a string literal"),
-    ("q41", "a DATE compared against a string literal"),
-    ("q42", "a DATE compared against a string literal"),
-    ("q43", "a DATE compared against a string literal"),
+    ("q43", "DATE_TRUNC, which was behind the date comparison this query also needed"),
 ];
 
 /// Splits the file into the statements it holds, each with the name of the comment above it.

@@ -309,7 +309,7 @@ impl Binder<'_> {
     ) -> Result<ExprRef> {
         let left_type = self.plan().expr_type(left).clone();
         let right_type = self.plan().expr_type(right).clone();
-        let common = left_type.promote(&right_type).ok_or_else(|| {
+        let common = comparison_type(&left_type, &right_type).ok_or_else(|| {
             Error::binder(format!(
                 "Cannot compare values of type {left_type} and type {right_type}"
             ))
@@ -499,6 +499,34 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
             format!("ROW({})", items.join(", "))
         }
         ast::Expr::Subquery { .. } => "subquery".to_string(),
+    }
+}
+
+/// The type a comparison of these two happens in.
+///
+/// Usually it is the type they promote to, which is the same rule a `UNION` or a `CASE` follows.
+/// The exception is a string against something that is not one. A `UNION` of an `INTEGER` and a
+/// `VARCHAR` is a `VARCHAR` because both values fit there, but a comparison is not asking where
+/// both fit, it is asking what the question means, and `x = '1'` asks whether `x` is one. So the
+/// string is read as the other type and the comparison happens there, which is what DuckDB does:
+/// `1 = '1.0'` is true, and `1 = 'abc'` is a conversion error rather than false.
+///
+/// Dates are the case ClickBench needs. Seven of its queries write `EventDate >= '2013-07-01'`,
+/// and DuckDB answers `DATE '2013-07-15' = '2013-7-15'` with true, which text comparison cannot
+/// do. Comparing as text would also cost a date to string conversion for every row of a hundred
+/// million, against one string to date conversion for the literal.
+fn comparison_type(left: &LogicalType, right: &LogicalType) -> Option<LogicalType> {
+    if let Some(common) = left.promote(right) {
+        return Some(common);
+    }
+    let reads_a_string = |ty: &LogicalType| {
+        ty.is_numeric() || ty.is_temporal() || matches!(ty, LogicalType::Boolean)
+    };
+    match (left, right) {
+        (LogicalType::Varchar, other) | (other, LogicalType::Varchar) if reads_a_string(other) => {
+            Some(other.clone())
+        }
+        _ => None,
     }
 }
 
