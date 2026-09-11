@@ -57,18 +57,25 @@ pub fn optimize(plan: &mut Plan) -> Result<()> {
 /// the one failure that running the query afterwards would not notice, and column pruning in
 /// particular is a pass whose only way of being wrong is exactly that.
 ///
+/// It also checks, in a debug build, that running the whole sequence a second time changes nothing.
+/// That is the property that makes a fixed sequence the right shape: a pass that keeps finding work
+/// on a plan it has already rewritten is a pass whose output depends on how many times it happened
+/// to run, and in a fixed sequence it runs once, so the plan that reaches the executor is whatever
+/// the first pass left behind. Each pass has its own test for this and the assertion is here anyway,
+/// because the pair that is not idempotent together is usually a pair that is idempotent apart.
+///
 /// # Errors
 ///
-/// Whatever a pass reported, and then, in a debug build, if a pass left the plan malformed or
-/// narrowed what it returns, which is a bug in the pass and not in the query.
+/// Whatever a pass reported, and then, in a debug build, if a pass left the plan malformed, narrowed
+/// what it returns or did not settle, all three of which are a bug in the pass and not in the query.
 pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
+    run(plan, context, &PASSES)
+}
+
+/// The sequence, over a list of passes the tests can choose.
+fn run(plan: &mut Plan, context: &Context, passes: &[&(dyn Pass + Sync)]) -> Result<()> {
     let before = output_columns(plan, plan.root());
-    for pass in PASSES {
-        if context.is_disabled(pass.name()) {
-            continue;
-        }
-        pass.run(plan, context)?;
-    }
+    once(plan, context, passes)?;
     if cfg!(debug_assertions) {
         plan.validate()?;
         let after = output_columns(plan, plan.root());
@@ -77,6 +84,25 @@ pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
                 "a pass turned a query of {before} columns into one of {after}"
             )));
         }
+        let settled = plan.to_string();
+        once(plan, context, passes)?;
+        let again = plan.to_string();
+        if again != settled {
+            return Err(Error::internal(format!(
+                "the passes did not settle, since running them again gave a different plan\n\n{settled}\n{again}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One run of every pass that is turned on.
+fn once(plan: &mut Plan, context: &Context, passes: &[&(dyn Pass + Sync)]) -> Result<()> {
+    for pass in passes {
+        if context.is_disabled(pass.name()) {
+            continue;
+        }
+        pass.run(plan, context)?;
     }
     Ok(())
 }
@@ -206,6 +232,34 @@ mod tests {
             plan.to_string(),
             "Project #1 [\"+\"(1::INTEGER, 1::INTEGER)::INTEGER AS n]\n  Get memory.main.t AS t #0 []\n"
         );
+    }
+
+    /// A pass that finds the same work every time it looks, which is what the assertion is for.
+    #[derive(Debug)]
+    struct Restless;
+
+    impl Pass for Restless {
+        fn name(&self) -> &'static str {
+            "restless"
+        }
+
+        fn run(&self, plan: &mut Plan, _context: &Context) -> Result<()> {
+            let root = plan.root();
+            if !matches!(*plan.node(root), Node::Limit { .. }) {
+                return Ok(());
+            }
+            let stacked = plan.add_node(Node::Limit { input: root, count: Some(1), offset: 0 });
+            plan.set_root(stacked);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_pass_that_never_settles_is_a_reported_error_and_not_a_plan() {
+        let text = "Limit 1 offset 0\n  Get memory.main.t AS t #0 [a::INTEGER]\n";
+        let mut plan = Plan::parse(text).expect("a well formed plan");
+        let error = run(&mut plan, &Context::new(), &[&Restless]).expect_err("it never settles");
+        assert!(error.message().starts_with("the passes did not settle"), "{}", error.message());
     }
 
     /// Folding before pruning, which is the reason the order in [`PASSES`] is the order it is. The
