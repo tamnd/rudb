@@ -56,6 +56,12 @@ impl Span {
 pub enum ErrorCode {
     /// The text is not SQL.
     Parser,
+    /// The text is SQL and a value in it is not one the statement can take.
+    ///
+    /// DuckDB's own line between this and [`ErrorCode::Parser`] is not one anybody would draw
+    /// twice, and it is on the wire, so it is here: `SET threads=0` is a syntax error there and a
+    /// syntax error here.
+    Syntax,
     /// The text is SQL and it does not mean anything, for example a column that is not in scope.
     Binder,
     /// A named object is missing, or one that should be missing is not.
@@ -94,6 +100,7 @@ impl ErrorCode {
     pub const fn duckdb_name(self) -> &'static str {
         match self {
             Self::Parser => "Parser Error",
+            Self::Syntax => "Syntax Error",
             Self::Binder => "Binder Error",
             Self::Catalog => "Catalog Error",
             Self::Conversion => "Conversion Error",
@@ -118,6 +125,7 @@ impl ErrorCode {
         matches!(
             self,
             Self::Parser
+                | Self::Syntax
                 | Self::Binder
                 | Self::Catalog
                 | Self::Conversion
@@ -184,6 +192,11 @@ impl Error {
     /// The text is not SQL.
     pub fn parser(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Parser, message)
+    }
+
+    /// The text is SQL and a value in it is not one the statement can take.
+    pub fn syntax(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Syntax, message)
     }
 
     /// The text is SQL and it does not mean anything.
