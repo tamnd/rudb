@@ -14,7 +14,7 @@
 
 use rudb_catalog::{Catalog, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_functions::{resolve, resolve_table};
+use rudb_functions::{Columns, TableFunction, parquet_fields, resolve, resolve_table};
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, parse_ast};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey};
@@ -867,9 +867,15 @@ impl<'a> Binder<'a> {
                 )));
             }
         }
+        // The name is looked up before the arguments are bound so that a call of something that is
+        // not a table function says that, rather than reporting whatever is wrong with the
+        // arguments of a function that was never going to exist.
+        if TableFunction::lookup(function_name).is_none() {
+            return Err(Error::catalog(format!(
+                "Table Function with name {function_name} does not exist!"
+            )));
+        }
         let written = ast.expr_list(args).to_vec();
-        let resolved = resolve_table(function_name, written.len())?;
-
         let empty = Scope::empty();
         let previous = std::mem::replace(&mut self.clause, "table function arguments");
         let mut bound = Vec::with_capacity(written.len());
@@ -877,12 +883,22 @@ impl<'a> Binder<'a> {
             bound.push(self.bind_expr(ast, expr, &empty)?);
         }
         self.clause = previous;
+
+        // The types are what resolve the call, not the count, because `read_parquet(3)` is a
+        // different answer from `read_parquet('3')` and only the types tell them apart.
+        let given: Vec<LogicalType> =
+            bound.iter().map(|&expr| self.plan.expr_type(expr).clone()).collect();
+        let resolved = resolve_table(function_name, &given)?;
         let cast: Vec<ExprRef> = bound
             .iter()
             .zip(&resolved.arguments)
             .map(|(&expr, ty)| self.cast_to(expr, ty))
             .collect();
 
+        let fields = match resolved.columns {
+            Columns::Fixed(fields) => fields,
+            Columns::Parquet => parquet_fields(&self.file_argument(cast[0])?)?,
+        };
         let label = if alias == NONE {
             resolved.function.name().to_string()
         } else {
@@ -890,7 +906,7 @@ impl<'a> Binder<'a> {
         };
         let index = self.fresh_index();
         let mut scope = Scope::empty();
-        for (at, field) in resolved.columns.iter().enumerate() {
+        for (at, field) in fields.iter().enumerate() {
             scope.push(Visible {
                 table: label.clone(),
                 name: field.name.clone(),
@@ -904,10 +920,33 @@ impl<'a> Binder<'a> {
         }
         let function = self.plan.intern(resolved.function.name());
         let args = self.plan.add_expr_list(&cast);
-        let fields = self.plan.add_fields(&resolved.columns);
-        let node =
-            self.plan.add_node(Node::TableFunction { index, function, args, columns: fields });
+        let columns = self.plan.add_fields(&fields);
+        let node = self.plan.add_node(Node::TableFunction { index, function, args, columns });
         Ok((node, scope))
+    }
+
+    /// The file name a table function argument names, which has to be a constant.
+    ///
+    /// A table function that reads a file is resolved by opening the file, and that happens here
+    /// rather than when the query runs, because the rest of the statement cannot bind until the
+    /// column names are known. So the path has to be something this binder can work out without
+    /// running anything, and a literal is that. DuckDB folds a constant expression first, so
+    /// `read_parquet('a' || '.parquet')` works there, and folding is M1 work that this will pick up
+    /// for free once the optimizer runs before the plan is finished rather than after.
+    fn file_argument(&self, expr: ExprRef) -> Result<String> {
+        let Expr::Constant(reference) = *self.plan.expr(expr) else {
+            return Err(Error::not_implemented(
+                "a table function file name that is not a constant",
+            ));
+        };
+        match self.plan.value(reference) {
+            Value::Varchar(path) => Ok(path.clone()),
+            // DuckDB's own wording, which says list because its overload takes one.
+            Value::Null => Err(Error::parser("read_parquet cannot take NULL list as parameter")),
+            other => {
+                Err(Error::internal(format!("a file name bound as VARCHAR arrived as {other}")))
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

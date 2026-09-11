@@ -5,16 +5,17 @@
 //! resolution problem from [`crate::signature`]: the answer is not a return type, it is a list of
 //! columns, because the caller can alias them and select from them and join against them.
 //!
-//! Two of them are here, `range` and `generate_series`, which between them account for two thousand
-//! records in DuckDB's `sqllogictest` corpus. They exist because a test that needs a thousand rows
-//! should not have to write a thousand rows, and the corpus uses them the way a person uses a for
-//! loop. Everything else DuckDB has under this name reads a file or reads the catalog, and both of
-//! those are their own piece of work rather than an entry in a table.
-//!
-//! The difference between the two is one row. `range` stops before the end and `generate_series`
+//! Three of them are here. `range` and `generate_series` between them account for two thousand
+//! records in DuckDB's `sqllogictest` corpus, because a test that needs a thousand rows should not
+//! have to write a thousand rows, and the corpus uses them the way a person uses a for loop. The
+//! difference between those two is one row: `range` stops before the end and `generate_series`
 //! stops on it, which is the difference between a half open interval and a closed one, and it is
 //! the only difference. Nothing else about them differs, including the name of the column, which is
 //! the function's own name in both cases.
+//!
+//! `read_parquet` is the third and it is a different kind of thing, because its columns are in the
+//! file rather than in this table. That is what [`Columns`] exists to say. A caller that resolves a
+//! call has to open the file to finish resolving it, and [`crate::file`] is where that happens.
 
 use rudb_common::{Error, Field, LogicalType, Result};
 
@@ -28,6 +29,8 @@ pub enum TableFunction {
     Range,
     /// The same three, stopping on the end.
     GenerateSeries,
+    /// `read_parquet(path)`, the rows of a Parquet file.
+    ReadParquet,
 }
 
 impl TableFunction {
@@ -37,10 +40,13 @@ impl TableFunction {
         match self {
             Self::Range => "range",
             Self::GenerateSeries => "generate_series",
+            Self::ReadParquet => "read_parquet",
         }
     }
 
     /// Whether the last value is produced.
+    ///
+    /// Only the two series functions differ here. `read_parquet` answers false and nothing asks it.
     #[must_use]
     pub const fn inclusive(self) -> bool {
         matches!(self, Self::GenerateSeries)
@@ -55,8 +61,26 @@ impl TableFunction {
         if name.eq_ignore_ascii_case("generate_series") {
             return Some(Self::GenerateSeries);
         }
+        if name.eq_ignore_ascii_case("read_parquet") || name.eq_ignore_ascii_case("parquet_scan") {
+            return Some(Self::ReadParquet);
+        }
         None
     }
+}
+
+/// Where a call's columns come from.
+///
+/// A table function that produces a fixed set of columns is resolved by this crate and nothing
+/// else has to be consulted. One that reads a file is not, because the columns are in the file, so
+/// the answer here is which file to open rather than what is in it. An enum rather than an empty
+/// column list, because an empty list is what `read_parquet` of a file with no columns would also
+/// give and a caller that forgot to handle the case would get an empty table instead of an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Columns {
+    /// The columns this call produces, with the names an unaliased call gives them.
+    Fixed(Vec<Field>),
+    /// The columns of the Parquet file the first argument names.
+    Parquet,
 }
 
 /// A resolved table function call.
@@ -66,24 +90,40 @@ pub struct ResolvedTable {
     pub function: TableFunction,
     /// What each argument has to be cast to, the same length as what was passed in.
     pub arguments: Vec<LogicalType>,
-    /// The columns the call produces, with the names an unaliased call gives them.
-    pub columns: Vec<Field>,
+    /// Where the columns the call produces come from.
+    pub columns: Columns,
 }
 
-/// Resolve a table function call by name and argument count.
+/// Resolve a table function call by name and the types of its arguments.
 ///
-/// The types are not consulted, only the count. Both of these take integers in every position and
-/// the binder casts to that, so there is nothing here for a type to choose between. DuckDB also has
-/// a timestamp and interval form of both, which is a second set of columns rather than a second
-/// overload of the same ones, and adding it means adding it rather than widening this.
+/// The series pair does not consult the types, only the count, because it takes integers in every
+/// position and the binder casts to that, so there is nothing there for a type to choose between.
+/// DuckDB also has a timestamp and interval form of both, which is a second set of columns rather
+/// than a second overload of the same ones, and adding it means adding it rather than widening this.
+///
+/// `read_parquet` does consult them, because DuckDB does. `read_parquet(3)` is a binder error there
+/// rather than a read of a file called `3`, which was measured against the binary rather than
+/// assumed, and it is the right answer: a path that arrived as a number is a query that meant
+/// something else.
 ///
 /// # Errors
 ///
-/// When no table function has that name, or when it has that name and not that many arguments.
-pub fn resolve_table(name: &str, arity: usize) -> Result<ResolvedTable> {
+/// When no table function has that name, or when it has that name and not those arguments.
+pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTable> {
     let Some(function) = TableFunction::lookup(name) else {
         return Err(Error::catalog(format!("Table Function with name {name} does not exist!")));
     };
+    if function == TableFunction::ReadParquet {
+        if arguments.len() != 1 || arguments[0] != LogicalType::Varchar {
+            return Err(no_overload(function, arguments));
+        }
+        return Ok(ResolvedTable {
+            function,
+            arguments: vec![LogicalType::Varchar],
+            columns: Columns::Parquet,
+        });
+    }
+    let arity = arguments.len();
     if !(1..=3).contains(&arity) {
         return Err(Error::binder(format!(
             "Table function {}() takes between 1 and 3 arguments, {arity} were given",
@@ -93,8 +133,24 @@ pub fn resolve_table(name: &str, arity: usize) -> Result<ResolvedTable> {
     Ok(ResolvedTable {
         function,
         arguments: vec![LogicalType::BigInt; arity],
-        columns: vec![Field::new(function.name(), LogicalType::BigInt)],
+        columns: Columns::Fixed(vec![Field::new(function.name(), LogicalType::BigInt)]),
     })
+}
+
+/// DuckDB's message for a call that matched a name and no overload of it.
+///
+/// The candidate list it prints carries fifteen named parameters that none of them accept here, so
+/// what is listed is the one overload that exists. The first line is the one a test in the wild
+/// asserts on and it is reproduced exactly.
+fn no_overload(function: TableFunction, arguments: &[LogicalType]) -> Error {
+    let written: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+    Error::binder(format!(
+        "No function matches the given name and argument types '{}({})'. You might need to add \
+         explicit type casts.\n\tCandidate functions:\n\t{}(VARCHAR)\n",
+        function.name(),
+        written.join(", "),
+        function.name()
+    ))
 }
 
 /// The values `start`, `stop` and `step` produce, in order.
@@ -169,25 +225,82 @@ fn length(function: TableFunction, start: i64, stop: i64, step: i64) -> usize {
 mod tests {
     use super::*;
 
+    /// The fixed columns of a resolved call, which every function but `read_parquet` has.
+    fn fixed(resolved: &ResolvedTable) -> &[Field] {
+        match &resolved.columns {
+            Columns::Fixed(fields) => fields,
+            Columns::Parquet => panic!("{} resolves to a file", resolved.function.name()),
+        }
+    }
+
+    /// A call of `count` integer arguments, which is what every series call looks like.
+    fn integers(count: usize) -> Vec<LogicalType> {
+        vec![LogicalType::BigInt; count]
+    }
+
     #[test]
     fn a_name_that_is_not_a_table_function_says_so_rather_than_binding() {
-        let error = resolve_table("read_csv", 1).unwrap_err();
+        let error = resolve_table("read_csv", &integers(1)).unwrap_err();
         assert!(error.to_string().contains("read_csv"), "{error}");
     }
 
     #[test]
     fn both_names_resolve_and_each_one_names_its_own_column() {
-        let range = resolve_table("range", 1).unwrap();
-        assert_eq!(range.columns[0].name, "range");
-        let series = resolve_table("GENERATE_SERIES", 3).unwrap();
-        assert_eq!(series.columns[0].name, "generate_series");
+        let range = resolve_table("range", &integers(1)).unwrap();
+        assert_eq!(fixed(&range)[0].name, "range");
+        let series = resolve_table("GENERATE_SERIES", &integers(3)).unwrap();
+        assert_eq!(fixed(&series)[0].name, "generate_series");
         assert_eq!(series.arguments.len(), 3);
     }
 
     #[test]
     fn no_arguments_and_four_arguments_are_both_the_arity_error() {
-        assert!(resolve_table("range", 0).is_err());
-        assert!(resolve_table("range", 4).is_err());
+        assert!(resolve_table("range", &integers(0)).is_err());
+        assert!(resolve_table("range", &integers(4)).is_err());
+    }
+
+    #[test]
+    fn a_series_call_ignores_the_types_it_was_given_and_casts_them_all_to_bigint() {
+        let resolved =
+            resolve_table("range", &[LogicalType::Varchar, LogicalType::Double]).unwrap();
+        assert_eq!(resolved.arguments, integers(2));
+    }
+
+    #[test]
+    fn read_parquet_takes_one_string_and_says_its_columns_are_in_the_file() {
+        let resolved = resolve_table("read_parquet", &[LogicalType::Varchar]).unwrap();
+        assert_eq!(resolved.function, TableFunction::ReadParquet);
+        assert_eq!(resolved.arguments, vec![LogicalType::Varchar]);
+        assert_eq!(resolved.columns, Columns::Parquet);
+    }
+
+    #[test]
+    fn parquet_scan_is_the_same_function_under_duckdbs_other_name_for_it() {
+        assert_eq!(TableFunction::lookup("parquet_scan"), Some(TableFunction::ReadParquet));
+        // And it records itself under the one name, so a plan does not have two spellings in it.
+        let resolved = resolve_table("parquet_scan", &[LogicalType::Varchar]).unwrap();
+        assert_eq!(resolved.function.name(), "read_parquet");
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_string_is_the_message_duckdb_gives_for_it() {
+        // Measured against v1.4.1 on server3: `read_parquet(3)` does not cast, it fails to match.
+        let error = resolve_table("read_parquet", &[LogicalType::Integer]).unwrap_err();
+        assert!(
+            error.message().starts_with(
+                "No function matches the given name and argument types 'read_parquet(INTEGER)'."
+            ),
+            "{error}"
+        );
+        assert!(error.message().contains("read_parquet(VARCHAR)"), "{error}");
+    }
+
+    #[test]
+    fn read_parquet_of_no_arguments_or_two_is_the_same_no_overload_message() {
+        let two = resolve_table("read_parquet", &[LogicalType::Varchar, LogicalType::Varchar]);
+        assert!(two.unwrap_err().message().contains("read_parquet(VARCHAR, VARCHAR)"));
+        let none = resolve_table("read_parquet", &[]);
+        assert!(none.unwrap_err().message().contains("read_parquet()"));
     }
 
     #[test]
