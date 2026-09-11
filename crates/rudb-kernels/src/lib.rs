@@ -61,6 +61,7 @@
 pub mod aggregate;
 pub mod cast;
 pub mod compare;
+mod datetime;
 pub mod fallback;
 pub mod logic;
 mod number;

@@ -24,11 +24,8 @@ const SQL: &str = include_str!("../testdata/clickbench.sql");
 ///
 /// Every entry is a missing piece of DuckDB rather than a difference of opinion about SQL, so every
 /// entry is a bug with a fix rather than a note about dialects.
-const GAPS: &[(&str, &str)] = &[
-    ("q19", "EXTRACT(minute FROM ts), which the grammar parses and the binder drops"),
-    ("q29", "REGEXP_REPLACE, and a regular expression engine to run under it"),
-    ("q43", "DATE_TRUNC, which was behind the date comparison this query also needed"),
-];
+const GAPS: &[(&str, &str)] =
+    &[("q29", "REGEXP_REPLACE, and a regular expression engine to run under it")];
 
 /// Splits the file into the statements it holds, each with the name of the comment above it.
 ///

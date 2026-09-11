@@ -49,6 +49,7 @@
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
 
+use crate::datetime::Part;
 use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
 use crate::shape::{first, identity, nulls_of, single};
@@ -350,6 +351,7 @@ fn binary(
         "!~~" => like_of(left, right, returns, rows, false, true),
         "~~*" => like_of(left, right, returns, rows, true, false),
         "!~~*" => like_of(left, right, returns, rows, true, true),
+        "date_part" | "date_trunc" => date_of(name, left, right, returns, rows),
         _ => Ok(None),
     }
 }
@@ -989,6 +991,94 @@ impl Pattern {
     }
 }
 
+/// `date_part` and `date_trunc`, against a part that is the same on every row.
+///
+/// The part is a string literal in every query anybody writes, and it is the whole of what the loop
+/// would otherwise have to decide, so it is read once per vector. What is left per row is one
+/// division or one call into the calendar, over a run of `i32` days or `i64` microseconds.
+///
+/// ClickBench query 43 groups a hundred million rows by `DATE_TRUNC('minute', EventTime)`, so this
+/// is a loop whose shape shows up in a number somebody publishes.
+fn date_of(
+    name: &str,
+    spec: &Vector,
+    when: &Vector,
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let (Some(Value::Varchar(spelling)), Some(data)) = (spec.constant_value(), when.data()) else {
+        return Ok(None);
+    };
+    let truncating = name == "date_trunc";
+    // A truncation keeps the type it was given and a part is always a bigint, and anything else is
+    // a cast the binder put there, which the row at a time path handles and counts.
+    if truncating {
+        if returns != when.logical_type() {
+            return Ok(None);
+        }
+    } else if *returns != LogicalType::BigInt {
+        return Ok(None);
+    }
+    let part = Part::parse(spelling)?;
+    let base = nulls_of(when).and(&nulls_of(spec), rows);
+    match (when.logical_type(), data, truncating) {
+        (LogicalType::Date, Data::Int32(days), false) => {
+            let mut out = vec![0i64; rows];
+            let validity = over_valid(rows, base, |index| {
+                out[index] = part.of_days(days[index])?;
+                Ok(true)
+            })?;
+            finish(returns, Data::Int64(out.into()), validity)
+        }
+        (LogicalType::Date, Data::Int32(days), true) => {
+            let mut out = vec![0i32; rows];
+            let validity = over_valid(rows, base, |index| {
+                out[index] = part.truncate_days(days[index])?;
+                Ok(true)
+            })?;
+            finish(returns, Data::Int32(out.into()), validity)
+        }
+        (LogicalType::Timestamp, Data::Int64(micros), false) => {
+            let mut out = vec![0i64; rows];
+            let validity = over_valid(rows, base, |index| {
+                out[index] = part.of_micros(micros[index])?;
+                Ok(true)
+            })?;
+            finish(returns, Data::Int64(out.into()), validity)
+        }
+        (LogicalType::Timestamp, Data::Int64(micros), true) => {
+            let mut out = vec![0i64; rows];
+            let validity = over_valid(rows, base, |index| {
+                out[index] = part.truncate_micros(micros[index])?;
+                Ok(true)
+            })?;
+            finish(returns, Data::Int64(out.into()), validity)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `date_part` and `date_trunc` on one row.
+fn date_value(name: &str, spec: &Value, when: &Value) -> Result<Value> {
+    let Value::Varchar(spelling) = spec else {
+        return Err(Error::internal(format!("{name} of a {} part", spec.logical_type())));
+    };
+    let part = Part::parse(spelling)?;
+    match (name == "date_trunc", when) {
+        (false, Value::Date(days)) => part.of_days(*days).map(Value::BigInt),
+        (false, Value::Timestamp(micros)) => part.of_micros(*micros).map(Value::BigInt),
+        (true, Value::Date(days)) => part.truncate_days(*days).map(Value::Date),
+        (true, Value::Timestamp(micros)) => part.truncate_micros(*micros).map(Value::Timestamp),
+        // DuckDB has overloads for a time, an interval and a timestamp with a time zone as well,
+        // and refuses anything else at binding. This refuses the same set a step later, because the
+        // signature table has one row per name and no way to say which types the row accepts.
+        _ => Err(Error::binder(format!(
+            "No function matches the given name and argument types '{name}(VARCHAR, {})'. You might need to add explicit type casts.",
+            when.logical_type()
+        ))),
+    }
+}
+
 /// Calls a scalar function on one row.
 ///
 /// # Errors
@@ -1024,6 +1114,7 @@ pub fn call_values(name: &str, args: &[Value], returns: &LogicalType) -> Result<
         ("!~~", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, false))),
         ("~~*", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, true))),
         ("!~~*", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, true))),
+        ("date_part" | "date_trunc", [spec, when]) => date_value(name, spec, when),
         _ => Err(Error::not_implemented(format!(
             "the {name} function with {} arguments",
             args.len()
@@ -1530,6 +1621,13 @@ mod tests {
                 },
                 LogicalType::Boolean => Value::Boolean(small > 0),
                 LogicalType::Varchar => Value::Varchar(text(rng)),
+                // Roughly the years 600 to 3300 either side of the epoch, and nine thousand years
+                // of timestamps, because a calendar that is only ever asked about this decade is a
+                // calendar whose leap years and week numbers are never asked about at all.
+                LogicalType::Date => Value::Date(rng.below(1_000_000) as i32 - 500_000),
+                LogicalType::Timestamp => {
+                    Value::Timestamp(rng.next() as i64 % 300_000_000_000_000_000)
+                }
                 other => panic!("the generator has nothing for a {other}"),
             });
         }
@@ -1643,6 +1741,70 @@ mod tests {
             let flags = sample(&LogicalType::Boolean, 96, nulls, &mut rng);
             agrees("not", std::slice::from_ref(&flags), &LogicalType::Boolean);
         }
+    }
+
+    /// Every part, on both the types that have a loop, against the row at a time path.
+    ///
+    /// The part is what decides which piece of calendar arithmetic runs, so a test that only asks
+    /// for the minute is a test of one branch out of twenty. An era does not truncate and both
+    /// paths have to refuse it with the same words, which is a thing `agrees` checks for free.
+    #[test]
+    fn every_part_of_a_date_agrees_with_the_row_at_a_time_path() {
+        const PARTS: &[&str] = &[
+            "year",
+            "month",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "week",
+            "quarter",
+            "dayofweek",
+            "isodow",
+            "dayofyear",
+            "decade",
+            "century",
+            "millennium",
+            "era",
+            "isoyear",
+            "yearweek",
+        ];
+        let mut rng = Rng(0xdead_beef_1234_5eed);
+        for nulls in [0, 7, 1] {
+            for ty in [LogicalType::Date, LogicalType::Timestamp] {
+                let when = sample(&ty, 96, nulls, &mut rng);
+                for spelling in PARTS {
+                    let part = Vector::constant(
+                        LogicalType::Varchar,
+                        Value::Varchar((*spelling).to_owned()),
+                        96,
+                    );
+                    agrees("date_part", &[part.clone(), when.clone()], &LogicalType::BigInt);
+                    agrees("date_trunc", &[part, when.clone()], &ty);
+                }
+            }
+        }
+    }
+
+    /// A part that changes from row to row has no loop, the same way a `LIKE` pattern that changes
+    /// from row to row has none, and it still has to be right.
+    #[test]
+    fn a_part_that_varies_per_row_is_still_right() {
+        let part = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("minute".into()), Value::Varchar("hour".into())],
+        )
+        .expect("two rows");
+        let when = Vector::from_values(
+            LogicalType::Timestamp,
+            &[Value::Timestamp(13 * 3_600_000_000 + 45 * 60_000_000), Value::Timestamp(0)],
+        )
+        .expect("two rows");
+        let found = call("date_part", &[part, when], &LogicalType::BigInt).expect("two parts");
+        assert_eq!(found.value_at(0), Value::BigInt(45));
+        assert_eq!(found.value_at(1), Value::BigInt(0));
     }
 
     /// A pattern that changes from row to row is legal SQL and has no loop, so it has to come out
