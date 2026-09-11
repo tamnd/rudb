@@ -21,7 +21,8 @@ use std::path::Path;
 
 use rudb_common::{Error, Field, Result};
 use rudb_csv::Reader as CsvReader;
-use rudb_io::{File, Filesystem, OpenMode, RealFilesystem};
+use rudb_io::glob::has_magic;
+use rudb_io::{File, Filesystem, OpenMode, RealFilesystem, expand};
 use rudb_parquet::Reader;
 
 /// A reader over the Parquet file at `path`, positioned before its first row group.
@@ -43,13 +44,44 @@ pub fn open_csv(path: &str) -> Result<CsvReader> {
     CsvReader::open(open_file(path)?, path)
 }
 
-/// Whether there is a file at `path`.
+/// Whether there is a file, rather than a directory, at `path`.
 ///
 /// The replacement scan asks, because a name that looks like a file and is not one is a different
-/// answer from a file this build has no reader for.
+/// answer from a file this build has no reader for. A directory is not a file: DuckDB reports
+/// `SELECT * FROM 'some/directory'` as a table that does not exist, which was measured.
 #[must_use]
-pub fn exists(path: &str) -> bool {
-    RealFilesystem::new().exists(Path::new(path))
+pub fn is_file(path: &str) -> bool {
+    let at = Path::new(path);
+    let filesystem = RealFilesystem::new();
+    filesystem.exists(at) && !filesystem.is_dir(at)
+}
+
+/// Whether a path argument stands for a set of files rather than for one.
+///
+/// The binder asks because the two are named differently. A file gives its columns the stem of its
+/// name to answer to and a pattern gives them the whole of what was written, both measured.
+#[must_use]
+pub fn is_pattern(path: &str) -> bool {
+    has_magic(path)
+}
+
+/// The files a path argument names, which is one file, or every file a pattern matched.
+///
+/// Expanded here rather than in the executor because DuckDB expands at bind time: a pattern that
+/// matches nothing is an error before the query starts, and the schema comes from the first file, so
+/// the binder has to know which file that is.
+///
+/// # Errors
+///
+/// When nothing matched, with DuckDB's own wording, which says pattern whether or not one was
+/// written because a path that is simply missing and a pattern that matched nothing are the same
+/// answer there.
+pub fn files(pattern: &str) -> Result<Vec<String>> {
+    let found = expand(&RealFilesystem::new(), pattern)?;
+    if found.is_empty() {
+        return Err(Error::io(format!("No files found that match the pattern \"{pattern}\"")));
+    }
+    Ok(found)
 }
 
 /// The file at `path`, open for reading.

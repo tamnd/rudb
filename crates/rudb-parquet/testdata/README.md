@@ -89,3 +89,21 @@ pq.write_table(table, "bytes.parquet", compression="snappy", row_group_size=1024
 `raw` starts every value with `0xff 0xfe`, which is not valid UTF-8 under any reading, so it is the column that has to be refused by name rather than decoded into something.
 
 DuckDB reads both columns as `BLOB` and answers n=2048, count(words)=1861, sum(octet_length(words))=16749, min(words)='byte_0000', max(words)='byte_1023'.
+
+## parts
+
+A directory of small files, for the patterns that read more than one file at a time. Written by duckdb v1.4.1.
+
+```sql
+COPY (SELECT i::INTEGER AS a, 'one' AS s FROM range(3) t(i)) TO 'parts/p1.parquet';
+COPY (SELECT (i+10)::INTEGER AS a, 'two' AS s FROM range(4) t(i)) TO 'parts/p2.parquet';
+COPY (SELECT (i+100)::INTEGER AS a, 'three' AS s FROM range(2) t(i)) TO 'parts/deep/p3.parquet';
+COPY (SELECT 1::INTEGER AS a, 'full' AS s) TO 'parts/odd/a_full.parquet';
+COPY (SELECT 2::INTEGER AS a) TO 'parts/odd/b_narrow.parquet';
+COPY (SELECT 1::INTEGER AS a) TO 'parts/widen/a_int.parquet';
+COPY (SELECT '5' AS a) TO 'parts/widen/b_text.parquet';
+```
+
+DuckDB reads `parts/p*.parquet` as 7 rows summing to 49, `parts/*/p*.parquet` as 2 rows summing to 201, and `parts/**/p*.parquet` as 9 rows summing to 250.
+
+The three names that are not `p` something are the awkward cases and are kept out of the way of the patterns above on purpose. `odd` is a pair of files that do not agree about their columns, which is the schema mismatch message. `widen` is a pair that agree about the name and not the type, where the first file decides and the second is cast to it, so the two rows read as the integers 1 and 5.

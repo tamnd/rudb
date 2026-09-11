@@ -11,7 +11,7 @@
 //! workload to measure, and both arrive at M2.
 
 use std::fs::{File as StdFile, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rudb_common::{Error, Result};
 
@@ -54,6 +54,22 @@ impl Filesystem for RealFilesystem {
 
     fn exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+
+    fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let entries = std::fs::read_dir(path)
+            .map_err(|e| Error::io(format!("could not read {}: {e}", path.display())))?;
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| Error::io(format!("could not read {}: {e}", path.display())))?;
+            found.push(entry.path());
+        }
+        Ok(found)
     }
 
     fn remove(&self, path: &Path) -> Result<()> {

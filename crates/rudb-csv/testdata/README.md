@@ -48,3 +48,14 @@ Four lines, tab separated, with a quoted tab, a quoted newline and a doubled quo
 The extension is what sends a file to the CSV reader, and the reader is what works out that this one is tabs. A `.tsv` file full of commas is read as commas in duckdb v1.4.1, which was measured, so the extension picks the reader and nothing more.
 
 DuckDB reads it as `name VARCHAR, note VARCHAR` and three rows, the second of which holds a newline inside a field.
+
+## parts
+
+Two small files, for the patterns that read more than one file at a time, written by hand.
+
+```
+c1.csv      a,s / 1,one / 2,one
+c2.csv      a,s / 10,two
+```
+
+DuckDB reads `parts/c*.csv` as 3 rows summing to 13.

@@ -15,7 +15,8 @@
 use rudb_catalog::{Catalog, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_functions::{
-    Columns, TableFunction, csv_fields, exists, parquet_fields, resolve, resolve_table,
+    Columns, TableFunction, csv_fields, files, is_file, is_pattern, parquet_fields, resolve,
+    resolve_table,
 };
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, parse_ast};
@@ -901,7 +902,7 @@ impl<'a> Binder<'a> {
         let given: Vec<LogicalType> =
             bound.iter().map(|&expr| self.plan.expr_type(expr).clone()).collect();
         let resolved = resolve_table(function_name, &given)?;
-        let cast: Vec<ExprRef> = bound
+        let mut cast: Vec<ExprRef> = bound
             .iter()
             .zip(&resolved.arguments)
             .map(|(&expr, ty)| self.cast_to(expr, ty))
@@ -909,8 +910,20 @@ impl<'a> Binder<'a> {
 
         let fields = match resolved.columns {
             Columns::Fixed(fields) => fields,
-            Columns::Parquet => parquet_fields(&self.file_argument(cast[0])?)?,
-            Columns::Csv => csv_fields(&self.file_argument(cast[0])?)?,
+            columns => {
+                // The one argument is a pattern, and what replaces it is one constant per file it
+                // matched. The executor is handed names rather than a pattern, so it never walks a
+                // directory and the answer cannot change between binding a prepared statement and
+                // running it, which is the same reason the schema is settled here.
+                let paths = files(&self.file_argument(cast[0])?)?;
+                let first = paths.first().map_or("", String::as_str);
+                let fields = match columns {
+                    Columns::Csv => csv_fields(first)?,
+                    _ => parquet_fields(first)?,
+                };
+                cast = paths.iter().map(|path| self.path_constant(path)).collect();
+                fields
+            }
         };
         let label = if alias == NONE {
             resolved.function.name().to_string()
@@ -943,7 +956,7 @@ impl<'a> Binder<'a> {
         let path = *path;
         let extension = path.rsplit_once('.').map(|(_, after)| after).unwrap_or_default();
         let Some(function) = Self::reader_for(extension) else {
-            if exists(path) {
+            if is_file(path) {
                 // A file that is really there and that nothing here can read is a different mistake
                 // from a name that is not a file, and DuckDB says so with both lines, the second of
                 // which is the way out. A file with no dot in it lands here too, which is why the
@@ -956,26 +969,40 @@ impl<'a> Binder<'a> {
             }
             return Err(missing);
         };
-        // The file is opened before it is known to exist, so a name that ends in .csv and is not
-        // there gives the reader's own message rather than the catalog's. That is DuckDB's order
-        // and it is the helpful one: somebody who wrote a file name wants to hear about the file.
+        // The pattern is expanded before it is known to match anything, so a name that ends in .csv
+        // and is not there gives the reader's own message rather than the catalog's. That is
+        // DuckDB's order and it is the helpful one: somebody who wrote a file name wants to hear
+        // about the file.
+        let paths = files(path)?;
+        let first = paths.first().map_or("", String::as_str);
         let fields = match function {
-            TableFunction::ReadParquet => parquet_fields(path)?,
-            _ => csv_fields(path)?,
+            TableFunction::ReadParquet => parquet_fields(first)?,
+            _ => csv_fields(first)?,
         };
         // The name the columns answer to is the file's stem, so `SELECT mixed.a FROM
         // 'data/mixed.parquet'` works. That is DuckDB's choice and it is the useful one, since the
-        // alternative is a table name with a dot and a slash in it that nothing can write.
+        // alternative is a table name with a dot and a slash in it that nothing can write. A pattern
+        // keeps the whole of what was written instead, which is DuckDB's choice too and was
+        // measured: there is no stem to take when the name stands for a directory full of files.
         let label = if alias == NONE {
-            let file = path.rsplit_once('/').map_or(path, |(_, file)| file);
-            file.rsplit_once('.').map_or(file, |(stem, _)| stem).to_string()
+            if is_pattern(path) {
+                path.to_string()
+            } else {
+                let file = path.rsplit_once('/').map_or(path, |(_, file)| file);
+                file.rsplit_once('.').map_or(file, |(stem, _)| stem).to_string()
+            }
         } else {
             ast.string(alias).to_string()
         };
-        let value = self.plan.add_value(Value::Varchar(path.to_string()));
-        let argument = self.plan.add_expr(Expr::Constant(value), LogicalType::Varchar);
+        let arguments: Vec<ExprRef> = paths.iter().map(|path| self.path_constant(path)).collect();
         let names: Vec<&str> = ast.name(columns).collect();
-        self.table_function_source(function, &[argument], fields, &label, &names)
+        self.table_function_source(function, &arguments, fields, &label, &names)
+    }
+
+    /// One file name, as a constant expression in the plan.
+    fn path_constant(&mut self, path: &str) -> ExprRef {
+        let value = self.plan.add_value(Value::Varchar(path.to_string()));
+        self.plan.add_expr(Expr::Constant(value), LogicalType::Varchar)
     }
 
     /// The table function a file with this extension is read by, and `None` for one nothing reads.
