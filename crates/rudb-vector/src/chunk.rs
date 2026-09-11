@@ -163,6 +163,57 @@ impl Chunk {
         Self::with_rows(columns, rows)
     }
 
+    /// The rows a selection kept, copied, so that nothing downstream reads through an indirection.
+    ///
+    /// The copying counterpart to [`Self::select`], and the two exist because neither one is right
+    /// twice. Which one to call is measured rather than argued, and the measurement says something
+    /// other than what the argument does, so here is both.
+    ///
+    /// The argument is that selecting pays nothing now and one redirection on every later read of
+    /// every kept row, while compacting pays a copy now and nothing afterwards, so the deciding
+    /// variable is selectivity: keep a few rows and select, keep most of them and compact. The
+    /// measurement says the deciding variable is not selectivity at all, it is how many times the
+    /// rows are read again afterwards, and selectivity barely moves the line. On server3, over a
+    /// chunk of two integer columns, compacting loses to selecting at every selectivity from one
+    /// percent to a hundred when there is one later pass over the kept rows, and beats it at every
+    /// selectivity from one percent to a hundred when there are sixteen. With four later passes the
+    /// two are within a few percent of each other everywhere. Put a varchar column in the chunk and
+    /// compaction loses almost everywhere, because copying string bytes is most of what it costs and
+    /// the dictionary it avoids is most of what it saves.
+    ///
+    /// Which is why nothing in the streaming pipeline calls this yet. A filter today feeds an
+    /// aggregate or a projection and that is one pass or two, and end to end on two million rows
+    /// `SELECT sum(a), sum(b), count(*) FROM t WHERE a > ?` measures the same either way at one
+    /// percent selectivity and fifty percent slower compacting at fifty percent selectivity. The
+    /// operators that will want this are the ones that hold chunks rather than pass them on, the
+    /// hash join build side and the sort, because a chunk that is kept alive as a selection keeps
+    /// the whole chunk it was selected from alive with it, and that is a hundred to one on memory
+    /// rather than a few percent on time.
+    ///
+    /// Takes the chunk by value like [`Self::select`] does, even though the payload is copied rather
+    /// than moved, because a caller that still wanted the original after compacting it would be
+    /// holding both copies and should say so.
+    ///
+    /// # Errors
+    ///
+    /// If the selection points past the end of the chunk, or if a column has a type with no flat
+    /// layout, which today means the nested types.
+    pub fn compact(self, selection: &Selection) -> Result<Self> {
+        if let Some(bad) = selection.iter().find(|&index| index >= self.rows) {
+            return Err(Error::internal(format!(
+                "a selection keeps row {bad} of a chunk that has {} rows",
+                self.rows
+            )));
+        }
+        let rows = selection.len();
+        let indices = selection.indices();
+        let mut columns = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            columns.push(column.gather(indices)?);
+        }
+        Self::with_rows(columns, rows)
+    }
+
     /// The columns at the given positions, in that order.
     ///
     /// A position may appear twice, which is what `SELECT x, x FROM t` is, and the second one costs
@@ -292,6 +343,34 @@ mod tests {
         let mut kept = Selection::empty();
         kept.push(7);
         let error = chunk.select(&kept).expect_err("row seven does not exist");
+        assert!(error.message().contains("row 7"), "{error}");
+    }
+
+    /// The two halves of section 7.1's decision have to answer the same question the same way, or
+    /// the threshold between them is a place where a query changes its answer.
+    #[test]
+    fn compacting_keeps_the_same_rows_selecting_does_and_leaves_no_indirection() {
+        let chunk = Chunk::new(vec![integers(&[10, 20, 30, 40]), integers(&[1, 2, 3, 4])])
+            .expect("four rows");
+        let kept = Selection::from_predicate(4, |index| index % 2 == 1);
+        let selected = chunk.clone().select(&kept).expect("rows one and three exist");
+        let compacted = chunk.compact(&kept).expect("rows one and three exist");
+        assert_eq!(compacted.len(), selected.len());
+        for row in 0..compacted.len() {
+            assert_eq!(
+                compacted.row(row).collect::<Vec<_>>(),
+                selected.row(row).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(compacted.column(0).expect("one column").form(), Form::Flat);
+    }
+
+    #[test]
+    fn a_selection_past_the_end_is_caught_by_compacting_too() {
+        let chunk = Chunk::new(vec![integers(&[1, 2])]).expect("two rows");
+        let mut kept = Selection::empty();
+        kept.push(7);
+        let error = chunk.compact(&kept).expect_err("row seven does not exist");
         assert!(error.message().contains("row 7"), "{error}");
     }
 

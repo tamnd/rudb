@@ -406,16 +406,150 @@ impl Vector {
         if let Body::Flat(_) = self.body {
             return Ok(self.clone());
         }
-        let values: Vec<Value> = self.iter().collect();
-        let mut data = empty_data_for(&self.ty)?;
-        for value in &values {
-            push_value(&mut data, value)?;
+        self.copied((0..self.len).collect(), false)
+    }
+
+    /// The values at the given positions, copied, in a form that does not point back at this vector.
+    ///
+    /// This is the copying counterpart to [`Self::dictionary`], and the two are the two halves of
+    /// the decision `spec/07-execution.md` section 7.1 describes. Which half is right is measured
+    /// rather than argued, and [`Chunk::compact`](crate::Chunk::compact) is where the measurement
+    /// is written down.
+    ///
+    /// A dictionary chain is walked to its leaf first and the codes composed on the way down, so the
+    /// copy runs once over the data rather than once per level, and a position that is null at any
+    /// level comes out null here. The copy is a typed loop per physical layout rather than a `Value`
+    /// per row, which is the whole point of it and is what [`Self::flatten`] now goes through too.
+    ///
+    /// # Errors
+    ///
+    /// If the type has no flat layout, which today means the nested types.
+    pub fn gather(&self, indices: &[u32]) -> Result<Self> {
+        self.copied(indices.iter().map(|&index| index as usize).collect(), true)
+    }
+
+    /// The copy both [`Self::gather`] and [`Self::flatten`] are.
+    ///
+    /// `constants_stay` is the one thing the two want differently. A gather of a constant is a
+    /// shorter constant and copying it out would be a thousand writes of the same value for nothing,
+    /// but flattening promises flat form to a caller that is about to read the data slice, so for
+    /// that one the constant has to be written out.
+    fn copied(&self, at: Vec<usize>, constants_stay: bool) -> Result<Self> {
+        let rows = at.len();
+        let (at, leaf) = self.resolve(at);
+        let live: Vec<bool> = at.iter().map(|&index| index != NOWHERE).collect();
+        let validity = Validity::from_run(&live);
+        let body = match &leaf.body {
+            // Every position holds the same value, so the only thing the gather can change is the
+            // length and which positions are null. A gather with no null in it is still a constant.
+            Body::Constant(value) => {
+                if constants_stay && matches!(validity, Validity::AllValid) {
+                    return Ok(Self::constant(self.ty.clone(), value.as_ref().clone(), rows));
+                }
+                let mut data = empty_data_for(&self.ty)?;
+                for &index in &at {
+                    push_value(&mut data, if index == NOWHERE { &Value::Null } else { value })?;
+                }
+                Body::Flat(data)
+            }
+            // A sequence is arithmetic rather than storage, so the gather is the arithmetic done at
+            // the positions asked for, and a null writes the zero every other layout writes.
+            Body::Sequence { start, step } => Body::Flat(Data::Int64(
+                at.iter()
+                    .map(|&index| if index == NOWHERE { 0 } else { start + step * index as i64 })
+                    .collect(),
+            )),
+            // A flat body with no values is the untyped null, so every position asked for is null
+            // whatever was asked for. Going through the copy would build a run of no values and
+            // call it `rows` long, which is a vector whose length and data disagree.
+            Body::Flat(Data::Empty) => {
+                return Ok(Self::constant(self.ty.clone(), Value::Null, rows));
+            }
+            Body::Flat(data) => Body::Flat(copy_of(data, &at)),
+            // Unreachable, because `resolve` stops at the first body that is not a dictionary.
+            Body::Dictionary { .. } => {
+                return Err(Error::internal("a dictionary survived being resolved"));
+            }
+        };
+        Ok(Self { ty: self.ty.clone(), len: rows, validity, body })
+    }
+
+    /// Where each wanted position lives in the first body that is not a dictionary, and that body.
+    ///
+    /// A position that is null anywhere on the way down, or past the end of anything on the way
+    /// down, comes back as [`NOWHERE`]. That single sentinel is what keeps the copy loop from
+    /// carrying a validity mask alongside the positions it is already walking.
+    fn resolve(&self, mut at: Vec<usize>) -> (Vec<usize>, &Self) {
+        let mut source = self;
+        loop {
+            for slot in &mut at {
+                if *slot >= source.len || !source.validity.is_valid(*slot) {
+                    *slot = NOWHERE;
+                }
+            }
+            let Body::Dictionary { codes, values } = &source.body else {
+                return (at, source);
+            };
+            for slot in &mut at {
+                *slot = match codes.get(*slot) {
+                    Some(&code) => code as usize,
+                    None => NOWHERE,
+                };
+            }
+            source = values.as_ref();
         }
-        // Taken from the values rather than from `self.validity`, because a dictionary keeps its
-        // nulls in the vector it points at and its own validity says nothing about them. Reading it
-        // instead of them is how a null survives being selected and then comes out as a zero.
-        let validity = Validity::from_iter(self.len, |index| !values[index].is_null());
-        Ok(Self { ty: self.ty.clone(), len: self.len, validity, body: Body::Flat(data) })
+    }
+}
+
+/// The position of a value that is not anywhere, because it is null or out of range.
+///
+/// `usize::MAX` rather than an `Option<usize>`, because the copy loop's bounds check rejects it for
+/// free and an `Option` would put a second branch next to the one already there.
+const NOWHERE: usize = usize::MAX;
+
+/// A run of data copied at the given positions, with a zero wherever the position is [`NOWHERE`].
+///
+/// A zero and not a skip, because every layout here is a parallel array to a validity mask and a
+/// short one would put every value after the first null at the wrong index. It is the same rule
+/// [`push_value`] follows for a null.
+fn copy_of(data: &Data, at: &[usize]) -> Data {
+    macro_rules! copied {
+        ($values:expr, $variant:path, $zero:expr) => {{
+            let values = $values;
+            let mut out = Vec::with_capacity(at.len());
+            for &index in at {
+                // One bounds check rather than a null test and a bounds check, because `NOWHERE` is
+                // past the end of every slice there can be.
+                out.push(values.get(index).copied().unwrap_or($zero));
+            }
+            $variant(out)
+        }};
+    }
+    match data {
+        Data::Empty => Data::Empty,
+        Data::Bool(values) => copied!(values, Data::Bool, false),
+        Data::Int8(values) => copied!(values, Data::Int8, 0),
+        Data::Int16(values) => copied!(values, Data::Int16, 0),
+        Data::Int32(values) => copied!(values, Data::Int32, 0),
+        Data::Int64(values) => copied!(values, Data::Int64, 0),
+        Data::Int128(values) => copied!(values, Data::Int128, 0),
+        Data::UInt8(values) => copied!(values, Data::UInt8, 0),
+        Data::UInt16(values) => copied!(values, Data::UInt16, 0),
+        Data::UInt32(values) => copied!(values, Data::UInt32, 0),
+        Data::UInt64(values) => copied!(values, Data::UInt64, 0),
+        Data::UInt128(values) => copied!(values, Data::UInt128, 0),
+        Data::Float32(values) => copied!(values, Data::Float32, 0.0),
+        Data::Float64(values) => copied!(values, Data::Float64, 0.0),
+        Data::Interval(values) => copied!(values, Data::Interval, (0, 0, 0)),
+        // The one layout where a gather is a copy of bytes rather than a copy of fixed width slots,
+        // and the reason compaction is a decision rather than a default on a string column.
+        Data::Varlen(values) => {
+            let mut out = StringColumn::with_capacity(at.len());
+            for &index in at {
+                out.push(values.get(index).unwrap_or(""));
+            }
+            Data::Varlen(out)
+        }
     }
 }
 
@@ -820,6 +954,94 @@ mod tests {
         assert_eq!(flat.value_at(0), Value::Null);
         assert_eq!(flat.value_at(1), Value::Integer(3));
         assert_eq!(flat.value_at(2), Value::Null);
+    }
+
+    /// The property that makes `gather` usable at all: it has to be the same function as reading the
+    /// wanted positions one at a time, over every form, or compaction changes answers.
+    #[test]
+    fn gathering_reads_what_reading_one_position_at_a_time_reads() {
+        let mut column = StringColumn::new();
+        column.push("alpha");
+        column.push("beta");
+        column.push("gamma");
+        let cases = [
+            integers(&[10, 20, 30, 40]),
+            integers(&[10, 20, 30, 40]).with_validity(Validity::from_iter(4, |i| i != 2)),
+            Vector::constant(LogicalType::Integer, Value::Integer(9), 4),
+            Vector::sequence(100, -7, 4),
+            Vector::sequence(100, -7, 4).with_validity(Validity::from_iter(4, |i| i % 2 == 0)),
+            Vector::dictionary(
+                vec![2, 0, 1, 2],
+                Vector::flat(LogicalType::Varchar, Data::Varlen(column)).unwrap(),
+            )
+            .unwrap(),
+            Vector::dictionary(
+                vec![1, 0, 1, 0],
+                Vector::from_values(LogicalType::Integer, &[Value::Integer(5), Value::Null])
+                    .unwrap(),
+            )
+            .unwrap(),
+        ];
+        let wanted = [3_u32, 0, 2, 2, 1];
+        for vector in cases {
+            let gathered = vector.gather(&wanted).unwrap();
+            assert_eq!(gathered.len(), wanted.len());
+            assert_eq!(gathered.logical_type(), vector.logical_type());
+            for (slot, &index) in wanted.iter().enumerate() {
+                assert_eq!(
+                    gathered.value_at(slot),
+                    vector.value_at(index as usize),
+                    "slot {slot} of {:?}",
+                    vector.form()
+                );
+            }
+        }
+    }
+
+    /// A gather past the end is not an error, because the selection that produced the indices is
+    /// checked by its caller and the one thing that must not happen here is a read of the wrong
+    /// value. An index nothing answers is null, which is what an outer join pad needs anyway.
+    #[test]
+    fn gathering_a_position_that_is_not_there_is_a_null_and_not_a_wrong_value() {
+        let vector = integers(&[1, 2, 3]);
+        let gathered = vector.gather(&[2, 9]).unwrap();
+        assert_eq!(gathered.value_at(0), Value::Integer(3));
+        assert_eq!(gathered.value_at(1), Value::Null);
+    }
+
+    /// The vector with nothing in it at all, which is what an untyped `NULL` is stored as. Every
+    /// position asked for is past its end, so the answer is nulls and the length has to be the
+    /// length that was asked for rather than the length that was there.
+    #[test]
+    fn gathering_from_a_vector_of_no_values_is_that_many_nulls() {
+        let vector = Vector::flat(LogicalType::Null, Data::Empty).unwrap();
+        let gathered = vector.gather(&[0, 1, 2]).unwrap();
+        assert_eq!(gathered.len(), 3);
+        assert_eq!(gathered.value_at(0), Value::Null);
+        assert_eq!(gathered.value_at(2), Value::Null);
+    }
+
+    /// Every position holds the same value, so a gather with no hole in it has nothing to copy and
+    /// the result is the constant again rather than a run of a thousand copies of it.
+    #[test]
+    fn gathering_a_constant_stays_a_constant() {
+        let vector = Vector::constant(LogicalType::Integer, Value::Integer(4), 100);
+        let gathered = vector.gather(&[7, 7, 99]).unwrap();
+        assert_eq!(gathered.form(), Form::Constant);
+        assert_eq!(gathered.len(), 3);
+        assert_eq!(gathered.value_at(2), Value::Integer(4));
+    }
+
+    /// A dictionary over a dictionary is what a second filter over an already filtered chunk builds,
+    /// and the gather has to walk to the bottom of that chain rather than one step down it.
+    #[test]
+    fn gathering_walks_a_dictionary_over_a_dictionary_to_the_values() {
+        let inner = Vector::dictionary(vec![2, 1, 0], integers(&[7, 8, 9])).unwrap();
+        let outer = Vector::dictionary(vec![1, 2], inner).unwrap();
+        let gathered = outer.gather(&[1, 0]).unwrap();
+        assert_eq!(gathered.form(), Form::Flat);
+        assert_eq!(gathered.value_at(0), Value::Integer(7));
+        assert_eq!(gathered.value_at(1), Value::Integer(8));
     }
 
     #[test]
