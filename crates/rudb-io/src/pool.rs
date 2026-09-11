@@ -22,10 +22,14 @@
 //! read, then scattered back into the per request buffers. Section 5.3 says coalescing is worth
 //! more than concurrency on spinning media and on object storage, where the per request cost
 //! dominates. It is not free: merging two ranges means reading into a scratch buffer and copying
-//! out of it, so where the read is served from the page cache the merge pays a second copy to save
-//! a syscall. Which way that comes out is a fact about a machine, so it is a knob with a
-//! measurement behind it rather than a thing that is always on. `cargo xtask io` is the
-//! measurement.
+//! out of it, plus reading the bytes in the gap and throwing them away. Which way that comes out is
+//! a fact about a machine and about an access pattern, so it is a knob with a measurement behind it
+//! rather than a thing that is always on. `cargo xtask io` is the measurement, and the defaults in
+//! [`Config::local_disk`] say which run of it produced them.
+//!
+//! The short version of that run: cold, coalescing over a small gap is worth nearly two to one on
+//! scattered pages and worth nothing on a sequential scan, and coalescing over a large gap is worth
+//! two to one against you on a column projection. So the gap is small.
 //!
 //! # What this is not
 //!
@@ -65,20 +69,35 @@ pub struct Config {
 impl Config {
     /// The sizing for a local disk.
     ///
-    /// Threads equal to the core count, floored at two and capped at eight. An NVMe device is
-    /// saturated at a queue depth in the tens and a pread that hits the page cache is a memcpy, so
-    /// past a handful of threads the extra ones are contending for the same memory bandwidth the
-    /// execution threads want.
+    /// Every number here came out of `cargo xtask io --cold` on `server3`, which is what that task
+    /// exists for. The warm table is the opposite of the cold one on almost every row, which is the
+    /// reason the cold one is the one that decided this.
     ///
-    /// Coalescing off. On a warm cache the merge trades a saved syscall for a second copy of every
-    /// byte, and the table from `cargo xtask io` is what would change this.
+    /// Threads equal to the core count, floored at two and capped at eight. Cold, on eight cores, a
+    /// batch of scattered reads goes from 2.7 seconds through the loop to 392 milliseconds at eight
+    /// threads, and sixteen threads is 413, inside the spread. Sequential is 204 at eight and 211 at
+    /// sixteen, the same. Eight is where the device saturates and past it the extra threads are
+    /// contending for the memory bandwidth the execution threads want.
+    ///
+    /// Coalescing on, over gaps of sixteen kilobytes. The gap is the whole decision and it is a
+    /// narrow one. Sixteen kilobytes takes a batch of scattered eight kilobyte pages from 413
+    /// milliseconds to 223, nearly twice as fast, and it does it while reading only 1.22 times the
+    /// bytes asked for. Widening it to half a megabyte buys nothing on that pattern that is outside
+    /// the spread, reads 7.03 times the bytes, and costs a column projection dearly: 64 kilobyte
+    /// ranges 448 kilobytes apart go from 60 milliseconds unmerged to 115 merged, because the gaps
+    /// between columns are real and reading them is work. Sixteen kilobytes is small enough to leave
+    /// that pattern alone entirely, which is why it is the number.
+    ///
+    /// The span cap means a sequential scan in one megabyte ranges merges nothing at all, which the
+    /// table confirms: its read count does not move at any gap. That is the intended answer. A one
+    /// megabyte read is already large enough that saving the syscall next to it is not measurable.
     #[must_use]
     pub fn local_disk() -> Self {
         Self {
             threads: cores().clamp(2, 8),
-            coalesce_gap: 0,
+            coalesce_gap: 16 << 10,
             coalesce_span: 1 << 20,
-            coalesce: false,
+            coalesce: true,
         }
     }
 
@@ -594,11 +613,33 @@ mod tests {
     }
 
     #[test]
-    fn coalescing_is_off_on_a_local_disk_and_on_for_an_object_store() {
-        assert!(!Config::local_disk().coalesce);
+    fn both_defaults_coalesce_and_the_local_one_does_it_far_more_narrowly() {
+        // Both merge, because `cargo xtask io --cold` says merging a small gap is worth nearly two
+        // to one on scattered reads even on a local device. The gap is what separates them: a local
+        // disk merges over kilobytes, an object store over hundreds of them, because an object
+        // store request costs a round trip whatever it asks for.
+        assert!(Config::local_disk().coalesce);
         assert!(Config::object_store().coalesce);
+        assert!(Config::object_store().coalesce_gap >= Config::local_disk().coalesce_gap * 8);
         // The sizing difference is the point of there being two, per section 5.3.
         assert!(Config::object_store().threads >= Config::local_disk().threads * 4);
+    }
+
+    #[test]
+    fn the_local_gap_is_too_small_to_swallow_the_space_between_two_columns() {
+        // The row the default was chosen on. 64KiB ranges 448KiB apart is a projection of one
+        // column out of eight, and merging those cold costs two to one, so the default must leave
+        // that pattern alone. This is that claim as an assertion rather than as a paragraph.
+        let pool = Pool::new(Config::local_disk().with_threads(1));
+        let fs = SimFilesystem::new();
+        let handle = fs.open(Path::new("/columns"), OpenMode::Create).unwrap();
+        handle.write_at(0, &vec![7u8; 2 << 20]).unwrap();
+        handle.sync().unwrap();
+        let file = Pooled::new(handle, pool.clone());
+        let requests = (0..4).map(|i| Request::new(i * (512 << 10), 64 << 10)).collect::<Vec<_>>();
+        file.submit(requests).wait().unwrap();
+        assert_eq!(pool.stats().reads, 4, "four columns 448KiB apart are four reads and not one");
+        assert_eq!(pool.stats().read, pool.stats().wanted, "and nothing else was read");
     }
 
     #[test]
