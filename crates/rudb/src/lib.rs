@@ -33,6 +33,14 @@
 //! most of its data from a program rather than from a string of SQL. The DDL statements bind to the
 //! same catalog calls these make.
 //!
+//! # Prepared statements
+//!
+//! [`Database::prepare`] and [`Connection::prepare`] parse a statement once and hand back a
+//! [`Prepared`] that runs with values for its parameters, written `?`, `?1`, `$1` or `$name`. The
+//! statement is bound again for each set of values rather than planned once and filled in, because
+//! an analytical plan depends on what the values are: a scan that keeps one row in a million and a
+//! scan that keeps half the table want different plans, and the binder is cheap next to either.
+//!
 //! # Threading
 //!
 //! A [`Database`] is a handle. Cloning one, or calling [`Database::connect`], gives another handle
@@ -48,6 +56,7 @@
 
 mod connection;
 mod database;
+mod prepared;
 mod result;
 mod statements;
 
@@ -56,5 +65,6 @@ mod tests;
 
 pub use connection::Connection;
 pub use database::Database;
+pub use prepared::Prepared;
 pub use result::QueryResult;
 pub use statements::{Statement, is_complete, statements};

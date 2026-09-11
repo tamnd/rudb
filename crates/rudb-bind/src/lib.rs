@@ -22,11 +22,15 @@
 
 mod binder;
 mod expr;
+mod parameters;
 mod scope;
 mod statement;
 
-pub use binder::{bind, bind_sql};
-pub use statement::{Bound, CreateTable, DropTable, Insert, bind_statement, bind_statement_sql};
+pub use binder::{bind, bind_sql, bind_with};
+pub use parameters::Parameters;
+pub use statement::{
+    Bound, CreateTable, DropTable, Insert, bind_statement, bind_statement_sql, bind_statement_with,
+};
 
 #[cfg(test)]
 mod tests;

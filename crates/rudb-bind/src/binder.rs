@@ -23,6 +23,7 @@ use rudb_parse::{NONE, parse_ast};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey};
 
 use crate::expr::{describe, has_aggregate};
+use crate::parameters::Parameters;
 use crate::scope::{Scope, Visible};
 
 /// Binds a parsed statement against a catalog.
@@ -32,12 +33,21 @@ use crate::scope::{Scope, Visible};
 /// If the script does not hold exactly one statement, if a name does not resolve, if a type does
 /// not work out, or if the query uses something M0 does not bind yet.
 pub fn bind(ast: &Ast, catalog: &Catalog) -> Result<Plan> {
+    bind_with(ast, catalog, &Parameters::new())
+}
+
+/// Binds a parsed query against a catalog, with values for its parameters.
+///
+/// # Errors
+///
+/// Everything [`bind`] reports, plus an error for a parameter that was given no value.
+pub fn bind_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters) -> Result<Plan> {
     let query = match ast.statements.as_slice() {
         [ast::Statement::Query(query)] => *query,
         [] => return Err(Error::binder("no statement to bind")),
         _ => return Err(Error::not_implemented("a script of more than one statement")),
     };
-    let mut binder = Binder::new(catalog);
+    let mut binder = Binder::with(catalog, parameters);
     let (root, _) = binder.bind_query(ast, query)?;
     let mut plan = binder.into_plan();
     plan.set_root(root);
@@ -70,6 +80,8 @@ pub(crate) struct Aggregation {
 #[derive(Debug)]
 pub(crate) struct Binder<'a> {
     catalog: &'a Catalog,
+    /// What the parameters were given, empty for a statement that is not prepared.
+    pub(crate) parameters: &'a Parameters,
     plan: Plan,
     next_index: u32,
     /// Set while a select block aggregates, which changes what a bare column means.
@@ -81,9 +93,10 @@ pub(crate) struct Binder<'a> {
 }
 
 impl<'a> Binder<'a> {
-    pub(crate) fn new(catalog: &'a Catalog) -> Self {
+    pub(crate) fn with(catalog: &'a Catalog, parameters: &'a Parameters) -> Self {
         Self {
             catalog,
+            parameters,
             plan: Plan::new(),
             next_index: 0,
             aggregation: None,
