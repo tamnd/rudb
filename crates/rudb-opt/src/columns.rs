@@ -6,84 +6,67 @@
 //! calls this pass the difference between 20 GB and 200 MB on ClickBench, and it means it literally:
 //! the file is 105 columns wide and the average query in that set names three of them.
 //!
-//! The pass walks down, collects every column each scan is actually read for, narrows the scan's
-//! field list to those, and points the readers at their new positions. Dropping a column moves every
-//! column after it up, so the rewrite of the bindings is not optional and is the only part of this
-//! that can produce a wrong answer rather than a slow one.
+//! The pass walks the plan from the root down, carrying the set of columns each table index is read
+//! for. At a scan it narrows the field list to the columns something above it named, and at a
+//! projection nothing above it reads the whole of, it drops the expressions nobody asked for.
+//! Dropping a column moves every column after it up, so the rewrite of the bindings is not optional
+//! and is the only part of this that can produce a wrong answer rather than a slow one.
+//!
+//! The projection half is what makes a view cost what the file costs. A view expands inline at its
+//! reference, so `SELECT count(*) FROM hits` over `CREATE VIEW hits AS SELECT * FROM
+//! read_parquet(...)` arrives here as a count over a projection of all one hundred and five columns
+//! over a scan of all one hundred and five columns. Narrowing only the scan does nothing there,
+//! because the projection above it reads every one. Measured on the real ClickBench partition on
+//! server2, that count took 3.39 seconds through the projection and 0.009 seconds without it.
 //!
 //! A scan that nothing reads a column of prunes to no columns at all, which is `SELECT count(*)`.
 //! Both scan operators produce chunks that carry a row count and no vectors for that case, and the
 //! Parquet reader in particular then reads no column data whatsoever, which is what makes counting
-//! the rows of a file a footer read.
+//! the rows of a file a footer read. A projection prunes to no expressions the same way and for the
+//! same reason, and passes the row count of its input through.
+//!
+//! What it does not narrow is an aggregate, a `VALUES` list, and either side of a set operation. The
+//! first two are noted where they are skipped. A set operation lines its two sides up by position
+//! rather than binding to them, so narrowing one side without the other would change what the
+//! columns line up with, and narrowing both would take a rule that maps the set operation's own read
+//! set onto each side. That rule is worth writing and is not written here.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 
-/// Narrows every scan in `plan` to the columns something above it reads.
+/// Narrows every scan and every interior projection in `plan` to the columns something above reads.
 ///
-/// Rewrites in place. A plan this has already run over is left alone the second time, because a
-/// scan whose column list is already what is read of it is not changed.
+/// Rewrites in place. A plan this has already run over is left alone the second time, because a node
+/// whose columns are already what is read of it is not changed.
 pub fn prune(plan: &mut Plan) {
-    let nodes = reachable(plan);
-    let exposed = exposed(plan);
-    let exprs = expressions(plan, &nodes);
-
-    let mut read: HashMap<u32, BTreeSet<u32>> = HashMap::new();
-    for &expr in &exprs {
-        if let Expr::Column(binding) = *plan.expr(expr) {
-            read.entry(binding.table).or_default().insert(binding.column);
-        }
-    }
-
-    // Old position to new, per table index, for the scans that lost a column. A scan that kept all
+    let order = top_down(plan);
+    let untouched = untouched(plan, &order);
+    // Old position to new, per table index, for the nodes that lost a column. A node that kept all
     // of them is not in here, so the rebinding walk below skips it without having to compare.
     let mut moved: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &node in &nodes {
-        // A scan whose columns are the query's own output is left alone, because narrowing it
-        // would change the answer rather than the work. The binder always puts a projection on
-        // top, so this is for the plans that come out of `Plan::parse` in the plan tests.
-        if exposed.contains(&node) {
-            continue;
+    let mut read: HashMap<u32, BTreeSet<u32>> = HashMap::new();
+    let mut found = Found::default();
+
+    // Parents before children, which is what makes one walk enough. A node is narrowed to the
+    // columns everything above it reads, so everything above it has to have been read first.
+    for node in order {
+        if !untouched.contains(&node) {
+            narrow(plan, node, &read, &mut moved);
         }
-        let (index, columns) = match *plan.node(node) {
-            Node::Get { index, columns, .. } | Node::TableFunction { index, columns, .. } => {
-                (index, columns)
+        let mark = found.order.len();
+        expressions(plan, node, &mut found);
+        for &expr in &found.order[mark..] {
+            if let Expr::Column(binding) = *plan.expr(expr) {
+                read.entry(binding.table).or_default().insert(binding.column);
             }
-            _ => continue,
-        };
-        let empty = BTreeSet::new();
-        let wanted = read.get(&index).unwrap_or(&empty);
-        let held = plan.field_list(columns).len();
-        if wanted.len() == held {
-            continue;
         }
-        let kept: Vec<_> = wanted
-            .iter()
-            .filter_map(|&at| plan.field_list(columns).get(at as usize).cloned())
-            .collect();
-        // A binding that points past the end of the scan is a malformed plan, and pruning is not
-        // where that gets reported. Leaving the scan alone keeps this pass out of the way of
-        // `Plan::validate`, which says so with the node number.
-        if kept.len() != wanted.len() {
-            continue;
-        }
-        let mut positions = vec![0; held];
-        for (new, &old) in wanted.iter().enumerate() {
-            positions[old as usize] = new as u32;
-        }
-        let narrowed = plan.add_fields(&kept);
-        match plan.node_mut(node) {
-            Node::Get { columns, .. } | Node::TableFunction { columns, .. } => *columns = narrowed,
-            _ => unreachable!("the node was one of these two a moment ago"),
-        }
-        moved.insert(index, positions);
     }
 
     if moved.is_empty() {
         return;
     }
-    for &expr in &exprs {
+    for &expr in &found.order {
         let Expr::Column(binding) = *plan.expr(expr) else { continue };
         let Some(positions) = moved.get(&binding.table) else { continue };
         let to = positions[binding.column as usize];
@@ -91,14 +74,99 @@ pub fn prune(plan: &mut Plan) {
     }
 }
 
-/// Every node the root reaches, which is every node a run would touch.
+/// Narrow one node to what `read` says is read of it, recording where its columns moved to.
+///
+/// A node whose bindings point past the end of what it holds is a malformed plan, and pruning is not
+/// where that gets reported. Leaving it alone keeps this pass out of the way of [`Plan::validate`],
+/// which says so with the node number.
+fn narrow(
+    plan: &mut Plan,
+    node: NodeRef,
+    read: &HashMap<u32, BTreeSet<u32>>,
+    moved: &mut HashMap<u32, Vec<u32>>,
+) {
+    let empty = BTreeSet::new();
+    match *plan.node(node) {
+        // A `VALUES` list keeps its columns on purpose rather than by omission. The rows are already
+        // in the plan, so narrowing one saves reading nothing and would cost a rewrite of every row.
+        // An aggregate keeps its own on purpose too: an aggregate nobody reads the result of is a
+        // shape the binder does not build, and dropping one would drop whatever it counted.
+        Node::Get { index, columns, .. } | Node::TableFunction { index, columns, .. } => {
+            let wanted = read.get(&index).unwrap_or(&empty);
+            let held = plan.field_list(columns).len();
+            if wanted.len() == held {
+                return;
+            }
+            let kept: Vec<_> = wanted
+                .iter()
+                .filter_map(|&at| plan.field_list(columns).get(at as usize).cloned())
+                .collect();
+            if kept.len() != wanted.len() {
+                return;
+            }
+            let narrowed = plan.add_fields(&kept);
+            match plan.node_mut(node) {
+                Node::Get { columns, .. } | Node::TableFunction { columns, .. } => {
+                    *columns = narrowed;
+                }
+                _ => unreachable!("the node was one of these two a moment ago"),
+            }
+            moved.insert(index, positions(wanted, held));
+        }
+        Node::Project { index, exprs, names, .. } => {
+            let wanted = read.get(&index).unwrap_or(&empty);
+            let held = plan.expr_list(exprs).len();
+            if wanted.len() == held {
+                return;
+            }
+            let kept: Vec<_> = wanted
+                .iter()
+                .filter_map(|&at| plan.expr_list(exprs).get(at as usize).copied())
+                .collect();
+            let labels: Vec<_> = wanted
+                .iter()
+                .filter_map(|&at| plan.name_list(names).get(at as usize).copied())
+                .collect();
+            if kept.len() != wanted.len() || labels.len() != wanted.len() {
+                return;
+            }
+            let narrowed = plan.add_expr_list(&kept);
+            let renamed = plan.add_name_list(&labels);
+            match plan.node_mut(node) {
+                Node::Project { exprs, names, .. } => {
+                    *exprs = narrowed;
+                    *names = renamed;
+                }
+                _ => unreachable!("the node was a projection a moment ago"),
+            }
+            moved.insert(index, positions(wanted, held));
+        }
+        _ => {}
+    }
+}
+
+/// Where each of `held` columns ends up once everything outside `wanted` is dropped.
+///
+/// The columns that stay keep the order the node had them in rather than the order the query named
+/// them in, which for a scan is the difference between reading a Parquet file forwards and seeking
+/// back and forth through it. The entries for the dropped columns are never read, since nothing
+/// binds to a column that was dropped for not being bound to.
+fn positions(wanted: &BTreeSet<u32>, held: usize) -> Vec<u32> {
+    let mut positions = vec![0; held];
+    for (new, &old) in wanted.iter().enumerate() {
+        positions[old as usize] = new as u32;
+    }
+    positions
+}
+
+/// Every node the root reaches, parents before children.
 ///
 /// Not every node in the arena. A rewrite that replaced a node leaves the old one behind, and a
 /// column read only by something unreachable is a column nothing reads.
-fn reachable(plan: &Plan) -> Vec<NodeRef> {
+fn top_down(plan: &Plan) -> Vec<NodeRef> {
     let mut found = Vec::new();
-    let mut pending = vec![plan.root()];
-    while let Some(node) = pending.pop() {
+    let mut pending = VecDeque::from([plan.root()]);
+    while let Some(node) = pending.pop_front() {
         if found.contains(&node) {
             continue;
         }
@@ -108,14 +176,22 @@ fn reachable(plan: &Plan) -> Vec<NodeRef> {
     found
 }
 
-/// The nodes whose columns reach the query's output unchanged.
+/// The nodes this pass leaves alone, for either of the two reasons there are.
 ///
-/// The root, and then down through every operator that passes its input's columns through. Both
-/// sides of a join are in it, since a join's output is both of them. The walk stops at the first
-/// operator that introduces columns of its own, which is a projection, an aggregate or a set
-/// operation, because from there up the scan's columns are that operator's business and not the
-/// answer's.
-fn exposed(plan: &Plan) -> HashSet<NodeRef> {
+/// The first is that the node's columns are the query's own output, where narrowing would change
+/// the answer rather than the work. That is the root, and then down through every operator that
+/// passes its input's columns through. Both sides of a join are in it, since a join's output is both
+/// of them. The walk stops at the first operator that introduces columns of its own, because from
+/// there up those columns are that operator's business and not the answer's. The binder always puts
+/// a projection on top, so the scans this reaches are the ones that come out of [`Plan::parse`] in
+/// the plan tests.
+///
+/// The second is that the node feeds a set operation. Nothing binds to either side of one, because
+/// a set operation lines its sides up by position and produces an index of its own, so a pass that
+/// went by what is bound would narrow both sides to nothing and answer a `UNION ALL` with no columns
+/// at all. Every side of every reachable set operation is in here for that reason and not because of
+/// where it sits.
+fn untouched(plan: &Plan, order: &[NodeRef]) -> HashSet<NodeRef> {
     let mut found = HashSet::new();
     let mut pending = vec![plan.root()];
     while let Some(node) = pending.pop() {
@@ -127,38 +203,40 @@ fn exposed(plan: &Plan) -> HashSet<NodeRef> {
         }
         pending.extend(plan.node(node).children().into_iter().flatten());
     }
+    for &node in order {
+        if let Node::SetOp { left, right, .. } = *plan.node(node) {
+            found.insert(left);
+            found.insert(right);
+        }
+    }
     found
 }
 
-/// Every expression those nodes hold, operands included, each one once.
-fn expressions(plan: &Plan, nodes: &[NodeRef]) -> Vec<ExprRef> {
-    let mut found = Found::default();
-    for &node in nodes {
-        match *plan.node(node) {
-            Node::Get { .. } | Node::Dummy | Node::SetOp { .. } | Node::CrossProduct { .. } => {}
-            Node::Values { rows, .. } => {
-                for &row in plan.row_list(rows) {
-                    list(plan, row, &mut found);
-                }
+/// Every expression one node holds, operands included, each one once.
+fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
+    match *plan.node(node) {
+        Node::Get { .. } | Node::Dummy | Node::SetOp { .. } | Node::CrossProduct { .. } => {}
+        Node::Values { rows, .. } => {
+            for &row in plan.row_list(rows) {
+                list(plan, row, found);
             }
-            Node::TableFunction { args, .. } => list(plan, args, &mut found),
-            Node::Filter { predicate, .. } => walk(plan, predicate, &mut found),
-            Node::Project { exprs, .. } => list(plan, exprs, &mut found),
-            Node::Aggregate { groups, aggregates, .. } => {
-                list(plan, groups, &mut found);
-                list(plan, aggregates, &mut found);
-            }
-            Node::Sort { keys, .. } => {
-                for key in plan.sort_key_list(keys) {
-                    walk(plan, key.expr, &mut found);
-                }
-            }
-            Node::Limit { .. } => {}
-            Node::Distinct { on, .. } => list(plan, on, &mut found),
-            Node::Join { conditions, .. } => list(plan, conditions, &mut found),
         }
+        Node::TableFunction { args, .. } => list(plan, args, found),
+        Node::Filter { predicate, .. } => walk(plan, predicate, found),
+        Node::Project { exprs, .. } => list(plan, exprs, found),
+        Node::Aggregate { groups, aggregates, .. } => {
+            list(plan, groups, found);
+            list(plan, aggregates, found);
+        }
+        Node::Sort { keys, .. } => {
+            for key in plan.sort_key_list(keys) {
+                walk(plan, key.expr, found);
+            }
+        }
+        Node::Limit { .. } => {}
+        Node::Distinct { on, .. } => list(plan, on, found),
+        Node::Join { conditions, .. } => list(plan, conditions, found),
     }
-    found.order
 }
 
 /// The expressions found so far, and which they are.
@@ -316,6 +394,41 @@ mod tests {
         let before = "Project #1 [upper(CASE WHEN (#0.2::INTEGER > 3::INTEGER)::BOOLEAN THEN #0.0::VARCHAR ELSE ''::VARCHAR END::VARCHAR)::VARCHAR AS a]\n  Get memory.main.t AS t #0 [a::VARCHAR, b::VARCHAR, c::INTEGER]\n";
         let after = "Project #1 [upper(CASE WHEN (#0.1::INTEGER > 3::INTEGER)::BOOLEAN THEN #0.0::VARCHAR ELSE ''::VARCHAR END::VARCHAR)::VARCHAR AS a]\n  Get memory.main.t AS t #0 [a::VARCHAR, c::INTEGER]\n";
         assert_eq!(pruned(before), after);
+    }
+
+    #[test]
+    fn a_projection_in_the_middle_loses_the_expressions_nothing_above_it_reads() {
+        // The shape a view arrives in, and the one narrowing scans alone does nothing for. The
+        // inner projection is the view's `SELECT *`, and until it loses `a` and `c` the scan under
+        // it has to keep them, because the projection reads them.
+        let before = "Project #2 [#1.1::VARCHAR AS b]\n  Project #1 [#0.0::INTEGER AS a, #0.1::VARCHAR AS b, #0.2::INTEGER AS c]\n    Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR, c::INTEGER]\n";
+        let after = "Project #2 [#1.0::VARCHAR AS b]\n  Project #1 [#0.0::VARCHAR AS b]\n    Get memory.main.t AS t #0 [b::VARCHAR]\n";
+        assert_eq!(pruned(before), after);
+    }
+
+    #[test]
+    fn counting_the_rows_through_a_projection_reads_no_columns_either() {
+        // `SELECT count(*) FROM hits` where `hits` is a view over the file. Measured on the real
+        // ClickBench partition on server2, this is 3.39 seconds before and 0.009 seconds after.
+        let before = "Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n  Project #1 [#0.0::INTEGER AS a, #0.1::VARCHAR AS b]\n    Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR]\n";
+        let after = "Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n  Project #1 []\n    Get memory.main.t AS t #0 []\n";
+        assert_eq!(pruned(before), after);
+    }
+
+    #[test]
+    fn pruning_a_projection_twice_is_pruning_it_once() {
+        let before = "Project #2 [#1.1::VARCHAR AS b]\n  Project #1 [#0.0::INTEGER AS a, #0.1::VARCHAR AS b]\n    Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR]\n";
+        let once = pruned(before);
+        assert_eq!(pruned(&once), once);
+    }
+
+    #[test]
+    fn neither_side_of_a_set_operation_is_narrowed() {
+        // A set operation lines its sides up by position and nothing binds to either side's index,
+        // so a pass that went by what is bound would narrow both of them to nothing and answer a
+        // `UNION ALL` with no columns at all.
+        let text = "Aggregate #3 groups=[] aggregates=[count_star()::BIGINT]\n  SetOp UNION ALL #2\n    Get memory.main.t AS t #0 [a::INTEGER]\n    Get memory.main.u AS u #1 [x::INTEGER]\n";
+        assert_eq!(pruned(text), text);
     }
 
     #[test]

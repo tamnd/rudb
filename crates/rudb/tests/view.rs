@@ -183,6 +183,26 @@ fn writing_to_a_view_is_refused_in_the_binarys_own_grammar() {
 }
 
 #[test]
+fn a_query_through_a_view_reads_the_columns_it_names_and_not_the_ones_the_body_lists() {
+    // The reason a view expands inline instead of becoming a node. What the binder hands over is a
+    // hundred columns wide when the view says `SELECT *`, and what runs has to be as narrow as the
+    // query. On the real ClickBench partition this is the difference between 3.39 seconds and 0.009
+    // seconds for the count, because a scan of no columns is a read of the Parquet footer.
+    let database = ran(&[
+        "CREATE TABLE t (a INTEGER, b VARCHAR, c INTEGER)",
+        "CREATE VIEW v AS SELECT * FROM t",
+    ]);
+    assert_eq!(
+        database.plan("SELECT COUNT(*) FROM v").expect("a plan"),
+        "Project #3 [#2.0::BIGINT AS \"count_star()\"]\n  Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n    Project #1 []\n      Get memory.main.t AS t #0 []\n"
+    );
+    assert_eq!(
+        database.plan("SELECT b FROM v WHERE c > 1").expect("a plan"),
+        "Project #2 [#1.0::VARCHAR AS b]\n  Filter (#1.1::INTEGER > 1::INTEGER)::BOOLEAN\n    Project #1 [#0.0::VARCHAR AS b, #0.1::INTEGER AS c]\n      Get memory.main.t AS t #0 [b::VARCHAR, c::INTEGER]\n"
+    );
+}
+
+#[test]
 fn a_view_over_a_parquet_file_runs_the_published_benchmark_sql_unmodified() {
     // The point of the whole feature. These four are ClickBench q1, q2, q3 and q5 as published,
     // character for character, semicolons and all, and the only thing that makes them run against
