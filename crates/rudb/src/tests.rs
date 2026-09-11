@@ -317,6 +317,45 @@ fn the_integers_the_benchmark_stores_become_the_dates_the_benchmark_queries() {
     );
 }
 
+/// `SELECT * REPLACE`, which is the other half of that recipe.
+///
+/// The entry loads the file with one `SELECT * REPLACE (...)` over `read_parquet` rather than by
+/// listing all hundred and five columns, so the star has to keep every column it stood for, in
+/// order, with the replaced ones substituted in place. The name comes from the replace list and not
+/// from the table, which only shows when the two are spelled with different case.
+#[test]
+fn a_star_can_replace_some_of_what_it_stands_for() {
+    let db = Database::new();
+    db.create_table(
+        "hits",
+        vec![
+            Field::new("EventDate", LogicalType::Integer),
+            Field::new("UserID", LogicalType::BigInt),
+        ],
+    )
+    .unwrap();
+    db.append("hits", &[vec![Value::Integer(days_from_civil(2013, 7, 15)), Value::BigInt(7)]])
+        .unwrap();
+    let result =
+        db.query("SELECT * REPLACE (make_date(EventDate) AS eventdate) FROM hits").unwrap();
+    assert_eq!(result.names(), &["eventdate", "UserID"]);
+    assert_eq!(
+        result.rows().collect::<Vec<_>>(),
+        vec![vec![Value::Date(days_from_civil(2013, 7, 15)), Value::BigInt(7)]]
+    );
+    // A qualified star takes one too, and the replacement is an ordinary expression that can read
+    // any column in scope and not only the one it is replacing.
+    assert_eq!(
+        rows(&db, "SELECT hits.* REPLACE (UserID + 1 AS UserID) FROM hits"),
+        vec![vec![Value::Integer(days_from_civil(2013, 7, 15)), Value::BigInt(8)]]
+    );
+    assert_eq!(
+        failure(&db, "SELECT * REPLACE (nope + 1 AS nope) FROM hits"),
+        "Column \"nope\" in REPLACE list not found in FROM clause Candidate bindings: \
+         \"EventDate\", \"UserID\""
+    );
+}
+
 /// The part is a string wherever it came from, and a specifier that names nothing is DuckDB's
 /// message rather than a panic in a match arm.
 #[test]
