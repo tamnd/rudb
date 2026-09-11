@@ -198,6 +198,7 @@ version = "0.2.4"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
+ "rudb-regex",
  "rudb-vector",
 ]
 
@@ -231,6 +232,13 @@ dependencies = [
 
 [[package]]
 name = "rudb-plan"
+version = "0.2.4"
+dependencies = [
+ "rudb-common",
+]
+
+[[package]]
+name = "rudb-regex"
 version = "0.2.4"
 dependencies = [
  "rudb-common",

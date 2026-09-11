@@ -52,6 +52,7 @@ use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
 use crate::datetime::Part;
 use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
+use crate::regexp;
 use crate::shape::{first, identity, nulls_of, single};
 
 /// Calls a scalar function on a batch.
@@ -111,6 +112,9 @@ fn specialized<V: AsRef<Vector>>(
     returns: &LogicalType,
     rows: usize,
 ) -> Result<Option<Vector>> {
+    if regexp::is_regexp(name) {
+        return regexp::vectorized(name, args, returns, rows);
+    }
     match args {
         [only] => unary(name, only.as_ref(), returns, rows),
         [left, right] => binary(name, left.as_ref(), right.as_ref(), returns, rows),
@@ -124,7 +128,7 @@ fn specialized<V: AsRef<Vector>>(
 /// Division by zero is the reason for the return value. It is the one thing in this file that turns
 /// a valid input into a null output, so the driver has to be able to hear about it, and collecting
 /// the indices costs nothing at all on the overwhelmingly common path where there are none.
-fn over_valid(
+pub(crate) fn over_valid(
     len: usize,
     base: Validity,
     mut body: impl FnMut(usize) -> Result<bool>,
@@ -159,7 +163,11 @@ fn over_valid(
 }
 
 /// The result vector, with the layout check that `Vector::flat` does kept rather than skipped.
-fn finish(returns: &LogicalType, data: Data, validity: Validity) -> Result<Option<Vector>> {
+pub(crate) fn finish(
+    returns: &LogicalType,
+    data: Data,
+    validity: Validity,
+) -> Result<Option<Vector>> {
     Ok(Some(Vector::flat(returns.clone(), data)?.with_validity(validity)))
 }
 
@@ -317,7 +325,7 @@ fn fold_of(
 /// through 6, so this is the shape a string producing kernel has to take rather than the shape
 /// [`over_valid`] takes. A null pushes the empty string, which is what `Vector::from_values` writes
 /// under a null and is therefore what keeps a specialized result equal to the oracle's.
-fn each_string(
+pub(crate) fn each_string(
     rows: usize,
     base: &Validity,
     mut body: impl FnMut(usize, &mut StringColumn),
@@ -1115,6 +1123,7 @@ pub fn call_values(name: &str, args: &[Value], returns: &LogicalType) -> Result<
         ("~~*", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, true))),
         ("!~~*", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, true))),
         ("date_part" | "date_trunc", [spec, when]) => date_value(name, spec, when),
+        (_, [_, _, ..]) if regexp::is_regexp(name) => regexp::value(name, args),
         _ => Err(Error::not_implemented(format!(
             "the {name} function with {} arguments",
             args.len()
