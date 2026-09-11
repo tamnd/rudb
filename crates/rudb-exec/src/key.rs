@@ -12,13 +12,20 @@
 //! IEEE, and because a `DISTINCT` that emits NaN twice is a result that changes with the order the
 //! rows arrived in.
 
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use rudb_common::Value;
 
 /// A row of values compared and hashed the way SQL groups rows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Key(pub(crate) Vec<Value>);
+
+/// A map from a row to whatever is being counted about it.
+pub(crate) type RowMap<V> = HashMap<Key, V, BuildHasherDefault<Digest>>;
+
+/// A set of rows, which is what duplicate elimination and `DISTINCT` inside an aggregate both are.
+pub(crate) type RowSet = HashSet<Key, BuildHasherDefault<Digest>>;
 
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
@@ -34,6 +41,84 @@ impl Hash for Key {
         for value in &self.0 {
             hash_value(value, state);
         }
+    }
+}
+
+/// The hasher a table of rows is built on.
+///
+/// The standard library's default is SipHash, which is chosen to survive an attacker who gets to
+/// pick the keys. Nobody picks the keys of a group by: they are the rows of a table that is already
+/// on this machine, and the cost of the choice is paid on every one of them. A group by over a
+/// hundred million rows hashes a hundred million times and SipHash is several times the price of
+/// what is here, which is a multiply and a rotate per word.
+///
+/// The multiply leaves the entropy in the high bits and the standard table buckets on the low ones,
+/// so [`Hasher::finish`] spreads them back before handing the value over. Without that last step a
+/// key whose words differ only near the top lands in one bucket and the table degenerates into a
+/// list.
+///
+/// This is not a defence against a chosen key. A query that groups on a column somebody else filled
+/// can be made to collide, and the answer to that is a limit on what one query may take, which the
+/// memory budget already is, rather than a hash nobody can predict.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Digest(u64);
+
+/// An odd constant with a well spread bit pattern, which is all the multiply asks of it.
+const ODD: u64 = 0x517c_c1b7_2722_0a95;
+
+impl Digest {
+    /// Folds one word into the running value.
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(ODD);
+    }
+}
+
+impl Hasher for Digest {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            self.mix(u64::from_le_bytes(word.try_into().unwrap_or([0; 8])));
+        }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut last = [0; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.mix(u64::from_le_bytes(last));
+        }
+        self.mix(bytes.len() as u64);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.mix(u64::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.mix(u64::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.mix(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        self.mix(value as u64);
+        self.mix((value >> 64) as u64);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.mix(value as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        let mut spread = self.0;
+        spread ^= spread >> 32;
+        spread = spread.wrapping_mul(ODD);
+        spread ^= spread >> 29;
+        spread
     }
 }
 
@@ -94,13 +179,11 @@ fn canonical(number: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::hash_map::DefaultHasher;
-
     use super::*;
 
     /// One key's hash, which is what the map buckets on and therefore what has to agree with `eq`.
     fn digest(key: &Key) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = Digest::default();
         key.hash(&mut hasher);
         hasher.finish()
     }
@@ -159,6 +242,31 @@ mod tests {
             assert_eq!(left, right, "{left:?} and {right:?} should group together");
             assert_eq!(digest(&left), digest(&right), "{left:?} hashes apart from {right:?}");
         }
+    }
+
+    /// The standard table takes the bucket from the low bits of the hash, and a multiply pushes
+    /// what it mixed towards the high ones. A key that only ever differs near the top is what a
+    /// `BIGINT` column of identifiers looks like, and without the spreading step in `finish` every
+    /// one of these lands in the same bucket and the table stops being a table.
+    #[test]
+    fn keys_that_differ_only_in_their_high_bits_land_in_different_buckets() {
+        let buckets = 1024;
+        let mut taken = HashSet::new();
+        for step in 0..64i64 {
+            let value = Value::BigInt((step + 1) << 40);
+            taken.insert(digest(&key(&[value])) % buckets);
+        }
+        assert!(taken.len() > 55, "64 keys landed in {} of {buckets} buckets", taken.len());
+    }
+
+    /// The order of the columns is part of the key, or `GROUP BY a, b` would put `(1, 2)` and
+    /// `(2, 1)` in one group whenever the two columns hold each other's values.
+    #[test]
+    fn the_same_values_in_a_different_order_are_a_different_key() {
+        let forwards = key(&[Value::Integer(1), Value::Integer(2)]);
+        let backwards = key(&[Value::Integer(2), Value::Integer(1)]);
+        assert_ne!(forwards, backwards);
+        assert_ne!(digest(&forwards), digest(&backwards));
     }
 
     /// Two decimals that print the same and are stored differently are two values, and the general

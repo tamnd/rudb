@@ -478,6 +478,29 @@ impl Vector {
         }
     }
 
+    /// The text at `index`, borrowed rather than copied.
+    ///
+    /// [`Self::value_at`] on a `VARCHAR` column allocates a `String` per call, and a group by that
+    /// reads a string column keys on one string per input row. This hands back the bytes where they
+    /// already are, so a caller with somewhere to put them does not go to the allocator at all.
+    ///
+    /// `None` for a null, for an index past the end, for a column that is not `VARCHAR`, and for the
+    /// constant and sequence forms, whose values are not stored per position. A caller that gets
+    /// `None` has to fall back to [`Self::value_at`], which is correct for all of those.
+    #[must_use]
+    pub fn text_at(&self, index: usize) -> Option<&str> {
+        if self.ty != LogicalType::Varchar || index >= self.len || !self.validity.is_valid(index) {
+            return None;
+        }
+        match &self.body {
+            Body::Flat(data) => data.str_at(index),
+            Body::Dictionary { codes, values } => {
+                values.text_at(usize::try_from(*codes.get(index)?).ok()?)
+            }
+            _ => None,
+        }
+    }
+
     /// Every value in order, as single values.
     pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
         (0..self.len).map(|index| self.value_at(index))
@@ -1163,6 +1186,55 @@ mod tests {
         assert_eq!(vector.logical_type(), &LogicalType::Varchar);
         assert_eq!(vector.value_at(2), Value::Varchar("green".into()));
         assert_eq!(vector.len(), 4);
+    }
+
+    /// The accessor a group by keys a string column through, which has to agree with `value_at` on
+    /// every position or two rows holding one string end up in two groups.
+    #[test]
+    fn text_is_read_where_it_already_is_for_the_forms_that_store_it() {
+        let mut column = StringColumn::new();
+        column.push("red");
+        column.push("green");
+        column.push("");
+        let flat = Vector::flat(LogicalType::Varchar, Data::Varlen(column)).unwrap();
+        for index in 0..flat.len() {
+            assert_eq!(flat.text_at(index).map(str::to_string), text_of(&flat.value_at(index)));
+        }
+        let dictionary = Vector::dictionary(vec![1, 0, 1, 2], flat).unwrap();
+        for index in 0..dictionary.len() {
+            assert_eq!(
+                dictionary.text_at(index).map(str::to_string),
+                text_of(&dictionary.value_at(index))
+            );
+        }
+        assert_eq!(dictionary.text_at(4), None, "past the end");
+    }
+
+    /// The forms and types that have no text to hand back, which a caller answers by falling back
+    /// to `value_at`. A blob is the one that would be a correctness bug rather than a slow path,
+    /// since its bytes are not required to be text and it is not a `VARCHAR` either way.
+    #[test]
+    fn text_is_refused_where_it_is_not_stored_as_itself() {
+        let nulls =
+            Vector::from_values(LogicalType::Varchar, &[Value::Varchar("red".into()), Value::Null])
+                .unwrap();
+        assert_eq!(nulls.text_at(0), Some("red"));
+        assert_eq!(nulls.text_at(1), None, "a null has no text");
+        let constant = Vector::constant(LogicalType::Varchar, Value::Varchar("red".into()), 3);
+        assert_eq!(constant.text_at(0), None, "a constant is not stored per position");
+        assert_eq!(integers(&[1, 2]).text_at(0), None, "an integer is not text");
+        let mut bytes = StringColumn::new();
+        bytes.push("red");
+        let blob = Vector::flat(LogicalType::Blob, Data::Varlen(bytes)).unwrap();
+        assert_eq!(blob.text_at(0), None, "a blob is not a varchar");
+    }
+
+    /// The text of a value, for comparing `text_at` against `value_at` position by position.
+    fn text_of(value: &Value) -> Option<String> {
+        match value {
+            Value::Varchar(text) => Some(text.clone()),
+            _ => None,
+        }
     }
 
     #[test]
