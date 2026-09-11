@@ -1,9 +1,12 @@
 //! The catalog: attached databases, their schemas, and the tables in them.
 
+use std::fmt;
+
 use rudb_common::{Error, Field, Result};
 
 use crate::name::{QualifiedName, same_name};
 use crate::table::Table;
+use crate::view::View;
 
 /// The default attached database, which is the one an in-memory session gets.
 pub const DEFAULT_CATALOG: &str = "memory";
@@ -31,14 +34,43 @@ impl Database {
     }
 }
 
+/// What a name in a schema turned out to be.
+///
+/// Tables and views share one namespace, so a lookup that only asked about tables would answer that
+/// `v` does not exist when what is true is that `v` is a view. Every message that tells those two
+/// apart is spelled with this, and the spelling is the binary's: `Table` and `View`, capitalised,
+/// in sentences such as `Existing object v is of type View, trying to drop type Table`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    /// A table, which holds rows.
+    Table,
+    /// A view, which holds a query.
+    View,
+}
+
+impl fmt::Display for Entry {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.write_str(match self {
+            Self::Table => "Table",
+            Self::View => "View",
+        })
+    }
+}
+
 /// One schema.
 #[derive(Debug, Clone)]
 pub struct Schema {
     name: String,
     tables: Vec<Table>,
+    views: Vec<View>,
 }
 
 impl Schema {
+    /// A schema of that name with nothing in it.
+    fn empty(name: &str) -> Self {
+        Self { name: name.to_string(), tables: Vec::new(), views: Vec::new() }
+    }
+
     /// The schema name.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -49,6 +81,23 @@ impl Schema {
     #[must_use]
     pub fn tables(&self) -> &[Table] {
         &self.tables
+    }
+
+    /// The views in it.
+    #[must_use]
+    pub fn views(&self) -> &[View] {
+        &self.views
+    }
+
+    /// What a name in this schema is, if it is anything.
+    fn kind(&self, name: &str) -> Option<Entry> {
+        if self.tables.iter().any(|held| same_name(&held.name().table, name)) {
+            return Some(Entry::Table);
+        }
+        if self.views.iter().any(|held| same_name(&held.name().table, name)) {
+            return Some(Entry::View);
+        }
+        None
     }
 }
 
@@ -82,7 +131,7 @@ impl Catalog {
         Self {
             databases: vec![Database {
                 name: DEFAULT_CATALOG.to_string(),
-                schemas: vec![Schema { name: DEFAULT_SCHEMA.to_string(), tables: Vec::new() }],
+                schemas: vec![Schema::empty(DEFAULT_SCHEMA)],
             }],
             default_catalog: DEFAULT_CATALOG.to_string(),
             default_schema: DEFAULT_SCHEMA.to_string(),
@@ -118,7 +167,7 @@ impl Catalog {
         }
         self.databases.push(Database {
             name: name.to_string(),
-            schemas: vec![Schema { name: DEFAULT_SCHEMA.to_string(), tables: Vec::new() }],
+            schemas: vec![Schema::empty(DEFAULT_SCHEMA)],
         });
         Ok(())
     }
@@ -133,7 +182,7 @@ impl Catalog {
         if database.schemas.iter().any(|held| same_name(&held.name, name)) {
             return Err(Error::catalog(format!("Schema with name \"{name}\" already exists!")));
         }
-        database.schemas.push(Schema { name: name.to_string(), tables: Vec::new() });
+        database.schemas.push(Schema::empty(name));
         Ok(())
     }
 
@@ -141,18 +190,34 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// If the database or the schema is missing, if a table of that name is already there, or if
-    /// two columns have the same name.
+    /// If the database or the schema is missing, if a table or a view of that name is already
+    /// there, or if two columns have the same name.
     pub fn create_table(&mut self, name: QualifiedName, columns: Vec<Field>) -> Result<()> {
         let table = Table::new(name.clone(), columns)?;
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
-        if schema.tables.iter().any(|held| same_name(&held.name().table, &name.table)) {
-            return Err(Error::catalog(format!(
-                "Table with name \"{}\" already exists!",
-                name.table
-            )));
+        if schema.kind(&name.table).is_some() {
+            return Err(taken(Entry::Table, &name.table));
         }
         schema.tables.push(table);
+        Ok(())
+    }
+
+    /// Creates a view.
+    ///
+    /// The body is not checked here. Whether it binds is the binder's question and it is asked
+    /// before this is called, because a view that cannot bind is refused at creation.
+    ///
+    /// # Errors
+    ///
+    /// If the database or the schema is missing, or if a table or a view of that name is already
+    /// there.
+    pub fn create_view(&mut self, view: View) -> Result<()> {
+        let name = view.name().clone();
+        let schema = self.schema_mut(&name.catalog, &name.schema)?;
+        if schema.kind(&name.table).is_some() {
+            return Err(taken(Entry::View, &name.table));
+        }
+        schema.views.push(view);
         Ok(())
     }
 
@@ -160,16 +225,64 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// If there is no such table.
+    /// If there is no such table, or if the name is a view, which is a different sentence because
+    /// it is a different mistake.
     pub fn drop_table(&mut self, name: &QualifiedName) -> Result<()> {
+        self.drop_entry(name, Entry::Table)
+    }
+
+    /// Removes a view.
+    ///
+    /// # Errors
+    ///
+    /// If there is no such view, or if the name is a table.
+    pub fn drop_view(&mut self, name: &QualifiedName) -> Result<()> {
+        self.drop_entry(name, Entry::View)
+    }
+
+    /// Removes whichever of the two the caller said it was dropping, refusing the other one.
+    fn drop_entry(&mut self, name: &QualifiedName, wanted: Entry) -> Result<()> {
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
-        match schema.tables.iter().position(|held| same_name(&held.name().table, &name.table)) {
-            Some(at) => {
-                schema.tables.remove(at);
+        match schema.kind(&name.table) {
+            None => Err(missing_table(&name.table)),
+            Some(found) if found != wanted => Err(Error::catalog(format!(
+                "Existing object {} is of type {found}, trying to drop type {wanted}",
+                name.table
+            ))),
+            Some(Entry::Table) => {
+                schema.tables.retain(|held| !same_name(&held.name().table, &name.table));
                 Ok(())
             }
-            None => Err(missing_table(&name.table)),
+            Some(Entry::View) => {
+                schema.views.retain(|held| !same_name(&held.name().table, &name.table));
+                Ok(())
+            }
         }
+    }
+
+    /// What a full name is, if it is anything.
+    ///
+    /// # Errors
+    ///
+    /// If the database, the schema, or the name itself is missing.
+    pub fn entry(&self, name: &QualifiedName) -> Result<Entry> {
+        self.schema(&name.catalog, &name.schema)?
+            .kind(&name.table)
+            .ok_or_else(|| missing_table(&name.table))
+    }
+
+    /// A view by its full name.
+    ///
+    /// # Errors
+    ///
+    /// If the database, the schema or the view is missing.
+    pub fn view(&self, name: &QualifiedName) -> Result<&View> {
+        let schema = self.schema(&name.catalog, &name.schema)?;
+        schema
+            .views
+            .iter()
+            .find(|held| same_name(&held.name().table, &name.table))
+            .ok_or_else(|| missing_table(&name.table))
     }
 
     /// A table by its full name.
@@ -201,7 +314,7 @@ impl Catalog {
             .ok_or_else(|| missing_table(&table))
     }
 
-    /// Turns the parts of a written name into the full name of a table that exists.
+    /// Turns the parts of a written name into the full name of a table or a view that exists.
     ///
     /// One part is a table in the default schema. Three parts are a catalog, a schema and a table.
     /// Two parts are the interesting case: they are a schema and a table if the first part names a
@@ -214,13 +327,14 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// If the name has no parts or more than three, or if it does not resolve to a table.
+    /// If the name has no parts or more than three, or if it does not resolve to either.
     pub fn resolve(&self, parts: &[&str]) -> Result<QualifiedName> {
         let candidates = self.candidates(parts)?;
         let mut first_error = None;
         for candidate in &candidates {
-            match self.table(candidate) {
-                Ok(table) => return Ok(table.name().clone()),
+            match self.entry(candidate) {
+                Ok(Entry::Table) => return Ok(self.table(candidate)?.name().clone()),
+                Ok(Entry::View) => return Ok(self.view(candidate)?.name().clone()),
                 // The first reading is the preferred one, so its complaint is the one that names
                 // the piece the writer most likely meant and got wrong.
                 Err(error) => first_error = first_error.or(Some(error)),
@@ -309,11 +423,22 @@ fn missing_table(name: &str) -> Error {
     Error::catalog(format!("Table with name {name} does not exist!"))
 }
 
+/// The error for creating something over a name that is already taken.
+///
+/// The type in the sentence is the one being created rather than the one already there, which reads
+/// backwards and is what the binary says. `CREATE TABLE v` over an existing view `v` is `Table with
+/// name "v" already exists!` and `CREATE VIEW t` over an existing table `t` is `View with name "t"
+/// already exists!`, both measured against duckdb v1.5.1.
+fn taken(wanted: Entry, name: &str) -> Error {
+    Error::catalog(format!("{wanted} with name \"{name}\" already exists!"))
+}
+
 #[cfg(test)]
 mod tests {
     use rudb_common::LogicalType;
 
     use super::*;
+    use crate::view::View;
 
     fn with_hits() -> Catalog {
         let mut catalog = Catalog::new();
@@ -425,6 +550,67 @@ mod tests {
         let catalog = Catalog::new();
         let error = catalog.resolve(&["a", "b", "c", "d"]).expect_err("four parts");
         assert!(error.message().contains("4 parts"), "{error}");
+    }
+
+    fn with_view() -> Catalog {
+        let mut catalog = with_hits();
+        catalog
+            .create_view(View::new(
+                QualifiedName::new("memory", "main", "recent"),
+                "SELECT * FROM hits".to_string(),
+                Vec::new(),
+            ))
+            .expect("a view in the default schema");
+        catalog
+    }
+
+    #[test]
+    fn a_view_resolves_the_way_a_table_does() {
+        let catalog = with_view();
+        let name = catalog.resolve(&["RECENT"]).expect("the view, whatever the case");
+        assert_eq!(name.to_string(), "memory.main.recent");
+        assert_eq!(catalog.entry(&name).expect("it is there"), Entry::View);
+        assert_eq!(catalog.view(&name).expect("the body").sql(), "SELECT * FROM hits");
+    }
+
+    #[test]
+    fn the_two_share_one_namespace_and_the_message_names_what_was_being_made() {
+        let mut catalog = with_view();
+        let error = catalog
+            .create_table(
+                QualifiedName::new("memory", "main", "recent"),
+                vec![Field::new("n", LogicalType::Integer)],
+            )
+            .expect_err("recent is a view");
+        assert_eq!(error.to_string(), "Catalog Error: Table with name \"recent\" already exists!");
+
+        let error = catalog
+            .create_view(View::new(
+                QualifiedName::new("memory", "main", "HITS"),
+                "SELECT 1".to_string(),
+                Vec::new(),
+            ))
+            .expect_err("hits is a table");
+        assert_eq!(error.to_string(), "Catalog Error: View with name \"HITS\" already exists!");
+    }
+
+    #[test]
+    fn dropping_one_as_the_other_names_both_types() {
+        let mut catalog = with_view();
+        let view = catalog.resolve(&["recent"]).expect("the view");
+        let error = catalog.drop_table(&view).expect_err("it is a view");
+        assert_eq!(
+            error.to_string(),
+            "Catalog Error: Existing object recent is of type View, trying to drop type Table"
+        );
+        let table = catalog.resolve(&["hits"]).expect("the table");
+        let error = catalog.drop_view(&table).expect_err("it is a table");
+        assert_eq!(
+            error.to_string(),
+            "Catalog Error: Existing object hits is of type Table, trying to drop type View"
+        );
+        catalog.drop_view(&view).expect("dropping it as what it is");
+        assert!(catalog.resolve(&["recent"]).is_err(), "it is gone");
     }
 
     #[test]

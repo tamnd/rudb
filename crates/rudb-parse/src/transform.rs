@@ -22,9 +22,9 @@ use std::collections::HashMap;
 use rudb_common::{Error, Result};
 
 use crate::ast::{
-    Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, Distinct, DropTable, Expr, ExprRef, Insert,
-    JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Select,
-    SelectRef, SetOp, Slice, Source, SourceRef, Statement, StrRef, Target, UnaryOp,
+    Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, CreateView, Distinct, DropTable, Expr, ExprRef,
+    Insert, JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef,
+    Select, SelectRef, SetOp, Slice, Source, SourceRef, Statement, StrRef, Target, UnaryOp,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -285,17 +285,28 @@ impl<'a> Transform<'a> {
 
     /// `CreateStatement <- 'CREATE' OrReplace? Temporary? CreateStatementVariation`.
     ///
-    /// Of the nine variations, `CreateTableStmt` is the one that is done. The other eight are a
-    /// view, a macro, a sequence, a type, a schema, an index, a secret and a trigger, and each of
-    /// them is a catalog entry this database has no room for yet.
+    /// Of the nine variations, `CreateTableStmt` and `CreateViewStmt` are the ones that are done.
+    /// The other seven are a macro, a sequence, a type, a schema, an index, a secret and a trigger,
+    /// and each of them is a catalog entry this database has no room for yet.
     fn create_statement(&mut self, node: u32) -> Result<Statement> {
         let or_replace = self.find(node, "OrReplace") != NONE;
         let temporary = self.find(node, "Temporary") != NONE;
         let variation = self.find(node, "CreateStatementVariation");
         let inner = self.first(variation);
-        if self.name(inner) != "CreateTableStmt" {
-            return self.unsupported(inner);
+        match self.name(inner) {
+            "CreateTableStmt" => self.create_table_statement(inner, or_replace, temporary),
+            "CreateViewStmt" => self.create_view_statement(inner, or_replace, temporary),
+            _ => self.unsupported(inner),
         }
+    }
+
+    /// `CreateTableStmt <- 'TABLE' IfNotExists? QualifiedName CreateTableDefinition`.
+    fn create_table_statement(
+        &mut self,
+        inner: u32,
+        or_replace: bool,
+        temporary: bool,
+    ) -> Result<Statement> {
         let name = self.name_parts(self.find(inner, "QualifiedName"));
         let if_not_exists = self.find(inner, "IfNotExists") != NONE;
         let definition = self.find(inner, "CreateTableDefinition");
@@ -315,6 +326,55 @@ impl<'a> Transform<'a> {
             temporary,
         });
         Ok(Statement::CreateTable(index))
+    }
+
+    /// `CreateViewStmt <- CreateSecure? CreateRecursive? 'VIEW' IfNotExists? QualifiedName
+    /// InsertColumnList? WithList? 'AS' SelectStatementInternal`.
+    ///
+    /// The body is transformed here as well as kept as text. Transforming it is what makes a view
+    /// whose body does not parse a parse error at creation, which is where it belongs, and the text
+    /// is what the catalog keeps so that the body can be bound again at every reference.
+    fn create_view_statement(
+        &mut self,
+        inner: u32,
+        or_replace: bool,
+        temporary: bool,
+    ) -> Result<Statement> {
+        for kid in self.kids(inner) {
+            // `SECURE` is a column and row policy, `RECURSIVE` is a different shape of view
+            // entirely, and `WITH` carries options. Dropping any of the three silently would make a
+            // view that is not the view that was asked for.
+            if matches!(self.name(kid), "CreateSecure" | "CreateRecursive" | "WithList") {
+                return self.unsupported(kid);
+            }
+        }
+        let name = self.name_parts(self.find(inner, "QualifiedName"));
+        let if_not_exists = self.find(inner, "IfNotExists") != NONE;
+        let list = self.find(inner, "InsertColumnList");
+        let columns = if list == NONE {
+            Slice::default()
+        } else {
+            let mut parts = Vec::new();
+            for kid in self.kids(self.find(list, "ColumnList")) {
+                parts.push(self.identifier(kid));
+            }
+            self.part_slice(parts)
+        };
+        let body = self.find(inner, "SelectStatementInternal");
+        let sql = self.text(body).to_string();
+        let sql = self.intern(&sql);
+        let query = self.query(body)?;
+        let index = self.ast.create_views.len() as u32;
+        self.ast.create_views.push(CreateView {
+            name,
+            columns,
+            query,
+            sql,
+            if_not_exists,
+            or_replace,
+            temporary,
+        });
+        Ok(Statement::CreateView(index))
     }
 
     /// `CreateColumnList <- Parens(CreateTableColumnList?) PartitionSortedOptions? WithList?`.
@@ -411,7 +471,8 @@ impl<'a> Transform<'a> {
     /// `DropStatement <- 'DROP' DropEntries DropBehavior?`.
     ///
     /// `DropTable <- TableOrView IfExists? List(BaseTableName)`, and `TableOrView` covers `VIEW`
-    /// and `MATERIALIZED VIEW` as well as `TABLE`, so it is checked rather than assumed.
+    /// and `MATERIALIZED VIEW` as well as `TABLE`, so it is checked rather than assumed. The first
+    /// two are done and a materialized view is not a thing this database has.
     fn drop_statement(&mut self, node: u32) -> Result<Statement> {
         if self.find(node, "DropBehavior") != NONE {
             return self.unsupported(self.find(node, "DropBehavior"));
@@ -422,9 +483,11 @@ impl<'a> Transform<'a> {
             return self.unsupported(inner);
         }
         let kind = self.find(inner, "TableOrView");
-        if self.name(self.first(kind)) != "CommentTable" {
-            return self.unsupported(kind);
-        }
+        let view = match self.name(self.first(kind)) {
+            "CommentTable" => false,
+            "CommentView" => true,
+            _ => return self.unsupported(kind),
+        };
         let if_exists = self.find(inner, "IfExists") != NONE;
         let mut names = Vec::new();
         for kid in self.kids(inner) {
@@ -434,7 +497,7 @@ impl<'a> Transform<'a> {
         }
         let names = self.name_list_slice(names);
         let index = self.ast.drop_tables.len() as u32;
-        self.ast.drop_tables.push(DropTable { names, if_exists });
+        self.ast.drop_tables.push(DropTable { names, if_exists, view });
         Ok(Statement::DropTable(index))
     }
 
@@ -1931,9 +1994,29 @@ mod tests {
                 }
                 out
             }
+            Statement::CreateView(index) => {
+                let create = ast.create_view(index);
+                let mut out = "CREATE".to_string();
+                if create.or_replace {
+                    out += " OR REPLACE";
+                }
+                if create.temporary {
+                    out += " TEMPORARY";
+                }
+                out += " VIEW";
+                if create.if_not_exists {
+                    out += " IF NOT EXISTS";
+                }
+                out += &format!(" {}", ast.name_text(create.name));
+                if !create.columns.is_empty() {
+                    let columns = ast.name(create.columns).collect::<Vec<_>>().join(", ");
+                    out += &format!(" ({columns})");
+                }
+                out + &format!(" AS {}", show_query(&ast, create.query))
+            }
             Statement::DropTable(index) => {
                 let drop = ast.drop_table(index);
-                let mut out = "DROP TABLE".to_string();
+                let mut out = if drop.view { "DROP VIEW" } else { "DROP TABLE" }.to_string();
                 if drop.if_exists {
                     out += " IF EXISTS";
                 }
@@ -2000,16 +2083,42 @@ mod tests {
     }
 
     #[test]
+    fn a_create_view_carries_its_body_twice_over() {
+        assert_eq!(
+            round_statement("CREATE VIEW v AS SELECT a FROM u"),
+            "CREATE VIEW v AS SELECT a FROM u"
+        );
+        assert_eq!(
+            round_statement("CREATE OR REPLACE VIEW main.v (x, y) AS SELECT a, b FROM u"),
+            "CREATE OR REPLACE VIEW main.v (x, y) AS SELECT a, b FROM u"
+        );
+        // The text the catalog keeps is the body and only the body, so that binding it again is
+        // binding a query rather than a `CREATE` statement.
+        let ast = parse_ast("CREATE VIEW v (x) AS SELECT a FROM u WHERE a > 1").expect("parses");
+        let Statement::CreateView(index) = ast.statements[0] else {
+            panic!("not a create view");
+        };
+        assert_eq!(ast.string(ast.create_view(index).sql), "SELECT a FROM u WHERE a > 1");
+    }
+
+    #[test]
+    fn a_drop_view_is_not_a_drop_table() {
+        assert_eq!(round_statement("DROP VIEW IF EXISTS a, b"), "DROP VIEW IF EXISTS a, b");
+        assert_eq!(round_statement("DROP TABLE a"), "DROP TABLE a");
+    }
+
+    #[test]
     fn a_drop_table_is_a_list_of_qualified_names() {
         assert_eq!(round_statement("DROP TABLE t"), "DROP TABLE t");
         assert_eq!(round_statement("DROP TABLE IF EXISTS a, b.c"), "DROP TABLE IF EXISTS a, b.c");
     }
 
     #[test]
-    fn dropping_something_that_is_not_a_table_is_refused() {
-        // `TableOrView` covers `VIEW` and `MATERIALIZED VIEW` as well, and a view dropped as if it
-        // were a table is a wrong answer rather than a missing feature.
-        let error = parse_ast("DROP VIEW v").unwrap_err().to_string();
+    fn dropping_something_that_is_neither_a_table_nor_a_view_is_refused() {
+        // `TableOrView` covers `MATERIALIZED VIEW` as well, which is not a thing this database has,
+        // and dropping one as if it were an ordinary view is a wrong answer rather than a missing
+        // feature.
+        let error = parse_ast("DROP MATERIALIZED VIEW v").unwrap_err().to_string();
         assert!(error.starts_with("Not implemented Error"), "{error}");
     }
 
