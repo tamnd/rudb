@@ -18,6 +18,10 @@
 //! chosen point, and models the thing that actually happens on a crash: writes that were not
 //! separated by an `fsync` can land in any combination.
 //!
+//! [`Request`] and [`Completion`], which are how a caller states every read it wants in one call
+//! instead of one at a time. `spec/engine/05-scan.md` section 5.3 has the argument and
+//! [`submit`] has the details.
+//!
 //! # What is not here yet
 //!
 //! Direct I/O, io_uring, the thread pool backend and object storage. `spec/05-storage.md` sections
@@ -37,6 +41,7 @@
 
 pub mod real;
 pub mod sim;
+pub mod submit;
 
 use std::fmt::Debug;
 use std::path::Path;
@@ -44,7 +49,8 @@ use std::path::Path;
 use rudb_common::Result;
 
 pub use real::RealFilesystem;
-pub use sim::{Crash, Op, SimFilesystem};
+pub use sim::{Completions, Crash, Op, SimFilesystem};
+pub use submit::{Completion, Filler, Request, Response};
 
 /// How a file is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +91,31 @@ pub trait File: Debug + Send + Sync {
     ///
     /// If the underlying read fails.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
+
+    /// States every read the caller wants and hands back something to wait on or poll.
+    ///
+    /// This is the interface a scan is written against, per `spec/engine/05-scan.md` section 5.3.
+    /// A row group scan knows all of its byte ranges before it reads any of them, so it says all of
+    /// them at once, and a backend that hears all of them at once can issue them concurrently and
+    /// can coalesce the adjacent ones. Neither is available to a caller that asks one range at a
+    /// time, which is the whole reason the method exists.
+    ///
+    /// The default here is the loop over [`Self::read_at`], so every backend has a correct
+    /// implementation from the moment it exists and a backend with a real queue underneath it
+    /// overrides this rather than being the only thing that works. A failed read fails that one
+    /// request and leaves the rest of the batch alone, because the caller may well be able to
+    /// answer the query from what did arrive, and in any case it is the caller that knows.
+    fn submit(&self, requests: Vec<Request>) -> Completion {
+        let (completion, filler) = Completion::pending(requests.len());
+        for (index, request) in requests.into_iter().enumerate() {
+            let offset = request.offset();
+            let mut buf = request.into_buffer();
+            let outcome =
+                self.read_at(offset, &mut buf).map(|read| Response::new(index, offset, read, buf));
+            filler.finish(index, outcome);
+        }
+        completion
+    }
 
     /// Reads exactly `buf.len()` bytes starting at `offset`.
     ///

@@ -32,6 +32,19 @@
 //! essentially every device this will run on, and a larger one is decomposed by the caller into
 //! block sized writes, so the interesting reordering is between writes rather than inside one.
 //!
+//! # The read side
+//!
+//! Writes were the whole story while the only thing above this layer was a writer. A reader arrived
+//! at M2d and it has its own three failures, listed in the test gate on the sub-milestone issue:
+//! short reads, reordered completions and an error part way through a batch. All three are
+//! injectable here, through [`SimFilesystem::short_read_at`], [`SimFilesystem::fail_read_at`] and
+//! [`SimFilesystem::complete`], and all three are deterministic, which is the point of doing it
+//! here rather than by unplugging a disk.
+//!
+//! Reads are not in the operation log and do not move the failure point indices, so a crash test
+//! written before any of this still enumerates the same points. They are counted separately, by
+//! [`SimFilesystem::reads_served`], and the read faults are addressed by that counter.
+//!
 //! [`sync`]: crate::File::sync
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,6 +53,7 @@ use std::sync::{Arc, Mutex};
 
 use rudb_common::{Error, Result};
 
+use crate::submit::{Completion, Request, Response};
 use crate::{File, Filesystem, OpenMode};
 
 /// One recorded operation.
@@ -181,6 +195,38 @@ fn apply(bytes: &mut Vec<u8>, change: &Change) {
     }
 }
 
+/// The order a batch handed to `submit` comes back in.
+///
+/// A reader that only ever works because the answers arrived in the order it asked for them is a
+/// reader that works on a warm page cache and breaks on the first machine where two reads take
+/// different amounts of time. Which is every machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Completions {
+    /// In submission order, which is the boring case and the default.
+    #[default]
+    InOrder,
+    /// Last submitted first. Cheap, deterministic, and it catches a caller that reads the first
+    /// response before checking which request it answers.
+    Reversed,
+    /// A deterministic shuffle from this seed, so a failing run is rerunnable from the seed alone.
+    Shuffled(u64),
+}
+
+/// What the simulation has been told to do to the reads.
+#[derive(Debug, Default)]
+struct ReadFaults {
+    /// How many reads have been served since this filesystem was made. The faults below are
+    /// addressed by this number, so a test says which read it wants to break rather than having to
+    /// reach the file handle that will serve it.
+    served: u64,
+    /// Reads that come back with fewer bytes than were asked for, and how many bytes they give.
+    short: BTreeMap<u64, usize>,
+    /// Reads that come back as an error.
+    failing: BTreeSet<u64>,
+    /// The order a submitted batch is completed in.
+    order: Completions,
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     files: BTreeMap<PathBuf, SimFile>,
@@ -189,6 +235,7 @@ struct Inner {
     next_seq: u64,
     /// The index in the log at which one operation is made to fail.
     fail_at: Option<usize>,
+    reads: ReadFaults,
 }
 
 impl Inner {
@@ -204,6 +251,64 @@ impl Inner {
             return Err(Error::io(format!("injected failure at operation {index}")));
         }
         Ok(())
+    }
+
+    /// Serves one read, applying whatever fault was addressed at this read.
+    ///
+    /// The read is counted before anything else can go wrong with it, so an injected failure on
+    /// read seven does not shift what read eight is.
+    fn serve_read(&mut self, path: &Path, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let number = self.reads.served;
+        self.reads.served += 1;
+        let failing = self.reads.failing.remove(&number);
+        let short = self.reads.short.remove(&number);
+        if failing {
+            return Err(Error::io(format!("injected read failure on read {number}")));
+        }
+        let file = self
+            .files
+            .get(path)
+            .ok_or_else(|| Error::io(format!("{} was removed while open", path.display())))?;
+        let bytes = file.visible();
+        let start = offset as usize;
+        if start >= bytes.len() {
+            return Ok(0);
+        }
+        let mut n = buf.len().min(bytes.len() - start);
+        if let Some(cap) = short {
+            n = n.min(cap);
+        }
+        buf[..n].copy_from_slice(&bytes[start..start + n]);
+        Ok(n)
+    }
+}
+
+/// Permutes a batch of finished reads into the order the simulation says they came back in.
+///
+/// The reads themselves are served in submission order whatever this says, so that the numbering
+/// the read faults are addressed by does not depend on the completion order. Only the order the
+/// caller hears about them in changes, which is the thing being tested.
+fn reorder<T>(outcomes: &mut [T], order: Completions) {
+    match order {
+        Completions::InOrder => {}
+        Completions::Reversed => outcomes.reverse(),
+        Completions::Shuffled(seed) => {
+            // SplitMix64, written out because it is nine lines and the workspace has no
+            // dependencies. Any deterministic generator would do; this one is the one with the
+            // shortest description that passes the tests people run on generators.
+            let mut state = seed;
+            let mut next = move || {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^ (z >> 31)
+            };
+            for i in (1..outcomes.len()).rev() {
+                let j = (next() % (i as u64 + 1)) as usize;
+                outcomes.swap(i, j);
+            }
+        }
     }
 }
 
@@ -268,6 +373,46 @@ impl SimFilesystem {
         self.lock().fail_at = None;
     }
 
+    /// How many reads have been served since this filesystem was made.
+    ///
+    /// This is the number the read faults below are addressed by, and it is also the byte counting
+    /// hook's coarser sibling: a reader that reads a row group it should have pruned makes more
+    /// reads than one that does not, and the count says so whatever the answer was.
+    #[must_use]
+    pub fn reads_served(&self) -> u64 {
+        self.lock().reads.served
+    }
+
+    /// Makes read number `read` come back with `len` bytes rather than the length asked for.
+    ///
+    /// A short read is not an error, it is a short read, and the reason it is worth injecting is
+    /// that a decoder which treats a returned buffer as full reads whatever was in the buffer
+    /// before, which is a wrong answer and not a crash.
+    pub fn short_read_at(&self, read: u64, len: usize) {
+        self.lock().reads.short.insert(read, len);
+    }
+
+    /// Makes read number `read` fail.
+    ///
+    /// Once, like [`Self::fail_at`], and for the same reason: the interesting question is whether
+    /// the caller survives one failure, not whether it survives a disk that is gone.
+    pub fn fail_read_at(&self, read: u64) {
+        self.lock().reads.failing.insert(read);
+    }
+
+    /// Sets the order a batch handed to `submit` comes back in.
+    pub fn complete(&self, order: Completions) {
+        self.lock().reads.order = order;
+    }
+
+    /// Cancels every injected read fault and puts completions back in submission order.
+    pub fn clear_read_faults(&self) {
+        let mut inner = self.lock();
+        inner.reads.short.clear();
+        inner.reads.failing.clear();
+        inner.reads.order = Completions::InOrder;
+    }
+
     /// The writes that have been issued and not made durable, as sequence numbers with their file.
     ///
     /// These are the numbers [`Crash::Keeping`] takes. The order is the order they were issued in,
@@ -310,6 +455,7 @@ impl SimFilesystem {
                 log: Vec::new(),
                 next_seq: 0,
                 fail_at: None,
+                reads: ReadFaults::default(),
             })),
         }
     }
@@ -412,16 +558,25 @@ impl SimHandle {
 
 impl File for SimHandle {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let inner = self.fs.lock();
-        let file = inner.files.get(&self.path).ok_or_else(|| self.missing())?;
-        let bytes = file.visible();
-        let start = offset as usize;
-        if start >= bytes.len() {
-            return Ok(0);
+        self.fs.lock().serve_read(&self.path, offset, buf)
+    }
+
+    fn submit(&self, requests: Vec<Request>) -> Completion {
+        let (completion, filler) = Completion::pending(requests.len());
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for (index, request) in requests.into_iter().enumerate() {
+            let offset = request.offset();
+            let mut buf = request.into_buffer();
+            let outcome =
+                self.read_at(offset, &mut buf).map(|read| Response::new(index, offset, read, buf));
+            outcomes.push((index, outcome));
         }
-        let n = buf.len().min(bytes.len() - start);
-        buf[..n].copy_from_slice(&bytes[start..start + n]);
-        Ok(n)
+        let order = self.fs.lock().reads.order;
+        reorder(&mut outcomes, order);
+        for (index, outcome) in outcomes {
+            filler.finish(index, outcome);
+        }
+        completion
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
@@ -474,7 +629,8 @@ impl File for SimHandle {
 mod tests {
     use std::path::Path;
 
-    use super::{Crash, Op, SimFilesystem};
+    use super::{Completions, Crash, Op, SimFilesystem};
+    use crate::submit::{Request, Response};
     use crate::{Filesystem, OpenMode};
 
     fn write_two_unsynced(fs: &SimFilesystem) {
@@ -648,5 +804,118 @@ mod tests {
         fs.clear_log();
         assert_eq!(fs.op_count(), 0);
         assert_eq!(fs.durable_contents(Path::new("/db")).unwrap(), b"kept".to_vec());
+    }
+
+    /// Sixteen bytes of `abcdefghijklmnop`, which is short enough to read in an assertion.
+    fn alphabet(fs: &SimFilesystem) -> Box<dyn crate::File> {
+        let file = fs.open(Path::new("/data"), OpenMode::Create).unwrap();
+        file.write_at(0, b"abcdefghijklmnop").unwrap();
+        file.sync().unwrap();
+        file
+    }
+
+    #[test]
+    fn a_submitted_batch_comes_back_whole_and_in_submission_order() {
+        let fs = SimFilesystem::new();
+        let file = alphabet(&fs);
+        let responses = file
+            .submit(vec![Request::new(0, 4), Request::new(8, 4), Request::new(4, 4)])
+            .wait()
+            .unwrap();
+        let bytes: Vec<&[u8]> = responses.iter().map(Response::bytes).collect();
+        assert_eq!(bytes, [b"abcd", b"ijkl", b"efgh"]);
+        assert_eq!(fs.reads_served(), 3);
+    }
+
+    #[test]
+    fn reordered_completions_still_say_which_request_they_answer() {
+        // The failure this is aimed at is a caller that takes the first response to arrive and
+        // assumes it is the first page it asked for. In order the bug is invisible.
+        let fs = SimFilesystem::new();
+        let file = alphabet(&fs);
+        fs.complete(Completions::Reversed);
+        let mut completion = file.submit(vec![Request::new(0, 4), Request::new(4, 4)]);
+        let first = completion.take().unwrap().unwrap();
+        assert_eq!(first.index(), 1);
+        assert_eq!(first.bytes(), b"efgh");
+        assert_eq!(completion.take().unwrap().unwrap().index(), 0);
+        assert!(completion.take().is_none());
+    }
+
+    #[test]
+    fn a_shuffle_is_the_same_shuffle_every_time_for_a_seed() {
+        let order = |seed| {
+            let fs = SimFilesystem::new();
+            let file = alphabet(&fs);
+            fs.complete(Completions::Shuffled(seed));
+            let mut completion =
+                file.submit((0..8).map(|i| Request::new(i * 2, 2)).collect::<Vec<_>>());
+            let mut seen = Vec::new();
+            while let Some(response) = completion.take() {
+                seen.push(response.unwrap().index());
+            }
+            seen
+        };
+        assert_eq!(order(7), order(7), "the same seed is the same run");
+        assert_ne!(order(7), order(8), "and a different one is a different run");
+        let mut sorted = order(7);
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..8).collect::<Vec<_>>(), "every request is answered exactly once");
+    }
+
+    #[test]
+    fn an_injected_short_read_is_short_and_is_not_an_error() {
+        let fs = SimFilesystem::new();
+        let file = alphabet(&fs);
+        fs.short_read_at(1, 2);
+        let responses = file.submit(vec![Request::new(0, 4), Request::new(4, 4)]).wait().unwrap();
+        assert!(!responses[0].is_short());
+        assert!(responses[1].is_short());
+        assert_eq!(responses[1].bytes(), b"ef");
+        // Once. The next read at the same offset is whole again, because the question is whether
+        // the caller survives one short read rather than whether it survives a broken disk.
+        assert_eq!(file.read_at(4, &mut [0u8; 4]).unwrap(), 4);
+    }
+
+    #[test]
+    fn an_error_part_way_through_a_batch_leaves_the_rest_of_the_batch_alone() {
+        let fs = SimFilesystem::new();
+        let file = alphabet(&fs);
+        fs.fail_read_at(1);
+        let mut completion =
+            file.submit(vec![Request::new(0, 4), Request::new(4, 4), Request::new(8, 4)]);
+        let mut answered = 0;
+        let mut failed = 0;
+        while let Some(outcome) = completion.take() {
+            match outcome {
+                Ok(_) => answered += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        assert_eq!((answered, failed), (2, 1));
+    }
+
+    #[test]
+    fn a_failed_read_does_not_shift_which_read_the_next_fault_lands_on() {
+        let fs = SimFilesystem::new();
+        let file = alphabet(&fs);
+        fs.fail_read_at(0);
+        fs.short_read_at(1, 1);
+        let responses = file.submit(vec![Request::new(0, 4), Request::new(4, 4)]);
+        let mut outcomes = responses;
+        let first = outcomes.take().unwrap();
+        let second = outcomes.take().unwrap();
+        assert!(first.is_err());
+        assert_eq!(second.unwrap().bytes(), b"e");
+    }
+
+    #[test]
+    fn read_at_and_a_batch_of_one_are_the_same_read() {
+        let fs = SimFilesystem::new();
+        let file = alphabet(&fs);
+        let mut buf = [0u8; 5];
+        file.read_exact_at(3, &mut buf).unwrap();
+        let batched = file.submit(vec![Request::new(3, 5)]).wait().unwrap();
+        assert_eq!(batched[0].bytes(), &buf);
     }
 }
