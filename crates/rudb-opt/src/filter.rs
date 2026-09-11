@@ -56,9 +56,12 @@
 //! filter run over them. Writing the better plan for the slower operator is how a pass makes a query
 //! slower while looking correct, so this waits for #211.
 //!
-//! What is not here is the rule that turns an outer join into an inner one when the predicate above
-//! it would have thrown away every padded row anyway. That needs the null rejecting analysis, which
-//! is its own item in #102 and its own pull request.
+//! Before any of that, the join is asked what kind of join it really is. An outer join exists to
+//! produce rows padded with nulls, so a predicate above it that cannot be true of a padded row turns
+//! it into a join that never made them. `crate::nulls` is that question and it runs first, because
+//! the answer decides which sides `kept` says may be pushed into: a left join that becomes an inner
+//! join in the same visit takes the predicate that converted it straight into the side it could not
+//! have been pushed into a moment earlier.
 //!
 //! # Predicates nobody wrote
 //!
@@ -90,7 +93,7 @@ use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 
 use crate::pass::{Context, Pass};
 use crate::tables::{TableSet, Tables, produced};
-use crate::{transitive, walk};
+use crate::{nulls, transitive, walk};
 
 /// Moves every predicate as far down the plan as it can go.
 #[derive(Debug, Clone, Copy)]
@@ -200,8 +203,9 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         // the join hands that side's rows on as they are. What is left over reads both sides, and
         // for an inner join a condition and a filter above it mean the same thing, so it becomes a
         // condition and runs while the pairs are being built rather than after.
-        Node::Join { left, right, kind, conditions } => {
+        Node::Join { left, right, kind: written, conditions } => {
             let below = (produced(plan, left), produced(plan, right));
+            let kind = nulls::narrow(plan, written, &pending, (&below.0, &below.1));
             let held = plan.expr_list(conditions).to_vec();
             let (extra_left, extra_right) =
                 transitive::across(plan, tables, kind, &held, &pending, (&below.0, &below.1));
@@ -223,6 +227,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             let above = if rebuilt_left == left
                 && rebuilt_right == right
                 && rebuilt_conditions == conditions
+                && kind == written
             {
                 at
             } else {
@@ -593,9 +598,12 @@ Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER = #1.1::
     #[test]
     fn only_the_kept_side_of_an_outer_join_takes_a_predicate() {
         // The left side of a LEFT join comes out as it went in. The right side comes out padded with
-        // nulls, and a predicate that ran before the padding saw a different row.
+        // nulls, and a predicate that ran before the padding saw a different row. The predicate over
+        // `b` here is `b.a IS NULL`, which is the one shape that wants the padded rows and so the
+        // one that leaves the join a left join, since anything else over that side would make it an
+        // inner join through `crate::nulls`.
         let before = "\
-Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN
+Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER IS NOT DISTINCT FROM NULL::\"NULL\")::BOOLEAN)::BOOLEAN
   Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
     Get memory.main.t AS a #0 [a::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER]
@@ -604,7 +612,7 @@ Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::
         // filter is the copy of the second that the join's equality implies, which may go into `b`
         // even though a predicate may not, for the reason `crate::transitive::droppable` gives.
         let after = "\
-Filter (#1.0::INTEGER = 2::INTEGER)::BOOLEAN
+Filter (#1.0::INTEGER IS NOT DISTINCT FROM NULL::\"NULL\")::BOOLEAN
   Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
     Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
       Get memory.main.t AS a #0 [a::INTEGER]
@@ -617,9 +625,11 @@ Filter (#1.0::INTEGER = 2::INTEGER)::BOOLEAN
     #[test]
     fn a_predicate_over_both_sides_of_an_outer_join_stays_above_it() {
         // An outer join's condition decides which rows are padded, so moving a filter into it would
-        // pad the rows the filter refused instead of dropping them.
+        // pad the rows the filter refused instead of dropping them. `IS NOT DISTINCT FROM` rather
+        // than `=`, because an equality over the padded side is null over a padded row and would
+        // make this an inner join through `crate::nulls`, where this one is true of two nulls.
         let text = "\
-Filter (#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN
+Filter (#0.0::INTEGER IS NOT DISTINCT FROM #1.0::INTEGER)::BOOLEAN
   Join LEFT on=[(#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN]
     Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
@@ -630,7 +640,7 @@ Filter (#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN
     #[test]
     fn a_full_outer_join_takes_nothing_and_neither_does_a_positional_one() {
         let full = "\
-Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
+Filter (#0.0::INTEGER IS NOT DISTINCT FROM NULL::\"NULL\")::BOOLEAN
   Join FULL on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
     Get memory.main.t AS a #0 [a::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER]
@@ -646,6 +656,72 @@ Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
     Get memory.main.t AS b #1 [a::INTEGER]
 ";
         assert_eq!(pushed(positional), positional);
+    }
+
+    #[test]
+    fn a_left_join_whose_padded_rows_are_all_filtered_out_is_an_inner_join() {
+        // `SELECT * FROM a LEFT JOIN b ON a.a = b.a WHERE b.a = 2`. Every row the left join makes
+        // that an inner join would not has a null `b.a` in it, and the predicate is null over every
+        // one of them, so the query asked for an inner join in a roundabout way.
+        let before = "\
+Filter (#1.0::INTEGER = 2::INTEGER)::BOOLEAN
+  Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        // The predicate then goes into the side it could not have been pushed into a moment before,
+        // and `crate::transitive` writes the copy of it that the join's equality implies. Both of
+        // those follow from the kind, which is why the kind is decided first.
+        let after = "\
+Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+  Filter (#0.0::INTEGER = 2::INTEGER)::BOOLEAN
+    Get memory.main.t AS a #0 [a::INTEGER]
+  Filter (#1.0::INTEGER = 2::INTEGER)::BOOLEAN
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn is_not_null_over_the_padded_side_is_the_same_rewrite() {
+        // The way people write it when they mean it, and the reason `crate::nulls` tracks whether a
+        // value is known to be there and not only whether it is known to be null.
+        let before = "\
+Filter (#1.0::INTEGER IS DISTINCT FROM NULL::\"NULL\")::BOOLEAN
+  Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        // Once it is an inner join, `crate::transitive` says the same thing about `a.a`, since the
+        // join's equality makes a null on one side a null on the other.
+        let after = "\
+Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+  Filter (#0.0::INTEGER IS DISTINCT FROM NULL::\"NULL\")::BOOLEAN
+    Get memory.main.t AS a #0 [a::INTEGER]
+  Filter (#1.0::INTEGER IS DISTINCT FROM NULL::\"NULL\")::BOOLEAN
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_full_outer_join_becomes_the_one_sided_join_the_predicate_left_of_it() {
+        // Rejecting on the left takes away the rows that came from an unmatched right row, and what
+        // is left is every left row with its match or with nulls, which is a left join.
+        let before = "\
+Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
+  Join FULL on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        let after = "\
+Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+  Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
+    Get memory.main.t AS a #0 [a::INTEGER]
+  Filter (#1.0::INTEGER = 1::INTEGER)::BOOLEAN
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
     }
 
     #[test]
