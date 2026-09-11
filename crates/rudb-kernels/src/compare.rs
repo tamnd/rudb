@@ -69,6 +69,7 @@ use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
 
 use crate::fallback::{self, Kernel};
 use crate::number::{approximate, integral};
+use crate::shape::{first, identity, nulls_of, single};
 
 /// Which comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -187,24 +188,6 @@ fn blank_the_nulls(mut answers: Vec<bool>, validity: &Validity) -> Vec<bool> {
     answers
 }
 
-/// Which rows of a vector are not null, as the kernels need to read it.
-///
-/// A dictionary keeps its nulls in the vector it points at and its own validity says nothing about
-/// them, so reading `vector.validity()` on a dictionary is wrong in the one way that matters: it
-/// reports every row valid and a null then comes out as whatever the value at code zero happens to
-/// be. `Vector::flatten` carries the same note for the same reason.
-fn nulls_of(vector: &Vector) -> Validity {
-    let Some((codes, values)) = vector.dictionary_parts() else {
-        return vector.validity().clone();
-    };
-    match values.validity() {
-        Validity::AllValid => Validity::AllValid,
-        Validity::AllInvalid if codes.is_empty() => Validity::AllValid,
-        Validity::AllInvalid => Validity::AllInvalid,
-        inner => Validity::from_iter(codes.len(), |index| inner.is_valid(codes[index] as usize)),
-    }
-}
-
 /// The answers for a form pair this file has a loop for, or `None` to say it has not.
 fn specialized(
     op: Comparison,
@@ -225,47 +208,33 @@ fn specialized(
         return dispatch(op, len, one, identity, other, identity, left_valid, right_valid);
     }
     if let (Some(one), Some(value)) = (left.data(), right.constant_value()) {
-        let single =
-            Vector::from_values(left.logical_type().clone(), std::slice::from_ref(value)).ok()?;
-        let other = single.data()?;
+        let held = single(left.logical_type(), value)?;
+        let other = held.data()?;
         return dispatch(op, len, one, identity, other, first, left_valid, right_valid);
     }
     if let (Some(value), Some(other)) = (left.constant_value(), right.data()) {
         // The same loop with the comparison turned around, rather than a second loop.
-        let single =
-            Vector::from_values(right.logical_type().clone(), std::slice::from_ref(value)).ok()?;
-        let one = single.data()?;
+        let held = single(right.logical_type(), value)?;
+        let one = held.data()?;
         return dispatch(op.swapped(), len, other, identity, one, first, right_valid, left_valid);
     }
     if let (Some((codes, values)), Some(value)) = (left.dictionary_parts(), right.constant_value())
     {
         let one = values.data()?;
-        let single =
-            Vector::from_values(left.logical_type().clone(), std::slice::from_ref(value)).ok()?;
-        let other = single.data()?;
+        let held = single(left.logical_type(), value)?;
+        let other = held.data()?;
         let at = |index: usize| codes[index] as usize;
         return dispatch(op, len, one, at, other, first, left_valid, right_valid);
     }
     if let (Some(value), Some((codes, values))) = (left.constant_value(), right.dictionary_parts())
     {
         let other = values.data()?;
-        let single =
-            Vector::from_values(right.logical_type().clone(), std::slice::from_ref(value)).ok()?;
-        let one = single.data()?;
+        let held = single(right.logical_type(), value)?;
+        let one = held.data()?;
         let at = |index: usize| codes[index] as usize;
         return dispatch(op.swapped(), len, other, at, one, first, right_valid, left_valid);
     }
     None
-}
-
-/// Row `index` of a side that is stored one value per row.
-fn identity(index: usize) -> usize {
-    index
-}
-
-/// Row `index` of a side that is one value however long the vector is.
-fn first(_: usize) -> usize {
-    0
 }
 
 /// One loop per physical layout, generated rather than written out.
@@ -885,6 +854,9 @@ mod tests {
     /// the fallback counter. Sequence against a column is the one this file leaves out on purpose.
     #[test]
     fn a_form_pair_with_no_loop_is_still_right_and_says_so() {
+        // The counters are process wide and another test in this crate resets them, so the ones
+        // that read a count take turns.
+        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let before = fallback::count(Kernel::Compare, Form::Sequence, Form::Flat);
         let sequence = Vector::sequence(10, 1, 4);
         let flat = Vector::from_values(

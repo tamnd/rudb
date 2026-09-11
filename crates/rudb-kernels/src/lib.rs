@@ -19,10 +19,11 @@
 //! `&[i32]` out of a flat vector replaces a body without touching a caller. Sub-milestone 2b is
 //! where that replacement happens, one file at a time, each with a microbenchmark next to it.
 //!
-//! [`compare::compare`] is done. It dispatches once on the form pair and once on the physical layout, hoists
-//! the operator out of the loop, and keeps the old row at a time loop as the oracle its property
-//! test checks against rather than as dead code. The kernels that have not been converted yet still
-//! run the old loop, and they are still correct.
+//! [`compare::compare`] and [`scalar::call`] are done. They dispatch once on the form pair and once on the
+//! physical layout, hoist everything that does not change from row to row out of the loop, and keep
+//! the old row at a time loop as the oracle their property tests check against rather than as dead
+//! code. The kernels that have not been converted yet still run the old loop, and they are still
+//! correct.
 //!
 //! The other optimization that has been here from the start is the constant fast path: a cast or a
 //! comparison where both sides are constant vectors costs one operation rather than 1024. That one
@@ -55,6 +56,7 @@ pub mod fallback;
 pub mod logic;
 mod number;
 pub mod scalar;
+mod shape;
 
 pub use aggregate::Accumulator;
 pub use cast::{cast, cast_value};
