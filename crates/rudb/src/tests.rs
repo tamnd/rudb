@@ -927,7 +927,7 @@ fn a_database_remembers_what_it_was_opened_with() {
         .unwrap()
         .with_query_timeout(Duration::from_secs(10));
     let db = Database::open_with(":memory:", config).unwrap();
-    assert_eq!(db.config().memory_limit(), Some(2 * 1024 * 1024 * 1024));
+    assert_eq!(db.config().memory_limit(), Some(2_000_000_000));
     assert_eq!(db.config().threads(), 3);
     assert_eq!(db.config().query_timeout(), Some(Duration::from_secs(10)));
     // The settings survive the query path, which is the whole point of reading them back: a harness
@@ -939,7 +939,7 @@ fn a_database_remembers_what_it_was_opened_with() {
 #[test]
 fn a_database_opened_the_plain_way_has_the_defaults() {
     let db = Database::new();
-    assert_eq!(db.config(), &Config::default());
+    assert_eq!(db.config(), Config::default());
     assert_eq!(db.config().memory_limit(), None);
 }
 
@@ -1079,4 +1079,98 @@ fn the_limit_is_on_the_database_rather_than_on_each_query() {
     assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
     drop(first);
     db.query(wide).expect("the room came back");
+}
+
+#[test]
+fn set_disabled_optimizers_turns_a_pass_off_for_the_statements_that_follow() {
+    // The whole reason this statement exists: a plan that is wrong after optimization and right
+    // before it is a plan whose pass can be named, and naming it is how the bisector will work.
+    let db = Database::new();
+    let folded = db.plan("SELECT 1 + 2").unwrap();
+    assert!(folded.contains('3'), "{folded}");
+    db.execute("SET disabled_optimizers = 'expression_rewriter'").unwrap();
+    let unfolded = db.plan("SELECT 1 + 2").unwrap();
+    assert!(unfolded.contains("\"+\""), "{unfolded}");
+    assert_eq!(db.setting("disabled_optimizers").unwrap(), "expression_rewriter");
+    db.execute("RESET disabled_optimizers").unwrap();
+    assert_eq!(db.plan("SELECT 1 + 2").unwrap(), folded);
+}
+
+#[test]
+fn a_pass_that_nobody_has_is_refused_by_the_statement_that_named_it() {
+    let db = Database::new();
+    let error = db.execute("SET disabled_optimizers = 'no_such_pass'").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Parser Error");
+    assert_eq!(db.setting("disabled_optimizers").unwrap(), "", "a refused set changed nothing");
+}
+
+#[test]
+fn set_memory_limit_moves_the_budget_the_queries_after_it_are_held_to() {
+    let db = Database::new();
+    assert_eq!(db.memory().limit(), None);
+    db.execute("SET memory_limit = '1GiB'").unwrap();
+    assert_eq!(db.memory().limit(), Some(1 << 30));
+    assert_eq!(db.config().memory_limit(), Some(1 << 30));
+    assert_eq!(db.setting("memory_limit").unwrap(), "1.0 GiB");
+    // A gigabyte and a gibibyte are two different numbers, which is what the binary does.
+    db.execute("SET memory_limit = '1GB'").unwrap();
+    assert_eq!(db.memory().limit(), Some(1_000_000_000));
+    db.execute("RESET memory_limit").unwrap();
+    assert_eq!(db.memory().limit(), None, "back to what the database was opened with");
+}
+
+#[test]
+fn a_memory_limit_set_in_the_middle_of_a_session_refuses_the_next_query_that_passes_it() {
+    let db = Database::new();
+    let wide = "SELECT range FROM range(80000)";
+    db.query(wide).expect("no limit yet");
+    // Eighty thousand eight byte numbers is six hundred and forty kilobytes, so a hundred is not
+    // enough room for them and the query that ran a moment ago stops running.
+    db.execute("SET memory_limit = '100KB'").unwrap();
+    let error = db.query(wide).expect_err("the limit is on now");
+    assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
+}
+
+#[test]
+fn set_threads_is_recorded_even_though_nothing_runs_in_parallel_yet() {
+    let db = Database::with_config(Config::new().with_threads(2).unwrap());
+    db.execute("SET threads = 8").unwrap();
+    assert_eq!(db.config().threads(), 8);
+    assert_eq!(db.setting("threads").unwrap(), "8");
+    let error = db.execute("SET threads = 0").unwrap_err();
+    assert_eq!(error.to_string(), "Syntax Error: Must have at least 1 thread!");
+    db.execute("RESET threads").unwrap();
+    assert_eq!(db.config().threads(), 2, "reset is what the database was opened with");
+}
+
+#[test]
+fn a_name_that_is_not_a_setting_says_which_ones_there_are() {
+    let db = Database::new();
+    let error = db.execute("SET bogus = 1").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Catalog Error");
+    assert!(error.message().contains("\"bogus\""), "{error}");
+    assert!(error.message().contains("\"threads\""), "{error}");
+}
+
+#[test]
+fn the_two_scopes_this_database_does_not_have_are_two_different_sentences() {
+    let db = Database::new();
+    let error = db.execute("SET LOCAL threads = 2").unwrap_err();
+    assert_eq!(error.to_string(), "Not implemented Error: SET LOCAL is not implemented.");
+    let error = db.execute("SET SESSION threads = 2").unwrap_err();
+    assert_eq!(error.to_string(), "Catalog Error: option \"threads\" cannot be set locally");
+    db.execute("SET GLOBAL threads = 2").expect("global is the scope every setting here has");
+    assert_eq!(db.config().threads(), 2);
+}
+
+#[test]
+fn the_settings_a_database_was_opened_with_are_what_reset_goes_back_to() {
+    let db = Database::with_config(Config::new().with_memory_limit(SMALL).with_threads(2).unwrap());
+    db.execute("SET memory_limit = '4GB'").unwrap();
+    db.execute("SET threads = 16").unwrap();
+    assert_eq!(db.opened_with().memory_limit(), Some(SMALL));
+    db.execute("RESET memory_limit").unwrap();
+    db.execute("RESET threads").unwrap();
+    assert_eq!(db.config(), db.opened_with());
+    assert_eq!(db.memory().limit(), Some(SMALL));
 }

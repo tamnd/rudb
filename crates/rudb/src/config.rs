@@ -26,7 +26,7 @@ use rudb_common::{Error, Result};
 /// otherwise. Recording the intent first is what lets the harnesses be written against the final
 /// shape, and it is also what makes the gap visible: a setting that is stored and ignored is easier
 /// to find than a setting that was never accepted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     memory_limit: Option<u64>,
     threads: usize,
@@ -103,8 +103,8 @@ impl Config {
 
     /// The same settings with this memory limit, written the way a person writes one.
     ///
-    /// `1GB`, `512MiB`, `2048`. See [`parse_size`] for exactly what is accepted and why both
-    /// spellings of a gigabyte mean the same thing here.
+    /// `1GB`, `512MiB`, `2048`. See [`parse_size`] for exactly what is accepted and why the two
+    /// spellings of a gigabyte are two different numbers.
     ///
     /// # Errors
     ///
@@ -167,54 +167,83 @@ impl Config {
 
 /// A size written the way a person writes one, in bytes.
 ///
-/// A number on its own is bytes. A number with `KB`, `MB`, `GB` or `TB` after it is that many
-/// powers of 1024, and `KiB`, `MiB`, `GiB` and `TiB` mean the same thing. That is what DuckDB does
-/// and it is wrong about what the SI prefixes mean, but a script that says `memory_limit='10GB'`
-/// and gets 10 * 1024^3 from DuckDB has to get the same number here, and being right about the
-/// prefix at the cost of a different answer to the same string is not a trade worth making.
+/// `KB`, `MB`, `GB` and `TB` are powers of a thousand, and `KiB`, `MiB`, `GiB` and `TiB` are powers
+/// of 1024. That is what DuckDB does, measured on the pinned binary: `SET memory_limit='1GB'` reads
+/// back as `953.6 MiB` and `SET memory_limit='1GiB'` reads back as `1.0 GiB`. A script that says
+/// `10GB` has to get the same number from both engines, so the two spellings are two numbers here
+/// even though treating them as one is tidier.
 ///
-/// Case does not matter and a space before the unit is allowed, because both appear in the wild.
+/// A number with no unit is bytes, which DuckDB refuses and this accepts, because this is also the
+/// function a harness calls to turn a number it already has into a limit. `SET memory_limit` does
+/// not take that path, so the statement still refuses a bare number the way the binary does.
+///
+/// Case does not matter, a space before the unit is allowed and the number may have a fraction,
+/// because all three appear in the wild and DuckDB takes all three. The messages are word for word
+/// the ones the binary prints, so a script that matches on them matches on both engines.
 ///
 /// # Errors
 ///
-/// For text that is not a number, a unit that is not one of the eight, and a size that does not fit
-/// in a `u64`.
+/// For text that is not a number, a number below zero, a unit that is not one of the nine, and a
+/// size that does not fit in a `u64`.
 pub fn parse_size(text: &str) -> Result<u64> {
     let text = text.trim();
     let digits = text.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c.is_whitespace());
     let unit = text[digits.len()..].trim().to_ascii_uppercase();
-    let number: u64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| Error::invalid_input(format!("\"{text}\" is not a size")))?;
-    let power = match unit.as_str() {
-        "" | "B" => 0,
-        "KB" | "KIB" => 1,
-        "MB" | "MIB" => 2,
-        "GB" | "GIB" => 3,
-        "TB" | "TIB" => 4,
+    let number: f64 =
+        digits.trim().parse().map_err(|_| Error::parser("Memory must have a number (e.g. 1GB)"))?;
+    let scale: f64 = match unit.as_str() {
+        "" | "B" => 1.0,
+        "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        "KIB" => 1024.0,
+        "MIB" => 1024f64.powi(2),
+        "GIB" => 1024f64.powi(3),
+        "TIB" => 1024f64.powi(4),
         other => {
-            return Err(Error::invalid_input(format!(
-                "\"{other}\" is not a unit, which is one of B, KB, MB, GB and TB"
+            let other = other.to_ascii_lowercase();
+            return Err(Error::parser(format!(
+                "Unknown unit for memory: '{other}' (expected: KB, MB, GB, TB for 1000^i units or KiB, MiB, GiB, TiB for 1024^i units)"
             )));
         }
     };
-    number
-        .checked_mul(1024u64.pow(power))
-        .ok_or_else(|| Error::invalid_input(format!("\"{text}\" is larger than a 64 bit size")))
+    let bytes = number * scale;
+    if !bytes.is_finite() || bytes < 0.0 {
+        return Err(Error::parser(format!("\"{text}\" is not a size")));
+    }
+    if bytes >= SIZE_CEILING {
+        return Err(Error::parser(format!("\"{text}\" is larger than a 64 bit size")));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the range is checked on the line above and a size is a whole number of bytes"
+    )]
+    Ok(bytes as u64)
 }
+
+/// The first size that does not survive the trip through an `f64` and back.
+///
+/// A size is parsed as a float so that `1.5GB` is a size, and a float at or past this cannot be
+/// turned into a `u64`. Two to the sixty fourth rather than `u64::MAX`, because `u64::MAX` is not a
+/// float and comparing against the nearest one that is would let a value through that does not fit.
+const SIZE_CEILING: f64 = 18_446_744_073_709_551_616.0;
 
 /// A size in bytes, written the way a person reads one.
 ///
-/// The largest unit that leaves a whole number, so that a limit set as `1GB` prints as `1GB` rather
-/// than as a number nobody recognizes. A size that is not a whole number of any unit prints as
-/// bytes, which is exact, because a rounded number in a configuration dump is a number somebody
-/// will later compare against what they set.
+/// The largest unit that leaves a whole number, binary before decimal, so that a limit set as `1GiB`
+/// prints as `1GiB` and one set as `2GB` prints as `2GB`. A size that is not a whole number of any
+/// unit prints as bytes, which is exact, because a rounded number in a configuration dump is a
+/// number somebody will later compare against what they set.
 fn format_size(bytes: u64) -> String {
-    for (power, unit) in [(4, "TB"), (3, "GB"), (2, "MB"), (1, "KB")] {
-        let scale = 1024u64.pow(power);
-        if bytes >= scale && bytes % scale == 0 {
-            return format!("{}{unit}", bytes / scale);
+    for power in (1..=4).rev() {
+        for (scale, unit) in [(1024u64, "iB"), (1000u64, "B")] {
+            let Some(scale) = scale.checked_pow(power) else { continue };
+            if bytes >= scale && bytes % scale == 0 {
+                let prefix = ["K", "M", "G", "T"][power as usize - 1];
+                return format!("{}{prefix}{unit}", bytes / scale);
+            }
         }
     }
     format!("{bytes}B")
@@ -264,27 +293,42 @@ mod tests {
     }
 
     #[test]
-    fn a_size_with_a_unit_is_that_many_powers_of_1024() {
+    fn a_decimal_unit_is_a_power_of_a_thousand_and_a_binary_one_a_power_of_1024() {
         assert_eq!(parse_size("1024").expect("a number is bytes"), 1024);
-        assert_eq!(parse_size("1KB").expect("a kilobyte"), 1024);
-        assert_eq!(parse_size("1MB").expect("a megabyte"), 1024 * 1024);
-        assert_eq!(parse_size("10GB").expect("ten gigabytes"), 10 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size("1TB").expect("a terabyte"), 1024u64.pow(4));
+        assert_eq!(parse_size("1KB").expect("a kilobyte"), 1000);
+        assert_eq!(parse_size("1MB").expect("a megabyte"), 1_000_000);
+        assert_eq!(parse_size("10GB").expect("ten gigabytes"), 10_000_000_000);
+        assert_eq!(parse_size("1TB").expect("a terabyte"), 1_000_000_000_000);
+        assert_eq!(parse_size("1KiB").expect("a kibibyte"), 1024);
+        assert_eq!(parse_size("1MiB").expect("a mebibyte"), 1024 * 1024);
+        assert_eq!(parse_size("1GiB").expect("a gibibyte"), 1024u64.pow(3));
+        assert_eq!(parse_size("1TiB").expect("a tebibyte"), 1024u64.pow(4));
     }
 
     #[test]
-    fn the_two_spellings_of_a_gigabyte_are_the_same_number_here() {
-        // DuckDB is wrong about what the SI prefix means and a script that says 10GB has to get the
-        // same number from both engines, so this agreement is the point rather than an oversight.
-        assert_eq!(parse_size("1GB").expect("a gigabyte"), parse_size("1GiB").expect("a gibibyte"));
+    fn the_two_spellings_of_a_gigabyte_are_two_different_numbers() {
+        // Measured on the pinned binary: SET memory_limit='1GB' reads back as 953.6 MiB, which is
+        // 10^9 bytes printed in binary units, and '1GiB' reads back as 1.0 GiB. A script that says
+        // 10GB has to get the same number from both engines, so the difference is the point.
+        let decimal = parse_size("1GB").expect("a gigabyte");
+        let binary = parse_size("1GiB").expect("a gibibyte");
+        assert_eq!(decimal, 1_000_000_000);
+        assert_eq!(binary, 1_073_741_824);
+        assert_eq!(rudb_common::human(decimal), "953.7 MiB");
     }
 
     #[test]
     fn case_and_a_space_before_the_unit_are_both_allowed() {
-        let expected = 512 * 1024 * 1024;
-        assert_eq!(parse_size("512mb").expect("lower case"), expected);
-        assert_eq!(parse_size("512 MB").expect("a space"), expected);
-        assert_eq!(parse_size("  512MiB  ").expect("surrounding space"), expected);
+        assert_eq!(parse_size("512mb").expect("lower case"), 512_000_000);
+        assert_eq!(parse_size("512 MB").expect("a space"), 512_000_000);
+        assert_eq!(parse_size("  512MiB  ").expect("surrounding space"), 512 * 1024 * 1024);
+        assert_eq!(parse_size("512 gib").expect("both at once"), 512 * 1024u64.pow(3));
+    }
+
+    #[test]
+    fn a_fraction_is_a_size_because_duckdb_takes_one() {
+        assert_eq!(parse_size("1.5GB").expect("a gigabyte and a half"), 1_500_000_000);
+        assert_eq!(parse_size("0.5MiB").expect("half a mebibyte"), 512 * 1024);
     }
 
     #[test]
@@ -292,17 +336,17 @@ mod tests {
         assert!(parse_size("").is_err());
         assert!(parse_size("lots").is_err());
         assert!(parse_size("-1").is_err());
-        assert!(parse_size("1.5GB").is_err());
         let error = parse_size("5PB").expect_err("petabytes are not a unit here");
-        assert!(error.to_string().contains("not a unit"), "{error}");
-        let error = parse_size("16777216TB").expect_err("that does not fit in a u64");
+        assert!(error.to_string().contains("Unknown unit"), "{error}");
+        let error = parse_size("16777216TiB").expect_err("that does not fit in a u64");
         assert!(error.to_string().contains("64 bit"), "{error}");
     }
 
     #[test]
     fn a_size_prints_back_as_the_unit_it_was_written_in() {
-        assert_eq!(format_size(1024), "1KB");
-        assert_eq!(format_size(10 * 1024 * 1024 * 1024), "10GB");
+        assert_eq!(format_size(1024), "1KiB");
+        assert_eq!(format_size(10 * 1024u64.pow(3)), "10GiB");
+        assert_eq!(format_size(2_000_000_000), "2GB");
         assert_eq!(format_size(0), "0B");
         // Not a whole number of anything, so bytes, because a rounded number in a configuration
         // dump is one somebody will later compare against what they set.

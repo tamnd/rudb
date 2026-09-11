@@ -106,6 +106,7 @@ mod connection;
 mod database;
 mod prepared;
 mod result;
+mod settings;
 mod statements;
 mod syntax;
 
