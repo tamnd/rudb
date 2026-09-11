@@ -199,7 +199,7 @@ fn plain(
         }
         Physical::ByteArray => {
             text(column)?;
-            strings(body, at, count, levels, total)
+            strings(column, body, at, count, levels, total)
         }
         Physical::Int96 => Err(Error::io(
             "an INT96 column, which is the timestamp the format deprecated and this reader does \
@@ -242,18 +242,18 @@ fn delta(
             // slicing it is what lets the levels in front of the values stay where they are.
             let spans: Vec<(usize, usize)> =
                 spans.into_iter().map(|(start, len)| (start + at, len)).collect();
-            place(body, &spans, levels, total)
+            place(column, body, &spans, levels, total)
         }
         Encoding::DeltaByteArray => {
             text(column)?;
             let built = crate::delta::byte_array(tail(&body, at)?, count)?;
             // The one encoding whose strings are not in the page, so this is the one column that
             // gets a fresh arena. Nothing else in this reader copies a string's bytes.
-            let mut column = StringColumn::with_capacity(total);
+            let mut out = StringColumn::with_capacity(total);
             let mut next = 0;
             for index in 0..total {
                 if !levels.is_empty() && levels.get(index) != Some(&1) {
-                    column.push("");
+                    out.push("");
                     continue;
                 }
                 let bytes = built.get(next).ok_or_else(|| {
@@ -262,13 +262,11 @@ fn delta(
                         built.len()
                     ))
                 })?;
-                let value = std::str::from_utf8(bytes).map_err(|_| {
-                    Error::io("a delta byte array value that is not text".to_string())
-                })?;
-                column.push(value);
+                let value = std::str::from_utf8(bytes).map_err(|_| not_text(column))?;
+                out.push(value);
                 next += 1;
             }
-            Ok(Data::Varlen(column))
+            Ok(Data::Varlen(out))
         }
         Encoding::ByteStreamSplit => {
             let width = match column.physical {
@@ -296,38 +294,69 @@ fn delta(
 /// The empty string stands in for a null, and it costs nothing: a view that short holds its bytes
 /// inside itself and never touches the arena. The validity beside the column is what says it is not
 /// a string at all.
-fn place(body: Vec<u8>, spans: &[(usize, usize)], levels: &[u32], total: usize) -> Result<Data> {
-    let mut column = StringColumn::over(Buffer::from_vec(body));
+fn place(
+    column: &SchemaColumn,
+    body: Vec<u8>,
+    spans: &[(usize, usize)],
+    levels: &[u32],
+    total: usize,
+) -> Result<Data> {
+    let mut out = StringColumn::over(Buffer::from_vec(body));
     let mut next = 0;
     for index in 0..total {
         if !levels.is_empty() && levels.get(index) != Some(&1) {
-            column.push("");
+            out.push("");
             continue;
         }
         let &(start, len) = spans.get(next).ok_or_else(|| {
             Error::io(format!("a page with {} strings where {total} were wanted", spans.len()))
         })?;
-        column.push_in_place(start, len)?;
+        out.push_in_place(start, len).map_err(|_| not_text(column))?;
         next += 1;
     }
-    Ok(Data::Varlen(column))
+    Ok(Data::Varlen(out))
 }
 
-/// Checks that a byte array column holds text, which is the only kind this reader reads.
+/// Checks that a byte array column is one this reader has somewhere to put.
 ///
-/// A byte array with no annotation, or one annotated as `BSON`, is bytes rather than text, and the
-/// string column it would go into validates UTF-8 on the way in. Reading it needs a seam past that
-/// validation, which does not exist yet, and guessing at the bytes being text would be a wrong
-/// answer on the first file where they are not.
+/// `VARCHAR` and `BLOB`, which between them are every byte array a flat file holds. They are one
+/// storage here, because rudb has one variable length column and it is a string column, so a blob
+/// is read as its bytes and carries `BLOB` as its type the way it already does everywhere else in
+/// the engine.
+///
+/// That is the whole of the limitation and it is worth stating plainly rather than leaving to be
+/// found: the string column validates UTF-8 on the way in, so a blob whose bytes are not valid
+/// UTF-8 is refused with an error that names the column. `spread` and the kernels above want a byte
+/// column for this and it arrives with the storage layer. It is not a guess in the meantime, which
+/// is the thing that would have been wrong: a reader that assumed the bytes were text would answer
+/// the query rather than refuse it.
+///
+/// The annotation matters less than it looks like it should. The ClickBench file has twenty eight
+/// byte array columns and not one of them is annotated, so all twenty eight are `BLOB` and reading
+/// only `VARCHAR` meant reading none of them. All twenty eight million values in the first
+/// partition are valid UTF-8, which is why this is the change that makes that file readable.
 fn text(column: &SchemaColumn) -> Result<()> {
     expect(column.ty.physical(), PhysicalType::Varlen, &column.ty)?;
-    if column.ty != LogicalType::Varchar {
+    if !matches!(column.ty, LogicalType::Varchar | LogicalType::Blob) {
         return Err(Error::io(format!(
             "a {} column, which this reader does not read yet",
             column.ty
         )));
     }
     Ok(())
+}
+
+/// Says which column a set of bytes that are not text came from.
+///
+/// The string column reports the offset it refused, which says nothing to anyone reading a query
+/// that failed. The column name and the type it was annotated with are what a caller can act on,
+/// since an unannotated byte array holding bytes is a file doing nothing wrong.
+fn not_text(column: &SchemaColumn) -> Error {
+    Error::not_implemented(format!(
+        "the column {} holds bytes that are not valid UTF-8, and reading those needs the byte \
+         column that arrives with the storage layer",
+        column.name
+    ))
 }
 
 /// The bytes of `body` from `at`, or an error naming how far short it fell.
@@ -372,7 +401,14 @@ fn booleans(bytes: &[u8], count: usize) -> Result<Vec<bool>> {
 }
 
 /// Reads `count` length prefixed byte arrays, leaving their bytes in the page.
-fn strings(body: Vec<u8>, at: usize, count: usize, levels: &[u32], total: usize) -> Result<Data> {
+fn strings(
+    column: &SchemaColumn,
+    body: Vec<u8>,
+    at: usize,
+    count: usize,
+    levels: &[u32],
+    total: usize,
+) -> Result<Data> {
     // Where each string is, found by walking the lengths, before the page is handed to the column.
     // Two passes over the same buffer, because the column owns the arena from the moment it is
     // built and the offsets have to be known by then.
@@ -396,7 +432,7 @@ fn strings(body: Vec<u8>, at: usize, count: usize, levels: &[u32], total: usize)
         spans.push((start, len));
         cursor = end;
     }
-    place(body, &spans, levels, total)
+    place(column, body, &spans, levels, total)
 }
 
 /// Narrows wire integers into whichever integer layout the column's type calls for.
