@@ -13,6 +13,7 @@
 pub mod columns;
 pub mod filter;
 pub mod fold;
+pub mod nulls;
 pub mod pass;
 pub mod tables;
 mod transitive;
