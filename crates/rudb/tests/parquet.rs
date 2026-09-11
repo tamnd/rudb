@@ -176,7 +176,7 @@ fn an_alias_on_a_replaced_file_is_what_the_columns_answer_to_instead() {
 
 #[test]
 fn a_table_of_that_name_is_read_before_a_file_of_that_name() {
-    let mut database = Database::new();
+    let database = Database::new();
     let name = fixture().replace('\'', "\"");
     database.execute(&format!("CREATE TABLE {name} (x INTEGER)")).expect("creates");
     let sql = format!("SELECT count(*) FROM {}", fixture());
@@ -228,7 +228,7 @@ fn a_file_can_be_loaded_into_a_table_once_and_queried_many_times() {
     // Which is the point of `CREATE TABLE AS` in this milestone. A suite that runs forty three
     // queries over one file should decode it once, and the rows a table hands back are the rows
     // the file had.
-    let mut database = Database::new();
+    let database = Database::new();
     let sql = format!("CREATE TABLE loaded AS SELECT a, s, day FROM {}", fixture());
     database.execute(&sql).expect("loads");
     let result = database.query("SELECT * FROM loaded").expect("runs");
@@ -250,7 +250,7 @@ fn loading_a_file_into_a_table_reads_the_columns_it_is_loading_and_no_others() {
     let sql = format!("SELECT a, s FROM {}", fixture());
     let plan = database.plan(&sql).expect("binds");
     assert!(plan.contains("[a::INTEGER, s::VARCHAR]"), "{plan}");
-    let mut database = Database::new();
+    let database = Database::new();
     let loading = format!("CREATE TABLE loaded AS {sql}");
     database.execute(&loading).expect("loads");
     assert_eq!(database.value("SELECT count(*) FROM loaded").expect("runs"), Value::BigInt(4096));
@@ -259,7 +259,7 @@ fn loading_a_file_into_a_table_reads_the_columns_it_is_loading_and_no_others() {
 
 #[test]
 fn a_table_loaded_from_a_file_can_be_appended_to_from_the_same_file() {
-    let mut database = Database::new();
+    let database = Database::new();
     database
         .execute(&format!("CREATE TABLE loaded AS SELECT a FROM {}", fixture()))
         .expect("loads");

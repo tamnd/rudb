@@ -203,7 +203,7 @@ fn a_file_that_is_there_and_has_an_extension_nothing_reads_says_so() {
 
 #[test]
 fn a_file_can_be_loaded_into_a_table_and_queried_from_there() {
-    let mut database = Database::new();
+    let database = Database::new();
     let sql = format!("CREATE TABLE loaded AS SELECT a, s FROM read_csv({})", fixture("mixed.csv"));
     database.execute(&sql).expect("loads");
     assert_eq!(database.value("SELECT count(*) FROM loaded").expect("runs"), Value::BigInt(4096));
