@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
+use rudb_common::{ALLOCATION, Error, Field, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Accumulator, is_true};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::Chunk;
@@ -121,6 +121,7 @@ impl<'a> Aggregate<'a> {
         // The hash table, charged separately from the chunks it produces, because it is given back
         // when the last group has been finished and they are not.
         let mut scratch = self.memory.reservation();
+        let mut charged = 0;
         let mut order: Vec<Key> = Vec::new();
         let mut slots: HashMap<Key, usize> = HashMap::new();
         let mut states: Vec<Vec<Accumulator>> = Vec::new();
@@ -178,11 +179,11 @@ impl<'a> Aggregate<'a> {
                         None => {
                             let slot = states.len();
                             // A group costs its key twice, once in the table and once in the list
-                            // that keeps the arrival order, and an accumulator per call. The
-                            // accumulator is charged as its own width and not as what it holds,
-                            // because what a `list()` or a `string_agg()` holds grows with the
-                            // input and there is no way to ask one how large it has become.
-                            taken += 2 * rows::footprint(&key.0) + group_state(self.calls.len());
+                            // that keeps the arrival order, and its own state beside them. What the
+                            // four containers took to hold all of that is charged separately, below
+                            // and once per chunk, because it is a property of the containers rather
+                            // than of this group.
+                            taken += group_state(&key.0, self.calls.len());
                             slots.insert(key.clone(), slot);
                             order.push(key);
                             states.push(self.fresh()?);
@@ -214,6 +215,8 @@ impl<'a> Aggregate<'a> {
                 }
             }
             scratch.grow(taken)?;
+            let now = tables(&slots, &order, &states, &seen);
+            rows::capacity(now, &mut charged, &mut scratch)?;
         }
         let mut out = Vec::with_capacity(order.len());
         for (slot, key) in order.into_iter().enumerate() {
@@ -252,10 +255,60 @@ impl Operator for Aggregate<'_> {
     }
 }
 
-/// What one new group costs beyond its key, which is an accumulator and a distinct set per call.
-fn group_state(calls: usize) -> u64 {
-    let bytes = calls * (size_of::<Accumulator>() + size_of::<HashSet<Key>>());
-    u64::try_from(bytes).unwrap_or(u64::MAX)
+/// What one new group costs, not counting the room the four containers made for it.
+///
+/// The key twice, because the table and the arrival order each own a copy, and each copy is a
+/// separate block from the allocator. Then the two vectors this group's own state lives in, one of
+/// accumulators and one of distinct sets, one per aggregate call, and each of those is a block too.
+/// A query with no aggregate calls, which is what `DISTINCT` binds to, allocates neither, because an
+/// empty `Vec` does not go to the allocator at all.
+///
+/// An accumulator is charged as its own width and not as what it holds. That is a knowing undercount
+/// and it is the one left: what a `list()` or a `string_agg()` holds grows with the input and there
+/// is no way to ask one how large it has become.
+fn group_state(key: &[Value], calls: usize) -> u64 {
+    let mut bytes = 2 * rows::heap(key);
+    if calls > 0 {
+        let calls = u64::try_from(calls).unwrap_or(u64::MAX);
+        let width = |size: usize| u64::try_from(size).unwrap_or(u64::MAX);
+        bytes += calls * width(size_of::<Accumulator>()) + ALLOCATION;
+        bytes += calls * width(size_of::<HashSet<Key>>()) + ALLOCATION;
+    }
+    bytes
+}
+
+/// What the four containers have taken from the allocator between them.
+///
+/// Capacity rather than length in all four, which is the point of #227. A `Vec` doubles and so sits
+/// between half empty and full, and a `HashMap` fills to seven eighths before doubling as well, so
+/// a table of seventeen million groups has paid for somewhere between seventeen and thirty four
+/// million slots and the old charge counted seventeen.
+///
+/// The hash table also has a control byte per bucket beside the buckets themselves, which is how it
+/// answers a lookup without touching the keys, and there are more buckets than the capacity it
+/// reports. [`rows::buckets`] has that arithmetic.
+///
+/// The keys and the states these have room for are not counted here. They are charged as each group
+/// arrives, by [`group_state`], and the two have to divide the group between them without
+/// overlapping.
+fn tables(
+    slots: &HashMap<Key, usize>,
+    order: &Vec<Key>,
+    states: &Vec<Vec<Accumulator>>,
+    seen: &Vec<Vec<HashSet<Key>>>,
+) -> u64 {
+    let width = |count: usize, size: usize| {
+        u64::try_from(count).unwrap_or(u64::MAX).saturating_mul(width_of(size))
+    };
+    rows::buckets(slots.capacity()) * (width_of(size_of::<(Key, usize)>()) + 1)
+        + width(order.capacity(), size_of::<Key>())
+        + width(states.capacity(), size_of::<Vec<Accumulator>>())
+        + width(seen.capacity(), size_of::<Vec<HashSet<Key>>>())
+}
+
+/// A `size_of` in the width the budget is counted in.
+fn width_of(size: usize) -> u64 {
+    u64::try_from(size).unwrap_or(u64::MAX)
 }
 
 /// What a group column is called in this operator's schema.
@@ -316,6 +369,7 @@ impl<'a> Distinct<'a> {
 
     fn build(&mut self) -> Result<()> {
         let mut scratch = self.memory.reservation();
+        let mut charged = 0;
         let mut seen: HashSet<Key> = HashSet::new();
         let mut kept: Vec<Vec<Value>> = Vec::new();
         while let Some(chunk) = self.input.next()? {
@@ -334,13 +388,19 @@ impl<'a> Distinct<'a> {
                 } else {
                     Key(keys.iter().map(|column| column.value_at(row)).collect())
                 };
-                let size = rows::footprint(&key.0) + rows::footprint(&values);
+                // The row is kept twice, once as the key in the table and once in the output, and
+                // each copy is its own block. What the table and the output took to have room for
+                // them is charged below, once per chunk.
+                let size = rows::heap(&key.0) + rows::heap(&values);
                 if seen.insert(key) {
                     kept.push(values);
                     taken += size;
                 }
             }
             scratch.grow(taken)?;
+            let now = rows::buckets(seen.capacity()) * (width_of(size_of::<Key>()) + 1)
+                + width_of(kept.capacity() * size_of::<Vec<Value>>());
+            rows::capacity(now, &mut charged, &mut scratch)?;
         }
         self.chunks = rows::chunks(&self.schema.types(), &kept, &mut self.held)?;
         Ok(())
