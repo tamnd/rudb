@@ -279,6 +279,15 @@ pub enum QueryBody {
     /// `INSERT INTO t SELECT 1` the same shape by the time anything downstream sees them, which is
     /// the reason the insert walker does not have two arms.
     Values(Slice),
+    /// `DESCRIBE SELECT ...`, `DESCRIBE t` and `DESCRIBE 'file.parquet'`.
+    ///
+    /// A query body rather than a statement, because that is where the grammar puts it:
+    /// `SelectStatementType <- ... / DescribeStatement / ...`, so `FROM (DESCRIBE SELECT 1)` is a
+    /// subquery over one and needs no rule of its own. The two spellings that name something
+    /// instead of writing a query arrive here as `DESCRIBE SELECT * FROM that`, which is not a
+    /// shortcut: on the reference binary `DESCRIBE t` and `DESCRIBE SELECT * FROM t` produce the
+    /// same six columns and the same rows, down to the primary key and the default.
+    Describe(QueryRef),
 }
 
 /// Which set operator.

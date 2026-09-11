@@ -24,6 +24,17 @@ pub(crate) struct Visible {
     pub(crate) binding: ColumnBinding,
     /// What it is.
     pub(crate) ty: LogicalType,
+    /// Whether the column it came from refuses nulls.
+    ///
+    /// Only `DESCRIBE` reads this, and only to fill the `null` column with `NO` or `YES`. It is
+    /// carried on the scope rather than asked of the plan because the question is about where a
+    /// column came from and the scope is the only thing that still knows: by the time a projection
+    /// is a node, a column that is passed straight through and one that is computed look the same.
+    ///
+    /// A column that is not a plain reference is nullable whatever it was built from, which is
+    /// also what the reference binary says. `DESCRIBE SELECT * FROM t` keeps `NO` on a `NOT NULL`
+    /// column and `DESCRIBE SELECT c + 0 FROM t` does not.
+    pub(crate) not_null: bool,
 }
 
 /// The columns a name can resolve against.
@@ -208,18 +219,21 @@ mod tests {
             name: "UserID".into(),
             binding: ColumnBinding::new(0, 0),
             ty: LogicalType::BigInt,
+            not_null: false,
         });
         scope.push(Visible {
             table: "hits".into(),
             name: "url".into(),
             binding: ColumnBinding::new(0, 1),
             ty: LogicalType::Varchar,
+            not_null: false,
         });
         scope.push(Visible {
             table: "visits".into(),
             name: "url".into(),
             binding: ColumnBinding::new(1, 0),
             ty: LogicalType::Varchar,
+            not_null: false,
         });
         scope
     }

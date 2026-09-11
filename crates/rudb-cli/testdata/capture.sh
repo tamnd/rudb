@@ -25,6 +25,11 @@ duckdb -batch -init /dev/null -cmd ".mode csv" -c ".read $here/quoting.sql" >"$h
 # separator and the two files differ by exactly that.
 duckdb -batch -init /dev/null -csv -c ".read $here/quoting.sql" >"$here/quoting-flag.txt"
 duckdb -batch -init /dev/null -c ".show" >"$here/show.txt"
+# Every shape of DESCRIBE in one file, against the table setup.sql leaves behind and one the script
+# makes itself with a NOT NULL column on it. The six columns and the NO and the YES in them are the
+# part worth capturing: rudb-compat asks DuckDB for the types of a result by selecting out of a
+# DESCRIBE, so the names and the order of those columns are an interface and not a print.
+duckdb -batch -init /dev/null -cmd ".read $here/setup.sql" -csv -c ".read $here/describe.sql" >"$here/describe.txt"
 # Three positional arguments, which is a database and two statements. There is no limit on how many
 # and no error for the count, which is worth a capture rather than a sentence because rudb used to
 # refuse the third one.
