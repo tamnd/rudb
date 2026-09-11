@@ -106,6 +106,15 @@ impl<'a> Reader<'a> {
         Self { bytes, at: 0, last_id: 0 }
     }
 
+    /// How many bytes have been consumed.
+    ///
+    /// A page header is the one structure in a Parquet file whose length nothing records. It is
+    /// written immediately in front of the page it describes, so the only way to find where the
+    /// page starts is to decode the header and ask how far that got.
+    pub(crate) fn position(&self) -> usize {
+        self.at
+    }
+
     /// The next field of the current structure, or nothing when the stop byte is reached.
     ///
     /// # Errors
@@ -349,87 +358,91 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// A Thrift compact writer, for tests.
+///
+/// Writing one is cheaper than committing a fixture for every shape, and it is the only
+/// Thrift writer in the workspace, because rudb writes Parquet at 2m and not here. It sits
+/// here rather than inside `tests` because the page header tests need it too, and two
+/// encoders that have to agree is one more than the number worth having.
 #[cfg(test)]
-mod tests {
-    use super::{Kind, Reader};
+#[derive(Debug, Default)]
+pub(crate) struct Writer {
+    bytes: Vec<u8>,
+    last_id: i16,
+}
 
-    /// The encoder the tests write their bytes with.
-    ///
-    /// Writing one is cheaper than committing a fixture for every shape, and it is the only
-    /// Thrift writer in the workspace, because rudb writes Parquet at 2m and not here.
-    #[derive(Debug, Default)]
-    struct Writer {
-        bytes: Vec<u8>,
-        last_id: i16,
+#[cfg(test)]
+impl Writer {
+    pub(crate) fn varint(&mut self, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                self.bytes.push(byte);
+                return;
+            }
+            self.bytes.push(byte | 0x80);
+        }
     }
 
-    impl Writer {
-        fn varint(&mut self, mut value: u64) {
-            loop {
-                let byte = (value & 0x7f) as u8;
-                value >>= 7;
-                if value == 0 {
-                    self.bytes.push(byte);
-                    return;
-                }
-                self.bytes.push(byte | 0x80);
-            }
-        }
+    pub(crate) fn zigzag(&mut self, value: i64) {
+        self.varint(((value << 1) ^ (value >> 63)) as u64);
+    }
 
-        fn zigzag(&mut self, value: i64) {
-            self.varint(((value << 1) ^ (value >> 63)) as u64);
+    pub(crate) fn field(&mut self, id: i16, wire: u8) {
+        let delta = id - self.last_id;
+        if delta > 0 && delta <= 15 {
+            self.bytes.push(((delta as u8) << 4) | wire);
+        } else {
+            self.bytes.push(wire);
+            self.zigzag(i64::from(id));
         }
+        self.last_id = id;
+    }
 
-        fn field(&mut self, id: i16, wire: u8) {
-            let delta = id - self.last_id;
-            if delta > 0 && delta <= 15 {
-                self.bytes.push(((delta as u8) << 4) | wire);
-            } else {
-                self.bytes.push(wire);
-                self.zigzag(i64::from(id));
-            }
-            self.last_id = id;
+    pub(crate) fn int(&mut self, id: i16, value: i64) {
+        self.field(id, 6);
+        self.zigzag(value);
+    }
+
+    pub(crate) fn string(&mut self, id: i16, value: &str) {
+        self.field(id, 8);
+        self.varint(value.len() as u64);
+        self.bytes.extend_from_slice(value.as_bytes());
+    }
+
+    pub(crate) fn boolean(&mut self, id: i16, value: bool) {
+        self.field(id, if value { 1 } else { 2 });
+    }
+
+    pub(crate) fn list_of_ints(&mut self, id: i16, values: &[i64]) {
+        self.field(id, 9);
+        if values.len() < 15 {
+            self.bytes.push(((values.len() as u8) << 4) | 5);
+        } else {
+            self.bytes.push(0xf5);
+            self.varint(values.len() as u64);
         }
-
-        fn int(&mut self, id: i16, value: i64) {
-            self.field(id, 6);
+        for &value in values {
             self.zigzag(value);
         }
-
-        fn string(&mut self, id: i16, value: &str) {
-            self.field(id, 8);
-            self.varint(value.len() as u64);
-            self.bytes.extend_from_slice(value.as_bytes());
-        }
-
-        fn boolean(&mut self, id: i16, value: bool) {
-            self.field(id, if value { 1 } else { 2 });
-        }
-
-        fn list_of_ints(&mut self, id: i16, values: &[i64]) {
-            self.field(id, 9);
-            if values.len() < 15 {
-                self.bytes.push(((values.len() as u8) << 4) | 5);
-            } else {
-                self.bytes.push(0xf5);
-                self.varint(values.len() as u64);
-            }
-            for &value in values {
-                self.zigzag(value);
-            }
-        }
-
-        fn nested(&mut self, id: i16, inner: Writer) {
-            self.field(id, 12);
-            self.bytes.extend_from_slice(&inner.bytes);
-            self.bytes.push(0);
-        }
-
-        fn stop(mut self) -> Vec<u8> {
-            self.bytes.push(0);
-            self.bytes
-        }
     }
+
+    pub(crate) fn nested(&mut self, id: i16, inner: Writer) {
+        self.field(id, 12);
+        self.bytes.extend_from_slice(&inner.bytes);
+        self.bytes.push(0);
+    }
+
+    pub(crate) fn stop(mut self) -> Vec<u8> {
+        self.bytes.push(0);
+        self.bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Kind, Reader, Writer};
 
     #[test]
     fn a_field_id_is_a_delta_until_it_is_too_far() {
