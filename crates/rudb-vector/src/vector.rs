@@ -123,6 +123,24 @@ impl Data {
         self.len() == 0
     }
 
+    /// How many bytes of memory these values are holding.
+    ///
+    /// One arm per layout through the same macro as [`Data::len`], for the same reason: a layout
+    /// added without a size here is a layout the memory limit would charge nothing for, and a
+    /// buffer that is free is a buffer that can be grown until the process dies.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        macro_rules! sizes {
+            ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+                match self {
+                    Self::Empty => 0,
+                    $(Self::$variant(values) => values.footprint(),)+
+                }
+            };
+        }
+        crate::for_each_layout!(all, sizes)
+    }
+
     /// An integer at `index`, widened, for any of the signed integer layouts.
     ///
     /// Used by the decimal path, which needs the unscaled value out of whichever width the width
@@ -340,6 +358,30 @@ impl Vector {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// How many bytes of memory this vector is holding.
+    ///
+    /// What the memory limit charges for it. A constant and a sequence hold one value and two
+    /// numbers however long they are, which is the point of both forms, so the number here is the
+    /// form's cost and not the column's width times its length.
+    ///
+    /// A dictionary counts its values in full, and two vectors sharing one dictionary each report
+    /// all of it. That over counts, deliberately: working out that two operators are looking at the
+    /// same `Arc` means threading identity through the accounting, and a limit that over counts
+    /// refuses a query that would have fit while a limit that under counts lets one through that
+    /// does not. The first is a worse answer to give and the second is a worse thing to be.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        let body = match &self.body {
+            Body::Flat(data) => data.footprint(),
+            Body::Constant(value) => value.footprint(),
+            Body::Sequence { .. } => 0,
+            Body::Dictionary { codes, values } => {
+                codes.capacity() * size_of::<u32>() + values.footprint()
+            }
+        };
+        size_of::<Self>() + self.validity.footprint() + body
     }
 
     /// Which of the values are not null.
@@ -1396,5 +1438,36 @@ mod tests {
         let value = Value::Decimal { unscaled: 1_000_000, width: 4, scale: 1 };
         let error = Vector::from_values(ty, &[value]).unwrap_err();
         assert!(error.to_string().contains("does not fit"), "{error}");
+    }
+
+    #[test]
+    fn a_flat_vector_costs_its_values_and_a_constant_costs_one() {
+        let flat = integers(&[1; 1000]);
+        assert!(
+            flat.footprint() >= 4000,
+            "a thousand i32 are four thousand bytes: {}",
+            flat.footprint()
+        );
+        // The forms that compute their values rather than storing them cost nothing per value,
+        // which is the point of having them and is what the memory limit should see.
+        let constant = Vector::constant(LogicalType::Integer, Value::Integer(1), 1_000_000);
+        assert!(constant.footprint() < 200, "a constant is one value: {}", constant.footprint());
+        let sequence = Vector::sequence(0, 1, 1_000_000);
+        assert!(sequence.footprint() < 200, "a sequence is two numbers: {}", sequence.footprint());
+    }
+
+    #[test]
+    fn a_string_vector_costs_the_bytes_of_its_long_strings() {
+        let short =
+            Vector::from_values(LogicalType::Varchar, &[Value::Varchar("red".into())]).unwrap();
+        let long = "a string well past the sixteen bytes a view holds inline".to_string();
+        let spilled =
+            Vector::from_values(LogicalType::Varchar, &[Value::Varchar(long.clone())]).unwrap();
+        assert!(
+            spilled.footprint() >= short.footprint() + long.len(),
+            "the arena is counted: {} against {}",
+            spilled.footprint(),
+            short.footprint()
+        );
     }
 }

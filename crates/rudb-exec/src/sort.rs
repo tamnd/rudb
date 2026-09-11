@@ -10,7 +10,7 @@
 
 use std::cmp::Ordering;
 
-use rudb_common::{Error, Result, Value};
+use rudb_common::{Error, Memory, Reservation, Result, Value};
 use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::Chunk;
 
@@ -29,10 +29,18 @@ pub(crate) struct Sort<'a> {
     built: bool,
     chunks: Vec<Chunk>,
     at: usize,
+    memory: Memory,
+    /// What the sorted chunks are charged, held for as long as this operator holds them.
+    held: Reservation,
 }
 
 impl<'a> Sort<'a> {
-    pub(crate) fn new(plan: &'a Plan, input: Box<dyn Operator + 'a>, keys: Slice) -> Self {
+    pub(crate) fn new(
+        plan: &'a Plan,
+        input: Box<dyn Operator + 'a>,
+        keys: Slice,
+        memory: &Memory,
+    ) -> Self {
         let schema = input.schema().clone();
         Self {
             input,
@@ -42,21 +50,31 @@ impl<'a> Sort<'a> {
             built: false,
             chunks: Vec::new(),
             at: 0,
+            memory: memory.clone(),
+            held: memory.reservation(),
         }
     }
 
     fn build(&mut self) -> Result<()> {
         let exprs: Vec<_> = self.keys.iter().map(|key| key.expr).collect();
+        // The keys and the rows waiting to be sorted, charged separately from the sorted chunks
+        // below, because this one is given back the moment the sort is done with it and the other
+        // is held for as long as anybody can ask this operator for a chunk.
+        let mut scratch = self.memory.reservation();
         let mut sortable: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
         while let Some(chunk) = self.input.next()? {
             let keys = evaluate_all(self.plan, &exprs, &self.schema, &chunk)?;
+            let mut taken = 0;
             // row at a time: 2i (#63) sorts a normalized key that is one comparable byte string a
             // row rather than a `Vec<Value>`, and moves the payload by index at the end instead of
             // carrying a copy of every row through the sort.
             for row in 0..chunk.len() {
-                let key = keys.iter().map(|column| column.value_at(row)).collect();
-                sortable.push((key, chunk.row(row).collect()));
+                let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
+                let values: Vec<Value> = chunk.row(row).collect();
+                taken += rows::footprint(&key) + rows::footprint(&values);
+                sortable.push((key, values));
             }
+            scratch.grow(taken)?;
         }
         let mut failure: Option<Error> = None;
         sortable.sort_by(|left, right| {
@@ -78,7 +96,7 @@ impl<'a> Sort<'a> {
             return Err(error);
         }
         let ordered: Vec<Vec<Value>> = sortable.into_iter().map(|(_, row)| row).collect();
-        self.chunks = rows::chunks(&self.schema.types(), &ordered)?;
+        self.chunks = rows::chunks(&self.schema.types(), &ordered, &mut self.held)?;
         Ok(())
     }
 }
