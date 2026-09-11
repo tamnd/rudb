@@ -216,7 +216,7 @@ fn straight<M: Fn(usize) -> usize>(
             for index in 0..rows {
                 out.push(<$ty>::try_from(values[at(index)]).ok()?);
             }
-            $variant(out)
+            $variant(out.into())
         }};
     }
     macro_rules! by_target {
@@ -415,7 +415,7 @@ fn exact_out(run: Vec<i128>, width: Option<u8>, physical: PhysicalType) -> Optio
             for &whole in &run {
                 out.push(<$ty>::try_from(whole).ok()?);
             }
-            $variant(out)
+            $variant(out.into())
         }};
     }
     Some(match physical {
@@ -423,7 +423,7 @@ fn exact_out(run: Vec<i128>, width: Option<u8>, physical: PhysicalType) -> Optio
         PhysicalType::Int16 => narrowed!(Data::Int16, i16),
         PhysicalType::Int32 => narrowed!(Data::Int32, i32),
         PhysicalType::Int64 => narrowed!(Data::Int64, i64),
-        PhysicalType::Int128 => Data::Int128(run),
+        PhysicalType::Int128 => Data::Int128(run.into()),
         PhysicalType::UInt8 => narrowed!(Data::UInt8, u8),
         PhysicalType::UInt16 => narrowed!(Data::UInt16, u16),
         PhysicalType::UInt32 => narrowed!(Data::UInt32, u32),
@@ -443,7 +443,7 @@ fn exact_out(run: Vec<i128>, width: Option<u8>, physical: PhysicalType) -> Optio
 )]
 fn approximate_out(run: Vec<f64>, single: bool) -> Option<Data> {
     if !single {
-        return Some(Data::Float64(run));
+        return Some(Data::Float64(run.into()));
     }
     let mut out = Vec::with_capacity(run.len());
     for number in run {
@@ -453,7 +453,7 @@ fn approximate_out(run: Vec<f64>, single: bool) -> Option<Data> {
         }
         out.push(narrowed);
     }
-    Some(Data::Float32(out))
+    Some(Data::Float32(out.into()))
 }
 
 /// Casts one value.

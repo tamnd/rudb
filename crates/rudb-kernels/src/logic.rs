@@ -33,7 +33,7 @@
 //! removed actually has.
 
 use rudb_common::{Error, LogicalType, Result, Value};
-use rudb_vector::{Data, Form, Validity, Vector};
+use rudb_vector::{Buffer, Data, Form, Validity, Vector};
 
 use crate::fallback::{self, Kernel};
 use crate::shape::{identity, nulls_of};
@@ -117,7 +117,7 @@ fn fold_runs<const DOMINANT: bool>(children: &[Vector], rows: usize) -> Option<V
         // `Data::Empty` and validity that normalizes to all valid. Written out rather than reached
         // by falling through so that an empty chunk does not show up in the fallback counters as a
         // form pair worth specializing.
-        return Vector::flat(LogicalType::Boolean, Data::Bool(Vec::new())).ok();
+        return Vector::flat(LogicalType::Boolean, Data::Bool(Buffer::new())).ok();
     }
     // A child that is not boolean is an error the row at a time path raises with the type in the
     // message, and it raises it only for rows that are not null, so the fast path cannot answer for
@@ -187,7 +187,7 @@ fn fold_runs<const DOMINANT: bool>(children: &[Vector], rows: usize) -> Option<V
         // unknown is a row nothing decided, so the same expression produces both.
         decided.iter().zip(&unknown).map(|(&hit, &null)| !(hit | null)).collect()
     };
-    Some(Vector::flat(LogicalType::Boolean, Data::Bool(data)).ok()?.with_validity(validity))
+    Some(Vector::flat(LogicalType::Boolean, Data::Bool(data.into())).ok()?.with_validity(validity))
 }
 
 /// Folds one child into the two runs.

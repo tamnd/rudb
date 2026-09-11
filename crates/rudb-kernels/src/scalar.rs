@@ -193,7 +193,7 @@ fn not_of(
         out[index] = !held[index];
         Ok(true)
     })?;
-    finish(returns, Data::Bool(out), validity)
+    finish(returns, Data::Bool(out.into()), validity)
 }
 
 /// Unary minus and `abs`, where the argument and the result are the same type.
@@ -231,7 +231,7 @@ fn sign_of(
                                 )),
                             }
                         })?;
-                        finish(returns, Data::$variant(out), validity)
+                        finish(returns, Data::$variant(out.into()), validity)
                     }
                 )+
                 Data::Float32(held) => {
@@ -240,7 +240,7 @@ fn sign_of(
                         out[index] = if negating { -held[index] } else { held[index].abs() };
                         Ok(true)
                     })?;
-                    finish(returns, Data::Float32(out), validity)
+                    finish(returns, Data::Float32(out.into()), validity)
                 }
                 Data::Float64(held) => {
                     let mut out = vec![0.0f64; rows];
@@ -248,7 +248,7 @@ fn sign_of(
                         out[index] = if negating { -held[index] } else { held[index].abs() };
                         Ok(true)
                     })?;
-                    finish(returns, Data::Float64(out), validity)
+                    finish(returns, Data::Float64(out.into()), validity)
                 }
                 _ => Ok(None),
             }
@@ -280,7 +280,7 @@ fn length_of(
         out[index] = i64::try_from(characters).unwrap_or(i64::MAX);
         Ok(true)
     })?;
-    finish(returns, Data::Int64(out), validity)
+    finish(returns, Data::Int64(out.into()), validity)
 }
 
 /// `lower` and `upper`.
@@ -542,7 +542,7 @@ where
                         return Ok(None);
                     }
                     blank(&mut out, base);
-                    return finish(returns, Data::$variant(out), base.clone());
+                    return finish(returns, Data::$variant(out.into()), base.clone());
                 }
             )+
         };
@@ -560,7 +560,7 @@ where
                 // operator match can stay inside the step rather than outside the loop.
                 let _ = sweep(&mut out, a, &at_left, b, &at_right, step);
                 blank(&mut out, base);
-                return finish(returns, Data::$variant(out), base.clone());
+                return finish(returns, Data::$variant(out.into()), base.clone());
             }
         };
     }
@@ -644,7 +644,7 @@ where
                             )),
                         }
                     })?;
-                    return finish(returns, Data::$variant(out), validity);
+                    return finish(returns, Data::$variant(out.into()), validity);
                 }
             )+
         };
@@ -662,7 +662,7 @@ where
                     out[index] = $narrow(float_step(op, $widen(x), $widen(y)));
                     Ok(true)
                 })?;
-                return finish(returns, Data::$variant(out), validity);
+                return finish(returns, Data::$variant(out.into()), validity);
             }
         };
     }
@@ -746,7 +746,7 @@ where
                             )),
                         }
                     })?;
-                    return finish(returns, Data::$variant(out), validity);
+                    return finish(returns, Data::$variant(out.into()), validity);
                 }
             )+
         };
@@ -805,7 +805,7 @@ where
         out[index] = x / y;
         Ok(true)
     })?;
-    finish(returns, Data::Float64(out), validity)
+    finish(returns, Data::Float64(out.into()), validity)
 }
 
 /// `||`, where both sides are already strings.
@@ -886,7 +886,7 @@ fn like_of(
         out[index] = compiled.holds(text, &mut characters) != negated;
         Ok(true)
     })?;
-    finish(returns, Data::Bool(out), validity)
+    finish(returns, Data::Bool(out.into()), validity)
 }
 
 /// A `LIKE` pattern, after the shape of it has been looked at once.

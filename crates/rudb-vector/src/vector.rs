@@ -17,6 +17,7 @@
 
 use rudb_common::{Error, LogicalType, Result, Value};
 
+use crate::buffer::Buffer;
 use crate::string::{StringColumn, StringView};
 use crate::validity::Validity;
 
@@ -63,33 +64,33 @@ pub enum Data {
     /// No values, for the type of an untyped `NULL`.
     Empty,
     /// One byte per value.
-    Bool(Vec<bool>),
+    Bool(Buffer<bool>),
     /// 8 bit signed.
-    Int8(Vec<i8>),
+    Int8(Buffer<i8>),
     /// 16 bit signed.
-    Int16(Vec<i16>),
+    Int16(Buffer<i16>),
     /// 32 bit signed.
-    Int32(Vec<i32>),
+    Int32(Buffer<i32>),
     /// 64 bit signed.
-    Int64(Vec<i64>),
+    Int64(Buffer<i64>),
     /// 128 bit signed.
-    Int128(Vec<i128>),
+    Int128(Buffer<i128>),
     /// 8 bit unsigned.
-    UInt8(Vec<u8>),
+    UInt8(Buffer<u8>),
     /// 16 bit unsigned.
-    UInt16(Vec<u16>),
+    UInt16(Buffer<u16>),
     /// 32 bit unsigned.
-    UInt32(Vec<u32>),
+    UInt32(Buffer<u32>),
     /// 64 bit unsigned.
-    UInt64(Vec<u64>),
+    UInt64(Buffer<u64>),
     /// 128 bit unsigned.
-    UInt128(Vec<u128>),
+    UInt128(Buffer<u128>),
     /// IEEE 754 binary32.
-    Float32(Vec<f32>),
+    Float32(Buffer<f32>),
     /// IEEE 754 binary64.
-    Float64(Vec<f64>),
+    Float64(Buffer<f64>),
     /// The months, days and microseconds triple.
-    Interval(Vec<(i32, i32, i64)>),
+    Interval(Buffer<(i32, i32, i64)>),
     /// Strings, as 16 byte views plus the arena the long ones live in.
     Varlen(StringColumn),
 }
@@ -568,7 +569,7 @@ fn copy_of(data: &Data, at: &[usize]) -> Data {
     macro_rules! copied {
         ($values:expr, $variant:path, $zero:expr) => {{
             let values = $values;
-            let mut out = Vec::with_capacity(at.len());
+            let mut out = Buffer::with_capacity(at.len());
             for &index in at {
                 // One bounds check rather than a null test and a bounds check, because `NOWHERE` is
                 // past the end of every slice there can be.
@@ -707,20 +708,20 @@ fn empty_data_for(ty: &LogicalType) -> Result<Data> {
     use rudb_common::PhysicalType as P;
     Ok(match ty.physical() {
         P::Empty => Data::Empty,
-        P::Bool => Data::Bool(Vec::new()),
-        P::Int8 => Data::Int8(Vec::new()),
-        P::Int16 => Data::Int16(Vec::new()),
-        P::Int32 => Data::Int32(Vec::new()),
-        P::Int64 => Data::Int64(Vec::new()),
-        P::Int128 => Data::Int128(Vec::new()),
-        P::UInt8 => Data::UInt8(Vec::new()),
-        P::UInt16 => Data::UInt16(Vec::new()),
-        P::UInt32 => Data::UInt32(Vec::new()),
-        P::UInt64 => Data::UInt64(Vec::new()),
-        P::UInt128 => Data::UInt128(Vec::new()),
-        P::Float32 => Data::Float32(Vec::new()),
-        P::Float64 => Data::Float64(Vec::new()),
-        P::Interval => Data::Interval(Vec::new()),
+        P::Bool => Data::Bool(Buffer::new()),
+        P::Int8 => Data::Int8(Buffer::new()),
+        P::Int16 => Data::Int16(Buffer::new()),
+        P::Int32 => Data::Int32(Buffer::new()),
+        P::Int64 => Data::Int64(Buffer::new()),
+        P::Int128 => Data::Int128(Buffer::new()),
+        P::UInt8 => Data::UInt8(Buffer::new()),
+        P::UInt16 => Data::UInt16(Buffer::new()),
+        P::UInt32 => Data::UInt32(Buffer::new()),
+        P::UInt64 => Data::UInt64(Buffer::new()),
+        P::UInt128 => Data::UInt128(Buffer::new()),
+        P::Float32 => Data::Float32(Buffer::new()),
+        P::Float64 => Data::Float64(Buffer::new()),
+        P::Interval => Data::Interval(Buffer::new()),
         P::Varlen => Data::Varlen(StringColumn::new()),
         other => {
             return Err(Error::not_implemented(format!(
@@ -841,7 +842,7 @@ mod tests {
     use crate::validity::Validity;
 
     fn integers(values: &[i32]) -> Vector {
-        Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec())).unwrap()
+        Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into())).unwrap()
     }
 
     #[test]
@@ -906,9 +907,9 @@ mod tests {
     #[test]
     fn a_type_that_does_not_match_its_layout_is_refused_at_construction() {
         // One comparison here against a wrong answer read out three layers later.
-        let wrong = Vector::flat(LogicalType::Varchar, Data::Int32(vec![1]));
+        let wrong = Vector::flat(LogicalType::Varchar, Data::Int32(vec![1].into()));
         assert!(wrong.is_err());
-        let right = Vector::flat(LogicalType::Date, Data::Int32(vec![1]));
+        let right = Vector::flat(LogicalType::Date, Data::Int32(vec![1].into()));
         assert!(right.is_ok(), "a date is stored in an i32 and that has to be allowed");
     }
 
@@ -1180,7 +1181,7 @@ mod tests {
     #[test]
     fn a_decimal_reads_its_width_and_scale_from_the_type_and_not_the_data() {
         let ty = LogicalType::decimal(9, 2).unwrap();
-        let vector = Vector::flat(ty, Data::Int32(vec![1234])).unwrap();
+        let vector = Vector::flat(ty, Data::Int32(vec![1234].into())).unwrap();
         assert_eq!(vector.value_at(0), Value::Decimal { unscaled: 1234, width: 9, scale: 2 });
         assert_eq!(vector.value_at(0).to_string(), "12.34");
     }

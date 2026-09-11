@@ -23,6 +23,22 @@ pub struct Chunk {
     rows: usize,
 }
 
+/// The scheduler's half of the data plane contract, imposed now rather than at layer eight.
+///
+/// `spec/engine/03-data-plane.md` section 3.10. A chunk is what one thread hands another, so a chunk
+/// is `Send`, and that is not free: it rules out an `Rc` anywhere in a vector, it rules out a borrow
+/// of thread local state, and it is what the pin handle in [`Buffer`](crate::Buffer) is protecting
+/// against a lifetime parameter.
+///
+/// It is a static assertion rather than a comment because the failure mode is quiet. Every one of
+/// those mistakes compiles perfectly well on its own and is only a problem the day a chunk is put in
+/// a queue, which is eight layers from here and far too late to be told. This way the build breaks
+/// on the commit that introduces it.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Chunk>();
+};
+
 impl Chunk {
     /// A chunk of `columns`, taking the row count from the first of them.
     ///
@@ -273,7 +289,7 @@ mod tests {
     use crate::vector::{Data, Form};
 
     fn integers(values: &[i32]) -> Vector {
-        Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec()))
+        Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into()))
             .expect("integers are an i32 layout")
     }
 
