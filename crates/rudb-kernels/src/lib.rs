@@ -1,4 +1,5 @@
-//! The compute kernels: casting, comparison, arithmetic, three-valued logic and the aggregates.
+//! The compute kernels: casting, comparison, arithmetic, three-valued logic, the aggregates and
+//! turning a vector of flags into the rows it keeps.
 //!
 //! Rank 3 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
@@ -26,6 +27,12 @@
 //! [`aggregate::Accumulator`], is the odd one out because it has state rather than an output vector,
 //! so its batch interface folds a vector into the running state instead of returning one. The
 //! shapes none of them has a loop for still run the old loop, and they are still correct.
+//!
+//! [`select::selection`] arrived after those five and is the other end of the same measurement.
+//! A comparison that produces a boolean vector in under a nanosecond a row is no use if the
+//! operator above it then reads that vector back a value at a time, which is what a filter was
+//! doing, so the sixth file turns the flags into the positions that survived without a branch in
+//! the loop.
 //!
 //! The other optimization that has been here from the start is the constant fast path: a cast or a
 //! comparison where both sides are constant vectors costs one operation rather than 1024. That one
@@ -58,6 +65,7 @@ pub mod fallback;
 pub mod logic;
 mod number;
 pub mod scalar;
+pub mod select;
 mod shape;
 
 pub use aggregate::Accumulator;
@@ -66,3 +74,4 @@ pub use compare::{Comparison, compare, compare_values, order, order_with_nulls};
 pub use fallback::Kernel;
 pub use logic::{Connective, combine, is_true};
 pub use scalar::{call, call_values};
+pub use select::selection;
