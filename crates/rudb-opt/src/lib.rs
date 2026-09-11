@@ -2,8 +2,8 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Two passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is the
-//! start of it. Column pruning came first, because it is the pass whose absence is measured in
+//! Three passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
+//! the start of it. Column pruning came first, because it is the pass whose absence is measured in
 //! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
 //! nothing able to tell it which subset.
@@ -11,8 +11,10 @@
 #![forbid(unsafe_code)]
 
 pub mod columns;
+pub mod filter;
 pub mod fold;
 pub mod pass;
+mod walk;
 
 use rudb_common::{Error, Result};
 use rudb_plan::{Node, NodeRef, Plan};
@@ -33,7 +35,14 @@ pub const RANK: u8 = 11;
 /// nothing refers to, so a `CASE WHEN false THEN t.a ELSE 1 END` costs a column read when the two run
 /// the other way around. Nothing in the other direction is given up: pruning drops columns and
 /// renumbers bindings, and neither of those makes anything foldable.
-pub static PASSES: [&(dyn Pass + Sync); 2] = [&fold::ExpressionRewriter, &columns::UnusedColumns];
+///
+/// Filter pushdown goes between them. After folding, because a predicate that folds to a constant is
+/// a predicate with nothing to push and the pass that moves it should not be the one that finds out.
+/// Before pruning, because moving a filter below a projection rewrites it in terms of columns the
+/// projection reads, and pruning has to see the plan after the move or it drops a column that
+/// something now refers to.
+pub static PASSES: [&(dyn Pass + Sync); 3] =
+    [&fold::ExpressionRewriter, &filter::FilterPushdown, &columns::UnusedColumns];
 
 /// Rewrites a bound plan into the plan that runs, with every pass on.
 ///

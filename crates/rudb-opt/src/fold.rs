@@ -36,12 +36,11 @@ use std::collections::HashMap;
 
 use rudb_common::{LogicalType, Result, Value};
 use rudb_kernels::{Comparison, Connective, call_values, cast_value, combine, compare_values};
-use rudb_plan::{
-    Arm, CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice, SortKey,
-};
+use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice, SortKey};
 use rudb_vector::Vector;
 
 use crate::pass::{Context, Pass, top_down};
+use crate::walk;
 
 /// The functions whose value is not decided by their arguments.
 ///
@@ -201,9 +200,7 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
 
 /// Rewrites a run of expressions, handing back a new slice only if one of them changed.
 fn expr_list(plan: &mut Plan, slice: Slice, done: &mut Done) -> Option<Slice> {
-    let held = plan.expr_list(slice).to_vec();
-    let rewritten: Vec<ExprRef> = held.iter().map(|&expr| expression(plan, expr, done)).collect();
-    (rewritten != held).then(|| plan.add_expr_list(&rewritten))
+    walk::list(plan, slice, &mut |plan, expr| expression(plan, expr, done))
 }
 
 /// Rewrites one expression and everything under it, bottom up.
@@ -217,76 +214,10 @@ fn expression(plan: &mut Plan, expr: ExprRef, done: &mut Done) -> ExprRef {
     if let Some(&already) = done.get(&expr) {
         return already;
     }
-    let rebuilt = rebuild(plan, expr, done);
+    let rebuilt = walk::rebuild(plan, expr, &mut |plan, child| expression(plan, child, done));
     let simplified = simplify(plan, rebuilt);
     done.insert(expr, simplified);
     simplified
-}
-
-/// Rewrites the operands, rebuilding the expression only if one of them moved.
-fn rebuild(plan: &mut Plan, expr: ExprRef, done: &mut Done) -> ExprRef {
-    let ty = plan.expr_type(expr).clone();
-    match *plan.expr(expr) {
-        Expr::Column(_) | Expr::Constant(_) => expr,
-        Expr::Cast { input, try_cast } => {
-            let rewritten = expression(plan, input, done);
-            if rewritten == input {
-                expr
-            } else {
-                plan.add_expr(Expr::Cast { input: rewritten, try_cast }, ty)
-            }
-        }
-        Expr::Compare { op, left, right } => {
-            let rewritten_left = expression(plan, left, done);
-            let rewritten_right = expression(plan, right, done);
-            if rewritten_left == left && rewritten_right == right {
-                expr
-            } else {
-                plan.add_expr(
-                    Expr::Compare { op, left: rewritten_left, right: rewritten_right },
-                    ty,
-                )
-            }
-        }
-        Expr::Conjunction { op, children } => match expr_list(plan, children, done) {
-            None => expr,
-            Some(children) => plan.add_expr(Expr::Conjunction { op, children }, ty),
-        },
-        Expr::Function { name, args } => match expr_list(plan, args, done) {
-            None => expr,
-            Some(args) => plan.add_expr(Expr::Function { name, args }, ty),
-        },
-        Expr::Aggregate { name, args, distinct, filter } => {
-            let rewritten_args = expr_list(plan, args, done);
-            let rewritten_filter = filter.map(|inner| expression(plan, inner, done));
-            if rewritten_args.is_none() && rewritten_filter == filter {
-                expr
-            } else {
-                let args = rewritten_args.unwrap_or(args);
-                plan.add_expr(
-                    Expr::Aggregate { name, args, distinct, filter: rewritten_filter },
-                    ty,
-                )
-            }
-        }
-        Expr::Case { arms, otherwise } => {
-            let held = plan.arm_list(arms).to_vec();
-            let rewritten: Vec<Arm> = held
-                .iter()
-                .map(|arm| Arm {
-                    when: expression(plan, arm.when, done),
-                    then: expression(plan, arm.then, done),
-                })
-                .collect();
-            let rewritten_otherwise = otherwise.map(|inner| expression(plan, inner, done));
-            if rewritten == held && rewritten_otherwise == otherwise {
-                expr
-            } else {
-                let arms = plan.add_arms(&rewritten);
-                plan.add_expr(Expr::Case { arms, otherwise: rewritten_otherwise }, ty)
-            }
-        }
-    }
 }
 
 /// Applies every rule to one expression whose operands are already rewritten.
