@@ -27,6 +27,7 @@ use rudb_vector::{Chunk, Vector};
 
 use crate::prepared::{comparison, connective, narrow};
 use crate::schema::Schema;
+use crate::written::written;
 
 /// Evaluates one expression over a chunk, producing one vector as long as the chunk.
 ///
@@ -66,7 +67,9 @@ pub fn evaluate(plan: &Plan, expr: ExprRef, schema: &Schema, chunk: &Chunk) -> R
         }
         Expr::Function { name, args } => {
             let args = evaluate_all(plan, plan.expr_list(args), schema, chunk)?;
-            rudb_kernels::call(plan.string(name), &args, &ty)
+            // The renderer runs only if a kernel asks for it, which is only on the row that divides
+            // by zero, so a chunk that computes nothing but answers pays nothing for it.
+            rudb_kernels::call(plan.string(name), &args, &ty, Some(&|| written(plan, expr, schema)))
         }
         Expr::Aggregate { name, .. } => Err(Error::internal(format!(
             "the {} aggregate was evaluated as an ordinary expression",

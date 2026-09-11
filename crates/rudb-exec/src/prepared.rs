@@ -41,6 +41,7 @@ use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Chunk, Selection, Vector};
 
 use crate::schema::Schema;
+use crate::written::written;
 
 /// The scheduler's half of the expression contract, imposed now rather than at layer eight.
 ///
@@ -125,6 +126,13 @@ enum Step {
     Function {
         /// The resolved function name, held here so the plan is not consulted per chunk.
         name: String,
+        /// How the call is written, for the one error message that quotes it.
+        ///
+        /// Rendered when the pipeline is built rather than when a chunk arrives, because the plan
+        /// is here and is not there. It is a short string per function node in the query and it is
+        /// built once, which is a different cost from the tree walk's, where the plan is still to
+        /// hand and the rendering can wait until the row that fails.
+        written: String,
         /// Where the argument list starts.
         start: usize,
         /// How many arguments it has.
@@ -444,9 +452,9 @@ impl Prepared {
                     })?,
                 )
             }
-            Step::Function { name, start, len } => {
+            Step::Function { name, written, start, len } => {
                 Some(self.with_operands(*start, *len, chunk, slots, |args| {
-                    rudb_kernels::call(name, args, ty)
+                    rudb_kernels::call(name, args, ty, Some(&|| written.clone()))
                 })?)
             }
             Step::Case { arms, otherwise } => {
@@ -607,7 +615,12 @@ impl Prepared {
             }
             Expr::Function { name, args } => {
                 let (start, len) = self.push_list(plan, plan.expr_list(args), schema)?;
-                Step::Function { name: plan.string(name).to_string(), start, len }
+                Step::Function {
+                    name: plan.string(name).to_string(),
+                    written: written(plan, expr, schema),
+                    start,
+                    len,
+                }
             }
             Expr::Aggregate { name, .. } => {
                 return Err(Error::internal(format!(
@@ -669,7 +682,7 @@ fn missing(index: usize) -> Error {
 /// The chunk cut down to the given rows.
 ///
 /// The reason `CASE` is written with this rather than by evaluating every arm over the whole chunk
-/// and picking afterwards. `CASE WHEN x <> 0 THEN 1 / x ELSE 0 END` divides by zero on the rows the
+/// and picking afterwards. `CASE WHEN x <> 0 THEN 1 // x ELSE 0 END` divides by zero on the rows the
 /// arm does not apply to if the arm is evaluated for them, and a `CASE` that raises on a row it was
 /// written to exclude is the classic wrong answer this shape prevents.
 pub(crate) fn narrow(chunk: &Chunk, rows: &[usize]) -> Result<Chunk> {
@@ -814,6 +827,25 @@ mod tests {
     #[test]
     fn a_function_agrees() {
         agrees("\"+\"(#0.0::INTEGER, 1::INTEGER)::INTEGER AS a");
+    }
+
+    /// The two evaluators quote the same expression when a divisor is zero. Per #262.
+    ///
+    /// This is the one message in the engine that depends on how an expression is written rather
+    /// than on what it computes, and the two evaluators render it at different times: the prepared
+    /// form when the pipeline is built, the tree walk on the row that fails. Same renderer, so the
+    /// same sentence, and this is what says so.
+    #[test]
+    fn both_evaluators_quote_the_same_expression_when_a_divisor_is_zero() {
+        let (schema, chunk) = input();
+        let (plan, list) = projection("\"//\"(#0.0::INTEGER, 0::INTEGER)::INTEGER AS a");
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the expression resolves");
+        let mut scratch = prepared.scratch();
+        let mut out = Vec::new();
+        let fast = prepared.evaluate(&chunk, &mut scratch, &mut out).expect_err("divides by zero");
+        let slow = evaluate(&plan, list[0], &schema, &chunk).expect_err("divides by zero");
+        assert_eq!(fast.message(), slow.message());
+        assert!(fast.message().starts_with("Division by zero in expression (x // 0)."), "{fast}");
     }
 
     #[test]

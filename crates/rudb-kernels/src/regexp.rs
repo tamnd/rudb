@@ -73,7 +73,7 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
                 let text = source.get(index);
                 out[index] =
                     if whole { call.regex.is_full_match(text) } else { call.regex.is_match(text) };
-                Ok(true)
+                Ok(())
             })?;
             finish(returns, Data::Bool(out.into()), validity)
         }

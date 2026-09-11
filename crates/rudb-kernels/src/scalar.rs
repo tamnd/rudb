@@ -10,9 +10,11 @@
 //! inside each function, which is the only way to be sure that a function added later does not
 //! quietly forget it.
 //!
-//! Division by zero produces null rather than raising. That is DuckDB's behaviour and it is not
-//! Postgres's, and it is one of the compatibility decisions that is worth a line of its own,
-//! because a query that returns a row where another engine raises is a difference a user notices.
+//! Dividing by zero is three behaviours and not one, which `divided_by_zero` writes out. `/` is
+//! IEEE arithmetic on two doubles and answers an infinity or a nan, `//` raises whatever it was
+//! given, and `%` raises on integers and decimals and answers a nan on floats. All three were
+//! measured against the pinned binary rather than reasoned about, because a query that returns a
+//! row where another engine raises is a difference a user notices.
 //!
 //! # How the vectorized path is put together
 //!
@@ -38,8 +40,7 @@
 //!
 //! The body is not run at a row that is already null. That is not an optimization, it is
 //! correctness: the value stored under a null is a zero, and adding two zeros is fine but dividing
-//! by one is a null the oracle never produced and overflowing on one is an error the oracle never
-//! raised.
+//! by one raises an error the oracle never raised and overflowing on one raises another.
 //!
 //! A `LIKE` pattern is compiled once per vector rather than once per row. `%google%`, which is
 //! ClickBench query 21 over a hundred million rows, comes out as a substring search rather than as
@@ -55,6 +56,19 @@ use crate::number::{approximate, digits, fit, integral, pow10, rescale};
 use crate::regexp;
 use crate::shape::{first, identity, nulls_of, single};
 
+/// How the call being evaluated is written, for the one error that quotes it.
+///
+/// DuckDB's division by zero message names the expression rather than the numbers in it, and the
+/// expression it names is the bound one, so `a // 0` over a column says `a` and a decimal literal
+/// says the digits the cast gave it. A kernel has the numbers and not the expression, so the caller
+/// that has the plan hands this down.
+///
+/// It is a closure rather than a string because it is wanted only on the row that fails. Rendering
+/// an expression once a chunk to carry it into an error that almost never happens is a cost every
+/// chunk pays for a message nobody reads. `None` is a caller with no expression to name, which
+/// quotes the two values instead.
+pub type Written<'a> = Option<&'a dyn Fn() -> String>;
+
 /// Calls a scalar function on a batch.
 ///
 /// `returns` is the type the binder resolved the call to, and it is passed in rather than derived
@@ -65,7 +79,12 @@ use crate::shape::{first, identity, nulls_of, single};
 ///
 /// If the arguments are not all the same length, if the function is not one of the ones written
 /// here, or if the call fails at some row.
-pub fn call<V: AsRef<Vector>>(name: &str, args: &[V], returns: &LogicalType) -> Result<Vector> {
+pub fn call<V: AsRef<Vector>>(
+    name: &str,
+    args: &[V],
+    returns: &LogicalType,
+    written: Written<'_>,
+) -> Result<Vector> {
     let rows = args.first().map_or(0, |arg| arg.as_ref().len());
     for (at, arg) in args.iter().enumerate() {
         if arg.as_ref().len() != rows {
@@ -81,10 +100,14 @@ pub fn call<V: AsRef<Vector>>(name: &str, args: &[V], returns: &LogicalType) -> 
     if rows > 0 && !args.is_empty() && args.iter().all(|arg| arg.as_ref().form() == Form::Constant)
     {
         let row: Vec<Value> = args.iter().map(|arg| arg.as_ref().value_at(0)).collect();
-        return Ok(Vector::constant(returns.clone(), call_values(name, &row, returns)?, rows));
+        return Ok(Vector::constant(
+            returns.clone(),
+            call_values(name, &row, returns, written)?,
+            rows,
+        ));
     }
 
-    if let Some(vector) = specialized(name, args, returns, rows)? {
+    if let Some(vector) = specialized(name, args, returns, rows, written)? {
         return Ok(vector);
     }
 
@@ -100,7 +123,7 @@ pub fn call<V: AsRef<Vector>>(name: &str, args: &[V], returns: &LogicalType) -> 
     for index in 0..rows {
         row.clear();
         row.extend(args.iter().map(|arg| arg.as_ref().value_at(index)));
-        values.push(call_values(name, &row, returns)?);
+        values.push(call_values(name, &row, returns, written)?);
     }
     Vector::from_values(returns.clone(), &values)
 }
@@ -111,35 +134,32 @@ fn specialized<V: AsRef<Vector>>(
     args: &[V],
     returns: &LogicalType,
     rows: usize,
+    written: Written<'_>,
 ) -> Result<Option<Vector>> {
     if regexp::is_regexp(name) {
         return regexp::vectorized(name, args, returns, rows);
     }
     match args {
         [only] => unary(name, only.as_ref(), returns, rows),
-        [left, right] => binary(name, left.as_ref(), right.as_ref(), returns, rows),
+        [left, right] => binary(name, left.as_ref(), right.as_ref(), returns, rows, written),
         _ => Ok(None),
     }
 }
 
-/// Runs `body` at every row that is not already null, and records the rows where the body itself
-/// produced one.
+/// Runs `body` at every row that is not already null, and hands back the nulls of the answer.
 ///
-/// Division by zero is the reason for the return value. It is the one thing in this file that turns
-/// a valid input into a null output, so the driver has to be able to hear about it, and collecting
-/// the indices costs nothing at all on the overwhelmingly common path where there are none.
+/// The answer has the nulls the arguments had and no others. Nothing in this file turns a valid
+/// input into a null output: division by zero used to, which is what this used to collect indices
+/// for, and it raises now, so the mask that comes out is the mask that went in.
 pub(crate) fn over_valid(
     len: usize,
     base: Validity,
-    mut body: impl FnMut(usize) -> Result<bool>,
+    mut body: impl FnMut(usize) -> Result<()>,
 ) -> Result<Validity> {
-    let mut became_null: Vec<usize> = Vec::new();
     match &base {
         Validity::AllValid => {
             for index in 0..len {
-                if !body(index)? {
-                    became_null.push(index);
-                }
+                body(index)?;
             }
         }
         // Nothing to compute. Every answer is null and the data is never touched, which is what a
@@ -147,19 +167,15 @@ pub(crate) fn over_valid(
         Validity::AllInvalid => {}
         Validity::Mask(mask) => {
             for index in 0..len {
-                if mask.get(index) && !body(index)? {
-                    became_null.push(index);
+                if mask.get(index) {
+                    body(index)?;
                 }
             }
         }
     }
-    let mut validity = base;
-    for index in became_null {
-        validity = validity.with_null(index, len);
-    }
     // An empty vector has no null to record, and `Vector::from_values` normalizes the empty mask it
     // builds to all valid, so a specialized empty result has to say the same thing.
-    Ok(if len == 0 { Validity::AllValid } else { validity.normalize(len) })
+    Ok(if len == 0 { Validity::AllValid } else { base.normalize(len) })
 }
 
 /// The result vector, with the layout check that `Vector::flat` does kept rather than skipped.
@@ -223,7 +239,7 @@ fn made_timestamp(
     let mut out = vec![0i64; rows];
     let validity = over_valid(rows, base, |index| {
         out[index] = micros_of_millis(millis[index])?;
-        Ok(true)
+        Ok(())
     })?;
     finish(returns, Data::Int64(out.into()), validity)
 }
@@ -251,7 +267,7 @@ fn not_of(
     let mut out = vec![false; rows];
     let validity = over_valid(rows, base, |index| {
         out[index] = !held[index];
-        Ok(true)
+        Ok(())
     })?;
     finish(returns, Data::Bool(out.into()), validity)
 }
@@ -281,7 +297,7 @@ fn sign_of(
                             match computed {
                                 Some(answer) => {
                                     out[index] = answer;
-                                    Ok(true)
+                                    Ok(())
                                 }
                                 None if negating => Err(overflow(
                                     Op::Subtract,
@@ -299,7 +315,7 @@ fn sign_of(
                     let mut out = vec![0.0f32; rows];
                     let validity = over_valid(rows, base, |index| {
                         out[index] = if negating { -held[index] } else { held[index].abs() };
-                        Ok(true)
+                        Ok(())
                     })?;
                     finish(returns, Data::Float32(out.into()), validity)
                 }
@@ -307,7 +323,7 @@ fn sign_of(
                     let mut out = vec![0.0f64; rows];
                     let validity = over_valid(rows, base, |index| {
                         out[index] = if negating { -held[index] } else { held[index].abs() };
-                        Ok(true)
+                        Ok(())
                     })?;
                     finish(returns, Data::Float64(out.into()), validity)
                 }
@@ -339,7 +355,7 @@ fn length_of(
         // the same number `chars().count()` reaches and it never decodes anything.
         let characters = bytes.iter().filter(|byte| (**byte as i8) >= -0x40).count();
         out[index] = i64::try_from(characters).unwrap_or(i64::MAX);
-        Ok(true)
+        Ok(())
     })?;
     finish(returns, Data::Int64(out.into()), validity)
 }
@@ -363,7 +379,7 @@ fn bytes_of(
     let validity = over_valid(rows, base, |index| {
         let bytes = column.bytes(index).unwrap_or_default();
         out[index] = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
-        Ok(true)
+        Ok(())
     })?;
     finish(returns, Data::Int64(out.into()), validity)
 }
@@ -423,9 +439,10 @@ fn binary(
     right: &Vector,
     returns: &LogicalType,
     rows: usize,
+    written: Written<'_>,
 ) -> Result<Option<Vector>> {
     if let Some(op) = arithmetic_op(name) {
-        return arithmetic_of(op, left, right, returns);
+        return arithmetic_of(op, left, right, returns, written);
     }
     match name {
         "/" => slash_of(left, right, returns),
@@ -530,6 +547,7 @@ fn arithmetic_of(
     left: &Vector,
     right: &Vector,
     returns: &LogicalType,
+    written: Written<'_>,
 ) -> Result<Option<Vector>> {
     // Both sides already the result type is what makes a native operation on the run's own width
     // exactly the oracle's widen to `i128` and narrow back, rather than nearly it. A decimal
@@ -546,7 +564,7 @@ fn arithmetic_of(
     if !lined_up {
         return Ok(None);
     }
-    by_form!(left, right, arithmetic_runs, op, left, right, returns)
+    by_form!(left, right, arithmetic_runs, op, left, right, returns, written)
 }
 
 /// One optimistic pass over the two runs, with the operator hoisted out of the loop.
@@ -610,6 +628,7 @@ fn arithmetic_runs<L, R>(
     left: &Vector,
     right: &Vector,
     returns: &LogicalType,
+    written: Written<'_>,
 ) -> Result<Option<Vector>>
 where
     L: Fn(usize) -> usize,
@@ -620,12 +639,16 @@ where
     // A decimal shares its run with the integer of the same width and the two want different
     // arithmetic, so `returns` and not the run is what decides, and it decides first.
     if matches!(returns, LogicalType::Decimal { .. }) {
-        return decimal_runs(one, at_left, other, at_right, op, &base, left, right, returns);
+        return decimal_runs(
+            one, at_left, other, at_right, op, &base, left, right, returns, written,
+        );
     }
-    // Dividing has to look at the divisor before it computes and has to know whether the row was
-    // already null before it calls a zero divisor a null, so it keeps the careful loop.
+    // Dividing has to look at the divisor before it computes, and has to know whether the row was
+    // already null before it raises on a zero, so it keeps the careful loop.
     if matches!(op, Op::Divide | Op::Modulo) {
-        return guarded_runs(one, at_left, other, at_right, op, base, left, right, returns);
+        return guarded_runs(
+            one, at_left, other, at_right, op, base, left, right, returns, written,
+        );
     }
     fast_runs(one, at_left, other, at_right, op, &base, returns, rows)
 }
@@ -723,7 +746,8 @@ where
     Ok(None)
 }
 
-/// Dividing and taking a remainder, where a zero on the right is a null and not an answer.
+/// Dividing and taking a remainder, where a zero on the right is an error rather than an answer,
+/// except on the float remainder, where it is a nan.
 #[expect(
     clippy::too_many_arguments,
     reason = "two sides with an index each, the operator, the nulls, the two vectors the error \
@@ -740,6 +764,7 @@ fn guarded_runs<L, R>(
     left: &Vector,
     right: &Vector,
     returns: &LogicalType,
+    written: Written<'_>,
 ) -> Result<Option<Vector>>
 where
     L: Fn(usize) -> usize,
@@ -754,7 +779,12 @@ where
                     let validity = over_valid(rows, base, |index| {
                         let (x, y) = (a[at_left(index)], b[at_right(index)]);
                         if y == 0 {
-                            return Ok(false);
+                            return Err(divided_by_zero(
+                                written,
+                                op,
+                                &left.value_at(index),
+                                &right.value_at(index),
+                            ));
                         }
                         let computed = if matches!(op, Op::Divide) {
                             x.checked_div(y)
@@ -768,7 +798,7 @@ where
                         match computed {
                             Some(answer) => {
                                 out[index] = answer;
-                                Ok(true)
+                                Ok(())
                             }
                             None => Err(overflow(
                                 op,
@@ -790,11 +820,16 @@ where
                 let mut out = vec![0 as $native; rows];
                 let validity = over_valid(rows, base, |index| {
                     let (x, y) = (a[at_left(index)], b[at_right(index)]);
-                    if y == 0.0 {
-                        return Ok(false);
+                    if y == 0.0 && matches!(op, Op::Divide) {
+                        return Err(divided_by_zero(
+                            written,
+                            op,
+                            &left.value_at(index),
+                            &right.value_at(index),
+                        ));
                     }
                     out[index] = $narrow(float_step(op, $widen(x), $widen(y)));
-                    Ok(true)
+                    Ok(())
                 })?;
                 return finish(returns, Data::$variant(out.into()), validity);
             }
@@ -838,6 +873,7 @@ fn decimal_runs<L, R>(
     left: &Vector,
     right: &Vector,
     returns: &LogicalType,
+    written: Written<'_>,
 ) -> Result<Option<Vector>>
 where
     L: Fn(usize) -> usize,
@@ -868,7 +904,12 @@ where
                         let x = i128::from(a[at_left(index)]);
                         let y = i128::from(b[at_right(index)]);
                         if guarding && y == 0 {
-                            return Ok(false);
+                            return Err(divided_by_zero(
+                                written,
+                                op,
+                                &left.value_at(index),
+                                &right.value_at(index),
+                            ));
                         }
                         let unscaled = match op {
                             Op::Add => x.checked_add(y),
@@ -891,7 +932,7 @@ where
                         match fits {
                             Some(answer) => {
                                 out[index] = answer;
-                                Ok(true)
+                                Ok(())
                             }
                             None => Err(overflow(
                                 op,
@@ -959,11 +1000,8 @@ where
     let mut out = vec![0.0f64; rows];
     let validity = over_valid(rows, base, |index| {
         let (x, y) = (a[at_left(index)], b[at_right(index)]);
-        if y == 0.0 {
-            return Ok(false);
-        }
         out[index] = x / y;
-        Ok(true)
+        Ok(())
     })?;
     finish(returns, Data::Float64(out.into()), validity)
 }
@@ -1044,7 +1082,7 @@ fn like_of(
         let folded = if fold_case { Some(text.to_lowercase()) } else { None };
         let text = folded.as_deref().unwrap_or(text);
         out[index] = compiled.holds(text, &mut characters) != negated;
-        Ok(true)
+        Ok(())
     })?;
     finish(returns, Data::Bool(out.into()), validity)
 }
@@ -1145,7 +1183,7 @@ fn date_of(
             let mut out = vec![0i64; rows];
             let validity = over_valid(rows, base, |index| {
                 out[index] = part.of_days(days[index])?;
-                Ok(true)
+                Ok(())
             })?;
             finish(returns, Data::Int64(out.into()), validity)
         }
@@ -1153,7 +1191,7 @@ fn date_of(
             let mut out = vec![0i32; rows];
             let validity = over_valid(rows, base, |index| {
                 out[index] = part.truncate_days(days[index])?;
-                Ok(true)
+                Ok(())
             })?;
             finish(returns, Data::Int32(out.into()), validity)
         }
@@ -1161,7 +1199,7 @@ fn date_of(
             let mut out = vec![0i64; rows];
             let validity = over_valid(rows, base, |index| {
                 out[index] = part.of_micros(micros[index])?;
-                Ok(true)
+                Ok(())
             })?;
             finish(returns, Data::Int64(out.into()), validity)
         }
@@ -1169,7 +1207,7 @@ fn date_of(
             let mut out = vec![0i64; rows];
             let validity = over_valid(rows, base, |index| {
                 out[index] = part.truncate_micros(micros[index])?;
-                Ok(true)
+                Ok(())
             })?;
             finish(returns, Data::Int64(out.into()), validity)
         }
@@ -1248,7 +1286,12 @@ fn made_timestamp_value(millis: &Value) -> Result<Value> {
 /// # Errors
 ///
 /// If the function is not one of the ones written here, or if the call fails.
-pub fn call_values(name: &str, args: &[Value], returns: &LogicalType) -> Result<Value> {
+pub fn call_values(
+    name: &str,
+    args: &[Value],
+    returns: &LogicalType,
+    written: Written<'_>,
+) -> Result<Value> {
     if name == "coalesce" {
         let found = args.iter().find(|value| !value.is_null());
         return Ok(found.cloned().unwrap_or(Value::Null));
@@ -1264,11 +1307,11 @@ pub fn call_values(name: &str, args: &[Value], returns: &LogicalType) -> Result<
             Some(held) => Ok(Value::Boolean(!held)),
             None => Err(Error::internal(format!("not of a {}", only.logical_type()))),
         },
-        ("+", [left, right]) => arithmetic(Op::Add, left, right, returns),
-        ("-", [left, right]) => arithmetic(Op::Subtract, left, right, returns),
-        ("*", [left, right]) => arithmetic(Op::Multiply, left, right, returns),
-        ("%", [left, right]) => arithmetic(Op::Modulo, left, right, returns),
-        ("//", [left, right]) => arithmetic(Op::Divide, left, right, returns),
+        ("+", [left, right]) => arithmetic(Op::Add, left, right, returns, written),
+        ("-", [left, right]) => arithmetic(Op::Subtract, left, right, returns, written),
+        ("*", [left, right]) => arithmetic(Op::Multiply, left, right, returns, written),
+        ("%", [left, right]) => arithmetic(Op::Modulo, left, right, returns, written),
+        ("//", [left, right]) => arithmetic(Op::Divide, left, right, returns, written),
         ("/", [left, right]) => divide(left, right),
         ("||", [left, right]) => Ok(Value::Varchar(format!("{left}{right}"))),
         ("lower", [only]) => Ok(Value::Varchar(only.to_string().to_lowercase())),
@@ -1348,6 +1391,22 @@ fn overflow(op: Op, ty: &LogicalType, left: &Value, right: &Value) -> Error {
     ))
 }
 
+/// The sentence DuckDB says when a divisor is zero, which is not every divisor by zero.
+///
+/// `/` never gets here: it promotes to a double and answers an infinity or a nan. `//` always gets
+/// here, whatever it was given. `%` gets here on integers and decimals and not on floats, where the
+/// IEEE answer is a nan. The sentence names the expression rather than the numbers, so a caller with
+/// the plan hands one down and a caller without one quotes the two values, which is the same text
+/// whenever the expression was folded to a pair of constants.
+fn divided_by_zero(written: Written<'_>, op: Op, left: &Value, right: &Value) -> Error {
+    let quoted =
+        written.map_or_else(|| format!("({left} {} {right})", op.symbol()), |render| render());
+    Error::invalid_input(format!(
+        "Division by zero in expression {quoted}. Use TRY(...) to return NULL for this expression, \
+         or SET null_on_division_by_zero=true to return NULL for all divisions by zero."
+    ))
+}
+
 /// `abs` says it differently: `Overflow on abs(-2147483648)`, with no type in it and no punctuation
 /// on the end.
 fn abs_overflow(value: &Value) -> Error {
@@ -1420,18 +1479,30 @@ fn ending(op: Op, ty: &LogicalType) -> &'static str {
     }
 }
 
-fn arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> Result<Value> {
+fn arithmetic(
+    op: Op,
+    left: &Value,
+    right: &Value,
+    ty: &LogicalType,
+    written: Written<'_>,
+) -> Result<Value> {
     match ty {
-        LogicalType::Float | LogicalType::Double => float_arithmetic(op, left, right, ty),
+        LogicalType::Float | LogicalType::Double => float_arithmetic(op, left, right, ty, written),
         LogicalType::Decimal { width, scale } => {
-            decimal_arithmetic(op, left, right, *width, *scale)
+            decimal_arithmetic(op, left, right, *width, *scale, written)
         }
-        other if other.is_integer() => integer_arithmetic(op, left, right, ty),
+        other if other.is_integer() => integer_arithmetic(op, left, right, ty, written),
         other => Err(Error::not_implemented(format!("{} on {other}", op.word()))),
     }
 }
 
-fn integer_arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> Result<Value> {
+fn integer_arithmetic(
+    op: Op,
+    left: &Value,
+    right: &Value,
+    ty: &LogicalType,
+    written: Written<'_>,
+) -> Result<Value> {
     let (a, b) = match (integral(left), integral(right)) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -1444,7 +1515,7 @@ fn integer_arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> 
         }
     };
     if matches!(op, Op::Divide | Op::Modulo) && b == 0 {
-        return Ok(Value::Null);
+        return Err(divided_by_zero(written, op, left, right));
     }
     let wide = match op {
         Op::Add => a.checked_add(b),
@@ -1456,7 +1527,13 @@ fn integer_arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> 
     wide.and_then(|whole| fit(whole, ty)).ok_or_else(|| overflow(op, ty, left, right))
 }
 
-fn float_arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> Result<Value> {
+fn float_arithmetic(
+    op: Op,
+    left: &Value,
+    right: &Value,
+    ty: &LogicalType,
+    written: Written<'_>,
+) -> Result<Value> {
     let (a, b) = match (approximate(left), approximate(right)) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -1468,8 +1545,10 @@ fn float_arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> Re
             )));
         }
     };
-    if matches!(op, Op::Divide | Op::Modulo) && b == 0.0 {
-        return Ok(Value::Null);
+    // `//` raises on a zero divisor whatever it was given and `%` does not, so a float remainder
+    // by zero is the IEEE answer and a float `//` by zero is the error. Measured both ways.
+    if matches!(op, Op::Divide) && b == 0.0 {
+        return Err(divided_by_zero(written, op, left, right));
     }
     let result = float_step(op, a, b);
     if matches!(ty, LogicalType::Float) {
@@ -1482,7 +1561,14 @@ fn float_arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> Re
     Ok(Value::Double(result))
 }
 
-fn decimal_arithmetic(op: Op, left: &Value, right: &Value, width: u8, scale: u8) -> Result<Value> {
+fn decimal_arithmetic(
+    op: Op,
+    left: &Value,
+    right: &Value,
+    width: u8,
+    scale: u8,
+    written: Written<'_>,
+) -> Result<Value> {
     let ty = LogicalType::Decimal { width, scale };
     if matches!(op, Op::Multiply) {
         return decimal_product(left, right, width, scale, &ty);
@@ -1499,7 +1585,7 @@ fn decimal_arithmetic(op: Op, left: &Value, right: &Value, width: u8, scale: u8)
         }
     };
     if matches!(op, Op::Divide | Op::Modulo) && b == 0 {
-        return Ok(Value::Null);
+        return Err(divided_by_zero(written, op, left, right));
     }
     let unscaled = match op {
         Op::Add => a.checked_add(b),
@@ -1577,9 +1663,8 @@ fn divide(left: &Value, right: &Value) -> Result<Value> {
             )));
         }
     };
-    if b == 0.0 {
-        return Ok(Value::Null);
-    }
+    // No guard. `/` promotes both sides to a double and is IEEE arithmetic from there, so a zero
+    // divisor is an infinity or a nan and never an error, whatever the arguments were written as.
     Ok(Value::Double(a / b))
 }
 
@@ -1687,7 +1772,7 @@ mod tests {
     use super::*;
 
     fn called(name: &str, args: &[Value], returns: &LogicalType) -> Value {
-        call_values(name, args, returns).expect("this call is written")
+        call_values(name, args, returns, None).expect("this call is written")
     }
 
     #[test]
@@ -1708,27 +1793,56 @@ mod tests {
 
     #[test]
     fn arithmetic_that_overflows_says_so_rather_than_wrapping() {
-        let error =
-            call_values("+", &[Value::Integer(i32::MAX), Value::Integer(1)], &LogicalType::Integer)
-                .expect_err("2147483647 + 1 is not an integer");
+        let error = call_values(
+            "+",
+            &[Value::Integer(i32::MAX), Value::Integer(1)],
+            &LogicalType::Integer,
+            None,
+        )
+        .expect_err("2147483647 + 1 is not an integer");
         assert_eq!(error.message(), "Overflow in addition of INT32 (2147483647 + 1)!");
     }
 
-    /// DuckDB returns null here where Postgres raises, and this is the line that records it.
+    /// A zero divisor is three different things depending on the operator, and this is the line
+    /// that records which is which. Per #262.
     #[test]
-    fn dividing_by_zero_is_null() {
+    fn a_zero_divisor_is_an_infinity_on_slash_and_an_error_on_the_other_two() {
         assert_eq!(
-            called("/", &[Value::Integer(1), Value::Integer(0)], &LogicalType::Double),
-            Value::Null
+            called("/", &[Value::Double(1.0), Value::Double(0.0)], &LogicalType::Double),
+            Value::Double(f64::INFINITY)
         );
+        let error =
+            call_values("//", &[Value::Integer(1), Value::Integer(0)], &LogicalType::Integer, None)
+                .expect_err("1 // 0 raises");
         assert_eq!(
-            called("//", &[Value::Integer(1), Value::Integer(0)], &LogicalType::Integer),
-            Value::Null
+            error.message(),
+            "Division by zero in expression (1 // 0). Use TRY(...) to return NULL for this \
+             expression, or SET null_on_division_by_zero=true to return NULL for all divisions by \
+             zero."
         );
-        assert_eq!(
-            called("%", &[Value::Integer(1), Value::Integer(0)], &LogicalType::Integer),
-            Value::Null
-        );
+        let error =
+            call_values("%", &[Value::Integer(1), Value::Integer(0)], &LogicalType::Integer, None)
+                .expect_err("1 % 0 raises");
+        assert!(error.message().starts_with("Division by zero in expression (1 % 0)."), "{error}");
+        // The float remainder is the exception. IEEE says nan and so does the pinned binary.
+        let remainder =
+            called("%", &[Value::Double(1.0), Value::Double(0.0)], &LogicalType::Double);
+        assert!(matches!(remainder, Value::Double(answer) if answer.is_nan()), "{remainder}");
+    }
+
+    /// The caller with a plan hands down the expression, and the message quotes that rather than
+    /// the two values.
+    #[test]
+    fn a_named_expression_is_what_the_message_quotes() {
+        let written = || "(a // 0)".to_string();
+        let error = call_values(
+            "//",
+            &[Value::Integer(7), Value::Integer(0)],
+            &LogicalType::Integer,
+            Some(&written),
+        )
+        .expect_err("7 // 0 raises");
+        assert!(error.message().starts_with("Division by zero in expression (a // 0)."), "{error}");
     }
 
     #[test]
@@ -1841,7 +1955,7 @@ mod tests {
 
     #[test]
     fn a_function_nobody_has_written_says_which_one() {
-        let error = call_values("sqrt", &[Value::Double(4.0)], &LogicalType::Double)
+        let error = call_values("sqrt", &[Value::Double(4.0)], &LogicalType::Double, None)
             .expect_err("sqrt is not written yet");
         assert!(error.message().contains("the sqrt function"), "{error}");
     }
@@ -1854,7 +1968,7 @@ mod tests {
         )
         .expect("three rows");
         let right = Vector::constant(LogicalType::Integer, Value::Integer(10), 3);
-        let sum = call("+", &[left, right], &LogicalType::Integer).expect("adds");
+        let sum = call("+", &[left, right], &LogicalType::Integer, None).expect("adds");
         assert_eq!(sum.value_at(0), Value::Integer(11));
         assert_eq!(sum.value_at(1), Value::Integer(12));
         assert_eq!(sum.value_at(2), Value::Null);
@@ -1864,7 +1978,7 @@ mod tests {
     fn arguments_of_different_lengths_are_caught() {
         let left = Vector::constant(LogicalType::Integer, Value::Integer(1), 3);
         let right = Vector::constant(LogicalType::Integer, Value::Integer(1), 4);
-        let error = call("+", &[left, right], &LogicalType::Integer).expect_err("ragged");
+        let error = call("+", &[left, right], &LogicalType::Integer, None).expect_err("ragged");
         assert!(error.message().contains("argument 1"), "{error}");
     }
 
@@ -1880,7 +1994,7 @@ mod tests {
         for index in 0..rows {
             row.clear();
             row.extend(args.iter().map(|arg| arg.value_at(index)));
-            values.push(call_values(name, &row, returns)?);
+            values.push(call_values(name, &row, returns, None)?);
         }
         Vector::from_values(returns.clone(), &values)
     }
@@ -1894,8 +2008,12 @@ mod tests {
     fn agrees(name: &str, args: &[Vector], returns: &LogicalType) {
         let forms: Vec<Form> = args.iter().map(Vector::form).collect();
         let what = format!("{name} on {forms:?} returning {returns}");
-        match (call(name, args, returns), oracle(name, args, returns)) {
-            (Ok(fast), Ok(slow)) => assert_eq!(fast, slow, "{what}"),
+        match (call(name, args, returns, None), oracle(name, args, returns)) {
+            // The debug rendering rather than the vectors themselves, because a nan is a real
+            // answer here now that a float remainder by zero is one, and no nan equals any nan.
+            // Comparing the text is the stronger check everywhere else too, since it tells a
+            // negative zero from a positive one where `==` does not.
+            (Ok(fast), Ok(slow)) => assert_eq!(format!("{fast:?}"), format!("{slow:?}"), "{what}"),
             (Err(fast), Err(slow)) => assert_eq!(fast.message(), slow.message(), "{what}"),
             (fast, slow) => panic!("{what}: one path gave {fast:?} and the other gave {slow:?}"),
         }
@@ -2129,7 +2247,8 @@ mod tests {
             &[Value::Timestamp(13 * 3_600_000_000 + 45 * 60_000_000), Value::Timestamp(0)],
         )
         .expect("two rows");
-        let found = call("date_part", &[part, when], &LogicalType::BigInt).expect("two parts");
+        let found =
+            call("date_part", &[part, when], &LogicalType::BigInt, None).expect("two parts");
         assert_eq!(found.value_at(0), Value::BigInt(45));
         assert_eq!(found.value_at(1), Value::BigInt(0));
     }
@@ -2158,7 +2277,7 @@ mod tests {
     fn a_call_where_every_argument_is_constant_costs_one_call() {
         let left = Vector::constant(LogicalType::Integer, Value::Integer(3), 1024);
         let right = Vector::constant(LogicalType::Integer, Value::Integer(4), 1024);
-        let sum = call("+", &[left, right], &LogicalType::Integer).expect("adds");
+        let sum = call("+", &[left, right], &LogicalType::Integer, None).expect("adds");
         assert_eq!(sum.form(), Form::Constant);
         assert_eq!(sum.len(), 1024);
         assert_eq!(sum.value_at(1000), Value::Integer(7));
@@ -2177,7 +2296,7 @@ mod tests {
         .expect("three values");
         let codes = Vector::dictionary(vec![0, 1, 2, 1, 0], values).expect("a dictionary");
         let ten = Vector::constant(LogicalType::Integer, Value::Integer(10), 5);
-        let sum = call("+", &[codes, ten], &LogicalType::Integer).expect("adds");
+        let sum = call("+", &[codes, ten], &LogicalType::Integer, None).expect("adds");
         assert_eq!(sum.value_at(0), Value::Null);
         assert_eq!(sum.value_at(1), Value::Integer(15));
         assert_eq!(sum.value_at(4), Value::Null);
@@ -2224,6 +2343,7 @@ mod tests {
                 "make_date",
                 &[Value::Integer(year), Value::Integer(month), Value::Integer(day)],
                 &LogicalType::Date,
+                None,
             )
             .expect_err("a date that is not a date");
             assert_eq!(error.message(), format!("Date out of range: {written}"));
@@ -2243,8 +2363,9 @@ mod tests {
     /// on data that bound.
     #[test]
     fn milliseconds_that_do_not_fit_in_microseconds_say_which_two_units_they_are() {
-        let error = call_values("epoch_ms", &[Value::BigInt(i64::MAX)], &LogicalType::Timestamp)
-            .expect_err("that is not a timestamp");
+        let error =
+            call_values("epoch_ms", &[Value::BigInt(i64::MAX)], &LogicalType::Timestamp, None)
+                .expect_err("that is not a timestamp");
         assert_eq!(error.message(), "Could not convert Timestamp(MS) to Timestamp(US)");
     }
 
@@ -2273,7 +2394,7 @@ mod tests {
     #[test]
     fn an_empty_call_is_an_empty_answer() {
         let empty = Vector::from_values(LogicalType::Integer, &[]).expect("no rows");
-        let sum = call("+", &[empty.clone(), empty], &LogicalType::Integer).expect("adds");
+        let sum = call("+", &[empty.clone(), empty], &LogicalType::Integer, None).expect("adds");
         assert_eq!(sum.len(), 0);
         assert_eq!(sum.validity(), &Validity::AllValid);
     }
@@ -2286,7 +2407,7 @@ mod tests {
             Vector::from_values(LogicalType::TinyInt, &[Value::TinyInt(i8::MIN)]).expect("one row");
         let right = Vector::constant(LogicalType::TinyInt, Value::TinyInt(-1), 1);
         agrees("%", &[left.clone(), right.clone()], &LogicalType::TinyInt);
-        let answer = call("%", &[left, right], &LogicalType::TinyInt).expect("modulo");
+        let answer = call("%", &[left, right], &LogicalType::TinyInt, None).expect("modulo");
         assert_eq!(answer.value_at(0), Value::TinyInt(0));
     }
 }
