@@ -164,6 +164,22 @@ fn order_by_and_limit_and_offset_compose() {
     );
 }
 
+/// An order by with a limit runs as a top N, which holds the rows that could still come out rather
+/// than the whole input. What it has to produce is what the sort produced, over enough rows that it
+/// trims several times and over more than one chunk of input.
+#[test]
+fn an_order_by_with_a_limit_answers_what_the_sort_would_have() {
+    let db = Database::new();
+    db.create_table("many", vec![Field::new("x", LogicalType::Integer)]).unwrap();
+    // Counting down, so the answer is at the end of the input and nothing is right by accident.
+    let counted: Vec<Vec<Value>> = (0..5000).rev().map(|x| vec![Value::Integer(x)]).collect();
+    db.append("many", &counted).unwrap();
+    let wanted: Vec<Vec<Value>> = (7..17).map(|x| vec![Value::Integer(x)]).collect();
+    assert_eq!(rows(&db, "SELECT x FROM many ORDER BY x LIMIT 10 OFFSET 7"), wanted);
+    db.execute("SET disabled_optimizers = 'top_n'").unwrap();
+    assert_eq!(rows(&db, "SELECT x FROM many ORDER BY x LIMIT 10 OFFSET 7"), wanted);
+}
+
 #[test]
 fn distinct_collapses_equal_rows() {
     let db = database();

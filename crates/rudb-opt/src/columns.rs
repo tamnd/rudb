@@ -240,7 +240,7 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
             list(plan, groups, found);
             list(plan, aggregates, found);
         }
-        Node::Sort { keys, .. } => {
+        Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
             for key in plan.sort_key_list(keys) {
                 walk(plan, key.expr, found);
             }
