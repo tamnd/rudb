@@ -250,6 +250,26 @@ impl Vector {
     /// integer column, and an aggregate over one is an aggregate over integers no matter what the
     /// logical type says.
     ///
+    /// A dictionary over a dictionary is composed into one level here rather than left as two, so
+    /// the form has a depth of one always and a kernel that reads [`Self::dictionary_parts`] is
+    /// reading the values rather than another layer of codes. Two filters over the same chunk build
+    /// the second case and four conjuncts pushed down separately build four of it.
+    ///
+    /// The cost of leaving them stacked turned out to be a cliff rather than a slope. Every loop in
+    /// `rudb-kernels` reaches for the values behind the codes with [`Self::data`], a dictionary
+    /// pointing at a dictionary has no data to hand back, so the second level does not make the
+    /// kernels slower, it turns them off and drops the work onto the row at a time path that exists
+    /// to be correct rather than fast. Measured on server3 over a chunk of two numeric columns and a
+    /// consumer of two vectorized passes, one level reads at 3.5 nanoseconds a row and two levels at
+    /// 104, and the third and fourth levels cost almost nothing more because the first one had
+    /// already given up everything there was to give. Composing is one pass over the outer codes,
+    /// which the range check above is already making.
+    ///
+    /// The one dictionary that is not composed past is one carrying a validity of its own. A
+    /// dictionary is built all valid and only [`Self::with_validity`] can change that, so such a
+    /// vector is saying that its nulls are at this level rather than in the values it points at, and
+    /// composing past it would drop them.
+    ///
     /// # Errors
     ///
     /// If any code is past the end of the value vector.
@@ -260,6 +280,7 @@ impl Vector {
                 values.len()
             )));
         }
+        let (codes, values) = compose(codes, values);
         Ok(Self {
             ty: values.ty.clone(),
             len: codes.len(),
@@ -498,6 +519,37 @@ impl Vector {
             }
             source = values.as_ref();
         }
+    }
+}
+
+/// One level of dictionary out of however many levels were handed to [`Vector::dictionary`].
+///
+/// Every dictionary in the system is built through that constructor and every one of them comes
+/// through here first, so the invariant this maintains is that the vector a dictionary points at is
+/// never itself a dictionary that could have been composed away. That makes the work a single `if`
+/// rather than a loop: the inner vector was already composed when it was built, so composing the
+/// outer codes through it leaves the result no deeper than the inner vector already was.
+///
+/// The codes are indexed rather than fetched with `get`, because the caller has already walked the
+/// whole outer array to check that every code is in range and the inner array is exactly as long as
+/// the vector those codes were checked against.
+fn compose(codes: Vec<u32>, values: Vector) -> (Vec<u32>, Vector) {
+    // A dictionary carrying a validity of its own is one whose nulls live at this level rather than
+    // in the values, which is the one thing composition cannot carry down with it.
+    if !matches!(values.validity, Validity::AllValid) {
+        return (codes, values);
+    }
+    let Vector { ty, len, validity, body } = values;
+    match body {
+        Body::Dictionary { codes: inner, values: leaf } => {
+            debug_assert!(
+                !matches!(leaf.body, Body::Dictionary { .. })
+                    || !matches!(leaf.validity, Validity::AllValid),
+                "a dictionary was stacked on a dictionary without going through the constructor"
+            );
+            (codes.iter().map(|&code| inner[code as usize]).collect(), *leaf)
+        }
+        body => (codes, Vector { ty, len, validity, body }),
     }
 }
 
@@ -1033,15 +1085,79 @@ mod tests {
     }
 
     /// A dictionary over a dictionary is what a second filter over an already filtered chunk builds,
-    /// and the gather has to walk to the bottom of that chain rather than one step down it.
+    /// and the gather has to walk to the bottom of that chain rather than one step down it. The
+    /// constructor composes the ordinary chain away, so the one built here is the kind it cannot,
+    /// which is a level holding nulls of its own.
     #[test]
     fn gathering_walks_a_dictionary_over_a_dictionary_to_the_values() {
+        let inner = Vector::dictionary(vec![2, 1, 0], integers(&[7, 8, 9]))
+            .unwrap()
+            .with_validity(Validity::from_iter(3, |index| index != 2));
+        let outer = Vector::dictionary(vec![1, 2], inner).unwrap();
+        let gathered = outer.gather(&[0, 1]).unwrap();
+        assert_eq!(gathered.form(), Form::Flat);
+        assert_eq!(gathered.value_at(0), Value::Integer(8));
+        assert_eq!(gathered.value_at(1), Value::Null);
+    }
+
+    /// Two filters over one chunk build a dictionary over a dictionary, four conjuncts pushed down
+    /// separately build four levels of it, and every level is a dependent load on every later read
+    /// of every row plus a code array that cannot be freed. Composing at construction is one pass
+    /// over the codes the range check was walking anyway.
+    #[test]
+    fn a_dictionary_over_a_dictionary_is_composed_into_one_level() {
         let inner = Vector::dictionary(vec![2, 1, 0], integers(&[7, 8, 9])).unwrap();
         let outer = Vector::dictionary(vec![1, 2], inner).unwrap();
-        let gathered = outer.gather(&[1, 0]).unwrap();
-        assert_eq!(gathered.form(), Form::Flat);
-        assert_eq!(gathered.value_at(0), Value::Integer(7));
-        assert_eq!(gathered.value_at(1), Value::Integer(8));
+        let (codes, values) = outer.dictionary_parts().unwrap();
+        assert_eq!(codes, [1, 0]);
+        assert_eq!(values.form(), Form::Flat);
+        assert_eq!(outer.value_at(0), Value::Integer(8));
+        assert_eq!(outer.value_at(1), Value::Integer(7));
+    }
+
+    /// The invariant stated as the thing it is there for, which is that the depth does not grow with
+    /// the number of filters. Four levels stacked one at a time are one level at the end of it.
+    #[test]
+    fn stacking_dictionaries_does_not_make_them_deeper() {
+        let mut vector = integers(&[10, 20, 30, 40]);
+        for _ in 0..4 {
+            vector = Vector::dictionary(vec![3, 2, 1, 0], vector).unwrap();
+        }
+        let (codes, values) = vector.dictionary_parts().unwrap();
+        assert_eq!(values.form(), Form::Flat);
+        assert_eq!(codes, [0, 1, 2, 3]);
+        assert_eq!(
+            vector.iter().collect::<Vec<_>>(),
+            integers(&[10, 20, 30, 40]).iter().collect::<Vec<_>>()
+        );
+    }
+
+    /// Composing has to carry the nulls down with it. The values hold them, the codes point at them,
+    /// and a composed code that lands on a null position is still a null.
+    #[test]
+    fn composing_a_dictionary_keeps_the_nulls_its_values_hold() {
+        let values =
+            Vector::from_values(LogicalType::Integer, &[Value::Integer(3), Value::Null]).unwrap();
+        let inner = Vector::dictionary(vec![1, 0, 1], values).unwrap();
+        let outer = Vector::dictionary(vec![0, 1], inner).unwrap();
+        assert_eq!(outer.dictionary_parts().unwrap().1.form(), Form::Flat);
+        assert_eq!(outer.value_at(0), Value::Null);
+        assert_eq!(outer.value_at(1), Value::Integer(3));
+    }
+
+    /// The one level composition cannot go past. A dictionary that was given a validity of its own is
+    /// saying its nulls are at that level rather than in the values, and pointing the outer codes
+    /// straight at the values would read through the holes instead of stopping at them.
+    #[test]
+    fn a_dictionary_holding_its_own_nulls_is_not_composed_past() {
+        let inner = Vector::dictionary(vec![0, 1, 2], integers(&[1, 2, 3]))
+            .unwrap()
+            .with_validity(Validity::from_iter(3, |index| index != 1));
+        let outer = Vector::dictionary(vec![1, 2, 0], inner).unwrap();
+        assert_eq!(outer.dictionary_parts().unwrap().1.form(), Form::Dictionary);
+        assert_eq!(outer.value_at(0), Value::Null);
+        assert_eq!(outer.value_at(1), Value::Integer(3));
+        assert_eq!(outer.value_at(2), Value::Integer(1));
     }
 
     #[test]

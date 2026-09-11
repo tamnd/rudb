@@ -872,6 +872,33 @@ mod tests {
         assert!(fallback::count(Kernel::Compare, Form::Sequence, Form::Flat) > before);
     }
 
+    /// The reason `Vector::dictionary` composes rather than stacks, stated as the thing that breaks
+    /// if it stops.
+    ///
+    /// Every loop in this file reaches for the values behind the codes with `Vector::data`, and a
+    /// dictionary pointing at a dictionary has no data to hand back, so a second filter over an
+    /// already filtered chunk used to turn every one of these kernels off and drop the comparison
+    /// onto the row at a time path. Measured on server3 over a chunk of two numeric columns that was
+    /// selected twice, that was 3.5 nanoseconds a row becoming 104, and a third and fourth level
+    /// cost nothing more because the first one had already given up everything there was to give.
+    #[test]
+    fn a_second_level_of_codes_does_not_turn_the_loops_off() {
+        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
+        let before = fallback::count(Kernel::Compare, Form::Dictionary, Form::Constant);
+        let values = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(1), Value::Integer(5), Value::Integer(9)],
+        )
+        .expect("three rows");
+        let once = Vector::dictionary(vec![2, 1, 0], values).expect("codes are in range");
+        let twice = Vector::dictionary(vec![1, 2], once).expect("codes are in range");
+        let cut = Vector::constant(LogicalType::Integer, Value::Integer(4), 2);
+        let result = compare(Comparison::Greater, &twice, &cut).expect("compares");
+        assert_eq!(result.value_at(0), Value::Boolean(true));
+        assert_eq!(result.value_at(1), Value::Boolean(false));
+        assert_eq!(fallback::count(Kernel::Compare, Form::Dictionary, Form::Constant), before);
+    }
+
     /// Either side all null, on one of the six ordinary comparisons, is every answer null without
     /// the data being read. The vector this produces has to be the one the oracle produces, which
     /// is a flat run of falses under an all invalid validity rather than a constant.
