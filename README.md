@@ -67,7 +67,7 @@ The command line and the sixteen output modes are DuckDB's, diffed against a rea
 
 ```
 $ rudb --print-config
-version: 0.2.9
+version: 0.2.10
 memory-limit: unlimited
 threads: 10
 query-timeout: none
