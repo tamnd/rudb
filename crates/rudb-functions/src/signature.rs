@@ -75,18 +75,24 @@ enum Shape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fixed {
     Boolean,
+    Integer,
     BigInt,
     Double,
     Varchar,
+    Date,
+    Timestamp,
 }
 
 impl Fixed {
     fn ty(self) -> LogicalType {
         match self {
             Self::Boolean => LogicalType::Boolean,
+            Self::Integer => LogicalType::Integer,
             Self::BigInt => LogicalType::BigInt,
             Self::Double => LogicalType::Double,
             Self::Varchar => LogicalType::Varchar,
+            Self::Date => LogicalType::Date,
+            Self::Timestamp => LogicalType::Timestamp,
         }
     }
 }
@@ -96,27 +102,58 @@ impl Fixed {
 /// A range rather than a count because `-` is both the negation and the subtraction, and one name
 /// with two arities is much less trouble than two names that the transformer would have to tell
 /// apart before the binder ever sees the call.
+///
+/// `OneOf` is the range with a hole in it. `make_date` takes one argument or three and not two, and
+/// a range that accepted two would bind a call DuckDB refuses and then have nothing to compute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Arity {
-    least: usize,
-    most: Option<usize>,
+enum Arity {
+    Exactly(usize),
+    Between(usize, Option<usize>),
+    OneOf(&'static [usize]),
 }
 
 impl Arity {
     const fn exactly(count: usize) -> Self {
-        Self { least: count, most: Some(count) }
+        Self::Exactly(count)
     }
 
     const fn between(least: usize, most: usize) -> Self {
-        Self { least, most: Some(most) }
+        Self::Between(least, Some(most))
     }
 
     const fn at_least(least: usize) -> Self {
-        Self { least, most: None }
+        Self::Between(least, None)
+    }
+
+    const fn one_of(counts: &'static [usize]) -> Self {
+        Self::OneOf(counts)
     }
 
     fn accepts(self, count: usize) -> bool {
-        count >= self.least && self.most.is_none_or(|most| count <= most)
+        match self {
+            Self::Exactly(wanted) => count == wanted,
+            Self::Between(least, most) => count >= least && most.is_none_or(|most| count <= most),
+            Self::OneOf(counts) => counts.contains(&count),
+        }
+    }
+
+    /// Every count this accepts, with an open end stopped one past where it starts, for the tests
+    /// that hold each row of the table to its own shape at each count it claims to take.
+    #[cfg(test)]
+    fn counts(self) -> Vec<usize> {
+        match self {
+            Self::Exactly(count) => vec![count],
+            Self::Between(least, most) => (least..=most.unwrap_or(least + 1)).collect(),
+            Self::OneOf(counts) => counts.to_vec(),
+        }
+    }
+
+    #[cfg(test)]
+    fn least(self) -> usize {
+        match self {
+            Self::Exactly(count) | Self::Between(count, _) => count,
+            Self::OneOf(counts) => counts.iter().copied().min().unwrap_or(0),
+        }
     }
 }
 
@@ -192,6 +229,34 @@ const TABLE: &[Entry] = &[
         arity: Arity::exactly(2),
         shape: Shape::LeadingFixedToLast(Fixed::Varchar),
         numeric_only: false,
+    },
+    // The two that turn a number into a date and a timestamp, which is how every ClickBench entry
+    // on the board reads that data: the Parquet stores four of its columns as integers and every
+    // query in the set treats them as dates and times. DuckDB's own entry wraps them in exactly
+    // these two calls, so these are what let that entry run here unmodified.
+    //
+    // One argument is days since the epoch and three are a year, a month and a day. Upstream reads
+    // the single one as an INTEGER and the triple as three BIGINTs, and both are INTEGER here,
+    // because the column this is called on is an INTEGER and a widening pass over a hundred million
+    // values to reach a function that immediately narrows again is a pass nobody asked for. The
+    // difference shows on a year that does not fit in an INTEGER, where upstream converts and then
+    // complains about the destination and this complains about the cast.
+    Entry {
+        name: "make_date",
+        kind: FunctionKind::Scalar,
+        arity: Arity::one_of(&[1, 3]),
+        shape: Shape::FixedTo(Fixed::Integer, Fixed::Date),
+        numeric_only: true,
+    },
+    // Milliseconds since the epoch. Upstream also has seven overloads that read a date or a time
+    // and give the milliseconds back, which this table has no way to say yet because it is one row
+    // per name and those pick by argument type. `epoch_ms` of a timestamp is the missing half.
+    Entry {
+        name: "epoch_ms",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::FixedTo(Fixed::BigInt, Fixed::Timestamp),
+        numeric_only: true,
     },
     // Regular expressions. The pattern is a string like the text is, so three of the four are the
     // plain string shape. `regexp_extract` is not, because its third argument is the group number
@@ -421,6 +486,33 @@ mod tests {
         assert_eq!(truncated.arguments, vec![LogicalType::Varchar, LogicalType::Date]);
     }
 
+    /// The two constructors, and the arity with a hole in it. Two arguments is not a `make_date`
+    /// upstream has and it is not one here either.
+    #[test]
+    fn a_date_is_made_from_one_number_or_from_three_and_never_from_two() {
+        let day = resolve("make_date", &[LogicalType::Integer]).expect("days since the epoch");
+        assert_eq!(day.returns, LogicalType::Date);
+        assert_eq!(day.arguments, vec![LogicalType::Integer]);
+        let civil =
+            resolve("make_date", &vec![LogicalType::BigInt; 3]).expect("a year, a month and a day");
+        assert_eq!(civil.returns, LogicalType::Date);
+        assert_eq!(civil.arguments, vec![LogicalType::Integer; 3]);
+        let error = resolve("make_date", &vec![LogicalType::Integer; 2]).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "No function matches the given name and argument types 'make_date(INTEGER, INTEGER)'. You might need to add explicit type casts."
+        );
+    }
+
+    #[test]
+    fn milliseconds_since_the_epoch_are_a_timestamp() {
+        let stamp = resolve("epoch_ms", &[LogicalType::Integer]).expect("a timestamp");
+        assert_eq!(stamp.returns, LogicalType::Timestamp);
+        assert_eq!(stamp.arguments, vec![LogicalType::BigInt], "the argument widens to read it");
+        let error = resolve("epoch_ms", &[LogicalType::Varchar]).unwrap_err();
+        assert!(error.message().contains("'epoch_ms(VARCHAR)'"), "{error}");
+    }
+
     /// The part is cast rather than checked, so a part that arrives as something other than a
     /// string is a string by the time the kernel sees it.
     #[test]
@@ -501,8 +593,7 @@ mod tests {
     #[test]
     fn every_entry_resolves_at_every_count_it_accepts() {
         for entry in TABLE {
-            let most = entry.arity.most.unwrap_or(entry.arity.least + 1);
-            for count in entry.arity.least..=most {
+            for count in entry.arity.counts() {
                 let ty =
                     if entry.numeric_only { LogicalType::Integer } else { LogicalType::Varchar };
                 let arguments = vec![ty; count];
@@ -521,7 +612,7 @@ mod tests {
             let promotes =
                 matches!(entry.shape, Shape::Promoted | Shape::PromotedTo(_) | Shape::Accumulated);
             assert!(
-                !(promotes && entry.arity.least == 0),
+                !(promotes && entry.arity.least() == 0),
                 "{} promotes over its arguments and takes none",
                 entry.name
             );
