@@ -450,7 +450,6 @@ fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
     let mut db = scripted(&["CREATE TABLE t (a INTEGER)"]);
     for statement in [
         "CREATE TEMPORARY TABLE u (a INTEGER)",
-        "CREATE TABLE u (a INTEGER NOT NULL)",
         "CREATE TABLE u (a INTEGER PRIMARY KEY)",
         "INSERT INTO t VALUES (1) RETURNING a",
         "INSERT INTO t (a, a) VALUES (1, 2)",
@@ -460,6 +459,21 @@ fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
         assert!(!message.is_empty(), "{statement} was accepted");
     }
     assert!(db.catalog().tables().all(|table| table.name().table != "u"));
+}
+
+#[test]
+fn a_not_null_column_refuses_a_null_and_keeps_what_came_before_it() {
+    let mut db = scripted(&[
+        "CREATE TABLE t (a INTEGER NOT NULL, b VARCHAR)",
+        "INSERT INTO t VALUES (1, NULL)",
+    ]);
+    assert_eq!(
+        refusal(&mut db, "INSERT INTO t VALUES (NULL, 'x')"),
+        "NOT NULL constraint failed: t.a"
+    );
+    // The whole statement is refused rather than the row, so the table is what it was before it.
+    assert_eq!(db.table_len("t").unwrap(), 1);
+    assert_eq!(rows(&db, "SELECT a, b FROM t"), vec![vec![integer(1), Value::Null]]);
 }
 
 #[test]

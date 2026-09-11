@@ -92,7 +92,7 @@ impl Database {
     pub fn append(&mut self, name: &str, rows: &[Vec<Value>]) -> Result<()> {
         let parts: Vec<&str> = name.split('.').collect();
         let resolved = self.catalog.resolve(&parts)?;
-        self.catalog.table_mut(&resolved)?.rows_mut().append_rows(rows)
+        self.catalog.table_mut(&resolved)?.append_rows(rows)
     }
 
     /// How many rows a table holds.
@@ -152,7 +152,7 @@ impl Database {
                 let result = self.run(&insert.source)?;
                 let table = self.catalog.table_mut(&insert.name)?;
                 for chunk in result.chunks() {
-                    table.rows_mut().append(chunk.clone())?;
+                    table.append(chunk.clone())?;
                 }
                 Ok(QueryResult::empty())
             }
@@ -177,7 +177,7 @@ impl Database {
         if let Some(rows) = rows {
             let table = self.catalog.table_mut(&create.name)?;
             for chunk in rows.chunks() {
-                table.rows_mut().append(chunk.clone())?;
+                table.append(chunk.clone())?;
             }
         }
         Ok(())

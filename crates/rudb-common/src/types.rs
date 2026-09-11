@@ -13,19 +13,32 @@ use std::fmt;
 
 use crate::error::{Error, Result};
 
-/// A named field of a `STRUCT` or a `UNION`.
+/// A named field of a `STRUCT` or a `UNION`, and a named column of a table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Field {
     /// The field name, unquoted and case sensitive as stored.
     pub name: String,
     /// The field type.
     pub ty: LogicalType,
+    /// Whether the column refuses nulls, which is the `NOT NULL` the DDL declared it with.
+    ///
+    /// Always false inside a `STRUCT` or a `UNION`, because a null is a property of a value at
+    /// every nesting level and no type in SQL says a value cannot be one. This is here rather than
+    /// on a separate column type because a table column is already spelled with this struct, and a
+    /// second one that was this one plus a flag would have to be threaded through the binder, the
+    /// scope and every operator schema to carry a bit that only the insert path reads.
+    pub not_null: bool,
 }
 
 impl Field {
-    /// A field with a name and a type.
+    /// A field with a name and a type, which accepts nulls.
     pub fn new(name: impl Into<String>, ty: LogicalType) -> Self {
-        Self { name: name.into(), ty }
+        Self { name: name.into(), ty, not_null: false }
+    }
+
+    /// A column with a name and a type, which refuses nulls.
+    pub fn required(name: impl Into<String>, ty: LogicalType) -> Self {
+        Self { name: name.into(), ty, not_null: true }
     }
 }
 

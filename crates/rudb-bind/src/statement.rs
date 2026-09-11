@@ -128,13 +128,6 @@ fn create_table(ast: &Ast, catalog: &Catalog, index: ast::CreateTableRef) -> Res
     let parts: Vec<&str> = ast.name(written.name).collect();
     let name = catalog.resolve_for_create(&parts)?;
     let defs = ast.column_defs(written.columns);
-    for def in defs {
-        if def.not_null {
-            // Nothing carries a nullability yet, so accepting this would mean an insert of a null
-            // succeeding where DuckDB raises. `rudb_common::Field` is where it goes when it lands.
-            return Err(Error::not_implemented("a NOT NULL column constraint"));
-        }
-    }
     let (columns, source) = if written.query == NONE {
         let mut columns = Vec::with_capacity(defs.len());
         for def in defs {
@@ -145,7 +138,13 @@ fn create_table(ast: &Ast, catalog: &Catalog, index: ast::CreateTableRef) -> Res
                     ast.string(def.name)
                 )));
             }
-            columns.push(Field::new(ast.string(def.name), LogicalType::parse(text)?));
+            let ty = LogicalType::parse(text)?;
+            let column = ast.string(def.name);
+            columns.push(if def.not_null {
+                Field::required(column, ty)
+            } else {
+                Field::new(column, ty)
+            });
         }
         (columns, None)
     } else {
