@@ -326,8 +326,8 @@ impl Shared {
                 rudb_opt::optimize(&mut insert.source)?;
                 let result = run(&insert.source, &catalog)?;
                 let table = catalog.table_mut(&insert.name)?;
-                for chunk in result.chunks() {
-                    table.append(chunk.clone())?;
+                for chunk in result.into_chunks() {
+                    table.append(chunk)?;
                 }
                 Ok(QueryResult::empty())
             }
@@ -381,8 +381,8 @@ fn create_table(mut create: rudb_bind::CreateTable, catalog: &mut Catalog) -> Re
     catalog.create_table(create.name.clone(), create.columns)?;
     if let Some(rows) = rows {
         let table = catalog.table_mut(&create.name)?;
-        for chunk in rows.chunks() {
-            table.append(chunk.clone())?;
+        for chunk in rows.into_chunks() {
+            table.append(chunk)?;
         }
     }
     Ok(())
