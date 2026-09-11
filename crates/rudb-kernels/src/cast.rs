@@ -165,24 +165,86 @@ fn convert_run<M: Fn(usize) -> usize>(
     physical: PhysicalType,
 ) -> Option<Data> {
     match (from, into) {
+        (Numeric::Exact { scale: was, .. }, Numeric::Exact { scale: now, width: None })
+            if was == now =>
+        {
+            straight(data, at, rows, physical)
+        }
         (Numeric::Exact { scale: was, .. }, Numeric::Exact { scale: now, width }) => {
             let mut run = exact_run(data, at, rows)?;
             restage(&mut run, was, now)?;
-            exact_out(&run, width, physical)
+            exact_out(run, width, physical)
         }
         (Numeric::Exact { scale, .. }, Numeric::Approximate { single }) => {
-            let run = exact_run(data, at, rows)?;
-            approximate_out(&loosen(&run, scale), single)
+            loosened(data, at, rows, scale, single)
         }
         (Numeric::Approximate { .. }, Numeric::Exact { scale, width }) => {
             let run = float_run(data, at, rows)?;
-            exact_out(&tighten(&run, scale)?, width, physical)
+            exact_out(tighten(&run, scale)?, width, physical)
         }
         (Numeric::Approximate { .. }, Numeric::Approximate { single }) => {
             let run = float_run(data, at, rows)?;
-            approximate_out(&run, single)
+            approximate_out(run, single)
         }
     }
+}
+
+/// The exact to exact case with nothing to do in between, which is every integer widening and
+/// every integer narrowing in every query.
+///
+/// This one does not pivot. The other three quadrants gather into a run of `i128`, move that run to
+/// the target scale and then fit it, which is three passes over sixteen kilobytes to do what is
+/// here a load, a range check and a store. Integer to integer is common enough to be worth the
+/// eighty one bodies the two macros below expand to, and it is the difference between this kernel
+/// reading as a load and a store in a profile and reading as a memory bound copy.
+///
+/// Every pair of integer widths has a `TryFrom`, including each width with itself, so the eighty
+/// one arms are the same three lines and the ones that cannot fail are a move once the compiler has
+/// looked at them.
+fn straight<M: Fn(usize) -> usize>(
+    data: &Data,
+    at: M,
+    rows: usize,
+    physical: PhysicalType,
+) -> Option<Data> {
+    macro_rules! fitted {
+        ($values:expr, $variant:path, $ty:ty) => {{
+            let values = $values;
+            let mut out = Vec::with_capacity(rows);
+            for index in 0..rows {
+                out.push(<$ty>::try_from(values[at(index)]).ok()?);
+            }
+            $variant(out)
+        }};
+    }
+    macro_rules! by_target {
+        ($values:expr) => {
+            match physical {
+                PhysicalType::Int8 => fitted!($values, Data::Int8, i8),
+                PhysicalType::Int16 => fitted!($values, Data::Int16, i16),
+                PhysicalType::Int32 => fitted!($values, Data::Int32, i32),
+                PhysicalType::Int64 => fitted!($values, Data::Int64, i64),
+                PhysicalType::Int128 => fitted!($values, Data::Int128, i128),
+                PhysicalType::UInt8 => fitted!($values, Data::UInt8, u8),
+                PhysicalType::UInt16 => fitted!($values, Data::UInt16, u16),
+                PhysicalType::UInt32 => fitted!($values, Data::UInt32, u32),
+                PhysicalType::UInt64 => fitted!($values, Data::UInt64, u64),
+                _ => return None,
+            }
+        };
+    }
+    Some(match data {
+        Data::Int8(values) => by_target!(values),
+        Data::Int16(values) => by_target!(values),
+        Data::Int32(values) => by_target!(values),
+        Data::Int64(values) => by_target!(values),
+        Data::Int128(values) => by_target!(values),
+        Data::UInt8(values) => by_target!(values),
+        Data::UInt16(values) => by_target!(values),
+        Data::UInt32(values) => by_target!(values),
+        Data::UInt64(values) => by_target!(values),
+        _ => return None,
+    })
 }
 
 /// The exact numbers a run of data holds, read through one form's index mapping.
@@ -252,20 +314,57 @@ fn restage(run: &mut [i128], was: u8, now: u8) -> Option<()> {
     Some(())
 }
 
-/// A run of exact numbers at a scale, as the doubles they stand for.
+/// The exact to approximate case, fused for the same reason [`straight`] is.
+///
+/// Nine source layouts is nine bodies, which is worth writing out for a conversion that every
+/// average, every division and every comparison of an integer column against a written fraction
+/// goes through. A `FLOAT` target still takes the second pass in [`approximate_out`], because the
+/// answer it has to reach is the double narrowed rather than the source narrowed, and a single
+/// rounding and two roundings are not always the same number.
 ///
 /// Scale zero gets its own loop rather than dividing by a factor of one, because a division is a
-/// division whatever it is by and every integer going to a double comes through here.
+/// division whatever it is by, and scale zero is every integer that ever goes to a double.
 #[expect(
     clippy::cast_precision_loss,
     reason = "a wide integer past 2^53 losing digits is what a double is, and this is the float path"
 )]
-fn loosen(run: &[i128], scale: u8) -> Vec<f64> {
-    if scale == 0 {
-        return run.iter().map(|&whole| whole as f64).collect();
+fn loosened<M: Fn(usize) -> usize>(
+    data: &Data,
+    at: M,
+    rows: usize,
+    scale: u8,
+    single: bool,
+) -> Option<Data> {
+    macro_rules! doubles {
+        ($values:expr) => {{
+            let values = $values;
+            let mut out = Vec::with_capacity(rows);
+            if scale == 0 {
+                for index in 0..rows {
+                    out.push(values[at(index)] as f64);
+                }
+            } else {
+                let factor = pow10(scale) as f64;
+                for index in 0..rows {
+                    out.push(values[at(index)] as f64 / factor);
+                }
+            }
+            out
+        }};
     }
-    let factor = pow10(scale) as f64;
-    run.iter().map(|&whole| whole as f64 / factor).collect()
+    let run: Vec<f64> = match data {
+        Data::Int8(values) => doubles!(values),
+        Data::Int16(values) => doubles!(values),
+        Data::Int32(values) => doubles!(values),
+        Data::Int64(values) => doubles!(values),
+        Data::Int128(values) => doubles!(values),
+        Data::UInt8(values) => doubles!(values),
+        Data::UInt16(values) => doubles!(values),
+        Data::UInt32(values) => doubles!(values),
+        Data::UInt64(values) => doubles!(values),
+        _ => return None,
+    };
+    approximate_out(run, single)
 }
 
 /// A run of doubles as the exact numbers they round to at a scale, or `None` when one of them has
@@ -293,7 +392,11 @@ fn tighten(run: &[f64], scale: u8) -> Option<Vec<i128>> {
 
 /// A run of exact numbers in the container the target type is held in, or `None` when one of them
 /// does not fit.
-fn exact_out(run: &[i128], width: Option<u8>, physical: PhysicalType) -> Option<Data> {
+///
+/// The run is taken by value so that a `HUGEINT` target, where the container the values are already
+/// in is the container they belong in, hands the same allocation straight on rather than copying
+/// sixteen kilobytes to reach the same bytes.
+fn exact_out(run: Vec<i128>, width: Option<u8>, physical: PhysicalType) -> Option<Data> {
     if let Some(width) = width {
         // This is `digits(whole) > width` with the counting taken out of the loop. `digits` divides
         // by ten until there is nothing left, up to thirty eight times, and a decimal column is
@@ -307,7 +410,7 @@ fn exact_out(run: &[i128], width: Option<u8>, physical: PhysicalType) -> Option<
     macro_rules! narrowed {
         ($variant:path, $ty:ty) => {{
             let mut out = Vec::with_capacity(run.len());
-            for &whole in run {
+            for &whole in &run {
                 out.push(<$ty>::try_from(whole).ok()?);
             }
             $variant(out)
@@ -318,7 +421,7 @@ fn exact_out(run: &[i128], width: Option<u8>, physical: PhysicalType) -> Option<
         PhysicalType::Int16 => narrowed!(Data::Int16, i16),
         PhysicalType::Int32 => narrowed!(Data::Int32, i32),
         PhysicalType::Int64 => narrowed!(Data::Int64, i64),
-        PhysicalType::Int128 => Data::Int128(run.to_vec()),
+        PhysicalType::Int128 => Data::Int128(run),
         PhysicalType::UInt8 => narrowed!(Data::UInt8, u8),
         PhysicalType::UInt16 => narrowed!(Data::UInt16, u16),
         PhysicalType::UInt32 => narrowed!(Data::UInt32, u32),
@@ -329,16 +432,19 @@ fn exact_out(run: &[i128], width: Option<u8>, physical: PhysicalType) -> Option<
 
 /// A run of doubles in the container the target type is held in, or `None` when narrowing one of
 /// them to single precision turned a finite number into an infinity.
+///
+/// Taken by value for the same reason as [`exact_out`]: a `DOUBLE` target is already holding its
+/// own answer and has nothing left to do but say so.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "narrowing to a float is what a cast to FLOAT is, and the line below catches the loss"
 )]
-fn approximate_out(run: &[f64], single: bool) -> Option<Data> {
+fn approximate_out(run: Vec<f64>, single: bool) -> Option<Data> {
     if !single {
-        return Some(Data::Float64(run.to_vec()));
+        return Some(Data::Float64(run));
     }
     let mut out = Vec::with_capacity(run.len());
-    for &number in run {
+    for number in run {
         let narrowed = number as f32;
         if narrowed.is_infinite() && number.is_finite() {
             return None;
@@ -774,6 +880,7 @@ mod tests {
 
     #[test]
     fn a_null_in_a_vector_stays_null_across_a_cast() {
+        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let input = Vector::from_values(
             LogicalType::Integer,
             &[Value::Integer(1), Value::Null, Value::Integer(3)],
@@ -863,6 +970,10 @@ mod tests {
     /// three null densities. This is the test the rewrite rests on.
     #[test]
     fn every_numeric_pair_agrees_with_the_row_at_a_time_path() {
+        // Most of the pairs below are pairs the sweep refuses, every refusal increments a process
+        // wide counter, and the tests in `fallback` assert exact counts. This holds the same lock
+        // they do so that a test that is about answers cannot fail a test that is about counting.
+        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let mut rng = Rng(0x5eed_cabb_a9e0_0001);
         let types: [LogicalType; 15] = [
             LogicalType::TinyInt,
@@ -944,6 +1055,7 @@ mod tests {
     /// to keep working through the refusal rather than being swallowed by it.
     #[test]
     fn one_value_that_does_not_fit_sends_the_whole_vector_back_to_the_loop() {
+        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let input = Vector::from_values(
             LogicalType::Integer,
             &[Value::Integer(1), Value::Integer(40_000), Value::Integer(3)],
