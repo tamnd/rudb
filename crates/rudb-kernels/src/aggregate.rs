@@ -210,6 +210,8 @@ impl Accumulator {
         // An aggregate reads one vector, so its form goes in both halves of the report rather than
         // leaving a column of zeros next to every row of it.
         fallback::record(Kernel::Aggregate, input.form(), input.form());
+        // row at a time: the path recorded on the line above, which exists to be correct for an
+        // aggregate `folded` does not cover and counts itself so that aggregate shows up.
         for row in 0..rows {
             let value = input.value_at(row);
             self.update(std::slice::from_ref(&value))?;

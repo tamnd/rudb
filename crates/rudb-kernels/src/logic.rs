@@ -70,6 +70,8 @@ pub fn combine(op: Connective, children: &[Vector]) -> Result<Vector> {
     let left = first.form();
     fallback::record(Kernel::Logic, left, children.get(1).map_or(left, Vector::form));
     let mut values = Vec::with_capacity(rows);
+    // row at a time: the path recorded on the line above, which exists to be correct for a set of
+    // forms `folded` does not cover and counts itself so that set shows up.
     for index in 0..rows {
         let mut answer = Some(matches!(op, Connective::And));
         for child in children {
