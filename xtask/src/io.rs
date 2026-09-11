@@ -185,40 +185,55 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
 fn measure(file: &Arc<dyn File>, pattern: &Pattern, engine: Engine, cold: bool) -> Row {
     let wanted = pattern.wanted();
 
-    let once = || match engine {
-        Engine::Loop => {
-            let mut got = 0u64;
-            for &(offset, len) in &pattern.ranges {
-                let mut buf = vec![0u8; len];
-                got += file.read_at(offset, &mut buf).expect("read failed") as u64;
-            }
-            (pattern.ranges.len() as u64, got)
-        }
+    // The pool is built once and outside every timed region, because a pool is built once in a
+    // process and not once per batch. Building it inside would be timing eight thread spawns and
+    // eight joins per sample, which is a real cost of something but it is not the cost of a read.
+    let pool = match engine {
+        Engine::Loop => None,
         Engine::Pool { threads, gap } => {
             let config = match gap {
                 Some(gap) => Config::local_disk().with_threads(threads).coalescing(gap),
                 None => Config::local_disk().with_threads(threads).not_coalescing(),
             };
-            let pool = Pool::new(config);
-            let completion = pool.submit(file, pattern.requests());
-            completion.wait().expect("submit failed");
-            let stats = pool.stats();
-            (stats.reads, stats.read)
+            Some(Pool::new(config))
         }
     };
 
-    let (time, reads, read) = if cold {
+    let once = || match &pool {
+        None => {
+            for &(offset, len) in &pattern.ranges {
+                let mut buf = vec![0u8; len];
+                file.read_at(offset, &mut buf).expect("read failed");
+            }
+        }
+        Some(pool) => {
+            let completion = pool.submit(file, pattern.requests());
+            completion.wait().expect("submit failed");
+        }
+    };
+
+    // The counters come off a warmup run rather than off the timed ones, as a difference, because
+    // the pool's counters accumulate across every batch it has ever served and the row wants the
+    // per batch number. The loop has no counters, so its two numbers are what it was asked for.
+    let before = pool.as_ref().map(Pool::stats);
+    once();
+    let (reads, read) = match (&pool, before) {
+        (Some(pool), Some(before)) => {
+            let after = pool.stats();
+            (after.reads - before.reads, after.read - before.read)
+        }
+        _ => (pattern.ranges.len() as u64, wanted),
+    };
+
+    let time = if cold {
         // One sample, because the second one is not cold. Dropping the cache between two samples of
-        // one number would be dropping it between the two halves of that number.
+        // one number would be dropping it between the two halves of that number. The warmup above
+        // is what filled the cache, so the drop goes after it and immediately before the clock.
         let _ = drop_caches();
         let start = Instant::now();
-        let (reads, read) = once();
-        let elapsed = start.elapsed().as_nanos() as f64;
-        (Number { median: elapsed, iqr: f64::NAN }, reads, read)
+        once();
+        Number { median: start.elapsed().as_nanos() as f64, iqr: f64::NAN }
     } else {
-        // The warmup run is also where the counters come from, because the counters are the same
-        // every run and taking them here keeps the timed loop to nothing but the reads.
-        let (reads, read) = once();
         let mut samples = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
             let start = Instant::now();
@@ -226,11 +241,10 @@ fn measure(file: &Arc<dyn File>, pattern: &Pattern, engine: Engine, cold: bool) 
             samples.push(start.elapsed().as_nanos() as f64);
         }
         samples.sort_by(f64::total_cmp);
-        let time = Number {
+        Number {
             median: percentile(&samples, 50),
             iqr: percentile(&samples, 75) - percentile(&samples, 25),
-        };
-        (time, reads, read)
+        }
     };
 
     Row { pattern: pattern.name, engine: engine.name(), wanted, time, reads, read }
