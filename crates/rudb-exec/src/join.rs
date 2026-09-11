@@ -158,6 +158,9 @@ impl<'a> Join<'a> {
                 let combined = widen(left_row, left_types, chunk)?;
                 let flags = evaluate_all(self.plan, &self.conditions, &self.combined, &combined)?;
                 let merged = combine(Connective::And, &flags)?;
+                // row at a time: this is the nested loop join, which is the join that exists until
+                // 2h (#62) builds the hash join on top of 2f's table. The flags are already a
+                // vector here, so what this wants is the selection that 2c (#57) threads.
                 for row in 0..rows {
                     if is_true(&merged.value_at(row)) {
                         hits.push(base + row);

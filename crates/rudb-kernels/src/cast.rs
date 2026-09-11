@@ -72,6 +72,8 @@ pub fn cast(input: &Vector, target: &LogicalType, try_cast: bool) -> Result<Vect
     // column of zeros next to every row of it.
     fallback::record(Kernel::Cast, input.form(), input.form());
     let mut values = Vec::with_capacity(input.len());
+    // row at a time: the path recorded on the line above, which exists to be correct for a
+    // conversion `swept` does not cover and counts itself so that conversion shows up.
     for index in 0..input.len() {
         values.push(cast_value(&input.value_at(index), target, try_cast)?);
     }

@@ -50,6 +50,9 @@ impl<'a> Sort<'a> {
         let mut sortable: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
         while let Some(chunk) = self.input.next()? {
             let keys = evaluate_all(self.plan, &exprs, &self.schema, &chunk)?;
+            // row at a time: 2i (#63) sorts a normalized key that is one comparable byte string a
+            // row rather than a `Vec<Value>`, and moves the payload by index at the end instead of
+            // carrying a copy of every row through the sort.
             for row in 0..chunk.len() {
                 let key = keys.iter().map(|column| column.value_at(row)).collect();
                 sortable.push((key, chunk.row(row).collect()));

@@ -16,6 +16,7 @@ mod compare;
 mod focus;
 mod grammar;
 mod layers;
+mod rowloop;
 mod ruletable;
 mod sha256;
 mod smoke;
@@ -28,6 +29,7 @@ fn main() -> ExitCode {
     let result = match task.as_deref() {
         Some("layers") => layers::check(&root()),
         Some("style") => style::check(&root()),
+        Some("rowloop") => rowloop::check(&root()),
         Some("msrv") => msrv(),
         Some("grammar") => vendor::verify(),
         Some("gen-grammar") => {
@@ -65,6 +67,9 @@ fn usage() {
     println!();
     println!("  layers   every crate depends only on crates of strictly lower rank");
     println!("  style    the prose rules for markdown in this repository");
+    println!(
+        "  rowloop  no loop over the rows of a vector builds a Value, unless it says it means to"
+    );
     println!("  msrv     the workspace still builds on the oldest Rust the manifest claims");
     println!("  grammar  the vendored DuckDB grammar is byte for byte what VENDOR recorded");
     println!(
@@ -112,6 +117,7 @@ fn ci(full: bool) -> Result<(), String> {
     focus.report();
 
     layers::check(&root)?;
+    rowloop::check(&root)?;
     if focus.prose {
         style::check(&root)?;
     }

@@ -92,6 +92,8 @@ pub fn call(name: &str, args: &[Vector], returns: &LogicalType) -> Result<Vector
 
     let mut row = Vec::with_capacity(args.len());
     let mut values = Vec::with_capacity(rows);
+    // row at a time: the path recorded above, which is every function that has no vectorized form
+    // yet, and counts itself so which functions those are shows up in the report.
     for index in 0..rows {
         row.clear();
         row.extend(args.iter().map(|arg| arg.value_at(index)));
