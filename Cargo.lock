@@ -217,6 +217,7 @@ name = "rudb-parquet"
 version = "0.2.4"
 dependencies = [
  "rudb-common",
+ "rudb-compress",
  "rudb-encoding",
  "rudb-io",
  "rudb-vector",
