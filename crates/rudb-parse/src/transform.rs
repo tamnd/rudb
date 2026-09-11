@@ -1608,9 +1608,17 @@ impl<'a> Transform<'a> {
 ///
 /// DuckDB does not fold identifier case at any point, quoted or not, so this only removes the
 /// quotes and resolves the doubled ones. Anything else would be the parser deciding what a name is.
+///
+/// Single quotes are stripped too, and the only way one gets here is the file name in `FROM
+/// 'hits.parquet'`, because the matcher takes a string for a name in that position and in `COPY t TO
+/// '...'` and nowhere else. Leaving them on would make that name different from the one `FROM
+/// "hits.parquet"` writes, and DuckDB reads both of those as the same file.
 fn unquote(text: &str) -> String {
-    match text.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
-        Some(body) => body.replace("\"\"", "\""),
+    if let Some(body) = text.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+        return body.replace("\"\"", "\"");
+    }
+    match text.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')) {
+        Some(body) => body.replace("''", "'"),
         None => text.to_string(),
     }
 }
@@ -2349,6 +2357,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_file_name_in_a_from_clause_is_a_table_name_with_the_quotes_off() {
+        // Both spellings have to arrive as the same name, because the binder decides whether it is
+        // a file by looking at the name, and `'hits.parquet'` with the quotes still on it is not
+        // a path that anything can open.
+        assert_eq!(round("SELECT * FROM 'hits.parquet'"), "SELECT * FROM hits.parquet");
+        assert_eq!(round("SELECT * FROM \"hits.parquet\""), "SELECT * FROM hits.parquet");
+        assert_eq!(round("SELECT * FROM 'hits.parquet' AS h"), "SELECT * FROM hits.parquet AS h");
     }
 
     #[test]
