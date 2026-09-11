@@ -108,6 +108,29 @@ fn every_mode_prints_what_duckdb_prints() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// The counts under a `duckbox` table, and the row of dots that stands in for what it left out.
+///
+/// One query per line of `counts.sql` against the file of the same number, and between them they
+/// cover every shape the footer has: no footer at all under nine rows, a row count on its own, a row
+/// count a box is widened to fit, a count of what was shown on its own line and merged onto the one
+/// above it, a column count beside it, and the hint in the gap between the two. The dots are in
+/// there too, both the alignment of them and the fact that the value they line up under is the
+/// shorter of the two either side of the gap rather than the shortest on show.
+#[test]
+fn the_counts_under_a_table_are_the_ones_duckdb_prints() {
+    let queries = golden("counts.sql");
+    let mut wrong = Vec::new();
+    for (at, query) in queries.lines().enumerate() {
+        let (out, err, failed) = run(&["-c", query]);
+        assert!(!failed, "{query} failed: {err}");
+        let want = golden(&format!("counts-{}.txt", at + 1));
+        if !same_ignoring_trailing_space(&out, &want) {
+            wrong.push(format!("--- {query}\nwant:\n{want}\ngot:\n{out}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn an_empty_result_prints_its_columns_and_a_row_count() {
     let (out, _, failed) =

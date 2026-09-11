@@ -16,3 +16,10 @@ for mode in duckbox box table markdown line list csv tabs json jsonlines quote i
 done
 duckdb -batch -init /dev/null -cmd ".read $here/setup.sql" -c "SELECT * FROM t WHERE a > 9000" >"$here/empty.txt"
 duckdb -batch -init /dev/null -c ".show" >"$here/show.txt"
+# One file per line of counts.sql, which is where the row count and the column count and the row of
+# dots get their shapes. The test reads the same file, so a query added here needs nothing else.
+at=0
+while IFS= read -r query; do
+  at=$((at + 1))
+  duckdb -batch -init /dev/null -c "$query" >"$here/counts-$at.txt"
+done <"$here/counts.sql"
