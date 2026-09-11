@@ -20,8 +20,10 @@ path = "src/lib.rs"
 name = "rudb"
 path = "src/main.rs"
 
+# One dependency, which is the whole point of the crate. The shell is a program over the embedding
+# API and nothing else, so anything it needs and cannot get from `rudb` is something a program
+# somebody else writes could not get either.
 [dependencies]
-rudb-common.workspace = true
 rudb.workspace = true
 
 [lints]

@@ -6,7 +6,15 @@
 //! spawning a process and so that `rudb-compat` can drive it as a target the same way it drives the
 //! library. Everything the shell does goes through [`rudb::Database`], which means the shell has no
 //! way to reach anything the embedding API cannot, which is the point: if the prompt can do it, a
-//! program can do it.
+//! program can do it. The manifest says the same thing in the form the compiler checks, which is
+//! that `rudb` is the only dependency.
+//!
+//! Statements run on a [`rudb::Connection`] rather than on the database directly, which is the
+//! thing an interrupt has to reach. What is not here is the signal handler that would call
+//! [`rudb::Connection::interrupt`], because installing one needs `libc` and the dependency budget
+//! in `spec/18-package-layout.md` is a decision to make on purpose rather than in passing. That is
+//! the same decision line editing is waiting behind. The library half is done and tested, so the
+//! shell side is a handler and a clone of the connection the day the dependency is settled.
 //!
 //! The command line and the dot commands are DuckDB's, down to the single dash long options it
 //! inherits from SQLite. The output modes are DuckDB's too, byte for byte, because the reason

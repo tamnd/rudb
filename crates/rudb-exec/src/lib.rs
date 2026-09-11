@@ -37,6 +37,7 @@
 #![forbid(unsafe_code)]
 
 mod build;
+mod cancel;
 mod expr;
 mod group;
 mod join;
@@ -53,7 +54,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-pub use build::build;
+pub use build::{build, build_with};
 pub use expr::{evaluate, evaluate_all};
 pub use operator::Operator;
 pub use prepared::{Prepared, Scratch};

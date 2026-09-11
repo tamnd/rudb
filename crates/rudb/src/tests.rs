@@ -856,3 +856,65 @@ fn a_database_opened_the_plain_way_has_the_defaults() {
     assert_eq!(db.config(), &Config::default());
     assert_eq!(db.config().memory_limit(), None);
 }
+
+/// The query that runs long enough to be stopped, which is a count nobody waits for.
+const FOREVER: &str = "SELECT count(*) FROM range(100000000000)";
+
+#[test]
+fn a_query_that_runs_too_long_is_stopped_by_the_limit_it_was_opened_with() {
+    let db = Database::with_config(Config::new().with_query_timeout(Duration::from_millis(50)));
+    let started = std::time::Instant::now();
+    let error = db.query(FOREVER).expect_err("that does not finish");
+    assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+    assert!(error.message().contains("50 millisecond"), "{error}");
+    // The limit is on the statement rather than a suggestion, so this has to be over in about the
+    // time it was given rather than in the time the query would have taken, which is hours.
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+}
+
+#[test]
+fn a_limit_does_not_stop_a_query_that_finishes_inside_it() {
+    let db = Database::with_config(Config::new().with_query_timeout(Duration::from_secs(60)));
+    assert_eq!(db.value("SELECT 42").unwrap(), Value::Integer(42));
+    // And the clock starts again for the next statement rather than carrying on from the first.
+    assert_eq!(db.value("SELECT 43").unwrap(), Value::Integer(43));
+}
+
+#[test]
+fn another_thread_can_interrupt_a_running_query() {
+    let db = Database::new();
+    let connection = db.connect();
+    let stopper = connection.clone();
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        stopper.interrupt();
+    });
+    let error = connection.query(FOREVER).expect_err("the other thread stopped it");
+    watchdog.join().expect("the watchdog ran");
+    assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+    assert_eq!(error.message(), "Interrupted!");
+}
+
+#[test]
+fn an_interrupt_stops_the_statement_it_was_meant_for_and_not_the_next_one() {
+    let db = Database::new();
+    let connection = db.connect();
+    connection.interrupt();
+    // The flag is cleared at the top of each statement, so an interrupt nothing was running under
+    // is dropped rather than killing whatever comes next.
+    assert_eq!(connection.value("SELECT 1").unwrap(), Value::Integer(1));
+}
+
+#[test]
+fn a_statement_that_writes_is_stoppable_too_and_leaves_nothing_behind() {
+    let db = Database::with_config(Config::new().with_query_timeout(Duration::from_millis(50)));
+    db.execute("CREATE TABLE big (x BIGINT)").unwrap();
+    let error = db
+        .execute("INSERT INTO big SELECT x FROM range(100000000000) t(x)")
+        .expect_err("that does not finish");
+    assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+    // Nothing was appended, because the source runs to completion before anything is. That is not
+    // a rollback, it is the absence of a partial write, and it stops being enough the day the
+    // writes stream.
+    assert_eq!(db.table_len("big").unwrap(), 0);
+}

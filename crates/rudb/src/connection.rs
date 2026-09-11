@@ -1,6 +1,6 @@
 //! One caller's handle on a database.
 
-use rudb_common::{Error, Result, Value};
+use rudb_common::{Cancel, Error, Result, Value};
 
 use crate::database::Shared;
 use crate::prepared::Prepared;
@@ -20,12 +20,33 @@ use crate::result::QueryResult;
 #[derive(Debug, Clone)]
 pub struct Connection {
     shared: Shared,
+    cancel: Cancel,
 }
 
 impl Connection {
     /// A connection on this database. Called by [`crate::Database::connect`].
     pub(crate) fn new(shared: Shared) -> Self {
-        Self { shared }
+        Self { shared, cancel: Cancel::new() }
+    }
+
+    /// Stops the statement this connection is running.
+    ///
+    /// Returns straight away. The statement stops at its next chunk boundary and the thread running
+    /// it gets an `Interrupt Error` back, so a caller that wants to know it has stopped waits on
+    /// that thread rather than on this call. A connection with nothing running is unaffected,
+    /// because the flag is cleared at the top of each statement.
+    ///
+    /// This is the call a signal handler makes, and a [`Connection`] is cheap to clone, so the
+    /// handler holds a clone and the query holds the original. It is also the call a watchdog thread
+    /// makes for a limit that is not a plain time limit: for a plain one, set
+    /// [`crate::Config::with_query_timeout`] and the statement enforces it itself.
+    pub fn interrupt(&self) {
+        self.cancel.cancel();
+    }
+
+    /// The token for one statement: this connection's flag, and the configured time limit.
+    fn token(&self) -> Cancel {
+        self.cancel.restart(self.shared.timeout())
     }
 
     /// Runs one query and returns every row it produced.
@@ -35,7 +56,7 @@ impl Connection {
     /// A parse error, a binder error, or anything the operators raise while running, which is
     /// mostly cast failures and arithmetic that leaves the range of its type.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
-        self.shared.query(sql)
+        self.shared.query(sql, &self.token())
     }
 
     /// Runs one statement, which may change the database.
@@ -48,7 +69,7 @@ impl Connection {
     ///
     /// A parse error, a binder error, a catalog error, or anything the operators raise.
     pub fn execute(&self, sql: &str) -> Result<QueryResult> {
-        self.shared.execute(sql)
+        self.shared.execute(sql, &self.token())
     }
 
     /// The plan for a query, in the textual form `spec/07-execution.md` describes, without running

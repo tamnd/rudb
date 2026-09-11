@@ -50,6 +50,31 @@
 //! That lock is the whole of the concurrency story until `rudb-txn` has one. A statement that writes
 //! is serialized against every reader rather than isolated from them, which is correct and is
 //! coarse, and the thing that makes it finer is a transaction rather than a different lock.
+//!
+//! # Stopping a query
+//!
+//! Two ways, and they answer two different questions. [`Config::with_query_timeout`] is a limit the
+//! statement enforces on itself, which is what a harness running somebody else's SQL wants, because
+//! the thing it is guarding against is a query that never ends rather than a person who changed
+//! their mind. [`Connection::interrupt`] is the other end of a token somebody else holds, which is
+//! what a signal handler wants, and it is DuckDB's model as well: `duckdb_interrupt` takes a
+//! connection.
+//!
+//! ```
+//! use std::time::Duration;
+//! use rudb::{Config, Database};
+//!
+//! let db = Database::with_config(Config::new().with_query_timeout(Duration::from_millis(50)));
+//! let error = db.query("SELECT count(*) FROM range(100000000000)").expect_err("too slow");
+//! assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+//! ```
+//!
+//! A query stops at its next chunk boundary rather than immediately, which is a thousand rows of
+//! work later, and the reason is in [`Cancel`]. Nothing is rolled back, because there are no
+//! transactions yet: a stopped `INSERT` has written nothing, since the source runs to completion
+//! before anything is appended, and a stopped `CREATE TABLE AS SELECT` leaves no table behind for
+//! the same reason. That stops being true the day the writes stream, and the thing that makes it
+//! true again is a transaction.
 
 #![forbid(unsafe_code)]
 
@@ -75,7 +100,7 @@ pub use syntax::{RowOrder, accepts, line_and_column, parses, row_order, split, w
 // The types the API deals in, so a program that embeds rudb depends on this crate and nothing else.
 // `rudb-compat` and `rudb-bench` driving the library through one crate is the point of #110, and a
 // caller who had to reach for `rudb-common` to name the type of a value would not be doing that.
-pub use rudb_common::{Error, ErrorCode, Field, LogicalType, Result, Span, Value};
+pub use rudb_common::{Cancel, Error, ErrorCode, Field, LogicalType, Result, Span, Value};
 pub use rudb_vector::Chunk;
 
 /// Arrow interchange, which is what [`QueryResult::to_arrow`] hands back.

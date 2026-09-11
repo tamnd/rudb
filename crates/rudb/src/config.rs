@@ -21,12 +21,12 @@ use rudb_common::{Error, Result};
 /// used is not a result, and a run that says eight while the engine used one is worse than one that
 /// says nothing.
 ///
-/// None of the three is enforced yet, and the documentation on each says so rather than implying
-/// otherwise. The memory limit needs a buffer manager to be the thing that respects it, which is
-/// E2. The timeout needs cancellation, which is the next item on #110. The thread count needs a
-/// parallel executor, which is E4. Recording the intent first is what lets the harnesses be written
-/// against the final shape, and it is also what makes the gap visible: a setting that is stored and
-/// ignored is easier to find than a setting that was never accepted.
+/// The query timeout is enforced. The other two are not yet, and the documentation on each says so
+/// rather than implying otherwise. The memory limit needs a buffer manager to be the thing that
+/// respects it, which is E2, and the thread count needs a parallel executor, which is E4. Recording
+/// the intent first is what lets the harnesses be written against the final shape, and it is also
+/// what makes the gap visible: a setting that is stored and ignored is easier to find than a
+/// setting that was never accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     memory_limit: Option<u64>,
@@ -71,6 +71,11 @@ impl Config {
     }
 
     /// How long a query may run, or `None` for no limit.
+    ///
+    /// Enforced. The clock starts when the statement starts, so it is a limit on one statement
+    /// rather than on a session, and a statement over the limit stops at its next chunk boundary
+    /// with an `Interrupt Error` saying what limit it passed. See [`crate::Cancel`] for what a
+    /// chunk boundary costs in response time and why it is the right place to check.
     #[must_use]
     pub fn query_timeout(&self) -> Option<Duration> {
         self.query_timeout
