@@ -888,6 +888,32 @@ fn multiplying_two_decimals_keeps_the_digits_of_both_of_them() {
     assert_eq!(rows(&db, run), vec![decimal(0), decimal(15), decimal(30)]);
 }
 
+/// `//` is integer division only when there are integers on both sides of it.
+///
+/// Measured on the pinned binary: `7.5 // 2.5` is the DOUBLE 3.0, `7.5 // 2` is 3.75 and
+/// `7.9 // 1.0` is 7.9, so once a side is not an integer it is `/` under another spelling and it
+/// neither keeps the decimal type nor truncates the answer.
+#[test]
+fn integer_division_with_a_decimal_in_it_is_a_double() {
+    let db = Database::new();
+    let sql = "SELECT 7.5 // 2.5 AS q";
+    assert_eq!(db.query(sql).unwrap().types(), &[LogicalType::Double]);
+    assert_eq!(rows(&db, sql), vec![vec![Value::Double(3.0)]]);
+    let sql = "SELECT 7.5 // 2 AS q";
+    assert_eq!(db.query(sql).unwrap().types(), &[LogicalType::Double]);
+    assert_eq!(rows(&db, sql), vec![vec![Value::Double(3.75)]]);
+    let sql = "SELECT 7.9 // 1.0 AS q";
+    assert_eq!(rows(&db, sql), vec![vec![Value::Double(7.9)]]);
+    let sql = "SELECT 7 // 2 AS q";
+    assert_eq!(db.query(sql).unwrap().types(), &[LogicalType::Integer]);
+    assert_eq!(rows(&db, sql), vec![vec![Value::Integer(3)]]);
+    // A run rather than one value, so the vectorized loop answers the same as the folded constant.
+    let run = "SELECT a // 2.0 AS q FROM range(4) t(a)";
+    assert_eq!(db.query(run).unwrap().types(), &[LogicalType::Double]);
+    let double = |value| vec![Value::Double(value)];
+    assert_eq!(rows(&db, run), vec![double(0.0), double(0.5), double(1.0), double(1.5)]);
+}
+
 /// The sum of the two largest `DECIMAL(18,0)` values, which does not fit in a `DECIMAL(18,0)`.
 ///
 /// It used to raise `Out of Range Error: Overflow in addition`, because the result kept the

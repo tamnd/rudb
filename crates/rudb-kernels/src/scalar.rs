@@ -876,6 +876,10 @@ where
                                 x.checked_mul(y).and_then(|wide| rescale(wide, held, scale))
                             }
                             Op::Modulo => x.checked_rem(y),
+                            // Nothing reaches this. `/` promotes both sides to DOUBLE and `//`
+                            // does the same the moment a side is a decimal, which is DuckDB's
+                            // rule and was measured, so a decimal run is never divided as a
+                            // decimal. It is here because the match is over every operator.
                             Op::Divide => {
                                 x.checked_div(y).and_then(|whole| whole.checked_mul(pow10(scale)))
                             }
@@ -905,13 +909,18 @@ where
     Ok(None)
 }
 
-/// One float operation, in the one place, so that `//` truncating cannot be got wrong twice.
+/// One float operation, in the one place, so that the two paths cannot disagree.
+///
+/// `Op::Divide` gets here from `//`, and it does not truncate. `//` is integer division only when
+/// there are integers on both sides of it: `7.0 // 2.0` is 3.5 on the pinned binary and
+/// `7.9 // 1.0` is 7.9, so once a side is a float it is `/` under another spelling. The truncation
+/// that is left is the one the integer path does by dividing integers.
 fn float_step(op: Op, x: f64, y: f64) -> f64 {
     match op {
         Op::Add => x + y,
         Op::Subtract => x - y,
         Op::Multiply => x * y,
-        Op::Divide => (x / y).trunc(),
+        Op::Divide => x / y,
         Op::Modulo => x % y,
     }
 }
@@ -1373,13 +1382,7 @@ fn float_arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> Re
     if matches!(op, Op::Divide | Op::Modulo) && b == 0.0 {
         return Ok(Value::Null);
     }
-    let result = match op {
-        Op::Add => a + b,
-        Op::Subtract => a - b,
-        Op::Multiply => a * b,
-        Op::Divide => (a / b).trunc(),
-        Op::Modulo => a % b,
-    };
+    let result = float_step(op, a, b);
     if matches!(ty, LogicalType::Float) {
         #[expect(
             clippy::cast_possible_truncation,
@@ -1649,6 +1652,20 @@ mod tests {
             called("//", &[Value::Integer(7), Value::Integer(2)], &LogicalType::Integer),
             Value::Integer(3)
         );
+    }
+
+    /// `//` over floats does not truncate, which was measured: `7.0 // 2.0` is 3.5 on the pinned
+    /// binary and `7.9 // 1.0` is 7.9. Once a side is not an integer it is `/` under another
+    /// spelling, and the truncation that is left is the one dividing two integers does.
+    #[test]
+    fn integer_division_over_floats_divides_and_does_not_truncate() {
+        let slash = |left, right| {
+            called("//", &[Value::Double(left), Value::Double(right)], &LogicalType::Double)
+        };
+        assert_eq!(slash(7.0, 2.0), Value::Double(3.5));
+        assert_eq!(slash(7.5, 2.0), Value::Double(3.75));
+        assert_eq!(slash(7.9, 1.0), Value::Double(7.9));
+        assert_eq!(slash(-7.9, 1.0), Value::Double(-7.9));
     }
 
     #[test]
