@@ -129,6 +129,20 @@ impl Chunk {
         self.rows == 0
     }
 
+    /// How many bytes of memory this chunk is holding.
+    ///
+    /// What the memory limit charges for a chunk somebody kept. A chunk handed from one operator to
+    /// the next and dropped is not charged at all, because charging it would count the same
+    /// megabyte once per level of the tree, and the levels of the tree are not where a query runs
+    /// out of memory.
+    ///
+    /// Every size in this workspace counts the thing itself as well as what it owns, so a column's
+    /// own bytes are already in its own number and are not added again here.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        size_of::<Self>() + self.columns.iter().map(Vector::footprint).sum::<usize>()
+    }
+
     /// The type of each column.
     #[must_use]
     pub fn types(&self) -> Vec<LogicalType> {
@@ -418,5 +432,14 @@ mod tests {
         for row in 0..flat.len() {
             assert_eq!(flat.value_at(row, 0), selected.value_at(row, 0), "row {row}");
         }
+    }
+
+    #[test]
+    fn a_chunk_costs_what_its_columns_cost() {
+        let chunk = Chunk::new(vec![integers(&[1; 1000]), integers(&[2; 1000])])
+            .expect("two columns of a thousand");
+        let columns: usize = chunk.columns().iter().map(Vector::footprint).sum();
+        assert_eq!(chunk.footprint(), size_of::<Chunk>() + columns);
+        assert!(chunk.footprint() >= 8000, "two thousand i32: {}", chunk.footprint());
     }
 }

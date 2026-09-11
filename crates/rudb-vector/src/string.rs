@@ -198,6 +198,16 @@ pub struct StringColumn {
 }
 
 impl StringColumn {
+    /// How many bytes of memory this column is holding.
+    ///
+    /// The views and the arena. A short string lives inside its view and costs nothing beyond it,
+    /// which is the whole reason the representation exists, so a column of short strings costs
+    /// sixteen bytes a string and a column of long ones costs sixteen plus the bytes themselves.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        self.views.capacity() * size_of::<StringView>() + self.arena.footprint()
+    }
+
     /// An empty column.
     #[must_use]
     pub fn new() -> Self {

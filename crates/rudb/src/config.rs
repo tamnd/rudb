@@ -21,12 +21,11 @@ use rudb_common::{Error, Result};
 /// used is not a result, and a run that says eight while the engine used one is worse than one that
 /// says nothing.
 ///
-/// The query timeout is enforced. The other two are not yet, and the documentation on each says so
-/// rather than implying otherwise. The memory limit needs a buffer manager to be the thing that
-/// respects it, which is E2, and the thread count needs a parallel executor, which is E4. Recording
-/// the intent first is what lets the harnesses be written against the final shape, and it is also
-/// what makes the gap visible: a setting that is stored and ignored is easier to find than a
-/// setting that was never accepted.
+/// The query timeout and the memory limit are enforced. The thread count is not yet, because that
+/// needs a parallel executor, which is E4, and the documentation on it says so rather than implying
+/// otherwise. Recording the intent first is what lets the harnesses be written against the final
+/// shape, and it is also what makes the gap visible: a setting that is stored and ignored is easier
+/// to find than a setting that was never accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     memory_limit: Option<u64>,
@@ -50,11 +49,18 @@ impl Config {
 
     /// How many bytes the engine may use, or `None` for no limit.
     ///
+    /// Enforced, by the operators that buffer without bound charging what they hold against one
+    /// budget for the whole database. A query that passes the limit stops with an `Out of Memory
+    /// Error` saying what it asked for and what was already held. See [`rudb_common::Memory`] for
+    /// what is counted and what is not, which is a shorter list than it will be: nothing here hooks
+    /// the allocator, so the number is what the operators said they were holding.
+    ///
     /// No limit is the default, which is not what DuckDB does. DuckDB defaults to eighty percent of
     /// physical memory, and reading physical memory means asking the operating system in three
     /// different ways for three different platforms. This workspace has no dependencies, so that is
-    /// code we would be writing and maintaining ourselves for a number that nothing consults yet.
-    /// When the buffer manager arrives and the number starts mattering, it arrives with it.
+    /// code we would be writing and maintaining ourselves, and a default that refuses a query on
+    /// one machine and runs it on another is a default worth putting off until there is a machine
+    /// it is measured on.
     #[must_use]
     pub fn memory_limit(&self) -> Option<u64> {
         self.memory_limit

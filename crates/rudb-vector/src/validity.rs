@@ -21,6 +21,17 @@ pub enum Validity {
 }
 
 impl Validity {
+    /// How many bytes of memory this representation is holding.
+    ///
+    /// The two cheap arms hold none at all, which is the point of having them.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        match self {
+            Self::AllValid | Self::AllInvalid => 0,
+            Self::Mask(mask) => mask.footprint(),
+        }
+    }
+
     /// Whether the value at `index` is not null.
     ///
     /// Out of range reads report invalid rather than panicking, because this is called from
@@ -162,6 +173,12 @@ pub struct Bitmap {
 }
 
 impl Bitmap {
+    /// How many bytes of memory this bitmap is holding.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        self.words.capacity() * size_of::<u64>()
+    }
+
     /// A bitmap with room for `len` values, all valid.
     #[must_use]
     pub fn all_valid(len: usize) -> Self {

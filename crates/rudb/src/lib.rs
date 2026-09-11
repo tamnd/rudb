@@ -75,6 +75,29 @@
 //! before anything is appended, and a stopped `CREATE TABLE AS SELECT` leaves no table behind for
 //! the same reason. That stops being true the day the writes stream, and the thing that makes it
 //! true again is a transaction.
+//!
+//! # Running out of memory
+//!
+//! The third way a query stops. [`Config::with_memory_limit`] is a budget for the whole database,
+//! and the operators that buffer without bound charge what they hold against it. A query that asks
+//! for more than is left stops with an `Out of Memory Error` rather than being killed from outside,
+//! which is the difference between a harness that reports a result for a file and a harness that
+//! reports nothing because the process died.
+//!
+//! ```
+//! use rudb::{Config, Database};
+//!
+//! let db = Database::with_config(Config::new().with_memory_limit(1 << 20));
+//! let error = db.query("SELECT * FROM range(10000000) ORDER BY range").expect_err("too large");
+//! assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
+//! // And the budget is given back, so the connection is still usable.
+//! assert_eq!(db.memory().used(), 0);
+//! assert_eq!(db.value("SELECT 1").expect("a small query still runs"), rudb::Value::Integer(1));
+//! ```
+//!
+//! What is counted is what the operators said they were holding, which is not the resident size of
+//! the process. [`rudb_common::Memory`] says exactly what that covers and which direction it errs
+//! in.
 
 #![forbid(unsafe_code)]
 

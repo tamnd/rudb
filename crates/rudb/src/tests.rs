@@ -1004,3 +1004,79 @@ fn a_statement_that_writes_is_stoppable_too_and_leaves_nothing_behind() {
     // writes stream.
     assert_eq!(db.table_len("big").unwrap(), 0);
 }
+
+/// A memory limit small enough that a sort over a few hundred thousand rows cannot fit in it.
+///
+/// A row buffered by a pipeline breaker is a `Vec<Value>` today, which is a hundred bytes or so for
+/// one number, so a megabyte is a few thousand rows. The queries below are far larger than that, so
+/// the test is about the limit stopping them and not about where exactly the boundary sits.
+const SMALL: u64 = 1 << 20;
+
+#[test]
+fn a_query_that_buffers_too_much_is_stopped_by_the_memory_limit() {
+    let db = Database::with_config(Config::new().with_memory_limit(SMALL));
+    let error = db.query("SELECT * FROM range(10000000) ORDER BY range").expect_err("too large");
+    assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
+    assert!(error.message().contains("could not allocate"), "{error}");
+    assert!(error.message().contains("1.0 MiB used"), "{error}");
+}
+
+#[test]
+fn every_operator_that_buffers_is_held_to_the_limit() {
+    // One query per pipeline breaker, because a limit that catches the sort and not the grouping is
+    // a limit somebody finds out about from a dead process rather than from an error.
+    let queries = [
+        "SELECT * FROM range(10000000) ORDER BY range",
+        "SELECT range, count(*) FROM range(10000000) GROUP BY range",
+        "SELECT DISTINCT range FROM range(10000000)",
+        "SELECT * FROM range(10000000) UNION ALL SELECT * FROM range(10)",
+        "SELECT * FROM range(10000000) a, range(10000000) b WHERE a.range = b.range",
+    ];
+    for query in queries {
+        let db = Database::with_config(Config::new().with_memory_limit(SMALL));
+        let error = db.query(query).err().unwrap_or_else(|| panic!("{query} should not have fit"));
+        assert_eq!(error.code().duckdb_name(), "Out of Memory Error", "{query}");
+    }
+}
+
+#[test]
+fn the_budget_is_given_back_when_the_query_stops() {
+    let db = Database::with_config(Config::new().with_memory_limit(SMALL));
+    db.query("SELECT * FROM range(10000000) ORDER BY range").expect_err("too large");
+    assert_eq!(db.memory().used(), 0, "an operator that failed still gave its rows back");
+    // And the database is usable, which is the difference between an error and a dead process.
+    assert_eq!(db.value("SELECT 1").unwrap(), Value::Integer(1));
+}
+
+#[test]
+fn a_result_holds_its_bytes_until_it_is_dropped() {
+    let db = Database::with_config(Config::new().with_memory_limit(SMALL));
+    let result = db.query("SELECT * FROM range(1000)").unwrap();
+    assert!(result.footprint() > 0, "a thousand rows are charged something");
+    assert_eq!(db.memory().used(), result.footprint());
+    drop(result);
+    assert_eq!(db.memory().used(), 0);
+}
+
+#[test]
+fn a_database_with_no_limit_counts_what_it_holds_anyway() {
+    // So that a program can watch the number before it decides what limit to set.
+    let db = Database::new();
+    let result = db.query("SELECT * FROM range(1000)").unwrap();
+    assert_eq!(db.memory().limit(), None);
+    assert_eq!(db.memory().used(), result.footprint());
+}
+
+#[test]
+fn the_limit_is_on_the_database_rather_than_on_each_query() {
+    // Two results alive at once are held to one limit between them, which is what DuckDB's
+    // memory_limit means and the only reading that is any use.
+    let db = Database::with_config(Config::new().with_memory_limit(SMALL));
+    // Eighty thousand eight byte numbers is most of a megabyte and two of them is more than one.
+    let wide = "SELECT range FROM range(80000)";
+    let first = db.query(wide).expect("one fits");
+    let error = db.query(wide).expect_err("there is no room for a second copy");
+    assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
+    drop(first);
+    db.query(wide).expect("the room came back");
+}

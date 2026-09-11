@@ -4,7 +4,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rudb_bind::{Bound, Parameters};
 use rudb_catalog::{Catalog, Entry, View};
-use rudb_common::{Cancel, Error, Field, Result, Value};
+use rudb_common::{Cancel, Error, Field, Memory, Result, Value};
 
 use rudb_parse::ast::Ast;
 
@@ -44,6 +44,7 @@ pub(crate) struct Shared {
 struct Inner {
     catalog: RwLock<Catalog>,
     config: Config,
+    memory: Memory,
 }
 
 impl Default for Database {
@@ -62,7 +63,8 @@ impl Database {
     /// An empty database held in memory, opened with these settings.
     #[must_use]
     pub fn with_config(config: Config) -> Self {
-        let inner = Inner { catalog: RwLock::new(Catalog::new()), config };
+        let memory = Memory::new(config.memory_limit());
+        let inner = Inner { catalog: RwLock::new(Catalog::new()), config, memory };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
 
@@ -73,6 +75,17 @@ impl Database {
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.shared.inner.config
+    }
+
+    /// The memory budget every query against this database is held to.
+    ///
+    /// One budget for the database rather than one per query, which is what
+    /// [`Config::memory_limit`] means: two queries running at once share the limit rather than
+    /// getting one each. Public because [`rudb_common::Memory::used`] is the only way to see what
+    /// is being held, and a program that sets a limit wants to know how close it is.
+    #[must_use]
+    pub fn memory(&self) -> &Memory {
+        &self.shared.inner.memory
     }
 
     /// Opens a database by name.
@@ -308,7 +321,7 @@ impl Shared {
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let catalog = self.read();
         let plan = planned(sql, &catalog)?;
-        run(&plan, &catalog, cancel)
+        run(&plan, &catalog, cancel, &self.inner.memory)
     }
 
     /// The query timeout this database was opened with.
@@ -357,10 +370,10 @@ impl Shared {
         match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize(&mut plan)?;
-                run(&plan, &catalog, cancel)
+                run(&plan, &catalog, cancel, &self.inner.memory)
             }
             Bound::CreateTable(create) => {
-                create_table(create, &mut catalog, cancel)?;
+                create_table(create, &mut catalog, cancel, &self.inner.memory)?;
                 Ok(QueryResult::empty())
             }
             Bound::CreateView(create) => {
@@ -382,7 +395,7 @@ impl Shared {
                 // and a version of this that appended chunk by chunk would either read its own
                 // output forever or depend on how the scan holds its chunks.
                 rudb_opt::optimize(&mut insert.source)?;
-                let result = run(&insert.source, &catalog, cancel)?;
+                let result = run(&insert.source, &catalog, cancel, &self.inner.memory)?;
                 let table = catalog.table_mut(&insert.name)?;
                 for chunk in result.into_chunks() {
                     table.append(chunk)?;
@@ -404,19 +417,31 @@ fn planned(sql: &str, catalog: &Catalog) -> Result<rudb_plan::Plan> {
     Ok(plan)
 }
 
-/// Builds and drains one plan, stopping if the token says to.
-fn run(plan: &rudb_plan::Plan, catalog: &Catalog, cancel: &Cancel) -> Result<QueryResult> {
-    let mut root = rudb_exec::build_with(plan, catalog, cancel)?;
+/// Builds and drains one plan, stopping if the token says to or if it runs out of memory.
+///
+/// The result is materialized, so it is charged, and the charge is handed to the result and
+/// released when the result is dropped. That is what makes a program holding ten results at once
+/// count as holding ten results: the limit is on the database and a result outlives the query.
+fn run(
+    plan: &rudb_plan::Plan,
+    catalog: &Catalog,
+    cancel: &Cancel,
+    memory: &Memory,
+) -> Result<QueryResult> {
+    let mut root = rudb_exec::build_with(plan, catalog, cancel, memory)?;
     let names = root.schema().names();
     let types = root.schema().types();
+    let mut held = memory.reservation();
     let mut chunks = Vec::new();
     while let Some(chunk) = root.next()? {
         if chunk.is_empty() {
             continue;
         }
-        chunks.push(chunk.flatten()?);
+        let chunk = chunk.flatten()?;
+        held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
+        chunks.push(chunk);
     }
-    Ok(QueryResult::new(names, types, chunks))
+    Ok(QueryResult::new(names, types, chunks, held))
 }
 
 /// The `CREATE VIEW` half of a statement.
@@ -438,6 +463,7 @@ fn create_table(
     mut create: rudb_bind::CreateTable,
     catalog: &mut Catalog,
     cancel: &Cancel,
+    memory: &Memory,
 ) -> Result<()> {
     if create.if_not_exists && catalog.table(&create.name).is_ok() {
         return Ok(());
@@ -447,7 +473,7 @@ fn create_table(
     let rows = match &mut create.source {
         Some(plan) => {
             rudb_opt::optimize(plan)?;
-            Some(run(plan, catalog, cancel)?)
+            Some(run(plan, catalog, cancel, memory)?)
         }
         None => None,
     };

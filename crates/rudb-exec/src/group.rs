@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Accumulator, is_true};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::Chunk;
@@ -53,6 +53,9 @@ pub(crate) struct Aggregate<'a> {
     built: bool,
     chunks: Vec<Chunk>,
     at: usize,
+    memory: Memory,
+    /// What the finished chunks are charged, held for as long as this operator holds them.
+    held: Reservation,
 }
 
 impl<'a> Aggregate<'a> {
@@ -68,6 +71,7 @@ impl<'a> Aggregate<'a> {
         index: u32,
         groups: Slice,
         aggregates: Slice,
+        memory: &Memory,
     ) -> Result<Self> {
         let input_schema = input.schema().clone();
         let groups: Vec<ExprRef> = plan.expr_list(groups).to_vec();
@@ -107,11 +111,16 @@ impl<'a> Aggregate<'a> {
             built: false,
             chunks: Vec::new(),
             at: 0,
+            memory: memory.clone(),
+            held: memory.reservation(),
         })
     }
 
     /// Reads the whole input and builds the hash table.
     fn build(&mut self) -> Result<()> {
+        // The hash table, charged separately from the chunks it produces, because it is given back
+        // when the last group has been finished and they are not.
+        let mut scratch = self.memory.reservation();
         let mut order: Vec<Key> = Vec::new();
         let mut slots: HashMap<Key, usize> = HashMap::new();
         let mut states: Vec<Vec<Accumulator>> = Vec::new();
@@ -137,6 +146,7 @@ impl<'a> Aggregate<'a> {
         let every = by_vector.iter().all(|&yes| yes);
         while let Some(chunk) = self.input.next()? {
             let keys = evaluate_all(self.plan, &self.groups, &self.input_schema, &chunk)?;
+            let mut taken = 0;
             let mut arguments = Vec::with_capacity(self.calls.len());
             let mut filters = Vec::with_capacity(self.calls.len());
             for call in &self.calls {
@@ -167,6 +177,12 @@ impl<'a> Aggregate<'a> {
                         Some(&slot) => slot,
                         None => {
                             let slot = states.len();
+                            // A group costs its key twice, once in the table and once in the list
+                            // that keeps the arrival order, and an accumulator per call. The
+                            // accumulator is charged as its own width and not as what it holds,
+                            // because what a `list()` or a `string_agg()` holds grows with the
+                            // input and there is no way to ask one how large it has become.
+                            taken += 2 * rows::footprint(&key.0) + group_state(self.calls.len());
                             slots.insert(key.clone(), slot);
                             order.push(key);
                             states.push(self.fresh()?);
@@ -186,12 +202,18 @@ impl<'a> Aggregate<'a> {
                     }
                     let args: Vec<Value> =
                         arguments[at].iter().map(|column| column.value_at(row)).collect();
-                    if call.distinct && !seen[slot][at].insert(Key(args.clone())) {
-                        continue;
+                    if call.distinct {
+                        let key = Key(args.clone());
+                        let size = rows::footprint(&key.0);
+                        if !seen[slot][at].insert(key) {
+                            continue;
+                        }
+                        taken += size;
                     }
                     states[slot][at].update(&args)?;
                 }
             }
+            scratch.grow(taken)?;
         }
         let mut out = Vec::with_capacity(order.len());
         for (slot, key) in order.into_iter().enumerate() {
@@ -201,7 +223,7 @@ impl<'a> Aggregate<'a> {
             }
             out.push(row);
         }
-        self.chunks = rows::chunks(&self.schema.types(), &out)?;
+        self.chunks = rows::chunks(&self.schema.types(), &out, &mut self.held)?;
         Ok(())
     }
 
@@ -228,6 +250,12 @@ impl Operator for Aggregate<'_> {
         self.at += 1;
         Ok(Some(chunk))
     }
+}
+
+/// What one new group costs beyond its key, which is an accumulator and a distinct set per call.
+fn group_state(calls: usize) -> u64 {
+    let bytes = calls * (size_of::<Accumulator>() + size_of::<HashSet<Key>>());
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 /// What a group column is called in this operator's schema.
@@ -260,10 +288,18 @@ pub(crate) struct Distinct<'a> {
     built: bool,
     chunks: Vec<Chunk>,
     at: usize,
+    memory: Memory,
+    /// What the kept chunks are charged, held for as long as this operator holds them.
+    held: Reservation,
 }
 
 impl<'a> Distinct<'a> {
-    pub(crate) fn new(plan: &'a Plan, input: Box<dyn Operator + 'a>, on: Slice) -> Self {
+    pub(crate) fn new(
+        plan: &'a Plan,
+        input: Box<dyn Operator + 'a>,
+        on: Slice,
+        memory: &Memory,
+    ) -> Self {
         let schema = input.schema().clone();
         Self {
             input,
@@ -273,10 +309,13 @@ impl<'a> Distinct<'a> {
             built: false,
             chunks: Vec::new(),
             at: 0,
+            memory: memory.clone(),
+            held: memory.reservation(),
         }
     }
 
     fn build(&mut self) -> Result<()> {
+        let mut scratch = self.memory.reservation();
         let mut seen: HashSet<Key> = HashSet::new();
         let mut kept: Vec<Vec<Value>> = Vec::new();
         while let Some(chunk) = self.input.next()? {
@@ -285,6 +324,7 @@ impl<'a> Distinct<'a> {
             } else {
                 evaluate_all(self.plan, &self.on, &self.schema, &chunk)?
             };
+            let mut taken = 0;
             // row at a time: `DISTINCT` is a grouping that keeps no aggregate, so it gets its
             // answer from the same table 2f (#60) builds and stops building a key here then.
             for row in 0..chunk.len() {
@@ -294,12 +334,15 @@ impl<'a> Distinct<'a> {
                 } else {
                     Key(keys.iter().map(|column| column.value_at(row)).collect())
                 };
+                let size = rows::footprint(&key.0) + rows::footprint(&values);
                 if seen.insert(key) {
                     kept.push(values);
+                    taken += size;
                 }
             }
+            scratch.grow(taken)?;
         }
-        self.chunks = rows::chunks(&self.schema.types(), &kept)?;
+        self.chunks = rows::chunks(&self.schema.types(), &kept, &mut self.held)?;
         Ok(())
     }
 }

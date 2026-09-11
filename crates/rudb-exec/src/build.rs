@@ -12,7 +12,7 @@
 //! whole of the lifetime story here.
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Cancel, Result};
+use rudb_common::{Cancel, Memory, Result};
 use rudb_functions::TableFunction;
 use rudb_plan::{Node, NodeRef, Plan};
 
@@ -32,14 +32,20 @@ use crate::stream::{Filter, Limit, Project};
 /// If the plan names a table or a column the catalog does not have, if an expression is malformed
 /// in a way [`Plan::validate`] would have caught, or anything an operator's construction reports.
 pub fn build<'a>(plan: &'a Plan, catalog: &'a Catalog) -> Result<Box<dyn Operator + 'a>> {
-    build_with(plan, catalog, &Cancel::new())
+    build_with(plan, catalog, &Cancel::new(), &Memory::unlimited())
 }
 
-/// Builds the operator tree for a plan's root, stoppable through this token.
+/// Builds the operator tree for a plan's root, stoppable through this token and held to this
+/// budget.
 ///
 /// Every node in the tree is wrapped in a check, so the query stops at the first chunk boundary
 /// after the token says to. See the `cancel` module for why the check is uniform rather than
 /// placed in the operators that can loop.
+///
+/// The budget is not uniform, and that is the difference between the two. A streaming operator
+/// holds one chunk and gives it away again, so charging every node would count the same megabyte
+/// once per level of the tree. Only the operators that buffer without bound take a reservation, and
+/// [`rudb_common::Memory`] lists which ones those are.
 ///
 /// # Errors
 ///
@@ -48,14 +54,16 @@ pub fn build_with<'a>(
     plan: &'a Plan,
     catalog: &'a Catalog,
     cancel: &Cancel,
+    memory: &Memory,
 ) -> Result<Box<dyn Operator + 'a>> {
-    node(plan, catalog, cancel, plan.root())
+    node(plan, catalog, cancel, memory, plan.root())
 }
 
 fn node<'a>(
     plan: &'a Plan,
     catalog: &'a Catalog,
     cancel: &Cancel,
+    memory: &Memory,
     reference: NodeRef,
 ) -> Result<Box<dyn Operator + 'a>> {
     let inner: Box<dyn Operator + 'a> = match *plan.node(reference) {
@@ -75,44 +83,52 @@ fn node<'a>(
             }
         }
         Node::Filter { input, predicate } => {
-            Box::new(Filter::new(plan, node(plan, catalog, cancel, input)?, predicate)?)
+            Box::new(Filter::new(plan, node(plan, catalog, cancel, memory, input)?, predicate)?)
         }
-        Node::Project { input, index, exprs, names } => {
-            Box::new(Project::new(plan, node(plan, catalog, cancel, input)?, index, exprs, names)?)
-        }
+        Node::Project { input, index, exprs, names } => Box::new(Project::new(
+            plan,
+            node(plan, catalog, cancel, memory, input)?,
+            index,
+            exprs,
+            names,
+        )?),
         Node::Aggregate { input, index, groups, aggregates } => Box::new(Aggregate::new(
             plan,
-            node(plan, catalog, cancel, input)?,
+            node(plan, catalog, cancel, memory, input)?,
             index,
             groups,
             aggregates,
+            memory,
         )?),
         Node::Sort { input, keys } => {
-            Box::new(Sort::new(plan, node(plan, catalog, cancel, input)?, keys))
+            Box::new(Sort::new(plan, node(plan, catalog, cancel, memory, input)?, keys, memory))
         }
         Node::Limit { input, count, offset } => {
-            Box::new(Limit::new(node(plan, catalog, cancel, input)?, count, offset))
+            Box::new(Limit::new(node(plan, catalog, cancel, memory, input)?, count, offset))
         }
         Node::Distinct { input, on } => {
-            Box::new(Distinct::new(plan, node(plan, catalog, cancel, input)?, on))
+            Box::new(Distinct::new(plan, node(plan, catalog, cancel, memory, input)?, on, memory))
         }
         Node::Join { left, right, kind, conditions } => Box::new(Join::new(
             plan,
-            node(plan, catalog, cancel, left)?,
-            node(plan, catalog, cancel, right)?,
+            node(plan, catalog, cancel, memory, left)?,
+            node(plan, catalog, cancel, memory, right)?,
             kind,
             conditions,
+            memory,
         )),
         Node::CrossProduct { left, right } => Box::new(CrossProduct::new(
-            node(plan, catalog, cancel, left)?,
-            node(plan, catalog, cancel, right)?,
+            node(plan, catalog, cancel, memory, left)?,
+            node(plan, catalog, cancel, memory, right)?,
+            memory,
         )),
         Node::SetOp { left, right, kind, all, index } => Box::new(SetOp::new(
-            node(plan, catalog, cancel, left)?,
-            node(plan, catalog, cancel, right)?,
+            node(plan, catalog, cancel, memory, left)?,
+            node(plan, catalog, cancel, memory, right)?,
             kind,
             all,
             index,
+            memory,
         )),
     };
     Ok(Box::new(Guarded::new(inner, cancel.clone())))
