@@ -180,6 +180,47 @@ fn an_order_by_with_a_limit_answers_what_the_sort_would_have() {
     assert_eq!(rows(&db, "SELECT x FROM many ORDER BY x LIMIT 10 OFFSET 7"), wanted);
 }
 
+/// The group key of a row is written into the buffer the row before it used, which for a string
+/// column means the bytes go where the last row's bytes were rather than into a new allocation. The
+/// case that breaks a buffer being reused is a column where what is in the slot and what is arriving
+/// keep changing shape, so this one alternates strings of different lengths with nulls and with the
+/// empty string, and it runs over enough rows to cross several chunks.
+#[test]
+fn grouping_a_string_column_counts_each_string_once_however_the_rows_are_ordered() {
+    let db = Database::new();
+    db.create_table("words", vec![Field::new("s", LogicalType::Varchar)]).unwrap();
+    let shapes = [Some(""), Some("a"), None, Some("a longer one"), None, Some("ab")];
+    let written: Vec<Vec<Value>> = (0..6000)
+        .map(|at| match shapes[at % shapes.len()] {
+            Some(word) => vec![Value::Varchar(word.to_string())],
+            None => vec![Value::Null],
+        })
+        .collect();
+    db.append("words", &written).unwrap();
+    let mut answer = rows(&db, "SELECT s, count(*) FROM words GROUP BY s");
+    answer.sort_by_key(|row| format!("{:?}", row[0]));
+    assert_eq!(
+        answer,
+        vec![
+            vec![Value::Null, Value::BigInt(2000)],
+            vec![text(""), Value::BigInt(1000)],
+            vec![text("a longer one"), Value::BigInt(1000)],
+            vec![text("a"), Value::BigInt(1000)],
+            vec![text("ab"), Value::BigInt(1000)],
+        ]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(DISTINCT s) FROM words"),
+        vec![vec![Value::BigInt(4)]],
+        "a distinct inside an aggregate keys on the same buffer"
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM (SELECT DISTINCT s FROM words)"),
+        vec![vec![Value::BigInt(5)]],
+        "and duplicate elimination counts the null group as a row where count(DISTINCT) does not"
+    );
+}
+
 #[test]
 fn distinct_collapses_equal_rows() {
     let db = database();
