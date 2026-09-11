@@ -791,7 +791,6 @@ mod tests {
 
     #[test]
     fn the_vector_path_averages_whole_numbers_exactly_as_well() {
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let values = wide_values();
         let vector = Vector::from_values(LogicalType::BigInt, &values).expect("a vector of these");
         let mut accumulator = Accumulator::new("avg", &LogicalType::Double).expect("a known one");
@@ -956,9 +955,6 @@ mod tests {
     /// three null densities, against the loop the loops replaced.
     #[test]
     fn every_aggregate_over_every_type_agrees_with_the_row_at_a_time_path() {
-        // Some of the pairs below are shapes the one pass form refuses on purpose, and refusing
-        // increments a process wide counter that other tests assert exact values of.
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let mut rng = Rng(0x5eed_ca11_ab1e_0003);
         let types = [
             LogicalType::TinyInt,
@@ -998,7 +994,6 @@ mod tests {
 
     #[test]
     fn a_sum_of_numbers_stays_off_the_row_at_a_time_path_and_a_sum_of_strings_does_not() {
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         fallback::reset();
         let numbers = Vector::from_values(
             LogicalType::Integer,
@@ -1076,7 +1071,6 @@ mod tests {
     /// vector can overflow on its own, and the overflow is the answer rather than a detail.
     #[test]
     fn a_total_of_hugeints_goes_the_row_at_a_time_way_and_still_overflows() {
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         fallback::reset();
         let rows = vec![Value::HugeInt(i128::MAX); 2];
         let vector = Vector::from_values(LogicalType::HugeInt, &rows).expect("a vector");

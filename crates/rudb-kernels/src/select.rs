@@ -275,7 +275,6 @@ mod tests {
     /// have a loop, against reading the flags a value at a time.
     #[test]
     fn the_rows_kept_are_the_rows_the_row_at_a_time_path_keeps() {
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let mut rng = Rng(0x5eed_ca11_ab1e_0005);
         for nulls in [0_usize, 8, 3, 1] {
             for share in [0_u64, 1, 16, 50, 84, 99, 100] {
@@ -371,7 +370,6 @@ mod tests {
 
     #[test]
     fn a_constant_is_answered_without_a_loop_and_a_non_boolean_is_not_answered_at_all() {
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         fallback::reset();
         let all = Vector::constant(LogicalType::Boolean, YES, 500);
         assert_eq!(selection(&all, 500), Selection::identity(500));

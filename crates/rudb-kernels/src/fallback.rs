@@ -94,7 +94,38 @@ fn form_index(form: Form) -> usize {
 const WIDTH: usize = FORMS.len() + 1;
 const CELLS: usize = Kernel::ALL.len() * WIDTH * WIDTH;
 
+#[cfg(not(test))]
 static COUNTS: [AtomicU64; CELLS] = [const { AtomicU64::new(0) }; CELLS];
+
+// One table per thread in a test build, and one table for the process everywhere else.
+//
+// The counts a harness wants are the counts for a run, so the table the library keeps is process
+// wide. The counts a test wants are its own, and the test harness runs tests in parallel in one
+// process, so under `cfg(test)` every thread gets a table of its own and a test sees nothing but
+// what it recorded. A test binary here is a hundred and twenty tests of which fourteen read these
+// counters and the rest call kernels, so with one shared table the fourteen fail whenever one of
+// the other hundred happens to fall through at the same moment. That is what took the 0.2.12
+// release down and it did it by failing on a machine nobody was watching.
+//
+// A lock is the other way to write this and it was the way this was written. It does not work,
+// because it only serializes the tests that take it, and the test that has to take it is every
+// test that calls a kernel rather than the ones that read the counters.
+#[cfg(test)]
+thread_local! {
+    static COUNTS: [AtomicU64; CELLS] = const { [const { AtomicU64::new(0) }; CELLS] };
+}
+
+/// Reads the table this thread counts into.
+#[cfg(not(test))]
+fn with_counts<T>(read: impl FnOnce(&[AtomicU64; CELLS]) -> T) -> T {
+    read(&COUNTS)
+}
+
+/// Reads the table this thread counts into.
+#[cfg(test)]
+fn with_counts<T>(read: impl FnOnce(&[AtomicU64; CELLS]) -> T) -> T {
+    COUNTS.with(read)
+}
 
 /// Where a kernel and a form pair live in the table.
 fn cell(kernel: Kernel, left: Form, right: Form) -> usize {
@@ -107,13 +138,13 @@ fn cell(kernel: Kernel, left: Form, right: Form) -> usize {
 /// diagnostic that is read once, after, by a harness, and paying for ordering on it would be
 /// paying for a guarantee nobody uses.
 pub fn record(kernel: Kernel, left: Form, right: Form) {
-    COUNTS[cell(kernel, left, right)].fetch_add(1, Ordering::Relaxed);
+    with_counts(|counts| counts[cell(kernel, left, right)].fetch_add(1, Ordering::Relaxed));
 }
 
 /// How many times a kernel fell through on this pair of forms.
 #[must_use]
 pub fn count(kernel: Kernel, left: Form, right: Form) -> u64 {
-    COUNTS[cell(kernel, left, right)].load(Ordering::Relaxed)
+    with_counts(|counts| counts[cell(kernel, left, right)].load(Ordering::Relaxed))
 }
 
 /// Every combination that has fallen through at least once, most frequent first.
@@ -140,19 +171,12 @@ pub fn hot() -> Vec<(Kernel, Form, Form, u64)> {
 /// below. It is not synchronized against a running query, because a diagnostic that took a lock
 /// would be a diagnostic that changed what it measures.
 pub fn reset() {
-    for counter in &COUNTS {
-        counter.store(0, Ordering::Relaxed);
-    }
+    with_counts(|counts| {
+        for counter in counts {
+            counter.store(0, Ordering::Relaxed);
+        }
+    });
 }
-
-/// The lock every test that resets the counters holds while it does.
-///
-/// The counters are process wide and the test harness runs tests in parallel, so two tests that
-/// both reset would otherwise pass alone and fail together, which is the worst kind of test to own.
-/// It lives here rather than in the test module below because the kernel tests in the other files
-/// reset the counters too and they need the same lock, not a second one.
-#[cfg(test)]
-pub(crate) static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The counts as a table, or a line saying there are none.
 #[must_use]
@@ -175,11 +199,10 @@ pub fn report() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Form, Kernel, TURN, count, hot, record, report, reset};
+    use super::{Form, Kernel, count, hot, record, report, reset};
 
     #[test]
     fn a_fall_through_lands_in_the_cell_for_its_own_form_pair() {
-        let _turn = TURN.lock().expect("no test panics while holding this");
         reset();
         record(Kernel::Compare, Form::Sequence, Form::Constant);
         record(Kernel::Compare, Form::Sequence, Form::Constant);
@@ -193,7 +216,6 @@ mod tests {
 
     #[test]
     fn the_report_names_the_combination_rather_than_a_number_on_its_own() {
-        let _turn = TURN.lock().expect("no test panics while holding this");
         reset();
         assert!(report().contains("every kernel call took a specialized path"));
         for _ in 0..7 {

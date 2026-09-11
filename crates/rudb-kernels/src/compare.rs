@@ -1154,9 +1154,7 @@ mod tests {
     /// the fallback counter. Sequence against a column is the one this file leaves out on purpose.
     #[test]
     fn a_form_pair_with_no_loop_is_still_right_and_says_so() {
-        // The counters are process wide and another test in this crate resets them, so the ones
-        // that read a count take turns.
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
+        // The counters are per thread in a test build, so this reads its own and nothing else's.
         let before = fallback::count(Kernel::Compare, Form::Sequence, Form::Flat);
         let sequence = Vector::sequence(10, 1, 4);
         let flat = Vector::from_values(
@@ -1183,7 +1181,6 @@ mod tests {
     /// cost nothing more because the first one had already given up everything there was to give.
     #[test]
     fn a_second_level_of_codes_does_not_turn_the_loops_off() {
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let before = fallback::count(Kernel::Compare, Form::Dictionary, Form::Constant);
         let values = Vector::from_values(
             LogicalType::Integer,
