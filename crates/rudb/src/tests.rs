@@ -6,9 +6,11 @@
 //! a name a query writes has to be the name the binder resolves and the name the executor reads,
 //! and a type the binder decided has to be the type the operator produces.
 
+use std::time::Duration;
+
 use rudb_common::{Field, LogicalType, Value, days_from_civil};
 
-use crate::{Database, arrow};
+use crate::{Config, Database, arrow};
 
 /// `t(x INTEGER, s VARCHAR)` with a null in it, plus an empty table to test the degenerate cases.
 fn database() -> Database {
@@ -828,4 +830,29 @@ fn an_aggregate_over_a_wide_result_keeps_every_chunk_as_its_own_batch() {
     assert_eq!(rows, 3000);
     let bytes: usize = batches.iter().map(|batch| batch.column(0).unwrap().values().len()).sum();
     assert_eq!(bytes, 3000 * 8);
+}
+
+#[test]
+fn a_database_remembers_what_it_was_opened_with() {
+    let config = Config::new()
+        .with_memory_limit_text("2GB")
+        .unwrap()
+        .with_threads(3)
+        .unwrap()
+        .with_query_timeout(Duration::from_secs(10));
+    let db = Database::open_with(":memory:", config).unwrap();
+    assert_eq!(db.config().memory_limit(), Some(2 * 1024 * 1024 * 1024));
+    assert_eq!(db.config().threads(), 3);
+    assert_eq!(db.config().query_timeout(), Some(Duration::from_secs(10)));
+    // The settings survive the query path, which is the whole point of reading them back: a harness
+    // that opened the database is the thing that reports what the run used.
+    db.query("SELECT 1").unwrap();
+    assert_eq!(db.config().threads(), 3);
+}
+
+#[test]
+fn a_database_opened_the_plain_way_has_the_defaults() {
+    let db = Database::new();
+    assert_eq!(db.config(), &Config::default());
+    assert_eq!(db.config().memory_limit(), None);
 }

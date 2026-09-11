@@ -67,7 +67,10 @@ The command line and the sixteen output modes are DuckDB's, diffed against a rea
 
 ```
 $ rudb --print-config
-version: 0.2.4
+version: 0.2.9
+memory-limit: unlimited
+threads: 10
+query-timeout: none
 vector-size: 1024
 row-group-size: 122880
 storage-format: native (rudb v1), DuckDB import and export

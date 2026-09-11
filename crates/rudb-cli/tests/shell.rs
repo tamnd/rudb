@@ -277,6 +277,11 @@ fn version_and_help_and_config_print_and_stop() {
     let (out, _, failed) = run(&["--print-config"]);
     assert!(!failed);
     assert!(out.contains("vector-size: 1024"), "{out}");
+    // The settings a run can change come from the config object rather than from a literal in the
+    // shell, so that what this prints is what the engine was opened with.
+    assert!(out.contains("memory-limit: unlimited"), "{out}");
+    assert!(out.contains("query-timeout: none"), "{out}");
+    assert!(out.contains("threads: "), "{out}");
 }
 
 #[test]
