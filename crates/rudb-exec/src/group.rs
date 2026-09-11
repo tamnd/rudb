@@ -116,13 +116,25 @@ impl<'a> Aggregate<'a> {
         let mut slots: HashMap<Key, usize> = HashMap::new();
         let mut states: Vec<Vec<Accumulator>> = Vec::new();
         let mut seen: Vec<Vec<HashSet<Key>>> = Vec::new();
-        if self.groups.is_empty() {
+        let alone = self.groups.is_empty();
+        if alone {
             let key = Key(Vec::new());
             slots.insert(key.clone(), 0);
             order.push(key);
             states.push(self.fresh()?);
             seen.push(vec![HashSet::new(); self.calls.len()]);
         }
+        // Which calls fold a vector at a time. An ungrouped aggregate has exactly one slot, so
+        // there is no key to build, no hash to take and no lookup to do, and what is left of the
+        // row loop is the fold itself. `DISTINCT` needs a value per row to put in a set and
+        // `FILTER` needs the rows it kept, and neither has a vector form yet, so a call with either
+        // stays on the row loop while the calls beside it do not.
+        let by_vector: Vec<bool> = self
+            .calls
+            .iter()
+            .map(|call| alone && !call.distinct && call.filter.is_none())
+            .collect();
+        let every = by_vector.iter().all(|&yes| yes);
         while let Some(chunk) = self.input.next()? {
             let keys = evaluate_all(self.plan, &self.groups, &self.input_schema, &chunk)?;
             let mut arguments = Vec::with_capacity(self.calls.len());
@@ -134,20 +146,35 @@ impl<'a> Aggregate<'a> {
                     None => None,
                 });
             }
+            for at in 0..self.calls.len() {
+                if by_vector[at] {
+                    states[0][at].update_run(&arguments[at], chunk.len())?;
+                }
+            }
+            if alone && every {
+                continue;
+            }
             for row in 0..chunk.len() {
-                let key = Key(keys.iter().map(|column| column.value_at(row)).collect());
-                let slot = match slots.get(&key) {
-                    Some(&slot) => slot,
-                    None => {
-                        let slot = states.len();
-                        slots.insert(key.clone(), slot);
-                        order.push(key);
-                        states.push(self.fresh()?);
-                        seen.push(vec![HashSet::new(); self.calls.len()]);
-                        slot
+                let slot = if alone {
+                    0
+                } else {
+                    let key = Key(keys.iter().map(|column| column.value_at(row)).collect());
+                    match slots.get(&key) {
+                        Some(&slot) => slot,
+                        None => {
+                            let slot = states.len();
+                            slots.insert(key.clone(), slot);
+                            order.push(key);
+                            states.push(self.fresh()?);
+                            seen.push(vec![HashSet::new(); self.calls.len()]);
+                            slot
+                        }
                     }
                 };
                 for (at, call) in self.calls.iter().enumerate() {
+                    if by_vector[at] {
+                        continue;
+                    }
                     if let Some(flags) = &filters[at] {
                         if !is_true(&flags.value_at(row)) {
                             continue;
