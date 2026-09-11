@@ -34,11 +34,14 @@ pub enum Kernel {
     Cast,
     /// The aggregates.
     Aggregate,
+    /// Turning a vector of flags into the rows it keeps, in `select`.
+    Select,
 }
 
 impl Kernel {
     /// Every kernel that reports, in the order the table prints them.
-    const ALL: [Self; 5] = [Self::Compare, Self::Scalar, Self::Logic, Self::Cast, Self::Aggregate];
+    const ALL: [Self; 6] =
+        [Self::Compare, Self::Scalar, Self::Logic, Self::Cast, Self::Aggregate, Self::Select];
 
     /// The name used in the report.
     #[must_use]
@@ -49,6 +52,7 @@ impl Kernel {
             Self::Logic => "logic",
             Self::Cast => "cast",
             Self::Aggregate => "aggregate",
+            Self::Select => "select",
         }
     }
 
@@ -59,6 +63,7 @@ impl Kernel {
             Self::Logic => 2,
             Self::Cast => 3,
             Self::Aggregate => 4,
+            Self::Select => 5,
         }
     }
 }
