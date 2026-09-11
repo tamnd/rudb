@@ -197,8 +197,15 @@ impl<'a> Aggregate<'a> {
                             // those three containers took to have room for all of that is charged
                             // separately, below and once per chunk, because it is a property of the
                             // containers rather than of this group.
-                            taken += rows::heap(&key.0);
-                            slots.insert(key.clone(), slot);
+                            //
+                            // The copy is what gets charged and not the buffer it was copied from,
+                            // which is the whole reason it is made before the charge rather than
+                            // after. `key` is filled again for every row and a string in it keeps
+                            // whatever the longest string it has held needed, so charging that
+                            // charges every group in the table for the longest key in the table.
+                            let stored = key.clone();
+                            taken += rows::heap(&stored.0);
+                            slots.insert(stored, slot);
                             self.fresh(&mut states)?;
                             if sets {
                                 seen.resize_with(seen.len() + calls, RowSet::default);
@@ -227,8 +234,10 @@ impl<'a> Aggregate<'a> {
                         if set.contains(args) {
                             continue;
                         }
-                        taken += rows::footprint(&args.0);
-                        set.insert(args.clone());
+                        // The copy and not the buffer, for the reason the group key above gives.
+                        let stored = args.clone();
+                        taken += rows::footprint(&stored.0);
+                        set.insert(stored);
                     }
                     states[slot * calls + at].update(&args.0)?;
                 }
@@ -428,9 +437,11 @@ impl<'a> Distinct<'a> {
                     if self.on.is_empty() { key.0.clone() } else { chunk.row(row).collect() };
                 // The row is kept twice, once as the key in the table and once in the output, and
                 // each copy is its own block. What the table and the output took to have room for
-                // them is charged below, once per chunk.
-                taken += rows::heap(&key.0) + rows::heap(&values);
-                seen.insert(key.clone());
+                // them is charged below, once per chunk. The copy is charged and not the buffer it
+                // came from, for the reason the group key in `build` above gives.
+                let stored = key.clone();
+                taken += rows::heap(&stored.0) + rows::heap(&values);
+                seen.insert(stored);
                 kept.push(values);
             }
             scratch.grow(taken)?;
