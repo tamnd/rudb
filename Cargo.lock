@@ -215,8 +215,10 @@ dependencies = [
  "rudb-catalog",
  "rudb-common",
  "rudb-functions",
+ "rudb-kernels",
  "rudb-plan",
  "rudb-storage",
+ "rudb-vector",
 ]
 
 [[package]]
