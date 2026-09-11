@@ -1,0 +1,11 @@
+CREATE TABLE parts(a INTEGER NOT NULL, b VARCHAR);
+DESCRIBE t;
+DESCRIBE parts;
+DESCRIBE SELECT * FROM t;
+DESCRIBE SELECT * FROM parts;
+DESCRIBE SELECT a, a + 1 AS bumped, b || 'x' AS joined FROM parts;
+DESC t;
+DESCRIBE SELECT 1 AS one, 2.5 AS fraction, NULL AS nothing;
+SELECT column_name, column_type FROM (DESCRIBE SELECT 1 AS a, 2.5 AS b) WHERE column_name = 'b';
+DESCRIBE DESCRIBE SELECT 1 AS a;
+DESCRIBE VALUES (1, 'a');
