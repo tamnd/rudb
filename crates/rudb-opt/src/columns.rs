@@ -25,11 +25,13 @@
 //! the rows of a file a footer read. A projection prunes to no expressions the same way and for the
 //! same reason, and passes the row count of its input through.
 //!
-//! What it does not narrow is an aggregate, a `VALUES` list, and either side of a set operation. The
-//! first two are noted where they are skipped. A set operation lines its two sides up by position
-//! rather than binding to them, so narrowing one side without the other would change what the
-//! columns line up with, and narrowing both would take a rule that maps the set operation's own read
-//! set onto each side. That rule is worth writing and is not written here.
+//! What it does not narrow is an aggregate, a `VALUES` list, either side of a set operation, and the
+//! input of a `DISTINCT` that names no columns. The first two are noted where they are skipped. A set
+//! operation lines its two sides up by position rather than binding to them, so narrowing one side
+//! without the other would change what the columns line up with, and narrowing both would take a rule
+//! that maps the set operation's own read set onto each side. That rule is worth writing and is not
+//! written here. A plain `DISTINCT` is distinct on everything its input produces and says so by
+//! naming nothing, which is the same problem in a different shape.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -187,11 +189,14 @@ fn positions(wanted: &BTreeSet<u32>, held: usize) -> Vec<u32> {
 /// a projection on top, so the scans this reaches are the ones that come out of [`Plan::parse`] in
 /// the plan tests.
 ///
-/// The second is that the node feeds a set operation. Nothing binds to either side of one, because
-/// a set operation lines its sides up by position and produces an index of its own, so a pass that
-/// went by what is bound would narrow both sides to nothing and answer a `UNION ALL` with no columns
-/// at all. Every side of every reachable set operation is in here for that reason and not because of
-/// where it sits.
+/// The second is that the node feeds an operator that reads all of it without binding to any of it.
+/// A set operation is one: it lines its sides up by position and produces an index of its own, so a
+/// pass that went by what is bound would narrow both sides to nothing and answer a `UNION ALL` with
+/// no columns at all. A `DISTINCT` that names no columns is the other, and a plain `SELECT DISTINCT`
+/// is exactly that, because the binder writes the column list only for `DISTINCT ON`. Narrowing its
+/// input to what is bound above it leaves an operator deduplicating rows that have nothing left to
+/// tell them apart, so `SELECT count(*) FROM (SELECT DISTINCT region FROM sales)` comes back as 1 on
+/// any table with at least one row. Both sit here for what they are and not for where they sit.
 fn untouched(plan: &Plan, order: &[NodeRef]) -> HashSet<NodeRef> {
     let mut found = HashSet::new();
     let mut pending = vec![plan.root()];
@@ -205,9 +210,15 @@ fn untouched(plan: &Plan, order: &[NodeRef]) -> HashSet<NodeRef> {
         pending.extend(plan.node(node).children().into_iter().flatten());
     }
     for &node in order {
-        if let Node::SetOp { left, right, .. } = *plan.node(node) {
-            found.insert(left);
-            found.insert(right);
+        match *plan.node(node) {
+            Node::SetOp { left, right, .. } => {
+                found.insert(left);
+                found.insert(right);
+            }
+            Node::Distinct { input, on } if on.is_empty() => {
+                found.insert(input);
+            }
+            _ => {}
         }
     }
     found
@@ -430,6 +441,27 @@ mod tests {
         // `UNION ALL` with no columns at all.
         let text = "Aggregate #3 groups=[] aggregates=[count_star()::BIGINT]\n  SetOp UNION ALL #2\n    Get memory.main.t AS t #0 [a::INTEGER]\n    Get memory.main.u AS u #1 [x::INTEGER]\n";
         assert_eq!(pruned(text), text);
+    }
+
+    #[test]
+    fn a_distinct_that_names_no_columns_keeps_the_ones_it_is_distinct_on() {
+        // `SELECT count(*) FROM (SELECT DISTINCT b FROM t)`. The binder writes a column list only
+        // for `DISTINCT ON`, so a plain one names nothing and is distinct on everything under it.
+        // Narrowed to what is bound above, the projection loses `b`, and an operator deduplicating
+        // rows with no columns in them returns one row for any input that had any, which turns the
+        // count into 1 on every table in the world.
+        let text = "Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n  Distinct on=[]\n    Project #1 [#0.1::VARCHAR AS b]\n      Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR]\n";
+        let after = "Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n  Distinct on=[]\n    Project #1 [#0.0::VARCHAR AS b]\n      Get memory.main.t AS t #0 [b::VARCHAR]\n";
+        assert_eq!(pruned(text), after);
+    }
+
+    #[test]
+    fn a_distinct_on_named_columns_narrows_underneath_like_anything_else() {
+        // `DISTINCT ON` binds to what it reads, so the ordinary rule applies and `c` goes. The two
+        // cases are the same node and they have to be told apart by whether the list is empty.
+        let before = "Project #2 [#1.0::VARCHAR AS b]\n  Distinct on=[#1.0::VARCHAR]\n    Project #1 [#0.1::VARCHAR AS b, #0.2::INTEGER AS c]\n      Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR, c::INTEGER]\n";
+        let after = "Project #2 [#1.0::VARCHAR AS b]\n  Distinct on=[#1.0::VARCHAR]\n    Project #1 [#0.0::VARCHAR AS b]\n      Get memory.main.t AS t #0 [b::VARCHAR]\n";
+        assert_eq!(pruned(before), after);
     }
 
     #[test]
