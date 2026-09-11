@@ -15,6 +15,7 @@ mod codegen;
 mod compare;
 mod focus;
 mod grammar;
+mod io;
 mod kernels;
 mod layers;
 mod rowloop;
@@ -52,6 +53,10 @@ fn main() -> ExitCode {
         // against every engine on the machine and this one links the kernels rather than running a
         // binary.
         Some("kernels") => kernels::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        // The I/O table, which is what decides whether the pool coalesces by default. Separate from
+        // `kernels` because it reads a real file off a real disk and so it is the one table here
+        // whose answer is a fact about the machine rather than about the code.
+        Some("io") => io::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         Some("smoke") => smoke::run(),
         Some("ci") => ci(std::env::args().nth(2).as_deref() == Some("--full")),
         Some("help" | "--help" | "-h") | None => {
@@ -95,6 +100,10 @@ fn usage() {
     println!("  kernels  what one row costs, per physical layout, per form pair, per null rate,");
     println!("           plus the compaction surface and the vector size sweep. --json for the");
     println!("           machine readable form the rudb-bench kernels suite reads");
+    println!("  io       what a batch of reads costs through the pool and through the loop it");
+    println!("           replaces, per access pattern, per thread count, with the bytes read over");
+    println!("           the bytes wanted. --cold drops the page cache and needs Linux and root,");
+    println!("           and it is the column that means anything. --bytes <n> sizes the file");
     println!("  bench <suite>          the whole comparison, against every engine on this machine");
     println!("                         builds rudb and the harness, then runs the suite. needs a");
     println!("                         tamnd/rudb-bench checkout beside this one, or");

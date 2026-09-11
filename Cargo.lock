@@ -262,6 +262,7 @@ dependencies = [
  "rudb",
  "rudb-common",
  "rudb-exec",
+ "rudb-io",
  "rudb-kernels",
  "rudb-parse",
  "rudb-plan",
