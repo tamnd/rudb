@@ -69,7 +69,7 @@ fn statements() -> Vec<(String, String)> {
 
 /// A database with `hits` in it and nothing in `hits`.
 fn with_hits() -> Database {
-    let mut database = Database::new();
+    let database = Database::new();
     let (name, ddl) = statements().remove(0);
     assert_eq!(name, "hits", "the first statement in the file is not the DDL");
     database.execute(&ddl).expect("the official hits DDL");

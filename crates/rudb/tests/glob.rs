@@ -153,7 +153,7 @@ fn a_pattern_reads_csv_files_the_same_way_it_reads_parquet_ones() {
 
 #[test]
 fn a_pattern_can_be_loaded_into_a_table_like_any_other_query() {
-    let mut database = Database::new();
+    let database = Database::new();
     let sql = format!("CREATE TABLE parts AS SELECT * FROM {}", parquet("**/p*.parquet"));
     database.execute(&sql).expect("loads");
     assert_eq!(database.value("SELECT count(*) FROM parts").expect("runs"), Value::BigInt(9));

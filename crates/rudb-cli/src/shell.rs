@@ -73,10 +73,15 @@ impl std::fmt::Debug for Shell {
 }
 
 impl Shell {
-    /// A shell over a fresh database, writing results to `out` and errors to `err`.
-    pub fn new(options: &Options, out: Box<dyn Write>, err: Box<dyn Write>) -> Self {
+    /// A shell over `database`, writing results to `out` and errors to `err`.
+    pub fn new(
+        options: &Options,
+        database: Database,
+        out: Box<dyn Write>,
+        err: Box<dyn Write>,
+    ) -> Self {
         Self {
-            database: Database::new(),
+            database,
             settings: options.settings.clone(),
             out: Sink::Given(out),
             err,
@@ -312,9 +317,13 @@ impl Shell {
             }
             ".show" => self.show(),
             ".open" => {
-                return self.complain(
-                    "Error: .open needs a storage format, which is not built yet. See https://github.com/tamnd/rudb/issues/103",
-                );
+                // The library decides what a name means, so `.open :memory:` is a new empty
+                // database here the same way it is for a program, and a file is the library's
+                // sentence about the format that is missing rather than a second one written here.
+                match Database::open(&argument(0)) {
+                    Ok(database) => self.database = database,
+                    Err(problem) => return self.complain(&format!("Error: {}", problem.message())),
+                }
             }
             other => {
                 return self
