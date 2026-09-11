@@ -65,11 +65,13 @@ impl StringView {
         Self { length: text.len() as u32, payload }
     }
 
-    /// A view on bytes that are already known to be text, wherever they turn out to live.
+    /// A view on bytes, whatever they are, wherever they turn out to live.
     ///
-    /// The one constructor that takes bytes rather than a `&str`, for the copy between two columns
-    /// where the bytes were validated on the way into the first one. `offset` is where they are in
-    /// the destination arena and is ignored for a string short enough to sit in the view.
+    /// The one constructor that takes bytes rather than a `&str`, and the two callers want it for
+    /// different reasons. A copy between two columns has bytes that were validated on the way into
+    /// the first one and validating again would be work for nothing. A `BLOB` has bytes that were
+    /// never text and are not going to become it. `offset` is where they are in the destination
+    /// arena and is ignored for a string short enough to sit in the view.
     fn over(bytes: &[u8], offset: u64) -> Self {
         let mut payload = [0u8; 12];
         if bytes.len() <= INLINE_LIMIT {
@@ -125,8 +127,8 @@ impl StringView {
         if !self.is_inline() {
             return None;
         }
-        // Every constructor takes a `&str`, so the bytes came from valid UTF-8 and a prefix of the
-        // inline payload up to the recorded length is exactly what was written.
+        // `None` rather than a panic for a view that holds a blob, since the payload is whatever
+        // was written and only a column of text can promise that is a string.
         std::str::from_utf8(&self.payload[..self.len()]).ok()
     }
 
@@ -271,7 +273,17 @@ impl StringColumn {
     /// A position past the end of the source appends the empty string, which is what the copy loop
     /// wants for a row that resolved to nowhere.
     pub fn push_from(&mut self, source: &Self, index: usize) -> usize {
-        let bytes = source.bytes(index).unwrap_or(b"");
+        self.push_bytes(source.bytes(index).unwrap_or(b""))
+    }
+
+    /// Appends bytes that are not required to be text, and returns their index.
+    ///
+    /// What a `BLOB` is stored through. The column is the same column either way, because a string
+    /// here is already a length and some bytes and text is the reading rather than the storage, so
+    /// a blob costs nothing extra and shares every kernel that works on views. What it does not
+    /// share is [`Self::get`], which answers `None` for bytes that are not a string, so a caller
+    /// holding blobs reads them with [`Self::bytes`].
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> usize {
         let offset = self.arena.len() as u64;
         if bytes.len() > INLINE_LIMIT {
             self.arena.extend_from_slice(bytes);
@@ -470,6 +482,28 @@ mod tests {
             b"a string well past the inline limit!!",
             "the arena is the long strings and not the page"
         );
+    }
+
+    /// Bytes that are not text, which is what a `BLOB` holds. Both sides of the inline limit,
+    /// because a short one lives in its view and a long one lives in the arena and the byte that is
+    /// not a character has to survive either way. Reading them back as text is `None` and reading
+    /// them back as bytes is what went in.
+    #[test]
+    fn a_column_holds_bytes_that_are_not_a_string() {
+        let long = b"\xff\xfe and a good deal more than twelve bytes of it";
+        let mut column = StringColumn::new();
+        assert_eq!(column.push_bytes(b"a\xffb"), 0);
+        assert_eq!(column.push_bytes(long), 1);
+        assert_eq!(column.push_bytes(b""), 2);
+
+        assert_eq!(column.bytes(0), Some(b"a\xffb".as_slice()));
+        assert_eq!(column.bytes(1), Some(long.as_slice()));
+        assert_eq!(column.bytes(2), Some(b"".as_slice()));
+        assert_eq!(column.get(0), None, "a stray 0xff is not a character");
+        assert_eq!(column.get(1), None);
+        assert!(column.views()[0].is_inline());
+        assert!(!column.views()[1].is_inline());
+        assert_eq!(column.arena(), long, "only the long one needed the arena");
     }
 
     /// A copy of a copy, because the second one reads its bytes out of an arena the first one wrote

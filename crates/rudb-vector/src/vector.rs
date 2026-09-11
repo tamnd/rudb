@@ -162,6 +162,18 @@ impl Data {
             _ => None,
         }
     }
+
+    /// The bytes at `index`, for a `Varlen`, whatever they are.
+    ///
+    /// What a `BLOB` reads through, since the bytes of one are not required to be text and
+    /// [`Self::str_at`] answers `None` for the ones that are not.
+    #[must_use]
+    pub fn bytes_at(&self, index: usize) -> Option<&[u8]> {
+        match self {
+            Self::Varlen(column) => column.bytes(index),
+            _ => None,
+        }
+    }
 }
 
 /// A type, a length, a validity representation and some data.
@@ -744,7 +756,7 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
         }
         LogicalType::Varchar => data.str_at(index).map(|s| Value::Varchar(s.to_string())),
         LogicalType::Blob | LogicalType::Bit => {
-            data.str_at(index).map(|s| Value::Blob(s.as_bytes().to_vec()))
+            data.bytes_at(index).map(|bytes| Value::Blob(bytes.to_vec()))
         }
         LogicalType::Date => signed().and_then(|x| i32::try_from(x).ok()).map(Value::Date),
         LogicalType::Time | LogicalType::TimeTz => {
@@ -871,19 +883,12 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
             Value::Varchar(text) => {
                 column.push(text);
             }
-            // A blob is bytes and this column is text, so the only blobs that survive a round trip
-            // here are the ones that happen to be valid UTF-8. Real blob storage is a byte column
-            // and it arrives with the storage layer at M2 rather than being faked now.
-            Value::Blob(bytes) => match std::str::from_utf8(bytes) {
-                Ok(text) => {
-                    column.push(text);
-                }
-                Err(_) => {
-                    return Err(Error::not_implemented(
-                        "a blob that is not valid UTF-8, which needs the byte column from M2",
-                    ));
-                }
-            },
+            // A blob goes in as the bytes it is. The column stores a length and some bytes either
+            // way, so text is the reading of one rather than a different column, and a blob that
+            // is not UTF-8 is stored exactly like one that happens to be.
+            Value::Blob(bytes) => {
+                column.push_bytes(bytes);
+            }
             other => return Err(Error::internal(format!("{other:?} is not a string"))),
         },
     }
@@ -1360,6 +1365,26 @@ mod tests {
             let vector = Vector::from_values(ty, &[value.clone(), Value::Null]).unwrap();
             assert_eq!(vector.value_at(0), value, "a decimal of width {width}");
             assert_eq!(vector.value_at(1), Value::Null, "a null decimal of width {width}");
+        }
+    }
+
+    /// The bytes a blob holds are not required to be text, and a vector of them used to refuse the
+    /// ones that were not. A byte array column in a Parquet file that nothing annotated is a blob,
+    /// which is what ClickHouse writes and what ten of the ClickBench queries compare against, so
+    /// this is the path those take rather than a corner of the type system.
+    #[test]
+    fn a_blob_holds_bytes_that_are_not_text() {
+        let bytes = |raw: &[u8]| Value::Blob(raw.to_vec());
+        let values = [
+            bytes(b"a\xffb"),
+            bytes(b"\x00\x01\x02"),
+            Value::Null,
+            bytes(b"\xed\xa0\x80 and long enough to leave the view"),
+            bytes(b""),
+        ];
+        let vector = Vector::from_values(LogicalType::Blob, &values).unwrap();
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(&vector.value_at(index), value, "row {index}");
         }
     }
 
