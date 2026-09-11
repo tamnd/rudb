@@ -1,31 +1,41 @@
 #!/bin/sh
-# Build and install the DuckDB the grammar is vendored from.
+# Install the DuckDB the grammar is vendored from.
 #
 # The grammar under crates/rudb-parse/grammar comes from a commit on DuckDB's v2.0 development
-# branch, and there is no released binary at that commit to download. A published 1.4 or 1.5 is a
-# different language: it rejects `ORDER BY x ASCENDING`, which the vendored grammar accepts, and it
-# accepts `[1, 2] <-> [3, 4]`, which the v2.0 tokenizer cannot read as one token. So the reference
-# binary rudb-compat measures against is built here, at the commit written down in VENDOR.
+# branch. A published 1.4 or 1.5 is a different language: it rejects `ORDER BY x ASCENDING`, which
+# the vendored grammar accepts, and it accepts `[1, 2] <-> [3, 4]`, which the v2.0 tokenizer cannot
+# read as one token. So the reference binary rudb-compat measures against has to be the one at the
+# commit written down in VENDOR, and this is what puts it on a machine.
 #
-#   scripts/oracle              build and install on server3
-#   scripts/oracle server1      the same, on a different machine
-#   scripts/oracle gamingpc     the same, inside the WSL Ubuntu there
-#   scripts/oracle --here       build and install on this machine
-#   scripts/oracle server1 --from server3   copy the built binary instead of building it again
+#   scripts/oracle                          download and install on server3
+#   scripts/oracle server1                  the same, on a different machine
+#   scripts/oracle gamingpc                 the same, inside the WSL Ubuntu there
+#   scripts/oracle --here                   the same, on this machine
+#   scripts/oracle server1 --build          build it from source there rather than downloading
+#   scripts/oracle server1 --from server3   copy the binary another machine already has
 #
-# The copy is there because server1 has no cmake and no way to install one, and because three of
-# the four machines are the same Ubuntu on the same architecture, so the same file runs on all of
-# them. It only works between machines like that. gamingpc is a newer Ubuntu with a newer libc and
-# builds its own.
+# Downloading is the default. There is no release at this commit and artifacts.duckdb.org only
+# carries tags, but upstream's own CI builds a command line binary on every commit to the branch and
+# keeps it as a GitHub Actions artifact, which is public. That is a better reference than one built
+# here with whatever flags we picked, and it takes a minute rather than forty. It needs `gh` logged
+# in on the machine running this, it is Linux x86_64 only, and the artifact expires ninety days
+# after the run that made it. When it is gone `--build` is what is left, which is why the build is
+# still here.
 #
-# It installs into ~/.local/bin under a name carrying the version and the hash, and points a
-# `duckdb` symlink next to it at that file. Whatever DuckDB was already on the machine is left
-# exactly where it was, which matters because those are the binaries every earlier measurement was
-# taken against. ~/.local/bin is ahead of the usual install locations on the path on all four
-# machines, so `duckdb` is the pinned one from then on.
+# --build takes about five minutes on the 32 core box and about forty on a four core one. --from is
+# there because server1 has no cmake and no way to install one, and because three of the four
+# machines are the same Ubuntu on the same architecture. gamingpc is a newer Ubuntu with a newer
+# libc, so it does not take a copy from the others.
 #
-# The build takes about five minutes on the 32 core box and about forty on a four core one. Running
-# it again on a machine that already has this commit installed does nothing.
+# However the binary arrives, it is installed under a name carrying the version and the hash, and a
+# `duckdb` symlink beside it is pointed at the file. Whatever DuckDB was already on the machine is
+# left exactly where it was, which matters because those are the binaries every earlier measurement
+# was taken against. The last thing it does is check that `duckdb` on the path really is the file it
+# just wrote. That check is not ceremony: ~/.local/bin is on the path on server1 and inside
+# gamingpc's WSL and is not on it on server2 or server3, so an install can land somewhere the path
+# never reaches and leave the harness measuring the wrong language without saying so.
+#
+# Running it again on a machine that already has this commit installed does nothing.
 set -e
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -44,44 +54,171 @@ case "$1" in
   server1 | server2 | server3 | gamingpc | --here) host=$1; shift ;;
 esac
 
+how=download
 from=
-if [ "$1" = "--from" ]; then
-  from=$2
-  shift 2
-fi
+case "$1" in
+  --download) shift ;;
+  --build) how=build; shift ;;
+  --from) how=from; from=$2; shift 2 ;;
+esac
 
 short=$(echo "$commit" | cut -c1-10)
 
-if [ -n "$from" ]; then
-  if [ "$host" = gamingpc ] || [ "$host" = --here ]; then
-    echo "oracle: --from copies between the Linux boxes only" >&2
-    exit 1
-  fi
-  built=$(ssh "$from" "ls \$HOME/.local/bin/duckdb-*-$short 2>/dev/null | head -1")
-  if [ -z "$built" ]; then
-    echo "oracle: $from has no binary at $short, build it there first" >&2
-    exit 1
-  fi
-  name=$(basename "$built")
-  ssh "$from" "cat $built" | ssh "$host" "mkdir -p \$HOME/.local/bin \
-    && cat > \$HOME/.local/bin/$name \
-    && chmod 755 \$HOME/.local/bin/$name \
-    && ln -sfn \$HOME/.local/bin/$name \$HOME/.local/bin/duckdb \
-    && echo \"installed \$HOME/.local/bin/$name\" \
-    && \$HOME/.local/bin/duckdb --version"
-  exit 0
-fi
+# The name of the artifact upstream's CI uploads for this platform, and the workflow that uploads
+# it. Both are read off a run rather than guessed, so if either is renamed this says it found
+# nothing rather than downloading the wrong thing.
+workflow=Main
+artifact_name=duckdb-cli-linux-amd64.tar.gz
 
-# Everything below runs on the other machine. The three values out of VENDOR are substituted in
-# here, and every other dollar sign is escaped so that it is the remote shell that expands it.
-recipe=$(cat <<SH
+# Runs one short command on the target, with this script's stdin on its stdin.
+#
+# The command has to be free of quote characters, because on the way to gamingpc it travels through
+# cmd before it reaches the bash inside WSL. Everything long goes over stdin instead, which is why
+# the recipes below are shipped as a file and then run rather than passed as an argument.
+on_target() {
+  case "$host" in
+    --here) sh -c "$1" ;;
+    gamingpc) ssh gamingpc "wsl -d Ubuntu -e bash -c \"$1\"" ;;
+    *) ssh "$host" "$1" ;;
+  esac
+}
+
+# What to do with a binary once there is one. It arrives on stdin, because none of the three ways of
+# getting one leaves a file on the target: a download happens on the machine running this script, a
+# copy comes off a third machine, and a build ends up in a work directory that is not where the
+# binary should live.
+install_recipe=$(cat <<'SH'
 set -e
-installed=\$("\$HOME/.local/bin/duckdb" --version 2>/dev/null || echo none)
-if echo "\$installed" | grep -q "$short"; then
-  echo "already installed: \$installed"
+tmp=$(mktemp)
+cat > "$tmp"
+chmod 755 "$tmp"
+
+line=$("$tmp" --version)
+version=${line%% *}
+hash=${line##* }
+
+# /usr/local/bin wherever it can be reached, with sudo if that is what it takes, and ~/.local/bin
+# only when it cannot. Which one it is matters more than it looks. An ssh shell on server2 and
+# server3 has nothing under $HOME on its path at all, and inside gamingpc's WSL ~/.local/bin is on
+# the path of a login shell and not on the path of anything else, so on three of the four machines a
+# binary put in ~/.local/bin is invisible to something and `duckdb` goes on meaning the 1.4 or the
+# 1.5 that was already there. server1 is the one machine where sudo wants a password, and it is also
+# the one machine with ~/.local/bin on the path of every shell, so it lands there and is fine.
+as=
+if [ -w /usr/local/bin ]; then
+  dir=/usr/local/bin
+elif sudo -n true 2>/dev/null; then
+  dir=/usr/local/bin
+  as="sudo -n"
+else
+  dir=$HOME/.local/bin
+fi
+$as mkdir -p "$dir"
+
+$as install -m 755 "$tmp" "$dir/duckdb-$version-$hash"
+rm -f "$tmp"
+
+# A `duckdb` that is a real file rather than a link is the one that was there before, and it is the
+# binary some earlier measurement was taken against. It keeps its own name and stays in the same
+# directory rather than being written over.
+if [ -f "$dir/duckdb" ] && [ ! -L "$dir/duckdb" ]; then
+  was=$("$dir/duckdb" --version)
+  $as mv "$dir/duckdb" "$dir/duckdb-${was%% *}"
+  echo "kept $dir/duckdb-${was%% *}"
+fi
+
+$as ln -sfn "$dir/duckdb-$version-$hash" "$dir/duckdb"
+echo "installed $dir/duckdb-$version-$hash"
+
+found=$(command -v duckdb || true)
+if [ -z "$found" ]; then
+  echo "oracle: nothing called duckdb is on the path, put $dir on it" >&2
+  exit 1
+fi
+if [ "$(readlink -f "$found")" != "$(readlink -f "$dir/duckdb")" ]; then
+  echo "oracle: duckdb on the path is $found rather than $dir/duckdb" >&2
+  exit 1
+fi
+duckdb --version
+SH
+)
+
+# Whether this machine already has the pinned commit as its `duckdb`.
+already() {
+  on_target 'duckdb --version' 2>/dev/null | grep -q "$short"
+}
+
+if already; then
+  echo "already installed: $(on_target 'duckdb --version')"
   exit 0
 fi
 
+printf '%s\n' "$install_recipe" | on_target 'cat > /tmp/oracle-install.sh'
+
+case "$how" in
+  from)
+    if [ "$host" = gamingpc ] || [ "$host" = --here ]; then
+      echo "oracle: --from copies between the Linux boxes only" >&2
+      exit 1
+    fi
+    built=$(ssh "$from" "ls \$HOME/.local/bin/duckdb-*-$short /usr/local/bin/duckdb-*-$short 2>/dev/null | head -1")
+    if [ -z "$built" ]; then
+      echo "oracle: $from has no binary at $short, get one there first" >&2
+      exit 1
+    fi
+    ssh "$from" "cat $built" | on_target 'sh /tmp/oracle-install.sh'
+    ;;
+
+  download)
+    # One artifact is built per platform and the only one this fetches is the Linux x86_64 one,
+    # because that is what all four machines are. A mac asking for it would get a file it cannot
+    # run, and finding that out from `install` rather than from a sentence would be unkind.
+    platform=$(on_target 'uname -s -m')
+    if [ "$platform" != "Linux x86_64" ]; then
+      where=$host
+      if [ "$host" = --here ]; then where="this machine"; fi
+      echo "oracle: the artifact is Linux x86_64 and $where is $platform, use --build" >&2
+      exit 1
+    fi
+
+    slug=$(echo "$upstream" | sed -e 's|^.*github\.com[:/]||' -e 's|\.git$||')
+    run=$(gh api "repos/$slug/actions/runs?head_sha=$commit&per_page=100" \
+      -q "[.workflow_runs[] | select(.name == \"$workflow\" and .conclusion == \"success\")][0].id")
+    if [ -z "$run" ] || [ "$run" = null ]; then
+      echo "oracle: no successful $workflow run at $short on $slug, try --build" >&2
+      exit 1
+    fi
+    id=$(gh api "repos/$slug/actions/runs/$run/artifacts" \
+      -q "[.artifacts[] | select(.name == \"$artifact_name\" and .expired == false)][0].id")
+    if [ -z "$id" ] || [ "$id" = null ]; then
+      echo "oracle: run $run has no unexpired $artifact_name, it is ninety days old, try --build" >&2
+      exit 1
+    fi
+
+    work=$(mktemp -d)
+    # GitHub hands this back as the tar.gz that was uploaded rather than as a zip around it, which
+    # is not what the `/zip` in the URL suggests. Both shapes are read, because which one comes back
+    # is an accident of how a single file artifact is stored rather than something upstream said.
+    gh api "repos/$slug/actions/artifacts/$id/zip" > "$work/artifact"
+    case $(od -An -tx1 -N2 "$work/artifact" | tr -d ' ') in
+      1f8b) tar -xzf "$work/artifact" -C "$work" ;;
+      504b) unzip -q -o "$work/artifact" -d "$work" && tar -xzf "$work"/*.tar.gz -C "$work" ;;
+      *) echo "oracle: artifact $id is neither a gzip nor a zip" >&2; exit 1 ;;
+    esac
+    if [ ! -f "$work/duckdb" ]; then
+      echo "oracle: artifact $id holds no duckdb" >&2
+      exit 1
+    fi
+    echo "downloaded $artifact_name from run $run at $short"
+    on_target 'sh /tmp/oracle-install.sh' < "$work/duckdb"
+    rm -rf "$work"
+    ;;
+
+  build)
+    # This one runs on the other machine. The values out of VENDOR are substituted in here, and
+    # every other dollar sign is escaped so that it is the remote shell that expands it.
+    build_recipe=$(cat <<SH
+set -e
 work=\$HOME/duckdb-oracle
 mkdir -p "\$work"
 cd "\$work"
@@ -97,22 +234,9 @@ git checkout -q $commit
 # corpus file that reads one.
 GEN=ninja CORE_EXTENSIONS="parquet;json" make release
 
-built=\$work/duckdb/build/release/duckdb
-line=\$("\$built" --version)
-version=\${line%% *}
-hash=\${line##* }
-mkdir -p "\$HOME/.local/bin"
-install -m 755 "\$built" "\$HOME/.local/bin/duckdb-\$version-\$hash"
-ln -sfn "\$HOME/.local/bin/duckdb-\$version-\$hash" "\$HOME/.local/bin/duckdb"
-echo "installed \$HOME/.local/bin/duckdb-\$version-\$hash"
-"\$HOME/.local/bin/duckdb" --version
+sh /tmp/oracle-install.sh < "\$work/duckdb/build/release/duckdb"
 SH
 )
-
-case "$host" in
-  --here) printf '%s\n' "$recipe" | sh ;;
-  # ssh to the Windows box lands in cmd, and the Linux this has to build on is the WSL Ubuntu
-  # inside it. The recipe goes over stdin so that nothing in it has to survive cmd quoting.
-  gamingpc) printf '%s\n' "$recipe" | ssh gamingpc "wsl -d Ubuntu -- bash -s" ;;
-  *) printf '%s\n' "$recipe" | ssh "$host" 'bash -s' ;;
+    printf '%s\n' "$build_recipe" | on_target 'bash -s'
+    ;;
 esac
