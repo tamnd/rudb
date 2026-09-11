@@ -750,8 +750,10 @@ fn the_arguments_are_expressions_and_they_cannot_see_a_column() {
 #[test]
 fn a_table_function_that_does_not_exist_says_so_rather_than_being_read_as_a_table() {
     let db = Database::new();
-    let message = failure(&db, "SELECT * FROM read_csv('x.csv')");
-    assert!(message.contains("read_csv"), "{message}");
+    // `read_json` is the next file reader people will write and it is not one of the four, so it is
+    // the one that has to come back named rather than being taken for a table.
+    let message = failure(&db, "SELECT * FROM read_json('x.json')");
+    assert!(message.contains("read_json"), "{message}");
     let message = failure(&db, "SELECT * FROM nowhere.range(3)");
     assert!(message.contains("nowhere"), "{message}");
     let message = failure(&db, "SELECT * FROM range(1, 2, 3, 4)");

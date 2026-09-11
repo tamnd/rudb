@@ -15,6 +15,7 @@ readme.workspace = true
 [dependencies]
 rudb-common.workspace = true
 rudb-io.workspace = true
+rudb-kernels.workspace = true
 rudb-vector.workspace = true
 
 [lints]

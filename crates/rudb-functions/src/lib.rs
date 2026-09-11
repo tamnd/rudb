@@ -17,6 +17,6 @@ pub mod file;
 pub mod signature;
 pub mod table;
 
-pub use file::{open_parquet, parquet_fields};
+pub use file::{csv_fields, exists, open_csv, open_parquet, parquet_fields};
 pub use signature::{FunctionKind, Resolved, kind_of, resolve};
 pub use table::{Columns, ResolvedTable, TableFunction, resolve_table, series, series_length};

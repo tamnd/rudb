@@ -18,6 +18,7 @@ rudb-vector.workspace = true
 rudb-kernels.workspace = true
 rudb-ir.workspace = true
 rudb-io.workspace = true
+rudb-csv.workspace = true
 rudb-parquet.workspace = true
 
 [lints]
