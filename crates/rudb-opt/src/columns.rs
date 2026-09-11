@@ -31,9 +31,27 @@
 //! columns line up with, and narrowing both would take a rule that maps the set operation's own read
 //! set onto each side. That rule is worth writing and is not written here.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
+use rudb_common::Result;
 use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice};
+
+use crate::pass::{Context, Pass, top_down};
+
+/// Narrows every scan and every interior projection to the columns something above reads.
+#[derive(Debug, Clone, Copy)]
+pub struct UnusedColumns;
+
+impl Pass for UnusedColumns {
+    fn name(&self) -> &'static str {
+        "unused_columns"
+    }
+
+    fn run(&self, plan: &mut Plan, _context: &Context) -> Result<()> {
+        prune(plan);
+        Ok(())
+    }
+}
 
 /// Narrows every scan and every interior projection in `plan` to the columns something above reads.
 ///
@@ -157,23 +175,6 @@ fn positions(wanted: &BTreeSet<u32>, held: usize) -> Vec<u32> {
         positions[old as usize] = new as u32;
     }
     positions
-}
-
-/// Every node the root reaches, parents before children.
-///
-/// Not every node in the arena. A rewrite that replaced a node leaves the old one behind, and a
-/// column read only by something unreachable is a column nothing reads.
-fn top_down(plan: &Plan) -> Vec<NodeRef> {
-    let mut found = Vec::new();
-    let mut pending = VecDeque::from([plan.root()]);
-    while let Some(node) = pending.pop_front() {
-        if found.contains(&node) {
-            continue;
-        }
-        found.push(node);
-        pending.extend(plan.node(node).children().into_iter().flatten());
-    }
-    found
 }
 
 /// The nodes this pass leaves alone, for either of the two reasons there are.
