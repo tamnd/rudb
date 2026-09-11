@@ -21,6 +21,12 @@
 //! long before the budget noticed. CI runs in containers, so getting this wrong means the default
 //! is wrong exactly where it is least watched.
 //!
+//! The group to ask is the one this process is in, named in `/proc/self/cgroup`, and every parent
+//! of it up to the mount root, because a limit on a parent binds a child as much as its own does.
+//! Reading the mount root alone is the mistake #223 was: it is the right file only under Docker,
+//! where the mount is namespaced so that the root is the container's own group, and it is the wrong
+//! file for a systemd scope, for Kubernetes and for anything nested.
+//!
 //! It lives in this crate rather than next to the budget in `rudb-common` for the two reasons this
 //! crate exists. Asking the operating system how much memory it has is the same kind of question as
 //! asking it for a file, and on Linux it is literally a file read, which the rule at the top of
@@ -90,36 +96,142 @@ mod platform {
         }
     }
 
-    /// What the control group allows, if there is one and it has a number rather than `max`.
+    /// The smallest limit binding this process, across both hierarchy versions.
     ///
-    /// Version two first, because a machine with both mounted is running version two and version
-    /// one is there for compatibility. A group with no limit writes `max` in version two and a
-    /// number close to `u64::MAX` in version one, and both of those mean the same as no file at
-    /// all.
+    /// A machine may have either mounted or both, so both are asked and the answer is the smaller.
+    /// Version two is the one that is used on a modern machine and version one is there because a
+    /// long lived host may still be on it.
     fn cgroup() -> Option<u64> {
-        const V1: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
-        const V2: &str = "/sys/fs/cgroup/memory.max";
-        for at in [V2, V1] {
-            let Ok(text) = std::fs::read_to_string(at) else { continue };
-            let text = text.trim();
-            if text == "max" {
-                return None;
-            }
-            let Ok(bytes) = text.parse::<u64>() else { continue };
-            // Version one writes a number the size of the address space to mean no limit, and it is
-            // page aligned rather than exactly `u64::MAX`, so the test is an order of magnitude and
-            // not equality. No machine has an exabyte.
-            if bytes >= 1 << 60 {
-                return None;
-            }
-            return Some(bytes);
+        let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let v2 = smallest("/sys/fs/cgroup", v2_path(&own), "memory.max");
+        let v1 = smallest("/sys/fs/cgroup/memory", v1_path(&own), "memory.limit_in_bytes");
+        match (v2, v1) {
+            (Some(two), Some(one)) => Some(two.min(one)),
+            (two, one) => two.or(one),
         }
-        None
+    }
+
+    /// The group this process is in under the version two hierarchy.
+    ///
+    /// One line, `0::` and then the path, which is what the single hierarchy of version two means.
+    fn v2_path(own: &str) -> &str {
+        own.lines().find_map(|line| line.strip_prefix("0::")).unwrap_or("")
+    }
+
+    /// The group this process is in under the memory controller of the version one hierarchy.
+    ///
+    /// One line per controller, numbered, and the controller field holds a comma separated list
+    /// because one hierarchy can carry several. Only the one carrying `memory` says anything about
+    /// memory.
+    fn v1_path(own: &str) -> &str {
+        own.lines()
+            .find_map(|line| {
+                let mut fields = line.splitn(3, ':');
+                let controllers = fields.nth(1)?;
+                let path = fields.next()?;
+                controllers.split(',').any(|name| name == "memory").then_some(path)
+            })
+            .unwrap_or("")
+    }
+
+    /// The smallest limit from the group at `path` up through every parent to `mount`.
+    ///
+    /// Every ancestor is read rather than only the group the process is in, because a parent's
+    /// limit binds its children as much as their own does, and systemd routinely puts a limit on a
+    /// slice rather than on the scope inside it.
+    ///
+    /// The mount root is read too, and it is read even when `path` names a group that is not there.
+    /// Inside a container `/proc/self/cgroup` reports the path on the host, which does not exist
+    /// under the namespaced mount, and the mount root is the container's own group. So the walk
+    /// finds nothing and the last read is the one that answers.
+    fn smallest(mount: &str, path: &str, file: &str) -> Option<u64> {
+        let mut parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        let mut smallest: Option<u64> = None;
+        loop {
+            let mut at = std::path::PathBuf::from(mount);
+            at.extend(&parts);
+            at.push(file);
+            if let Some(bytes) = limit(&at) {
+                smallest = Some(smallest.map_or(bytes, |had| had.min(bytes)));
+            }
+            if parts.pop().is_none() {
+                return smallest;
+            }
+        }
+    }
+
+    /// One limit file, or `None` when it is absent, unreadable or says there is no limit.
+    ///
+    /// A group with no limit writes `max` in version two and a number the size of the address space
+    /// in version one. The version one number is page aligned rather than exactly `u64::MAX`, so the
+    /// test is an order of magnitude rather than equality. No machine has an exabyte.
+    fn limit(at: &std::path::Path) -> Option<u64> {
+        let text = std::fs::read_to_string(at).ok()?;
+        let bytes: u64 = text.trim().parse().ok()?;
+        (bytes < 1 << 60).then_some(bytes)
     }
 
     #[cfg(test)]
     mod tests {
-        use super::meminfo;
+        use super::{limit, meminfo, smallest, v1_path, v2_path};
+        use crate::scratch::TempDir;
+
+        #[test]
+        fn the_version_two_group_is_the_one_line_that_names_no_controller() {
+            let own = "0::/system.slice/run-r867.scope\n";
+            assert_eq!(v2_path(own), "/system.slice/run-r867.scope");
+            assert_eq!(v2_path("11:memory:/docker/abc\n"), "");
+            assert_eq!(v2_path(""), "");
+        }
+
+        #[test]
+        fn the_version_one_group_is_the_line_whose_controllers_include_memory() {
+            let own = "12:pids:/user.slice\n11:memory:/docker/abc\n0::/\n";
+            assert_eq!(v1_path(own), "/docker/abc");
+        }
+
+        #[test]
+        fn a_controller_named_memory_is_not_one_whose_name_merely_contains_it() {
+            // `hugetlb,memory` is a real pairing and `memory_recursiveprot` is a real mount option,
+            // so the field is split on commas and matched whole rather than searched for.
+            assert_eq!(v1_path("9:hugetlb,memory:/here\n"), "/here");
+            assert_eq!(v1_path("9:memory_pressure:/elsewhere\n"), "");
+        }
+
+        #[test]
+        fn a_group_with_no_limit_says_nothing_rather_than_a_number() {
+            let dir = TempDir::new("cgroup-none");
+            let at = dir.join("memory.max");
+            std::fs::write(&at, "max\n").expect("a file to read back");
+            assert_eq!(limit(&at), None);
+            // Version one's way of saying the same thing, page aligned rather than u64::MAX.
+            std::fs::write(&at, "9223372036854771712\n").expect("a file to read back");
+            assert_eq!(limit(&at), None);
+            std::fs::write(&at, "12884901888\n").expect("a file to read back");
+            assert_eq!(limit(&at), Some(12_884_901_888));
+            assert_eq!(limit(&dir.join("no-such-file")), None);
+        }
+
+        #[test]
+        fn the_walk_takes_the_smallest_limit_on_the_way_up() {
+            let mount = TempDir::new("cgroup-walk");
+            let deep = mount.join("system.slice/run.scope");
+            std::fs::create_dir_all(&deep).expect("a temporary hierarchy");
+            // A slice held to eight gigabytes with a scope inside it held to twelve. The scope's
+            // own file is the larger number and the one that binds is the parent's.
+            std::fs::write(deep.join("memory.max"), "12884901888").expect("a file");
+            std::fs::write(mount.join("system.slice/memory.max"), "8589934592").expect("a file");
+            std::fs::write(mount.join("memory.max"), "max").expect("a file");
+            let root = mount.path().to_str().expect("a path this test wrote");
+            let walked = smallest(root, "/system.slice/run.scope", "memory.max");
+            assert_eq!(walked, Some(8_589_934_592));
+            // A group that is not there is the container case, where the mount root answers. It
+            // says `max` here, so what this asserts is that a missing group is not an error and
+            // does not stop the walk before it reaches the root.
+            assert_eq!(smallest(root, "/docker/abc", "memory.max"), None);
+            std::fs::write(mount.join("memory.max"), "2147483648").expect("a file");
+            assert_eq!(smallest(root, "/docker/abc", "memory.max"), Some(2_147_483_648));
+        }
 
         #[test]
         fn memtotal_is_read_in_kibibytes() {
