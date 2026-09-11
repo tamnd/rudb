@@ -445,7 +445,8 @@ fn binary_tables(cells: &mut Vec<Cell>) {
                 let args = vec![left, right];
                 let returns = case.ty.clone();
                 if let Some((number, fell_back)) = cell(ROWS, || {
-                    call("+", black_box(&args), black_box(&returns)).map_err(|e| e.to_string())
+                    call("+", black_box(&args), black_box(&returns), None)
+                        .map_err(|e| e.to_string())
                 }) {
                     cells.push(Cell {
                         table: "arithmetic",
@@ -778,7 +779,7 @@ fn size_sweep(cells: &mut Vec<Cell>) {
             (
                 "add flat/flat",
                 time(|| {
-                    drop(black_box(call("+", black_box(&args), black_box(&returns))));
+                    drop(black_box(call("+", black_box(&args), black_box(&returns), None)));
                 }),
                 size,
             ),

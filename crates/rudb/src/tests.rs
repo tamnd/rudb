@@ -988,6 +988,64 @@ fn an_overflow_says_what_duckdb_says() {
     assert_eq!(failure(&db, sql), "Overflow on abs(-2147483648)");
 }
 
+/// A zero divisor is three different things, one per operator. Per #262.
+///
+/// `/` never raises, because the binder has already promoted both sides to DOUBLE and IEEE
+/// arithmetic answers an infinity or a nan. `//` always raises, whatever it was given. `%` raises on
+/// integers and on decimals and answers a nan on floats. All three were measured on the pinned
+/// binary, and none of them is null, which is what this used to answer for all of them.
+#[test]
+fn dividing_by_zero_raises_on_two_of_the_three_operators() {
+    let db = Database::new();
+    let double = |value| vec![vec![Value::Double(value)]];
+    assert_eq!(rows(&db, "SELECT 7 / 0"), double(f64::INFINITY));
+    assert_eq!(rows(&db, "SELECT (-7) / 0"), double(f64::NEG_INFINITY));
+    assert!(matches!(rows(&db, "SELECT 0 / 0")[0][0], Value::Double(answer) if answer.is_nan()));
+    assert!(matches!(rows(&db, "SELECT 7.5::DOUBLE % 0.0::DOUBLE")[0][0],
+            Value::Double(answer) if answer.is_nan()));
+    // The vectorized loop, which reaches the zero at the third row rather than at the first.
+    let run = rows(&db, "SELECT 10 / a FROM range(-1, 2) t(a)");
+    assert_eq!(run[0], vec![Value::Double(-10.0)]);
+    assert!(matches!(run[1][0], Value::Double(answer) if answer.is_infinite()));
+    assert_eq!(run[2], vec![Value::Double(10.0)]);
+}
+
+/// The division by zero sentence, word for word against the pinned binary. Per #262.
+///
+/// It quotes the expression rather than the two values, and the expression it quotes is the bound
+/// one: the casts the binder put in are in the text, a column is the name its table gives it, and a
+/// literal is the value it was folded to.
+#[test]
+fn dividing_by_zero_says_what_duckdb_says() {
+    let db = Database::new();
+    db.create_table("z", vec![Field::new("a", LogicalType::Integer)]).unwrap();
+    db.append("z", &[vec![Value::Integer(1)], vec![Value::Integer(-2)]]).unwrap();
+    let advice = "Use TRY(...) to return NULL for this expression, or SET \
+                  null_on_division_by_zero=true to return NULL for all divisions by zero.";
+    let cases = [
+        ("SELECT 7 // 0", "(7 // 0)"),
+        ("SELECT 7 % 0", "(7 % 0)"),
+        ("SELECT 7.50 % 0.00", "(7.50 % 0.00)"),
+        ("SELECT 7.0::DOUBLE // 0.0::DOUBLE", "(7.0 // 0.0)"),
+        // A column, so the constant folder leaves the row alone and the vectorized loop is what
+        // raises. Everything below this line goes through that loop.
+        ("SELECT a // 0 FROM z", "(a // 0)"),
+        ("SELECT a % 0 FROM z", "(a % 0)"),
+        ("SELECT a::DOUBLE // 0.0 FROM z", "(CAST(a AS DOUBLE) // 0.0)"),
+        ("SELECT (a + 1) // 0 FROM z", "((a + 1) // 0)"),
+        ("SELECT abs(a) % 0 FROM z", "(abs(a) % 0)"),
+        // Unary minus brackets its operand where a binary operator does not, which is measured and
+        // is what DuckDB does for every operator that is not binary.
+        ("SELECT -a // 0 FROM z", "(-(a) // 0)"),
+        ("SELECT 10 // (a - a) FROM z", "(10 // (a - a))"),
+        ("SELECT 10.5 % (a - a) FROM z", "(10.5 % CAST((a - a) AS DECIMAL(11,1)))"),
+    ];
+    for (sql, quoted) in cases {
+        let expected = format!("Division by zero in expression {quoted}. {advice}");
+        assert_eq!(failure(&db, sql), expected, "{sql}");
+    }
+}
+
 /// The sum of the two largest `DECIMAL(18,0)` values, which does not fit in a `DECIMAL(18,0)`.
 ///
 /// It used to raise `Out of Range Error: Overflow in addition`, because the result kept the

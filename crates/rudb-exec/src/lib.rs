@@ -51,6 +51,7 @@ mod sort;
 mod source;
 mod stream;
 mod topn;
+mod written;
 
 #[cfg(test)]
 mod tests;
@@ -60,3 +61,4 @@ pub use expr::{evaluate, evaluate_all};
 pub use operator::Operator;
 pub use prepared::{Prepared, Scratch};
 pub use schema::Schema;
+pub use written::written;
