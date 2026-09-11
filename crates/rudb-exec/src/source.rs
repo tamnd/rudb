@@ -436,14 +436,21 @@ impl FileReader {
 
     /// Tells the file the types the whole read settled on, where that is a thing to say.
     ///
-    /// It is for CSV and it is nothing for Parquet. A Parquet file states its types and the first
-    /// file's are the read's, so a later file that disagrees is read as what it holds and cast by
-    /// [`FileScan::conform`]. A CSV file has no types of its own, only the ones a sample of it
-    /// suggested, and the read's came from combining the samples of every file, so this replaces the
-    /// suggestion before a row is parsed rather than converting twice.
+    /// It is one thing for Parquet and everything for CSV. A Parquet file states its types and the
+    /// first file's are the read's, so a later file that disagrees is read as what it holds and cast
+    /// by [`FileScan::conform`]. The exception is a byte array column the plan wants as text, which
+    /// is `binary_as_string` arriving as the answer it produced rather than as a flag of its own,
+    /// and which is a rename rather than a conversion. A CSV file has no types of its own, only the
+    /// ones a sample of it suggested, and the read's came from combining the samples of every file,
+    /// so this replaces the suggestion before a row is parsed rather than converting twice.
     fn settle(&mut self, wanted: &[Field]) -> Result<()> {
         match self {
-            Self::Parquet(_) => Ok(()),
+            Self::Parquet(reader) => {
+                let text: Vec<bool> =
+                    wanted.iter().map(|field| field.ty == LogicalType::Varchar).collect();
+                reader.as_string(&text);
+                Ok(())
+            }
             Self::Csv(reader) => {
                 let types: Vec<LogicalType> = wanted.iter().map(|field| field.ty.clone()).collect();
                 reader.retype(&types)

@@ -980,17 +980,23 @@ impl<'a> Binder<'a> {
         // The name is looked up before the arguments are bound so that a call of something that is
         // not a table function says that, rather than reporting whatever is wrong with the
         // arguments of a function that was never going to exist.
-        if TableFunction::lookup(function_name).is_none() {
+        let Some(called) = TableFunction::lookup(function_name) else {
             return Err(Error::catalog(format!(
                 "Table Function with name {function_name} does not exist!"
             )));
-        }
-        let written = ast.expr_list(args).to_vec();
+        };
+        let written = ast.target_list(args).to_vec();
         let empty = Scope::empty();
         let previous = std::mem::replace(&mut self.clause, "table function arguments");
-        let mut bound = Vec::with_capacity(written.len());
-        for expr in written {
-            bound.push(self.bind_expr(ast, expr, &empty)?);
+        let mut bound = Vec::new();
+        let mut options = Options::default();
+        for argument in written {
+            let expr = self.bind_expr(ast, argument.expr, &empty)?;
+            if argument.alias == NONE {
+                bound.push(expr);
+            } else {
+                self.named_argument(called, ast.string(argument.alias), expr, &mut options)?;
+            }
         }
         self.clause = previous;
 
@@ -1014,12 +1020,23 @@ impl<'a> Binder<'a> {
                 // running it, which is the same reason the schema is settled here.
                 let paths = self.file_paths(cast[0], resolved.function.name())?;
                 let first = paths.first().map_or("", String::as_str);
-                let fields = match columns {
+                let mut fields = match columns {
                     // Parquet takes the first file's footer as the answer and CSV sniffs all of
                     // them, which is not a choice made here. See `csv_fields`.
                     Columns::Csv => csv_fields(&paths)?,
                     _ => parquet_fields(first)?,
                 };
+                if options.binary_as_string {
+                    // A byte array column with no annotation on it is a BLOB, and this is the caller
+                    // saying that the file's writer meant text. The reader already holds both in the
+                    // same string column and already validates the bytes, so the whole of the option
+                    // is what the column is called from here on.
+                    for field in &mut fields {
+                        if field.ty == LogicalType::Blob {
+                            field.ty = LogicalType::Varchar;
+                        }
+                    }
+                }
                 cast = paths.iter().map(|path| self.path_constant(path)).collect();
                 fields
             }
@@ -1031,6 +1048,63 @@ impl<'a> Binder<'a> {
         };
         let names: Vec<&str> = ast.name(columns).collect();
         self.table_function_source(resolved.function, &cast, fields, &label, &names)
+    }
+
+    /// One named parameter of a table function call, folded into what the call was given.
+    ///
+    /// The value has to be a constant of the type the parameter wants. It has to be constant
+    /// because an option can decide what the columns are and the columns are settled here, and it
+    /// has to be already of the type because there is no constant folding in front of the binder
+    /// yet. DuckDB folds first, so `binary_as_string=1` and `binary_as_string='yes'` are both true
+    /// there and both are turned away here, which is a gap that closes on its own the day the
+    /// optimizer runs before the plan is finished. `binary_as_string=True` is what the ClickBench
+    /// entry writes and is what has to work.
+    ///
+    /// A name that is not a parameter of this function is the binary's sentence followed by what it
+    /// could have been. The binary puts the candidates on their own indented lines and this puts
+    /// them on the same line, because an error is one line here.
+    fn named_argument(
+        &mut self,
+        function: TableFunction,
+        name: &str,
+        expr: ExprRef,
+        options: &mut Options,
+    ) -> Result<()> {
+        let known = function
+            .parameters()
+            .iter()
+            .find(|(parameter, _)| parameter.eq_ignore_ascii_case(name));
+        let Some((parameter, wanted)) = known else {
+            let candidates: Vec<String> = function
+                .parameters()
+                .iter()
+                .map(|(parameter, ty)| format!("{parameter} {ty}"))
+                .collect();
+            return Err(Error::binder(format!(
+                "Invalid named parameter \"{name}\" for function {} Candidates: {}",
+                function.name(),
+                candidates.join(", ")
+            )));
+        };
+        let Expr::Constant(reference) = *self.plan.expr(expr) else {
+            return Err(Error::not_implemented(format!(
+                "the named parameter {parameter} with a value that is not a constant"
+            )));
+        };
+        let value = self.plan.value(reference).clone();
+        if value == Value::Null {
+            return Err(Error::binder(format!("Cannot use NULL as argument to \"{parameter}\"")));
+        }
+        let given = self.plan.expr_type(expr).clone();
+        match (*parameter, value) {
+            ("binary_as_string", Value::Boolean(on)) => options.binary_as_string = on,
+            _ => {
+                return Err(Error::not_implemented(format!(
+                    "the named parameter {parameter} given a {given} where a {wanted} was wanted"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// A file where a table name goes, which is what DuckDB calls a replacement scan.
@@ -1457,6 +1531,18 @@ impl<'a> Binder<'a> {
     pub(crate) fn same_expr(&self, left: ExprRef, right: ExprRef) -> bool {
         same_expr(&self.plan, left, right)
     }
+}
+
+/// The named parameters a table function call was written with.
+///
+/// One field so far. It is a struct rather than the one boolean because the seventeen DuckDB has on
+/// `read_parquet` alone are all going to want somewhere to go, and because a call with none of them
+/// written should read as the default of this rather than as a bare false somewhere.
+#[derive(Debug, Default)]
+struct Options {
+    /// `binary_as_string`, which says an unannotated byte array column in a Parquet file holds
+    /// text. The ClickBench file has twenty eight of those and every query reads them as strings.
+    binary_as_string: bool,
 }
 
 /// The complaint about a `REPLACE` entry that named a column the star did not stand for.

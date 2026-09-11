@@ -378,7 +378,8 @@ pub enum Source {
     Function {
         /// The name, as a run of [`StrRef`] in `Ast::parts`, outermost first.
         name: Slice,
-        /// The arguments, as a run of [`ExprRef`] in `Ast::expr_lists`.
+        /// The arguments, as a run of [`Target`] where the alias is the parameter name and is
+        /// `NONE` for a positional one.
         args: Slice,
         /// The alias, or `NONE`.
         alias: StrRef,

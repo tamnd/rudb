@@ -51,7 +51,7 @@
 
 use std::collections::VecDeque;
 
-use rudb_common::{Error, Field, Result};
+use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_compress::Codec;
 use rudb_io::File;
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
@@ -115,6 +115,27 @@ impl Reader {
         self.projection = columns.to_vec();
         self.ready.clear();
         Ok(())
+    }
+
+    /// Reads the projected columns marked here as text where the file left them as bytes.
+    ///
+    /// This is `binary_as_string`. A byte array column with no annotation on it is a `BLOB` here,
+    /// because that is all the file said, and a caller who knows the writer meant text says so with
+    /// this. Nothing about the read changes: the column already comes back in the one string column
+    /// rudb has and its bytes are already validated on the way in, so the whole of the option is
+    /// what the column is called.
+    ///
+    /// One flag per projected column rather than one for the file, so a call that asks for the same
+    /// column twice and a call that asks for two of a hundred and five both line up with the answer
+    /// the binder worked out. A flag on a column the file did not store as a byte array does
+    /// nothing, since the caller is describing a file rather than asking for a conversion.
+    pub fn as_string(&mut self, columns: &[bool]) {
+        for (&at, &text) in self.projection.iter().zip(columns) {
+            let column = &mut self.metadata.schema[at];
+            if text && column.ty == LogicalType::Blob {
+                column.ty = LogicalType::Varchar;
+            }
+        }
     }
 
     /// The columns the reader produces, in the order it produces them.

@@ -17,11 +17,33 @@ fn fixture() -> String {
     format!("'{}/../rudb-parquet/testdata/mixed.parquet'", env!("CARGO_MANIFEST_DIR"))
 }
 
+/// The path of the byte array fixture, as a SQL string literal.
+///
+/// Two `binary` columns written by pyarrow, which arrive as `BYTE_ARRAY` with no logical type on
+/// them. That is the shape every string column in the ClickBench file has and it is the reason
+/// `binary_as_string` exists.
+fn bytes() -> String {
+    format!("'{}/../rudb-parquet/testdata/bytes.parquet'", env!("CARGO_MANIFEST_DIR"))
+}
+
 /// `SELECT <what> FROM read_parquet(<fixture>)`, as one value.
 fn one(what: &str) -> Value {
     let database = Database::new();
     let sql = format!("SELECT {what} FROM read_parquet({})", fixture());
     database.value(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"))
+}
+
+/// The type the `words` column of the byte array fixture is read as, under a call written out in
+/// full.
+///
+/// The other column of that file is bytes that are not valid UTF-8 under any reading, so it is left
+/// out here rather than asserted on. What it should do with `binary_as_string` on it is refuse, and
+/// it already refuses without it.
+fn word_type(call: &str) -> String {
+    let database = Database::new();
+    let sql = format!("SELECT words FROM {call}");
+    let result = database.query(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    result.types()[0].to_string()
 }
 
 #[test]
@@ -269,6 +291,71 @@ fn a_table_loaded_from_a_file_can_be_appended_to_from_the_same_file() {
         database.value("SELECT sum(a) FROM loaded").expect("runs"),
         Value::HugeInt(2 * 195_783)
     );
+}
+
+#[test]
+fn an_unannotated_byte_array_column_is_a_blob_until_the_call_says_it_is_not() {
+    // Which is what duckdb reads the same two columns as, and it is the whole difference between
+    // the clickbench file loading and failing. Twenty eight of its columns look like this.
+    assert_eq!(word_type(&format!("read_parquet({})", bytes())), "BLOB");
+    assert_eq!(word_type(&format!("read_parquet({}, binary_as_string=True)", bytes())), "VARCHAR");
+}
+
+#[test]
+fn a_column_read_as_text_holds_the_text_duckdb_reads_out_of_it() {
+    let database = Database::new();
+    let call = format!("read_parquet({}, binary_as_string=True)", bytes());
+    let sql =
+        format!("SELECT count(words), sum(length(words)), min(words), max(words) FROM {call}");
+    let result = database.query(&sql).expect("runs");
+    let row: Vec<Value> = (0..result.width()).map(|at| result.value_at(0, at)).collect();
+    assert_eq!(
+        row,
+        vec![
+            Value::BigInt(1861),
+            Value::HugeInt(16749),
+            Value::Varchar("byte_0000".into()),
+            Value::Varchar("byte_1023".into()),
+        ]
+    );
+}
+
+#[test]
+fn a_named_parameter_can_be_written_any_of_the_three_ways_the_binary_takes_it() {
+    // `:=` and `=>` are in the grammar and `=` is not, and the clickbench entry writes the one
+    // that is not, so all three have to arrive at the same place.
+    for spelling in
+        ["binary_as_string := True", "binary_as_string => True", "binary_as_string = True"]
+    {
+        let call = format!("read_parquet({}, {spelling})", bytes());
+        assert_eq!(word_type(&call), "VARCHAR", "{spelling}");
+    }
+    // And the default is off, so writing it false is the same as not writing it.
+    assert_eq!(word_type(&format!("read_parquet({}, binary_as_string=False)", bytes())), "BLOB");
+}
+
+#[test]
+fn a_named_parameter_the_function_does_not_have_is_the_binders_complaint() {
+    let database = Database::new();
+    let sql = format!("SELECT 1 FROM read_parquet({}, nonesuch=True)", bytes());
+    let error = database.query(&sql).unwrap_err();
+    assert!(
+        error
+            .message()
+            .starts_with("Invalid named parameter \"nonesuch\" for function read_parquet"),
+        "{error}"
+    );
+    // The list of what the function does take is on the end of the same message, the way the
+    // binary prints it, so a reader of the error is told what to write instead.
+    assert!(error.message().contains("binary_as_string BOOLEAN"), "{error}");
+}
+
+#[test]
+fn a_named_parameter_cannot_be_given_null() {
+    let database = Database::new();
+    let sql = format!("SELECT 1 FROM read_parquet({}, binary_as_string=NULL)", bytes());
+    let error = database.query(&sql).unwrap_err();
+    assert_eq!(error.message(), "Cannot use NULL as argument to \"binary_as_string\"");
 }
 
 #[test]
