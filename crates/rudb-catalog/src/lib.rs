@@ -19,4 +19,4 @@ pub mod table;
 
 pub use catalog::{Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, Database, Schema};
 pub use name::{QualifiedName, same_name};
-pub use table::Table;
+pub use table::{Table, duplicate_check};
