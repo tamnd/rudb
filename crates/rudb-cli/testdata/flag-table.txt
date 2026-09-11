@@ -1,0 +1,9 @@
+        echo: off
+     headers: on
+        mode: table
+   nullvalue: "NULL"
+      output: stdout
+colseparator: ";"
+rowseparator: "@"
+       width: 
+    filename: :memory:
