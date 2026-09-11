@@ -59,6 +59,7 @@ mod database;
 mod prepared;
 mod result;
 mod statements;
+mod syntax;
 
 #[cfg(test)]
 mod tests;
@@ -69,11 +70,12 @@ pub use database::Database;
 pub use prepared::Prepared;
 pub use result::QueryResult;
 pub use statements::{Statement, is_complete, statements};
+pub use syntax::{RowOrder, accepts, line_and_column, parses, row_order, split, where_it_happened};
 
 // The types the API deals in, so a program that embeds rudb depends on this crate and nothing else.
 // `rudb-compat` and `rudb-bench` driving the library through one crate is the point of #110, and a
 // caller who had to reach for `rudb-common` to name the type of a value would not be doing that.
-pub use rudb_common::{Error, Field, LogicalType, Result, Value};
+pub use rudb_common::{Error, ErrorCode, Field, LogicalType, Result, Span, Value};
 pub use rudb_vector::Chunk;
 
 /// Arrow interchange, which is what [`QueryResult::to_arrow`] hands back.
