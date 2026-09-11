@@ -4,7 +4,7 @@ An embedded analytical database written in Rust, compatible with DuckDB.
 
 Its own columnar format with global dictionaries and multi-column compression, and operators that run directly on the encoded data instead of decoding it first. The bar is ten times DuckDB on ClickBench at a tenth of the disk, and every part of that sentence is a number in [`spec/02-the-goal.md`](spec/02-the-goal.md) that can come out wrong.
 
-This is early. Nothing answers a query yet. What exists is the workspace, the layer rule that keeps it modular, the shell skeleton, and CI that is green on Linux, macOS and Windows from the first commit. The full technical design is written down in [`spec/`](spec/) before it is built, and the milestones that build it are tracked as issues.
+This is early. What exists is the workspace, the layer rule that keeps it modular, an engine that answers a query over in-memory tables, a shell with DuckDB's command line and output modes, and CI that is green on Linux, macOS and Windows from the first commit. The full technical design is written down in [`spec/`](spec/) before it is built, and the milestones that build it are tracked as issues.
 
 ## Why another analytical database
 
@@ -45,23 +45,29 @@ rudb is aiming at four things at once, stated as falsifiable claims rather than 
 
 ## Status
 
-M0 is finished, as of v0.1.0. There is a parser for `SELECT`, a binder, a logical plan with a textual form that reads back, a catalog, an in-memory table, the tier 0 kernels and a tier 0 interpreter, so a query runs end to end:
+M0 is finished, as of v0.1.0, and there is a shell you can type into:
 
 ```
-$ cargo xtask smoke
-SELECT * FROM t WHERE x > 5
-  6, row 6
-  7, row 7
-  8, row 8
-  9, row 9
-  10, row 10
+$ rudb
+rudb 0.2.4
+Enter ".help" for usage hints.
+D CREATE TABLE t(x INTEGER, name VARCHAR);
+D INSERT INTO t VALUES (6, 'row 6'), (7, 'row 7'), (2, 'row 2');
+D SELECT * FROM t WHERE x > 5;
+┌───────┬─────────┐
+│   x   │  name   │
+│ int32 │ varchar │
+├───────┼─────────┤
+│     6 │ row 6   │
+│     7 │ row 7   │
+└───────┴─────────┘
 ```
 
-That is the query M0 exists to produce and it is the whole of what works, checked on macOS, Linux and Windows with 502 tests green on each. No storage format, no optimizer, no transactions, no `CREATE TABLE`, and every join is a nested loop. The shell is still an argument parser rather than a shell. M1 is next and it is the format experiment.
+The command line and the sixteen output modes are DuckDB's, diffed against a real `duckdb` binary rather than described from memory. There is no storage format behind it yet, so the only database that opens is `:memory:`. No optimizer, no transactions, and every join is a nested loop. M1 is next and it is the format experiment.
 
 ```
 $ rudb --print-config
-version: 0.1.0
+version: 0.2.4
 vector-size: 1024
 row-group-size: 122880
 storage-format: native (rudb v1), DuckDB import and export

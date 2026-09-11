@@ -45,9 +45,11 @@
 
 mod database;
 mod result;
+mod statements;
 
 #[cfg(test)]
 mod tests;
 
 pub use database::Database;
 pub use result::QueryResult;
+pub use statements::{Statement, is_complete, statements};
