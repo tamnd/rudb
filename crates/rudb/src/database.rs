@@ -219,8 +219,13 @@ impl Database {
         Ok(())
     }
 
-    /// Builds and drains one plan.
+    /// Optimizes, builds and drains one plan.
+    ///
+    /// Every query goes through here, including the one behind `CREATE TABLE AS` and the one behind
+    /// `INSERT ... SELECT`, so this is the one place the optimizer has to be wired into and the one
+    /// place it can be taken out of.
     fn run(&self, plan: &rudb_plan::Plan) -> Result<QueryResult> {
+        let plan = &rudb_opt::optimize(plan)?;
         let mut root = rudb_exec::build(plan, &self.catalog)?;
         let names = root.schema().names();
         let types = root.schema().types();

@@ -2,7 +2,7 @@
 
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 
-use crate::expr::{Arm, Expr, SortKey};
+use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
 use crate::node::Node;
 use crate::{ExprRef, NodeRef, Slice, StrRef, ValueRef};
 
@@ -176,6 +176,51 @@ impl Plan {
     /// Appends a run to the row pool, each element itself a run of the expression list pool.
     pub fn add_rows(&mut self, rows: &[Slice]) -> Slice {
         extend(&mut self.rows, rows.iter().copied())
+    }
+
+    // Rewrites. The two things a pass does to a plan that is already built, and deliberately only
+    // those two, because everything else a pass wants is expressible as appending a new node and
+    // moving the root. A general `&mut` into the arena would also be a way to break the backwards
+    // reference rule from outside the crate, and there is no pass that needs one.
+
+    /// Replaces the node at `reference`.
+    ///
+    /// The children have to be the same children, or smaller, for the backwards reference rule to
+    /// survive, which [`Plan::validate`] checks. What this is for is the fields of a node that are
+    /// not references to other nodes: the projection on a scan, the conditions on a join.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the arena.
+    pub fn set_node(&mut self, reference: NodeRef, node: Node) {
+        self.nodes[reference as usize] = node;
+    }
+
+    /// Points a column reference at a different column.
+    ///
+    /// The whole of what projection pushdown does to an expression, and the reason it is this
+    /// rather than a way to write any expression at all: dropping a column from a scan moves the
+    /// columns after it along, and every reference to one of those has to move with it. The type
+    /// is untouched, because a column that moved is the same column.
+    ///
+    /// # Errors
+    ///
+    /// If the expression is not a column reference, which is a pass rewriting something it did not
+    /// mean to.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the arena.
+    pub fn rebind_column(&mut self, reference: ExprRef, binding: ColumnBinding) -> Result<()> {
+        match &mut self.exprs[reference as usize] {
+            Expr::Column(held) => {
+                *held = binding;
+                Ok(())
+            }
+            other => Err(Error::internal(format!(
+                "expression {reference} is {other:?} and not a column reference"
+            ))),
+        }
     }
 
     // Accessors. Every one panics on an out of range index rather than returning an option,
