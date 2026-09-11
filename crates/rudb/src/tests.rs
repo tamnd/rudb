@@ -213,6 +213,39 @@ fn a_case_expression_picks_the_first_arm_that_holds() {
     );
 }
 
+/// A comparison against a string reads the string as the other side's type rather than printing
+/// the other side. Every answer here is the answer DuckDB gives.
+#[test]
+fn a_comparison_with_a_string_happens_in_the_other_type() {
+    let db = database();
+    // Text comparison would say these two are different, since the day is not padded. The cast is
+    // spelled out because DATE '2013-07-15' is a typed literal and the transformer does not cover
+    // that rule yet.
+    assert_eq!(
+        rows(&db, "SELECT CAST('2013-07-15' AS DATE) = '2013-7-15'"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT CAST('2013-07-15' AS DATE) >= '2013-07-01'"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    // Text comparison would say ten is less than nine.
+    assert_eq!(rows(&db, "SELECT 10 > '9'"), vec![vec![Value::Boolean(true)]]);
+    assert_eq!(rows(&db, "SELECT TRUE = 'true'"), vec![vec![Value::Boolean(true)]]);
+    // Not here yet: DuckDB answers true to 1 = '1.0', because its string to integer cast rounds
+    // rather than refusing a decimal point, and rounds half away from zero. That is a difference
+    // in the cast rather than in this rule, and it belongs with the cast.
+}
+
+/// A string that will not read as the other type raises, rather than quietly comparing as text and
+/// answering false.
+#[test]
+fn a_string_that_is_not_the_other_type_is_a_conversion_error() {
+    let db = database();
+    assert!(failure(&db, "SELECT 1 = 'abc'").contains("abc"));
+    assert!(failure(&db, "SELECT CAST('2013-07-15' AS DATE) = 'nope'").contains("nope"));
+}
+
 #[test]
 fn a_cast_that_cannot_hold_the_value_is_an_error_and_try_cast_is_null() {
     let db = database();
