@@ -7,14 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
-# Two dependencies, and both are there because a task that measures or runs the engine cannot do it
-# without linking the engine. `bench` cannot time a parser it cannot call and `smoke` cannot run a
-# query it cannot ask. Everything else in this crate reads files and shells out on purpose, because a
-# task runner that fails to build is a task runner that cannot tell you why the build failed.
+# Every dependency here is a crate one of the measuring tasks has to link, because a task that
+# measures the engine cannot do it without the engine in the process. `bench` cannot time a parser
+# it cannot call, `kernels` cannot time a comparison it cannot make, and `smoke` cannot run a query
+# it cannot ask. Everything else in this crate reads files and shells out on purpose, because a task
+# runner that fails to build is a task runner that cannot tell you why the build failed.
 [dependencies]
 rudb.workspace = true
 rudb-common.workspace = true
+rudb-kernels.workspace = true
 rudb-parse.workspace = true
+rudb-vector.workspace = true
 
 [lints]
 workspace = true
