@@ -8,8 +8,7 @@
 //! prompt.
 //!
 //! ```
-//! use rudb::Database;
-//! use rudb_common::{Field, LogicalType, Value};
+//! use rudb::{Database, Field, LogicalType, Value};
 //!
 //! let db = Database::new();
 //! db.create_table("t", vec![Field::new("x", LogicalType::Integer)])?;
@@ -18,7 +17,7 @@
 //! let result = db.query("SELECT x FROM t WHERE x > 5")?;
 //! assert_eq!(result.len(), 1);
 //! assert_eq!(result.value_at(0, 0), Value::Integer(7));
-//! # Ok::<(), rudb_common::Error>(())
+//! # Ok::<(), rudb::Error>(())
 //! ```
 //!
 //! # What a query is today
@@ -68,3 +67,9 @@ pub use database::Database;
 pub use prepared::Prepared;
 pub use result::QueryResult;
 pub use statements::{Statement, is_complete, statements};
+
+// The types the API deals in, so a program that embeds rudb depends on this crate and nothing else.
+// `rudb-compat` and `rudb-bench` driving the library through one crate is the point of #110, and a
+// caller who had to reach for `rudb-common` to name the type of a value would not be doing that.
+pub use rudb_common::{Error, Field, LogicalType, Result, Value};
+pub use rudb_vector::Chunk;

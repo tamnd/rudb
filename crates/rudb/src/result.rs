@@ -20,6 +20,9 @@ pub struct QueryResult {
     names: Vec<String>,
     types: Vec<LogicalType>,
     chunks: Vec<Chunk>,
+    /// Where each chunk starts, so a row number finds its chunk by a search rather than by walking.
+    /// The last entry is the row count, which is what makes the search a plain partition point.
+    starts: Vec<usize>,
     rows: usize,
 }
 
@@ -27,8 +30,14 @@ impl QueryResult {
     /// A result of the given columns and chunks.
     #[must_use]
     pub(crate) fn new(names: Vec<String>, types: Vec<LogicalType>, chunks: Vec<Chunk>) -> Self {
-        let rows = chunks.iter().map(Chunk::len).sum();
-        Self { names, types, chunks, rows }
+        let mut starts = Vec::with_capacity(chunks.len() + 1);
+        let mut rows = 0;
+        for chunk in &chunks {
+            starts.push(rows);
+            rows += chunk.len();
+        }
+        starts.push(rows);
+        Self { names, types, chunks, starts, rows }
     }
 
     /// A result of no columns and no rows, which is what a statement that writes hands back.
@@ -72,10 +81,69 @@ impl QueryResult {
         self.rows == 0
     }
 
+    /// The name of one column, or the empty string if there is no such column.
+    #[must_use]
+    pub fn column_name(&self, column: usize) -> &str {
+        self.names.get(column).map_or("", String::as_str)
+    }
+
+    /// The type of one column, or `NULL` if there is no such column.
+    #[must_use]
+    pub fn column_type(&self, column: usize) -> LogicalType {
+        self.types.get(column).cloned().unwrap_or(LogicalType::Null)
+    }
+
     /// The batches, for a caller that wants the columnar form.
     #[must_use]
     pub fn chunks(&self) -> &[Chunk] {
         &self.chunks
+    }
+
+    /// How many batches the result is in.
+    ///
+    /// A caller that walks the columnar form walks this rather than the row count, which is the
+    /// whole point of having it: a result of ten million rows is a few thousand chunks and reading
+    /// it that way never builds a row.
+    #[must_use]
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// One batch, or `None` if it is past the end.
+    #[must_use]
+    pub fn chunk(&self, at: usize) -> Option<&Chunk> {
+        self.chunks.get(at)
+    }
+
+    /// The batches, one at a time.
+    ///
+    /// The same walk as `chunks().iter()` and the name a caller looks for. What it is not is a
+    /// promise about where the rows came from: they are all here already, and a result that does
+    /// not materialize is section 7.5's streaming result, which is a second type beside this one.
+    pub fn chunk_iter(&self) -> impl ExactSizeIterator<Item = &Chunk> {
+        self.chunks.iter()
+    }
+
+    /// The batches, taken rather than borrowed.
+    ///
+    /// For a caller that is turning the result into something else, an Arrow record batch or a
+    /// table to append to, and would otherwise clone every chunk to do it.
+    #[must_use]
+    pub fn into_chunks(self) -> Vec<Chunk> {
+        self.chunks
+    }
+
+    /// Which chunk a row is in, and where in it, or `None` if the row is past the end.
+    ///
+    /// A search rather than a walk. Reading a large result by row number is the ordinary way a
+    /// program uses one, and walking the chunk list for each row makes that quadratic in a result
+    /// of a few thousand chunks.
+    fn locate(&self, row: usize) -> Option<(usize, usize)> {
+        if row >= self.rows {
+            return None;
+        }
+        let at = self.starts.partition_point(|&start| start <= row) - 1;
+        Some((at, row - self.starts[at]))
     }
 
     /// One value, or null if the row or the column is past the end.
@@ -85,31 +153,33 @@ impl QueryResult {
     /// [`QueryResult::len`].
     #[must_use]
     pub fn value_at(&self, row: usize, column: usize) -> Value {
-        let mut remaining = row;
-        for chunk in &self.chunks {
-            if remaining < chunk.len() {
-                return chunk.value_at(remaining, column);
-            }
-            remaining -= chunk.len();
+        match self.locate(row) {
+            Some((at, offset)) => self.chunks[at].value_at(offset, column),
+            None => Value::Null,
         }
-        Value::Null
     }
 
     /// One row, left to right, or `None` if it is past the end.
     #[must_use]
     pub fn row(&self, row: usize) -> Option<Vec<Value>> {
-        let mut remaining = row;
-        for chunk in &self.chunks {
-            if remaining < chunk.len() {
-                return Some(chunk.row(remaining).collect());
-            }
-            remaining -= chunk.len();
-        }
-        None
+        let (at, offset) = self.locate(row)?;
+        Some(self.chunks[at].row(offset).collect())
     }
 
     /// Every row in order, which is the shape a test and a script both want.
     pub fn rows(&self) -> impl Iterator<Item = Vec<Value>> + '_ {
         self.chunks.iter().flat_map(|chunk| (0..chunk.len()).map(|row| chunk.row(row).collect()))
+    }
+
+    /// One column, top to bottom, across every chunk.
+    ///
+    /// Empty for a column that is not there. This is the read that matches how the rows are held, so
+    /// a program summing a column or handing one to a plotting library never transposes anything.
+    pub fn column(&self, column: usize) -> impl Iterator<Item = Value> + '_ {
+        let width = self.width();
+        self.chunks
+            .iter()
+            .filter(move |_| column < width)
+            .flat_map(move |chunk| (0..chunk.len()).map(move |row| chunk.value_at(row, column)))
     }
 }
