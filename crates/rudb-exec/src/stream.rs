@@ -20,9 +20,11 @@ use crate::schema::Schema;
 /// what makes `WHERE x <> 5` leave out the rows where `x` is null.
 ///
 /// The kept rows become a selection over the chunk rather than a copy of it, which is section 7.1's
-/// rule: a filter that keeps one row in a thousand costs the selection and not the payload. A chunk
-/// that keeps nothing is skipped here rather than handed on, because an empty chunk travelling up a
-/// deep pipeline is work every operator above does for no rows.
+/// rule: a filter that keeps one row in a thousand costs the selection and not the payload. The
+/// copying alternative is [`Chunk::compact`], and its documentation has the measurement that says
+/// why a streaming filter is not the caller for it. A chunk that keeps nothing is skipped here
+/// rather than handed on, because an empty chunk travelling up a deep pipeline is work every
+/// operator above does for no rows.
 #[derive(Debug)]
 pub(crate) struct Filter<'a> {
     input: Box<dyn Operator + 'a>,
