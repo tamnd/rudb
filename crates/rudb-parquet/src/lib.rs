@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 mod chunk;
+mod delta;
 mod hybrid;
 mod metadata;
 mod page;
