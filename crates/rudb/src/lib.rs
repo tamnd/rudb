@@ -73,3 +73,12 @@ pub use statements::{Statement, is_complete, statements};
 // caller who had to reach for `rudb-common` to name the type of a value would not be doing that.
 pub use rudb_common::{Error, Field, LogicalType, Result, Value};
 pub use rudb_vector::Chunk;
+
+/// Arrow interchange, which is what [`QueryResult::to_arrow`] hands back.
+///
+/// A module rather than a flat re-export because Arrow has a `Field` and a `Schema` of its own and
+/// so do we, and two types called `Field` in one namespace is a worse trade than four extra
+/// characters at the call site.
+pub mod arrow {
+    pub use rudb_arrow::{Array, DataType, Field, RecordBatch, Schema, TimeUnit};
+}

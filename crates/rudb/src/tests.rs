@@ -8,7 +8,7 @@
 
 use rudb_common::{Field, LogicalType, Value, days_from_civil};
 
-use crate::Database;
+use crate::{Database, arrow};
 
 /// `t(x INTEGER, s VARCHAR)` with a null in it, plus an empty table to test the degenerate cases.
 fn database() -> Database {
@@ -774,4 +774,58 @@ fn a_range_wider_than_one_chunk_comes_out_whole_and_in_order() {
     let result = db.query("SELECT count(*), min(range), max(range) FROM range(3000)").unwrap();
     let row = result.rows().next().unwrap();
     assert_eq!(row, vec![Value::BigInt(3000), Value::BigInt(0), Value::BigInt(2999)]);
+}
+
+#[test]
+fn a_result_converts_to_arrow_columns_with_the_names_the_query_gave_them() {
+    let db = database();
+    let result = db.query("SELECT x, s FROM t ORDER BY x, s").unwrap();
+    let batches = result.to_arrow().unwrap();
+    assert_eq!(batches.len(), result.chunk_count());
+    let batch = &batches[0];
+    assert_eq!(batch.len(), 4);
+    assert_eq!(
+        batch.schema().fields,
+        vec![
+            arrow::Field::new("x", arrow::DataType::Int32),
+            arrow::Field::new("s", arrow::DataType::Utf8)
+        ]
+    );
+    // The rows sort to 1 a, 1 null, 2 c, 3 a, so the integers are four little endian words and the
+    // strings are the three non null ones back to back with the null taking no bytes.
+    assert_eq!(
+        batch.column(0).unwrap().values(),
+        &[1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]
+    );
+    assert_eq!(batch.column(1).unwrap().values(), b"aca");
+    assert_eq!(batch.column(1).unwrap().null_count(), 1);
+}
+
+#[test]
+fn a_query_that_produced_no_rows_still_says_what_its_columns_were() {
+    let db = database();
+    let result = db.query("SELECT x FROM empty").unwrap();
+    assert!(result.to_arrow().unwrap().is_empty());
+    // Which is exactly why the schema is a separate call. A consumer reading it off the first batch
+    // would have no batch to read it off, and the query still has a column and that column still
+    // has a type.
+    let schema = result.arrow_schema().unwrap();
+    assert_eq!(schema.fields, vec![arrow::Field::new("x", arrow::DataType::Int32)]);
+    let empty = arrow::RecordBatch::empty(schema).unwrap();
+    assert_eq!(empty.width(), 1);
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn an_aggregate_over_a_wide_result_keeps_every_chunk_as_its_own_batch() {
+    // Batches are per chunk rather than one for the whole result, so a result that crossed the
+    // vector boundary is the case that proves the rows are all there and none of them are twice.
+    let db = Database::new();
+    let result = db.query("SELECT range FROM range(3000)").unwrap();
+    let batches = result.to_arrow().unwrap();
+    assert!(batches.len() > 1, "3000 rows is more than one chunk");
+    let rows: usize = batches.iter().map(rudb_arrow::RecordBatch::len).sum();
+    assert_eq!(rows, 3000);
+    let bytes: usize = batches.iter().map(|batch| batch.column(0).unwrap().values().len()).sum();
+    assert_eq!(bytes, 3000 * 8);
 }
