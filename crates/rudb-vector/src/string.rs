@@ -21,12 +21,17 @@ pub const INLINE_LIMIT: usize = 12;
 /// A 16 byte handle on a string.
 ///
 /// The layout is a `u32` length and 12 bytes of payload. For a string of 12 bytes or fewer the
-/// payload is the string, zero padded. For a longer one the first 4 bytes are the prefix, the next
-/// 4 are the index of the block holding it, and the last 4 are the offset into that block.
+/// payload is the string, zero padded. For a longer one the first 4 bytes are the prefix and the
+/// last 8 are the offset into the column's arena.
 ///
-/// A view on its own cannot produce a long string, only a short one. That is deliberate: the
-/// blocks live in the [`StringColumn`] and the borrow checker is what stops a view from outliving
-/// them, rather than a rule somebody has to remember.
+/// Arrow spends 4 of those 8 bytes on a buffer index and 4 on an offset within the buffer, because
+/// an Arrow array is a list of buffers. This column is one arena, so there is no buffer to name and
+/// the whole 8 bytes are the offset, which reads as one load rather than two and takes the reachable
+/// size of a column from 4 GiB to more than anything will ever put in one.
+///
+/// A view on its own cannot produce a long string, only a short one. That is deliberate: the arena
+/// lives in the [`StringColumn`] and the borrow checker is what stops a view from outliving it,
+/// rather than a rule somebody has to remember.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StringView {
     length: u32,
@@ -48,12 +53,11 @@ impl StringView {
         Self { length: text.len() as u32, payload }
     }
 
-    /// A view on a string that lives in a block.
-    fn indirect(text: &str, block: u32, offset: u32) -> Self {
+    /// A view on a string that lives in the arena.
+    fn indirect(text: &str, offset: u64) -> Self {
         let mut payload = [0u8; 12];
         payload[..4].copy_from_slice(&text.as_bytes()[..4]);
-        payload[4..8].copy_from_slice(&block.to_le_bytes());
-        payload[8..].copy_from_slice(&offset.to_le_bytes());
+        payload[4..].copy_from_slice(&offset.to_le_bytes());
         Self { length: text.len() as u32, payload }
     }
 
@@ -106,14 +110,17 @@ impl StringView {
         std::str::from_utf8(&self.payload[..self.len()]).ok()
     }
 
-    fn block(&self) -> usize {
-        u32::from_le_bytes([self.payload[4], self.payload[5], self.payload[6], self.payload[7]])
-            as usize
-    }
-
     fn offset(&self) -> usize {
-        u32::from_le_bytes([self.payload[8], self.payload[9], self.payload[10], self.payload[11]])
-            as usize
+        u64::from_le_bytes([
+            self.payload[4],
+            self.payload[5],
+            self.payload[6],
+            self.payload[7],
+            self.payload[8],
+            self.payload[9],
+            self.payload[10],
+            self.payload[11],
+        ]) as usize
     }
 
     /// Whether these two views are definitely different, answered from the view alone.
@@ -126,22 +133,37 @@ impl StringView {
     }
 }
 
-/// How much string data one block holds before another is started.
+/// A column of strings: the views, and the one arena the long ones live in.
 ///
-/// 16 KiB is four pages. Small enough that a column of short strings does not round up to
-/// something silly, large enough that the per-block bookkeeping disappears.
-const BLOCK_SIZE: usize = 16 * 1024;
-
-/// A column of strings: the views, and the blocks the long ones live in.
+/// The arena is append only, so an offset recorded in a view stays correct for the life of the
+/// column even though the arena's address does not. That is the property a `Vec<u8>` has and a raw
+/// pointer into it does not, and it is the reason a view holds an offset.
 ///
-/// Blocks are append only and never move, so an offset recorded in a view stays correct for the
-/// life of the column. Pushing a string longer than a block gives it a block of its own rather
-/// than splitting it, which keeps every string contiguous and keeps [`Self::get`] free of a
-/// stitching path that would be wrong more often than it ran.
+/// This was a `Vec<Vec<u8>>` of fixed size blocks, which meant reading one long string was two
+/// dependent loads, the outer vector's element to find the block's data pointer and then the bytes.
+/// One arena makes it one, from a base the compiler can keep in a register across a row loop, and it
+/// deletes the case where a string longer than a block needed a block of its own. On server3, over a
+/// chunk of 1024 strings, comparing a column against a literal went from 14.9 nanoseconds a row to
+/// 13.2 at 40 bytes a string and from 14.2 to 12.9 at 120, gathering half the rows from 29.5 to 25.3
+/// and from 36.9 to 29.1, and building the column from 12.0 to 8.9 at 40 bytes.
+///
+/// # The one number that got worse, and what it actually is
+///
+/// Building a column whose payload passes 128 KiB, which at 1024 rows means strings averaging more
+/// than 128 bytes, went the other way: 14.6 nanoseconds a row to 41.0. That is not the copy and it
+/// is not the doubling, it is glibc. An allocation that size comes from `mmap` rather than the heap,
+/// so it is handed back to the kernel when the column is dropped and the next chunk faults every
+/// page of it in again, while sixteen KiB blocks come back off a free list already faulted. Run the
+/// same benchmark with `MALLOC_MMAP_THRESHOLD_` raised and the arena builds that column in 9.6
+/// nanoseconds a row against the blocks' 16.2, so the design is not what is slow there.
+///
+/// The fix is that a chunk's payload should come from a pool the engine owns rather than from
+/// `malloc` per chunk, which is the buffer manager at layer three and is where this belongs.
+/// [`Self::reserve_bytes`] is the part that is available now, and it recovers a quarter of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StringColumn {
     views: Vec<StringView>,
-    blocks: Vec<Vec<u8>>,
+    arena: Vec<u8>,
 }
 
 impl StringColumn {
@@ -154,7 +176,7 @@ impl StringColumn {
     /// An empty column with room for `capacity` strings.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { views: Vec::with_capacity(capacity), blocks: Vec::new() }
+        Self { views: Vec::with_capacity(capacity), arena: Vec::new() }
     }
 
     /// How many strings are in the column.
@@ -180,8 +202,9 @@ impl StringColumn {
         let view = if text.len() <= INLINE_LIMIT {
             StringView::inline(text)
         } else {
-            let (block, offset) = self.append_bytes(text.as_bytes());
-            StringView::indirect(text, block, offset)
+            let offset = self.arena.len() as u64;
+            self.arena.extend_from_slice(text.as_bytes());
+            StringView::indirect(text, offset)
         };
         self.views.push(view);
         self.views.len() - 1
@@ -200,8 +223,7 @@ impl StringColumn {
         if let Some(inline) = view.inline_bytes() {
             return Some(inline);
         }
-        let block = self.blocks.get(view.block())?;
-        block.get(view.offset()..view.offset() + view.len())
+        self.arena.get(view.offset()..view.offset() + view.len())
     }
 
     /// The string at `index`, or `None` past the end.
@@ -216,27 +238,19 @@ impl StringColumn {
         (0..self.len()).filter_map(|index| self.get(index))
     }
 
-    /// Total bytes of payload held in blocks, which is what the memory accounting wants.
+    /// Total bytes of payload held in the arena, which is what the memory accounting wants.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
-        self.blocks.iter().map(Vec::len).sum()
+        self.arena.len()
     }
 
-    fn append_bytes(&mut self, bytes: &[u8]) -> (u32, u32) {
-        let fits = self
-            .blocks
-            .last()
-            .is_some_and(|block| block.len() + bytes.len() <= block.capacity().max(BLOCK_SIZE));
-        if !fits {
-            self.blocks.push(Vec::with_capacity(BLOCK_SIZE.max(bytes.len())));
-        }
-        let block_index = self.blocks.len() - 1;
-        let block = &mut self.blocks[block_index];
-        let offset = block.len();
-        block.extend_from_slice(bytes);
-        // A column with more than 4 billion blocks or a block over 4 GiB is not a thing that can
-        // exist here, since a vector holds 1024 values and a row group holds 122,880.
-        (block_index as u32, offset as u32)
+    /// Room for `bytes` of payload, taken in one allocation rather than as the strings arrive.
+    ///
+    /// A builder that knows the total byte count, which a scan reading a page and a gather copying a
+    /// column both do, saves the doubling entirely. Nothing is wrong without it, which is why it is
+    /// a hint and not a constructor argument.
+    pub fn reserve_bytes(&mut self, bytes: usize) {
+        self.arena.reserve(bytes);
     }
 }
 
@@ -295,8 +309,12 @@ mod tests {
         assert!(views[0].definitely_differs(&views[2]));
     }
 
+    /// A string of any size goes in whole, with the short ones on either side of it still reading
+    /// back. The old layout had a size at which a string stopped fitting a block and got one of its
+    /// own, and one arena has no such size, so the case worth keeping is the one that used to be
+    /// special rather than the branch that used to handle it.
     #[test]
-    fn a_string_longer_than_a_block_gets_a_block_of_its_own() {
+    fn a_string_far_larger_than_any_block_would_have_been_goes_in_whole() {
         let long = "x".repeat(40 * 1024);
         let mut column = StringColumn::new();
         column.push("short");
@@ -307,8 +325,12 @@ mod tests {
         assert_eq!(column.heap_bytes(), long.len());
     }
 
+    /// The property the whole arena rests on. Two thousand strings is tens of reallocations, and
+    /// every one of them moves the bytes to a new address while the offsets recorded in the views
+    /// before it stay exactly as they were. A view holding a pointer would be reading freed memory
+    /// by the end of this test.
     #[test]
-    fn blocks_hold_many_strings_and_the_offsets_stay_right() {
+    fn the_arena_moving_underneath_does_not_move_what_the_views_point_at() {
         let mut column = StringColumn::new();
         let strings: Vec<String> =
             (0..2000).map(|i| format!("value number {i} padded out")).collect();
@@ -320,6 +342,19 @@ mod tests {
         }
         assert_eq!(column.len(), 2000);
         assert_eq!(column.iter().count(), 2000);
+    }
+
+    #[test]
+    fn reserving_bytes_changes_nothing_but_where_the_allocation_happens() {
+        let mut column = StringColumn::with_capacity(3);
+        column.reserve_bytes(128);
+        for text in ["a string past the limit", "another one past it", "short"] {
+            column.push(text);
+        }
+        assert_eq!(column.get(0), Some("a string past the limit"));
+        assert_eq!(column.get(1), Some("another one past it"));
+        assert_eq!(column.get(2), Some("short"));
+        assert_eq!(column.heap_bytes(), 42);
     }
 
     #[test]
