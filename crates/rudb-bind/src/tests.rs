@@ -401,8 +401,14 @@ fn a_create_table_as_takes_the_query_s_types_and_the_statement_s_names() {
 
 #[test]
 fn a_create_table_that_cannot_work_says_so_before_it_is_run() {
-    assert!(statement_failure("CREATE TABLE s (a INTEGER, A VARCHAR)").contains("Duplicate"));
-    assert!(statement_failure("CREATE TABLE s (a, b) AS SELECT UserID FROM hits").contains("2"));
+    assert_eq!(
+        statement_failure("CREATE TABLE s (a INTEGER, A VARCHAR)"),
+        "Column with name A already exists!"
+    );
+    assert_eq!(
+        statement_failure("CREATE TABLE s (a, b) AS SELECT UserID FROM hits"),
+        "Target table has more colum names than query result."
+    );
     assert!(statement_failure("CREATE TABLE s (a NOSUCHTYPE)").contains("NOSUCHTYPE"));
 }
 

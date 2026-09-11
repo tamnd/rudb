@@ -6,6 +6,30 @@ use rudb_vector::{Chunk, Form};
 
 use crate::name::{QualifiedName, same_name};
 
+/// Refuses a column list that names the same column twice.
+///
+/// Exported because the binder makes the same check before anything is created. `CREATE OR REPLACE
+/// TABLE` drops the old table on its way to creating the new one, so a check that only happened
+/// inside [`Table::new`] would report the duplicate after the old table was already gone.
+///
+/// # Errors
+///
+/// If two of the columns have the same name, compared the way SQL compares names, which is without
+/// regard to case.
+pub fn duplicate_check(columns: &[Field]) -> Result<()> {
+    for (at, column) in columns.iter().enumerate() {
+        if columns[..at].iter().any(|held| same_name(&held.name, &column.name)) {
+            // The one that arrived second is the one named, spelled the way it was written rather
+            // than the way the first one was. `CREATE TABLE t (Abc INTEGER, aBC VARCHAR)` says aBC.
+            return Err(Error::catalog(format!(
+                "Column with name {} already exists!",
+                column.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// One table.
 ///
 /// The rows are a [`MemoryTable`] because that is what M0 has. When the storage format arrives the
@@ -24,18 +48,12 @@ impl Table {
     /// # Errors
     ///
     /// If two columns have the same name, which SQL does not allow and which would make a column
-    /// reference ambiguous in a way no error message could explain later.
+    /// reference ambiguous in a way no error message could explain later. The message is DuckDB's,
+    /// which names the column and not the table and is a catalog error rather than a binder one,
+    /// because the same sentence comes out of `CREATE TABLE t (a INT, a INT)` and out of a
+    /// `CREATE TABLE ... AS` whose column list repeats a name.
     pub fn new(name: QualifiedName, columns: Vec<Field>) -> Result<Self> {
-        for (at, column) in columns.iter().enumerate() {
-            if let Some(earlier) =
-                columns[..at].iter().find(|held| same_name(&held.name, &column.name))
-            {
-                return Err(Error::binder(format!(
-                    "table \"{}\" has a duplicate column name \"{}\"",
-                    name.table, earlier.name
-                )));
-            }
-        }
+        duplicate_check(&columns)?;
         let types = columns.iter().map(|column| column.ty.clone()).collect();
         Ok(Self { name, columns, rows: MemoryTable::new(types) })
     }
@@ -173,7 +191,9 @@ mod tests {
             vec![Field::new("a", LogicalType::Integer), Field::new("A", LogicalType::Varchar)],
         )
         .expect_err("two columns called a");
-        assert!(error.message().contains("duplicate column"), "{error}");
+        // Named after the second of the two and spelled the way it was written there, which is what
+        // duckdb v1.4.1 says for `CREATE TABLE t (a INTEGER, A VARCHAR)`.
+        assert_eq!(error.to_string(), "Catalog Error: Column with name A already exists!");
     }
 
     #[test]

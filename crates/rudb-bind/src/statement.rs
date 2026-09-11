@@ -14,7 +14,7 @@
 //! types, with the casts and the nulls for unmentioned columns already in it, so appending is a
 //! loop over chunks.
 
-use rudb_catalog::{Catalog, QualifiedName, same_name};
+use rudb_catalog::{Catalog, QualifiedName, duplicate_check, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, parse_ast};
@@ -150,13 +150,10 @@ fn create_table(ast: &Ast, catalog: &Catalog, index: ast::CreateTableRef) -> Res
     } else {
         let mut binder = Binder::new(catalog);
         let (root, scope) = binder.bind_query(ast, written.query)?;
-        if !defs.is_empty() && defs.len() != scope.len() {
-            return Err(Error::binder(format!(
-                "Table \"{}\" has {} columns but the query produces {}",
-                name.table,
-                defs.len(),
-                scope.len()
-            )));
+        if defs.len() > scope.len() {
+            // DuckDB's sentence, typo and all. A column list shorter than the query is fine and
+            // renames a prefix, so only this direction is an error.
+            return Err(Error::binder("Target table has more colum names than query result."));
         }
         let mut columns = Vec::with_capacity(scope.len());
         for (at, column) in scope.columns.iter().enumerate() {
@@ -165,6 +162,9 @@ fn create_table(ast: &Ast, catalog: &Catalog, index: ast::CreateTableRef) -> Res
                 None => column.name.clone(),
             };
             columns.push(Field::new(named, column.ty.clone()));
+        }
+        if defs.is_empty() {
+            deduplicate(&mut columns);
         }
         (columns, Some(finish(binder, root)?))
     };
@@ -178,17 +178,34 @@ fn create_table(ast: &Ast, catalog: &Catalog, index: ast::CreateTableRef) -> Res
     }))
 }
 
-/// The same check the catalog makes, made here so the message arrives before anything is created.
-fn duplicate_check(columns: &[Field]) -> Result<()> {
-    for (at, column) in columns.iter().enumerate() {
-        if columns[..at].iter().any(|held| same_name(&held.name, &column.name)) {
-            return Err(Error::binder(format!(
-                "Duplicate column name \"{}\" in a table definition",
-                column.name
-            )));
+/// Renames the columns a query repeated, which is what makes `CREATE TABLE t AS SELECT 1 AS a, 2 AS
+/// a` a table rather than an error.
+///
+/// A query is allowed to produce two columns of one name and `SELECT 1 AS a, 2 AS a` prints two
+/// columns called `a`, so a statement that turns a query into a table has to decide what to do with
+/// that, and DuckDB renames rather than refusing. The suffix is `_1`, then `_2`, counting up until
+/// the name is free, so a query that already has an `a_1` in it pushes the renamed column to `a_2`
+/// rather than colliding with it.
+///
+/// This only runs when the statement wrote no column list. With a list, even a short one, duckdb
+/// v1.4.1 takes the names as they come and a repeat is an error, so `CREATE TABLE t (z) AS SELECT 1
+/// AS a, 2 AS a` is a table of `z` and `a` and adding a third `a` to that query is a refusal.
+fn deduplicate(columns: &mut [Field]) {
+    for at in 0..columns.len() {
+        let taken = |name: &str, upto: usize, columns: &[Field]| {
+            columns[..upto].iter().any(|held| same_name(&held.name, name))
+        };
+        if !taken(&columns[at].name, at, columns) {
+            continue;
         }
+        let mut suffix = 1;
+        let mut candidate = format!("{}_{suffix}", columns[at].name);
+        while taken(&candidate, at, columns) {
+            suffix += 1;
+            candidate = format!("{}_{suffix}", columns[at].name);
+        }
+        columns[at].name = candidate;
     }
-    Ok(())
 }
 
 fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<Bound> {
