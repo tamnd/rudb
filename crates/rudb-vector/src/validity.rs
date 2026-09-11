@@ -102,6 +102,37 @@ impl Validity {
         Self::Mask(mask).normalize(len)
     }
 
+    /// Validity packed from one byte a row, which is what a kernel that accumulated its answer in a
+    /// `Vec<bool>` is holding when it finishes.
+    ///
+    /// The difference from [`Self::from_iter`] is the shape rather than the answer. `from_iter`
+    /// calls a closure and then a read modify write on a byte of the bitmap, once per row, and the
+    /// read modify write is a dependency on the row before it. This reads sixty four bytes and
+    /// writes one word, which has no dependency in it at all and is what the compiler needs to see
+    /// before it will use a vector instruction. On a thousand row vector that is the difference
+    /// between two nanoseconds a row and something too small to measure.
+    /// The bits past the end of the last word are set rather than clear, which looks like a detail
+    /// and is not. [`Bitmap`] does not carry a length, so its equality is over whole words, and
+    /// [`Bitmap::all_valid`] leaves those bits set. A constructor that left them clear would build
+    /// a validity that says exactly the same thing about every row that exists and still compares
+    /// unequal to the one [`Self::from_iter`] builds, which is a test failure with no wrong answer
+    /// in it and an afternoon to work out.
+    #[must_use]
+    pub fn from_run(valid: &[bool]) -> Self {
+        let len = valid.len();
+        let mut words = vec![0u64; len.div_ceil(64)];
+        for (word, run) in words.iter_mut().zip(valid.chunks(64)) {
+            // Only the last run can be short, and the shift is written around rather than as
+            // `u64::MAX << 64`, which is not a shift this machine has.
+            let mut packed = if run.len() == 64 { 0 } else { u64::MAX << run.len() };
+            for (bit, &live) in run.iter().enumerate() {
+                packed |= u64::from(live) << bit;
+            }
+            *word = packed;
+        }
+        Self::Mask(Bitmap { words }).normalize(len)
+    }
+
     /// The validity of a value that is valid in both inputs, which is what almost every binary
     /// operator wants and is worth having in one place.
     #[must_use]
@@ -186,6 +217,19 @@ impl Bitmap {
         count
     }
 
+    /// Sixty four validity bits at once, the lowest numbered row in the lowest bit.
+    ///
+    /// Past the end reads as all null, which is the same answer [`Self::get`] gives one bit at a
+    /// time. This exists because a kernel that asks [`Self::get`] once per row pays a bounds check,
+    /// a divide and a shift for each of them, and the word it wants was already in a register for
+    /// the previous sixty three. A loop that reads the word once and walks its bits is the same
+    /// answer at a fraction of the cost, and the three call sites that do that are the difference
+    /// between a nullable column being free and being the slowest thing in the kernel.
+    #[must_use]
+    pub fn word(&self, at: usize) -> u64 {
+        self.words.get(at).copied().unwrap_or(0)
+    }
+
     /// Intersects this bitmap with another, in place.
     pub fn and_with(&mut self, other: &Self) {
         for (index, word) in self.words.iter_mut().enumerate() {
@@ -217,6 +261,48 @@ mod tests {
         let mut mask = Bitmap::all_valid(64);
         mask.set(7, false);
         assert!(matches!(Validity::Mask(mask).normalize(64), Validity::Mask(_)));
+    }
+
+    #[test]
+    fn a_word_of_validity_says_the_same_thing_the_bits_do_one_at_a_time() {
+        let mut mask = Bitmap::all_valid(200);
+        mask.set(0, false);
+        mask.set(63, false);
+        mask.set(64, false);
+        mask.set(199, false);
+        for index in 0..200 {
+            let from_word = mask.word(index / 64) >> (index % 64) & 1 == 1;
+            assert_eq!(from_word, mask.get(index), "{index}");
+        }
+        // Past the end is all null, which is what reading one bit past the end says too.
+        assert_eq!(mask.word(9), 0);
+        assert!(!mask.get(9 * 64));
+    }
+
+    #[test]
+    fn packing_a_run_of_bytes_says_the_same_thing_as_setting_the_bits() {
+        // Two lengths that are not a whole number of words, because the bits past the end of the
+        // last word are the part of this that is easy to get wrong.
+        for len in [0, 1, 63, 64, 65, 100, 1024] {
+            let live: Vec<bool> = (0..len).map(|index| index % 7 != 0).collect();
+            let packed = Validity::from_run(&live);
+            let set = Validity::from_iter(len, |index| live[index]);
+            assert_eq!(packed, set, "{len}");
+            for (index, &want) in live.iter().enumerate() {
+                assert_eq!(packed.is_valid(index), want, "{len} at {index}");
+            }
+        }
+        // The bits past the end of the last word have to match what every other constructor
+        // leaves there, because a bitmap does not carry a length and its equality is over whole
+        // words. This is the assertion that caught it.
+        assert_eq!(
+            Validity::from_run(&[true, false, true]),
+            Validity::from_iter(3, |index| index != 1)
+        );
+        // And it collapses the uniform cases the same way everything else does.
+        assert_eq!(Validity::from_run(&[true; 64]), Validity::AllValid);
+        assert_eq!(Validity::from_run(&[false; 64]), Validity::AllInvalid);
+        assert_eq!(Validity::from_run(&[]), Validity::AllValid);
     }
 
     #[test]
