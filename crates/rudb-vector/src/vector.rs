@@ -15,6 +15,8 @@
 //! are not stored yet either, for the same reason: a `LIST(STRUCT(...))` is offsets plus child
 //! column chunks, and child column chunks are storage.
 
+use std::sync::Arc;
+
 use rudb_common::{Error, LogicalType, Result, Value};
 
 use crate::buffer::Buffer;
@@ -176,8 +178,23 @@ pub struct Vector {
 enum Body {
     Flat(Data),
     Constant(Box<Value>),
-    Sequence { start: i64, step: i64 },
-    Dictionary { codes: Vec<u32>, values: Box<Vector> },
+    Sequence {
+        start: i64,
+        step: i64,
+    },
+    /// The values are behind an `Arc` rather than a `Box` because slicing shares them.
+    ///
+    /// A dictionary vector is cut once per chunk and the dictionary itself is the same dictionary
+    /// every time, so a `Box` meant a copy of every value in it per cut. On the ClickBench columns
+    /// that are dictionary encoded the dictionary is larger than the chunk of codes pointing into
+    /// it, and copying it was ten percent of the cycles of reading the file.
+    ///
+    /// Nothing here mutates a dictionary in place, so sharing one is only ever a read, and the one
+    /// place that wants an owned copy of the values is [`compose`], which asks for one.
+    Dictionary {
+        codes: Vec<u32>,
+        values: Arc<Vector>,
+    },
 }
 
 impl Vector {
@@ -284,7 +301,7 @@ impl Vector {
             ty: values.ty.clone(),
             len: codes.len(),
             validity: Validity::AllValid,
-            body: Body::Dictionary { codes, values: Box::new(values) },
+            body: Body::Dictionary { codes, values: Arc::new(values) },
         })
     }
 
@@ -424,10 +441,10 @@ impl Vector {
     /// sequence stays arithmetic with its start moved along, a constant stays a shorter constant,
     /// and a flat body is the one that genuinely has to copy its range.
     ///
-    /// The dictionary is still cloned, because `Buffer` owns its values, so slicing a dictionary
-    /// vector copies the dictionary once. That is the same cost `Page::into_vector` in
-    /// `rudb-parquet` documents and it goes away with the same change: the buffer manager is what
-    /// can hand out a run inside a pinned page, and it is the only thing that can.
+    /// The dictionary itself is shared rather than copied, so a cut is the codes and nothing else.
+    /// It used to be copied, and on a read of a ClickBench partition that copy was ten percent of
+    /// the cycles: a page holds one dictionary and is cut into chunk sized pieces, so the whole
+    /// dictionary was copied once per chunk to be read the same way each time.
     ///
     /// # Errors
     ///
@@ -447,10 +464,9 @@ impl Vector {
             Body::Sequence { start, step } => {
                 Body::Sequence { start: start + step * at as i64, step: *step }
             }
-            Body::Dictionary { codes, values } => Body::Dictionary {
-                codes: codes[at..end].to_vec(),
-                values: Box::new(values.as_ref().clone()),
-            },
+            Body::Dictionary { codes, values } => {
+                Body::Dictionary { codes: codes[at..end].to_vec(), values: Arc::clone(values) }
+            }
             // The one form with nowhere to point, so its range is copied out. A gather is the
             // right tool here and does no more than this would: a flat body has no dictionary
             // under it for the gather to flatten.
@@ -609,7 +625,11 @@ fn compose(codes: Vec<u32>, values: Vector) -> (Vec<u32>, Vector) {
                     || !matches!(leaf.validity, Validity::AllValid),
                 "a dictionary was stacked on a dictionary without going through the constructor"
             );
-            (codes.iter().map(|&code| inner[code as usize]).collect(), *leaf)
+            // The leaf is shared, so taking it out of the `Arc` copies it when something else is
+            // still holding the same dictionary. That is the rare path: a dictionary over a
+            // dictionary only arrives from a caller that built one that way, and the cut that made
+            // sharing worth doing produces neither.
+            (codes.iter().map(|&code| inner[code as usize]).collect(), Arc::unwrap_or_clone(leaf))
         }
         body => (codes, Vector { ty, len, validity, body }),
     }
@@ -658,7 +678,7 @@ fn copy_of(data: &Data, at: &[usize]) -> Data {
                             .sum(),
                     );
                     for &index in at {
-                        out.push(values.get(index).unwrap_or(""));
+                        out.push_from(values, index);
                     }
                     Data::Varlen(out)
                 }
@@ -872,9 +892,11 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rudb_common::{LogicalType, Value};
 
-    use super::{Data, Form, VECTOR_SIZE, Vector};
+    use super::{Body, Data, Form, VECTOR_SIZE, Vector};
     use crate::string::StringColumn;
     use crate::validity::Validity;
 
@@ -903,6 +925,41 @@ mod tests {
             ]
         );
         assert_eq!(vector.gather(&[1, 2, 3]).unwrap().form(), Form::Flat, "which a gather loses");
+    }
+
+    #[test]
+    fn slicing_a_dictionary_shares_the_dictionary_rather_than_copying_it() {
+        // The assertion is about the address and not about the values, because the values were
+        // right when the dictionary was copied too. A page holds one dictionary and is cut into a
+        // chunk of codes at a time, so copying the dictionary here is a copy of every string in it
+        // per chunk, and on a read of a ClickBench partition it was ten percent of the cycles.
+        let values = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("red".into()), Value::Varchar("blue".into())],
+        )
+        .unwrap();
+        let vector = Vector::dictionary(vec![0, 1, 1, 0, 1], values).unwrap();
+        let Body::Dictionary { values: whole, .. } = &vector.body else {
+            panic!("a dictionary vector holds a dictionary");
+        };
+
+        let piece = vector.slice(1, 3).unwrap();
+        let Body::Dictionary { codes, values: cut } = &piece.body else {
+            panic!("a slice of a dictionary is a dictionary");
+        };
+        assert!(Arc::ptr_eq(whole, cut), "the cut copied the dictionary");
+        assert_eq!(codes, &[1, 1, 0], "the codes are the part that is cut");
+
+        // And a cut of a cut shares it too, since that is what a scan does to a page it reads twice.
+        let again = piece.slice(1, 2).unwrap();
+        let Body::Dictionary { values: cut, .. } = &again.body else {
+            panic!("a slice of a slice of a dictionary is a dictionary");
+        };
+        assert!(Arc::ptr_eq(whole, cut), "the second cut copied the dictionary");
+        assert_eq!(
+            again.iter().collect::<Vec<_>>(),
+            [Value::Varchar("blue".into()), Value::Varchar("red".into())]
+        );
     }
 
     #[test]
