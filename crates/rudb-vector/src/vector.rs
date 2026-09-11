@@ -412,6 +412,57 @@ impl Vector {
         (0..self.len).map(|index| self.value_at(index))
     }
 
+    /// A contiguous run of the values, in the form they are already in.
+    ///
+    /// This is the cut [`Self::gather`] cannot do. A gather walks a dictionary to its leaf and
+    /// copies, so gathering a piece of a dictionary encoded column hands back a flat one, and a
+    /// caller that only wanted the first thousand rows of a page has silently paid for a copy and
+    /// thrown the dictionary away. A group by over a dictionary encoded column is the case that
+    /// cares, and it is most of ClickBench.
+    ///
+    /// So each form is cut as itself. A dictionary keeps its dictionary and slices its codes, a
+    /// sequence stays arithmetic with its start moved along, a constant stays a shorter constant,
+    /// and a flat body is the one that genuinely has to copy its range.
+    ///
+    /// The dictionary is still cloned, because `Buffer` owns its values, so slicing a dictionary
+    /// vector copies the dictionary once. That is the same cost `Page::into_vector` in
+    /// `rudb-parquet` documents and it goes away with the same change: the buffer manager is what
+    /// can hand out a run inside a pinned page, and it is the only thing that can.
+    ///
+    /// # Errors
+    ///
+    /// If the range runs past the end of the vector, or if the type has no flat layout and the
+    /// body is one that has to be copied.
+    pub fn slice(&self, at: usize, len: usize) -> Result<Self> {
+        let end = at.checked_add(len).ok_or_else(|| Error::internal("a slice that wraps"))?;
+        if end > self.len {
+            return Err(Error::internal(format!("rows {at} to {end} of a vector of {}", self.len)));
+        }
+        if at == 0 && len == self.len {
+            return Ok(self.clone());
+        }
+        let validity = Validity::from_iter(len, |row| self.validity.is_valid(at + row));
+        let body = match &self.body {
+            Body::Constant(value) => Body::Constant(value.clone()),
+            Body::Sequence { start, step } => {
+                Body::Sequence { start: start + step * at as i64, step: *step }
+            }
+            Body::Dictionary { codes, values } => Body::Dictionary {
+                codes: codes[at..end].to_vec(),
+                values: Box::new(values.as_ref().clone()),
+            },
+            // The one form with nowhere to point, so its range is copied out. A gather is the
+            // right tool here and does no more than this would: a flat body has no dictionary
+            // under it for the gather to flatten.
+            Body::Flat(_) => {
+                let indices: Vec<u32> =
+                    (at..end).map(|row| u32::try_from(row).unwrap_or(u32::MAX)).collect();
+                return self.gather(&indices);
+            }
+        };
+        Ok(Self { ty: self.ty.clone(), len, validity, body })
+    }
+
     /// The same values in flat form.
     ///
     /// Flattening a vector that is already flat is free. Flattening any other form costs a copy,
@@ -829,6 +880,74 @@ mod tests {
 
     fn integers(values: &[i32]) -> Vector {
         Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into())).unwrap()
+    }
+
+    #[test]
+    fn slicing_a_dictionary_keeps_it_a_dictionary_where_gathering_would_not() {
+        let values = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("red".into()), Value::Varchar("blue".into())],
+        )
+        .unwrap();
+        let vector = Vector::dictionary(vec![0, 1, 1, 0, 1], values).unwrap();
+
+        let piece = vector.slice(1, 3).unwrap();
+        assert_eq!(piece.form(), Form::Dictionary, "the form is the whole point");
+        assert_eq!(piece.len(), 3);
+        assert_eq!(
+            piece.iter().collect::<Vec<_>>(),
+            [
+                Value::Varchar("blue".into()),
+                Value::Varchar("blue".into()),
+                Value::Varchar("red".into())
+            ]
+        );
+        assert_eq!(vector.gather(&[1, 2, 3]).unwrap().form(), Form::Flat, "which a gather loses");
+    }
+
+    #[test]
+    fn a_slice_carries_the_nulls_that_were_in_its_range_and_not_the_others() {
+        let vector =
+            integers(&[1, 2, 3, 4]).with_validity(Validity::from_run(&[false, true, false, true]));
+        let piece = vector.slice(1, 2).unwrap();
+        assert!(piece.validity().is_valid(0));
+        assert!(!piece.validity().is_valid(1));
+        assert_eq!(piece.value_at(1), Value::Null);
+    }
+
+    #[test]
+    fn slicing_a_sequence_moves_its_start_rather_than_writing_the_values_out() {
+        let vector = Vector::sequence(100, 5, 10);
+        let piece = vector.slice(3, 4).unwrap();
+        assert_eq!(piece.form(), Form::Sequence);
+        assert_eq!(
+            piece.iter().collect::<Vec<_>>(),
+            [Value::BigInt(115), Value::BigInt(120), Value::BigInt(125), Value::BigInt(130)]
+        );
+    }
+
+    #[test]
+    fn slicing_a_constant_is_a_shorter_constant() {
+        let vector = Vector::constant(LogicalType::Integer, Value::Integer(9), 8);
+        let piece = vector.slice(2, 3).unwrap();
+        assert_eq!(piece.form(), Form::Constant);
+        assert_eq!(piece.len(), 3);
+        assert_eq!(piece.value_at(2), Value::Integer(9));
+    }
+
+    #[test]
+    fn slicing_the_whole_vector_hands_it_back_as_it_was() {
+        let vector = integers(&[1, 2, 3]);
+        assert_eq!(
+            vector.slice(0, 3).unwrap().iter().collect::<Vec<_>>(),
+            [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        );
+    }
+
+    #[test]
+    fn a_slice_past_the_end_is_an_error_rather_than_a_short_vector() {
+        let error = integers(&[1, 2, 3]).slice(2, 2).unwrap_err();
+        assert!(error.to_string().contains("of a vector of 3"), "{error}");
     }
 
     #[test]
