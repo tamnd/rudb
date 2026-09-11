@@ -4,6 +4,10 @@ Notable changes, newest first. This project is pre-1.0 and follows no compatibil
 
 The version number says how far through the plan we are. **The minor version is the number of milestones finished**, so 0.0.y is work inside M0, 0.1.0 is the release where M0's exit criterion passed, 0.1.y is work inside M1, and so on. Patch releases happen whenever enough has landed to be worth a tag, which in practice is every few pull requests. The one exception is at the end: when M10 closes the version is 1.0.0 rather than 0.11.0, because that milestone is named 1.0 and pretending otherwise would be silly. The milestones are the issues at https://github.com/tamnd/rudb/issues.
 
+## Unreleased
+
+- `Vector::dictionary` composes a dictionary over a dictionary into one level instead of stacking them, so the form has a depth of one however many filters a chunk has been through. The cost of stacking was a cliff and not a slope: every loop in `rudb-kernels` reaches for the values behind the codes with `Vector::data`, a dictionary pointing at a dictionary has no data to hand back, so the second level did not make the kernels slower, it turned them off and dropped the work onto the row at a time path that exists to be correct rather than fast. On `server3`, over a chunk of two numeric columns selected twice and read by two vectorized passes, that was 3.5 nanoseconds a row becoming 104, and the third and fourth levels cost almost nothing more because the first one had already given up everything there was to give. With the same chunk in three columns, one of them strings, it was 16.8 becoming 252. Composing is one pass over the outer codes, which the range check on the way in was already making. The one level it does not compose past is a dictionary carrying a validity of its own, because that vector is saying its nulls are at that level rather than in the values and pointing the outer codes straight at the values would read through the holes instead of stopping at them.
+
 ## 0.1.2
 
 The compute kernels, and the gate that made it possible to measure them.
