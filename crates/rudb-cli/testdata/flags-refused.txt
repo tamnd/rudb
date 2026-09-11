@@ -1,0 +1,7 @@
+duckbox
+insert
+lines
+ndjson
+tabs
+trash
+tsv

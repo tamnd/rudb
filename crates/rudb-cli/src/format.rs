@@ -84,6 +84,22 @@ impl Format {
         })
     }
 
+    /// The mode a command line flag names, or `None` when there is no flag of that name.
+    ///
+    /// Twelve of the sixteen modes are also flags and four of them are not, and the four are an
+    /// error rather than a mode. This is upstream's list rather than a rule, so it is written out
+    /// rather than derived: `duckdb -help` has a line for each of these twelve and no line for
+    /// `-duckbox`, `-insert`, `-tabs` or `-trash`, and asking v2.0.0-dev84237 for any of those four
+    /// gets `Unrecognized option` and a non zero exit. The aliases are not flags either, so
+    /// `-lines`, `-tsv` and `-ndjson` are refused while `.mode lines` is still accepted. Per #238.
+    pub fn from_flag(name: &str) -> Option<Self> {
+        match name {
+            "ascii" | "box" | "column" | "csv" | "html" | "json" | "jsonlines" | "line"
+            | "list" | "markdown" | "quote" | "table" => Self::from_name(name),
+            _ => None,
+        }
+    }
+
     /// The name this mode answers to, which is what `.show` prints.
     pub fn name(self) -> &'static str {
         match self {
@@ -175,17 +191,30 @@ impl Settings {
 
     /// Switches mode the way a command line flag does, which is not the way `.mode` does.
     ///
-    /// A flag sets the column separator and leaves the row separator alone. The difference shows up
-    /// in exactly one place and it is the one people pipe into other programs: `duckdb -csv` ends a
-    /// row with `\n` and `duckdb -cmd ".mode csv"` ends it with `\r\n`, on the same build, in the
-    /// same run. It looks like an oversight upstream and it is not ours to correct, because a script
-    /// written against `duckdb -csv` is a script whose next stage is counting bytes.
+    /// There is no rule here, only a table, and the table is upstream's. `-ascii` sets both
+    /// separators, `-csv` sets the column separator and leaves the row separator, and the other ten
+    /// flags set neither. That is three behaviours across three flags on one build, which is why
+    /// this is a match rather than a line of code.
     ///
-    /// Checked against `duckdb v2.0.0-dev84237` for `-list`, `-csv` and `-ascii`, which are the
-    /// flags that name a mode and reach this.
+    /// It matters because these are the modes people pipe into other programs. `duckdb -csv` ends a
+    /// row with `\n` and `duckdb -cmd ".mode csv"` ends it with `\r\n`, and `duckdb -quote` writes
+    /// `'a'|'b'` where `duckdb -cmd ".mode quote"` writes `'a','b'`. A script written against the
+    /// flag is a script whose next stage counts bytes or splits on a character, so copying the
+    /// oversight is the whole point.
+    ///
+    /// Read out of `.show` on `duckdb v2.0.0-dev84237` for all twelve flags, once on its own and
+    /// once after `-separator ';' -newline '@'` so that leaving a separator alone can be told apart
+    /// from setting it to the same thing it already was. Per #239.
     pub fn set_format_flag(&mut self, format: Format) {
         self.format = format;
-        self.separator = format.separator().to_string();
+        match format {
+            Format::Ascii => {
+                self.separator = format.separator().to_string();
+                self.newline = format.newline().to_string();
+            }
+            Format::Csv => self.separator = format.separator().to_string(),
+            _ => {}
+        }
     }
 }
 

@@ -33,7 +33,9 @@ Options:
   --print-config         print the build configuration and exit
   -h, -help              print this and exit
 
-Any mode can also be given as an option, so -csv is the same as -cmd '.mode csv'.
+Most modes can also be given as an option: -ascii, -box, -column, -csv, -html, -json, -jsonlines,
+-line, -list, -markdown, -quote and -table. They set the mode and they do not all set the
+separators that .mode sets, which is what DuckDB does.
 ";
 
 /// What `.help` prints.

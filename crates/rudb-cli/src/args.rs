@@ -139,7 +139,7 @@ pub fn parse(arguments: &[String]) -> Action {
             "-no-stdin" => options.stop_after_commands = true,
             "-no-init" | "-unsigned" | "-unredacted" | "-safe" => {}
             other if other.starts_with('-') => {
-                match Format::from_name(other.trim_start_matches('-')) {
+                match Format::from_flag(other.trim_start_matches('-')) {
                     Some(format) => options.settings.set_format_flag(format),
                     None => return Action::Wrong(format!("unknown option {other}")),
                 }
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(parsed.settings.separator, ",");
     }
 
-    /// The row separator is the one thing a mode flag does not set, which is DuckDB's behaviour.
+    /// The row separator is the one thing the csv flag does not set, which is DuckDB's behaviour.
     ///
     /// `duckdb -csv` writes `\n` at the end of a row and `duckdb -cmd ".mode csv"` writes `\r\n`,
     /// on the same build in the same run, and `tests/shell.rs` holds both captures. This is the
@@ -226,8 +226,47 @@ mod tests {
     #[test]
     fn a_mode_flag_leaves_the_row_separator_where_it_was_and_the_dot_command_does_not() {
         assert_eq!(options(&["-csv"]).settings.newline, "\n");
-        assert_eq!(options(&["-ascii"]).settings.newline, "\n");
         assert_eq!(options(&["-csv", "-newline", ";"]).settings.newline, ";");
+    }
+
+    /// What each flag sets, against `duckdb v2.0.0-dev84237` read out of `.show`.
+    ///
+    /// The separators are given first so that a flag which leaves one alone can be told apart from
+    /// one that sets it to the value it already had. Per #239.
+    #[test]
+    fn each_mode_flag_sets_the_separators_that_flag_sets_and_no_others() {
+        let given = |flag: &str| {
+            let parsed = options(&["-separator", ";", "-newline", "@", flag]);
+            (parsed.settings.separator, parsed.settings.newline)
+        };
+        assert_eq!(given("-ascii"), ("\u{1f}".to_string(), "\u{1e}".to_string()));
+        assert_eq!(given("-csv"), (",".to_string(), "@".to_string()));
+        let neither = [
+            "-box",
+            "-column",
+            "-html",
+            "-json",
+            "-jsonlines",
+            "-line",
+            "-list",
+            "-markdown",
+            "-quote",
+            "-table",
+        ];
+        for flag in neither {
+            assert_eq!(given(flag), (";".to_string(), "@".to_string()), "{flag}");
+        }
+    }
+
+    /// The four modes that are not flags, per #238.
+    ///
+    /// Each of them is still a mode, so `.mode tabs` works and `-tabs` does not, which is what the
+    /// binary does. The aliases are not flags either.
+    #[test]
+    fn a_mode_that_duckdb_has_no_flag_for_is_an_error_here_too() {
+        for flag in ["-duckbox", "-insert", "-tabs", "-trash", "-lines", "-tsv", "-ndjson"] {
+            assert!(matches!(parse(&[flag.to_string()]), Action::Wrong(_)), "{flag}");
+        }
     }
 
     #[test]
