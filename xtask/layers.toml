@@ -14,6 +14,11 @@ rudb-common = 0
 rudb-io = 1
 rudb-vector = 1
 rudb-parse = 1
+# Rank 1 and not 2. A codec turns bytes into bytes. It knows nothing about a vector, a page or a
+# column, which is exactly why it can sit next to `rudb-io` rather than above `rudb-encoding`: the
+# thing above it that wants a decompressed page is at rank 5, and everything between the two is
+# free to not know this crate exists.
+rudb-compress = 1
 
 # Data representation. The encoding layer sits above vectors and below everything that consumes
 # them, so a new encoding from a paper is a module here and nothing above changes.
