@@ -1,4 +1,4 @@
-//! Filter pushdown, the half that stays on one input.
+//! Filter pushdown.
 //!
 //! A filter above an operator reads every row the operator produced. The same filter below it reads
 //! every row the operator was going to be given, and the operator then does its work on fewer rows.
@@ -6,10 +6,8 @@
 //! same reason column pruning is first by size: the cheapest row is the one nothing above the scan
 //! ever sees.
 //!
-//! #102 asks for this in two pull requests and this is the first. It is the framework and the
-//! operators with one input. A join is the second, because a predicate that moves to the wrong side
-//! of an outer join turns a row that should have been padded with nulls into a row that is not there
-//! at all, and that belongs in a pull request whose diff is only that.
+//! #102 asks for this in two pull requests. The first was the framework and the operators with one
+//! input, and this is the second, which is the joins.
 //!
 //! # Where a predicate stops
 //!
@@ -34,6 +32,34 @@
 //! has to be mapped onto each side before it can move, and that mapping is the same one column
 //! pruning does not have yet either.
 //!
+//! # Into a join
+//!
+//! Into the side that produces everything the predicate reads, when the join hands that side's rows
+//! on as they are. An inner join keeps both sides, an outer join keeps only the side it is named
+//! after, a full outer join keeps neither, and a positional join keeps neither for a reason that has
+//! nothing to do with nulls: it pairs rows up by their position, so taking a row out of one side
+//! renumbers every row after it. `kept` is that table and is the whole of the rule.
+//!
+//! What is left over reads both sides. Over an inner join it becomes a condition, because a
+//! condition and a filter above the join mean the same thing there and the condition is the one that
+//! runs while the pairs are being built. Over anything else it stays where it was. That one measures
+//! as a wash today, within the noise on 2000 rows against 50000, and it is kept because it is the
+//! plan a hash join wants and because a condition means the join stops materializing pairs that the
+//! filter above it was going to throw away.
+//!
+//! What a cross product does not do is become an inner join. It is the same rewrite, it is the one
+//! every textbook has and the one #102 wants, and it is a pessimization here today. Ten thousand
+//! rows against fifty thousand with `a.x = b.x` over them takes 1.25 seconds as a cross product with
+//! a filter above it and 10.7 seconds as a join with a condition, measured on server2. The reason is
+//! in `crates/rudb-exec/src/join.rs`: every join is a nested loop that pairs one left row against a
+//! chunk of the right side at a time, where the cross product hands whole chunks on and lets the
+//! filter run over them. Writing the better plan for the slower operator is how a pass makes a query
+//! slower while looking correct, so this waits for #211.
+//!
+//! What is not here is the rule that turns an outer join into an inner one when the predicate above
+//! it would have thrown away every padded row anyway. That needs the null rejecting analysis, which
+//! is its own item in #102 and its own pull request.
+//!
 //! # Taking the conjunction apart
 //!
 //! `WHERE a AND b` is two predicates. Splitting them is most of the value of the pass, because the
@@ -51,10 +77,13 @@
 //! few nodes on a plan and is the reason every pass walks from the root rather than over the arena.
 
 use rudb_common::{LogicalType, Result};
-use rudb_plan::{ColumnBinding, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
+use rudb_plan::{
+    ColumnBinding, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice,
+};
 
 use crate::fold::VOLATILE;
 use crate::pass::{Context, Pass};
+use crate::tables::{Tables, produced};
 use crate::walk;
 
 /// Moves every predicate as far down the plan as it can go.
@@ -74,7 +103,8 @@ impl Pass for FilterPushdown {
 
 /// Moves every predicate in `plan` as far down as it can go.
 pub fn push(plan: &mut Plan) {
-    let root = node(plan, plan.root(), Vec::new());
+    let mut tables = Tables::new();
+    let root = node(plan, plan.root(), Vec::new(), &mut tables);
     plan.set_root(root);
 }
 
@@ -87,14 +117,14 @@ pub fn push(plan: &mut Plan) {
 ///
 /// The node that comes back is `at` itself when nothing under it moved, so a subtree the pass has
 /// nothing to say about is left alone rather than copied.
-fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>) -> NodeRef {
+fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables) -> NodeRef {
     match *plan.node(at) {
         // The filter disappears here and is rebuilt wherever its parts stop, which is what merges
         // two filters in a row into one and what lets half of an AND go further than the other half.
         Node::Filter { input, predicate } => {
             let mut parts = pending;
             split(plan, predicate, &mut parts);
-            node(plan, input, parts)
+            node(plan, input, parts, tables)
         }
 
         Node::Project { input, index, exprs, names } => {
@@ -102,7 +132,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>) -> NodeRef {
             let (down, stay) = partition(plan, pending, index, &held);
             let moved = down.into_iter().map(|part| substitute(plan, part, index, &held));
             let moved: Vec<ExprRef> = moved.collect();
-            let rebuilt = node(plan, input, moved);
+            let rebuilt = node(plan, input, moved, tables);
             let above = if rebuilt == input {
                 at
             } else {
@@ -119,7 +149,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>) -> NodeRef {
             let (down, stay) = partition(plan, pending, index, &keys);
             let moved = down.into_iter().map(|part| substitute(plan, part, index, &keys));
             let moved: Vec<ExprRef> = moved.collect();
-            let rebuilt = node(plan, input, moved);
+            let rebuilt = node(plan, input, moved, tables);
             let above = if rebuilt == input {
                 at
             } else {
@@ -131,14 +161,14 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>) -> NodeRef {
         // Neither of these introduces a table index, so a predicate written against what comes out
         // is already written against what goes in.
         Node::Sort { input, keys } => {
-            let rebuilt = node(plan, input, pending);
+            let rebuilt = node(plan, input, pending, tables);
             if rebuilt == input { at } else { plan.add_node(Node::Sort { input: rebuilt, keys }) }
         }
         Node::Distinct { input, on } => {
             let whole_row = plan.expr_list(on).is_empty();
             let (down, stay) =
                 if whole_row { (pending, Vec::new()) } else { (Vec::new(), pending) };
-            let rebuilt = node(plan, input, down);
+            let rebuilt = node(plan, input, down, tables);
             let above = if rebuilt == input {
                 at
             } else {
@@ -150,7 +180,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>) -> NodeRef {
         // Nothing goes through a limit and the recursion happens anyway, because a filter that is
         // already below the limit still has somewhere to go.
         Node::Limit { input, count, offset } => {
-            let rebuilt = node(plan, input, Vec::new());
+            let rebuilt = node(plan, input, Vec::new(), tables);
             let above = if rebuilt == input {
                 at
             } else {
@@ -159,36 +189,57 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>) -> NodeRef {
             filter(plan, above, pending)
         }
 
-        // The second pull request. Both sides are still walked, so a filter written inside one side
-        // of a join reaches that side's scan today.
+        // A predicate goes into a side when that side produces everything the predicate reads and
+        // the join hands that side's rows on as they are. What is left over reads both sides, and
+        // for an inner join a condition and a filter above it mean the same thing, so it becomes a
+        // condition and runs while the pairs are being built rather than after.
         Node::Join { left, right, kind, conditions } => {
-            let rebuilt_left = node(plan, left, Vec::new());
-            let rebuilt_right = node(plan, right, Vec::new());
-            let above = if rebuilt_left == left && rebuilt_right == right {
+            let (to_left, to_right, over) = sides(plan, tables, pending, left, right, kept(kind));
+            let (added, stay) =
+                if kind == JoinKind::Inner { (over, Vec::new()) } else { (Vec::new(), over) };
+            let rebuilt_left = node(plan, left, to_left, tables);
+            let rebuilt_right = node(plan, right, to_right, tables);
+            let rebuilt_conditions = if added.is_empty() {
+                conditions
+            } else {
+                let all: Vec<ExprRef> =
+                    plan.expr_list(conditions).to_vec().into_iter().chain(added).collect();
+                plan.add_expr_list(&all)
+            };
+            let above = if rebuilt_left == left
+                && rebuilt_right == right
+                && rebuilt_conditions == conditions
+            {
                 at
             } else {
                 plan.add_node(Node::Join {
                     left: rebuilt_left,
                     right: rebuilt_right,
                     kind,
-                    conditions,
+                    conditions: rebuilt_conditions,
                 })
             };
-            filter(plan, above, pending)
+            filter(plan, above, stay)
         }
+
+        // Both sides of a cross product are kept as they are, so a predicate over one side goes
+        // into it. A predicate over both stays above, for the measured reason in this file's
+        // opening, and #211 is where that changes.
         Node::CrossProduct { left, right } => {
-            let rebuilt_left = node(plan, left, Vec::new());
-            let rebuilt_right = node(plan, right, Vec::new());
+            let (to_left, to_right, over) = sides(plan, tables, pending, left, right, (true, true));
+            let rebuilt_left = node(plan, left, to_left, tables);
+            let rebuilt_right = node(plan, right, to_right, tables);
             let above = if rebuilt_left == left && rebuilt_right == right {
                 at
             } else {
                 plan.add_node(Node::CrossProduct { left: rebuilt_left, right: rebuilt_right })
             };
-            filter(plan, above, pending)
+            filter(plan, above, over)
         }
+
         Node::SetOp { left, right, kind, all, index } => {
-            let rebuilt_left = node(plan, left, Vec::new());
-            let rebuilt_right = node(plan, right, Vec::new());
+            let rebuilt_left = node(plan, left, Vec::new(), tables);
+            let rebuilt_right = node(plan, right, Vec::new(), tables);
             let above = if rebuilt_left == left && rebuilt_right == right {
                 at
             } else {
@@ -209,6 +260,59 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>) -> NodeRef {
             filter(plan, at, pending)
         }
     }
+}
+
+/// Which sides of a join hand their rows on as they are.
+///
+/// The side a predicate may be pushed into. A row of a kept side comes out of the join with its own
+/// values in it, once per match or once in total, so a predicate over that side's columns answers
+/// the same before the join as after it. A row of the other side may come out padded with nulls it
+/// did not have going in, and a predicate that saw the row before the padding is a predicate that
+/// saw a different row.
+///
+/// A positional join keeps neither, which is the one entry here that is not about nulls. It pairs
+/// the nth row of one side with the nth row of the other, so removing a row from either side
+/// renumbers everything after it and pairs up rows that were never meant to meet.
+fn kept(kind: JoinKind) -> (bool, bool) {
+    match kind {
+        JoinKind::Inner => (true, true),
+        JoinKind::Left | JoinKind::Semi | JoinKind::Anti | JoinKind::Single => (true, false),
+        JoinKind::Right => (false, true),
+        JoinKind::Full | JoinKind::Positional => (false, false),
+    }
+}
+
+/// Sorts `pending` into what goes into the left side, what goes into the right, and what is left.
+///
+/// A predicate goes into a side when that side is kept and produces every table the predicate reads.
+/// A predicate that reads no table at all is a subset of either side and goes left, which is the
+/// same answer wherever it runs.
+fn sides(
+    plan: &Plan,
+    tables: &mut Tables,
+    pending: Vec<ExprRef>,
+    left: NodeRef,
+    right: NodeRef,
+    kept: (bool, bool),
+) -> (Vec<ExprRef>, Vec<ExprRef>, Vec<ExprRef>) {
+    if pending.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let (below_left, below_right) = (produced(plan, left), produced(plan, right));
+    let mut to_left = Vec::new();
+    let mut to_right = Vec::new();
+    let mut over = Vec::new();
+    for part in pending {
+        let read = tables.of(plan, part);
+        if kept.0 && read.is_subset_of(&below_left) {
+            to_left.push(part);
+        } else if kept.1 && read.is_subset_of(&below_right) {
+            to_right.push(part);
+        } else {
+            over.push(part);
+        }
+    }
+    (to_left, to_right, over)
 }
 
 /// Puts `parts` back as one filter over `input`, or hands back `input` when there are none.
@@ -507,14 +611,149 @@ Filter ((#0.0::INTEGER > 1::INTEGER)::BOOLEAN AND (#0.1::VARCHAR = 'a'::VARCHAR)
     }
 
     #[test]
-    fn a_filter_above_a_join_stays_there_until_the_second_pull_request() {
-        let text = "\
-Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
+    fn a_predicate_over_one_side_of_an_inner_join_goes_into_that_side() {
+        let before = "\
+Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN
   Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
     Get memory.main.t AS a #0 [a::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER]
 ";
+        let after = "\
+Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+  Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
+    Get memory.main.t AS a #0 [a::INTEGER]
+  Filter (#1.0::INTEGER = 2::INTEGER)::BOOLEAN
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_predicate_over_both_sides_of_an_inner_join_becomes_a_condition_of_it() {
+        let before = "\
+Filter (#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN
+  Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn only_the_kept_side_of_an_outer_join_takes_a_predicate() {
+        // The left side of a LEFT join comes out as it went in. The right side comes out padded with
+        // nulls, and a predicate that ran before the padding saw a different row.
+        let before = "\
+Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN
+  Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        let after = "\
+Filter (#1.0::INTEGER = 2::INTEGER)::BOOLEAN
+  Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
+      Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_predicate_over_both_sides_of_an_outer_join_stays_above_it() {
+        // An outer join's condition decides which rows are padded, so moving a filter into it would
+        // pad the rows the filter refused instead of dropping them.
+        let text = "\
+Filter (#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN
+  Join LEFT on=[(#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
         assert_eq!(pushed(text), text);
+    }
+
+    #[test]
+    fn a_full_outer_join_takes_nothing_and_neither_does_a_positional_one() {
+        let full = "\
+Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
+  Join FULL on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(full), full);
+
+        // Not about nulls. A positional join pairs the nth row with the nth row, so taking a row out
+        // of either side pairs up rows that were never meant to meet.
+        let positional = "\
+Filter (#0.0::INTEGER = 1::INTEGER)::BOOLEAN
+  Join POSITIONAL on=[]
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(positional), positional);
+    }
+
+    #[test]
+    fn a_predicate_over_one_side_of_a_cross_product_goes_into_that_side() {
+        let before = "\
+Filter (#0.0::INTEGER > 5::INTEGER)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        let after = "\
+CrossProduct
+  Filter (#0.0::INTEGER > 5::INTEGER)::BOOLEAN
+    Get memory.main.t AS a #0 [a::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_cross_product_does_not_become_a_join_while_the_join_is_the_slower_operator() {
+        // The rewrite every textbook has, kept out until #211, with the measurement in this file's
+        // opening. The half of the predicate that reads one side still goes into that side.
+        let before = "\
+Filter ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Filter (#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN
+  CrossProduct
+    Filter (#0.1::INTEGER > 5::INTEGER)::BOOLEAN
+      Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_predicate_over_a_projection_above_a_join_reaches_the_side_it_reads() {
+        // Two rewrites in one walk. The projection puts the predicate back in terms of the scans,
+        // and only then is it a predicate one side of the join produces everything for.
+        let before = "\
+Filter (#2.0::INTEGER > 5::INTEGER)::BOOLEAN
+  Project #2 [#1.0::INTEGER AS x]
+    Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+      Get memory.main.t AS a #0 [a::INTEGER]
+      Get memory.main.t AS b #1 [a::INTEGER]
+";
+        let after = "\
+Project #2 [#1.0::INTEGER AS x]
+  Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Filter (#1.0::INTEGER > 5::INTEGER)::BOOLEAN
+      Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
     }
 
     #[test]
