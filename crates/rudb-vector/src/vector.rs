@@ -17,7 +17,7 @@
 
 use rudb_common::{Error, LogicalType, Result, Value};
 
-use crate::string::StringColumn;
+use crate::string::{StringColumn, StringView};
 use crate::validity::Validity;
 
 /// How many values are in a full vector.
@@ -90,7 +90,7 @@ pub enum Data {
     Float64(Vec<f64>),
     /// The months, days and microseconds triple.
     Interval(Vec<(i32, i32, i64)>),
-    /// Strings, as 16 byte views plus the blocks the long ones live in.
+    /// Strings, as 16 byte views plus the arena the long ones live in.
     Varlen(StringColumn),
 }
 
@@ -597,6 +597,17 @@ fn copy_of(data: &Data, at: &[usize]) -> Data {
         // and the reason compaction is a decision rather than a default on a string column.
         Data::Varlen(values) => {
             let mut out = StringColumn::with_capacity(at.len());
+            // The bytes are known before any of them are copied, because a view carries its length
+            // and the wanted positions are already in hand, so the arena is one allocation rather
+            // than a run of doublings that each copy what the last one copied.
+            let views = values.views();
+            out.reserve_bytes(
+                at.iter()
+                    .filter_map(|&index| views.get(index))
+                    .filter(|view| !view.is_inline())
+                    .map(StringView::len)
+                    .sum(),
+            );
             for &index in at {
                 out.push(values.get(index).unwrap_or(""));
             }
