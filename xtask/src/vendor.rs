@@ -506,7 +506,11 @@ fn git_output(args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{between, matcher_overrides, memoized_rules, read_manifest, today};
+    use std::collections::BTreeMap;
+
+    use super::{
+        BINARY, between, matcher_overrides, memoized_rules, read_manifest, today, vendor_file,
+    };
 
     fn write_temp(name: &str, text: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
