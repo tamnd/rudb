@@ -3,16 +3,22 @@
 #
 # An embedded database is something other people link into their own program, so the hosts it
 # builds on are part of what it is. The matrix here is the same three hosts CI runs on plus the
-# two extra targets people actually deploy on, and a host that fails to build blocks the release
-# rather than being dropped from it.
+# two extra targets people actually deploy on, and a host that fails to build fails the run rather
+# than being dropped from it.
+#
+# What no host gets to do is hold the release up by not starting. GitHub's hosted macOS queue has
+# twice now left both darwin jobs unassigned for as long as it felt like with every other job
+# green. The first time it stopped the crates.io upload, so that job was moved to depend on the
+# gate rather than on the matrix. The second time it stopped the GitHub release, which sat in draft
+# through a tag that was already live on crates.io. A release that appears when a queue clears is a
+# release nobody can plan around, so the matrix is two jobs: the hosts that start now, which the
+# release waits for, and the hosts that start when they start, which are attached afterwards.
+# Nothing is dropped, the order is just no longer GitHub's to choose.
 #
 # A version on crates.io cannot be taken back, only yanked, so nothing is uploaded until the tag
-# has passed the gate. It does not wait for the binary matrix. What goes to the registry is source
-# that `cargo publish` compiles and verifies for itself on a Linux runner, so a cross build for a
-# host nobody is installing from cargo on cannot make that upload any more correct. It can and did
-# make it never happen: the 0.0.2 tag had both macOS jobs sit unassigned in GitHub's hosted queue
-# for half an hour with every other job green, and the registry has no reason to be downstream of
-# that.
+# has passed the gate. What goes to the registry is source that `cargo publish` compiles and
+# verifies for itself on a Linux runner, so a cross build for a host nobody is installing from
+# cargo on cannot make that upload any more correct.
 
 name: release
 
@@ -108,6 +114,7 @@ jobs:
       - name: record what this release writes
         run: cargo run -q --release --bin rudb -- --print-config
 
+  # The hosts whose runners GitHub assigns immediately. The release waits for these.
   build:
     name: build for ${{ matrix.target }}
     needs: verify
@@ -120,58 +127,40 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          - target: aarch64-apple-darwin
-            os: macos-26
-          - target: x86_64-apple-darwin
-            os: macos-26
           - target: x86_64-pc-windows-msvc
             os: windows-2025
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: add the target
-        run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: ./.github/actions/build-archive
         with:
-          key: ${{ matrix.target }}
-      - name: build
-        run: cargo build --release --bin rudb --target ${{ matrix.target }}
-      - name: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          name="rudb-${{ github.event.inputs.tag || github.ref_name }}-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/rudb.exe" "dist/$name/"
-          else
-            cp "target/${{ matrix.target }}/release/rudb" "dist/$name/"
-          fi
-          cp README.md LICENSE-APACHE CHANGELOG.md "dist/$name/"
-          cd dist
-          # Both formats, because the people who want a .zip and the people who want a .tar.gz do
-          # not overlap and neither group should have to install a tool.
-          tar --format=ustar -czf "$name.tar.gz" "$name"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a -tzip "$name.zip" "$name" > /dev/null
-          else
-            zip -qr "$name.zip" "$name"
-          fi
-          for f in "$name.tar.gz" "$name.zip"; do
-            if command -v sha256sum > /dev/null; then
-              sha256sum "$f" > "$f.sha256"
-            else
-              shasum -a 256 "$f" > "$f.sha256"
-            fi
-          done
-      - uses: actions/upload-artifact@v7.0.1
+          target: ${{ matrix.target }}
+          tag: ${{ github.event.inputs.tag || github.ref_name }}
+
+  # The same steps on the hosts whose runners GitHub's hosted queue makes you wait for, in a job of
+  # their own so that waiting for them is not waiting for the release. Both macOS jobs of the 0.0.2
+  # tag sat unassigned for half an hour with every other job green, which is why the crates.io
+  # upload was already moved off this path, and on 0.1.2 they sat there long enough that the GitHub
+  # release never came out of draft at all. A release that exists only when a queue clears is a
+  # release nobody can plan around. The archives are not dropped, they are attached when they are
+  # ready, which is what `attach` below does.
+  build-queued:
+    name: build for ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-26
+          - target: x86_64-apple-darwin
+            os: macos-26
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/build-archive
         with:
-          name: dist-${{ matrix.target }}
-          path: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*.sha256
-          if-no-files-found: error
-          retention-days: 7
+          target: ${{ matrix.target }}
+          tag: ${{ github.event.inputs.tag || github.ref_name }}
 
   publish:
     name: publish
@@ -221,6 +210,40 @@ jobs:
           # in spec/18-package-layout.md rather than by a label that also keeps the release off the
           # repository front page and out of what `gh release view` answers with.
           fail_on_unmatched_files: true
+
+  # The archives from the queued hosts, put on the release once they exist.
+  #
+  # It needs `publish` as well as `build-queued` because the release has to be there before anything
+  # can be uploaded onto it, and `--clobber` because re-running a release run should end in the same
+  # place rather than in an error about a file that is already there.
+  attach:
+    name: attach the rest
+    needs: [publish, build-queued]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: dist-*-apple-darwin
+          merge-multiple: true
+          path: dist
+      - name: list what is being attached
+        run: ls -l dist
+      - uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - name: put them on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release upload "$tag" dist/* --clobber --repo "${{ github.repository }}"
 
   # Every crate in the workspace goes to crates.io, in dependency order, which cargo works out for
   # itself from the workspace graph. They are versioned and released together per
