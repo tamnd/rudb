@@ -183,6 +183,7 @@ fn unary(name: &str, arg: &Vector, returns: &LogicalType, rows: usize) -> Result
             sign_of(name, data, base, rows, returns, arg)
         }
         "length" => length_of(data, base, rows, returns),
+        "strlen" => bytes_of(data, base, rows, returns),
         "lower" | "upper" => fold_of(name, data, base, rows, returns),
         "make_date" => made_date(data, base, rows, returns),
         "epoch_ms" => made_timestamp(data, base, rows, returns),
@@ -337,6 +338,30 @@ fn length_of(
         // the same number `chars().count()` reaches and it never decodes anything.
         let characters = bytes.iter().filter(|byte| (**byte as i8) >= -0x40).count();
         out[index] = i64::try_from(characters).unwrap_or(i64::MAX);
+        Ok(true)
+    })?;
+    finish(returns, Data::Int64(out.into()), validity)
+}
+
+/// `strlen`, which counts bytes where `length` counts characters.
+///
+/// The two differ on anything outside ASCII. `strlen('héllo')` is 6 and `length('héllo')` is 5,
+/// which is why this is a function of its own upstream rather than another name for `length`.
+/// ClickBench queries 28 and 29 are `AVG(STRLEN(URL))` and `AVG(STRLEN(Referer))` over a hundred
+/// million rows, so it gets the vectorized path for the same reason `length` has one.
+fn bytes_of(
+    data: &Data,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let (Data::Varlen(column), LogicalType::BigInt) = (data, returns) else {
+        return Ok(None);
+    };
+    let mut out = vec![0i64; rows];
+    let validity = over_valid(rows, base, |index| {
+        let bytes = column.bytes(index).unwrap_or_default();
+        out[index] = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
         Ok(true)
     })?;
     finish(returns, Data::Int64(out.into()), validity)
@@ -1212,6 +1237,7 @@ pub fn call_values(name: &str, args: &[Value], returns: &LogicalType) -> Result<
         ("lower", [only]) => Ok(Value::Varchar(only.to_string().to_lowercase())),
         ("upper", [only]) => Ok(Value::Varchar(only.to_string().to_uppercase())),
         ("length", [only]) => Ok(Value::BigInt(count_characters(only))),
+        ("strlen", [only]) => Ok(Value::BigInt(count_bytes(only))),
         ("~~", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, false))),
         ("!~~", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, false))),
         ("~~*", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, true))),
@@ -1436,6 +1462,15 @@ fn count_characters(value: &Value) -> i64 {
     i64::try_from(text).unwrap_or(i64::MAX)
 }
 
+/// `strlen`, which counts bytes rather than characters, the way DuckDB does.
+fn count_bytes(value: &Value) -> i64 {
+    let bytes = match value.as_str() {
+        Some(text) => text.len(),
+        None => value.to_string().len(),
+    };
+    i64::try_from(bytes).unwrap_or(i64::MAX)
+}
+
 /// SQL `LIKE`, where `%` is any run and `_` is one character.
 ///
 /// The loop is the standard one with a single backtracking point, which is linear on the patterns
@@ -1576,6 +1611,12 @@ mod tests {
         assert_eq!(
             called("length", &[Value::Varchar("héllo".into())], &LogicalType::BigInt),
             Value::BigInt(5)
+        );
+        // The one string where the two disagree, and the reason `strlen` is not an alias. Upstream
+        // says 6 here and 5 above.
+        assert_eq!(
+            called("strlen", &[Value::Varchar("héllo".into())], &LogicalType::BigInt),
+            Value::BigInt(6)
         );
     }
 
@@ -1828,7 +1869,9 @@ mod tests {
         for nulls in [0, 7, 1] {
             let left = sample(&LogicalType::Varchar, 96, nulls, &mut rng);
             let right = sample(&LogicalType::Varchar, 96, nulls, &mut rng);
-            agrees("length", std::slice::from_ref(&left), &LogicalType::BigInt);
+            for name in ["length", "strlen"] {
+                agrees(name, std::slice::from_ref(&left), &LogicalType::BigInt);
+            }
             for name in ["lower", "upper"] {
                 agrees(name, std::slice::from_ref(&left), &LogicalType::Varchar);
             }

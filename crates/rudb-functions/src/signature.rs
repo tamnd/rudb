@@ -189,6 +189,12 @@ const TABLE: &[Entry] = &[
     text("lower", Arity::exactly(1), Fixed::Varchar),
     text("upper", Arity::exactly(1), Fixed::Varchar),
     text("length", Arity::exactly(1), Fixed::BigInt),
+    // `strlen` is bytes where `length` is characters, and it is a separate row rather than an alias
+    // for that reason. `strlen('héllo')` is 6 upstream and `length('héllo')` is 5. It is here
+    // because DuckDB's own ClickBench entry writes `AVG(STRLEN(URL))` in query 28, so a rudb
+    // that has only `length` cannot run that board at all without the SQL being changed, and the
+    // whole point of the comparison is that it is not changed.
+    text("strlen", Arity::exactly(1), Fixed::BigInt),
     // Pattern matching. The transformer emits the operator spellings, so those are the names, and
     // `LIKE` is one of them rather than a keyword the binder has to know about separately.
     text("~~", Arity::exactly(2), Fixed::Boolean),
@@ -422,8 +428,40 @@ fn promote_all(name: &str, arguments: &[LogicalType]) -> Result<LogicalType> {
 }
 
 fn find(name: &str) -> Option<&'static Entry> {
+    let name = canonical(name);
     TABLE.iter().find(|entry| entry.name.eq_ignore_ascii_case(name))
 }
+
+/// The name a function is in [`TABLE`] under, which is its own name unless it is an alias.
+///
+/// Aliases are resolved here rather than by a second row in the table, so that [`Resolved::name`]
+/// is always the canonical name and the plan, the executor and every kernel below it see one name
+/// per function. A kernel that had to know `len` is `length` would be a kernel with a second place
+/// for the two to drift apart.
+///
+/// The list is DuckDB's, read off `duckdb_functions()` where `alias_of` is set, and it is only ever
+/// as long as the table it points into. There is no point aliasing a name onto a function this
+/// engine does not have yet, because the error would move from a missing function to a missing
+/// function under a different name.
+fn canonical(name: &str) -> &str {
+    ALIASES
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
+        .map_or(name, |(_, real)| *real)
+}
+
+/// Every other name DuckDB accepts for a function already in [`TABLE`].
+///
+/// `strlen` is deliberately not here. Upstream counts bytes with it and characters with `length`,
+/// so it is a different function and it has a row of its own.
+const ALIASES: &[(&str, &str)] = &[
+    ("len", "length"),
+    ("char_length", "length"),
+    ("character_length", "length"),
+    ("lcase", "lower"),
+    ("ucase", "upper"),
+    ("mean", "avg"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -446,6 +484,42 @@ mod tests {
         let integer =
             resolve("//", &[LogicalType::Integer, LogicalType::Integer]).expect("divides");
         assert_eq!(integer.returns, LogicalType::Integer);
+    }
+
+    /// An alias has to come back under the real name, because the name on [`Resolved`] is what the
+    /// plan interns and what every kernel below it matches on. SQL is case insensitive here, so the
+    /// shouted spelling has to land in the same place.
+    #[test]
+    fn an_alias_resolves_to_the_function_it_is_an_alias_of() {
+        for (alias, real) in ALIASES {
+            assert_eq!(canonical(alias), *real);
+            assert_eq!(canonical(&alias.to_uppercase()), *real);
+        }
+        let resolved = resolve("LEN", &[LogicalType::Varchar]).expect("len resolves");
+        assert_eq!(resolved.name, "length");
+        assert_eq!(resolved.returns, LogicalType::BigInt);
+    }
+
+    /// Every alias has to point at a row that exists, or the error a caller gets moves from a
+    /// missing function to a missing function under another name, which is worse.
+    #[test]
+    fn every_alias_points_at_a_real_function() {
+        for (alias, real) in ALIASES {
+            assert!(
+                TABLE.iter().any(|entry| entry.name == *real),
+                "{alias} points at {real}, which is not in the table"
+            );
+        }
+    }
+
+    /// `strlen` counts bytes and `length` counts characters, so it is a function and not an alias.
+    /// This is the test that stops someone folding it into [`ALIASES`] to save a row.
+    #[test]
+    fn strlen_is_its_own_function_and_not_an_alias_of_length() {
+        assert!(!ALIASES.iter().any(|(alias, _)| *alias == "strlen"));
+        let resolved = resolve("strlen", &[LogicalType::Varchar]).expect("strlen resolves");
+        assert_eq!(resolved.name, "strlen");
+        assert_eq!(resolved.returns, LogicalType::BigInt);
     }
 
     #[test]
