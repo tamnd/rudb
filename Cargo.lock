@@ -63,7 +63,6 @@ name = "rudb-cli"
 version = "0.2.11"
 dependencies = [
  "rudb",
- "rudb-common",
 ]
 
 [[package]]

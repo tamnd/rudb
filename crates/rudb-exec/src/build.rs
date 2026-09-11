@@ -12,10 +12,11 @@
 //! whole of the lifetime story here.
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::Result;
+use rudb_common::{Cancel, Result};
 use rudb_functions::TableFunction;
 use rudb_plan::{Node, NodeRef, Plan};
 
+use crate::cancel::Guarded;
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Join};
 use crate::operator::Operator;
@@ -24,22 +25,40 @@ use crate::sort::Sort;
 use crate::source::{Dummy, FileScan, Scan, Series, Values};
 use crate::stream::{Filter, Limit, Project};
 
-/// Builds the operator tree for a plan's root.
+/// Builds the operator tree for a plan's root, for a query nothing will stop.
 ///
 /// # Errors
 ///
 /// If the plan names a table or a column the catalog does not have, if an expression is malformed
 /// in a way [`Plan::validate`] would have caught, or anything an operator's construction reports.
 pub fn build<'a>(plan: &'a Plan, catalog: &'a Catalog) -> Result<Box<dyn Operator + 'a>> {
-    node(plan, catalog, plan.root())
+    build_with(plan, catalog, &Cancel::new())
+}
+
+/// Builds the operator tree for a plan's root, stoppable through this token.
+///
+/// Every node in the tree is wrapped in a check, so the query stops at the first chunk boundary
+/// after the token says to. See the `cancel` module for why the check is uniform rather than
+/// placed in the operators that can loop.
+///
+/// # Errors
+///
+/// The same as [`build`].
+pub fn build_with<'a>(
+    plan: &'a Plan,
+    catalog: &'a Catalog,
+    cancel: &Cancel,
+) -> Result<Box<dyn Operator + 'a>> {
+    node(plan, catalog, cancel, plan.root())
 }
 
 fn node<'a>(
     plan: &'a Plan,
     catalog: &'a Catalog,
+    cancel: &Cancel,
     reference: NodeRef,
 ) -> Result<Box<dyn Operator + 'a>> {
-    Ok(match *plan.node(reference) {
+    let inner: Box<dyn Operator + 'a> = match *plan.node(reference) {
         Node::Get { catalog: database, schema, table, index, columns, .. } => {
             let name =
                 QualifiedName::new(plan.string(database), plan.string(schema), plan.string(table));
@@ -56,37 +75,45 @@ fn node<'a>(
             }
         }
         Node::Filter { input, predicate } => {
-            Box::new(Filter::new(plan, node(plan, catalog, input)?, predicate)?)
+            Box::new(Filter::new(plan, node(plan, catalog, cancel, input)?, predicate)?)
         }
         Node::Project { input, index, exprs, names } => {
-            Box::new(Project::new(plan, node(plan, catalog, input)?, index, exprs, names)?)
+            Box::new(Project::new(plan, node(plan, catalog, cancel, input)?, index, exprs, names)?)
         }
-        Node::Aggregate { input, index, groups, aggregates } => {
-            Box::new(Aggregate::new(plan, node(plan, catalog, input)?, index, groups, aggregates)?)
+        Node::Aggregate { input, index, groups, aggregates } => Box::new(Aggregate::new(
+            plan,
+            node(plan, catalog, cancel, input)?,
+            index,
+            groups,
+            aggregates,
+        )?),
+        Node::Sort { input, keys } => {
+            Box::new(Sort::new(plan, node(plan, catalog, cancel, input)?, keys))
         }
-        Node::Sort { input, keys } => Box::new(Sort::new(plan, node(plan, catalog, input)?, keys)),
         Node::Limit { input, count, offset } => {
-            Box::new(Limit::new(node(plan, catalog, input)?, count, offset))
+            Box::new(Limit::new(node(plan, catalog, cancel, input)?, count, offset))
         }
         Node::Distinct { input, on } => {
-            Box::new(Distinct::new(plan, node(plan, catalog, input)?, on))
+            Box::new(Distinct::new(plan, node(plan, catalog, cancel, input)?, on))
         }
         Node::Join { left, right, kind, conditions } => Box::new(Join::new(
             plan,
-            node(plan, catalog, left)?,
-            node(plan, catalog, right)?,
+            node(plan, catalog, cancel, left)?,
+            node(plan, catalog, cancel, right)?,
             kind,
             conditions,
         )),
-        Node::CrossProduct { left, right } => {
-            Box::new(CrossProduct::new(node(plan, catalog, left)?, node(plan, catalog, right)?))
-        }
+        Node::CrossProduct { left, right } => Box::new(CrossProduct::new(
+            node(plan, catalog, cancel, left)?,
+            node(plan, catalog, cancel, right)?,
+        )),
         Node::SetOp { left, right, kind, all, index } => Box::new(SetOp::new(
-            node(plan, catalog, left)?,
-            node(plan, catalog, right)?,
+            node(plan, catalog, cancel, left)?,
+            node(plan, catalog, cancel, right)?,
             kind,
             all,
             index,
         )),
-    })
+    };
+    Ok(Box::new(Guarded::new(inner, cancel.clone())))
 }

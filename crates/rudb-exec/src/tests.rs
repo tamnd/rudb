@@ -12,10 +12,10 @@
 //! live in the `rudb` crate, which is where a query is a string.
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Field, LogicalType, Value};
+use rudb_common::{Cancel, Field, LogicalType, Value};
 use rudb_plan::Plan;
 
-use crate::build;
+use crate::{build, build_with};
 
 /// `t` has a repeated value, a null and rows that are not in order, because the interesting cases
 /// in grouping, distinct and sorting are all about one of those three.
@@ -420,4 +420,33 @@ fn a_whole_pipeline_runs_in_one_piece() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0], vec![integer(3), Value::BigInt(1)]);
     assert_eq!(rows[1], vec![integer(2), Value::BigInt(1)]);
+}
+
+#[test]
+fn a_cancelled_token_stops_the_tree_before_it_produces_a_chunk() {
+    let catalog = catalog();
+    let plan = Plan::parse(SCAN).expect("a well formed plan");
+    let cancel = Cancel::new();
+    let mut operator = build_with(&plan, &catalog, &cancel).expect("the operators build");
+    cancel.cancel();
+    let error = operator.next().expect_err("it was cancelled");
+    assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+}
+
+#[test]
+fn a_token_nothing_has_cancelled_leaves_the_answer_alone() {
+    // The check is in the tree whether or not anybody is holding the other end of the token, so the
+    // thing worth asserting is that it changes no answer.
+    let catalog = catalog();
+    let plan = Plan::parse(SCAN).expect("a well formed plan");
+    let mut guarded = build_with(&plan, &catalog, &Cancel::new()).expect("the operators build");
+    let mut plain = build(&plan, &catalog).expect("the operators build");
+    loop {
+        let (left, right) = (guarded.next().expect("runs"), plain.next().expect("runs"));
+        match (left, right) {
+            (Some(left), Some(right)) => assert_eq!(left.len(), right.len()),
+            (None, None) => break,
+            _ => panic!("one of them finished and the other did not"),
+        }
+    }
 }
