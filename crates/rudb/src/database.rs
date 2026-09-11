@@ -211,14 +211,17 @@ impl Database {
     }
 
     /// The `CREATE TABLE` half of [`Database::execute`].
-    fn run_create_table(&mut self, create: rudb_bind::CreateTable) -> Result<()> {
+    fn run_create_table(&mut self, mut create: rudb_bind::CreateTable) -> Result<()> {
         if create.if_not_exists && self.catalog.table(&create.name).is_ok() {
             return Ok(());
         }
         // The query runs before the old table is dropped, so `CREATE OR REPLACE TABLE t AS SELECT
         // * FROM t` reads the table it is about to replace rather than the empty new one.
-        let rows = match &create.source {
-            Some(plan) => Some(self.run(plan)?),
+        let rows = match &mut create.source {
+            Some(plan) => {
+                rudb_opt::optimize(plan)?;
+                Some(self.run(plan)?)
+            }
             None => None,
         };
         if create.or_replace && self.catalog.table(&create.name).is_ok() {

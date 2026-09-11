@@ -224,6 +224,54 @@ fn counting_the_rows_of_a_file_plans_a_scan_of_no_columns_at_all() {
 }
 
 #[test]
+fn a_file_can_be_loaded_into_a_table_once_and_queried_many_times() {
+    // Which is the point of `CREATE TABLE AS` in this milestone. A suite that runs forty three
+    // queries over one file should decode it once, and the rows a table hands back are the rows
+    // the file had.
+    let mut database = Database::new();
+    let sql = format!("CREATE TABLE loaded AS SELECT a, s, day FROM {}", fixture());
+    database.execute(&sql).expect("loads");
+    let result = database.query("SELECT * FROM loaded").expect("runs");
+    assert_eq!(result.len(), 4096);
+    assert_eq!(result.names(), ["a", "s", "day"]);
+    let types: Vec<String> = result.types().iter().map(ToString::to_string).collect();
+    assert_eq!(types, ["INTEGER", "VARCHAR", "DATE"]);
+    assert_eq!(database.value("SELECT sum(a) FROM loaded").expect("runs"), Value::HugeInt(195_783));
+    assert_eq!(database.value("SELECT count(s) FROM loaded").expect("runs"), Value::BigInt(3510));
+    assert_eq!(database.value("SELECT max(day) FROM loaded").expect("runs"), Value::Date(999));
+}
+
+#[test]
+fn loading_a_file_into_a_table_reads_the_columns_it_is_loading_and_no_others() {
+    // The pruning runs over the query under a `CREATE TABLE AS` as well, and this is the shape
+    // where it matters most: loading three columns of `hits` should not decode the other hundred
+    // and two on the way past.
+    let database = Database::new();
+    let sql = format!("SELECT a, s FROM {}", fixture());
+    let plan = database.plan(&sql).expect("binds");
+    assert!(plan.contains("[a::INTEGER, s::VARCHAR]"), "{plan}");
+    let mut database = Database::new();
+    let loading = format!("CREATE TABLE loaded AS {sql}");
+    database.execute(&loading).expect("loads");
+    assert_eq!(database.value("SELECT count(*) FROM loaded").expect("runs"), Value::BigInt(4096));
+    assert_eq!(database.query("SELECT * FROM loaded").expect("runs").width(), 2);
+}
+
+#[test]
+fn a_table_loaded_from_a_file_can_be_appended_to_from_the_same_file() {
+    let mut database = Database::new();
+    database
+        .execute(&format!("CREATE TABLE loaded AS SELECT a FROM {}", fixture()))
+        .expect("loads");
+    database.execute(&format!("INSERT INTO loaded SELECT a FROM {}", fixture())).expect("appends");
+    assert_eq!(database.value("SELECT count(*) FROM loaded").expect("runs"), Value::BigInt(8192));
+    assert_eq!(
+        database.value("SELECT sum(a) FROM loaded").expect("runs"),
+        Value::HugeInt(2 * 195_783)
+    );
+}
+
+#[test]
 fn a_column_the_file_does_not_have_is_the_error_a_missing_column_always_is() {
     let database = Database::new();
     let sql = format!("SELECT nosuch FROM read_parquet({})", fixture());

@@ -534,6 +534,72 @@ fn a_create_table_as_can_rename_the_query_s_columns() {
 }
 
 #[test]
+fn a_short_column_list_renames_the_front_and_leaves_the_rest_to_the_query() {
+    // Not an error. duckdb v1.4.1 makes a table of `a` and `2` here, where the second name is what
+    // the query calls that column, which for a bare literal is the literal.
+    let db = scripted(&["CREATE TABLE t (a) AS SELECT 1, 2"]);
+    assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["a", "2"]);
+}
+
+#[test]
+fn a_column_list_longer_than_the_query_is_the_error_duckdb_writes_for_it() {
+    let mut db = Database::new();
+    assert_eq!(
+        refusal(&mut db, "CREATE TABLE t (a, b, c) AS SELECT 1, 2"),
+        "Target table has more colum names than query result."
+    );
+}
+
+#[test]
+fn a_query_that_names_two_columns_the_same_gets_them_renamed_apart() {
+    // A query may produce two columns of one name and `SELECT 1 AS a, 2 AS a` prints both, so
+    // turning one into a table has to decide, and DuckDB renames rather than refusing.
+    let db = scripted(&["CREATE TABLE t AS SELECT 1 AS a, 2 AS a, 3 AS a"]);
+    assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["a", "a_1", "a_2"]);
+}
+
+#[test]
+fn a_renamed_column_steps_past_a_name_the_query_already_used() {
+    let db = scripted(&["CREATE TABLE t AS SELECT 1 AS a, 2 AS a, 3 AS a_1"]);
+    assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["a", "a_1", "a_1_1"]);
+    let db = scripted(&["CREATE TABLE t AS SELECT 1 AS a_1, 2 AS a, 3 AS a"]);
+    assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["a_1", "a", "a_2"]);
+}
+
+#[test]
+fn the_renaming_is_case_insensitive_and_keeps_the_case_it_was_written_in() {
+    let db = scripted(&["CREATE TABLE t AS SELECT 1 AS a, 2 AS A"]);
+    assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["a", "A_1"]);
+}
+
+#[test]
+fn a_column_list_turns_the_renaming_off_and_a_repeat_becomes_an_error() {
+    // Which is the rule duckdb v1.4.1 follows: with a list, even a short one, the names are the
+    // ones written or the ones the query gave, and two the same is a refusal.
+    let db = scripted(&["CREATE TABLE t (z) AS SELECT 1 AS a, 2 AS a"]);
+    assert_eq!(db.query("SELECT * FROM t").unwrap().names(), &["z", "a"]);
+    let mut db = Database::new();
+    assert_eq!(
+        refusal(&mut db, "CREATE TABLE t (z) AS SELECT 1 AS a, 2 AS a, 3 AS a"),
+        "Column with name a already exists!"
+    );
+    let mut db = Database::new();
+    assert_eq!(
+        refusal(&mut db, "CREATE TABLE t (a, a) AS SELECT 1, 2"),
+        "Column with name a already exists!"
+    );
+}
+
+#[test]
+fn two_columns_of_one_name_in_a_plain_create_is_the_same_error() {
+    let mut db = Database::new();
+    assert_eq!(
+        refusal(&mut db, "CREATE TABLE t (Abc INTEGER, aBC VARCHAR)"),
+        "Column with name aBC already exists!"
+    );
+}
+
+#[test]
 fn if_not_exists_leaves_the_table_and_its_rows_alone() {
     let mut db = scripted(&[
         "CREATE TABLE t (a INTEGER)",
