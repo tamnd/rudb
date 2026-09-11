@@ -111,6 +111,19 @@ fn every_mode_prints_what_duckdb_prints() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A database and two statements on the command line, which is three positional arguments.
+///
+/// DuckDB has no limit on how many there are and no error for the count. rudb refused the third one
+/// until #246, which is the kind of thing nobody finds out about until a script that has worked for
+/// years is handed to a different binary.
+#[test]
+fn every_positional_after_the_database_is_another_statement() {
+    let (out, err, failed) = run(&[":memory:", "SELECT 1 AS a", "SELECT 2 AS b"]);
+    assert!(!failed, "three positionals failed: {err}");
+    let want = golden("positionals.txt");
+    assert!(same_ignoring_trailing_space(&out, &want), "want:\n{want}\ngot:\n{out}");
+}
+
 /// The counts under a `duckbox` table, and the row of dots that stands in for what it left out.
 ///
 /// One query per line of `counts.sql` against the file of the same number, and between them they

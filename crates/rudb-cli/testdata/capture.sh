@@ -25,6 +25,10 @@ duckdb -batch -init /dev/null -cmd ".mode csv" -c ".read $here/quoting.sql" >"$h
 # separator and the two files differ by exactly that.
 duckdb -batch -init /dev/null -csv -c ".read $here/quoting.sql" >"$here/quoting-flag.txt"
 duckdb -batch -init /dev/null -c ".show" >"$here/show.txt"
+# Three positional arguments, which is a database and two statements. There is no limit on how many
+# and no error for the count, which is worth a capture rather than a sentence because rudb used to
+# refuse the third one.
+duckdb -batch -init /dev/null :memory: "SELECT 1 AS a" "SELECT 2 AS b" >"$here/positionals.txt"
 # What each mode flag leaves the settings at, which is not what the dot command of the same name
 # leaves them at and is not the same answer for every flag. The separators are set to something odd
 # first so that a flag which leaves one alone can be told apart from one that sets it to the value
