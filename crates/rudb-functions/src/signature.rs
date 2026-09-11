@@ -53,6 +53,15 @@ enum Shape {
     Promoted,
     /// Two arguments, and a decimal product is as wide as both operands together. `*`.
     Multiplied,
+    /// Every argument promotes to one type, and a decimal promotion becomes a double instead. `//`.
+    ///
+    /// `//` is integer division only when there are integers on both sides of it. Upstream answers
+    /// `7.5 // 2.5` with the DOUBLE 3.0 and `7.9 // 1.0` with 7.9, so it does not truncate what it
+    /// divides once a side is not an integer, and it is `/` under another spelling there. The one
+    /// thing it does not do is go to a double the way `/` does whatever it was given, since
+    /// `7 // 2` is 3 and an INTEGER on both engines, so it cannot share `/`'s shape. A FLOAT stays
+    /// a FLOAT, which was measured, so this is a rule about decimals rather than about width.
+    Divided,
     /// Every argument promotes and a decimal result gains a digit for the carry. `+` and `-`.
     ///
     /// Adding two `DECIMAL(18,0)` produces nineteen digits, so a rule that gives the sum eighteen
@@ -201,7 +210,7 @@ const TABLE: &[Entry] = &[
     // `/` is the exception and it is DuckDB's exception too: `7 / 2` is 3.5 and not 3, so the
     // result is a double whatever went in, and `//` is the operator that keeps the integer.
     number("/", Arity::exactly(2), Shape::PromotedTo(Fixed::Double)),
-    number("//", Arity::exactly(2), Shape::Promoted),
+    number("//", Arity::exactly(2), Shape::Divided),
     number("abs", Arity::exactly(1), Shape::Promoted),
     // Strings.
     // `||` is the one that takes anything and turns it into a string, which is why it is a
@@ -390,6 +399,17 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
                 }
                 _ => (vec![common.clone(); arguments.len()], common),
             }
+        }
+        Shape::Divided => {
+            let common = promote_all(name, arguments)?;
+            // The cast goes with the answer rather than being left where promotion put it, because
+            // a decimal run divided as a decimal and then widened to a double is not the same
+            // number as the same pair of values divided as doubles.
+            let returns = match common {
+                LogicalType::Decimal { .. } => LogicalType::Double,
+                other => other,
+            };
+            (vec![returns.clone(); arguments.len()], returns)
         }
         Shape::PromotedWithCarry => {
             let common = promote_all(name, arguments)?;
@@ -777,6 +797,36 @@ mod tests {
         let integer =
             resolve("//", &[LogicalType::Integer, LogicalType::Integer]).expect("divides");
         assert_eq!(integer.returns, LogicalType::Integer);
+    }
+
+    /// `//` is integer division only when there are integers on both sides of it, which was
+    /// measured: `7.5 // 2.5` is the DOUBLE 3.0 upstream and `7.5 // 2` is 3.75, so it neither
+    /// stays a decimal nor truncates what it divided.
+    #[test]
+    fn integer_division_of_anything_but_integers_is_ordinary_division() {
+        let decimal = LogicalType::Decimal { width: 4, scale: 2 };
+        let divides = |left: LogicalType, right: LogicalType| {
+            let resolved = resolve("//", &[left, right]).expect("divides");
+            (resolved.arguments, resolved.returns)
+        };
+        let double = || (vec![LogicalType::Double; 2], LogicalType::Double);
+        assert_eq!(divides(decimal.clone(), decimal.clone()), double());
+        assert_eq!(divides(decimal.clone(), LogicalType::Integer), double());
+        assert_eq!(divides(LogicalType::Integer, decimal), double());
+        assert_eq!(divides(LogicalType::Double, LogicalType::Double), double());
+        // A float stays a float, so this is a rule about decimals rather than about width.
+        assert_eq!(
+            divides(LogicalType::Float, LogicalType::Float),
+            (vec![LogicalType::Float; 2], LogicalType::Float)
+        );
+        assert_eq!(
+            divides(LogicalType::Integer, LogicalType::BigInt),
+            (vec![LogicalType::BigInt; 2], LogicalType::BigInt)
+        );
+        assert_eq!(
+            divides(LogicalType::HugeInt, LogicalType::HugeInt),
+            (vec![LogicalType::HugeInt; 2], LogicalType::HugeInt)
+        );
     }
 
     /// An alias has to come back under the real name, because the name on [`Resolved`] is what the
