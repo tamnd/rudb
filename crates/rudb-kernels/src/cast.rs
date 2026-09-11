@@ -926,7 +926,6 @@ mod tests {
 
     #[test]
     fn a_null_in_a_vector_stays_null_across_a_cast() {
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let input = Vector::from_values(
             LogicalType::Integer,
             &[Value::Integer(1), Value::Null, Value::Integer(3)],
@@ -1019,7 +1018,6 @@ mod tests {
         // Most of the pairs below are pairs the sweep refuses, every refusal increments a process
         // wide counter, and the tests in `fallback` assert exact counts. This holds the same lock
         // they do so that a test that is about answers cannot fail a test that is about counting.
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let mut rng = Rng(0x5eed_cabb_a9e0_0001);
         let types: [LogicalType; 15] = [
             LogicalType::TinyInt,
@@ -1076,7 +1074,6 @@ mod tests {
     /// checks the counter rather than the answer.
     #[test]
     fn a_numeric_cast_does_not_reach_the_row_at_a_time_path_and_a_string_one_does() {
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         fallback::reset();
         let input = Vector::from_values(
             LogicalType::Integer,
@@ -1101,7 +1098,6 @@ mod tests {
     /// to keep working through the refusal rather than being swallowed by it.
     #[test]
     fn one_value_that_does_not_fit_sends_the_whole_vector_back_to_the_loop() {
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let input = Vector::from_values(
             LogicalType::Integer,
             &[Value::Integer(1), Value::Integer(40_000), Value::Integer(3)],

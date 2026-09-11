@@ -478,9 +478,7 @@ mod tests {
 
     #[test]
     fn a_form_pair_with_no_loop_is_still_right_and_says_so() {
-        // The counters are process wide and another test in this crate resets them, so the ones
-        // that read a count take turns.
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
+        // The counters are per thread in a test build, so this reads its own and nothing else's.
         let before = fallback::count(Kernel::Logic, Form::Sequence, Form::Flat);
         let rows = 4;
         let ids = Vector::sequence(0, 1, rows);
