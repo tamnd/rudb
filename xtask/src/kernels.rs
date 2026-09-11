@@ -6,7 +6,8 @@
 //! again on a machine of record, which is what makes a regression something the next change trips
 //! over rather than something somebody notices two milestones later.
 //!
-//! Six tables, and each of them answers a question the kernels were written to have an answer to.
+//! Seven tables, and each of them answers a question the kernels were written to have an answer
+//! to.
 //!
 //! Comparison and arithmetic, every physical layout, four form pairs, three null rates. The target
 //! in 2b is fixed width flat against flat comparison under one nanosecond a row, and the reason
@@ -37,6 +38,11 @@
 //! costs are invisible in every table above this one, which times a kernel that has already been
 //! handed its operands, and they are the whole of the difference between the two columns here.
 //!
+//! Filters, a predicate evaluated whole against the same predicate threaded. Both sides are the
+//! prepared form, so the only thing between the two columns is whether a conjunct reads every row
+//! or only the rows the conjuncts before it left. A predicate of four conjuncts that each keep a
+//! fifth of the rows is the shape the difference is largest on, and it is also TPC-H Q6.
+//!
 //! # What this is not
 //!
 //! It is not `tamnd/rudb-bench`, and rule ten from `spec/15-rudb-bench.md` is printed under every
@@ -48,7 +54,7 @@ use std::path::Path;
 
 use rudb_common::{Field, LogicalType, Value};
 use rudb_exec::{Prepared, Schema, evaluate_all};
-use rudb_kernels::{Comparison, call, compare, fallback};
+use rudb_kernels::{Comparison, call, compare, fallback, selection};
 use rudb_plan::{Node, Plan};
 use rudb_vector::{Chunk, Data, Selection, StringColumn, VECTOR_SIZE, Validity, Vector};
 
@@ -140,8 +146,8 @@ struct Case {
 
 /// One measured cell, in the flat form the tables are printed from and the JSON is written from.
 ///
-/// Flat rather than a table shaped structure per table, because there are six tables and a reader
-/// that wants to diff two runs wants one list of records with keys on it, not six shapes.
+/// Flat rather than a table shaped structure per table, because there are seven tables and a
+/// reader that wants to diff two runs wants one list of records with keys on it, not seven shapes.
 struct Cell {
     /// Which table, so a consumer can group without knowing what order they were printed in.
     table: &'static str,
@@ -181,6 +187,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     compaction_surface(&mut cells);
     size_sweep(&mut cells);
     expressions(&mut cells);
+    filters(&mut cells);
 
     if json {
         print!("{}", as_json(&cells));
@@ -981,6 +988,138 @@ fn expressions(cells: &mut Vec<Cell>) {
     }
 }
 
+/// The columns a filter shape is written against.
+///
+/// Four bigints whose values are independent of each other, which is the whole difference between
+/// this and [`expression_input`]: there every column is the same run shifted by a constant, so a
+/// second conjunct on a second column keeps almost exactly the rows the first one kept and a chain
+/// of four of them is one filter wearing four hats. Here the scramble is salted per column, so four
+/// conjuncts that each keep a fifth of the rows keep about a six hundredth of them together, which
+/// is what a real predicate does and is the only shape where threading has anything to show.
+fn filter_input(rows: usize) -> (Schema, Chunk) {
+    let mut columns = Vec::new();
+    let mut fields = Vec::new();
+    for column in 0..4 {
+        let values: Vec<i64> =
+            (0..rows).map(|row| pattern(row.wrapping_add(column * 977), 0)).collect();
+        columns.push(
+            Vector::flat(LogicalType::BigInt, Data::Int64(values.into()))
+                .expect("a run of bigints is a bigint vector"),
+        );
+        fields.push(Field::new(format!("c{column}"), LogicalType::BigInt));
+    }
+    let schema = Schema::numbered(fields, 0);
+    (schema, Chunk::new(columns).expect("four columns of the same length"))
+}
+
+/// The filter shapes, in the order the table prints them.
+///
+/// The threshold is against a run of values in zero to sixty three, so a cut at sixteen keeps about
+/// three quarters of the rows and one at fifty one keeps about a fifth. One conjunct is the row with
+/// nothing to thread and is here so the other rows have a floor to be read against. Two and four are
+/// where the work a threaded predicate does not do starts to be most of the work. The last shape is
+/// the chunk a conjunct rejects outright, which is the case where threading stops running the rest
+/// of the predicate at all rather than merely running it over fewer rows.
+fn filter_shapes() -> Vec<Shape> {
+    let mut shapes = Vec::new();
+    for &(detail, cut) in &[("3 in 4 each", 16_i64), ("1 in 5 each", 51)] {
+        for conjuncts in [1_usize, 2, 4] {
+            let list: Vec<String> = (0..conjuncts)
+                .map(|column| format!("(#0.{column}::BIGINT > {cut}::BIGINT)::BOOLEAN"))
+                .collect();
+            let exprs = if conjuncts == 1 {
+                format!("{} AS a", list[0])
+            } else {
+                format!("({})::BOOLEAN AS a", list.join(" AND "))
+            };
+            shapes.push(Shape { case: format!("{conjuncts} conjunct filter"), detail, exprs });
+        }
+    }
+    let list: Vec<String> = (0..4)
+        .map(|column| {
+            let cut = if column == 0 { 64 } else { 16 };
+            format!("(#0.{column}::BIGINT > {cut}::BIGINT)::BOOLEAN")
+        })
+        .collect();
+    shapes.push(Shape {
+        case: "4 conjunct filter".to_string(),
+        detail: "first keeps none",
+        exprs: format!("({})::BOOLEAN AS a", list.join(" AND ")),
+    });
+    shapes
+}
+
+/// The filter table: a predicate evaluated whole against the same predicate threaded.
+///
+/// Both sides are the prepared form, so what is between them is the threading and nothing else. The
+/// whole side is what [`Prepared::evaluate_one`] and [`selection`] were doing before there was a
+/// threaded path: every conjunct over every row, the flag vectors combined, and the selection built
+/// from the answer. The threaded side is [`Prepared::evaluate_filter`], which runs a conjunct at a
+/// time over the rows the ones before it left.
+///
+/// The two are checked against each other before either is timed, for the reason [`expressions`]
+/// gives, and here the check is the whole answer rather than a sample of it because a selection is a
+/// list of row numbers and comparing two of them is one equality.
+fn filters(cells: &mut Vec<Cell>) {
+    let columns: Vec<String> =
+        (0..4).map(|column| format!("c{column}::BIGINT")).collect::<Vec<_>>();
+    for shape in filter_shapes() {
+        let text = format!(
+            "Project #1 [{}]\n  Get memory.main.t AS t #0 [{}]",
+            shape.exprs,
+            columns.join(", ")
+        );
+        let plan = match Plan::parse(&text) {
+            Ok(plan) => plan,
+            Err(error) => panic!("the shape `{}` does not parse: {error}", shape.exprs),
+        };
+        let Node::Project { exprs, .. } = *plan.node(plan.root()) else {
+            panic!("the root of that text is a projection");
+        };
+        let list = plan.expr_list(exprs).to_vec();
+        for &rows in CHUNKS {
+            let (schema, chunk) = filter_input(rows);
+            let prepared =
+                Prepared::new(&plan, &list, &schema).expect("every shape here is a resolvable one");
+            let mut scratch = prepared.scratch();
+
+            fallback::reset();
+            let whole = {
+                let flags =
+                    prepared.evaluate_one(&chunk, &mut scratch).expect("the predicate runs");
+                selection(flags, rows)
+            };
+            let threaded =
+                prepared.evaluate_filter(&chunk, &mut scratch).expect("the threaded form runs");
+            assert_eq!(whole, threaded, "{} {} disagrees", shape.case, shape.detail);
+            let fell_back = !fallback::hot().is_empty();
+
+            let unthreaded = time(|| {
+                let flags =
+                    prepared.evaluate_one(black_box(&chunk), &mut scratch).expect("it ran once");
+                drop(black_box(selection(flags, rows)));
+            });
+            let fast = time(|| {
+                drop(black_box(prepared.evaluate_filter(black_box(&chunk), &mut scratch)));
+            });
+
+            for (variant, number) in [("whole", unthreaded), ("threaded", fast)] {
+                cells.push(Cell {
+                    table: "filters",
+                    case: shape.case.clone(),
+                    detail: shape.detail.to_string(),
+                    variant: variant.to_string(),
+                    nulls: 0,
+                    rows,
+                    nanos: number.per(rows),
+                    spread: number.relative(),
+                    fell_back,
+                });
+            }
+        }
+    }
+}
+
 /// Print the tables.
 fn report(cells: &[Cell]) {
     println!("rudb kernels, nanoseconds a row, {ROWS} rows a chunk unless a column says otherwise");
@@ -992,6 +1131,7 @@ fn report(cells: &[Cell]) {
     surface_table(cells);
     sweep_table(cells);
     expression_table(cells);
+    filter_table(cells);
 
     println!();
     let starred = cells.iter().filter(|cell| cell.fell_back).count();
@@ -1195,6 +1335,54 @@ fn expression_table(cells: &[Cell]) {
             rows,
             tree.nanos,
             prepared.nanos,
+            times,
+            worst * 100.0
+        );
+    }
+}
+
+/// The filter table, which is the expression table's printer over the other pair of variants.
+fn filter_table(cells: &[Cell]) {
+    println!();
+    println!("filters, nanoseconds a row, no nulls");
+    println!(
+        "whole is every conjunct over every row, threaded is a conjunct at a time over what is left"
+    );
+    println!();
+    println!(
+        "{:<24}  {:<16}  {:>5}  {:>9}  {:>9}  {:>7}  {:>5}",
+        "predicate", "selectivity", "rows", "whole", "threaded", "times", "IQR"
+    );
+
+    let mut seen: Vec<(String, String, usize)> = Vec::new();
+    for row in cells.iter().filter(|cell| cell.table == "filters") {
+        let key = (row.case.clone(), row.detail.clone(), row.rows);
+        if !seen.contains(&key) {
+            seen.push(key);
+        }
+    }
+    for (case, detail, rows) in seen {
+        let found = |variant: &str| {
+            cells.iter().find(|cell| {
+                cell.table == "filters"
+                    && cell.case == case
+                    && cell.detail == detail
+                    && cell.rows == rows
+                    && cell.variant == variant
+            })
+        };
+        let (Some(whole), Some(threaded)) = (found("whole"), found("threaded")) else {
+            continue;
+        };
+        let times = if threaded.nanos == 0.0 { 0.0 } else { whole.nanos / threaded.nanos };
+        let worst = whole.spread.max(threaded.spread);
+        println!(
+            "{:<24}  {:<16}  {:>5}  {:>9.2}  {:>9.2}  {:>6.2}x  {:>4.1}%",
+            case,
+            detail,
+            rows,
+            whole.nanos,
+            threaded.nanos,
             times,
             worst * 100.0
         );

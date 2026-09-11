@@ -6,7 +6,6 @@
 //! morsel is a run of a scan pushed through every streaming operator above it by one thread.
 
 use rudb_common::Result;
-use rudb_kernels::selection;
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Selection};
 
@@ -16,8 +15,13 @@ use crate::schema::Schema;
 
 /// Keeps the rows where a predicate is true.
 ///
-/// True, not "not false". A null predicate drops the row, which is what [`selection`] encodes and
-/// what makes `WHERE x <> 5` leave out the rows where `x` is null.
+/// True, not "not false". A null predicate drops the row, which is what makes `WHERE x <> 5` leave
+/// out the rows where `x` is null.
+///
+/// The predicate is evaluated with [`Prepared::evaluate_filter`] rather than as an expression, so a
+/// top level `AND` runs a conjunct at a time over the rows the conjuncts before it left and stops
+/// the moment nothing is left. The difference on a four conjunct predicate is the difference between
+/// reading every row four times and reading it once.
 ///
 /// The kept rows become a selection over the chunk rather than a copy of it, which is section 7.1's
 /// rule: a filter that keeps one row in a thousand costs the selection and not the payload. The
@@ -57,8 +61,7 @@ impl Operator for Filter<'_> {
 
     fn next(&mut self) -> Result<Option<Chunk>> {
         while let Some(chunk) = self.input.next()? {
-            let flags = self.predicate.evaluate_one(&chunk, &mut self.scratch)?;
-            let kept = selection(flags, chunk.len());
+            let kept = self.predicate.evaluate_filter(&chunk, &mut self.scratch)?;
             if kept.is_empty() {
                 continue;
             }

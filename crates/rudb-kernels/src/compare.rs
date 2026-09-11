@@ -47,6 +47,12 @@
 //! comparisons, is every answer null without reading the data at all, which is a real case because
 //! it is what a constant `NULL` in a predicate is.
 //!
+//! A conjunct that is not the first one does not need every row. [`refine`] is the same three
+//! decisions with the output position mapped through the selection the conjuncts before it left, so
+//! every loop in this file serves the threaded path without being written twice. The mapping is a
+//! generic parameter rather than a function in a field, because an index mapping the compiler cannot
+//! see through is an indirect call in a loop that is otherwise three instructions.
+//!
 //! Strings resolve from the four byte prefix in the view. Two views whose prefixes differ are in
 //! that order, which holds because the payload past the end of a short string is zero and zero is
 //! the least byte, so prefix order is byte order whenever the prefixes are not equal. On `hits` the
@@ -65,9 +71,10 @@
 use std::cmp::Ordering;
 
 use rudb_common::{Error, LogicalType, Result, Value};
-use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
+use rudb_vector::{Data, Form, Selection, StringColumn, Validity, Vector};
 
 use crate::fallback::{self, Kernel};
+use crate::logic::is_true;
 use crate::number::{approximate, integral};
 use crate::shape::{first, identity, nulls_of, single};
 
@@ -147,7 +154,7 @@ pub fn compare(op: Comparison, left: &Vector, right: &Vector) -> Result<Vector> 
         return boolean(vec![false; len], Validity::AllInvalid, len);
     }
 
-    if let Some(answers) = specialized(op, left, right, &left_valid, &right_valid) {
+    if let Some(answers) = specialized(op, left, right, &left_valid, &right_valid, len, identity) {
         let validity =
             if op.is_total() { Validity::AllValid } else { left_valid.and(&right_valid, len) };
         return boolean(blank_the_nulls(answers, &validity), validity, len);
@@ -161,6 +168,107 @@ pub fn compare(op: Comparison, left: &Vector, right: &Vector) -> Result<Vector> 
         values.push(compare_values(op, &left.value_at(index), &right.value_at(index))?);
     }
     Vector::from_values(LogicalType::Boolean, &values)
+}
+
+/// The rows of `kept` the comparison also keeps.
+///
+/// This is [`compare`] for a conjunct that is not the first one. A filter with four conjuncts
+/// evaluated the obvious way runs all four over every row, so on TPC-H Q6, where each conjunct
+/// passes about a fifth of the rows and the four together pass about two percent, the last conjunct
+/// does fifty times the work it needs to. Handing it the rows the earlier ones kept is the whole
+/// difference, and it is a difference that grows with the number of conjuncts rather than washing
+/// out.
+///
+/// The answer is the rows of `kept`, in the order `kept` has them, for which the comparison is true.
+/// Null is not true, so a row whose either side is null is dropped on the six ordinary comparisons,
+/// which is the same rule [`crate::select::selection`] applies to a flag vector and the reason both
+/// of them are a kernel rather than a line at the call site.
+///
+/// # Errors
+///
+/// If the two sides are not the same length, or if a position in `kept` is past the end of them.
+pub fn refine(
+    op: Comparison,
+    left: &Vector,
+    right: &Vector,
+    kept: &Selection,
+) -> Result<Selection> {
+    if left.len() != right.len() {
+        return Err(Error::internal(format!(
+            "a comparison of a {} row vector with a {} row one",
+            left.len(),
+            right.len()
+        )));
+    }
+    let len = left.len();
+    // One vectorized pass over a run of `u32` before any of the loops below index with them, which
+    // is what turns a caller's mistake into this message rather than into a panic from inside a
+    // macro generated loop eight frames down.
+    if kept.indices().iter().any(|&row| row as usize >= len) {
+        return Err(Error::internal(format!("a selection past the end of a {len} row vector")));
+    }
+    if kept.is_empty() {
+        return Ok(Selection::empty());
+    }
+    if left.form() == Form::Constant && right.form() == Form::Constant {
+        let single = compare_values(op, &left.value_at(0), &right.value_at(0))?;
+        return Ok(if is_true(&single) { kept.clone() } else { Selection::empty() });
+    }
+
+    let (left_valid, right_valid) = (nulls_of(left), nulls_of(right));
+    if !op.is_total() && (left_valid == Validity::AllInvalid || right_valid == Validity::AllInvalid)
+    {
+        return Ok(Selection::empty());
+    }
+
+    let rows = kept.indices();
+    let map = |slot: usize| rows[slot] as usize;
+    if let Some(answers) = specialized(op, left, right, &left_valid, &right_valid, kept.len(), map)
+    {
+        // A total comparison has the nulls in the answer already, and two all valid sides have no
+        // null to drop, so both of those get the loop with nothing in it but the flag.
+        if op.is_total() || (left_valid == Validity::AllValid && right_valid == Validity::AllValid)
+        {
+            return Ok(narrowed(&answers, rows, |_| true));
+        }
+        // A bit at a time rather than a word at a time, which is the one place this path gives up
+        // something `compare` has. The rows are scattered by construction, so the two mask reads for
+        // one row are in different words as often as not and a word oriented loop would reread them.
+        return Ok(narrowed(&answers, rows, |slot| {
+            let row = rows[slot] as usize;
+            left_valid.is_valid(row) && right_valid.is_valid(row)
+        }));
+    }
+
+    fallback::record(Kernel::Compare, left.form(), right.form());
+    let mut out = Vec::with_capacity(kept.len());
+    // row at a time: the path recorded on the line above, for a pair of forms no specialization
+    // covers, reading only the rows the conjuncts before this one kept.
+    for &row in rows {
+        let index = row as usize;
+        if is_true(&compare_values(op, &left.value_at(index), &right.value_at(index))?) {
+            out.push(row);
+        }
+    }
+    Ok(Selection::from_indices(out))
+}
+
+/// The positions of `rows` whose answer is true and whose row is live, without a branch per row.
+///
+/// The same shape as the loop in `crate::select` and for the same reason: which rows a filter keeps is
+/// what the data decides rather than what the code does, so the branch is unpredictable by
+/// construction and a mispredict is worth more than the rest of the loop put together. Every slot
+/// writes its row at the current length and only a slot that is kept moves the length on.
+fn narrowed<L: Fn(usize) -> bool>(answers: &[bool], rows: &[u32], live: L) -> Selection {
+    let mut out = vec![0_u32; answers.len()];
+    let mut count = 0;
+    for (slot, &answer) in answers.iter().enumerate() {
+        out[count] = rows[slot];
+        // A single `&` rather than `&&`, because the short circuit would put back the branch.
+        count += usize::from(answer & live(slot));
+    }
+    out.truncate(count);
+    Selection::from_indices(out)
 }
 
 /// A `BOOLEAN` vector from a run of answers and the validity that says which of them count.
@@ -191,50 +299,64 @@ fn blank_the_nulls(mut answers: Vec<bool>, validity: &Validity) -> Vec<bool> {
 }
 
 /// The answers for a form pair this file has a loop for, or `None` to say it has not.
-fn specialized(
+///
+/// `map` turns an output position into the row of `left` and `right` it is the answer for, and
+/// `len` is how many output positions there are. [`compare`] passes [`identity`] and the length of
+/// its operands, which is every row. [`refine`] passes the selection it was handed and the size of
+/// it, which is how a conjunct after the first reads only the rows the conjuncts before it kept.
+///
+/// A generic parameter rather than a `fn(usize) -> usize` in a field, for the reason
+/// `spec/engine/03-data-plane.md` records as the first performance lesson of this layer: an index
+/// mapping the compiler cannot see through is an indirect call per row, and one of those in a loop
+/// that is otherwise three instructions is the whole loop.
+fn specialized<M>(
     op: Comparison,
     left: &Vector,
     right: &Vector,
     left_valid: &Validity,
     right_valid: &Validity,
-) -> Option<Vec<bool>> {
+    len: usize,
+    map: M,
+) -> Option<Vec<bool>>
+where
+    M: Fn(usize) -> usize + Copy,
+{
     // Across representations is the fallback's job. `INTEGER` against `BIGINT` reaches the same
     // answer through `numeric_order`, and a specialized loop that assumed the two runs had the same
     // layout would compare a four byte column against an eight byte one position by position.
     if left.logical_type() != right.logical_type() {
         return None;
     }
-    let len = left.len();
 
     if let (Some(one), Some(other)) = (left.data(), right.data()) {
-        return dispatch(op, len, one, identity, other, identity, left_valid, right_valid);
+        return dispatch(op, len, one, map, other, map, left_valid, right_valid, map);
     }
     if let (Some(one), Some(value)) = (left.data(), right.constant_value()) {
         let held = single(left.logical_type(), value)?;
         let other = held.data()?;
-        return dispatch(op, len, one, identity, other, first, left_valid, right_valid);
+        return dispatch(op, len, one, map, other, first, left_valid, right_valid, map);
     }
     if let (Some(value), Some(other)) = (left.constant_value(), right.data()) {
         // The same loop with the comparison turned around, rather than a second loop.
         let held = single(right.logical_type(), value)?;
         let one = held.data()?;
-        return dispatch(op.swapped(), len, other, identity, one, first, right_valid, left_valid);
+        return dispatch(op.swapped(), len, other, map, one, first, right_valid, left_valid, map);
     }
     if let (Some((codes, values)), Some(value)) = (left.dictionary_parts(), right.constant_value())
     {
         let one = values.data()?;
         let held = single(left.logical_type(), value)?;
         let other = held.data()?;
-        let at = |index: usize| codes[index] as usize;
-        return dispatch(op, len, one, at, other, first, left_valid, right_valid);
+        let at = |index: usize| codes[map(index)] as usize;
+        return dispatch(op, len, one, at, other, first, left_valid, right_valid, map);
     }
     if let (Some(value), Some((codes, values))) = (left.constant_value(), right.dictionary_parts())
     {
         let other = values.data()?;
         let held = single(right.logical_type(), value)?;
         let one = held.data()?;
-        let at = |index: usize| codes[index] as usize;
-        return dispatch(op.swapped(), len, other, at, one, first, right_valid, left_valid);
+        let at = |index: usize| codes[map(index)] as usize;
+        return dispatch(op.swapped(), len, other, at, one, first, right_valid, left_valid, map);
     }
     // A dictionary against a flat column. This pair had no loop until the kernel table put a number
     // on what that cost, which on `server3` was 83 nanoseconds a row against 1.2 for the dictionary
@@ -243,13 +365,13 @@ fn specialized(
     // every conjunct after the first.
     if let (Some((codes, values)), Some(other)) = (left.dictionary_parts(), right.data()) {
         let one = values.data()?;
-        let at = |index: usize| codes[index] as usize;
-        return dispatch(op, len, one, at, other, identity, left_valid, right_valid);
+        let at = |index: usize| codes[map(index)] as usize;
+        return dispatch(op, len, one, at, other, map, left_valid, right_valid, map);
     }
     if let (Some(one), Some((codes, values))) = (left.data(), right.dictionary_parts()) {
         let other = values.data()?;
-        let at = |index: usize| codes[index] as usize;
-        return dispatch(op.swapped(), len, other, at, one, identity, right_valid, left_valid);
+        let at = |index: usize| codes[map(index)] as usize;
+        return dispatch(op.swapped(), len, other, at, one, map, right_valid, left_valid, map);
     }
     None
 }
@@ -264,7 +386,7 @@ fn specialized(
     reason = "two sides with an index each, the operator, the length and two validities, all of \
               which the loop needs and none of which is worth a struct that exists for one call"
 )]
-fn dispatch<L, R>(
+fn dispatch<L, R, V>(
     op: Comparison,
     len: usize,
     left: &Data,
@@ -273,10 +395,12 @@ fn dispatch<L, R>(
     at_right: R,
     left_valid: &Validity,
     right_valid: &Validity,
+    at_valid: V,
 ) -> Option<Vec<bool>>
 where
     L: Fn(usize) -> usize,
     R: Fn(usize) -> usize,
+    V: Fn(usize) -> usize,
 {
     // A `Data::Interval` is in the ordered group because it is a tuple of three integers whose
     // derived order is months, then days, then microseconds, which is exactly what `order` does for
@@ -291,6 +415,7 @@ where
                         |index| one[at_left(index)].cmp(&other[at_right(index)]),
                         left_valid,
                         right_valid,
+                        &at_valid,
                     )),
                 )+
                 // Floats have their own order, which is DuckDB's rather than IEEE's, and the
@@ -306,6 +431,7 @@ where
                     },
                     left_valid,
                     right_valid,
+                    &at_valid,
                 )),
                 (Data::Float64(one), Data::Float64(other)) => Some(sweep(
                     op,
@@ -313,6 +439,7 @@ where
                     |index| float_order(one[at_left(index)], other[at_right(index)]),
                     left_valid,
                     right_valid,
+                    &at_valid,
                 )),
                 (Data::Varlen(one), Data::Varlen(other)) => Some(sweep(
                     op,
@@ -320,6 +447,7 @@ where
                     |index| string_order(one, at_left(index), other, at_right(index)),
                     left_valid,
                     right_valid,
+                    &at_valid,
                 )),
                 _ => None,
             }
@@ -362,15 +490,17 @@ fn string_order(
 /// This is where the match on the operator gets hoisted. Each arm calls a generic `fill` with a
 /// different predicate, so the compiler produces eight loops whose bodies are an ordering against a
 /// constant, rather than one loop with a branch table in it.
-fn sweep<O>(
+fn sweep<O, V>(
     op: Comparison,
     len: usize,
     order_at: O,
     left_valid: &Validity,
     right_valid: &Validity,
+    at_valid: V,
 ) -> Vec<bool>
 where
     O: Fn(usize) -> Ordering,
+    V: Fn(usize) -> usize,
 {
     let mut answers = vec![false; len];
     match op {
@@ -381,12 +511,14 @@ where
         Comparison::Greater => fill(&mut answers, order_at, |o| o == Ordering::Greater),
         Comparison::GreaterOrEqual => fill(&mut answers, order_at, |o| o != Ordering::Less),
         Comparison::DistinctFrom => {
-            total(&mut answers, order_at, left_valid, right_valid);
+            total(&mut answers, order_at, left_valid, right_valid, at_valid);
             for answer in &mut answers {
                 *answer = !*answer;
             }
         }
-        Comparison::NotDistinctFrom => total(&mut answers, order_at, left_valid, right_valid),
+        Comparison::NotDistinctFrom => {
+            total(&mut answers, order_at, left_valid, right_valid, at_valid);
+        }
     }
     answers
 }
@@ -409,16 +541,23 @@ where
 /// difference between this and `=`. The all valid case is checked once so that the common shape,
 /// which is a total comparison inside a join on columns that happen not to be nullable, does not
 /// pay for two validity lookups per row.
-fn total<O>(answers: &mut [bool], order_at: O, left_valid: &Validity, right_valid: &Validity)
-where
+fn total<O, V>(
+    answers: &mut [bool],
+    order_at: O,
+    left_valid: &Validity,
+    right_valid: &Validity,
+    at_valid: V,
+) where
     O: Fn(usize) -> Ordering,
+    V: Fn(usize) -> usize,
 {
     if *left_valid == Validity::AllValid && *right_valid == Validity::AllValid {
         fill(answers, order_at, |o| o == Ordering::Equal);
         return;
     }
     for (index, answer) in answers.iter_mut().enumerate() {
-        *answer = match (left_valid.is_valid(index), right_valid.is_valid(index)) {
+        let row = at_valid(index);
+        *answer = match (left_valid.is_valid(row), right_valid.is_valid(row)) {
             (true, true) => order_at(index) == Ordering::Equal,
             (false, false) => true,
             _ => false,
@@ -788,6 +927,146 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The rows of a selection the row at a time path keeps, which is what [`refine`] has to say.
+    fn refined(op: Comparison, left: &Vector, right: &Vector, kept: &Selection) -> Selection {
+        let mut out = Vec::new();
+        for &row in kept.indices() {
+            let index = row as usize;
+            let answer = compare_values(op, &left.value_at(index), &right.value_at(index))
+                .expect("the oracle is only asked about types that compare");
+            if is_true(&answer) {
+                out.push(row);
+            }
+        }
+        Selection::from_indices(out)
+    }
+
+    fn threads(op: Comparison, left: &Vector, right: &Vector, kept: &Selection) {
+        let fast = refine(op, left, right, kept).expect("compares");
+        assert_eq!(
+            fast,
+            refined(op, left, right, kept),
+            "{op:?} on a {:?} against a {:?} over {} rows",
+            left.form(),
+            right.form(),
+            kept.len()
+        );
+    }
+
+    /// Threading a selection through a comparison is the same rows as comparing everything and
+    /// then keeping the ones that were already kept. Every operator, every form pair that has a
+    /// loop, at four densities of selection, against the row at a time path.
+    #[test]
+    fn a_threaded_comparison_keeps_what_the_row_at_a_time_path_keeps() {
+        let mut rng = Rng(0x5eed_4321_1234_9876);
+        let types = [LogicalType::Integer, LogicalType::Double, LogicalType::Varchar];
+        for ty in &types {
+            for nulls in [0u64, 1, 3] {
+                let len = 37;
+                let make = |rng: &mut Rng| {
+                    let values: Vec<Value> = (0..len)
+                        .map(|_| {
+                            if nulls > 0 && rng.below(nulls + 1) == 0 {
+                                Value::Null
+                            } else {
+                                sample(ty, rng)
+                            }
+                        })
+                        .collect();
+                    Vector::from_values(ty.clone(), &values).expect("a flat vector")
+                };
+                let left = make(&mut rng);
+                let right = make(&mut rng);
+                let constant = Vector::constant(ty.clone(), sample(ty, &mut rng), len);
+                let null_constant = Vector::constant(ty.clone(), Value::Null, len);
+                let codes: Vec<u32> =
+                    (0..len).map(|_| rng.below(left.len() as u64) as u32).collect();
+                let dictionary =
+                    Vector::dictionary(codes, left.clone()).expect("codes are in range");
+
+                // Everything, every third row, a handful including the last one, and nothing,
+                // which is the state a conjunct chain reaches as soon as one conjunct rejects a
+                // whole chunk and is the case where the loop below must not read anything at all.
+                let selections = [
+                    Selection::identity(len),
+                    Selection::from_indices((0..len as u32).filter(|row| row % 3 == 0).collect()),
+                    Selection::from_indices(vec![2, 5, 6, 17, 36]),
+                    Selection::empty(),
+                ];
+                for op in EVERY {
+                    for kept in &selections {
+                        threads(op, &left, &right, kept);
+                        threads(op, &left, &constant, kept);
+                        threads(op, &constant, &left, kept);
+                        threads(op, &left, &null_constant, kept);
+                        threads(op, &null_constant, &left, kept);
+                        threads(op, &constant, &null_constant, kept);
+                        threads(op, &dictionary, &constant, kept);
+                        threads(op, &constant, &dictionary, kept);
+                        threads(op, &dictionary, &right, kept);
+                        threads(op, &right, &dictionary, kept);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Two conjuncts threaded one after the other are the rows both of them keep, which is the
+    /// property the whole filter path rests on. The second comparison sees the rows the first one
+    /// left and never looks at the others.
+    #[test]
+    fn a_second_conjunct_reads_only_what_the_first_one_left() {
+        let numbers: Vec<Value> = (0..64).map(|row| Value::Integer(row % 10)).collect();
+        let column = Vector::from_values(LogicalType::Integer, &numbers).expect("a flat vector");
+        let three = Vector::constant(LogicalType::Integer, Value::Integer(3), 64);
+        let seven = Vector::constant(LogicalType::Integer, Value::Integer(7), 64);
+
+        let first = refine(Comparison::Greater, &column, &three, &Selection::identity(64))
+            .expect("compares");
+        let both = refine(Comparison::Less, &column, &seven, &first).expect("compares");
+
+        let expected: Vec<u32> = (0..64)
+            .filter(|row| {
+                let value = row % 10;
+                value > 3 && value < 7
+            })
+            .collect();
+        assert_eq!(both.indices(), expected.as_slice());
+        assert!(both.len() < first.len(), "the second conjunct narrowed the selection");
+    }
+
+    /// A null is not a true, so a threaded comparison drops the row rather than keeping it with an
+    /// unknown answer. This is the rule that makes `WHERE a < 5` leave out the rows where `a` is
+    /// null, and it is the one a branchless loop gets wrong if the validity is left out of it.
+    #[test]
+    fn a_null_row_is_not_kept_by_an_ordinary_comparison_and_is_by_a_total_one() {
+        let column = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(1), Value::Null, Value::Integer(3), Value::Null],
+        )
+        .expect("four rows");
+        let cut = Vector::constant(LogicalType::Integer, Value::Integer(2), 4);
+        let all = Selection::identity(4);
+        assert_eq!(
+            refine(Comparison::Less, &column, &cut, &all).expect("compares").indices(),
+            &[0]
+        );
+        // The total comparison has an answer at every row, so the two nulls are kept here.
+        let nulls = Vector::constant(LogicalType::Integer, Value::Null, 4);
+        assert_eq!(
+            refine(Comparison::NotDistinctFrom, &column, &nulls, &all).expect("compares").indices(),
+            &[1, 3]
+        );
+    }
+
+    #[test]
+    fn a_selection_past_the_end_is_caught() {
+        let column = Vector::constant(LogicalType::Integer, Value::Integer(1), 4);
+        let past = Selection::from_indices(vec![0, 4]);
+        let error = refine(Comparison::Equal, &column, &column, &past).expect_err("out of range");
+        assert!(error.message().contains("4 row vector"), "{error}");
     }
 
     /// One value of a type, for the generator above.
