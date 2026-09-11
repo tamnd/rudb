@@ -15,6 +15,10 @@
 //! the kind of decision that gets remeasured rather than argued about, and it is tracked as an
 //! issue so that M3 measures it instead of inheriting it.
 
+use rudb_common::{Error, Result};
+
+use crate::buffer::Buffer;
+
 /// The longest string that fits entirely inside a view.
 pub const INLINE_LIMIT: usize = 12;
 
@@ -160,10 +164,19 @@ impl StringView {
 /// The fix is that a chunk's payload should come from a pool the engine owns rather than from
 /// `malloc` per chunk, which is the buffer manager at layer three and is where this belongs.
 /// [`Self::reserve_bytes`] is the part that is available now, and it recovers a quarter of it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// # Equality is about the strings and not about the arena
+///
+/// [`Self::over`] means two columns holding exactly the same strings can hold completely different
+/// arenas, because one of them was built by copying the strings in and the other was built over a
+/// page that already had them somewhere in it with other strings in between. Derived equality would
+/// call those two columns different, and every test in the workspace that compares two vectors would
+/// then be asserting on how a column was built rather than on what is in it. So equality is the
+/// strings, position by position, which is the only definition that survives the seam.
+#[derive(Debug, Clone, Default, Eq)]
 pub struct StringColumn {
     views: Vec<StringView>,
-    arena: Vec<u8>,
+    arena: Buffer<u8>,
 }
 
 impl StringColumn {
@@ -176,7 +189,27 @@ impl StringColumn {
     /// An empty column with room for `capacity` strings.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { views: Vec::with_capacity(capacity), arena: Vec::new() }
+        Self { views: Vec::with_capacity(capacity), arena: Buffer::new() }
+    }
+
+    /// A column with no strings in it yet, over an arena that already holds bytes.
+    ///
+    /// The seam `spec/engine/03-data-plane.md` section 3.5 asks for. Without it the only way in is
+    /// [`Self::push`], which copies, so a scan reading a Parquet page of strings copies every byte of
+    /// the page into an arena and the query then reads the copy. With it the page is the arena: the
+    /// scan hands the bytes over once, records where each string starts with
+    /// [`Self::push_in_place`], and nothing is copied but the views.
+    ///
+    /// It is useful today, because a reader that already has the page in a `Vec<u8>` can move it in
+    /// rather than copy out of it. It matters at layer three, when the [`Buffer`] is the pinned page
+    /// itself and the move is not even that.
+    ///
+    /// Appending with [`Self::push`] afterwards still works and still appends to the arena. That is
+    /// the case to keep away from once a real page is in here, because writing through a borrowed
+    /// buffer copies it, which is [`Buffer::to_mut`] and is the whole page.
+    #[must_use]
+    pub fn over(arena: Buffer<u8>) -> Self {
+        Self { views: Vec::new(), arena }
     }
 
     /// How many strings are in the column.
@@ -210,6 +243,57 @@ impl StringColumn {
         self.views.len() - 1
     }
 
+    /// Records a string that is already in the arena, and returns its index.
+    ///
+    /// The half of the seam that does the work. [`Self::over`] puts the page in, this says where in
+    /// it a string is, and between them a column of long strings is built without the payload being
+    /// touched at all.
+    ///
+    /// A string short enough to sit inside a view is copied into the view, which is at most twelve
+    /// bytes and is what makes it readable without going near the arena at all. Everything longer
+    /// keeps its bytes where they are and the view records the offset.
+    ///
+    /// # Errors
+    ///
+    /// If the range is not inside the arena, or if the bytes are not valid UTF-8. The validation is
+    /// the one cost this seam does not remove, and it is here rather than skipped because
+    /// [`Self::get`] hands back a `&str` and a column that cannot produce one for a string it claims
+    /// to hold is a wrong answer rather than a slow one. A scan over a page where the format
+    /// guarantees UTF-8 wants to validate the page once instead of once per string, which is a pass
+    /// the layer three reader makes and is not something this type can do on its behalf.
+    pub fn push_in_place(&mut self, offset: usize, len: usize) -> Result<usize> {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            Error::internal(format!(
+                "a string at {offset} of {len} bytes runs off the end of memory"
+            ))
+        })?;
+        let bytes = self.arena.get(offset..end).ok_or_else(|| {
+            Error::internal(format!(
+                "a string at {offset} of {len} bytes is not inside a {} byte arena",
+                self.arena.len()
+            ))
+        })?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| Error::internal(format!("the bytes at {offset} are not valid UTF-8")))?;
+        let view = if len <= INLINE_LIMIT {
+            StringView::inline(text)
+        } else {
+            StringView::indirect(text, offset as u64)
+        };
+        self.views.push(view);
+        Ok(self.views.len() - 1)
+    }
+
+    /// The bytes the long strings live in.
+    ///
+    /// For a column over a page this is the page, including whatever of it no view points at. The
+    /// offsets in the views are offsets into exactly this, which is what makes them meaningful to a
+    /// reader that put the page here in the first place.
+    #[must_use]
+    pub fn arena(&self) -> &[u8] {
+        &self.arena
+    }
+
     /// The bytes at `index`, or `None` past the end.
     ///
     /// This is what a comparison, a hash and an equality check all actually want, and it is worth
@@ -239,6 +323,9 @@ impl StringColumn {
     }
 
     /// Total bytes of payload held in the arena, which is what the memory accounting wants.
+    ///
+    /// For a column over a page it is the page and not the part of it any view points at, which is
+    /// the right answer for accounting, because the page is what is resident.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
         self.arena.len()
@@ -251,6 +338,31 @@ impl StringColumn {
     /// a hint and not a constructor argument.
     pub fn reserve_bytes(&mut self, bytes: usize) {
         self.arena.reserve(bytes);
+    }
+}
+
+/// Two columns are equal when they hold the same strings in the same order, whatever their arenas
+/// look like.
+///
+/// See the note on [`StringColumn`]. Comparing the views is not enough on its own either, because
+/// two views of the same long string at different offsets in different arenas are different views,
+/// so the comparison is length, then view by view with the payload read for the ones that are not
+/// inline. The prefix inside the view is what makes that cheap: a pair that differs in the first
+/// four bytes or in the length is settled without either arena being touched.
+impl PartialEq for StringColumn {
+    fn eq(&self, other: &Self) -> bool {
+        self.views.len() == other.views.len()
+            && (0..self.views.len()).all(|index| {
+                let mine = self.views[index];
+                let theirs = other.views[index];
+                if mine.definitely_differs(&theirs) {
+                    return false;
+                }
+                if mine.is_inline() {
+                    return mine == theirs;
+                }
+                self.bytes(index) == other.bytes(index)
+            })
     }
 }
 
@@ -273,6 +385,72 @@ impl<'a> FromIterator<&'a str> for StringColumn {
 #[cfg(test)]
 mod tests {
     use super::{INLINE_LIMIT, StringColumn, StringView};
+    use crate::buffer::Buffer;
+
+    /// The seam, used the way layer three will use it. The page arrives whole, each string is
+    /// recorded where it already is, and the arena at the end is the page byte for byte, including
+    /// the header this page has in front of the strings and the bytes between them that belong to
+    /// nothing. A column that had copied would have an arena the size of the strings instead.
+    #[test]
+    fn a_column_over_a_page_records_the_strings_without_moving_them() {
+        let page =
+            b"HEADER..a string well past the inline limit!!a second one past the limit".to_vec();
+        let mut column = StringColumn::over(Buffer::from_vec(page.clone()));
+        assert_eq!(column.push_in_place(8, 37).expect("inside the page"), 0);
+        assert_eq!(column.push_in_place(45, 27).expect("inside the page"), 1);
+        assert_eq!(column.get(0), Some("a string well past the inline limit!!"));
+        assert_eq!(column.get(1), Some("a second one past the limit"));
+        assert_eq!(column.arena(), page.as_slice());
+        assert_eq!(column.heap_bytes(), page.len());
+        assert_eq!(column.len(), 2);
+    }
+
+    /// A string short enough to live inside its view is copied into the view, which is twelve bytes
+    /// and is what lets it be read without the arena. The page is still the arena and is still
+    /// untouched, so a page of short strings costs the views and nothing else.
+    #[test]
+    fn a_short_string_in_a_page_is_copied_into_its_view() {
+        let mut column = StringColumn::over(Buffer::from_vec(b"one.two".to_vec()));
+        column.push_in_place(0, 3).expect("inside the page");
+        column.push_in_place(4, 3).expect("inside the page");
+        assert!(column.views()[0].is_inline());
+        assert_eq!(column.get(0), Some("one"));
+        assert_eq!(column.get(1), Some("two"));
+        assert_eq!(column.arena(), b"one.two");
+    }
+
+    /// The two ways a caller can be wrong about a page, both of them answered before anything is
+    /// recorded rather than at the point somebody reads the string back and finds nothing there.
+    #[test]
+    fn a_range_outside_the_page_or_bytes_that_are_not_text_are_refused() {
+        let mut column = StringColumn::over(Buffer::from_vec(vec![0xff, 0xfe, 0xfd]));
+        assert!(column.push_in_place(2, 4).is_err());
+        assert!(column.push_in_place(usize::MAX, 1).is_err());
+        assert!(column.push_in_place(0, 3).is_err());
+        assert_eq!(column.len(), 0);
+    }
+
+    /// What the seam does to equality. The same two strings, one column built by copying them in
+    /// and one built over a page that has them in the other order with a gap in the middle, and the
+    /// two arenas have nothing in common. Equality is the strings, so the columns are equal.
+    #[test]
+    fn the_same_strings_over_different_arenas_are_the_same_column() {
+        let copied: StringColumn =
+            ["the first string past the limit", "the second string past the limit"]
+                .into_iter()
+                .collect();
+        let page =
+            b"gap!the second string past the limit....the first string past the limit".to_vec();
+        let mut over = StringColumn::over(Buffer::from_vec(page));
+        over.push_in_place(40, 31).expect("inside the page");
+        over.push_in_place(4, 32).expect("inside the page");
+        assert_ne!(copied.arena(), over.arena());
+        assert_eq!(copied, over);
+
+        let mut different: StringColumn = copied.clone();
+        different.push("a third one past the inline limit");
+        assert_ne!(copied, different);
+    }
 
     #[test]
     fn a_view_is_sixteen_bytes_and_stays_sixteen_bytes() {

@@ -6,7 +6,7 @@
 //! Every operator in every later crate is written against it, which is why it is specified before
 //! the first operator exists and changed by RFC afterwards rather than by whoever needs it changed.
 //!
-//! Five pieces:
+//! Six pieces:
 //!
 //! - [`Vector`], a typed run of at most [`VECTOR_SIZE`] values in one of four physical forms.
 //! - [`Chunk`], some vectors of the same length, which is what one operator hands the next.
@@ -14,6 +14,7 @@
 //!   worth a measurable amount and costs one branch per vector to know.
 //! - [`Selection`], which is what a filter produces instead of compacting.
 //! - [`StringView`] and [`StringColumn`], the 16 byte string with the 4 byte prefix.
+//! - [`Buffer`], the run of values behind a flat vector, which is where the buffer manager arrives.
 //!
 //! # What is deliberately not here
 //!
@@ -36,12 +37,14 @@
 
 #![deny(unsafe_code)]
 
+pub mod buffer;
 pub mod chunk;
 pub mod selection;
 pub mod string;
 pub mod validity;
 pub mod vector;
 
+pub use buffer::{Buffer, Pin};
 pub use chunk::Chunk;
 pub use selection::Selection;
 pub use string::{INLINE_LIMIT, StringColumn, StringView};
