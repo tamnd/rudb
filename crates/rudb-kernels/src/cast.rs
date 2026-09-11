@@ -11,17 +11,44 @@
 //! `TRY_CAST` swallows, and a cast between two types nobody has written the code for is not,
 //! because turning "I have not implemented this" into a column of nulls is how a missing feature
 //! becomes a wrong answer.
+//!
+//! # How the vectorized path is put together
+//!
+//! There are twenty numeric types here if a decimal counts once, and casting each of them to each
+//! of the others is four hundred loops nobody is going to write or check. The way out is that an
+//! integer and a decimal are the same thing seen twice: an exact number held as an integer, written
+//! at a scale that happens to be zero when it is an integer. Once both sides are read that way, a
+//! cast from `DECIMAL(9, 2)` to `BIGINT` and a cast from `INTEGER` to `DECIMAL(18, 4)` stop being
+//! two problems and become one, which is moving a number from one scale to another and then fitting
+//! it. What is left is four quadrants, exact or approximate on each side, and a read arm and a
+//! write arm per physical layout, which is a number of loops that fits on a screen.
+//!
+//! The pivot is an `i128` for the exact quadrants and an `f64` for the approximate ones. That is one
+//! extra pass over sixteen kilobytes that stays in L1 rather than one fused loop per type pair, and
+//! it is the trade this file makes on purpose: the fused version is four hundred bodies and this one
+//! is nine, in a file whose whole job is to be the answer every faster tier is checked against.
+//!
+//! Nothing on the fast path looks at which rows are null, and it does not have to. A null still
+//! occupies a position, a vector writes a zero there, and zero converts to zero in every one of
+//! these loops, so the run that comes out already holds at every null position the same zero the
+//! row at a time path would have written. The mask is carried across untouched.
 
-use rudb_common::{Error, ErrorCode, LogicalType, Result, Value, days_from_civil};
-use rudb_vector::{Form, Vector};
+use std::cmp::Ordering;
 
+use rudb_common::{Error, ErrorCode, LogicalType, PhysicalType, Result, Value, days_from_civil};
+use rudb_vector::{Data, Form, Vector};
+
+use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
+use crate::shape::{identity, nulls_of};
 
 /// Casts every value of a vector.
 ///
 /// A cast to the type the vector already has is free. A constant vector costs one conversion
 /// rather than one per row, which matters because a literal in a predicate is a constant vector
-/// and the binder casts it on the way in.
+/// and the binder casts it on the way in. A flat or dictionary vector of one number type going to
+/// another takes the sweep below, which never builds a [`Value`]. Everything else takes the loop at
+/// the bottom of this function, which is the definition the rest of this file is written against.
 ///
 /// # Errors
 ///
@@ -38,11 +65,393 @@ pub fn cast(input: &Vector, target: &LogicalType, try_cast: bool) -> Result<Vect
         let single = cast_value(&input.value_at(0), target, try_cast)?;
         return Ok(Vector::constant(target.clone(), single, input.len()));
     }
+    if let Some(vector) = swept(input, target) {
+        return Ok(vector);
+    }
+    // A cast reads one vector, so its form goes in both halves of the report rather than leaving a
+    // column of zeros next to every row of it.
+    fallback::record(Kernel::Cast, input.form(), input.form());
     let mut values = Vec::with_capacity(input.len());
     for index in 0..input.len() {
         values.push(cast_value(&input.value_at(index), target, try_cast)?);
     }
     Vector::from_values(target.clone(), &values)
+}
+
+/// Every value of a vector converted without a [`Value`] being built for any of them, or `None`
+/// when this is not a pair of types the loops here cover and `None` again when a value did not fit.
+///
+/// Answering `None` for a value that did not fit rather than raising is what keeps this honest. The
+/// loop above raises with a message naming the value and the type it would not go into, and
+/// `TRY_CAST` turns some of those failures into nulls and deliberately not others, and a second
+/// copy of those two rules here would be a second copy of the part of this file that is hard to get
+/// right. So the sweep only ever returns an answer it is sure of, and a vector with one bad value
+/// in it costs one wasted pass and then goes through the same loop it always did.
+///
+/// That is also why `try_cast` is not a parameter. A sweep that came back with an answer converted
+/// every value it was given, and a cast that raises nothing and a `TRY_CAST` that produces no nulls
+/// are the same answer.
+fn swept(input: &Vector, target: &LogicalType) -> Option<Vector> {
+    let from = numeric(input.logical_type())?;
+    let into = numeric(target)?;
+    let rows = input.len();
+    let physical = target.physical();
+    let converted = match input.form() {
+        Form::Flat => {
+            let data = input.data()?;
+            if data.len() < rows {
+                return None;
+            }
+            convert_run(data, identity, rows, from, into, physical)?
+        }
+        Form::Dictionary => {
+            let (codes, values) = input.dictionary_parts()?;
+            if codes.len() < rows {
+                return None;
+            }
+            // Every code is inside the dictionary because `Vector::dictionary` checks that on the
+            // way in, so the gather below indexes without a bound of its own.
+            convert_run(values.data()?, |index| codes[index] as usize, rows, from, into, physical)?
+        }
+        _ => return None,
+    };
+    Some(Vector::flat(target.clone(), converted).ok()?.with_validity(nulls_of(input)))
+}
+
+/// What a specialized loop needs to know about one side of a numeric cast.
+#[derive(Clone, Copy)]
+enum Numeric {
+    /// An exact number at this scale, and the digits it has to fit into when it is a decimal.
+    Exact { scale: u8, width: Option<u8> },
+    /// A number held as a float, single precision rather than double.
+    Approximate { single: bool },
+}
+
+/// The shape of a type for the loops below, or `None` for a type they do not cover.
+///
+/// `BOOLEAN` is not here even though a boolean reads as an integer, because as a target it converts
+/// by comparing against zero rather than by fitting a width, and it would be the one arm that does
+/// not follow the rule the rest of this is built on. `UHUGEINT` is not here because a value above
+/// the `HUGEINT` range has no exact `i128` to pivot through, and no benchmark and no real schema
+/// has a column of them. `DATE` and the timestamps are not here although they are held as integers,
+/// because a cast between the two of them is a multiplication by the length of a day and a cast
+/// from either of them to an integer is refused outright, and neither of those is what treating
+/// them as exact numbers at scale zero would do.
+fn numeric(ty: &LogicalType) -> Option<Numeric> {
+    match *ty {
+        LogicalType::TinyInt
+        | LogicalType::SmallInt
+        | LogicalType::Integer
+        | LogicalType::BigInt
+        | LogicalType::HugeInt
+        | LogicalType::UTinyInt
+        | LogicalType::USmallInt
+        | LogicalType::UInteger
+        | LogicalType::UBigInt => Some(Numeric::Exact { scale: 0, width: None }),
+        LogicalType::Decimal { width, scale } => Some(Numeric::Exact { scale, width: Some(width) }),
+        LogicalType::Float => Some(Numeric::Approximate { single: true }),
+        LogicalType::Double => Some(Numeric::Approximate { single: false }),
+        _ => None,
+    }
+}
+
+/// The four quadrants, each one a read pass, a move and a write pass.
+fn convert_run<M: Fn(usize) -> usize>(
+    data: &Data,
+    at: M,
+    rows: usize,
+    from: Numeric,
+    into: Numeric,
+    physical: PhysicalType,
+) -> Option<Data> {
+    match (from, into) {
+        (Numeric::Exact { scale: was, .. }, Numeric::Exact { scale: now, width: None })
+            if was == now =>
+        {
+            straight(data, at, rows, physical)
+        }
+        (Numeric::Exact { scale: was, .. }, Numeric::Exact { scale: now, width }) => {
+            let mut run = exact_run(data, at, rows)?;
+            restage(&mut run, was, now)?;
+            exact_out(run, width, physical)
+        }
+        (Numeric::Exact { scale, .. }, Numeric::Approximate { single }) => {
+            loosened(data, at, rows, scale, single)
+        }
+        (Numeric::Approximate { .. }, Numeric::Exact { scale, width }) => {
+            let run = float_run(data, at, rows)?;
+            exact_out(tighten(&run, scale)?, width, physical)
+        }
+        (Numeric::Approximate { .. }, Numeric::Approximate { single }) => {
+            let run = float_run(data, at, rows)?;
+            approximate_out(run, single)
+        }
+    }
+}
+
+/// The exact to exact case with nothing to do in between, which is every integer widening and
+/// every integer narrowing in every query.
+///
+/// This one does not pivot. The other three quadrants gather into a run of `i128`, move that run to
+/// the target scale and then fit it, which is three passes over sixteen kilobytes to do what is
+/// here a load, a range check and a store. Integer to integer is common enough to be worth the
+/// eighty one bodies the two macros below expand to, and it is the difference between this kernel
+/// reading as a load and a store in a profile and reading as a memory bound copy.
+///
+/// Every pair of integer widths has a `TryFrom`, including each width with itself, so the eighty
+/// one arms are the same three lines and the ones that cannot fail are a move once the compiler has
+/// looked at them.
+fn straight<M: Fn(usize) -> usize>(
+    data: &Data,
+    at: M,
+    rows: usize,
+    physical: PhysicalType,
+) -> Option<Data> {
+    macro_rules! fitted {
+        ($values:expr, $variant:path, $ty:ty) => {{
+            let values = $values;
+            let mut out = Vec::with_capacity(rows);
+            for index in 0..rows {
+                out.push(<$ty>::try_from(values[at(index)]).ok()?);
+            }
+            $variant(out)
+        }};
+    }
+    macro_rules! by_target {
+        ($values:expr) => {
+            match physical {
+                PhysicalType::Int8 => fitted!($values, Data::Int8, i8),
+                PhysicalType::Int16 => fitted!($values, Data::Int16, i16),
+                PhysicalType::Int32 => fitted!($values, Data::Int32, i32),
+                PhysicalType::Int64 => fitted!($values, Data::Int64, i64),
+                PhysicalType::Int128 => fitted!($values, Data::Int128, i128),
+                PhysicalType::UInt8 => fitted!($values, Data::UInt8, u8),
+                PhysicalType::UInt16 => fitted!($values, Data::UInt16, u16),
+                PhysicalType::UInt32 => fitted!($values, Data::UInt32, u32),
+                PhysicalType::UInt64 => fitted!($values, Data::UInt64, u64),
+                _ => return None,
+            }
+        };
+    }
+    Some(match data {
+        Data::Int8(values) => by_target!(values),
+        Data::Int16(values) => by_target!(values),
+        Data::Int32(values) => by_target!(values),
+        Data::Int64(values) => by_target!(values),
+        Data::Int128(values) => by_target!(values),
+        Data::UInt8(values) => by_target!(values),
+        Data::UInt16(values) => by_target!(values),
+        Data::UInt32(values) => by_target!(values),
+        Data::UInt64(values) => by_target!(values),
+        _ => return None,
+    })
+}
+
+/// The exact numbers a run of data holds, read through one form's index mapping.
+///
+/// The mapping is a generic parameter rather than a `fn(usize) -> usize` held in a variable, which
+/// is the difference between a read the compiler unrolls and an indirect call per row it cannot see
+/// through. That difference was ten nanoseconds a row when `compare` was measured with the call in
+/// it, and it is the reason no kernel in this crate keeps one.
+fn exact_run<M: Fn(usize) -> usize>(data: &Data, at: M, rows: usize) -> Option<Vec<i128>> {
+    macro_rules! widened {
+        ($values:expr) => {
+            (0..rows).map(|index| i128::from($values[at(index)])).collect()
+        };
+    }
+    Some(match data {
+        Data::Int8(values) => widened!(values),
+        Data::Int16(values) => widened!(values),
+        Data::Int32(values) => widened!(values),
+        Data::Int64(values) => widened!(values),
+        Data::Int128(values) => (0..rows).map(|index| values[at(index)]).collect(),
+        Data::UInt8(values) => widened!(values),
+        Data::UInt16(values) => widened!(values),
+        Data::UInt32(values) => widened!(values),
+        Data::UInt64(values) => widened!(values),
+        _ => return None,
+    })
+}
+
+/// The approximate numbers a run of data holds, read through one form's index mapping.
+fn float_run<M: Fn(usize) -> usize>(data: &Data, at: M, rows: usize) -> Option<Vec<f64>> {
+    Some(match data {
+        Data::Float32(values) => (0..rows).map(|index| f64::from(values[at(index)])).collect(),
+        Data::Float64(values) => (0..rows).map(|index| values[at(index)]).collect(),
+        _ => return None,
+    })
+}
+
+/// Moves a whole run of exact numbers from one scale to another, in place.
+///
+/// Which of the three things to do is decided once, ahead of the loop, rather than by calling
+/// [`rescale`] per value. At equal scales `rescale` multiplies by ten to the zero and checks that
+/// product for overflow, and equal scales is every integer widening in every query, so leaving the
+/// decision inside the loop would put a multiply and a branch on the most common conversion there
+/// is. Going down rounds half away from zero, which is what `rescale` does and what DuckDB does.
+///
+/// The addition of half the factor cannot overflow. A value only reaches the third arm at a scale
+/// above zero, a scale above zero means it came out of a decimal, a decimal carries at most thirty
+/// eight digits, and ten to the thirty eighth plus half of it is still inside an `i128`.
+fn restage(run: &mut [i128], was: u8, now: u8) -> Option<()> {
+    match now.cmp(&was) {
+        Ordering::Equal => {}
+        Ordering::Greater => {
+            let factor = pow10(now - was);
+            for slot in run.iter_mut() {
+                *slot = slot.checked_mul(factor)?;
+            }
+        }
+        Ordering::Less => {
+            let factor = pow10(was - now);
+            let half = factor / 2;
+            for slot in run.iter_mut() {
+                let shifted = if *slot >= 0 { *slot + half } else { *slot - half };
+                *slot = shifted / factor;
+            }
+        }
+    }
+    Some(())
+}
+
+/// The exact to approximate case, fused for the same reason [`straight`] is.
+///
+/// Nine source layouts is nine bodies, which is worth writing out for a conversion that every
+/// average, every division and every comparison of an integer column against a written fraction
+/// goes through. A `FLOAT` target still takes the second pass in [`approximate_out`], because the
+/// answer it has to reach is the double narrowed rather than the source narrowed, and a single
+/// rounding and two roundings are not always the same number.
+///
+/// Scale zero gets its own loop rather than dividing by a factor of one, because a division is a
+/// division whatever it is by, and scale zero is every integer that ever goes to a double.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a wide integer past 2^53 losing digits is what a double is, and this is the float path"
+)]
+fn loosened<M: Fn(usize) -> usize>(
+    data: &Data,
+    at: M,
+    rows: usize,
+    scale: u8,
+    single: bool,
+) -> Option<Data> {
+    macro_rules! doubles {
+        ($values:expr) => {{
+            let values = $values;
+            let mut out = Vec::with_capacity(rows);
+            if scale == 0 {
+                for index in 0..rows {
+                    out.push(values[at(index)] as f64);
+                }
+            } else {
+                let factor = pow10(scale) as f64;
+                for index in 0..rows {
+                    out.push(values[at(index)] as f64 / factor);
+                }
+            }
+            out
+        }};
+    }
+    let run: Vec<f64> = match data {
+        Data::Int8(values) => doubles!(values),
+        Data::Int16(values) => doubles!(values),
+        Data::Int32(values) => doubles!(values),
+        Data::Int64(values) => doubles!(values),
+        Data::Int128(values) => doubles!(values),
+        Data::UInt8(values) => doubles!(values),
+        Data::UInt16(values) => doubles!(values),
+        Data::UInt32(values) => doubles!(values),
+        Data::UInt64(values) => doubles!(values),
+        _ => return None,
+    };
+    approximate_out(run, single)
+}
+
+/// A run of doubles as the exact numbers they round to at a scale, or `None` when one of them has
+/// no such number.
+///
+/// The bound is the one the row at a time path checks, and a NaN or an infinity fails it because
+/// every comparison against a NaN is false. A value that fails is not converted here at all, and
+/// the whole vector goes back through the loop that knows how to say which value it was.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the bound checked on the line above is what decides whether the value fits"
+)]
+fn tighten(run: &[f64], scale: u8) -> Option<Vec<i128>> {
+    let factor = pow10(scale) as f64;
+    let mut out = Vec::with_capacity(run.len());
+    for &number in run {
+        let scaled = (number * factor).round();
+        if !(-1.7014118346046923e38..=1.7014118346046923e38).contains(&scaled) {
+            return None;
+        }
+        out.push(scaled as i128);
+    }
+    Some(out)
+}
+
+/// A run of exact numbers in the container the target type is held in, or `None` when one of them
+/// does not fit.
+///
+/// The run is taken by value so that a `HUGEINT` target, where the container the values are already
+/// in is the container they belong in, hands the same allocation straight on rather than copying
+/// sixteen kilobytes to reach the same bytes.
+fn exact_out(run: Vec<i128>, width: Option<u8>, physical: PhysicalType) -> Option<Data> {
+    if let Some(width) = width {
+        // This is `digits(whole) > width` with the counting taken out of the loop. `digits` divides
+        // by ten until there is nothing left, up to thirty eight times, and a decimal column is
+        // exactly where that would be paid on every row. Needing more digits than the width is the
+        // same statement as being at or above ten to the width.
+        let limit = pow10(width).unsigned_abs();
+        if run.iter().any(|&whole| whole.unsigned_abs() >= limit) {
+            return None;
+        }
+    }
+    macro_rules! narrowed {
+        ($variant:path, $ty:ty) => {{
+            let mut out = Vec::with_capacity(run.len());
+            for &whole in &run {
+                out.push(<$ty>::try_from(whole).ok()?);
+            }
+            $variant(out)
+        }};
+    }
+    Some(match physical {
+        PhysicalType::Int8 => narrowed!(Data::Int8, i8),
+        PhysicalType::Int16 => narrowed!(Data::Int16, i16),
+        PhysicalType::Int32 => narrowed!(Data::Int32, i32),
+        PhysicalType::Int64 => narrowed!(Data::Int64, i64),
+        PhysicalType::Int128 => Data::Int128(run),
+        PhysicalType::UInt8 => narrowed!(Data::UInt8, u8),
+        PhysicalType::UInt16 => narrowed!(Data::UInt16, u16),
+        PhysicalType::UInt32 => narrowed!(Data::UInt32, u32),
+        PhysicalType::UInt64 => narrowed!(Data::UInt64, u64),
+        _ => return None,
+    })
+}
+
+/// A run of doubles in the container the target type is held in, or `None` when narrowing one of
+/// them to single precision turned a finite number into an infinity.
+///
+/// Taken by value for the same reason as [`exact_out`]: a `DOUBLE` target is already holding its
+/// own answer and has nothing left to do but say so.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "narrowing to a float is what a cast to FLOAT is, and the line below catches the loss"
+)]
+fn approximate_out(run: Vec<f64>, single: bool) -> Option<Data> {
+    if !single {
+        return Some(Data::Float64(run));
+    }
+    let mut out = Vec::with_capacity(run.len());
+    for number in run {
+        let narrowed = number as f32;
+        if narrowed.is_infinite() && number.is_finite() {
+            return None;
+        }
+        out.push(narrowed);
+    }
+    Some(Data::Float32(out))
 }
 
 /// Casts one value.
@@ -471,6 +880,7 @@ mod tests {
 
     #[test]
     fn a_null_in_a_vector_stays_null_across_a_cast() {
+        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
         let input = Vector::from_values(
             LogicalType::Integer,
             &[Value::Integer(1), Value::Null, Value::Integer(3)],
@@ -479,5 +889,226 @@ mod tests {
         let cast = cast(&input, &LogicalType::Varchar, false).expect("prints");
         assert_eq!(cast.value_at(0), Value::Varchar("1".into()));
         assert_eq!(cast.value_at(1), Value::Null);
+    }
+
+    /// The row at a time path, copied here so that changing the one above cannot quietly change
+    /// what the sweep is checked against.
+    fn oracle(input: &Vector, target: &LogicalType, try_cast: bool) -> Result<Vector> {
+        let mut values = Vec::with_capacity(input.len());
+        for index in 0..input.len() {
+            values.push(cast_value(&input.value_at(index), target, try_cast)?);
+        }
+        Vector::from_values(target.clone(), &values)
+    }
+
+    /// Both paths on one vector, which have to give the same answer or the same complaint.
+    fn agrees(input: &Vector, target: &LogicalType) {
+        let what = format!("{} to {target}", input.logical_type());
+        match (cast(input, target, false), oracle(input, target, false)) {
+            (Ok(fast), Ok(slow)) => assert_eq!(fast, slow, "{what}"),
+            (Err(fast), Err(slow)) => assert_eq!(fast.message(), slow.message(), "{what}"),
+            (Ok(fast), Err(slow)) => {
+                panic!("{what}: the sweep answered {fast:?} and the loop said {slow}")
+            }
+            (Err(fast), Ok(slow)) => {
+                panic!("{what}: the sweep said {fast} and the loop answered {slow:?}")
+            }
+        }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    /// A number for the generator below.
+    ///
+    /// Mostly small enough to fit every type here, and one time in eight large enough to fit a
+    /// `BIGINT` and nothing narrower. The second half is the half that matters: a vector the sweep
+    /// has to refuse is the case where this file is easiest to get wrong, and a generator that only
+    /// made values that fit would test the easy half twice.
+    fn small(rng: &mut Rng) -> i64 {
+        if rng.below(8) == 0 {
+            rng.below(300_000) as i64 - 150_000
+        } else {
+            rng.below(201) as i64 - 100
+        }
+    }
+
+    /// One value of a type, inside that type's own range.
+    fn sample(ty: &LogicalType, rng: &mut Rng) -> Value {
+        match *ty {
+            LogicalType::TinyInt => Value::TinyInt((small(rng) % 128) as i8),
+            LogicalType::SmallInt => Value::SmallInt((small(rng) % 32_768) as i16),
+            LogicalType::Integer => Value::Integer(small(rng) as i32),
+            LogicalType::BigInt => Value::BigInt(small(rng)),
+            LogicalType::HugeInt => Value::HugeInt(i128::from(small(rng))),
+            LogicalType::UTinyInt => Value::UTinyInt((small(rng).unsigned_abs() % 256) as u8),
+            LogicalType::USmallInt => Value::USmallInt((small(rng).unsigned_abs() % 65_536) as u16),
+            LogicalType::UInteger => Value::UInteger(small(rng).unsigned_abs() as u32),
+            LogicalType::UBigInt => Value::UBigInt(small(rng).unsigned_abs()),
+            LogicalType::Float => Value::Float(small(rng) as f32 / 4.0),
+            LogicalType::Double => Value::Double(small(rng) as f64 / 8.0),
+            LogicalType::Decimal { width, scale } => {
+                Value::Decimal { unscaled: i128::from(small(rng)) % pow10(width), width, scale }
+            }
+            ref other => panic!("the generator has no values for {other}"),
+        }
+    }
+
+    /// Every numeric type this file claims, against every other, flat and through a dictionary, at
+    /// three null densities. This is the test the rewrite rests on.
+    #[test]
+    fn every_numeric_pair_agrees_with_the_row_at_a_time_path() {
+        // Most of the pairs below are pairs the sweep refuses, every refusal increments a process
+        // wide counter, and the tests in `fallback` assert exact counts. This holds the same lock
+        // they do so that a test that is about answers cannot fail a test that is about counting.
+        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
+        let mut rng = Rng(0x5eed_cabb_a9e0_0001);
+        let types: [LogicalType; 15] = [
+            LogicalType::TinyInt,
+            LogicalType::SmallInt,
+            LogicalType::Integer,
+            LogicalType::BigInt,
+            LogicalType::HugeInt,
+            LogicalType::UTinyInt,
+            LogicalType::USmallInt,
+            LogicalType::UInteger,
+            LogicalType::UBigInt,
+            LogicalType::Float,
+            LogicalType::Double,
+            // One decimal per physical container, because the container is what the write pass
+            // matches on and a decimal that is two bytes wide and one that is sixteen take
+            // different arms of it.
+            LogicalType::decimal(4, 1).expect("a legal decimal"),
+            LogicalType::decimal(9, 2).expect("a legal decimal"),
+            LogicalType::decimal(18, 4).expect("a legal decimal"),
+            LogicalType::decimal(30, 6).expect("a legal decimal"),
+        ];
+        let len = 37;
+        for from in &types {
+            for nulls in [0u64, 1, 3] {
+                let values: Vec<Value> = (0..len)
+                    .map(|_| {
+                        if nulls > 0 && rng.below(nulls + 1) == 0 {
+                            Value::Null
+                        } else {
+                            sample(from, &mut rng)
+                        }
+                    })
+                    .collect();
+                let flat = Vector::from_values(from.clone(), &values).expect("a flat vector");
+                let codes: Vec<u32> = (0..len).map(|_| rng.below(len as u64) as u32).collect();
+                let dictionary =
+                    Vector::dictionary(codes, flat.clone()).expect("codes are in range");
+                for into in &types {
+                    // A cast to the type it already is hands the vector straight back, which for a
+                    // dictionary means a dictionary, and the loop below always builds a flat one.
+                    // Comparing those two would be comparing the shortcut against the definition of
+                    // something else.
+                    if into == from {
+                        continue;
+                    }
+                    agrees(&flat, into);
+                    agrees(&dictionary, into);
+                }
+            }
+        }
+    }
+
+    /// The sweep is only worth having if it is the path a numeric cast actually takes, so this
+    /// checks the counter rather than the answer.
+    #[test]
+    fn a_numeric_cast_does_not_reach_the_row_at_a_time_path_and_a_string_one_does() {
+        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
+        fallback::reset();
+        let input = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(1), Value::Null, Value::Integer(3)],
+        )
+        .expect("three integers");
+        for target in [
+            LogicalType::BigInt,
+            LogicalType::Double,
+            LogicalType::Float,
+            LogicalType::decimal(18, 3).expect("a legal decimal"),
+        ] {
+            cast(&input, &target, false).expect("widens");
+        }
+        assert_eq!(fallback::count(Kernel::Cast, Form::Flat, Form::Flat), 0);
+        cast(&input, &LogicalType::Varchar, false).expect("prints");
+        assert_eq!(fallback::count(Kernel::Cast, Form::Flat, Form::Flat), 1);
+        fallback::reset();
+    }
+
+    /// A vector the sweep refuses is a vector the loop below it has to explain, and `TRY_CAST` has
+    /// to keep working through the refusal rather than being swallowed by it.
+    #[test]
+    fn one_value_that_does_not_fit_sends_the_whole_vector_back_to_the_loop() {
+        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
+        let input = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(1), Value::Integer(40_000), Value::Integer(3)],
+        )
+        .expect("three integers");
+        let error =
+            cast(&input, &LogicalType::SmallInt, false).expect_err("40000 is not a smallint");
+        assert!(error.message().contains("40000"), "{error}");
+        let tried = cast(&input, &LogicalType::SmallInt, true).expect("try_cast nulls it out");
+        assert_eq!(tried.value_at(0), Value::SmallInt(1));
+        assert_eq!(tried.value_at(1), Value::Null);
+        assert_eq!(tried.value_at(2), Value::SmallInt(3));
+    }
+
+    /// Scale is the whole reason an integer and a decimal are read as one kind, so both directions
+    /// of it get an assertion that names the number rather than a generated one that does not.
+    #[test]
+    fn moving_a_run_between_scales_rounds_the_way_one_value_at_a_time_rounds() {
+        let two = LogicalType::decimal(9, 2).expect("a legal decimal");
+        let input = Vector::from_values(
+            two.clone(),
+            &[
+                Value::Decimal { unscaled: 155, width: 9, scale: 2 },
+                Value::Decimal { unscaled: -155, width: 9, scale: 2 },
+                Value::Decimal { unscaled: 100, width: 9, scale: 2 },
+            ],
+        )
+        .expect("three decimals");
+        let whole = cast(&input, &LogicalType::Integer, false).expect("rounds");
+        assert_eq!(whole.value_at(0), Value::Integer(2));
+        assert_eq!(whole.value_at(1), Value::Integer(-2));
+        assert_eq!(whole.value_at(2), Value::Integer(1));
+        let wider = cast(&input, &LogicalType::decimal(18, 5).expect("a legal decimal"), false)
+            .expect("rescales up");
+        assert_eq!(wider.value_at(0), Value::Decimal { unscaled: 155_000, width: 18, scale: 5 });
+        let back = cast(&whole, &two, false).expect("rescales back");
+        assert_eq!(back.value_at(0), Value::Decimal { unscaled: 200, width: 9, scale: 2 });
+    }
+
+    /// A dictionary keeps its nulls in the vector it points at, and a sweep that read the outer
+    /// validity would report every row valid and hand back whatever sits at code zero.
+    #[test]
+    fn a_null_behind_a_dictionary_code_is_still_a_null_after_the_sweep() {
+        let values = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(7), Value::Null, Value::Integer(9)],
+        )
+        .expect("three integers");
+        let input = Vector::dictionary(vec![2, 1, 0, 1], values).expect("codes are in range");
+        let widened = cast(&input, &LogicalType::BigInt, false).expect("widens");
+        assert_eq!(widened.value_at(0), Value::BigInt(9));
+        assert_eq!(widened.value_at(1), Value::Null);
+        assert_eq!(widened.value_at(2), Value::BigInt(7));
+        assert_eq!(widened.value_at(3), Value::Null);
     }
 }
