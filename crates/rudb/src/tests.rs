@@ -6,7 +6,7 @@
 //! a name a query writes has to be the name the binder resolves and the name the executor reads,
 //! and a type the binder decided has to be the type the operator produces.
 
-use rudb_common::{Field, LogicalType, Value};
+use rudb_common::{Field, LogicalType, Value, days_from_civil};
 
 use crate::Database;
 
@@ -235,6 +235,53 @@ fn a_comparison_with_a_string_happens_in_the_other_type() {
     // Not here yet: DuckDB answers true to 1 = '1.0', because its string to integer cast rounds
     // rather than refusing a decimal point, and rounds half away from zero. That is a difference
     // in the cast rather than in this rule, and it belongs with the cast.
+}
+
+/// 2013-07-15 at a time of day, which is the day ClickBench asks about.
+fn moment(hours: i64, minutes: i64, seconds: i64) -> Value {
+    let day = i64::from(days_from_civil(2013, 7, 15)) * 86_400_000_000;
+    Value::Timestamp(day + hours * 3_600_000_000 + minutes * 60_000_000 + seconds * 1_000_000)
+}
+
+/// The two shapes ClickBench needs, which are query 19 and query 43 with the column renamed.
+///
+/// `EXTRACT` is not a function in the grammar and is a call to `date_part` by the time the binder
+/// sees it, so this is also the test that the rewrite survives the trip. The truncation keeps the
+/// type it was given, which is why the second query can sort by it and get times rather than text.
+#[test]
+fn a_timestamp_can_be_taken_apart_and_grouped_by() {
+    let mut db = Database::new();
+    db.create_table("hits", vec![Field::new("ts", LogicalType::Timestamp)]).unwrap();
+    db.append("hits", &[vec![moment(10, 23, 45)], vec![moment(10, 23, 7)], vec![moment(11, 5, 0)]])
+        .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT extract(minute FROM ts) AS m, COUNT(*) FROM hits GROUP BY m ORDER BY m"),
+        vec![vec![Value::BigInt(5), Value::BigInt(1)], vec![Value::BigInt(23), Value::BigInt(2)],]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT DATE_TRUNC('hour', ts) AS h, COUNT(*) AS n FROM hits \
+             GROUP BY DATE_TRUNC('hour', ts) ORDER BY DATE_TRUNC('hour', ts)"
+        ),
+        vec![vec![moment(10, 0, 0), Value::BigInt(2)], vec![moment(11, 0, 0), Value::BigInt(1)],]
+    );
+}
+
+/// The part is a string wherever it came from, and a specifier that names nothing is DuckDB's
+/// message rather than a panic in a match arm.
+#[test]
+fn a_date_part_reads_its_specifier_three_ways_and_refuses_a_fourth() {
+    let db = database();
+    let stamp = "CAST('2013-07-15 10:23:45' AS TIMESTAMP)";
+    for sql in [
+        format!("SELECT extract(minute FROM {stamp})"),
+        format!("SELECT extract('minute' FROM {stamp})"),
+        format!("SELECT date_part('minute', {stamp})"),
+    ] {
+        assert_eq!(rows(&db, &sql), vec![vec![Value::BigInt(23)]], "{sql}");
+    }
+    assert!(failure(&db, &format!("SELECT date_part('qtr', {stamp})")).contains("qtr"));
 }
 
 /// A string that will not read as the other type raises, rather than quietly comparing as text and

@@ -1112,6 +1112,7 @@ impl<'a> Transform<'a> {
                     return Ok(self.push(Expr::Literal { kind, text: NONE }));
                 }
                 "FunctionExpression" => return self.function(node),
+                "ExtractExpression" => return self.extract(node),
                 "CastExpression" => return self.cast(node),
                 "CaseExpression" => return self.case(node),
                 "ParenthesisExpression" => return self.row(node),
@@ -1477,6 +1478,37 @@ impl<'a> Transform<'a> {
         }
         let args = self.expr_slice(args);
         Ok(self.push(Expr::Function { name, args, distinct }))
+    }
+
+    /// `ExtractExpression <- 'EXTRACT' Parens(ExtractArguments)` and
+    /// `ExtractArguments <- ExtractArgument 'FROM' Expression`.
+    ///
+    /// `EXTRACT` is not a function in the grammar because its argument list is not an argument
+    /// list, and it is a function everywhere after here because DuckDB's parser does the same
+    /// rewrite: `EXTRACT(minute FROM t)` is `date_part('minute', t)` and there is no separate
+    /// implementation of one of them. The part is a keyword, an identifier or a string in the
+    /// grammar, and all three become the string, which is why this is a rewrite and not a node.
+    fn extract(&mut self, node: u32) -> Result<ExprRef> {
+        let arguments = self.find(node, "ExtractArguments");
+        if arguments == NONE {
+            return self.unsupported(node);
+        }
+        let argument = self.first(self.first(arguments));
+        let part = match self.name(argument) {
+            "ExtractStringArgument" => self.string_value(argument),
+            // A keyword or an identifier, both taken as written. Which specifier names are legal is
+            // not a question about syntax, so the answer to it lives with the function.
+            "ExtractDatePartArgument" | "ExtractIdentifierArgument" => {
+                self.text(argument).to_string()
+            }
+            _ => return self.unsupported(argument),
+        };
+        let text = self.intern(&part);
+        let part = self.push(Expr::Literal { kind: LiteralKind::String, text });
+        let operand = self.expr(self.nth(arguments, 1))?;
+        let name = self.function_name("date_part");
+        let args = self.expr_slice(vec![part, operand]);
+        Ok(self.push(Expr::Function { name, args, distinct: false }))
     }
 
     /// `FunctionArgument <- NamedFunctionArgument / PositionalFunctionArgument`.

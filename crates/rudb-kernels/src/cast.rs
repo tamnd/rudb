@@ -38,6 +38,7 @@ use std::cmp::Ordering;
 use rudb_common::{Error, ErrorCode, LogicalType, PhysicalType, Result, Value, days_from_civil};
 use rudb_vector::{Data, Form, Vector};
 
+use crate::datetime::MICROS_PER_DAY;
 use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
 use crate::shape::{identity, nulls_of};
@@ -646,8 +647,6 @@ fn parse_decimal(text: &str, scale: u8) -> Option<i128> {
     let scaled = rescale(written, u8::try_from(fraction.len()).ok()?, scale)?;
     Some(sign * scaled)
 }
-
-const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
 
 fn to_date(value: &Value) -> Result<Value> {
     match value {

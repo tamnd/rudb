@@ -1,0 +1,510 @@
+//! The calendar, which is what `date_part` and `date_trunc` are made of.
+//!
+//! Both functions are one string and one date or timestamp, and the string decides which of twenty
+//! pieces of arithmetic happens. Splitting the string out into a [`Part`] is not tidiness: the
+//! string is a literal in every query anyone writes, so the vectorized path reads it once per vector
+//! and the loop underneath it does one piece of arithmetic per row with nothing left to decide.
+//!
+//! The arithmetic is written out rather than pulled in from a date library, for the reason
+//! [`rudb_common::civil_from_days`] gives: a library that disagrees with DuckDB about a week number
+//! or about a century before year one is a compatibility bug we would then own without being able to
+//! fix it. Every number this file produces was read off the DuckDB binary on `server3` first, and
+//! the tests below are those readings rather than a second opinion about what ISO 8601 says.
+//!
+//! Two of DuckDB's answers are worth knowing before reading the code, because both look like
+//! mistakes and neither is one. `date_part('millisecond', ...)` carries the seconds with it, so
+//! 59.654321 seconds is 59654 and not 654. And `date_part('century', ...)` of the year 2000 is 20,
+//! because the twentieth century ends with it, while `date_trunc('century', ...)` of the same
+//! timestamp is the year 2000 and not the year 1901, because truncation drops the last two digits.
+//! DuckDB is not being consistent there and neither are we, on purpose.
+//!
+//! What is missing is `timezone`, `timezone_hour` and `timezone_minute`, which need a session time
+//! zone before they mean anything, and the interval overloads of both functions.
+
+use rudb_common::{Error, Result, civil_from_days, days_from_civil};
+
+/// Microseconds in a day, which is the conversion between the two representations here.
+pub(crate) const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
+
+const MICROS_PER_HOUR: i64 = 3_600 * 1_000_000;
+const MICROS_PER_MINUTE: i64 = 60 * 1_000_000;
+const MICROS_PER_SECOND: i64 = 1_000_000;
+
+/// A piece of a date or a timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Part {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Millisecond,
+    Microsecond,
+    /// The ISO 8601 week, 1 through 53.
+    Week,
+    Quarter,
+    /// Sunday 0 through Saturday 6, which is Postgres's numbering and DuckDB's.
+    DayOfWeek,
+    /// Monday 1 through Sunday 7.
+    IsoDayOfWeek,
+    DayOfYear,
+    Decade,
+    Century,
+    Millennium,
+    /// 1 for a year after year zero and 0 for one before it.
+    Era,
+    /// The year the ISO week belongs to, which is not the calendar year at the turn of it.
+    IsoYear,
+    /// The ISO year and week as one number, so week 9 of 2024 is 202409.
+    YearWeek,
+    /// Seconds since 1970, which DuckDB answers as a double and this does not answer at all.
+    Epoch,
+}
+
+/// Every spelling DuckDB accepts, each one checked against the binary rather than guessed at.
+///
+/// A linear scan rather than a map because the list is fifty entries, because it is walked once per
+/// vector on the path that matters, and because a map would have to be built at startup to answer a
+/// question that a scan answers in the time the allocation alone would cost.
+const NAMES: &[(&str, Part)] = &[
+    ("year", Part::Year),
+    ("years", Part::Year),
+    ("yr", Part::Year),
+    ("y", Part::Year),
+    ("month", Part::Month),
+    ("months", Part::Month),
+    ("mon", Part::Month),
+    ("mons", Part::Month),
+    ("day", Part::Day),
+    ("days", Part::Day),
+    ("d", Part::Day),
+    ("hour", Part::Hour),
+    ("hours", Part::Hour),
+    ("hr", Part::Hour),
+    ("h", Part::Hour),
+    ("minute", Part::Minute),
+    ("minutes", Part::Minute),
+    ("min", Part::Minute),
+    ("mins", Part::Minute),
+    ("m", Part::Minute),
+    ("second", Part::Second),
+    ("seconds", Part::Second),
+    ("sec", Part::Second),
+    ("secs", Part::Second),
+    ("s", Part::Second),
+    ("millisecond", Part::Millisecond),
+    ("milliseconds", Part::Millisecond),
+    ("msec", Part::Millisecond),
+    ("msecs", Part::Millisecond),
+    ("ms", Part::Millisecond),
+    ("microsecond", Part::Microsecond),
+    ("microseconds", Part::Microsecond),
+    ("usec", Part::Microsecond),
+    ("usecs", Part::Microsecond),
+    ("us", Part::Microsecond),
+    ("week", Part::Week),
+    ("weeks", Part::Week),
+    ("w", Part::Week),
+    ("quarter", Part::Quarter),
+    ("quarters", Part::Quarter),
+    ("dayofweek", Part::DayOfWeek),
+    ("dow", Part::DayOfWeek),
+    ("weekday", Part::DayOfWeek),
+    ("isodow", Part::IsoDayOfWeek),
+    ("dayofyear", Part::DayOfYear),
+    ("doy", Part::DayOfYear),
+    ("decade", Part::Decade),
+    ("decades", Part::Decade),
+    ("dec", Part::Decade),
+    ("century", Part::Century),
+    ("centuries", Part::Century),
+    ("cent", Part::Century),
+    ("millennium", Part::Millennium),
+    ("millenniums", Part::Millennium),
+    ("mil", Part::Millennium),
+    ("era", Part::Era),
+    ("isoyear", Part::IsoYear),
+    ("yearweek", Part::YearWeek),
+    ("epoch", Part::Epoch),
+];
+
+impl Part {
+    /// Which part a specifier names.
+    ///
+    /// # Errors
+    ///
+    /// If it names none of them, with DuckDB's own message, since a query that asks for `qtr`
+    /// should be told the same thing by both engines.
+    pub(crate) fn parse(spelling: &str) -> Result<Self> {
+        NAMES
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(spelling))
+            .map(|(_, part)| *part)
+            .ok_or_else(|| {
+                Error::conversion(format!("extract specifier \"{spelling}\" not recognized"))
+            })
+    }
+
+    /// The part of a date, which is a count of days since 1970-01-01.
+    ///
+    /// # Errors
+    ///
+    /// If the part is one this file does not answer.
+    pub(crate) fn of_days(self, days: i32) -> Result<i64> {
+        let (year, month, day) = civil_from_days(days);
+        let wide = i64::from(year);
+        Ok(match self {
+            // A date has no time in it, and DuckDB says the time parts of one are zero rather than
+            // refusing to answer about them.
+            Self::Hour | Self::Minute | Self::Second | Self::Millisecond | Self::Microsecond => 0,
+            Self::Year => wide,
+            Self::Month => i64::from(month),
+            Self::Day => i64::from(day),
+            Self::Week => i64::from(iso_week(days).1),
+            Self::Quarter => i64::from((month - 1) / 3 + 1),
+            // Day zero is a Thursday, so the shift that puts Sunday at zero is four.
+            Self::DayOfWeek => i64::from((days + 4).rem_euclid(7)),
+            Self::IsoDayOfWeek => i64::from(iso_weekday(days)),
+            Self::DayOfYear => i64::from(days - days_from_civil(year, 1, 1) + 1),
+            Self::Decade => wide / 10,
+            // The first century is the years 1 to 100, so the arithmetic is off by one on both
+            // sides of year zero and there is no year zero in the counting at all.
+            Self::Century => {
+                if year > 0 {
+                    (wide - 1) / 100 + 1
+                } else {
+                    wide / 100 - 1
+                }
+            }
+            Self::Millennium => {
+                if year > 0 {
+                    (wide - 1) / 1_000 + 1
+                } else {
+                    wide / 1_000 - 1
+                }
+            }
+            Self::Era => i64::from(year > 0),
+            Self::IsoYear => i64::from(iso_week(days).0),
+            Self::YearWeek => {
+                let (year, week) = iso_week(days);
+                i64::from(year) * 100 + i64::from(week)
+            }
+            // DuckDB answers this as a double, and a signature that says bigint cannot hand one
+            // back. The fix is an overload rather than a cast, so this says so rather than rounding.
+            Self::Epoch => {
+                return Err(Error::not_implemented(
+                    "date_part('epoch', ...), which DuckDB answers as a double",
+                ));
+            }
+        })
+    }
+
+    /// The part of a timestamp, which is a count of microseconds since 1970-01-01.
+    ///
+    /// # Errors
+    ///
+    /// If the part is one this file does not answer, or if the timestamp is outside the range a
+    /// date covers and the part needs the date.
+    pub(crate) fn of_micros(self, micros: i64) -> Result<i64> {
+        let within = micros.rem_euclid(MICROS_PER_DAY);
+        Ok(match self {
+            Self::Hour => within / MICROS_PER_HOUR,
+            Self::Minute => within / MICROS_PER_MINUTE % 60,
+            Self::Second => within / MICROS_PER_SECOND % 60,
+            // These two carry the seconds with them. It looks wrong and it is what DuckDB and
+            // Postgres both answer, so 59.654321 seconds is 59654 and 59654321.
+            Self::Millisecond => within / 1_000 % 60_000,
+            Self::Microsecond => within % 60_000_000,
+            _ => return self.of_days(day_of(micros)?),
+        })
+    }
+
+    /// A date truncated to the part.
+    ///
+    /// # Errors
+    ///
+    /// If the part is one nothing can be truncated to.
+    pub(crate) fn truncate_days(self, days: i32) -> Result<i32> {
+        let (year, month, _) = civil_from_days(days);
+        Ok(match self {
+            // Everything below a day leaves a date alone, and so do the three parts that name a day
+            // rather than a length, which is what DuckDB answers for `date_trunc('dow', ...)`.
+            Self::Microsecond
+            | Self::Millisecond
+            | Self::Second
+            | Self::Minute
+            | Self::Hour
+            | Self::Day
+            | Self::DayOfWeek
+            | Self::IsoDayOfWeek
+            | Self::DayOfYear
+            | Self::Epoch => days,
+            Self::Week | Self::YearWeek => days - (iso_weekday(days) - 1),
+            Self::Month => days_from_civil(year, month, 1),
+            Self::Quarter => days_from_civil(year, (month - 1) / 3 * 3 + 1, 1),
+            Self::Year => days_from_civil(year, 1, 1),
+            // Truncation drops digits rather than counting centuries, so this is the year 2000 and
+            // not the year 2001 even though the century containing 2000 is the twentieth.
+            Self::Decade => days_from_civil(year - year % 10, 1, 1),
+            Self::Century => days_from_civil(year - year % 100, 1, 1),
+            Self::Millennium => days_from_civil(year - year % 1_000, 1, 1),
+            Self::IsoYear => iso_year_start(iso_week(days).0),
+            // DuckDB has no truncation for an era and says so rather than guessing, and this is its
+            // message down to the word statistics, which is a word about where in DuckDB the check
+            // happens to live.
+            Self::Era => {
+                return Err(Error::not_implemented(
+                    "Specifier type not implemented for DATETRUNC statistics",
+                ));
+            }
+        })
+    }
+
+    /// A timestamp truncated to the part.
+    ///
+    /// # Errors
+    ///
+    /// If the part is one nothing can be truncated to, or if the timestamp is outside the range a
+    /// date covers and the part needs the date.
+    pub(crate) fn truncate_micros(self, micros: i64) -> Result<i64> {
+        // A floor rather than a truncation towards zero at every step, so that a timestamp before
+        // the epoch lands on the boundary below it and not the one above it.
+        Ok(match self {
+            Self::Microsecond => micros,
+            Self::Millisecond => micros - micros.rem_euclid(1_000),
+            Self::Second | Self::Epoch => micros - micros.rem_euclid(MICROS_PER_SECOND),
+            Self::Minute => micros - micros.rem_euclid(MICROS_PER_MINUTE),
+            Self::Hour => micros - micros.rem_euclid(MICROS_PER_HOUR),
+            _ => i64::from(self.truncate_days(day_of(micros)?)?) * MICROS_PER_DAY,
+        })
+    }
+}
+
+/// The day a timestamp falls on.
+///
+/// A floor and not a truncation towards zero, so that a time before the epoch lands on the day it
+/// is in rather than on the day after it.
+fn day_of(micros: i64) -> Result<i32> {
+    i32::try_from(micros.div_euclid(MICROS_PER_DAY))
+        .map_err(|_| Error::conversion(format!("timestamp {micros} is outside the date range")))
+}
+
+/// The ISO weekday, Monday 1 through Sunday 7.
+fn iso_weekday(days: i32) -> i32 {
+    // Day zero is a Thursday, which is ISO weekday four.
+    (days + 3).rem_euclid(7) + 1
+}
+
+/// The ISO year and the ISO week a day falls in.
+///
+/// The rule is one sentence: a week belongs to the year its Thursday is in. Everything people find
+/// hard about ISO week numbers, including the fact that 1 January 2021 is week 53 of 2020, falls out
+/// of that sentence rather than needing a case of its own.
+fn iso_week(days: i32) -> (i32, i32) {
+    let thursday = days + (4 - iso_weekday(days));
+    let (year, _, _) = civil_from_days(thursday);
+    let week = (thursday - days_from_civil(year, 1, 1)) / 7 + 1;
+    (year, week)
+}
+
+/// The day an ISO year starts on, which is the Monday of the week 4 January is in.
+fn iso_year_start(year: i32) -> i32 {
+    let fourth = days_from_civil(year, 1, 4);
+    fourth - (iso_weekday(fourth) - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2024-02-29 13:45:59.654321, which is a leap day, a Thursday, and in ISO week 9.
+    fn moment() -> i64 {
+        i64::from(days_from_civil(2024, 2, 29)) * MICROS_PER_DAY
+            + 13 * MICROS_PER_HOUR
+            + 45 * MICROS_PER_MINUTE
+            + 59 * MICROS_PER_SECOND
+            + 654_321
+    }
+
+    fn part(spelling: &str) -> Part {
+        Part::parse(spelling).expect("a part this file knows")
+    }
+
+    /// Every one of these is what the DuckDB binary on `server3` answered for this timestamp.
+    #[test]
+    fn every_part_of_a_timestamp_is_what_duckdb_says_it_is() {
+        let wanted = [
+            ("year", 2024),
+            ("month", 2),
+            ("day", 29),
+            ("hour", 13),
+            ("minute", 45),
+            ("second", 59),
+            ("millisecond", 59_654),
+            ("microsecond", 59_654_321),
+            ("week", 9),
+            ("quarter", 1),
+            ("dayofweek", 4),
+            ("isodow", 4),
+            ("dayofyear", 60),
+            ("decade", 202),
+            ("century", 21),
+            ("millennium", 3),
+            ("era", 1),
+            ("isoyear", 2024),
+            ("yearweek", 202_409),
+        ];
+        for (spelling, answer) in wanted {
+            let found = part(spelling).of_micros(moment()).expect("a part of a timestamp");
+            assert_eq!(found, answer, "date_part('{spelling}', ...)");
+        }
+    }
+
+    #[test]
+    fn every_truncation_of_a_timestamp_is_what_duckdb_says_it_is() {
+        let at = |year, month, day, hours: i64, minutes: i64, seconds: i64, micros: i64| {
+            i64::from(days_from_civil(year, month, day)) * MICROS_PER_DAY
+                + hours * MICROS_PER_HOUR
+                + minutes * MICROS_PER_MINUTE
+                + seconds * MICROS_PER_SECOND
+                + micros
+        };
+        let wanted = [
+            ("year", at(2024, 1, 1, 0, 0, 0, 0)),
+            ("month", at(2024, 2, 1, 0, 0, 0, 0)),
+            ("day", at(2024, 2, 29, 0, 0, 0, 0)),
+            ("hour", at(2024, 2, 29, 13, 0, 0, 0)),
+            ("minute", at(2024, 2, 29, 13, 45, 0, 0)),
+            ("second", at(2024, 2, 29, 13, 45, 59, 0)),
+            ("millisecond", at(2024, 2, 29, 13, 45, 59, 654_000)),
+            ("microsecond", at(2024, 2, 29, 13, 45, 59, 654_321)),
+            ("week", at(2024, 2, 26, 0, 0, 0, 0)),
+            ("quarter", at(2024, 1, 1, 0, 0, 0, 0)),
+            ("decade", at(2020, 1, 1, 0, 0, 0, 0)),
+            ("century", at(2000, 1, 1, 0, 0, 0, 0)),
+            ("millennium", at(2000, 1, 1, 0, 0, 0, 0)),
+            ("isoyear", at(2024, 1, 1, 0, 0, 0, 0)),
+            ("yearweek", at(2024, 2, 26, 0, 0, 0, 0)),
+            ("epoch", at(2024, 2, 29, 13, 45, 59, 0)),
+        ];
+        for (spelling, answer) in wanted {
+            let found = part(spelling).truncate_micros(moment()).expect("a truncation");
+            assert_eq!(found, answer, "date_trunc('{spelling}', ...)");
+        }
+    }
+
+    /// A date has no time in it and DuckDB answers zero rather than refusing, which matters because
+    /// `EventDate` in ClickBench is a date and `EventTime` is a timestamp.
+    #[test]
+    fn the_time_parts_of_a_date_are_zero() {
+        let days = days_from_civil(2013, 7, 15);
+        for spelling in ["hour", "minute", "second", "millisecond", "microsecond"] {
+            assert_eq!(part(spelling).of_days(days).expect("a part of a date"), 0, "{spelling}");
+        }
+        assert_eq!(part("day").of_days(days).expect("a part of a date"), 15);
+    }
+
+    /// The four rows read off DuckDB for the parts that are off by one around the turn of a
+    /// century, which are the ones worth holding to because every one of them looks wrong.
+    #[test]
+    fn the_turn_of_a_century_is_counted_the_way_duckdb_counts_it() {
+        let wanted = [
+            (2000, 6, 1, 20, 2000, 2, 2000, 200, 2000),
+            (2021, 1, 1, 21, 2000, 3, 2000, 202, 2020),
+            (1999, 12, 31, 20, 1900, 2, 1000, 199, 1990),
+            (1970, 1, 1, 20, 1900, 2, 1000, 197, 1970),
+        ];
+        for (year, month, day, century, at_century, millennium, at_millennium, decade, at_decade) in
+            wanted
+        {
+            let days = days_from_civil(year, month, day);
+            let of = |spelling: &str| part(spelling).of_days(days).expect("a part of a date");
+            let start = |spelling: &str| {
+                let truncated = part(spelling).truncate_days(days).expect("a truncation");
+                civil_from_days(truncated).0
+            };
+            assert_eq!(of("century"), century, "century of {year}");
+            assert_eq!(start("century"), at_century, "century start of {year}");
+            assert_eq!(of("millennium"), millennium, "millennium of {year}");
+            assert_eq!(start("millennium"), at_millennium, "millennium start of {year}");
+            assert_eq!(of("decade"), decade, "decade of {year}");
+            assert_eq!(start("decade"), at_decade, "decade start of {year}");
+        }
+    }
+
+    /// Year zero and the years before it, where the century count skips a year that the calendar
+    /// has and the printed date is a year off the stored one.
+    #[test]
+    fn a_year_before_year_one_counts_backwards_the_way_duckdb_does() {
+        for (year, century, millennium, decade, era) in
+            [(-46, -1, -1, -4, 0), (1, 1, 1, 0, 1), (0, -1, -1, 0, 0)]
+        {
+            let days = days_from_civil(year, 6, 1);
+            let of = |spelling: &str| part(spelling).of_days(days).expect("a part of a date");
+            assert_eq!(of("century"), century, "century of {year}");
+            assert_eq!(of("millennium"), millennium, "millennium of {year}");
+            assert_eq!(of("decade"), decade, "decade of {year}");
+            assert_eq!(of("era"), era, "era of {year}");
+        }
+    }
+
+    /// 1 January 2021 is in week 53 of 2020, which is the case every home grown week number gets
+    /// wrong, so it is the case worth having a test for.
+    #[test]
+    fn a_week_belongs_to_the_year_its_thursday_is_in() {
+        for (year, month, day, iso_year, week) in [
+            (2021, 1, 1, 2020, 53),
+            (2024, 2, 29, 2024, 9),
+            (2024, 2, 25, 2024, 8),
+            (1970, 1, 1, 1970, 1),
+            (1999, 12, 31, 1999, 52),
+        ] {
+            let days = days_from_civil(year, month, day);
+            assert_eq!(iso_week(days), (iso_year, week), "{year}-{month}-{day}");
+        }
+    }
+
+    /// Sunday is 0 to `dayofweek` and 7 to `isodow`, which is two numberings for one question and
+    /// the reason both are in the enum.
+    #[test]
+    fn the_two_weekday_numberings_disagree_about_sunday() {
+        let sunday = days_from_civil(2024, 2, 25);
+        assert_eq!(part("dayofweek").of_days(sunday).expect("a weekday"), 0);
+        assert_eq!(part("isodow").of_days(sunday).expect("a weekday"), 7);
+    }
+
+    #[test]
+    fn a_specifier_that_is_not_one_says_so_the_way_duckdb_does() {
+        let error = Part::parse("qtr").expect_err("qtr is not a specifier");
+        assert_eq!(error.to_string(), "Conversion Error: extract specifier \"qtr\" not recognized");
+    }
+
+    #[test]
+    fn a_specifier_is_read_whatever_case_it_is_written_in() {
+        assert_eq!(Part::parse("MINUTE").expect("a part"), Part::Minute);
+        assert_eq!(Part::parse("Minute").expect("a part"), Part::Minute);
+        assert_eq!(Part::parse("mins").expect("a part"), Part::Minute);
+    }
+
+    /// The two DuckDB refuses, and it refuses them at different places for different reasons, so
+    /// neither message is invented here.
+    #[test]
+    fn the_parts_with_no_answer_say_which_answer_is_missing() {
+        let error = part("epoch").of_micros(moment()).expect_err("epoch is a double");
+        assert!(error.to_string().contains("double"), "{error}");
+        let error = part("era").truncate_micros(moment()).expect_err("an era does not truncate");
+        assert!(error.to_string().contains("DATETRUNC"), "{error}");
+    }
+
+    /// Before the epoch every one of these is a subtraction that a truncation towards zero gets
+    /// wrong by a whole unit, so the floor is worth a test of its own.
+    #[test]
+    fn a_time_before_the_epoch_truncates_downwards() {
+        let moment = -MICROS_PER_SECOND - 1;
+        assert_eq!(part("second").truncate_micros(moment).expect("a truncation"), -2_000_000);
+        assert_eq!(part("day").truncate_micros(moment).expect("a truncation"), -MICROS_PER_DAY);
+        assert_eq!(part("second").of_micros(moment).expect("a part"), 58);
+        assert_eq!(part("day").of_micros(moment).expect("a part"), 31);
+    }
+}

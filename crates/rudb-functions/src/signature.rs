@@ -57,6 +57,12 @@ enum Shape {
     FixedTo(Fixed, Fixed),
     /// The arguments are whatever they are and the result is fixed. `count(x)` over anything.
     AnyTo(Fixed),
+    /// The first argument is cast to one fixed type, the rest are left alone, and the result is
+    /// fixed. `date_part('minute', x)` is a bigint whatever `x` is.
+    LeadingFixedTo(Fixed, Fixed),
+    /// The first argument is cast to one fixed type, the rest are left alone, and the result is the
+    /// last argument's own type. `date_trunc('month', x)` gives back whatever kind of date `x` was.
+    LeadingFixedToLast(Fixed),
     /// Every argument promotes and an integer result widens to the accumulator. `sum`.
     Accumulated,
 }
@@ -168,6 +174,24 @@ const TABLE: &[Entry] = &[
         shape: Shape::Promoted,
         numeric_only: false,
     },
+    // Dates and times. `EXTRACT(minute FROM x)` is spelled `date_part('minute', x)` by the time it
+    // gets here, because that is what DuckDB's own parser does with it, so there is one entry for
+    // the two spellings. The part is a string and the thing it is a part of is left alone, which is
+    // what the two leading shapes are for: there is nothing to promote a timestamp towards.
+    Entry {
+        name: "date_part",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::LeadingFixedTo(Fixed::Varchar, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "date_trunc",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::LeadingFixedToLast(Fixed::Varchar),
+        numeric_only: false,
+    },
     // Aggregates.
     aggregate("count_star", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt), false),
     aggregate("count", Arity::exactly(1), Shape::AnyTo(Fixed::BigInt), false),
@@ -245,6 +269,18 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         }
         Shape::FixedTo(argument, result) => (vec![argument.ty(); arguments.len()], result.ty()),
         Shape::AnyTo(result) => (arguments.to_vec(), result.ty()),
+        Shape::LeadingFixedTo(first, result) => (leading(first, arguments), result.ty()),
+        Shape::LeadingFixedToLast(first) => {
+            // A null literal has no type and DuckDB refuses `date_trunc('month', NULL)` outright,
+            // because it cannot tell the date overload from the interval one. Refusing needs a
+            // table with both overloads in it to refuse from, which this is not yet, so the answer
+            // is the widest of the candidates rather than a message about a choice nobody made.
+            let last = match arguments.last() {
+                Some(LogicalType::Null) | None => LogicalType::Timestamp,
+                Some(ty) => ty.clone(),
+            };
+            (leading(first, arguments), last)
+        }
         Shape::Accumulated => {
             let common = promote_all(name, arguments)?;
             let returns = accumulator(&common);
@@ -252,6 +288,15 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         }
     };
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
+}
+
+/// The cast list for a shape that fixes the first argument and leaves the others as they are.
+fn leading(first: Fixed, arguments: &[LogicalType]) -> Vec<LogicalType> {
+    let mut cast_to = arguments.to_vec();
+    if let Some(head) = cast_to.first_mut() {
+        *head = first.ty();
+    }
+    cast_to
 }
 
 /// What a sum of this type accumulates into.
@@ -344,6 +389,29 @@ mod tests {
         assert_eq!(counted.returns, LogicalType::BigInt);
         assert_eq!(counted.arguments, vec![LogicalType::Varchar], "count does not cast its input");
         assert_eq!(resolve("count_star", &[]).expect("counts rows").returns, LogicalType::BigInt);
+    }
+
+    /// `date_part` says bigint whatever it reads and `date_trunc` hands back the type it was given,
+    /// which is two answers that one shape cannot give and is why there are two new ones.
+    #[test]
+    fn a_date_function_fixes_the_part_and_leaves_the_date_alone() {
+        let part = resolve("date_part", &[LogicalType::Varchar, LogicalType::Timestamp])
+            .expect("a part of a timestamp");
+        assert_eq!(part.returns, LogicalType::BigInt);
+        assert_eq!(part.arguments, vec![LogicalType::Varchar, LogicalType::Timestamp]);
+        let truncated = resolve("date_trunc", &[LogicalType::Varchar, LogicalType::Date])
+            .expect("a truncated date");
+        assert_eq!(truncated.returns, LogicalType::Date);
+        assert_eq!(truncated.arguments, vec![LogicalType::Varchar, LogicalType::Date]);
+    }
+
+    /// The part is cast rather than checked, so a part that arrives as something other than a
+    /// string is a string by the time the kernel sees it.
+    #[test]
+    fn the_part_of_a_date_function_is_cast_to_a_string() {
+        let resolved = resolve("date_part", &[LogicalType::Integer, LogicalType::Date])
+            .expect("the part is cast rather than refused");
+        assert_eq!(resolved.arguments, vec![LogicalType::Varchar, LogicalType::Date]);
     }
 
     #[test]
