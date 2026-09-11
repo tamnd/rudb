@@ -5,10 +5,13 @@
 //! against a description of DuckDB's behaviour written from memory, because that is how a
 //! compatibility claim quietly stops being true.
 //!
-//! The version on record is a 1.x release rather than the v2.0 alpha the rest of the project
-//! measures against. It is the right thing to diff output modes against anyway, since none of these
-//! modes changed between them, and the capture moves to the pinned binary when
-//! https://github.com/tamnd/rudb/issues/111 lands.
+//! The version on record is the v2.0 alpha at the commit the grammar is vendored from, which is the
+//! binary `scripts/oracle` installs. It is not a build anybody can get with a package manager, so
+//! the capture has to happen on a machine that has one, and the files here came off server2 rather
+//! than off a laptop. That is also why one of them changed shape when it moved: `.mode csv` ends its
+//! lines with a carriage return and a newline on Linux and the file captured on macOS had neither
+//! the carriage returns nor a reason for not having them. rudb writes the carriage return, so the
+//! goldens now say what rudb says and what the binary this project pins says.
 
 use std::io::Write;
 use std::process::ExitCode;
