@@ -19,11 +19,13 @@
 //! `&[i32]` out of a flat vector replaces a body without touching a caller. Sub-milestone 2b is
 //! where that replacement happens, one file at a time, each with a microbenchmark next to it.
 //!
-//! [`compare::compare`], [`scalar::call`], [`logic::combine`] and [`cast::cast`] are done. They
-//! dispatch once on the form pair and once on the physical layout, hoist everything that does not
-//! change from row to row out of the loop, and keep the old row at a time loop as the oracle their
-//! property tests check against rather than as dead code. The kernels that have not been converted
-//! yet still run the old loop, and they are still correct.
+//! All five files are done. [`compare::compare`], [`scalar::call`], [`logic::combine`] and
+//! [`cast::cast`] dispatch once on the form pair and once on the physical layout, hoist everything
+//! that does not change from row to row out of the loop, and keep the old row at a time loop as the
+//! oracle their property tests check against rather than as dead code. The fifth,
+//! [`aggregate::Accumulator`], is the odd one out because it has state rather than an output vector,
+//! so its batch interface folds a vector into the running state instead of returning one. The
+//! shapes none of them has a loop for still run the old loop, and they are still correct.
 //!
 //! The other optimization that has been here from the start is the constant fast path: a cast or a
 //! comparison where both sides are constant vectors costs one operation rather than 1024. That one
