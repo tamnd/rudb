@@ -532,6 +532,13 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
 /// and DuckDB answers `DATE '2013-07-15' = '2013-7-15'` with true, which text comparison cannot
 /// do. Comparing as text would also cost a date to string conversion for every row of a hundred
 /// million, against one string to date conversion for the literal.
+///
+/// A blob against text is the other exception and it goes the other way, to the blob. Text is
+/// bytes with a rule about what they mean and a blob is the bytes, so comparing in the blob is the
+/// comparison that always has an answer, where reading the blob as text has none for the bytes
+/// that are not a string. DuckDB agrees, and this is what the ClickBench queries need on a file
+/// written by ClickHouse: a byte array column with no annotation on it is a blob to both engines,
+/// and ten of the queries write `SearchPhrase <> ''` against one.
 fn comparison_type(left: &LogicalType, right: &LogicalType) -> Option<LogicalType> {
     if let Some(common) = left.promote(right) {
         return Some(common);
@@ -540,6 +547,9 @@ fn comparison_type(left: &LogicalType, right: &LogicalType) -> Option<LogicalTyp
         ty.is_numeric() || ty.is_temporal() || matches!(ty, LogicalType::Boolean)
     };
     match (left, right) {
+        (LogicalType::Varchar, LogicalType::Blob) | (LogicalType::Blob, LogicalType::Varchar) => {
+            Some(LogicalType::Blob)
+        }
         (LogicalType::Varchar, other) | (other, LogicalType::Varchar) if reads_a_string(other) => {
             Some(other.clone())
         }
@@ -697,5 +707,23 @@ mod tests {
     fn an_exponent_is_a_double_however_it_is_written() {
         assert!(matches!(number("1e3", false).expect("a number"), Value::Double(_)));
         assert!(matches!(number("1.5E-3", false).expect("a number"), Value::Double(_)));
+    }
+
+    /// Text against a number reads the text as the number, and text against a blob goes the other
+    /// way, to the blob. Both are exceptions to promotion and they point in opposite directions,
+    /// which is the part worth a test rather than a comment.
+    #[test]
+    fn a_comparison_of_two_types_that_do_not_promote_picks_the_one_that_has_an_answer() {
+        let common = |left, right| comparison_type(&left, &right);
+        assert_eq!(
+            common(LogicalType::Varchar, LogicalType::Blob),
+            Some(LogicalType::Blob),
+            "bytes are the reading that always has an answer"
+        );
+        assert_eq!(common(LogicalType::Blob, LogicalType::Varchar), Some(LogicalType::Blob));
+        assert_eq!(common(LogicalType::Varchar, LogicalType::Integer), Some(LogicalType::Integer));
+        assert_eq!(common(LogicalType::Varchar, LogicalType::Date), Some(LogicalType::Date));
+        assert_eq!(common(LogicalType::Blob, LogicalType::Integer), None);
+        assert_eq!(common(LogicalType::Integer, LogicalType::BigInt), Some(LogicalType::BigInt));
     }
 }

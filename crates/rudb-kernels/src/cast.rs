@@ -485,6 +485,7 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
         LogicalType::Double => to_double(value),
         LogicalType::Decimal { width, scale } => to_decimal(value, *width, *scale),
         LogicalType::Varchar => Ok(Value::Varchar(value.to_string())),
+        LogicalType::Blob => to_blob(value),
         LogicalType::Date => to_date(value),
         LogicalType::Timestamp => to_timestamp(value),
         other => {
@@ -646,6 +647,67 @@ fn parse_decimal(text: &str, scale: u8) -> Option<i128> {
     let written: i128 = format!("{whole}{fraction}").parse().ok()?;
     let scaled = rescale(written, u8::try_from(fraction.len()).ok()?, scale)?;
     Some(sign * scaled)
+}
+
+/// Text to bytes, which is not the bytes of the text.
+///
+/// A blob prints with every byte that is not a printable ASCII character written as `\xNN`, and
+/// reading one back has to undo that, so `'\x41'` is one byte and not four. Everything outside that
+/// escape is taken as itself, and only if it is ASCII: a byte above 127 in the text has no reading
+/// here that round trips, because the text it came from was UTF-8 and the blob is not, so DuckDB
+/// refuses it and says which character it refused on. This is the one cast where being lenient
+/// would quietly turn a two byte character into two bytes of a blob that nothing wrote.
+fn to_blob(value: &Value) -> Result<Value> {
+    let Value::Varchar(text) = value else {
+        return Err(not_convertible(value, &LogicalType::Blob));
+    };
+    let escape = |what: &str| {
+        Error::conversion(format!(
+            "Invalid hex escape code encountered in string -> blob conversion of string \"{text}\": {what}"
+        ))
+    };
+    let source = text.as_bytes();
+    let mut out = Vec::with_capacity(source.len());
+    let mut at = 0;
+    while at < source.len() {
+        let byte = source[at];
+        if byte == b'\\' {
+            let Some(code) = source.get(at + 1..at + 4) else {
+                return Err(escape("unterminated escape code at end of blob"));
+            };
+            let (high, low) = (hex(code[1]), hex(code[2]));
+            match (code[0], high, low) {
+                (b'x', Some(high), Some(low)) => out.push(high * 16 + low),
+                _ => {
+                    // The four bytes as they were written, which is what DuckDB puts here and is
+                    // the only part of the message that says where in the string to look. Lossy
+                    // because those four can cut a character in half, and a message is not worth
+                    // a panic.
+                    return Err(escape(&String::from_utf8_lossy(&source[at..at + 4])));
+                }
+            }
+            at += 4;
+            continue;
+        }
+        if !byte.is_ascii() {
+            return Err(Error::conversion(format!(
+                "Invalid byte encountered in STRING -> BLOB conversion of string \"{text}\". All non-ascii characters must be escaped with hex codes (e.g. \\xAA)"
+            )));
+        }
+        out.push(byte);
+        at += 1;
+    }
+    Ok(Value::Blob(out))
+}
+
+/// One hex digit as a number, either case.
+fn hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn to_date(value: &Value) -> Result<Value> {
@@ -1077,6 +1139,38 @@ mod tests {
         assert_eq!(wider.value_at(0), Value::Decimal { unscaled: 155_000, width: 18, scale: 5 });
         let back = cast(&whole, &two, false).expect("rescales back");
         assert_eq!(back.value_at(0), Value::Decimal { unscaled: 200, width: 9, scale: 2 });
+    }
+
+    /// Text to bytes is not the bytes of the text. `\xNN` is one byte, an ASCII character is
+    /// itself, and anything above 127 has no reading that round trips so it is refused.
+    #[test]
+    fn text_casts_to_a_blob_through_the_escapes_and_not_through_its_own_bytes() {
+        let blob = |text: &str| cast_to(Value::Varchar(text.into()), &LogicalType::Blob);
+        assert_eq!(blob("\\x41\\x42").expect("two escapes"), Value::Blob(b"AB".to_vec()));
+        assert_eq!(blob("abc").expect("plain ascii"), Value::Blob(b"abc".to_vec()));
+        assert_eq!(blob("").expect("the empty string"), Value::Blob(Vec::new()));
+        assert_eq!(blob("\\xff\\x00").expect("either case, both ends"), Value::Blob(vec![255, 0]));
+        assert_eq!(
+            blob("a\\x0Ab").expect("an escape in the middle"),
+            Value::Blob(b"a\nb".to_vec())
+        );
+    }
+
+    /// The messages are DuckDB's word for word, since a query that fails the same way but says
+    /// something else is still a difference someone has to reconcile.
+    #[test]
+    fn a_text_a_blob_cannot_read_says_which_part_it_could_not_read() {
+        let blob = |text: &str| {
+            cast_to(Value::Varchar(text.into()), &LogicalType::Blob).expect_err("not a blob")
+        };
+        assert!(blob("\\xZZ").message().contains("\\xZZ"), "{}", blob("\\xZZ"));
+        assert!(blob("\\x4").message().contains("unterminated escape code at end of blob"));
+        assert!(
+            blob("é").message().contains("All non-ascii characters must be escaped"),
+            "{}",
+            blob("é")
+        );
+        assert_eq!(blob("\\xZZ").code(), ErrorCode::Conversion);
     }
 
     /// A dictionary keeps its nulls in the vector it points at, and a sweep that read the outer

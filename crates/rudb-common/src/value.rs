@@ -316,9 +316,14 @@ fn write_decimal(f: &mut fmt::Formatter<'_>, unscaled: i128, scale: u8) -> fmt::
 }
 
 /// A blob prints as printable ASCII with everything else hex escaped, which is DuckDB's rule.
+///
+/// Three printable characters are escaped anyway, and they are the three that would otherwise make
+/// the printed form ambiguous: a backslash because it starts an escape, and the two quotes because
+/// the text this prints into is a string literal often enough. Every byte of all 256 was compared
+/// against DuckDB and these three were the only disagreement.
 fn write_blob(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
     for &byte in bytes {
-        if byte.is_ascii_graphic() || byte == b' ' {
+        if (byte.is_ascii_graphic() || byte == b' ') && !matches!(byte, b'\\' | b'\'' | b'"') {
             write!(f, "{}", byte as char)?;
         } else {
             write!(f, "\\x{byte:02X}")?;
@@ -551,6 +556,10 @@ mod tests {
     fn a_blob_escapes_what_is_not_printable() {
         assert_eq!(Value::Blob(b"ok".to_vec()).to_string(), "ok");
         assert_eq!(Value::Blob(vec![0, 1, b'a']).to_string(), "\\x00\\x01a");
+        assert_eq!(Value::Blob(vec![0x7f, 0xff]).to_string(), "\\x7F\\xFF");
+        // The three printable ones DuckDB escapes anyway, and the neighbours that it does not.
+        assert_eq!(Value::Blob(br#"'"\"#.to_vec()).to_string(), "\\x27\\x22\\x5C");
+        assert_eq!(Value::Blob(b" &`~".to_vec()).to_string(), " &`~");
     }
 
     #[test]
