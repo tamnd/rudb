@@ -21,6 +21,9 @@ done
 duckdb -batch -init /dev/null -cmd ".read $here/setup.sql" -c "SELECT * FROM t WHERE a > 9000" >"$here/empty.txt"
 # The one query that covers every byte the CSV writer puts quotes around.
 duckdb -batch -init /dev/null -cmd ".mode csv" -c ".read $here/quoting.sql" >"$here/quoting.txt"
+# The same query through the flag rather than the dot command, because the flag does not set the row
+# separator and the two files differ by exactly that.
+duckdb -batch -init /dev/null -csv -c ".read $here/quoting.sql" >"$here/quoting-flag.txt"
 duckdb -batch -init /dev/null -c ".show" >"$here/show.txt"
 # One file per line of counts.sql, which is where the row count and the column count and the row of
 # dots get their shapes. The test reads the same file, so a query added here needs nothing else.

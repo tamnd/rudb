@@ -1,0 +1,2 @@
+plain,space,comma,quote,apostrophe,cyrillic,accented,tab,delete,empty,nothing,"head,er"
+plain,a b,"a,b","a""b","a'b","ведомо","é","a	b","ab",,NULL,"a""b"

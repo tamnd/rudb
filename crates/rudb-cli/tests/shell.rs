@@ -263,6 +263,21 @@ fn a_csv_field_is_quoted_on_the_bytes_duckdb_quotes_it_on() {
     assert_eq!(out, golden("quoting.txt"));
 }
 
+/// `-csv` ends a row with a newline and `.mode csv` ends it with a carriage return and a newline.
+///
+/// Both goldens come out of the same binary in the same run of `testdata/capture.sh`, so the pair
+/// of them is the whole argument that this is DuckDB's behaviour rather than a capture accident. It
+/// reads like an oversight upstream and copying it is still right, because the people who reach for
+/// the flag are the people piping the output into something that counts bytes.
+#[test]
+fn a_mode_flag_and_the_dot_command_end_a_row_differently() {
+    let query = golden("quoting.sql");
+    let (out, err, failed) = run(&["-csv", "-c", query.trim_end()]);
+    assert!(!failed, "{err}");
+    assert_eq!(out, golden("quoting-flag.txt"));
+    assert!(!out.contains('\r'), "the flag does not set the row separator");
+}
+
 #[test]
 fn an_unknown_dot_command_is_an_error_and_the_run_fails() {
     let (_, err, failed) = run(&["-c", ".nonsense"]);
