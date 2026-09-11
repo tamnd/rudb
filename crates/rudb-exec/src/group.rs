@@ -5,20 +5,23 @@
 //! one would be two answers to the same question, and the only way to be sure that never happens is
 //! for both to ask the same type.
 //!
-//! The table is a `HashMap` from key to slot alongside a `Vec` of keys in first arrival order, so
-//! the output comes out in the order the groups were first seen. SQL does not promise that and
-//! DuckDB does not either, but a deterministic order costs one push per group and makes a failing
-//! test a diff instead of an investigation.
+//! The table is a `HashMap` from key to slot, and the slot is the number of groups that were seen
+//! before this one, so the output comes out in the order the groups were first seen. SQL does not
+//! promise that and DuckDB does not either, but a deterministic order costs nothing here and makes a
+//! failing test a diff instead of an investigation.
+//!
+//! The state of every group lives in flat vectors indexed by that slot rather than in a vector of
+//! its own, so a group that arrives costs a push and not a trip to the allocator, and the key of a
+//! row that is not a new group is written into a buffer this keeps rather than into a new one. What
+//! is left per row is the hash and the probe, which is what #237 was about.
 
-use std::collections::{HashMap, HashSet};
-
-use rudb_common::{ALLOCATION, Error, Field, LogicalType, Memory, Reservation, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Accumulator, is_true};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
-use rudb_vector::Chunk;
+use rudb_vector::{Chunk, Vector};
 
 use crate::expr::{evaluate, evaluate_all};
-use crate::key::Key;
+use crate::key::{Key, RowMap, RowSet};
 use crate::operator::Operator;
 use crate::rows;
 use crate::schema::Schema;
@@ -122,17 +125,22 @@ impl<'a> Aggregate<'a> {
         // when the last group has been finished and they are not.
         let mut scratch = self.memory.reservation();
         let mut charged = 0;
-        let mut order: Vec<Key> = Vec::new();
-        let mut slots: HashMap<Key, usize> = HashMap::new();
-        let mut states: Vec<Vec<Accumulator>> = Vec::new();
-        let mut seen: Vec<Vec<HashSet<Key>>> = Vec::new();
+        let mut slots: RowMap<usize> = RowMap::default();
+        let mut states: Vec<Accumulator> = Vec::new();
+        let mut seen: Vec<RowSet> = Vec::new();
+        let calls = self.calls.len();
+        // Whether any call is `DISTINCT`, and so whether the sets that answer that are built at all.
+        // A group by with a million groups and no `DISTINCT` anywhere in it used to allocate a
+        // million empty sets to look at none of them.
+        let sets = self.calls.iter().any(|call| call.distinct);
         let alone = self.groups.is_empty();
+        let mut groups = 0;
         if alone {
-            let key = Key(Vec::new());
-            slots.insert(key.clone(), 0);
-            order.push(key);
-            states.push(self.fresh()?);
-            seen.push(vec![HashSet::new(); self.calls.len()]);
+            groups = 1;
+            self.fresh(&mut states)?;
+            if sets {
+                seen.resize_with(calls, RowSet::default);
+            }
         }
         // Which calls fold a vector at a time. An ungrouped aggregate has exactly one slot, so
         // there is no key to build, no hash to take and no lookup to do, and what is left of the
@@ -145,6 +153,11 @@ impl<'a> Aggregate<'a> {
             .map(|call| alone && !call.distinct && call.filter.is_none())
             .collect();
         let every = by_vector.iter().all(|&yes| yes);
+        // One row of the group key and one row of arguments per call, filled again for each input
+        // row and kept between rows so that the buffers behind them are asked for once and not once
+        // per row. Only a row that turns out to be a group nobody has seen is copied out of them.
+        let mut key = Key(Vec::new());
+        let mut given: Vec<Key> = vec![Key(Vec::new()); calls];
         while let Some(chunk) = self.input.next()? {
             let keys = evaluate_all(self.plan, &self.groups, &self.input_schema, &chunk)?;
             let mut taken = 0;
@@ -157,9 +170,9 @@ impl<'a> Aggregate<'a> {
                     None => None,
                 });
             }
-            for at in 0..self.calls.len() {
+            for at in 0..calls {
                 if by_vector[at] {
-                    states[0][at].update_run(&arguments[at], chunk.len())?;
+                    states[at].update_run(&arguments[at], chunk.len())?;
                 }
             }
             if alone && every {
@@ -173,21 +186,23 @@ impl<'a> Aggregate<'a> {
                 let slot = if alone {
                     0
                 } else {
-                    let key = Key(keys.iter().map(|column| column.value_at(row)).collect());
+                    fill(&mut key, &keys, row);
                     match slots.get(&key) {
                         Some(&slot) => slot,
                         None => {
-                            let slot = states.len();
-                            // A group costs its key twice, once in the table and once in the list
-                            // that keeps the arrival order, and its own state beside them. What the
-                            // four containers took to hold all of that is charged separately, below
-                            // and once per chunk, because it is a property of the containers rather
-                            // than of this group.
-                            taken += group_state(&key.0, self.calls.len());
+                            let slot = groups;
+                            groups += 1;
+                            // A group costs the copy of its key that the table takes, and its own
+                            // accumulators and distinct sets in the two vectors beside it. What
+                            // those three containers took to have room for all of that is charged
+                            // separately, below and once per chunk, because it is a property of the
+                            // containers rather than of this group.
+                            taken += rows::heap(&key.0);
                             slots.insert(key.clone(), slot);
-                            order.push(key);
-                            states.push(self.fresh()?);
-                            seen.push(vec![HashSet::new(); self.calls.len()]);
+                            self.fresh(&mut states)?;
+                            if sets {
+                                seen.resize_with(seen.len() + calls, RowSet::default);
+                            }
                             slot
                         }
                     }
@@ -201,39 +216,78 @@ impl<'a> Aggregate<'a> {
                             continue;
                         }
                     }
-                    let args: Vec<Value> =
-                        arguments[at].iter().map(|column| column.value_at(row)).collect();
+                    let args = &mut given[at];
+                    fill(args, &arguments[at], row);
                     if call.distinct {
-                        let key = Key(args.clone());
-                        let size = rows::footprint(&key.0);
-                        if !seen[slot][at].insert(key) {
+                        // Asked before it is added, because the answer is usually that it is there
+                        // already and a set that is asked never takes a copy of what it was asked
+                        // about. A `count(DISTINCT x)` over a million rows and a thousand values
+                        // copies a thousand times rather than a million.
+                        let set = &mut seen[slot * calls + at];
+                        if set.contains(args) {
                             continue;
                         }
-                        taken += size;
+                        taken += rows::footprint(&args.0);
+                        set.insert(args.clone());
                     }
-                    states[slot][at].update(&args)?;
+                    states[slot * calls + at].update(&args.0)?;
                 }
             }
             scratch.grow(taken)?;
-            let now = tables(&slots, &order, &states, &seen);
+            let now = tables(&slots, &states, &seen);
             rows::capacity(now, &mut charged, &mut scratch)?;
         }
-        let mut out = Vec::with_capacity(order.len());
-        for (slot, key) in order.into_iter().enumerate() {
-            let mut row = key.0;
-            for accumulator in &states[slot] {
+        let mut out: Vec<Vec<Value>> = vec![Vec::new(); groups];
+        for (key, slot) in slots {
+            out[slot] = key.0;
+        }
+        for (slot, row) in out.iter_mut().enumerate() {
+            for accumulator in &states[slot * calls..slot * calls + calls] {
                 row.push(accumulator.finish()?);
             }
-            out.push(row);
         }
         self.chunks = rows::chunks(&self.schema.types(), &out, &mut self.held)?;
         Ok(())
     }
 
-    /// A fresh accumulator per call, which is what one new group costs.
-    fn fresh(&self) -> Result<Vec<Accumulator>> {
-        self.calls.iter().map(|call| Accumulator::new(&call.name, &call.returns)).collect()
+    /// A fresh accumulator per call, appended for the group that has just arrived.
+    ///
+    /// One flat vector of accumulators rather than a vector per group, so that a new group costs a
+    /// push and not a trip to the allocator. The accumulators of the group in `slot` are the run of
+    /// `calls` entries starting at `slot * calls`.
+    fn fresh(&self, states: &mut Vec<Accumulator>) -> Result<()> {
+        for call in &self.calls {
+            states.push(Accumulator::new(&call.name, &call.returns)?);
+        }
+        Ok(())
     }
+}
+
+/// Fills `key` with one row of `columns`, reusing what the row before it left behind.
+///
+/// The point of filling rather than collecting is the strings. A `Value::Varchar` owns its bytes, so
+/// reading a string column a row at a time takes a buffer from the allocator on every row and gives
+/// it back on the next one, and a group by over `URL` does that a hundred million times to look at
+/// each buffer once. Writing into the buffer that is already there asks for nothing. Every other
+/// value owns nothing, so overwriting one is a move of a few bytes.
+fn fill(key: &mut Key, columns: &[Vector], row: usize) {
+    key.0.truncate(columns.len());
+    for (at, column) in columns.iter().enumerate() {
+        match key.0.get_mut(at) {
+            Some(slot) => set(slot, column, row),
+            None => key.0.push(column.value_at(row)),
+        }
+    }
+}
+
+/// Puts one column's value at `row` into `slot`, keeping the buffer that is already there if it can.
+fn set(slot: &mut Value, column: &Vector, row: usize) {
+    if let (Value::Varchar(buffer), Some(text)) = (&mut *slot, column.text_at(row)) {
+        buffer.clear();
+        buffer.push_str(text);
+        return;
+    }
+    *slot = column.value_at(row);
 }
 
 impl Operator for Aggregate<'_> {
@@ -255,31 +309,9 @@ impl Operator for Aggregate<'_> {
     }
 }
 
-/// What one new group costs, not counting the room the four containers made for it.
+/// What the three containers have taken from the allocator between them.
 ///
-/// The key twice, because the table and the arrival order each own a copy, and each copy is a
-/// separate block from the allocator. Then the two vectors this group's own state lives in, one of
-/// accumulators and one of distinct sets, one per aggregate call, and each of those is a block too.
-/// A query with no aggregate calls, which is what `DISTINCT` binds to, allocates neither, because an
-/// empty `Vec` does not go to the allocator at all.
-///
-/// An accumulator is charged as its own width and not as what it holds. That is a knowing undercount
-/// and it is the one left: what a `list()` or a `string_agg()` holds grows with the input and there
-/// is no way to ask one how large it has become.
-fn group_state(key: &[Value], calls: usize) -> u64 {
-    let mut bytes = 2 * rows::heap(key);
-    if calls > 0 {
-        let calls = u64::try_from(calls).unwrap_or(u64::MAX);
-        let width = |size: usize| u64::try_from(size).unwrap_or(u64::MAX);
-        bytes += calls * width(size_of::<Accumulator>()) + ALLOCATION;
-        bytes += calls * width(size_of::<HashSet<Key>>()) + ALLOCATION;
-    }
-    bytes
-}
-
-/// What the four containers have taken from the allocator between them.
-///
-/// Capacity rather than length in all four, which is the point of #227. A `Vec` doubles and so sits
+/// Capacity rather than length in all three, which is the point of #227. A `Vec` doubles and so sits
 /// between half empty and full, and a `HashMap` fills to seven eighths before doubling as well, so
 /// a table of seventeen million groups has paid for somewhere between seventeen and thirty four
 /// million slots and the old charge counted seventeen.
@@ -288,22 +320,20 @@ fn group_state(key: &[Value], calls: usize) -> u64 {
 /// answers a lookup without touching the keys, and there are more buckets than the capacity it
 /// reports. [`rows::buckets`] has that arithmetic.
 ///
-/// The keys and the states these have room for are not counted here. They are charged as each group
-/// arrives, by [`group_state`], and the two have to divide the group between them without
+/// What the keys own away from the table is not counted here. That is charged as each group arrives,
+/// by [`rows::heap`] over the key, and the two have to divide the group between them without
 /// overlapping.
-fn tables(
-    slots: &HashMap<Key, usize>,
-    order: &Vec<Key>,
-    states: &Vec<Vec<Accumulator>>,
-    seen: &Vec<Vec<HashSet<Key>>>,
-) -> u64 {
+///
+/// An accumulator is charged as its own width and not as what it holds. That is a knowing undercount
+/// and it is the one left: what a `list()` or a `string_agg()` holds grows with the input and there
+/// is no way to ask one how large it has become.
+fn tables(slots: &RowMap<usize>, states: &Vec<Accumulator>, seen: &Vec<RowSet>) -> u64 {
     let width = |count: usize, size: usize| {
         u64::try_from(count).unwrap_or(u64::MAX).saturating_mul(width_of(size))
     };
     rows::buckets(slots.capacity()) * (width_of(size_of::<(Key, usize)>()) + 1)
-        + width(order.capacity(), size_of::<Key>())
-        + width(states.capacity(), size_of::<Vec<Accumulator>>())
-        + width(seen.capacity(), size_of::<Vec<HashSet<Key>>>())
+        + width(states.capacity(), size_of::<Accumulator>())
+        + width(seen.capacity(), size_of::<RowSet>())
 }
 
 /// A `size_of` in the width the budget is counted in.
@@ -370,8 +400,9 @@ impl<'a> Distinct<'a> {
     fn build(&mut self) -> Result<()> {
         let mut scratch = self.memory.reservation();
         let mut charged = 0;
-        let mut seen: HashSet<Key> = HashSet::new();
+        let mut seen: RowSet = RowSet::default();
         let mut kept: Vec<Vec<Value>> = Vec::new();
+        let mut key = Key(Vec::new());
         while let Some(chunk) = self.input.next()? {
             let keys = if self.on.is_empty() {
                 Vec::new()
@@ -382,20 +413,25 @@ impl<'a> Distinct<'a> {
             // row at a time: `DISTINCT` is a grouping that keeps no aggregate, so it gets its
             // answer from the same table 2f (#60) builds and stops building a key here then.
             for row in 0..chunk.len() {
-                let values: Vec<Value> = chunk.row(row).collect();
-                let key = if self.on.is_empty() {
-                    Key(values.clone())
+                if self.on.is_empty() {
+                    key.0.clear();
+                    key.0.extend(chunk.row(row));
                 } else {
-                    Key(keys.iter().map(|column| column.value_at(row)).collect())
-                };
+                    fill(&mut key, &keys, row);
+                }
+                // Asked before anything is copied, because a row that has been seen is a row this
+                // has no further use for, and most rows of a `DISTINCT` worth running have been.
+                if seen.contains(&key) {
+                    continue;
+                }
+                let values: Vec<Value> =
+                    if self.on.is_empty() { key.0.clone() } else { chunk.row(row).collect() };
                 // The row is kept twice, once as the key in the table and once in the output, and
                 // each copy is its own block. What the table and the output took to have room for
                 // them is charged below, once per chunk.
-                let size = rows::heap(&key.0) + rows::heap(&values);
-                if seen.insert(key) {
-                    kept.push(values);
-                    taken += size;
-                }
+                taken += rows::heap(&key.0) + rows::heap(&values);
+                seen.insert(key.clone());
+                kept.push(values);
             }
             scratch.grow(taken)?;
             let now = rows::buckets(seen.capacity()) * (width_of(size_of::<Key>()) + 1)

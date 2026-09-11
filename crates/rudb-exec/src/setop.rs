@@ -9,13 +9,11 @@
 //! The output columns are the left side's, under the set operation's own table index. Both sides
 //! were made type compatible by the binder, so nothing here casts anything.
 
-use std::collections::HashMap;
-
 use rudb_common::{Memory, Reservation, Result, Value};
 use rudb_plan::SetOpKind;
 use rudb_vector::Chunk;
 
-use crate::key::Key;
+use crate::key::{Key, RowMap, RowSet};
 use crate::operator::Operator;
 use crate::rows;
 use crate::schema::Schema;
@@ -119,8 +117,8 @@ impl Operator for SetOp<'_> {
 }
 
 /// How many times each row appears.
-fn counts(rows: &[Vec<Value>]) -> HashMap<Key, usize> {
-    let mut held = HashMap::new();
+fn counts(rows: &[Vec<Value>]) -> RowMap<usize> {
+    let mut held = RowMap::default();
     for row in rows {
         *held.entry(Key(row.clone())).or_insert(0) += 1;
     }
@@ -129,12 +127,12 @@ fn counts(rows: &[Vec<Value>]) -> HashMap<Key, usize> {
 
 /// The first occurrence of each row, in the order they arrived.
 fn deduplicated(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = RowSet::default();
     rows.into_iter().filter(|row| seen.insert(Key(row.clone()))).collect()
 }
 
 /// `EXCEPT ALL`: each left row survives unless a right row has already cancelled it.
-fn difference(left: Vec<Vec<Value>>, right: &HashMap<Key, usize>) -> Vec<Vec<Value>> {
+fn difference(left: Vec<Vec<Value>>, right: &RowMap<usize>) -> Vec<Vec<Value>> {
     let mut budget = right.clone();
     let mut out = Vec::new();
     for row in left {
@@ -147,7 +145,7 @@ fn difference(left: Vec<Vec<Value>>, right: &HashMap<Key, usize>) -> Vec<Vec<Val
 }
 
 /// `INTERSECT ALL`: a left row survives while the right side still has a copy to pair it with.
-fn intersection(left: Vec<Vec<Value>>, right: &HashMap<Key, usize>) -> Vec<Vec<Value>> {
+fn intersection(left: Vec<Vec<Value>>, right: &RowMap<usize>) -> Vec<Vec<Value>> {
     let mut budget = right.clone();
     let mut out = Vec::new();
     for row in left {
