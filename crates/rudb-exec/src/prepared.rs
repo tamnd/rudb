@@ -34,7 +34,9 @@
 //! count, and at 1024 rows the intermediate vectors are eight kilobytes and stay in L1.
 
 use rudb_common::{Error, LogicalType, Result, Value};
-use rudb_kernels::{Comparison, Connective, cast, combine, compare, is_true};
+use rudb_kernels::{
+    Comparison, Connective, cast, combine, compare, is_true, refine, refine_flags, selection,
+};
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Chunk, Selection, Vector};
 
@@ -303,20 +305,116 @@ impl Prepared {
         self.operand(root, chunk, &scratch.slots)
     }
 
+    /// Evaluates a single expression as a filter, handing back the rows it keeps.
+    ///
+    /// The difference between this and [`evaluate_one`](Self::evaluate_one) followed by
+    /// [`selection`] is the whole of what a threaded filter is. An `AND` evaluated as an expression
+    /// runs every conjunct over every row and then combines the flag vectors, so a predicate of four
+    /// conjuncts that each pass a fifth of the rows does five times the work of one that stops
+    /// looking at a row as soon as a conjunct rejects it. TPC-H Q6 is exactly that predicate.
+    ///
+    /// So the conjuncts of a top level `AND` are run one at a time, each over the rows the ones
+    /// before it left, and the moment nothing is left the rest of the predicate is not run at all.
+    /// The order is the order the plan gives, which is the optimizer's business rather than this
+    /// one's until the adaptive reordering of #57 lands.
+    ///
+    /// What is threaded is the conjunct's own comparison rather than the whole of its subtree. A
+    /// conjunct of `a + b > 5` still adds over the whole chunk, because the scalar kernels take a
+    /// vector rather than a selection, and it is the comparison and everything downstream of it that
+    /// reads only the rows still in play. A conjunct that is a bare column, a function or a nested
+    /// `OR` produces flags over the chunk and is intersected with [`refine_flags`], which is what
+    /// keeps one awkward conjunct from putting the others back on the unthreaded path.
+    ///
+    /// # Errors
+    ///
+    /// Anything a kernel reports, and an internal error if this was not built from exactly one
+    /// expression.
+    pub fn evaluate_filter(&self, chunk: &Chunk, scratch: &mut Scratch) -> Result<Selection> {
+        let [root] = self.roots[..] else {
+            return Err(Error::internal(format!(
+                "evaluate_filter over a prepared expression of {} roots",
+                self.roots.len()
+            )));
+        };
+        let Step::Conjunction { op: Connective::And, start, len } = self.steps[root] else {
+            let flags = self.evaluate_one(chunk, scratch)?;
+            return Ok(selection(flags, chunk.len()));
+        };
+
+        scratch.slots.clear();
+        scratch.slots.resize_with(self.steps.len(), || None);
+        // The array is in post order and this expression's steps are the whole of it, so the subtree
+        // of the first conjunct starts at zero and the subtree of every other one starts just after
+        // the conjunct before it ends. That is what makes running a conjunct at a time a matter of
+        // walking the same array in the same order rather than of holding a second structure.
+        let mut begin = 0;
+        let mut kept: Option<Selection> = None;
+        for at in 0..len {
+            let conjunct = self.operands[start + at];
+            if kept.as_ref().is_some_and(Selection::is_empty) {
+                break;
+            }
+            for index in begin..conjunct {
+                self.run_step(index, chunk, scratch)?;
+            }
+            let next = self.thread(conjunct, chunk, scratch, kept.as_ref())?;
+            kept = Some(next);
+            // A conjunct's subtree is its own, because nothing here looks for a common subexpression
+            // and so no step outside the range is reading one inside it.
+            for index in begin..=conjunct {
+                scratch.slots[index] = None;
+            }
+            begin = conjunct + 1;
+        }
+        Ok(kept.unwrap_or_else(|| Selection::identity(chunk.len())))
+    }
+
+    /// One conjunct, over the rows the conjuncts before it left, or over all of them for the first.
+    fn thread(
+        &self,
+        index: usize,
+        chunk: &Chunk,
+        scratch: &mut Scratch,
+        kept: Option<&Selection>,
+    ) -> Result<Selection> {
+        if let Step::Compare { op, left, right } = self.steps[index] {
+            let left = self.operand(left, chunk, &scratch.slots)?;
+            let right = self.operand(right, chunk, &scratch.slots)?;
+            return match kept {
+                // The first conjunct has every row in play, and asking the threaded kernel for that
+                // would be a pass over an identity selection the unthreaded one does not need.
+                None => Ok(selection(&compare(op, left, right)?, chunk.len())),
+                Some(kept) => refine(op, left, right, kept),
+            };
+        }
+        self.run_step(index, chunk, scratch)?;
+        let flags = self.operand(index, chunk, &scratch.slots)?;
+        match kept {
+            None => Ok(selection(flags, chunk.len())),
+            Some(kept) => refine_flags(flags, kept),
+        }
+    }
+
     /// Runs every step in order, filling the slots.
     fn run(&self, chunk: &Chunk, scratch: &mut Scratch) -> Result<()> {
         scratch.slots.clear();
         scratch.slots.resize_with(self.steps.len(), || None);
         for index in 0..self.steps.len() {
-            let produced = self.step(index, chunk, &scratch.slots)?;
-            scratch.slots[index] = produced;
-            let slots = &mut scratch.slots;
-            self.for_each_operand(index, |operand| {
-                if self.last_use[operand] == index {
-                    slots[operand] = None;
-                }
-            });
+            self.run_step(index, chunk, scratch)?;
         }
+        Ok(())
+    }
+
+    /// Runs one step and empties the slot of every operand this was the last step to read.
+    fn run_step(&self, index: usize, chunk: &Chunk, scratch: &mut Scratch) -> Result<()> {
+        let produced = self.step(index, chunk, &scratch.slots)?;
+        scratch.slots[index] = produced;
+        let slots = &mut scratch.slots;
+        self.for_each_operand(index, |operand| {
+            if self.last_use[operand] == index {
+                slots[operand] = None;
+            }
+        });
         Ok(())
     }
 
@@ -610,10 +708,11 @@ pub(crate) fn connective(op: ConjunctionOp) -> Connective {
 #[cfg(test)]
 mod tests {
     use rudb_common::{Field, LogicalType, Value};
+    use rudb_kernels::is_true;
     use rudb_plan::{ExprRef, Node, Plan};
-    use rudb_vector::{Chunk, Vector};
+    use rudb_vector::{Chunk, Selection, Vector};
 
-    use super::Prepared;
+    use super::{Prepared, narrow};
     use crate::expr::evaluate;
     use crate::schema::Schema;
 
@@ -752,6 +851,111 @@ mod tests {
         assert_eq!(live, 1, "a chain that has run should be holding its answer and nothing else");
     }
 
+    /// The rows a threaded filter keeps are the rows the tree walk says the predicate is true for.
+    ///
+    /// Every threaded conjunct is a chance to disagree with the unthreaded answer about a null,
+    /// about a row an earlier conjunct had already dropped, or about a chunk nothing survives, and
+    /// the answer is a set of row numbers rather than a vector, so this is checked against the tree
+    /// walk read a row at a time rather than against the prepared form it is part of.
+    fn filters(predicate: &str) {
+        let (schema, chunk) = input();
+        let (plan, list) = projection(&format!("{predicate} AS p"));
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+        let mut scratch = prepared.scratch();
+        let threaded = prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs");
+        let flags = evaluate(&plan, list[0], &schema, &chunk).expect("the tree walk runs");
+        let expected = Selection::from_predicate(chunk.len(), |row| is_true(&flags.value_at(row)));
+        assert_eq!(threaded, expected, "`{predicate}`");
+        // And running it again over the same scratch is the same answer, because a pipeline calls
+        // this once a chunk and a slot left behind by the conjunct before would show up here.
+        let again = prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs again");
+        assert_eq!(again, expected, "`{predicate}` a second time");
+    }
+
+    /// A predicate with no `AND` in it is not threaded and has to keep saying the same thing.
+    #[test]
+    fn a_single_comparison_filters_the_same_rows() {
+        filters("(#0.0::INTEGER > 1::INTEGER)::BOOLEAN");
+        filters("(#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN");
+        filters("(#0.0::INTEGER IS NOT DISTINCT FROM NULL::INTEGER)::BOOLEAN");
+    }
+
+    #[test]
+    fn a_chain_of_conjuncts_keeps_what_all_of_them_keep() {
+        filters(
+            "((#0.0::INTEGER > 1::INTEGER)::BOOLEAN AND (#0.0::INTEGER < 3::INTEGER)::BOOLEAN)\
+             ::BOOLEAN",
+        );
+        filters(
+            "((#0.0::INTEGER >= 1::INTEGER)::BOOLEAN AND (#0.0::INTEGER <= 3::INTEGER)::BOOLEAN \
+             AND (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN AND (#0.0::INTEGER <> 2::INTEGER)\
+             ::BOOLEAN)::BOOLEAN",
+        );
+    }
+
+    /// A conjunct that rejects every row, in front of one that would have kept some. The rows are
+    /// the same either way and the point of the shape is that the second conjunct never runs.
+    #[test]
+    fn a_conjunct_that_keeps_nothing_ends_the_predicate() {
+        filters(
+            "((#0.0::INTEGER > 9::INTEGER)::BOOLEAN AND (#0.0::INTEGER < 9::INTEGER)::BOOLEAN)\
+             ::BOOLEAN",
+        );
+    }
+
+    /// A conjunct whose operands are computed rather than read, which is the shape where the
+    /// comparison is threaded and the arithmetic under it is not.
+    #[test]
+    fn a_conjunct_over_a_computed_operand_keeps_the_same_rows() {
+        filters(
+            "((#0.0::INTEGER > 1::INTEGER)::BOOLEAN AND \
+             (\"+\"(#0.0::INTEGER, 1::INTEGER)::INTEGER < 4::INTEGER)::BOOLEAN)::BOOLEAN",
+        );
+    }
+
+    /// A conjunct that is not a comparison at all, which is the one that goes through the flag
+    /// kernel rather than the comparison kernel.
+    #[test]
+    fn a_conjunct_that_is_not_a_comparison_is_threaded_too() {
+        filters(
+            "((#0.0::INTEGER > 1::INTEGER)::BOOLEAN AND ((#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN \
+             OR (#0.0::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN",
+        );
+        filters(
+            "(((#0.1::VARCHAR = 'c'::VARCHAR)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)\
+             ::BOOLEAN AND (#0.0::INTEGER <> 1::INTEGER)::BOOLEAN)::BOOLEAN",
+        );
+    }
+
+    /// An `OR` at the top is not threaded, because a row the left side rejects is a row the right
+    /// side may still keep. Threading it would be the wrong answer rather than a slower one.
+    #[test]
+    fn an_or_at_the_top_is_not_threaded() {
+        filters(
+            "((#0.0::INTEGER > 2::INTEGER)::BOOLEAN OR (#0.1::VARCHAR = 'c'::VARCHAR)::BOOLEAN)\
+             ::BOOLEAN",
+        );
+    }
+
+    /// A filter over a chunk that has already been narrowed, which is what a second filter in a
+    /// pipeline sees and is the form pair the threaded kernels have to handle rather than fall
+    /// through on.
+    #[test]
+    fn a_filter_over_a_selected_chunk_keeps_the_same_rows() {
+        let (schema, chunk) = input();
+        let predicate = "((#0.0::INTEGER >= 1::INTEGER)::BOOLEAN AND \
+                         (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN)::BOOLEAN";
+        let (plan, list) = projection(&format!("{predicate} AS p"));
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+        let mut scratch = prepared.scratch();
+        let narrowed = narrow(&chunk, &[0, 3]).expect("two of the four rows");
+        let threaded = prepared.evaluate_filter(&narrowed, &mut scratch).expect("the filter runs");
+        let flags = evaluate(&plan, list[0], &schema, &narrowed).expect("the tree walk runs");
+        let expected =
+            Selection::from_predicate(narrowed.len(), |row| is_true(&flags.value_at(row)));
+        assert_eq!(threaded, expected);
+    }
+
     /// Preparing is per pipeline and evaluating is per chunk, so the scratch has to survive being
     /// used again and give the same answer the second time.
     #[test]
@@ -781,7 +985,7 @@ mod tests {
         let short = chunk
             .clone()
             .select(&{
-                let mut selection = rudb_vector::Selection::with_capacity(2);
+                let mut selection = Selection::with_capacity(2);
                 selection.push(0);
                 selection.push(2);
                 selection

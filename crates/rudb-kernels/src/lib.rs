@@ -70,8 +70,8 @@ mod shape;
 
 pub use aggregate::Accumulator;
 pub use cast::{cast, cast_value};
-pub use compare::{Comparison, compare, compare_values, order, order_with_nulls};
+pub use compare::{Comparison, compare, compare_values, order, order_with_nulls, refine};
 pub use fallback::Kernel;
 pub use logic::{Connective, combine, is_true};
 pub use scalar::{call, call_values};
-pub use select::selection;
+pub use select::{refine as refine_flags, selection};
