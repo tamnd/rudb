@@ -10,8 +10,7 @@
 
 use std::fmt::Write as _;
 
-use rudb::QueryResult;
-use rudb_common::{LogicalType, Value};
+use rudb::{LogicalType, QueryResult, Value};
 
 /// How many rows `duckbox` prints before it starts leaving some out.
 const MAX_ROWS: usize = 40;

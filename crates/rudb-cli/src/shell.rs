@@ -6,8 +6,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rudb::{Database, QueryResult};
-use rudb_common::{Error, Span};
+use rudb::{Connection, Database, Error, QueryResult, Span};
 
 use crate::args::{Command, Options};
 use crate::format::{Format, Settings, escaped, render};
@@ -52,6 +51,12 @@ pub enum Stop {
 /// A running shell.
 pub struct Shell {
     database: Database,
+    /// The connection statements run on, which is the thing an interrupt would have to reach.
+    ///
+    /// Held beside the database rather than instead of it, because `.tables` and `.schema` read the
+    /// catalog and that is a database call. Replaced whenever `.open` replaces the database, so the
+    /// two never name different things.
+    connection: Connection,
     settings: Settings,
     out: Sink,
     err: Box<dyn Write>,
@@ -81,6 +86,7 @@ impl Shell {
         err: Box<dyn Write>,
     ) -> Self {
         Self {
+            connection: database.connect(),
             database,
             settings: options.settings.clone(),
             out: Sink::Given(out),
@@ -217,7 +223,7 @@ impl Shell {
                 let _ = writeln!(self.out, "{}", statement.sql());
             }
             let started = Instant::now();
-            match self.database.execute(statement.sql()) {
+            match self.connection.execute(statement.sql()) {
                 Ok(result) => {
                     self.print(&result);
                     if self.timer {
@@ -321,7 +327,10 @@ impl Shell {
                 // database here the same way it is for a program, and a file is the library's
                 // sentence about the format that is missing rather than a second one written here.
                 match Database::open(&argument(0)) {
-                    Ok(database) => self.database = database,
+                    Ok(database) => {
+                        self.connection = database.connect();
+                        self.database = database;
+                    }
                     Err(problem) => return self.complain(&format!("Error: {}", problem.message())),
                 }
             }
@@ -495,7 +504,7 @@ fn pointer(sql: &str, span: Span) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{matches, on, pointer, split};
-    use rudb_common::Span;
+    use rudb::Span;
 
     #[test]
     fn a_dot_command_splits_on_whitespace() {

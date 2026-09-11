@@ -4,7 +4,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rudb_bind::{Bound, Parameters};
 use rudb_catalog::{Catalog, Entry, View};
-use rudb_common::{Error, Field, Result, Value};
+use rudb_common::{Cancel, Error, Field, Result, Value};
 
 use rudb_parse::ast::Ast;
 
@@ -239,12 +239,16 @@ impl Database {
     /// The same call as [`Connection::query`], for a program that has one database and no reason to
     /// name a connection.
     ///
+    /// The query timeout in [`Database::config`] applies, and nothing can interrupt it, because an
+    /// interrupt needs somebody holding the other end of a token and a bare database hands out no
+    /// token. [`Connection::interrupt`] is that other end.
+    ///
     /// # Errors
     ///
     /// A parse error, a binder error, or anything the operators raise while running, which is
     /// mostly cast failures and arithmetic that leaves the range of its type.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
-        self.shared.query(sql)
+        self.shared.query(sql, &self.shared.token())
     }
 
     /// Runs one statement, which may change the database.
@@ -253,7 +257,7 @@ impl Database {
     ///
     /// A parse error, a binder error, a catalog error, or anything the operators raise.
     pub fn execute(&self, sql: &str) -> Result<QueryResult> {
-        self.shared.execute(sql)
+        self.shared.execute(sql, &self.shared.token())
     }
 
     /// The plan for a query, in the textual form `spec/07-execution.md` describes, without running
@@ -301,10 +305,26 @@ impl Shared {
     }
 
     /// Runs one query and returns every row it produced.
-    pub(crate) fn query(&self, sql: &str) -> Result<QueryResult> {
+    pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let catalog = self.read();
         let plan = planned(sql, &catalog)?;
-        run(&plan, &catalog)
+        run(&plan, &catalog, cancel)
+    }
+
+    /// The query timeout this database was opened with.
+    pub(crate) fn timeout(&self) -> Option<std::time::Duration> {
+        self.inner.config.query_timeout()
+    }
+
+    /// The token a statement of this database's runs under, when nobody holds one of their own.
+    ///
+    /// It carries the configured query timeout and nothing can interrupt it, because there is
+    /// nobody holding the other half. [`Connection`] is where the other half lives.
+    pub(crate) fn token(&self) -> Cancel {
+        match self.inner.config.query_timeout() {
+            Some(timeout) => Cancel::after(timeout),
+            None => Cancel::new(),
+        }
     }
 
     /// The plan a query runs.
@@ -318,24 +338,29 @@ impl Shared {
     /// because the part that writes is decided by what the part that reads produced. `INSERT INTO t
     /// SELECT * FROM t` would otherwise read the table under a read lock, let go, and append to
     /// whatever the table had become in between.
-    pub(crate) fn execute(&self, sql: &str) -> Result<QueryResult> {
+    pub(crate) fn execute(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let ast = rudb_parse::parse_ast(sql)?;
-        self.execute_ast(&ast, &Parameters::new())
+        self.execute_ast(&ast, &Parameters::new(), cancel)
     }
 
     /// Runs one parsed statement, with values for its parameters.
     ///
     /// The prepared statement path, and the path an ordinary statement takes once it is parsed, so
     /// that there is one description of what running a statement does.
-    pub(crate) fn execute_ast(&self, ast: &Ast, parameters: &Parameters) -> Result<QueryResult> {
+    pub(crate) fn execute_ast(
+        &self,
+        ast: &Ast,
+        parameters: &Parameters,
+        cancel: &Cancel,
+    ) -> Result<QueryResult> {
         let mut catalog = self.write();
         match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize(&mut plan)?;
-                run(&plan, &catalog)
+                run(&plan, &catalog, cancel)
             }
             Bound::CreateTable(create) => {
-                create_table(create, &mut catalog)?;
+                create_table(create, &mut catalog, cancel)?;
                 Ok(QueryResult::empty())
             }
             Bound::CreateView(create) => {
@@ -357,7 +382,7 @@ impl Shared {
                 // and a version of this that appended chunk by chunk would either read its own
                 // output forever or depend on how the scan holds its chunks.
                 rudb_opt::optimize(&mut insert.source)?;
-                let result = run(&insert.source, &catalog)?;
+                let result = run(&insert.source, &catalog, cancel)?;
                 let table = catalog.table_mut(&insert.name)?;
                 for chunk in result.into_chunks() {
                     table.append(chunk)?;
@@ -379,9 +404,9 @@ fn planned(sql: &str, catalog: &Catalog) -> Result<rudb_plan::Plan> {
     Ok(plan)
 }
 
-/// Builds and drains one plan.
-fn run(plan: &rudb_plan::Plan, catalog: &Catalog) -> Result<QueryResult> {
-    let mut root = rudb_exec::build(plan, catalog)?;
+/// Builds and drains one plan, stopping if the token says to.
+fn run(plan: &rudb_plan::Plan, catalog: &Catalog, cancel: &Cancel) -> Result<QueryResult> {
+    let mut root = rudb_exec::build_with(plan, catalog, cancel)?;
     let names = root.schema().names();
     let types = root.schema().types();
     let mut chunks = Vec::new();
@@ -409,7 +434,11 @@ fn create_view(create: rudb_bind::CreateView, catalog: &mut Catalog) -> Result<(
 }
 
 /// The `CREATE TABLE` half of a statement.
-fn create_table(mut create: rudb_bind::CreateTable, catalog: &mut Catalog) -> Result<()> {
+fn create_table(
+    mut create: rudb_bind::CreateTable,
+    catalog: &mut Catalog,
+    cancel: &Cancel,
+) -> Result<()> {
     if create.if_not_exists && catalog.table(&create.name).is_ok() {
         return Ok(());
     }
@@ -418,7 +447,7 @@ fn create_table(mut create: rudb_bind::CreateTable, catalog: &mut Catalog) -> Re
     let rows = match &mut create.source {
         Some(plan) => {
             rudb_opt::optimize(plan)?;
-            Some(run(plan, catalog)?)
+            Some(run(plan, catalog, cancel)?)
         }
         None => None,
     };
