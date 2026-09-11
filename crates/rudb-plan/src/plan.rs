@@ -2,7 +2,7 @@
 
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 
-use crate::expr::{Arm, Expr, SortKey};
+use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
 use crate::node::Node;
 use crate::{ExprRef, NodeRef, Slice, StrRef, ValueRef};
 
@@ -290,6 +290,37 @@ impl Plan {
     #[must_use]
     pub fn row_list(&self, slice: Slice) -> &[Slice] {
         &self.rows[slice.range()]
+    }
+
+    // Rewriters. Two of them, both narrow on purpose. A pass that wants to change what an
+    // expression computes adds a new expression and points at it, because the type of an
+    // expression is stored beside it and a general `expr_mut` is a way to change one without the
+    // other. These two cannot: a binding does not carry a type and a node does not have one.
+
+    /// Points a column reference at a different column.
+    ///
+    /// What column pruning does after it narrows a scan, since dropping a column moves every column
+    /// after it up. The type does not change, because it is the same column of the same operator
+    /// read from a different position.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the arena, or if it is not a column reference, both of which are
+    /// bugs in the pass rather than anything a plan can be.
+    pub fn rebind(&mut self, reference: ExprRef, binding: ColumnBinding) {
+        match &mut self.exprs[reference as usize] {
+            Expr::Column(held) => *held = binding,
+            other => panic!("expression {reference} is {other:?}, not a column"),
+        }
+    }
+
+    /// The node at `reference`, to be rewritten in place.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the arena.
+    pub fn node_mut(&mut self, reference: NodeRef) -> &mut Node {
+        &mut self.nodes[reference as usize]
     }
 
     /// Checks the plan invariant.
