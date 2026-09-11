@@ -2,23 +2,50 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! One pass so far, which is column pruning. `spec/09-optimizer.md` section 9.1 describes a sequence
-//! and this is the first of it, chosen because it is the one whose absence is measured in gigabytes:
-//! a scan that reads 105 columns to answer a question about three is the whole of the difference on
-//! ClickBench, and the Parquet reader has been able to read a subset since M1 with nothing able to
-//! tell it which subset.
+//! Two passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is the
+//! start of it. Column pruning came first, because it is the pass whose absence is measured in
+//! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
+//! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
+//! nothing able to tell it which subset.
 
 #![forbid(unsafe_code)]
 
 pub mod columns;
+pub mod fold;
+pub mod pass;
 
 use rudb_common::{Error, Result};
 use rudb_plan::{Node, NodeRef, Plan};
 
+use crate::pass::{Context, Pass};
+
 /// The crate this rank belongs to, so that the layer check has something to read.
 pub const RANK: u8 = 11;
 
-/// Rewrites a bound plan into the plan that runs.
+/// The passes, in the order they run.
+///
+/// A fixed sequence rather than a loop to a fixed point, which is what `spec/09-optimizer.md`
+/// section 9.1 asks for and what DuckDB does. A fixed point is easy to write and hard to bound: a
+/// pair of passes that undo each other runs forever, and the version that stops after a few rounds
+/// has a plan that depends on how many rounds it was given.
+///
+/// Folding is before pruning because folding removes column references and pruning drops the columns
+/// nothing refers to, so a `CASE WHEN false THEN t.a ELSE 1 END` costs a column read when the two run
+/// the other way around. Nothing in the other direction is given up: pruning drops columns and
+/// renumbers bindings, and neither of those makes anything foldable.
+pub static PASSES: [&(dyn Pass + Sync); 2] = [&fold::ExpressionRewriter, &columns::UnusedColumns];
+
+/// Rewrites a bound plan into the plan that runs, with every pass on.
+///
+/// # Errors
+///
+/// If a pass left the plan malformed or narrowed what it returns, which is a bug in the pass and
+/// not in the query.
+pub fn optimize(plan: &mut Plan) -> Result<()> {
+    optimize_with(plan, &Context::new())
+}
+
+/// Rewrites a bound plan into the plan that runs, skipping the passes the context turned off.
 ///
 /// Every pass preserves the plan invariant, which is what [`Plan::validate`] checks, so this checks
 /// it once at the end rather than each pass checking itself. In a release build it does not, because
@@ -32,11 +59,16 @@ pub const RANK: u8 = 11;
 ///
 /// # Errors
 ///
-/// If a pass left the plan malformed or narrowed what it returns, which is a bug in the pass and
-/// not in the query.
-pub fn optimize(plan: &mut Plan) -> Result<()> {
+/// Whatever a pass reported, and then, in a debug build, if a pass left the plan malformed or
+/// narrowed what it returns, which is a bug in the pass and not in the query.
+pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
     let before = output_columns(plan, plan.root());
-    columns::prune(plan);
+    for pass in PASSES {
+        if context.is_disabled(pass.name()) {
+            continue;
+        }
+        pass.run(plan, context)?;
+    }
     if cfg!(debug_assertions) {
         plan.validate()?;
         let after = output_columns(plan, plan.root());
@@ -151,5 +183,40 @@ mod tests {
         let after = "Project #1 [#0.0::VARCHAR AS b]\n  Get memory.main.t AS t #0 [b::VARCHAR]\n";
         assert_eq!(optimized(before), after);
         assert_eq!(width(before), width(after));
+    }
+
+    #[test]
+    fn no_two_passes_answer_to_the_same_name() {
+        // The name is the address, so two passes sharing one would make the toggle turn off
+        // whichever came first in the list and silently leave the other on.
+        let mut names: Vec<&str> = PASSES.iter().map(|pass| pass.name()).collect();
+        names.sort_unstable();
+        let held = names.len();
+        names.dedup();
+        assert_eq!(names.len(), held, "{names:?}");
+    }
+
+    #[test]
+    fn a_pass_that_is_turned_off_does_not_run() {
+        let text = "Project #1 [\"+\"(1::INTEGER, 1::INTEGER)::INTEGER AS n]\n  Get memory.main.t AS t #0 [a::INTEGER]\n";
+        let mut plan = Plan::parse(text).expect("a well formed plan");
+        let context = Context::without("expression_rewriter").expect("a name that is a pass");
+        optimize_with(&mut plan, &context).expect("the other pass still runs");
+        assert_eq!(
+            plan.to_string(),
+            "Project #1 [\"+\"(1::INTEGER, 1::INTEGER)::INTEGER AS n]\n  Get memory.main.t AS t #0 []\n"
+        );
+    }
+
+    /// Folding before pruning, which is the reason the order in [`PASSES`] is the order it is. The
+    /// column is read only by a branch that cannot be taken, so one pass has to remove the branch
+    /// before the other can see that nothing reads the column.
+    #[test]
+    fn folding_runs_first_so_that_pruning_sees_the_columns_it_freed() {
+        let text = "Project #1 [CASE WHEN FALSE::BOOLEAN THEN #0.1::INTEGER ELSE #0.0::INTEGER END::INTEGER AS n]\n  Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n";
+        assert_eq!(
+            optimized(text),
+            "Project #1 [#0.0::INTEGER AS n]\n  Get memory.main.t AS t #0 [a::INTEGER]\n"
+        );
     }
 }
