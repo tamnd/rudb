@@ -4,7 +4,7 @@ use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_functions::{TableFunction, series_length};
 use rudb_plan::{ExprRef, Plan, Slice};
-use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
 use crate::expr::evaluate_all;
 use crate::operator::Operator;
@@ -239,13 +239,18 @@ impl Operator for Series {
             return Ok(None);
         }
         let count = self.left.min(VECTOR_SIZE);
-        let mut values = Vec::with_capacity(count);
+        // The loop is over `i64` rather than over `Value`, and the vector is built out of the run
+        // it fills rather than out of a list of tagged values that would have to be read back one
+        // at a time to find the run again. `range()` is the source every microbenchmark in
+        // `rudb-bench` reads from, so a chunk of it costing a `Value` a row would be measuring the
+        // generator instead of what is downstream of it.
+        let mut counted = Vec::with_capacity(count);
         for _ in 0..count {
-            values.push(rudb_common::Value::BigInt(self.at));
+            counted.push(self.at);
             self.at = self.at.saturating_add(self.step);
         }
         self.left -= count;
-        let vector = Vector::from_values(LogicalType::BigInt, &values)?;
+        let vector = Vector::flat(LogicalType::BigInt, Data::Int64(counted))?;
         Ok(Some(Chunk::with_rows(vec![vector], count)?))
     }
 }

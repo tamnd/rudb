@@ -76,6 +76,9 @@ pub fn evaluate(plan: &Plan, expr: ExprRef, schema: &Schema, chunk: &Chunk) -> R
                 let flags = evaluate(plan, arm.when, schema, &narrowed)?;
                 let mut taken = Vec::new();
                 let mut still = Vec::new();
+                // row at a time: 2c (#57) replaces this whole arm with a selection threaded through
+                // the arms and a scatter kernel writing the results back, which is the change that
+                // removes all three of these loops at once.
                 for (at, &row) in pending.iter().enumerate() {
                     if is_true(&flags.value_at(at)) {
                         taken.push((at, row));
@@ -87,6 +90,7 @@ pub fn evaluate(plan: &Plan, expr: ExprRef, schema: &Schema, chunk: &Chunk) -> R
                     let positions: Vec<usize> = taken.iter().map(|&(at, _)| at).collect();
                     let matched = narrow(&narrowed, &positions)?;
                     let results = evaluate(plan, arm.then, schema, &matched)?;
+                    // row at a time: the scatter this wants is 2c (#57), same as the loop above.
                     for (slot, &(_, row)) in taken.iter().enumerate() {
                         answers[row] = results.value_at(slot);
                     }
@@ -97,6 +101,7 @@ pub fn evaluate(plan: &Plan, expr: ExprRef, schema: &Schema, chunk: &Chunk) -> R
                 if !pending.is_empty() {
                     let narrowed = narrow(chunk, &pending)?;
                     let results = evaluate(plan, otherwise, schema, &narrowed)?;
+                    // row at a time: the scatter this wants is 2c (#57), same as the two above.
                     for (slot, &row) in pending.iter().enumerate() {
                         answers[row] = results.value_at(slot);
                     }

@@ -154,6 +154,10 @@ impl<'a> Aggregate<'a> {
             if alone && every {
                 continue;
             }
+            // row at a time: the worst one in the tree, because grouping is where the rows are.
+            // 2f (#60) gives it a table that hashes a column at a time and probes a vector at a
+            // time, and 2g (#61) gives the aggregate an update that takes a vector and a run of
+            // slots, at which point neither the key nor the argument is a `Value` any more.
             for row in 0..chunk.len() {
                 let slot = if alone {
                     0
@@ -281,6 +285,8 @@ impl<'a> Distinct<'a> {
             } else {
                 evaluate_all(self.plan, &self.on, &self.schema, &chunk)?
             };
+            // row at a time: `DISTINCT` is a grouping that keeps no aggregate, so it gets its
+            // answer from the same table 2f (#60) builds and stops building a key here then.
             for row in 0..chunk.len() {
                 let values: Vec<Value> = chunk.row(row).collect();
                 let key = if self.on.is_empty() {

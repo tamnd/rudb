@@ -155,6 +155,8 @@ pub fn compare(op: Comparison, left: &Vector, right: &Vector) -> Result<Vector> 
 
     fallback::record(Kernel::Compare, left.form(), right.form());
     let mut values = Vec::with_capacity(len);
+    // row at a time: the path recorded on the line above, which exists to be correct for a pair of
+    // forms no specialization covers and counts itself so that pair shows up in the report.
     for index in 0..len {
         values.push(compare_values(op, &left.value_at(index), &right.value_at(index))?);
     }
