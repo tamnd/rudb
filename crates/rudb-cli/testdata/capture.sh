@@ -5,6 +5,10 @@
 # duckdb-version.txt, so the version recorded there is always the version that produced the bytes
 # beside it. The shell test in tests/shell.rs diffs against these, which is the only reason any of
 # the claims in src/format.rs about DuckDB are worth believing.
+#
+# The `duckdb` it wants is the pinned one, which `scripts/oracle` installs and which no package
+# manager has. That means one of the machines rather than a laptop, and it means the files in here
+# are Linux output: `.mode csv` ends its lines with a carriage return and a newline there.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 duckdb -version >"$here/duckdb-version.txt"
