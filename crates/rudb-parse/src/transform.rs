@@ -195,6 +195,13 @@ impl<'a> Transform<'a> {
         Slice { start, len: self.ast.column_defs.len() as u32 - start }
     }
 
+    /// Turn a vector of targets into a slice of the target arena.
+    fn target_slice(&mut self, items: Vec<Target>) -> Slice {
+        let start = self.ast.targets.len() as u32;
+        self.ast.targets.extend(items);
+        Slice { start, len: self.ast.targets.len() as u32 - start }
+    }
+
     /// Turn a vector of qualified names into a slice of the name list arena.
     fn name_list_slice(&mut self, items: Vec<Slice>) -> Slice {
         let start = self.ast.name_lists.len() as u32;
@@ -840,9 +847,7 @@ impl<'a> Transform<'a> {
         for kid in self.kids(list) {
             targets.push(self.target(kid)?);
         }
-        let start = self.ast.targets.len() as u32;
-        self.ast.targets.extend(targets);
-        select.targets = Slice { start, len: self.ast.targets.len() as u32 - start };
+        select.targets = self.target_slice(targets);
         Ok(())
     }
 
@@ -1017,9 +1022,9 @@ impl<'a> Transform<'a> {
                 // arguments has the wrapper and no list under it.
                 let list = self.find(form, "TableFunctionArguments");
                 for kid in self.kids(list) {
-                    args.push(self.argument(kid)?);
+                    args.push(self.table_argument(kid)?);
                 }
-                let args = self.expr_slice(args);
+                let args = self.target_slice(args);
                 let (alias, columns) = self.table_alias(self.find(form, "TableAlias"));
                 Ok(self.push_source(Source::Function { name, args, alias, columns }))
             }
@@ -1563,9 +1568,7 @@ impl<'a> Transform<'a> {
             }
             replacements.push(Target { expr, alias });
         }
-        let start = self.ast.targets.len() as u32;
-        self.ast.targets.extend(replacements);
-        Ok(Slice { start, len: self.ast.targets.len() as u32 - start })
+        Ok(self.target_slice(replacements))
     }
 
     /// `FunctionExpression <- FunctionIdentifier FunctionExpressionArguments WithinGroupClause?
@@ -1638,6 +1641,45 @@ impl<'a> Transform<'a> {
             "PositionalFunctionArgument" => self.expr(self.first(inner)),
             _ => self.unsupported(inner),
         }
+    }
+
+    /// One argument of a table function, which is the same rule plus the names.
+    ///
+    /// `NamedParameter <- TypeFuncName Type? NamedParameterAssignment Expression` and
+    /// `NamedParameterAssignment <- ':=' / '=>'`, so those two spellings are what the grammar has.
+    /// The binary accepts a third, `name = value`, which the grammar has no rule for because it
+    /// parses as an equality and is picked apart afterwards. That is what happens here too: a
+    /// positional argument that is a comparison between a bare name and something else is a named
+    /// parameter, which is the reading upstream's own transformer gives it. `read_parquet(f,
+    /// binary_as_string=True)` is the query that matters and it is the spelling the ClickBench
+    /// entry uses.
+    ///
+    /// The name is not resolved here and neither is the value. Which parameters a function takes
+    /// is the binder's question, and so is whether `binary_as_string=True` means anything to the
+    /// function it was written on.
+    fn table_argument(&mut self, node: u32) -> Result<Target> {
+        let inner = self.first(node);
+        if self.name(inner) == "NamedFunctionArgument" {
+            let named = self.first(inner);
+            if self.count(named) != 3 {
+                // The optional `Type` between the name and the assignment, which is a macro
+                // parameter's declaration and not a call.
+                return self.unsupported(named);
+            }
+            let alias = self.identifier(self.first(named));
+            let expr = self.expr(self.nth(named, 2))?;
+            return Ok(Target { expr, alias });
+        }
+        let expr = self.expr(self.first(inner))?;
+        if let Expr::Binary { op: BinaryOp::Eq, left, right } = self.ast.expr(expr) {
+            if let Expr::Column { name } = self.ast.expr(left) {
+                if name.len == 1 {
+                    let alias = self.ast.parts[name.start as usize];
+                    return Ok(Target { expr: right, alias });
+                }
+            }
+        }
+        Ok(Target { expr, alias: NONE })
     }
 
     /// `CastExpression <- CastOrTryCast Parens(CastArguments)`.
@@ -1877,9 +1919,12 @@ mod tests {
             }
             Source::Function { name, args, alias: call_alias, .. } => {
                 let args = ast
-                    .expr_list(args)
+                    .target_list(args)
                     .iter()
-                    .map(|&item| show(ast, item))
+                    .map(|item| match item.alias {
+                        NONE => show(ast, item.expr),
+                        named => format!("{} := {}", ast.string(named), show(ast, item.expr)),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{}({args}){}", ast.name_text(name), alias(call_alias))
@@ -2129,6 +2174,29 @@ mod tests {
         // not a mistake about what is in the table, and duckdb reports it the same way.
         let error = parse_ast("SELECT * REPLACE (a + 1 AS a, a + 2 AS A) FROM t").unwrap_err();
         assert_eq!(error.to_string(), "Parser Error: Duplicate entry \"A\" in REPLACE list");
+    }
+
+    #[test]
+    fn a_table_function_argument_can_have_a_name_written_in_front_of_it() {
+        // The grammar has `:=` and `=>`. It does not have `=`, which parses as a comparison and is
+        // read back apart here, and that is the spelling the clickbench load recipe uses.
+        for spelling in
+            ["binary_as_string := True", "binary_as_string => True", "binary_as_string = True"]
+        {
+            assert_eq!(
+                round(&format!("SELECT * FROM read_parquet('f.parquet', {spelling})")),
+                "SELECT * FROM read_parquet('f.parquet', binary_as_string := TRUE)",
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_equality_that_is_not_a_bare_name_stays_an_argument() {
+        // A qualified name on the left is not a parameter name, and neither is anything that is
+        // not a name at all, so both of those stay the comparison they were written as.
+        assert_eq!(round("SELECT * FROM f(t.a = 1)"), "SELECT * FROM f((t.a Eq 1))");
+        assert_eq!(round("SELECT * FROM f(1 = 1)"), "SELECT * FROM f((1 Eq 1))");
     }
 
     #[test]
