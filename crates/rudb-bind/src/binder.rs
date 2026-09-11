@@ -889,8 +889,11 @@ impl<'a> Binder<'a> {
         let view = self.catalog.view(name)?;
         let full = name.to_string();
         if self.expanding.contains(&full) {
+            // Two quotes each side, which is what the binary prints. It quotes the name on the way
+            // in and then formats the quoted name into a quoted slot, so a view called `a` comes
+            // back as `""a""`. That is upstream's wart and copying it is the whole job here.
             return Err(Error::binder(format!(
-                "infinite recursion detected: attempting to recursively bind view \"{}\"",
+                "infinite recursion detected: attempting to recursively bind view \"\"{}\"\"",
                 name.table
             )));
         }
