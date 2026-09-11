@@ -514,26 +514,57 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
             LiteralKind::String => format!("'{}'", ast.string(text)),
             LiteralKind::Number => ast.string(text).to_string(),
         },
+        // A prefix operator is a function call with the argument in brackets, so `-i` is named
+        // `-(i)` rather than `-i`. A minus in front of a whole number is the exception, because
+        // DuckDB's grammar folds that sign into the number as it reads it: `-1` and `-(1)` are
+        // both named `-1` and `-(-1)` is named `1`. It is whole numbers only and it is the minus
+        // only, so `-(1.5)` is `-(1.5)` and `+1` is `+(1)`.
+        //
+        // The four `IS TRUE` spellings are named after what they mean rather than what was
+        // written, since each of them is a comparison against a boolean that treats null as a
+        // value. `IS UNKNOWN` is `IS NULL` with a word that only makes sense for a boolean, and
+        // the name is the one it shares.
         ast::Expr::Unary { op, operand } => {
             let inner = describe(ast, operand);
             match op {
                 UnaryOp::Not => format!("(NOT {inner})"),
-                UnaryOp::Negate => format!("-{inner}"),
-                UnaryOp::Plus => inner,
-                UnaryOp::BitNot => format!("~{inner}"),
-                UnaryOp::Factorial => format!("{inner}!"),
+                UnaryOp::Negate => match whole_number(ast, operand) {
+                    Some(number) => flip(&number),
+                    None => format!("-({inner})"),
+                },
+                UnaryOp::Plus => format!("+({inner})"),
+                UnaryOp::BitNot => format!("~({inner})"),
+                UnaryOp::Factorial => format!("factorial({inner})"),
                 UnaryOp::IsNull => format!("({inner} IS NULL)"),
                 UnaryOp::IsNotNull => format!("({inner} IS NOT NULL)"),
-                UnaryOp::IsTrue => format!("({inner} IS TRUE)"),
-                UnaryOp::IsNotTrue => format!("({inner} IS NOT TRUE)"),
-                UnaryOp::IsFalse => format!("({inner} IS FALSE)"),
-                UnaryOp::IsNotFalse => format!("({inner} IS NOT FALSE)"),
-                UnaryOp::IsUnknown => format!("({inner} IS UNKNOWN)"),
-                UnaryOp::IsNotUnknown => format!("({inner} IS NOT UNKNOWN)"),
+                UnaryOp::IsTrue => format!("(CAST({inner} AS BOOLEAN) IS NOT DISTINCT FROM true)"),
+                UnaryOp::IsNotTrue => format!("(CAST({inner} AS BOOLEAN) IS DISTINCT FROM true)"),
+                UnaryOp::IsFalse => {
+                    format!("(CAST({inner} AS BOOLEAN) IS NOT DISTINCT FROM false)")
+                }
+                UnaryOp::IsNotFalse => format!("(CAST({inner} AS BOOLEAN) IS DISTINCT FROM false)"),
+                UnaryOp::IsUnknown => format!("({inner} IS NULL)"),
+                UnaryOp::IsNotUnknown => format!("({inner} IS NOT NULL)"),
             }
         }
+        // Most binary operators are named as they were written, in brackets. The ones that are
+        // not are the ones that resolve to a function with a different name, and a name that says
+        // the operator where DuckDB says the function is a name a client keys a row by and does
+        // not find.
         ast::Expr::Binary { op, left, right } => {
-            format!("({} {} {})", describe(ast, left), spelling(ast, op), describe(ast, right))
+            let (left, right) = (describe(ast, left), describe(ast, right));
+            match op {
+                BinaryOp::Regex => format!("regexp_matches({left}, {right})"),
+                BinaryOp::RegexInsensitive => format!("regexp_matches({left}, {right}, 'i')"),
+                BinaryOp::NotRegexInsensitive => {
+                    format!("(NOT regexp_matches({left}, {right}, 'i'))")
+                }
+                BinaryOp::SimilarTo => format!("regexp_full_match({left}, {right})"),
+                BinaryOp::NotSimilarTo => format!("(NOT regexp_full_match({left}, {right}))"),
+                // The one operator DuckDB names with no brackets around it at all.
+                BinaryOp::Collate => format!("{left} COLLATE {right}"),
+                _ => format!("({left} {} {right})", name_spelling(ast, op)),
+            }
         }
         ast::Expr::Function { name, args, distinct } => {
             let written = ast.name(name).last().unwrap_or_default();
@@ -563,33 +594,61 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
             format!("{word}({} AS {})", describe(ast, operand), ast.string(ty))
         }
-        ast::Expr::Case { .. } => "CASE".to_string(),
+        // A CASE is named as the searched form it becomes, whichever form was written, with every
+        // condition and every result in brackets of their own and the `ELSE` without them. A
+        // missing `ELSE` is named `ELSE NULL`, since that is what it means. The two spaces after
+        // the word are DuckDB's: the operand of a simple CASE would go in that gap and a searched
+        // one has nothing to put there, and a simple CASE is a searched one by the time it is
+        // named, so the gap is always empty.
+        ast::Expr::Case { operand, arms, otherwise } => {
+            let mut text = "CASE ".to_string();
+            for arm in ast.arm_list(arms) {
+                let when = if operand == rudb_parse::NONE {
+                    describe(ast, arm.when)
+                } else {
+                    format!("({} = {})", describe(ast, operand), describe(ast, arm.when))
+                };
+                text.push_str(&format!(" WHEN ({when}) THEN ({})", describe(ast, arm.then)));
+            }
+            let fallback = if otherwise == rudb_parse::NONE {
+                "NULL".to_string()
+            } else {
+                describe(ast, otherwise)
+            };
+            format!("{text} ELSE {fallback} END")
+        }
+        // A negated BETWEEN and a negated IN are named as the negation of the one that is not,
+        // because that is what each of them is once it is bound.
         ast::Expr::Between { operand, low, high, negated } => {
-            let word = if negated { "NOT BETWEEN" } else { "BETWEEN" };
-            format!(
-                "({} {word} {} AND {})",
+            let text = format!(
+                "({} BETWEEN {} AND {})",
                 describe(ast, operand),
                 describe(ast, low),
                 describe(ast, high)
-            )
+            );
+            if negated { format!("(NOT {text})") } else { text }
         }
         ast::Expr::In { operand, list, negated } => {
-            let word = if negated { "NOT IN" } else { "IN" };
             let items: Vec<String> =
                 ast.expr_list(list).iter().map(|&item| describe(ast, item)).collect();
-            format!("({} {word} ({}))", describe(ast, operand), items.join(", "))
+            let text = format!("({} IN ({}))", describe(ast, operand), items.join(", "));
+            if negated { format!("(NOT {text})") } else { text }
         }
+        // `row` is a keyword and a function of that name, so DuckDB quotes it in the name to say
+        // which of the two it means.
         ast::Expr::Row { items } => {
             let items: Vec<String> =
                 ast.expr_list(items).iter().map(|&item| describe(ast, item)).collect();
-            format!("ROW({})", items.join(", "))
+            format!("\"row\"({})", items.join(", "))
         }
-        // DuckDB names a bracketed list after the function it is sugar for, qualified, so
-        // `SELECT [1, 2]` comes back as a column called `main.list_value(1, 2)`.
+        // DuckDB names a bracketed list after the function it is sugar for, so `SELECT [1, 2]`
+        // comes back as a column called `list_value(1, 2)`. It used to qualify that name with the
+        // schema and print `main.list_value(1, 2)`, which is what the reference binary said until
+        // this project pinned one at the commit the grammar is vendored from.
         ast::Expr::List { items } => {
             let items: Vec<String> =
                 ast.expr_list(items).iter().map(|&item| describe(ast, item)).collect();
-            format!("main.list_value({})", items.join(", "))
+            format!("list_value({})", items.join(", "))
         }
         // DuckDB names the column after the parameter, so `SELECT ?` comes back as `$1` whatever
         // the value turns out to be.
@@ -667,6 +726,51 @@ fn function_of(op: BinaryOp) -> Option<&'static str> {
         BinaryOp::NotILike => "!~~*",
         _ => return None,
     })
+}
+
+/// The whole number this is, with any minus signs already in front of it folded in.
+///
+/// It reads through a minus and stops at anything else, because that is where the grammar stops:
+/// a sign joins the number it precedes and a `+` never does. A number with a point in it is not
+/// one of these, so `-(1.5)` keeps its brackets where `-(1)` loses them.
+fn whole_number(ast: &Ast, expr: ast::ExprRef) -> Option<String> {
+    match ast.expr(expr) {
+        ast::Expr::Literal { kind: LiteralKind::Number, text } => {
+            let text = ast.string(text);
+            text.bytes().all(|byte| byte.is_ascii_digit()).then(|| text.to_string())
+        }
+        ast::Expr::Unary { op: UnaryOp::Negate, operand } => {
+            whole_number(ast, operand).map(|number| flip(&number))
+        }
+        _ => None,
+    }
+}
+
+/// The same number with the other sign.
+fn flip(number: &str) -> String {
+    match number.strip_prefix('-') {
+        Some(rest) => rest.to_string(),
+        None => format!("-{number}"),
+    }
+}
+
+/// How an operator is written in the name of a column, which is not always how it was written in
+/// the query.
+///
+/// DuckDB names an unaliased expression after the function the operator resolved to, and for most
+/// of them that function is spelled the way the operator is. The ones that are not are here. `<>`
+/// and `!=` are one function and it is called `!=`, so both spellings come back as the second.
+/// The pattern operators are the tilde spellings Postgres gives them, which is why `x LIKE 'a'`
+/// is named `(x ~~ 'a')` and `x GLOB 'a'` is named `(x ~~~ 'a')`.
+///
+/// This is not [`spelling`], which is the language somebody wrote and is what an error message
+/// about an operator has to quote back at them.
+fn name_spelling(ast: &Ast, op: BinaryOp) -> String {
+    match op {
+        BinaryOp::NotEq => "!=".to_string(),
+        BinaryOp::Glob => "~~~".to_string(),
+        _ => function_of(op).map_or_else(|| spelling(ast, op), str::to_string),
+    }
 }
 
 /// How an operator is written, for a name and for an error message.
