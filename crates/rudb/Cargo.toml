@@ -24,6 +24,7 @@ rudb-txn.workspace = true
 rudb-storage.workspace = true
 rudb-vector.workspace = true
 rudb-arrow.workspace = true
+rudb-io.workspace = true
 
 [lints]
 workspace = true

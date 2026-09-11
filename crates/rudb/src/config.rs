@@ -36,7 +36,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        Self { memory_limit: None, threads, query_timeout: None }
+        Self { memory_limit: rudb_io::default_memory_limit(), threads, query_timeout: None }
     }
 }
 
@@ -55,12 +55,21 @@ impl Config {
     /// what is counted and what is not, which is a shorter list than it will be: nothing here hooks
     /// the allocator, so the number is what the operators said they were holding.
     ///
-    /// No limit is the default, which is not what DuckDB does. DuckDB defaults to eighty percent of
-    /// physical memory, and reading physical memory means asking the operating system in three
-    /// different ways for three different platforms. This workspace has no dependencies, so that is
-    /// code we would be writing and maintaining ourselves, and a default that refuses a query on
-    /// one machine and runs it on another is a default worth putting off until there is a machine
-    /// it is measured on.
+    /// The default is eighty percent of what the machine has, which is what DuckDB does, and `None`
+    /// on a platform that will not say how much that is. See [`rudb_io::machine`] for how each
+    /// platform is asked and why the answer on Linux is the smaller of the machine and the control
+    /// group.
+    ///
+    /// It was `None` everywhere until #219, and the reason it is not any more is that a budget
+    /// nobody set is a budget the operating system enforces. Eight of the forty three ClickBench
+    /// queries ended in `memory allocation of 128 bytes failed`, which is the allocator's abort
+    /// handler, so the process was gone and there was no error for a harness to report. The same
+    /// queries under a limit say `Out of Memory Error` and name what they asked for. A database
+    /// that has an out of memory error and does not use it unless asked is a database that aborts
+    /// on every machine where nobody typed the `SET`.
+    ///
+    /// [`Config::with_no_memory_limit`] is still there and still means no limit, which is now a
+    /// thing somebody asks for rather than a thing they get.
     #[must_use]
     pub fn memory_limit(&self) -> Option<u64> {
         self.memory_limit
@@ -256,11 +265,25 @@ mod tests {
     use super::{Config, format_size, parse_size};
 
     #[test]
-    fn the_defaults_are_no_limits_and_every_core() {
+    fn the_defaults_are_most_of_the_machine_and_every_core() {
         let config = Config::new();
-        assert_eq!(config.memory_limit(), None);
+        assert_eq!(config.memory_limit(), rudb_io::default_memory_limit());
         assert_eq!(config.query_timeout(), None);
         assert!(config.threads() >= 1);
+    }
+
+    #[test]
+    fn the_default_limit_leaves_the_machine_something() {
+        // The twenty percent that is left is for what the budget does not count, which is the
+        // allocator's bookkeeping, the page cache the scan reads through, and every other process.
+        // A machine that will not say how much memory it has gets no limit, the same as before.
+        let Some(machine) = rudb_io::physical_memory() else {
+            eprintln!("skipping, this platform does not say how much memory it has");
+            return;
+        };
+        let limit = Config::new().memory_limit().expect("a machine that says its size has one");
+        assert!(limit < machine, "{limit} is not under {machine}");
+        assert!(limit > machine / 2, "{limit} is a smaller share of {machine} than intended");
     }
 
     #[test]
@@ -368,9 +391,22 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_print_as_the_absence_of_a_limit_rather_than_as_a_number() {
-        let settings = Config::new().settings();
+    fn a_limit_taken_off_prints_as_the_absence_of_one_rather_than_as_a_number() {
+        let settings = Config::new().with_no_memory_limit().settings();
         assert_eq!(settings[0].1, "unlimited");
         assert_eq!(settings[2].1, "none");
+    }
+
+    #[test]
+    fn the_default_limit_prints_as_a_size() {
+        // The point of printing it. A run that does not say what budget it had is a run nobody can
+        // reproduce, and a default nobody typed is exactly the one left out of the report.
+        if rudb_io::physical_memory().is_none() {
+            eprintln!("skipping, this platform does not say how much memory it has");
+            return;
+        }
+        let printed = Config::new().settings()[0].1.clone();
+        assert_ne!(printed, "unlimited");
+        assert!(printed.ends_with('B'), "{printed}");
     }
 }
