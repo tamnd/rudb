@@ -144,15 +144,17 @@ pub fn parse(arguments: &[String]) -> Action {
                     None => return Action::Wrong(format!("unknown option {other}")),
                 }
             }
+            // The first one is the database and every one after it is SQL, however many there are.
+            // There is no count to get wrong: `duckdb a.db "SELECT 1" extra` does not complain
+            // about the third argument, it runs it, and says the table `extra` does not exist.
+            // Per #246.
             other => {
                 positional += 1;
-                match positional {
-                    1 => options.database = other.to_string(),
-                    2 => {
-                        options.commands.push(Command::Sql(other.to_string()));
-                        options.stop_after_commands = true;
-                    }
-                    _ => return Action::Wrong(format!("too many arguments, starting at {other}")),
+                if positional == 1 {
+                    options.database = other.to_string();
+                } else {
+                    options.commands.push(Command::Sql(other.to_string()));
+                    options.stop_after_commands = true;
                 }
             }
         }
@@ -208,6 +210,24 @@ mod tests {
         let parsed = options(&["shop.db", "SELECT 1"]);
         assert_eq!(parsed.database, "shop.db");
         assert_eq!(parsed.commands, vec![Command::Sql("SELECT 1".to_string())]);
+        assert!(parsed.stop_after_commands);
+    }
+
+    /// Every positional after the first is another statement, in the order they were written.
+    ///
+    /// DuckDB has no limit here and no error for the count, so neither does this. Per #246.
+    #[test]
+    fn every_positional_after_the_database_is_another_statement() {
+        let parsed = options(&["shop.db", "SELECT 1", "SELECT 2", "SELECT 3"]);
+        assert_eq!(parsed.database, "shop.db");
+        assert_eq!(
+            parsed.commands,
+            vec![
+                Command::Sql("SELECT 1".to_string()),
+                Command::Sql("SELECT 2".to_string()),
+                Command::Sql("SELECT 3".to_string()),
+            ]
+        );
         assert!(parsed.stop_after_commands);
     }
 
