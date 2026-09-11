@@ -15,6 +15,7 @@ publish = false
 [dependencies]
 rudb.workspace = true
 rudb-common.workspace = true
+rudb-compress.workspace = true
 rudb-exec.workspace = true
 rudb-io.workspace = true
 rudb-kernels.workspace = true
