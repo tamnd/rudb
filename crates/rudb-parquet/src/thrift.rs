@@ -298,6 +298,15 @@ impl<'a> Reader<'a> {
         self.skip(kind)
     }
 
+    /// How many bytes have been read.
+    ///
+    /// The footer does not need this, because its length is stated before it is read. A page header
+    /// does: it sits at the front of a run of bytes whose length nobody wrote down, and the page's
+    /// own data begins where the header stops. This is how the reader finds that boundary.
+    pub(crate) fn position(&self) -> usize {
+        self.at
+    }
+
     /// One byte, or an error saying the structure ended in the middle of itself.
     fn byte(&mut self) -> Result<u8> {
         let byte = *self

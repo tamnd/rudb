@@ -21,6 +21,7 @@
 use std::fmt::Write as _;
 
 use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_compress::Codec;
 use rudb_io::File;
 
 use crate::thrift::{Kind, Reader};
@@ -74,61 +75,6 @@ impl Physical {
     }
 }
 
-/// What a column chunk's pages are compressed with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Compression {
-    /// Nothing, the page is its own bytes.
-    Uncompressed,
-    /// Snappy, which is what almost every writer emits and the one this reader decompresses.
-    Snappy,
-    /// gzip.
-    Gzip,
-    /// LZO.
-    Lzo,
-    /// Brotli.
-    Brotli,
-    /// LZ4 in the framed form the older writers used.
-    Lz4,
-    /// zstd.
-    Zstd,
-    /// LZ4 with no frame, which is what the format settled on.
-    Lz4Raw,
-}
-
-impl Compression {
-    /// The codec with this wire value.
-    fn from_wire(wire: i64) -> Result<Self> {
-        Ok(match wire {
-            0 => Self::Uncompressed,
-            1 => Self::Snappy,
-            2 => Self::Gzip,
-            3 => Self::Lzo,
-            4 => Self::Brotli,
-            5 => Self::Lz4,
-            6 => Self::Zstd,
-            7 => Self::Lz4Raw,
-            other => {
-                return Err(Error::io(format!("a parquet codec of {other}, which is not one")));
-            }
-        })
-    }
-
-    /// What the codec is called, for an error message that has to name one.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Uncompressed => "uncompressed",
-            Self::Snappy => "snappy",
-            Self::Gzip => "gzip",
-            Self::Lzo => "lzo",
-            Self::Brotli => "brotli",
-            Self::Lz4 => "lz4",
-            Self::Zstd => "zstd",
-            Self::Lz4Raw => "lz4_raw",
-        }
-    }
-}
-
 /// How the values in a page are encoded.
 ///
 /// `PlainDictionary` and `RleDictionary` are the same thing written by writers of different ages.
@@ -160,7 +106,7 @@ pub enum Encoding {
 
 impl Encoding {
     /// The encoding with this wire value.
-    fn from_wire(wire: i64) -> Result<Self> {
+    pub(crate) fn from_wire(wire: i64) -> Result<Self> {
         Ok(match wire {
             0 => Self::Plain,
             2 => Self::PlainDictionary,
@@ -243,7 +189,7 @@ pub struct ColumnChunk {
     /// How it is stored, repeated from the schema so a page decoder needs one structure.
     pub physical: Physical,
     /// What the pages are compressed with.
-    pub compression: Compression,
+    pub compression: Codec,
     /// Every encoding the writer said it used in this chunk.
     pub encodings: Vec<Encoding>,
     /// How many values are in the chunk, which counts nulls.
@@ -431,7 +377,7 @@ struct RawGroup {
 struct RawChunk {
     path: Vec<String>,
     physical: Physical,
-    compression: Compression,
+    compression: Codec,
     encodings: Vec<Encoding>,
     values: i64,
     compressed_size: i64,
@@ -844,7 +790,7 @@ fn read_column_metadata(reader: &mut Reader<'_>) -> Result<RawChunk> {
     let saved = reader.struct_begin();
     let mut physical = Physical::Boolean;
     let mut path = Vec::new();
-    let mut compression = Compression::Uncompressed;
+    let mut compression = Codec::Uncompressed;
     let mut encodings = Vec::new();
     let mut values = 0;
     let mut uncompressed_size = 0;
@@ -869,7 +815,7 @@ fn read_column_metadata(reader: &mut Reader<'_>) -> Result<RawChunk> {
                     path.push(reader.read_string()?.to_string());
                 }
             }
-            4 => compression = Compression::from_wire(reader.read_int()?)?,
+            4 => compression = Codec::from_parquet(reader.read_int()? as i32)?,
             5 => values = reader.read_int()?,
             6 => uncompressed_size = reader.read_int()?,
             7 => compressed_size = reader.read_int()?,
@@ -930,7 +876,8 @@ mod tests {
     use rudb_common::LogicalType;
     use rudb_io::{Filesystem, OpenMode, RealFilesystem};
 
-    use super::{Compression, Encoding, Metadata, Physical};
+    use super::{Encoding, Metadata, Physical};
+    use rudb_compress::Codec;
 
     /// The file every test here reads.
     ///
@@ -996,7 +943,7 @@ mod tests {
             for (at, chunk) in group.columns.iter().enumerate() {
                 assert_eq!(chunk.column, at);
                 assert_eq!(chunk.values, 2048);
-                assert_eq!(chunk.compression, Compression::Snappy);
+                assert_eq!(chunk.compression, Codec::Snappy);
                 assert!(chunk.data_page_offset > 0, "a data page at offset zero");
             }
         }
