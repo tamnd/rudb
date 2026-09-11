@@ -169,7 +169,7 @@ fn boolean(answers: Vec<bool>, validity: Validity, len: usize) -> Result<Vector>
     // builds to all valid, so saying the same here is what keeps an empty specialized result the
     // same vector as the oracle's rather than merely the same length.
     let validity = if len == 0 { Validity::AllValid } else { validity.normalize(len) };
-    Ok(Vector::flat(LogicalType::Boolean, Data::Bool(answers))?.with_validity(validity))
+    Ok(Vector::flat(LogicalType::Boolean, Data::Bool(answers.into()))?.with_validity(validity))
 }
 
 /// A false in every position the validity says is null.

@@ -250,7 +250,7 @@ impl Operator for Series {
             self.at = self.at.saturating_add(self.step);
         }
         self.left -= count;
-        let vector = Vector::flat(LogicalType::BigInt, Data::Int64(counted))?;
+        let vector = Vector::flat(LogicalType::BigInt, Data::Int64(counted.into()))?;
         Ok(Some(Chunk::with_rows(vec![vector], count)?))
     }
 }
