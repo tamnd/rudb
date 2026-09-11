@@ -68,6 +68,15 @@ pub struct Prepared {
     types: Vec<LogicalType>,
     /// The operand lists of the steps that have one, as runs of step indices.
     operands: Vec<usize>,
+    /// The last step that reads each step's slot, or `usize::MAX` for one nothing reads.
+    ///
+    /// A slot is emptied as soon as the step that was the last to read it has run. Keeping every
+    /// intermediate alive to the end of the array instead is what the first measured version of this
+    /// did, and a chain of eight additions was slower prepared than walked because of it: nine live
+    /// intermediates at eight kilobytes each is seventy two kilobytes of working set where the tree
+    /// walk has two, and two is the pair the allocator hands back and forth and that stays in L1.
+    /// Everything else about the prepared form was faster and this one thing paid all of it back.
+    last_use: Vec<usize>,
     /// The step index each expression this was built from ends at.
     roots: Vec<usize>,
 }
@@ -165,13 +174,54 @@ impl Prepared {
     /// data, which is why they are found here, once, rather than on some chunk in the middle of a
     /// scan.
     pub fn new(plan: &Plan, exprs: &[ExprRef], schema: &Schema) -> Result<Self> {
-        let mut prepared =
-            Self { steps: Vec::new(), types: Vec::new(), operands: Vec::new(), roots: Vec::new() };
+        let mut prepared = Self {
+            steps: Vec::new(),
+            types: Vec::new(),
+            operands: Vec::new(),
+            last_use: Vec::new(),
+            roots: Vec::new(),
+        };
         for &expr in exprs {
             let root = prepared.push(plan, expr, schema)?;
             prepared.roots.push(root);
         }
+        prepared.last_use = prepared.last_uses();
         Ok(prepared)
+    }
+
+    /// Which step is the last to read each step, computed once when the expression is prepared.
+    ///
+    /// A root is never freed, because the whole point of running the array was to produce it. A
+    /// step nothing reads and that is not a root cannot happen, since every step is pushed by the
+    /// node that wanted it, but saying `usize::MAX` rather than asserting that keeps this a fact
+    /// about the array rather than a claim about the builder.
+    fn last_uses(&self) -> Vec<usize> {
+        let mut last = vec![usize::MAX; self.steps.len()];
+        for index in 0..self.steps.len() {
+            self.for_each_operand(index, |operand| last[operand] = index);
+        }
+        for &root in &self.roots {
+            last[root] = usize::MAX;
+        }
+        last
+    }
+
+    /// Visits the steps one step reads, whatever shape its operands are held in.
+    fn for_each_operand(&self, index: usize, mut visit: impl FnMut(usize)) {
+        match &self.steps[index] {
+            // A case's branches are arrays of their own and read nothing out of this one.
+            Step::Column(_) | Step::Constant(_) | Step::Case { .. } => {}
+            Step::Cast { input, .. } => visit(*input),
+            Step::Compare { left, right, .. } => {
+                visit(*left);
+                visit(*right);
+            }
+            Step::Conjunction { start, len, .. } | Step::Function { start, len, .. } => {
+                for &operand in &self.operands[*start..*start + *len] {
+                    visit(operand);
+                }
+            }
+        }
     }
 
     /// Prepares one expression, which is the common case and saves the caller a slice.
@@ -260,6 +310,12 @@ impl Prepared {
         for index in 0..self.steps.len() {
             let produced = self.step(index, chunk, &scratch.slots)?;
             scratch.slots[index] = produced;
+            let slots = &mut scratch.slots;
+            self.for_each_operand(index, |operand| {
+                if self.last_use[operand] == index {
+                    slots[operand] = None;
+                }
+            });
         }
         Ok(())
     }
@@ -674,6 +730,26 @@ mod tests {
     #[test]
     fn a_column_mentioned_three_times_agrees() {
         agrees("\"+\"(\"+\"(#0.0::INTEGER, #0.0::INTEGER)::INTEGER, #0.0::INTEGER)::INTEGER AS a");
+    }
+
+    /// The intermediates of a chain are not all held to the end of it.
+    ///
+    /// This is the whole difference between the prepared form being faster than the tree walk on a
+    /// deep chain and being slower than it, and it is a property of the slot array rather than of
+    /// any answer, so it is asserted here rather than left to the benchmark to catch.
+    #[test]
+    fn a_chain_holds_one_intermediate_at_a_time() {
+        let (schema, chunk) = input();
+        let mut expr = "#0.0::INTEGER".to_string();
+        for _ in 0..8 {
+            expr = format!("\"+\"({expr}, 1::INTEGER)::INTEGER");
+        }
+        let (plan, list) = projection(&format!("{expr} AS a"));
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the chain resolves");
+        let mut scratch = prepared.scratch();
+        prepared.run(&chunk, &mut scratch).expect("the chain runs");
+        let live = scratch.slots.iter().filter(|slot| slot.is_some()).count();
+        assert_eq!(live, 1, "a chain that has run should be holding its answer and nothing else");
     }
 
     /// Preparing is per pipeline and evaluating is per chunk, so the scratch has to survive being
