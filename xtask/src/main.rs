@@ -15,12 +15,14 @@ mod codegen;
 mod compare;
 mod focus;
 mod grammar;
+mod kernels;
 mod layers;
 mod rowloop;
 mod ruletable;
 mod sha256;
 mod smoke;
 mod style;
+mod timing;
 mod vendor;
 mod version;
 
@@ -45,6 +47,11 @@ fn main() -> ExitCode {
             Some(suite) => compare::run(&root(), &suite),
             None => bench::run(&root()),
         },
+        // The kernel tables, which are the in-process measurement of rank three against itself.
+        // Not a suite name under `bench` above, because that word means the whole comparison
+        // against every engine on the machine and this one links the kernels rather than running a
+        // binary.
+        Some("kernels") => kernels::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         Some("smoke") => smoke::run(),
         Some("ci") => ci(std::env::args().nth(2).as_deref() == Some("--full")),
         Some("help" | "--help" | "-h") | None => {
@@ -85,6 +92,9 @@ fn usage() {
     println!("  bench    the front end against a frozen workload, as a table");
     println!("           rebuilds itself under the bench profile, because a debug number is not");
     println!("           a number, and it is not the benchmark: that is tamnd/rudb-bench");
+    println!("  kernels  what one row costs, per physical layout, per form pair, per null rate,");
+    println!("           plus the compaction surface and the vector size sweep. --json for the");
+    println!("           machine readable form the rudb-bench kernels suite reads");
     println!("  bench <suite>          the whole comparison, against every engine on this machine");
     println!("                         builds rudb and the harness, then runs the suite. needs a");
     println!("                         tamnd/rudb-bench checkout beside this one, or");
