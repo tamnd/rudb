@@ -122,33 +122,17 @@ fn answers() -> Vec<Answer> {
 /// that fails on a column being one character narrower reports a spacing change as a wrong answer,
 /// and this test is the one that has to be believed when it says the answer is wrong.
 ///
-/// The count duckdb writes under a table is dropped, because rudb does not write it yet. It is a
-/// line of one cell whatever the table is wide, which is not on its own enough to recognise it by
-/// since a one column table's rows are also one cell, so the cell has to read as a count as well.
-/// A one column table holding the text `10 rows` would lose that row here, and no such table is
-/// anywhere near this test.
+/// The counts under the table are outside it, so taking only the lines the box drew leaves them
+/// behind on their own. That was worth saying while rudb did not write them and is worth saying now
+/// that it does, because the reason this needs no filter is the shape of the output rather than luck.
 fn cells(rendered: &str) -> Vec<Vec<String>> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     for line in rendered.lines() {
         let Some(inner) = line.strip_prefix('│') else { continue };
         let inner = inner.strip_suffix('│').unwrap_or(inner);
-        let cells: Vec<String> = inner.split('│').map(|cell| cell.trim().to_string()).collect();
-        if cells.len() == 1 && is_count(&cells[0]) {
-            continue;
-        }
-        rows.push(cells);
+        rows.push(inner.split('│').map(|cell| cell.trim().to_string()).collect());
     }
     rows
-}
-
-/// Whether a cell is the line duckdb writes under a table rather than a value in it.
-fn is_count(cell: &str) -> bool {
-    let mut words = cell.split_whitespace();
-    let Some(number) = words.next() else { return false };
-    if !number.chars().all(|c| c.is_ascii_digit() || c == ',') {
-        return false;
-    }
-    matches!(words.next(), Some("rows" | "row"))
 }
 
 /// A database with the benchmark file loaded into `hits`.
