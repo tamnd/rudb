@@ -140,6 +140,15 @@ pub fn reset() {
     }
 }
 
+/// The lock every test that resets the counters holds while it does.
+///
+/// The counters are process wide and the test harness runs tests in parallel, so two tests that
+/// both reset would otherwise pass alone and fail together, which is the worst kind of test to own.
+/// It lives here rather than in the test module below because the kernel tests in the other files
+/// reset the counters too and they need the same lock, not a second one.
+#[cfg(test)]
+pub(crate) static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The counts as a table, or a line saying there are none.
 #[must_use]
 pub fn report() -> String {
@@ -161,12 +170,7 @@ pub fn report() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Form, Kernel, count, hot, record, report, reset};
-
-    /// The counters are process wide, so the tests in this module take turns rather than running
-    /// against each other. Two tests that both reset would otherwise pass alone and fail together,
-    /// which is the worst kind of test to own.
-    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::{Form, Kernel, TURN, count, hot, record, report, reset};
 
     #[test]
     fn a_fall_through_lands_in_the_cell_for_its_own_form_pair() {
