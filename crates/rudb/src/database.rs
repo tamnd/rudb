@@ -152,8 +152,19 @@ impl Database {
     /// A parse error, a binder error, or anything the operators raise while running, which is
     /// mostly cast failures and arithmetic that leaves the range of its type.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
-        let plan = rudb_bind::bind_sql(sql, &self.catalog)?;
+        let plan = self.planned(sql)?;
         self.run(&plan)
+    }
+
+    /// A query bound and then optimized, which is the plan that runs.
+    ///
+    /// Both of the ways in are through here, so that what a plan dump shows is what the query does.
+    /// A dump of the bound plan and a run of the optimized one would make the dump a description of
+    /// something nobody executes, which is the one thing a plan dump must not be.
+    fn planned(&self, sql: &str) -> Result<rudb_plan::Plan> {
+        let mut plan = rudb_bind::bind_sql(sql, &self.catalog)?;
+        rudb_opt::optimize(&mut plan)?;
+        Ok(plan)
     }
 
     /// Runs one statement, which may change the database.
@@ -169,7 +180,10 @@ impl Database {
     /// A parse error, a binder error, a catalog error, or anything the operators raise.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         match rudb_bind::bind_statement_sql(sql, &self.catalog)? {
-            Bound::Query(plan) => self.run(&plan),
+            Bound::Query(mut plan) => {
+                rudb_opt::optimize(&mut plan)?;
+                self.run(&plan)
+            }
             Bound::CreateTable(create) => {
                 self.run_create_table(create)?;
                 Ok(QueryResult::empty())
@@ -180,11 +194,12 @@ impl Database {
                 }
                 Ok(QueryResult::empty())
             }
-            Bound::Insert(insert) => {
+            Bound::Insert(mut insert) => {
                 // The source runs to completion before anything is appended, which is not an
                 // implementation detail. `INSERT INTO t SELECT * FROM t` reads the table it writes,
                 // and a version of this that appended chunk by chunk would either read its own
                 // output forever or depend on how the scan holds its chunks.
+                rudb_opt::optimize(&mut insert.source)?;
                 let result = self.run(&insert.source)?;
                 let table = self.catalog.table_mut(&insert.name)?;
                 for chunk in result.chunks() {
@@ -245,8 +260,7 @@ impl Database {
     ///
     /// A parse error or a binder error.
     pub fn plan(&self, sql: &str) -> Result<String> {
-        let plan = rudb_bind::bind_sql(sql, &self.catalog)?;
-        Ok(plan.to_string())
+        Ok(self.planned(sql)?.to_string())
     }
 
     /// Runs a query and returns the single value it produced.

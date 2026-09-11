@@ -23,9 +23,9 @@
 //!
 //! # What a query is today
 //!
-//! Parse, bind, execute. There is no optimizer in the middle: `rudb-opt` is a scaffold and
-//! `spec/09-optimizer.md`'s pass sequence is M1 work, so a plan runs in the shape the binder built
-//! it. There are no transactions either, and `rudb-txn` is in the dependency list for the same
+//! Parse, bind, optimize, execute. The optimizer is one pass, which is column pruning, so a scan
+//! reads the columns something above it asks for and the plan is otherwise the shape the binder
+//! built it. The rest of `spec/09-optimizer.md`'s sequence is M1 work. There are no transactions, and `rudb-txn` is in the dependency list for the same
 //! reason: the seam is where it will be and nothing goes through it yet.
 //!
 //! There is also no `CREATE TABLE` and no `INSERT`, because the M0 parser handles `SELECT` and

@@ -201,6 +201,29 @@ fn a_parquet_file_that_is_not_there_is_the_file_error_and_not_the_table_one() {
 }
 
 #[test]
+fn a_query_that_names_two_columns_plans_a_scan_of_those_two() {
+    // The other five are in the file and the plan does not mention them, so the reader is never
+    // asked for them. On ClickBench this is three columns out of 105 rather than two out of seven.
+    let database = Database::new();
+    let sql = format!("SELECT a, s FROM {} WHERE a < 10", fixture());
+    let plan = database.plan(&sql).expect("binds");
+    assert!(plan.contains("[a::INTEGER, s::VARCHAR]"), "{plan}");
+    for dropped in ["b::BIGINT", "d::DOUBLE", "flag::BOOLEAN", "day::DATE", "t::TIMESTAMP"] {
+        assert!(!plan.contains(dropped), "{dropped} survived in {plan}");
+    }
+}
+
+#[test]
+fn counting_the_rows_of_a_file_plans_a_scan_of_no_columns_at_all() {
+    // Which makes it a read of the footer. The row count is in there and no column chunk has to be
+    // touched to add it up.
+    let database = Database::new();
+    let sql = format!("SELECT count(*) FROM {}", fixture());
+    let plan = database.plan(&sql).expect("binds");
+    assert!(plan.contains("#0 []"), "{plan}");
+}
+
+#[test]
 fn a_column_the_file_does_not_have_is_the_error_a_missing_column_always_is() {
     let database = Database::new();
     let sql = format!("SELECT nosuch FROM read_parquet({})", fixture());
