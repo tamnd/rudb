@@ -97,6 +97,15 @@ const KEEP: &[f64] = &[0.1, 1.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0];
 /// The vector sizes the last table sweeps.
 const SIZES: &[usize] = &[256, 512, 1024, 2048, 4096];
 
+/// The chunk lengths the expression table runs every shape at.
+///
+/// A full chunk and a short one, because everything the prepared form removes is a cost per chunk
+/// rather than a cost per row: a schema search over sixteen fields amortized over a thousand rows
+/// is nothing, and over sixty four rows it is sixteen times more of the row. Sixty four rather than
+/// one because sixty four is what a chunk actually looks like after a selective filter, and the
+/// operators downstream of one are exactly the ones this is for.
+const CHUNKS: &[usize] = &[VECTOR_SIZE, 64];
+
 /// Builds a run of values: how many rows, and an offset that shifts every one of them.
 type Build = fn(usize, i64) -> Data;
 
@@ -820,16 +829,16 @@ fn expression_columns() -> Vec<Field> {
 /// both of them call the same kernel with the same validity once they get there. A null rate here
 /// would move both columns by the same amount and would say nothing about the difference between
 /// them, which is the only number the table is for.
-fn expression_input() -> (Schema, Chunk) {
+fn expression_input(rows: usize) -> (Schema, Chunk) {
     let all = cases();
     let bigint = all.iter().find(|case| case.layout == "Int64").expect("the list has a bigint");
     let double = all.iter().find(|case| case.layout == "Float64").expect("the list has a double");
     let mut columns = Vec::new();
     for column in 0..8 {
-        columns.push(flat(bigint, ROWS, column as i64, 0));
+        columns.push(flat(bigint, rows, column as i64, 0));
     }
     for column in 0..8 {
-        columns.push(flat(double, ROWS, column as i64, 0));
+        columns.push(flat(double, rows, column as i64, 0));
     }
     let schema = Schema::numbered(expression_columns(), 0);
     (schema, Chunk::new(columns).expect("sixteen columns of the same length"))
@@ -906,7 +915,6 @@ fn shapes() -> Vec<Shape> {
 /// [`evaluate_all`] collects into a fresh one on every call and a hoisted `Vec` on one side only
 /// would be this table's thumb on the scale rather than the design's.
 fn expressions(cells: &mut Vec<Cell>) {
-    let (schema, chunk) = expression_input();
     let columns: Vec<String> =
         expression_columns().iter().map(|field| format!("{}::{}", field.name, field.ty)).collect();
     for shape in shapes() {
@@ -923,49 +931,52 @@ fn expressions(cells: &mut Vec<Cell>) {
             panic!("the root of that text is a projection");
         };
         let list = plan.expr_list(exprs).to_vec();
-        let prepared =
-            Prepared::new(&plan, &list, &schema).expect("every shape here is a resolvable one");
-        let mut scratch = prepared.scratch();
+        for &rows in CHUNKS {
+            let (schema, chunk) = expression_input(rows);
+            let prepared =
+                Prepared::new(&plan, &list, &schema).expect("every shape here is a resolvable one");
+            let mut scratch = prepared.scratch();
 
-        fallback::reset();
-        let walked = evaluate_all(&plan, &list, &schema, &chunk).expect("the tree walk runs");
-        let mut ran = Vec::new();
-        prepared.evaluate(&chunk, &mut scratch, &mut ran).expect("the prepared form runs");
-        assert_eq!(walked.len(), ran.len(), "{} produced a different width", shape.case);
-        for (at, (slow, fast)) in walked.iter().zip(&ran).enumerate() {
-            assert_eq!(slow.len(), ROWS, "{} column {at} is not a full chunk", shape.case);
-            for row in 0..ROWS {
-                assert_eq!(
-                    slow.value_at(row),
-                    fast.value_at(row),
-                    "{} column {at} disagrees at row {row}",
-                    shape.case
-                );
+            fallback::reset();
+            let walked = evaluate_all(&plan, &list, &schema, &chunk).expect("the tree walk runs");
+            let mut ran = Vec::new();
+            prepared.evaluate(&chunk, &mut scratch, &mut ran).expect("the prepared form runs");
+            assert_eq!(walked.len(), ran.len(), "{} produced a different width", shape.case);
+            for (at, (slow, fast)) in walked.iter().zip(&ran).enumerate() {
+                assert_eq!(slow.len(), rows, "{} column {at} is not a full chunk", shape.case);
+                for row in 0..rows {
+                    assert_eq!(
+                        slow.value_at(row),
+                        fast.value_at(row),
+                        "{} column {at} disagrees at row {row}",
+                        shape.case
+                    );
+                }
             }
-        }
-        let fell_back = !fallback::hot().is_empty();
+            let fell_back = !fallback::hot().is_empty();
 
-        let tree = time(|| {
-            drop(black_box(evaluate_all(&plan, &list, &schema, black_box(&chunk))));
-        });
-        let fast = time(|| {
-            let mut out = Vec::with_capacity(list.len());
-            drop(black_box(prepared.evaluate(black_box(&chunk), &mut scratch, &mut out)));
-            drop(black_box(out));
-        });
-
-        for (variant, number) in [("tree", tree), ("prepared", fast)] {
-            cells.push(Cell {
-                table: "expressions",
-                case: shape.case.clone(),
-                detail: shape.detail.to_string(),
-                variant: variant.to_string(),
-                nulls: 0,
-                rows: ROWS,
-                nanos: number.per(ROWS),
-                spread: number.relative(),
-                fell_back,
+            let tree = time(|| {
+                drop(black_box(evaluate_all(&plan, &list, &schema, black_box(&chunk))));
             });
+            let fast = time(|| {
+                let mut out = Vec::with_capacity(list.len());
+                drop(black_box(prepared.evaluate(black_box(&chunk), &mut scratch, &mut out)));
+                drop(black_box(out));
+            });
+
+            for (variant, number) in [("tree", tree), ("prepared", fast)] {
+                cells.push(Cell {
+                    table: "expressions",
+                    case: shape.case.clone(),
+                    detail: shape.detail.to_string(),
+                    variant: variant.to_string(),
+                    nulls: 0,
+                    rows,
+                    nanos: number.per(rows),
+                    spread: number.relative(),
+                    fell_back,
+                });
+            }
         }
     }
 }
@@ -1142,29 +1153,30 @@ fn sweep_table(cells: &[Cell]) {
 /// The tree walk against the prepared form.
 fn expression_table(cells: &[Cell]) {
     println!();
-    println!("expressions, nanoseconds a row, {ROWS} rows a chunk, no nulls");
+    println!("expressions, nanoseconds a row, no nulls");
     println!(
         "tree is one walk of the bound tree per chunk, prepared is the same tree flattened once"
     );
     println!();
     println!(
-        "{:<24}  {:<8}  {:>9}  {:>9}  {:>7}  {:>5}",
-        "expression", "type", "tree", "prepared", "times", "IQR"
+        "{:<24}  {:<8}  {:>5}  {:>9}  {:>9}  {:>7}  {:>5}",
+        "expression", "type", "rows", "tree", "prepared", "times", "IQR"
     );
 
-    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut seen: Vec<(String, String, usize)> = Vec::new();
     for row in cells.iter().filter(|cell| cell.table == "expressions") {
-        let key = (row.case.clone(), row.detail.clone());
+        let key = (row.case.clone(), row.detail.clone(), row.rows);
         if !seen.contains(&key) {
             seen.push(key);
         }
     }
-    for (case, detail) in seen {
+    for (case, detail, rows) in seen {
         let found = |variant: &str| {
             cells.iter().find(|cell| {
                 cell.table == "expressions"
                     && cell.case == case
                     && cell.detail == detail
+                    && cell.rows == rows
                     && cell.variant == variant
             })
         };
@@ -1177,9 +1189,10 @@ fn expression_table(cells: &[Cell]) {
         let times = if prepared.nanos == 0.0 { 0.0 } else { tree.nanos / prepared.nanos };
         let worst = tree.spread.max(prepared.spread);
         println!(
-            "{:<24}  {:<8}  {:>9.2}  {:>9.2}  {:>6.2}x  {:>4.1}%",
+            "{:<24}  {:<8}  {:>5}  {:>9.2}  {:>9.2}  {:>6.2}x  {:>4.1}%",
             case,
             detail,
+            rows,
             tree.nanos,
             prepared.nanos,
             times,
