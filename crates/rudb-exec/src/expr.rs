@@ -7,6 +7,13 @@
 //! that loop respectively. Neither of those can be checked against anything until this exists, so
 //! this exists first and stays.
 //!
+//! What runs in a pipeline is [`Prepared`](crate::Prepared), which does once per pipeline the four
+//! things this does once per chunk. This stays as the reference the prepared form is checked
+//! against, for the reason `spec/engine/04-expressions.md` gives for keeping every slow path that
+//! a fast path replaced: a fast path with nothing to disagree with is a fast path nobody can tell
+//! is wrong. It is also still what the operators that evaluate an expression exactly once use,
+//! since preparing a tree to run it on one chunk is more work than walking it.
+//!
 //! Nothing here decides a type. Every expression in a bound plan carries the type it evaluates to,
 //! the binder put the casts in, and a kernel is told what it returns rather than working it out.
 //! An evaluator that inferred anything would be a second type system that has to agree with the
@@ -14,10 +21,11 @@
 //! disagree.
 
 use rudb_common::{Error, Result, Value};
-use rudb_kernels::{Comparison, Connective, cast, combine, compare, is_true};
-use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
-use rudb_vector::{Chunk, Selection, Vector};
+use rudb_kernels::{cast, combine, compare, is_true};
+use rudb_plan::{Expr, ExprRef, Plan};
+use rudb_vector::{Chunk, Vector};
 
+use crate::prepared::{comparison, connective, narrow};
 use crate::schema::Schema;
 
 /// Evaluates one expression over a chunk, producing one vector as long as the chunk.
@@ -124,43 +132,4 @@ pub fn evaluate_all(
     chunk: &Chunk,
 ) -> Result<Vec<Vector>> {
     exprs.iter().map(|&expr| evaluate(plan, expr, schema, chunk)).collect()
-}
-
-/// The chunk cut down to the given rows.
-///
-/// The reason `CASE` is written with this rather than by evaluating every arm over the whole chunk
-/// and picking afterwards. `CASE WHEN x <> 0 THEN 1 / x ELSE 0 END` divides by zero on the rows the
-/// arm does not apply to if the arm is evaluated for them, and a `CASE` that raises on a row it was
-/// written to exclude is the classic wrong answer this shape prevents.
-fn narrow(chunk: &Chunk, rows: &[usize]) -> Result<Chunk> {
-    let mut selection = Selection::with_capacity(rows.len());
-    for &row in rows {
-        selection.push(row);
-    }
-    chunk.clone().select(&selection)
-}
-
-/// The kernels' comparison for the plan's.
-///
-/// A translation rather than one shared enum, because the kernels are rank 3 and the plan is rank
-/// 9. This function is the whole of what that separation costs.
-fn comparison(op: CompareOp) -> Comparison {
-    match op {
-        CompareOp::Equal => Comparison::Equal,
-        CompareOp::NotEqual => Comparison::NotEqual,
-        CompareOp::Less => Comparison::Less,
-        CompareOp::LessOrEqual => Comparison::LessOrEqual,
-        CompareOp::Greater => Comparison::Greater,
-        CompareOp::GreaterOrEqual => Comparison::GreaterOrEqual,
-        CompareOp::DistinctFrom => Comparison::DistinctFrom,
-        CompareOp::NotDistinctFrom => Comparison::NotDistinctFrom,
-    }
-}
-
-/// The kernels' connective for the plan's.
-fn connective(op: ConjunctionOp) -> Connective {
-    match op {
-        ConjunctionOp::And => Connective::And,
-        ConjunctionOp::Or => Connective::Or,
-    }
 }

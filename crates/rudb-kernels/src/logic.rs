@@ -49,18 +49,26 @@ pub enum Connective {
 
 /// Combines two or more boolean vectors.
 ///
+/// The children are anything that hands back a [`Vector`] by reference, which is `&[Vector]` for a
+/// caller holding a list it built and `&[&Vector]` for one whose operands are somewhere else. The
+/// evaluator at layer twelve is the second kind: its operands are slots in a scratch array and
+/// columns of the chunk it was handed, and a signature that demanded a `Vec<Vector>` would make it
+/// copy every column of every conjunct on every chunk to satisfy the type rather than the work.
+///
 /// # Errors
 ///
 /// If there are no children, if they are not all the same length, or if one of them is not boolean.
-pub fn combine(op: Connective, children: &[Vector]) -> Result<Vector> {
-    let first =
-        children.first().ok_or_else(|| Error::internal("a conjunction with no children"))?;
+pub fn combine<V: AsRef<Vector>>(op: Connective, children: &[V]) -> Result<Vector> {
+    let first = children
+        .first()
+        .map(AsRef::as_ref)
+        .ok_or_else(|| Error::internal("a conjunction with no children"))?;
     let rows = first.len();
     for (at, child) in children.iter().enumerate() {
-        if child.len() != rows {
+        if child.as_ref().len() != rows {
             return Err(Error::internal(format!(
                 "child {at} of a conjunction is {} rows and child 0 is {rows}",
-                child.len()
+                child.as_ref().len()
             )));
         }
     }
@@ -68,14 +76,14 @@ pub fn combine(op: Connective, children: &[Vector]) -> Result<Vector> {
         return Ok(vector);
     }
     let left = first.form();
-    fallback::record(Kernel::Logic, left, children.get(1).map_or(left, Vector::form));
+    fallback::record(Kernel::Logic, left, children.get(1).map_or(left, |c| c.as_ref().form()));
     let mut values = Vec::with_capacity(rows);
     // row at a time: the path recorded on the line above, which exists to be correct for a set of
     // forms `folded` does not cover and counts itself so that set shows up.
     for index in 0..rows {
         let mut answer = Some(matches!(op, Connective::And));
         for child in children {
-            let held = match child.value_at(index) {
+            let held = match child.as_ref().value_at(index) {
                 Value::Boolean(held) => Some(held),
                 Value::Null => None,
                 other => {
@@ -101,17 +109,20 @@ pub fn combine(op: Connective, children: &[Vector]) -> Result<Vector> {
 /// is the only thing that differs between `AND` and `OR` in the loop below, and passing it as a
 /// value would put a comparison against it inside the loop for something that cannot change while
 /// the loop runs.
-fn folded(op: Connective, children: &[Vector], rows: usize) -> Option<Vector> {
+fn folded<V: AsRef<Vector>>(op: Connective, children: &[V], rows: usize) -> Option<Vector> {
     match op {
-        Connective::And => fold_runs::<false>(children, rows),
-        Connective::Or => fold_runs::<true>(children, rows),
+        Connective::And => fold_runs::<false, _>(children, rows),
+        Connective::Or => fold_runs::<true, _>(children, rows),
     }
 }
 
 /// One pass per child, carrying the run that says decided and the run that says unknown.
 ///
 /// `DOMINANT` is the value that ends the question for a row: false for `AND`, true for `OR`.
-fn fold_runs<const DOMINANT: bool>(children: &[Vector], rows: usize) -> Option<Vector> {
+fn fold_runs<const DOMINANT: bool, V: AsRef<Vector>>(
+    children: &[V],
+    rows: usize,
+) -> Option<Vector> {
     if rows == 0 {
         // What `from_values` builds from no values at all, which is the empty run rather than
         // `Data::Empty` and validity that normalizes to all valid. Written out rather than reached
@@ -122,7 +133,7 @@ fn fold_runs<const DOMINANT: bool>(children: &[Vector], rows: usize) -> Option<V
     // A child that is not boolean is an error the row at a time path raises with the type in the
     // message, and it raises it only for rows that are not null, so the fast path cannot answer for
     // it at all. It hands the whole call back rather than guessing.
-    if children.iter().any(|child| child.logical_type() != &LogicalType::Boolean) {
+    if children.iter().any(|child| child.as_ref().logical_type() != &LogicalType::Boolean) {
         return None;
     }
 
@@ -131,6 +142,7 @@ fn fold_runs<const DOMINANT: bool>(children: &[Vector], rows: usize) -> Option<V
     let mut nullable = false;
 
     for child in children {
+        let child = child.as_ref();
         let nulls = nulls_of(child);
         nullable |= nulls.has_nulls(rows);
         match child.form() {
@@ -314,7 +326,8 @@ mod tests {
 
     #[test]
     fn a_conjunction_with_no_children_is_caught() {
-        let error = combine(Connective::And, &[]).expect_err("nothing to combine");
+        let nothing: &[Vector] = &[];
+        let error = combine(Connective::And, nothing).expect_err("nothing to combine");
         assert!(error.message().contains("no children"), "{error}");
     }
 

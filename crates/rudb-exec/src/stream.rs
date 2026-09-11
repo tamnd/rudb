@@ -10,8 +10,8 @@ use rudb_kernels::selection;
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Selection};
 
-use crate::expr::{evaluate, evaluate_all};
 use crate::operator::Operator;
+use crate::prepared::{Prepared, Scratch};
 use crate::schema::Schema;
 
 /// Keeps the rows where a predicate is true.
@@ -28,15 +28,25 @@ use crate::schema::Schema;
 #[derive(Debug)]
 pub(crate) struct Filter<'a> {
     input: Box<dyn Operator + 'a>,
-    plan: &'a Plan,
-    predicate: ExprRef,
+    predicate: Prepared,
+    scratch: Scratch,
     schema: Schema,
 }
 
 impl<'a> Filter<'a> {
-    pub(crate) fn new(plan: &'a Plan, input: Box<dyn Operator + 'a>, predicate: ExprRef) -> Self {
+    /// # Errors
+    ///
+    /// If the predicate does not resolve against the input's schema, which is a failure of the plan
+    /// and is now found when the operator is built rather than on the first chunk.
+    pub(crate) fn new(
+        plan: &'a Plan,
+        input: Box<dyn Operator + 'a>,
+        predicate: ExprRef,
+    ) -> Result<Self> {
         let schema = input.schema().clone();
-        Self { input, plan, predicate, schema }
+        let predicate = Prepared::one(plan, predicate, &schema)?;
+        let scratch = predicate.scratch();
+        Ok(Self { input, predicate, scratch, schema })
     }
 }
 
@@ -47,8 +57,8 @@ impl Operator for Filter<'_> {
 
     fn next(&mut self) -> Result<Option<Chunk>> {
         while let Some(chunk) = self.input.next()? {
-            let flags = evaluate(self.plan, self.predicate, &self.schema, &chunk)?;
-            let kept = selection(&flags, chunk.len());
+            let flags = self.predicate.evaluate_one(&chunk, &mut self.scratch)?;
+            let kept = selection(flags, chunk.len());
             if kept.is_empty() {
                 continue;
             }
@@ -65,9 +75,8 @@ impl Operator for Filter<'_> {
 #[derive(Debug)]
 pub(crate) struct Project<'a> {
     input: Box<dyn Operator + 'a>,
-    plan: &'a Plan,
-    exprs: Vec<ExprRef>,
-    input_schema: Schema,
+    exprs: Prepared,
+    scratch: Scratch,
     schema: Schema,
 }
 
@@ -103,7 +112,9 @@ impl<'a> Project<'a> {
             })
             .collect();
         let input_schema = input.schema().clone();
-        Ok(Self { input, plan, exprs, input_schema, schema: Schema::numbered(fields, index) })
+        let exprs = Prepared::new(plan, &exprs, &input_schema)?;
+        let scratch = exprs.scratch();
+        Ok(Self { input, exprs, scratch, schema: Schema::numbered(fields, index) })
     }
 }
 
@@ -116,7 +127,8 @@ impl Operator for Project<'_> {
         let Some(chunk) = self.input.next()? else {
             return Ok(None);
         };
-        let columns = evaluate_all(self.plan, &self.exprs, &self.input_schema, &chunk)?;
+        let mut columns = Vec::with_capacity(self.exprs.len());
+        self.exprs.evaluate(&chunk, &mut self.scratch, &mut columns)?;
         Ok(Some(Chunk::with_rows(columns, chunk.len())?))
     }
 }

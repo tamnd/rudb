@@ -15,8 +15,10 @@ publish = false
 [dependencies]
 rudb.workspace = true
 rudb-common.workspace = true
+rudb-exec.workspace = true
 rudb-kernels.workspace = true
 rudb-parse.workspace = true
+rudb-plan.workspace = true
 rudb-vector.workspace = true
 
 [lints]

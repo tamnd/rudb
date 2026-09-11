@@ -6,7 +6,7 @@
 //! again on a machine of record, which is what makes a regression something the next change trips
 //! over rather than something somebody notices two milestones later.
 //!
-//! Five tables, and each of them answers a question the kernels were written to have an answer to.
+//! Six tables, and each of them answers a question the kernels were written to have an answer to.
 //!
 //! Comparison and arithmetic, every physical layout, four form pairs, three null rates. The target
 //! in 2b is fixed width flat against flat comparison under one nanosecond a row, and the reason
@@ -30,6 +30,13 @@
 //! and at 4096 rows do not. That is a claim about a machine, so it is measured on the machine
 //! rather than asserted.
 //!
+//! Expressions, the tree walk against the prepared form. This is the first table that is not a
+//! kernel at all. It is here rather than in a table of its own because a kernel number is the
+//! explanation of the number above it, and the thing sub-milestone 2c is doing is taking the four
+//! per chunk costs that sit between a pipeline and a kernel call out of the per chunk path. Those
+//! costs are invisible in every table above this one, which times a kernel that has already been
+//! handed its operands, and they are the whole of the difference between the two columns here.
+//!
 //! # What this is not
 //!
 //! It is not `tamnd/rudb-bench`, and rule ten from `spec/15-rudb-bench.md` is printed under every
@@ -39,8 +46,10 @@
 use std::hint::black_box;
 use std::path::Path;
 
-use rudb_common::{LogicalType, Value};
+use rudb_common::{Field, LogicalType, Value};
+use rudb_exec::{Prepared, Schema, evaluate_all};
 use rudb_kernels::{Comparison, call, compare, fallback};
+use rudb_plan::{Node, Plan};
 use rudb_vector::{Chunk, Data, Selection, StringColumn, VECTOR_SIZE, Validity, Vector};
 
 use crate::timing::{Number, build_line, rebuild, shared_caveats, time};
@@ -88,6 +97,15 @@ const KEEP: &[f64] = &[0.1, 1.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0];
 /// The vector sizes the last table sweeps.
 const SIZES: &[usize] = &[256, 512, 1024, 2048, 4096];
 
+/// The chunk lengths the expression table runs every shape at.
+///
+/// A full chunk and a short one, because everything the prepared form removes is a cost per chunk
+/// rather than a cost per row: a schema search over sixteen fields amortized over a thousand rows
+/// is nothing, and over sixty four rows it is sixteen times more of the row. Sixty four rather than
+/// one because sixty four is what a chunk actually looks like after a selective filter, and the
+/// operators downstream of one are exactly the ones this is for.
+const CHUNKS: &[usize] = &[VECTOR_SIZE, 64];
+
 /// Builds a run of values: how many rows, and an offset that shifts every one of them.
 type Build = fn(usize, i64) -> Data;
 
@@ -122,8 +140,8 @@ struct Case {
 
 /// One measured cell, in the flat form the tables are printed from and the JSON is written from.
 ///
-/// Flat rather than a table shaped structure per table, because there are five tables and a reader
-/// that wants to diff two runs wants one list of records with keys on it, not five shapes.
+/// Flat rather than a table shaped structure per table, because there are six tables and a reader
+/// that wants to diff two runs wants one list of records with keys on it, not six shapes.
 struct Cell {
     /// Which table, so a consumer can group without knowing what order they were printed in.
     table: &'static str,
@@ -162,6 +180,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     string_table(&mut cells);
     compaction_surface(&mut cells);
     size_sweep(&mut cells);
+    expressions(&mut cells);
 
     if json {
         print!("{}", as_json(&cells));
@@ -788,6 +807,180 @@ fn size_sweep(cells: &mut Vec<Cell>) {
     }
 }
 
+/// The columns every expression shape is written against.
+///
+/// Eight bigints and eight doubles, so a shape can mention a column it has already mentioned, can
+/// mention eight different ones, and can do the same arithmetic in an integer and in a float
+/// without changing anything else about the row.
+fn expression_columns() -> Vec<Field> {
+    let mut fields = Vec::new();
+    for column in 0..8 {
+        fields.push(Field::new(format!("c{column}"), LogicalType::BigInt));
+    }
+    for column in 0..8 {
+        fields.push(Field::new(format!("d{column}"), LogicalType::Double));
+    }
+    fields
+}
+
+/// The chunk those columns arrive in, with no nulls in it.
+///
+/// No nulls because the thing this table is comparing is two ways of walking the same tree, and
+/// both of them call the same kernel with the same validity once they get there. A null rate here
+/// would move both columns by the same amount and would say nothing about the difference between
+/// them, which is the only number the table is for.
+fn expression_input(rows: usize) -> (Schema, Chunk) {
+    let all = cases();
+    let bigint = all.iter().find(|case| case.layout == "Int64").expect("the list has a bigint");
+    let double = all.iter().find(|case| case.layout == "Float64").expect("the list has a double");
+    let mut columns = Vec::new();
+    for column in 0..8 {
+        columns.push(flat(bigint, rows, column as i64, 0));
+    }
+    for column in 0..8 {
+        columns.push(flat(double, rows, column as i64, 0));
+    }
+    let schema = Schema::numbered(expression_columns(), 0);
+    (schema, Chunk::new(columns).expect("sixteen columns of the same length"))
+}
+
+/// One expression shape, written in the plan's textual form.
+struct Shape {
+    /// What the first column prints.
+    case: String,
+    /// The type the shape is written at.
+    detail: &'static str,
+    /// The projection list, the part between the brackets of a `Project` node.
+    exprs: String,
+}
+
+/// The shapes, in the order the table prints them.
+///
+/// A chain because it is the shape the tree walk is worst at and the shape a real projection is
+/// made of: every link is a recursion, a schema search for whatever is at the bottom of it, and a
+/// type clone. A conjunction because it is what a filter is. A column named three times because it
+/// is the copy the prepared form exists to stop making, and one that says three rather than one is
+/// a column whose copy is charged three times. A projection of eight columns because that is the
+/// shape where the tree walk is doing nothing at all except copying, so the ratio in that row is
+/// the price of the copy on its own with no arithmetic hiding it.
+fn shapes() -> Vec<Shape> {
+    let mut shapes = Vec::new();
+    for &(detail, column, one) in
+        &[("BIGINT", "#0.0::BIGINT", "1::BIGINT"), ("DOUBLE", "#0.8::DOUBLE", "1.0::DOUBLE")]
+    {
+        for depth in [2, 4, 8] {
+            let mut expr = column.to_string();
+            for _ in 0..depth {
+                expr = format!("\"+\"({expr}, {one})::{detail}");
+            }
+            shapes.push(Shape {
+                case: format!("chain depth {depth}"),
+                detail,
+                exprs: format!("{expr} AS a"),
+            });
+        }
+    }
+    let conjuncts: Vec<String> =
+        (0..4).map(|column| format!("(#0.{column}::BIGINT > 32::BIGINT)::BOOLEAN")).collect();
+    shapes.push(Shape {
+        case: "four conjunct filter".to_string(),
+        detail: "BIGINT",
+        exprs: format!("({})::BOOLEAN AS a", conjuncts.join(" AND ")),
+    });
+    shapes.push(Shape {
+        case: "one column three times".to_string(),
+        detail: "BIGINT",
+        exprs: "\"+\"(\"+\"(#0.0::BIGINT, #0.0::BIGINT)::BIGINT, #0.0::BIGINT)::BIGINT AS a"
+            .to_string(),
+    });
+    let passed: Vec<String> =
+        (0..8).map(|column| format!("#0.{column}::BIGINT AS a{column}")).collect();
+    shapes.push(Shape {
+        case: "eight columns passed".to_string(),
+        detail: "BIGINT",
+        exprs: passed.join(", "),
+    });
+    shapes
+}
+
+/// The expression table: the tree walk against the prepared form, same expression, same chunk.
+///
+/// Both sides are run once and checked against each other before either is timed, for the reason
+/// [`cell`] gives about never timing an error return, and for a second reason this table has that
+/// the others do not: the whole claim of a prepared form is that it answers what the tree walk
+/// answers, so a table that reported a number without checking that would be reporting how fast
+/// two things disagree.
+///
+/// The prepared side builds its output vector inside the timed region, because the tree walk's
+/// [`evaluate_all`] collects into a fresh one on every call and a hoisted `Vec` on one side only
+/// would be this table's thumb on the scale rather than the design's.
+fn expressions(cells: &mut Vec<Cell>) {
+    let columns: Vec<String> =
+        expression_columns().iter().map(|field| format!("{}::{}", field.name, field.ty)).collect();
+    for shape in shapes() {
+        let text = format!(
+            "Project #1 [{}]\n  Get memory.main.t AS t #0 [{}]",
+            shape.exprs,
+            columns.join(", ")
+        );
+        let plan = match Plan::parse(&text) {
+            Ok(plan) => plan,
+            Err(error) => panic!("the shape `{}` does not parse: {error}", shape.exprs),
+        };
+        let Node::Project { exprs, .. } = *plan.node(plan.root()) else {
+            panic!("the root of that text is a projection");
+        };
+        let list = plan.expr_list(exprs).to_vec();
+        for &rows in CHUNKS {
+            let (schema, chunk) = expression_input(rows);
+            let prepared =
+                Prepared::new(&plan, &list, &schema).expect("every shape here is a resolvable one");
+            let mut scratch = prepared.scratch();
+
+            fallback::reset();
+            let walked = evaluate_all(&plan, &list, &schema, &chunk).expect("the tree walk runs");
+            let mut ran = Vec::new();
+            prepared.evaluate(&chunk, &mut scratch, &mut ran).expect("the prepared form runs");
+            assert_eq!(walked.len(), ran.len(), "{} produced a different width", shape.case);
+            for (at, (slow, fast)) in walked.iter().zip(&ran).enumerate() {
+                assert_eq!(slow.len(), rows, "{} column {at} is not a full chunk", shape.case);
+                for row in 0..rows {
+                    assert_eq!(
+                        slow.value_at(row),
+                        fast.value_at(row),
+                        "{} column {at} disagrees at row {row}",
+                        shape.case
+                    );
+                }
+            }
+            let fell_back = !fallback::hot().is_empty();
+
+            let tree = time(|| {
+                drop(black_box(evaluate_all(&plan, &list, &schema, black_box(&chunk))));
+            });
+            let fast = time(|| {
+                let mut out = Vec::with_capacity(list.len());
+                drop(black_box(prepared.evaluate(black_box(&chunk), &mut scratch, &mut out)));
+                drop(black_box(out));
+            });
+
+            for (variant, number) in [("tree", tree), ("prepared", fast)] {
+                cells.push(Cell {
+                    table: "expressions",
+                    case: shape.case.clone(),
+                    detail: shape.detail.to_string(),
+                    variant: variant.to_string(),
+                    nulls: 0,
+                    rows,
+                    nanos: number.per(rows),
+                    spread: number.relative(),
+                    fell_back,
+                });
+            }
+        }
+    }
+}
+
 /// Print the tables.
 fn report(cells: &[Cell]) {
     println!("rudb kernels, nanoseconds a row, {ROWS} rows a chunk unless a column says otherwise");
@@ -798,6 +991,7 @@ fn report(cells: &[Cell]) {
     grid(cells, "strings", "string comparison, left < right");
     surface_table(cells);
     sweep_table(cells);
+    expression_table(cells);
 
     println!();
     let starred = cells.iter().filter(|cell| cell.fell_back).count();
@@ -953,6 +1147,57 @@ fn sweep_table(cells: &[Cell]) {
             }
         }
         println!();
+    }
+}
+
+/// The tree walk against the prepared form.
+fn expression_table(cells: &[Cell]) {
+    println!();
+    println!("expressions, nanoseconds a row, no nulls");
+    println!(
+        "tree is one walk of the bound tree per chunk, prepared is the same tree flattened once"
+    );
+    println!();
+    println!(
+        "{:<24}  {:<8}  {:>5}  {:>9}  {:>9}  {:>7}  {:>5}",
+        "expression", "type", "rows", "tree", "prepared", "times", "IQR"
+    );
+
+    let mut seen: Vec<(String, String, usize)> = Vec::new();
+    for row in cells.iter().filter(|cell| cell.table == "expressions") {
+        let key = (row.case.clone(), row.detail.clone(), row.rows);
+        if !seen.contains(&key) {
+            seen.push(key);
+        }
+    }
+    for (case, detail, rows) in seen {
+        let found = |variant: &str| {
+            cells.iter().find(|cell| {
+                cell.table == "expressions"
+                    && cell.case == case
+                    && cell.detail == detail
+                    && cell.rows == rows
+                    && cell.variant == variant
+            })
+        };
+        let (Some(tree), Some(prepared)) = (found("tree"), found("prepared")) else {
+            continue;
+        };
+        // The ratio is printed from the two medians and nothing is claimed about it beyond that.
+        // A ratio of two numbers whose spreads overlap is not a speedup, and the two spreads are
+        // in the last column so a reader can see when that is the case rather than being told.
+        let times = if prepared.nanos == 0.0 { 0.0 } else { tree.nanos / prepared.nanos };
+        let worst = tree.spread.max(prepared.spread);
+        println!(
+            "{:<24}  {:<8}  {:>5}  {:>9.2}  {:>9.2}  {:>6.2}x  {:>4.1}%",
+            case,
+            detail,
+            rows,
+            tree.nanos,
+            prepared.nanos,
+            times,
+            worst * 100.0
+        );
     }
 }
 

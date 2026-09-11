@@ -521,6 +521,18 @@ impl Vector {
     }
 }
 
+/// So that a kernel can take its operands as either a list of vectors or a list of references.
+///
+/// A caller that built a `Vec<Vector>` and a caller whose operands are already somewhere else, in a
+/// chunk or in an evaluator's scratch, want the same kernel. Without this the second kind has to
+/// clone every operand into a `Vec` to satisfy the signature, and a clone of a vector is a copy of
+/// the whole column, so the type would be charging real memory traffic for nothing.
+impl AsRef<Vector> for Vector {
+    fn as_ref(&self) -> &Vector {
+        self
+    }
+}
+
 /// One level of dictionary out of however many levels were handed to [`Vector::dictionary`].
 ///
 /// Every dictionary in the system is built through that constructor and every one of them comes

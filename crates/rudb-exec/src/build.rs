@@ -50,7 +50,7 @@ fn node<'a>(
             Box::new(Series::new(plan, index, plan.string(function), args)?)
         }
         Node::Filter { input, predicate } => {
-            Box::new(Filter::new(plan, node(plan, catalog, input)?, predicate))
+            Box::new(Filter::new(plan, node(plan, catalog, input)?, predicate)?)
         }
         Node::Project { input, index, exprs, names } => {
             Box::new(Project::new(plan, node(plan, catalog, input)?, index, exprs, names)?)

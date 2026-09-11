@@ -386,13 +386,18 @@ fn a_cast_that_cannot_succeed_says_what_it_could_not_convert() {
 
 /// A column that no operator in the tree produces is a bug in whoever built the plan, and the
 /// message names the binding rather than a position in a chunk.
+///
+/// It is caught when the tree is built rather than on the first chunk, because a filter resolves
+/// its predicate against the input's schema once and keeps the resolved positions. That is a
+/// property worth asserting rather than an accident of where the code lives: a plan that cannot
+/// resolve is broken before any data is read, and finding it on the first chunk means finding it
+/// after a scan has opened files and a scheduler has handed out morsels.
 #[test]
 fn a_column_that_is_not_in_the_input_says_which_one() {
     let catalog = catalog();
     let plan = Plan::parse(&format!("Filter (#7.3::INTEGER > 1::INTEGER)::BOOLEAN\n  {SCAN}"))
         .expect("a well formed plan");
-    let mut operator = build(&plan, &catalog).expect("the operators build");
-    let error = operator.next().expect_err("there is no table 7");
+    let error = build(&plan, &catalog).expect_err("there is no table 7");
     assert!(error.message().contains("column #7.3"), "{error}");
 }
 
