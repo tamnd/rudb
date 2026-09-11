@@ -722,11 +722,86 @@ impl<'a> Transform<'a> {
                         let rows = self.values_clause(kind)?;
                         Ok(self.push_query(Query::bare(QueryBody::Values(rows))))
                     }
+                    "DescribeStatement" => self.describe_statement(kind),
                     _ => self.unsupported(kind),
                 }
             }
             _ => self.unsupported(inner),
         }
+    }
+
+    /// `DescribeStatement <- ShowTables / ShowDeprecatedSelect / DescribeSelect / ShowAllTables /
+    /// ShowByName / DescribeByName`.
+    ///
+    /// Two of the six are done and they are the two that describe a relation. The four that are
+    /// not are `SHOW`, which is a different statement wearing this rule: three of its four forms
+    /// list what the database has rather than what a query returns, and the fourth is `SHOW <query>`,
+    /// which upstream documents as deprecated. Describing something through a deprecated spelling
+    /// is not worth implementing before the spelling that replaced it has users.
+    ///
+    /// `SUMMARIZE` shares `DescribeByName` and `DescribeSelect` with `DESCRIBE` and is refused
+    /// here, because it returns twelve columns of statistics rather than six of schema and reading
+    /// it as a describe would answer a different question than the one that was asked.
+    fn describe_statement(&mut self, node: u32) -> Result<QueryRef> {
+        let inner = self.first(node);
+        match self.name(inner) {
+            "DescribeSelect" => {
+                self.describe_and_not_summarize(inner)?;
+                let query = self.query(self.find(inner, "SelectStatementInternal"))?;
+                Ok(self.push_query(Query::bare(QueryBody::Describe(query))))
+            }
+            "DescribeByName" => {
+                self.describe_and_not_summarize(inner)?;
+                let target = self.find(inner, "DescribeTarget");
+                if target == NONE {
+                    return self.unsupported(inner);
+                }
+                let source = self.describe_target(target)?;
+                let query = self.star_over(source);
+                Ok(self.push_query(Query::bare(QueryBody::Describe(query))))
+            }
+            _ => self.unsupported(inner),
+        }
+    }
+
+    /// `DescribeOrSummarize <- DescribeRule / Summarize`, where only the first is done.
+    fn describe_and_not_summarize(&mut self, node: u32) -> Result<()> {
+        let word = self.find(node, "DescribeOrSummarize");
+        if word == NONE || self.name(self.first(word)) != "DescribeRule" {
+            return self.unsupported(if word == NONE { node } else { word });
+        }
+        Ok(())
+    }
+
+    /// `DescribeTarget <- DescribeBaseTableName / DescribeStringLiteral`, as a source to read from.
+    ///
+    /// Both become a `FROM` item and not a lookup of their own, because the string form is the
+    /// replacement scan and the binder already knows how to turn `'hits.parquet'` into a reader.
+    /// A name that is a table, a view, a file or nothing at all then gets one answer from one place.
+    fn describe_target(&mut self, node: u32) -> Result<SourceRef> {
+        let inner = self.first(node);
+        let name = match self.name(inner) {
+            "DescribeBaseTableName" => self.name_parts(self.find(inner, "BaseTableName")),
+            "DescribeStringLiteral" => {
+                let text = self.string_value(self.find(inner, "StringLiteral"));
+                let part = self.intern(&text);
+                self.part_slice(vec![part])
+            }
+            _ => return self.unsupported(inner),
+        };
+        Ok(self.push_source(Source::Table { name, alias: NONE, columns: Slice::default() }))
+    }
+
+    /// `SELECT * FROM <source>`, which is what `DESCRIBE t` means.
+    fn star_over(&mut self, source: SourceRef) -> QueryRef {
+        let star =
+            self.push(Expr::Star { qualifier: Slice::default(), replacements: Slice::default() });
+        let targets = self.target_slice(vec![Target { expr: star, alias: NONE }]);
+        let start = self.ast.source_lists.len() as u32;
+        self.ast.source_lists.push(source);
+        let from = Slice { start, len: 1 };
+        let select = self.push_select(Select { targets, from, ..Select::empty() });
+        self.push_query(Query::bare(QueryBody::Select(select)))
     }
 
     /// `ValuesClause <- 'VALUES' List(ValuesExpressions)`, each of which is `Parens(List(Expression))`.
@@ -2090,6 +2165,7 @@ mod tests {
                 out
             }
             QueryBody::Values(rows) => show_rows(ast, rows),
+            QueryBody::Describe(inner) => format!("DESCRIBE {}", show_query(ast, inner)),
         };
         if query.order_by_all {
             out += " ORDER BY ALL";
@@ -2469,6 +2545,42 @@ mod tests {
         assert_eq!(round("VALUES (1), (2, 3)"), "VALUES (1), (2, 3)");
     }
 
+    /// `DESCRIBE` is a query body, and the two spellings that name something become a star over it.
+    ///
+    /// Naming a table is not a shortcut for the query. On the reference binary `DESCRIBE t` and
+    /// `DESCRIBE SELECT * FROM t` print the same six columns and the same rows, down to the `NO` on
+    /// a column that refuses nulls, so rewriting one into the other costs nothing and leaves the
+    /// binder with one case instead of three. A file name goes down the same path as a table name
+    /// because a bare string in a `FROM` clause is already a name the replacement scan picks up.
+    #[test]
+    fn describe_rewrites_a_name_into_a_star_over_it() {
+        assert_eq!(round("DESCRIBE SELECT 1 AS a"), "DESCRIBE SELECT 1 AS a");
+        assert_eq!(round("DESCRIBE t"), "DESCRIBE SELECT * FROM t");
+        assert_eq!(round("DESC t"), "DESCRIBE SELECT * FROM t");
+        assert_eq!(round("DESCRIBE 'x.parquet'"), "DESCRIBE SELECT * FROM x.parquet");
+        // A body and not a statement kind, so it nests both ways with no rule of its own.
+        assert_eq!(
+            round("SELECT column_name FROM (DESCRIBE SELECT 1 AS a)"),
+            "SELECT column_name FROM (DESCRIBE SELECT 1 AS a)"
+        );
+        assert_eq!(round("DESCRIBE DESCRIBE SELECT 1 AS a"), "DESCRIBE DESCRIBE SELECT 1 AS a");
+    }
+
+    /// `SUMMARIZE` shares both of `DESCRIBE`'s grammar rules and is a different statement.
+    ///
+    /// It reads every row and returns one row per column carrying the min, the max, the count and
+    /// the approximate distinct count, so none of it falls out of the `DESCRIBE` path. The word is
+    /// the only thing in the tree that tells the two apart, which is why the transform looks at it
+    /// rather than trusting the rule name it arrived under.
+    #[test]
+    fn summarize_is_refused_even_though_it_parses_as_a_describe() {
+        for query in ["SUMMARIZE t", "SUMMARIZE SELECT 1"] {
+            let error = parse_ast(query).expect_err("summarize is not implemented");
+            let message = error.to_string();
+            assert!(message.starts_with("Not implemented Error"), "{query} failed with {message}");
+        }
+    }
+
     #[test]
     fn every_statement_in_the_corpus_gets_a_defined_answer() {
         // The point of the test is the word defined. Forty of these are statement kinds and
@@ -2493,7 +2605,7 @@ mod tests {
         }
         // Not an assertion about the right number. It is a ratchet: this only moves up, and the
         // day it moves down somebody has taken a construct out without meaning to.
-        assert!(done >= 22, "only {done} of the corpus transforms, which is fewer than it was");
+        assert!(done >= 23, "only {done} of the corpus transforms, which is fewer than it was");
     }
 
     #[test]

@@ -276,6 +276,29 @@ fn a_csv_field_is_quoted_on_the_bytes_duckdb_quotes_it_on() {
     assert_eq!(out, golden("quoting.txt"));
 }
 
+/// Every shape of `DESCRIBE`, byte for byte against the pinned binary.
+///
+/// The six columns are an interface rather than a print. `rudb-compat` asks DuckDB what types a
+/// result has by running `SELECT column_name, column_type FROM (DESCRIBE <statement>)`, so the names
+/// and the order of those columns are what a second engine reads, and the ninth line of
+/// describe.sql is that exact query. The rest of the file pins the parts that are easy to get
+/// almost right: `NO` survives a `SELECT *` off a `NOT NULL` column and does not survive arithmetic
+/// on it, a decimal literal is `DECIMAL(2,1)` rather than `DOUBLE`, and a bare `NULL` has a type
+/// whose name is spelled with the quotes in it.
+#[test]
+fn describe_prints_the_six_columns_duckdb_prints() {
+    let (out, err, failed) = run(&[
+        "-cmd",
+        &format!(".read {}", testdata("setup.sql")),
+        "-csv",
+        "-c",
+        &format!(".read {}", testdata("describe.sql")),
+    ]);
+    assert!(!failed, "{err}");
+    let want = golden("describe.txt");
+    assert!(same_ignoring_trailing_space(&out, &want), "want:\n{want}\ngot:\n{out}");
+}
+
 /// `-csv` ends a row with a newline and `.mode csv` ends it with a carriage return and a newline.
 ///
 /// Both goldens come out of the same binary in the same run of `testdata/capture.sh`, so the pair

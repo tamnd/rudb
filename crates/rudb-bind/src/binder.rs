@@ -150,7 +150,86 @@ impl<'a> Binder<'a> {
                 self.bind_set_op(ast, &written, op, quantifier, left, right)
             }
             ast::QueryBody::Values(rows) => self.bind_values(ast, &written, rows),
+            ast::QueryBody::Describe(inner) => self.bind_describe(ast, &written, inner),
         }
+    }
+
+    /// `DESCRIBE <query>`, which is six VARCHAR columns saying what the query returns.
+    ///
+    /// The query is bound and never run, because binding is the whole of the answer: the names and
+    /// the types of a query's columns are settled by the time the binder is done with it, so the
+    /// rows of a describe are a constant from there on. That is why this comes out as a `VALUES`
+    /// whose rows were computed here rather than as an operator of its own, and it is what makes
+    /// `SELECT column_name FROM (DESCRIBE ...) WHERE ...` an ordinary query over an ordinary
+    /// relation with no special case above it.
+    ///
+    /// The six columns, their order and their types are the reference binary's. `key`, `default`
+    /// and `extra` are null for everything this engine can declare, since `PRIMARY KEY`, `UNIQUE`
+    /// and `DEFAULT` are all refused by `CREATE TABLE` today and there is nothing for the first two
+    /// to hold, and `extra` is empty upstream as well on every table it was asked about. They are
+    /// here rather than left out because the width of a result is part of the result, and a program
+    /// that reads the fifth column has to find one.
+    fn bind_describe(
+        &mut self,
+        ast: &Ast,
+        query: &ast::Query,
+        inner: ast::QueryRef,
+    ) -> Result<(NodeRef, Scope)> {
+        let (_, described) = self.bind_query(ast, inner)?;
+        let fields: Vec<Field> = ["column_name", "column_type", "null", "key", "default", "extra"]
+            .iter()
+            .map(|name| Field::new(*name, LogicalType::Varchar))
+            .collect();
+        let mut slices = Vec::with_capacity(described.columns.len());
+        for column in described.columns.clone() {
+            // `NO` and `YES` and not a boolean, because the column is VARCHAR upstream and a
+            // client that prints the result has to get the same four or three characters.
+            let written = [
+                column.name.clone(),
+                column.ty.to_string(),
+                if column.not_null { "NO" } else { "YES" }.to_owned(),
+            ];
+            let mut items: Vec<ExprRef> = written
+                .into_iter()
+                .map(|text| self.plan.add_constant(Value::Varchar(text)))
+                .collect();
+            for _ in 0..3 {
+                let empty = self.plan.add_constant(Value::Null);
+                items.push(self.cast_to(empty, &LogicalType::Varchar));
+            }
+            slices.push(self.plan.add_expr_list(&items));
+        }
+        let rows = self.plan.add_rows(&slices);
+        let columns = self.plan.add_fields(&fields);
+        let index = self.fresh_index();
+        let mut node = self.plan.add_node(Node::Values { index, columns, rows });
+        let mut scope = Scope::empty();
+        for (at, field) in fields.iter().enumerate() {
+            scope.push(Visible {
+                table: String::new(),
+                name: field.name.clone(),
+                binding: ColumnBinding::new(index, at as u32),
+                ty: field.ty.clone(),
+                not_null: false,
+            });
+        }
+        let keys = self.sort_keys(ast, query, &scope, &[])?;
+        if !keys.is_empty() {
+            let keys = self.plan.add_sort_keys(&keys);
+            node = self.plan.add_node(Node::Sort { input: node, keys });
+        }
+        node = self.apply_limit(ast, query, node)?;
+        Ok((node, scope))
+    }
+
+    /// Whether a projected expression is a column passed straight through from below.
+    ///
+    /// Only `DESCRIBE` asks, and only to decide whether the `null` column says `NO`. Anything that
+    /// is computed is nullable however strict its inputs were, which is both the safe reading and
+    /// the one the reference binary gives.
+    fn passes_through(&self, expr: ExprRef, input: &Scope) -> bool {
+        let Expr::Column(binding) = *self.plan.expr(expr) else { return false };
+        input.columns.iter().any(|column| column.binding == binding && column.not_null)
     }
 
     /// `VALUES (1, 'a'), (2, 'b')`, as a query in its own right.
@@ -227,6 +306,7 @@ impl<'a> Binder<'a> {
                 name: field.name.clone(),
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
+                not_null: false,
             });
         }
         let keys = self.sort_keys(ast, query, &scope, &[])?;
@@ -292,6 +372,9 @@ impl<'a> Binder<'a> {
                 name: column.name.clone(),
                 binding: ColumnBinding::new(index, at as u32),
                 ty: ty.clone(),
+                // A column of a set operation is nullable whatever the two sides were, because a
+                // column that refuses nulls on one side and takes them on the other takes them.
+                not_null: false,
             });
         }
         // Above a set operation there is nothing but the output columns, so an ORDER BY term is
@@ -383,6 +466,7 @@ impl<'a> Binder<'a> {
                 name: name.clone(),
                 binding: ColumnBinding::new(project, at as u32),
                 ty: self.plan.expr_type(*expr).clone(),
+                not_null: self.passes_through(*expr, &input),
             });
         }
 
@@ -447,6 +531,7 @@ impl<'a> Binder<'a> {
                 name: name.clone(),
                 binding: ColumnBinding::new(index, at as u32),
                 ty,
+                not_null: output.columns[at].not_null,
             });
         }
         let exprs = self.plan.add_expr_list(&kept);
@@ -873,6 +958,7 @@ impl<'a> Binder<'a> {
                 name: field.name.clone(),
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
+                not_null: field.not_null,
             });
         }
         if !columns.is_empty() {
@@ -1214,6 +1300,9 @@ impl<'a> Binder<'a> {
                 name: field.name.clone(),
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
+                // A reader takes what the file has, and no file format this reads says a column
+                // cannot be null. The reference binary answers YES for every column of a Parquet.
+                not_null: false,
             });
         }
         if !names.is_empty() {

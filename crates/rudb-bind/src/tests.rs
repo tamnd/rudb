@@ -354,6 +354,62 @@ fn what_is_not_bound_yet_says_what_was_written_rather_than_producing_a_wrong_pla
     }
 }
 
+/// `DESCRIBE` is answered while it is bound, so what comes out is a `VALUES` and nothing else.
+///
+/// The query it describes is bound, because that is the only way to learn the names and the types,
+/// and then it is dropped. Nothing reads a row of it. A plan that still had a `Get` under here
+/// would be a plan that opens the table to answer a question about the table's shape, which on a
+/// hundred million row file is the difference between instant and a minute.
+#[test]
+fn describe_is_answered_at_bind_time_and_comes_out_as_rows() {
+    let text = plan("DESCRIBE SELECT url, counter FROM hits");
+    assert!(text.starts_with("Values"), "{text}");
+    assert!(!text.contains("Get"), "the described query is bound and then thrown away: {text}");
+    assert!(text.contains("'url'") && text.contains("'VARCHAR'"), "{text}");
+    assert!(text.contains("'counter'") && text.contains("'INTEGER'"), "{text}");
+    // The six columns are an interface: `rudb-compat` reads the types of every result it compares
+    // out of `SELECT column_name, column_type FROM (DESCRIBE ...)`, so the names and the order of
+    // them are what another program depends on rather than what a person happens to see.
+    assert_eq!(
+        plan("SELECT * FROM (DESCRIBE SELECT 1 AS a)").lines().next().map(|line| {
+            line.split_once('[')
+                .map_or(String::new(), |(_, rest)| rest.trim_end_matches(']').into())
+        }),
+        Some(
+            "#1.0::VARCHAR AS column_name, #1.1::VARCHAR AS column_type, #1.2::VARCHAR AS null, \
+             #1.3::VARCHAR AS key, #1.4::VARCHAR AS default, #1.5::VARCHAR AS extra"
+                .to_string()
+        )
+    );
+}
+
+/// `NO` survives a column being passed through and does not survive anything being done to it.
+///
+/// That is the reference binary's rule and not an approximation of it. A projection that hands a
+/// column straight on cannot introduce a null, and one that computes anything at all can, so the
+/// scope carries the flag and the projection copies it only for a bare column reference.
+#[test]
+fn describe_says_no_for_a_column_that_refuses_nulls_until_something_is_done_to_it() {
+    let mut catalog = catalog();
+    catalog
+        .create_table(
+            QualifiedName::new("memory", "main", "strict"),
+            vec![Field::required("a", LogicalType::Integer), Field::new("b", LogicalType::Varchar)],
+        )
+        .expect("a table nothing else has created");
+    let says = |query: &str| {
+        bind_sql(query, &catalog).unwrap_or_else(|error| panic!("{query}: {error}")).to_string()
+    };
+    assert!(says("DESCRIBE strict").contains("'NO'"));
+    assert!(says("DESCRIBE SELECT * FROM strict").contains("'NO'"));
+    assert!(says("DESCRIBE SELECT a FROM strict").contains("'NO'"));
+    assert!(!says("DESCRIBE SELECT a + 1 AS c FROM strict").contains("'NO'"));
+    // A set operation takes nulls if either side does, whichever side the `NOT NULL` was on.
+    assert!(
+        !says("DESCRIBE SELECT a FROM strict UNION ALL SELECT counter FROM hits").contains("'NO'")
+    );
+}
+
 // The statements that are not queries. What is worth asserting here is the resolution: which table
 // the name landed on, which column each value goes into, and which type each one arrives as. What
 // happens to the catalog afterwards is `rudb`'s test to write, because the binder never touches it.
