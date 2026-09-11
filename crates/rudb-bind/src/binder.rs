@@ -12,7 +12,7 @@
 //! the plan as [`Expr::Cast`] nodes, so an executor never has to decide what a comparison between
 //! an `INTEGER` and a `BIGINT` does.
 
-use rudb_catalog::{Catalog, same_name};
+use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_functions::{
     Columns, TableFunction, csv_fields, files, is_file, is_pattern, parquet_fields, resolve,
@@ -90,6 +90,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) in_aggregate: bool,
     /// Where we are, for an error message that says which clause the writer should look at.
     pub(crate) clause: &'static str,
+    /// The views whose bodies are open on the stack, which is what catches a cycle.
+    expanding: Vec<String>,
 }
 
 impl<'a> Binder<'a> {
@@ -102,6 +104,7 @@ impl<'a> Binder<'a> {
             aggregation: None,
             in_aggregate: false,
             clause: "SELECT clause",
+            expanding: Vec::new(),
         }
     }
 
@@ -822,16 +825,16 @@ impl<'a> Binder<'a> {
         let catalog = self.catalog;
         // The catalog is asked first and the file is the fallback, which is the order DuckDB uses:
         // a table really called `mixed.parquet` wins over a file of that name sitting next to it.
-        let found = catalog.resolve(&parts).and_then(|resolved| {
-            let table = catalog.table(&resolved)?;
-            Ok((resolved, table))
-        });
-        let (resolved, table) = match found {
-            Ok(found) => found,
+        let resolved = match catalog.resolve(&parts) {
+            Ok(resolved) => resolved,
             Err(missing) => {
                 return self.bind_replacement_scan(ast, &parts, alias, columns, missing);
             }
         };
+        if catalog.entry(&resolved)? == Entry::View {
+            return self.bind_view(ast, &resolved, alias, columns);
+        }
+        let table = catalog.table(&resolved)?;
         let fields: Vec<Field> = table.columns().to_vec();
         let label =
             if alias == NONE { resolved.table.clone() } else { ast.string(alias).to_string() };
@@ -862,6 +865,57 @@ impl<'a> Binder<'a> {
             index,
             columns,
         });
+        Ok((node, scope))
+    }
+
+    /// A view where a table goes, which is the body bound again right here.
+    ///
+    /// Inline and not behind a node. The view is gone by the time the plan exists, so everything
+    /// downstream sees the query somebody would have written by hand, and the column pruning that
+    /// makes `SELECT COUNT(*) FROM 'hits.parquet'` read no columns at all keeps working through
+    /// `FROM hits`. A `Node::View` would be a barrier with nothing on the other side of it.
+    ///
+    /// The scope this builds is a subquery's, right down to the name in the error message. duckdb
+    /// v1.5.1 reports a view whose column list has gone stale as `table "unnamed_subquery" has 1
+    /// columns available but 2 columns specified`, which is the sentence its subquery alias rule
+    /// produces, so a view there is a subquery with the view's name written over it afterwards.
+    fn bind_view(
+        &mut self,
+        ast: &Ast,
+        name: &QualifiedName,
+        alias: ast::StrRef,
+        columns: ast::Slice,
+    ) -> Result<(NodeRef, Scope)> {
+        let view = self.catalog.view(name)?;
+        let full = name.to_string();
+        if self.expanding.contains(&full) {
+            return Err(Error::binder(format!(
+                "infinite recursion detected: attempting to recursively bind view \"{}\"",
+                name.table
+            )));
+        }
+        let body = parse_ast(view.sql())?;
+        let query = match body.statements.as_slice() {
+            [ast::Statement::Query(query)] => *query,
+            // Only a query can have got past the binder at creation, so this is a view the catalog
+            // was handed some other way rather than anything a statement can produce.
+            _ => return Err(Error::binder(format!("view \"{}\" is not a query", name.table))),
+        };
+        self.expanding.push(full);
+        let bound = self.bind_query(&body, query);
+        self.expanding.pop();
+        let (node, mut scope) = bound?;
+
+        let aliases: Vec<&str> = view.aliases().iter().map(String::as_str).collect();
+        if !aliases.is_empty() {
+            scope.rename(&aliases, "unnamed_subquery")?;
+        }
+        let label = if alias == NONE { name.table.clone() } else { ast.string(alias).to_string() };
+        scope.relabel(&label);
+        if !columns.is_empty() {
+            let names: Vec<&str> = ast.name(columns).collect();
+            scope.rename(&names, &label)?;
+        }
         Ok((node, scope))
     }
 

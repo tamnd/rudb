@@ -29,7 +29,8 @@ mod statement;
 pub use binder::{bind, bind_sql, bind_with};
 pub use parameters::Parameters;
 pub use statement::{
-    Bound, CreateTable, DropTable, Insert, bind_statement, bind_statement_sql, bind_statement_with,
+    Bound, CreateTable, CreateView, DropTable, Insert, bind_statement, bind_statement_sql,
+    bind_statement_with,
 };
 
 #[cfg(test)]
