@@ -192,7 +192,7 @@ impl fmt::Display for Value {
             Self::UInteger(v) => write!(f, "{v}"),
             Self::UBigInt(v) => write!(f, "{v}"),
             Self::UHugeInt(v) => write!(f, "{v}"),
-            Self::Float(v) => write_float(f, f64::from(*v)),
+            Self::Float(v) => write_float(f, *v),
             Self::Double(v) => write_float(f, *v),
             Self::Decimal { unscaled, scale, .. } => write_decimal(f, *unscaled, *scale),
             Self::Varchar(v) => f.write_str(v),
@@ -225,18 +225,74 @@ impl fmt::Display for Value {
     }
 }
 
-/// Floats print the shortest text that reads back as the same value, which is what Rust's own
-/// formatter does, with one exception: an integral float prints a trailing `.0` in Rust and does
-/// not in DuckDB.
-fn write_float(f: &mut fmt::Formatter<'_>, value: f64) -> fmt::Result {
+/// The two float types, so that one printer can serve both without going through `f64`.
+///
+/// Widening an `f32` to print it is wrong and quietly so: `0.1f32` as an `f64` is
+/// `0.10000000149011612`, and the shortest text that reads back as the same `f32` is `0.1`. DuckDB
+/// prints `0.1`, and it prints it because it formats the `float` rather than a `double` made out of
+/// one.
+trait Real: Copy + fmt::Display + fmt::LowerExp {
+    fn is_nan(self) -> bool;
+    fn is_infinite(self) -> bool;
+    fn is_sign_negative(self) -> bool;
+}
+
+impl Real for f32 {
+    fn is_nan(self) -> bool {
+        Self::is_nan(self)
+    }
+
+    fn is_infinite(self) -> bool {
+        Self::is_infinite(self)
+    }
+
+    fn is_sign_negative(self) -> bool {
+        Self::is_sign_negative(self)
+    }
+}
+
+impl Real for f64 {
+    fn is_nan(self) -> bool {
+        Self::is_nan(self)
+    }
+
+    fn is_infinite(self) -> bool {
+        Self::is_infinite(self)
+    }
+
+    fn is_sign_negative(self) -> bool {
+        Self::is_sign_negative(self)
+    }
+}
+
+/// Floats print the shortest text that reads back as the same value, laid out the way DuckDB lays
+/// it out.
+///
+/// Rust and DuckDB agree on the digits and disagree on everything around them. A float with nothing
+/// after the point keeps its `.0`, so a `DOUBLE` never looks like an integer. Anything with a
+/// decimal exponent outside `-4..16` is written in exponent form with a signed two digit exponent,
+/// so `1e16` is `1e+16` and `0.00001` is `1e-05`, while `1e15` is still written out in full. That
+/// is C's `%g` rule and it is what DuckDB's formatter implements, checked against the binary rather
+/// than read out of its source.
+fn write_float<T: Real>(f: &mut fmt::Formatter<'_>, value: T) -> fmt::Result {
     if value.is_nan() {
         return f.write_str("nan");
     }
     if value.is_infinite() {
-        return f.write_str(if value > 0.0 { "inf" } else { "-inf" });
+        return f.write_str(if value.is_sign_negative() { "-inf" } else { "inf" });
     }
-    let text = format!("{value}");
-    f.write_str(text.strip_suffix(".0").unwrap_or(&text))
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((scientific.as_str(), "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    if (-4..16).contains(&exponent) {
+        let text = format!("{value}");
+        if text.contains('.') {
+            return f.write_str(&text);
+        }
+        return write!(f, "{text}.0");
+    }
+    let sign = if exponent < 0 { '-' } else { '+' };
+    write!(f, "{mantissa}e{sign}{:02}", exponent.abs())
 }
 
 fn write_decimal(f: &mut fmt::Formatter<'_>, unscaled: i128, scale: u8) -> fmt::Result {
@@ -449,11 +505,37 @@ mod tests {
     }
 
     #[test]
-    fn an_integral_float_prints_without_the_rust_trailing_zero() {
-        assert_eq!(Value::Double(1.0).to_string(), "1");
+    fn a_float_keeps_the_point_that_says_it_is_one() {
+        assert_eq!(Value::Double(1.0).to_string(), "1.0");
+        assert_eq!(Value::Double(-3.0).to_string(), "-3.0");
         assert_eq!(Value::Double(1.5).to_string(), "1.5");
-        assert_eq!(Value::Double(f64::INFINITY).to_string(), "inf");
+        assert_eq!(Value::Double(-0.0).to_string(), "-0.0");
         assert_eq!(Value::Float(0.5).to_string(), "0.5");
+    }
+
+    #[test]
+    fn a_float_is_printed_from_its_own_width_rather_than_widened_first() {
+        // 0.1f32 as an f64 is 0.10000000149011612, and printing that would be a real bug rather
+        // than a rounding difference, so this is the test that pins it.
+        assert_eq!(Value::Float(0.1).to_string(), "0.1");
+        assert_eq!(Value::Float(1.0).to_string(), "1.0");
+    }
+
+    #[test]
+    fn a_float_switches_to_an_exponent_where_duckdb_switches() {
+        assert_eq!(Value::Double(1e15).to_string(), "1000000000000000.0");
+        assert_eq!(Value::Double(1e16).to_string(), "1e+16");
+        assert_eq!(Value::Double(1e20).to_string(), "1e+20");
+        assert_eq!(Value::Double(1e-4).to_string(), "0.0001");
+        assert_eq!(Value::Double(1e-5).to_string(), "1e-05");
+        assert_eq!(Value::Double(1.234_567_890_123_456_8e17).to_string(), "1.2345678901234568e+17");
+    }
+
+    #[test]
+    fn a_float_that_is_not_a_number_says_so_the_way_duckdb_says_it() {
+        assert_eq!(Value::Double(f64::INFINITY).to_string(), "inf");
+        assert_eq!(Value::Double(f64::NEG_INFINITY).to_string(), "-inf");
+        assert_eq!(Value::Double(f64::NAN).to_string(), "nan");
     }
 
     #[test]

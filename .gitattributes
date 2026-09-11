@@ -5,6 +5,9 @@ tests/**/*.expected -text
 tests/**/*.slt -text
 tests/**/*.plan -text
 tests/**/*.ir -text
+# The shell's golden output, captured from a real duckdb. CSV mode ends its rows with CRLF, and a
+# checkout that quietly turned those into LF would fail the test on Windows and nowhere else.
+crates/rudb-cli/testdata/** -text
 # The DuckDB grammar is upstream's bytes and its checksums are in VENDOR, so a line ending
 # rewrite here would fail `cargo xtask grammar` on Windows and nowhere else. Marking it vendored
 # also keeps it out of the language statistics, which is honest.

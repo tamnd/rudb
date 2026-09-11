@@ -1,0 +1,9 @@
+        echo: off
+     headers: on
+        mode: duckbox
+   nullvalue: "NULL"
+      output: stdout
+colseparator: "|"
+rowseparator: "\n"
+       width: 
+    filename: :memory:
