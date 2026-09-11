@@ -19,6 +19,10 @@ for mode in duckbox box table markdown line list csv tabs json jsonlines quote i
     -c "SELECT * FROM t ORDER BY a" >"$here/mode-$mode.txt"
 done
 duckdb -batch -init /dev/null -cmd ".read $here/setup.sql" -c "SELECT * FROM t WHERE a > 9000" >"$here/empty.txt"
+# The CSV quoting rule, over one value of every class it treats differently. Twice, because the
+# `-csv` flag and the `.mode csv` dot command name the same mode and end a row differently.
+duckdb -batch -init /dev/null -cmd ".mode csv" -f "$here/quoting.sql" >"$here/quoting-mode.txt"
+duckdb -batch -init /dev/null -csv -f "$here/quoting.sql" >"$here/quoting-flag.txt"
 duckdb -batch -init /dev/null -c ".show" >"$here/show.txt"
 # One file per line of counts.sql, which is where the row count and the column count and the row of
 # dots get their shapes. The test reads the same file, so a query added here needs nothing else.

@@ -134,6 +134,28 @@ fn the_counts_under_a_table_are_the_ones_duckdb_prints() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Which values a CSV field gets quotes around, and which it does not.
+///
+/// `quoting.sql` is one row with one value of every class the rule treats differently: a plain word,
+/// a word with a space in it, the separator, a quote, a tab, a string above ASCII, the empty string
+/// and a null. The rule is a lookup table over bytes rather than anything about meaning, so `a b`
+/// comes back bare and a Russian word comes back quoted, and the second of those is why this matters
+/// beyond tidiness: ClickBench's corpus is Russian and almost every string in it is above ASCII.
+///
+/// Twice, because the `-csv` flag and the `.mode csv` dot command name the same mode and end a row
+/// differently. That is DuckDB's behaviour on one build in one run and it is not ours to correct.
+#[test]
+fn a_csv_field_is_quoted_exactly_where_duckdb_quotes_it() {
+    let file = testdata("quoting.sql");
+    let (dotted, err, failed) = run(&["-cmd", ".mode csv", "-f", &file]);
+    assert!(!failed, "{err}");
+    assert_eq!(dotted, golden("quoting-mode.txt"));
+    let (flagged, err, failed) = run(&["-csv", "-f", &file]);
+    assert!(!failed, "{err}");
+    assert_eq!(flagged, golden("quoting-flag.txt"));
+    assert!(dotted.contains("\r\n") && !flagged.contains('\r'), "the two row separators are one");
+}
+
 #[test]
 fn an_empty_result_prints_its_columns_and_a_row_count() {
     let (out, _, failed) =

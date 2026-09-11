@@ -118,8 +118,9 @@ impl Format {
 
     /// What `.mode` sets the row separator to.
     ///
-    /// CSV gets `\r\n` because RFC 4180 says so and because DuckDB does it, which surprises people
-    /// reading the file on a Unix machine and is nonetheless what a CSV is.
+    /// CSV gets `\r\n` because RFC 4180 says so and because `.mode csv` does it, which surprises
+    /// people reading the file on a Unix machine and is nonetheless what a CSV is. The `-csv` flag
+    /// is the one that does not, and [`Settings::set_format_flag`] is where that lives.
     fn newline(self) -> &'static str {
         match self {
             Self::Csv => "\r\n",
@@ -171,6 +172,21 @@ impl Settings {
         self.format = format;
         self.separator = format.separator().to_string();
         self.newline = format.newline().to_string();
+    }
+
+    /// Switches mode the way a command line flag does, which is not the way `.mode` does.
+    ///
+    /// A flag sets the column separator and leaves the row separator alone. The difference shows up
+    /// in exactly one place and it is the one people pipe into other programs: `duckdb -csv` ends a
+    /// row with `\n` and `duckdb -cmd ".mode csv"` ends it with `\r\n`, on the same build, in the
+    /// same run. It looks like an oversight upstream and it is not ours to correct, because a script
+    /// written against `duckdb -csv` is a script whose next stage is counting bytes.
+    ///
+    /// Checked against `duckdb v2.0.0-dev84237` for `-list`, `-csv` and `-ascii`, which are the
+    /// flags that name a mode and reach this.
+    pub fn set_format_flag(&mut self, format: Format) {
+        self.format = format;
+        self.separator = format.separator().to_string();
     }
 }
 
@@ -695,12 +711,24 @@ fn separated(result: &QueryResult, cells: &[Vec<String>], settings: &Settings) -
     out
 }
 
-/// One CSV field, quoted when RFC 4180 says it has to be.
+/// One CSV field, quoted when DuckDB would quote it.
+///
+/// Which is a good deal more often than RFC 4180 asks for. The RFC wants quotes around a field
+/// holding the separator, a quote or a line break, and DuckDB quotes all of those plus every
+/// control character, the delete character, and every byte above ASCII. So `SELECT 'Привет'` comes
+/// back quoted and `SELECT 'a b'` does not, which looks arbitrary until you notice it is a lookup
+/// table over bytes rather than a rule about meaning.
+///
+/// It matters here more than a formatting detail usually would, because ClickBench's `hits` is a
+/// Russian language corpus and almost every string in it is above ASCII. A reader that only did
+/// what the RFC asks would differ from `duckdb` on most rows of most string queries, which is
+/// exactly how a differential run fills up with diffs that are nothing to do with the engine.
+///
+/// Checked against `duckdb v2.0.0-dev84237` over a plain word, a word with a space in it, a comma,
+/// a quote, a tab, the delete character, a byte above ASCII, the empty string and a line break.
 fn csv(text: &str, settings: &Settings) -> String {
     let awkward = text.contains(&settings.separator)
-        || text.contains('"')
-        || text.contains('\n')
-        || text.contains('\r');
+        || text.bytes().any(|byte| byte < 0x20 || byte == b'"' || byte >= 0x7f);
     if awkward { format!("\"{}\"", text.replace('"', "\"\"")) } else { text.to_string() }
 }
 

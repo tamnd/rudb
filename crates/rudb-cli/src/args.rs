@@ -140,7 +140,7 @@ pub fn parse(arguments: &[String]) -> Action {
             "-no-init" | "-unsigned" | "-unredacted" | "-safe" => {}
             other if other.starts_with('-') => {
                 match Format::from_name(other.trim_start_matches('-')) {
-                    Some(format) => options.settings.set_format(format),
+                    Some(format) => options.settings.set_format_flag(format),
                     None => return Action::Wrong(format!("unknown option {other}")),
                 }
             }
@@ -216,6 +216,17 @@ mod tests {
         let parsed = options(&["-csv"]);
         assert_eq!(parsed.settings.format, Format::Csv);
         assert_eq!(parsed.settings.separator, ",");
+    }
+
+    #[test]
+    fn a_mode_flag_leaves_the_row_separator_where_it_was_and_the_dot_command_does_not() {
+        // `duckdb -csv` ends a row with a newline and `.mode csv` ends it with a carriage return
+        // and a newline, on the same build. Both were read off `duckdb v2.0.0-dev84237`.
+        let parsed = options(&["-csv"]);
+        assert_eq!(parsed.settings.newline, "\n");
+        let mut settings = parsed.settings;
+        settings.set_format(Format::Csv);
+        assert_eq!(settings.newline, "\r\n");
     }
 
     #[test]

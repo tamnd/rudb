@@ -1,0 +1,2 @@
+plain,spaced,comma,quoted,tabbed,deleted,cyrillic,blank,nothing
+plain,a b,"a,b","a""b","	","","Привет",,NULL
