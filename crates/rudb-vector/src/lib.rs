@@ -16,6 +16,10 @@
 //! - [`StringView`] and [`StringColumn`], the 16 byte string with the 4 byte prefix.
 //! - [`Buffer`], the run of values behind a flat vector, which is where the buffer manager arrives.
 //!
+//! Next to them is [`for_each_layout`], which is the list of physical layouts a kernel writes its
+//! loop against. It is here rather than in the kernels because the list is a property of [`Data`],
+//! and a kernel that keeps its own copy of it is a kernel that will one day be missing a type.
+//!
 //! # What is deliberately not here
 //!
 //! Encoded vectors are M3 work, not because they are hard but because they only pay off alongside
@@ -39,6 +43,7 @@
 
 pub mod buffer;
 pub mod chunk;
+mod layout;
 pub mod selection;
 pub mod string;
 pub mod validity;

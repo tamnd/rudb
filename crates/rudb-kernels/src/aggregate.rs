@@ -138,7 +138,7 @@ impl Accumulator {
         match &mut self.state {
             State::Counted(count) => *count += 1,
             State::Whole { total, seen } => {
-                let whole = integral(value).ok_or_else(|| not_summable(value))?;
+                let whole = integral(value).ok_or_else(|| not_narrow(value))?;
                 *total = total.checked_add(whole).ok_or_else(overflowed)?;
                 *seen = true;
             }
@@ -147,7 +147,7 @@ impl Accumulator {
                 *seen += 1;
             }
             State::Scaled { total, scale, seen } => {
-                let unscaled = at_scale(value, *scale).ok_or_else(|| not_summable(value))?;
+                let unscaled = at_scale(value, *scale).ok_or_else(|| not_narrow(value))?;
                 *total = total.checked_add(unscaled).ok_or_else(overflowed)?;
                 *seen = true;
             }
@@ -344,12 +344,12 @@ impl Accumulator {
     }
 }
 
-fn not_summable(value: &Value) -> Error {
+fn not_narrow(value: &Value) -> Error {
     Error::not_implemented(format!("summing a {}", value.logical_type()))
 }
 
 fn approximate_or_error(value: &Value) -> Result<f64> {
-    crate::number::approximate(value).ok_or_else(|| not_summable(value))
+    crate::number::approximate(value).ok_or_else(|| not_narrow(value))
 }
 
 /// A value as an unscaled integer at a fixed scale.
@@ -447,7 +447,17 @@ fn whole_sum<M: Fn(usize) -> usize>(
     nulls: &Validity,
 ) -> Option<i128> {
     macro_rules! summed {
-        ($values:expr) => {{
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => summed!(@run values),)+
+                // A total of hugeints can overflow inside one vector, and then the overflow is the
+                // answer rather than a detail. The `narrow` group is exactly the widths where it
+                // cannot, so both hugeints are out of it and both go the row at a time way, which is
+                // the way that raises.
+                _ => return None,
+            }
+        };
+        (@run $values:expr) => {{
             let values = $values;
             let mut total: i128 = 0;
             match nulls {
@@ -473,19 +483,7 @@ fn whole_sum<M: Fn(usize) -> usize>(
             total
         }};
     }
-    Some(match data {
-        Data::Int8(values) => summed!(values),
-        Data::Int16(values) => summed!(values),
-        Data::Int32(values) => summed!(values),
-        Data::Int64(values) => summed!(values),
-        Data::UInt8(values) => summed!(values),
-        Data::UInt16(values) => summed!(values),
-        Data::UInt32(values) => summed!(values),
-        Data::UInt64(values) => summed!(values),
-        // A total of hugeints can overflow inside one vector, and then the overflow is the answer
-        // rather than a detail. That one goes the row at a time way, which is the way that raises.
-        _ => return None,
-    })
+    Some(rudb_vector::for_each_layout!(narrow, summed))
 }
 
 /// The running total carried through the rows that are not null, in floating point.
@@ -510,8 +508,20 @@ fn real_sum<M: Fn(usize) -> usize>(
     let factor = pow10(scale) as f64;
     let scaled = scale != 0;
     let all = i64::try_from(rows).ok()?;
+    // Every integer arm converts with `as`, which for the widths below `2^53` is the same value
+    // `f64::from` gives and for the ones above it is the rounding this whole function is about.
+    // Splitting the list in two so that the narrow half could say `from` would be two lists that
+    // produce the same code, which is two chances to put a width in the wrong one.
     macro_rules! added {
-        ($values:expr, $convert:expr) => {{
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => added!(@run values, |number| number as f64),)+
+                Data::Float32(values) => added!(@run values, f64::from),
+                Data::Float64(values) => added!(@run values, |number: f64| number),
+                _ => return None,
+            }
+        };
+        (@run $values:expr, $convert:expr) => {{
             let values = $values;
             let convert = $convert;
             let mut total = from;
@@ -545,21 +555,7 @@ fn real_sum<M: Fn(usize) -> usize>(
             (total, seen)
         }};
     }
-    let (total, seen) = match data {
-        Data::Int8(values) => added!(values, |number| f64::from(number)),
-        Data::Int16(values) => added!(values, |number| f64::from(number)),
-        Data::Int32(values) => added!(values, |number| f64::from(number)),
-        Data::Int64(values) => added!(values, |number| number as f64),
-        Data::Int128(values) => added!(values, |number| number as f64),
-        Data::UInt8(values) => added!(values, |number| f64::from(number)),
-        Data::UInt16(values) => added!(values, |number| f64::from(number)),
-        Data::UInt32(values) => added!(values, |number| f64::from(number)),
-        Data::UInt64(values) => added!(values, |number| number as f64),
-        Data::UInt128(values) => added!(values, |number| number as f64),
-        Data::Float32(values) => added!(values, |number| f64::from(number)),
-        Data::Float64(values) => added!(values, |number: f64| number),
-        _ => return None,
-    };
+    let (total, seen) = rudb_vector::for_each_layout!(integer, added);
     Some(Contribution::Real { total, seen })
 }
 
@@ -572,7 +568,17 @@ fn extreme<M: Fn(usize) -> usize>(
     least: bool,
 ) -> Option<Option<usize>> {
     macro_rules! best {
-        ($values:expr) => {{
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => best!(@run values),)+
+                // A float orders NaN the way the comparison kernel says rather than the way the
+                // hardware does, and a string extreme is a comparison of bytes rather than of
+                // numbers. Both are worth a loop of their own and neither gets a wrong one here.
+                // The two hugeints are out because the seed and the running best are both `i128`.
+                _ => return None,
+            }
+        };
+        (@run $values:expr) => {{
             let values = $values;
             // The winner is a row number and a number, not an `Option` of a pair. Carrying the
             // option into the loop puts a discriminant test on every row, and the first row is the
@@ -616,20 +622,7 @@ fn extreme<M: Fn(usize) -> usize>(
             (held != usize::MAX).then_some(held)
         }};
     }
-    Some(match data {
-        Data::Int8(values) => best!(values),
-        Data::Int16(values) => best!(values),
-        Data::Int32(values) => best!(values),
-        Data::Int64(values) => best!(values),
-        Data::UInt8(values) => best!(values),
-        Data::UInt16(values) => best!(values),
-        Data::UInt32(values) => best!(values),
-        Data::UInt64(values) => best!(values),
-        // A float orders NaN the way the comparison kernel says rather than the way the hardware
-        // does, and a string extreme is a comparison of bytes rather than of numbers. Both are
-        // worth a loop of their own and neither gets a wrong one here.
-        _ => return None,
-    })
+    Some(rudb_vector::for_each_layout!(narrow, best))
 }
 
 #[cfg(test)]

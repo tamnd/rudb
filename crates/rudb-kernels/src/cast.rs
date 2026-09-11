@@ -220,33 +220,27 @@ fn straight<M: Fn(usize) -> usize>(
         }};
     }
     macro_rules! by_target {
-        ($values:expr) => {
+        ($values:expr, $(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match physical {
-                PhysicalType::Int8 => fitted!($values, Data::Int8, i8),
-                PhysicalType::Int16 => fitted!($values, Data::Int16, i16),
-                PhysicalType::Int32 => fitted!($values, Data::Int32, i32),
-                PhysicalType::Int64 => fitted!($values, Data::Int64, i64),
-                PhysicalType::Int128 => fitted!($values, Data::Int128, i128),
-                PhysicalType::UInt8 => fitted!($values, Data::UInt8, u8),
-                PhysicalType::UInt16 => fitted!($values, Data::UInt16, u16),
-                PhysicalType::UInt32 => fitted!($values, Data::UInt32, u32),
-                PhysicalType::UInt64 => fitted!($values, Data::UInt64, u64),
+                $(PhysicalType::$variant => fitted!($values, Data::$variant, $native),)+
                 _ => return None,
             }
         };
     }
-    Some(match data {
-        Data::Int8(values) => by_target!(values),
-        Data::Int16(values) => by_target!(values),
-        Data::Int32(values) => by_target!(values),
-        Data::Int64(values) => by_target!(values),
-        Data::Int128(values) => by_target!(values),
-        Data::UInt8(values) => by_target!(values),
-        Data::UInt16(values) => by_target!(values),
-        Data::UInt32(values) => by_target!(values),
-        Data::UInt64(values) => by_target!(values),
-        _ => return None,
-    })
+    // The source list and the target list are the same list, which is the point. A width added to
+    // one of them and not the other is a cast that silently goes the row at a time way in one
+    // direction and not the other, and it cannot happen when there is one list.
+    macro_rules! by_source {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => {
+                    rudb_vector::for_each_layout!(exact, by_target, values)
+                })+
+                _ => return None,
+            }
+        };
+    }
+    Some(rudb_vector::for_each_layout!(exact, by_source))
 }
 
 /// The exact numbers a run of data holds, read through one form's index mapping.
@@ -256,23 +250,19 @@ fn straight<M: Fn(usize) -> usize>(
 /// through. That difference was ten nanoseconds a row when `compare` was measured with the call in
 /// it, and it is the reason no kernel in this crate keeps one.
 fn exact_run<M: Fn(usize) -> usize>(data: &Data, at: M, rows: usize) -> Option<Vec<i128>> {
+    // The `i128` arm widens an `i128` to an `i128`, which is the reflexive `From` and is a move.
+    // Writing it out separately would be the same code with a chance of being different code.
     macro_rules! widened {
-        ($values:expr) => {
-            (0..rows).map(|index| i128::from($values[at(index)])).collect()
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => {
+                    (0..rows).map(|index| i128::from(values[at(index)])).collect()
+                })+
+                _ => return None,
+            }
         };
     }
-    Some(match data {
-        Data::Int8(values) => widened!(values),
-        Data::Int16(values) => widened!(values),
-        Data::Int32(values) => widened!(values),
-        Data::Int64(values) => widened!(values),
-        Data::Int128(values) => (0..rows).map(|index| values[at(index)]).collect(),
-        Data::UInt8(values) => widened!(values),
-        Data::UInt16(values) => widened!(values),
-        Data::UInt32(values) => widened!(values),
-        Data::UInt64(values) => widened!(values),
-        _ => return None,
-    })
+    Some(rudb_vector::for_each_layout!(exact, widened))
 }
 
 /// The approximate numbers a run of data holds, read through one form's index mapping.
@@ -338,7 +328,13 @@ fn loosened<M: Fn(usize) -> usize>(
     single: bool,
 ) -> Option<Data> {
     macro_rules! doubles {
-        ($values:expr) => {{
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => doubles!(@run values),)+
+                _ => return None,
+            }
+        };
+        (@run $values:expr) => {{
             let values = $values;
             let mut out = Vec::with_capacity(rows);
             if scale == 0 {
@@ -354,18 +350,7 @@ fn loosened<M: Fn(usize) -> usize>(
             out
         }};
     }
-    let run: Vec<f64> = match data {
-        Data::Int8(values) => doubles!(values),
-        Data::Int16(values) => doubles!(values),
-        Data::Int32(values) => doubles!(values),
-        Data::Int64(values) => doubles!(values),
-        Data::Int128(values) => doubles!(values),
-        Data::UInt8(values) => doubles!(values),
-        Data::UInt16(values) => doubles!(values),
-        Data::UInt32(values) => doubles!(values),
-        Data::UInt64(values) => doubles!(values),
-        _ => return None,
-    };
+    let run: Vec<f64> = rudb_vector::for_each_layout!(exact, doubles);
     approximate_out(run, single)
 }
 
@@ -410,26 +395,24 @@ fn exact_out(run: Vec<i128>, width: Option<u8>, physical: PhysicalType) -> Optio
         }
     }
     macro_rules! narrowed {
-        ($variant:path, $ty:ty) => {{
-            let mut out = Vec::with_capacity(run.len());
-            for &whole in &run {
-                out.push(<$ty>::try_from(whole).ok()?);
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match physical {
+                $(PhysicalType::$variant => {
+                    let mut out = Vec::with_capacity(run.len());
+                    for &whole in &run {
+                        out.push(<$native>::try_from(whole).ok()?);
+                    }
+                    Data::$variant(out.into())
+                })+
+                // The run is a run of `i128` already, so the hugeint target is the one with nothing
+                // to narrow, and it takes the run as it stands rather than copying it value by
+                // value into a second one of the same width.
+                PhysicalType::Int128 => Data::Int128(run.into()),
+                _ => return None,
             }
-            $variant(out.into())
-        }};
+        };
     }
-    Some(match physical {
-        PhysicalType::Int8 => narrowed!(Data::Int8, i8),
-        PhysicalType::Int16 => narrowed!(Data::Int16, i16),
-        PhysicalType::Int32 => narrowed!(Data::Int32, i32),
-        PhysicalType::Int64 => narrowed!(Data::Int64, i64),
-        PhysicalType::Int128 => Data::Int128(run.into()),
-        PhysicalType::UInt8 => narrowed!(Data::UInt8, u8),
-        PhysicalType::UInt16 => narrowed!(Data::UInt16, u16),
-        PhysicalType::UInt32 => narrowed!(Data::UInt32, u32),
-        PhysicalType::UInt64 => narrowed!(Data::UInt64, u64),
-        _ => return None,
-    })
+    Some(rudb_vector::for_each_layout!(narrow, narrowed))
 }
 
 /// A run of doubles in the container the target type is held in, or `None` when narrowing one of
