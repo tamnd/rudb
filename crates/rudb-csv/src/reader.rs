@@ -103,6 +103,37 @@ impl Reader {
         Ok(())
     }
 
+    /// Reads the projected columns as these types rather than as the ones the sample chose.
+    ///
+    /// A read that covers several files produces one stream and a stream has one schema, and no
+    /// single file's sample is that schema. Every file is sniffed on its own and the answers are
+    /// combined by [`crate::across`], so each file is then told what the whole read settled on,
+    /// including the first one. Without it a file whose column happens to hold nothing but whole
+    /// numbers hands up a BIGINT column into a stream that is DOUBLE because some other file in the
+    /// set held a decimal.
+    ///
+    /// This is not a cast of what was read. The type is what the text is converted with, so saying
+    /// it before any row is read converts once rather than converting to the wrong type and again to
+    /// the right one. A value that then does not fit is the conversion error, named and lined the
+    /// way any other one is.
+    ///
+    /// # Errors
+    ///
+    /// When the list is not as long as the projection.
+    pub fn retype(&mut self, types: &[LogicalType]) -> Result<()> {
+        if types.len() != self.projection.len() {
+            return Err(Error::io(format!(
+                "{} types for a projection of {} columns",
+                types.len(),
+                self.projection.len()
+            )));
+        }
+        for (&at, ty) in self.projection.iter().zip(types) {
+            self.fields[at].ty = ty.clone();
+        }
+        Ok(())
+    }
+
     /// How this file is punctuated, which is what the sniffer decided.
     #[must_use]
     pub const fn dialect(&self) -> Dialect {
@@ -507,6 +538,25 @@ mod tests {
             "{error}"
         );
         assert!(error.message().contains("sample_size = 20480"), "{error}");
+    }
+
+    #[test]
+    fn a_file_told_a_wider_type_than_it_sniffed_reads_its_whole_numbers_as_that_type() {
+        // What a glob does to every file it names. This file on its own is BIGINT and the set it
+        // belongs to is DOUBLE because some other file in it holds a decimal, so the column comes
+        // out DOUBLE and the rows come with it rather than the reader being overruled afterwards.
+        let mut reader = read("a\n1\n2\n");
+        assert_eq!(reader.fields()[0].ty, LogicalType::BigInt);
+        reader.retype(&[LogicalType::Double]).expect("one type for one column");
+        assert_eq!(reader.fields()[0].ty, LogicalType::Double);
+        assert_eq!(all(&mut reader), [[Value::Double(1.0)], [Value::Double(2.0)]]);
+    }
+
+    #[test]
+    fn a_type_list_that_is_not_as_long_as_the_projection_is_refused() {
+        let mut reader = read("a,b\n1,two\n");
+        let error = reader.retype(&[LogicalType::Double]).unwrap_err();
+        assert!(error.message().contains("1 types for a projection of 2 columns"), "{error}");
     }
 
     fn all_or_error(reader: &mut Reader) -> Result<Vec<Vec<Value>>> {

@@ -59,3 +59,33 @@ c2.csv      a,s / 10,two
 ```
 
 DuckDB reads `parts/c*.csv` as 3 rows summing to 13.
+
+## sniff
+
+Three small files for the rule that every file a pattern matched is sniffed, not only the first one, written by hand.
+
+```
+sniff/s1.csv        id,tag / 1,x / 2,y
+sniff/s2.csv        id,tag / 3,z
+sniff/s3.csv        id,tag / 4.5,w
+sniff/odd/o1.csv    id / 1
+sniff/odd/o2.csv    other / 2
+```
+
+DuckDB reads `sniff/*.csv` as `id DOUBLE, tag VARCHAR`, 4 rows, `sum(id)` 10.5. Only the third file holds a decimal and it widens the whole read, which is the point: a reader that took the first file's word would answer BIGINT. The same was checked at four and at six files before these three were written down, with only the last file holding the value that widens, and the answer was the same both times.
+
+DuckDB reads `sniff/s[12].csv`, which is the same directory without the file holding the decimal, as `id BIGINT`, 3 rows, `sum(id)` 6.
+
+DuckDB reads `sniff/odd/*.csv` as an error, because the second file does not have the column the first one has.
+
+```
+Invalid Input Error: Schema mismatch between globbed files.
+Main file schema: odd/o1.csv
+Current file: odd/o2.csv
+Column with name: "id" is missing
+Potential Fixes 
+* Consider setting union_by_name=true.
+* Consider setting files_to_sniff to a higher value (e.g., files_to_sniff = -1)
+```
+
+The trailing space after `Potential Fixes` is the binary's and is kept. This is a different sentence from the one the Parquet reader gives for the same situation, which is next to the Parquet fixtures, because the two readers in DuckDB are two pieces of code that each wrote their own.
