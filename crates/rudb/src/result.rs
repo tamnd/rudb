@@ -1,6 +1,7 @@
 //! What a query hands back.
 
-use rudb_common::{LogicalType, Value};
+use rudb_arrow::{DataType, Field, RecordBatch, Schema};
+use rudb_common::{LogicalType, Result, Value};
 use rudb_vector::Chunk;
 
 /// The rows a query produced, with the names and types of its columns.
@@ -181,5 +182,40 @@ impl QueryResult {
             .iter()
             .filter(move |_| column < width)
             .flat_map(move |chunk| (0..chunk.len()).map(move |row| chunk.value_at(row, column)))
+    }
+
+    /// The column names and Arrow types, without converting any values.
+    ///
+    /// Separate from [`QueryResult::to_arrow`] because a result of no rows has no batches and still
+    /// has columns, and a consumer that reads the schema off the first batch would have nothing to
+    /// read it off. Cheap enough to call on its own: it looks at the types and never at the rows.
+    ///
+    /// # Errors
+    ///
+    /// For a column of a type Arrow has no counterpart for here yet.
+    pub fn arrow_schema(&self) -> Result<Schema> {
+        let mut fields = Vec::with_capacity(self.width());
+        for (name, ty) in self.names.iter().zip(&self.types) {
+            fields.push(Field::new(name.clone(), DataType::of(ty)?));
+        }
+        Ok(Schema::new(fields))
+    }
+
+    /// The result as Arrow record batches, one per chunk.
+    ///
+    /// One per chunk rather than one for the whole result, because the chunks are what the executor
+    /// produced and concatenating them would mean copying every value a second time to build a
+    /// single large batch that most consumers immediately walk in pieces anyway. A consumer that
+    /// does want one batch has every column in hand to build it.
+    ///
+    /// A result of no rows converts to no batches. The schema is [`QueryResult::arrow_schema`], and
+    /// [`RecordBatch::empty`] turns it into the empty batch for a consumer that needs one.
+    ///
+    /// # Errors
+    ///
+    /// For a column of a type Arrow has no counterpart for here yet, and for a chunk whose values
+    /// are not the layout its type says they are.
+    pub fn to_arrow(&self) -> Result<Vec<RecordBatch>> {
+        self.chunks.iter().map(|chunk| RecordBatch::of(chunk, &self.names)).collect()
     }
 }
