@@ -269,7 +269,11 @@ fn fold(plan: &Plan, expr: ExprRef) -> Option<Value> {
                 return None;
             }
             let values = constants(plan, args)?;
-            call_values(name, &values, plan.expr_type(expr)).ok()
+            // No expression to name, because nothing here keeps the error: a call that fails is a
+            // call that does not fold, the node stays in the plan, and the executor raises the same
+            // failure later with the expression to hand. `7 // 0` is that, and the message a user
+            // sees for it comes from the executor and not from here.
+            call_values(name, &values, plan.expr_type(expr), None).ok()
         }
         _ => None,
     }
