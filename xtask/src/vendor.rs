@@ -16,6 +16,14 @@ use crate::sha256;
 
 const UPSTREAM: &str = "https://github.com/duckdb/duckdb.git";
 const DEFAULT_REF: &str = "v2.0-cyanoptera";
+/// Where the binary at this commit comes from, recorded next to the commit itself.
+///
+/// There is nothing to download. The ref is a development branch and no release is cut from it, so
+/// the DuckDB that `rudb-compat` measures against is built from source at the commit below. That is
+/// what `scripts/oracle` does, and the line exists so that the grammar and the binary cannot drift
+/// apart quietly: a compatibility number taken against a released 1.5 and a grammar taken from a
+/// v2.0 commit are two claims about two different databases.
+const BINARY: &str = "built from source at this commit, see scripts/oracle";
 /// Where the vendored tree lives, relative to the workspace root.
 pub(crate) const DEST: &str = "crates/rudb-parse/grammar";
 
@@ -407,6 +415,7 @@ fn vendor_file(reference: &str, commit: &str, manifest: &BTreeMap<String, String
     out.push_str(&format!("upstream: {UPSTREAM}\n"));
     out.push_str(&format!("ref: {reference}\n"));
     out.push_str(&format!("commit: {commit}\n"));
+    out.push_str(&format!("binary: {BINARY}\n"));
     out.push_str(&format!("retrieved: {}\n", today()));
     out.push_str("\n# sha256 of every vendored file, relative to this directory.\n");
     for (name, sum) in manifest {
@@ -581,6 +590,20 @@ mod tests {
         assert!((2026..2100).contains(&year), "{today}");
         assert!((1..=12).contains(&month), "{today}");
         assert!((1..=31).contains(&day), "{today}");
+    }
+
+    #[test]
+    fn the_header_says_where_a_binary_at_this_commit_comes_from() {
+        // A grammar from one DuckDB and a reference binary from another is the failure this line
+        // is against, so the header carries both the commit and how to get the binary at it.
+        let manifest = BTreeMap::from([("statements/select.gram".to_string(), "1111".to_string())]);
+        let written = vendor_file("v2.0-cyanoptera", "cc7e7bac7f", &manifest);
+        let lines: Vec<&str> = written.lines().collect();
+        let commit = lines.iter().position(|l| l.starts_with("commit: ")).expect("a commit line");
+        assert_eq!(lines[commit + 1], format!("binary: {BINARY}"));
+        // The reader ignores it, so adding it changes nothing about what the checksums compare to.
+        let path = write_temp("vendor-binary", &written);
+        assert_eq!(read_manifest(&path).len(), 1);
     }
 
     #[test]

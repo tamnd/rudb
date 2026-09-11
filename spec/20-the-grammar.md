@@ -165,6 +165,8 @@ Written down because it will be run by somebody who has not read this document.
 
 `v2.0-cyanoptera` is DuckDB's default branch rather than a tag, because 2.0 had not been released when this was written and the last tag was v1.5.5. A branch name pins nothing, so the pin is the commit SHA and the ref is recorded alongside it as the thing to re-resolve.
 
+There is no binary published at that commit either, so the DuckDB step 4 runs against is built from source at it. `scripts/oracle` does that on one of the Linux boxes and installs it into `~/.local/bin` under a name carrying the version and the hash, leaving whatever DuckDB was already there alone, and `VENDOR` records where the binary comes from on a `binary:` line next to the commit. A released 1.5.5 is a different language and not a near miss: it rejects `ORDER BY x ASCENDING`, which this grammar accepts, and it accepts `[1, 2] <-> [3, 4]`, which this tokenizer cannot read as one token. A number taken against one of those is a number about a database this project does not track, and `rudb-compat duckdb` says which of the two it has.
+
 **How often this actually moves**, measured over the four releases the grammar has existed for. The first three are the autocomplete copy described in section 20.1, which is not the same artifact, but it is the same file set maintained by the same people and it is the only evidence available. Rule counts are per file, so a missing trailing newline does not merge two definitions, and the changed line count is `diff -r` over the statements directory in both directions.
 
 | release | rules | lines | bytes | changed lines since previous |

@@ -1,0 +1,118 @@
+#!/bin/sh
+# Build and install the DuckDB the grammar is vendored from.
+#
+# The grammar under crates/rudb-parse/grammar comes from a commit on DuckDB's v2.0 development
+# branch, and there is no released binary at that commit to download. A published 1.4 or 1.5 is a
+# different language: it rejects `ORDER BY x ASCENDING`, which the vendored grammar accepts, and it
+# accepts `[1, 2] <-> [3, 4]`, which the v2.0 tokenizer cannot read as one token. So the reference
+# binary rudb-compat measures against is built here, at the commit written down in VENDOR.
+#
+#   scripts/oracle              build and install on server3
+#   scripts/oracle server1      the same, on a different machine
+#   scripts/oracle gamingpc     the same, inside the WSL Ubuntu there
+#   scripts/oracle --here       build and install on this machine
+#   scripts/oracle server1 --from server3   copy the built binary instead of building it again
+#
+# The copy is there because server1 has no cmake and no way to install one, and because three of
+# the four machines are the same Ubuntu on the same architecture, so the same file runs on all of
+# them. It only works between machines like that. gamingpc is a newer Ubuntu with a newer libc and
+# builds its own.
+#
+# It installs into ~/.local/bin under a name carrying the version and the hash, and points a
+# `duckdb` symlink next to it at that file. Whatever DuckDB was already on the machine is left
+# exactly where it was, which matters because those are the binaries every earlier measurement was
+# taken against. ~/.local/bin is ahead of the usual install locations on the path on all four
+# machines, so `duckdb` is the pinned one from then on.
+#
+# The build takes about five minutes on the 32 core box and about forty on a four core one. Running
+# it again on a machine that already has this commit installed does nothing.
+set -e
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+vendor="$root/crates/rudb-parse/grammar/VENDOR"
+upstream=$(awk '$1 == "upstream:" { print $2 }' "$vendor")
+reference=$(awk '$1 == "ref:" { print $2 }' "$vendor")
+commit=$(awk '$1 == "commit:" { print $2 }' "$vendor")
+
+if [ -z "$commit" ]; then
+  echo "oracle: no commit in $vendor" >&2
+  exit 1
+fi
+
+host=server3
+case "$1" in
+  server1 | server2 | server3 | gamingpc | --here) host=$1; shift ;;
+esac
+
+from=
+if [ "$1" = "--from" ]; then
+  from=$2
+  shift 2
+fi
+
+short=$(echo "$commit" | cut -c1-10)
+
+if [ -n "$from" ]; then
+  if [ "$host" = gamingpc ] || [ "$host" = --here ]; then
+    echo "oracle: --from copies between the Linux boxes only" >&2
+    exit 1
+  fi
+  built=$(ssh "$from" "ls \$HOME/.local/bin/duckdb-*-$short 2>/dev/null | head -1")
+  if [ -z "$built" ]; then
+    echo "oracle: $from has no binary at $short, build it there first" >&2
+    exit 1
+  fi
+  name=$(basename "$built")
+  ssh "$from" "cat $built" | ssh "$host" "mkdir -p \$HOME/.local/bin \
+    && cat > \$HOME/.local/bin/$name \
+    && chmod 755 \$HOME/.local/bin/$name \
+    && ln -sfn \$HOME/.local/bin/$name \$HOME/.local/bin/duckdb \
+    && echo \"installed \$HOME/.local/bin/$name\" \
+    && \$HOME/.local/bin/duckdb --version"
+  exit 0
+fi
+
+# Everything below runs on the other machine. The three values out of VENDOR are substituted in
+# here, and every other dollar sign is escaped so that it is the remote shell that expands it.
+recipe=$(cat <<SH
+set -e
+installed=\$("\$HOME/.local/bin/duckdb" --version 2>/dev/null || echo none)
+if echo "\$installed" | grep -q "$short"; then
+  echo "already installed: \$installed"
+  exit 0
+fi
+
+work=\$HOME/duckdb-oracle
+mkdir -p "\$work"
+cd "\$work"
+if [ ! -d duckdb/.git ]; then
+  git clone --filter=blob:none --branch $reference --single-branch $upstream duckdb
+fi
+cd duckdb
+git fetch --filter=blob:none origin $reference
+git checkout -q $commit
+
+# The two extensions the harness needs in the binary rather than downloaded at runtime: json for
+# json_serialize_sql, which is how it asks DuckDB whether some text is SQL, and parquet for every
+# corpus file that reads one.
+GEN=ninja CORE_EXTENSIONS="parquet;json" make release
+
+built=\$work/duckdb/build/release/duckdb
+line=\$("\$built" --version)
+version=\${line%% *}
+hash=\${line##* }
+mkdir -p "\$HOME/.local/bin"
+install -m 755 "\$built" "\$HOME/.local/bin/duckdb-\$version-\$hash"
+ln -sfn "\$HOME/.local/bin/duckdb-\$version-\$hash" "\$HOME/.local/bin/duckdb"
+echo "installed \$HOME/.local/bin/duckdb-\$version-\$hash"
+"\$HOME/.local/bin/duckdb" --version
+SH
+)
+
+case "$host" in
+  --here) printf '%s\n' "$recipe" | sh ;;
+  # ssh to the Windows box lands in cmd, and the Linux this has to build on is the WSL Ubuntu
+  # inside it. The recipe goes over stdin so that nothing in it has to survive cmd quoting.
+  gamingpc) printf '%s\n' "$recipe" | ssh gamingpc "wsl -d Ubuntu -- bash -s" ;;
+  *) printf '%s\n' "$recipe" | ssh "$host" 'bash -s' ;;
+esac

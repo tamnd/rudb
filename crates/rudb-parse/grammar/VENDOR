@@ -11,6 +11,7 @@
 upstream: https://github.com/duckdb/duckdb.git
 ref: v2.0-cyanoptera
 commit: cc7e7bac7fcb6e0994359965a87ac4f6a96f2e17
+binary: built from source at this commit, see scripts/oracle
 retrieved: 2026-09-10
 
 # sha256 of every vendored file, relative to this directory.
