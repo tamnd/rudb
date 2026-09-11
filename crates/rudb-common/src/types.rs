@@ -276,6 +276,21 @@ impl LogicalType {
         )
     }
 
+    /// The width and scale of the decimal that holds every value of this type exactly.
+    ///
+    /// A decimal is its own, an integer is one with no fraction and room for its digits, and
+    /// nothing else has one. This is what the rule for the type of a product is written in terms
+    /// of, since `DECIMAL(4,2) * INTEGER` is as wide as `DECIMAL(4,2) * DECIMAL(10,0)` upstream and
+    /// the two ought to be the same line of code here.
+    #[must_use]
+    pub fn decimal_shape(&self) -> Option<(u8, u8)> {
+        match self {
+            Self::Decimal { width, scale } => Some((*width, *scale)),
+            other if other.is_integer() => Some((decimal_digits(other), 0)),
+            _ => None,
+        }
+    }
+
     /// Whether this is a date, a time, a timestamp or an interval.
     #[must_use]
     pub fn is_temporal(&self) -> bool {
@@ -307,8 +322,12 @@ impl LogicalType {
 
     /// The type both of these can be cast to without losing a value, if there is one.
     ///
-    /// This is DuckDB's `MaxLogicalType` and it is what decides the type of `a + b`, of the arms of
-    /// a `CASE`, and of the columns of a `UNION`. The rule is a total order over the numeric types
+    /// This is DuckDB's `MaxLogicalType` and it is where the type of `a + b` starts, and it is the
+    /// whole answer for the arms of a `CASE` and the columns of a `UNION`. An addition takes one
+    /// more digit than this when the answer is a decimal, because two eighteen digit numbers add to
+    /// nineteen, and that part is the signature table's rather than this function's: a `UNION` of
+    /// two `DECIMAL(18,0)` columns is a `DECIMAL(18,0)` and their sum is not. The rule is a total
+    /// order over the numeric types
     /// with everything else absorbing into `VARCHAR` only when it is asked to, and `NULL` absorbing
     /// into anything, which is what makes `CASE WHEN c THEN NULL ELSE 1 END` an integer.
     ///
@@ -536,12 +555,20 @@ fn promote_numeric(left: LogicalType, right: LogicalType) -> LogicalType {
 }
 
 /// How many decimal digits an integer type needs, which is what a decimal has to leave room for.
+///
+/// It is the digits of the largest value the type holds, which is why `BIGINT` is nineteen and
+/// `UBIGINT` is twenty: 9,223,372,036,854,775,807 against 18,446,744,073,709,551,615. The pair
+/// below it is not like that, because a signed type and the unsigned type of the same width have
+/// the same digit count once the sign is off the front. Measured on `v2.0.0-dev84237` through the
+/// type of a sum: `DECIMAL(4,2)` with a `BIGINT` is `DECIMAL(22,2)` and with a `UBIGINT` is
+/// `DECIMAL(23,2)`.
 fn decimal_digits(ty: &LogicalType) -> u8 {
     match ty {
         LogicalType::TinyInt | LogicalType::UTinyInt => 3,
         LogicalType::SmallInt | LogicalType::USmallInt => 5,
         LogicalType::Integer | LogicalType::UInteger => 10,
-        LogicalType::BigInt | LogicalType::UBigInt => 20,
+        LogicalType::BigInt => 19,
+        LogicalType::UBigInt => 20,
         _ => MAX_DECIMAL_WIDTH,
     }
 }
@@ -983,6 +1010,24 @@ mod promotion_tests {
             decimal.promote(&LogicalType::Integer),
             Some(LogicalType::Decimal { width: 12, scale: 2 })
         );
+    }
+
+    /// A signed and an unsigned integer of the same width leave different room, at the top pair.
+    ///
+    /// 9,223,372,036,854,775,807 is nineteen digits and 18,446,744,073,709,551,615 is twenty, so
+    /// the two do not promote with a decimal to the same type, and every narrower pair does.
+    #[test]
+    fn a_bigint_leaves_room_for_one_digit_fewer_than_a_ubigint() {
+        let decimal = LogicalType::Decimal { width: 4, scale: 2 };
+        assert_eq!(
+            decimal.promote(&LogicalType::BigInt),
+            Some(LogicalType::Decimal { width: 21, scale: 2 })
+        );
+        assert_eq!(
+            decimal.promote(&LogicalType::UBigInt),
+            Some(LogicalType::Decimal { width: 22, scale: 2 })
+        );
+        assert_eq!(decimal.promote(&LogicalType::Integer), decimal.promote(&LogicalType::UInteger));
     }
 
     #[test]

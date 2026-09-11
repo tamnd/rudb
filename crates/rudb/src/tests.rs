@@ -777,6 +777,46 @@ fn values_is_a_query_and_the_columns_take_the_type_every_row_agrees_on() {
     );
 }
 
+/// `1.5 * 1.5` is 2.25, which needs the two decimal places a product of two of them has.
+///
+/// It used to answer 2.2 typed `DECIMAL(2,1)`, because the result kept what the operands promote
+/// to and the last digit of the answer had nowhere to go. Per #243. The second query is the same
+/// rule through the kernel rather than a value at a time, since a column of them takes the run at a
+/// time path and that one multiplies unscaled values at their own scales.
+#[test]
+fn multiplying_two_decimals_keeps_the_digits_of_both_of_them() {
+    let db = Database::new();
+    let sql = "SELECT 1.5 * 1.5 AS p";
+    assert_eq!(db.query(sql).unwrap().types(), &[LogicalType::Decimal { width: 4, scale: 2 }]);
+    assert_eq!(rows(&db, sql), vec![vec![Value::Decimal { unscaled: 225, width: 4, scale: 2 }]]);
+    let run = "SELECT a * 1.5 AS p FROM range(3) t(a)";
+    assert_eq!(db.query(run).unwrap().types(), &[LogicalType::Decimal { width: 21, scale: 1 }]);
+    let decimal = |unscaled| vec![Value::Decimal { unscaled, width: 21, scale: 1 }];
+    assert_eq!(rows(&db, run), vec![decimal(0), decimal(15), decimal(30)]);
+}
+
+/// The sum of the two largest `DECIMAL(18,0)` values, which does not fit in a `DECIMAL(18,0)`.
+///
+/// It used to raise `Out of Range Error: Overflow in addition`, because the result kept the
+/// operands' own type and two eighteen digit numbers add to nineteen digits. DuckDB answers
+/// 1999999999999999998 typed `DECIMAL(19,0)` and now so does this. Per #243.
+#[test]
+fn adding_two_decimals_widens_the_answer_by_the_digit_the_carry_needs() {
+    let db = Database::new();
+    let sql = "SELECT 999999999999999999::DECIMAL(18,0) + 999999999999999999::DECIMAL(18,0) AS s";
+    let result = db.query(sql).unwrap();
+    assert_eq!(result.types(), &[LogicalType::Decimal { width: 19, scale: 0 }]);
+    assert_eq!(
+        rows(&db, sql),
+        vec![vec![Value::Decimal { unscaled: 1_999_999_999_999_999_998, width: 19, scale: 0 }]]
+    );
+    // The mixed case, where nothing overflows and the type was one digit narrower than upstream.
+    assert_eq!(
+        db.query("SELECT 2.0 + 1::INTEGER").unwrap().types(),
+        &[LogicalType::Decimal { width: 12, scale: 1 }]
+    );
+}
+
 #[test]
 fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
     // Each of these parses and each of them would be a wrong answer if it were accepted and the
