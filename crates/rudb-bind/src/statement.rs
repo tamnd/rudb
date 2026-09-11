@@ -21,6 +21,7 @@ use rudb_parse::{NONE, parse_ast};
 use rudb_plan::{Expr, ExprRef, Node, Plan};
 
 use crate::binder::Binder;
+use crate::parameters::Parameters;
 
 /// One statement, bound.
 ///
@@ -79,6 +80,19 @@ pub struct Insert {
 /// If the script does not hold exactly one statement, if a name does not resolve, if a type does
 /// not work out, or if the statement uses something that is not bound yet.
 pub fn bind_statement(ast: &Ast, catalog: &Catalog) -> Result<Bound> {
+    bind_statement_with(ast, catalog, &Parameters::new())
+}
+
+/// Binds one parsed statement against a catalog, with values for its parameters.
+///
+/// This is the prepared statement path. The statement is parsed once and bound once per set of
+/// values, so a parameter is a constant by the time the plan exists and everything after the binder
+/// sees an ordinary query. That is why there is no parameter in `rudb_plan::Expr`.
+///
+/// # Errors
+///
+/// Everything [`bind_statement`] reports, plus an error for a parameter that was given no value.
+pub fn bind_statement_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters) -> Result<Bound> {
     let statement = match ast.statements.as_slice() {
         [statement] => *statement,
         [] => return Err(Error::binder("no statement to bind")),
@@ -86,13 +100,13 @@ pub fn bind_statement(ast: &Ast, catalog: &Catalog) -> Result<Bound> {
     };
     match statement {
         ast::Statement::Query(query) => {
-            let mut binder = Binder::new(catalog);
+            let mut binder = Binder::with(catalog, parameters);
             let (root, _) = binder.bind_query(ast, query)?;
             Ok(Bound::Query(finish(binder, root)?))
         }
-        ast::Statement::CreateTable(index) => create_table(ast, catalog, index),
+        ast::Statement::CreateTable(index) => create_table(ast, catalog, parameters, index),
         ast::Statement::DropTable(index) => drop_table(ast, catalog, index),
-        ast::Statement::Insert(index) => insert(ast, catalog, index),
+        ast::Statement::Insert(index) => insert(ast, catalog, parameters, index),
     }
 }
 
@@ -114,7 +128,12 @@ fn finish(binder: Binder<'_>, root: rudb_plan::NodeRef) -> Result<Plan> {
     Ok(plan)
 }
 
-fn create_table(ast: &Ast, catalog: &Catalog, index: ast::CreateTableRef) -> Result<Bound> {
+fn create_table(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    index: ast::CreateTableRef,
+) -> Result<Bound> {
     let written = ast.create_table(index);
     if written.temporary {
         // A temporary table lives in the `temp` catalog and is dropped when the connection goes,
@@ -148,7 +167,7 @@ fn create_table(ast: &Ast, catalog: &Catalog, index: ast::CreateTableRef) -> Res
         }
         (columns, None)
     } else {
-        let mut binder = Binder::new(catalog);
+        let mut binder = Binder::with(catalog, parameters);
         let (root, scope) = binder.bind_query(ast, written.query)?;
         if defs.len() > scope.len() {
             // DuckDB's sentence, typo and all. A column list shorter than the query is fine and
@@ -222,7 +241,12 @@ fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<
     Ok(Bound::DropTable(DropTable { names }))
 }
 
-fn insert(ast: &Ast, catalog: &Catalog, index: ast::InsertRef) -> Result<Bound> {
+fn insert(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    index: ast::InsertRef,
+) -> Result<Bound> {
     let written = ast.insert(index);
     let parts: Vec<&str> = ast.name(written.name).collect();
     let name = catalog.resolve(&parts)?;
@@ -254,7 +278,7 @@ fn insert(ast: &Ast, catalog: &Catalog, index: ast::InsertRef) -> Result<Bound> 
         targets
     };
 
-    let mut binder = Binder::new(catalog);
+    let mut binder = Binder::with(catalog, parameters);
     let (root, scope) = binder.bind_query(ast, written.source)?;
     if scope.len() != targets.len() {
         return Err(Error::binder(format!(

@@ -44,8 +44,14 @@ pub fn parse_ast(query: &str) -> Result<Ast> {
 
 /// Transform a parse tree that has already been produced.
 pub fn transform(query: &str, tokens: &[Token], tree: &Tree) -> Result<Ast> {
-    let mut transform =
-        Transform { query, tokens, tree, ast: Ast::default(), interned: HashMap::new() };
+    let mut transform = Transform {
+        query,
+        tokens,
+        tree,
+        ast: Ast::default(),
+        interned: HashMap::new(),
+        anonymous: 0,
+    };
     transform.program(tree.root())?;
     Ok(transform.ast)
 }
@@ -56,6 +62,8 @@ struct Transform<'a> {
     tree: &'a Tree,
     ast: Ast,
     interned: HashMap<String, StrRef>,
+    /// How many bare `?` parameters have been seen, which is what numbers the next one.
+    anonymous: u32,
 }
 
 impl<'a> Transform<'a> {
@@ -1117,6 +1125,10 @@ impl<'a> Transform<'a> {
                 "CaseExpression" => return self.case(node),
                 "ParenthesisExpression" => return self.row(node),
                 "BoundedListExpression" => return self.list(node),
+                "QuestionMarkNumberedParameter"
+                | "AnonymousParameter"
+                | "NumberedParameter"
+                | "ColLabelParameter" => return self.parameter(node),
                 "SubqueryExpression" => return self.subquery(node),
                 _ if count == 1 => node = self.first(node),
                 _ => return self.unsupported(node),
@@ -1573,6 +1585,25 @@ impl<'a> Transform<'a> {
         Ok(self.push(Expr::Row { items }))
     }
 
+    /// `Parameter <- '?' Number / '?' / '$' Number / '$' ColLabel`, a prepared statement parameter.
+    ///
+    /// The identifier is what follows the marker, so `?1` and `$1` are both the parameter named 1,
+    /// and a bare `?` takes the next number by where it was written. That is what DuckDB does, which
+    /// is why `? + $2` prints as `$1 + $2`: the counting is its own and does not skip a number
+    /// because a later parameter claimed it.
+    fn parameter(&mut self, node: u32) -> Result<ExprRef> {
+        let written = self.text(node).trim();
+        let written = written.trim_start_matches(['?', '$']).trim();
+        let name = if written.is_empty() {
+            self.anonymous += 1;
+            self.anonymous.to_string()
+        } else {
+            written.to_string()
+        };
+        let name = self.intern(&name);
+        Ok(self.push(Expr::Parameter { name }))
+    }
+
     /// `BoundedListExpression <- '[' List(Expression)? ']'`, which is a LIST value.
     ///
     /// One item is a list of one here, unlike the parenthesised form, because the brackets are what
@@ -1705,6 +1736,7 @@ mod tests {
                 format!("({not}{} IN [{}])", show(ast, operand), list(items))
             }
             Expr::List { items } => format!("[{}]", list(items)),
+            Expr::Parameter { name } => format!("${}", ast.string(name)),
             Expr::Row { items } => format!("ROW({})", list(items)),
             Expr::Subquery { query } => format!("({})", show_query(ast, query)),
         }
@@ -2121,6 +2153,24 @@ mod tests {
         assert_eq!(round("SELECT [1, 2, 3]"), "SELECT [1, 2, 3]");
         assert_eq!(round("SELECT []"), "SELECT []");
         assert_eq!(round("SELECT ['a.parquet', 'b.parquet']"), "SELECT ['a.parquet', 'b.parquet']");
+    }
+
+    #[test]
+    fn a_parameter_carries_its_identifier_however_it_was_written() {
+        assert_eq!(round("SELECT $1"), "SELECT $1");
+        assert_eq!(round("SELECT ?1"), "SELECT $1");
+        assert_eq!(round("SELECT $name"), "SELECT $name");
+        // A bare question mark is numbered by where it is, and the counting is its own, so a later
+        // `$2` does not push the first one along. This is duckdb v1.4.1, which prints `$1 + $2`.
+        assert_eq!(round("SELECT ? + $2"), "SELECT ($1 Add $2)");
+        assert_eq!(round("SELECT ?, ?, ?"), "SELECT $1, $2, $3");
+    }
+
+    #[test]
+    fn the_parameters_of_a_statement_are_listed_once_each_in_written_order() {
+        let ast = parse_ast("SELECT $b, $a, $b WHERE $a").expect("parses");
+        assert_eq!(ast.parameters(), vec!["b", "a"]);
+        assert!(parse_ast("SELECT 1").expect("parses").parameters().is_empty());
     }
 
     #[test]

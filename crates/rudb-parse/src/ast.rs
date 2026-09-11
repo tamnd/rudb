@@ -488,6 +488,12 @@ pub enum Expr {
         /// Whether it was written `NOT IN`.
         negated: bool,
     },
+    /// A prepared statement parameter, written `?`, `?1`, `$1` or `$name`.
+    Parameter {
+        /// The identifier, which is the number for a positional one and the word for a named one.
+        /// A bare `?` is numbered by where it was written, so the identifier is there either way.
+        name: StrRef,
+    },
     /// A bracketed list of expressions, `[a, b, c]`, which is a LIST value.
     List {
         /// The items, as a run of [`ExprRef`], in the order they were written.
@@ -707,6 +713,23 @@ impl Ast {
     /// The text behind a [`StrRef`], or the empty string for `NONE`.
     pub fn string(&self, index: StrRef) -> &str {
         if index == NONE { "" } else { &self.strings[index as usize] }
+    }
+
+    /// Every parameter identifier the statement uses, once each, in the order they were written.
+    ///
+    /// The arena is built as the walk goes, so its order is the written order, and a parameter used
+    /// twice is one identifier here because it is one value to provide.
+    pub fn parameters(&self) -> Vec<&str> {
+        let mut found: Vec<&str> = Vec::new();
+        for expr in &self.exprs {
+            if let Expr::Parameter { name } = *expr {
+                let name = self.string(name);
+                if !found.contains(&name) {
+                    found.push(name);
+                }
+            }
+        }
+        found
     }
 
     /// The parts of a name, outermost first.
