@@ -6,7 +6,7 @@
 //! morsel is a run of a scan pushed through every streaming operator above it by one thread.
 
 use rudb_common::Result;
-use rudb_kernels::is_true;
+use rudb_kernels::selection;
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Selection};
 
@@ -16,7 +16,7 @@ use crate::schema::Schema;
 
 /// Keeps the rows where a predicate is true.
 ///
-/// True, not "not false". A null predicate drops the row, which is what [`is_true`] encodes and
+/// True, not "not false". A null predicate drops the row, which is what [`selection`] encodes and
 /// what makes `WHERE x <> 5` leave out the rows where `x` is null.
 ///
 /// The kept rows become a selection over the chunk rather than a copy of it, which is section 7.1's
@@ -46,12 +46,7 @@ impl Operator for Filter<'_> {
     fn next(&mut self) -> Result<Option<Chunk>> {
         while let Some(chunk) = self.input.next()? {
             let flags = evaluate(self.plan, self.predicate, &self.schema, &chunk)?;
-            let mut kept = Selection::with_capacity(chunk.len());
-            for row in 0..chunk.len() {
-                if is_true(&flags.value_at(row)) {
-                    kept.push(row);
-                }
-            }
+            let kept = selection(&flags, chunk.len());
             if kept.is_empty() {
                 continue;
             }

@@ -42,6 +42,17 @@ impl Selection {
         Self { indices: (0..len as u32).collect() }
     }
 
+    /// A selection from positions a caller has already worked out, in order.
+    ///
+    /// For a kernel that fills a buffer of its own and counts as it goes, which is how a selection
+    /// loop is written without a branch in it: every row writes its index at the current length and
+    /// only a row that is kept moves the length on. Pushing one at a time would put a capacity check
+    /// and a conversion on a loop whose whole point is that it has neither.
+    #[must_use]
+    pub fn from_indices(indices: Vec<u32>) -> Self {
+        Self { indices }
+    }
+
     /// A selection of the positions a predicate accepts.
     pub fn from_predicate(len: usize, keep: impl Fn(usize) -> bool) -> Self {
         let mut selection = Self::with_capacity(len);
