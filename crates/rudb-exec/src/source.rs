@@ -3,7 +3,7 @@
 use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_csv::Reader as CsvReader;
-use rudb_functions::{TableFunction, open_csv, open_parquet, series_length};
+use rudb_functions::{Given, TableFunction, csv_given, open_csv, open_parquet, series_length};
 use rudb_kernels::cast;
 use rudb_parquet::Reader;
 use rudb_plan::{ExprRef, Plan, Slice};
@@ -290,6 +290,7 @@ impl Operator for Series {
 pub(crate) struct FileScan {
     function: TableFunction,
     paths: Vec<String>,
+    given: Given,
     at: usize,
     reader: Option<FileReader>,
     wanted: Vec<Field>,
@@ -308,13 +309,17 @@ impl FileScan {
         index: u32,
         function: TableFunction,
         args: Slice,
+        options: Slice,
+        settings: Slice,
         columns: Slice,
     ) -> Result<Self> {
         let paths = file_arguments(plan, args, function)?;
+        let given = csv_options(plan, options, settings)?;
         let wanted = plan.field_list(columns).to_vec();
         let mut scan = Self {
             function,
             paths,
+            given,
             at: 0,
             reader: None,
             wanted: wanted.clone(),
@@ -331,7 +336,7 @@ impl FileScan {
     fn advance(&mut self) -> Result<()> {
         self.reader = None;
         let Some(path) = self.paths.get(self.at) else { return Ok(()) };
-        let mut reader = FileReader::open(self.function, path)?;
+        let mut reader = FileReader::open(self.function, path, self.given)?;
         let first = if self.at == 0 { None } else { self.paths.first().map(String::as_str) };
         reader.project(&positions(self.function, &self.wanted, &reader.fields(), path, first)?)?;
         reader.settle(&self.wanted)?;
@@ -411,9 +416,9 @@ enum FileReader {
 
 impl FileReader {
     /// Opens `path` with the reader `function` names.
-    fn open(function: TableFunction, path: &str) -> Result<Self> {
+    fn open(function: TableFunction, path: &str, given: Given) -> Result<Self> {
         match function {
-            TableFunction::ReadCsv => Ok(Self::Csv(open_csv(path)?)),
+            TableFunction::ReadCsv => Ok(Self::Csv(open_csv(path, given)?)),
             _ => Ok(Self::Parquet(open_parquet(path)?)),
         }
     }
@@ -465,6 +470,27 @@ impl FileReader {
             Self::Csv(reader) => reader.next_chunk(),
         }
     }
+}
+
+/// What the call's named parameters said about how the CSV files are written.
+///
+/// The binder worked this out to sniff the files with and wrote the names and the values into the
+/// plan, and this works it out again from them to read the files with. Both go through
+/// [`csv_given`], so a file is read the way it was sniffed and the columns a query was planned
+/// against are the columns it reads. A `read_parquet` call has none of these and gets the default,
+/// which says nothing and is never asked.
+fn csv_options(plan: &Plan, options: Slice, settings: Slice) -> Result<Given> {
+    if options.len == 0 {
+        return Ok(Given::default());
+    }
+    let exprs: Vec<ExprRef> = plan.expr_list(settings).to_vec();
+    let source = Schema::empty();
+    let one = Chunk::with_rows(Vec::new(), 1)?;
+    let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
+    let names: Vec<&str> = plan.name_list(options).iter().map(|name| plan.string(*name)).collect();
+    let written: Vec<(&str, rudb_common::Value)> =
+        names.into_iter().zip(evaluated.iter().map(|vector| vector.value_at(0))).collect();
+    csv_given(&written)
 }
 
 /// The file names a file reading table function was called with.

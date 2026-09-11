@@ -75,6 +75,18 @@ pub enum Node {
         function: StrRef,
         /// The arguments, into the expression list pool.
         args: Slice,
+        /// The names of the named parameters the call was written with, into the name pool.
+        ///
+        /// `read_csv('f.csv', delim=';')` keeps the `delim` here rather than only in whatever the
+        /// binder made of it, because the executor opens the file a second time and has to open it
+        /// the same way. A parameter the binder answers on its own, such as `binary_as_string`,
+        /// is here too, so that a plan prints back as the call that was written.
+        options: Slice,
+        /// What each of those names was given, into the expression list pool and the same length.
+        ///
+        /// Constants, every one of them. The binder refuses anything else, because a parameter can
+        /// decide what the columns are and the columns are settled there.
+        settings: Slice,
         /// The produced columns with their types, into the field pool.
         columns: Slice,
     },
@@ -378,6 +390,8 @@ mod tests {
                 index: 0,
                 function: 0,
                 args: Slice::EMPTY,
+                options: Slice::EMPTY,
+                settings: Slice::EMPTY,
                 columns: Slice::EMPTY,
             },
             Node::Filter { input: 0, predicate: 0 },

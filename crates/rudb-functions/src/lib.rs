@@ -17,6 +17,9 @@ pub mod file;
 pub mod signature;
 pub mod table;
 
-pub use file::{csv_fields, files, is_file, is_pattern, open_csv, open_parquet, parquet_fields};
+pub use file::{
+    csv_fields, csv_given, files, is_file, is_pattern, open_csv, open_parquet, parquet_fields,
+};
+pub use rudb_csv::Given;
 pub use signature::{FunctionKind, Resolved, kind_of, resolve};
 pub use table::{Columns, ResolvedTable, TableFunction, resolve_table, series, series_length};

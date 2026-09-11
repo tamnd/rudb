@@ -14,7 +14,7 @@ use rudb_io::File;
 use rudb_kernels::cast_value;
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
-use crate::dialect::{self, Dialect};
+use crate::dialect::{self, Dialect, Given};
 use crate::infer;
 
 /// How much is read at a time, and how much the sniffer gets to look at.
@@ -29,6 +29,7 @@ const BLOCK: usize = 1 << 20;
 pub struct Reader {
     file: Box<dyn File>,
     path: String,
+    given: Given,
     dialect: Dialect,
     fields: Vec<Field>,
     projection: Vec<usize>,
@@ -50,9 +51,23 @@ impl Reader {
     /// When the file cannot be read, and when the first block of it does not hold one whole record,
     /// which is a single line longer than a megabyte and is not a CSV file anybody meant to write.
     pub fn open(file: Box<dyn File>, path: &str) -> Result<Self> {
+        Self::open_with(file, path, Given::default())
+    }
+
+    /// The same, with whatever the caller already knows about how the file is written.
+    ///
+    /// This is where `read_csv('f.csv', delim=';', header=true)` arrives. A given value replaces the
+    /// sniffer's answer rather than seeding it, and it replaces it before the sample is split, so the
+    /// types and the column names come out of the file read the way the caller said it is written.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Reader::open`] reports.
+    pub fn open_with(file: Box<dyn File>, path: &str, given: Given) -> Result<Self> {
         let mut reader = Self {
             file,
             path: path.to_string(),
+            given,
             dialect: Dialect::comma_separated(),
             fields: Vec::new(),
             projection: Vec::new(),
@@ -65,11 +80,15 @@ impl Reader {
         };
         reader.fill()?;
         let sample = reader.buffer.clone();
-        let quote = dialect::quote(&sample);
-        let delimiter = dialect::delimiter(&sample, quote)?;
-        reader.dialect = Dialect { delimiter, quote, escape: quote, header: false };
+        let quote = given.quote.or_else(|| dialect::quote(&sample));
+        let delimiter = match given.delimiter {
+            Some(byte) => byte,
+            None => dialect::delimiter(&sample, quote)?,
+        };
+        let escape = given.escape.or(quote);
+        reader.dialect = Dialect { delimiter, quote, escape, header: false };
         let rows = reader.sample_rows(&sample)?;
-        let (header, fields) = describe(&rows);
+        let (header, fields) = describe(&rows, given.header);
         reader.dialect.header = header;
         reader.fields = fields;
         reader.projection = (0..reader.fields.len()).collect();
@@ -193,6 +212,11 @@ impl Reader {
     /// answer to the question the message raises. Somebody reading it wants to know what was
     /// guessed and how to override the guess, and a shorter message would send them to the
     /// documentation to find out.
+    ///
+    /// A line of that block says where its value came from, and a value the call gave is `(Set By
+    /// User)` rather than `(Auto-Detected)`, measured on `v2.0.0-dev84237` by reading a file with
+    /// `delim=';'` past the sample. Telling somebody that what they wrote down was auto-detected is
+    /// the one thing the block could say that would send them looking in the wrong place.
     fn conversion_error(&self, text: &str, field: &Field, line: u64) -> String {
         format!(
             "CSV Error on Line: {line}\nOriginal Line: {text}\nError when converting column \
@@ -202,19 +226,19 @@ impl Reader {
              types={{'{}': 'VARCHAR'}}\n* Set the sample size to a larger value to enable the \
              auto-detection to scan more values, e.g., sample_size=-1\n* Use a COPY statement to \
              automatically derive types from an existing table.\n* Check whether the null string \
-             value is set correctly (e.g., nullstr = 'N/A')\n\n  file = {}\n  delimiter = {} \
-             (Auto-Detected)\n  quote = {} (Auto-Detected)\n  escape = {} (Auto-Detected)\n  \
-             header = {} (Auto-Detected)\n  sample_size = {}\n",
+             value is set correctly (e.g., nullstr = 'N/A')\n\n  file = {}\n  delimiter = {}\n  \
+             quote = {}\n  escape = {}\n  header = {} {}\n  sample_size = {}\n",
             field.name,
             field.ty,
             field.name,
             field.ty,
             field.name,
             self.path,
-            Dialect::shown(Some(self.dialect.delimiter)),
-            Dialect::shown(self.dialect.quote),
-            Dialect::shown(self.dialect.escape),
+            Given::shown(self.given.delimiter, Some(self.dialect.delimiter)),
+            Given::shown(self.given.quote, self.dialect.quote),
+            Given::shown(self.given.escape, self.dialect.escape),
             self.dialect.header,
+            Given::source(self.given.header.is_some()),
             infer::SAMPLE,
         )
     }
@@ -306,7 +330,11 @@ impl Reader {
 /// once the first row is set aside has a header, because two rows of words is a header and a row.
 /// Otherwise the first row is a header exactly when it does not fit the types the rest of the file
 /// has, which is what makes `1,2` over `3,4` a file of two rows and `a,b` over `1,2` a file of one.
-fn describe(rows: &[Vec<Option<String>>]) -> (bool, Vec<Field>) {
+///
+/// `told` is the caller answering the question instead, which is `header=true` or `header=false` on
+/// the call. It decides the names and the types as well as the row count, since a first row that is
+/// data is a row the types have to fit and a first row that is a header is not.
+fn describe(rows: &[Vec<Option<String>>], told: Option<bool>) -> (bool, Vec<Field>) {
     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
     let body = types(&rows[1.min(rows.len())..], width);
     let all_text = body.iter().all(|ty| *ty == LogicalType::Varchar);
@@ -316,7 +344,8 @@ fn describe(rows: &[Vec<Option<String>>]) -> (bool, Vec<Field>) {
             Some(text) => infer::fits(text, ty),
         })
     });
-    let header = rows.len() > 1 && (all_text || !first_fits);
+    // An empty file has no row to take names from, so it has no header whatever it was told.
+    let header = !rows.is_empty() && told.unwrap_or(rows.len() > 1 && (all_text || !first_fits));
     if !header {
         let types = types(rows, width);
         let fields = types
@@ -386,6 +415,17 @@ mod tests {
         drop(file);
         let file = filesystem.open(path, OpenMode::Read).expect("opens");
         Reader::open(file, "/t.csv").expect("sniffs")
+    }
+
+    /// The same file opened with something already known about how it is written.
+    fn read_with(text: &str, given: Given) -> Reader {
+        let filesystem = SimFilesystem::new();
+        let path = Path::new("/t.csv");
+        let file = filesystem.open(path, OpenMode::Create).expect("creates");
+        file.write_at(0, text.as_bytes()).expect("writes");
+        drop(file);
+        let file = filesystem.open(path, OpenMode::Read).expect("opens");
+        Reader::open_with(file, "/t.csv", given).expect("reads")
     }
 
     fn names_and_types(reader: &Reader) -> Vec<(String, String)> {
@@ -538,6 +578,60 @@ mod tests {
             "{error}"
         );
         assert!(error.message().contains("sample_size = 20480"), "{error}");
+    }
+
+    /// Measured. The header row becomes a row, so the names are the generated ones and the first
+    /// column holds `a`, `1` and `2`, which is text rather than the BIGINT the sniffer would say.
+    #[test]
+    fn a_file_told_it_has_no_header_reads_its_first_line_as_a_row() {
+        let mut reader =
+            read_with("a,b\n1,x\n2,y\n", Given { header: Some(false), ..Given::default() });
+        assert_eq!(
+            names_and_types(&reader),
+            [
+                ("column0".to_string(), "VARCHAR".to_string()),
+                ("column1".to_string(), "VARCHAR".to_string()),
+            ]
+        );
+        assert_eq!(all(&mut reader).len(), 3);
+    }
+
+    /// The other way round, on a file the sniffer would call two rows of data.
+    #[test]
+    fn a_file_told_it_has_a_header_takes_its_first_line_as_the_names() {
+        let reader = read_with("1,2\n3,4\n", Given { header: Some(true), ..Given::default() });
+        assert_eq!(reader.fields().iter().map(|f| f.name.clone()).collect::<Vec<_>>(), ["1", "2"]);
+    }
+
+    /// A given delimiter is used rather than tried, so a file that is really commas is one column.
+    #[test]
+    fn a_given_delimiter_is_the_delimiter_whatever_the_file_looks_like() {
+        let reader = read_with("a,b\n1,x\n", Given { delimiter: Some(b';'), ..Given::default() });
+        assert_eq!(reader.dialect().delimiter, b';');
+        assert_eq!(reader.fields().len(), 1);
+    }
+
+    /// A quote the sniffer would never find, since it only ever looks for the double quote.
+    #[test]
+    fn a_given_quote_makes_a_field_that_holds_the_delimiter_one_value() {
+        let mut reader =
+            read_with("a,b\n1,'x,y'\n", Given { quote: Some(b'\''), ..Given::default() });
+        assert_eq!(all(&mut reader), [vec![Value::BigInt(1), Value::Varchar("x,y".into())]]);
+    }
+
+    /// The block under a conversion error says which of its lines the caller wrote down.
+    #[test]
+    fn the_block_says_set_by_user_for_what_the_call_gave_it() {
+        let mut text = String::from("c;d\n");
+        for row in 0..infer::SAMPLE {
+            text.push_str(&format!("{row};x\n"));
+        }
+        text.push_str("oops;x\n");
+        let given = Given { delimiter: Some(b';'), ..Given::default() };
+        let mut reader = read_with(&text, given);
+        let error = all_or_error(&mut reader).unwrap_err();
+        assert!(error.message().contains("delimiter = ; (Set By User)"), "{error}");
+        assert!(error.message().contains("header = true (Auto-Detected)"), "{error}");
     }
 
     #[test]

@@ -75,11 +75,27 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             }
             out.write_char(']')
         }
-        Node::TableFunction { index, function, args, columns } => {
+        Node::TableFunction { index, function, args, options, settings, columns } => {
             out.write_char(' ')?;
             write_identifier(out, plan.string(function))?;
             out.write_str(" args=")?;
             write_expr_list(plan, out, args)?;
+            // Written only when there are some, so that the plan of a call with no named parameter
+            // is the same text it was before there were any to write.
+            if options.len > 0 {
+                out.write_str(" options=[")?;
+                for (at, (&name, &value)) in
+                    plan.name_list(options).iter().zip(plan.expr_list(settings)).enumerate()
+                {
+                    if at > 0 {
+                        out.write_str(", ")?;
+                    }
+                    write_identifier(out, plan.string(name))?;
+                    out.write_char('=')?;
+                    write_expr(plan, out, value)?;
+                }
+                out.write_char(']')?;
+            }
             write!(out, " #{index} ")?;
             write_schema(plan, out, columns)
         }
