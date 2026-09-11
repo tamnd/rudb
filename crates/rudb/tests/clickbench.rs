@@ -13,6 +13,9 @@
 //! opening a new one does. That is deliberate: the number in this list is the honest measure of how
 //! far the front end is from the compatibility claim, and it is only worth anything if it cannot
 //! drift.
+//!
+//! The list is now empty, which took the count from thirty four to forty three over five changes.
+//! Holding it there is what the equality in the assertion is for.
 
 use rudb::Database;
 
@@ -24,8 +27,12 @@ const SQL: &str = include_str!("../testdata/clickbench.sql");
 ///
 /// Every entry is a missing piece of DuckDB rather than a difference of opinion about SQL, so every
 /// entry is a bug with a fix rather than a note about dialects.
-const GAPS: &[(&str, &str)] =
-    &[("q29", "REGEXP_REPLACE, and a regular expression engine to run under it")];
+///
+/// The list is empty. All forty three plan, against the official DDL, with the SQL unmodified. That
+/// is the front end done as a measure, and it is only the front end: planning a query is not
+/// answering it, and what the numbers in `tamnd/rudb-bench` need next is the Parquet reader wired to
+/// a table function so there is data under these plans.
+const GAPS: &[(&str, &str)] = &[];
 
 /// Splits the file into the statements it holds, each with the name of the comment above it.
 ///

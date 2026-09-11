@@ -65,6 +65,7 @@ mod datetime;
 pub mod fallback;
 pub mod logic;
 mod number;
+mod regexp;
 pub mod scalar;
 pub mod select;
 mod shape;

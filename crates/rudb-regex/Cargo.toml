@@ -1,6 +1,6 @@
 [package]
-name = "rudb-kernels"
-description = "The generated cross product of operator, physical form and type, with runtime SIMD dispatch."
+name = "rudb-regex"
+description = "A regular expression engine, written rather than depended on: a parser, a program and a Pike virtual machine."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,9 +14,6 @@ readme.workspace = true
 
 [dependencies]
 rudb-common.workspace = true
-rudb-vector.workspace = true
-rudb-encoding.workspace = true
-rudb-regex.workspace = true
 
 [lints]
 workspace = true
