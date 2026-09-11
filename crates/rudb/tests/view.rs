@@ -221,9 +221,11 @@ fn a_query_through_a_view_reads_the_columns_it_names_and_not_the_ones_the_body_l
         database.plan("SELECT COUNT(*) FROM v").expect("a plan"),
         "Project #3 [#2.0::BIGINT AS \"count_star()\"]\n  Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n    Project #1 []\n      Get memory.main.t AS t #0 []\n"
     );
+    // The filter is under the view's own projection rather than over it, which is filter pushdown,
+    // and that is what lets the projection be one column wide instead of two.
     assert_eq!(
         database.plan("SELECT b FROM v WHERE c > 1").expect("a plan"),
-        "Project #2 [#1.0::VARCHAR AS b]\n  Filter (#1.1::INTEGER > 1::INTEGER)::BOOLEAN\n    Project #1 [#0.0::VARCHAR AS b, #0.1::INTEGER AS c]\n      Get memory.main.t AS t #0 [b::VARCHAR, c::INTEGER]\n"
+        "Project #2 [#1.0::VARCHAR AS b]\n  Project #1 [#0.0::VARCHAR AS b]\n    Filter (#0.1::INTEGER > 1::INTEGER)::BOOLEAN\n      Get memory.main.t AS t #0 [b::VARCHAR, c::INTEGER]\n"
     );
 }
 
