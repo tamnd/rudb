@@ -11,8 +11,11 @@
 //! rule, and a test that went through them would fail here when they changed. The SQL level tests
 //! live in the `rudb` crate, which is where a query is a string.
 
+use std::collections::HashSet;
+
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{Cancel, Field, LogicalType, Memory, Value};
+use rudb_kernels::Accumulator;
 use rudb_plan::Plan;
 
 use crate::{build, build_with};
@@ -490,6 +493,65 @@ fn a_token_nothing_has_cancelled_leaves_the_answer_alone() {
             _ => panic!("one of them finished and the other did not"),
         }
     }
+}
+
+#[test]
+fn a_group_is_charged_for_the_room_it_takes_and_not_only_for_what_it_holds() {
+    // #227. The hash table was charged for its entries and not for its capacity, and the per group
+    // allocations around it were not charged at all, so the budget was spent at about two fifths of
+    // the real footprint and a limit stopped nothing. The bound below is arithmetic anybody can
+    // redo and it does not depend on the values: every group takes a slot in each of the four
+    // containers and two blocks of its own, whatever is in it.
+    const GROUPS: i32 = 4096;
+    let mut catalog = Catalog::new();
+    let wide = QualifiedName::new("memory", "main", "wide");
+    catalog
+        .create_table(wide.clone(), vec![Field::new("x", LogicalType::Integer)])
+        .expect("a fresh table");
+    let rows: Vec<Vec<Value>> = (0..GROUPS).map(|at| vec![Value::Integer(at)]).collect();
+    catalog
+        .table_mut(&wide)
+        .expect("the table just created")
+        .rows_mut()
+        .append_rows(&rows)
+        .expect("one row of the table's own type per group");
+
+    let memory = Memory::unlimited();
+    let plan = Plan::parse(
+        "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]\n  \
+         Get memory.main.wide AS wide #0 [x::INTEGER]\n",
+    )
+    .expect("a well formed plan");
+    let mut operator =
+        build_with(&plan, &catalog, &Cancel::new(), &memory).expect("the operators build");
+    let mut seen = 0;
+    while let Some(chunk) = operator.next().expect("the aggregate runs") {
+        seen += chunk.len();
+    }
+    assert_eq!(seen, GROUPS as usize, "one group per distinct value");
+
+    // What a group was charged before #227: its key twice by the whole footprint of the vector, and
+    // an accumulator and a distinct set for the one call. Nothing for the four containers it needs a
+    // slot in and nothing for the blocks the allocator hands out, which together are most of it.
+    let key = size_of::<Vec<Value>>() + size_of::<Value>();
+    let before = 2 * key + size_of::<Accumulator>() + size_of::<HashSet<Vec<Value>>>();
+    // The slot each group takes in the four containers, which is what was charged for none of. A
+    // floor rather than the figure: it assumes every container is exactly full, and none of them
+    // are, and it counts nothing for the blocks the allocator hands out. So the charge has to clear
+    // it by some margin and the old charge could not clear it at all.
+    let slots = size_of::<(Vec<Value>, usize)>()
+        + size_of::<Vec<Value>>()
+        + size_of::<Vec<Accumulator>>()
+        + size_of::<Vec<HashSet<Vec<Value>>>>();
+    let groups = u64::try_from(GROUPS).expect("a small count");
+    let before = groups * u64::try_from(before).expect("a small size");
+    let floor = before + groups * u64::try_from(slots).expect("a small size");
+    assert!(
+        memory.peak() > floor,
+        "{} charged for {GROUPS} groups, against {before} for their contents alone and {floor} \
+         once every group is charged for a slot in each of the four containers",
+        memory.peak()
+    );
 }
 
 #[test]

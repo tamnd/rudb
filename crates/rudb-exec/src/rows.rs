@@ -12,15 +12,62 @@
 //! one place per crate is one somebody can believe rather than one that has to be re-audited every
 //! time an operator is added.
 
-use rudb_common::{LogicalType, Reservation, Result, Value};
+use rudb_common::{ALLOCATION, LogicalType, Reservation, Result, Value};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::operator::Operator;
 
 /// What one buffered row costs, counting the values and the vector holding them.
 pub(crate) fn footprint(row: &[Value]) -> u64 {
-    let bytes = size_of::<Vec<Value>>() + row.iter().map(Value::footprint).sum::<usize>();
+    u64::try_from(size_of::<Vec<Value>>()).unwrap_or(u64::MAX) + heap(row)
+}
+
+/// What one buffered row owns away from itself, which is everything [`footprint`] counts except
+/// the three words of the vector's own header.
+///
+/// Separate because a row sitting inside a container has those three words counted already, by
+/// [`capacity`] over the container that holds it, and counting them again here would charge them
+/// twice. Per #227 the containers are now charged for what they took rather than for what they are
+/// using, and the two have to divide the row between them without overlapping.
+pub(crate) fn heap(row: &[Value]) -> u64 {
+    let bytes = row.iter().map(Value::footprint).sum::<usize>() + ALLOCATION_USIZE;
     u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+/// [`ALLOCATION`] in the type the sizes around it are in.
+const ALLOCATION_USIZE: usize = ALLOCATION as usize;
+
+/// Charges whatever a set of containers has grown by since it was last charged.
+///
+/// `now` is what they take today and `charged` is what they were last charged, which this updates.
+///
+/// A container's capacity is what it took from the allocator and its length is what it is using,
+/// and the difference is not small. A `Vec` doubles, so it is between half empty and full, and a
+/// `HashMap` fills to seven eighths and then doubles as well. Charging the entries alone charges
+/// the used part of a structure that paid for all of it, which is the larger half of #227.
+///
+/// Asked once per input chunk, the same granularity everything else in here charges at, so the
+/// overshoot before a query is told is bounded by one chunk of insertions.
+///
+/// # Errors
+///
+/// [`rudb_common::ErrorCode::OutOfMemory`] when the growth passes the limit.
+pub(crate) fn capacity(now: u64, charged: &mut u64, held: &mut Reservation) -> Result<()> {
+    let grown = now.saturating_sub(*charged);
+    if grown > 0 {
+        held.grow(grown)?;
+        *charged = now;
+    }
+    Ok(())
+}
+
+/// How many buckets a hash table has to have to hold `entries` without growing again.
+///
+/// Both `HashMap` and `HashSet` are open addressed and refuse to fill past seven eighths, and they
+/// report the seven rather than the eight, so the table on the heap is a bucket and a control byte
+/// for each of eight sevenths of what `capacity` says.
+pub(crate) fn buckets(entries: usize) -> u64 {
+    u64::try_from(entries).unwrap_or(u64::MAX).saturating_mul(8).div_ceil(7)
 }
 
 /// Drains an operator into rows, charging what they take against the budget.
@@ -30,6 +77,10 @@ pub(crate) fn footprint(row: &[Value]) -> u64 {
 /// runs at and for the same reason: a thousand rows is a bounded overshoot and a check per row is a
 /// branch in the row loop.
 ///
+/// Two charges rather than one. Each row is charged what it owns, and the vector holding the rows is
+/// charged what it has taken from the allocator rather than what it has put in it, which is up to
+/// twice as much because a `Vec` doubles.
+///
 /// # Errors
 ///
 /// Anything the operator reports while producing its input, and
@@ -37,14 +88,17 @@ pub(crate) fn footprint(row: &[Value]) -> u64 {
 /// with.
 pub(crate) fn collect(input: &mut dyn Operator, held: &mut Reservation) -> Result<Vec<Vec<Value>>> {
     let mut rows = Vec::new();
+    let mut charged = 0;
     while let Some(chunk) = input.next()? {
         let mut taken = 0;
         for row in 0..chunk.len() {
             let values: Vec<Value> = chunk.row(row).collect();
-            taken += footprint(&values);
+            taken += heap(&values);
             rows.push(values);
         }
         held.grow(taken)?;
+        let slots = u64::try_from(rows.capacity() * size_of::<Vec<Value>>()).unwrap_or(u64::MAX);
+        capacity(slots, &mut charged, held)?;
     }
     Ok(rows)
 }

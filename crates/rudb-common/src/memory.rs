@@ -16,9 +16,16 @@ use crate::error::{Error, Result};
 ///
 /// What an operator says it is holding. Nothing here hooks the allocator, so the number is the sum
 /// of what the buffering operators reserved and not the resident size of the process. The gap is
-/// real and it is in one direction: a query that holds a gigabyte of rows has reserved a gigabyte,
-/// and the allocator's own bookkeeping on top of that is not counted. Under reporting is the safe
-/// direction for a first version, because the alternative is refusing a query that would have fit.
+/// real and it is in one direction, since an operator charges for what it asked for and never for
+/// more.
+///
+/// How large the gap is decides whether the limit is any use. Under reporting is the safe direction
+/// only while it is small: a budget that is spent at two fifths of the real footprint is not a
+/// conservative limit, it is a limit that lets a query take two and a half times what it was
+/// allowed and get killed from outside anyway, which is exactly what it was there to prevent. #227
+/// found the aggregate doing that and it is why the operators charge a container for its capacity
+/// rather than its length and add [`ALLOCATION`] per block. [`Memory::peak`] is the accounted side
+/// of that comparison, so the gap can be measured rather than assumed.
 ///
 /// The operators that reserve are the ones that buffer without bound, which is sorting, grouping,
 /// duplicate elimination, joining, set operations and the result a query hands back. A streaming
@@ -48,6 +55,13 @@ struct Budget {
     /// for more, which is what DuckDB does and is the only behaviour that does not turn a setting
     /// into a way of killing whatever happens to be running.
     limit: AtomicU64,
+    /// The most that has ever been held at once, which nothing gives back.
+    ///
+    /// Added for #227, where the question was how far the accounting is from what the process
+    /// actually takes, and the only way to ask it was to run a query under `/usr/bin/time -v` and
+    /// compare by hand. Now the accounted side of that comparison is a number the database will
+    /// say, so a test can assert on it and a benchmark can print it beside the resident set.
+    peak: AtomicU64,
 }
 
 /// What the limit holds when there is no limit.
@@ -55,6 +69,19 @@ struct Budget {
 /// A sentinel rather than an `Option`, because an `Option<u64>` is not atomic and a lock around the
 /// limit would be a lock taken on every reservation.
 const NO_LIMIT: u64 = u64::MAX;
+
+/// What the allocator takes on top of a block, for every block handed out.
+///
+/// Every general purpose allocator keeps a header beside the block and rounds the size up to an
+/// alignment, and none of them will say by how much. Sixteen is glibc's, an eight byte header and a
+/// sixteen byte alignment, and it is a floor rather than an average, so a caller that adds this per
+/// allocation is still under reporting and is under reporting by much less than one that adds
+/// nothing.
+///
+/// It matters because the things this budget counts are made of small allocations. A hash table of
+/// seventeen million groups is seventeen million blocks, and sixteen bytes apiece is a quarter of a
+/// gigabyte that was invisible before #227.
+pub const ALLOCATION: u64 = 16;
 
 impl Default for Memory {
     fn default() -> Self {
@@ -83,7 +110,7 @@ impl Memory {
     #[must_use]
     pub fn new(limit: Option<u64>) -> Self {
         let limit = AtomicU64::new(limit.unwrap_or(NO_LIMIT));
-        Self { inner: Arc::new(Budget { used: AtomicU64::new(0), limit }) }
+        Self { inner: Arc::new(Budget { used: AtomicU64::new(0), limit, peak: AtomicU64::new(0) }) }
     }
 
     /// The limit, if there is one.
@@ -108,6 +135,28 @@ impl Memory {
     #[must_use]
     pub fn used(&self) -> u64 {
         self.inner.used.load(Ordering::Relaxed)
+    }
+
+    /// The most that was ever held at once since the last [`Memory::forget_peak`].
+    ///
+    /// [`Memory::used`] falls back to zero when a query ends, so it answers what is held and never
+    /// what was held, and what was held is the number worth knowing. It is what a query cost, it is
+    /// what has to be compared against the resident set to find out whether the accounting means
+    /// anything, and it is the one to print beside a benchmark row.
+    ///
+    /// It is a property of the budget rather than of a query, so two queries running at once share
+    /// one and it is the peak of the pair.
+    #[must_use]
+    pub fn peak(&self) -> u64 {
+        self.inner.peak.load(Ordering::Relaxed)
+    }
+
+    /// Puts the high water mark back to what is held right now.
+    ///
+    /// Back to what is held rather than to zero, because a mark below the current total would be a
+    /// number that says less was held than is held.
+    pub fn forget_peak(&self) {
+        self.inner.peak.store(self.used(), Ordering::Relaxed);
     }
 
     /// A reservation on this budget that is holding nothing yet.
@@ -140,7 +189,8 @@ impl Memory {
     /// total that was never allowed and refuses a query that would have fit.
     fn take(&self, bytes: u64) -> Result<()> {
         let Some(limit) = self.limit() else {
-            self.inner.used.fetch_add(bytes, Ordering::Relaxed);
+            let was = self.inner.used.fetch_add(bytes, Ordering::Relaxed);
+            self.inner.peak.fetch_max(was + bytes, Ordering::Relaxed);
             return Ok(());
         };
         let mut used = self.inner.used.load(Ordering::Relaxed);
@@ -160,7 +210,10 @@ impl Memory {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.inner.peak.fetch_max(wanted, Ordering::Relaxed);
+                    return Ok(());
+                }
                 Err(now) => used = now,
             }
         }
@@ -244,6 +297,44 @@ pub fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Memory, human};
+
+    #[test]
+    fn the_peak_remembers_what_used_forgets() {
+        let memory = Memory::with_limit(1 << 20);
+        {
+            let _held = memory.reserve(1000).expect("room for the first");
+            let _more = memory.reserve(2000).expect("room for the second");
+            assert_eq!(memory.used(), 3000);
+            assert_eq!(memory.peak(), 3000);
+        }
+        assert_eq!(memory.used(), 0);
+        assert_eq!(memory.peak(), 3000, "what was held is the number worth knowing");
+        let held = memory.reserve(500).expect("room again");
+        assert_eq!(memory.peak(), 3000, "a smaller total does not move the mark down");
+        memory.forget_peak();
+        assert_eq!(memory.peak(), 500, "forgetting goes back to what is held, not to zero");
+        drop(held);
+    }
+
+    #[test]
+    fn a_budget_with_no_limit_still_has_a_peak() {
+        // The unlimited path is a plain add rather than the compare and exchange loop, so it is a
+        // second place the mark has to be moved and a second place to forget to.
+        let memory = Memory::unlimited();
+        let held = memory.reserve(4096).expect("nothing is refused");
+        drop(held);
+        assert_eq!(memory.used(), 0);
+        assert_eq!(memory.peak(), 4096);
+    }
+
+    #[test]
+    fn a_refused_reservation_does_not_move_the_mark() {
+        let memory = Memory::with_limit(1000);
+        let held = memory.reserve(900).expect("room for this");
+        memory.reserve(200).expect_err("no room for that");
+        assert_eq!(memory.peak(), 900, "what was refused was never held");
+        drop(held);
+    }
 
     #[test]
     fn an_unlimited_budget_refuses_nothing_and_still_counts() {
