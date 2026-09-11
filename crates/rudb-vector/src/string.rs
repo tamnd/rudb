@@ -65,6 +65,22 @@ impl StringView {
         Self { length: text.len() as u32, payload }
     }
 
+    /// A view on bytes that are already known to be text, wherever they turn out to live.
+    ///
+    /// The one constructor that takes bytes rather than a `&str`, for the copy between two columns
+    /// where the bytes were validated on the way into the first one. `offset` is where they are in
+    /// the destination arena and is ignored for a string short enough to sit in the view.
+    fn over(bytes: &[u8], offset: u64) -> Self {
+        let mut payload = [0u8; 12];
+        if bytes.len() <= INLINE_LIMIT {
+            payload[..bytes.len()].copy_from_slice(bytes);
+        } else {
+            payload[..4].copy_from_slice(&bytes[..4]);
+            payload[4..].copy_from_slice(&offset.to_le_bytes());
+        }
+        Self { length: bytes.len() as u32, payload }
+    }
+
     /// The length in bytes.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -243,6 +259,27 @@ impl StringColumn {
         self.views.len() - 1
     }
 
+    /// Appends the string at `index` of another column, and returns its index here.
+    ///
+    /// This is what a gather and a slice over a string column want, and it is worth having next to
+    /// [`Self::push`] because that one takes a `&str` and the only way to get one out of a column
+    /// is [`Self::get`], which validates UTF-8. Validating there is a waste on this path twice
+    /// over: the bytes were validated on the way into the source column, and a copy cannot make
+    /// valid bytes invalid. Reading a ClickBench partition spent eight percent of its cycles on
+    /// that second validation.
+    ///
+    /// A position past the end of the source appends the empty string, which is what the copy loop
+    /// wants for a row that resolved to nowhere.
+    pub fn push_from(&mut self, source: &Self, index: usize) -> usize {
+        let bytes = source.bytes(index).unwrap_or(b"");
+        let offset = self.arena.len() as u64;
+        if bytes.len() > INLINE_LIMIT {
+            self.arena.extend_from_slice(bytes);
+        }
+        self.views.push(StringView::over(bytes, offset));
+        self.views.len() - 1
+    }
+
     /// Records a string that is already in the arena, and returns its index.
     ///
     /// The half of the seam that does the work. [`Self::over`] puts the page in, this says where in
@@ -403,6 +440,59 @@ mod tests {
         assert_eq!(column.arena(), page.as_slice());
         assert_eq!(column.heap_bytes(), page.len());
         assert_eq!(column.len(), 2);
+    }
+
+    /// Copying between two columns, which is what a gather and a slice over a string column are.
+    /// A column built over a page has an arena full of bytes no view points at, and the copy has to
+    /// take the strings rather than the arena, so the destination holds the strings and nothing
+    /// else. The last case is the row that resolved to nowhere, which is an empty string here and a
+    /// null in the validity mask beside it.
+    #[test]
+    fn copying_from_another_column_takes_the_strings_and_not_the_page_they_were_in() {
+        let page = b"HEADER..a string well past the inline limit!!short".to_vec();
+        let mut source = StringColumn::over(Buffer::from_vec(page.clone()));
+        source.push_in_place(8, 37).expect("inside the page");
+        source.push_in_place(45, 5).expect("inside the page");
+
+        let mut out = StringColumn::new();
+        assert_eq!(out.push_from(&source, 1), 0);
+        assert_eq!(out.push_from(&source, 0), 1);
+        assert_eq!(out.push_from(&source, 9), 2, "a position that is not there");
+
+        assert_eq!(out.get(0), Some("short"));
+        assert_eq!(out.get(1), Some("a string well past the inline limit!!"));
+        assert_eq!(out.get(2), Some(""));
+        assert!(out.views()[0].is_inline(), "a short string stays in its view");
+        assert!(!out.views()[1].is_inline());
+        assert_eq!(out.views()[1].prefix(), *b"a st", "the prefix is the string's own");
+        assert_eq!(
+            out.arena(),
+            b"a string well past the inline limit!!",
+            "the arena is the long strings and not the page"
+        );
+    }
+
+    /// A copy of a copy, because the second one reads its bytes out of an arena the first one wrote
+    /// rather than out of a page, and an offset written in one and read in the other is the way
+    /// this goes wrong.
+    #[test]
+    fn copying_from_a_column_that_was_itself_copied_reads_the_same_strings() {
+        let mut first = StringColumn::new();
+        for text in ["a string well past the inline limit", "short", "another long one past it"] {
+            first.push(text);
+        }
+        let mut second = StringColumn::new();
+        for index in (0..first.len()).rev() {
+            second.push_from(&first, index);
+        }
+        let mut third = StringColumn::new();
+        for index in 0..second.len() {
+            third.push_from(&second, index);
+        }
+        assert_eq!(
+            third.iter().collect::<Vec<_>>(),
+            ["another long one past it", "short", "a string well past the inline limit"]
+        );
     }
 
     /// A string short enough to live inside its view is copied into the view, which is twelve bytes
