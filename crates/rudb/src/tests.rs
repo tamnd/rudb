@@ -914,6 +914,80 @@ fn integer_division_with_a_decimal_in_it_is_a_double() {
     assert_eq!(rows(&db, run), vec![double(0.0), double(0.5), double(1.0), double(1.5)]);
 }
 
+/// Every overflow sentence, word for word and mark for mark against the pinned binary. Per #257.
+///
+/// The type is the integer the value is stored in rather than the type it was written as, a decimal
+/// prints its operands with the point taken out, an integer ends on `!` and a decimal on `;`, a
+/// decimal subtraction is called `subtract`, and a decimal multiplication ends on advice about how
+/// to get out of the overflow instead of on punctuation.
+#[test]
+fn an_overflow_says_what_duckdb_says() {
+    let db = Database::new();
+    let cases = [
+        ("127::TINYINT + 1::TINYINT", "Overflow in addition of INT8 (127 + 1)!"),
+        ("(-128)::TINYINT - 1::TINYINT", "Overflow in subtraction of INT8 (-128 - 1)!"),
+        ("127::TINYINT * 2::TINYINT", "Overflow in multiplication of INT8 (127 * 2)!"),
+        ("32767::SMALLINT + 1::SMALLINT", "Overflow in addition of INT16 (32767 + 1)!"),
+        ("2147483647::INTEGER + 1::INTEGER", "Overflow in addition of INT32 (2147483647 + 1)!"),
+        (
+            "9223372036854775807::BIGINT + 1::BIGINT",
+            "Overflow in addition of INT64 (9223372036854775807 + 1)!",
+        ),
+        ("255::UTINYINT + 1::UTINYINT", "Overflow in addition of UINT8 (255 + 1)!"),
+        ("65535::USMALLINT + 1::USMALLINT", "Overflow in addition of UINT16 (65535 + 1)!"),
+        ("4294967295::UINTEGER + 1::UINTEGER", "Overflow in addition of UINT32 (4294967295 + 1)!"),
+        (
+            "18446744073709551615::UBIGINT + 1::UBIGINT",
+            "Overflow in addition of UINT64 (18446744073709551615 + 1)!",
+        ),
+        (
+            "170141183460469231731687303715884105727::HUGEINT + 1::HUGEINT",
+            "Overflow in addition of INT128 (170141183460469231731687303715884105727 + 1)!",
+        ),
+        (
+            "99999999999999999999999999999999999999::DECIMAL(38,0) + 1::DECIMAL(38,0)",
+            "Overflow in addition of DECIMAL(38) (99999999999999999999999999999999999999 + 1);",
+        ),
+        (
+            "(-99999999999999999999999999999999999999)::DECIMAL(38,0) - 1::DECIMAL(38,0)",
+            "Overflow in subtract of DECIMAL(38) (-99999999999999999999999999999999999999 - 1);",
+        ),
+        (
+            "9999999999.99::DECIMAL(38,2) * 9999999999999999999999999999.99::DECIMAL(38,2)",
+            concat!(
+                "Overflow in multiplication of DECIMAL(38) ",
+                "(999999999999 * 999999999999999999999999999999). ",
+                "You might want to add an explicit cast to a decimal with a smaller scale.",
+            ),
+        ),
+        (
+            "9999999999.9999::DECIMAL(18,4) * 99999999.9999::DECIMAL(18,4)",
+            concat!(
+                "Overflow in multiplication of DECIMAL(18) (99999999999999 * 999999999999). ",
+                "You might want to add an explicit cast to a bigger decimal.",
+            ),
+        ),
+        ("abs((-2147483648)::INTEGER)", "Overflow on abs(-2147483648)"),
+        ("abs((-32768)::SMALLINT)", "Overflow on abs(-32768)"),
+        ("abs((-9223372036854775808)::BIGINT)", "Overflow on abs(-9223372036854775808)"),
+    ];
+    for (expression, expected) in cases {
+        assert_eq!(failure(&db, &format!("SELECT {expression}")), expected, "{expression}");
+    }
+    // The vectorized loop, which is a second copy of each of these messages and has to say the same
+    // thing. One operand comes out of a column so that the constant folder leaves the row alone.
+    let one = "FROM range(1, 2) t(a)";
+    let sql = format!("SELECT 127::TINYINT + a::TINYINT {one}");
+    assert_eq!(failure(&db, &sql), "Overflow in addition of INT8 (127 + 1)!");
+    let big = "99999999999999999999999999999999999999::DECIMAL(38,0)";
+    let sql = format!("SELECT {big} + a::DECIMAL(38,0) {one}");
+    let expected =
+        "Overflow in addition of DECIMAL(38) (99999999999999999999999999999999999999 + 1);";
+    assert_eq!(failure(&db, &sql), expected);
+    let sql = "SELECT abs(a::INTEGER) FROM range(-2147483648, -2147483647) t(a)";
+    assert_eq!(failure(&db, sql), "Overflow on abs(-2147483648)");
+}
+
 /// The sum of the two largest `DECIMAL(18,0)` values, which does not fit in a `DECIMAL(18,0)`.
 ///
 /// It used to raise `Out of Range Error: Overflow in addition`, because the result kept the

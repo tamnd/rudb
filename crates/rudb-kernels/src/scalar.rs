@@ -283,12 +283,13 @@ fn sign_of(
                                     out[index] = answer;
                                     Ok(true)
                                 }
-                                None => Err(overflow(
+                                None if negating => Err(overflow(
                                     Op::Subtract,
                                     returns,
                                     &Value::Integer(0),
                                     &arg.value_at(index),
                                 )),
+                                None => Err(abs_overflow(&arg.value_at(index))),
                             }
                         })?;
                         finish(returns, Data::$variant(out.into()), validity)
@@ -1323,12 +1324,100 @@ impl Op {
     }
 }
 
+/// The overflow message, which is DuckDB's sentence down to the punctuation on the end.
+///
+/// There is more shape to it than there looks. The type is the physical integer rather than the SQL
+/// name, a decimal prints its operands unscaled, an integer ends the sentence on `!` and a decimal
+/// on `;`, a decimal subtraction is called `subtract` where everything else is called by the noun,
+/// and a decimal multiplication ends on a hint instead of punctuation. All of it was measured
+/// against the pinned binary, and every arithmetic message in the engine comes through here so
+/// there is one place to keep it right.
 fn overflow(op: Op, ty: &LogicalType, left: &Value, right: &Value) -> Error {
+    let decimal = matches!(ty, LogicalType::Decimal { .. });
+    let (left, right) = if decimal {
+        (unscaled(left), unscaled(right))
+    } else {
+        (left.to_string(), right.to_string())
+    };
+    let word = if decimal && matches!(op, Op::Subtract) { "subtract" } else { op.word() };
     Error::out_of_range(format!(
-        "Overflow in {} of {ty} ({left} {} {right})!",
-        op.word(),
-        op.symbol()
+        "Overflow in {word} of {} ({left} {} {right}){}",
+        physical(ty),
+        op.symbol(),
+        ending(op, ty)
     ))
+}
+
+/// `abs` says it differently: `Overflow on abs(-2147483648)`, with no type in it and no punctuation
+/// on the end.
+fn abs_overflow(value: &Value) -> Error {
+    Error::out_of_range(format!("Overflow on abs({value})"))
+}
+
+/// The digits a decimal holds, rather than the number it means.
+///
+/// Upstream says `(999999999999 * 999999999999)` for a pair of DECIMAL(38,2) values, so the point
+/// is gone from the operands the same way the scale is gone from the type name.
+fn unscaled(value: &Value) -> String {
+    match value {
+        Value::Decimal { unscaled, .. } => unscaled.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The name the message gives a type, which is the integer it is stored in rather than the type it
+/// is written as: `INT32` for an INTEGER, `UINT16` for a USMALLINT, and `DECIMAL(18)` for a
+/// DECIMAL(18,8), carrying the width of the storage and not the width that was declared.
+fn physical(ty: &LogicalType) -> String {
+    let name = match ty {
+        LogicalType::TinyInt => "INT8",
+        LogicalType::SmallInt => "INT16",
+        LogicalType::Integer => "INT32",
+        LogicalType::BigInt => "INT64",
+        LogicalType::HugeInt => "INT128",
+        LogicalType::UTinyInt => "UINT8",
+        LogicalType::USmallInt => "UINT16",
+        LogicalType::UInteger => "UINT32",
+        LogicalType::UBigInt => "UINT64",
+        LogicalType::UHugeInt => "UINT128",
+        LogicalType::Decimal { width, .. } => return format!("DECIMAL({})", storage_width(*width)),
+        other => return other.to_string(),
+    };
+    name.to_string()
+}
+
+/// The widest decimal the integer behind this one holds.
+///
+/// A decimal is stored in the narrowest of `i16`, `i32`, `i64` and `i128` that fits its width, and
+/// the message names the bucket rather than the declaration, so a DECIMAL(18,8) and a DECIMAL(11,0)
+/// are both `DECIMAL(18)`. The two wide buckets were measured. The two narrow ones follow the same
+/// rule and are hard to reach, since a decimal that narrow widens before it can overflow.
+fn storage_width(width: u8) -> u8 {
+    match width {
+        0..=4 => 4,
+        5..=9 => 9,
+        10..=18 => 18,
+        _ => 38,
+    }
+}
+
+/// What the sentence ends on.
+///
+/// A decimal multiplication ends on advice rather than punctuation, and which advice depends on
+/// whether there is a wider decimal to move to. At 38 digits there is not one, so the only way out
+/// is to give up scale.
+fn ending(op: Op, ty: &LogicalType) -> &'static str {
+    let width = match ty {
+        LogicalType::Decimal { width, .. } => storage_width(*width),
+        _ => return "!",
+    };
+    match op {
+        Op::Multiply if width == 38 => {
+            ". You might want to add an explicit cast to a decimal with a smaller scale."
+        }
+        Op::Multiply => ". You might want to add an explicit cast to a bigger decimal.",
+        _ => ";",
+    }
 }
 
 fn arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> Result<Value> {
@@ -1522,7 +1611,7 @@ fn absolute(value: &Value, ty: &LogicalType) -> Result<Value> {
             Some(whole) => whole
                 .checked_abs()
                 .and_then(|positive| fit(positive, ty))
-                .ok_or_else(|| overflow(Op::Subtract, ty, &Value::Integer(0), value)),
+                .ok_or_else(|| abs_overflow(value)),
             None => Err(Error::not_implemented(format!("abs of a {}", value.logical_type()))),
         },
     }
@@ -1622,7 +1711,7 @@ mod tests {
         let error =
             call_values("+", &[Value::Integer(i32::MAX), Value::Integer(1)], &LogicalType::Integer)
                 .expect_err("2147483647 + 1 is not an integer");
-        assert!(error.message().contains("Overflow in addition of INTEGER"), "{error}");
+        assert_eq!(error.message(), "Overflow in addition of INT32 (2147483647 + 1)!");
     }
 
     /// DuckDB returns null here where Postgres raises, and this is the line that records it.
