@@ -289,4 +289,40 @@ mod tests {
         let once = pruned(before);
         assert_eq!(pruned(&once), once);
     }
+
+    #[test]
+    fn the_columns_that_stay_keep_the_order_the_scan_had_them_in() {
+        // Not the order the query named them in. A reader that had to seek backwards through a
+        // Parquet file because the plan asked for column 40 before column 3 would read the same
+        // bytes in a worse order.
+        let before = "Project #1 [#0.3::VARCHAR AS d, #0.1::INTEGER AS b]\n  Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER, c::INTEGER, d::VARCHAR]\n";
+        let after = "Project #1 [#0.1::VARCHAR AS d, #0.0::INTEGER AS b]\n  Get memory.main.t AS t #0 [b::INTEGER, d::VARCHAR]\n";
+        assert_eq!(pruned(before), after);
+    }
+
+    #[test]
+    fn a_column_only_a_sort_key_reads_is_kept() {
+        // `ORDER BY` on a column the query does not select. It never reaches the output and it is
+        // still read, so the walk has to go through the sort keys and not only the projection.
+        let before = "Project #1 [#0.0::INTEGER AS a]\n  Sort [#0.2::INTEGER DESC NULLS LAST]\n    Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER, c::INTEGER]\n";
+        let after = "Project #1 [#0.0::INTEGER AS a]\n  Sort [#0.1::INTEGER DESC NULLS LAST]\n    Get memory.main.t AS t #0 [a::INTEGER, c::INTEGER]\n";
+        assert_eq!(pruned(before), after);
+    }
+
+    #[test]
+    fn a_column_buried_inside_an_expression_is_found_the_same_as_a_bare_one() {
+        // The leaves are what count, however many layers of function call and CASE are on top of
+        // them, which is what makes the expression walk recursive rather than a look at the roots.
+        let before = "Project #1 [upper(CASE WHEN (#0.2::INTEGER > 3::INTEGER)::BOOLEAN THEN #0.0::VARCHAR ELSE ''::VARCHAR END::VARCHAR)::VARCHAR AS a]\n  Get memory.main.t AS t #0 [a::VARCHAR, b::VARCHAR, c::INTEGER]\n";
+        let after = "Project #1 [upper(CASE WHEN (#0.1::INTEGER > 3::INTEGER)::BOOLEAN THEN #0.0::VARCHAR ELSE ''::VARCHAR END::VARCHAR)::VARCHAR AS a]\n  Get memory.main.t AS t #0 [a::VARCHAR, c::INTEGER]\n";
+        assert_eq!(pruned(before), after);
+    }
+
+    #[test]
+    fn a_values_list_keeps_its_columns_even_when_nothing_reads_them() {
+        // On purpose rather than by omission. The rows are already in the plan, so narrowing one
+        // saves reading nothing and would cost a rewrite of every row.
+        let text = "Project #1 [#0.0::BIGINT AS a]\n  Values #0 [a::BIGINT, b::BIGINT] rows=[[1::BIGINT, 2::BIGINT], [3::BIGINT, 4::BIGINT]]\n";
+        assert_eq!(pruned(text), text);
+    }
 }
