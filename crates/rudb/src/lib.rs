@@ -84,6 +84,11 @@
 //! which is the difference between a harness that reports a result for a file and a harness that
 //! reports nothing because the process died.
 //!
+//! There is a budget without anybody setting one. It is eighty percent of what the machine has, the
+//! way DuckDB's is, and [`Config::memory_limit`] says what it is on this machine and what to do to
+//! turn it off. The default is the whole point of the error: a limit that has to be typed is a limit
+//! that is not there on the machine where the query went wrong.
+//!
 //! ```
 //! use rudb::{Config, Database};
 //!

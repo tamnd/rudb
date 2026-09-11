@@ -313,7 +313,10 @@ fn version_and_help_and_config_print_and_stop() {
     assert!(out.contains("vector-size: 1024"), "{out}");
     // The settings a run can change come from the config object rather than from a literal in the
     // shell, so that what this prints is what the engine was opened with.
-    assert!(out.contains("memory-limit: unlimited"), "{out}");
+    // Eighty percent of what the machine has, so the number is the machine's and not a literal,
+    // and what is asserted is that a budget was read and printed rather than which one.
+    assert!(out.contains("memory-limit: "), "{out}");
+    assert!(!out.contains("memory-limit: unlimited"), "{out}");
     assert!(out.contains("query-timeout: none"), "{out}");
     assert!(out.contains("threads: "), "{out}");
 }

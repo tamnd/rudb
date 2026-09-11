@@ -957,7 +957,11 @@ fn a_database_remembers_what_it_was_opened_with() {
 fn a_database_opened_the_plain_way_has_the_defaults() {
     let db = Database::new();
     assert_eq!(db.config(), Config::default());
-    assert_eq!(db.config().memory_limit(), None);
+    // Eighty percent of the machine, so the number belongs to the machine and what is asserted is
+    // that the database took it. The one it must not be is no limit, since that is the state where
+    // a runaway query is stopped by the allocator and takes the process with it. See #219.
+    assert_eq!(db.config().memory_limit(), rudb_io::default_memory_limit());
+    assert_eq!(db.memory().limit(), db.config().memory_limit());
 }
 
 /// The query that runs long enough to be stopped, which is a count nobody waits for.
@@ -1077,8 +1081,9 @@ fn a_result_holds_its_bytes_until_it_is_dropped() {
 
 #[test]
 fn a_database_with_no_limit_counts_what_it_holds_anyway() {
-    // So that a program can watch the number before it decides what limit to set.
-    let db = Database::new();
+    // So that a program can watch the number before it decides what limit to set. It has to ask for
+    // no limit now, because a database opened the plain way has one.
+    let db = Database::with_config(Config::new().with_no_memory_limit());
     let result = db.query("SELECT * FROM range(1000)").unwrap();
     assert_eq!(db.memory().limit(), None);
     assert_eq!(db.memory().used(), result.footprint());
@@ -1123,7 +1128,8 @@ fn a_pass_that_nobody_has_is_refused_by_the_statement_that_named_it() {
 
 #[test]
 fn set_memory_limit_moves_the_budget_the_queries_after_it_are_held_to() {
-    let db = Database::new();
+    // Opened with no limit so that the reset at the end has one unambiguous thing to go back to.
+    let db = Database::with_config(Config::new().with_no_memory_limit());
     assert_eq!(db.memory().limit(), None);
     db.execute("SET memory_limit = '1GiB'").unwrap();
     assert_eq!(db.memory().limit(), Some(1 << 30));
