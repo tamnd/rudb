@@ -1116,6 +1116,7 @@ impl<'a> Transform<'a> {
                 "CastExpression" => return self.cast(node),
                 "CaseExpression" => return self.case(node),
                 "ParenthesisExpression" => return self.row(node),
+                "BoundedListExpression" => return self.list(node),
                 "SubqueryExpression" => return self.subquery(node),
                 _ if count == 1 => node = self.first(node),
                 _ => return self.unsupported(node),
@@ -1572,6 +1573,19 @@ impl<'a> Transform<'a> {
         Ok(self.push(Expr::Row { items }))
     }
 
+    /// `BoundedListExpression <- '[' List(Expression)? ']'`, which is a LIST value.
+    ///
+    /// One item is a list of one here, unlike the parenthesised form, because the brackets are what
+    /// say list and there is nothing else `[a]` could mean.
+    fn list(&mut self, node: u32) -> Result<ExprRef> {
+        let mut items = Vec::new();
+        for kid in self.kids(node) {
+            items.push(self.expr(kid)?);
+        }
+        let items = self.expr_slice(items);
+        Ok(self.push(Expr::List { items }))
+    }
+
     /// `SubqueryExpression <- SubqueryNot? SubqueryExists? SubqueryReference`.
     fn subquery(&mut self, node: u32) -> Result<ExprRef> {
         if self.find(node, "SubqueryNot") != NONE || self.find(node, "SubqueryExists") != NONE {
@@ -1690,6 +1704,7 @@ mod tests {
                 let not = if negated { "NOT " } else { "" };
                 format!("({not}{} IN [{}])", show(ast, operand), list(items))
             }
+            Expr::List { items } => format!("[{}]", list(items)),
             Expr::Row { items } => format!("ROW({})", list(items)),
             Expr::Subquery { query } => format!("({})", show_query(ast, query)),
         }
@@ -2096,6 +2111,16 @@ mod tests {
     fn a_parenthesised_single_expression_is_not_a_row() {
         assert_eq!(round("SELECT (a)"), "SELECT a");
         assert_eq!(round("SELECT (a, b)"), "SELECT ROW(a, b)");
+    }
+
+    #[test]
+    fn a_bracketed_list_is_a_list_of_however_many_items_were_written() {
+        // One item is a list of one, which is where this parts company with the parenthesised form
+        // above: `(a)` is `a` and `[a]` is a list, because the brackets are what say list.
+        assert_eq!(round("SELECT [a]"), "SELECT [a]");
+        assert_eq!(round("SELECT [1, 2, 3]"), "SELECT [1, 2, 3]");
+        assert_eq!(round("SELECT []"), "SELECT []");
+        assert_eq!(round("SELECT ['a.parquet', 'b.parquet']"), "SELECT ['a.parquet', 'b.parquet']");
     }
 
     #[test]
