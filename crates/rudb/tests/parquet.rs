@@ -1,4 +1,5 @@
-//! `read_parquet` from SQL, which is the first query rudb answers out of a file on disk.
+//! `read_parquet` from SQL, which is the first query rudb answers out of a file on disk, and the
+//! replacement scan that lets the same file be written where a table name goes.
 //!
 //! The fixture is `rudb-parquet`'s, referred to across the workspace rather than copied, because two
 //! copies of a binary file are two things to keep in step and a test that reads the stale one passes
@@ -141,6 +142,62 @@ fn a_path_that_is_not_a_string_does_not_become_one() {
     let database = Database::new();
     let error = database.query("SELECT * FROM read_parquet(3)").unwrap_err();
     assert!(error.message().contains("read_parquet(INTEGER)"), "{error}");
+}
+
+#[test]
+fn a_file_name_where_a_table_name_goes_reads_the_file() {
+    let database = Database::new();
+    let sql = format!("SELECT count(*) FROM {}", fixture());
+    assert_eq!(database.value(&sql).expect("runs"), Value::BigInt(4096));
+}
+
+#[test]
+fn a_double_quoted_file_name_is_the_same_file_as_a_single_quoted_one() {
+    let database = Database::new();
+    let quoted = fixture().replace('\'', "\"");
+    let sql = format!("SELECT count(*) FROM {quoted}");
+    assert_eq!(database.value(&sql).expect("runs"), Value::BigInt(4096));
+}
+
+#[test]
+fn the_columns_of_a_replaced_file_answer_to_the_stem_of_its_name() {
+    // Not to the path, which has a slash and a dot in it and could not be written as a name.
+    let database = Database::new();
+    let sql = format!("SELECT mixed.a FROM {} LIMIT 1", fixture());
+    assert_eq!(database.value(&sql).expect("runs"), Value::Integer(0));
+}
+
+#[test]
+fn an_alias_on_a_replaced_file_is_what_the_columns_answer_to_instead() {
+    let database = Database::new();
+    let sql = format!("SELECT p.a FROM {} AS p LIMIT 1", fixture());
+    assert_eq!(database.value(&sql).expect("runs"), Value::Integer(0));
+}
+
+#[test]
+fn a_table_of_that_name_is_read_before_a_file_of_that_name() {
+    let mut database = Database::new();
+    let name = fixture().replace('\'', "\"");
+    database.execute(&format!("CREATE TABLE {name} (x INTEGER)")).expect("creates");
+    let sql = format!("SELECT count(*) FROM {}", fixture());
+    assert_eq!(database.value(&sql).expect("runs"), Value::BigInt(0));
+}
+
+#[test]
+fn a_name_that_is_not_a_parquet_file_is_still_a_table_that_does_not_exist() {
+    let database = Database::new();
+    let error = database.query("SELECT * FROM 'notes.txt'").unwrap_err();
+    assert_eq!(error.message(), "Table with name notes.txt does not exist!");
+}
+
+#[test]
+fn a_parquet_file_that_is_not_there_is_the_file_error_and_not_the_table_one() {
+    let database = Database::new();
+    let error = database.query("SELECT * FROM '/nowhere/at/all.parquet'").unwrap_err();
+    assert_eq!(
+        error.message(),
+        "No files found that match the pattern \"/nowhere/at/all.parquet\""
+    );
 }
 
 #[test]
