@@ -1,10 +1,12 @@
 //! `CREATE VIEW`, from both ends: the catalog rules and what a view does when it is selected from.
 //!
-//! Every sentence asserted here was read off duckdb v1.5.1 on server2 rather than decided here, and
-//! the awkward ones are awkward because the binary is. A collision names the type being created and
-//! not the type already there. A drop of the wrong type says which is which even under `IF EXISTS`.
-//! A short column list renames a prefix rather than being an error, and a long one is refused. And
-//! an insert into a view says `is not an table`, article and all.
+//! Every sentence asserted here was read off the pinned duckdb on server2 rather than decided here,
+//! which is v2.0.0-dev84237 at cc7e7bac7f, the commit the grammar is vendored from. The awkward ones
+//! are awkward because the binary is. A collision names the type that is already there. A drop of
+//! the wrong type says which is which even under `IF EXISTS`, and quotes the name. A short column
+//! list renames a prefix rather than being an error, and a long one is refused. An insert into a
+//! view says `is not an table`, article and all. And a view that expands forever comes back with its
+//! name double quoted twice over.
 //!
 //! The last test is the reason the rest of them exist. `CREATE VIEW hits AS SELECT * FROM
 //! read_parquet(...)` is what lets a published benchmark query that says `FROM hits` run against
@@ -44,8 +46,8 @@ fn a_view_answers_with_the_rows_its_body_produces() {
 #[test]
 fn a_view_is_bound_again_at_every_reference_rather_than_frozen_when_it_was_made() {
     // The measured behaviour, and the whole reason the catalog keeps the text instead of a plan.
-    // duckdb v1.5.1 answers a view over `SELECT * FROM t` with a column that was added to `t` after
-    // the view was created, so the star is expanded when the view is read and not when it is made.
+    // duckdb answers a view over `SELECT * FROM t` with a column that was added to `t` after the
+    // view was created, so the star is expanded when the view is read and not when it is made.
     let database = ran(&[
         "CREATE TABLE t (i INTEGER)",
         "INSERT INTO t VALUES (1)",
@@ -74,16 +76,17 @@ fn a_view_over_a_table_that_was_never_there_is_refused_when_it_is_made() {
 }
 
 #[test]
-fn a_view_and_a_table_are_one_namespace_and_the_message_names_what_was_being_made() {
-    // Backwards to read and this is what the binary says. Making a table over an existing view says
-    // Table, and making a view over an existing table says View.
+fn a_view_and_a_table_are_one_namespace_and_the_message_names_what_is_already_there() {
+    // The type in the sentence is the one in the way, not the one being made. It was the other way
+    // round in v1.5.1 and upstream changed it, which is an argument for pinning the reference binary
+    // to the vendored commit and not to whatever is released.
     assert_eq!(
         refused(&["CREATE VIEW v AS SELECT 1"], "CREATE TABLE v (i INTEGER)"),
-        "Catalog Error: Table with name \"v\" already exists!"
+        "Catalog Error: View with name \"v\" already exists!"
     );
     assert_eq!(
         refused(&["CREATE TABLE t (i INTEGER)"], "CREATE VIEW t AS SELECT 1"),
-        "Catalog Error: View with name \"t\" already exists!"
+        "Catalog Error: Table with name \"t\" already exists!"
     );
     assert_eq!(
         refused(&["CREATE VIEW v AS SELECT 1"], "CREATE VIEW v AS SELECT 2"),
@@ -95,16 +98,16 @@ fn a_view_and_a_table_are_one_namespace_and_the_message_names_what_was_being_mad
 fn dropping_one_as_the_other_says_which_is_which_even_under_if_exists() {
     assert_eq!(
         refused(&["CREATE VIEW v AS SELECT 1"], "DROP TABLE v"),
-        "Catalog Error: Existing object v is of type View, trying to drop type Table"
+        "Catalog Error: Existing object \"v\" is of type View, trying to drop type Table"
     );
     assert_eq!(
         refused(&["CREATE TABLE t (i INTEGER)"], "DROP VIEW t"),
-        "Catalog Error: Existing object t is of type Table, trying to drop type View"
+        "Catalog Error: Existing object \"t\" is of type Table, trying to drop type View"
     );
     // `IF EXISTS` is about the name not being there, not about it being something else.
     assert_eq!(
         refused(&["CREATE VIEW v AS SELECT 1"], "DROP TABLE IF EXISTS v"),
-        "Catalog Error: Existing object v is of type View, trying to drop type Table"
+        "Catalog Error: Existing object \"v\" is of type View, trying to drop type Table"
     );
 }
 
@@ -112,7 +115,29 @@ fn dropping_one_as_the_other_says_which_is_which_even_under_if_exists() {
 fn a_dropped_view_is_gone_and_dropping_one_that_never_was_is_fine_under_if_exists() {
     let database = ran(&["CREATE VIEW v AS SELECT 1", "DROP VIEW v", "DROP VIEW IF EXISTS v"]);
     let error = database.query("SELECT * FROM v").expect_err("it is gone");
+    // A read says table whatever the name might have been, because a query asking for `v` is asking
+    // for something to read and does not care which of the two it would have been.
     assert_eq!(error.to_string(), "Catalog Error: Table with name v does not exist!");
+    // A drop says which of the two it was dropping, because `DROP VIEW` said so.
+    assert_eq!(
+        refused(&[], "DROP VIEW gone"),
+        "Catalog Error: View with name gone does not exist!"
+    );
+    assert_eq!(
+        refused(&[], "DROP TABLE gone"),
+        "Catalog Error: Table with name gone does not exist!"
+    );
+}
+
+#[test]
+fn or_replace_and_if_not_exists_in_one_statement_is_refused_by_the_parser() {
+    // duckdb has no create rule with room for both and says so before it binds anything. The
+    // vendored grammar has room for both, so rudb refuses it at the same stage with the same
+    // sentence, and the same sentence covers the table form.
+    let sentence = "Parser Error: Cannot specify both OR REPLACE and IF NOT EXISTS within single \
+                    create statement";
+    assert_eq!(refused(&[], "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT 1"), sentence);
+    assert_eq!(refused(&[], "CREATE OR REPLACE TABLE IF NOT EXISTS t (i INTEGER)"), sentence);
 }
 
 #[test]
@@ -170,7 +195,7 @@ fn a_view_that_would_expand_forever_says_so_rather_than_running_out_of_stack() {
     );
     assert_eq!(
         error,
-        "Binder Error: infinite recursion detected: attempting to recursively bind view \"a\""
+        "Binder Error: infinite recursion detected: attempting to recursively bind view \"\"a\"\""
     );
 }
 

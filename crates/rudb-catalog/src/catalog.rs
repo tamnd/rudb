@@ -39,7 +39,7 @@ impl Database {
 /// Tables and views share one namespace, so a lookup that only asked about tables would answer that
 /// `v` does not exist when what is true is that `v` is a view. Every message that tells those two
 /// apart is spelled with this, and the spelling is the binary's: `Table` and `View`, capitalised,
-/// in sentences such as `Existing object v is of type View, trying to drop type Table`.
+/// in sentences such as `Existing object "v" is of type View, trying to drop type Table`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
     /// A table, which holds rows.
@@ -195,8 +195,8 @@ impl Catalog {
     pub fn create_table(&mut self, name: QualifiedName, columns: Vec<Field>) -> Result<()> {
         let table = Table::new(name.clone(), columns)?;
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
-        if schema.kind(&name.table).is_some() {
-            return Err(taken(Entry::Table, &name.table));
+        if let Some(found) = schema.kind(&name.table) {
+            return Err(taken(found, &name.table));
         }
         schema.tables.push(table);
         Ok(())
@@ -214,8 +214,8 @@ impl Catalog {
     pub fn create_view(&mut self, view: View) -> Result<()> {
         let name = view.name().clone();
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
-        if schema.kind(&name.table).is_some() {
-            return Err(taken(Entry::View, &name.table));
+        if let Some(found) = schema.kind(&name.table) {
+            return Err(taken(found, &name.table));
         }
         schema.views.push(view);
         Ok(())
@@ -244,9 +244,11 @@ impl Catalog {
     fn drop_entry(&mut self, name: &QualifiedName, wanted: Entry) -> Result<()> {
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
         match schema.kind(&name.table) {
-            None => Err(missing_table(&name.table)),
+            // The type in this one is the type being dropped, so `DROP VIEW gone` is a missing view
+            // and `DROP TABLE gone` is a missing table over the same absent name.
+            None => Err(missing(wanted, &name.table)),
             Some(found) if found != wanted => Err(Error::catalog(format!(
-                "Existing object {} is of type {found}, trying to drop type {wanted}",
+                "Existing object \"{}\" is of type {found}, trying to drop type {wanted}",
                 name.table
             ))),
             Some(Entry::Table) => {
@@ -329,18 +331,42 @@ impl Catalog {
     ///
     /// If the name has no parts or more than three, or if it does not resolve to either.
     pub fn resolve(&self, parts: &[&str]) -> Result<QualifiedName> {
+        self.resolve_as(parts, Entry::Table)
+    }
+
+    /// The same as [`Catalog::resolve`], except that a name which is not there is reported as a
+    /// missing `wanted` rather than as a missing table.
+    ///
+    /// A statement that says which of the two it meant gets to say it in the complaint, so `DROP
+    /// VIEW gone` is a missing view and `DROP TABLE gone` is a missing table over the same absent
+    /// name. A statement that does not say, such as a read, is resolving a table as far as the
+    /// message is concerned, which is why plain `resolve` passes [`Entry::Table`].
+    ///
+    /// # Errors
+    ///
+    /// If the name has no parts or more than three, or if it does not resolve to either.
+    pub fn resolve_as(&self, parts: &[&str], wanted: Entry) -> Result<QualifiedName> {
         let candidates = self.candidates(parts)?;
         let mut first_error = None;
         for candidate in &candidates {
-            match self.entry(candidate) {
-                Ok(Entry::Table) => return Ok(self.table(candidate)?.name().clone()),
-                Ok(Entry::View) => return Ok(self.view(candidate)?.name().clone()),
+            let held = match self.schema(&candidate.catalog, &candidate.schema) {
+                Ok(schema) => schema.kind(&candidate.table),
                 // The first reading is the preferred one, so its complaint is the one that names
                 // the piece the writer most likely meant and got wrong.
-                Err(error) => first_error = first_error.or(Some(error)),
+                Err(error) => {
+                    first_error = first_error.or(Some(error));
+                    continue;
+                }
+            };
+            match held {
+                Some(Entry::Table) => return Ok(self.table(candidate)?.name().clone()),
+                Some(Entry::View) => return Ok(self.view(candidate)?.name().clone()),
+                None => {
+                    first_error = first_error.or_else(|| Some(missing(wanted, &candidate.table)));
+                }
             }
         }
-        Err(first_error.unwrap_or_else(|| missing_table(&parts.join("."))))
+        Err(first_error.unwrap_or_else(|| missing(wanted, &parts.join("."))))
     }
 
     /// The full name a `CREATE` of this written name would make, without requiring it to exist.
@@ -423,14 +449,27 @@ fn missing_table(name: &str) -> Error {
     Error::catalog(format!("Table with name {name} does not exist!"))
 }
 
+/// The error for a name that is not there, named after what was being looked for.
+///
+/// A read says table whatever the name turns out to be, because a query that reads from `v` is
+/// asking for a table and does not know or care that `v` could have been a view. A drop says which
+/// of the two it was dropping, because `DROP VIEW` said so.
+fn missing(wanted: Entry, name: &str) -> Error {
+    Error::catalog(format!("{wanted} with name {name} does not exist!"))
+}
+
 /// The error for creating something over a name that is already taken.
 ///
-/// The type in the sentence is the one being created rather than the one already there, which reads
-/// backwards and is what the binary says. `CREATE TABLE v` over an existing view `v` is `Table with
-/// name "v" already exists!` and `CREATE VIEW t` over an existing table `t` is `View with name "t"
-/// already exists!`, both measured against duckdb v1.5.1.
-fn taken(wanted: Entry, name: &str) -> Error {
-    Error::catalog(format!("{wanted} with name \"{name}\" already exists!"))
+/// The type in the sentence is the one that is already there, not the one being created. `CREATE
+/// TABLE v` over an existing view `v` is `View with name "v" already exists!` and `CREATE VIEW t`
+/// over an existing table `t` is `Table with name "t" already exists!`, both measured against
+/// v2.0.0-dev84237 at cc7e7bac7f, which is the commit the grammar is vendored from.
+///
+/// It went the other way round in v1.5.1, where the sentence named the type being created. That
+/// reads backwards and upstream changed it, which is the argument for pinning the reference to the
+/// vendored commit rather than to whatever is released.
+fn taken(found: Entry, name: &str) -> Error {
+    Error::catalog(format!("{found} with name \"{name}\" already exists!"))
 }
 
 #[cfg(test)]
@@ -582,7 +621,7 @@ mod tests {
                 vec![Field::new("n", LogicalType::Integer)],
             )
             .expect_err("recent is a view");
-        assert_eq!(error.to_string(), "Catalog Error: Table with name \"recent\" already exists!");
+        assert_eq!(error.to_string(), "Catalog Error: View with name \"recent\" already exists!");
 
         let error = catalog
             .create_view(View::new(
@@ -591,7 +630,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect_err("hits is a table");
-        assert_eq!(error.to_string(), "Catalog Error: View with name \"HITS\" already exists!");
+        assert_eq!(error.to_string(), "Catalog Error: Table with name \"HITS\" already exists!");
     }
 
     #[test]
@@ -601,13 +640,13 @@ mod tests {
         let error = catalog.drop_table(&view).expect_err("it is a view");
         assert_eq!(
             error.to_string(),
-            "Catalog Error: Existing object recent is of type View, trying to drop type Table"
+            "Catalog Error: Existing object \"recent\" is of type View, trying to drop type Table"
         );
         let table = catalog.resolve(&["hits"]).expect("the table");
         let error = catalog.drop_view(&table).expect_err("it is a table");
         assert_eq!(
             error.to_string(),
-            "Catalog Error: Existing object hits is of type Table, trying to drop type View"
+            "Catalog Error: Existing object \"hits\" is of type Table, trying to drop type View"
         );
         catalog.drop_view(&view).expect("dropping it as what it is");
         assert!(catalog.resolve(&["recent"]).is_err(), "it is gone");
