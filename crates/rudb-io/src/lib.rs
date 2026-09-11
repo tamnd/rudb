@@ -42,16 +42,18 @@
 
 #![deny(unsafe_code)]
 
+pub mod glob;
 pub mod pool;
 pub mod real;
 pub mod sim;
 pub mod submit;
 
 use std::fmt::Debug;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rudb_common::Result;
 
+pub use glob::expand;
 pub use pool::{Config, Pool, Pooled, Stats};
 pub use real::RealFilesystem;
 pub use sim::{Completions, Crash, Op, SimFilesystem};
@@ -201,6 +203,24 @@ pub trait Filesystem: Debug + Send + Sync {
 
     /// Whether a path exists.
     fn exists(&self, path: &Path) -> bool;
+
+    /// Whether a path is a directory.
+    ///
+    /// Separate from [`Filesystem::exists`] because a pattern walk has to tell the two apart:
+    /// `data/*` matches a directory and a file alike and only one of them can be read as a table.
+    fn is_dir(&self, path: &Path) -> bool;
+
+    /// What is directly inside a directory, as whole paths rather than as names.
+    ///
+    /// The order is whatever the filesystem gives, which is not an order. Anything that shows a
+    /// caller more than one of these sorts them, because a directory's own layout differs between
+    /// two machines holding the same files.
+    ///
+    /// # Errors
+    ///
+    /// If the directory cannot be read. A path that is not a directory is the caller's mistake and
+    /// is an error here rather than an empty list.
+    fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
 
     /// Deletes a file.
     ///

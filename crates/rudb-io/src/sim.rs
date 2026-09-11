@@ -506,6 +506,30 @@ impl Filesystem for SimFilesystem {
         inner.files.contains_key(path) || inner.dirs.contains(path)
     }
 
+    fn is_dir(&self, path: &Path) -> bool {
+        let inner = self.lock();
+        inner.dirs.contains(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let inner = self.lock();
+        if !inner.dirs.contains(path) {
+            return Err(Error::io(format!("{} is not a directory", path.display())));
+        }
+        // Not recorded in the operation log. The log is what the crash tests replay and a listing
+        // changes nothing, so an entry for it would be a line every test that lists has to expect.
+        let mut found: Vec<PathBuf> = inner
+            .files
+            .keys()
+            .chain(inner.dirs.iter())
+            .filter(|entry| entry.parent() == Some(path))
+            .cloned()
+            .collect();
+        found.sort();
+        found.dedup();
+        Ok(found)
+    }
+
     fn remove(&self, path: &Path) -> Result<()> {
         let mut inner = self.lock();
         inner.record(Op::Remove { path: path.to_path_buf() })?;
