@@ -31,7 +31,13 @@ pub(crate) fn nulls_of(vector: &Vector) -> Validity {
         Validity::AllValid => Validity::AllValid,
         Validity::AllInvalid if codes.is_empty() => Validity::AllValid,
         Validity::AllInvalid => Validity::AllInvalid,
-        inner => Validity::from_iter(codes.len(), |index| inner.is_valid(codes[index] as usize)),
+        inner => {
+            // A gather by code, so the read side cannot go a word at a time, but the write side
+            // can and does. `from_run` packs sixty four answers into one word instead of doing a
+            // read modify write on the bitmap for every row.
+            let live: Vec<bool> = codes.iter().map(|&code| inner.is_valid(code as usize)).collect();
+            Validity::from_run(&live)
+        }
     }
 }
 
