@@ -1,0 +1,70 @@
+# Build the shell for one target and package it as the two archives a release publishes.
+#
+# This is a composite action rather than a step list in the workflow because the release matrix is
+# split in two. The hosts that publish the release and the hosts that GitHub's queue keeps waiting
+# are different jobs now, and they run exactly the same steps, so the steps live in one file and
+# neither copy can drift from the other.
+#
+# The caller checks the repository out. A local action is read from the workspace, so the checkout
+# has to have happened before this file is looked at, which means it cannot be the first step here.
+
+name: build archive
+description: build the rudb shell for one target and package it with its checksums
+
+inputs:
+  target:
+    description: the Rust target triple to build
+    required: true
+  tag:
+    description: the tag the archives are named after
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: add the target
+      shell: bash
+      run: rustup target add ${{ inputs.target }}
+    - uses: Swatinem/rust-cache@v2.9.2
+      with:
+        key: ${{ inputs.target }}
+    - name: build
+      shell: bash
+      run: cargo build --release --bin rudb --target ${{ inputs.target }}
+    - name: package
+      shell: bash
+      run: |
+        set -euo pipefail
+        name="rudb-${{ inputs.tag }}-${{ inputs.target }}"
+        mkdir -p "dist/$name"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          cp "target/${{ inputs.target }}/release/rudb.exe" "dist/$name/"
+        else
+          cp "target/${{ inputs.target }}/release/rudb" "dist/$name/"
+        fi
+        cp README.md LICENSE-APACHE CHANGELOG.md "dist/$name/"
+        cd dist
+        # Both formats, because the people who want a .zip and the people who want a .tar.gz do not
+        # overlap and neither group should have to install a tool.
+        tar --format=ustar -czf "$name.tar.gz" "$name"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          7z a -tzip "$name.zip" "$name" > /dev/null
+        else
+          zip -qr "$name.zip" "$name"
+        fi
+        for f in "$name.tar.gz" "$name.zip"; do
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$f" > "$f.sha256"
+          else
+            shasum -a 256 "$f" > "$f.sha256"
+          fi
+        done
+    - uses: actions/upload-artifact@v7.0.1
+      with:
+        name: dist-${{ inputs.target }}
+        path: |
+          dist/*.tar.gz
+          dist/*.zip
+          dist/*.sha256
+        if-no-files-found: error
+        retention-days: 7
