@@ -22,7 +22,7 @@ pub mod shell;
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
-use rudb::Database;
+use rudb::{Config, Database};
 
 pub use args::{Action, Command, Options, parse};
 pub use format::{Format, Settings};
@@ -101,8 +101,16 @@ fn read_input(shell: &mut Shell, options: &Options) -> Stop {
 
 /// The settled decisions from `spec/00-README.md` that a reader would otherwise have to take on
 /// trust. Printing them is cheap and it makes a bug report say which build it came from.
+///
+/// The first three lines are the ones a run can change, and they come from [`rudb::Config`] rather
+/// than from a literal here, so that what this prints is what the engine was actually opened with.
+/// A benchmark result that does not say how many threads it used is not a result, and one that says
+/// eight while the engine used one is worse than one that says nothing.
 fn print_config(out: &mut dyn Write) {
     let _ = writeln!(out, "version: {VERSION}");
+    for (name, value) in Config::default().settings() {
+        let _ = writeln!(out, "{name}: {value}");
+    }
     let _ = writeln!(out, "vector-size: 1024");
     let _ = writeln!(out, "row-group-size: 122880");
     let _ = writeln!(out, "storage-format: native (rudb v1), DuckDB import and export");
