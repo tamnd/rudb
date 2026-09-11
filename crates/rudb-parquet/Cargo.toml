@@ -14,6 +14,7 @@ readme.workspace = true
 
 [dependencies]
 rudb-common.workspace = true
+rudb-compress.workspace = true
 rudb-io.workspace = true
 rudb-vector.workspace = true
 rudb-encoding.workspace = true
