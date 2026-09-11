@@ -8,6 +8,7 @@ use rudb_common::{Error, Field, Result, Value};
 
 use rudb_parse::ast::Ast;
 
+use crate::config::Config;
 use crate::connection::{Connection, single};
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
@@ -42,6 +43,7 @@ pub(crate) struct Shared {
 #[derive(Debug)]
 struct Inner {
     catalog: RwLock<Catalog>,
+    config: Config,
 }
 
 impl Default for Database {
@@ -54,8 +56,23 @@ impl Database {
     /// An empty database with the default catalog and schema, held in memory.
     #[must_use]
     pub fn new() -> Self {
-        let inner = Inner { catalog: RwLock::new(Catalog::new()) };
+        Self::with_config(Config::default())
+    }
+
+    /// An empty database held in memory, opened with these settings.
+    #[must_use]
+    pub fn with_config(config: Config) -> Self {
+        let inner = Inner { catalog: RwLock::new(Catalog::new()), config };
         Self { shared: Shared { inner: Arc::new(inner) } }
+    }
+
+    /// What this database was opened with.
+    ///
+    /// Read only, because the settings are set once at open time. See [`Config`] for why that is
+    /// narrower than DuckDB on purpose and what it would take to widen it.
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        &self.shared.inner.config
     }
 
     /// Opens a database by name.
@@ -69,8 +86,17 @@ impl Database {
     ///
     /// When the name is a file.
     pub fn open(path: &str) -> Result<Self> {
+        Self::open_with(path, Config::default())
+    }
+
+    /// Opens a database by name, with these settings.
+    ///
+    /// # Errors
+    ///
+    /// When the name is a file.
+    pub fn open_with(path: &str, config: Config) -> Result<Self> {
         if path.is_empty() || path == MEMORY {
-            return Ok(Self::new());
+            return Ok(Self::with_config(config));
         }
         Err(Error::not_implemented(format!(
             "cannot open \"{path}\", because there is no storage format yet, see \

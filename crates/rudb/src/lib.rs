@@ -53,6 +53,7 @@
 
 #![forbid(unsafe_code)]
 
+mod config;
 mod connection;
 mod database;
 mod prepared;
@@ -62,6 +63,7 @@ mod statements;
 #[cfg(test)]
 mod tests;
 
+pub use config::{Config, parse_size};
 pub use connection::Connection;
 pub use database::Database;
 pub use prepared::Prepared;
