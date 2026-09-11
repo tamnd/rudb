@@ -4,6 +4,7 @@ use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_csv::Reader as CsvReader;
 use rudb_functions::{TableFunction, open_csv, open_parquet, series_length};
+use rudb_kernels::cast;
 use rudb_parquet::Reader;
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
@@ -257,115 +258,239 @@ impl Operator for Series {
     }
 }
 
-/// A scan of a Parquet file.
+/// A scan of one or more files, Parquet or CSV.
 ///
-/// The file is named by the one argument, which the binder already required to be a constant, and
-/// it is opened here rather than being carried from the binder. Binding and running are separated
-/// by however long a prepared statement lives, and a plan that held an open descriptor would hold
-/// it for all of that.
+/// The files are named by the arguments, which the binder already expanded: a pattern was walked
+/// there and a name that is not a pattern was checked there, so what arrives is a list of names that
+/// existed when the statement was bound. They are opened here rather than being carried from the
+/// binder, because binding and running are separated by however long a prepared statement lives and
+/// a plan that held open descriptors would hold them for all of that.
 ///
-/// The plan's column list is resolved against the file's by name, which is the same thing
-/// [`Scan`] does against a catalog table and for the same reason. Today the binder projects every
-/// column in order, so the mapping is the identity, and the moment projection pushdown makes the
-/// plan's list a subset the reader reads a subset. That is the difference `spec/engine/05-scan.md`
-/// section 5.6 describes between reading two columns of ClickBench and reading a hundred and five.
+/// One at a time, in the order the list gives, which is the order the rows come out in. Opening all
+/// of them up front would mean a directory of ten thousand files costing ten thousand descriptors
+/// before the first row, and closing each one at its end is what makes a scan of a whole directory
+/// cost one.
+///
+/// The plan's column list is resolved against each file's by name, which is the same thing [`Scan`]
+/// does against a catalog table and for the same reason. Today the binder projects every column in
+/// order, so the mapping is the identity, and the moment projection pushdown makes the plan's list a
+/// subset the reader reads a subset. That is the difference `spec/engine/05-scan.md` section 5.6
+/// describes between reading two columns of ClickBench and reading a hundred and five.
+///
+/// The first file decides the types and every file after it is cast to them, which is DuckDB's rule
+/// and was measured: a second file holding `'5'` where the first holds an `INTEGER` reads as 5, and
+/// one holding `'txt'` is a conversion error naming the file it came from.
 #[derive(Debug)]
-pub(crate) struct ParquetScan {
-    reader: Reader,
+pub(crate) struct FileScan {
+    function: TableFunction,
+    paths: Vec<String>,
+    at: usize,
+    reader: Option<FileReader>,
+    wanted: Vec<Field>,
     schema: Schema,
 }
 
-impl ParquetScan {
-    /// The rows of a `read_parquet` call.
+impl FileScan {
+    /// The rows of a `read_parquet` or `read_csv` call, over every file it names.
     ///
     /// # Errors
     ///
-    /// If the file is gone or unreadable since it was bound, or if it no longer has a column the
-    /// plan asked for, which is what a file replaced between binding and running looks like.
-    pub(crate) fn new(plan: &Plan, index: u32, args: Slice, columns: Slice) -> Result<Self> {
-        let path = file_argument(plan, args, "read_parquet")?;
-        let mut reader = open_parquet(&path)?;
+    /// If the first file is gone or unreadable since it was bound, or if it no longer has a column
+    /// the plan asked for, which is what a file replaced between binding and running looks like.
+    pub(crate) fn new(
+        plan: &Plan,
+        index: u32,
+        function: TableFunction,
+        args: Slice,
+        columns: Slice,
+    ) -> Result<Self> {
+        let paths = file_arguments(plan, args, function)?;
         let wanted = plan.field_list(columns).to_vec();
-        reader.project(&positions(&wanted, &reader.fields(), &path)?)?;
-        Ok(Self { reader, schema: Schema::numbered(wanted, index) })
+        let mut scan = Self {
+            function,
+            paths,
+            at: 0,
+            reader: None,
+            wanted: wanted.clone(),
+            schema: Schema::numbered(wanted, index),
+        };
+        // The first file is opened now rather than on the first call for `next`, so that a file that
+        // has gone missing since binding is reported where a caller is still asking a question about
+        // this scan rather than in the middle of a result.
+        scan.advance()?;
+        Ok(scan)
+    }
+
+    /// Opens the next file and projects it, or leaves the reader empty at the end of the list.
+    fn advance(&mut self) -> Result<()> {
+        self.reader = None;
+        let Some(path) = self.paths.get(self.at) else { return Ok(()) };
+        let mut reader = FileReader::open(self.function, path)?;
+        let first = if self.at == 0 { None } else { self.paths.first().map(String::as_str) };
+        reader.project(&positions(&self.wanted, &reader.fields(), path, first)?)?;
+        self.reader = Some(reader);
+        self.at += 1;
+        Ok(())
     }
 }
 
-impl Operator for ParquetScan {
+impl Operator for FileScan {
     fn schema(&self) -> &Schema {
         &self.schema
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {
-        self.reader.next_chunk()
+        loop {
+            let Some(reader) = self.reader.as_mut() else { return Ok(None) };
+            if let Some(chunk) = reader.next_chunk()? {
+                // A file that is empty gives no chunk rather than an empty one, so this is not the
+                // place that skips it. The loop above is.
+                return Ok(Some(self.conform(chunk)?));
+            }
+            self.advance()?;
+        }
     }
 }
 
-/// A scan of a CSV file.
+impl FileScan {
+    /// The chunk with every column in the type the first file gave it.
+    ///
+    /// Almost always nothing, because almost always every file has the same schema, and the check is
+    /// a type comparison per column per chunk rather than per row.
+    fn conform(&self, chunk: Chunk) -> Result<Chunk> {
+        let rows = chunk.len();
+        let mut columns = Vec::with_capacity(self.wanted.len());
+        let mut changed = false;
+        for (at, field) in self.wanted.iter().enumerate() {
+            let column = chunk.column(at)?;
+            if column.logical_type() == &field.ty {
+                columns.push(column.clone());
+                continue;
+            }
+            changed = true;
+            columns.push(cast(column, &field.ty, false).map_err(|error| {
+                let path = self.paths.get(self.at.saturating_sub(1)).map_or("", String::as_str);
+                Error::conversion(format!(
+                    "Error while reading file \"{path}\": failed to cast column \"{}\" from type \
+                     {} to {}: {}",
+                    field.name,
+                    column.logical_type(),
+                    field.ty,
+                    error.message()
+                ))
+            })?);
+        }
+        if !changed {
+            return Ok(chunk);
+        }
+        Chunk::with_rows(columns, rows)
+    }
+}
+
+/// One open file, whichever of the two readers it needed.
 ///
-/// The same shape as [`ParquetScan`] and for the same reasons, down to resolving the plan's columns
-/// against the file's by name. What is behind the two is not the same at all: a Parquet file states
-/// its schema and stores each column apart, so reading two of a hundred and five is reading two
-/// stretches of the file, while a CSV file states nothing and interleaves everything, so every byte
-/// is read and parsed whatever the projection is and the projection only saves the conversion and
-/// the copy. That is why the two are separate operators rather than one over a trait: the scan that
-/// wants to grow row group skipping and the scan that wants to grow a parallel split of the byte
-/// range have nothing in the middle worth sharing yet.
+/// An enum rather than a trait because there are two of them and they are both in this workspace.
+/// What is behind the two is not alike at all, which is the reason the enum is here rather than the
+/// readers being made to look the same: a Parquet file states its schema and stores each column
+/// apart, so reading two of a hundred and five is reading two stretches of the file, while a CSV
+/// file states nothing and interleaves everything, so every byte is parsed whatever the projection
+/// is and the projection only saves the conversion and the copy. The three calls they do share are
+/// exactly the three the scan above needs.
 #[derive(Debug)]
-pub(crate) struct CsvScan {
-    reader: CsvReader,
-    schema: Schema,
+enum FileReader {
+    Parquet(Reader),
+    Csv(CsvReader),
 }
 
-impl CsvScan {
-    /// The rows of a `read_csv` call.
-    ///
-    /// # Errors
-    ///
-    /// If the file is gone or unreadable since it was bound, or if it no longer has a column the
-    /// plan asked for, which is what a file replaced between binding and running looks like.
-    pub(crate) fn new(plan: &Plan, index: u32, args: Slice, columns: Slice) -> Result<Self> {
-        let path = file_argument(plan, args, "read_csv")?;
-        let mut reader = open_csv(&path)?;
-        let wanted = plan.field_list(columns).to_vec();
-        reader.project(&positions(&wanted, &reader.fields(), &path)?)?;
-        Ok(Self { reader, schema: Schema::numbered(wanted, index) })
+impl FileReader {
+    /// Opens `path` with the reader `function` names.
+    fn open(function: TableFunction, path: &str) -> Result<Self> {
+        match function {
+            TableFunction::ReadCsv => Ok(Self::Csv(open_csv(path)?)),
+            _ => Ok(Self::Parquet(open_parquet(path)?)),
+        }
+    }
+
+    /// The columns the file holds, in the order it holds them.
+    fn fields(&self) -> Vec<Field> {
+        match self {
+            Self::Parquet(reader) => reader.fields(),
+            Self::Csv(reader) => reader.fields(),
+        }
+    }
+
+    /// Reads only these columns, by position in the file, in this order.
+    fn project(&mut self, columns: &[usize]) -> Result<()> {
+        match self {
+            Self::Parquet(reader) => reader.project(columns),
+            Self::Csv(reader) => reader.project(columns),
+        }
+    }
+
+    /// The next chunk, or `None` at the end of the file.
+    fn next_chunk(&mut self) -> Result<Option<Chunk>> {
+        match self {
+            Self::Parquet(reader) => reader.next_chunk(),
+            Self::Csv(reader) => reader.next_chunk(),
+        }
     }
 }
 
-impl Operator for CsvScan {
-    fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        self.reader.next_chunk()
-    }
-}
-
-/// The file name a file reading table function was called with.
+/// The file names a file reading table function was called with.
 ///
-/// The binder already refused anything that is not one constant string, so a failure here is a plan
-/// that was built wrong rather than a statement somebody wrote wrong, and it says so.
-fn file_argument(plan: &Plan, args: Slice, function: &str) -> Result<String> {
+/// The binder already refused anything that is not a constant string and already expanded whatever
+/// patterns there were, so a failure here is a plan that was built wrong rather than a statement
+/// somebody wrote wrong, and it says so.
+fn file_arguments(plan: &Plan, args: Slice, function: TableFunction) -> Result<Vec<String>> {
     let exprs: Vec<ExprRef> = plan.expr_list(args).to_vec();
     let source = Schema::empty();
     let one = Chunk::with_rows(Vec::new(), 1)?;
     let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
-    match evaluated.first().map(|vector| vector.value_at(0)) {
-        Some(rudb_common::Value::Varchar(path)) => Ok(path),
-        other => Err(Error::internal(format!(
-            "{function}() bound with {other:?} rather than one constant file name"
-        ))),
+    let mut paths = Vec::with_capacity(evaluated.len());
+    for vector in &evaluated {
+        match vector.value_at(0) {
+            rudb_common::Value::Varchar(path) => paths.push(path),
+            other => {
+                return Err(Error::internal(format!(
+                    "{}() bound with {other:?} rather than constant file names",
+                    function.name()
+                )));
+            }
+        }
     }
+    Ok(paths)
 }
 
 /// Where in `held` each of `wanted` is, by name.
-fn positions(wanted: &[Field], held: &[Field], path: &str) -> Result<Vec<usize>> {
+///
+/// `first` is the file the schema came from, and is `None` when `path` is that file. The two say
+/// different things about a missing column and DuckDB writes both: the first file is the one the
+/// plan was bound against, so a column missing from it means the file was replaced since, while a
+/// column missing from a later one means the files in the set do not agree with each other.
+fn positions(
+    wanted: &[Field],
+    held: &[Field],
+    path: &str,
+    first: Option<&str>,
+) -> Result<Vec<usize>> {
     let mut positions = Vec::with_capacity(wanted.len());
     for field in wanted {
         let at = held.iter().position(|column| column.name == field.name).ok_or_else(|| {
-            Error::io(format!("File \"{path}\" does not have a column named \"{}\"", field.name))
+            let Some(first) = first else {
+                return Error::io(format!(
+                    "File \"{path}\" does not have a column named \"{}\"",
+                    field.name
+                ));
+            };
+            let candidates: Vec<&str> = held.iter().map(|column| column.name.as_str()).collect();
+            Error::invalid_input(format!(
+                "Failed to read file \"{path}\": schema mismatch in glob: column \"{}\" was read \
+                 from the original file \"{first}\", but could not be found in file \
+                 \"{path}\".\nCandidate names: {}\nIf you are trying to read files with different \
+                 schemas, try setting union_by_name=True",
+                field.name,
+                candidates.join(", ")
+            ))
         })?;
         positions.push(at);
     }
