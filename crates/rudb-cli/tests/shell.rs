@@ -278,6 +278,90 @@ fn a_mode_flag_and_the_dot_command_end_a_row_differently() {
     assert!(!out.contains('\r'), "the flag does not set the row separator");
 }
 
+/// The twelve modes DuckDB also has a command line flag for, in the order `duckdb -help` lists them.
+const FLAGS: &[&str] = &[
+    "ascii",
+    "box",
+    "column",
+    "csv",
+    "html",
+    "json",
+    "jsonlines",
+    "line",
+    "list",
+    "markdown",
+    "quote",
+    "table",
+];
+
+/// Every mode name and every alias for one, which is what `capture.sh` probes the binary with.
+///
+/// The list is in both places because the capture runs on a machine with the pinned DuckDB on it
+/// and this runs everywhere, and a name that falls out of one of the two shows up as a name in
+/// `flags-refused.txt` that this does not know about.
+const NAMES: &[&str] = &[
+    "ascii",
+    "box",
+    "column",
+    "csv",
+    "duckbox",
+    "html",
+    "insert",
+    "json",
+    "jsonlines",
+    "line",
+    "lines",
+    "list",
+    "markdown",
+    "ndjson",
+    "quote",
+    "table",
+    "tabs",
+    "trash",
+    "tsv",
+];
+
+/// What each flag sets, against a capture of `.show` from the binary.
+///
+/// `duckdb -quote` writes `'a'|'b'` and `duckdb -cmd ".mode quote"` writes `'a','b'`, and `-ascii`
+/// sets the row separator where `-csv` does not. Reading it out of `.show` rather than out of a
+/// query is what makes the difference between leaving a separator alone and setting it to what it
+/// already was visible. The separators are given first for the same reason. Per #239.
+#[test]
+fn every_mode_flag_leaves_the_settings_where_duckdb_leaves_them() {
+    let mut wrong = Vec::new();
+    for mode in FLAGS {
+        let flag = format!("-{mode}");
+        let (out, err, failed) = run(&["-separator", ";", "-newline", "@", &flag, "-c", ".show"]);
+        assert!(!failed, "flag {mode} failed: {err}");
+        let want = golden(&format!("flag-{mode}.txt"));
+        if out != want {
+            wrong.push(format!("--- {mode}\nwant:\n{want}\ngot:\n{out}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The names the binary has no flag for are the names this has no flag for.
+///
+/// Four of the sixteen modes are not flags upstream and neither are the three aliases, and this
+/// shell used to accept all nineteen because it derived the flags from the mode table instead of
+/// copying the list. A script written against `rudb -tabs` is a script that fails against the
+/// binary with a suggestion list and a non zero exit. Per #238.
+#[test]
+fn a_mode_name_duckdb_has_no_flag_for_is_refused_here_too() {
+    let captured = golden("flags-refused.txt");
+    let refused: Vec<&str> =
+        captured.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    for name in &refused {
+        assert!(NAMES.contains(name), "{name} is refused by the binary and is not in NAMES");
+    }
+    for name in NAMES {
+        let (_, err, failed) = run(&[&format!("-{name}"), "-c", "SELECT 1"]);
+        assert_eq!(failed, refused.contains(name), "-{name}: {err}");
+    }
+}
+
 #[test]
 fn an_unknown_dot_command_is_an_error_and_the_run_fails() {
     let (_, err, failed) = run(&["-c", ".nonsense"]);

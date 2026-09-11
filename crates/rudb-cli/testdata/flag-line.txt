@@ -1,0 +1,9 @@
+        echo: off
+     headers: on
+        mode: line
+   nullvalue: "NULL"
+      output: stdout
+colseparator: ";"
+rowseparator: "@"
+       width: 
+    filename: :memory:
