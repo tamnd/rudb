@@ -14,7 +14,9 @@
 
 use rudb_catalog::{Catalog, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_functions::{Columns, TableFunction, parquet_fields, resolve, resolve_table};
+use rudb_functions::{
+    Columns, TableFunction, csv_fields, exists, parquet_fields, resolve, resolve_table,
+};
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, parse_ast};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey};
@@ -908,6 +910,7 @@ impl<'a> Binder<'a> {
         let fields = match resolved.columns {
             Columns::Fixed(fields) => fields,
             Columns::Parquet => parquet_fields(&self.file_argument(cast[0])?)?,
+            Columns::Csv => csv_fields(&self.file_argument(cast[0])?)?,
         };
         let label = if alias == NONE {
             resolved.function.name().to_string()
@@ -939,10 +942,27 @@ impl<'a> Binder<'a> {
         let [path] = parts else { return Err(missing) };
         let path = *path;
         let extension = path.rsplit_once('.').map(|(_, after)| after).unwrap_or_default();
-        if !extension.eq_ignore_ascii_case("parquet") {
+        let Some(function) = Self::reader_for(extension) else {
+            if exists(path) {
+                // A file that is really there and that nothing here can read is a different mistake
+                // from a name that is not a file, and DuckDB says so with both lines, the second of
+                // which is the way out. A file with no dot in it lands here too, which is why the
+                // test is on the extension having a reader rather than on there being an extension.
+                return Err(Error::binder(format!(
+                    "No extension found that is capable of reading the file \"{path}\"\n* If this \
+                     file is a supported file format you can explicitly use the reader functions, \
+                     such as read_csv, read_json or read_parquet"
+                )));
+            }
             return Err(missing);
-        }
-        let fields = parquet_fields(path)?;
+        };
+        // The file is opened before it is known to exist, so a name that ends in .csv and is not
+        // there gives the reader's own message rather than the catalog's. That is DuckDB's order
+        // and it is the helpful one: somebody who wrote a file name wants to hear about the file.
+        let fields = match function {
+            TableFunction::ReadParquet => parquet_fields(path)?,
+            _ => csv_fields(path)?,
+        };
         // The name the columns answer to is the file's stem, so `SELECT mixed.a FROM
         // 'data/mixed.parquet'` works. That is DuckDB's choice and it is the useful one, since the
         // alternative is a table name with a dot and a slash in it that nothing can write.
@@ -955,7 +975,23 @@ impl<'a> Binder<'a> {
         let value = self.plan.add_value(Value::Varchar(path.to_string()));
         let argument = self.plan.add_expr(Expr::Constant(value), LogicalType::Varchar);
         let names: Vec<&str> = ast.name(columns).collect();
-        self.table_function_source(TableFunction::ReadParquet, &[argument], fields, &label, &names)
+        self.table_function_source(function, &[argument], fields, &label, &names)
+    }
+
+    /// The table function a file with this extension is read by, and `None` for one nothing reads.
+    ///
+    /// Both spellings of a tab separated file go to the CSV reader, which is not a shortcut: the
+    /// extension picks the reader and the reader sniffs the punctuation, so a `.tsv` file that holds
+    /// commas is read as commas. That was measured rather than assumed. The comparison ignores case
+    /// because `UP.CSV` reads in duckdb v1.4.1.
+    fn reader_for(extension: &str) -> Option<TableFunction> {
+        if extension.eq_ignore_ascii_case("parquet") {
+            return Some(TableFunction::ReadParquet);
+        }
+        if extension.eq_ignore_ascii_case("csv") || extension.eq_ignore_ascii_case("tsv") {
+            return Some(TableFunction::ReadCsv);
+        }
+        None
     }
 
     /// The node and the scope of a table function call whose arguments and columns are settled.

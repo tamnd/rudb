@@ -1,4 +1,4 @@
-//! The table functions that read a file, which today is `read_parquet`.
+//! The table functions that read a file, which today are `read_parquet` and `read_csv`.
 //!
 //! These are the ones [`crate::table`] cannot finish resolving on its own, because their columns
 //! are in the file rather than in a table in this crate. So a caller resolves the call, gets
@@ -20,7 +20,8 @@
 use std::path::Path;
 
 use rudb_common::{Error, Field, Result};
-use rudb_io::{Filesystem, OpenMode, RealFilesystem};
+use rudb_csv::Reader as CsvReader;
+use rudb_io::{File, Filesystem, OpenMode, RealFilesystem};
 use rudb_parquet::Reader;
 
 /// A reader over the Parquet file at `path`, positioned before its first row group.
@@ -29,6 +30,30 @@ use rudb_parquet::Reader;
 ///
 /// When the file is not there, with DuckDB's own wording, and whatever reading the footer reports.
 pub fn open_parquet(path: &str) -> Result<Reader> {
+    Reader::open(open_file(path)?)
+}
+
+/// A reader over the CSV file at `path`, positioned at its first row, with its punctuation and its
+/// column types already worked out.
+///
+/// # Errors
+///
+/// When the file is not there, with DuckDB's own wording, and whatever sniffing it reports.
+pub fn open_csv(path: &str) -> Result<CsvReader> {
+    CsvReader::open(open_file(path)?, path)
+}
+
+/// Whether there is a file at `path`.
+///
+/// The replacement scan asks, because a name that looks like a file and is not one is a different
+/// answer from a file this build has no reader for.
+#[must_use]
+pub fn exists(path: &str) -> bool {
+    RealFilesystem::new().exists(Path::new(path))
+}
+
+/// The file at `path`, open for reading.
+fn open_file(path: &str) -> Result<Box<dyn File>> {
     let filesystem = RealFilesystem::new();
     let at = Path::new(path);
     if !filesystem.exists(at) {
@@ -36,8 +61,7 @@ pub fn open_parquet(path: &str) -> Result<Reader> {
         // here. A path that is simply missing and a glob that matched nothing are the same answer.
         return Err(Error::io(format!("No files found that match the pattern \"{path}\"")));
     }
-    let file = filesystem.open(at, OpenMode::Read)?;
-    Reader::open(file)
+    filesystem.open(at, OpenMode::Read)
 }
 
 /// The columns of the Parquet file at `path`, in the order the file stores them.
@@ -47,6 +71,15 @@ pub fn open_parquet(path: &str) -> Result<Reader> {
 /// Everything [`open_parquet`] reports.
 pub fn parquet_fields(path: &str) -> Result<Vec<Field>> {
     Ok(open_parquet(path)?.fields())
+}
+
+/// The columns of the CSV file at `path`, sniffed out of its front.
+///
+/// # Errors
+///
+/// Everything [`open_csv`] reports.
+pub fn csv_fields(path: &str) -> Result<Vec<Field>> {
+    Ok(open_csv(path)?.fields())
 }
 
 #[cfg(test)]

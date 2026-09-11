@@ -5,7 +5,7 @@
 //! resolution problem from [`crate::signature`]: the answer is not a return type, it is a list of
 //! columns, because the caller can alias them and select from them and join against them.
 //!
-//! Three of them are here. `range` and `generate_series` between them account for two thousand
+//! Four of them are here. `range` and `generate_series` between them account for two thousand
 //! records in DuckDB's `sqllogictest` corpus, because a test that needs a thousand rows should not
 //! have to write a thousand rows, and the corpus uses them the way a person uses a for loop. The
 //! difference between those two is one row: `range` stops before the end and `generate_series`
@@ -13,9 +13,11 @@
 //! the only difference. Nothing else about them differs, including the name of the column, which is
 //! the function's own name in both cases.
 //!
-//! `read_parquet` is the third and it is a different kind of thing, because its columns are in the
-//! file rather than in this table. That is what [`Columns`] exists to say. A caller that resolves a
-//! call has to open the file to finish resolving it, and [`crate::file`] is where that happens.
+//! `read_parquet` and `read_csv` are the other two and they are a different kind of thing, because
+//! their columns are in the file rather than in this table. That is what [`Columns`] exists to say.
+//! A caller that resolves one of those has to open the file to finish resolving it, and
+//! [`crate::file`] is where that happens. For CSV there is nothing in the file that states the
+//! columns either, so opening it means sniffing it.
 
 use rudb_common::{Error, Field, LogicalType, Result};
 
@@ -31,6 +33,8 @@ pub enum TableFunction {
     GenerateSeries,
     /// `read_parquet(path)`, the rows of a Parquet file.
     ReadParquet,
+    /// `read_csv(path)`, the rows of a CSV file, with everything about how it is written sniffed.
+    ReadCsv,
 }
 
 impl TableFunction {
@@ -41,12 +45,14 @@ impl TableFunction {
             Self::Range => "range",
             Self::GenerateSeries => "generate_series",
             Self::ReadParquet => "read_parquet",
+            Self::ReadCsv => "read_csv",
         }
     }
 
     /// Whether the last value is produced.
     ///
-    /// Only the two series functions differ here. `read_parquet` answers false and nothing asks it.
+    /// Only the two series functions differ here. The file readers answer false and nothing asks
+    /// them.
     #[must_use]
     pub const fn inclusive(self) -> bool {
         matches!(self, Self::GenerateSeries)
@@ -63,6 +69,12 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("read_parquet") || name.eq_ignore_ascii_case("parquet_scan") {
             return Some(Self::ReadParquet);
+        }
+        // `read_csv_auto` is the older spelling and DuckDB still answers to it. It meant sniffing
+        // back when `read_csv` did not sniff unless it was told to, and today they are the same
+        // function, which is why they are the same variant here.
+        if name.eq_ignore_ascii_case("read_csv") || name.eq_ignore_ascii_case("read_csv_auto") {
+            return Some(Self::ReadCsv);
         }
         None
     }
@@ -81,6 +93,8 @@ pub enum Columns {
     Fixed(Vec<Field>),
     /// The columns of the Parquet file the first argument names.
     Parquet,
+    /// The columns of the CSV file the first argument names, which are sniffed out of its front.
+    Csv,
 }
 
 /// A resolved table function call.
@@ -101,10 +115,10 @@ pub struct ResolvedTable {
 /// DuckDB also has a timestamp and interval form of both, which is a second set of columns rather
 /// than a second overload of the same ones, and adding it means adding it rather than widening this.
 ///
-/// `read_parquet` does consult them, because DuckDB does. `read_parquet(3)` is a binder error there
-/// rather than a read of a file called `3`, which was measured against the binary rather than
-/// assumed, and it is the right answer: a path that arrived as a number is a query that meant
-/// something else.
+/// The file readers do consult them, because DuckDB does. `read_parquet(3)` and `read_csv(3)` are
+/// binder errors there rather than reads of a file called `3`, which was measured against the binary
+/// rather than assumed, and it is the right answer: a path that arrived as a number is a query that
+/// meant something else.
 ///
 /// # Errors
 ///
@@ -113,15 +127,11 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
     let Some(function) = TableFunction::lookup(name) else {
         return Err(Error::catalog(format!("Table Function with name {name} does not exist!")));
     };
-    if function == TableFunction::ReadParquet {
+    if let Some(columns) = file_columns(function) {
         if arguments.len() != 1 || arguments[0] != LogicalType::Varchar {
             return Err(no_overload(function, arguments));
         }
-        return Ok(ResolvedTable {
-            function,
-            arguments: vec![LogicalType::Varchar],
-            columns: Columns::Parquet,
-        });
+        return Ok(ResolvedTable { function, arguments: vec![LogicalType::Varchar], columns });
     }
     let arity = arguments.len();
     if !(1..=3).contains(&arity) {
@@ -135,6 +145,16 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
         arguments: vec![LogicalType::BigInt; arity],
         columns: Columns::Fixed(vec![Field::new(function.name(), LogicalType::BigInt)]),
     })
+}
+
+/// Where a file reading table function's columns come from, and `None` for one that does not read
+/// a file.
+fn file_columns(function: TableFunction) -> Option<Columns> {
+    match function {
+        TableFunction::ReadParquet => Some(Columns::Parquet),
+        TableFunction::ReadCsv => Some(Columns::Csv),
+        TableFunction::Range | TableFunction::GenerateSeries => None,
+    }
 }
 
 /// DuckDB's message for a call that matched a name and no overload of it.
@@ -225,11 +245,13 @@ fn length(function: TableFunction, start: i64, stop: i64, step: i64) -> usize {
 mod tests {
     use super::*;
 
-    /// The fixed columns of a resolved call, which every function but `read_parquet` has.
+    /// The fixed columns of a resolved call, which every function that does not read a file has.
     fn fixed(resolved: &ResolvedTable) -> &[Field] {
         match &resolved.columns {
             Columns::Fixed(fields) => fields,
-            Columns::Parquet => panic!("{} resolves to a file", resolved.function.name()),
+            Columns::Parquet | Columns::Csv => {
+                panic!("{} resolves to a file", resolved.function.name())
+            }
         }
     }
 
