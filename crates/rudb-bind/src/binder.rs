@@ -804,8 +804,18 @@ impl<'a> Binder<'a> {
     ) -> Result<(NodeRef, Scope)> {
         let parts: Vec<&str> = ast.name(name).collect();
         let catalog = self.catalog;
-        let resolved = catalog.resolve(&parts)?;
-        let table = catalog.table(&resolved)?;
+        // The catalog is asked first and the file is the fallback, which is the order DuckDB uses:
+        // a table really called `mixed.parquet` wins over a file of that name sitting next to it.
+        let found = catalog.resolve(&parts).and_then(|resolved| {
+            let table = catalog.table(&resolved)?;
+            Ok((resolved, table))
+        });
+        let (resolved, table) = match found {
+            Ok(found) => found,
+            Err(missing) => {
+                return self.bind_replacement_scan(ast, &parts, alias, columns, missing);
+            }
+        };
         let fields: Vec<Field> = table.columns().to_vec();
         let label =
             if alias == NONE { resolved.table.clone() } else { ast.string(alias).to_string() };
@@ -904,22 +914,77 @@ impl<'a> Binder<'a> {
         } else {
             ast.string(alias).to_string()
         };
+        let names: Vec<&str> = ast.name(columns).collect();
+        self.table_function_source(resolved.function, &cast, fields, &label, &names)
+    }
+
+    /// A file where a table name goes, which is what DuckDB calls a replacement scan.
+    ///
+    /// `SELECT * FROM 'hits.parquet'` is how most DuckDB queries in the wild are written, ClickBench
+    /// among them, so this is not sugar over `read_parquet` so much as the spelling people use. The
+    /// catalog has already been asked and has already said no, and `missing` is what it said, so a
+    /// name that is not a file comes back with the catalog's own answer rather than with a complaint
+    /// about files.
+    ///
+    /// Only a single unqualified name is a candidate. A qualified one names a schema and a schema
+    /// that does not exist is not a path.
+    fn bind_replacement_scan(
+        &mut self,
+        ast: &Ast,
+        parts: &[&str],
+        alias: ast::StrRef,
+        columns: ast::Slice,
+        missing: Error,
+    ) -> Result<(NodeRef, Scope)> {
+        let [path] = parts else { return Err(missing) };
+        let path = *path;
+        let extension = path.rsplit_once('.').map(|(_, after)| after).unwrap_or_default();
+        if !extension.eq_ignore_ascii_case("parquet") {
+            return Err(missing);
+        }
+        let fields = parquet_fields(path)?;
+        // The name the columns answer to is the file's stem, so `SELECT mixed.a FROM
+        // 'data/mixed.parquet'` works. That is DuckDB's choice and it is the useful one, since the
+        // alternative is a table name with a dot and a slash in it that nothing can write.
+        let label = if alias == NONE {
+            let file = path.rsplit_once('/').map_or(path, |(_, file)| file);
+            file.rsplit_once('.').map_or(file, |(stem, _)| stem).to_string()
+        } else {
+            ast.string(alias).to_string()
+        };
+        let value = self.plan.add_value(Value::Varchar(path.to_string()));
+        let argument = self.plan.add_expr(Expr::Constant(value), LogicalType::Varchar);
+        let names: Vec<&str> = ast.name(columns).collect();
+        self.table_function_source(TableFunction::ReadParquet, &[argument], fields, &label, &names)
+    }
+
+    /// The node and the scope of a table function call whose arguments and columns are settled.
+    ///
+    /// The half a written out call shares with a replacement scan, which is everything after the
+    /// question of what the file is called has been answered one way or the other.
+    fn table_function_source(
+        &mut self,
+        function: TableFunction,
+        args: &[ExprRef],
+        fields: Vec<Field>,
+        label: &str,
+        names: &[&str],
+    ) -> Result<(NodeRef, Scope)> {
         let index = self.fresh_index();
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {
             scope.push(Visible {
-                table: label.clone(),
+                table: label.to_string(),
                 name: field.name.clone(),
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
             });
         }
-        if !columns.is_empty() {
-            let names: Vec<&str> = ast.name(columns).collect();
-            scope.rename(&names, &label)?;
+        if !names.is_empty() {
+            scope.rename(names, label)?;
         }
-        let function = self.plan.intern(resolved.function.name());
-        let args = self.plan.add_expr_list(&cast);
+        let function = self.plan.intern(function.name());
+        let args = self.plan.add_expr_list(args);
         let columns = self.plan.add_fields(&fields);
         let node = self.plan.add_node(Node::TableFunction { index, function, args, columns });
         Ok((node, scope))
