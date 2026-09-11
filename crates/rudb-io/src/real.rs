@@ -151,6 +151,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::RealFilesystem;
+    use crate::submit::Request;
     use crate::{Filesystem, OpenMode};
 
     /// A directory under the system temporary directory that removes itself.
@@ -251,6 +252,30 @@ mod tests {
         let mut buf = [0xffu8; 6];
         file.read_exact_at(0, &mut buf).unwrap();
         assert_eq!(&buf, b"abc\0\0\0");
+    }
+
+    #[test]
+    fn a_batch_of_reads_comes_back_answering_the_requests_it_was_given() {
+        // The real filesystem takes the default `submit`, which is the loop over `read_at`. That
+        // is still worth a test, because the default is what every backend has until somebody
+        // writes it a queue, and a scan is written against `submit` from its first line.
+        let dir = TempDir::new("submit");
+        let fs = RealFilesystem::new();
+        let path = dir.join("data");
+        let file = fs.open(&path, OpenMode::CreateNew).unwrap();
+        file.write_at(0, b"abcdefghijklmnop").unwrap();
+        file.sync().unwrap();
+
+        let responses = file
+            .submit(vec![Request::new(8, 4), Request::new(0, 4), Request::new(12, 8)])
+            .wait()
+            .unwrap();
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].bytes(), b"ijkl");
+        assert_eq!(responses[1].bytes(), b"abcd");
+        // The last one runs off the end of the file, which is a short read and not an error.
+        assert!(responses[2].is_short());
+        assert_eq!(responses[2].bytes(), b"mnop");
     }
 
     #[test]
