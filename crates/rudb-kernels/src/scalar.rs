@@ -1927,9 +1927,7 @@ mod tests {
             &[Value::Varchar("goo%".into()), Value::Varchar("goo%".into())],
         )
         .expect("two rows");
-        // The counters are process wide and the harness runs tests in parallel, so the ones that
-        // read a count take turns.
-        let _turn = fallback::TURN.lock().expect("no test panics while holding this");
+        // The counters are per thread in a test build, so this reads its own and nothing else's.
         let before = fallback::count(Kernel::Scalar, Form::Flat, Form::Flat);
         agrees("~~", &[text, pattern], &LogicalType::Boolean);
         assert!(fallback::count(Kernel::Scalar, Form::Flat, Form::Flat) > before);
