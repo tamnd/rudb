@@ -130,7 +130,7 @@ fn add(program: &Program, text: &str, list: &mut List, pc: usize, at: usize, slo
 }
 
 /// Whether an assertion holds at a position.
-fn holds(assertion: Assertion, text: &str, at: usize) -> bool {
+pub(crate) fn holds(assertion: Assertion, text: &str, at: usize) -> bool {
     match assertion {
         Assertion::TextStart => at == 0,
         Assertion::TextEnd => at == text.len(),
