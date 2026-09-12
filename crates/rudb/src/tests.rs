@@ -513,6 +513,84 @@ fn the_regular_expression_functions_answer_the_way_duckdb_does() {
     );
 }
 
+/// The three spellings of a null check, end to end. Per #306.
+///
+/// Every answer and every column name below was read off the pinned binary. `nullif` is a macro
+/// there, `CASE WHEN a = b THEN NULL ELSE a END`, and the two things that follow from that are worth
+/// pointing at: a null on the right is not a match, because `1 = NULL` is null rather than true, and
+/// the answer keeps the first argument's type even when the comparison had to widen to happen at all.
+#[test]
+fn the_null_checks_answer_the_way_duckdb_does() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT COALESCE(NULL, 1)"), vec![vec![Value::Integer(1)]]);
+    assert_eq!(rows(&db, "SELECT coalesce(NULL, NULL, 3, 4)"), vec![vec![Value::Integer(3)]]);
+    assert_eq!(rows(&db, "SELECT coalesce(NULL, NULL)"), vec![vec![Value::Null]]);
+    assert_eq!(rows(&db, "SELECT coalesce(2)"), vec![vec![Value::Integer(2)]]);
+    assert_eq!(
+        rows(&db, "SELECT ifnull(NULL, 3), ifnull(1, 3)"),
+        vec![vec![Value::Integer(3), Value::Integer(1)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT nullif(1, 2), nullif(2, 2)"),
+        vec![vec![Value::Integer(1), Value::Null]]
+    );
+    // A null on either side. The right one is not a match and the left one is the answer.
+    assert_eq!(
+        rows(&db, "SELECT nullif(1, NULL), nullif(NULL, 1)"),
+        vec![vec![Value::Integer(1), Value::Null]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT nullif('a', 'a'), nullif('a', 'b')"),
+        vec![vec![Value::Null, text("a")]]
+    );
+    assert_eq!(rows(&db, "SELECT nullif(TRUE, FALSE)"), vec![vec![Value::Boolean(true)]]);
+    // The comparison happens at DECIMAL(11,1) and the answer is still an INTEGER, both measured.
+    assert_eq!(
+        rows(&db, "SELECT nullif(2, 2.5), typeof(nullif(2, 2.5))"),
+        vec![vec![Value::Integer(2), text("INTEGER")]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT typeof(coalesce(1, 2.5)), typeof(nullif(1::BIGINT, 2::SMALLINT))"),
+        vec![vec![text("DECIMAL(11,1)"), text("BIGINT")]]
+    );
+    // Over a column, where the null row is the one that moves.
+    assert_eq!(
+        rows(&db, "SELECT coalesce(s, 'none') FROM t"),
+        vec![vec![text("a")], vec![text("none")], vec![text("c")], vec![text("a")]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT nullif(x, 1) FROM t"),
+        vec![
+            vec![Value::Integer(3)],
+            vec![Value::Null],
+            vec![Value::Integer(2)],
+            vec![Value::Null]
+        ]
+    );
+    // The names upstream gives these columns. `COALESCE` is an operator there rather than a
+    // function, so it is printed in capitals whichever case was written and `IFNULL` becomes it.
+    assert_eq!(
+        db.query("SELECT coalesce(x, 1) FROM t").unwrap().names(),
+        &["COALESCE(x, 1)".to_string()]
+    );
+    assert_eq!(
+        db.query("SELECT IFNULL(x, 1) FROM t").unwrap().names(),
+        &["COALESCE(x, 1)".to_string()]
+    );
+    // Upstream quotes this one, because NULLIF is a keyword and the name it prints is the macro's.
+    // The quoting is #251 and the call is the same call.
+    assert_eq!(
+        db.query("SELECT NULLIF(x, 1) FROM t").unwrap().names(),
+        &["nullif(x, 1)".to_string()]
+    );
+    // The counts the grammar refuses, and the one upstream's parser refuses itself.
+    assert!(failure(&db, "SELECT nullif(1)").contains("syntax error at or near \")\""));
+    assert!(failure(&db, "SELECT nullif(1, 2, 3)").contains("syntax error at or near \",\""));
+    assert!(failure(&db, "SELECT coalesce()").contains("syntax error at or near \")\""));
+    assert_eq!(failure(&db, "SELECT ifnull(1)"), "Wrong number of arguments to IFNULL.");
+    assert_eq!(failure(&db, "SELECT ifnull(1, 2, 3)"), "Wrong number of arguments to IFNULL.");
+}
+
 /// `typeof` names the type of an expression, which is decided before a row moves. Per #229.
 ///
 /// Every answer here was read off the pinned binary. The one worth pointing at is `typeof(NULL)`,

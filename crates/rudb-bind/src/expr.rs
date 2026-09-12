@@ -606,7 +606,15 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
             // A column name is not folded, because that one comes from the catalog rather than
             // from the query, which is why `output_name` asks the scope first and only falls
             // through to here.
-            let name = written.to_ascii_lowercase();
+            // `COALESCE` is the exception, and it is one because it is not a function name upstream.
+            // It is an operator there, so there was nothing for the parser to fold and the name it
+            // prints is the operator's own spelling: `coalesce(NULL, 1)` and `ifnull(NULL, 1)` both
+            // come back as a column called `COALESCE(NULL, 1)`.
+            let name = if rudb_catalog::same_name(written, "coalesce") {
+                "COALESCE".to_string()
+            } else {
+                written.to_ascii_lowercase()
+            };
             // `DISTINCT` is part of the name because it is part of what was computed.
             // `count(UserID)` and `count(DISTINCT UserID)` are two different answers and a result
             // that called them both the first one would be reporting the wrong one.

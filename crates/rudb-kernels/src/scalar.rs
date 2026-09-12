@@ -6,9 +6,10 @@
 //! table lookup and the bodies below become the generated specializations, and the interface the
 //! executor calls does not change.
 //!
-//! Null in, null out, for everything except `coalesce`. That rule is applied once here rather than
-//! inside each function, which is the only way to be sure that a function added later does not
-//! quietly forget it.
+//! Null in, null out, for everything except `coalesce` and `nullif`. That rule is applied once here
+//! rather than inside each function, which is the only way to be sure that a function added later
+//! does not quietly forget it. The two exceptions are the two functions whose whole job is to answer
+//! something other than null when a null goes in.
 //!
 //! Dividing by zero is three behaviours and not one, which `divided_by_zero` writes out. `/` is
 //! IEEE arithmetic on two doubles and answers an infinity or a nan, `//` raises whatever it was
@@ -50,6 +51,8 @@
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
 
+use crate::cast;
+use crate::compare::{self, Comparison};
 use crate::datetime::Part;
 use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
@@ -1441,6 +1444,18 @@ pub fn call_values(
         let found = args.iter().find(|value| !value.is_null());
         return Ok(found.cloned().unwrap_or(Value::Null));
     }
+    // `nullif` is above the null rule for the same reason `coalesce` is. It is
+    // `CASE WHEN a = b THEN NULL ELSE a END`, and `a = NULL` is null rather than true, so a null on
+    // the right hands back the left value instead of blanking it: `nullif(1, NULL)` is 1 upstream.
+    if let ("nullif", [left, right]) = (name, args) {
+        if compare::compare_values(Comparison::Equal, left, right)?.as_bool() == Some(true) {
+            return Ok(Value::Null);
+        }
+        // The two arguments were cast to the type they promote to so that the comparison happens
+        // there, and the answer is the first argument's own type, so it goes back to where it
+        // started. Promotion only ever widens, so this cast cannot fail and cannot lose anything.
+        return cast::cast_value(left, returns, false);
+    }
     if args.iter().any(Value::is_null) {
         return Ok(Value::Null);
     }
@@ -1942,6 +1957,35 @@ mod tests {
 
     fn called(name: &str, args: &[Value], returns: &LogicalType) -> Value {
         call_values(name, args, returns, None).expect("this call is written")
+    }
+
+    /// What `nullif` does with the nulls and with a comparison that was cast. Per #306.
+    #[test]
+    fn nullif_blanks_a_pair_that_matches_and_keeps_the_left_one_otherwise() {
+        let integer = LogicalType::Integer;
+        assert_eq!(
+            called("nullif", &[Value::Integer(2), Value::Integer(2)], &integer),
+            Value::Null
+        );
+        assert_eq!(
+            called("nullif", &[Value::Integer(1), Value::Integer(2)], &integer),
+            Value::Integer(1)
+        );
+        // `1 = NULL` is null and not true, so the left value comes back rather than being blanked.
+        assert_eq!(
+            called("nullif", &[Value::Integer(1), Value::Null], &integer),
+            Value::Integer(1)
+        );
+        assert_eq!(called("nullif", &[Value::Null, Value::Integer(1)], &integer), Value::Null);
+        // The binder casts both sides to what they promote to and the answer goes back to the first
+        // argument's type, which is the one thing this function has to do that the others do not.
+        let decimal = |unscaled| Value::Decimal { unscaled, width: 11, scale: 1 };
+        assert_eq!(
+            called("nullif", &[decimal(20), decimal(25)], &integer),
+            Value::Integer(2),
+            "2 is not 2.5, and what comes back is the 2 the query wrote"
+        );
+        assert_eq!(called("nullif", &[decimal(20), decimal(20)], &integer), Value::Null);
     }
 
     #[test]
