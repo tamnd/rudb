@@ -220,7 +220,15 @@ impl<'a> Building<'a, '_> {
                 let schema = aggregate.schema().clone();
                 let counters = self.watch(id, pipeline, "Aggregate", None);
                 let made = Arc::clone(&counters);
-                Box::new(Broken::new(input, Watched::new(aggregate, counters), out, made, schema))
+                let driver = self.report.driving(pipeline);
+                Box::new(Broken::new(
+                    input,
+                    Watched::new(aggregate, counters),
+                    driver,
+                    out,
+                    made,
+                    schema,
+                ))
             }
             Node::Sort { input, keys } => {
                 let input = self.node(input)?;
@@ -228,7 +236,15 @@ impl<'a> Building<'a, '_> {
                 let (sort, out) = Sort::new(plan, &schema, keys, memory)?;
                 let counters = self.watch(id, pipeline, "Sort", None);
                 let made = Arc::clone(&counters);
-                Box::new(Broken::new(input, Watched::new(sort, counters), out, made, schema))
+                let driver = self.report.driving(pipeline);
+                Box::new(Broken::new(
+                    input,
+                    Watched::new(sort, counters),
+                    driver,
+                    out,
+                    made,
+                    schema,
+                ))
             }
             Node::Limit { input, count, offset } => {
                 let input = self.node(input)?;
@@ -243,7 +259,8 @@ impl<'a> Building<'a, '_> {
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
                 let counters = self.watch(id, pipeline, "TopN", None);
                 let made = Arc::clone(&counters);
-                Box::new(Broken::new(input, Watched::new(top, counters), out, made, schema))
+                let driver = self.report.driving(pipeline);
+                Box::new(Broken::new(input, Watched::new(top, counters), driver, out, made, schema))
             }
             Node::Distinct { input, on } => {
                 let input = self.node(input)?;
@@ -251,7 +268,15 @@ impl<'a> Building<'a, '_> {
                 let (distinct, out) = Distinct::new(plan, &schema, on, memory)?;
                 let counters = self.watch(id, pipeline, "Distinct", None);
                 let made = Arc::clone(&counters);
-                Box::new(Broken::new(input, Watched::new(distinct, counters), out, made, schema))
+                let driver = self.report.driving(pipeline);
+                Box::new(Broken::new(
+                    input,
+                    Watched::new(distinct, counters),
+                    driver,
+                    out,
+                    made,
+                    schema,
+                ))
             }
             Node::Join { left, right, kind, conditions } => {
                 // The right side runs first, because no left row can be answered until every right
@@ -274,8 +299,10 @@ impl<'a> Building<'a, '_> {
                 Box::new(Paired::new(
                     right,
                     Watched::new(gather, kept),
+                    self.report.driving(gathering),
                     left,
                     Watched::new(join, counters),
+                    self.report.driving(pipeline),
                     out,
                     made,
                     schema,
@@ -298,6 +325,7 @@ impl<'a> Building<'a, '_> {
                 Box::new(Fed::new(
                     right,
                     Watched::new(keep, held),
+                    self.report.driving(aside),
                     Streamed::new(left, Watched::new(cross, counters), schema),
                 ))
             }
@@ -317,8 +345,10 @@ impl<'a> Building<'a, '_> {
                 Box::new(Paired::new(
                     right,
                     Watched::new(gather, kept),
+                    self.report.driving(counting),
                     left,
                     Watched::new(setop, counters),
+                    self.report.driving(pipeline),
                     out,
                     made,
                     schema,

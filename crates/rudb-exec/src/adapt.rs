@@ -17,7 +17,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use rudb_common::{Error, Result};
-use rudb_metrics::Counters;
+use rudb_metrics::{Counters, Driver};
 use rudb_pipeline::{Morsel, Progress, Sink, Source, Stream};
 use rudb_vector::Chunk;
 
@@ -159,15 +159,22 @@ impl<S: Stream> Operator for Streamed<'_, S> {
 pub(crate) struct Fed<'a, F: Sink, S: Stream> {
     first: Box<dyn Operator + 'a>,
     aside: F,
+    /// The driver of the pipeline that ends in `aside`, which is the one drained here.
+    aside_driver: Arc<Driver>,
     then: Streamed<'a, S>,
     built: bool,
 }
 
 impl<'a, F: Sink, S: Stream> Fed<'a, F, S> {
-    /// `first` and `aside` are the side that has to be finished first, and `then` is the stream with
-    /// the rest of the tree under it.
-    pub(crate) fn new(first: Box<dyn Operator + 'a>, aside: F, then: Streamed<'a, S>) -> Self {
-        Self { first, aside, then, built: false }
+    /// `first` and `aside` are the side that has to be finished first, `aside_driver` drives the
+    /// pipeline those two make, and `then` is the stream with the rest of the tree under it.
+    pub(crate) fn new(
+        first: Box<dyn Operator + 'a>,
+        aside: F,
+        aside_driver: Arc<Driver>,
+        then: Streamed<'a, S>,
+    ) -> Self {
+        Self { first, aside, aside_driver, then, built: false }
     }
 }
 
@@ -187,7 +194,7 @@ impl<F: Sink, S: Stream> Operator for Fed<'_, F, S> {
 
     fn next(&mut self) -> Result<Option<Chunk>> {
         if !self.built {
-            drain(self.first.as_mut(), &self.aside)?;
+            drain(self.first.as_mut(), &self.aside, &self.aside_driver)?;
             self.built = true;
         }
         self.then.next()
@@ -208,6 +215,8 @@ impl<F: Sink, S: Stream> Operator for Fed<'_, F, S> {
 pub(crate) struct Broken<'a, K: Sink> {
     input: Box<dyn Operator + 'a>,
     sink: K,
+    /// The driver of the pipeline that ends in `sink`, which is the one drained here.
+    driver: Arc<Driver>,
     out: Buffered,
     made: Arc<Counters>,
     schema: Schema,
@@ -216,20 +225,22 @@ pub(crate) struct Broken<'a, K: Sink> {
 }
 
 impl<'a, K: Sink> Broken<'a, K> {
-    /// `out` is the source half the sink finalises into, `made` counts what comes back out of it,
-    /// and `schema` is what comes out of it.
+    /// `driver` drives the pipeline that `input` and `sink` make, `out` is the source half the sink
+    /// finalises into, `made` counts what comes back out of it, and `schema` is what comes out of
+    /// it.
     pub(crate) fn new(
         input: Box<dyn Operator + 'a>,
         sink: K,
+        driver: Arc<Driver>,
         out: Buffered,
         made: Arc<Counters>,
         schema: Schema,
     ) -> Self {
-        Self { input, sink, out, made, schema, built: false, at: 0 }
+        Self { input, sink, driver, out, made, schema, built: false, at: 0 }
     }
 
     fn build(&mut self) -> Result<()> {
-        drain(self.input.as_mut(), &self.sink)
+        drain(self.input.as_mut(), &self.sink, &self.driver)
     }
 }
 
@@ -275,8 +286,12 @@ impl<K: Sink> Operator for Broken<'_, K> {
 pub(crate) struct Paired<'a, F: Sink, K: Sink> {
     first: Box<dyn Operator + 'a>,
     aside: F,
+    /// The driver of the pipeline that ends in `aside`, which is the one drained first.
+    aside_driver: Arc<Driver>,
     second: Box<dyn Operator + 'a>,
     sink: K,
+    /// The driver of the pipeline that ends in `sink`, which is the one that waits for it.
+    driver: Arc<Driver>,
     out: Buffered,
     made: Arc<Counters>,
     schema: Schema,
@@ -286,23 +301,38 @@ pub(crate) struct Paired<'a, F: Sink, K: Sink> {
 
 impl<'a, F: Sink, K: Sink> Paired<'a, F, K> {
     /// `first` and `aside` are the side that has to be finished first, `second` and `sink` are the
-    /// side that uses it, `out` is what `sink` finalises into, and `made` counts what comes back
-    /// out of it.
+    /// side that uses it, each with the driver of the pipeline it makes, `out` is what `sink`
+    /// finalises into, and `made` counts what comes back out of it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         first: Box<dyn Operator + 'a>,
         aside: F,
+        aside_driver: Arc<Driver>,
         second: Box<dyn Operator + 'a>,
         sink: K,
+        driver: Arc<Driver>,
         out: Buffered,
         made: Arc<Counters>,
         schema: Schema,
     ) -> Self {
-        Self { first, aside, second, sink, out, made, schema, built: false, at: 0 }
+        Self {
+            first,
+            aside,
+            aside_driver,
+            second,
+            sink,
+            driver,
+            out,
+            made,
+            schema,
+            built: false,
+            at: 0,
+        }
     }
 
     fn build(&mut self) -> Result<()> {
-        drain(self.first.as_mut(), &self.aside)?;
-        drain(self.second.as_mut(), &self.sink)
+        drain(self.first.as_mut(), &self.aside, &self.aside_driver)?;
+        drain(self.second.as_mut(), &self.sink, &self.driver)
     }
 }
 
@@ -339,7 +369,14 @@ impl<F: Sink, K: Sink> Operator for Paired<'_, F, K> {
 /// One instance, because there is one thread here. `combine` takes it by value and `finalize`
 /// happens once after it, which is the contract every sink is written against, so the only thing
 /// that changes when there are several threads is how many times the first three lines happen.
-fn drain<K: Sink>(input: &mut dyn Operator, sink: &K) -> Result<()> {
+///
+/// This loop is the pipeline's driver, so it is timed and charged to `driver`. What it costs is not
+/// nothing: it pulls a chunk through every operator below it and drops it again, and on a scan of
+/// ten million rows it goes round ten thousand times. None of that is inside an operator's own
+/// span, so without this it is time the document cannot account for. See `rudb_metrics::Driver` for
+/// how that stays separate from the time of the pipelines that run inside this one.
+fn drain<K: Sink>(input: &mut dyn Operator, sink: &K, driver: &Driver) -> Result<()> {
+    let _running = driver.running();
     let mut local = sink.local();
     while let Some(chunk) = input.next()? {
         match sink.sink(&chunk, &mut local)? {
