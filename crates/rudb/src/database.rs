@@ -379,15 +379,21 @@ impl Shared {
         match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new())? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                run(sql, &plan, &catalog, cancel, &self.inner.memory)
+                run(sql, &plan, &catalog, cancel, &self.inner.memory, context.statistics())
             }
-            Bound::Explain(mut plan) => {
+            Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                explained(&rudb_opt::explain::explain_with(
+                let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
+                explaining(
                     &plan,
-                    context.statistics(),
-                    rudb_opt::explain::Seams::new(&seams, rudb_exec::registries()),
-                ))
+                    &catalog,
+                    cancel,
+                    &self.inner.memory,
+                    &context,
+                    seams,
+                    analyze,
+                    sql,
+                )
             }
             _ => Err(Error::not_implemented("a statement that is not a query, on the query path")),
         }
@@ -483,15 +489,21 @@ impl Shared {
         match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                run(sql, &plan, &catalog, cancel, &self.inner.memory)
+                run(sql, &plan, &catalog, cancel, &self.inner.memory, context.statistics())
             }
-            Bound::Explain(mut plan) => {
+            Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                explained(&rudb_opt::explain::explain_with(
+                let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
+                explaining(
                     &plan,
-                    context.statistics(),
-                    rudb_opt::explain::Seams::new(&seams, rudb_exec::registries()),
-                ))
+                    &catalog,
+                    cancel,
+                    &self.inner.memory,
+                    &context,
+                    seams,
+                    analyze,
+                    sql,
+                )
             }
             Bound::Setting(setting) => {
                 let value = setting.value.as_ref();
@@ -526,7 +538,14 @@ impl Shared {
                 // and a version of this that appended chunk by chunk would either read its own
                 // output forever or depend on how the scan holds its chunks.
                 rudb_opt::optimize_with(&mut insert.source, &context)?;
-                let result = run(sql, &insert.source, &catalog, cancel, &self.inner.memory)?;
+                let result = run(
+                    sql,
+                    &insert.source,
+                    &catalog,
+                    cancel,
+                    &self.inner.memory,
+                    context.statistics(),
+                )?;
                 let table = catalog.table_mut(&insert.name)?;
                 for chunk in result.into_chunks() {
                     table.append(chunk)?;
@@ -575,6 +594,7 @@ fn run(
     catalog: &Catalog,
     cancel: &Cancel,
     memory: &Memory,
+    statistics: &rudb_opt::estimate::Statistics,
 ) -> Result<QueryResult> {
     let report = Report::new();
     let building = Span::start();
@@ -602,7 +622,42 @@ fn run(
     metrics.timing.total_ns = built_wall.saturating_add(ran_wall);
     metrics.resource.cpu_ns = built_cpu.saturating_add(ran_cpu);
     report.fill(&mut metrics);
+    rudb_opt::explain::record_estimates(plan, statistics, &mut metrics);
     Ok(QueryResult::new(names, types, chunks, held).measured(metrics))
+}
+
+/// The plan `EXPLAIN` prints, run first if `ANALYZE` was asked for.
+///
+/// `ANALYZE` runs the query and throws the rows away. That is the whole difference between the two,
+/// and it is deliberately the only difference: the plan that is printed is the plan that was built
+/// and drained, so a number on a line came from the operator on that line rather than from an
+/// operator something else would have built.
+///
+/// The rows are dropped rather than returned because the result set of `EXPLAIN ANALYZE` is the
+/// plan. DuckDB does the same and calls the row `analyzed_plan`, and a client that gets a query's
+/// rows back from an `EXPLAIN` has no way to tell which it asked for.
+#[allow(clippy::too_many_arguments)]
+fn explaining(
+    plan: &rudb_plan::Plan,
+    catalog: &Catalog,
+    cancel: &Cancel,
+    memory: &Memory,
+    context: &rudb_opt::pass::Context,
+    seams: rudb_opt::explain::Seams<'_>,
+    analyze: bool,
+    sql: &str,
+) -> Result<QueryResult> {
+    let statistics = context.statistics();
+    if !analyze {
+        return explained(
+            "logical_plan",
+            &rudb_opt::explain::explain_with(plan, statistics, seams),
+        );
+    }
+    let result = run(sql, plan, catalog, cancel, memory, statistics)?;
+    let measured = result.metrics().expect("a query that ran reports what it did");
+    let text = rudb_opt::explain::analyzed(plan, statistics, seams, measured);
+    explained("analyzed_plan", &text)
 }
 
 /// One row of two strings, which is the result set `EXPLAIN` hands back.
@@ -615,9 +670,8 @@ fn run(
 /// One row rather than one per operator. DuckDB puts its whole tree in a single value and every
 /// shell prints it as a block, and splitting it into rows would mean a shell's column width
 /// deciding where a plan wraps.
-fn explained(text: &str) -> Result<QueryResult> {
-    let key =
-        Vector::from_values(LogicalType::Varchar, &[Value::Varchar("logical_plan".to_owned())])?;
+fn explained(key: &str, text: &str) -> Result<QueryResult> {
+    let key = Vector::from_values(LogicalType::Varchar, &[Value::Varchar(key.to_owned())])?;
     let value = Vector::from_values(LogicalType::Varchar, &[Value::Varchar(text.to_owned())])?;
     Ok(QueryResult::new(
         vec!["explain_key".to_owned(), "explain_value".to_owned()],
@@ -658,7 +712,7 @@ fn create_table(
     let rows = match &mut create.source {
         Some(plan) => {
             rudb_opt::optimize_with(plan, context)?;
-            Some(run(sql, plan, catalog, cancel, memory)?)
+            Some(run(sql, plan, catalog, cancel, memory, context.statistics())?)
         }
         None => None,
     };

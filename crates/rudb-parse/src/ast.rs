@@ -85,12 +85,17 @@ pub enum Statement {
     Set(SettingRef),
     /// `RESET name`, which is the same shape with nothing on the right of it.
     Reset(SettingRef),
-    /// `EXPLAIN` over a query.
+    /// `EXPLAIN` over a query, and whether `ANALYZE` was asked for.
     ///
     /// The query rather than a statement, because the grammar lets every statement be explained
     /// and a plan is the only thing there is to show. `EXPLAIN INSERT` is a refusal rather than a
     /// plan of the source, since the source is not what the statement does.
-    Explain(QueryRef),
+    ///
+    /// `ANALYZE` means the query is run and the plan is printed with what happened on it, so it is
+    /// a flag on the same statement rather than a statement of its own. Everything between the
+    /// parser and the printer is the same either way, which is the point: the analyzed plan has to
+    /// be the plan that ran.
+    Explain { query: QueryRef, analyze: bool },
 }
 
 /// `SET name = value` and `RESET name`.

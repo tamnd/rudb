@@ -47,7 +47,10 @@ pub enum Bound {
     /// code. What makes it an explain is that the layer above optimizes it and prints it instead
     /// of running it, which is the point: a plan that was built differently because somebody asked
     /// to see it is not the plan that runs.
-    Explain(Plan),
+    ///
+    /// With `analyze` set the layer above runs it as well and prints what happened on it. Still the
+    /// same plan, for the same reason.
+    Explain { plan: Plan, analyze: bool },
 }
 
 /// A bound `SET` or `RESET`.
@@ -167,10 +170,10 @@ pub fn bind_statement_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters
         ast::Statement::Set(index) | ast::Statement::Reset(index) => {
             setting(ast, catalog, parameters, index)
         }
-        ast::Statement::Explain(query) => {
+        ast::Statement::Explain { query, analyze } => {
             let mut binder = Binder::with(catalog, parameters);
             let (root, _) = binder.bind_query(ast, query)?;
-            Ok(Bound::Explain(finish(binder, root)?))
+            Ok(Bound::Explain { plan: finish(binder, root)?, analyze })
         }
     }
 }

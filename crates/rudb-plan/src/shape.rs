@@ -115,6 +115,15 @@ impl Shape {
         self.placed(node).operator
     }
 
+    /// The operator this node becomes, or none for a node the root does not reach.
+    ///
+    /// The tolerant form of [`Shape::operator`], for a caller walking the whole arena rather than
+    /// the tree, which is what somebody filling one fact in per operator ends up doing.
+    #[must_use]
+    pub fn operator_of(&self, node: NodeRef) -> Option<OperatorRef> {
+        self.of.get(node as usize).copied().flatten().map(|placed| placed.operator)
+    }
+
     /// The operator holding the side of this node that has to finish first, if it has two inputs.
     ///
     /// # Panics

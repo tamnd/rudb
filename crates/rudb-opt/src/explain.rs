@@ -5,8 +5,13 @@
 //! `spec/09-optimizer.md` section 9.5 asks of `EXPLAIN` at this milestone. The physical plan is the
 //! other half and it waits for there to be a physical plan: today the executor is built straight
 //! off the logical one by `crates/rudb-exec/src/build.rs`, so a physical section would be the same
-//! tree with different words on it. `EXPLAIN ANALYZE` is the third and it needs the metrics
-//! document of a query that actually ran.
+//! tree with different words on it.
+//!
+//! `EXPLAIN ANALYZE` is [`analyzed`], which is the same three sections with the numbers of a query
+//! that actually ran written next to them. It prints from the metrics document rather than from
+//! anything of its own, so what it shows and what `--metrics run.json` writes out are the same
+//! numbers read two ways, and a disagreement between a printed plan and a recorded run is not a
+//! thing that can happen.
 //!
 //! This is in the optimizer rather than in `rudb-plan` because the estimate is here, and printing
 //! the plan without the estimate would be `Plan::to_string`, which already exists.
@@ -39,7 +44,8 @@
 
 use std::fmt::Write as _;
 
-use rudb_plan::{Node, NodeRef, PipelineRef, Plan, Shape};
+use rudb_metrics::{Document, Operator};
+use rudb_plan::{Node, NodeRef, OperatorRef, PipelineRef, Plan, Shape};
 use rudb_seam::{Registries, SeamId, Settings};
 
 use crate::estimate::{Statistics, rows};
@@ -110,48 +116,142 @@ pub fn explain(plan: &Plan, statistics: &Statistics) -> String {
 /// [`crate::estimate`] is careful about.
 #[must_use]
 pub fn explain_with(plan: &Plan, statistics: &Statistics, seams: Seams<'_>) -> String {
+    printed(plan, statistics, seams, None)
+}
+
+/// The plan as `EXPLAIN ANALYZE` prints it, which is the same three sections with what happened
+/// written next to what was expected.
+///
+/// The document has to be the one the same plan produced. Every number in the output is looked up
+/// by the operator id [`Shape`] gives a node, which is the id the builder tagged that operator's
+/// counters with, so a document from a different query lines nothing up rather than lining the
+/// wrong things up.
+#[must_use]
+pub fn analyzed(
+    plan: &Plan,
+    statistics: &Statistics,
+    seams: Seams<'_>,
+    measured: &Document,
+) -> String {
+    printed(plan, statistics, seams, Some(measured))
+}
+
+/// Writes the estimated row count of every node onto the operator row that node became.
+///
+/// Done here because the estimate is here and the mapping from a node to an operator is in
+/// `rudb-plan`, and neither of those is something the crate that runs a query should be working out
+/// for itself. An estimate an order of magnitude away from what happened is how a bad plan explains
+/// itself, and `rudb_metrics::warnings` cannot say so over a document where the estimate is missing.
+pub fn record_estimates(plan: &Plan, statistics: &Statistics, document: &mut Document) {
     let shape = Shape::of(plan);
+    let mut estimated = vec![None; shape.operators() as usize];
+    for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        if let Some(id) = shape.operator_of(node) {
+            estimated[id as usize] = rows(plan, node, statistics);
+        }
+    }
+    for operator in &mut document.operators {
+        if let Some(estimate) = estimated.get(operator.id as usize) {
+            operator.estimated_rows = *estimate;
+        }
+    }
+}
+
+/// The three sections, with the measured numbers in them if there are any.
+fn printed(
+    plan: &Plan,
+    statistics: &Statistics,
+    seams: Seams<'_>,
+    measured: Option<&Document>,
+) -> String {
+    let shape = Shape::of(plan);
+    let printing = Printing { plan, statistics, shape: &shape, seams, measured };
     let mut out = String::new();
-    write_node(plan, statistics, &shape, seams, plan.root(), 0, &mut out);
-    write_pipelines(&shape, &mut out);
+    printing.write_node(plan.root(), 0, &mut out);
+    write_pipelines(&shape, measured, &mut out);
     write_seams(seams, &mut out);
+    if let Some(measured) = measured {
+        write_totals(measured, &mut out);
+    }
     out
 }
 
-fn write_node(
-    plan: &Plan,
-    statistics: &Statistics,
-    shape: &Shape,
-    seams: Seams<'_>,
-    node: NodeRef,
-    depth: usize,
-    out: &mut String,
-) {
-    let printed = plan.operator(node);
-    let estimate = match rows(plan, node, statistics) {
-        Some(count) => format!("~{count} rows"),
-        None => "rows unknown".to_owned(),
-    };
-    let pipeline = shape.pipeline(node);
-    let marker = if seams.all_reference(plan.node(node)) { " [reference]" } else { "" };
-    // The estimate goes after the operator rather than in a column of its own, because the tree is
-    // indented and a column would have to be wider than the deepest line to line up.
-    let _ = writeln!(
-        out,
-        "{:indent$}{printed}  [{estimate}] [pipeline {pipeline}]{marker}",
-        "",
-        indent = depth * 2
-    );
-    for child in children(plan.node(node)) {
-        write_node(plan, statistics, shape, seams, child, depth + 1, out);
+/// Everything a line of the tree is written from, which is the same for every line.
+///
+/// The walk down the tree changes the node and the depth and nothing else, so the rest is carried
+/// here rather than as five more arguments repeated at each level.
+#[derive(Clone, Copy)]
+struct Printing<'a> {
+    plan: &'a Plan,
+    statistics: &'a Statistics,
+    shape: &'a Shape,
+    seams: Seams<'a>,
+    measured: Option<&'a Document>,
+}
+
+impl Printing<'_> {
+    fn write_node(self, node: NodeRef, depth: usize, out: &mut String) {
+        let printed = self.plan.operator(node);
+        let estimate = match rows(self.plan, node, self.statistics) {
+            Some(count) => format!("~{count} rows"),
+            None => "rows unknown".to_owned(),
+        };
+        let pipeline = self.shape.pipeline(node);
+        let marker =
+            if self.seams.all_reference(self.plan.node(node)) { " [reference]" } else { "" };
+        let actual = self
+            .measured
+            .map(|measured| actually(measured, self.shape.operator(node)))
+            .unwrap_or_default();
+        // The estimate goes after the operator rather than in a column of its own, because the tree
+        // is indented and a column would have to be wider than the deepest line to line up.
+        let _ = writeln!(
+            out,
+            "{:indent$}{printed}  [{estimate}] [pipeline {pipeline}]{marker}{actual}",
+            "",
+            indent = depth * 2
+        );
+        if let (Some(measured), Some(gathered)) = (self.measured, self.shape.gathered(node)) {
+            // The operator holding the side that finishes first has no line of the plan to sit on,
+            // because it is not a node. It gets its own line under the one it belongs to rather
+            // than being left out, since it is where the time of a build side actually goes.
+            if let Some(operator) = row(measured, gathered) {
+                let _ = writeln!(
+                    out,
+                    "{:indent$}{} of the side that finishes first{}",
+                    "",
+                    operator.kind,
+                    actually(measured, gathered),
+                    indent = (depth + 1) * 2
+                );
+            }
+        }
+        for child in children(self.plan.node(node)) {
+            self.write_node(child, depth + 1, out);
+        }
     }
+}
+
+/// What one operator did, as it goes on the end of its line.
+fn actually(measured: &Document, id: OperatorRef) -> String {
+    let Some(operator) = row(measured, id) else {
+        return "  [not measured]".to_owned();
+    };
+    let held = operator.memory.high_water;
+    let memory = if held == 0 { String::new() } else { format!(", {} held", bytes(held)) };
+    format!("  [{} rows, {}{memory}]", operator.rows_out, duration(operator.wall_ns))
+}
+
+/// The operator row with this id.
+fn row(measured: &Document, id: OperatorRef) -> Option<&Operator> {
+    measured.operators.iter().find(|operator| operator.id == id)
 }
 
 /// The pipelines and what each of them waits for.
 ///
 /// Printed even when there is only one, because a reader who sees no section cannot tell a plan
 /// that does not break from a build of `EXPLAIN` that does not say.
-fn write_pipelines(shape: &Shape, out: &mut String) {
+fn write_pipelines(shape: &Shape, measured: Option<&Document>, out: &mut String) {
     let _ = writeln!(out, "\nPipelines");
     for pipeline in shape.all() {
         let waits = shape.waits_for(pipeline);
@@ -161,7 +261,61 @@ fn write_pipelines(shape: &Shape, out: &mut String) {
             format!("waits for {}", listed(waits))
         };
         let root = if pipeline == ROOT { ", and the answer comes out of it" } else { "" };
-        let _ = writeln!(out, "  pipeline {pipeline} {waiting}{root}");
+        let took = measured
+            .and_then(|measured| measured.pipelines.iter().find(|row| row.id == pipeline))
+            .map(|row| format!("  [{} wall, {} cpu]", duration(row.wall_ns), duration(row.cpu_ns)))
+            .unwrap_or_default();
+        let _ = writeln!(out, "  pipeline {pipeline} {waiting}{root}{took}");
+    }
+}
+
+/// The whole query's numbers, and anything the document has to warn about them.
+fn write_totals(measured: &Document, out: &mut String) {
+    let timing = &measured.timing;
+    let _ = writeln!(out, "\nTotals");
+    let _ = writeln!(
+        out,
+        "  {} building the tree, {} running it, {} in all",
+        duration(timing.physical_ns),
+        duration(timing.execute_ns),
+        duration(timing.total_ns)
+    );
+    let _ = writeln!(
+        out,
+        "  {} of cpu, {} held at the peak",
+        duration(measured.resource.cpu_ns),
+        bytes(measured.resource.peak_bytes)
+    );
+    let warnings = measured.warnings();
+    if !warnings.is_empty() {
+        let _ = writeln!(out, "\nWarnings");
+        for warning in &warnings {
+            let _ = writeln!(out, "  {warning}");
+        }
+    }
+}
+
+/// A duration, in whichever unit a person would say it in.
+///
+/// Three significant figures and no more, because the fourth is noise on any measurement this is
+/// printing and a reader who sees it starts believing it.
+fn duration(ns: u64) -> String {
+    match ns {
+        0 => "0s".to_owned(),
+        1..1_000 => format!("{ns}ns"),
+        1_000..1_000_000 => format!("{:.3}us", ns as f64 / 1_000.0),
+        1_000_000..1_000_000_000 => format!("{:.3}ms", ns as f64 / 1_000_000.0),
+        _ => format!("{:.3}s", ns as f64 / 1_000_000_000.0),
+    }
+}
+
+/// A byte count, in whichever unit a person would say it in.
+fn bytes(count: u64) -> String {
+    match count {
+        0..1024 => format!("{count} bytes"),
+        1024..1_048_576 => format!("{:.1} KiB", count as f64 / 1024.0),
+        1_048_576..1_073_741_824 => format!("{:.1} MiB", count as f64 / 1_048_576.0),
+        _ => format!("{:.1} GiB", count as f64 / 1_073_741_824.0),
     }
 }
 

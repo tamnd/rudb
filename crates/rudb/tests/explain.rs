@@ -106,14 +106,56 @@ fn explain_marks_every_line_that_is_running_a_reference_implementation() {
 }
 
 #[test]
-fn explain_analyze_is_refused_rather_than_answered_with_a_plan_and_no_timings() {
-    // A plan is not what was asked for. Per operator timing over a query that actually ran is, and
-    // answering the wrong question quietly is worse than saying the feature is not here.
-    let database = with_rows(10);
-    let error = database.query("EXPLAIN ANALYZE SELECT a FROM t").expect_err("not yet");
-    assert_eq!(error.code().duckdb_name(), "Not implemented Error");
-    // Named, so that the refusal cannot pass for whatever error happens to come out of this path.
-    assert!(error.to_string().contains("ANALYZE"), "{error}");
+fn explain_analyze_runs_the_query_and_prints_what_each_operator_actually_did() {
+    // The estimate stays where it was and the measurement goes beside it, so that the two are read
+    // against each other. A filter that kept everything it was told would keep a fifth is the thing
+    // this output exists to make obvious.
+    let database = with_rows(1000);
+    let text = explained(&database, "EXPLAIN ANALYZE SELECT a FROM t WHERE a > 5");
+    for line in tree(&text) {
+        assert!(line.contains("[~"), "a line with no estimate on it: {line}");
+        assert!(line.contains(" rows, "), "a line with no measurement on it: {line}");
+    }
+    assert!(text.contains("[994 rows, "), "{text}");
+    assert!(text.contains("[1000 rows, "), "{text}");
+}
+
+#[test]
+fn explain_analyze_counts_the_rows_a_pipeline_breaker_finally_handed_out() {
+    // A sort produces nothing until it has seen everything, and the rows come back out of the
+    // buffer it filled rather than through the operator, so this is the number that goes missing if
+    // nobody counts it there. Zero here is what makes the estimate look a thousand times wrong.
+    let database = with_rows(1000);
+    let text = explained(&database, "EXPLAIN ANALYZE SELECT a FROM t ORDER BY a");
+    let sort = tree(&text)[0];
+    assert!(sort.starts_with("Sort "), "{text}");
+    assert!(sort.contains("[1000 rows, "), "{sort}");
+    assert!(!text.contains("q-error"), "a sort that produced every row it was given: {text}");
+    // The same buffer sits under a join, so the same number goes missing there if it is only
+    // counted in one of the two places.
+    let joined = explained(&database, "EXPLAIN ANALYZE SELECT t.a FROM t JOIN t AS u ON t.a = u.a");
+    let join = tree(&joined)
+        .into_iter()
+        .find(|line| line.trim_start().starts_with("Join "))
+        .unwrap_or_else(|| panic!("no join on the plan: {joined}"));
+    assert!(join.contains("[1000 rows, "), "{join}");
+}
+
+#[test]
+fn explain_analyze_reports_the_whole_query_under_its_own_key() {
+    // A client reading the result back has to be able to tell a plan that ran from a plan that did
+    // not, and the key is the only place that distinction shows up.
+    let database = with_rows(100);
+    let result = database.query("EXPLAIN ANALYZE SELECT a FROM t").expect("the explain ran");
+    assert_eq!(result.value_at(0, 0), Value::Varchar("analyzed_plan".to_owned()));
+    let plain = database.query("EXPLAIN SELECT a FROM t").expect("the explain ran");
+    assert_eq!(plain.value_at(0, 0), Value::Varchar("logical_plan".to_owned()));
+    let text = explained(&database, "EXPLAIN ANALYZE SELECT a FROM t");
+    assert!(text.contains("\nPipelines\n"), "{text}");
+    assert!(text.contains("\nSeams\n"), "{text}");
+    assert!(text.contains("\nTotals\n"), "{text}");
+    assert!(text.contains(" building the tree, "), "{text}");
+    assert!(text.contains(" of cpu, "), "{text}");
 }
 
 #[test]

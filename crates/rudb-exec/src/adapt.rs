@@ -14,8 +14,10 @@
 //! moving them first.
 
 use std::fmt;
+use std::sync::Arc;
 
 use rudb_common::{Error, Result};
+use rudb_metrics::Counters;
 use rudb_pipeline::{Morsel, Progress, Sink, Source, Stream};
 use rudb_vector::Chunk;
 
@@ -199,24 +201,31 @@ impl<F: Sink, S: Stream> Operator for Fed<'_, F, S> {
 /// chunks back out of the [`Buffered`] the sink filled. The order is the order the serial driver
 /// uses, which is on purpose: when the tree is built as a pipeline this adapter is deleted and the
 /// driver does exactly this.
+///
+/// The rows come back out of the [`Buffered`] rather than through the sink, so nothing the sink is
+/// wrapped in sees them and a sink would report having produced nothing. `made` is the same
+/// counters the wrapper holds, counted here as each finished chunk is handed out.
 pub(crate) struct Broken<'a, K: Sink> {
     input: Box<dyn Operator + 'a>,
     sink: K,
     out: Buffered,
+    made: Arc<Counters>,
     schema: Schema,
     built: bool,
     at: usize,
 }
 
 impl<'a, K: Sink> Broken<'a, K> {
-    /// `out` is the source half the sink finalises into, and `schema` is what comes out of it.
+    /// `out` is the source half the sink finalises into, `made` counts what comes back out of it,
+    /// and `schema` is what comes out of it.
     pub(crate) fn new(
         input: Box<dyn Operator + 'a>,
         sink: K,
         out: Buffered,
+        made: Arc<Counters>,
         schema: Schema,
     ) -> Self {
-        Self { input, sink, out, schema, built: false, at: 0 }
+        Self { input, sink, out, made, schema, built: false, at: 0 }
     }
 
     fn build(&mut self) -> Result<()> {
@@ -244,7 +253,8 @@ impl<K: Sink> Operator for Broken<'_, K> {
             self.built = true;
         }
         let chunk = self.out.at(self.at)?;
-        if chunk.is_some() {
+        if let Some(chunk) = chunk.as_ref() {
+            self.made.made(chunk.len() as u64);
             self.at += 1;
         }
         Ok(chunk)
@@ -259,12 +269,16 @@ impl<K: Sink> Operator for Broken<'_, K> {
 /// `aside`, and only then everything into `sink`. The scheduler is what enforces that later, from
 /// the same edge, which is why this runs them in the order it does rather than in whatever order is
 /// convenient here.
+///
+/// As in [`Broken`], the rows come back out of the [`Buffered`] rather than through the sink, so
+/// `made` is the sink's counters and is counted here.
 pub(crate) struct Paired<'a, F: Sink, K: Sink> {
     first: Box<dyn Operator + 'a>,
     aside: F,
     second: Box<dyn Operator + 'a>,
     sink: K,
     out: Buffered,
+    made: Arc<Counters>,
     schema: Schema,
     built: bool,
     at: usize,
@@ -272,16 +286,18 @@ pub(crate) struct Paired<'a, F: Sink, K: Sink> {
 
 impl<'a, F: Sink, K: Sink> Paired<'a, F, K> {
     /// `first` and `aside` are the side that has to be finished first, `second` and `sink` are the
-    /// side that uses it, and `out` is what `sink` finalises into.
+    /// side that uses it, `out` is what `sink` finalises into, and `made` counts what comes back
+    /// out of it.
     pub(crate) fn new(
         first: Box<dyn Operator + 'a>,
         aside: F,
         second: Box<dyn Operator + 'a>,
         sink: K,
         out: Buffered,
+        made: Arc<Counters>,
         schema: Schema,
     ) -> Self {
-        Self { first, aside, second, sink, out, schema, built: false, at: 0 }
+        Self { first, aside, second, sink, out, made, schema, built: false, at: 0 }
     }
 
     fn build(&mut self) -> Result<()> {
@@ -310,7 +326,8 @@ impl<F: Sink, K: Sink> Operator for Paired<'_, F, K> {
             self.built = true;
         }
         let chunk = self.out.at(self.at)?;
-        if chunk.is_some() {
+        if let Some(chunk) = chunk.as_ref() {
+            self.made.made(chunk.len() as u64);
             self.at += 1;
         }
         Ok(chunk)

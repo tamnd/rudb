@@ -229,6 +229,7 @@ dependencies = [
  "rudb-common",
  "rudb-functions",
  "rudb-kernels",
+ "rudb-metrics",
  "rudb-plan",
  "rudb-seam",
  "rudb-storage",
