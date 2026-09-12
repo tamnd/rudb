@@ -39,10 +39,17 @@
 //! answered wrongly. That is the one place where F4 has work left in an operator rather than in the
 //! scheduler.
 //!
-//! An operator with two inputs is two pipelines with an edge between them, and the set operation is
-//! the first one of those to move. The side that has to finish first ends in a `gather::Gather`,
-//! which holds its rows and does nothing else, and the side that uses it reads them through a
-//! handle. The join gets the same treatment when it moves.
+//! An operator with two inputs is two pipelines with an edge between them, and the set operation
+//! and the join are both built that way. The side that has to finish first ends in a
+//! `gather::Gather`, which holds its rows and does nothing else, and the side that uses it reads
+//! them through a handle. That edge is the one the scheduler will read off the plan, and for the
+//! join it is where the hash table goes when #62 replaces the nested loop.
+//!
+//! The cross product is the one operator that has not moved, and the reason is in its
+//! documentation: one input chunk becomes many output chunks, a [`Stream`](rudb_pipeline::Stream)
+//! turns one chunk into one chunk, and a [`Sink`](rudb_pipeline::Sink) would have to hold a million
+//! rows it is written to avoid holding. That needs a way for an operator to tell the driver it has
+//! more output for the input it already has, which is a change to `rudb-pipeline`.
 //!
 //! A sink finalises into a `buffer::Buffered`, which is a separate source that reads the finished
 //! chunks back out, rather than handing them back from `finalize`. That split is what makes the
