@@ -125,6 +125,52 @@ impl Selection {
             self.indices.iter().filter_map(|&slot| earlier.indices.get(slot as usize).copied());
         Self { indices: indices.collect() }
     }
+
+    /// The positions this selection holds that `taken` does not.
+    ///
+    /// Both sides have to be in ascending order, which every selection in this engine is: a kernel
+    /// fills one by walking the rows upward and a composed one keeps that order. So this is one
+    /// merge over the pair rather than a search per position.
+    ///
+    /// This is what a threaded `OR` narrows its work with. Each branch is given the rows no branch
+    /// before it accepted, and the rows it accepts come out of that set for the branch after.
+    #[must_use]
+    pub fn without(&self, taken: &Self) -> Self {
+        let mut indices = Vec::with_capacity(self.indices.len().saturating_sub(taken.len()));
+        let mut next = taken.indices.iter().copied().peekable();
+        for &index in &self.indices {
+            while next.peek().is_some_and(|&other| other < index) {
+                next.next();
+            }
+            if next.peek() == Some(&index) {
+                next.next();
+            } else {
+                indices.push(index);
+            }
+        }
+        Self { indices }
+    }
+
+    /// The positions below `len` that this selection does not hold.
+    ///
+    /// The other half of a threaded `OR`. What the branches leave behind is the rows none of them
+    /// accepted, and the rows the filter keeps are all the others.
+    #[must_use]
+    pub fn complement(&self, len: usize) -> Self {
+        let mut indices = Vec::with_capacity(len.saturating_sub(self.indices.len()));
+        let mut next = self.indices.iter().copied().peekable();
+        for index in 0..len as u32 {
+            while next.peek().is_some_and(|&held| held < index) {
+                next.next();
+            }
+            if next.peek() == Some(&index) {
+                next.next();
+            } else {
+                indices.push(index);
+            }
+        }
+        Self { indices }
+    }
 }
 
 #[cfg(test)]
@@ -164,6 +210,32 @@ mod tests {
     fn composing_with_the_identity_changes_nothing() {
         let selection = Selection::from_predicate(8, |i| i > 4);
         assert_eq!(selection.compose(&Selection::identity(8)), selection);
+    }
+
+    #[test]
+    fn taking_rows_out_of_a_selection_leaves_the_rest_in_order() {
+        let live = Selection::from_indices(vec![1, 4, 5, 9, 12]);
+        let taken = Selection::from_indices(vec![4, 9]);
+        assert_eq!(live.without(&taken).indices(), &[1, 5, 12]);
+        // Taking nothing and taking everything are the two ends a threaded `OR` hits on its first
+        // branch, and neither of them is allowed to be a special case at the call site.
+        assert_eq!(live.without(&Selection::empty()), live);
+        assert!(live.without(&live).is_empty());
+    }
+
+    #[test]
+    fn taking_rows_that_are_not_there_changes_nothing() {
+        let live = Selection::from_indices(vec![2, 6]);
+        assert_eq!(live.without(&Selection::from_indices(vec![0, 3, 7])), live);
+    }
+
+    #[test]
+    fn the_complement_is_every_position_the_selection_left_out() {
+        let selection = Selection::from_indices(vec![0, 2, 3]);
+        assert_eq!(selection.complement(6).indices(), &[1, 4, 5]);
+        assert_eq!(Selection::empty().complement(3), Selection::identity(3));
+        assert!(Selection::identity(3).complement(3).is_empty());
+        assert!(Selection::empty().complement(0).is_empty());
     }
 
     #[test]
