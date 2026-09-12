@@ -682,3 +682,39 @@ fn a_budget_too_small_for_one_group_says_so_rather_than_running_forever() {
     drop(operator);
     assert_eq!(memory.used(), 0, "the failed operator gave everything back");
 }
+
+#[test]
+fn every_seam_has_a_row_in_the_strategies_table() {
+    let rows = run("TableFunction rudb_strategies args=[] #0 [seam::VARCHAR, milestone::VARCHAR, \
+         implementation::VARCHAR]");
+    assert_eq!(rows.len(), rudb_seam::SeamId::ALL.len(), "one row per seam, registered or not");
+    let seams: Vec<Value> =
+        rudb_seam::SeamId::ALL.iter().map(|seam| text(seam.name())).collect::<Vec<_>>();
+    let listed: Vec<Value> = rows.iter().map(|row| row[0].clone()).collect();
+    assert_eq!(listed, seams, "in the order the design lists them");
+}
+
+#[test]
+fn a_seam_with_no_registry_says_so_rather_than_being_left_out() {
+    // Nothing is registered yet, which is the state F0 is meant to show honestly. Every row has a
+    // seam, a milestone that owes it and a description, and nulls where an implementation would be.
+    let rows = run("TableFunction rudb_strategies args=[] #0 [seam::VARCHAR, milestone::VARCHAR, \
+         implementation::VARCHAR, is_reference::BOOLEAN]");
+    for row in &rows {
+        assert!(matches!(row[0], Value::Varchar(_)), "a seam name");
+        assert!(matches!(row[1], Value::Varchar(_)), "the milestone that owes it");
+        assert_eq!(row[2], Value::Null, "no implementation yet");
+        assert_eq!(row[3], Value::Null, "so nothing is the reference either");
+    }
+}
+
+#[test]
+fn the_strategies_table_hands_back_the_columns_it_was_asked_for() {
+    // Not its own first few. The binder projects every column in order today, so a subset only
+    // arrives here once a pass trims the list, and an operator that ignored the list would answer
+    // with the right column names over the wrong column values.
+    let rows = run("TableFunction rudb_strategies args=[] #0 [milestone::VARCHAR, seam::VARCHAR]");
+    let first = rows.first().expect("at least one seam");
+    assert_eq!(first[0], text("F1"), "the milestone column, not the first column of the table");
+    assert_eq!(first[1], text("vector.form"));
+}

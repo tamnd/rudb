@@ -5,7 +5,7 @@
 //! resolution problem from [`crate::signature`]: the answer is not a return type, it is a list of
 //! columns, because the caller can alias them and select from them and join against them.
 //!
-//! Four of them are here. `range` and `generate_series` between them account for two thousand
+//! Five of them are here. `range` and `generate_series` between them account for two thousand
 //! records in DuckDB's `sqllogictest` corpus, because a test that needs a thousand rows should not
 //! have to write a thousand rows, and the corpus uses them the way a person uses a for loop. The
 //! difference between those two is one row: `range` stops before the end and `generate_series`
@@ -18,6 +18,11 @@
 //! A caller that resolves one of those has to open the file to finish resolving it, and
 //! [`crate::file`] is where that happens. For CSV there is nothing in the file that states the
 //! columns either, so opening it means sniffing it.
+//!
+//! `rudb_strategies()` is the fifth and it is not a DuckDB function. It lists every seam in the
+//! engine and every implementation registered against it, which is how a reader finds out what this
+//! engine will let them swap and what it lets them swap today. It takes no arguments and its
+//! columns are fixed, so resolving it is the simplest case in this file.
 
 use rudb_common::{Error, Field, LogicalType, Result};
 
@@ -35,6 +40,8 @@ pub enum TableFunction {
     ReadParquet,
     /// `read_csv(path)`, the rows of a CSV file, with everything about how it is written sniffed.
     ReadCsv,
+    /// `rudb_strategies()`, every seam and every implementation registered against it.
+    RudbStrategies,
 }
 
 impl TableFunction {
@@ -46,6 +53,7 @@ impl TableFunction {
             Self::GenerateSeries => "generate_series",
             Self::ReadParquet => "read_parquet",
             Self::ReadCsv => "read_csv",
+            Self::RudbStrategies => "rudb_strategies",
         }
     }
 
@@ -108,6 +116,9 @@ impl TableFunction {
         // function, which is why they are the same variant here.
         if name.eq_ignore_ascii_case("read_csv") || name.eq_ignore_ascii_case("read_csv_auto") {
             return Some(Self::ReadCsv);
+        }
+        if name.eq_ignore_ascii_case("rudb_strategies") {
+            return Some(Self::RudbStrategies);
         }
         None
     }
@@ -185,6 +196,18 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
         return Ok(ResolvedTable { function, arguments: vec![wanted], columns });
     }
     let arity = arguments.len();
+    if function == TableFunction::RudbStrategies {
+        if arity != 0 {
+            return Err(Error::binder(format!(
+                "Table function rudb_strategies() takes no arguments, {arity} were given"
+            )));
+        }
+        return Ok(ResolvedTable {
+            function,
+            arguments: Vec::new(),
+            columns: Columns::Fixed(strategy_fields()),
+        });
+    }
     if !(1..=3).contains(&arity) {
         return Err(Error::binder(format!(
             "Table function {}() takes between 1 and 3 arguments, {arity} were given",
@@ -204,8 +227,37 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
     match function {
         TableFunction::ReadParquet => Some(Columns::Parquet),
         TableFunction::ReadCsv => Some(Columns::Csv),
-        TableFunction::Range | TableFunction::GenerateSeries => None,
+        TableFunction::Range | TableFunction::GenerateSeries | TableFunction::RudbStrategies => {
+            None
+        }
     }
+}
+
+/// The columns `rudb_strategies()` produces.
+///
+/// Named here rather than in the executor because the binder resolves the call and the executor
+/// fills it, and a table whose two halves disagree about its own columns is a bug that shows up as
+/// a wrong answer rather than as a compile error.
+///
+/// Nine columns and every one of them earns its place at a seam that has no implementations yet,
+/// which is twenty six of the twenty seven today. `seam`, `milestone` and `seam_description` say
+/// what the seam is and which milestone owes it its first two implementations, and they are filled
+/// whether or not anything is registered. The other six describe an implementation and are null
+/// when there is none, which is how the table says that a seam is planned rather than built without
+/// anybody having to read a design document to find out.
+#[must_use]
+pub fn strategy_fields() -> Vec<Field> {
+    vec![
+        Field::new("seam", LogicalType::Varchar),
+        Field::new("milestone", LogicalType::Varchar),
+        Field::new("seam_description", LogicalType::Varchar),
+        Field::new("implementation", LogicalType::Varchar),
+        Field::new("implementation_description", LogicalType::Varchar),
+        Field::new("provenance", LogicalType::Varchar),
+        Field::new("determinism", LogicalType::Varchar),
+        Field::new("is_reference", LogicalType::Boolean),
+        Field::new("is_default", LogicalType::Boolean),
+    ]
 }
 
 /// DuckDB's message for a call that matched a name and no overload of it.
@@ -418,5 +470,19 @@ mod tests {
         // Not run, only counted. The point is that the count is worked out in i128, so this comes
         // out as a huge number rather than as a negative one that becomes a capacity panic.
         assert_eq!(length(TableFunction::Range, i64::MIN, i64::MAX, 1), usize::MAX);
+    }
+
+    #[test]
+    fn rudb_strategies_takes_no_arguments_and_produces_a_fixed_table() {
+        let resolved = resolve_table("rudb_strategies", &[]).unwrap();
+        assert_eq!(resolved.function, TableFunction::RudbStrategies);
+        assert!(resolved.arguments.is_empty());
+        assert_eq!(fixed(&resolved), strategy_fields());
+    }
+
+    #[test]
+    fn rudb_strategies_with_an_argument_says_it_takes_none() {
+        let error = resolve_table("rudb_strategies", &[LogicalType::BigInt]).unwrap_err();
+        assert!(error.to_string().contains("takes no arguments"), "{error}");
     }
 }
