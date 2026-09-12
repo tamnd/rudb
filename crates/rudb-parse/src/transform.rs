@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use rudb_common::{Error, Result};
+use rudb_common::{Error, Result, Value};
 
 use crate::ast::{
     Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, CreateView, Distinct, DropTable, Expr, ExprRef,
@@ -2207,20 +2207,17 @@ impl<'a> Transform<'a> {
         Ok(value)
     }
 
-    /// The prefix letter a string literal was written with, for the token that opens it.
+    /// The token that opens a string literal, which is the whole of it when it has a prefix.
     ///
     /// Only the first token is asked, because a prefixed literal is one token: `E'a' 'b'` is a
     /// syntax error upstream rather than a concatenation, so there is no second prefix to disagree
     /// with this one.
-    fn string_prefix(&self, node: u32) -> Option<u8> {
+    fn first_string(&self, node: u32) -> &'a str {
         let span = self.tree.node(node);
-        let token = self.tokens[span.start as usize..span.end as usize]
+        self.tokens[span.start as usize..span.end as usize]
             .iter()
-            .find(|token| token.kind == Kind::String)?;
-        match token.text(self.query).as_bytes() {
-            [first, b'\'', ..] => Some(*first),
-            _ => None,
-        }
+            .find(|token| token.kind == Kind::String)
+            .map_or("", |token| token.text(self.query))
     }
 
     /// A string literal as an expression, which is the value plus what the prefix makes of it.
@@ -2228,11 +2225,26 @@ impl<'a> Transform<'a> {
     /// `N'abc'` is a cast of the string to VARCHAR upstream and not a plain string, and the column
     /// name is the proof: the pinned binary answers it in a column called `CAST('abc' AS VARCHAR)`.
     /// So it is written here as the cast it is, and then there is nothing left to keep in step.
+    ///
+    /// `x'4142'` is not a string at all, it is a BLOB, so it is the one prefix that becomes a
+    /// different kind of literal rather than a string with something done to it.
     fn string_literal(&mut self, node: u32) -> Result<ExprRef> {
+        let token = self.first_string(node);
+        let prefix = match token.as_bytes() {
+            [prefix, b'\'', ..] => *prefix,
+            _ => 0,
+        };
+        if matches!(prefix, b'X' | b'x') {
+            if let Some(body) = token.get(1..).and_then(quoted_body) {
+                let text = blob_text(body.as_bytes())?;
+                let text = self.intern(&text);
+                return Ok(self.push(Expr::Literal { kind: LiteralKind::Blob, text }));
+            }
+        }
         let value = self.string_value(node)?;
         let text = self.intern(&value);
         let literal = self.push(Expr::Literal { kind: LiteralKind::String, text });
-        if matches!(self.string_prefix(node), Some(b'N' | b'n')) {
+        if matches!(prefix, b'N' | b'n') {
             let ty = self.intern("VARCHAR");
             return Ok(self.push(Expr::Cast { operand: literal, ty, try_cast: false }));
         }
@@ -2264,7 +2276,35 @@ fn string_token(text: &str) -> Result<String> {
         // characters `b101` as a VARCHAR, and `B''` with the one character `b`, which is measured
         // and not guessed. Nothing else is done with the body.
         b'B' | b'b' => Ok(format!("b{}", body.replace("''", "'"))),
+        // `x'41'` is a BLOB and a BLOB is not a string, so the places that want a string out of a
+        // literal, which are DESCRIBE and the part in EXTRACT, do not get one from this spelling.
         _ => Err(Error::not_implemented(format!("the string literal {text} is not supported yet"))),
+    }
+}
+
+/// The text a blob literal's body means, which is the text a blob prints as.
+///
+/// `x'4142'` is two bytes and the pinned binary calls the column `'AB'::BLOB`, so what is kept here
+/// is the printed form and not the source. The cast that reads it back gives the bytes again, which
+/// is what makes one text enough for both the value and the name, and it is `Value` that prints it
+/// so the two spellings of a blob cannot drift apart.
+///
+/// Upstream writes `\xHH` for every pair without looking at the digits and lets the cast refuse the
+/// ones that are not hex, which is why `x'4'` is a parser error and `x'zz'` is a conversion error
+/// one step later. Doing the same thing gives both messages in the same words. The pairs are bytes
+/// and not characters: `x'éé'` is four bytes and so two pairs, which is how upstream counts them.
+fn blob_text(body: &[u8]) -> Result<String> {
+    if body.len() % 2 != 0 {
+        return Err(Error::parser("Hex string literal must have an even number of hex digits"));
+    }
+    let digit = |byte: u8| (byte as char).to_digit(16).map(|digit| digit as u8);
+    let bytes: Option<Vec<u8>> =
+        body.chunks(2).map(|pair| Some(digit(pair[0])? * 16 + digit(pair[1])?)).collect();
+    match bytes {
+        Some(bytes) => Ok(Value::Blob(bytes).to_string()),
+        None => {
+            Ok(body.chunks(2).map(|pair| format!("\\x{}", String::from_utf8_lossy(pair))).collect())
+        }
     }
 }
 
@@ -2448,6 +2488,7 @@ mod tests {
             Expr::Literal { kind, text } => match kind {
                 LiteralKind::Number => ast.string(text).to_string(),
                 LiteralKind::String => format!("'{}'", ast.string(text)),
+                LiteralKind::Blob => format!("'{}'::BLOB", ast.string(text)),
                 other => format!("{other:?}").to_uppercase(),
             },
             Expr::Unary { op, operand } => format!("({op:?} {})", show(ast, operand)),
@@ -3278,9 +3319,31 @@ mod tests {
         assert_eq!(round("SELECT B'101'"), "SELECT 'b101'");
         assert_eq!(round("SELECT b'abc'"), "SELECT 'babc'");
         assert_eq!(round("SELECT B''"), "SELECT 'b'", "an empty one is the letter on its own");
-        // X is a blob and a blob is not a string, so it raises until there is one to answer with.
-        let error = parse_ast("SELECT x'ff'").unwrap_err().to_string();
-        assert_eq!(error, "Not implemented Error: the string literal x'ff' is not supported yet");
+    }
+
+    /// X is the prefix that is not a string at all, per #329.
+    ///
+    /// What is kept is the text the blob prints as, because that is the text the column is named
+    /// after and the text the cast reads the bytes back from, and one text that does both is one
+    /// text that cannot disagree with itself.
+    #[test]
+    fn a_hex_string_is_a_blob_and_not_a_string() {
+        assert_eq!(round("SELECT x'4142'"), "SELECT 'AB'::BLOB");
+        assert_eq!(round("SELECT X'4142'"), "SELECT 'AB'::BLOB");
+        assert_eq!(round("SELECT x'ff41'"), "SELECT '\\xFFA'::BLOB", "a byte that does not print");
+        assert_eq!(round("SELECT x''"), "SELECT ''::BLOB", "an empty one is an empty blob");
+        // A quote and a backslash are bytes that do not print either, which is what keeps the text
+        // something the cast can read back.
+        assert_eq!(round("SELECT x'2741'"), "SELECT '\\x27A'::BLOB");
+        assert_eq!(round("SELECT x'5c7834314141'"), "SELECT '\\x5Cx41AA'::BLOB");
+        // An odd number of digits is a parser error and a digit that is not one is not, because
+        // upstream writes the pairs out without looking at them and the cast is what looks.
+        let error = parse_ast("SELECT x'4'").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Parser Error: Hex string literal must have an even number of hex digits"
+        );
+        assert_eq!(round("SELECT x'41zz'"), "SELECT '\\x41\\xzz'::BLOB");
     }
 
     #[test]

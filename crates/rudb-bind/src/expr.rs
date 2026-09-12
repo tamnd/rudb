@@ -105,10 +105,17 @@ impl Binder<'_> {
             LiteralKind::Null => Value::Null,
             LiteralKind::True => Value::Boolean(true),
             LiteralKind::False => Value::Boolean(false),
-            LiteralKind::String => Value::Varchar(ast.string(text).to_string()),
+            LiteralKind::String | LiteralKind::Blob => Value::Varchar(ast.string(text).to_string()),
             LiteralKind::Number => number(ast.string(text), false)?,
         };
-        Ok(self.plan_mut().add_constant(value))
+        let constant = self.plan_mut().add_constant(value);
+        // A blob literal is the text a blob prints as, so the cast that reads that text back is the
+        // whole of the conversion, and the one that refuses `x'zz'` is the one that already refuses
+        // `'\xzz'::BLOB`, in the same words. Per #329.
+        if kind == LiteralKind::Blob {
+            return Ok(self.cast_to(constant, &LogicalType::Blob));
+        }
+        Ok(constant)
     }
 
     /// `[a, b, c]`, which is a LIST value.
@@ -537,6 +544,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
             LiteralKind::True => "true".to_string(),
             LiteralKind::False => "false".to_string(),
             LiteralKind::String => format!("'{}'", ast.string(text)),
+            LiteralKind::Blob => format!("'{}'::BLOB", ast.string(text)),
             LiteralKind::Number => ast.string(text).to_string(),
         },
         // A prefix operator is a function call with the argument in brackets, so `-i` is named
