@@ -6,8 +6,11 @@
 //! In push terms that is two pipelines and a dependency between them, and the pipeline that is
 //! depended on ends in a sink that keeps its rows and does nothing else.
 //!
-//! This is that sink. The rows come out through a [`Rows`] handle, which is what the operator on
-//! the other side of the dependency holds.
+//! This is that sink, and there are two of it. [`Gather`] takes its input apart into rows, which
+//! come out through a [`Rows`] handle, and [`Keep`] holds the chunks as they were given to it and
+//! fills a [`Buffered`]. Which one an operator wants is decided by what it does with the side: one
+//! that answers a row at a time wants rows, and one that replays the side as it stands wants the
+//! chunks it was handed.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +18,7 @@ use rudb_common::{Error, Memory, Reservation, Result, Value};
 use rudb_pipeline::{Progress, Sink};
 use rudb_vector::Chunk;
 
+use crate::buffer::Buffered;
 use crate::rows;
 
 /// Rows somebody gathered, readable once the pipeline that filled them has finished.
@@ -121,6 +125,76 @@ pub(crate) fn take(chunk: &Chunk, local: &mut Gathering) -> Result<()> {
     rows::capacity(slots, &mut local.counted, &mut local.charged)
 }
 
+/// A sink that keeps every chunk it is given, as the chunk it was given.
+///
+/// The other sink in this file takes its input apart into rows, which is what an operator that
+/// decides one row at a time needs. An operator that replays its side as it stands does not: a cross
+/// product pairs one left row with a whole right chunk, so taking those chunks apart and building
+/// them again would be a copy of the whole side for nothing. Same edge, same shape, different thing
+/// kept.
+///
+/// What it fills is a [`Buffered`], because that is already the source that reads finished chunks
+/// back out and there is no reason for a second one.
+#[derive(Debug)]
+pub(crate) struct Keep {
+    memory: Memory,
+    chunks: Mutex<Vec<Chunk>>,
+    /// What the kept chunks are charged, held for as long as they are readable, which is as long as
+    /// the operator that depends on them is running.
+    charged: Mutex<Vec<Reservation>>,
+    out: Buffered,
+}
+
+/// What one instance of a keep is holding.
+#[derive(Debug)]
+pub(crate) struct Kept {
+    chunks: Vec<Chunk>,
+    charged: Reservation,
+}
+
+impl Keep {
+    /// A keep and the source its chunks come out of.
+    pub(crate) fn new(memory: &Memory) -> (Self, Buffered) {
+        let out = Buffered::new();
+        let keep = Self {
+            memory: memory.clone(),
+            chunks: Mutex::new(Vec::new()),
+            charged: Mutex::new(Vec::new()),
+            out: out.clone(),
+        };
+        (keep, out)
+    }
+}
+
+impl Sink for Keep {
+    type Local = Kept;
+
+    fn local(&self) -> Kept {
+        Kept { chunks: Vec::new(), charged: self.memory.reservation() }
+    }
+
+    fn sink(&self, chunk: &Chunk, local: &mut Kept) -> Result<Progress> {
+        // An empty chunk is dropped rather than kept, because an operator replaying this side would
+        // pair every one of its rows with it and produce nothing each time.
+        if !chunk.is_empty() {
+            local.charged.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
+            local.chunks.push(chunk.clone());
+        }
+        Ok(Progress::More)
+    }
+
+    fn combine(&self, local: Kept) -> Result<()> {
+        self.chunks.lock().map_err(poisoned)?.extend(local.chunks);
+        self.charged.lock().map_err(poisoned)?.push(local.charged);
+        Ok(())
+    }
+
+    fn finalize(&self) -> Result<()> {
+        let chunks = std::mem::take(&mut *self.chunks.lock().map_err(poisoned)?);
+        self.out.fill(chunks)
+    }
+}
+
 /// A fresh instance's state, for an operator that gathers one of its sides itself.
 pub(crate) fn gathering(memory: &Memory) -> Gathering {
     Gathering { rows: Vec::new(), charged: memory.reservation(), counted: 0 }
@@ -140,7 +214,7 @@ mod tests {
     use rudb_common::{LogicalType, Memory, Value};
     use rudb_vector::{Data, Vector};
 
-    use super::{Chunk, Gather, Sink};
+    use super::{Chunk, Gather, Keep, Sink};
 
     fn chunk(values: &[i32]) -> Chunk {
         let column = Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into()))
@@ -197,5 +271,25 @@ mod tests {
 
         assert!(rows.take().expect("readable").is_empty());
         assert!(rows.take().expect("readable").is_empty());
+    }
+
+    /// The other sink in here. What goes in comes back as the chunks it went in as, and an empty
+    /// one is not one of them, because an operator replaying this side would pair every row it has
+    /// with it and produce nothing each time.
+    #[test]
+    fn a_keep_holds_the_chunks_it_was_given_and_drops_the_empty_ones() {
+        let memory = Memory::unlimited();
+        let (keep, out) = Keep::new(&memory);
+
+        let mut local = keep.local();
+        keep.sink(&chunk(&[1, 2]), &mut local).expect("two rows");
+        keep.sink(&Chunk::empty(&[LogicalType::Integer]), &mut local).expect("no rows");
+        keep.sink(&chunk(&[3]), &mut local).expect("one row");
+        keep.combine(local).expect("the one instance");
+        keep.finalize().expect("the chunks");
+
+        assert_eq!(out.len().expect("readable"), 2);
+        assert_eq!(out.at(0).expect("readable").expect("the first").len(), 2);
+        assert_eq!(out.at(1).expect("readable").expect("the second").len(), 1);
     }
 }

@@ -32,14 +32,13 @@ use std::sync::Mutex;
 
 use rudb_common::{Cancel, Error, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Connective, combine, is_true};
-use rudb_pipeline::{Progress, Sink};
+use rudb_pipeline::{Progress, Sink, Stream};
 use rudb_plan::{ExprRef, JoinKind, Plan, Slice};
 use rudb_vector::{Chunk, Vector};
 
 use crate::buffer::Buffered;
 use crate::expr::evaluate_all;
 use crate::gather::{self, Gathering, Rows};
-use crate::operator::Operator;
 use crate::rows;
 use crate::schema::Schema;
 
@@ -282,100 +281,91 @@ fn poisoned<T>(_: T) -> Error {
 
 /// An unconditional cross product.
 ///
-/// The only join shaped operator here that does not materialize its left side. It holds the right
-/// side, because that one has to be replayed once per left row, and then walks the left a row at a
-/// time emitting one combined chunk per right chunk. A cross product of a thousand by a thousand is
-/// a million rows and there is no way around producing them, but there is a way around holding them
+/// The only join shaped operator here that does not hold its left side. It holds the right side,
+/// because that one has to be replayed once per left row, and then walks the left a row at a time
+/// emitting one combined chunk per right chunk. A cross product of a thousand by a thousand is a
+/// million rows and there is no way around producing them, but there is a way around holding them
 /// all at once and this is it.
 ///
-/// It is also the one operator here that is still pulled, and the reason is that property. One input
-/// chunk becomes many output chunks, and neither [`Sink`] nor [`rudb_pipeline::Stream`] can say that
-/// yet: a stream transforms one chunk into one chunk, and a sink that held the answer would hold the
-/// million rows this is written to avoid. What it needs is a way for an operator to tell the driver
-/// that it has more output for the input it was already given, which is a change to the pipeline
-/// crate rather than to this file, and it is the next one.
+/// That is also why it is a [`Stream`] rather than a [`Sink`]. One input chunk becomes as many
+/// output chunks as the right side has, and what says so is [`Progress::Again`]: the driver hands
+/// each one on and asks for the next. The left chunk being walked lives in the instance state,
+/// because the chunk the driver hands back on the next call holds whatever the operators below left
+/// in it.
+///
+/// The right side is kept as the chunks it arrived in, by a [`Keep`](crate::gather::Keep) at the end
+/// of the pipeline this one depends on. Rows would have to be built back into chunks here, once, for
+/// nothing.
 #[derive(Debug)]
-pub(crate) struct CrossProduct<'a> {
-    left: Box<dyn Operator + 'a>,
-    right: Box<dyn Operator + 'a>,
+pub(crate) struct CrossProduct {
     left_types: Vec<LogicalType>,
+    types: Vec<LogicalType>,
     schema: Schema,
-    stored: Vec<Chunk>,
-    prepared: bool,
-    current: Option<Chunk>,
-    left_row: usize,
-    right_chunk: usize,
-    /// What the stored right side is charged. The output is not charged, because this operator
-    /// hands each chunk out and forgets it.
-    held: Reservation,
+    /// The right side, filled by the pipeline this one depends on.
+    right: Buffered,
 }
 
-impl<'a> CrossProduct<'a> {
-    pub(crate) fn new(
-        left: Box<dyn Operator + 'a>,
-        right: Box<dyn Operator + 'a>,
-        memory: &Memory,
-    ) -> Self {
-        let left_schema = left.schema().clone();
-        let schema = Schema::concat(&left_schema, right.schema());
-        Self {
-            left,
-            right,
-            left_types: left_schema.types(),
-            schema,
-            stored: Vec::new(),
-            prepared: false,
-            current: None,
-            left_row: 0,
-            right_chunk: 0,
-            held: memory.reservation(),
-        }
+/// Where one instance of a cross product is in the left chunk it was given.
+#[derive(Debug)]
+pub(crate) struct Crossing {
+    /// The left chunk being walked, held while there is any of it left to pair.
+    left: Option<Chunk>,
+    row: usize,
+    at: usize,
+}
+
+impl CrossProduct {
+    /// `right` is the handle on the chunks the other pipeline kept.
+    pub(crate) fn new(left: &Schema, right_schema: &Schema, right: Buffered) -> Self {
+        let schema = Schema::concat(left, right_schema);
+        Self { left_types: left.types(), types: schema.types(), schema, right }
     }
-}
 
-impl Operator for CrossProduct<'_> {
-    fn schema(&self) -> &Schema {
+    /// What this operator produces, which is both sides' columns.
+    pub(crate) fn schema(&self) -> &Schema {
         &self.schema
     }
+}
 
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        if !self.prepared {
-            while let Some(chunk) = self.right.next()? {
-                if !chunk.is_empty() {
-                    self.held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
-                    self.stored.push(chunk);
-                }
+impl Stream for CrossProduct {
+    type Local = Crossing;
+
+    fn local(&self) -> Crossing {
+        Crossing { left: None, row: 0, at: 0 }
+    }
+
+    fn push(&self, chunk: &mut Chunk, local: &mut Crossing) -> Result<Progress> {
+        let stored = self.right.len()?;
+        let left = match local.left.take() {
+            // Being asked again, so the chunk holds whatever was downstream of it and the left side
+            // is the one this instance kept.
+            Some(left) => left,
+            None => {
+                local.row = 0;
+                local.at = 0;
+                chunk.clone()
             }
-            self.prepared = true;
+        };
+        if stored == 0 || left.is_empty() {
+            *chunk = Chunk::empty(&self.types);
+            return Ok(Progress::More);
         }
-        if self.stored.is_empty() {
-            return Ok(None);
+        let right = self
+            .right
+            .at(local.at)?
+            .ok_or_else(|| Error::internal("a cross product asked for a chunk nobody kept"))?;
+        let row: Vec<Value> = left.row(local.row).collect();
+        *chunk = widen(&row, &self.left_types, &right)?;
+        local.at += 1;
+        if local.at >= stored {
+            local.at = 0;
+            local.row += 1;
         }
-        loop {
-            let Some(chunk) = &self.current else {
-                match self.left.next()? {
-                    Some(chunk) => {
-                        self.current = Some(chunk);
-                        self.left_row = 0;
-                        self.right_chunk = 0;
-                    }
-                    None => return Ok(None),
-                }
-                continue;
-            };
-            if self.left_row >= chunk.len() {
-                self.current = None;
-                continue;
-            }
-            let left_row: Vec<Value> = chunk.row(self.left_row).collect();
-            let out = widen(&left_row, &self.left_types, &self.stored[self.right_chunk])?;
-            self.right_chunk += 1;
-            if self.right_chunk >= self.stored.len() {
-                self.right_chunk = 0;
-                self.left_row += 1;
-            }
-            return Ok(Some(out));
+        if local.row >= left.len() {
+            return Ok(Progress::More);
         }
+        local.left = Some(left);
+        Ok(Progress::Again)
     }
 }
 
@@ -442,8 +432,8 @@ mod tests {
     use rudb_plan::{JoinKind, Plan, Slice};
     use rudb_vector::{Data, Vector};
 
-    use super::{Buffered, Chunk, Gathered, Join, Schema, Sink};
-    use crate::gather::{Gather, Rows};
+    use super::{Buffered, Chunk, CrossProduct, Gathered, Join, Progress, Schema, Sink, Stream};
+    use crate::gather::{Gather, Keep, Rows};
 
     fn chunk(values: &[i32]) -> Chunk {
         let column = Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into()))
@@ -557,5 +547,70 @@ mod tests {
             rows(&out, 2),
             [vec![Value::Integer(1), Value::Integer(10)], vec![Value::Integer(2), Value::Null],]
         );
+    }
+
+    /// Every output chunk of one cross product over one left chunk, in the order it produced them.
+    fn crossed(cross: &CrossProduct, left: &[i32]) -> Vec<Vec<Value>> {
+        let mut local = cross.local();
+        let mut chunk = chunk(left);
+        let mut out = Vec::new();
+        loop {
+            let progress = cross.push(&mut chunk, &mut local).expect("a chunk");
+            out.extend(
+                (0..chunk.len()).map(|row| vec![chunk.value_at(row, 0), chunk.value_at(row, 1)]),
+            );
+            if progress != Progress::Again {
+                return out;
+            }
+            // What the driver hands back is whatever the operators below it left in the chunk, and
+            // this is the cheapest stand in for that.
+            chunk = Chunk::empty(&[]);
+        }
+    }
+
+    /// The right side as two chunks, so that the walk over them is exercised rather than assumed.
+    fn kept(memory: &Memory, first: &[i32], second: &[i32]) -> (Keep, Buffered) {
+        let (keep, out) = Keep::new(memory);
+        let mut local = keep.local();
+        keep.sink(&chunk(first), &mut local).expect("the first right chunk");
+        keep.sink(&chunk(second), &mut local).expect("the second");
+        keep.combine(local).expect("the one instance");
+        keep.finalize().expect("the chunks");
+        (keep, out)
+    }
+
+    #[test]
+    fn a_cross_product_pairs_one_left_row_with_one_right_chunk_at_a_time() {
+        let memory = Memory::unlimited();
+        let (_keep, right) = kept(&memory, &[10, 20], &[30]);
+        let cross = CrossProduct::new(&schema("a", 0), &schema("b", 1), right);
+
+        assert_eq!(
+            crossed(&cross, &[1, 2]),
+            [
+                vec![Value::Integer(1), Value::Integer(10)],
+                vec![Value::Integer(1), Value::Integer(20)],
+                vec![Value::Integer(1), Value::Integer(30)],
+                vec![Value::Integer(2), Value::Integer(10)],
+                vec![Value::Integer(2), Value::Integer(20)],
+                vec![Value::Integer(2), Value::Integer(30)],
+            ]
+        );
+    }
+
+    /// Nothing on the right is nothing at all, and the way a stream says that is an empty chunk it
+    /// does not ask to be called again for.
+    #[test]
+    fn a_cross_product_with_nothing_on_the_right_produces_nothing() {
+        let memory = Memory::unlimited();
+        let (keep, right) = Keep::new(&memory);
+        keep.combine(keep.local()).expect("an instance that saw nothing");
+        keep.finalize().expect("no chunks");
+        let cross = CrossProduct::new(&schema("a", 0), &schema("b", 1), right);
+
+        let mut local = cross.local();
+        let mut chunk = chunk(&[1, 2]);
+        assert_eq!(cross.push(&mut chunk, &mut local).expect("no rows"), Progress::More);
+        assert!(chunk.is_empty());
     }
 }
