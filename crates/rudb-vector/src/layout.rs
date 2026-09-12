@@ -75,8 +75,9 @@
 ///   the ones where a null slot can be filled with a zero and a gather is a copy of fixed width
 ///   slots rather than a copy of bytes.
 /// - `ordered`, the layouts whose SQL order is the derived order of the element type. A float is
-///   not in it, because `NaN` orders where SQL says rather than where the hardware says, and a
-///   string is not in it, because its order is over the bytes a view points at.
+///   not in it, because `NaN` orders where SQL says rather than where the hardware says, a string
+///   is not in it, because its order is over the bytes a view points at, and an interval is not in
+///   it, because three counts that are the same length compare as one number and not as a triple.
 /// - `integer`, the ten integer widths.
 /// - `signed` and `unsigned`, the five of each that `integer` is made of. Several kernels want one
 ///   half and not the other, negation being the clearest, since negating an unsigned value is an
@@ -143,7 +144,6 @@ macro_rules! for_each_layout {
             (UInt32, u32, 0),
             (UInt64, u64, 0),
             (UInt128, u128, 0),
-            (Interval, (i32, i32, i64), (0, 0, 0)),
         }
     };
     (integer, $callback:ident $(, $extra:tt)*) => {
@@ -273,8 +273,8 @@ mod tests {
     #[test]
     fn each_group_plus_what_it_leaves_out_is_the_group_above_it() {
         assert_eq!(sorted(ALL, &[]), sorted(FIXED, &["Varlen"]));
-        assert_eq!(sorted(FIXED, &[]), sorted(ORDERED, FLOAT));
-        assert_eq!(sorted(ORDERED, &[]), sorted(INTEGER, &["Bool", "Interval"]));
+        assert_eq!(sorted(FIXED, &[]), sorted(ORDERED, &["Float32", "Float64", "Interval"]));
+        assert_eq!(sorted(ORDERED, &[]), sorted(INTEGER, &["Bool"]));
         assert_eq!(sorted(INTEGER, &[]), sorted(SIGNED, UNSIGNED));
         assert_eq!(sorted(INTEGER, &[]), sorted(EXACT, &["UInt128"]));
         assert_eq!(sorted(EXACT, &[]), sorted(NARROW, &["Int128"]));

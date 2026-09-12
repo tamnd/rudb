@@ -393,6 +393,27 @@ pub fn civil_from_days(days: i32) -> (i32, u32, u32) {
     (year as i32, month as u32, day as u32)
 }
 
+/// How long an interval is in microseconds, which is the one number two of them are compared as.
+///
+/// The three counts are kept apart because adding a month to a date is not adding thirty days to
+/// it, and an interval that has been flattened cannot tell the difference. Comparing two of them
+/// has to answer with one number all the same, and DuckDB's number is this one, thirty days to a
+/// month and twenty four hours to a day. So `INTERVAL '1 month'` and `INTERVAL '30 days'` are
+/// equal and still print differently, which is upstream's behaviour and not a rounding chosen here.
+///
+/// Ordering, `GROUP BY`, `DISTINCT`, a join key and the min and max aggregates all read this, so
+/// there is one function rather than a comparison in one file and a hash in another that can come
+/// to disagree about which two intervals are the same one.
+///
+/// The answer is an `i128` because the largest interval is the whole of an `i32` of months, which
+/// at thirty days each is six hundred times what an `i64` of microseconds holds.
+#[must_use]
+pub fn interval_micros(months: i32, days: i32, micros: i64) -> i128 {
+    const MICROS_PER_DAY: i128 = 86_400 * 1_000_000;
+    const DAYS_PER_MONTH: i128 = 30;
+    (i128::from(months) * DAYS_PER_MONTH + i128::from(days)) * MICROS_PER_DAY + i128::from(micros)
+}
+
 /// The civil date to days since the epoch, the inverse of [`civil_from_days`].
 #[must_use]
 pub fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
