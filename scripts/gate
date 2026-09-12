@@ -10,8 +10,12 @@
 #   scripts/gate server1      the same, on a different machine
 #   scripts/gate server3 --full   nothing narrowed
 #
-# It copies the working tree, including uncommitted work and the .git directory, because the focus
-# in `cargo xtask ci` is computed from the diff and a copy without .git has no diff to compute.
+# It copies the working tree, including uncommitted work, and works out the diff here rather than
+# there. That is not a preference. This checkout is a git worktree, so its `.git` is a file naming a
+# directory under the main clone, and the copy of that file on the other machine names a path that
+# does not exist there. `cargo xtask ci` ran git, got nothing, said "no git base to compare against"
+# and ran the whole workspace, every single time, which made the focus in it dead code from the day
+# it was written. So the diff is computed on this side, where git works, and handed over.
 set -e
 
 host=server3
@@ -34,6 +38,34 @@ rsync -a --delete \
   --rsync-path "mkdir -p ~/$remote && rsync" \
   "$root/" "$host:$remote/"
 
+# The merge base with the trunk when there is one, so a branch is measured against what it branched
+# from rather than against its own first commit, and the previous commit when this is the trunk.
+base=$(git -C "$root" merge-base origin/main HEAD 2>/dev/null || true)
+head=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)
+if [ -z "$base" ] || [ "$base" = "$head" ]; then
+  base=$(git -C "$root" rev-parse HEAD~1 2>/dev/null || true)
+fi
+
+changed=""
+if [ -n "$base" ]; then
+  # Committed and uncommitted together. The gate is run before the commit at least as often as
+  # after it, and a diff that only sees committed work is a green on a tree that does not build.
+  changed=$(
+    {
+      git -C "$root" diff --name-only "$base...HEAD"
+      git -C "$root" status --porcelain --untracked-files=all | cut -c4- | sed 's/.* -> //' | tr -d '"'
+    } | sed '/^$/d' | sort -u
+  )
+fi
+
+# A path holding a single quote would end the quoting on the other side of the ssh and turn the rest
+# of a filename into a command. There are none here and there is no reason for one, so the answer is
+# to notice and stop narrowing rather than to build an escaping scheme for a case that does not
+# arise. Running everything is always a correct answer, it is only a slow one.
+case "$changed" in
+  *\'*) base=""; changed="" ;;
+esac
+
 # Non-interactive ssh does not read the profile that puts cargo on the path, so it goes on here.
 # shellcheck disable=SC2029
-ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; cd ~/$remote && cargo xtask ci $*"
+ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; export RUDB_CI_BASE='$base'; export RUDB_CI_CHANGED='$changed'; cd ~/$remote && cargo xtask ci $*"

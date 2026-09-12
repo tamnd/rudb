@@ -98,6 +98,9 @@ impl Focus {
 /// merge base to use, so it falls back to the previous commit, which is the honest reading of
 /// "what did I just change" when the answer is one commit.
 pub(crate) fn detect(root: &Path) -> Focus {
+    if let Some((base, paths)) = handed_over() {
+        return from_paths(root, base, paths);
+    }
     let Some(base) = base(root) else {
         return Focus::everything("no git base to compare against");
     };
@@ -119,7 +122,33 @@ pub(crate) fn detect(root: &Path) -> Focus {
         }
     }
     let paths: Vec<String> = paths.into_iter().filter(|p| !p.is_empty()).collect();
+    from_paths(root, base, paths)
+}
 
+/// The diff somebody else already took, when there is one.
+///
+/// `scripts/gate` copies the working tree to another machine and runs the gate there, and the copy
+/// has no usable git: this checkout is a worktree, so its `.git` is a file naming a directory that
+/// only exists on the machine the copy came from. So the caller works the diff out where git works
+/// and sets these two, and the whole of the narrowing below runs on paths rather than on a
+/// repository. `RUDB_CI_BASE` is what says a diff was handed over at all, because an empty
+/// `RUDB_CI_CHANGED` is a real answer and means nothing changed.
+fn handed_over() -> Option<(String, Vec<String>)> {
+    let base = std::env::var("RUDB_CI_BASE").ok().filter(|base| !base.trim().is_empty())?;
+    let changed = std::env::var("RUDB_CI_CHANGED").unwrap_or_default();
+    let paths: Vec<String> = changed
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    Some((base.trim().to_string(), paths))
+}
+
+/// What a list of changed paths means for each part of the gate.
+fn from_paths(root: &Path, base: String, paths: Vec<String>) -> Focus {
     let mut direct = BTreeSet::new();
     let mut prose = false;
     let mut grammar = false;
@@ -255,7 +284,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{closure, manifest_of, members};
+    use super::{closure, from_paths, manifest_of, members};
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -295,5 +324,45 @@ mod tests {
     #[test]
     fn a_change_to_nothing_reaches_nothing() {
         assert!(closure(&root(), &BTreeSet::new()).is_empty());
+    }
+
+    /// The bug these are here for is the one that made all of the above pointless. `scripts/gate`
+    /// copies the tree to another machine and this checkout is a worktree, so the `.git` that
+    /// arrives names a directory that is not on that machine, git said nothing and the gate ran the
+    /// whole workspace on every invocation. The diff now comes in as a list of paths, and a list of
+    /// paths is a thing that can be tested without a repository to be in.
+    #[test]
+    fn a_handed_over_diff_narrows_the_same_way_a_local_one_does() {
+        let focus =
+            from_paths(&root(), "abc123".into(), vec!["crates/rudb-exec/src/group.rs".into()]);
+        assert!(!focus.everything);
+        assert!(focus.crates.contains("rudb-exec"), "{:?}", focus.crates);
+        assert!(focus.crates.contains("rudb"), "the crate above it is not in {:?}", focus.crates);
+        assert!(!focus.crates.contains("rudb-parse"), "reached down into {:?}", focus.crates);
+        assert!(!focus.prose, "no markdown changed");
+        assert!(!focus.grammar, "the grammar did not change");
+    }
+
+    #[test]
+    fn a_handed_over_diff_of_only_prose_compiles_nothing() {
+        let focus = from_paths(&root(), "abc123".into(), vec!["spec/07-execution.md".into()]);
+        assert!(focus.no_code(), "{:?}", focus.crates);
+        assert!(focus.prose);
+    }
+
+    #[test]
+    fn a_handed_over_diff_naming_the_workspace_manifest_reaches_every_crate() {
+        let focus = from_paths(&root(), "abc123".into(), vec!["Cargo.toml".into()]);
+        assert!(focus.crates.contains("rudb-common"));
+        assert!(focus.crates.contains("xtask"));
+        assert!(focus.prose);
+        assert!(focus.grammar);
+    }
+
+    #[test]
+    fn a_handed_over_diff_with_nothing_in_it_is_a_gate_with_nothing_to_do() {
+        let focus = from_paths(&root(), "abc123".into(), Vec::new());
+        assert!(focus.no_code());
+        assert!(!focus.everything, "an empty diff is an answer rather than a missing one");
     }
 }
