@@ -219,14 +219,16 @@ impl<'a> Building<'a, '_> {
                     Aggregate::new(plan, input.schema(), index, groups, aggregates, memory)?;
                 let schema = aggregate.schema().clone();
                 let counters = self.watch(id, pipeline, "Aggregate", None);
-                Box::new(Broken::new(input, Watched::new(aggregate, counters), out, schema))
+                let made = Arc::clone(&counters);
+                Box::new(Broken::new(input, Watched::new(aggregate, counters), out, made, schema))
             }
             Node::Sort { input, keys } => {
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let (sort, out) = Sort::new(plan, &schema, keys, memory)?;
                 let counters = self.watch(id, pipeline, "Sort", None);
-                Box::new(Broken::new(input, Watched::new(sort, counters), out, schema))
+                let made = Arc::clone(&counters);
+                Box::new(Broken::new(input, Watched::new(sort, counters), out, made, schema))
             }
             Node::Limit { input, count, offset } => {
                 let input = self.node(input)?;
@@ -240,14 +242,16 @@ impl<'a> Building<'a, '_> {
                 let schema = input.schema().clone();
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
                 let counters = self.watch(id, pipeline, "TopN", None);
-                Box::new(Broken::new(input, Watched::new(top, counters), out, schema))
+                let made = Arc::clone(&counters);
+                Box::new(Broken::new(input, Watched::new(top, counters), out, made, schema))
             }
             Node::Distinct { input, on } => {
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let (distinct, out) = Distinct::new(plan, &schema, on, memory)?;
                 let counters = self.watch(id, pipeline, "Distinct", None);
-                Box::new(Broken::new(input, Watched::new(distinct, counters), out, schema))
+                let made = Arc::clone(&counters);
+                Box::new(Broken::new(input, Watched::new(distinct, counters), out, made, schema))
             }
             Node::Join { left, right, kind, conditions } => {
                 // The right side runs first, because no left row can be answered until every right
@@ -266,12 +270,14 @@ impl<'a> Building<'a, '_> {
                 let schema = join.schema().clone();
                 let kept = self.watch(gather_id, gathering, "Gather", None);
                 let counters = self.watch(id, pipeline, "Join", None);
+                let made = Arc::clone(&counters);
                 Box::new(Paired::new(
                     right,
                     Watched::new(gather, kept),
                     left,
                     Watched::new(join, counters),
                     out,
+                    made,
                     schema,
                 ))
             }
@@ -307,12 +313,14 @@ impl<'a> Building<'a, '_> {
                 let schema = setop.schema().clone();
                 let kept = self.watch(gather_id, counting, "Gather", None);
                 let counters = self.watch(id, pipeline, "SetOp", None);
+                let made = Arc::clone(&counters);
                 Box::new(Paired::new(
                     right,
                     Watched::new(gather, kept),
                     left,
                     Watched::new(setop, counters),
                     out,
+                    made,
                     schema,
                 ))
             }
