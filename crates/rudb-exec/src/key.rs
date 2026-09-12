@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 
-use rudb_common::Value;
+use rudb_common::{Value, interval_micros};
 
 /// A row of values compared and hashed the way SQL groups rows.
 #[derive(Debug, Clone, Default)]
@@ -145,6 +145,13 @@ pub(crate) fn same(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Float(a), Value::Float(b)) => a == b || (a.is_nan() && b.is_nan()),
         (Value::Double(a), Value::Double(b)) => a == b || (a.is_nan() && b.is_nan()),
+        // Two intervals of the same length are one group, so a day and twenty four hours group
+        // together and print differently, which is what upstream does and what the comparison
+        // kernel says about the same pair.
+        (
+            Value::Interval { months: am, days: ad, micros: au },
+            Value::Interval { months: bm, days: bd, micros: bu },
+        ) => interval_micros(*am, *ad, *au) == interval_micros(*bm, *bd, *bu),
         _ => left == right,
     }
 }
@@ -155,7 +162,7 @@ pub(crate) fn same(left: &Value, right: &Value) -> bool {
 /// key is a `Value` today because rows are `Value`s today, and the row layout that section 7.4
 /// describes, a fixed width prefix with the payload beside it, is what replaces both this and the
 /// `Vec<Value>` it hashes. Every case that shows up in a ClickBench group key is written out above
-/// that fallback, so the slow path is the nested types and the intervals.
+/// that fallback, so the slow path is the nested types.
 fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
     std::mem::discriminant(value).hash(state);
     match value {
@@ -179,6 +186,12 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
             unscaled.hash(state);
             width.hash(state);
             scale.hash(state);
+        }
+        // The length rather than the three counts, because `same` calls two intervals of the same
+        // length one value and a hash that could tell them apart would put that one value in two
+        // buckets.
+        Value::Interval { months, days, micros } => {
+            interval_micros(*months, *days, *micros).hash(state);
         }
         other => other.to_string().hash(state),
     }
@@ -232,6 +245,21 @@ mod tests {
         let negative = key(&[Value::Double(-0.0)]);
         assert_eq!(zero, negative);
         assert_eq!(digest(&zero), digest(&negative));
+    }
+
+    /// Two intervals of the same length are one value, so they have to be one group and one
+    /// bucket, the same as the two zeros above.
+    #[test]
+    fn two_intervals_of_the_same_length_are_one_group() {
+        let day = key(&[Value::Interval { months: 0, days: 1, micros: 0 }]);
+        let hours = key(&[Value::Interval { months: 0, days: 0, micros: 86_400_000_000 }]);
+        assert_eq!(day, hours);
+        assert_eq!(digest(&day), digest(&hours));
+        let month = key(&[Value::Interval { months: 1, days: 0, micros: 0 }]);
+        let thirty = key(&[Value::Interval { months: 0, days: 30, micros: 0 }]);
+        assert_eq!(month, thirty);
+        assert_eq!(digest(&month), digest(&thirty));
+        assert_ne!(day, month);
     }
 
     #[test]
