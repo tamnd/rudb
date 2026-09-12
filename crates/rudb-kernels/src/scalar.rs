@@ -1524,6 +1524,14 @@ pub fn call_values(
         ("+" | "-", [left @ Value::Interval { .. }, right @ Value::Interval { .. }]) => {
             datetime::combine(left, right, name == "-")
         }
+        ("+" | "-", [left, right]) if datetime::is_counted(left, right) => {
+            datetime::counted(left, right, name == "-")
+        }
+        ("-", [left @ Value::Date(_), right @ Value::Date(_)])
+        | ("-", [left @ Value::Timestamp(_), right @ Value::Timestamp(_)]) => {
+            datetime::apart(left, right)
+        }
+        ("+", [left, right]) if datetime::is_joined(left, right) => datetime::joined(left, right),
         // The zero divisor is caught here rather than inside the scaling, because this is where
         // the written expression is and the sentence names the expression rather than the values.
         ("/", [left, right])
