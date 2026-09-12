@@ -255,6 +255,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-seam"
+version = "0.2.31"
+dependencies = [
+ "rudb-common",
+]
+
+[[package]]
 name = "rudb-storage"
 version = "0.2.31"
 dependencies = [
