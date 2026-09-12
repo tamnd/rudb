@@ -221,6 +221,34 @@ fn grouping_a_string_column_counts_each_string_once_however_the_rows_are_ordered
     );
 }
 
+/// The same question asked of a string that came out of a cross product, which is where it was
+/// answered wrong. A cross product hands the left row down as constant vectors, one value standing
+/// for the whole chunk, and the comparison after the hash probe could not read one, so every row
+/// opened a group of its own. TPC-H q05, q07 and q10 all returned the same group key once per row
+/// because of it, and they are all written with a comma in the `FROM` rather than a `JOIN`.
+#[test]
+fn grouping_a_string_that_came_out_of_a_cross_product_still_counts_each_string_once() {
+    let db = Database::new();
+    db.execute("CREATE TABLE w AS SELECT i AS k, 'word' || (i % 3) AS s FROM range(9) t(i)")
+        .unwrap();
+    db.execute("CREATE TABLE n AS SELECT i AS k FROM range(9) t(i)").unwrap();
+    let mut answer = rows(&db, "SELECT s, count(*) FROM w, n WHERE w.k = n.k GROUP BY s");
+    answer.sort_by_key(|row| format!("{:?}", row[0]));
+    assert_eq!(
+        answer,
+        vec![
+            vec![text("word0"), Value::BigInt(3)],
+            vec![text("word1"), Value::BigInt(3)],
+            vec![text("word2"), Value::BigInt(3)],
+        ]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM (SELECT DISTINCT s FROM w, n WHERE w.k = n.k)"),
+        vec![vec![Value::BigInt(3)]],
+        "and duplicate elimination keys on the same table"
+    );
+}
+
 #[test]
 fn distinct_collapses_equal_rows() {
     let db = database();
