@@ -1073,6 +1073,39 @@ fn a_written_day_that_does_not_exist_is_refused() {
     );
 }
 
+/// A TIME can be made now, per #228, which was a type you could declare a column of and never put
+/// a value in.
+///
+/// The written form is read with a lot more slack than a date or a timestamp is, which is upstream
+/// and not a decision here: the seconds are optional, a date in front is thrown away, and anything
+/// after the numbers is ignored. The printing is the other half, since a TIME prints the fraction
+/// it has and no more, so `12:34:56.100` comes back as `12:34:56.1`.
+#[test]
+fn a_time_can_be_written_and_read_back() {
+    let db = database();
+    let at = |hours: i64, minutes: i64, seconds: i64, micros: i64| {
+        vec![vec![Value::Time(((hours * 60 + minutes) * 60 + seconds) * 1_000_000 + micros)]]
+    };
+    assert_eq!(rows(&db, "SELECT TIME '12:34:56'"), at(12, 34, 56, 0));
+    assert_eq!(rows(&db, "SELECT CAST('12:34:56' AS TIME)"), at(12, 34, 56, 0));
+    assert_eq!(rows(&db, "SELECT '12:34'::TIME"), at(12, 34, 0, 0));
+    assert_eq!(rows(&db, "SELECT '12:34:56.1234567'::TIME"), at(12, 34, 56, 123_456));
+    assert_eq!(rows(&db, "SELECT '2024-01-02 03:04:05'::TIME"), at(3, 4, 5, 0));
+    assert_eq!(rows(&db, "SELECT '12:34:56 UTC'::TIME"), at(12, 34, 56, 0));
+    assert_eq!(rows(&db, "SELECT TIMESTAMP '2024-01-02 03:04:05'::TIME"), at(3, 4, 5, 0));
+    assert_eq!(rows(&db, "SELECT '12:34:56.100'::TIME::VARCHAR"), vec![vec![text("12:34:56.1")]]);
+    assert_eq!(rows(&db, "SELECT typeof(TIME '12:34:56')"), vec![vec![text("TIME")]]);
+    assert_eq!(
+        failure(&db, "SELECT '25:00:00'::TIME"),
+        "time field value out of range: \"25:00:00\", expected format is ([YYYY-MM-DD ]HH:MM:SS[.MS])"
+    );
+    assert_eq!(rows(&db, "SELECT TRY_CAST('25:00:00' AS TIME)"), vec![vec![Value::Null]]);
+    assert_eq!(
+        failure(&db, "SELECT DATE '2024-01-02'::TIME"),
+        "Unimplemented type for cast (DATE -> TIME)"
+    );
+}
+
 /// The third spelling of a cast, the one TPC-H q14 is written in.
 ///
 /// The keyword is not a keyword the way `CAST` is, it is the type name, so the check that matters

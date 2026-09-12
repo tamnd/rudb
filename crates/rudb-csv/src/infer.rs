@@ -12,17 +12,16 @@
 //! is the order the binary uses, and those two do overlap because a cast to `DATE` reads a time on
 //! the end and throws it away, so `timed` below keeps a timestamp off the `DATE` rung.
 //!
-//! `TIME` is a rung DuckDB has and this does not, and the gap is deliberate rather than forgotten.
-//! `rudb-kernels` has no cast from `VARCHAR` to `TIME`, so a column sniffed as one would be a column
-//! declared with a type its own values cannot be converted to, which is a worse answer than the
-//! `VARCHAR` it falls through to. The rung goes in when the cast does, and the test below says so in
-//! both directions so that adding the cast without adding the rung fails.
+//! `TIME` sits between `DOUBLE` and `DATE`, which is where the binary has it. Nothing it takes is
+//! anything `DATE` takes, so the position between those two is not observable and the rung above it
+//! is, which is the one that matters.
 //!
-//! Three of the rules are the sniffer's rather than the cast's, and all three were measured. `007`
+//! Four of the rules are the sniffer's rather than the cast's, and all four were measured. `007`
 //! is a `VARCHAR` here although `CAST('007' AS BIGINT)` is 7, because a column of zero padded
 //! numbers is a column of codes and adding them up is not what anybody meant. `+1` is a `VARCHAR`
-//! for the same sort of reason. A day with a time on it is a `TIMESTAMP` and not a `DATE`, although
-//! the cast to `DATE` takes it. Everything else defers to the cast, which is the point: a string
+//! for the same sort of reason. A day with a time on it is a `TIMESTAMP` and not a `DATE`, and a
+//! clock with anything else around it is a `VARCHAR` and not a `TIME`, although the casts to `DATE`
+//! and to `TIME` take both. Everything else defers to the cast, which is the point: a string
 //! the sniffer calls a `BIGINT` is a string the reader then casts to `BIGINT`, so a test that
 //! disagreed with the cast would produce a column whose declared type its own values do not fit.
 
@@ -31,10 +30,11 @@ use rudb_kernels::cast_value;
 
 /// The types tried, in the order they are tried. `VARCHAR` is the bottom and is not in here because
 /// it never fails.
-pub const LADDER: [LogicalType; 5] = [
+pub const LADDER: [LogicalType; 6] = [
     LogicalType::Boolean,
     LogicalType::BigInt,
     LogicalType::Double,
+    LogicalType::Time,
     LogicalType::Date,
     LogicalType::Timestamp,
 ];
@@ -72,6 +72,7 @@ pub fn fits(text: &str, candidate: &LogicalType) -> bool {
         LogicalType::BigInt if !numeric(text) => false,
         LogicalType::Double if !numeric(text) => false,
         LogicalType::Date if timed(text) => false,
+        LogicalType::Time if !clock(text) => false,
         _ => {
             let value = Value::Varchar(text.to_string());
             matches!(cast_value(&value, candidate, true), Ok(converted) if !converted.is_null())
@@ -86,6 +87,18 @@ pub fn fits(text: &str, candidate: &LogicalType) -> bool {
 /// apart itself or every timestamp column would come back as a `DATE`.
 fn timed(text: &str) -> bool {
     text.trim().contains([' ', 'T'])
+}
+
+/// Whether a value is nothing but a clock.
+///
+/// The fourth rule that is not the cast's, and the same sort of rule as `timed`. The cast to `TIME`
+/// takes a date in front and any amount of rubbish behind, so it would take a whole timestamp
+/// column and every value in it would lose its day. A column of `12:34:56 UTC` is a `VARCHAR` to
+/// the binary, which is what this refuses it for.
+fn clock(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty()
+        && text.bytes().all(|byte| byte.is_ascii_digit() || byte == b':' || byte == b'.')
 }
 
 /// The spellings DuckDB's sniffer reads as a boolean.
@@ -135,17 +148,22 @@ mod tests {
         assert_eq!(of(&["1", "x"]), LogicalType::Varchar);
     }
 
+    /// The `TIME` rung, and the two values next to it that the binary leaves alone although the
+    /// cast underneath takes both.
     #[test]
-    fn a_column_of_times_is_a_varchar_here_and_a_time_in_duckdb() {
-        // The one rung this ladder is missing, and the test is here so that the gap is a thing
-        // somebody deleted rather than a thing somebody never noticed. It goes away when
-        // `rudb-kernels` can cast a VARCHAR to a TIME, and the second assertion is what says so.
-        assert_eq!(of(&["03:04:05"]), LogicalType::Varchar);
-        let value = Value::Varchar("03:04:05".into());
-        assert!(
-            cast_value(&value, &LogicalType::Time, true).is_err(),
-            "the cast exists now, so TIME belongs back in the ladder"
-        );
+    fn a_column_of_clocks_is_a_time_and_a_column_of_anything_else_is_not() {
+        assert_eq!(of(&["03:04:05", "12:34:56"]), LogicalType::Time);
+        assert_eq!(of(&["12:34"]), LogicalType::Time);
+        assert_eq!(of(&["12:34:56.5"]), LogicalType::Time);
+        assert_eq!(of(&["12:34:56 UTC"]), LogicalType::Varchar);
+        assert_eq!(of(&["2020-01-02 03:04:05"]), LogicalType::Timestamp);
+        for taken in ["12:34:56 UTC", "2020-01-02 03:04:05"] {
+            let value = Value::Varchar(taken.into());
+            assert!(
+                cast_value(&value, &LogicalType::Time, true).is_ok_and(|time| !time.is_null()),
+                "{taken}: the cast takes it, which is why the rung has a rule of its own"
+            );
+        }
     }
 
     /// The `DATE` rung would swallow this column otherwise, because the cast under it takes a time
