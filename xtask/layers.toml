@@ -22,6 +22,10 @@ rudb-compress = 1
 # Rank 1 for the same reason. A regular expression engine turns text into positions. It knows
 # nothing about a vector or a type, and the kernel that calls it is at rank 3.
 rudb-regex = 1
+# The metrics document. Rank 1 because everything that has a number to report is above it, starting
+# with the instrumentation shim in `rudb-pipeline` at rank 4, and a crate that collects from the
+# whole engine has to sit under all of it rather than beside the part that reports first.
+rudb-metrics = 1
 
 # Data representation. The encoding layer sits above vectors and below everything that consumes
 # them, so a new encoding from a paper is a module here and nothing above changes.

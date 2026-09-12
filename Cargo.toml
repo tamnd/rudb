@@ -41,6 +41,7 @@ rudb-ir = { version = "=0.2.34", path = "crates/rudb-ir" }
 rudb-jit = { version = "=0.2.34", path = "crates/rudb-jit" }
 rudb-json = { version = "=0.2.34", path = "crates/rudb-json" }
 rudb-kernels = { version = "=0.2.34", path = "crates/rudb-kernels" }
+rudb-metrics = { version = "=0.2.34", path = "crates/rudb-metrics" }
 rudb-opt = { version = "=0.2.34", path = "crates/rudb-opt" }
 rudb-parquet = { version = "=0.2.34", path = "crates/rudb-parquet" }
 rudb-parse = { version = "=0.2.34", path = "crates/rudb-parse" }
