@@ -71,7 +71,7 @@ pub mod select;
 mod shape;
 mod subscript;
 
-pub use aggregate::Accumulator;
+pub use aggregate::{Accumulator, NOWHERE, update_scattered};
 pub use cast::{cast, cast_value};
 pub use compare::{Comparison, compare, compare_values, order, order_with_nulls, refine};
 pub use fallback::Kernel;
