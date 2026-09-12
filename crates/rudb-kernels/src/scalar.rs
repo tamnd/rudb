@@ -347,12 +347,7 @@ fn sign_of<A: Fn(usize) -> usize>(
                                     out[index] = answer;
                                     Ok(())
                                 }
-                                None if negating => Err(overflow(
-                                    Op::Subtract,
-                                    returns,
-                                    &Value::Integer(0),
-                                    &arg.value_at(index),
-                                )),
+                                None if negating => Err(negation_overflow()),
                                 None => Err(abs_overflow(&arg.value_at(index))),
                             }
                         })?;
@@ -1562,6 +1557,17 @@ fn abs_overflow(value: &Value) -> Error {
     Error::out_of_range(format!("Overflow on abs({value})"))
 }
 
+/// Negation says it differently again, and names neither the type nor the value it was given.
+///
+/// This used to come out of [`overflow`] as the subtraction `0 - -2147483648`, which reads like an
+/// expression nobody wrote and is not what upstream says. There are only two ways to reach it, and
+/// both are a value nothing can widen: a column, where the constant folder has no value to look at
+/// until the loop is already running, and a `HUGEINT`, where there is no wider signed type to move
+/// to. Per #264.
+fn negation_overflow() -> Error {
+    Error::out_of_range("Overflow in negation of numeric value!")
+}
+
 /// The digits a decimal holds, rather than the number it means.
 ///
 /// Upstream says `(999999999999 * 999999999999)` for a pair of DECIMAL(38,2) values, so the point
@@ -1828,7 +1834,7 @@ fn negate(value: &Value, ty: &LogicalType) -> Result<Value> {
             Some(whole) => whole
                 .checked_neg()
                 .and_then(|negated| fit(negated, ty))
-                .ok_or_else(|| overflow(Op::Subtract, ty, &Value::Integer(0), value)),
+                .ok_or_else(negation_overflow),
             None => Err(Error::not_implemented(format!("negating a {}", value.logical_type()))),
         },
     }

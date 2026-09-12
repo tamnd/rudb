@@ -31,6 +31,11 @@
 //! That cannot happen if the kernels and the binder agree, which is the point: it is a disagreement
 //! between the two, and turning it into a plan that still runs correctly is better than turning it
 //! into a validation failure a long way from the cause.
+//!
+//! There is one fold that changes the type on purpose, and `widened_negation` is it. Negating the
+//! smallest value of a signed integer type has no answer in that type, and upstream answers in the
+//! next one up rather than raising, so the type of the expression depends on the value and only this
+//! pass can see the value. It is the one place where what comes out is not what the binder typed.
 
 use std::collections::HashMap;
 
@@ -230,6 +235,9 @@ fn simplify(plan: &mut Plan, expr: ExprRef) -> ExprRef {
             return folded;
         }
     }
+    if let Some(widened) = widened_negation(plan, expr) {
+        return widened;
+    }
     match *plan.expr(expr) {
         Expr::Conjunction { op, children } => conjunction(plan, expr, op, children),
         Expr::Case { arms, otherwise } => case(plan, expr, arms, otherwise),
@@ -303,6 +311,40 @@ fn constant_of(plan: &mut Plan, expr: ExprRef, value: Value) -> Option<ExprRef> 
         return None;
     }
     let held = plan.add_value(value);
+    Some(plan.add_expr(Expr::Constant(held), ty))
+}
+
+/// Negating the smallest value of a signed integer type, which widens instead of raising.
+///
+/// `-((-128)::TINYINT)` is the SMALLINT 128 on the pinned binary, and a SMALLINT goes to INTEGER, an
+/// INTEGER to BIGINT and a BIGINT to HUGEINT the same way. It is a rule about the one value in each
+/// type that has no negative and not a rule about the type, so `typeof(-(1::INTEGER))` is still
+/// INTEGER and everything but the smallest value comes out of the fold above with the type it went in
+/// with. A HUGEINT is not in the table because there is nothing wider to widen it to, and a column is
+/// not here at all, so both of those still raise. Per #264.
+///
+/// The type the binder gave the call has to be the argument's own type for this to fire. If it is
+/// not, something upstream of here has already decided the expression is wider than it looks, and
+/// widening it a second time would be two rules deciding one type.
+fn widened_negation(plan: &mut Plan, expr: ExprRef) -> Option<ExprRef> {
+    let Expr::Function { name, args } = *plan.expr(expr) else { return None };
+    if plan.string(name) != "-" {
+        return None;
+    }
+    let &[only] = plan.expr_list(args) else { return None };
+    let value = constant(plan, only)?;
+    if *plan.expr_type(expr) != value.logical_type() {
+        return None;
+    }
+    let widened = match value {
+        Value::TinyInt(i8::MIN) => Value::SmallInt(128),
+        Value::SmallInt(i16::MIN) => Value::Integer(32_768),
+        Value::Integer(i32::MIN) => Value::BigInt(2_147_483_648),
+        Value::BigInt(i64::MIN) => Value::HugeInt(9_223_372_036_854_775_808),
+        _ => return None,
+    };
+    let ty = widened.logical_type();
+    let held = plan.add_value(widened);
     Some(plan.add_expr(Expr::Constant(held), ty))
 }
 
@@ -486,6 +528,37 @@ mod tests {
         );
         let after = format!("Project #1 [6::INTEGER AS n]\n{SCAN}");
         assert_eq!(folded(&before), after);
+    }
+
+    /// The one fold that comes out wider than it went in, at all four widths. Per #264.
+    #[test]
+    fn negating_the_smallest_value_of_a_signed_type_widens_by_one_step() {
+        let cases = [
+            ("-128::TINYINT", "TINYINT", "128::SMALLINT"),
+            ("-32768::SMALLINT", "SMALLINT", "32768::INTEGER"),
+            ("-2147483648::INTEGER", "INTEGER", "2147483648::BIGINT"),
+            ("-9223372036854775808::BIGINT", "BIGINT", "9223372036854775808::HUGEINT"),
+        ];
+        for (argument, ty, expected) in cases {
+            let before = format!("Project #1 [\"-\"({argument})::{ty} AS n]\n{SCAN}");
+            let after = format!("Project #1 [{expected} AS n]\n{SCAN}");
+            assert_eq!(folded(&before), after, "{argument}");
+        }
+    }
+
+    #[test]
+    fn negating_anything_but_the_smallest_value_keeps_the_type_it_was_given() {
+        let before = format!("Project #1 [\"-\"(-127::TINYINT)::TINYINT AS n]\n{SCAN}");
+        let after = format!("Project #1 [127::TINYINT AS n]\n{SCAN}");
+        assert_eq!(folded(&before), after);
+        // A HUGEINT has nowhere to widen to, so this is a fold that raises and is abandoned, and the
+        // executor is left to say the sentence.
+        let smallest = "-170141183460469231731687303715884105728::HUGEINT";
+        let hugeint = format!("Project #1 [\"-\"({smallest})::HUGEINT AS n]\n{SCAN}");
+        assert_eq!(folded(&hugeint), hugeint);
+        // A column has no value here to look at, whatever the values in it turn out to be.
+        let column = format!("Project #1 [\"-\"(#0.0::INTEGER)::INTEGER AS n]\n{SCAN}");
+        assert_eq!(folded(&column), column);
     }
 
     #[test]

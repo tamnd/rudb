@@ -413,7 +413,11 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         }
         Shape::PromotedWithCarry => {
             let common = promote_all(name, arguments)?;
-            // One argument is a negation or a unary plus, and neither one can carry.
+            // One argument is a negation or a unary plus, and neither one can carry. Negating the
+            // smallest value of a type is the exception and it is not a signature's to take, since
+            // the type of the answer depends on the value: the constant folder widens that one
+            // value by a step, per #264, and the signature says the same thing here as upstream's
+            // does.
             let returns = if arguments.len() > 1 { carrying(common) } else { common };
             (vec![returns.clone(); arguments.len()], returns)
         }
