@@ -77,7 +77,10 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
                 }
             };
             let mut shell = Shell::new(&options, database, out, err);
-            let mut stop = shell.run_commands(&options.commands);
+            let mut stop = shell.run_commands(&settings(&options.sets));
+            if stop == Stop::Done {
+                stop = shell.run_commands(&options.commands);
+            }
             if stop == Stop::Done && !options.stop_after_commands {
                 stop = read_input(&mut shell, &options);
             }
@@ -85,6 +88,26 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
             if shell.failed() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
     }
+}
+
+/// The `SET` statement each `--set name=value` runs.
+///
+/// SQL rather than a call into the library, which is the whole argument for the flag existing. A
+/// process flag, a session `SET` and a per query hint are three ways of saying one thing, and the
+/// cheapest way to keep them saying the same thing is for two of them to be the third one.
+///
+/// The name is quoted because a seam name has dots in it and DuckDB's grammar has no dot in an
+/// identifier, and the value is single quoted with the doubling a SQL string wants. Neither is a
+/// security boundary: somebody who can pass a flag can pass `-c` as well.
+fn settings(sets: &[String]) -> Vec<Command> {
+    sets.iter()
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(name, value)| {
+            let name = name.trim().replace('"', "\"\"");
+            let value = value.trim().replace('\'', "''");
+            Command::Sql(format!("SET \"{name}\" = '{value}';"))
+        })
+        .collect()
 }
 
 /// Reads whatever is on standard input, with a prompt if that is a terminal.

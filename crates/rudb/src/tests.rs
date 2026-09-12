@@ -2210,6 +2210,62 @@ fn set_threads_is_recorded_even_though_nothing_runs_in_parallel_yet() {
 }
 
 #[test]
+fn a_seam_is_set_and_read_back_through_the_statement_everything_else_goes_through() {
+    let db = Database::new();
+    assert_eq!(db.setting("seam.hash.table").unwrap(), "default");
+
+    // Quoted, because a seam name has dots in it and DuckDB's grammar has no dot in an identifier.
+    db.execute("SET \"seam.hash.table\" = 'unchained'").unwrap();
+    assert_eq!(db.setting("seam.hash.table").unwrap(), "unchained");
+    assert_eq!(db.seams().pinned(crate::seam::SeamId::HashTable), Some("unchained"));
+
+    // Underscores for the dots is the spelling that needs no quotes, and it is the same seam.
+    db.execute("SET seam_hash_table = 'linear-chained'").unwrap();
+    assert_eq!(db.setting("hash.table").unwrap(), "linear-chained");
+
+    db.execute("RESET seam_hash_table").unwrap();
+    assert_eq!(db.setting("seam.hash.table").unwrap(), "default");
+    assert_eq!(db.seams().pinned(crate::seam::SeamId::HashTable), None);
+}
+
+#[test]
+fn the_policy_is_a_seam_like_the_rest_and_a_mistyped_one_names_the_seams() {
+    let db = Database::new();
+    db.execute("SET seam_policy = 'reference'").unwrap();
+    assert_eq!(db.seams().mode(), crate::seam::PolicyMode::Reference);
+    assert_eq!(db.setting("seam.policy").unwrap(), "reference");
+
+    let error = db.execute("SET \"seam.hash.tabel\" = 'unchained'").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Catalog Error");
+    assert!(error.message().contains("rudb_strategies()"), "{error}");
+
+    let error = db.execute("SET seam_policy = 'clever'").unwrap_err();
+    assert!(error.message().contains("reference, default or adaptive-bandit"), "{error}");
+}
+
+#[test]
+fn a_hint_pins_a_seam_for_one_query_and_leaves_the_session_alone() {
+    let db = Database::new();
+    let sql = "SELECT /*+ hash.table(unchained) */ 42";
+    assert_eq!(db.value(sql).unwrap(), Value::Integer(42));
+
+    let seams = db.seams_for(sql).unwrap();
+    assert_eq!(seams.pinned(crate::seam::SeamId::HashTable), Some("unchained"));
+    assert_eq!(db.seams().pinned(crate::seam::SeamId::HashTable), None, "the session is untouched");
+}
+
+#[test]
+fn a_hint_naming_a_seam_nobody_has_fails_the_query_rather_than_being_ignored() {
+    let db = Database::new();
+    let error = db.query("SELECT /*+ hash.tabel(unchained) */ 42").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Catalog Error");
+    assert!(error.message().contains("no seam called hash.tabel"), "{error}");
+
+    // A comment without the plus is a comment, whatever is written in it.
+    assert_eq!(db.value("SELECT /* hash.tabel(unchained) */ 42").unwrap(), Value::Integer(42));
+}
+
+#[test]
 fn a_name_that_is_not_a_setting_says_which_ones_there_are() {
     let db = Database::new();
     let error = db.execute("SET bogus = 1").unwrap_err();

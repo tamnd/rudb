@@ -29,6 +29,7 @@ Options:
   -nullvalue TEXT        what a null prints as
   -readonly              open without allowing writes
   -separator SEP         what goes between values in the separated modes
+  --set NAME=VALUE       run SET NAME = VALUE before anything else, repeatable
   -version               print the version and exit
   --print-config         print the build configuration and exit
   -h, -help              print this and exit
