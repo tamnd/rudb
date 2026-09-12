@@ -407,10 +407,16 @@ pub fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
     ((era * 146_097 + day_of_era - 719_468) as i32)
 }
 
+/// The date, with the era on the end of it when the year is not an anno domini one.
+///
+/// The years the arithmetic counts in are astronomical, so there is a year zero and the year
+/// before it is minus one, while the era a date prints in has no year zero and counts backwards
+/// from one. The one is the other with the sign dropped and the number shifted by one, so the
+/// astronomical year zero prints as `0001-01-01 (BC)` and minus 2020 prints as 2021 BC.
 fn write_date(f: &mut fmt::Formatter<'_>, days: i32) -> fmt::Result {
     let (year, month, day) = civil_from_days(days);
-    if year < 0 {
-        write!(f, "{:04}-{month:02}-{day:02} (BC)", -year + 1)
+    if year <= 0 {
+        write!(f, "{:04}-{month:02}-{day:02} (BC)", 1 - year)
     } else {
         write!(f, "{year:04}-{month:02}-{day:02}")
     }
@@ -518,6 +524,23 @@ mod tests {
         // gets wrong in one direction or the other.
         assert_eq!(days_from_civil(1900, 3, 1) - days_from_civil(1900, 2, 28), 1);
         assert_eq!(days_from_civil(2000, 3, 1) - days_from_civil(2000, 2, 28), 2);
+    }
+
+    #[test]
+    fn a_year_at_or_before_zero_prints_in_the_era_before_christ() {
+        let date = |year, month, day| Value::Date(days_from_civil(year, month, day)).to_string();
+        // The year one is the first anno domini one and the year before it is one BC, so the day
+        // after `0001-12-31 (BC)` is `0001-01-01` with no year zero in between.
+        assert_eq!(date(1, 1, 1), "0001-01-01");
+        assert_eq!(date(0, 1, 1), "0001-01-01 (BC)");
+        assert_eq!(date(0, 12, 31), "0001-12-31 (BC)");
+        assert_eq!(date(-1, 1, 1), "0002-01-01 (BC)");
+        assert_eq!(date(-2020, 3, 4), "2021-03-04 (BC)");
+        let timestamp = |year, month, day| {
+            Value::Timestamp(i64::from(days_from_civil(year, month, day)) * 86_400 * 1_000_000)
+                .to_string()
+        };
+        assert_eq!(timestamp(0, 1, 1), "0001-01-01 (BC) 00:00:00");
     }
 
     #[test]

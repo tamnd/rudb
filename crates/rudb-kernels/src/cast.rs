@@ -1029,8 +1029,8 @@ impl Fault {
 /// is the first of January and `'2020-01-01 abc'` is a format failure rather than a date with
 /// something ignored after it.
 fn parse_date(text: &str) -> Parsed<i32> {
-    let (date, time) = split_time(text.trim());
-    let days = parse_day(date)?;
+    let (date, era, time) = split_parts(text.trim())?;
+    let days = parse_day(date, era)?;
     if let Some(time) = time {
         parse_time(time)?;
     }
@@ -1039,8 +1039,8 @@ fn parse_date(text: &str) -> Parsed<i32> {
 
 /// `YYYY-MM-DD` with an optional `HH:MM:SS[.ffffff]` after it, as microseconds since the epoch.
 fn parse_timestamp(text: &str) -> Parsed<i64> {
-    let (date, time) = split_time(text.trim());
-    let days = i64::from(parse_day(date)?);
+    let (date, era, time) = split_parts(text.trim())?;
+    let days = i64::from(parse_day(date, era)?);
     let micros = match time {
         None => 0,
         Some(time) => parse_time(time)?,
@@ -1056,31 +1056,83 @@ fn split_time(text: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// `YYYY-MM-DD` as days since the epoch.
-fn parse_day(text: &str) -> Parsed<i32> {
-    let mut parts = text.split('-');
-    let year: i32 = field(parts.next())?;
+/// The date, the era and the time in a written date or timestamp.
+///
+/// The era marker sits where the time would start and the time comes after it, so
+/// `'0001-01-01 (BC) 10:00:00'` is ten in the morning on the first of January in the year one
+/// before Christ. It is spelled either way around, it needs the separator that put it there, and
+/// it needs another one in front of a time, which is why `'2021-01-01(BC)'` and
+/// `'0001-01-01 (BC)10:00:00'` are both refused.
+fn split_parts(text: &str) -> Parsed<(&str, bool, Option<&str>)> {
+    let (date, rest) = split_time(text);
+    let Some(rest) = rest else { return Ok((date, false, None)) };
+    let marked = rest.get(..BC.len()).is_some_and(|head| head.eq_ignore_ascii_case(BC));
+    if !marked {
+        return Ok((date, false, Some(rest.trim_start())));
+    }
+    let after = &rest[BC.len()..];
+    match after.chars().next() {
+        None => Ok((date, true, None)),
+        Some(separator @ (' ' | 'T')) => {
+            Ok((date, true, Some(after[separator.len_utf8()..].trim_start())))
+        }
+        Some(_) => Err(Fault::Format),
+    }
+}
+
+/// How the era before Christ is written on the end of a date.
+const BC: &str = "(BC)";
+
+/// `YYYY-MM-DD` as days since the epoch, with `era` saying the string was marked as before Christ.
+///
+/// A year is astronomical when it is written with a sign and it is the era's own when the marker
+/// is there, so `'-0000-01-01'` and `'0001-01-01 (BC)'` are the same day. The two ways of saying
+/// it do not mix and the era counts from one, which is why `'-2021-01-01 (BC)'` and
+/// `'0000-01-01 (BC)'` are both badly written rather than out of range.
+fn parse_day(text: &str, era: bool) -> Parsed<i32> {
+    let (signed, rest) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let mut parts = rest.split('-');
+    let written: i32 = field(parts.next())?;
     let month: u32 = field(parts.next())?;
     let day: u32 = field(parts.next())?;
     if parts.next().is_some() {
         return Err(Fault::Format);
     }
+    let year = match (era, signed) {
+        (true, false) if written >= 1 => 1 - written,
+        (true, _) => return Err(Fault::Format),
+        (false, true) => -written,
+        (false, false) => written,
+    };
     if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return Err(Fault::Range);
     }
     let days = days_from_civil(year, month, day);
-    // The two ends of the `i32` are what DuckDB keeps for its infinities, and past them
-    // `days_from_civil` has wrapped, which the round trip is what catches. So the year that does
-    // not fit says its day is out of range rather than answering with some other day.
-    if days == i32::MAX || days == i32::MIN || civil_from_days(days) != (year, month, day) {
+    // The two infinities sit at plus and minus `i32::MAX` and the bottom of the `i32` is not a
+    // date at all, so the oldest day is `5877642-06-25 (BC)` and the newest is `5881580-07-10`.
+    // Past them `days_from_civil` has wrapped, which is what the round trip catches. So the year
+    // that does not fit says its day is out of range rather than answering with some other day.
+    if !(i32::MIN + 2..=i32::MAX - 1).contains(&days) || civil_from_days(days) != (year, month, day)
+    {
         return Err(Fault::Range);
     }
     Ok(days)
 }
 
-/// One field of a written date, which has to be there and has to be a number.
+/// One field of a written date, which has to be there and has to be digits.
+///
+/// Digits and nothing else, because the sign a number is allowed to carry is read off the front of
+/// the year before the fields are split and a second one is not a date, which is why `'+2021-01-01'`
+/// and `'2021-+01-01'` are both refused.
 fn field<T: FromStr>(part: Option<&str>) -> Parsed<T> {
-    part.ok_or(Fault::Format)?.parse().map_err(|_| Fault::Format)
+    let part = part.ok_or(Fault::Format)?;
+    if !part.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Fault::Format);
+    }
+    part.parse().map_err(|_| Fault::Format)
 }
 
 /// How many days that month of that year has.
@@ -1226,11 +1278,11 @@ fn parse_clock_fields(text: &str) -> Parsed<i64> {
 /// `'2020-01-01 24:00:00'` is midnight because the timestamp it came from is the second of January.
 fn parse_clock(text: &str) -> Option<i64> {
     let text = text.trim_start();
-    let clock = match split_time(text) {
+    let clock = match split_parts(text).ok()? {
         // A dash is a date only when it comes before any clock, because the offset on the end of
         // `'12:34:56-05'` is a dash too and that is a time and not a day.
-        (day, rest) if day.contains('-') && !day.contains(':') => {
-            parse_day(day).ok()?;
+        (day, era, rest) if day.contains('-') && !day.contains(':') => {
+            parse_day(day, era).ok()?;
             match rest {
                 // A day on its own is midnight, and a day with a separator and nothing after it is
                 // a time that was not written.
@@ -1939,6 +1991,70 @@ mod tests {
             );
         }
         for text in ["2013-13-01", "2021-02-29", "2021-04-31"] {
+            let error =
+                cast_to(Value::Varchar(text.into()), &LogicalType::Date).expect_err("no such day");
+            assert_eq!(error.message(), format!("date field value out of range: \"{text}\""));
+        }
+    }
+
+    /// The era is a suffix on the date and the sign is a prefix on the year, they say the same
+    /// thing, and the day they name prints in the era it belongs to. Every line was measured.
+    #[test]
+    fn a_year_at_or_before_zero_is_a_date_before_christ() {
+        for (text, printed) in [
+            ("0000-01-01", "0001-01-01 (BC)"),
+            ("-0000-01-01", "0001-01-01 (BC)"),
+            ("-0001-01-01", "0002-01-01 (BC)"),
+            ("-2020-03-04", "2021-03-04 (BC)"),
+            ("0001-01-01 (BC)", "0001-01-01 (BC)"),
+            ("0001-01-01 (bc)", "0001-01-01 (BC)"),
+            ("2021-01-01 (BC) ", "2021-01-01 (BC)"),
+            // The year zero is a leap year and the year before it, which is two before Christ,
+            // is not, because the leap rule counts in astronomical years.
+            ("0000-02-29", "0001-02-29 (BC)"),
+            ("-0004-02-29", "0005-02-29 (BC)"),
+            // The oldest day there is. A day earlier is out of range below.
+            ("-5877641-06-25", "5877642-06-25 (BC)"),
+            ("5877642-06-25 (BC)", "5877642-06-25 (BC)"),
+        ] {
+            let date = cast_to(Value::Varchar(text.into()), &LogicalType::Date).expect(text);
+            assert_eq!(date.to_string(), printed, "{text}");
+        }
+        for text in ["0001-01-01 (BC) 10:00:00", "0001-01-01 (BC)  10:00:00", "-0001-01-01 10:00"] {
+            let stamp = cast_to(Value::Varchar(text.into()), &LogicalType::Timestamp).expect(text);
+            assert!(stamp.to_string().ends_with(" (BC) 10:00:00"), "{stamp}");
+        }
+        // A time takes the day in front of it and throws it away, era and all.
+        let time = cast_to(Value::Varchar("0001-01-01 (BC) 10:00:00".into()), &LogicalType::Time)
+            .expect("ten in the morning");
+        assert_eq!(time, Value::Time(10 * 3_600_000_000));
+    }
+
+    /// The era is one spelling in one place with one space in front of it, and it counts from the
+    /// year one, so a year of zero written with it is a year that does not exist.
+    #[test]
+    fn an_era_written_some_other_way_is_not_a_date() {
+        for text in [
+            "2021-01-01(BC)",
+            "2021-01-01  (BC)",
+            "2021-01-01 (BC)x",
+            "2021-01-01 (BC)10:00:00",
+            "2021-01-01 BC",
+            "2021-01-01 (AD)",
+            "2021-01-01 (BC) (BC)",
+            "0000-01-01 (BC)",
+            "-2021-01-01 (BC)",
+            "+2021-01-01",
+            "2021-+01-01",
+        ] {
+            let error =
+                cast_to(Value::Varchar(text.into()), &LogicalType::Date).expect_err("no such day");
+            assert_eq!(
+                error.message(),
+                format!("invalid date field format: \"{text}\", expected format is (YYYY-MM-DD)")
+            );
+        }
+        for text in ["-0001-02-29", "-5877641-06-24", "5877642-06-24 (BC)"] {
             let error =
                 cast_to(Value::Varchar(text.into()), &LogicalType::Date).expect_err("no such day");
             assert_eq!(error.message(), format!("date field value out of range: \"{text}\""));
