@@ -23,6 +23,7 @@ use crate::operator::Operator;
 use crate::setop::SetOp;
 use crate::sort::Sort;
 use crate::source::{Dummy, FileScan, Scan, Series, Values};
+use crate::strategies::Strategies;
 use crate::stream::{Filter, Limit, Project};
 use crate::topn::TopN;
 
@@ -80,6 +81,9 @@ fn node<'a>(
                 Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => Box::new(
                     FileScan::new(plan, index, function, args, options, settings, columns)?,
                 ),
+                Some(TableFunction::RudbStrategies) => {
+                    Box::new(Strategies::new(plan, index, columns)?)
+                }
                 _ => Box::new(Series::new(plan, index, plan.string(function), args)?),
             }
         }

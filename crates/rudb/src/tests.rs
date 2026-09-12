@@ -2240,3 +2240,34 @@ fn the_settings_a_database_was_opened_with_are_what_reset_goes_back_to() {
     assert_eq!(db.config(), db.opened_with());
     assert_eq!(db.memory().limit(), Some(SMALL));
 }
+
+#[test]
+fn rudb_strategies_lists_every_seam_with_the_milestone_that_owes_it() {
+    let db = database();
+    let listed = rows(&db, "SELECT seam, milestone FROM rudb_strategies() ORDER BY seam");
+    assert_eq!(listed.len(), 27, "the seam list is closed and this is its length");
+    for row in &listed {
+        let Value::Varchar(milestone) = &row[1] else { panic!("a milestone per seam") };
+        assert!(milestone.starts_with('F'), "{milestone} is not a milestone");
+    }
+}
+
+#[test]
+fn a_seam_nobody_has_implemented_reads_back_as_planned_rather_than_missing() {
+    let db = database();
+    let listed = rows(
+        &db,
+        "SELECT count(*) FROM rudb_strategies() WHERE implementation IS NULL AND seam_description \
+         IS NOT NULL",
+    );
+    assert_eq!(listed, vec![vec![Value::BigInt(27)]], "nothing is registered yet, and it says so");
+}
+
+#[test]
+fn rudb_strategies_takes_no_arguments() {
+    let db = database();
+    assert!(
+        failure(&db, "SELECT * FROM rudb_strategies(1)").contains("takes no arguments"),
+        "a call with an argument is a binder error rather than an ignored argument"
+    );
+}
