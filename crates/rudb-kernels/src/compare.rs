@@ -72,7 +72,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use rudb_common::{Error, LogicalType, Result, Value, interval_micros};
-use rudb_vector::{Data, Form, Packed, Selection, StringColumn, Validity, Vector};
+use rudb_vector::{Data, Form, Packed, Selection, StringColumn, StringView, Validity, Vector};
 
 use crate::fallback::{self, Kernel};
 use crate::logic::is_true;
@@ -405,6 +405,53 @@ where
         let one = column.data()?;
         return dispatch(op.swapped(), len, other, map, one, first, right_valid, left_valid, map);
     }
+    // A string column against another one or against a literal, with the views read where they are.
+    // It catches the string view form, whose bytes live in an arena the vector shares and so has no
+    // data slice for the branches above to find, and it catches the flat form as well so that the
+    // two cannot be compared by two different loops. The order itself is the one `view_order`
+    // writes down either way.
+    if let (Some((one, one_arena)), Some((other, other_arena))) =
+        (left.text_parts(), right.text_parts())
+    {
+        return Some(sweep(
+            op,
+            len,
+            |index| view_order(one.get(map(index)), one_arena, other.get(map(index)), other_arena),
+            left_valid,
+            right_valid,
+            map,
+        ));
+    }
+    // A string column against a literal. The literal becomes one view before the loop starts, so
+    // every row is a four byte prefix against the same four bytes and the payload is only read for
+    // the rows the prefix could not settle.
+    if let (Some((one, one_arena)), Some(value)) = (left.text_parts(), right.constant_value()) {
+        let column = readied(held, left.logical_type(), value)?;
+        let (other, other_arena) = column.text_parts()?;
+        let wanted = other.first();
+        return Some(sweep(
+            op,
+            len,
+            |index| view_order(one.get(map(index)), one_arena, wanted, other_arena),
+            left_valid,
+            right_valid,
+            map,
+        ));
+    }
+    if let (Some(value), Some((other, other_arena))) = (left.constant_value(), right.text_parts()) {
+        // The same loop with the comparison turned around, rather than a second loop.
+        let column = readied(held, right.logical_type(), value)?;
+        let (one, one_arena) = column.text_parts()?;
+        let wanted = one.first();
+        return Some(sweep(
+            op.swapped(),
+            len,
+            |index| view_order(other.get(map(index)), other_arena, wanted, one_arena),
+            right_valid,
+            left_valid,
+            map,
+        ));
+    }
     if let (Some((codes, values)), Some(value)) = (left.positions(), right.constant_value()) {
         let one = values.data()?;
         let column = readied(held, left.logical_type(), value)?;
@@ -609,7 +656,21 @@ fn string_order(
     right: &StringColumn,
     at_right: usize,
 ) -> Ordering {
-    let (Some(one), Some(other)) = (left.views().get(at_left), right.views().get(at_right)) else {
+    view_order(left.views().get(at_left), left.arena(), right.views().get(at_right), right.arena())
+}
+
+/// The same comparison written against a view and the arena behind it rather than against a column.
+///
+/// Both forms that hold strings come through here, so a flat varchar column and a string view column
+/// order a pair of rows the same way and there is no second copy of the prefix rule to drift from
+/// this one.
+fn view_order(
+    one: Option<&StringView>,
+    one_arena: &[u8],
+    other: Option<&StringView>,
+    other_arena: &[u8],
+) -> Ordering {
+    let (Some(one), Some(other)) = (one, other) else {
         return Ordering::Equal;
     };
     let (prefix, against) = (one.prefix(), other.prefix());
@@ -620,8 +681,8 @@ fn string_order(
     // pushed from a `&str` so the validation cannot fail, and on a URL column, where every row
     // shares the `http` prefix and the payload therefore decides every comparison, it was the
     // larger half of the per row cost.
-    let bytes = left.bytes(at_left).unwrap_or_default();
-    let against_bytes = right.bytes(at_right).unwrap_or_default();
+    let bytes = one.bytes_in(one_arena).unwrap_or_default();
+    let against_bytes = other.bytes_in(other_arena).unwrap_or_default();
     bytes.cmp(against_bytes)
 }
 
@@ -1562,5 +1623,82 @@ mod tests {
         let flat_rows = refine(Comparison::Greater, &flat, &constant, &kept).expect("refines");
         assert_eq!(packed_rows.indices(), flat_rows.indices());
         assert!(!packed_rows.is_empty(), "the literal is inside the range");
+    }
+
+    /// A column of URLs, which is the shape the string view form exists for: a shared prefix that
+    /// the four bytes in the view cannot settle, and payloads long enough to be in the arena.
+    fn urls(count: usize) -> Vector {
+        let mut rng = Rng(0x5eed_1234);
+        let values: Vec<Value> = (0..count)
+            .map(|_| {
+                let host = rng.below(6);
+                let path = rng.below(40);
+                Value::Varchar(format!("http://example{host}.test/a/rather/long/path/{path}"))
+            })
+            .collect();
+        Vector::from_values(LogicalType::Varchar, &values).expect("strings")
+    }
+
+    #[test]
+    fn a_string_view_column_against_a_literal_answers_what_the_oracle_answers() {
+        let before = fallback::count(Kernel::Compare, Form::StringView, Form::Constant);
+        let shared = urls(64).shared_text().expect("shares");
+        assert_eq!(shared.form(), Form::StringView);
+        let literals = ["http://example3.test/a/rather/long/path/7", "a", "zzz", ""];
+        for literal in literals {
+            let value = Value::Varchar(literal.to_owned());
+            let constant = Vector::constant(LogicalType::Varchar, value, 64);
+            for op in EVERY {
+                agrees(op, &shared, &constant);
+                agrees(op, &constant, &shared);
+            }
+        }
+        assert_eq!(
+            fallback::count(Kernel::Compare, Form::StringView, Form::Constant),
+            before,
+            "the form has a loop of its own for every comparison"
+        );
+    }
+
+    #[test]
+    fn a_string_view_column_against_another_one_answers_what_the_oracle_answers() {
+        let shared = urls(48).shared_text().expect("shares");
+        let other = urls(48).shared_text().expect("shares");
+        let flat = urls(48);
+        for op in EVERY {
+            agrees(op, &shared, &other);
+            agrees(op, &shared, &flat);
+            agrees(op, &flat, &shared);
+        }
+    }
+
+    #[test]
+    fn the_nulls_of_a_string_view_column_are_the_nulls_the_oracle_sees() {
+        let shared = urls(32)
+            .with_validity(Validity::from_iter(32, |row| row % 4 != 1))
+            .shared_text()
+            .expect("shares");
+        let constant =
+            Vector::constant(LogicalType::Varchar, Value::Varchar("http://example3".into()), 32);
+        for op in EVERY {
+            agrees(op, &shared, &constant);
+        }
+    }
+
+    /// The two forms hold the same strings in two different places, so a filter over either one has
+    /// to keep the same rows. This is the differential check that the arena being shared changed
+    /// nothing about what a comparison means.
+    #[test]
+    fn a_filter_over_either_string_form_keeps_the_same_rows() {
+        let flat = urls(96);
+        let shared = flat.clone().shared_text().expect("shares");
+        let constant =
+            Vector::constant(LogicalType::Varchar, Value::Varchar("http://example3".into()), 96);
+        let kept = Selection::from_predicate(96, |row| row % 5 != 0);
+        for op in EVERY {
+            let over_flat = refine(op, &flat, &constant, &kept).expect("refines");
+            let over_shared = refine(op, &shared, &constant, &kept).expect("refines");
+            assert_eq!(over_shared.indices(), over_flat.indices(), "{op:?}");
+        }
     }
 }

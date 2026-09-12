@@ -43,6 +43,16 @@ pub struct StringView {
 }
 
 impl StringView {
+    /// The view on the empty string.
+    ///
+    /// What a copy loop writes for a position that resolved to nowhere, for the same reason a fixed
+    /// width copy writes a zero there. The views are a parallel array to a validity mask, so a row
+    /// that got skipped rather than filled would put every row after it at the wrong index.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { length: 0, payload: [0; 12] }
+    }
+
     /// A view on a string that fits inline.
     ///
     /// # Panics
@@ -72,7 +82,12 @@ impl StringView {
     /// the first one and validating again would be work for nothing. A `BLOB` has bytes that were
     /// never text and are not going to become it. `offset` is where they are in the destination
     /// arena and is ignored for a string short enough to sit in the view.
-    fn over(bytes: &[u8], offset: u64) -> Self {
+    ///
+    /// It is public because the string view form of a vector is built from views a caller made, and
+    /// a scan laying chunks over a page of strings is exactly the caller that has bytes and an
+    /// offset into somebody else's arena rather than a column to push into.
+    #[must_use]
+    pub fn over(bytes: &[u8], offset: u64) -> Self {
         let mut payload = [0u8; 12];
         if bytes.len() <= INLINE_LIMIT {
             payload[..bytes.len()].copy_from_slice(bytes);
@@ -130,6 +145,24 @@ impl StringView {
         // `None` rather than a panic for a view that holds a blob, since the payload is whatever
         // was written and only a column of text can promise that is a string.
         std::str::from_utf8(&self.payload[..self.len()]).ok()
+    }
+
+    /// The bytes, given the arena the long strings of this column live in.
+    ///
+    /// A short string is in the view and the arena is not read at all, which is why this takes the
+    /// arena rather than requiring one that has the string in it.
+    ///
+    /// This exists because a view and the bytes it points at do not have to be held by the same
+    /// object. [`StringColumn`] owns both, and the string view form of a vector holds the views
+    /// itself and shares the arena with every other cut of the same page, so a cut of a varchar
+    /// column is the views and nothing else. Both of them resolve a row the same way, and this is
+    /// where that one way is written.
+    #[must_use]
+    pub fn bytes_in<'a>(&'a self, arena: &'a [u8]) -> Option<&'a [u8]> {
+        if let Some(inline) = self.inline_bytes() {
+            return Some(inline);
+        }
+        arena.get(self.offset()..self.offset() + self.len())
     }
 
     fn offset(&self) -> usize {
@@ -353,6 +386,16 @@ impl StringColumn {
         &self.arena
     }
 
+    /// The views and the arena, taken out of the column rather than borrowed from it.
+    ///
+    /// What the string view form of a vector is built from. It takes `self` because the point of
+    /// that form is that the arena moves into an `Arc` and is never copied again, and a method that
+    /// borrowed would have to clone every byte of the arena to hand one over.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<StringView>, Buffer<u8>) {
+        (self.views, self.arena)
+    }
+
     /// The bytes at `index`, or `None` past the end.
     ///
     /// This is what a comparison, a hash and an equality check all actually want, and it is worth
@@ -362,11 +405,7 @@ impl StringColumn {
     /// answer. On a varchar filter it was measured at most of the per row cost.
     #[must_use]
     pub fn bytes(&self, index: usize) -> Option<&[u8]> {
-        let view = self.views.get(index)?;
-        if let Some(inline) = view.inline_bytes() {
-            return Some(inline);
-        }
-        self.arena.get(view.offset()..view.offset() + view.len())
+        self.views.get(index)?.bytes_in(&self.arena)
     }
 
     /// The string at `index`, or `None` past the end.
