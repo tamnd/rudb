@@ -44,7 +44,7 @@ The failure mode being avoided is a crate tree that looks modular and is not: fo
 
 **Optimization and planning.**
 
-`rudb-plan`, the logical and physical plan representations, their textual forms, and Substrait conversion. The one walk that decides where a plan breaks into pipelines is here too, because the executor numbers its operators from it and `EXPLAIN` prints it, and a rule with two implementations of it is a printed plan that stops matching the one that ran.
+`rudb-plan`, the logical and physical plan representations, their textual forms, and Substrait conversion. The one walk that decides what shape a plan runs as is here too, which is both where it breaks into pipelines and what each operator is numbered, because the executor builds from it and `EXPLAIN` prints it, and a rule with two implementations of it is a printed plan that stops matching the one that ran.
 
 `rudb-opt`, the rewrite passes, cardinality estimation, join ordering, RPT, layout adaptation. Each pass is a module with a uniform interface, which is what makes document 9.1's per-pass disabling and document 14.2's automatic bisection possible.
 
@@ -52,7 +52,7 @@ The failure mode being avoided is a crate tree that looks modular and is not: fo
 
 `rudb-pipeline`, the push operator interface, the pipeline, and the single threaded driver. Source, stream and sink, the four reasons an operator can be blocked, the one pull adapter at the root of the query, and the instrumentation shim that wraps an operator of any of the three kinds so that measuring one is not something an operator can forget to do. Rank 4, because it is plumbing over chunks and knows nothing about a schema, a plan or a binding, which is what lets an operator be tested with a source made of two literal chunks and no planner anywhere in the picture. Depends on `rudb-common`, `rudb-vector` and `rudb-metrics`.
 
-`rudb-exec`, operators, morsels, the scheduler, hash tables, sorting, spilling. It is also where the shim gets put around every operator, because building the tree is the one walk that sees all of them, and that is where an operator's id and its pipeline number come from.
+`rudb-exec`, operators, morsels, the scheduler, hash tables, sorting, spilling. It is also where the shim gets put around every operator, because building the tree is the one walk that sees all of them. The id and the pipeline number an operator reports under are not decided here, they are read off the shape `rudb-plan` works out, so that `EXPLAIN` can print an operator's number without building it.
 
 `rudb-ir`, the expression IR from document 8.5.
 

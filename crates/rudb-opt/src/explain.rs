@@ -13,10 +13,10 @@
 //!
 //! # Why the pipelines are not worked out here
 //!
-//! They come from [`Pipelines`], which lives in `rudb-plan`, and the executor numbers its operators
-//! out of the same call. Two walks that both decide where a plan breaks would agree on the day they
-//! were written and disagree some time after, and the one that would be wrong is this one, which is
-//! the one somebody reads when they are trying to find out why a query is slow.
+//! They come from [`Shape`], which lives in `rudb-plan`, and the executor builds its tree out of the
+//! same call. Two walks that both decide where a plan breaks would agree on the day they were
+//! written and disagree some time after, and the one that would be wrong is this one, which is the
+//! one somebody reads when they are trying to find out why a query is slow.
 //!
 //! # What the reference marker means
 //!
@@ -39,7 +39,7 @@
 
 use std::fmt::Write as _;
 
-use rudb_plan::{Node, NodeRef, PipelineRef, Pipelines, Plan};
+use rudb_plan::{Node, NodeRef, PipelineRef, Plan, Shape};
 use rudb_seam::{Registries, SeamId, Settings};
 
 use crate::estimate::{Statistics, rows};
@@ -110,10 +110,10 @@ pub fn explain(plan: &Plan, statistics: &Statistics) -> String {
 /// [`crate::estimate`] is careful about.
 #[must_use]
 pub fn explain_with(plan: &Plan, statistics: &Statistics, seams: Seams<'_>) -> String {
-    let pipelines = Pipelines::of(plan);
+    let shape = Shape::of(plan);
     let mut out = String::new();
-    write_node(plan, statistics, &pipelines, seams, plan.root(), 0, &mut out);
-    write_pipelines(&pipelines, &mut out);
+    write_node(plan, statistics, &shape, seams, plan.root(), 0, &mut out);
+    write_pipelines(&shape, &mut out);
     write_seams(seams, &mut out);
     out
 }
@@ -121,7 +121,7 @@ pub fn explain_with(plan: &Plan, statistics: &Statistics, seams: Seams<'_>) -> S
 fn write_node(
     plan: &Plan,
     statistics: &Statistics,
-    pipelines: &Pipelines,
+    shape: &Shape,
     seams: Seams<'_>,
     node: NodeRef,
     depth: usize,
@@ -132,7 +132,7 @@ fn write_node(
         Some(count) => format!("~{count} rows"),
         None => "rows unknown".to_owned(),
     };
-    let pipeline = pipelines.pipeline(node);
+    let pipeline = shape.pipeline(node);
     let marker = if seams.all_reference(plan.node(node)) { " [reference]" } else { "" };
     // The estimate goes after the operator rather than in a column of its own, because the tree is
     // indented and a column would have to be wider than the deepest line to line up.
@@ -143,7 +143,7 @@ fn write_node(
         indent = depth * 2
     );
     for child in children(plan.node(node)) {
-        write_node(plan, statistics, pipelines, seams, child, depth + 1, out);
+        write_node(plan, statistics, shape, seams, child, depth + 1, out);
     }
 }
 
@@ -151,10 +151,10 @@ fn write_node(
 ///
 /// Printed even when there is only one, because a reader who sees no section cannot tell a plan
 /// that does not break from a build of `EXPLAIN` that does not say.
-fn write_pipelines(pipelines: &Pipelines, out: &mut String) {
+fn write_pipelines(shape: &Shape, out: &mut String) {
     let _ = writeln!(out, "\nPipelines");
-    for pipeline in pipelines.all() {
-        let waits = pipelines.waits_for(pipeline);
+    for pipeline in shape.all() {
+        let waits = shape.waits_for(pipeline);
         let waiting = if waits.is_empty() {
             "waits for nothing".to_owned()
         } else {
