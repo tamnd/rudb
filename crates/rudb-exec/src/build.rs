@@ -124,6 +124,7 @@ fn node<'a>(
             node(plan, catalog, cancel, memory, right)?,
             kind,
             conditions,
+            cancel,
             memory,
         )),
         Node::CrossProduct { left, right } => Box::new(CrossProduct::new(

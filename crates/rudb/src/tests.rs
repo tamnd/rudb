@@ -1732,6 +1732,23 @@ fn a_limit_does_not_stop_a_query_that_finishes_inside_it() {
 }
 
 #[test]
+fn a_join_that_runs_too_long_is_stopped_partway_through_its_own_loop() {
+    // The timeout is checked between the chunks an operator produces, and a nested loop join
+    // produces its first chunk only after the whole join is done. Fifty thousand left rows against
+    // twenty thousand right ones is a billion comparisons and about a minute, all of it inside one
+    // call, so without a check in the loop itself the clock below is read once, at the end.
+    let db = Database::with_config(Config::new().with_query_timeout(Duration::from_millis(50)));
+    db.execute("CREATE TABLE l AS SELECT i AS k FROM range(50000) t(i)").unwrap();
+    db.execute("CREATE TABLE r AS SELECT i * 2 AS k FROM range(20000) t(i)").unwrap();
+    let started = std::time::Instant::now();
+    let error =
+        db.query("SELECT count(*) FROM l JOIN r ON l.k = r.k").expect_err("that does not finish");
+    assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+    // One left row's pass over the right side is what it may overshoot by, which is milliseconds.
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+}
+
+#[test]
 fn another_thread_can_interrupt_a_running_query() {
     let db = Database::new();
     let connection = db.connect();
