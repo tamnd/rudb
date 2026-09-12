@@ -35,7 +35,8 @@
 
 use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
 use rudb_kernels::{
-    Comparison, Connective, cast, combine, compare, is_true, refine, refine_flags, selection,
+    Comparison, Connective, Recipe, cast, combine, compare, is_true, refine, refine_flags,
+    selection,
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Chunk, Selection, Vector};
@@ -125,8 +126,13 @@ enum Step {
     },
     /// A scalar function over a run of [`Prepared::operands`].
     Function {
-        /// The resolved function name, held here so the plan is not consulted per chunk.
-        name: String,
+        /// The call, with the name resolved and whatever the kernel could work out from the
+        /// arguments that were literals already worked out.
+        ///
+        /// Held here so the plan is not consulted per chunk, and built here so that a regular
+        /// expression is compiled once for the query rather than once for each of the hundred
+        /// thousand chunks a pipeline over `hits` runs.
+        recipe: Recipe,
         /// How the call is written, for the one error message that quotes it.
         ///
         /// Rendered when the pipeline is built rather than when a chunk arrives, because the plan
@@ -275,6 +281,18 @@ impl Prepared {
     #[must_use]
     pub fn len(&self) -> usize {
         self.roots.len()
+    }
+
+    /// How many of the function steps worked something out when this was built.
+    ///
+    /// For the tests, which cannot see the hoisting in an answer because an answer that changed
+    /// would be a bug.
+    #[cfg(test)]
+    fn hoisted(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| matches!(step, Step::Function { recipe, .. } if recipe.hoists()))
+            .count()
     }
 
     /// Whether it was built from no expressions at all.
@@ -605,9 +623,9 @@ impl Prepared {
                     })?,
                 )
             }
-            Step::Function { name, written, start, len } => {
+            Step::Function { recipe, written, start, len } => {
                 Some(self.with_operands(*start, *len, chunk, slots, |args| {
-                    rudb_kernels::call(name, args, ty, Some(&|| written.clone()))
+                    rudb_kernels::call_prepared(recipe, args, ty, Some(&|| written.clone()))
                 })?)
             }
             Step::Case { arms, otherwise } => {
@@ -769,7 +787,7 @@ impl Prepared {
             Expr::Function { name, args } => {
                 let (start, len) = self.push_list(plan, plan.expr_list(args), schema)?;
                 Step::Function {
-                    name: plan.string(name).to_string(),
+                    recipe: Recipe::new(plan.string(name), &self.literals(start, len)),
                     written: written(plan, expr, schema),
                     start,
                     len,
@@ -819,6 +837,24 @@ impl Prepared {
         let len = indices.len();
         self.operands.extend(indices);
         Ok((start, len))
+    }
+
+    /// The literal behind each argument in a run of the operand list, and `None` for an argument
+    /// that is anything else.
+    ///
+    /// This is what a [`Recipe`] hoists from. An argument that is a literal in the plan arrives as a
+    /// constant vector holding exactly this value on every chunk, so what a kernel reads here is
+    /// what it would have read per chunk. An argument that is a cast of a literal reads as `None`,
+    /// which is a call the kernel decides per chunk as it always did, and the optimizer folds most
+    /// of those before the plan gets here anyway.
+    fn literals(&self, start: usize, len: usize) -> Vec<Option<Value>> {
+        self.operands[start..start + len]
+            .iter()
+            .map(|&operand| match &self.steps[operand] {
+                Step::Constant(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -1372,5 +1408,65 @@ mod tests {
         let list = plan.expr_list(aggregates).to_vec();
         let error = Prepared::new(&plan, &list, &schema).expect_err("sum is not a scalar");
         assert!(error.message().contains("sum"), "{error}");
+    }
+
+    /// How many of an expression's function steps worked something out when it was prepared, and
+    /// whether the answer it gives is still the tree walk's answer.
+    ///
+    /// The count is the point of the assertion, because an answer that moved would be a bug. The
+    /// agreement is what says the answer did not move.
+    fn prepares(expr: &str, lifted: usize) {
+        let (schema, _) = input();
+        let projected = format!("{expr} AS a");
+        let (plan, list) = projection(&projected);
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the expression resolves");
+        assert_eq!(prepared.hoisted(), lifted, "`{expr}`");
+        agrees(&projected);
+    }
+
+    /// A pattern the user wrote is compiled where the plan is, which is once.
+    #[test]
+    fn a_literal_pattern_is_compiled_when_the_pipeline_is_built() {
+        prepares("\"~~\"(#0.1::VARCHAR, 'a%'::VARCHAR)::BOOLEAN", 1);
+        prepares("\"~~*\"(#0.1::VARCHAR, '%A%'::VARCHAR)::BOOLEAN", 1);
+    }
+
+    /// A regular expression, which is the one where the compiling is worth real time.
+    ///
+    /// ClickBench query 29 runs one pattern over a hundred million rows, which is a hundred thousand
+    /// chunks, and before this each of those hundred thousand compiled the pattern again.
+    #[test]
+    fn a_regular_expression_is_compiled_when_the_pipeline_is_built() {
+        prepares("\"regexp_matches\"(#0.1::VARCHAR, '^a'::VARCHAR)::BOOLEAN", 1);
+        prepares("\"regexp_replace\"(#0.1::VARCHAR, 'a'::VARCHAR, 'b'::VARCHAR)::VARCHAR", 1);
+    }
+
+    /// A pattern that is not a literal, which is legal SQL and is decided per chunk as it was.
+    #[test]
+    fn a_pattern_that_is_not_a_literal_is_left_to_the_chunk() {
+        prepares("\"~~\"(#0.1::VARCHAR, #0.1::VARCHAR)::BOOLEAN", 0);
+    }
+
+    /// A function with nothing to work out, which is almost all of them.
+    #[test]
+    fn a_function_with_no_prepare_step_prepares_nothing() {
+        prepares("\"upper\"(#0.1::VARCHAR)::VARCHAR", 0);
+    }
+
+    /// A pattern that does not compile still fails where the query said it does.
+    ///
+    /// Preparing is not allowed to move an error earlier. Compiling at build time and reporting
+    /// there would raise before a row had been read, and under a `CASE` arm it would raise on a
+    /// query whose rows never reach the call at all.
+    #[test]
+    fn a_pattern_that_does_not_compile_fails_on_the_chunk_and_not_before() {
+        let (schema, chunk) = input();
+        let (plan, list) =
+            projection("\"regexp_matches\"(#0.1::VARCHAR, 'a('::VARCHAR)::BOOLEAN AS a");
+        let prepared = Prepared::new(&plan, &list, &schema).expect("preparing does not compile it");
+        assert_eq!(prepared.hoisted(), 0);
+        let mut scratch = prepared.scratch();
+        let mut out = Vec::new();
+        prepared.evaluate(&chunk, &mut scratch, &mut out).expect_err("the chunk raises");
     }
 }

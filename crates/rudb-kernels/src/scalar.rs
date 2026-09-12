@@ -56,6 +56,7 @@ use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
+use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
 use crate::shape::{first, identity, nulls_of, single};
 use crate::subscript;
@@ -90,6 +91,35 @@ pub fn call<V: AsRef<Vector>>(
     returns: &LogicalType,
     written: Written<'_>,
 ) -> Result<Vector> {
+    run(name, &Hoisted::Nothing, args, returns, written)
+}
+
+/// Calls a scalar function on a batch, with the per query work already done.
+///
+/// The same function as [`call`] and the same answer. What the recipe saves is everything the call
+/// would otherwise decide on every chunk from arguments that were literals in the query, which for
+/// a regular expression is compiling it. See [`crate::prepare`].
+///
+/// # Errors
+///
+/// The same ones [`call`] reports, on the same inputs. A recipe never moves an error earlier.
+pub fn call_prepared<V: AsRef<Vector>>(
+    recipe: &Recipe,
+    args: &[V],
+    returns: &LogicalType,
+    written: Written<'_>,
+) -> Result<Vector> {
+    run(recipe.name(), recipe.hoisted(), args, returns, written)
+}
+
+/// The body both entry points share.
+fn run<V: AsRef<Vector>>(
+    name: &str,
+    hoisted: &Hoisted,
+    args: &[V],
+    returns: &LogicalType,
+    written: Written<'_>,
+) -> Result<Vector> {
     let rows = args.first().map_or(0, |arg| arg.as_ref().len());
     for (at, arg) in args.iter().enumerate() {
         if arg.as_ref().len() != rows {
@@ -112,7 +142,7 @@ pub fn call<V: AsRef<Vector>>(
         ));
     }
 
-    if let Some(vector) = specialized(name, args, returns, rows, written)? {
+    if let Some(vector) = specialized(name, hoisted, args, returns, rows, written)? {
         return Ok(vector);
     }
 
@@ -136,19 +166,38 @@ pub fn call<V: AsRef<Vector>>(
 /// The result for a call this file has a loop for, or `None` to say it has not.
 fn specialized<V: AsRef<Vector>>(
     name: &str,
+    hoisted: &Hoisted,
     args: &[V],
     returns: &LogicalType,
     rows: usize,
     written: Written<'_>,
 ) -> Result<Option<Vector>> {
     if regexp::is_regexp(name) {
-        return regexp::vectorized(name, args, returns, rows);
+        return regexp::vectorized(name, hoisted.regexp(), args, returns, rows);
     }
     match args {
         [only] => unary(name, only.as_ref(), returns, rows),
-        [left, right] => binary(name, left.as_ref(), right.as_ref(), returns, rows, written),
+        [left, right] => {
+            binary(name, hoisted, left.as_ref(), right.as_ref(), returns, rows, written)
+        }
         _ => Ok(None),
     }
+}
+
+/// What a recipe can lift out of a call to `name`, given the arguments that were literals.
+///
+/// `None` says there was nothing to lift, which covers three cases that behave the same: the
+/// function has no prepare step, the argument that would drive it is not a literal, and the literal
+/// is one that does not compile. The third is the one worth stating, because it is what keeps a
+/// recipe from moving an error to a place the query did not put it.
+pub(crate) fn hoist(name: &str, literals: &[Option<Value>]) -> Option<Hoisted> {
+    if regexp::is_regexp(name) {
+        return regexp::hoist(name, literals).map(|call| Hoisted::Regexp(Box::new(call)));
+    }
+    let [_, Some(Value::Varchar(spelling))] = literals else {
+        return None;
+    };
+    Like::of(name, spelling).map(Hoisted::Like)
 }
 
 /// Runs `body` at every row that is not already null, and hands back the nulls of the answer.
@@ -488,6 +537,7 @@ pub(crate) fn each_string(
 /// A two argument call, for the functions with a loop.
 fn binary(
     name: &str,
+    hoisted: &Hoisted,
     left: &Vector,
     right: &Vector,
     returns: &LogicalType,
@@ -500,10 +550,7 @@ fn binary(
     match name {
         "/" => slash_of(left, right, returns),
         "||" => concat_of(left, right, returns),
-        "~~" => like_of(left, right, returns, rows, false, false),
-        "!~~" => like_of(left, right, returns, rows, false, true),
-        "~~*" => like_of(left, right, returns, rows, true, false),
-        "!~~*" => like_of(left, right, returns, rows, true, true),
+        "~~" | "!~~" | "~~*" | "!~~*" => like_of(name, hoisted.like(), left, right, returns, rows),
         "date_part" | "date_trunc" => date_of(name, left, right, returns, rows),
         _ => Ok(None),
     }
@@ -1110,30 +1157,40 @@ where
 /// vector here meant the real file never reached this loop at all. That was #288, and it cost six
 /// times the whole predicate.
 fn like_of(
+    name: &str,
+    prepared: Option<&Like>,
     text: &Vector,
     pattern: &Vector,
     returns: &LogicalType,
     rows: usize,
-    fold_case: bool,
-    negated: bool,
 ) -> Result<Option<Vector>> {
     if !matches!(returns, LogicalType::Boolean) {
         return Ok(None);
     }
-    let Some(Value::Varchar(spelling)) = pattern.constant_value() else {
-        return Ok(None);
-    };
-    // The pattern is compiled once for the whole vector. This is the difference between ClickBench
+    // A pipeline that was built from a plan has already compiled this, and one that was not
+    // compiles it here for the whole vector, which is still the difference between ClickBench
     // query 21 doing a substring search per row and doing four allocations and a backtracking walk.
-    let spelling = if fold_case { spelling.to_lowercase() } else { spelling.clone() };
-    let compiled = Pattern::compile(&spelling);
+    let held;
+    let like = match prepared {
+        Some(like) => like,
+        None => {
+            let Some(Value::Varchar(spelling)) = pattern.constant_value() else {
+                return Ok(None);
+            };
+            let Some(built) = Like::of(name, spelling) else {
+                return Ok(None);
+            };
+            held = built;
+            &held
+        }
+    };
     let base = nulls_of(text).and(&nulls_of(pattern), rows);
     match text.form() {
         Form::Flat => {
             let Some(Data::Varlen(column)) = text.data() else {
                 return Ok(None);
             };
-            like_run(column, identity, &compiled, base, rows, returns, fold_case, negated)
+            like_run(column, identity, like, base, rows, returns)
         }
         Form::Dictionary | Form::Rle => {
             let Some((codes, values)) = text.positions() else {
@@ -1148,7 +1205,7 @@ fn like_of(
             // Every code is inside the dictionary because `Vector::dictionary` checks that on the
             // way in, so the gather indexes without a bound of its own.
             let at = move |index: usize| codes[index] as usize;
-            like_run(column, at, &compiled, base, rows, returns, fold_case, negated)
+            like_run(column, at, like, base, rows, returns)
         }
         // There is no constant arm and there cannot be a useful one. This function needs the pattern
         // to be constant to get this far, so a constant text here would be a call whose every
@@ -1158,21 +1215,56 @@ fn like_of(
     }
 }
 
+/// A `LIKE` whose pattern has been looked at, which is everything about the call bar the text.
+///
+/// This is what [`crate::prepare`] lifts out of the per chunk path. It is small, and what it saves
+/// per chunk is the walk over the spelling, the four allocations the walk can make and, for the
+/// case folding spellings, a `to_lowercase` of the pattern.
+#[derive(Debug)]
+pub(crate) struct Like {
+    /// The pattern, already folded to lower case where `fold_case` is set.
+    compiled: Pattern,
+    /// Whether the match ignores case, which is the `*` in the spelling.
+    fold_case: bool,
+    /// Whether the answer is inverted, which is the `!` in the spelling.
+    negated: bool,
+}
+
+impl Like {
+    /// The call `name` spells against `spelling`, or `None` when the name is not a `LIKE`.
+    pub(crate) fn of(name: &str, spelling: &str) -> Option<Self> {
+        let (fold_case, negated) = match name {
+            "~~" => (false, false),
+            "!~~" => (false, true),
+            "~~*" => (true, false),
+            "!~~*" => (true, true),
+            _ => return None,
+        };
+        // Folding the pattern here rather than per chunk is the same answer, because the loop folds
+        // the text on both paths and a fold of a fold is a fold.
+        let folded;
+        let spelling = if fold_case {
+            folded = spelling.to_lowercase();
+            &folded
+        } else {
+            spelling
+        };
+        Some(Self { compiled: Pattern::compile(spelling), fold_case, negated })
+    }
+}
+
 /// The `LIKE` loop itself, once per form the text can arrive in.
 ///
 /// The mapping is a generic parameter for the reason spelled out on [`by_form`], which is that a
 /// function pointer here is an indirect call per row and this loop is one of the two or three that
 /// ClickBench spends real time in.
-#[expect(clippy::too_many_arguments, reason = "one loop, and every argument is what it needs")]
 fn like_run<A: Fn(usize) -> usize>(
     column: &StringColumn,
     at: A,
-    compiled: &Pattern,
+    like: &Like,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
-    fold_case: bool,
-    negated: bool,
 ) -> Result<Option<Vector>> {
     let mut out = vec![false; rows];
     let mut characters: Vec<char> = Vec::new();
@@ -1181,9 +1273,9 @@ fn like_run<A: Fn(usize) -> usize>(
         // `str::to_lowercase` and not a character by character fold, for the same reason the
         // `lower` kernel uses it: the two functions disagree about a final sigma, and the oracle
         // this is checked against calls the string one.
-        let folded = if fold_case { Some(text.to_lowercase()) } else { None };
+        let folded = if like.fold_case { Some(text.to_lowercase()) } else { None };
         let text = folded.as_deref().unwrap_or(text);
-        out[index] = compiled.holds(text, &mut characters) != negated;
+        out[index] = like.compiled.holds(text, &mut characters) != like.negated;
         Ok(())
     })?;
     finish(returns, Data::Bool(out.into()), validity)
@@ -2380,9 +2472,10 @@ mod tests {
         .expect("builds");
         let text = Vector::dictionary(vec![0, 1, 2, 0], values).expect("codes are in range");
         let pattern = Vector::constant(LogicalType::Varchar, Value::Varchar("%google%".into()), 4);
-        let answer = binary("~~", &text, &pattern, &LogicalType::Boolean, 4, None)
-            .expect("the call is written")
-            .expect("a dictionary text has a loop of its own");
+        let answer =
+            binary("~~", &Hoisted::Nothing, &text, &pattern, &LogicalType::Boolean, 4, None)
+                .expect("the call is written")
+                .expect("a dictionary text has a loop of its own");
         let rows: Vec<Value> = (0..4).map(|row| answer.value_at(row)).collect();
         assert_eq!(
             rows,
@@ -2394,7 +2487,7 @@ mod tests {
         // that is not constant does not get past the pattern check.
         let text = Vector::constant(LogicalType::Varchar, Value::Varchar("google".into()), 4);
         assert!(
-            binary("~~", &text, &pattern, &LogicalType::Boolean, 4, None)
+            binary("~~", &Hoisted::Nothing, &text, &pattern, &LogicalType::Boolean, 4, None)
                 .expect("the call is written")
                 .is_none()
         );

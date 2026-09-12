@@ -31,9 +31,26 @@ pub(crate) fn is_regexp(name: &str) -> bool {
     matches!(name, "regexp_replace" | "regexp_matches" | "regexp_full_match" | "regexp_extract")
 }
 
+/// What a recipe can lift out of a call to one of these, given the arguments that were literals.
+///
+/// A pattern that does not compile and an option letter that is not one both come back as `None`
+/// rather than as an error, so the sentence the user sees still comes out of the chunk that reached
+/// the call. Preparing a query is not allowed to raise something running it would have raised.
+pub(crate) fn hoist(name: &str, literals: &[Option<Value>]) -> Option<Call> {
+    let mut rest: Vec<&Value> = Vec::with_capacity(literals.len());
+    for held in literals.iter().skip(1) {
+        rest.push(held.as_ref()?);
+    }
+    let Ok(call) = Call::read(name, &rest) else {
+        return None;
+    };
+    call
+}
+
 /// The vectorized path, or `None` when this call is not one it has a loop for.
 pub(crate) fn vectorized<V: AsRef<Vector>>(
     name: &str,
+    prepared: Option<&Call>,
     args: &[V],
     returns: &LogicalType,
     rows: usize,
@@ -44,15 +61,27 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
     let Some(source) = Source::of(text) else {
         return Ok(None);
     };
-    let mut constants: Vec<&Value> = Vec::new();
-    for arg in args.iter().skip(1) {
-        let Some(value) = arg.as_ref().constant_value() else {
-            return Ok(None);
-        };
-        constants.push(value);
-    }
-    let Some(call) = Call::read(name, &constants)? else {
-        return Ok(None);
+    // Compiled when the pipeline was built where the caller had a plan to read the pattern out of,
+    // and compiled here for this one vector where it did not. ClickBench query 29 runs a hundred
+    // thousand chunks, so the first is a hundred thousand compilations saved and the second is the
+    // path a call through `call` with no recipe still takes.
+    let held;
+    let call = match prepared {
+        Some(call) => call,
+        None => {
+            let mut constants: Vec<&Value> = Vec::new();
+            for arg in args.iter().skip(1) {
+                let Some(value) = arg.as_ref().constant_value() else {
+                    return Ok(None);
+                };
+                constants.push(value);
+            }
+            let Some(read) = Call::read(name, &constants)? else {
+                return Ok(None);
+            };
+            held = read;
+            &held
+        }
     };
     let base = nulls_of(text);
     match (name, returns) {
@@ -112,7 +141,8 @@ pub(crate) fn value(name: &str, args: &[Value]) -> Result<Value> {
 }
 
 /// Everything a call needs that does not change from row to row.
-struct Call {
+#[derive(Debug)]
+pub(crate) struct Call {
     regex: Regex,
     /// The replacement, taken apart here rather than per row, and empty for everything that is not
     /// `regexp_replace`.
