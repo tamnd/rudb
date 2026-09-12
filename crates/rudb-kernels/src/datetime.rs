@@ -19,7 +19,7 @@
 //! DuckDB is not being consistent there and neither are we, on purpose.
 //!
 //! What is missing is `timezone`, `timezone_hour` and `timezone_minute`, which need a session time
-//! zone before they mean anything, and the interval overload of `date_trunc`.
+//! zone before they mean anything, and `epoch`, which is a double and needs an overload of its own.
 
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 
@@ -375,6 +375,51 @@ impl Part {
             Self::Minute => micros - micros.rem_euclid(MICROS_PER_MINUTE),
             Self::Hour => micros - micros.rem_euclid(MICROS_PER_HOUR),
             _ => i64::from(self.truncate_days(day_of(micros)?)?) * MICROS_PER_DAY,
+        })
+    }
+
+    /// An interval truncated to the part.
+    ///
+    /// A truncation clears every field below the part and leaves the ones above it alone, so an
+    /// interval truncated to a month keeps its months and loses its days and its microseconds. The
+    /// field the part lands in is cut down to a whole number of the part towards zero, which is
+    /// where this and the timestamp above it disagree: a timestamp floors, so that a moment before
+    /// the epoch lands on the boundary below it, and a length has no epoch to be before.
+    ///
+    /// Every part an interval does not have is still answered here, unlike [`Part::of_interval`],
+    /// because a truncation to a part a length has none of is the length with that part and
+    /// everything under it cleared. So a week truncates the days to a multiple of seven and a day
+    /// of the week does nothing at all, both measured.
+    ///
+    /// # Errors
+    ///
+    /// If the part is an era, with the sentence upstream uses for a length, which is the one it
+    /// uses for a moment with the last word taken off.
+    pub(crate) fn truncate_interval(
+        self,
+        months: i32,
+        days: i32,
+        micros: i64,
+    ) -> Result<(i32, i32, i64)> {
+        let whole = |unit: i32| months - months % unit;
+        let clipped = |unit: i64| micros - micros % unit;
+        Ok(match self {
+            Self::Millennium => (whole(12_000), 0, 0),
+            Self::Century => (whole(1_200), 0, 0),
+            Self::Decade => (whole(120), 0, 0),
+            Self::Year | Self::IsoYear => (whole(12), 0, 0),
+            Self::Quarter => (whole(3), 0, 0),
+            Self::Month => (months, 0, 0),
+            Self::Week | Self::YearWeek => (months, days - days % 7, 0),
+            Self::Day | Self::DayOfWeek | Self::IsoDayOfWeek | Self::DayOfYear => (months, days, 0),
+            Self::Hour => (months, days, clipped(MICROS_PER_HOUR)),
+            Self::Minute => (months, days, clipped(MICROS_PER_MINUTE)),
+            Self::Second | Self::Epoch => (months, days, clipped(MICROS_PER_SECOND)),
+            Self::Millisecond => (months, days, clipped(1_000)),
+            Self::Microsecond => (months, days, micros),
+            Self::Era => {
+                return Err(Error::not_implemented("Specifier type not implemented for DATETRUNC"));
+            }
         })
     }
 }
@@ -1527,6 +1572,66 @@ mod tests {
         assert_eq!(of_interval("microsecond", (0, 0, -6_700_000)), -6_700_000);
         assert_eq!(of_interval("quarter", (-5, 0, 0)), 0);
         assert_eq!(of_interval("quarter", (-1, 0, 0)), 1);
+    }
+
+    fn truncate_interval(
+        spelling: &str,
+        (months, days, micros): (i32, i32, i64),
+    ) -> (i32, i32, i64) {
+        part(spelling).truncate_interval(months, days, micros).expect("a truncated interval")
+    }
+
+    /// A truncation clears every field below the part and leaves the ones above it, which is why
+    /// the months survive a truncation to a day and the days do not survive one to a month.
+    #[test]
+    fn truncating_an_interval_clears_everything_under_the_part() {
+        let clock = 6 * MICROS_PER_HOUR + 7 * MICROS_PER_MINUTE + 8_900_000;
+        let length = (14, 10, clock);
+        for (spelling, answer) in [
+            ("millennium", (0, 0, 0)),
+            ("century", (0, 0, 0)),
+            ("decade", (0, 0, 0)),
+            ("year", (12, 0, 0)),
+            ("isoyear", (12, 0, 0)),
+            ("quarter", (12, 0, 0)),
+            ("month", (14, 0, 0)),
+            ("week", (14, 7, 0)),
+            ("yearweek", (14, 7, 0)),
+            ("day", (14, 10, 0)),
+            ("dow", (14, 10, 0)),
+            ("doy", (14, 10, 0)),
+            ("hour", (14, 10, 6 * MICROS_PER_HOUR)),
+            ("minute", (14, 10, 6 * MICROS_PER_HOUR + 7 * MICROS_PER_MINUTE)),
+            ("second", (14, 10, clock - 900_000)),
+            ("epoch", (14, 10, clock - 900_000)),
+            ("millisecond", (14, 10, clock)),
+            ("microsecond", (14, 10, clock)),
+        ] {
+            assert_eq!(truncate_interval(spelling, length), answer, "{spelling} of a length");
+        }
+    }
+
+    /// A length below zero is cut down towards zero rather than downwards, which is the one place
+    /// this and the timestamp truncation above it disagree, since a length has no epoch to be
+    /// before.
+    #[test]
+    fn truncating_a_length_below_zero_cuts_towards_zero() {
+        assert_eq!(truncate_interval("decade", (-125, 0, 0)), (-120, 0, 0));
+        assert_eq!(truncate_interval("year", (-14, 5, 6 * MICROS_PER_HOUR)), (-12, 0, 0));
+        assert_eq!(truncate_interval("week", (0, -20, 0)), (0, -14, 0));
+        assert_eq!(truncate_interval("second", (0, 0, -6_987_654)), (0, 0, -6_000_000));
+        assert_eq!(truncate_interval("millisecond", (0, 0, -6_987_654)), (0, 0, -6_987_000));
+    }
+
+    /// The one part a length cannot be truncated to, and its sentence is the sentence a moment gets
+    /// with the last word taken off, which is upstream's and not a typo here.
+    #[test]
+    fn a_length_truncated_to_an_era_says_so_without_the_word_statistics() {
+        let error = part("era").truncate_interval(14, 10, 0).expect_err("an era does not truncate");
+        assert_eq!(
+            error.to_string(),
+            "Not implemented Error: Specifier type not implemented for DATETRUNC"
+        );
     }
 
     /// The parts that need a calendar, refused with the type in the sentence and the specifier
