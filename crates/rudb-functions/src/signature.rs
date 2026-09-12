@@ -93,6 +93,16 @@ enum Shape {
     LeadingFixedToLast(Fixed),
     /// Every argument promotes and an integer result widens to the accumulator. `sum`.
     Accumulated,
+    /// The first argument is a string or a list and the result is one piece of it. `array_extract`.
+    ///
+    /// The index is a BIGINT and nothing is cast to one, which is upstream's rule rather than an
+    /// omission here: `[1, 2, 3][1.5]` is a binder error there listing the four overloads, so a
+    /// decimal index is refused and not rounded. The bounds of a slice are the other way round,
+    /// which is why that is a shape of its own and not this one with a longer arity.
+    Extracted,
+    /// The first argument is a string or a list, the rest are the bounds, and the result is the first
+    /// argument's own type. `array_slice`.
+    Sliced,
 }
 
 /// The return types a signature can name outright.
@@ -313,6 +323,27 @@ const TABLE: &[Entry] = &[
         shape: Shape::LeadingFixedTo(2, Fixed::Varchar, Fixed::Varchar),
         numeric_only: false,
     },
+    // Subscripting. A bracket is one of these two calls by the time the transformer is done with it,
+    // `x[2]` being `array_extract(x, 2)` and `x[1:2]` being `array_slice(x, 1, 2)`, which is what
+    // DuckDB's own transformer writes as well. Both take a string or a list and give back a piece of
+    // the same thing, so neither one can name its return type here: it is read off the argument.
+    Entry {
+        name: "array_extract",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Extracted,
+        numeric_only: false,
+    },
+    // Three arguments is a range and four is a range with a step. There is no two argument form,
+    // which is why a slice cannot share the row above: `array_slice([1, 2, 3], 1)` is an arity error
+    // upstream rather than the whole list from the first element on.
+    Entry {
+        name: "array_slice",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(3, 4),
+        shape: Shape::Sliced,
+        numeric_only: false,
+    },
     // Aggregates.
     aggregate("count_star", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt), false),
     aggregate("count", Arity::exactly(1), Shape::AnyTo(Fixed::BigInt), false),
@@ -457,6 +488,36 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let returns = accumulator(&common);
             (vec![common; arguments.len()], returns)
         }
+        Shape::Extracted => {
+            let target = &arguments[0];
+            let index = &arguments[1];
+            let Some(element) = element_of(target) else {
+                return Err(no_match(entry.name, arguments));
+            };
+            if !index.is_integer() && *index != LogicalType::Null {
+                return Err(no_match(entry.name, arguments));
+            }
+            (vec![target.clone(), LogicalType::BigInt], element)
+        }
+        Shape::Sliced => {
+            let target = &arguments[0];
+            if element_of(target).is_none() {
+                // Upstream's own sentence, shouted, and it is the same sentence whichever of the two
+                // spellings the call was written with.
+                return Err(Error::binder("ARRAY_SLICE can only operate on LISTs and VARCHARs"));
+            }
+            // A step is declared BIGINT and so it is not cast to one either, while the two bounds
+            // are declared ANY and are: `array_slice([1, 2, 3], 1.5, 2)` is `[2]` upstream, rounded,
+            // and `array_slice([1, 2, 3], 1, 2, 1.5)` is a binder error.
+            if let Some(step) = arguments.get(3) {
+                if !step.is_integer() && *step != LogicalType::Null {
+                    return Err(no_match(entry.name, arguments));
+                }
+            }
+            let mut cast_to = vec![LogicalType::BigInt; arguments.len()];
+            cast_to[0] = target.clone();
+            (cast_to, target.clone())
+        }
     };
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
 }
@@ -534,7 +595,44 @@ const CANDIDATES: &[(&str, &[&str])] = &[
             "regexp_full_match(string VARCHAR, regex VARCHAR, \"options\" VARCHAR) -> BOOLEAN",
         ],
     ),
+    // Four overloads of which this engine has two. The STRUCT one is `x.y`, which the transformer
+    // writes as `struct_extract`, and a TUPLE is the positional half of the same idea.
+    (
+        "array_extract",
+        &[
+            "array_extract(\"array\" T[], \"index\" BIGINT) -> T",
+            "array_extract(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+            "array_extract(\"struct\" STRUCT, \"key\" VARCHAR) -> ANY",
+            "array_extract(\"tuple\" TUPLE, \"index\" BIGINT) -> ANY",
+        ],
+    ),
+    (
+        "array_slice",
+        &[
+            "array_slice(col0 ANY, col1 ANY, col2 ANY) -> ANY",
+            "array_slice(col0 ANY, col1 ANY, col2 ANY, col3 BIGINT) -> ANY",
+        ],
+    ),
 ];
+
+/// What one element of a subscripted value is, or `None` for a value that cannot be subscripted.
+///
+/// A string is subscripted by character and a character is a string, so `'abcdef'[2]` is a VARCHAR
+/// and not a type of its own. An untyped null takes the VARCHAR overload, which was measured:
+/// `typeof(array_extract(NULL, 1))` is VARCHAR on the pinned binary while
+/// `typeof(array_slice(NULL, 1, 2))` is NULL, so the null goes here and the slice keeps the type it
+/// was handed.
+///
+/// A STRUCT is subscripted by name rather than by position and is not one of these. `x.y` is
+/// `struct_extract(x, 'y')` by the time it leaves the transformer, which is a function this table
+/// does not have yet, so that call fails with the name of the function it is missing.
+fn element_of(ty: &LogicalType) -> Option<LogicalType> {
+    match ty {
+        LogicalType::Varchar | LogicalType::Null => Some(LogicalType::Varchar),
+        LogicalType::List(element) | LogicalType::Array(element, _) => Some((**element).clone()),
+        _ => None,
+    }
+}
 
 /// The cast list for a shape that fixes the leading arguments and leaves the others as they are.
 fn leading(count: usize, first: Fixed, arguments: &[LogicalType]) -> Vec<LogicalType> {
@@ -683,6 +781,16 @@ fn canonical(name: &str) -> &str {
 ///
 /// `strlen` is deliberately not here. Upstream counts bytes with it and characters with `length`,
 /// so it is a different function and it has a row of its own.
+/// The three subscript spellings point the way the transformer writes them rather than the way
+/// `duckdb_functions()` has them. Upstream is `array_slice` aliased onto `list_slice`, and
+/// `array_extract` and `list_extract` are two functions there rather than one, differing in the
+/// overloads they carry for a STRUCT and a TUPLE. Neither of those is here, so they are one function
+/// here, and the name it is under is the one a bracket produces, which is what keeps the message a
+/// bracket produces word for word the reference's.
+///
+/// What that costs is the same thing every row below costs: the message names the canonical spelling
+/// and not the written one, so `list_slice(1, 2, 3)` says `array_slice` here where upstream says
+/// `list_slice`, exactly as `len(1)` says `length`.
 const ALIASES: &[(&str, &str)] = &[
     ("len", "length"),
     ("char_length", "length"),
@@ -690,6 +798,9 @@ const ALIASES: &[(&str, &str)] = &[
     ("lcase", "lower"),
     ("ucase", "upper"),
     ("mean", "avg"),
+    ("list_extract", "array_extract"),
+    ("list_element", "array_extract"),
+    ("list_slice", "array_slice"),
 ];
 
 #[cfg(test)]
@@ -1074,7 +1185,15 @@ mod tests {
             for count in entry.arity.counts() {
                 let ty =
                     if entry.numeric_only { LogicalType::Integer } else { LogicalType::Varchar };
-                let arguments = vec![ty; count];
+                let mut arguments = vec![ty; count];
+                // A subscript is the one shape whose arguments are not all alike. The first is the
+                // string or the list and everything after it is a whole number, so a row of strings
+                // is not a call it accepts and not a call worth asserting it accepts.
+                if matches!(entry.shape, Shape::Extracted | Shape::Sliced) {
+                    for bound in arguments.iter_mut().skip(1) {
+                        *bound = LogicalType::BigInt;
+                    }
+                }
                 resolve(entry.name, &arguments).unwrap_or_else(|error| {
                     panic!("{} does not resolve at {count} arguments: {error}", entry.name)
                 });

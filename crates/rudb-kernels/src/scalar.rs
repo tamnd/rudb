@@ -55,6 +55,7 @@ use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
 use crate::regexp;
 use crate::shape::{first, identity, nulls_of, single};
+use crate::subscript;
 
 /// How the call being evaluated is written, for the one error that quotes it.
 ///
@@ -1470,6 +1471,11 @@ pub fn call_values(
         ("make_date", [days]) => made_date_value(days),
         ("make_date", [year, month, day]) => made_civil_value(year, month, day),
         ("epoch_ms", [millis]) => made_timestamp_value(millis),
+        ("array_extract", [target, index]) => subscript::extract(target, index),
+        ("array_slice", [target, begin, end]) => subscript::slice(target, begin, end, None),
+        ("array_slice", [target, begin, end, step]) => {
+            subscript::slice(target, begin, end, Some(step))
+        }
         (_, [_, _, ..]) if regexp::is_regexp(name) => regexp::value(name, args),
         _ => Err(Error::not_implemented(format!(
             "the {name} function with {} arguments",
