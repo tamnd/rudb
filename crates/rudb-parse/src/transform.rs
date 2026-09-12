@@ -1634,19 +1634,11 @@ impl<'a> Transform<'a> {
                         _ => return self.unsupported(dot),
                     }
                 }
-                // `SliceExpression <- '[' SliceBound ']'`, one index or a range.
-                "SliceExpression" => {
-                    let bound = self.first(inner);
-                    let has_end = self.find(bound, "EndSliceBound") != NONE;
-                    let has_step = self.find(bound, "StepSliceBound") != NONE;
-                    if has_end || has_step {
-                        return self.unsupported(inner);
-                    }
-                    let index = self.expr(self.first(bound))?;
-                    let name = self.function_name("array_extract");
-                    let args = self.expr_slice(vec![expr, index]);
-                    self.push(Expr::Function { name, args, distinct: false })
-                }
+                // `SliceExpression <- '[' SliceBound ']'` over
+                // `SliceBound <- Expression? EndSliceBound? StepSliceBound?`, so a subscript is one
+                // index when neither colon is there and a range when either of them is. Both become
+                // a call, the same two calls DuckDB's own transformer writes.
+                "SliceExpression" => self.subscript(inner, expr)?,
                 // `PostfixOperator <- '!'`.
                 "PostfixOperator" => {
                     self.push(Expr::Unary { op: UnaryOp::Factorial, operand: expr })
@@ -1655,6 +1647,73 @@ impl<'a> Transform<'a> {
             };
         }
         Ok(expr)
+    }
+
+    /// `SliceExpression <- '[' SliceBound ']'`, which is `array_extract` or `array_slice`.
+    ///
+    /// The three parts of the bound are all optional and any of the eight combinations parses, so
+    /// which call this is comes from which parts are there rather than from how many children the
+    /// bound has. One expression and no colon is an index. Anything with a colon in it is a range,
+    /// and a range the query did not write both ends of gets the ends DuckDB's transformer gives it:
+    /// a missing begin is 1 and a missing end is -1, which is the last element, so `x[:]` is the
+    /// whole of `x` and `array_slice(x, 1, -1)` answers the same thing.
+    ///
+    /// `EndSliceMinus` is the `-` in `x[1:-]`, which upstream reads as a range with no end rather
+    /// than as a subtraction of nothing, and it answers `x[1:]`. So it is the missing end too.
+    ///
+    /// The step is the odd one. `x[1:2:]` is a step that is written and empty, and what upstream
+    /// does with it is pass a list where the step goes, which then fails to bind because the fourth
+    /// parameter is a BIGINT. The empty list here is that, measured off the pinned binary: it says
+    /// `array_slice(INTEGER[], INTEGER_LITERAL, INTEGER_LITERAL, INTEGER[])` has no match, and the
+    /// fourth type in that sentence is the list. Writing a 1 there instead would answer a row where
+    /// the reference refuses.
+    fn subscript(&mut self, node: u32, target: ExprRef) -> Result<ExprRef> {
+        let bound = self.first(node);
+        let (mut begin, mut end, mut step) = (NONE, NONE, NONE);
+        for kid in self.kids(bound) {
+            match self.name(kid) {
+                "EndSliceBound" => end = kid,
+                "StepSliceBound" => step = kid,
+                _ => begin = kid,
+            }
+        }
+        if end == NONE && step == NONE {
+            if begin == NONE {
+                return Err(Error::parser("Empty subscript '[]' is not allowed"));
+            }
+            let index = self.expr(begin)?;
+            let name = self.function_name("array_extract");
+            let args = self.expr_slice(vec![target, index]);
+            return Ok(self.push(Expr::Function { name, args, distinct: false }));
+        }
+        let first = if begin == NONE { self.literal_number("1") } else { self.expr(begin)? };
+        // `EndSliceBound <- ':' EndSliceValue?` and `EndSliceValue <- Expression / EndSliceMinus`,
+        // so the end is written only when the value is there and is not the lone hyphen.
+        let value = if end == NONE { NONE } else { self.find(end, "EndSliceValue") };
+        let written = if value == NONE { NONE } else { self.first(value) };
+        let last = if written == NONE || self.name(written) == "EndSliceMinus" {
+            self.literal_number("-1")
+        } else {
+            self.expr(written)?
+        };
+        let mut args = vec![target, first, last];
+        if step != NONE {
+            let by = self.first(step);
+            args.push(if by == NONE {
+                self.push(Expr::List { items: Slice::default() })
+            } else {
+                self.expr(by)?
+            });
+        }
+        let name = self.function_name("array_slice");
+        let args = self.expr_slice(args);
+        Ok(self.push(Expr::Function { name, args, distinct: false }))
+    }
+
+    /// A number literal the transformer writes rather than reads, for a bound a range left out.
+    fn literal_number(&mut self, digits: &str) -> ExprRef {
+        let text = self.intern(digits);
+        self.push(Expr::Literal { kind: LiteralKind::Number, text })
     }
 
     /// A one part function name, for the calls the transformer invents rather than reads.
@@ -2842,6 +2901,28 @@ mod tests {
         // binder needs a rule for something the function resolver already handles.
         assert_eq!(round("SELECT (f(x)).y"), "SELECT struct_extract(f(x), 'y')");
         assert_eq!(round("SELECT a[1]"), "SELECT array_extract(a, 1)");
+    }
+
+    /// The four ways of leaving a bound out, all of which upstream fills in the same way.
+    #[test]
+    fn a_range_gets_the_bounds_the_query_left_out() {
+        assert_eq!(round("SELECT a[1:2]"), "SELECT array_slice(a, 1, 2)");
+        assert_eq!(round("SELECT a[:2]"), "SELECT array_slice(a, 1, 2)");
+        assert_eq!(round("SELECT a[2:]"), "SELECT array_slice(a, 2, -1)");
+        assert_eq!(round("SELECT a[:]"), "SELECT array_slice(a, 1, -1)");
+        // `EndSliceMinus`, which is a range with no end rather than a subtraction of nothing.
+        assert_eq!(round("SELECT a[1:-]"), "SELECT array_slice(a, 1, -1)");
+        assert_eq!(round("SELECT a[1:2:3]"), "SELECT array_slice(a, 1, 2, 3)");
+        // A step that was written and left empty, which upstream fills with a list so that the call
+        // fails to bind. Answering a row here would be answering where the reference refuses.
+        assert_eq!(round("SELECT a[1:2:]"), "SELECT array_slice(a, 1, 2, [])");
+    }
+
+    /// `[]` is the one subscript the parser takes and the transformer refuses, in upstream's words.
+    #[test]
+    fn an_empty_subscript_is_not_a_subscript() {
+        let error = parse_ast("SELECT a[]").expect_err("an empty subscript");
+        assert_eq!(error.message(), "Empty subscript '[]' is not allowed");
     }
 
     #[test]

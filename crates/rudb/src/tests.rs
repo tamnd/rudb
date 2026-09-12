@@ -513,6 +513,83 @@ fn the_regular_expression_functions_answer_the_way_duckdb_does() {
     );
 }
 
+/// Brackets on a string, which the transformer writes as `array_extract` and `array_slice` and the
+/// binder then resolves like any other call. Per #278.
+#[test]
+fn a_bracket_on_a_string_indexes_it_by_character() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT 'abcdef'[2]"), vec![vec![text("b")]]);
+    assert_eq!(rows(&db, "SELECT 'abcdef'[-1]"), vec![vec![text("f")]]);
+    // Off either end is the empty string rather than a null, which is a string only rule.
+    assert_eq!(rows(&db, "SELECT 'abcdef'[0]"), vec![vec![text("")]]);
+    assert_eq!(rows(&db, "SELECT 'abcdef'[9]"), vec![vec![text("")]]);
+    assert_eq!(rows(&db, "SELECT 'héllo'[2]"), vec![vec![text("é")]]);
+    assert_eq!(rows(&db, "SELECT 'abcdef'[2:4]"), vec![vec![text("bcd")]]);
+    // The four ways of leaving a bound out, which the transformer fills in before the binder sees
+    // them, and the two that clamp.
+    assert_eq!(rows(&db, "SELECT 'abcdef'[:3]"), vec![vec![text("abc")]]);
+    assert_eq!(rows(&db, "SELECT 'abcdef'[4:]"), vec![vec![text("def")]]);
+    assert_eq!(rows(&db, "SELECT 'abcdef'[:]"), vec![vec![text("abcdef")]]);
+    assert_eq!(rows(&db, "SELECT 'abcdef'[1:-]"), vec![vec![text("abcdef")]]);
+    assert_eq!(rows(&db, "SELECT 'abcdef'[3:99]"), vec![vec![text("cdef")]]);
+    assert_eq!(rows(&db, "SELECT 'abcdef'[4:2]"), vec![vec![text("")]]);
+    // A column rather than a literal, and a null row, which stays null through both calls.
+    assert_eq!(
+        rows(&db, "SELECT s[1], s[1:1] FROM t"),
+        vec![
+            vec![text("a"), text("a")],
+            vec![Value::Null, Value::Null],
+            vec![text("c"), text("c")],
+            vec![text("a"), text("a")],
+        ]
+    );
+    // The same two calls written out, including the three spellings that are aliases of them.
+    assert_eq!(rows(&db, "SELECT array_extract('abcdef', 2)"), vec![vec![text("b")]]);
+    assert_eq!(rows(&db, "SELECT list_extract('abcdef', 2)"), vec![vec![text("b")]]);
+    assert_eq!(rows(&db, "SELECT list_element('abcdef', 2)"), vec![vec![text("b")]]);
+    assert_eq!(rows(&db, "SELECT list_slice('abcdef', 2, 4)"), vec![vec![text("bcd")]]);
+}
+
+/// One index into a list, which is as far as the list side of this gets today. Per #278.
+///
+/// A slice of a list answers a list, and there is no LIST vector yet, so `[1, 2, 3][1:2]` stops
+/// with the same message `SELECT [1, 2, 3]` stops with. An index answers an element, and an element
+/// of a list of numbers is a number, so these run all the way through.
+#[test]
+fn a_bracket_on_a_list_picks_one_element_out_of_it() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT [1,2,3][2]"), vec![vec![integer(2)]]);
+    assert_eq!(rows(&db, "SELECT [1,2,3][-1]"), vec![vec![integer(3)]]);
+    // Off either end of a list is a null, which is where the list and the string disagree.
+    assert_eq!(rows(&db, "SELECT [1,2,3][0]"), vec![vec![Value::Null]]);
+    assert_eq!(rows(&db, "SELECT [1,2,3][4]"), vec![vec![Value::Null]]);
+    assert_eq!(rows(&db, "SELECT list_extract([1,2,3], 2)"), vec![vec![integer(2)]]);
+    let error = db.query("SELECT [1,2,3][1:2]").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Not implemented Error");
+    assert_eq!(error.message(), db.query("SELECT [1,2,3]").unwrap_err().message());
+}
+
+/// The four ways a subscript is refused, in DuckDB's words. Per #278.
+#[test]
+fn the_subscripts_that_are_refused_say_what_duckdb_says() {
+    let db = database();
+    let error = db.query("SELECT 'abcdef'[]").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Parser Error");
+    assert_eq!(error.message(), "Empty subscript '[]' is not allowed");
+    // A step on a string is not implemented upstream either, and the suggested rewrite is
+    // upstream's, unbalanced parenthesis and all.
+    let error = db.query("SELECT 'abcdef'[1:6:2]").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Not implemented Error");
+    assert!(error.message().starts_with("Slice with steps has not been implemented"), "{error}");
+    // A number is neither a list nor a string, and this is the one message that names the function
+    // rather than listing what it would have taken.
+    let error = db.query("SELECT array_slice(1, 2, 3)").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Binder Error");
+    assert_eq!(error.message(), "ARRAY_SLICE can only operate on LISTs and VARCHARs");
+    // An index is a whole number and is not cast to one, so a decimal is no call at all.
+    assert!(failure(&db, "SELECT 'abcdef'[1.5]").starts_with("No function matches"));
+}
+
 /// A dollar quoted string is the text between the tags and nothing else. Per #276.
 ///
 /// The comparison is the test worth having. The literal on its own looked plausible in the shell
