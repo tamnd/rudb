@@ -1353,6 +1353,7 @@ impl<'a> Transform<'a> {
                 "OverlayExpression" => return self.overlay(node),
                 "ExtractExpression" => return self.extract(node),
                 "CastExpression" => return self.cast(node),
+                "TypeLiteral" => return self.typed_literal(node),
                 "CaseExpression" => return self.case(node),
                 "ParenthesisExpression" => return self.row(node),
                 // `ParensExpression <- Parens(Expression)` covers more text than its child and
@@ -2093,6 +2094,22 @@ impl<'a> Transform<'a> {
         let text = self.text(self.nth(arguments, 1)).to_string();
         let ty = self.intern(&text);
         Ok(self.push(Expr::Cast { operand, ty, try_cast }))
+    }
+
+    /// `TypeLiteral <- Type StringLiteral`, which is the cast written the other way round.
+    ///
+    /// `DATE '1995-09-01'` and `CAST('1995-09-01' AS DATE)` are the same expression upstream, and
+    /// the proof is the column name: the pinned binary answers both of them in a column called
+    /// `CAST('1995-09-01' AS DATE)`. So this is the cast node and nothing else, which means every
+    /// type the cast already takes is a typed literal for free and the two can never drift.
+    ///
+    /// The string is the literal the grammar matched rather than any expression, so there is no
+    /// constant folding question here. `DATE x` does not parse in the first place.
+    fn typed_literal(&mut self, node: u32) -> Result<ExprRef> {
+        let text = self.text(self.first(node)).to_string();
+        let ty = self.intern(&text);
+        let operand = self.expr(self.nth(node, 1))?;
+        Ok(self.push(Expr::Cast { operand, ty, try_cast: false }))
     }
 
     /// `CaseExpression <- 'CASE' Expression? CaseWhenThen+ CaseElse? 'END'`.
@@ -2865,7 +2882,7 @@ mod tests {
 
     #[test]
     fn every_statement_in_the_corpus_gets_a_defined_answer() {
-        // The point of the test is the word defined. Forty of these are statement kinds and
+        // The point of the test is the word defined. Half of these are statement kinds and
         // clauses this milestone does not cover, and the requirement is not that they work, it is
         // that they fail by saying so. A panic, a silently dropped clause or an internal error
         // would each be a different bug and all three would be invisible without this.
@@ -2887,7 +2904,7 @@ mod tests {
         }
         // Not an assertion about the right number. It is a ratchet: this only moves up, and the
         // day it moves down somebody has taken a construct out without meaning to.
-        assert!(done >= 23, "only {done} of the corpus transforms, which is fewer than it was");
+        assert!(done >= 31, "only {done} of the corpus transforms, which is fewer than it was");
     }
 
     #[test]
@@ -3083,6 +3100,30 @@ mod tests {
             round("SELECT x::DECIMAL(18, 3)"),
             "SELECT CAST(x AS DECIMAL(18, 3))",
             "the type is kept as text because parsing it is the type system's job"
+        );
+    }
+
+    #[test]
+    fn a_typed_literal_is_a_third_spelling_of_the_same_cast() {
+        assert_eq!(round("SELECT DATE '1995-09-01'"), "SELECT CAST('1995-09-01' AS DATE)");
+        assert_eq!(
+            round("SELECT date '1995-09-01'"),
+            "SELECT CAST('1995-09-01' AS date)",
+            "the type is kept as written, the same as it is in the other two spellings"
+        );
+        assert_eq!(
+            round("SELECT TIMESTAMP '2020-01-01 03:04:05'"),
+            "SELECT CAST('2020-01-01 03:04:05' AS TIMESTAMP)"
+        );
+        assert_eq!(
+            round("SELECT DECIMAL(5, 2) '1.5'"),
+            "SELECT CAST('1.5' AS DECIMAL(5, 2))",
+            "any type the cast takes is a typed literal, parameters and all"
+        );
+        assert_eq!(
+            round("SELECT VARCHAR 'hi' FROM t"),
+            "SELECT CAST('hi' AS VARCHAR) FROM t",
+            "including the ones where the cast has nothing to do"
         );
     }
 

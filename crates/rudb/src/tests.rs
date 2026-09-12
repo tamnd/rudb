@@ -876,6 +876,31 @@ fn a_cast_that_cannot_hold_the_value_is_an_error_and_try_cast_is_null() {
     assert_eq!(rows(&db, "SELECT TRY_CAST('oops' AS INTEGER)"), vec![vec![Value::Null]]);
 }
 
+/// The third spelling of a cast, the one TPC-H q14 is written in.
+///
+/// The keyword is not a keyword the way `CAST` is, it is the type name, so the check that matters
+/// is that the same list of types works here as works in the other two spellings. The name of the
+/// column is the same too, because it is the same node: the pinned binary calls all three of them
+/// `CAST('1995-09-01' AS DATE)`.
+#[test]
+fn a_type_in_front_of_a_string_is_a_cast_of_that_string() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT DATE '2013-07-15'"),
+        vec![vec![Value::Date(days_from_civil(2013, 7, 15))]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT date '2013-07-15'"),
+        vec![vec![Value::Date(days_from_civil(2013, 7, 15))]],
+        "the type is a name and names are not case sensitive"
+    );
+    assert_eq!(rows(&db, "SELECT INTEGER '42' + 1"), vec![vec![Value::Integer(43)]]);
+    assert_eq!(rows(&db, "SELECT VARCHAR 'hi'"), vec![vec![text("hi")]]);
+    let result = db.query("SELECT DATE '1995-09-01'").unwrap();
+    assert_eq!(result.names(), &["CAST('1995-09-01' AS DATE)"]);
+    assert!(failure(&db, "SELECT DATE 'nope'").contains("nope"));
+}
+
 #[test]
 fn a_missing_table_names_the_table() {
     let db = database();
