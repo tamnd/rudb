@@ -51,6 +51,7 @@ mod sort;
 mod source;
 mod spill;
 mod stream;
+mod table;
 mod topn;
 mod written;
 
