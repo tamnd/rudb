@@ -26,9 +26,9 @@ use rudb_common::{Error, Result, civil_from_days, days_from_civil};
 /// Microseconds in a day, which is the conversion between the two representations here.
 pub(crate) const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
 
-const MICROS_PER_HOUR: i64 = 3_600 * 1_000_000;
-const MICROS_PER_MINUTE: i64 = 60 * 1_000_000;
-const MICROS_PER_SECOND: i64 = 1_000_000;
+pub(crate) const MICROS_PER_HOUR: i64 = 3_600 * 1_000_000;
+pub(crate) const MICROS_PER_MINUTE: i64 = 60 * 1_000_000;
+pub(crate) const MICROS_PER_SECOND: i64 = 1_000_000;
 
 /// A piece of a date or a timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
