@@ -15,6 +15,7 @@ use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{Cancel, Field, LogicalType, Memory, Value};
 use rudb_kernels::Accumulator;
 use rudb_plan::Plan;
+use rudb_seam::Settings;
 
 use crate::{build, build_with};
 
@@ -467,8 +468,8 @@ fn a_cancelled_token_stops_the_tree_before_it_produces_a_chunk() {
     let catalog = catalog();
     let plan = Plan::parse(SCAN).expect("a well formed plan");
     let cancel = Cancel::new();
-    let mut operator =
-        build_with(&plan, &catalog, &cancel, &Memory::unlimited()).expect("the operators build");
+    let mut operator = build_with(&plan, &catalog, &cancel, &Memory::unlimited(), &Settings::new())
+        .expect("the operators build");
     cancel.cancel();
     let error = operator.next().expect_err("it was cancelled");
     assert_eq!(error.code().duckdb_name(), "Interrupt Error");
@@ -480,8 +481,9 @@ fn a_token_nothing_has_cancelled_leaves_the_answer_alone() {
     // thing worth asserting is that it changes no answer.
     let catalog = catalog();
     let plan = Plan::parse(SCAN).expect("a well formed plan");
-    let mut guarded = build_with(&plan, &catalog, &Cancel::new(), &Memory::unlimited())
-        .expect("the operators build");
+    let mut guarded =
+        build_with(&plan, &catalog, &Cancel::new(), &Memory::unlimited(), &Settings::new())
+            .expect("the operators build");
     let mut plain = build(&plan, &catalog).expect("the operators build");
     loop {
         let (left, right) = (guarded.next().expect("runs"), plain.next().expect("runs"));
@@ -520,8 +522,8 @@ fn a_group_is_charged_for_the_room_it_takes_and_not_only_for_what_it_holds() {
          Get memory.main.wide AS wide #0 [x::INTEGER]\n",
     )
     .expect("a well formed plan");
-    let mut operator =
-        build_with(&plan, &catalog, &Cancel::new(), &memory).expect("the operators build");
+    let mut operator = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
+        .expect("the operators build");
     let mut seen = 0;
     while let Some(chunk) = operator.next().expect("the aggregate runs") {
         seen += chunk.len();
@@ -556,7 +558,7 @@ fn a_budget_too_small_for_the_rows_stops_the_operator_that_buffers_them() {
     let plan = Plan::parse(&format!("Sort [#0.0::INTEGER ASC NULLS LAST]\n  {SCAN}"))
         .expect("a well formed plan");
     let memory = Memory::with_limit(1);
-    let mut operator = build_with(&plan, &catalog, &Cancel::new(), &memory)
+    let mut operator = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
         .expect("the operators build, because nothing is held yet");
     let error = operator.next().expect_err("one byte is not enough for a row");
     assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
@@ -602,8 +604,8 @@ fn crowd(groups: i32) -> Catalog {
 fn under(catalog: &Catalog, text: &str, memory: &Memory) -> Vec<Vec<Value>> {
     let plan = Plan::parse(text).expect("a well formed plan");
     plan.validate().expect("the plan holds together");
-    let mut operator =
-        build_with(&plan, catalog, &Cancel::new(), memory).expect("the operators build");
+    let mut operator = build_with(&plan, catalog, &Cancel::new(), memory, &Settings::new())
+        .expect("the operators build");
     let mut rows: Vec<Vec<Value>> = Vec::new();
     while let Some(chunk) = operator.next().expect("the query runs") {
         for row in 0..chunk.len() {
@@ -675,7 +677,7 @@ fn a_budget_too_small_for_one_group_says_so_rather_than_running_forever() {
     )
     .expect("a well formed plan");
     let memory = Memory::with_limit(1);
-    let mut operator = build_with(&plan, &catalog, &Cancel::new(), &memory)
+    let mut operator = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
         .expect("the operators build, because nothing is held yet");
     let error = operator.next().expect_err("one byte is not enough for a group");
     assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
@@ -685,27 +687,38 @@ fn a_budget_too_small_for_one_group_says_so_rather_than_running_forever() {
 
 #[test]
 fn every_seam_has_a_row_in_the_strategies_table() {
+    // One row per seam that has nothing registered, and one per implementation of a seam that has
+    // something, which is three for the compaction seam and one row each for the other twenty six.
     let rows = run("TableFunction rudb_strategies args=[] #0 [seam::VARCHAR, milestone::VARCHAR, \
          implementation::VARCHAR]");
-    assert_eq!(rows.len(), rudb_seam::SeamId::ALL.len(), "one row per seam, registered or not");
+    let mut listed: Vec<Value> = rows.iter().map(|row| row[0].clone()).collect();
+    listed.dedup();
     let seams: Vec<Value> =
         rudb_seam::SeamId::ALL.iter().map(|seam| text(seam.name())).collect::<Vec<_>>();
-    let listed: Vec<Value> = rows.iter().map(|row| row[0].clone()).collect();
     assert_eq!(listed, seams, "in the order the design lists them");
 }
 
 #[test]
 fn a_seam_with_no_registry_says_so_rather_than_being_left_out() {
-    // Nothing is registered yet, which is the state F0 is meant to show honestly. Every row has a
-    // seam, a milestone that owes it and a description, and nulls where an implementation would be.
+    // Twenty six of the twenty seven, which is the state F1 is meant to show honestly. Each of
+    // those rows has a seam, a milestone that owes it and a description, and nulls where an
+    // implementation would be. The compaction seam has three rows with none of that missing.
     let rows = run("TableFunction rudb_strategies args=[] #0 [seam::VARCHAR, milestone::VARCHAR, \
          implementation::VARCHAR, is_reference::BOOLEAN]");
+    let mut planned = 0;
+    let mut built = 0;
     for row in &rows {
         assert!(matches!(row[0], Value::Varchar(_)), "a seam name");
         assert!(matches!(row[1], Value::Varchar(_)), "the milestone that owes it");
-        assert_eq!(row[2], Value::Null, "no implementation yet");
-        assert_eq!(row[3], Value::Null, "so nothing is the reference either");
+        if row[2] == Value::Null {
+            assert_eq!(row[3], Value::Null, "nothing is the reference where nothing is registered");
+            planned += 1;
+        } else {
+            assert!(matches!(row[3], Value::Boolean(_)), "a registered one says whether it is");
+            built += 1;
+        }
     }
+    assert_eq!((planned, built), (26, 3));
 }
 
 #[test]
@@ -734,9 +747,15 @@ fn the_ids_the_builder_tags_its_counters_with_are_the_ones_the_plan_says() {
     let shape = rudb_plan::Shape::of(&plan);
     let report = rudb_metrics::Report::new();
     let catalog = catalog();
-    let mut root =
-        crate::build_measured(&plan, &catalog, &Cancel::new(), &Memory::unlimited(), &report)
-            .expect("the tree builds");
+    let mut root = crate::build_measured(
+        &plan,
+        &catalog,
+        &Cancel::new(),
+        &Memory::unlimited(),
+        &Settings::new(),
+        &report,
+    )
+    .expect("the tree builds");
     while root.next().expect("the query runs").is_some() {}
     let mut document = rudb_metrics::Document::new(text);
     report.fill(&mut document);
