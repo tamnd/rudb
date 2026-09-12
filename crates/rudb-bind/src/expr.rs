@@ -843,14 +843,30 @@ fn spelling(ast: &Ast, op: BinaryOp) -> String {
 /// takes the narrowest of the four widths that holds it. A literal with a decimal point is a
 /// `DECIMAL` of exactly the digits written, which is what makes `0.1 + 0.2` come out as `0.3` here
 /// and as something else in a system that reads it as a double.
+///
+/// An underscore is a digit separator and is not part of the number, so `1_000` is a thousand and
+/// `1_0.5_0` is `DECIMAL(4,2)`. The tokenizer has already thrown out the ones that are not between
+/// two digits, so there is nothing to validate here and nothing to do but drop them.
+///
+/// There are three ways to write something that looks like a number and is not, and upstream gives a
+/// different answer to each of them, which is #277. A second exponent marker is a parser error,
+/// because scanning the literal is where it is noticed. Anything else with an exponent marker in it
+/// is a failed conversion to `DOUBLE`, and `SELECT 1e` with nothing behind it is that. More than one
+/// dot is a failed cast to the `DECIMAL` the shape of the text asked for, which is a cast rather than
+/// a conversion because the text picked a type before anything tried to read it.
 fn number(text: &str, negative: bool) -> Result<Value> {
     let sign = if negative { "-" } else { "" };
-    let written = format!("{sign}{text}");
-    let unreadable = || Error::conversion(format!("Could not convert string '{text}' to a number"));
+    let bare: String = text.chars().filter(|c| *c != '_').collect();
+    let written = format!("{sign}{bare}");
+    let unreadable =
+        || Error::invalid_input(format!("Could not convert string '{text}' to DOUBLE"));
     if text.contains(['e', 'E']) {
+        if text.matches(['e', 'E']).count() > 1 {
+            return Err(Error::parser("Already found scientific notation"));
+        }
         return Ok(Value::Double(written.parse::<f64>().map_err(|_| unreadable())?));
     }
-    let Some(point) = text.find('.') else {
+    let Some(point) = text.rfind('.') else {
         if let Ok(value) = written.parse::<i32>() {
             return Ok(Value::Integer(value));
         }
@@ -862,12 +878,20 @@ fn number(text: &str, negative: bool) -> Result<Value> {
         }
         return Ok(Value::Double(written.parse::<f64>().map_err(|_| unreadable())?));
     };
-    let scale = text.len() - point - 1;
+    // The last dot is the decimal point and every other one counts as a digit of the width, which
+    // is upstream's arithmetic and the reason `1.2.3` asks for `DECIMAL(4,1)` off three digits.
+    let dots = text.matches('.').count();
+    let scale = text[point + 1..].chars().filter(char::is_ascii_digit).count();
     let digits: String = text.chars().filter(char::is_ascii_digit).collect();
-    let width = digits.len();
+    let width = (digits.len() + dots - 1).max(1);
     if width <= MAX_DECIMAL_WIDTH as usize && scale <= MAX_DECIMAL_WIDTH as usize {
+        if dots > 1 {
+            return Err(Error::invalid_input(format!(
+                "Failed to cast value: Could not convert string \"{text}\" to DECIMAL({width},{scale})"
+            )));
+        }
         if let Ok(unscaled) = format!("{sign}{digits}").parse::<i128>() {
-            return Ok(Value::Decimal { unscaled, width: width.max(1) as u8, scale: scale as u8 });
+            return Ok(Value::Decimal { unscaled, width: width as u8, scale: scale as u8 });
         }
     }
     Ok(Value::Double(written.parse::<f64>().map_err(|_| unreadable())?))
@@ -904,6 +928,40 @@ mod tests {
     fn an_exponent_is_a_double_however_it_is_written() {
         assert!(matches!(number("1e3", false).expect("a number"), Value::Double(_)));
         assert!(matches!(number("1.5E-3", false).expect("a number"), Value::Double(_)));
+    }
+
+    #[test]
+    fn an_underscore_separates_digits_and_is_not_one() {
+        assert_eq!(number("1_000", false).expect("a number"), Value::Integer(1000));
+        assert!(matches!(number("1e1_0", false).expect("a number"), Value::Double(d) if d == 1e10));
+        assert_eq!(
+            number("1_0.5_0", false).expect("a number"),
+            Value::Decimal { unscaled: 1050, width: 4, scale: 2 }
+        );
+    }
+
+    /// Three shapes that are not a number, and the three different things upstream says about them.
+    /// The messages are the point, so they are written out rather than matched on a kind.
+    #[test]
+    fn what_is_not_a_number_says_which_way_it_is_not_one() {
+        let message =
+            |text: &str| number(text, false).expect_err("not a number").message().to_owned();
+        assert_eq!(message("1e"), "Could not convert string '1e' to DOUBLE");
+        assert_eq!(message("1e-"), "Could not convert string '1e-' to DOUBLE");
+        assert_eq!(message("1e2e"), "Already found scientific notation");
+        assert_eq!(message("1E2E3"), "Already found scientific notation");
+        assert_eq!(
+            message("1.2.3"),
+            "Failed to cast value: Could not convert string \"1.2.3\" to DECIMAL(4,1)"
+        );
+        assert_eq!(
+            message("1_0.2.3"),
+            "Failed to cast value: Could not convert string \"1_0.2.3\" to DECIMAL(5,1)"
+        );
+        // Too wide for any DECIMAL, so the dots stop being a cast that failed and become a double
+        // that will not read, which is the one case where two of these three meet.
+        let wide = "1.2.34567890123456789012345678901234567890";
+        assert_eq!(message(wide), format!("Could not convert string '{wide}' to DOUBLE"));
     }
 
     /// Text against a number reads the text as the number, and text against a blob goes the other
