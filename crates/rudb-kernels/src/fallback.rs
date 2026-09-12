@@ -1,7 +1,7 @@
 //! How often a kernel took the row at a time path, and for which shape of input.
 //!
 //! `spec/engine/03-data-plane.md` asks for this by name, and the reason is that the alternative to
-//! counting is guessing. There are six physical forms, so thirty six form pairs per kernel, and
+//! counting is guessing. There are seven physical forms, so forty nine form pairs per kernel, and
 //! writing a hand tuned loop for all of them is both a lot of code and a lot of places for a wrong
 //! answer to hide. Writing the handful a real query hits and a correct slow path for the rest is
 //! the right amount of code, but only if there is a way to find out that one of the rest is on the
@@ -95,8 +95,15 @@ impl Kernel {
 }
 
 /// Every physical form, in the order the table prints them.
-const FORMS: [Form; 6] =
-    [Form::Flat, Form::Constant, Form::Sequence, Form::Dictionary, Form::Rle, Form::BitPacked];
+const FORMS: [Form; 7] = [
+    Form::Flat,
+    Form::Constant,
+    Form::Sequence,
+    Form::Dictionary,
+    Form::Rle,
+    Form::BitPacked,
+    Form::StringView,
+];
 
 /// The name of a form, for the report.
 fn form_name(form: Form) -> &'static str {
@@ -107,6 +114,7 @@ fn form_name(form: Form) -> &'static str {
         Form::Dictionary => "dictionary",
         Form::Rle => "rle",
         Form::BitPacked => "bit-packed",
+        Form::StringView => "string-view",
         // `Form` is not exhaustive as far as this crate is concerned, and more encodings are coming
         // to it. A name rather than a panic means the day one lands is a day the report says
         // `other` for a while, not a day the report aborts the process.

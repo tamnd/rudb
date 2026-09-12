@@ -6,15 +6,20 @@
 //!
 //! A vector is a type, a length of at most [`VECTOR_SIZE`], a physical form, a validity
 //! representation and some data. Four of the forms are the ones in `spec/04-architecture.md`
-//! section 4.3: flat, constant, sequence and dictionary. Run length is the fifth and it is the first
-//! of the encoded ones, which arrive one at a time with the kernels that read them rather than all
-//! at once ahead of anything that can use them.
+//! section 4.3: flat, constant, sequence and dictionary. Run length, bit packed and string view come
+//! after them, one at a time with the kernels that read them rather than all at once ahead of
+//! anything that can use them.
 //!
 //! Dictionary and run length are the pair worth understanding together, because they answer
 //! different questions about the same column. A dictionary says which distinct values there are, so
 //! it wins on low cardinality however the rows are ordered. Run length says where the values stop,
 //! so it wins on a clustered column however many distinct values it has. A column can want either
 //! one without wanting the other, and `hits` has columns of both kinds.
+//!
+//! String view is the odd one out, because it is not about making a column smaller. It is about who
+//! owns the bytes: the views are the vector's and the arena is shared, so cutting a chunk out of a
+//! page of strings moves sixteen bytes a row and copies none of the payload. Every other form here
+//! trades a little work per row for less memory, and that one trades nothing at all.
 //!
 //! **What is not here yet.** Buffers are owned. Section 7.1 says a vector borrowed from a buffer
 //! managed page carries a pin, and there is no buffer manager until M2, so there is nothing to pin
@@ -70,6 +75,14 @@ pub enum Form {
     /// and a mask per value, which is why this is worth it at storage and at rest and is not a form
     /// anything should be building in the middle of a pipeline.
     BitPacked,
+    /// Sixteen byte views over an arena the vector shares rather than owns.
+    ///
+    /// The form a varchar column is in once more than one vector is looking at the same page. A flat
+    /// varchar vector owns its arena, so cutting a chunk out of it copies every byte of every long
+    /// string in the range, and on ClickBench that is most of what reading `URL` costs. Sharing the
+    /// arena makes the cut the views and nothing else, the way a dictionary cut is the codes and
+    /// nothing else.
+    StringView,
     /// One value per run, with the row each run ends at.
     ///
     /// The form a clustered column is in. `hits` is written in time order, so `EventDate` is a few
@@ -263,6 +276,19 @@ enum Body {
         width: u32,
         base: i128,
         offset: usize,
+    },
+    /// The views of a string column, over an arena that other vectors are reading at the same time.
+    ///
+    /// The views are owned because a cut is a different run of views, and the arena is shared
+    /// because a cut is the same bytes. That split is the whole form: sixteen bytes a row move and
+    /// the payload does not, however many cuts a page is taken in.
+    ///
+    /// A row's bytes are found the same way [`StringColumn`] finds them, through
+    /// [`StringView::bytes_in`], so a short string never reads the arena at all and the two ways of
+    /// holding strings cannot answer a row differently.
+    Views {
+        views: Vec<StringView>,
+        arena: Arc<Buffer<u8>>,
     },
     /// One value per run, with the row each run ends at, exclusive and increasing.
     ///
@@ -565,6 +591,60 @@ impl Vector {
         Ok(packed.with_validity(self.validity.clone()))
     }
 
+    /// A vector of string views over an arena somebody else is holding too.
+    ///
+    /// The way in for a scan that has a page of strings and wants several chunks over it. Each chunk
+    /// gets its own run of views and they all share the one arena, so the bytes are read where the
+    /// page put them and nothing copies them.
+    ///
+    /// Every view is checked against the arena here rather than when a row is read. That is a pass
+    /// over the views at construction, which is the same pass the caller just did to build them, and
+    /// what it buys is that a row of this form cannot resolve to bytes that are not there. The check
+    /// is on the offsets and not on the bytes, so it says nothing about whether the payload is text,
+    /// which is the same promise a `BLOB` column makes.
+    ///
+    /// # Errors
+    ///
+    /// If the type is not one stored as views, or if a view points past the end of the arena.
+    pub fn string_views(
+        ty: LogicalType,
+        views: Vec<StringView>,
+        arena: Arc<Buffer<u8>>,
+    ) -> Result<Self> {
+        if ty.physical() != rudb_common::PhysicalType::Varlen {
+            return Err(Error::internal(format!("a {ty} vector cannot hold string views")));
+        }
+        if views.iter().any(|view| view.bytes_in(&arena).is_none()) {
+            return Err(Error::internal("a string view points past the end of its arena"));
+        }
+        let len = views.len();
+        Ok(Self { ty, len, validity: Validity::AllValid, body: Body::Views { views, arena } })
+    }
+
+    /// The same strings, in a form where a cut of them does not copy the bytes.
+    ///
+    /// The counterpart of [`Self::run_encoded`] and [`Self::bit_packed`] for a string column, and
+    /// the only one of the three that takes `self` by value. It has to: what it does is move the
+    /// arena into an `Arc` so nothing copies it again, and a version taking `&self` would start by
+    /// copying the arena once to have one to move.
+    ///
+    /// Anything that is not a flat string column comes back as it was, which includes a column that
+    /// is already in this form.
+    ///
+    /// # Errors
+    ///
+    /// Nothing here fails today. The result is a `Result` because the check inside
+    /// [`Self::string_views`] is worth running on the views this builds rather than trusting that
+    /// this function built them right.
+    pub fn shared_text(self) -> Result<Self> {
+        let Body::Flat(Data::Varlen(column)) = self.body else {
+            return Ok(self);
+        };
+        let (views, arena) = column.into_parts();
+        let shared = Self::string_views(self.ty, views, Arc::new(arena))?;
+        Ok(shared.with_validity(self.validity))
+    }
+
     /// The same vector with a different validity.
     #[must_use]
     pub fn with_validity(mut self, validity: Validity) -> Self {
@@ -611,6 +691,12 @@ impl Vector {
                 codes.capacity() * size_of::<u32>() + values.footprint()
             }
             Body::Packed { words, .. } => words.capacity() * size_of::<u64>(),
+            // The arena counts in full in every vector sharing it, for the reason a shared
+            // dictionary does: over counting refuses a query that would have fit and under counting
+            // admits one that does not, and the first is the better way to be wrong.
+            Body::Views { views, arena } => {
+                views.capacity() * size_of::<StringView>() + arena.footprint()
+            }
             Body::Runs { ends, values } => ends.capacity() * size_of::<u32>() + values.footprint(),
         };
         size_of::<Self>() + self.validity.footprint() + body
@@ -631,6 +717,7 @@ impl Vector {
             Body::Sequence { .. } => Form::Sequence,
             Body::Dictionary { .. } => Form::Dictionary,
             Body::Packed { .. } => Form::BitPacked,
+            Body::Views { .. } => Form::StringView,
             Body::Runs { .. } => Form::Rle,
         }
     }
@@ -747,6 +834,25 @@ impl Vector {
         }
     }
 
+    /// The views and the arena, for either form that stores strings, and `None` for the rest.
+    ///
+    /// This is to the two string forms what [`Self::positions`] is to the two forms that point
+    /// somewhere else. A flat varchar column owns its arena and a string view column shares one, and
+    /// a kernel reading a row wants the view and the bytes either way, so every specialization
+    /// written against this covers both forms and neither has to be reopened when a third way of
+    /// holding an arena arrives.
+    ///
+    /// The arena is whatever the long strings live in, which for a column over a page is the page,
+    /// including the parts of it no view points at. Only the views say which bytes are a row.
+    #[must_use]
+    pub fn text_parts(&self) -> Option<(&[StringView], &[u8])> {
+        match &self.body {
+            Body::Flat(Data::Varlen(column)) => Some((column.views(), column.arena())),
+            Body::Views { views, arena } => Some((views, arena)),
+            _ => None,
+        }
+    }
+
     /// The start and the step, for a sequence vector, and `None` for any other form.
     #[must_use]
     pub fn sequence_parts(&self) -> Option<(i64, i64)> {
@@ -786,6 +892,15 @@ impl Vector {
                 unpack(&self.ty, words, *offset, *width, *base, &[index])
                     .map_or(Value::Null, |data| value_from(&self.ty, &data, 0))
             }
+            // The bytes are where the arena has them, and what they are read as is the logical
+            // type's business, so this hands the row to the same reader a flat column goes through
+            // rather than deciding here that a `BLOB` is a string.
+            Body::Views { views, arena } => {
+                match views.get(index).and_then(|v| v.bytes_in(arena)) {
+                    Some(bytes) => bytes_as(&self.ty, bytes),
+                    None => Value::Null,
+                }
+            }
             Body::Flat(data) => value_from(&self.ty, data, index),
         }
     }
@@ -810,6 +925,9 @@ impl Vector {
                 values.text_at(usize::try_from(*codes.get(index)?).ok()?)
             }
             Body::Runs { ends, values } => values.text_at(run_holding(ends, index)?),
+            Body::Views { views, arena } => {
+                std::str::from_utf8(views.get(index)?.bytes_in(arena)?).ok()
+            }
             _ => None,
         }
     }
@@ -866,6 +984,15 @@ impl Vector {
                 base: *base,
                 offset: offset + at,
             },
+            // The cut a flat string column cannot do. Sixteen bytes a row move and the payload stays
+            // where the page put it, so taking a chunk out of a column of long strings costs the
+            // same as taking one out of a column of integers. A flat varchar body copies every byte
+            // of every long string in the range instead, which is the measurement written down in
+            // `Chunk::compact`: compaction loses on a varchar column, and this is the half of the
+            // reason that is about cutting rather than about selecting.
+            Body::Views { views, arena } => {
+                Body::Views { views: views[at..end].to_vec(), arena: Arc::clone(arena) }
+            }
             // Only the runs the range touches survive, the first and last of them cut back to where
             // the range starts and stops, and every end moved to be relative to the new row zero. A
             // cut of a hundred rows out of a column of a hundred million is a handful of runs, which
@@ -939,11 +1066,12 @@ impl Vector {
 
     /// The copy both [`Self::gather`] and [`Self::flatten`] are.
     ///
-    /// `constants_stay` is the one thing the two want differently. A gather of a constant is a
-    /// shorter constant and copying it out would be a thousand writes of the same value for nothing,
-    /// but flattening promises flat form to a caller that is about to read the data slice, so for
-    /// that one the constant has to be written out.
-    fn copied(&self, at: Vec<usize>, constants_stay: bool) -> Result<Self> {
+    /// `forms_stay` is the one thing the two want differently. A gather of a constant is a shorter
+    /// constant and copying it out would be a thousand writes of the same value for nothing, and a
+    /// gather of string views is a shorter run of views over the same arena rather than a copy of
+    /// the bytes. Flattening promises flat form to a caller that is about to read the data slice, so
+    /// for that one both of them have to be written out.
+    fn copied(&self, at: Vec<usize>, forms_stay: bool) -> Result<Self> {
         let rows = at.len();
         let (at, leaf) = self.resolve(at);
         let live: Vec<bool> = at.iter().map(|&index| index != NOWHERE).collect();
@@ -952,7 +1080,7 @@ impl Vector {
             // Every position holds the same value, so the only thing the gather can change is the
             // length and which positions are null. A gather with no null in it is still a constant.
             Body::Constant(value) => {
-                if constants_stay && matches!(validity, Validity::AllValid) {
+                if forms_stay && matches!(validity, Validity::AllValid) {
                     return Ok(Self::constant(self.ty.clone(), value.as_ref().clone(), rows));
                 }
                 let mut data = empty_data_for(&self.ty)?;
@@ -980,6 +1108,37 @@ impl Vector {
             // per row and this is the path a flatten of a scanned column takes.
             Body::Packed { words, width, base, offset } => {
                 Body::Flat(unpack(&self.ty, words, *offset, *width, *base, &at)?)
+            }
+            // A gather keeps the form, which is what makes selecting rows out of a string column
+            // cost sixteen bytes a row instead of the bytes of the strings. The arena it shares is
+            // the whole arena and not the part the kept rows point at, so a selection that throws
+            // most of a page away goes on holding the page. That is the trade the form is: a cut and
+            // a filter are cheap and the memory comes back when the last vector over the page goes,
+            // and a caller that wants the bytes narrowed asks for a flatten.
+            Body::Views { views, arena } if forms_stay => Body::Views {
+                views: at
+                    .iter()
+                    .map(|&index| views.get(index).copied().unwrap_or_else(StringView::empty))
+                    .collect(),
+                arena: Arc::clone(arena),
+            },
+            // Flattening promises a data slice, so the bytes are copied out into an arena of their
+            // own and the shared one is let go of. The total is known before any of it is copied,
+            // the way the flat copy works it out, so the new arena is one allocation.
+            Body::Views { views, arena } => {
+                let mut out = StringColumn::with_capacity(at.len());
+                out.reserve_bytes(
+                    at.iter()
+                        .filter_map(|&index| views.get(index))
+                        .filter(|view| !view.is_inline())
+                        .map(StringView::len)
+                        .sum(),
+                );
+                for &index in &at {
+                    let bytes = views.get(index).and_then(|view| view.bytes_in(arena));
+                    out.push_bytes(bytes.unwrap_or_default());
+                }
+                Body::Flat(Data::Varlen(out))
             }
             // Unreachable, because `resolve` walks past both of the forms that point at another
             // vector and stops at the first body that does not.
@@ -1477,9 +1636,8 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
         LogicalType::Decimal { width, scale } => {
             signed().map(|unscaled| Value::Decimal { unscaled, width: *width, scale: *scale })
         }
-        LogicalType::Varchar => data.str_at(index).map(|s| Value::Varchar(s.to_string())),
-        LogicalType::Blob | LogicalType::Bit => {
-            data.bytes_at(index).map(|bytes| Value::Blob(bytes.to_vec()))
+        LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit => {
+            data.bytes_at(index).map(|bytes| bytes_as(ty, bytes))
         }
         LogicalType::Date => signed().and_then(|x| i32::try_from(x).ok()).map(Value::Date),
         LogicalType::Time | LogicalType::TimeTz => {
@@ -1501,6 +1659,22 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
         _ => None,
     };
     value.unwrap_or(Value::Null)
+}
+
+/// One row of a string column as a value, given what its bytes are meant to be read as.
+///
+/// Both forms that hold strings come through here, so a row that is a `BLOB` in a flat column is a
+/// `BLOB` in a string view column too. Bytes that are not text in a `VARCHAR` column are a null
+/// rather than a panic, since everything that got in went in as a string and a column that has
+/// something else in it is a bug somewhere earlier that a read should not turn into a crash.
+fn bytes_as(ty: &LogicalType, bytes: &[u8]) -> Value {
+    match ty {
+        LogicalType::Varchar => {
+            std::str::from_utf8(bytes).map_or(Value::Null, |text| Value::Varchar(text.to_owned()))
+        }
+        LogicalType::Blob | LogicalType::Bit => Value::Blob(bytes.to_vec()),
+        _ => Value::Null,
+    }
 }
 
 /// An empty run of data of the right layout for a type.
@@ -1625,7 +1799,8 @@ mod tests {
     use rudb_common::{LogicalType, Value};
 
     use super::{Body, Data, Form, VECTOR_SIZE, Vector};
-    use crate::string::StringColumn;
+    use crate::buffer::Buffer;
+    use crate::string::{StringColumn, StringView};
     use crate::validity::Validity;
 
     fn integers(values: &[i32]) -> Vector {
@@ -2478,5 +2653,141 @@ mod tests {
         assert!(Vector::packed(LogicalType::Integer, vec![0], 64, 0, 4).is_err(), "too wide");
         assert!(Vector::packed(LogicalType::Integer, vec![0], 8, 0, 9).is_err(), "too few words");
         assert!(Vector::packed(LogicalType::TinyInt, vec![0], 8, 100, 8).is_err(), "would not fit");
+    }
+
+    /// A column of strings long enough that the payload is in the arena rather than in the views.
+    fn long_strings(count: usize) -> Vector {
+        let values: Vec<Value> = (0..count)
+            .map(|row| {
+                Value::Varchar(format!("a string too long to sit inside a view, number {row}"))
+            })
+            .collect();
+        Vector::from_values(LogicalType::Varchar, &values).unwrap()
+    }
+
+    #[test]
+    fn a_string_column_in_view_form_reads_back_the_same_strings() {
+        let flat = long_strings(40);
+        let shared = flat.clone().shared_text().unwrap();
+        assert_eq!(shared.form(), Form::StringView);
+        assert_eq!(shared.len(), 40);
+        for row in 0..40 {
+            assert_eq!(shared.value_at(row), flat.value_at(row), "row {row}");
+            assert_eq!(shared.text_at(row), flat.text_at(row), "row {row}");
+        }
+    }
+
+    #[test]
+    fn a_short_string_is_read_out_of_its_view_and_never_out_of_the_arena() {
+        let flat = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("red".into()), Value::Varchar("green".into()), Value::Null],
+        )
+        .unwrap();
+        let shared = flat.shared_text().unwrap();
+        // Nothing went to the arena, so the whole column resolves with an empty one.
+        let (views, arena) = shared.text_parts().unwrap();
+        assert!(arena.is_empty(), "three short strings need no arena");
+        assert_eq!(views[0].bytes_in(arena), Some(&b"red"[..]));
+        assert_eq!(shared.value_at(1), Value::Varchar("green".into()));
+        assert_eq!(shared.value_at(2), Value::Null, "the validity came across");
+    }
+
+    #[test]
+    fn a_cut_of_a_view_column_shares_the_arena_rather_than_copying_the_bytes() {
+        let shared = long_strings(64).shared_text().unwrap();
+        let cut = shared.slice(16, 8).unwrap();
+        assert_eq!(cut.form(), Form::StringView, "a cut of views is views");
+        assert_eq!(cut.len(), 8);
+        assert_eq!(cut.value_at(0), shared.value_at(16));
+        assert_eq!(cut.value_at(7), shared.value_at(23));
+        // The arena is the same bytes at the same address, which is the whole point of the form.
+        let (_, whole) = shared.text_parts().unwrap();
+        let (_, piece) = cut.text_parts().unwrap();
+        assert_eq!(piece.as_ptr(), whole.as_ptr(), "the cut shares the page");
+        assert_eq!(piece.len(), whole.len());
+    }
+
+    #[test]
+    fn a_flat_string_column_has_to_copy_the_bytes_its_cut_keeps() {
+        let flat = long_strings(64);
+        let cut = flat.slice(16, 8).unwrap();
+        assert_eq!(cut.form(), Form::Flat);
+        let (_, whole) = flat.text_parts().unwrap();
+        let (_, piece) = cut.text_parts().unwrap();
+        assert!(piece.len() < whole.len(), "the flat cut carries only what it kept");
+    }
+
+    #[test]
+    fn a_gather_of_a_view_column_keeps_the_form_and_a_flatten_copies_out_of_it() {
+        let shared = long_strings(32).shared_text().unwrap();
+        let picked: Vec<u32> = (0..32).step_by(3).collect();
+        let gathered = shared.gather(&picked).unwrap();
+        assert_eq!(gathered.form(), Form::StringView, "selecting rows moves views, not bytes");
+        assert_eq!(gathered.len(), picked.len());
+        for (row, &from) in picked.iter().enumerate() {
+            assert_eq!(gathered.value_at(row), shared.value_at(from as usize), "row {row}");
+        }
+        let flattened = gathered.flatten().unwrap();
+        assert_eq!(flattened.form(), Form::Flat);
+        assert_eq!(flattened.iter().collect::<Vec<_>>(), gathered.iter().collect::<Vec<_>>());
+        // The flatten is what narrows the bytes, so the arena it built holds only the rows it kept.
+        let (_, narrowed) = flattened.text_parts().unwrap();
+        let (_, whole) = shared.text_parts().unwrap();
+        assert!(narrowed.len() < whole.len(), "flattening lets the page go");
+    }
+
+    #[test]
+    fn a_null_in_a_view_column_survives_being_gathered_and_flattened() {
+        let shared = long_strings(8)
+            .with_validity(Validity::from_iter(8, |row| row % 3 != 0))
+            .shared_text()
+            .unwrap();
+        let gathered = shared.gather(&[0, 1, 2, 3, 4]).unwrap();
+        let expected =
+            [Value::Null, shared.value_at(1), shared.value_at(2), Value::Null, shared.value_at(4)];
+        assert_eq!(gathered.iter().collect::<Vec<_>>(), expected);
+        assert_eq!(gathered.flatten().unwrap().iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn both_string_forms_hand_a_kernel_the_same_views_and_the_same_bytes() {
+        let flat = long_strings(6);
+        let shared = flat.clone().shared_text().unwrap();
+        let (flat_views, flat_arena) = flat.text_parts().unwrap();
+        let (shared_views, shared_arena) = shared.text_parts().unwrap();
+        assert_eq!(flat_views.len(), shared_views.len());
+        for row in 0..6 {
+            assert_eq!(
+                flat_views[row].bytes_in(flat_arena),
+                shared_views[row].bytes_in(shared_arena),
+                "row {row}"
+            );
+        }
+        // Nothing else answers this, which is what keeps a kernel from taking it for a string column.
+        assert!(Vector::sequence(0, 1, 4).text_parts().is_none());
+        assert!(integers(&[1, 2, 3]).text_parts().is_none());
+    }
+
+    #[test]
+    fn a_column_that_is_not_strings_cannot_be_held_as_views() {
+        let views = vec![StringView::inline("red")];
+        let arena = Arc::new(Buffer::new());
+        let wrong = Vector::string_views(LogicalType::Integer, views, arena);
+        assert!(wrong.is_err(), "an integer column has no views");
+        assert_eq!(integers(&[1, 2]).shared_text().unwrap().form(), Form::Flat, "left alone");
+    }
+
+    #[test]
+    fn a_view_pointing_past_its_arena_is_refused_at_construction() {
+        let long = "a string too long to sit inside a view";
+        let arena: Arc<Buffer<u8>> = Arc::new(long.as_bytes().to_vec().into());
+        let good = vec![StringView::over(long.as_bytes(), 0)];
+        assert!(Vector::string_views(LogicalType::Varchar, good, Arc::clone(&arena)).is_ok());
+        let bad = vec![StringView::over(long.as_bytes(), 4)];
+        assert!(
+            Vector::string_views(LogicalType::Varchar, bad, arena).is_err(),
+            "four bytes short of what the view claims"
+        );
     }
 }
