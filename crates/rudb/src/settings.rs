@@ -5,6 +5,13 @@
 //! is that set, and it is three because [`crate::Config`] holds three things a program can choose
 //! and a fourth that DuckDB has no setting for.
 //!
+//! The seam settings are the exception to the fixed set, and they are a separate set rather than
+//! three more names. `SET seam.hash.table = 'unchained'` picks which implementation runs at one of
+//! the twenty seven seams in `rudb_seam`, there are twenty seven of them plus the policy, and none
+//! of them is a DuckDB setting, so putting them in [`Settings::NAMES`] would make `duckdb_settings()`
+//! list twenty eight names the binary has never heard of. They go through the same [`Settings::apply`]
+//! anyway, because a second door into the settings is a second place for a scope rule to be wrong.
+//!
 //! Every setting here is global, which is the scope DuckDB gives all three of them. `SET LOCAL` is
 //! refused with the sentence the binary prints, and `SET SESSION` is refused with the one it prints
 //! for a global setting, which is a different sentence and says which of the two the writer got
@@ -19,6 +26,7 @@ use std::sync::RwLock;
 
 use rudb_common::{Error, Memory, Result, Value, human};
 use rudb_parse::ast::Scope;
+use rudb_seam::SEAM_PREFIX;
 
 use crate::config::{Config, parse_size};
 
@@ -34,6 +42,13 @@ pub(crate) struct Settings {
     /// compares against and what a read of the setting has to hand back. It is validated when it is
     /// set, so the context it builds later cannot fail.
     disabled: RwLock<String>,
+    /// Which implementation runs at each seam, as `SET seam.<name>` has left it.
+    ///
+    /// Held here rather than in [`Config`], because there are twenty seven of them and a `Config`
+    /// is a value a program copies. The session settings are the middle of the three surfaces in
+    /// `spec/17-milestones.md`: the process flag sets them by running a `SET` at startup, and a
+    /// per query hint is this with the query's own pins laid over a copy.
+    seams: RwLock<rudb_seam::Settings>,
 }
 
 impl Settings {
@@ -46,12 +61,22 @@ impl Settings {
             defaults: config,
             current: RwLock::new(config),
             disabled: RwLock::new(String::new()),
+            seams: RwLock::new(rudb_seam::Settings::new()),
         }
     }
 
     /// The passes `SET disabled_optimizers` turned off, for building an optimizer context.
     pub(crate) fn disabled_optimizers(&self) -> String {
         self.disabled.read().unwrap_or_else(|held| held.into_inner()).clone()
+    }
+
+    /// The seam settings as the statements have left them.
+    ///
+    /// A copy, because a statement reads them once at plan time and a reference would be a lock
+    /// held for the length of the query. Twenty seven seams is a small map and most sessions pin
+    /// none of them, so the copy is a copy of nothing much.
+    pub(crate) fn seams(&self) -> rudb_seam::Settings {
+        self.seams.read().unwrap_or_else(|held| held.into_inner()).clone()
     }
 
     /// The configuration as the statements have left it.
@@ -89,6 +114,20 @@ impl Settings {
                 return Err(Error::catalog(format!("option \"{name}\" cannot be {verb} locally")));
             }
             Scope::Global | Scope::Unwritten => {}
+        }
+        if is_seam(name) {
+            // `RESET seam.hash.table` is the same thing as setting it to `default`, which is the
+            // word the seam settings already use for an unpinned seam, so there is one path
+            // through rather than a reset that has to know what a pin is.
+            let text = match value {
+                None => "default".to_string(),
+                Some(value) => text_of(value),
+            };
+            return self
+                .seams
+                .write()
+                .unwrap_or_else(|held| held.into_inner())
+                .set(name, text.trim());
         }
         if !Self::NAMES.contains(&name) {
             let known: Vec<String> =
@@ -139,6 +178,11 @@ impl Settings {
     ///
     /// For a name that is not a setting.
     pub(crate) fn value(&self, name: &str) -> Result<String> {
+        if is_seam(name) {
+            return self.seams().get(name).ok_or_else(|| {
+                Error::catalog(format!("no seam called {name}, see rudb_strategies() for the list"))
+            });
+        }
         let config = self.config();
         match name {
             "disabled_optimizers" => Ok(self.disabled_optimizers()),
@@ -161,6 +205,23 @@ impl Settings {
     fn replace(&self, config: Config) {
         *self.current.write().unwrap_or_else(|held| held.into_inner()) = config;
     }
+}
+
+/// Whether this name is a seam rather than one of the settings DuckDB has.
+///
+/// A name with the `seam.` prefix is one whatever follows the prefix is, so that a mistyped seam
+/// gets the error naming the seams rather than the one naming the three DuckDB settings. Without
+/// the prefix it has to be a name `rudb_seam` knows, which is where the three spellings of a seam
+/// name are decided.
+///
+/// A DuckDB setting wins, which matters for exactly nothing today and costs one comparison. The
+/// day DuckDB adds a setting whose name collides with a seam of ours, the compatible answer is the
+/// one that wins and the prefixed spelling is still there for the other one.
+fn is_seam(name: &str) -> bool {
+    if Settings::NAMES.contains(&name) {
+        return false;
+    }
+    name.starts_with(SEAM_PREFIX) || rudb_seam::seam_named(name).is_some()
 }
 
 /// A value as the text a setting reads.

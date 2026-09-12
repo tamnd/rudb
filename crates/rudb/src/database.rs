@@ -98,6 +98,30 @@ impl Database {
         self.shared.inner.settings.value(name)
     }
 
+    /// Which implementation runs at each seam, as this session has left it.
+    ///
+    /// The session half of the three surfaces. The other two reach the same place: a process flag
+    /// is a `SET` the shell runs before anything else, and a per query hint is this with the
+    /// query's own pins laid on top, which is [`Database::seams_for`].
+    #[must_use]
+    pub fn seams(&self) -> rudb_seam::Settings {
+        self.shared.inner.settings.seams()
+    }
+
+    /// The seam settings one query runs under, which is [`Database::seams`] plus its hints.
+    ///
+    /// `SELECT /*+ hash.table(unchained) */ ...` pins a seam for one statement and leaves the
+    /// session alone, which is what a researcher comparing two implementations of one thing over a
+    /// suite needs, because the alternative is a `SET` before every query and a `RESET` after it
+    /// that somebody eventually forgets.
+    ///
+    /// # Errors
+    ///
+    /// A parse error, and everything a hint naming a seam nobody has raises.
+    pub fn seams_for(&self, sql: &str) -> Result<rudb_seam::Settings> {
+        self.shared.seams(sql)
+    }
+
     /// The memory budget every query against this database is held to.
     ///
     /// One budget for the database rather than one per query, which is what
@@ -341,8 +365,24 @@ impl Shared {
     /// Runs one query and returns every row it produced.
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let catalog = self.read();
+        let _seams = self.seams(sql)?;
         let plan = planned(sql, &catalog, &self.optimizer()?)?;
         run(&plan, &catalog, cancel, &self.inner.memory)
+    }
+
+    /// The seam settings a statement runs under, which is the session's with its hints on top.
+    ///
+    /// What the settings choose goes nowhere yet, because no seam has a second implementation to
+    /// choose between until F1 and every one of the twenty seven is unregistered. What they do
+    /// today is fail a statement whose hint names a seam nobody has, which is the half of the
+    /// behaviour worth having before the other half arrives: a hint that is quietly ignored is a
+    /// measurement of the wrong thing.
+    pub(crate) fn seams(&self, sql: &str) -> Result<rudb_seam::Settings> {
+        let mut seams = self.inner.settings.seams();
+        for hint in rudb_parse::hints(sql)? {
+            seams.hint(hint)?;
+        }
+        Ok(seams)
     }
 
     /// The passes this database's queries run, as `SET disabled_optimizers` has left them.
@@ -383,6 +423,7 @@ impl Shared {
     /// whatever the table had become in between.
     pub(crate) fn execute(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let ast = rudb_parse::parse_ast(sql)?;
+        let _seams = self.seams(sql)?;
         self.execute_ast(&ast, &Parameters::new(), cancel)
     }
 
