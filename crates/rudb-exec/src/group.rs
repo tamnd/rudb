@@ -22,7 +22,7 @@
 //! change because a set per group is a different shape from a table over the whole input.
 
 use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
-use rudb_kernels::{Accumulator, is_true};
+use rudb_kernels::{Accumulator, NOWHERE, is_true, update_scattered};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
@@ -253,6 +253,10 @@ impl Pass<'_> {
         // One hash per row of the chunk in hand, built a column at a time before the row loop
         // starts. Kept between chunks for the reason the buffers above are.
         let mut hashes: Vec<u64> = Vec::new();
+        // One slot per row of the chunk in hand, which is what the probe produces and what the
+        // scatter consumes, and the same slots with a call's `FILTER` folded into them.
+        let mut slots: Vec<usize> = Vec::new();
+        let mut kept: Vec<usize> = Vec::new();
         // The file the rows that do not fit go to, made the first time the budget says the table
         // has to stop growing and `None` for as long as it does not. One row of it, kept between
         // rows so that writing does not go to the allocator per row.
@@ -275,15 +279,12 @@ impl Pass<'_> {
             if !alone {
                 crate::table::hash(keys, *length, &mut hashes);
             }
-            #[expect(
-                clippy::needless_range_loop,
-                reason = "hashes is empty when there is no key to hash, and every other thing in \
-                          the body is indexed by the row as well"
-            )]
-            // row at a time: what is left of it. 2g (#61) gives the aggregate an update that takes
-            // a vector and a run of slots, at which point the argument stops being a `Value` too.
+            // The probe, and nothing else. What comes out of it is one slot per row, which is what
+            // the scatter below needs and what the row loop used to consume as it went.
+            slots.clear();
+            slots.resize(*length, NOWHERE);
             for row in 0..*length {
-                let slot = if alone {
+                slots[row] = if alone {
                     0
                 } else {
                     match table.probe(hashes[row], keys, row) {
@@ -314,33 +315,38 @@ impl Pass<'_> {
                         }
                     }
                 };
-                for (at, call) in self.calls.iter().enumerate() {
-                    if by_vector[at] {
-                        continue;
-                    }
-                    if let Some(flags) = &filters[at] {
-                        if !is_true(&flags.value_at(row)) {
-                            continue;
-                        }
-                    }
-                    let args = &mut given[at];
-                    fill(args, &arguments[at], row);
-                    if call.distinct {
-                        // Asked before it is added, because the answer is usually that it is there
-                        // already and a set that is asked never takes a copy of what it was asked
-                        // about. A `count(DISTINCT x)` over a million rows and a thousand values
-                        // copies a thousand times rather than a million.
-                        let set = &mut seen[slot * calls + at];
-                        if set.contains(args) {
-                            continue;
-                        }
-                        // The copy and not the buffer, for the reason the group key above gives.
-                        let stored = args.clone();
-                        aside += rows::footprint(&stored.0);
-                        set.insert(stored);
-                    }
-                    states[slot * calls + at].update(&args.0)?;
+            }
+            // The aggregate half of #61. Every call that is not `DISTINCT` folds the whole chunk in
+            // one pass, with the aggregate and the layout of its argument matched on once for the
+            // chunk rather than once per row, and with no `Value` built at all on the paths the
+            // kernel covers.
+            for (at, call) in self.calls.iter().enumerate() {
+                if by_vector[at] {
+                    continue;
                 }
+                if call.distinct {
+                    aside +=
+                        self.distinct(&mut states, &mut seen, &seen_rows, &slots, at, &mut given)?;
+                    continue;
+                }
+                let picked = match &filters[at] {
+                    None => &slots,
+                    Some(flags) => {
+                        // A row the filter dropped belongs to nothing, which is the same thing the
+                        // scatter already understands a spilled row to be, so the filter goes into
+                        // the slots rather than into the loop that reads them.
+                        kept.clear();
+                        kept.extend(slots.iter().enumerate().map(|(row, &slot)| {
+                            if slot != NOWHERE && is_true(&flags.value_at(row)) {
+                                slot
+                            } else {
+                                NOWHERE
+                            }
+                        }));
+                        &kept
+                    }
+                };
+                update_scattered(&mut states, picked, calls, at, arguments[at].first(), *length)?;
             }
             rows::capacity(table.owned(), &mut charged_keys, &mut scratch)?;
             containers.grow(aside)?;
@@ -426,6 +432,57 @@ impl Pass<'_> {
             Some(file) if file.rows() > 0 => Ok(Some(file)),
             _ => Ok(None),
         }
+    }
+
+    /// One `DISTINCT` call over a chunk, which is the one shape that still needs a value per row.
+    ///
+    /// `DISTINCT` inside an aggregate is a grouping of its own, one set per group per call, and the
+    /// set is keyed on the same `Key` grouping was keyed on before #237. Giving it the table in
+    /// `table.rs` is a change of its own and is deliberately not this one, so this is the row loop
+    /// that used to be the whole of the aggregate, kept for the calls that need it.
+    ///
+    /// What comes back is what the values copied into the sets own away from themselves, which the
+    /// caller charges once for the chunk.
+    fn distinct(
+        &self,
+        states: &mut [Accumulator],
+        seen: &mut [RowSet],
+        rows: &Rows,
+        slots: &[usize],
+        at: usize,
+        given: &mut [Key],
+    ) -> Result<u64> {
+        let calls = self.calls.len();
+        let mut aside = 0;
+        // row at a time: a set of rows is what `DISTINCT` is, and the table that would replace this
+        // one is the one #237 built for grouping. Until that is shared, this is the honest loop.
+        for (row, &slot) in slots.iter().enumerate() {
+            if slot == NOWHERE {
+                continue;
+            }
+            if let Some(flags) = &rows.filters[at] {
+                if !is_true(&flags.value_at(row)) {
+                    continue;
+                }
+            }
+            let args = &mut given[at];
+            fill(args, &rows.arguments[at], row);
+            // Asked before it is added, because the answer is usually that it is there already and
+            // a set that is asked never takes a copy of what it was asked about. A
+            // `count(DISTINCT x)` over a million rows and a thousand values copies a thousand times
+            // rather than a million.
+            let set = &mut seen[slot * calls + at];
+            if set.contains(args) {
+                continue;
+            }
+            // The copy and not the buffer, because the buffer keeps whatever the longest value it
+            // has ever held needed and the charge counts capacity.
+            let stored = args.clone();
+            aside += rows::footprint(&stored.0);
+            set.insert(stored);
+            states[slot * calls + at].update(&args.0)?;
+        }
+        Ok(aside)
     }
 
     /// A fresh accumulator per call, appended for the group that has just arrived.

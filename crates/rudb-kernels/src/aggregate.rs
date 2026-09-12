@@ -37,6 +37,20 @@
 //! `min` and `max` read the data to find which row won and then ask the vector for that one row.
 //! One `Value` per vector instead of one per row, and one call into the comparison kernel instead
 //! of one per row.
+//!
+//! # The grouped form
+//!
+//! [`update_run`](Accumulator::update_run) folds a vector into one accumulator, which is what an
+//! ungrouped aggregate wants and is no use at all to a `GROUP BY`, where the rows of one vector
+//! belong to as many different accumulators as there are groups in it. [`update_scattered`] is the
+//! grouped form: one vector, one slot per row saying which accumulator that row belongs to, and one
+//! pass that reads the run once and folds each value into the accumulator its row points at.
+//!
+//! It cannot reduce the way the ungrouped form does, because two adjacent rows are usually two
+//! different groups and there is nothing to add up before the scatter. What it removes is everything
+//! else: the `Value` built per row, which for a string column is a malloc, the match on which
+//! aggregate this is, and the match on which layout the column is in. All three of those are decided
+//! once per vector here and none of them per row.
 
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::{Data, Form, Validity, Vector};
@@ -45,6 +59,14 @@ use crate::compare::order;
 use crate::fallback::{self, Kernel};
 use crate::number::{fit, integral, pow10, rescale};
 use crate::shape::{identity, nulls_of};
+
+/// Where a row that belongs to no accumulator points.
+///
+/// A row a `FILTER` threw away and a row that went to a spill file both have nothing to update, and
+/// the caller says so by pointing them here rather than by handing over a second mask. One sentinel
+/// rather than a second buffer, because the slots are written per row anyway and the test is a
+/// compare against a constant.
+pub const NOWHERE: usize = usize::MAX;
 
 /// A running aggregate.
 #[derive(Debug, Clone)]
@@ -416,6 +438,386 @@ impl Accumulator {
             State::Extreme(held) => Ok(held.clone().unwrap_or(Value::Null)),
         }
     }
+}
+
+/// Folds one vector into many accumulators, each row into the one its slot points at.
+///
+/// `states` is the caller's flat array of accumulators, `stride` is how many aggregates there are
+/// per group and `offset` is which of them this call is, so the accumulator a row belongs to is at
+/// `slots[row] * stride + offset`. That is the layout a hash aggregate already keeps, one run of
+/// accumulators per group, so nothing is copied to call this and the slots are the probe results the
+/// operator has in hand. A slot of [`NOWHERE`] is a row that contributes to nothing.
+///
+/// A shape the one pass form does not cover falls through to [`Accumulator::update`] per row and
+/// records itself in [`crate::fallback`], exactly as [`Accumulator::update_run`] does, so this
+/// always reaches the answer the row at a time loop reaches. The rows are walked in order in every
+/// path, which is what keeps a floating point total inside one group adding in the same order and
+/// rounding the same way.
+///
+/// # Errors
+///
+/// The same errors [`Accumulator::update`] raises, and an internal error if the slots are shorter
+/// than the rows or if the vector is.
+pub fn update_scattered(
+    states: &mut [Accumulator],
+    slots: &[usize],
+    stride: usize,
+    offset: usize,
+    input: Option<&Vector>,
+    rows: usize,
+) -> Result<()> {
+    if states.is_empty() {
+        return Ok(());
+    }
+    if slots.len() < rows {
+        return Err(Error::internal(format!(
+            "an aggregate handed {rows} rows and {} slots",
+            slots.len()
+        )));
+    }
+    let Some(first) = states.get(offset) else {
+        return Err(Error::internal(format!(
+            "an aggregate at {offset} of {} accumulators",
+            states.len()
+        )));
+    };
+    let kind = first.kind;
+    let into = Where { slots, stride, offset };
+    // `count(*)` reads nothing, so it never asks for the argument it does not have.
+    if kind == Kind::CountStar {
+        for row in 0..rows {
+            let Some(index) = into.index(row) else { continue };
+            if let State::Counted(count) = &mut states[index].state {
+                *count += 1;
+            }
+        }
+        return Ok(());
+    }
+    let Some(input) = input else {
+        return Err(Error::internal("an aggregate over 0 arguments".to_string()));
+    };
+    if input.len() < rows {
+        return Err(Error::internal(format!(
+            "an aggregate handed {rows} rows and a vector of {}",
+            input.len()
+        )));
+    }
+    let nulls = nulls_of(input);
+    // Every aggregate here skips nulls, so a vector that is entirely null contributes nothing to
+    // anything whatever the type is and whatever the form is.
+    if matches!(nulls, Validity::AllInvalid) {
+        return Ok(());
+    }
+    let feed = feed_of(first, input.logical_type());
+    if let Some(feed) = feed {
+        if spread(states, into, input, rows, &nulls, feed)? {
+            return Ok(());
+        }
+    }
+    // An aggregate reads one vector, so its form goes in both halves of the report.
+    fallback::record(Kernel::Aggregate, input.form(), input.form());
+    // row at a time: the path recorded on the line above, which exists to be correct for a column
+    // `spread` does not cover and counts itself so that column shows up.
+    for row in 0..rows {
+        let Some(index) = into.index(row) else { continue };
+        let value = input.value_at(row);
+        states[index].update(std::slice::from_ref(&value))?;
+    }
+    Ok(())
+}
+
+/// Which accumulator a row belongs to.
+#[derive(Clone, Copy)]
+struct Where<'w> {
+    slots: &'w [usize],
+    stride: usize,
+    offset: usize,
+}
+
+impl Where<'_> {
+    /// The accumulator this row folds into, or none if it folds into nothing.
+    fn index(self, row: usize) -> Option<usize> {
+        let slot = self.slots[row];
+        (slot != NOWHERE).then(|| slot * self.stride + self.offset)
+    }
+}
+
+/// What one run of values is read as on the way into many accumulators.
+#[derive(Clone, Copy)]
+enum Feed {
+    /// A count of the rows that are not null, which reads the mask and not the data.
+    Counted,
+    /// An exact number per row.
+    Whole,
+    /// A number per row in floating point, at the scale a decimal column is held at.
+    Real { scale: u8 },
+    /// A number per row against the best that group has seen, the smallest one if true.
+    Extreme(bool),
+}
+
+/// How a column is read for a call, or none if the one pass form does not cover it.
+///
+/// This is [`Accumulator::folded`]'s `want` with the running total left out, because there is no one
+/// running total here. It has to make the same choices for the same reasons, so the arms are in the
+/// same order and the comments there are the comments here.
+fn feed_of(first: &Accumulator, ty: &LogicalType) -> Option<Feed> {
+    match (&first.state, ty) {
+        (State::Counted(_), _) => Some(Feed::Counted),
+        (State::Whole { .. }, _) => Some(Feed::Whole),
+        (State::Scaled { scale, .. }, LogicalType::Decimal { scale: held, .. })
+            if held == scale =>
+        {
+            Some(Feed::Whole)
+        }
+        (State::Scaled { .. }, _) => None,
+        (State::Mean { .. }, ty) if ty.is_integer() => Some(Feed::Whole),
+        (State::Mean { .. } | State::Real { .. }, ty) => {
+            Some(Feed::Real { scale: decimal_scale(ty) })
+        }
+        // A number is compared as a number and anything else is compared the way the comparison
+        // kernel says, which a run of `i128` cannot do for a float, a string or a date.
+        (State::Extreme(_), ty) if ty.is_integer() => Some(Feed::Extreme(first.kind == Kind::Min)),
+        (State::Extreme(_), _) => None,
+    }
+}
+
+/// One pass over a vector, folding each row into the accumulator it belongs to.
+fn spread(
+    states: &mut [Accumulator],
+    into: Where<'_>,
+    input: &Vector,
+    rows: usize,
+    nulls: &Validity,
+    feed: Feed,
+) -> Result<bool> {
+    // Both counts are answered by the mask on its own, whatever the form and whatever the type, so
+    // they come back before there is any question of which loop to run.
+    if matches!(feed, Feed::Counted) {
+        for row in 0..rows {
+            if !nulls.is_valid(row) {
+                continue;
+            }
+            let Some(index) = into.index(row) else { continue };
+            if let State::Counted(count) = &mut states[index].state {
+                *count += 1;
+            }
+        }
+        return Ok(true);
+    }
+    match input.form() {
+        Form::Flat => {
+            let Some(data) = input.data() else { return Ok(false) };
+            if data.len() < rows {
+                return Ok(false);
+            }
+            let run = Run { input, data, rows, nulls };
+            scatter(states, into, &run, identity, feed)
+        }
+        Form::Dictionary => {
+            let Some((codes, values)) = input.dictionary_parts() else { return Ok(false) };
+            if codes.len() < rows {
+                return Ok(false);
+            }
+            let Some(data) = values.data() else { return Ok(false) };
+            let run = Run { input, data, rows, nulls };
+            // Every code is inside the dictionary because `Vector::dictionary` checks that on the
+            // way in, so the gather below indexes without a bound of its own.
+            scatter(states, into, &run, |index| codes[index] as usize, feed)
+        }
+        // A constant and a sequence both have a closed form per group that is better than any loop,
+        // and neither is what a scan of a column produces, so both wait for the counter to ask.
+        _ => Ok(false),
+    }
+}
+
+/// One vector to read, in the shape the three loops below all want it.
+struct Run<'r> {
+    input: &'r Vector,
+    data: &'r Data,
+    rows: usize,
+    nulls: &'r Validity,
+}
+
+fn scatter<M: Fn(usize) -> usize>(
+    states: &mut [Accumulator],
+    into: Where<'_>,
+    run: &Run<'_>,
+    at: M,
+    feed: Feed,
+) -> Result<bool> {
+    match feed {
+        Feed::Counted => Ok(true),
+        Feed::Whole => whole_into(states, into, run, at),
+        Feed::Real { scale } => real_into(states, into, run, at, scale),
+        Feed::Extreme(least) => extreme_into(states, into, run, at, least),
+    }
+}
+
+/// An exact number per row into the running total of the group that row belongs to.
+fn whole_into<M: Fn(usize) -> usize>(
+    states: &mut [Accumulator],
+    into: Where<'_>,
+    run: &Run<'_>,
+    at: M,
+) -> Result<bool> {
+    macro_rules! each {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match run.data {
+                $(Data::$variant(values) => {
+                    for row in 0..run.rows {
+                        if !run.nulls.is_valid(row) {
+                            continue;
+                        }
+                        let Some(index) = into.index(row) else { continue };
+                        fold_whole(&mut states[index], i128::from(values[at(row)]))?;
+                    }
+                })+
+                // A total of hugeints can overflow inside one group, and then the overflow is the
+                // answer rather than a detail, so both of those go the row at a time way.
+                _ => return Ok(false),
+            }
+        };
+    }
+    rudb_vector::for_each_layout!(narrow, each);
+    Ok(true)
+}
+
+/// One exact number into one accumulator, which is [`Accumulator::update`] with the `Value` gone.
+fn fold_whole(into: &mut Accumulator, number: i128) -> Result<()> {
+    match &mut into.state {
+        State::Whole { total, seen } | State::Scaled { total, seen, .. } => {
+            *total = total.checked_add(number).ok_or_else(overflowed)?;
+            *seen = true;
+        }
+        State::Mean { whole, real, seen, exact } => {
+            match whole.checked_add(number).filter(|_| *exact) {
+                Some(total) => *whole = total,
+                None => {
+                    if *exact {
+                        *real = exactly(*whole);
+                        *exact = false;
+                    }
+                    *real += exactly(number);
+                }
+            }
+            *seen += 1;
+        }
+        // `feed_of` chose this loop off the state, so the states left over cannot be here.
+        other => {
+            return Err(Error::internal(format!("an exact total into {other:?}")));
+        }
+    }
+    Ok(())
+}
+
+/// A number per row in floating point into the running total of the group that row belongs to.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a wide integer past 2^53 losing digits is what a double is, and this is the float path"
+)]
+fn real_into<M: Fn(usize) -> usize>(
+    states: &mut [Accumulator],
+    into: Where<'_>,
+    run: &Run<'_>,
+    at: M,
+    scale: u8,
+) -> Result<bool> {
+    let factor = pow10(scale) as f64;
+    let scaled = scale != 0;
+    macro_rules! each {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match run.data {
+                $(Data::$variant(values) => each!(@run values, |number| number as f64),)+
+                Data::Float32(values) => each!(@run values, f64::from),
+                Data::Float64(values) => each!(@run values, |number: f64| number),
+                _ => return Ok(false),
+            }
+        };
+        (@run $values:expr, $convert:expr) => {{
+            let values = $values;
+            let convert = $convert;
+            for row in 0..run.rows {
+                if !run.nulls.is_valid(row) {
+                    continue;
+                }
+                let Some(index) = into.index(row) else { continue };
+                let number = convert(values[at(row)]);
+                fold_real(&mut states[index], if scaled { number / factor } else { number });
+            }
+        }};
+    }
+    rudb_vector::for_each_layout!(integer, each);
+    Ok(true)
+}
+
+/// One approximate number into one accumulator.
+fn fold_real(into: &mut Accumulator, number: f64) {
+    match &mut into.state {
+        State::Real { total, seen } => {
+            *total += number;
+            *seen += 1;
+        }
+        State::Mean { whole, real, seen, exact } => {
+            // The first value that is not whole. What was counted exactly so far comes across as
+            // one conversion, and the rest of the group is added the way the float path adds.
+            if *exact {
+                *real = exactly(*whole);
+                *exact = false;
+            }
+            *real += number;
+            *seen += 1;
+        }
+        // `feed_of` chose this loop off the state, so the states left over cannot be here.
+        _ => {}
+    }
+}
+
+/// A number per row against the best the group it belongs to has seen.
+fn extreme_into<M: Fn(usize) -> usize>(
+    states: &mut [Accumulator],
+    into: Where<'_>,
+    run: &Run<'_>,
+    at: M,
+    least: bool,
+) -> Result<bool> {
+    macro_rules! each {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match run.data {
+                $(Data::$variant(values) => {
+                    // row at a time: a scatter is per row by definition, since two adjacent rows
+                    // are usually two different groups and there is nothing to reduce before it.
+                    // The `Value` below is built on a win rather than on a row, which is the part
+                    // that makes this loop worth having over the one it replaced.
+                    for row in 0..run.rows {
+                        if !run.nulls.is_valid(row) {
+                            continue;
+                        }
+                        let Some(index) = into.index(row) else { continue };
+                        let number = i128::from(values[at(row)]);
+                        let State::Extreme(held) = &mut states[index].state else {
+                            return Err(Error::internal("an extreme into a total".to_string()));
+                        };
+                        let replace = match held {
+                            None => true,
+                            Some(current) => {
+                                let mark = integral(current).ok_or_else(|| not_narrow(current))?;
+                                if least { number < mark } else { number > mark }
+                            }
+                        };
+                        // The `Value` is built on a win and not per row, which for a column that
+                        // arrives sorted is once and for a column that arrives shuffled is about
+                        // the harmonic number of the rows in the group.
+                        if replace {
+                            *held = Some(run.input.value_at(row));
+                        }
+                    }
+                })+
+                _ => return Ok(false),
+            }
+        };
+    }
+    rudb_vector::for_each_layout!(narrow, each);
+    Ok(true)
 }
 
 fn not_narrow(value: &Value) -> Error {
@@ -990,6 +1392,191 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// How many aggregates a group holds in the test below, and which of them is the one measured.
+    ///
+    /// Not one and not the first one, because a stride of one and an offset of zero are the two
+    /// values that make the index arithmetic right by accident.
+    const STRIDE: usize = 3;
+    const OFFSET: usize = 1;
+
+    /// Which group each row belongs to, with some rows belonging to none.
+    ///
+    /// Round robin with a stride that is coprime with nothing in particular, so consecutive rows
+    /// land in different groups, which is the case the scattered path exists for and the case a
+    /// loop that quietly folded runs together would get wrong.
+    fn deal(rows: usize, groups: usize) -> Vec<usize> {
+        (0..rows).map(|row| if row % 11 == 5 { NOWHERE } else { (row * 7 + 3) % groups }).collect()
+    }
+
+    /// One accumulator per group fed a row at a time, which is the answer the scatter has to reach.
+    fn group_at_a_time(
+        name: &str,
+        returns: &LogicalType,
+        batches: &[(Vector, Vec<usize>)],
+        groups: usize,
+        reads: bool,
+    ) -> Result<Vec<Value>> {
+        let mut states = Vec::new();
+        for _ in 0..groups {
+            states.push(Accumulator::new(name, returns)?);
+        }
+        for (batch, slots) in batches {
+            for (row, &slot) in slots.iter().enumerate() {
+                if slot == NOWHERE {
+                    continue;
+                }
+                if reads {
+                    let value = batch.value_at(row);
+                    states[slot].update(std::slice::from_ref(&value))?;
+                } else {
+                    states[slot].update(&[])?;
+                }
+            }
+        }
+        states.iter().map(Accumulator::finish).collect()
+    }
+
+    /// The same groups through one call per batch.
+    fn group_at_once(
+        name: &str,
+        returns: &LogicalType,
+        batches: &[(Vector, Vec<usize>)],
+        groups: usize,
+        reads: bool,
+    ) -> Result<Vec<Value>> {
+        let mut states = Vec::new();
+        for _ in 0..groups * STRIDE {
+            states.push(Accumulator::new(name, returns)?);
+        }
+        for (batch, slots) in batches {
+            let input = reads.then_some(batch);
+            update_scattered(&mut states, slots, STRIDE, OFFSET, input, slots.len())?;
+        }
+        (0..groups).map(|group| states[group * STRIDE + OFFSET].finish()).collect()
+    }
+
+    /// Every aggregate over every type, dealt out into five groups, against one accumulator each.
+    ///
+    /// This is the invariant the whole scattered path rests on and it is the same invariant the
+    /// vector at a time test above asserts: a faster loop that reaches a different answer is not an
+    /// answer. Two batches rather than one, because a state that is restarted at every vector is
+    /// right on one vector and wrong on the query, and the slots change between them so no group
+    /// sees the same rows twice.
+    #[test]
+    fn every_aggregate_scattered_into_groups_agrees_with_one_accumulator_per_group() {
+        let mut rng = Rng(0x5eed_ca11_ab1e_0061);
+        let groups = 5;
+        let types = [
+            LogicalType::TinyInt,
+            LogicalType::SmallInt,
+            LogicalType::Integer,
+            LogicalType::BigInt,
+            LogicalType::HugeInt,
+            LogicalType::UTinyInt,
+            LogicalType::USmallInt,
+            LogicalType::UInteger,
+            LogicalType::UBigInt,
+            LogicalType::Float,
+            LogicalType::Double,
+            LogicalType::decimal(9, 2).expect("a legal decimal"),
+            LogicalType::decimal(18, 4).expect("a legal decimal"),
+            LogicalType::decimal(30, 6).expect("a legal decimal"),
+            LogicalType::Varchar,
+        ];
+        for ty in &types {
+            for name in ["count_star", "count", "sum", "avg", "min", "max"] {
+                let returns = returns_of(name, ty);
+                let reads = name != "count_star";
+                for nulls in [0_usize, 4, 1] {
+                    let first = flat(ty, 97, nulls, &mut rng);
+                    let second = flat(ty, 64, nulls, &mut rng);
+                    let codes: Vec<u32> = (0..97).map(|index| (index % 13) as u32).collect();
+                    let coded = Vector::dictionary(codes, first.clone()).expect("codes in range");
+                    for (shape, batches) in [
+                        ("flat", vec![first.clone(), second.clone()]),
+                        ("dictionary", vec![coded, second.clone()]),
+                    ] {
+                        let dealt: Vec<(Vector, Vec<usize>)> = batches
+                            .into_iter()
+                            .map(|batch| {
+                                let slots = deal(batch.len(), groups);
+                                (batch, slots)
+                            })
+                            .collect();
+                        let note = format!("{name} over {ty}, {shape}, one null in {nulls}");
+                        let slow = group_at_a_time(name, &returns, &dealt, groups, reads);
+                        let fast = group_at_once(name, &returns, &dealt, groups, reads);
+                        match (slow, fast) {
+                            (Ok(slow), Ok(fast)) => assert_eq!(slow, fast, "{note}"),
+                            (Err(slow), Err(fast)) => {
+                                assert_eq!(slow.message(), fast.message(), "{note}");
+                            }
+                            (slow, fast) => panic!(
+                                "{note}: one path answered and the other did not, \
+                                 {slow:?} against {fast:?}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A row pointing at [`NOWHERE`] contributes to nothing, which is how a `FILTER` and a spilled
+    /// row are both said. Counting is the aggregate that would notice a row it should not have seen.
+    #[test]
+    fn a_row_that_belongs_to_no_group_is_counted_by_nobody() {
+        let column = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(1), Value::Integer(2), Value::Integer(3), Value::Integer(4)],
+        )
+        .expect("a vector of integers");
+        let mut states = vec![Accumulator::new("sum", &LogicalType::HugeInt).expect("known"); 2];
+        let slots = [0, NOWHERE, 1, NOWHERE];
+        update_scattered(&mut states, &slots, 1, 0, Some(&column), 4).expect("folds them in");
+        assert_eq!(states[0].finish().expect("finishes"), Value::HugeInt(1));
+        assert_eq!(states[1].finish().expect("finishes"), Value::HugeInt(3));
+    }
+
+    /// The shapes a grouped ClickBench query is made of stay off the row at a time path, and a
+    /// column the scatter has no typed loop for goes down it and says so.
+    #[test]
+    fn the_shapes_a_grouped_query_is_made_of_stay_off_the_row_at_a_time_path() {
+        let numbers = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        )
+        .expect("a vector of integers");
+        let words = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("a".into()), Value::Varchar("b".into()), Value::Varchar("c".into())],
+        )
+        .expect("a vector of strings");
+        let slots = [0_usize, 1, 0];
+        for (name, returns, column) in [
+            ("count_star", LogicalType::BigInt, None),
+            ("count", LogicalType::BigInt, Some(&numbers)),
+            ("sum", LogicalType::HugeInt, Some(&numbers)),
+            ("avg", LogicalType::Double, Some(&numbers)),
+            ("min", LogicalType::Integer, Some(&numbers)),
+            ("max", LogicalType::Integer, Some(&numbers)),
+        ] {
+            fallback::reset();
+            let mut states = vec![Accumulator::new(name, &returns).expect("known"); 2];
+            update_scattered(&mut states, &slots, 1, 0, column, 3).expect("folds them in");
+            assert_eq!(
+                fallback::count(Kernel::Aggregate, Form::Flat, Form::Flat),
+                0,
+                "{name} over an integer column took the row at a time path"
+            );
+        }
+        fallback::reset();
+        let mut states = vec![Accumulator::new("min", &LogicalType::Varchar).expect("known"); 2];
+        update_scattered(&mut states, &slots, 1, 0, Some(&words), 3).expect("folds them in");
+        assert_eq!(states[0].finish().expect("finishes"), Value::Varchar("a".into()));
+        assert_eq!(fallback::count(Kernel::Aggregate, Form::Flat, Form::Flat), 1);
     }
 
     #[test]
