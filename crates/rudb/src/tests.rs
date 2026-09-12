@@ -620,6 +620,37 @@ fn a_predicate_that_is_always_true_leaves_no_filter_behind() {
     );
 }
 
+/// A limit ends up under the projection above it, so the expressions are evaluated for the rows
+/// that come out rather than for a whole chunk of rows that were going to be dropped. The rows are
+/// the same either way, which is the half of this worth asserting, and the plan is the other half.
+#[test]
+fn a_limit_ends_up_under_the_projection_and_answers_the_same_rows() {
+    let db = database();
+    let text = db.plan("SELECT x + 1 AS y FROM t LIMIT 2").unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with("Project"), "{text}");
+    assert!(lines[1].trim_start().starts_with("Limit 2 offset 0"), "{text}");
+    let wanted = vec![vec![integer(4)], vec![integer(2)]];
+    assert_eq!(rows(&db, "SELECT x + 1 AS y FROM t LIMIT 2"), wanted);
+    db.execute("SET disabled_optimizers = 'limit_pushdown'").unwrap();
+    let text = db.plan("SELECT x + 1 AS y FROM t LIMIT 2").unwrap();
+    assert!(text.lines().next().unwrap().starts_with("Limit 2 offset 0"), "{text}");
+    assert_eq!(rows(&db, "SELECT x + 1 AS y FROM t LIMIT 2"), wanted);
+}
+
+/// The pass runs before top N, so an order by with a limit is still fused rather than left as a
+/// sort with a limit that has wandered off above it.
+#[test]
+fn an_order_by_with_a_limit_is_still_one_operator_after_the_limit_has_moved() {
+    let db = database();
+    let printed = db.plan("SELECT s FROM t ORDER BY x DESC LIMIT 2").unwrap();
+    assert!(printed.contains("TopN 2 offset 0"), "{printed}");
+    assert_eq!(
+        rows(&db, "SELECT s FROM t ORDER BY x DESC LIMIT 2"),
+        vec![vec![text("a")], vec![text("c")]]
+    );
+}
+
 #[test]
 fn creating_a_table_twice_is_an_error_and_dropping_it_makes_room_again() {
     let db = Database::new();
