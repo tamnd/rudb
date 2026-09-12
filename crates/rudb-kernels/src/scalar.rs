@@ -1515,6 +1515,11 @@ pub fn call_values(
             Some(held) => Ok(Value::Boolean(!held)),
             None => Err(Error::internal(format!("not of a {}", only.logical_type()))),
         },
+        // Date arithmetic is above the numeric arithmetic because the two share a spelling, and
+        // it is the argument types that tell them apart, the same way the signature does it.
+        ("+" | "-", [left, right]) if datetime::is_shift(left, right) => {
+            datetime::shift(left, right, name == "-")
+        }
         ("+", [left, right]) => arithmetic(Op::Add, left, right, returns, written),
         ("-", [left, right]) => arithmetic(Op::Subtract, left, right, returns, written),
         ("*", [left, right]) => arithmetic(Op::Multiply, left, right, returns, written),
