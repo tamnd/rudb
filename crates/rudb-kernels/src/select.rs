@@ -59,10 +59,14 @@ pub fn selection(flags: &Vector, rows: usize) -> Selection {
 /// [`selection`] for a conjunct that is not the first one. A predicate is threaded through the
 /// comparison kernel where it can be, because [`crate::compare::refine`] reads only the rows it is
 /// given and never builds a flag vector at all, and through this where it cannot: a conjunct that is
-/// a bare boolean column, a function call or a nested `OR` produces flags over the whole chunk and
-/// then has to be intersected with what the conjuncts before it left. The second one is worth having
-/// because a predicate with one awkward conjunct in it would otherwise put every conjunct back on
-/// the unthreaded path.
+/// a bare boolean column, a function call or a nested connective produces flags over the whole chunk
+/// and then has to be intersected with what the conjuncts before it left. The second one is worth
+/// having because a predicate with one awkward conjunct in it would otherwise put every conjunct
+/// back on the unthreaded path.
+///
+/// The branches of a threaded `OR` come through here too. What `kept` holds there is the rows no
+/// branch has accepted yet rather than the rows every conjunct has kept, which is the caller's
+/// business and not this one's: either way it is the rows still worth looking at.
 ///
 /// # Errors
 ///
