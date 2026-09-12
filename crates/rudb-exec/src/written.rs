@@ -15,6 +15,7 @@
 
 use std::fmt::{self, Write};
 
+use rudb_common::Value;
 use rudb_plan::{Expr, ExprRef, Plan};
 
 use crate::schema::Schema;
@@ -39,7 +40,15 @@ fn form<W: Write>(plan: &Plan, out: &mut W, expr: ExprRef, schema: &Schema) -> f
             // rather than panicked on, because no error message is worth a panic.
             None => write!(out, "#{}.{}", binding.table, binding.column),
         },
-        Expr::Constant(value) => write!(out, "{}", plan.value(value)),
+        // An interval is the one constant that is quoted and cast rather than written plain, which
+        // is `'1 day'::INTERVAL`. It is also the only constant of its kind that can reach a
+        // message at all: every other non numeric type is folded away before the division that
+        // would name it, and dividing an interval by zero is the one division of a non number
+        // there is. Measured for #393.
+        Expr::Constant(value) => match plan.value(value) {
+            held @ Value::Interval { .. } => write!(out, "'{held}'::INTERVAL"),
+            held => write!(out, "{held}"),
+        },
         Expr::Cast { input, try_cast } => {
             out.write_str(if try_cast { "TRY_CAST(" } else { "CAST(" })?;
             form(plan, out, input, schema)?;

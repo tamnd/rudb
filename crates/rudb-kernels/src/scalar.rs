@@ -834,7 +834,7 @@ where
                         if y == 0 {
                             return Err(divided_by_zero(
                                 written,
-                                op,
+                                op.symbol(),
                                 &left.value_at(index),
                                 &right.value_at(index),
                             ));
@@ -876,7 +876,7 @@ where
                     if y == 0.0 && matches!(op, Op::Divide) {
                         return Err(divided_by_zero(
                             written,
-                            op,
+                            op.symbol(),
                             &left.value_at(index),
                             &right.value_at(index),
                         ));
@@ -959,7 +959,7 @@ where
                         if guarding && y == 0 {
                             return Err(divided_by_zero(
                                 written,
-                                op,
+                                op.symbol(),
                                 &left.value_at(index),
                                 &right.value_at(index),
                             ));
@@ -1509,6 +1509,7 @@ pub fn call_values(
     }
     match (name, args) {
         ("+", [only]) => Ok(only.clone()),
+        ("-", [only @ Value::Interval { .. }]) => datetime::negated(only),
         ("-", [only]) => negate(only, returns),
         ("abs", [only]) => absolute(only, returns),
         ("not", [only]) => match only.as_bool() {
@@ -1519,6 +1520,21 @@ pub fn call_values(
         // it is the argument types that tell them apart, the same way the signature does it.
         ("+" | "-", [left, right]) if datetime::is_shift(left, right) => {
             datetime::shift(left, right, name == "-")
+        }
+        ("+" | "-", [left @ Value::Interval { .. }, right @ Value::Interval { .. }]) => {
+            datetime::combine(left, right, name == "-")
+        }
+        // The zero divisor is caught here rather than inside the scaling, because this is where
+        // the written expression is and the sentence names the expression rather than the values.
+        ("/", [left, right])
+            if datetime::is_scale(left, right) && approximate(right) == Some(0.0) =>
+        {
+            // The symbol is a single slash and not [`Op::Divide`]'s double one, since this is
+            // the one division by zero `/` reports rather than answering an infinity.
+            Err(divided_by_zero(written, "/", left, right))
+        }
+        ("*" | "/", [left, right]) if datetime::is_scale(left, right) => {
+            datetime::scaled(left, right, name == "/")
         }
         ("+", [left, right]) => arithmetic(Op::Add, left, right, returns, written),
         ("-", [left, right]) => arithmetic(Op::Subtract, left, right, returns, written),
@@ -1572,8 +1588,9 @@ pub fn call_values(
 
 /// Which arithmetic, kept separate from the spelling so that the overflow message can name it the
 /// way DuckDB names it.
+///
 #[derive(Debug, Clone, Copy)]
-enum Op {
+pub(crate) enum Op {
     Add,
     Subtract,
     Multiply,
@@ -1611,7 +1628,7 @@ impl Op {
 /// and a decimal multiplication ends on a hint instead of punctuation. All of it was measured
 /// against the pinned binary, and every arithmetic message in the engine comes through here so
 /// there is one place to keep it right.
-fn overflow(op: Op, ty: &LogicalType, left: &Value, right: &Value) -> Error {
+pub(crate) fn overflow(op: Op, ty: &LogicalType, left: &Value, right: &Value) -> Error {
     let decimal = matches!(ty, LogicalType::Decimal { .. });
     let (left, right) = if decimal {
         (unscaled(left), unscaled(right))
@@ -1634,9 +1651,8 @@ fn overflow(op: Op, ty: &LogicalType, left: &Value, right: &Value) -> Error {
 /// IEEE answer is a nan. The sentence names the expression rather than the numbers, so a caller with
 /// the plan hands one down and a caller without one quotes the two values, which is the same text
 /// whenever the expression was folded to a pair of constants.
-fn divided_by_zero(written: Written<'_>, op: Op, left: &Value, right: &Value) -> Error {
-    let quoted =
-        written.map_or_else(|| format!("({left} {} {right})", op.symbol()), |render| render());
+fn divided_by_zero(written: Written<'_>, symbol: &str, left: &Value, right: &Value) -> Error {
+    let quoted = written.map_or_else(|| format!("({left} {symbol} {right})"), |render| render());
     Error::invalid_input(format!(
         "Division by zero in expression {quoted}. Use TRY(...) to return NULL for this expression, \
          or SET null_on_division_by_zero=true to return NULL for all divisions by zero."
@@ -1656,7 +1672,7 @@ fn abs_overflow(value: &Value) -> Error {
 /// both are a value nothing can widen: a column, where the constant folder has no value to look at
 /// until the loop is already running, and a `HUGEINT`, where there is no wider signed type to move
 /// to. Per #264.
-fn negation_overflow() -> Error {
+pub(crate) fn negation_overflow() -> Error {
     Error::out_of_range("Overflow in negation of numeric value!")
 }
 
@@ -1725,7 +1741,7 @@ fn integer_arithmetic(
         }
     };
     if matches!(op, Op::Divide | Op::Modulo) && b == 0 {
-        return Err(divided_by_zero(written, op, left, right));
+        return Err(divided_by_zero(written, op.symbol(), left, right));
     }
     let wide = match op {
         Op::Add => a.checked_add(b),
@@ -1758,7 +1774,7 @@ fn float_arithmetic(
     // `//` raises on a zero divisor whatever it was given and `%` does not, so a float remainder
     // by zero is the IEEE answer and a float `//` by zero is the error. Measured both ways.
     if matches!(op, Op::Divide) && b == 0.0 {
-        return Err(divided_by_zero(written, op, left, right));
+        return Err(divided_by_zero(written, op.symbol(), left, right));
     }
     let result = float_step(op, a, b);
     if matches!(ty, LogicalType::Float) {
@@ -1795,7 +1811,7 @@ fn decimal_arithmetic(
         }
     };
     if matches!(op, Op::Divide | Op::Modulo) && b == 0 {
-        return Err(divided_by_zero(written, op, left, right));
+        return Err(divided_by_zero(written, op.symbol(), left, right));
     }
     let unscaled = match op {
         Op::Add => a.checked_add(b),

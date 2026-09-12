@@ -21,7 +21,10 @@
 //! What is missing is `timezone`, `timezone_hour` and `timezone_minute`, which need a session time
 //! zone before they mean anything, and the interval overloads of both functions.
 
-use rudb_common::{Error, Result, Value, civil_from_days, days_from_civil};
+use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
+
+use crate::cast;
+use crate::scalar::{Op, negation_overflow, overflow};
 
 /// Microseconds in a day, which is the conversion between the two representations here.
 pub(crate) const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
@@ -542,6 +545,193 @@ fn not_in_range() -> Error {
     Error::conversion("Date and time not in timestamp range")
 }
 
+/// Two intervals added or taken apart, which is field by field and not by length.
+///
+/// The order over intervals says a month is thirty days, but the arithmetic does not, because the
+/// three fields mean different things once a date is involved. `INTERVAL '1 month' + INTERVAL '30
+/// days'` is one month and thirty days and not two months.
+///
+/// The two directions fail differently, which was measured rather than assumed. Addition reports
+/// the plain integer overflow, naming the physical type and the two counts, and subtraction has a
+/// sentence of its own that names the field instead.
+pub(crate) fn combine(left: &Value, right: &Value, subtract: bool) -> Result<Value> {
+    let (
+        Value::Interval { months: a_months, days: a_days, micros: a_micros },
+        Value::Interval { months: b_months, days: b_days, micros: b_micros },
+    ) = (left, right)
+    else {
+        return Err(Error::internal(format!("{left} and {right} are not two intervals")));
+    };
+    if subtract {
+        return Ok(Value::Interval {
+            months: a_months.checked_sub(*b_months).ok_or_else(|| short("months"))?,
+            days: a_days.checked_sub(*b_days).ok_or_else(|| short("days"))?,
+            micros: a_micros.checked_sub(*b_micros).ok_or_else(|| short("micros"))?,
+        });
+    }
+    let whole = |a: i32, b: i32| {
+        a.checked_add(b).ok_or_else(|| {
+            overflow(Op::Add, &LogicalType::Integer, &Value::Integer(a), &Value::Integer(b))
+        })
+    };
+    Ok(Value::Interval {
+        months: whole(*a_months, *b_months)?,
+        days: whole(*a_days, *b_days)?,
+        micros: a_micros.checked_add(*b_micros).ok_or_else(|| {
+            overflow(
+                Op::Add,
+                &LogicalType::BigInt,
+                &Value::BigInt(*a_micros),
+                &Value::BigInt(*b_micros),
+            )
+        })?,
+    })
+}
+
+/// An interval with a minus in front of it, which negates all three fields.
+pub(crate) fn negated(value: &Value) -> Result<Value> {
+    let Value::Interval { months, days, micros } = value else {
+        return Err(Error::internal(format!("{value} is not an interval")));
+    };
+    Ok(Value::Interval {
+        months: months.checked_neg().ok_or_else(negation_overflow)?,
+        days: days.checked_neg().ok_or_else(negation_overflow)?,
+        micros: micros.checked_neg().ok_or_else(negation_overflow)?,
+    })
+}
+
+/// Whether a pair of values is an interval being scaled by a number.
+///
+/// The number is a whole one or a double and nothing else, because those are the two the signature
+/// casts to, and which of the two it is decides which arithmetic happens.
+pub(crate) fn is_scale(left: &Value, right: &Value) -> bool {
+    let interval = |value: &Value| matches!(value, Value::Interval { .. });
+    let number = |value: &Value| matches!(value, Value::BigInt(_) | Value::Double(_));
+    (interval(left) && number(right)) || (number(left) && interval(right))
+}
+
+/// An interval times a number or divided by one.
+///
+/// There are two multiplications and one division. A whole number multiplies the three fields as
+/// they are and nothing moves between them, so `INTERVAL '1 month' * 3` is three months. A number
+/// with a point in it goes through [`spread`], and dividing always does, which is why
+/// `INTERVAL '1 month' / 3` is ten days rather than nothing at all.
+///
+/// # Errors
+///
+/// If a field does not fit what holds it, in one of the three sentences upstream has for it.
+pub(crate) fn scaled(left: &Value, right: &Value, divide: bool) -> Result<Value> {
+    let (months, days, micros, factor) = match (left, right) {
+        (Value::Interval { months, days, micros }, factor)
+        | (factor, Value::Interval { months, days, micros }) => (*months, *days, *micros, factor),
+        _ => return Err(Error::internal(format!("{left} and {right} are not a scale"))),
+    };
+    match factor {
+        Value::BigInt(count) => whole(months, days, micros, *count),
+        Value::Double(factor) => spread(months, days, micros, *factor, divide),
+        other => Err(Error::internal(format!("{other} does not scale an interval"))),
+    }
+}
+
+/// An interval times a whole number, which is three multiplications and no arithmetic between them.
+///
+/// The count arrives as a `BIGINT` because that is what the overload takes, and the first thing
+/// upstream does with it is narrow it to the width a month count is held in, so a factor of ten
+/// billion is a cast failure and not an overflow.
+fn whole(months: i32, days: i32, micros: i64, count: i64) -> Result<Value> {
+    let count = cast::narrow(count)?;
+    let field = |value: i32| {
+        value.checked_mul(count).ok_or_else(|| {
+            overflow(
+                Op::Multiply,
+                &LogicalType::Integer,
+                &Value::Integer(value),
+                &Value::Integer(count),
+            )
+        })
+    };
+    Ok(Value::Interval {
+        months: field(months)?,
+        days: field(days)?,
+        micros: micros.checked_mul(i64::from(count)).ok_or_else(|| {
+            overflow(
+                Op::Multiply,
+                &LogicalType::BigInt,
+                &Value::BigInt(micros),
+                &Value::BigInt(i64::from(count)),
+            )
+        })?,
+    })
+}
+
+/// An interval scaled by a double, where what is left over on a field moves down to the next one.
+///
+/// The lengths the leftovers move at are the ones the order over intervals uses, thirty days to a
+/// month and twenty four hours to a day, so half of a month is fifteen days and a third of a day is
+/// eight hours. Neither is a calendar answer and both are upstream's.
+///
+/// The month leftover is the one piece of this that is not plain arithmetic. Upstream turns it into
+/// a whole number of millionths of a day before it becomes microseconds, so `INTERVAL '1 month' / 7`
+/// is `4 days 06:51:25.6896` and not the `06:51:25.714286` the exact division would give. The day
+/// leftover has no such step, which is why `INTERVAL '3 days' / 7` does end in `.571429`. It reads
+/// like a mistake upstream, and it is copied here on purpose, because a query that answers one way
+/// on one engine and another way on the other is the bug we are paid to not have.
+///
+/// The microseconds round half to even at the end, so half a microsecond is none and two and a half
+/// are two.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "upstream scales in a double as well, so the same digits go missing on both engines"
+)]
+fn spread(months: i32, days: i32, micros: i64, factor: f64, divide: bool) -> Result<Value> {
+    let apply = |field: f64| if divide { field / factor } else { field * factor };
+    let months = apply(f64::from(months));
+    let days = apply(f64::from(days));
+    let micros = apply(micros as f64);
+    let millionths = (months.fract() * 30.0 * 1e6).round_ties_even();
+    let day = MICROS_PER_DAY as f64;
+    let spilled = millionths * (day / 1e6) + days.fract() * day;
+    let carried = (spilled / day).trunc();
+    Ok(Value::Interval {
+        months: field(months.trunc(), divide)?,
+        days: field(days.trunc() + carried, divide)?,
+        micros: moment(micros + spilled - carried * day, divide)?,
+    })
+}
+
+/// The sentence for a subtraction that leaves a field with no room, which names the field.
+fn short(field: &str) -> Error {
+    Error::out_of_range(format!("Interval {field} subtraction out of range"))
+}
+
+/// A whole double back into a month or a day count.
+#[expect(clippy::cast_possible_truncation, reason = "the range is checked before the cast")]
+fn field(value: f64, divide: bool) -> Result<i32> {
+    if value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX) {
+        Ok(value as i32)
+    } else {
+        Err(too_big(divide))
+    }
+}
+
+/// The same for the microseconds, where the top of the range is written out because `i64::MAX` as a
+/// double is the power of two above it and a cast at that value saturates rather than failing.
+#[expect(clippy::cast_possible_truncation, reason = "the range is checked before the cast")]
+fn moment(value: f64, divide: bool) -> Result<i64> {
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    let value = value.round_ties_even();
+    if (-LIMIT..LIMIT).contains(&value) { Ok(value as i64) } else { Err(too_big(divide)) }
+}
+
+/// One sentence each for the two operators, and the punctuation on the end of them is upstream's.
+fn too_big(divide: bool) -> Error {
+    if divide {
+        Error::out_of_range("Overflow in INTERVAL division")
+    } else {
+        Error::out_of_range("Overflow in multiplication of INTERVAL.")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +759,20 @@ mod tests {
 
     fn every(months: i32, days: i32, micros: i64) -> Value {
         Value::Interval { months, days, micros }
+    }
+
+    fn half() -> Value {
+        Value::Double(0.5)
+    }
+
+    /// What two intervals added or taken apart print as.
+    fn added(left: &Value, right: &Value, subtract: bool) -> String {
+        combine(left, right, subtract).expect("the fields have room").to_string()
+    }
+
+    /// What a scaled interval prints as.
+    fn times(interval: &Value, factor: &Value, divide: bool) -> String {
+        scaled(interval, factor, divide).expect("the fields have room").to_string()
     }
 
     /// What the shift prints, which is what the statement it came from prints.
@@ -667,6 +871,168 @@ mod tests {
         let error = shift(&far, &every(0, 1, 0), false).expect_err("no such moment");
         assert_eq!(error.to_string(), "Conversion Error: Date and time not in timestamp range");
         assert_eq!(shown(&day(294_247, 1, 9), &every(0, 1, 0), false), "294247-01-10 00:00:00");
+    }
+
+    /// Two intervals keep their three fields apart, whatever the order over them says.
+    #[test]
+    fn two_intervals_add_and_subtract_one_field_at_a_time() {
+        assert_eq!(added(&every(1, 0, 0), &every(0, 30, 0), false), "1 month 30 days");
+        let left = every(1, 2, 3 * MICROS_PER_HOUR);
+        let right = every(2, 1, MICROS_PER_HOUR);
+        assert_eq!(added(&left, &right, true), "-1 month 1 day 02:00:00");
+        assert_eq!(added(&left, &right, false), "3 months 3 days 04:00:00");
+    }
+
+    /// The two directions run out of room differently, which is upstream's doing and not ours.
+    #[test]
+    fn adding_reports_the_field_it_filled_and_subtracting_names_it() {
+        let one = every(1, 1, 1);
+        let full = every(i32::MAX, i32::MAX, i64::MAX);
+        let error = combine(&full, &one, false).expect_err("no room for another month");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Overflow in addition of INT32 (2147483647 + 1)!"
+        );
+        let error =
+            combine(&every(0, i32::MAX, 0), &one, false).expect_err("no room for another day");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Overflow in addition of INT32 (2147483647 + 1)!"
+        );
+        let error = combine(&every(0, 0, i64::MAX), &one, false).expect_err("no room for another");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Overflow in addition of INT64 (9223372036854775807 + 1)!"
+        );
+        let empty = every(i32::MIN, i32::MIN, i64::MIN);
+        let error = combine(&empty, &one, true).expect_err("no room below");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Interval months subtraction out of range"
+        );
+        let error = combine(&every(0, i32::MIN, 0), &one, true).expect_err("no room below");
+        assert_eq!(error.to_string(), "Out of Range Error: Interval days subtraction out of range");
+        let error = combine(&every(0, 0, i64::MIN), &one, true).expect_err("no room below");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Interval micros subtraction out of range"
+        );
+    }
+
+    /// A minus in front of an interval turns all three fields around.
+    #[test]
+    fn an_interval_negates_every_field_it_has() {
+        let held = negated(&every(1, 2, 3 * MICROS_PER_HOUR)).expect("room to turn around");
+        assert_eq!(held.to_string(), "-1 month -2 days -03:00:00");
+        let error = negated(&every(i32::MIN, 0, 0)).expect_err("nothing to turn it into");
+        assert_eq!(error.to_string(), "Out of Range Error: Overflow in negation of numeric value!");
+    }
+
+    /// A whole number multiplies the three fields where they are, so nothing moves between them.
+    #[test]
+    fn a_count_multiplies_each_field_where_it_stands() {
+        assert_eq!(times(&every(1, 0, 0), &Value::BigInt(3), false), "3 months");
+        assert_eq!(
+            times(&every(1, 1, 1), &Value::BigInt(2), false),
+            "2 months 2 days 00:00:00.000002"
+        );
+        assert_eq!(times(&every(0, 0, 25 * MICROS_PER_HOUR), &Value::BigInt(2), false), "50:00:00");
+        assert_eq!(times(&every(1, 0, 0), &Value::BigInt(0), false), "00:00:00");
+        assert_eq!(times(&every(1, 0, 0), &Value::BigInt(-1), false), "-1 month");
+    }
+
+    /// The count is narrowed before anything is multiplied, so a huge one is a cast failure.
+    #[test]
+    fn a_count_that_does_not_fit_a_month_count_fails_as_a_cast() {
+        let error = scaled(&every(1, 0, 0), &Value::BigInt(10_000_000_000), false)
+            .expect_err("no room in a month count");
+        assert_eq!(
+            error.to_string(),
+            "Invalid Input Error: Type INT64 with value 10000000000 can't be cast because the value is out of range for the destination type INT32"
+        );
+        let error = scaled(&every(i32::MAX, 0, 0), &Value::BigInt(2), false).expect_err("too many");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Overflow in multiplication of INT32 (2147483647 * 2)!"
+        );
+        let error = scaled(&every(0, 0, i64::MAX), &Value::BigInt(2), false).expect_err("too many");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Overflow in multiplication of INT64 (9223372036854775807 * 2)!"
+        );
+    }
+
+    /// Every row here is a statement that was run against the pinned binary for #393.
+    ///
+    /// The leftovers are what this is about. A month leftover is thirty days and a day leftover is
+    /// twenty four hours, and the month one goes through a whole number of millionths of a day on
+    /// the way, which is why a month in seven parts ends in `.6896` and three days in seven parts
+    /// ends in `.571429`.
+    #[test]
+    fn a_number_with_a_point_in_it_moves_the_leftovers_down() {
+        let month = every(1, 0, 0);
+        assert_eq!(times(&month, &half(), false), "15 days");
+        assert_eq!(times(&month, &Value::Double(7.0), true), "4 days 06:51:25.6896");
+        assert_eq!(times(&month, &Value::Double(3.0), true), "10 days");
+        assert_eq!(
+            times(&every(1200, 0, 0), &Value::Double(7.0), true),
+            "14 years 3 months 12 days 20:34:17.1552"
+        );
+        assert_eq!(times(&every(1, 1, 0), &Value::Double(7.0), true), "4 days 10:17:08.546743");
+        assert_eq!(times(&every(-1, 1, 0), &Value::Double(7.0), true), "-4 days -03:25:42.832457");
+        assert_eq!(times(&every(0, 3, 0), &Value::Double(7.0), true), "10:17:08.571429");
+        assert_eq!(times(&every(1, 1, 0), &Value::Double(0.75), false), "23 days 06:00:00");
+        let day_and_a_bit = every(0, 1, 30 * MICROS_PER_HOUR);
+        assert_eq!(times(&day_and_a_bit, &half(), false), "27:00:00");
+        let three_quarters = every(1, 1, 12 * MICROS_PER_HOUR);
+        assert_eq!(times(&three_quarters, &Value::Double(0.75), false), "23 days 15:00:00");
+        assert_eq!(
+            times(&every(0, 0, 25 * MICROS_PER_HOUR), &Value::Double(1.5), false),
+            "37:30:00"
+        );
+        let all_of_it = every(13, 1, MICROS_PER_HOUR + MICROS_PER_SECOND);
+        assert_eq!(
+            times(&all_of_it, &Value::Double(1.5), false),
+            "1 year 7 months 16 days 13:30:01.5"
+        );
+    }
+
+    /// The microseconds round half to even at the end, so a half of one is none of one.
+    #[test]
+    fn the_microseconds_round_half_to_even() {
+        assert_eq!(times(&every(0, 0, 1), &half(), false), "00:00:00");
+        assert_eq!(times(&every(0, 0, 3), &half(), false), "00:00:00.000002");
+        assert_eq!(times(&every(0, 0, 5), &Value::Double(-0.5), false), "-00:00:00.000002");
+        assert_eq!(times(&every(0, 0, 1), &Value::Double(2.5), false), "00:00:00.000002");
+    }
+
+    /// One sentence for a multiplication that does not fit and another for a division that does not.
+    #[test]
+    fn a_scaled_interval_that_does_not_fit_says_which_operator_it_was() {
+        let full = every(i32::MAX, 0, 0);
+        let error = scaled(&full, &Value::Double(2.0), false).expect_err("too many months");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Overflow in multiplication of INTERVAL."
+        );
+        let error = scaled(&full, &half(), true).expect_err("too many months");
+        assert_eq!(error.to_string(), "Out of Range Error: Overflow in INTERVAL division");
+        let day = every(0, 1, 0);
+        let error = scaled(&day, &Value::Double(f64::NAN), false).expect_err("no such interval");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Overflow in multiplication of INTERVAL."
+        );
+        let error = scaled(&day, &Value::Double(f64::NAN), true).expect_err("no such interval");
+        assert_eq!(error.to_string(), "Out of Range Error: Overflow in INTERVAL division");
+        let error = scaled(&day, &Value::Double(f64::INFINITY), false).expect_err("no such one");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Overflow in multiplication of INTERVAL."
+        );
+        // Dividing by an infinity is nothing at all rather than a failure, since every field lands
+        // on zero and zero fits.
+        assert_eq!(times(&day, &Value::Double(f64::INFINITY), true), "00:00:00");
     }
 
     /// The two ends of the timestamp range, which are not the two ends of the `i64` that holds it.
