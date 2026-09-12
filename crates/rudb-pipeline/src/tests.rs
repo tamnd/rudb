@@ -77,6 +77,46 @@ impl Stream for Evens {
     }
 }
 
+/// Hands every chunk it is given on `copies` times, which is the smallest operator whose one input
+/// chunk is several output chunks. A cross product is this with the other side of the join in it.
+#[derive(Debug)]
+struct Repeating {
+    copies: usize,
+}
+
+/// The chunk a [`Repeating`] is in the middle of, and how many copies of it are left.
+#[derive(Debug, Default)]
+struct Repeat {
+    held: Option<Chunk>,
+    left: usize,
+}
+
+impl Stream for Repeating {
+    type Local = Repeat;
+
+    fn local(&self) -> Repeat {
+        Repeat::default()
+    }
+
+    fn push(&self, chunk: &mut Chunk, local: &mut Repeat) -> rudb_common::Result<Progress> {
+        let held = match local.held.take() {
+            // Being asked again, so what is in the chunk is whatever was downstream of it.
+            Some(held) => held,
+            None => {
+                local.left = self.copies;
+                chunk.clone()
+            }
+        };
+        local.left -= 1;
+        *chunk = held.clone();
+        if local.left == 0 {
+            return Ok(Progress::More);
+        }
+        local.held = Some(held);
+        Ok(Progress::Again)
+    }
+}
+
 /// Stops the pipeline once it has seen `limit` rows go past.
 #[derive(Debug)]
 struct StopAfter {
@@ -199,6 +239,34 @@ fn streams_run_in_the_order_they_were_added() {
     run_serial(&built, &Cancel::new()).unwrap();
 
     assert_eq!(*sink.global.lock().unwrap(), 30);
+}
+
+#[test]
+fn a_stream_with_more_output_than_input_is_asked_again_for_the_same_chunk() {
+    let source = Arc::new(Counting::new((1..=10).collect(), 10, 10));
+    let sink = Arc::new(Total::default());
+    let built =
+        pipeline(source, Arc::clone(&sink)).then(Arc::new(Repeating { copies: 3 }) as Arc<_>);
+
+    run_serial(&built, &Cancel::new()).unwrap();
+
+    assert_eq!(*sink.global.lock().unwrap(), 165);
+}
+
+/// Two of them stacked, which is what makes the resume an order rather than a flag. The one nearest
+/// the sink finishes its copies before the one below it produces its next one, and the total only
+/// comes out right if every copy of every copy reaches the sink exactly once.
+#[test]
+fn two_stacked_streams_that_both_ask_again_each_get_their_turn() {
+    let source = Arc::new(Counting::new((1..=10).collect(), 10, 10));
+    let sink = Arc::new(Total::default());
+    let built = pipeline(source, Arc::clone(&sink))
+        .then(Arc::new(Repeating { copies: 2 }) as Arc<dyn DynStream>)
+        .then(Arc::new(Repeating { copies: 3 }) as Arc<dyn DynStream>);
+
+    run_serial(&built, &Cancel::new()).unwrap();
+
+    assert_eq!(*sink.global.lock().unwrap(), 330);
 }
 
 #[test]

@@ -27,11 +27,12 @@
 //! # The move to push
 //!
 //! The interface every operator ends up behind is in `rudb-pipeline`, and they are moving to it one
-//! at a time rather than in one commit. The filter, the projection and the limit are
-//! [`Stream`](rudb_pipeline::Stream) implementations, and the sort, the top N, the distinct, the set
-//! operations and the aggregate are [`Sink`](rudb_pipeline::Sink) implementations. All of them take
-//! `&self` and are handed the mutable part separately, so one of them can be instantiated on as many
-//! threads as F4 wants without copying its predicate or its key list.
+//! at a time rather than in one commit. The filter, the projection, the limit and the cross product
+//! are [`Stream`](rudb_pipeline::Stream) implementations, and the sort, the top N, the distinct, the
+//! set operations, the aggregate and the join are [`Sink`](rudb_pipeline::Sink) implementations. All
+//! of them take `&self` and are handed the mutable part separately, so one of them can be
+//! instantiated on as many threads as F4 wants without copying its predicate or its key list. What
+//! is left pulling is the leaf sources.
 //!
 //! Being in the shape is not the same as being parallel. The aggregate holds its hash table in the
 //! instance, which is where it has to be, and merging two of those tables needs a serialize and a
@@ -45,11 +46,11 @@
 //! them through a handle. That edge is the one the scheduler will read off the plan, and for the
 //! join it is where the hash table goes when #62 replaces the nested loop.
 //!
-//! The cross product is the one operator that has not moved, and the reason is in its
-//! documentation: one input chunk becomes many output chunks, a [`Stream`](rudb_pipeline::Stream)
-//! turns one chunk into one chunk, and a [`Sink`](rudb_pipeline::Sink) would have to hold a million
-//! rows it is written to avoid holding. That needs a way for an operator to tell the driver it has
-//! more output for the input it already has, which is a change to `rudb-pipeline`.
+//! The cross product sits on that edge too, and it is the operator that made `rudb-pipeline` grow a
+//! [`Progress::Again`](rudb_pipeline::Progress::Again). One of its input chunks becomes as many
+//! output chunks as its right side has, which a stream could not say and a sink could only answer by
+//! holding the whole product. Its right side is kept as chunks rather than rows, by the other sink
+//! in `gather`, because it replays them as they stand.
 //!
 //! A sink finalises into a `buffer::Buffered`, which is a separate source that reads the finished
 //! chunks back out, rather than handing them back from `finalize`. That split is what makes the

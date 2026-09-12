@@ -27,6 +27,9 @@ pub(crate) struct Streamed<'a, S: Stream> {
     local: S::Local,
     schema: Schema,
     done: bool,
+    /// Whether the stream has more output for the chunk it already has, which is what a cross
+    /// product says once per right chunk.
+    again: bool,
 }
 
 impl<'a, S: Stream> Streamed<'a, S> {
@@ -34,7 +37,7 @@ impl<'a, S: Stream> Streamed<'a, S> {
     /// for a projection is its own.
     pub(crate) fn new(input: Box<dyn Operator + 'a>, stream: S, schema: Schema) -> Self {
         let local = stream.local();
-        Self { input, stream, local, schema, done: false }
+        Self { input, stream, local, schema, done: false, again: false }
     }
 }
 
@@ -54,9 +57,18 @@ impl<S: Stream> Operator for Streamed<'_, S> {
 
     fn next(&mut self) -> Result<Option<Chunk>> {
         while !self.done {
-            let Some(mut chunk) = self.input.next()? else { break };
+            // An operator that asked to be called again is holding its own input, and the contract
+            // says it overwrites whatever it is handed, so there is nothing to pull for it.
+            let mut chunk = if self.again {
+                Chunk::empty(&[])
+            } else {
+                let Some(chunk) = self.input.next()? else { break };
+                chunk
+            };
+            self.again = false;
             match self.stream.push(&mut chunk, &mut self.local)? {
                 Progress::Done => self.done = true,
+                Progress::Again => self.again = true,
                 Progress::Blocked(blocked) => return Err(parked(&blocked)),
                 // `Progress` is non exhaustive, and anything added to it later is something this
                 // adapter has no idea what to do with, so it is treated as ordinary progress. The
@@ -71,6 +83,50 @@ impl<S: Stream> Operator for Streamed<'_, S> {
             }
         }
         Ok(None)
+    }
+}
+
+/// One streaming operator that cannot start until another pipeline has finished.
+///
+/// A cross product streams its left side and replays its right side, so the right side has to be in
+/// hand before the first left chunk arrives. That is the same dependency edge [`Paired`] runs, with
+/// a stream on the near end of it rather than a sink, so this runs the pipeline it depends on first
+/// and then gets out of the way.
+pub(crate) struct Fed<'a, F: Sink, S: Stream> {
+    first: Box<dyn Operator + 'a>,
+    aside: F,
+    then: Streamed<'a, S>,
+    built: bool,
+}
+
+impl<'a, F: Sink, S: Stream> Fed<'a, F, S> {
+    /// `first` and `aside` are the side that has to be finished first, and `then` is the stream with
+    /// the rest of the tree under it.
+    pub(crate) fn new(first: Box<dyn Operator + 'a>, aside: F, then: Streamed<'a, S>) -> Self {
+        Self { first, aside, then, built: false }
+    }
+}
+
+impl<F: Sink, S: Stream> fmt::Debug for Fed<'_, F, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fed")
+            .field("aside", &self.aside)
+            .field("then", &self.then)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: Sink, S: Stream> Operator for Fed<'_, F, S> {
+    fn schema(&self) -> &Schema {
+        self.then.schema()
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        if !self.built {
+            drain(self.first.as_mut(), &self.aside)?;
+            self.built = true;
+        }
+        self.then.next()
     }
 }
 

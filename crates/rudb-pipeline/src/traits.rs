@@ -62,6 +62,13 @@ pub trait Stream: Send + Sync + fmt::Debug {
     /// `LIMIT` stops a scan rather than reading rows in order to discard them. The chunk it
     /// returns `Done` with is still delivered.
     ///
+    /// [`Progress::Again`] means the opposite end of the same idea: there is more output in the
+    /// input this operator was already given, so it should be called again once the chunk it just
+    /// produced has been through everything below it. That is what a cross product needs, and it is
+    /// the reason it is not written as a sink that holds the whole product. An operator that says so
+    /// keeps whatever it still needs itself, because the chunk it is handed on the next call holds
+    /// whatever the operators below it left in it.
+    ///
     /// # Errors
     ///
     /// Whatever an expression, a cast or a kernel reports.

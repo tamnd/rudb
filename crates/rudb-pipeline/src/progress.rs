@@ -14,6 +14,18 @@ use std::fmt;
 pub enum Progress {
     /// Did work, call again.
     More,
+    /// Did work, and there is more output in the input this operator already has.
+    ///
+    /// Only a [`Stream`](crate::Stream) says this, and only an operator whose one input chunk
+    /// becomes several output chunks: a cross product, an unnest, a window that pads its frame. The
+    /// alternative is holding the whole product, and a thousand rows against a thousand is a million
+    /// rows nobody asked to have in memory at once.
+    ///
+    /// The driver hands the chunk it was given on, and then calls the same operator again. What is
+    /// in the chunk on that second call is whatever the operators below left in it, so an operator
+    /// that says this has to be holding everything it still needs and has to overwrite the chunk
+    /// rather than read it.
+    Again,
     /// Did work, and that is the end of this unit.
     Done,
     /// Could not proceed. The scheduler parks the task and runs another.
