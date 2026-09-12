@@ -45,6 +45,9 @@ pub fn bind_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters) -> Resul
     let query = match ast.statements.as_slice() {
         [ast::Statement::Query(query)] => *query,
         [] => return Err(Error::binder("no statement to bind")),
+        // One statement that is not a query is its own answer. Reporting it as a script of several
+        // reads as a count being wrong, and the count is right.
+        [_] => return Err(Error::not_implemented("a statement that is not a query")),
         _ => return Err(Error::not_implemented("a script of more than one statement")),
     };
     let mut binder = Binder::with(catalog, parameters);

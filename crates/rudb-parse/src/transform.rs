@@ -289,8 +289,37 @@ impl<'a> Transform<'a> {
             "InsertStatement" => self.insert_statement(inner),
             "SetStatement" => self.set_statement(inner),
             "ResetStatement" => self.reset_statement(inner),
+            "ExplainStatement" => self.explain_statement(inner),
             _ => self.unsupported(inner),
         }
+    }
+
+    /// `ExplainStatement <- 'EXPLAIN' AnalyzeKeyword? ExplainOptionList? ExplainableStatements`.
+    ///
+    /// Of the twenty one explainable statements, the one that is done is the query. The other
+    /// twenty either do not exist here yet or have nothing to show: a plan is what `EXPLAIN`
+    /// prints, and a `SET` has no plan. An `INSERT` has a plan for its source and showing that
+    /// would answer a question nobody asked, since the source is not what the statement does.
+    ///
+    /// `ANALYZE` and the option list are refusals. `EXPLAIN ANALYZE` is per operator timing over a
+    /// query that actually ran, which needs the instrumentation `spec/engine/10-scheduler.md`
+    /// section 10.7 specifies, and answering it with a plan and no timings would be answering a
+    /// different question quietly.
+    fn explain_statement(&mut self, node: u32) -> Result<Statement> {
+        let analyze = self.find(node, "AnalyzeKeyword");
+        if analyze != NONE {
+            return self.unsupported(analyze);
+        }
+        let options = self.find(node, "ExplainOptionList");
+        if options != NONE {
+            return self.unsupported(options);
+        }
+        let inner = self.first(self.find(node, "ExplainableStatements"));
+        if self.name(inner) != "ExplainSelectStatement" {
+            return self.unsupported(inner);
+        }
+        let query = self.query(self.find(inner, "SelectStatementInternal"))?;
+        Ok(Statement::Explain(query))
     }
 
     /// `SetStatement <- 'SET' SetAssignmentOrTimeZone`.
@@ -2878,6 +2907,31 @@ mod tests {
                 };
                 format!("RESET{scope} {}", ast.string(setting.name))
             }
+            Statement::Explain(index) => format!("EXPLAIN {}", show_query(&ast, index)),
+        }
+    }
+
+    #[test]
+    fn an_explain_keeps_the_query_it_was_asked_about() {
+        assert_eq!(
+            round_statement("EXPLAIN SELECT a FROM t WHERE a > 1"),
+            "EXPLAIN SELECT a FROM t WHERE (a Gt 1)"
+        );
+        assert_eq!(round_statement("explain select 1"), "EXPLAIN SELECT 1");
+    }
+
+    #[test]
+    fn the_parts_of_an_explain_that_are_not_the_query_are_refused_by_name() {
+        // A plan with no timings on it is an answer to a different question, and an option list
+        // that chooses a format is a promise about the output this does not keep.
+        for (query, named) in [
+            ("EXPLAIN ANALYZE SELECT 1", "AnalyzeKeyword"),
+            ("EXPLAIN (FORMAT JSON) SELECT 1", "ExplainOptionList"),
+            ("EXPLAIN INSERT INTO t VALUES (1)", "InsertStatement"),
+            ("EXPLAIN CREATE TABLE u (a INTEGER)", "CreateStatement"),
+        ] {
+            let error = parse_ast(query).expect_err(query).to_string();
+            assert!(error.contains(named), "{query}: {error}");
         }
     }
 

@@ -41,6 +41,13 @@ pub enum Bound {
     Insert(Insert),
     /// `SET name = value`, or `RESET name`, which is the same thing with no value.
     Setting(Setting),
+    /// `EXPLAIN` over a query, holding the plan of the query rather than the query.
+    ///
+    /// The same `Plan` a [`Bound::Query`] would have carried, bound the same way and by the same
+    /// code. What makes it an explain is that the layer above optimizes it and prints it instead
+    /// of running it, which is the point: a plan that was built differently because somebody asked
+    /// to see it is not the plan that runs.
+    Explain(Plan),
 }
 
 /// A bound `SET` or `RESET`.
@@ -159,6 +166,11 @@ pub fn bind_statement_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, index),
         ast::Statement::Set(index) | ast::Statement::Reset(index) => {
             setting(ast, catalog, parameters, index)
+        }
+        ast::Statement::Explain(query) => {
+            let mut binder = Binder::with(catalog, parameters);
+            let (root, _) = binder.bind_query(ast, query)?;
+            Ok(Bound::Explain(finish(binder, root)?))
         }
     }
 }
