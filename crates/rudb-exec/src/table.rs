@@ -199,14 +199,22 @@ impl Table {
     /// the comparison reads the bytes where they already are. Everything else owns nothing, so
     /// `value_at` on it is a copy of a few bytes and going through [`same`] keeps the one definition
     /// of what groups together.
+    ///
+    /// [`Vector::text_at`] hands back nothing for the forms that do not store their text per
+    /// position, and a caller that reads that as a difference is a caller that never finds a group
+    /// again. A nested loop join makes its left side constant vectors, so a group by on a string
+    /// column from the left of a join is exactly that case, and it answered with one group per row.
+    /// So nothing from `text_at` means fall through to `value_at`, which is right for every form.
     fn holds(&self, slot: usize, keys: &[Vector], row: usize) -> bool {
         for (at, column) in keys.iter().enumerate() {
             let stored = &self.columns[at][slot];
             if let Value::Varchar(text) = stored {
-                if column.text_at(row) != Some(text.as_str()) {
-                    return false;
+                if let Some(borrowed) = column.text_at(row) {
+                    if borrowed != text.as_str() {
+                        return false;
+                    }
+                    continue;
                 }
-                continue;
             }
             if !same(stored, &column.value_at(row)) {
                 return false;
@@ -482,6 +490,52 @@ mod tests {
         assert!(matches!(table.probe(hashes[1], &keys, 1), Probe::Found(found) if found == slot));
         assert!(matches!(table.probe(hashes[2], &keys, 2), Probe::Vacant(_)));
         assert_eq!(table.len(), 1);
+    }
+
+    /// A string column that is a constant vector is still a string column. The hash of it already
+    /// agreed with the flat form, and the comparison after the probe did not, so every row of a
+    /// group by on the left side of a join opened a group of its own and the answer had the same
+    /// string in it once per row.
+    #[test]
+    fn a_group_is_found_again_when_its_string_key_arrives_as_a_constant() {
+        let long = "lovelace, and a string past the sixteen bytes a view holds inline";
+        for text in ["ada", "", long] {
+            let names = Vector::constant(LogicalType::Varchar, Value::Varchar(text.into()), 2);
+            let keys = [names];
+            let mut hashes = Vec::new();
+            hash(&keys, 2, &mut hashes);
+
+            let mut table = Table::new(1);
+            let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
+                panic!("an empty table found a group");
+            };
+            let slot = table.insert(bucket, hashes[0], &keys, 0).expect("room for one group");
+            assert!(
+                matches!(table.probe(hashes[1], &keys, 1), Probe::Found(found) if found == slot),
+                "{text:?} did not find itself"
+            );
+            assert_eq!(table.len(), 1);
+        }
+    }
+
+    /// The other half of it, which is that falling through to `value_at` did not make everything
+    /// one group. A constant of one string and a flat column of another are two groups.
+    #[test]
+    fn two_constants_of_different_strings_are_still_two_groups() {
+        let ada = Vector::constant(LogicalType::Varchar, Value::Varchar("ada".into()), 1);
+        let grace = Vector::constant(LogicalType::Varchar, Value::Varchar("grace".into()), 1);
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        hash(std::slice::from_ref(&ada), 1, &mut first);
+        hash(std::slice::from_ref(&grace), 1, &mut second);
+
+        let mut table = Table::new(1);
+        let keys = [ada];
+        let Probe::Vacant(bucket) = table.probe(first[0], &keys, 0) else {
+            panic!("an empty table found a group");
+        };
+        table.insert(bucket, first[0], &keys, 0).expect("room for one group");
+        assert!(matches!(table.probe(second[0], &[grace], 0), Probe::Vacant(_)));
     }
 
     /// Growing is where a table stops working quietly. Every key put in before a rehash has to be
