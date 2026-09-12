@@ -9,10 +9,11 @@
 # on past it. So this asks the index what is already there, excludes it, and waits when the
 # registry tells it to wait.
 #
-# There are two rate limits and the difference between them is three hours.
+# There are three rate limits and only two of them can be waited out inside one job.
 #
 #   A new crate:            a burst of 5, then one every ten minutes.
 #   A new version of one:   a burst of 30, then one a minute.
+#   A new version of one:   twenty in any twenty four hours, per crate.
 #
 # So the first release of this workspace is 27 new crates and takes about three and a half hours of
 # mostly waiting, and every release after it is a couple of minutes. The pause is picked from which
@@ -20,6 +21,14 @@
 # attempt count is picked from how many crates are left. Nothing here is clever; it is just the
 # arithmetic of the published limits, written down so the next person does not have to rediscover
 # it at three in the morning during a release.
+#
+# The third one is different in kind, because the wait is hours rather than seconds and no job
+# should sit through it. It was found the hard way on 0.2.27: five patch releases in one day is a
+# hundred and forty five uploads, every crate in the workspace was at twenty for the day, and this
+# script spent forty minutes retrying `rudb-common` at seventy seconds a go before giving up with
+# nothing published. The answer is to say so and stop, because the release is not lost. The tag is
+# up, the binaries are up, and re-running this job once a slot has aged out finishes it. The other
+# half of the answer is not to release five times in a day.
 #
 # Run from the root of the workspace with CARGO_REGISTRY_TOKEN set. Running it when everything is
 # already published is a no-op that exits zero, which is what makes re-running the release job the
@@ -120,6 +129,16 @@ for attempt in $(seq 1 "$attempts"); do
     echo "something else published a crate while this ran, re-reading the index in 10s"
     sleep 10
     continue
+  fi
+
+  # The daily cap, which is the one 429 that no amount of sleeping inside this job will clear. It
+  # frees a slot when the oldest upload in the window ages out, so the wait is measured in hours and
+  # the right thing to do is to hand the release back with the reason rather than to burn the job.
+  if grep -q "too many versions of this crate in the last 24 hours" /tmp/publish.log; then
+    echo "crates.io caps a crate at twenty versions a day and every crate here is at the cap" >&2
+    echo "$up of $total are up at $version, which is where a re-run will carry on from" >&2
+    echo "a slot frees when the oldest upload of the day ages out, so re-run this job then" >&2
+    exit 1
   fi
 
   if ! grep -q "429 Too Many Requests" /tmp/publish.log; then
