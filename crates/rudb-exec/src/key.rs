@@ -69,8 +69,30 @@ const ODD: u64 = 0x517c_c1b7_2722_0a95;
 impl Digest {
     /// Folds one word into the running value.
     fn mix(&mut self, word: u64) {
-        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(ODD);
+        self.0 = mix(self.0, word);
     }
+}
+
+/// Folds one word into a running hash.
+///
+/// Free rather than a method because the grouping table in `table.rs` hashes a column at a time and
+/// never builds a [`Digest`] at all, and two hash functions that are meant to be the same one are
+/// two hash functions that will eventually differ. The rule lives here, where the equality it has to
+/// agree with lives.
+pub(crate) fn mix(state: u64, word: u64) -> u64 {
+    (state.rotate_left(5) ^ word).wrapping_mul(ODD)
+}
+
+/// Moves the entropy a run of [`mix`] left in the high bits back down into the low ones.
+///
+/// Every table in here buckets on the low bits, and the multiply in `mix` pushes what it mixed the
+/// other way, so a key whose words differ only near the top lands in one bucket without this.
+pub(crate) fn spread(state: u64) -> u64 {
+    let mut spread = state;
+    spread ^= spread >> 32;
+    spread = spread.wrapping_mul(ODD);
+    spread ^= spread >> 29;
+    spread
 }
 
 impl Hasher for Digest {
@@ -114,16 +136,12 @@ impl Hasher for Digest {
     }
 
     fn finish(&self) -> u64 {
-        let mut spread = self.0;
-        spread ^= spread >> 32;
-        spread = spread.wrapping_mul(ODD);
-        spread ^= spread >> 29;
-        spread
+        spread(self.0)
     }
 }
 
 /// Whether two values group together.
-fn same(left: &Value, right: &Value) -> bool {
+pub(crate) fn same(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Float(a), Value::Float(b)) => a == b || (a.is_nan() && b.is_nan()),
         (Value::Double(a), Value::Double(b)) => a == b || (a.is_nan() && b.is_nan()),
@@ -167,7 +185,7 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
 }
 
 /// The bit pattern a float hashes as, collapsing the two zeros and every NaN.
-fn canonical(number: f64) -> u64 {
+pub(crate) fn canonical(number: f64) -> u64 {
     if number.is_nan() {
         return f64::NAN.to_bits();
     }
