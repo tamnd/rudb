@@ -1972,9 +1972,16 @@ mod tests {
             ("a%b", "%a%b%", true),
             ("a%b", "_%_", true),
             ("http://x/google%2F12.15", "%google%", true),
+            // One of the nine URLs that went missing out of ClickBench q21, cut down to the part
+            // that matters, which is the `%` sitting immediately after the word the pattern wants.
+            ("amalgama-lab.com.ua/google%2F12.15&he=900&Select", "%google%", true),
             ("a%", "%a", false),
             ("a%b", "%a", false),
             ("%b", "a%", false),
+            // The other direction. A `%` in the text stands for itself there too, so it does not
+            // stand in for the two characters the pattern is asking for.
+            ("goo%gle", "google", false),
+            ("goo%gle", "%google%", false),
         ] {
             let held = called(
                 "~~",
@@ -2142,6 +2149,12 @@ mod tests {
 
     /// A string, chosen so that the inline limit, the empty string, multi byte characters and the
     /// substring the `LIKE` patterns look for all turn up often.
+    ///
+    /// Two of these hold a `%` or a `_`, which are the pattern characters, because a text is not a
+    /// pattern and nothing in it is special. That the list held neither is why #279 got past this
+    /// test for as long as it did. The compiled forms and the general walk disagreed about a `%` in
+    /// the text and there was no text here to disagree over, so a property test that compares the
+    /// two forms against each other on every string it can think of never thought of one.
     fn text(rng: &mut Rng) -> String {
         let words = [
             "",
@@ -2154,6 +2167,8 @@ mod tests {
             "thirteen bytes",
             "π is two bytes and this string is not inline at all",
             "g",
+            "google%2F12",
+            "goo_gle%",
         ];
         words[rng.below(words.len() as u64) as usize].to_owned()
     }
