@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Five passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
+//! Six passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
 //! the start of it. Column pruning came first, because it is the pass whose absence is measured in
 //! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -14,6 +14,7 @@ pub mod columns;
 pub mod empty;
 pub mod filter;
 pub mod fold;
+pub mod limit;
 pub mod nulls;
 pub mod pass;
 pub mod tables;
@@ -53,14 +54,20 @@ pub const RANK: u8 = 11;
 /// is before pruning for the same reason folding is: the subtrees it removes are subtrees pruning
 /// would otherwise walk and work out column lists for.
 ///
+/// Limit pushdown is second to last, which is to say it is immediately before top N. A limit that
+/// has moved below the projections above it is a limit that may now be sitting directly on a sort,
+/// and that pair is what top N fuses, so running the two the other way around would leave the fusion
+/// with a plan it cannot see the shape of.
+///
 /// Top N is last, because it is the one pass that fuses two operators into one rather than moving
 /// something around. Everything before it is written against a sort and a limit, and a pass that had
 /// to know about both spellings of the same plan is a pass with two of every rule in it.
-pub static PASSES: [&(dyn Pass + Sync); 5] = [
+pub static PASSES: [&(dyn Pass + Sync); 6] = [
     &fold::ExpressionRewriter,
     &filter::FilterPushdown,
     &empty::EmptyResultPullup,
     &columns::UnusedColumns,
+    &limit::LimitPushdown,
     &topn::TopN,
 ];
 
