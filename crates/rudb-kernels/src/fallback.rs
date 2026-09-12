@@ -16,9 +16,18 @@
 //! The counts are process wide and never reset by the library. A benchmark harness reads them at
 //! the end of a run and prints the ones that are not zero, which turns "we should probably
 //! specialize sequence against constant" into either a number or silence.
+//!
+//! There is a second counter and [`record`] bumps both. This one answers which form pair to go and
+//! write a specialization for, which is a question about a build rather than about a query, so it is
+//! process wide and has no idea which operator was running. [`rudb_common::slow`] answers which
+//! operator in this query is the one paying, which needs the count to be per thread so that the
+//! instrumentation shim can take a difference around a call. Neither number can be worked out from
+//! the other, they cost an add each, and the alternative to having both is reading one of them and
+//! guessing the other.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rudb_common::{Cause, slow};
 use rudb_vector::Form;
 
 /// Which kernel fell through.
@@ -64,6 +73,23 @@ impl Kernel {
             Self::Cast => 3,
             Self::Aggregate => 4,
             Self::Select => 5,
+        }
+    }
+
+    /// The same kernel as the metrics document names it.
+    ///
+    /// Two enums for one list of kernels is not ideal and it is the layer rule rather than a
+    /// preference. The document is written at rank 4 and this crate is at rank 3, so the vocabulary
+    /// the document is spelled in has to be somewhere both can see, which is rank 0. The test below
+    /// is what keeps the two lists the same list.
+    const fn cause(self) -> Cause {
+        match self {
+            Self::Compare => Cause::Compare,
+            Self::Scalar => Cause::Scalar,
+            Self::Logic => Cause::Logic,
+            Self::Cast => Cause::Cast,
+            Self::Aggregate => Cause::Aggregate,
+            Self::Select => Cause::Select,
         }
     }
 }
@@ -139,6 +165,7 @@ fn cell(kernel: Kernel, left: Form, right: Form) -> usize {
 /// paying for a guarantee nobody uses.
 pub fn record(kernel: Kernel, left: Form, right: Form) {
     with_counts(|counts| counts[cell(kernel, left, right)].fetch_add(1, Ordering::Relaxed));
+    slow::took(kernel.cause());
 }
 
 /// How many times a kernel fell through on this pair of forms.
@@ -199,7 +226,36 @@ pub fn report() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Form, Kernel, count, hot, record, report, reset};
+    use rudb_common::slow;
+
+    use super::{Cause, Form, Kernel, count, hot, record, report, reset};
+
+    #[test]
+    fn a_fall_through_is_counted_by_form_pair_here_and_by_kernel_where_the_document_reads_it() {
+        reset();
+        slow::reset();
+        record(Kernel::Select, Form::Dictionary, Form::Flat);
+        record(Kernel::Select, Form::Constant, Form::Flat);
+        assert_eq!(count(Kernel::Select, Form::Dictionary, Form::Flat), 1);
+        assert_eq!(count(Kernel::Select, Form::Constant, Form::Flat), 1);
+        // The other counter does not split by form, because the question it answers is which
+        // operator is paying rather than which specialization is missing.
+        assert_eq!(slow::here().get(Cause::Select), 2);
+        assert_eq!(slow::here().total(), 2);
+        reset();
+        slow::reset();
+    }
+
+    #[test]
+    fn every_kernel_names_a_cause_of_its_own() {
+        let mut named: Vec<&str> = Kernel::ALL.iter().map(|kernel| kernel.cause().name()).collect();
+        named.sort_unstable();
+        named.dedup();
+        assert_eq!(named.len(), Kernel::ALL.len());
+        for kernel in Kernel::ALL {
+            assert_eq!(kernel.name(), kernel.cause().name(), "one kernel, one name");
+        }
+    }
 
     #[test]
     fn a_fall_through_lands_in_the_cell_for_its_own_form_pair() {
