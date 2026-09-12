@@ -49,6 +49,7 @@ mod schema;
 mod setop;
 mod sort;
 mod source;
+mod spill;
 mod stream;
 mod topn;
 mod written;
