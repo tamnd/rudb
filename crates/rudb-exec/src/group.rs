@@ -32,7 +32,6 @@ use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 use crate::buffer::Buffered;
 use crate::expr::{evaluate, evaluate_all};
 use crate::key::{Key, RowSet};
-use crate::operator::Operator;
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
@@ -55,27 +54,58 @@ struct Call {
 /// this operator's table index means and what the binder assumed when it made one.
 ///
 /// An ungrouped aggregate produces exactly one row even over an empty input. That is done by
-/// creating the single empty group when the operator is built rather than when the first row
+/// creating the single empty group when the instance is created rather than when the first row
 /// arrives, which is the whole of the difference between `SELECT count(*) FROM empty` answering
 /// zero and answering nothing.
+///
+/// # One table for now
+///
+/// As a [`Sink`], the table and everything beside it live in the instance rather than in here, which
+/// is where they have to be: a table shared between threads would be a lock per probe. What that
+/// leaves is `combine`, and combining two aggregate instances means merging two tables, which needs
+/// a serialize and a combine per aggregate that `spec/engine/07-aggregate.md` section 7.8 names as
+/// debt not yet paid. So a second instance is refused rather than answered wrongly, and until that
+/// debt is paid an aggregate is one instance however many threads the pipeline has. Everything else
+/// about it is already in the shape F4 wants, including the spilling.
 #[derive(Debug)]
 pub(crate) struct Aggregate<'a> {
-    input: Box<dyn Operator + 'a>,
     plan: &'a Plan,
     input_schema: Schema,
     groups: Vec<ExprRef>,
     calls: Vec<Call>,
     schema: Schema,
-    built: bool,
-    chunks: Vec<Chunk>,
-    at: usize,
+    /// Whether there are no group expressions, so every row goes to the one slot.
+    alone: bool,
+    /// Whether any call is `DISTINCT`, and so whether the sets that answer that are built at all. A
+    /// group by with a million groups and no `DISTINCT` anywhere in it used to allocate a million
+    /// empty sets to look at none of them.
+    sets: bool,
+    /// Which calls fold a vector at a time. An ungrouped aggregate has exactly one slot, so there
+    /// is no key to build, no hash to take and no lookup to do, and what is left of the row loop is
+    /// the fold itself. `DISTINCT` needs a value per row to put in a set and `FILTER` needs the rows
+    /// it kept, and neither has a vector form yet, so a call with either stays on the row loop while
+    /// the calls beside it do not.
+    by_vector: Vec<bool>,
+    /// Whether every call folds a vector at a time, which is when the row loop is skipped whole.
+    every: bool,
     memory: Memory,
-    /// What the finished chunks are charged, held for as long as this operator holds them.
+    /// The chunks the passes have finished, and what they are charged.
+    built: Mutex<Built>,
+    out: Buffered,
+}
+
+/// What the passes have finished, which is the answer as it is assembled.
+#[derive(Debug)]
+struct Built {
+    chunks: Vec<Chunk>,
+    /// What those chunks are charged, held for as long as they are readable.
     held: Reservation,
+    /// How many instances have combined, because the second one is not supported.
+    instances: usize,
 }
 
 impl<'a> Aggregate<'a> {
-    /// An aggregation over the plan's groups and aggregate calls.
+    /// An aggregation over the plan's groups and aggregate calls, and the source it finishes into.
     ///
     /// # Errors
     ///
@@ -83,13 +113,13 @@ impl<'a> Aggregate<'a> {
     /// which is checked again here because this operator has no sensible behaviour if it is wrong.
     pub(crate) fn new(
         plan: &'a Plan,
-        input: Box<dyn Operator + 'a>,
+        input: &Schema,
         index: u32,
         groups: Slice,
         aggregates: Slice,
         memory: &Memory,
-    ) -> Result<Self> {
-        let input_schema = input.schema().clone();
+    ) -> Result<(Self, Buffered)> {
+        let input_schema = input.clone();
         let groups: Vec<ExprRef> = plan.expr_list(groups).to_vec();
         let mut calls = Vec::new();
         for &reference in plan.expr_list(aggregates) {
@@ -117,19 +147,53 @@ impl<'a> Aggregate<'a> {
             fields.push(Field::new(call.name.clone(), call.returns.clone()));
         }
         let schema = Schema::numbered(fields, index);
-        Ok(Self {
-            input,
+        let alone = groups.is_empty();
+        let by_vector: Vec<bool> =
+            calls.iter().map(|call| alone && !call.distinct && call.filter.is_none()).collect();
+        let out = Buffered::new();
+        let aggregate = Self {
             plan,
             input_schema,
+            alone,
+            sets: calls.iter().any(|call| call.distinct),
+            every: by_vector.iter().all(|&yes| yes),
+            by_vector,
             groups,
             calls,
             schema,
-            built: false,
-            chunks: Vec::new(),
-            at: 0,
             memory: memory.clone(),
-            held: memory.reservation(),
-        })
+            built: Mutex::new(Built {
+                chunks: Vec::new(),
+                held: memory.reservation(),
+                instances: 0,
+            }),
+            out: out.clone(),
+        };
+        Ok((aggregate, out))
+    }
+
+    /// What this operator produces, which is the group expressions followed by the aggregates.
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// One input chunk, with the group keys, the arguments and the filters evaluated out of it.
+    ///
+    /// The same shape a spill file is read back into, which is what lets one row loop serve a chunk
+    /// that was pushed and a chunk that was written out and read again.
+    fn read(&self, chunk: &Chunk) -> Result<Rows> {
+        let rows = chunk.len();
+        let keys = evaluate_all(self.plan, &self.groups, &self.input_schema, chunk)?;
+        let mut arguments = Vec::with_capacity(self.calls.len());
+        let mut filters = Vec::with_capacity(self.calls.len());
+        for call in &self.calls {
+            arguments.push(evaluate_all(self.plan, &call.args, &self.input_schema, chunk)?);
+            filters.push(match call.filter {
+                Some(filter) => Some(evaluate(self.plan, filter, &self.input_schema, chunk)?),
+                None => None,
+            });
+        }
+        Ok(Rows { keys, arguments, filters, rows })
     }
 
     /// Reads the whole input and builds the hash table, over as many passes as the budget needs.
@@ -155,44 +219,210 @@ impl<'a> Aggregate<'a> {
     /// carried between passes is the finished chunks and nothing else. A query whose answer on its
     /// own fills the budget still runs out, which is correct: there is no way to hold seventeen
     /// million rows in room that does not hold them.
-    fn build(&mut self) -> Result<()> {
-        // Borrowed field by field rather than as `&self`, because the first pass holds the input
-        // out of the same struct and the two borrows have to be disjoint.
-        let pass = Pass {
-            plan: self.plan,
-            input_schema: &self.input_schema,
-            schema: &self.schema,
-            groups: &self.groups,
-            calls: &self.calls,
-            memory: &self.memory,
+    /// One more pass, over the file the pass before it left behind.
+    ///
+    /// The file is read back through the same fold the pushed chunks went through, so there is one
+    /// row loop, one table and one set of charges however many passes a query takes. What comes back
+    /// is the next file, or `None` when this pass finished everything that was left.
+    fn again(
+        &self,
+        file: &mut Spill,
+        chunks: &mut Vec<Chunk>,
+        held: &mut Reservation,
+    ) -> Result<Option<Spill>> {
+        let mut spilled = Spilled::new(file.read()?, self.spilled_types());
+        let mut local = self.start();
+        if let Some(error) = local.failure.take() {
+            return Err(error);
+        }
+        while let Some(rows) = spilled.next(self)? {
+            self.fold(&rows, &mut local)?;
+        }
+        self.finish(local, chunks, held)
+    }
+
+    /// What one instance starts a pass with.
+    ///
+    /// An ungrouped aggregate has its one group here, which is what makes `SELECT count(*)` over an
+    /// empty input answer zero rather than nothing. Building an accumulator can fail, on an
+    /// aggregate name nothing implements, and [`Sink::local`] has nowhere to put an error, so the
+    /// failure is carried in the instance and reported by the first call that can report it.
+    fn start(&self) -> Building {
+        let calls = self.calls.len();
+        let mut local = Building {
+            // The keys and the rows made out of them, given back when this pass ends, because by
+            // then they are in the chunks.
+            scratch: self.memory.reservation(),
+            // The three containers and the sets a `DISTINCT` fills, which are gone before the
+            // chunks are built rather than after. Their own reservation so that their charge can go
+            // when they do, which is what leaves room for the chunks. A key is not in here, because
+            // a key is moved into the rows and outlives all of it. Per #272.
+            containers: self.memory.reservation(),
+            charged: 0,
+            // What the keys the table has taken a copy of own away from themselves, charged against
+            // the scratch rather than against the containers because those strings move into the
+            // rows and outlive the table. `charged` and this one are the same arrangement over two
+            // reservations.
+            charged_keys: 0,
+            table: Table::new(self.groups.len()),
+            states: Vec::new(),
+            seen: Vec::new(),
+            groups: 0,
+            // One row of arguments per call, filled again for each input row and kept between rows
+            // so that the buffers behind them are asked for once and not once per row. Only a row
+            // that turns out to be new to a `DISTINCT` is copied out of one.
+            given: vec![Key(Vec::new()); calls],
+            // One hash per row of the chunk in hand, built a column at a time before the row loop
+            // starts. Kept between chunks for the reason the buffers above are.
+            hashes: Vec::new(),
+            // One slot per row of the chunk in hand, which is what the probe produces and what the
+            // scatter consumes, and the same slots with a call's `FILTER` folded into them.
+            slots: Vec::new(),
+            kept: Vec::new(),
+            // The file the rows that do not fit go to, made the first time the budget says the
+            // table has to stop growing and `None` for as long as it does not. One row of it, kept
+            // between rows so that writing does not go to the allocator per row.
+            over: None,
+            away: Vec::new(),
+            failure: None,
         };
-        let mut source = Source::Input(&mut *self.input);
-        let mut left = pass.once(&mut source, &mut self.chunks, &mut self.held)?;
-        while let Some(mut file) = left {
-            // The file is read back through the same `once` the input went through, so there is one
-            // row loop, one table and one set of charges however many passes a query takes.
-            let mut source = Source::Spilled(Spilled::new(file.read()?, pass.spilled_types()));
-            left = pass.once(&mut source, &mut self.chunks, &mut self.held)?;
+        if self.alone {
+            local.groups = 1;
+            if let Err(error) = self.fresh(&mut local.states) {
+                local.failure = Some(error);
+            }
+            if self.sets {
+                local.seen.resize_with(calls, RowSet::default);
+            }
+        }
+        local
+    }
+
+    /// One chunk of rows folded into the table.
+    fn fold(&self, seen_rows: &Rows, local: &mut Building) -> Result<()> {
+        // Field by field, because the `DISTINCT` path below holds four of them at once and they
+        // have to be disjoint borrows.
+        let Building {
+            scratch,
+            containers,
+            charged,
+            charged_keys,
+            table,
+            states,
+            seen,
+            groups,
+            given,
+            hashes,
+            slots,
+            kept,
+            over,
+            away,
+            failure: _,
+        } = local;
+        let calls = self.calls.len();
+        let alone = self.alone;
+        let Rows { keys, arguments, filters, rows: length } = seen_rows;
+        let mut aside = 0;
+        for at in 0..calls {
+            if self.by_vector[at] {
+                states[at].update_run(&arguments[at], *length)?;
+            }
+        }
+        if alone && self.every {
+            return Ok(());
+        }
+        // The column at a time half of #237. One pass over each key column turns the whole chunk
+        // into one hash per row, with the type of the column matched on once rather than once per
+        // value, and the row loop below is then a probe with the hash already in hand.
+        if !alone {
+            crate::table::hash(keys, *length, hashes);
+        }
+        // The probe, and nothing else. What comes out of it is one slot per row, which is what the
+        // scatter below needs and what the row loop used to consume as it went.
+        slots.clear();
+        slots.resize(*length, NOWHERE);
+        for row in 0..*length {
+            slots[row] = if alone {
+                0
+            } else {
+                match table.probe(hashes[row], keys, row) {
+                    Probe::Found(slot) => slot,
+                    Probe::Vacant(bucket) => {
+                        if let Some(file) = over.as_mut() {
+                            // The table is as large as the budget will let it be and this key is
+                            // not in it, so the row goes out whole. Every later row with this key
+                            // goes out too, because the key is never inserted here, and that is
+                            // what lets the next pass finish the group without knowing anything
+                            // about this one.
+                            put_away(file, seen_rows, row, away)?;
+                            continue;
+                        }
+                        // A group costs the copy of its key that the table takes, and its own
+                        // accumulators and distinct sets in the two vectors beside it. What all of
+                        // those took to have room for it is charged below and once per chunk,
+                        // because it is a property of the containers rather than of this group, and
+                        // what the key owns away from itself the table adds up as it goes and is
+                        // charged the same way.
+                        let slot = table.insert(bucket, hashes[row], keys, row)?;
+                        *groups = table.len();
+                        self.fresh(states)?;
+                        if self.sets {
+                            seen.resize_with(seen.len() + calls, RowSet::default);
+                        }
+                        slot
+                    }
+                }
+            };
+        }
+        // The aggregate half of #61. Every call that is not `DISTINCT` folds the whole chunk in one
+        // pass, with the aggregate and the layout of its argument matched on once for the chunk
+        // rather than once per row, and with no `Value` built at all on the paths the kernel covers.
+        for (at, call) in self.calls.iter().enumerate() {
+            if self.by_vector[at] {
+                continue;
+            }
+            if call.distinct {
+                aside += self.distinct(states, seen, seen_rows, slots, at, given)?;
+                continue;
+            }
+            let picked = match &filters[at] {
+                None => &*slots,
+                Some(flags) => {
+                    // A row the filter dropped belongs to nothing, which is the same thing the
+                    // scatter already understands a spilled row to be, so the filter goes into the
+                    // slots rather than into the loop that reads them.
+                    kept.clear();
+                    kept.extend(slots.iter().enumerate().map(|(row, &slot)| {
+                        if slot != NOWHERE && is_true(&flags.value_at(row)) {
+                            slot
+                        } else {
+                            NOWHERE
+                        }
+                    }));
+                    &*kept
+                }
+            };
+            update_scattered(states, picked, calls, at, arguments[at].first(), *length)?;
+        }
+        rows::capacity(table.owned(), charged_keys, scratch)?;
+        containers.grow(aside)?;
+        let now = tables(table, states, seen);
+        rows::capacity(now, charged, containers)?;
+        // Asked after the chunk has been folded in and not before, so that a pass always takes at
+        // least one chunk of groups whatever the budget says. That is what makes the loop in
+        // `combine` finish: a pass that could spill from its first row would spill every row and
+        // hand back a file the same size as what it was given.
+        match over.as_ref() {
+            None if !alone && crowded(&self.memory) => {
+                *over = Some(Spill::new("aggregate", self.spilled_types())?);
+            }
+            Some(file) => hopeless(file, *groups)?,
+            None => {}
         }
         Ok(())
     }
-}
 
-/// The parts of an [`Aggregate`] one pass over the rows needs.
-///
-/// A struct of borrows rather than a method on the operator, so that the first pass can hold the
-/// input operator mutably while the pass holds everything else.
-struct Pass<'p> {
-    plan: &'p Plan,
-    input_schema: &'p Schema,
-    schema: &'p Schema,
-    groups: &'p [ExprRef],
-    calls: &'p [Call],
-    memory: &'p Memory,
-}
-
-impl Pass<'_> {
-    /// One pass: fill a table until it cannot take another group, then spill what is left.
+    /// The end of a pass: the table becomes chunks and whatever did not fit is handed back.
     ///
     /// The chunks the finished groups make are appended to `chunks` and charged against `held`,
     /// which the operator holds for as long as it holds them. What comes back is the file the rows
@@ -204,171 +434,14 @@ impl Pass<'_> {
     /// keeping the rows of every pass until the last pass ended would hold both copies of the whole
     /// answer at once. Ending the pass with the chunks alone means the second copy is only ever of
     /// what one pass finished.
-    fn once(
+    fn finish(
         &self,
-        source: &mut Source<'_, '_>,
+        local: Building,
         chunks: &mut Vec<Chunk>,
         held: &mut Reservation,
     ) -> Result<Option<Spill>> {
-        // The keys and the rows made out of them, given back when this pass ends, because by then
-        // they are in the chunks.
-        let mut scratch = self.memory.reservation();
-        // The three containers and the sets a `DISTINCT` fills, which are gone before the chunks
-        // are built rather than after. Their own reservation so that their charge can go when they
-        // do, which is what leaves room for the chunks. A key is not in here, because a key is moved
-        // into the rows and outlives all of it. Per #272.
-        let mut containers = self.memory.reservation();
-        let mut charged = 0;
-        // What the keys the table has taken a copy of own away from themselves, charged against the
-        // scratch rather than against the containers because those strings move into the rows and
-        // outlive the table. `charged` and this one are the same arrangement over two reservations.
-        let mut charged_keys = 0;
-        let mut table = Table::new(self.groups.len());
-        let mut states: Vec<Accumulator> = Vec::new();
-        let mut seen: Vec<RowSet> = Vec::new();
+        let Building { mut scratch, mut containers, table, states, seen, groups, over, .. } = local;
         let calls = self.calls.len();
-        // Whether any call is `DISTINCT`, and so whether the sets that answer that are built at all.
-        // A group by with a million groups and no `DISTINCT` anywhere in it used to allocate a
-        // million empty sets to look at none of them.
-        let sets = self.calls.iter().any(|call| call.distinct);
-        let alone = self.groups.is_empty();
-        let mut groups = 0;
-        if alone {
-            groups = 1;
-            self.fresh(&mut states)?;
-            if sets {
-                seen.resize_with(calls, RowSet::default);
-            }
-        }
-        // Which calls fold a vector at a time. An ungrouped aggregate has exactly one slot, so
-        // there is no key to build, no hash to take and no lookup to do, and what is left of the
-        // row loop is the fold itself. `DISTINCT` needs a value per row to put in a set and
-        // `FILTER` needs the rows it kept, and neither has a vector form yet, so a call with either
-        // stays on the row loop while the calls beside it do not.
-        let by_vector: Vec<bool> = self
-            .calls
-            .iter()
-            .map(|call| alone && !call.distinct && call.filter.is_none())
-            .collect();
-        let every = by_vector.iter().all(|&yes| yes);
-        // One row of arguments per call, filled again for each input row and kept between rows so
-        // that the buffers behind them are asked for once and not once per row. Only a row that
-        // turns out to be new to a `DISTINCT` is copied out of one.
-        let mut given: Vec<Key> = vec![Key(Vec::new()); calls];
-        // One hash per row of the chunk in hand, built a column at a time before the row loop
-        // starts. Kept between chunks for the reason the buffers above are.
-        let mut hashes: Vec<u64> = Vec::new();
-        // One slot per row of the chunk in hand, which is what the probe produces and what the
-        // scatter consumes, and the same slots with a call's `FILTER` folded into them.
-        let mut slots: Vec<usize> = Vec::new();
-        let mut kept: Vec<usize> = Vec::new();
-        // The file the rows that do not fit go to, made the first time the budget says the table
-        // has to stop growing and `None` for as long as it does not. One row of it, kept between
-        // rows so that writing does not go to the allocator per row.
-        let mut over: Option<Spill> = None;
-        let mut away: Vec<Value> = Vec::new();
-        while let Some(seen_rows) = source.next(self)? {
-            let Rows { keys, arguments, filters, rows: length } = &seen_rows;
-            let mut aside = 0;
-            for at in 0..calls {
-                if by_vector[at] {
-                    states[at].update_run(&arguments[at], *length)?;
-                }
-            }
-            if alone && every {
-                continue;
-            }
-            // The column at a time half of #237. One pass over each key column turns the whole
-            // chunk into one hash per row, with the type of the column matched on once rather than
-            // once per value, and the row loop below is then a probe with the hash already in hand.
-            if !alone {
-                crate::table::hash(keys, *length, &mut hashes);
-            }
-            // The probe, and nothing else. What comes out of it is one slot per row, which is what
-            // the scatter below needs and what the row loop used to consume as it went.
-            slots.clear();
-            slots.resize(*length, NOWHERE);
-            for row in 0..*length {
-                slots[row] = if alone {
-                    0
-                } else {
-                    match table.probe(hashes[row], keys, row) {
-                        Probe::Found(slot) => slot,
-                        Probe::Vacant(bucket) => {
-                            if let Some(file) = over.as_mut() {
-                                // The table is as large as the budget will let it be and this key
-                                // is not in it, so the row goes out whole. Every later row with
-                                // this key goes out too, because the key is never inserted here,
-                                // and that is what lets the next pass finish the group without
-                                // knowing anything about this one.
-                                put_away(file, &seen_rows, row, &mut away)?;
-                                continue;
-                            }
-                            // A group costs the copy of its key that the table takes, and its own
-                            // accumulators and distinct sets in the two vectors beside it. What all
-                            // of those took to have room for it is charged below and once per
-                            // chunk, because it is a property of the containers rather than of this
-                            // group, and what the key owns away from itself the table adds up as it
-                            // goes and is charged the same way.
-                            let slot = table.insert(bucket, hashes[row], keys, row)?;
-                            groups = table.len();
-                            self.fresh(&mut states)?;
-                            if sets {
-                                seen.resize_with(seen.len() + calls, RowSet::default);
-                            }
-                            slot
-                        }
-                    }
-                };
-            }
-            // The aggregate half of #61. Every call that is not `DISTINCT` folds the whole chunk in
-            // one pass, with the aggregate and the layout of its argument matched on once for the
-            // chunk rather than once per row, and with no `Value` built at all on the paths the
-            // kernel covers.
-            for (at, call) in self.calls.iter().enumerate() {
-                if by_vector[at] {
-                    continue;
-                }
-                if call.distinct {
-                    aside +=
-                        self.distinct(&mut states, &mut seen, &seen_rows, &slots, at, &mut given)?;
-                    continue;
-                }
-                let picked = match &filters[at] {
-                    None => &slots,
-                    Some(flags) => {
-                        // A row the filter dropped belongs to nothing, which is the same thing the
-                        // scatter already understands a spilled row to be, so the filter goes into
-                        // the slots rather than into the loop that reads them.
-                        kept.clear();
-                        kept.extend(slots.iter().enumerate().map(|(row, &slot)| {
-                            if slot != NOWHERE && is_true(&flags.value_at(row)) {
-                                slot
-                            } else {
-                                NOWHERE
-                            }
-                        }));
-                        &kept
-                    }
-                };
-                update_scattered(&mut states, picked, calls, at, arguments[at].first(), *length)?;
-            }
-            rows::capacity(table.owned(), &mut charged_keys, &mut scratch)?;
-            containers.grow(aside)?;
-            let now = tables(&table, &states, &seen);
-            rows::capacity(now, &mut charged, &mut containers)?;
-            // Asked after the chunk has been folded in and not before, so that a pass always takes
-            // at least one chunk of groups whatever the budget says. That is what makes the loop in
-            // `build` finish: a pass that could spill from its first row would spill every row and
-            // hand back a file the same size as what it was given.
-            match over.as_ref() {
-                None if !alone && crowded(self.memory) => {
-                    over = Some(Spill::new("aggregate", self.spilled_types())?);
-                }
-                Some(file) => hopeless(file, groups)?,
-                None => {}
-            }
-        }
         // The distinct sets are finished with and the table and the accumulators are not, so the
         // charge for the sets goes here rather than after the chunks are built, which is part of
         // the room the chunks are built in.
@@ -496,7 +569,7 @@ impl Pass<'_> {
     /// push and not a trip to the allocator. The accumulators of the group in `slot` are the run of
     /// `calls` entries starting at `slot * calls`.
     fn fresh(&self, states: &mut Vec<Accumulator>) -> Result<()> {
-        for call in self.calls {
+        for call in &self.calls {
             states.push(Accumulator::new(&call.name, &call.returns)?);
         }
         Ok(())
@@ -514,15 +587,15 @@ impl Pass<'_> {
     /// described the same way whether or not any row has been written to it yet.
     fn spilled_types(&self) -> Vec<LogicalType> {
         let mut types = Vec::new();
-        for &group in self.groups {
+        for &group in &self.groups {
             types.push(self.plan.expr_type(group).clone());
         }
-        for call in self.calls {
+        for call in &self.calls {
             for &argument in &call.args {
                 types.push(self.plan.expr_type(argument).clone());
             }
         }
-        for call in self.calls {
+        for call in &self.calls {
             if let Some(filter) = call.filter {
                 types.push(self.plan.expr_type(filter).clone());
             }
@@ -543,7 +616,8 @@ struct Rows {
 }
 
 impl Rows {
-    /// How many columns one of these rows is written out as, which is [`Pass::spilled_types`] long.
+    /// How many columns one of these rows is written out as, which is
+    /// [`Aggregate::spilled_types`] long.
     fn width(&self) -> usize {
         self.keys.len()
             + self.arguments.iter().map(Vec::len).sum::<usize>()
@@ -551,43 +625,30 @@ impl Rows {
     }
 }
 
-/// Where the rows a pass folds are coming from.
+/// What one instance of an aggregate holds while it folds.
 ///
-/// The first pass reads the operator below it and every pass after that reads the file the pass
-/// before it wrote. Writing it as one enum with one `next` rather than as two loops is the whole
-/// reason the table, the row loop, the `DISTINCT` sets and the memory charging are written once:
-/// neither case knows which one it is.
-enum Source<'s, 'o> {
-    Input(&'s mut (dyn Operator + 'o)),
-    Spilled(Spilled<'s>),
-}
-
-impl Source<'_, '_> {
-    /// The next chunk of rows, or `None` at the end of the input or the file.
-    fn next(&mut self, pass: &Pass<'_>) -> Result<Option<Rows>> {
-        match self {
-            Source::Input(input) => {
-                let Some(chunk) = input.next()? else {
-                    return Ok(None);
-                };
-                let rows = chunk.len();
-                let keys = evaluate_all(pass.plan, pass.groups, pass.input_schema, &chunk)?;
-                let mut arguments = Vec::with_capacity(pass.calls.len());
-                let mut filters = Vec::with_capacity(pass.calls.len());
-                for call in pass.calls {
-                    arguments.push(evaluate_all(pass.plan, &call.args, pass.input_schema, &chunk)?);
-                    filters.push(match call.filter {
-                        Some(filter) => {
-                            Some(evaluate(pass.plan, filter, pass.input_schema, &chunk)?)
-                        }
-                        None => None,
-                    });
-                }
-                Ok(Some(Rows { keys, arguments, filters, rows }))
-            }
-            Source::Spilled(spilled) => spilled.next(pass),
-        }
-    }
+/// Everything the row loop touches is in here rather than in the operator, because every one of
+/// these is written to once per row and a lock per row is not an engine. The two reservations and
+/// the two counters beside them are the memory charging, which is per instance for the same reason
+/// and is handed over when the instance combines.
+#[derive(Debug)]
+pub(crate) struct Building {
+    scratch: Reservation,
+    containers: Reservation,
+    charged: u64,
+    charged_keys: u64,
+    table: Table,
+    states: Vec<Accumulator>,
+    seen: Vec<RowSet>,
+    groups: usize,
+    given: Vec<Key>,
+    hashes: Vec<u64>,
+    slots: Vec<usize>,
+    kept: Vec<usize>,
+    over: Option<Spill>,
+    away: Vec<Value>,
+    /// What went wrong before any row arrived, which there is nowhere else to report from.
+    failure: Option<Error>,
 }
 
 /// A spill file being read back, and the buffers reading it fills.
@@ -609,7 +670,7 @@ impl<'s> Spilled<'s> {
     }
 
     /// Up to [`VECTOR_SIZE`] rows, turned back into the vectors they were written out of.
-    fn next(&mut self, pass: &Pass<'_>) -> Result<Option<Rows>> {
+    fn next(&mut self, pass: &Aggregate<'_>) -> Result<Option<Rows>> {
         // Field by field, because the row being read and the columns it is being moved into are two
         // borrows of this and the loop below holds both.
         let Self { reader, types, row, columns } = self;
@@ -639,11 +700,11 @@ impl<'s> Spilled<'s> {
         let mut taking = built.into_iter();
         let keys: Vec<Vector> = taking.by_ref().take(pass.groups.len()).collect();
         let mut arguments = Vec::with_capacity(pass.calls.len());
-        for call in pass.calls {
+        for call in &pass.calls {
             arguments.push(taking.by_ref().take(call.args.len()).collect());
         }
         let mut filters = Vec::with_capacity(pass.calls.len());
-        for call in pass.calls {
+        for call in &pass.calls {
             filters.push(if call.filter.is_some() { taking.next() } else { None });
         }
         Ok(Some(Rows { keys, arguments, filters, rows }))
@@ -758,22 +819,72 @@ fn set(slot: &mut Value, column: &Vector, row: usize) {
     *slot = column.value_at(row);
 }
 
-impl Operator for Aggregate<'_> {
-    fn schema(&self) -> &Schema {
-        &self.schema
+impl Sink for Aggregate<'_> {
+    type Local = Building;
+
+    fn local(&self) -> Building {
+        self.start()
     }
 
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        if !self.built {
-            self.build()?;
-            self.built = true;
+    fn sink(&self, chunk: &Chunk, local: &mut Building) -> Result<Progress> {
+        if let Some(error) = local.failure.take() {
+            return Err(error);
         }
-        if self.at >= self.chunks.len() {
-            return Ok(None);
+        let rows = self.read(chunk)?;
+        self.fold(&rows, local)?;
+        Ok(Progress::More)
+    }
+
+    /// The end of one instance, and as many more passes as the budget needs.
+    ///
+    /// One pass is what this used to be and is what almost every query still does: read everything,
+    /// put every group in a table, turn the table into rows. What is new is what happens when the
+    /// table cannot hold every group, which is #220, and which on the ClickBench file is `GROUP BY
+    /// UserID` and its seventeen million of them.
+    ///
+    /// A pass that runs out of room keeps the groups it already has and writes any row whose key is
+    /// not one of them to a file. Nothing already in the table ever goes to the file, so a key is
+    /// either finished in this pass or absent from it entirely, and that is the whole of why this
+    /// works: the next pass can aggregate the file on its own, knowing nothing about the rows that
+    /// came before, because no group is split across the two.
+    ///
+    /// It is also why no aggregate state is written out. Splitting the input by row rather than by
+    /// key would leave a partial state on each side to be merged, and a merge needs a serialize and
+    /// a combine per aggregate, which `spec/engine/07-aggregate.md` section 7.8 names as debt not
+    /// yet paid. Splitting by key means there is nothing to merge and every aggregate keeps working
+    /// unchanged.
+    ///
+    /// Each pass gives its table and the rows it made back before the next one starts, so what is
+    /// carried between passes is the finished chunks and nothing else. A query whose answer on its
+    /// own fills the budget still runs out, which is correct: there is no way to hold seventeen
+    /// million rows in room that does not hold them.
+    ///
+    /// The later passes happen here rather than in `finalize`, because they are this instance's
+    /// rows and nobody else's. A second instance would be a second table to merge with this one,
+    /// which is the debt above, so it is refused.
+    fn combine(&self, local: Building) -> Result<()> {
+        if let Some(error) = local.failure {
+            return Err(error);
         }
-        let chunk = self.chunks[self.at].clone();
-        self.at += 1;
-        Ok(Some(chunk))
+        let mut built = self.built.lock().map_err(poisoned)?;
+        built.instances += 1;
+        if built.instances > 1 {
+            return Err(Error::not_implemented(
+                "two instances of one aggregate are two hash tables, and merging them needs a \
+                 serialize and a combine per aggregate that nothing implements yet",
+            ));
+        }
+        let Built { chunks, held, .. } = &mut *built;
+        let mut left = self.finish(local, chunks, held)?;
+        while let Some(mut file) = left {
+            left = self.again(&mut file, chunks, held)?;
+        }
+        Ok(())
+    }
+
+    fn finalize(&self) -> Result<()> {
+        let chunks = std::mem::take(&mut self.built.lock().map_err(poisoned)?.chunks);
+        self.out.fill(chunks)
     }
 }
 
@@ -1031,7 +1142,7 @@ mod tests {
     use rudb_plan::{Plan, Slice};
     use rudb_vector::{Chunk, Data, Vector};
 
-    use super::Distinct;
+    use super::{Aggregate, Distinct};
     use crate::buffer::Buffered;
     use crate::schema::Schema;
 
@@ -1078,6 +1189,38 @@ mod tests {
         distinct.finalize().expect("the answer");
 
         assert_eq!(column(&out), [Value::Integer(1), Value::Integer(2), Value::Integer(3)]);
+    }
+
+    /// An ungrouped aggregate with no calls at all, which is the smallest one there is and enough
+    /// to drive the sink with.
+    #[test]
+    fn an_ungrouped_aggregate_answers_one_row_from_one_instance() {
+        let plan = Plan::new();
+        let schema = Schema::numbered(vec![Field::new("a", LogicalType::Integer)], 0);
+        let (aggregate, out) =
+            Aggregate::new(&plan, &schema, 1, Slice::EMPTY, Slice::EMPTY, &Memory::unlimited())
+                .expect("no aggregates to take apart");
+
+        aggregate.combine(aggregate.local()).expect("the one instance");
+        aggregate.finalize().expect("the answer");
+
+        assert_eq!(out.at(0).expect("readable").expect("one chunk").len(), 1);
+    }
+
+    /// The debt, spelled out as a test. Two tables cannot be merged without a serialize and a
+    /// combine per aggregate, and saying so is better than adding the two group totals up and
+    /// calling that an answer.
+    #[test]
+    fn a_second_instance_of_an_aggregate_is_refused() {
+        let plan = Plan::new();
+        let schema = Schema::numbered(vec![Field::new("a", LogicalType::Integer)], 0);
+        let (aggregate, _) =
+            Aggregate::new(&plan, &schema, 1, Slice::EMPTY, Slice::EMPTY, &Memory::unlimited())
+                .expect("no aggregates to take apart");
+
+        aggregate.combine(aggregate.local()).expect("the first instance");
+        let why = aggregate.combine(aggregate.local()).expect_err("and not the second");
+        assert!(why.to_string().contains("two hash tables"), "{why}");
     }
 
     #[test]

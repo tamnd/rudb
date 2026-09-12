@@ -28,10 +28,16 @@
 //!
 //! The interface every operator ends up behind is in `rudb-pipeline`, and they are moving to it one
 //! at a time rather than in one commit. The filter, the projection and the limit are
-//! [`Stream`](rudb_pipeline::Stream) implementations, and the sort, the top N, the distinct and the
-//! set operations are [`Sink`](rudb_pipeline::Sink) implementations. All of them take `&self` and
-//! are handed the mutable part separately, so one of them can be instantiated on as many threads as
-//! F4 wants without copying its predicate or its key list.
+//! [`Stream`](rudb_pipeline::Stream) implementations, and the sort, the top N, the distinct, the set
+//! operations and the aggregate are [`Sink`](rudb_pipeline::Sink) implementations. All of them take
+//! `&self` and are handed the mutable part separately, so one of them can be instantiated on as many
+//! threads as F4 wants without copying its predicate or its key list.
+//!
+//! Being in the shape is not the same as being parallel. The aggregate holds its hash table in the
+//! instance, which is where it has to be, and merging two of those tables needs a serialize and a
+//! combine per aggregate that nothing implements yet, so a second instance is refused rather than
+//! answered wrongly. That is the one place where F4 has work left in an operator rather than in the
+//! scheduler.
 //!
 //! An operator with two inputs is two pipelines with an edge between them, and the set operation is
 //! the first one of those to move. The side that has to finish first ends in a `gather::Gather`,
