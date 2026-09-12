@@ -161,8 +161,8 @@ fn fold_runs<const DOMINANT: bool, V: AsRef<Vector>>(
                 }
                 absorb::<DOMINANT, _>(values, identity, &nulls, &mut decided, &mut unknown);
             }
-            Form::Dictionary => {
-                let (codes, values) = child.dictionary_parts()?;
+            Form::Dictionary | Form::Rle => {
+                let (codes, values) = child.positions()?;
                 let Some(Data::Bool(held)) = values.data() else {
                     return None;
                 };

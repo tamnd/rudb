@@ -16,6 +16,8 @@
 //! a number before it is worth writing: the column this is measured on, `Referer`, has enough
 //! distinct values that the dictionary form may never appear on it.
 
+use std::borrow::Cow;
+
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_regex::{Options, Regex, Rewrite};
 use rudb_vector::{Data, StringColumn, Vector};
@@ -166,10 +168,11 @@ impl Call {
     }
 }
 
-/// The text side of a call, which is a flat column or a dictionary over one.
+/// The text side of a call, which is a flat column or one read through positions.
 enum Source<'a> {
     Flat(&'a StringColumn),
-    Dictionary(&'a [u32], &'a StringColumn),
+    /// A dictionary or a run length column, which are the same thing to a loop that reads text.
+    Indirect(Cow<'a, [u32]>, &'a StringColumn),
 }
 
 impl<'a> Source<'a> {
@@ -180,9 +183,9 @@ impl<'a> Source<'a> {
         if let Some(Data::Varlen(column)) = vector.data() {
             return Some(Self::Flat(column));
         }
-        let (codes, values) = vector.dictionary_parts()?;
+        let (codes, values) = vector.positions()?;
         match values.data() {
-            Some(Data::Varlen(column)) => Some(Self::Dictionary(codes, column)),
+            Some(Data::Varlen(column)) => Some(Self::Indirect(codes, column)),
             _ => None,
         }
     }
@@ -192,7 +195,7 @@ impl<'a> Source<'a> {
     fn get(&self, index: usize) -> &'a str {
         match self {
             Self::Flat(column) => column.get(index).unwrap_or_default(),
-            Self::Dictionary(codes, values) => {
+            Self::Indirect(codes, values) => {
                 codes.get(index).and_then(|&code| values.get(code as usize)).unwrap_or_default()
             }
         }

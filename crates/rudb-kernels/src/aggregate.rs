@@ -613,8 +613,8 @@ fn spread(
             let run = Run { input, data, rows, nulls };
             scatter(states, into, &run, identity, feed)
         }
-        Form::Dictionary => {
-            let Some((codes, values)) = input.dictionary_parts() else { return Ok(false) };
+        Form::Dictionary | Form::Rle => {
+            let Some((codes, values)) = input.positions() else { return Ok(false) };
             if codes.len() < rows {
                 return Ok(false);
             }
@@ -890,8 +890,8 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
             }
             collect(data, identity, rows, nulls, want)
         }
-        Form::Dictionary => {
-            let (codes, values) = input.dictionary_parts()?;
+        Form::Dictionary | Form::Rle => {
+            let (codes, values) = input.positions()?;
             if codes.len() < rows {
                 return None;
             }
@@ -1353,8 +1353,8 @@ mod tests {
         }
     }
 
-    /// Every aggregate over every type this crate knows, in both forms that have a loop and at
-    /// three null densities, against the loop the loops replaced.
+    /// Every aggregate over every type this crate knows, in all three forms that have a loop and
+    /// at three null densities, against the loop the loops replaced.
     #[test]
     fn every_aggregate_over_every_type_agrees_with_the_row_at_a_time_path() {
         let mut rng = Rng(0x5eed_ca11_ab1e_0003);
@@ -1386,9 +1386,16 @@ mod tests {
                     let note = format!("{name} over {ty}, flat, one null in {nulls}");
                     agrees(name, &returns, &[first.clone(), second.clone()], &note);
                     let codes: Vec<u32> = (0..97).map(|index| (index % 13) as u32).collect();
-                    let coded = Vector::dictionary(codes, first).expect("codes are in range");
+                    let coded = Vector::dictionary(codes, first.clone()).expect("in range");
                     let note = format!("{name} over {ty}, dictionary, one null in {nulls}");
-                    agrees(name, &returns, &[coded, second], &note);
+                    agrees(name, &returns, &[coded, second.clone()], &note);
+                    // Runs of thirteen rows each, so a value the flat vector held once is read
+                    // thirteen times and a run boundary lands inside a batch rather than on it.
+                    let ends: Vec<u32> = (1..=8).map(|run| (run * 13).min(97)).collect();
+                    let runs = Vector::runs(ends, first.slice(0, 8).expect("eight values"))
+                        .expect("one value for each run");
+                    let note = format!("{name} over {ty}, runs, one null in {nulls}");
+                    agrees(name, &returns, &[runs, second], &note);
                 }
             }
         }
@@ -1577,6 +1584,28 @@ mod tests {
         update_scattered(&mut states, &slots, 1, 0, Some(&words), 3).expect("folds them in");
         assert_eq!(states[0].finish().expect("finishes"), Value::Varchar("a".into()));
         assert_eq!(fallback::count(Kernel::Aggregate, Form::Flat, Form::Flat), 1);
+    }
+
+    /// The point of the shared accessor. A run length column goes down the same loop a dictionary
+    /// does, so it does not reach the path that builds a `Value` a row, and the counter says so.
+    #[test]
+    fn a_sum_over_runs_takes_the_same_loop_a_dictionary_takes() {
+        fallback::reset();
+        let values = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(5), Value::Null, Value::Integer(7)],
+        )
+        .expect("a vector of integers");
+        let runs = Vector::runs(vec![4, 6, 10], values).expect("one value for each run");
+        assert_eq!(runs.form(), Form::Rle);
+        let mut summing =
+            Accumulator::new("sum", &LogicalType::HugeInt).expect("a known aggregate");
+        summing.update_run(std::slice::from_ref(&runs), 10).expect("sums");
+        // Four fives and four sevens, with the two nulls in the middle contributing nothing.
+        assert_eq!(summing.finish().expect("finishes"), Value::HugeInt(48));
+        assert_eq!(fallback::count(Kernel::Aggregate, Form::Rle, Form::Rle), 0);
+        assert_eq!(fallback::count(Kernel::Aggregate, Form::Flat, Form::Flat), 0);
+        fallback::reset();
     }
 
     #[test]
