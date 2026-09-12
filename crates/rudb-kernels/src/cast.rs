@@ -1491,7 +1491,7 @@ impl Counts {
 /// the error code is not. Everywhere else it is a conversion failure and here it is an invalid
 /// input, which is upstream throwing a different exception from the same message, and it is why
 /// `recoverable` covers invalid input at all.
-fn narrow(count: i64) -> Result<i32> {
+pub(crate) fn narrow(count: i64) -> Result<i32> {
     i32::try_from(count).map_err(|_| {
         Error::invalid_input(format!(
             "Type INT64 with value {count} can't be cast because the value is out of range for the destination type INT32"
