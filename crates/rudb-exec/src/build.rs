@@ -16,7 +16,7 @@ use rudb_common::{Cancel, Memory, Result};
 use rudb_functions::TableFunction;
 use rudb_plan::{Node, NodeRef, Plan};
 
-use crate::adapt::Streamed;
+use crate::adapt::{Broken, Streamed};
 use crate::cancel::Guarded;
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Join};
@@ -109,21 +109,22 @@ fn node<'a>(
             memory,
         )?),
         Node::Sort { input, keys } => {
-            Box::new(Sort::new(plan, node(plan, catalog, cancel, memory, input)?, keys, memory))
+            let input = node(plan, catalog, cancel, memory, input)?;
+            let schema = input.schema().clone();
+            let (sort, out) = Sort::new(plan, &schema, keys, memory)?;
+            Box::new(Broken::new(input, sort, out, schema))
         }
         Node::Limit { input, count, offset } => {
             let input = node(plan, catalog, cancel, memory, input)?;
             let schema = input.schema().clone();
             Box::new(Streamed::new(input, Limit::new(count, offset), schema))
         }
-        Node::TopN { input, keys, count, offset } => Box::new(TopN::new(
-            plan,
-            node(plan, catalog, cancel, memory, input)?,
-            keys,
-            count,
-            offset,
-            memory,
-        )),
+        Node::TopN { input, keys, count, offset } => {
+            let input = node(plan, catalog, cancel, memory, input)?;
+            let schema = input.schema().clone();
+            let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
+            Box::new(Broken::new(input, top, out, schema))
+        }
         Node::Distinct { input, on } => {
             Box::new(Distinct::new(plan, node(plan, catalog, cancel, memory, input)?, on, memory))
         }

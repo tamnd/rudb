@@ -25,112 +25,168 @@
 //!
 //! What is held is twice the bound rather than the bound, so that a trim is amortized over `n` rows
 //! rather than run on every row after the first `n`.
+//!
+//! # The shape a sink has
+//!
+//! Like the sort, this is a [`Sink`]. The difference between them is where the trimming happens: an
+//! instance trims what it holds as it goes, and `combine` trims again over what two instances
+//! brought, which is what keeps the bound the bound rather than the bound times the number of
+//! threads. On one thread there is one instance and the second trim does nothing.
 
-use rudb_common::{Error, Memory, Reservation, Result, Value};
+use std::sync::Mutex;
+
+use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Value};
+use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::Chunk;
 
-use crate::expr::evaluate_all;
-use crate::operator::Operator;
+use crate::buffer::Buffered;
+use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 use crate::sort::compare;
 
+/// One row in the running: the values of its keys, and the row itself.
+type Sortable = (Vec<Value>, Vec<Value>);
+
 /// The first rows of an ordering, without holding the rest.
 #[derive(Debug)]
-pub(crate) struct TopN<'a> {
-    input: Box<dyn Operator + 'a>,
-    plan: &'a Plan,
+pub(crate) struct TopN {
     keys: Vec<SortKey>,
-    schema: Schema,
+    /// The key expressions, evaluated against the input's schema.
+    exprs: Prepared,
+    /// The input's types, which are also the output's.
+    types: Vec<LogicalType>,
     /// How many rows to emit, once the ones to skip have been skipped.
     count: usize,
     /// How many rows to skip first.
     offset: usize,
     /// `count + offset`, which is how many rows can still turn out to be wanted.
     bound: usize,
-    built: bool,
-    chunks: Vec<Chunk>,
-    at: usize,
     memory: Memory,
-    /// What the finished chunks are charged, held for as long as this operator holds them.
-    held: Reservation,
+    /// What every instance brought, already trimmed to the bound.
+    rows: Mutex<Vec<Sortable>>,
+    /// What those rows are charged, given back once the finished chunks are charged instead.
+    charged: Mutex<Vec<Reservation>>,
+    /// What the finished chunks are charged, held for as long as they are readable.
+    held: Mutex<Reservation>,
+    out: Buffered,
 }
 
-impl<'a> TopN<'a> {
+/// What one instance of a top N holds while it runs.
+#[derive(Debug)]
+pub(crate) struct Running {
+    kept: Vec<Sortable>,
+    scratch: Scratch,
+    charged: Reservation,
+    failure: Option<Error>,
+}
+
+impl TopN {
+    /// # Errors
+    ///
+    /// If a sort key does not resolve against the input's schema.
     pub(crate) fn new(
-        plan: &'a Plan,
-        input: Box<dyn Operator + 'a>,
+        plan: &Plan,
+        input: &Schema,
         keys: Slice,
         count: u64,
         offset: u64,
         memory: &Memory,
-    ) -> Self {
-        let schema = input.schema().clone();
+    ) -> Result<(Self, Buffered)> {
         // A limit past what a `Vec` can hold is a limit nothing reaches, so saturating here turns a
         // bound nobody can hit into the largest one this machine has room for, and the operator
         // degenerates into the sort it would have been.
         let count = usize::try_from(count).unwrap_or(usize::MAX);
         let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-        Self {
-            input,
-            plan,
-            keys: plan.sort_key_list(keys).to_vec(),
-            schema,
+        let keys = plan.sort_key_list(keys).to_vec();
+        let exprs: Vec<_> = keys.iter().map(|key| key.expr).collect();
+        let out = Buffered::new();
+        let top = Self {
+            exprs: Prepared::new(plan, &exprs, input)?,
+            keys,
+            types: input.types(),
             count,
             offset,
             bound: count.saturating_add(offset),
-            built: false,
-            chunks: Vec::new(),
-            at: 0,
             memory: memory.clone(),
-            held: memory.reservation(),
+            rows: Mutex::new(Vec::new()),
+            charged: Mutex::new(Vec::new()),
+            held: Mutex::new(memory.reservation()),
+            out: out.clone(),
+        };
+        Ok((top, out))
+    }
+}
+
+impl Sink for TopN {
+    type Local = Running;
+
+    fn local(&self) -> Running {
+        Running {
+            kept: Vec::new(),
+            scratch: self.exprs.scratch(),
+            charged: self.memory.reservation(),
+            failure: None,
         }
     }
 
-    fn build(&mut self) -> Result<()> {
-        let exprs: Vec<_> = self.keys.iter().map(|key| key.expr).collect();
-        // The rows still in the running, charged separately from the finished chunks below, because
-        // this one is given back the moment the last trim is done with it.
-        let mut scratch = self.memory.reservation();
-        let mut kept: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
-        let mut failure: Option<Error> = None;
-        let ceiling = self.bound.saturating_mul(2);
-        while let Some(chunk) = self.input.next()? {
-            let keys = evaluate_all(self.plan, &exprs, &self.schema, &chunk)?;
-            let mut taken = 0;
-            // row at a time: the same layout the sort holds, and 2i (#63) replaces both at once with
-            // a normalized key that is one comparable byte string a row and a payload beside it.
-            for row in 0..chunk.len() {
-                let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
-                let values: Vec<Value> = chunk.row(row).collect();
-                taken += rows::footprint(&key) + rows::footprint(&values);
-                kept.push((key, values));
-            }
-            scratch.grow(taken)?;
-            if kept.len() > ceiling {
-                trim(&self.keys, &mut kept, self.bound, &mut failure);
-                recharge(&kept, &mut scratch)?;
-            }
+    fn sink(&self, chunk: &Chunk, local: &mut Running) -> Result<Progress> {
+        let mut keys = Vec::with_capacity(self.keys.len());
+        self.exprs.evaluate(chunk, &mut local.scratch, &mut keys)?;
+        let mut taken = 0;
+        // row at a time: the same layout the sort holds, and 2i (#63) replaces both at once with a
+        // normalized key that is one comparable byte string a row and a payload beside it.
+        for row in 0..chunk.len() {
+            let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
+            let values: Vec<Value> = chunk.row(row).collect();
+            taken += rows::footprint(&key) + rows::footprint(&values);
+            local.kept.push((key, values));
         }
-        trim(&self.keys, &mut kept, self.bound, &mut failure);
+        local.charged.grow(taken)?;
+        if local.kept.len() > self.bound.saturating_mul(2) {
+            trim(&self.keys, &mut local.kept, self.bound, &mut local.failure);
+            recharge(&local.kept, &mut local.charged)?;
+        }
+        Ok(Progress::More)
+    }
+
+    fn combine(&self, mut local: Running) -> Result<()> {
+        if let Some(error) = local.failure {
+            return Err(error);
+        }
+        let mut rows = self.rows.lock().map_err(poisoned)?;
+        rows.extend(local.kept);
+        // Trimmed here as well as in the instance, so that combining thirty two instances holding
+        // the bound each leaves the bound and not thirty two times it.
+        let mut failure = None;
+        trim(&self.keys, &mut rows, self.bound, &mut failure);
         if let Some(error) = failure {
             return Err(error);
         }
+        recharge(&rows, &mut local.charged)?;
+        self.charged.lock().map_err(poisoned)?.push(local.charged);
+        Ok(())
+    }
+
+    fn finalize(&self) -> Result<()> {
+        let kept = std::mem::take(&mut *self.rows.lock().map_err(poisoned)?);
         let wanted = kept.into_iter().skip(self.offset).take(self.count);
         let ordered: Vec<Vec<Value>> = wanted.map(|(_, row)| row).collect();
-        self.chunks = rows::chunks(&self.schema.types(), &ordered, &mut self.held)?;
+        let mut held = self.held.lock().map_err(poisoned)?;
+        let chunks = rows::chunks(&self.types, &ordered, &mut held)?;
+        self.out.fill(chunks)?;
+        self.charged.lock().map_err(poisoned)?.clear();
         Ok(())
     }
 }
 
+fn poisoned<T>(_: T) -> Error {
+    Error::internal("a thread panicked while holding the rows a top N is keeping")
+}
+
 /// Orders what is held and keeps the first `bound` of it.
-fn trim(
-    keys: &[SortKey],
-    kept: &mut Vec<(Vec<Value>, Vec<Value>)>,
-    bound: usize,
-    failure: &mut Option<Error>,
-) {
+fn trim(keys: &[SortKey], kept: &mut Vec<Sortable>, bound: usize, failure: &mut Option<Error>) {
     kept.sort_by(|left, right| compare(keys, &left.0, &right.0, failure));
     kept.truncate(bound);
 }
@@ -140,28 +196,9 @@ fn trim(
 /// Released and taken again rather than shrunk, because a reservation gives everything back at once
 /// and has no partial release. Nothing else can be holding the difference at this point, since the
 /// operator is between two reads of its input.
-fn recharge(kept: &[(Vec<Value>, Vec<Value>)], scratch: &mut Reservation) -> Result<()> {
+fn recharge(kept: &[Sortable], scratch: &mut Reservation) -> Result<()> {
     let footprint =
         kept.iter().map(|(key, values)| rows::footprint(key) + rows::footprint(values)).sum();
     scratch.release();
     scratch.grow(footprint)
-}
-
-impl Operator for TopN<'_> {
-    fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        if !self.built {
-            self.build()?;
-            self.built = true;
-        }
-        if self.at >= self.chunks.len() {
-            return Ok(None);
-        }
-        let chunk = self.chunks[self.at].clone();
-        self.at += 1;
-        Ok(Some(chunk))
-    }
 }

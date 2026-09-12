@@ -13,9 +13,10 @@
 use std::fmt;
 
 use rudb_common::{Error, Result};
-use rudb_pipeline::{Progress, Stream};
+use rudb_pipeline::{Progress, Sink, Stream};
 use rudb_vector::Chunk;
 
+use crate::buffer::Buffered;
 use crate::operator::Operator;
 use crate::schema::Schema;
 
@@ -73,6 +74,74 @@ impl<S: Stream> Operator for Streamed<'_, S> {
     }
 }
 
+/// One pipeline breaker with the tree below it.
+///
+/// A sink sees its whole input before it produces anything, so this drains the tree below into it
+/// on the first call, combines the one instance there is, finalises, and then reads the finished
+/// chunks back out of the [`Buffered`] the sink filled. The order is the order the serial driver
+/// uses, which is on purpose: when the tree is built as a pipeline this adapter is deleted and the
+/// driver does exactly this.
+pub(crate) struct Broken<'a, K: Sink> {
+    input: Box<dyn Operator + 'a>,
+    sink: K,
+    out: Buffered,
+    schema: Schema,
+    built: bool,
+    at: usize,
+}
+
+impl<'a, K: Sink> Broken<'a, K> {
+    /// `out` is the source half the sink finalises into, and `schema` is what comes out of it.
+    pub(crate) fn new(
+        input: Box<dyn Operator + 'a>,
+        sink: K,
+        out: Buffered,
+        schema: Schema,
+    ) -> Self {
+        Self { input, sink, out, schema, built: false, at: 0 }
+    }
+
+    fn build(&mut self) -> Result<()> {
+        let mut local = self.sink.local();
+        while let Some(chunk) = self.input.next()? {
+            match self.sink.sink(&chunk, &mut local)? {
+                Progress::Done => break,
+                Progress::Blocked(blocked) => return Err(parked(&blocked)),
+                _ => {}
+            }
+        }
+        self.sink.combine(local)?;
+        self.sink.finalize()
+    }
+}
+
+impl<K: Sink> fmt::Debug for Broken<'_, K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Broken")
+            .field("sink", &self.sink)
+            .field("input", &self.input)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K: Sink> Operator for Broken<'_, K> {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        if !self.built {
+            self.build()?;
+            self.built = true;
+        }
+        let chunk = self.out.at(self.at)?;
+        if chunk.is_some() {
+            self.at += 1;
+        }
+        Ok(chunk)
+    }
+}
+
 /// The error a blocked stream gets here.
 ///
 /// Nothing in the tree returns [`Progress::Blocked`] yet, and the operators that will are the ones
@@ -81,7 +150,6 @@ impl<S: Stream> Operator for Streamed<'_, S> {
 /// is the useful half of the report.
 fn parked(blocked: &rudb_pipeline::Blocked) -> Error {
     Error::not_implemented(format!(
-        "a streaming operator blocked {blocked} and the pull tree has nothing else to run, \
-         which is F4"
+        "an operator blocked {blocked} and the pull tree has nothing else to run, which is F4"
     ))
 }
