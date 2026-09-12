@@ -123,7 +123,7 @@ fn check_one(name: &str, text: &str) -> (Vec<String>, usize) {
 /// binding that names a row. Both halves are needed. Without the first, every `for` in the workspace
 /// is a row loop; without the second, a loop over three comparison operators or a handful of column
 /// names is one, and those are the loops where a `Value` is the right thing to build.
-fn is_row_loop(code: &str) -> bool {
+pub(crate) fn is_row_loop(code: &str) -> bool {
     if !code.trim_start().starts_with("for ") {
         return false;
     }
