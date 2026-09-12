@@ -498,6 +498,26 @@ fn a_part_of_an_interval_is_one_of_its_three_fields() {
     assert_eq!(refused, "\"interval\" units \"week\" not recognized");
 }
 
+/// Truncating an interval keeps the fields above the part and clears the ones below it, and the
+/// column form has to agree with the single value one about which those are.
+#[test]
+fn truncating_an_interval_keeps_the_fields_above_the_part() {
+    let db = database();
+    let length = "INTERVAL '14 months 10 days 06:07:08.9'";
+    let months = Value::Interval { months: 14, days: 0, micros: 0 };
+    assert_eq!(rows(&db, &format!("SELECT date_trunc('month', {length})")), vec![vec![months]]);
+    let week = Value::Interval { months: 14, days: 7, micros: 0 };
+    assert_eq!(rows(&db, &format!("SELECT date_trunc('week', {length})")), vec![vec![week]]);
+    let lengths = format!("FROM (VALUES ({length}), (CAST(NULL AS INTERVAL))) t(length)");
+    let hour = Value::Interval { months: 14, days: 10, micros: 6 * 3_600 * 1_000_000 };
+    assert_eq!(
+        rows(&db, &format!("SELECT date_trunc('hour', length) {lengths}")),
+        vec![vec![hour], vec![Value::Null]]
+    );
+    let refused = failure(&db, &format!("SELECT date_trunc('era', {length})"));
+    assert_eq!(refused, "Specifier type not implemented for DATETRUNC");
+}
+
 /// ClickBench query 29 with the aggregates cut down to one, which is the last of the forty three to
 /// plan and the only one that needs a regular expression.
 ///
