@@ -1,6 +1,6 @@
 //! The calendar, which is what `date_part` and `date_trunc` are made of.
 //!
-//! Both functions are one string and one date or timestamp, and the string decides which of twenty
+//! Both functions are one string and one moment or length, and the string decides which of twenty
 //! pieces of arithmetic happens. Splitting the string out into a [`Part`] is not tidiness: the
 //! string is a literal in every query anyone writes, so the vectorized path reads it once per vector
 //! and the loop underneath it does one piece of arithmetic per row with nothing left to decide.
@@ -19,7 +19,7 @@
 //! DuckDB is not being consistent there and neither are we, on purpose.
 //!
 //! What is missing is `timezone`, `timezone_hour` and `timezone_minute`, which need a session time
-//! zone before they mean anything, and the interval overloads of both functions.
+//! zone before they mean anything, and the interval overload of `date_trunc`.
 
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 
@@ -260,6 +260,101 @@ impl Part {
                 return Err(Error::not_implemented(
                     "Specifier type not implemented for DATETRUNC statistics",
                 ));
+            }
+        })
+    }
+
+    /// This part again, if an interval is made of it.
+    ///
+    /// An interval is three counts and not a moment, so the parts that need a calendar have no
+    /// answer over one. Upstream refuses those at run time rather than at binding, with a sentence
+    /// that names the type and echoes the specifier as it was written, which is why this takes the
+    /// spelling as well as the part it was already parsed into.
+    ///
+    /// # Errors
+    ///
+    /// If the part is one an interval does not have, which is every part that has to look at a
+    /// calendar to mean anything: the week, the three ways of numbering a day, the ISO year and the
+    /// era. A time zone is refused here as well, one step before the fact that we have none.
+    pub(crate) fn of_an_interval(self, spelling: &str) -> Result<Self> {
+        if self.fits_an_interval() {
+            Ok(self)
+        } else {
+            Err(Error::not_implemented(format!("\"interval\" units \"{spelling}\" not recognized")))
+        }
+    }
+
+    /// Whether an interval is made of this part.
+    ///
+    /// The list lives here and nowhere else, so the check in [`Part::of_an_interval`] and the
+    /// arithmetic in [`Part::of_interval`] cannot come apart.
+    fn fits_an_interval(self) -> bool {
+        matches!(
+            self,
+            Self::Year
+                | Self::Month
+                | Self::Day
+                | Self::Hour
+                | Self::Minute
+                | Self::Second
+                | Self::Millisecond
+                | Self::Microsecond
+                | Self::Decade
+                | Self::Century
+                | Self::Millennium
+                | Self::Quarter
+                | Self::Epoch
+        )
+    }
+
+    /// The part of an interval, which is a count of months, a count of days and a count of
+    /// microseconds.
+    ///
+    /// The three counts stay apart here the way they stay apart everywhere else, so this reads one
+    /// field and never converts between them. `date_part('day', INTERVAL '36 hours')` is zero and
+    /// `date_part('hour', INTERVAL '36 hours')` is thirty six, because nothing carries the hours up
+    /// into a day and nothing is going to.
+    ///
+    /// The years and everything longer divide the months, and the division truncates towards zero
+    /// rather than flooring, so minus eleven months is zero years and minus fourteen is minus one.
+    /// The minutes and everything shorter take the remainder of the microseconds the way the clock
+    /// parts of a timestamp do, carrying the seconds into the milliseconds, but the hours do not,
+    /// since there is no day above them to roll into.
+    ///
+    /// # Errors
+    ///
+    /// If the part is `epoch`, which is a double, and if it is one an interval does not have, which
+    /// the caller was supposed to have refused already.
+    pub(crate) fn of_interval(self, months: i32, days: i32, micros: i64) -> Result<i64> {
+        let months = i64::from(months);
+        Ok(match self {
+            Self::Year => months / 12,
+            Self::Month => months % 12,
+            Self::Day => i64::from(days),
+            Self::Hour => micros / MICROS_PER_HOUR,
+            Self::Minute => micros / MICROS_PER_MINUTE % 60,
+            Self::Second => micros / MICROS_PER_SECOND % 60,
+            Self::Millisecond => micros / 1_000 % 60_000,
+            Self::Microsecond => micros % 60_000_000,
+            Self::Decade => months / 120,
+            Self::Century => months / 1_200,
+            Self::Millennium => months / 12_000,
+            // The quarter of a whole year is the first one, and the quarter of a negative count of
+            // months is measured the same way, so eleven months is the fourth quarter and minus
+            // five months is the zeroth. It is upstream's arithmetic rather than a number anybody
+            // would name.
+            Self::Quarter => months % 12 / 3 + 1,
+            // The same overload the date path is waiting for, since seconds with a fraction on them
+            // are not a bigint whatever they are counted from.
+            Self::Epoch => {
+                return Err(Error::not_implemented(
+                    "date_part('epoch', ...), which DuckDB answers as a double",
+                ));
+            }
+            _ => {
+                return Err(Error::internal(format!(
+                    "an interval has no {self:?} in it and the caller did not check"
+                )));
             }
         })
     }
@@ -1380,6 +1475,72 @@ mod tests {
         assert_eq!(part("day").truncate_micros(moment).expect("a truncation"), -MICROS_PER_DAY);
         assert_eq!(part("second").of_micros(moment).expect("a part"), 58);
         assert_eq!(part("day").of_micros(moment).expect("a part"), 31);
+    }
+
+    /// `INTERVAL '1 year 2 months 3 days 04:05:06.7'`, which has something in all three fields.
+    const LENGTH: (i32, i32, i64) =
+        (14, 3, 4 * MICROS_PER_HOUR + 5 * MICROS_PER_MINUTE + 6_700_000);
+
+    fn of_interval(spelling: &str, (months, days, micros): (i32, i32, i64)) -> i64 {
+        part(spelling).of_interval(months, days, micros).expect("a part of an interval")
+    }
+
+    /// Every one of these was read off the binary, and the ones worth looking twice at are the day
+    /// and the hour of thirty six hours, which is a length that has no days in it at all.
+    #[test]
+    fn every_part_of_an_interval_reads_one_field_and_leaves_the_others_alone() {
+        for (spelling, answer) in [
+            ("year", 1),
+            ("month", 2),
+            ("day", 3),
+            ("hour", 4),
+            ("minute", 5),
+            ("second", 6),
+            ("millisecond", 6_700),
+            ("microsecond", 6_700_000),
+            ("quarter", 1),
+        ] {
+            assert_eq!(of_interval(spelling, LENGTH), answer, "{spelling} of a length");
+        }
+        let hours = (0, 0, 36 * MICROS_PER_HOUR);
+        assert_eq!(of_interval("day", hours), 0);
+        assert_eq!(of_interval("hour", hours), 36);
+        assert_eq!(of_interval("minute", (0, 0, 125 * MICROS_PER_MINUTE)), 5);
+        assert_eq!(of_interval("second", (0, 0, 3_661 * MICROS_PER_SECOND)), 1);
+        assert_eq!(of_interval("millisecond", (0, 0, 3_661 * MICROS_PER_SECOND)), 1_000);
+        assert_eq!(of_interval("decade", (300, 0, 0)), 2);
+        assert_eq!(of_interval("century", (3_000, 0, 0)), 2);
+        assert_eq!(of_interval("millennium", (30_000, 0, 0)), 2);
+        assert_eq!(of_interval("quarter", (11, 0, 0)), 4);
+        assert_eq!(of_interval("quarter", (0, 0, 0)), 1);
+    }
+
+    /// A length below zero divides towards zero rather than downwards, which is the opposite of
+    /// what a timestamp before the epoch does, and both were measured rather than picked.
+    #[test]
+    fn a_length_below_zero_counts_towards_zero() {
+        assert_eq!(of_interval("year", (-11, 0, 0)), 0);
+        assert_eq!(of_interval("year", (-14, 0, 0)), -1);
+        assert_eq!(of_interval("month", (-14, 0, 0)), -2);
+        assert_eq!(of_interval("decade", (-1_500, 0, 0)), -12);
+        assert_eq!(of_interval("second", (0, 0, -3_661 * MICROS_PER_SECOND)), -1);
+        assert_eq!(of_interval("microsecond", (0, 0, -6_700_000)), -6_700_000);
+        assert_eq!(of_interval("quarter", (-5, 0, 0)), 0);
+        assert_eq!(of_interval("quarter", (-1, 0, 0)), 1);
+    }
+
+    /// The parts that need a calendar, refused with the type in the sentence and the specifier
+    /// spelled the way it was written rather than the way it was matched.
+    #[test]
+    fn the_parts_an_interval_does_not_have_name_the_type_and_the_spelling() {
+        for spelling in ["week", "dow", "doy", "isoyear", "isodow", "era", "yearweek", "WEEKDAY"] {
+            let error = part(spelling).of_an_interval(spelling).expect_err("not an interval part");
+            assert_eq!(
+                error.to_string(),
+                format!("Not implemented Error: \"interval\" units \"{spelling}\" not recognized")
+            );
+        }
+        assert_eq!(part("month").of_an_interval("month").expect("an interval part"), Part::Month);
     }
 
     fn built(name: &str, count: i128) -> (i32, i32, i64) {

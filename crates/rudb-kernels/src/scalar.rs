@@ -1283,6 +1283,12 @@ fn date_of(
         return Ok(None);
     }
     let part = Part::parse(spelling)?;
+    // An interval has no calendar in it, so it has fewer parts than a date does, and the check is
+    // here rather than in the loop because it is the same answer on every row.
+    let part = match when.logical_type() {
+        LogicalType::Interval if !truncating => part.of_an_interval(spelling)?,
+        _ => part,
+    };
     let base = nulls_of(when).and(&nulls_of(spec), rows);
     match when.form() {
         Form::Flat => {
@@ -1360,6 +1366,15 @@ fn date_runs<A: Fn(usize) -> usize>(
             })?;
             finish(returns, Data::Int64(out.into()), validity)
         }
+        (LogicalType::Interval, Data::Interval(fields), false) => {
+            let mut out = vec![0i64; rows];
+            let validity = over_valid(rows, base, |index| {
+                let (months, days, micros) = fields[at(index)];
+                out[index] = part.of_interval(months, days, micros)?;
+                Ok(())
+            })?;
+            finish(returns, Data::Int64(out.into()), validity)
+        }
         _ => Ok(None),
     }
 }
@@ -1373,6 +1388,9 @@ fn date_value(name: &str, spec: &Value, when: &Value) -> Result<Value> {
     match (name == "date_trunc", when) {
         (false, Value::Date(days)) => part.of_days(*days).map(Value::BigInt),
         (false, Value::Timestamp(micros)) => part.of_micros(*micros).map(Value::BigInt),
+        (false, Value::Interval { months, days, micros }) => {
+            part.of_an_interval(spelling)?.of_interval(*months, *days, *micros).map(Value::BigInt)
+        }
         (true, Value::Date(days)) => part.truncate_days(*days).map(Value::Date),
         (true, Value::Timestamp(micros)) => part.truncate_micros(*micros).map(Value::Timestamp),
         // DuckDB has overloads for a time, an interval and a timestamp with a time zone as well,

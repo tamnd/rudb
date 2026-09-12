@@ -474,6 +474,30 @@ fn a_date_part_reads_its_specifier_three_ways_and_refuses_a_fourth() {
     assert!(failure(&db, &format!("SELECT date_part('qtr', {stamp})")).contains("qtr"));
 }
 
+/// A part of an interval is one of its three fields and never a sum of them, so thirty six hours
+/// has no days in it and asking for the days says zero.
+///
+/// The column form is here as well as the single value one because the two are different loops, and
+/// the parts an interval does not have are refused in both of them.
+#[test]
+fn a_part_of_an_interval_is_one_of_its_three_fields() {
+    let db = database();
+    let lengths = "FROM (VALUES (INTERVAL '14 months'), (INTERVAL '-14 months'), \
+                   (CAST(NULL AS INTERVAL))) t(length)";
+    let one = |value: i64| vec![vec![Value::BigInt(value)]];
+    assert_eq!(rows(&db, "SELECT date_part('hour', INTERVAL '36 hours')"), one(36));
+    assert_eq!(rows(&db, "SELECT date_part('day', INTERVAL '36 hours')"), one(0));
+    assert_eq!(rows(&db, "SELECT extract(month FROM INTERVAL '14 months')"), one(2));
+    assert_eq!(
+        rows(&db, &format!("SELECT date_part('month', length) {lengths}")),
+        vec![vec![Value::BigInt(2)], vec![Value::BigInt(-2)], vec![Value::Null]]
+    );
+    let refused = failure(&db, &format!("SELECT date_part('week', length) {lengths}"));
+    assert_eq!(refused, "\"interval\" units \"week\" not recognized");
+    let refused = failure(&db, "SELECT date_part('week', INTERVAL '5 days')");
+    assert_eq!(refused, "\"interval\" units \"week\" not recognized");
+}
+
 /// ClickBench query 29 with the aggregates cut down to one, which is the last of the forty three to
 /// plan and the only one that needs a regular expression.
 ///
