@@ -30,6 +30,8 @@ use std::collections::BTreeMap;
 
 use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 
+use crate::walk;
+
 /// What one conjunct of a filter is assumed to keep.
 ///
 /// A fifth, which is DuckDB's default for a predicate it cannot reason about and has been the
@@ -173,13 +175,21 @@ pub fn rows(plan: &Plan, node: NodeRef, stats: &Statistics) -> Option<u64> {
 /// however many branches it has, and something inside a function call is not reached, because
 /// `f(a AND b)` is one predicate about whatever `f` does.
 ///
+/// A conjunct with the same value for every row is not counted. The selectivity constant is a guess
+/// about a predicate over data, and a condition that does not read the data keeps every row or none
+/// of them rather than a fifth of them. Most of those are folded away before this ever sees them,
+/// and the one that survives is the fold that was abandoned so that the error still comes from
+/// running the query.
+///
 /// Capped at eight so that a query written by a generator does not compound its way to a factor of
 /// a million. Past a handful of conditions the product has stopped meaning anything anyway, and the
 /// cap is where it stops pretending to.
 fn conjuncts(plan: &Plan, predicate: ExprRef) -> i32 {
     let counted = match *plan.expr(predicate) {
-        Expr::Conjunction { op: ConjunctionOp::And, children } => plan.expr_list(children).len(),
-        _ => 1,
+        Expr::Conjunction { op: ConjunctionOp::And, children } => {
+            plan.expr_list(children).iter().filter(|&&part| !walk::constant(plan, part)).count()
+        }
+        _ => usize::from(!walk::constant(plan, predicate)),
     };
     i32::try_from(counted.min(8)).unwrap_or(8)
 }
@@ -325,6 +335,19 @@ mod tests {
         // And each part counts, so six of them cut harder than one of them.
         let one = format!("Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n  {}", scan("t", 0));
         assert_eq!(estimate(&one, &[("t", 1_000_000)]), Some(200_000));
+    }
+
+    #[test]
+    fn a_condition_that_reads_no_column_is_not_counted_as_a_condition() {
+        // A fifth is a guess about a predicate over data. One that does not read the data keeps
+        // every row or none of them, and taking a fifth for it is taking a fifth for nothing.
+        let both = format!(
+            "Filter ((#0.0::INTEGER > 1::INTEGER)::BOOLEAN AND (1::INTEGER > 2::INTEGER)::BOOLEAN)::BOOLEAN\n  {}",
+            scan("t", 0)
+        );
+        assert_eq!(estimate(&both, &[("t", 1_000_000)]), Some(200_000));
+        let alone = format!("Filter (1::INTEGER > 2::INTEGER)::BOOLEAN\n  {}", scan("t", 0));
+        assert_eq!(estimate(&alone, &[("t", 1_000_000)]), Some(1_000_000));
     }
 
     #[test]

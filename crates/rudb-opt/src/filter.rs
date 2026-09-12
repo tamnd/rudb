@@ -412,12 +412,19 @@ fn partition(
 }
 
 /// Whether every column `expr` reads can be replaced by what `held` computes it from.
+///
+/// A source has to be two things. Not volatile, because the substitution writes it down where the
+/// predicate reads it and leaves it where it was, so a volatile one is called twice and the row
+/// that passed the test is not the row that comes out. And elementwise, because the predicate ends
+/// up below the operator that produced the column and an expression reading more than its own row
+/// answers differently there. Nothing the binder builds can fail the second test today, since an
+/// aggregate is a node and not a projection expression, and it is asked rather than assumed.
 fn substitutable(plan: &Plan, expr: ExprRef, index: u32, held: &[ExprRef]) -> bool {
     let mut answer = true;
     walk::columns(plan, expr, &mut |binding| {
         answer &= binding.table == index;
         answer &= match held.get(binding.column as usize) {
-            Some(&source) => !walk::volatile(plan, source),
+            Some(&source) => !walk::volatile(plan, source) && walk::elementwise(plan, source),
             None => false,
         };
     });
