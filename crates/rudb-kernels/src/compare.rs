@@ -70,7 +70,7 @@
 
 use std::cmp::Ordering;
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, Result, Value, interval_micros};
 use rudb_vector::{Data, Form, Selection, StringColumn, Validity, Vector};
 
 use crate::fallback::{self, Kernel};
@@ -402,9 +402,6 @@ where
     R: Fn(usize) -> usize,
     V: Fn(usize) -> usize,
 {
-    // A `Data::Interval` is in the ordered group because it is a tuple of three integers whose
-    // derived order is months, then days, then microseconds, which is exactly what `order` does for
-    // the same value by hand.
     macro_rules! layouts {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match (left, right) {
@@ -437,6 +434,20 @@ where
                     op,
                     len,
                     |index| float_order(one[at_left(index)], other[at_right(index)]),
+                    left_valid,
+                    right_valid,
+                    &at_valid,
+                )),
+                // An interval is three counts and the order is over the one length they add up to,
+                // so this is not the derived order of the triple and cannot be generated above.
+                (Data::Interval(one), Data::Interval(other)) => Some(sweep(
+                    op,
+                    len,
+                    |index| {
+                        let (months, days, micros) = one[at_left(index)];
+                        let (bm, bd, bu) = other[at_right(index)];
+                        interval_micros(months, days, micros).cmp(&interval_micros(bm, bd, bu))
+                    },
                     left_valid,
                     right_valid,
                     &at_valid,
@@ -625,7 +636,7 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
         (
             Value::Interval { months: am, days: ad, micros: au },
             Value::Interval { months: bm, days: bd, micros: bu },
-        ) => Ok((am, ad, au).cmp(&(bm, bd, bu))),
+        ) => Ok(interval_micros(*am, *ad, *au).cmp(&interval_micros(*bm, *bd, *bu))),
         _ => numeric_order(left, right),
     }
 }
@@ -801,6 +812,22 @@ mod tests {
         );
     }
 
+    /// An interval is three counts and two of them that are the same length are one value, at
+    /// thirty days to a month and twenty four hours to a day, which is what upstream answers. The
+    /// three counts are still kept apart, because adding a month to a date is not adding thirty
+    /// days to it, so these pairs are equal and print differently.
+    #[test]
+    fn two_intervals_of_the_same_length_are_one_value() {
+        let day = Value::Interval { months: 0, days: 1, micros: 0 };
+        let hours = Value::Interval { months: 0, days: 0, micros: 86_400_000_000 };
+        let month = Value::Interval { months: 1, days: 0, micros: 0 };
+        let thirty = Value::Interval { months: 0, days: 30, micros: 0 };
+        let long_day = Value::Interval { months: 0, days: 0, micros: 90_000_000_000 };
+        assert_eq!(compared(Comparison::Equal, day.clone(), hours), Value::Boolean(true));
+        assert_eq!(compared(Comparison::Equal, month, thirty), Value::Boolean(true));
+        assert_eq!(compared(Comparison::Greater, long_day, day), Value::Boolean(true));
+    }
+
     #[test]
     fn a_number_compares_the_same_however_it_is_stored() {
         assert_eq!(
@@ -874,7 +901,7 @@ mod tests {
     #[test]
     fn every_specialized_path_agrees_with_the_row_at_a_time_path() {
         let mut rng = Rng(0x5eed_1234_9876_4321);
-        let types: [LogicalType; 10] = [
+        let types: [LogicalType; 11] = [
             LogicalType::Boolean,
             LogicalType::TinyInt,
             LogicalType::SmallInt,
@@ -885,6 +912,7 @@ mod tests {
             LogicalType::Float,
             LogicalType::Double,
             LogicalType::Varchar,
+            LogicalType::Interval,
         ];
         for ty in &types {
             for nulls in [0u64, 1, 3] {
@@ -1091,6 +1119,17 @@ mod tests {
                 1 => -0.0,
                 other => other as f64 - 2.0,
             }),
+            // The same length written three ways and two lengths that are close to it, because an
+            // interval that compares as a triple gets every pair here wrong and one that compares
+            // as a length gets them right.
+            LogicalType::Interval => match rng.below(6) {
+                0 => Value::Interval { months: 0, days: 1, micros: 0 },
+                1 => Value::Interval { months: 0, days: 0, micros: 86_400_000_000 },
+                2 => Value::Interval { months: 1, days: -29, micros: 86_400_000_000 },
+                3 => Value::Interval { months: 1, days: 0, micros: 0 },
+                4 => Value::Interval { months: 0, days: 0, micros: 90_000_000_000 },
+                _ => Value::Interval { months: -1, days: 0, micros: 0 },
+            },
             // Short, at the inline limit, over it, and sharing a prefix with each other, which is
             // where a comparison that trusts the prefix too far goes wrong.
             LogicalType::Varchar => Value::Varchar(

@@ -30,7 +30,7 @@
 //! tag is a constant, and two key columns of different types are told apart by their position in the
 //! fold and by the comparison that follows the probe.
 
-use rudb_common::{Error, Result, Value};
+use rudb_common::{Error, Result, Value, interval_micros};
 use rudb_vector::{Data, Vector};
 
 use crate::key::{canonical, mix, same, spread};
@@ -279,7 +279,8 @@ pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>) {
 /// because the same column arrives flat in one chunk and as a dictionary in the next. The module
 /// comment has the argument. The arms that are missing, which are the intervals and the nested
 /// types, are missing on purpose: they fall through to the general path in every form, so there is
-/// nothing for them to disagree with.
+/// nothing for them to disagree with. An interval is hashed as the one length its three counts add
+/// up to, which is what makes a day and twenty four hours one group.
 fn fold(column: &Vector, rows: usize, hashes: &mut [u64]) {
     let validity = column.validity();
     /// One pass over a run of values, turning each into a word the same way the general path does.
@@ -339,9 +340,9 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64]) {
 
 /// Folds one value into a running hash, for the forms and types that have no run to walk.
 ///
-/// The nested types and the intervals go through `Display`, which is slow and is the same honest
-/// answer `key.rs` gives: a group key is a `Value` until section 7.4's row layout replaces it, and
-/// every type that shows up in a ClickBench group key is written out above that fallback.
+/// The nested types go through `Display`, which is slow and is the same honest answer `key.rs`
+/// gives: a group key is a `Value` until section 7.4's row layout replaces it, and every type that
+/// shows up in a ClickBench group key is written out above that fallback.
 fn fold_value(state: u64, value: &Value) -> u64 {
     match value {
         Value::Null => mix(state, NOTHING),
@@ -365,6 +366,13 @@ fn fold_value(state: u64, value: &Value) -> u64 {
             mix(mix(state, *x as u64), (*x >> 64) as u64)
         }
         Value::UHugeInt(x) => mix(mix(state, *x as u64), (*x >> 64) as u64),
+        // The one length the three counts add up to, read as two words the same way, because a
+        // day and twenty four hours are one group and a hash that told them apart would put that
+        // one group in two buckets.
+        Value::Interval { months, days, micros } => {
+            let length = interval_micros(*months, *days, *micros);
+            mix(mix(state, length as u64), (length >> 64) as u64)
+        }
         other => mix(state, bytes_word(other.to_string().as_bytes())),
     }
 }
