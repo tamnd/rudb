@@ -204,8 +204,11 @@ mod tests {
 
     #[test]
     fn a_missing_checkout_says_where_it_looked_and_what_to_clone() {
+        // Joined rather than written out, because a separator is a backslash on Windows and the
+        // sentence is printed with whatever separator the platform puts in it.
+        let looked = Path::new("/nowhere").join("rudb-compat");
         let why = beside(Path::new("/nowhere/rudb")).expect_err("there is no checkout there");
-        assert!(why.contains("/nowhere/rudb-compat"), "{why}");
+        assert!(why.contains(&looked.display().to_string()), "{why}");
         assert!(why.contains("git clone"), "{why}");
         assert!(why.contains("RUDB_COMPAT_REPO"), "{why}");
     }
@@ -221,16 +224,21 @@ mod tests {
     }
 
     /// The two lines cargo actually printed for rudb before and after #343 was fixed.
+    ///
+    /// The path in a line is built rather than written out, because cargo prints a path the way the
+    /// platform spells it and the separator on Windows is a backslash.
     #[test]
     fn the_resolved_rudb_is_read_off_the_line_cargo_prints_for_it() {
         let package = Path::new("/root/gate/rudb").join("crates").join("rudb");
-        assert!(points_at("rudb v0.2.30 (/root/gate/rudb/crates/rudb)\n", &package));
+        let printed = |at: &Path| format!("rudb v0.2.30 ({})\n", at.display());
+        assert!(points_at(&printed(&package), &package));
         assert!(!points_at(
             "rudb v0.2.29 (https://github.com/tamnd/rudb?branch=main#ab1510cc)\n",
             &package
         ));
         // A checkout somewhere else is not this one, which is the case a plain version comparison
         // would have said yes to.
-        assert!(!points_at("rudb v0.2.30 (/home/dev/rudb/crates/rudb)\n", &package));
+        let elsewhere = Path::new("/home/dev/rudb").join("crates").join("rudb");
+        assert!(!points_at(&printed(&elsewhere), &package));
     }
 }
