@@ -14,13 +14,31 @@
 //! The condition is evaluated over the left row paired with a whole chunk of the right side rather
 //! than one right row at a time, which keeps the evaluator on its batch interface and makes the
 //! left side's columns constant vectors that cost one value each.
+//!
+//! # Two pipelines and an edge
+//!
+//! A join is two inputs, and two inputs is two pipelines with a dependency between them. The right
+//! side ends in a [`Gather`](crate::gather::Gather), which keeps its rows and does nothing else, and
+//! the left side ends here. The order is not a choice: no left row can be answered until every right
+//! row it might match has been seen, and that is the edge the scheduler will read off the plan. It
+//! is also the edge the hash join in #62 builds on, with the build side where the gather is now.
+//!
+//! The left side is held whole as well, which the nested loop always did and the hash join will not.
+//! What replaces it is a probe that runs a chunk at a time and needs no state past the match bitmap,
+//! and the shape here is already the one that wants: the rows arrive at [`Sink::sink`] chunk by
+//! chunk, and it is [`Sink::finalize`] that keeps them rather than the interface.
+
+use std::sync::Mutex;
 
 use rudb_common::{Cancel, Error, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Connective, combine, is_true};
+use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{ExprRef, JoinKind, Plan, Slice};
 use rudb_vector::{Chunk, Vector};
 
+use crate::buffer::Buffered;
 use crate::expr::evaluate_all;
+use crate::gather::{self, Gathering, Rows};
 use crate::operator::Operator;
 use crate::rows;
 use crate::schema::Schema;
@@ -28,8 +46,6 @@ use crate::schema::Schema;
 /// A join with a condition.
 #[derive(Debug)]
 pub(crate) struct Join<'a> {
-    left: Box<dyn Operator + 'a>,
-    right: Box<dyn Operator + 'a>,
     plan: &'a Plan,
     kind: JoinKind,
     conditions: Vec<ExprRef>,
@@ -37,78 +53,100 @@ pub(crate) struct Join<'a> {
     right_schema: Schema,
     combined: Schema,
     schema: Schema,
-    built: bool,
-    chunks: Vec<Chunk>,
-    at: usize,
     memory: Memory,
     /// The same token the `cancel` module wraps every node in, held here as well.
     ///
-    /// This is the one operator that needs it. The wrapper checks between calls to `next` and the
-    /// whole join happens inside the first of them, so a nested loop over a hundred thousand left
+    /// This is the one operator that needs it. The wrapper checks between chunks and the whole
+    /// nested loop happens inside one call to `finalize`, so a loop over a hundred thousand left
     /// rows and thirty thousand right ones runs for a minute with nothing looking at the token.
     cancel: Cancel,
-    /// What the joined chunks are charged, held for as long as this operator holds them.
-    held: Reservation,
+    /// The right side, filled by the pipeline this one depends on.
+    right: Rows,
+    /// The left side, as every instance gathered it.
+    left: Mutex<Vec<Vec<Value>>>,
+    /// What the left side is charged, given back once the finished chunks are charged instead.
+    charged: Mutex<Vec<Reservation>>,
+    /// What the joined chunks are charged, held for as long as they are readable.
+    held: Mutex<Reservation>,
+    out: Buffered,
+}
+
+/// The side of a join that is finished before the other one starts.
+///
+/// The schema and the rows travel together because they are one thing, which is what the pipeline
+/// on the other end of the dependency edge produced. When the hash join arrives this is where its
+/// table goes.
+pub(crate) struct Gathered<'s> {
+    /// What that side's rows look like.
+    pub(crate) schema: &'s Schema,
+    /// The rows, readable once the pipeline that filled them has finished.
+    pub(crate) rows: Rows,
 }
 
 impl<'a> Join<'a> {
+    /// The sink for the left side, and the source the answer comes out of.
+    ///
+    /// `left` is the left input's schema and `right` is the side the pipeline before this one
+    /// gathered.
     pub(crate) fn new(
         plan: &'a Plan,
-        left: Box<dyn Operator + 'a>,
-        right: Box<dyn Operator + 'a>,
+        left: &Schema,
+        right: Gathered<'_>,
         kind: JoinKind,
         conditions: Slice,
         cancel: &Cancel,
         memory: &Memory,
-    ) -> Self {
-        let left_schema = left.schema().clone();
-        let right_schema = right.schema().clone();
-        let combined = Schema::concat(&left_schema, &right_schema);
+    ) -> (Self, Buffered) {
+        let combined = Schema::concat(left, right.schema);
         let schema = match kind {
-            JoinKind::Semi | JoinKind::Anti => left_schema.clone(),
+            JoinKind::Semi | JoinKind::Anti => left.clone(),
             _ => combined.clone(),
         };
-        Self {
-            left,
-            right,
+        let out = Buffered::new();
+        let join = Self {
             plan,
             kind,
             conditions: plan.expr_list(conditions).to_vec(),
-            left_schema,
-            right_schema,
+            left_schema: left.clone(),
+            right_schema: right.schema.clone(),
             combined,
             schema,
-            built: false,
-            chunks: Vec::new(),
-            at: 0,
             memory: memory.clone(),
             cancel: cancel.clone(),
-            held: memory.reservation(),
-        }
+            right: right.rows,
+            left: Mutex::new(Vec::new()),
+            charged: Mutex::new(Vec::new()),
+            held: Mutex::new(memory.reservation()),
+            out: out.clone(),
+        };
+        (join, out)
     }
 
-    fn build(&mut self) -> Result<()> {
-        // Both sides and the rows being paired up, charged apart from the chunks that come out,
-        // because a nested loop join holds all of it at once and gives back everything but the
-        // output when it is done.
+    /// What this operator produces, which is both sides' columns unless the kind throws one away.
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// The joined rows, before they are turned back into chunks.
+    fn joined(
+        &self,
+        left_rows: &[Vec<Value>],
+        right_rows: &[Vec<Value>],
+    ) -> Result<Vec<Vec<Value>>> {
+        // The rows being paired up, charged apart from the chunks that come out, because a nested
+        // loop join holds all of it at once and gives back everything but the output when it is
+        // done.
         let mut scratch = self.memory.reservation();
         let left_types = self.left_schema.types();
         let right_types = self.right_schema.types();
-        let left_rows = rows::collect(self.left.as_mut(), &mut scratch)?;
-        let right_rows = rows::collect(self.right.as_mut(), &mut scratch)?;
         if self.kind == JoinKind::Positional {
-            self.chunks = rows::chunks(
-                &self.schema.types(),
-                &positional(&left_rows, &right_rows, left_types.len(), right_types.len()),
-                &mut self.held,
-            )?;
-            return Ok(());
+            return Ok(positional(left_rows, right_rows, left_types.len(), right_types.len()));
         }
-        let right_chunks = rows::chunks(&right_types, &right_rows, &mut scratch)?;
+        let right_chunks = rows::chunks(&right_types, right_rows, &mut scratch)?;
         let mut matched = vec![false; right_rows.len()];
         scratch.grow(u64::try_from(right_rows.len()).unwrap_or(u64::MAX))?;
         let mut out: Vec<Vec<Value>> = Vec::new();
-        for left_row in &left_rows {
+        for left_row in left_rows {
             // Once per left row, in the same place and for the same reason as the reservation at
             // the bottom of the loop. What a query can run past its clock by is one pass over the
             // right side, which is the smallest unit this loop has that is not the inner one.
@@ -164,8 +202,7 @@ impl<'a> Join<'a> {
                 }
             }
         }
-        self.chunks = rows::chunks(&self.schema.types(), &out, &mut self.held)?;
-        Ok(())
+        Ok(out)
     }
 
     /// The right side rows one left row matches, by position in the right side.
@@ -204,23 +241,43 @@ impl<'a> Join<'a> {
     }
 }
 
-impl Operator for Join<'_> {
-    fn schema(&self) -> &Schema {
-        &self.schema
+impl Sink for Join<'_> {
+    type Local = Gathering;
+
+    fn local(&self) -> Gathering {
+        gather::gathering(&self.memory)
     }
 
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        if !self.built {
-            self.build()?;
-            self.built = true;
-        }
-        if self.at >= self.chunks.len() {
-            return Ok(None);
-        }
-        let chunk = self.chunks[self.at].clone();
-        self.at += 1;
-        Ok(Some(chunk))
+    fn sink(&self, chunk: &Chunk, local: &mut Gathering) -> Result<Progress> {
+        gather::take(chunk, local)?;
+        Ok(Progress::More)
     }
+
+    fn combine(&self, local: Gathering) -> Result<()> {
+        let (rows, charged) = gather::into_parts(local);
+        self.left.lock().map_err(poisoned)?.extend(rows);
+        self.charged.lock().map_err(poisoned)?.push(charged);
+        Ok(())
+    }
+
+    fn finalize(&self) -> Result<()> {
+        let left_rows = std::mem::take(&mut *self.left.lock().map_err(poisoned)?);
+        let right_rows = self.right.take()?;
+        let out = self.joined(&left_rows, &right_rows)?;
+        // Both sides go before the answer is built, because the answer is as large as both of them
+        // together and holding three copies is what the budget exists to stop.
+        drop(left_rows);
+        drop(right_rows);
+        let mut held = self.held.lock().map_err(poisoned)?;
+        let chunks = rows::chunks(&self.schema.types(), &out, &mut held)?;
+        self.out.fill(chunks)?;
+        self.charged.lock().map_err(poisoned)?.clear();
+        Ok(())
+    }
+}
+
+fn poisoned<T>(_: T) -> Error {
+    Error::internal("a thread panicked while holding the rows a join gathered")
 }
 
 /// An unconditional cross product.
@@ -230,6 +287,13 @@ impl Operator for Join<'_> {
 /// time emitting one combined chunk per right chunk. A cross product of a thousand by a thousand is
 /// a million rows and there is no way around producing them, but there is a way around holding them
 /// all at once and this is it.
+///
+/// It is also the one operator here that is still pulled, and the reason is that property. One input
+/// chunk becomes many output chunks, and neither [`Sink`] nor [`rudb_pipeline::Stream`] can say that
+/// yet: a stream transforms one chunk into one chunk, and a sink that held the answer would hold the
+/// million rows this is written to avoid. What it needs is a way for an operator to tell the driver
+/// that it has more output for the input it was already given, which is a change to the pipeline
+/// crate rather than to this file, and it is the next one.
 #[derive(Debug)]
 pub(crate) struct CrossProduct<'a> {
     left: Box<dyn Operator + 'a>,
@@ -370,4 +434,128 @@ fn widen(left_row: &[Value], left_types: &[LogicalType], right: &Chunk) -> Resul
         .collect();
     columns.extend(right.columns().iter().cloned());
     Chunk::with_rows(columns, rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use rudb_common::{Cancel, Field, LogicalType, Memory, Value};
+    use rudb_plan::{JoinKind, Plan, Slice};
+    use rudb_vector::{Data, Vector};
+
+    use super::{Buffered, Chunk, Gathered, Join, Schema, Sink};
+    use crate::gather::{Gather, Rows};
+
+    fn chunk(values: &[i32]) -> Chunk {
+        let column = Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into()))
+            .expect("integers are an i32 layout");
+        Chunk::new(vec![column]).expect("one column is one length")
+    }
+
+    fn schema(name: &str, table: u32) -> Schema {
+        Schema::numbered(vec![Field::new(name, LogicalType::Integer)], table)
+    }
+
+    /// The right side of a join, run to the end the way the pipeline before this one would.
+    fn gathered(memory: &Memory, values: &[i32]) -> (Gather, Rows) {
+        let (gather, rows) = Gather::new(memory);
+        let mut local = gather.local();
+        if !values.is_empty() {
+            gather.sink(&chunk(values), &mut local).expect("the right rows");
+        }
+        gather.combine(local).expect("the one instance");
+        gather.finalize().expect("nothing to do");
+        (gather, rows)
+    }
+
+    /// The one left chunk through the sink, and the answer out of the other end.
+    fn run(join: &Join<'_>, left: &[i32]) {
+        let mut local = join.local();
+        if !left.is_empty() {
+            join.sink(&chunk(left), &mut local).expect("the left rows");
+        }
+        join.combine(local).expect("the one instance");
+        join.finalize().expect("the answer");
+    }
+
+    fn rows(out: &Buffered, width: usize) -> Vec<Vec<Value>> {
+        let Some(chunk) = out.at(0).expect("readable") else { return Vec::new() };
+        (0..chunk.len())
+            .map(|row| (0..width).map(|column| chunk.value_at(row, column)).collect())
+            .collect()
+    }
+
+    #[test]
+    fn every_left_row_meets_every_right_row_when_there_is_no_condition() {
+        let plan = Plan::new();
+        let memory = Memory::unlimited();
+        let (_gather, right) = gathered(&memory, &[10, 20]);
+        let (join, out) = Join::new(
+            &plan,
+            &schema("a", 0),
+            Gathered { schema: &schema("b", 1), rows: right },
+            JoinKind::Inner,
+            Slice::EMPTY,
+            &Cancel::new(),
+            &memory,
+        );
+
+        run(&join, &[1, 2]);
+
+        assert_eq!(
+            rows(&out, 2),
+            [
+                vec![Value::Integer(1), Value::Integer(10)],
+                vec![Value::Integer(1), Value::Integer(20)],
+                vec![Value::Integer(2), Value::Integer(10)],
+                vec![Value::Integer(2), Value::Integer(20)],
+            ]
+        );
+    }
+
+    /// The kind that keeps the left row rather than pairing it, and the side of it that a right
+    /// side with nothing in it is the easiest way to reach.
+    #[test]
+    fn an_anti_join_against_nothing_keeps_every_left_row() {
+        let plan = Plan::new();
+        let memory = Memory::unlimited();
+        let (_gather, right) = gathered(&memory, &[]);
+        let (join, out) = Join::new(
+            &plan,
+            &schema("a", 0),
+            Gathered { schema: &schema("b", 1), rows: right },
+            JoinKind::Anti,
+            Slice::EMPTY,
+            &Cancel::new(),
+            &memory,
+        );
+
+        run(&join, &[1, 2]);
+
+        assert_eq!(rows(&out, 1), [vec![Value::Integer(1)], vec![Value::Integer(2)]]);
+    }
+
+    /// A positional join does not stop at the shorter side, which is DuckDB's rule and the one
+    /// thing about this kind that is easy to get wrong.
+    #[test]
+    fn a_positional_join_pads_the_shorter_side() {
+        let plan = Plan::new();
+        let memory = Memory::unlimited();
+        let (_gather, right) = gathered(&memory, &[10]);
+        let (join, out) = Join::new(
+            &plan,
+            &schema("a", 0),
+            Gathered { schema: &schema("b", 1), rows: right },
+            JoinKind::Positional,
+            Slice::EMPTY,
+            &Cancel::new(),
+            &memory,
+        );
+
+        run(&join, &[1, 2]);
+
+        assert_eq!(
+            rows(&out, 2),
+            [vec![Value::Integer(1), Value::Integer(10)], vec![Value::Integer(2), Value::Null],]
+        );
+    }
 }
