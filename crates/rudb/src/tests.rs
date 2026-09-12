@@ -1391,6 +1391,31 @@ fn one_long_group_key_does_not_charge_every_short_one_for_its_length() {
     assert_eq!(loose.query("SELECT s, count(*) FROM k GROUP BY s").unwrap().len(), 201);
 }
 
+/// A group by is charged for the rows it builds out of its table and not only for the chunks it
+/// builds out of those. Per #272.
+#[test]
+fn a_group_by_is_charged_for_the_rows_it_makes_out_of_its_table() {
+    // A million groups. The rows are a vector header and two values each and come to seventy
+    // megabytes, on top of the two hundred and seventy the table and the keys and the chunks come
+    // to between them. Three hundred sits between the two, so this query fits if the rows are free
+    // and does not if they are charged, which is the whole of what is being tested. It is a
+    // narrower margin than a test likes and it is the honest one: the rows are a quarter of what
+    // this query holds, so a limit that tells them apart is a limit within a quarter of the truth.
+    let db = Database::with_config(Config::new().with_memory_limit(300 << 20));
+    let query = "SELECT range, count(*) FROM range(1000000) GROUP BY range";
+    // The error rather than `expect_err`, because the result this is asking not to get is a million
+    // rows and printing it is not how anybody wants to find out that it came back.
+    let error = db
+        .query(query)
+        .err()
+        .unwrap_or_else(|| panic!("the rows should not have fit beside the rest"));
+    assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
+    // And with room for them it answers, so what is being tested is the accounting rather than the
+    // grouping.
+    let loose = Database::with_config(Config::new().with_memory_limit(512 << 20));
+    assert_eq!(loose.query(query).unwrap().len(), 1_000_000);
+}
+
 #[test]
 fn the_budget_is_given_back_when_the_query_stops() {
     let db = Database::with_config(Config::new().with_memory_limit(SMALL));
