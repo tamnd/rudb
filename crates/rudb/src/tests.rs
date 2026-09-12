@@ -498,6 +498,33 @@ fn a_part_of_an_interval_is_one_of_its_three_fields() {
     assert_eq!(refused, "\"interval\" units \"week\" not recognized");
 }
 
+/// `epoch` and `julian` carry a fraction, so `date_part` is declared as a double and the binder
+/// narrows it back to a bigint when the specifier is a literal naming a whole part. Midday is in
+/// here because that fraction is half a day to `julian` and half of nothing to a date.
+///
+/// The last case is the reason the narrowing lives in the binder rather than in the function table.
+/// A specifier that is a column cannot be looked at while binding, so the answer is a double even
+/// when every row of it happens to say `year`, and DuckDB prints `2020.0` there for the same reason.
+#[test]
+fn the_two_parts_that_carry_a_fraction_are_doubles() {
+    let db = database();
+    let stamp = "CAST('2020-01-01 12:00:00' AS TIMESTAMP)";
+    let one = |value: f64| vec![vec![Value::Double(value)]];
+    assert_eq!(rows(&db, &format!("SELECT date_part('epoch', {stamp})")), one(1_577_880_000.0));
+    assert_eq!(rows(&db, &format!("SELECT date_part('julian', {stamp})")), one(2_458_850.5));
+    assert_eq!(rows(&db, "SELECT date_part('jd', DATE '2020-01-01')"), one(2_458_850.0));
+    assert_eq!(rows(&db, "SELECT date_part('epoch', INTERVAL '1 year')"), one(31_557_600.0));
+    assert_eq!(
+        rows(&db, &format!("SELECT date_part('year', {stamp})")),
+        vec![vec![Value::BigInt(2_020)]]
+    );
+    let parts = "FROM (VALUES ('year'), ('epoch')) t(part)";
+    assert_eq!(
+        rows(&db, &format!("SELECT date_part(part, DATE '2020-01-01') {parts}")),
+        vec![vec![Value::Double(2_020.0)], vec![Value::Double(1_577_836_800.0)]]
+    );
+}
+
 /// Truncating an interval keeps the fields above the part and clears the ones below it, and the
 /// column form has to agree with the single value one about which those are.
 #[test]

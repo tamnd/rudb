@@ -11,7 +11,7 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{Error, LogicalType, MAX_DECIMAL_WIDTH, Result, Value};
-use rudb_functions::{FunctionKind, kind_of, resolve};
+use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::Ast;
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
 use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef};
@@ -375,9 +375,31 @@ impl Binder<'_> {
         for (arg, wanted) in args.iter().zip(&resolved.arguments) {
             cast.push(self.cast_to(*arg, wanted));
         }
+        let returns = self.narrowed_part(resolved.name, &cast, resolved.returns);
         let args = self.plan_mut().add_expr_list(&cast);
         let name = self.plan_mut().intern(resolved.name);
-        Ok(self.plan_mut().add_expr(Expr::Function { name, args }, resolved.returns))
+        Ok(self.plan_mut().add_expr(Expr::Function { name, args }, returns))
+    }
+
+    /// The answer type of a `date_part`, which is the one call whose type comes from the value of
+    /// an argument rather than from the type of one.
+    ///
+    /// Upstream declares the function as a DOUBLE and narrows it to a BIGINT when the specifier is
+    /// a constant naming a part that is whole. So `typeof(date_part('minute', ts))` is BIGINT,
+    /// `typeof(date_part('epoch', ts))` is DOUBLE because seconds carry a fraction, and
+    /// `typeof(date_part(p, ts))` over a column of specifiers is DOUBLE whatever that column turns
+    /// out to hold, since nothing at binding time can know. All three were measured.
+    ///
+    /// A specifier that names nothing is left alone here rather than refused, so that the message
+    /// about it comes from the one place that writes it, which is the kernel.
+    fn narrowed_part(&self, name: &str, args: &[ExprRef], returns: LogicalType) -> LogicalType {
+        if name != "date_part" {
+            return returns;
+        }
+        let Some(&spec) = args.first() else { return returns };
+        let Expr::Constant(value) = *self.plan().expr(spec) else { return returns };
+        let Value::Varchar(spelling) = self.plan().value(value) else { return returns };
+        part_type(spelling)
     }
 
     /// A cast to `ty`, or the expression itself when it is already that type.

@@ -18,8 +18,9 @@
 //! timestamp is the year 2000 and not the year 1901, because truncation drops the last two digits.
 //! DuckDB is not being consistent there and neither are we, on purpose.
 //!
-//! What is missing is `timezone`, `timezone_hour` and `timezone_minute`, which need a session time
-//! zone before they mean anything, and `epoch`, which is a double and needs an overload of its own.
+//! Most parts are whole numbers, but `epoch` and `julian` are not, so each reader here has a double
+//! twin next to it and the binder decides which one a query gets. What is missing is `timezone`,
+//! `timezone_hour` and `timezone_minute`, which need a session time zone before they mean anything.
 
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 
@@ -61,8 +62,14 @@ pub(crate) enum Part {
     IsoYear,
     /// The ISO year and week as one number, so week 9 of 2024 is 202409.
     YearWeek,
-    /// Seconds since 1970, which DuckDB answers as a double and this does not answer at all.
+    /// Seconds since 1970, with the fraction, which is why this part is a double.
     Epoch,
+    /// Days since noon on 24 November 4714 BC, with the fraction, which is the other double.
+    ///
+    /// The count is off by half a day from the way it is usually written, since the astronomical
+    /// day starts at noon and DuckDB's starts at midnight. `date_part('julian', DATE '2020-01-01')`
+    /// is 2458850 where an almanac says the Julian day of that midnight is 2458849.5, measured.
+    Julian,
 }
 
 /// Every spelling DuckDB accepts, each one checked against the binary rather than guessed at.
@@ -130,7 +137,13 @@ const NAMES: &[(&str, Part)] = &[
     ("isoyear", Part::IsoYear),
     ("yearweek", Part::YearWeek),
     ("epoch", Part::Epoch),
+    ("julian", Part::Julian),
+    ("jd", Part::Julian),
 ];
+
+/// The day the Julian count starts, as a count of days from 1970, which is the number that turns
+/// one into the other.
+const JULIAN_AT_EPOCH: i64 = 2_440_588;
 
 impl Part {
     /// Which part a specifier names.
@@ -193,12 +206,11 @@ impl Part {
                 let (year, week) = iso_week(days);
                 i64::from(year) * 100 + i64::from(week)
             }
-            // DuckDB answers this as a double, and a signature that says bigint cannot hand one
-            // back. The fix is an overload rather than a cast, so this says so rather than rounding.
-            Self::Epoch => {
-                return Err(Error::not_implemented(
-                    "date_part('epoch', ...), which DuckDB answers as a double",
-                ));
+            // The two that carry a fraction are doubles, and the binder knows it: a call that asks
+            // for either of them is a double call and never reaches this. Reaching it anyway is a
+            // bug in the binder rather than a query anybody wrote.
+            Self::Epoch | Self::Julian => {
+                return Err(Error::internal(format!("{self:?} is a double and this is not")));
             }
         })
     }
@@ -223,6 +235,68 @@ impl Part {
         })
     }
 
+    /// The part of a date as a double.
+    ///
+    /// Every part can be asked for as a double, not only the two that are one. `date_part(p, d)`
+    /// over a column of specifiers is a double call, since nothing at binding time knows what the
+    /// column holds, and it still has to answer `year` when a row says year. So this is the whole
+    /// number widened for every part but the two that carry a fraction.
+    ///
+    /// # Errors
+    ///
+    /// If the part is one a date does not have.
+    pub(crate) fn double_of_days(self, days: i32) -> Result<f64> {
+        Ok(match self {
+            Self::Epoch => f64::from(days) * 86_400.0,
+            Self::Julian => f64::from(days) + JULIAN_AT_EPOCH as f64,
+            // A part of a date is a year at the widest, so this is exact for every value a date
+            // can hold, unlike the microsecond arithmetic next to it.
+            _ => self.of_days(days)? as f64,
+        })
+    }
+
+    /// The part of a timestamp as a double.
+    ///
+    /// The two fractional parts are worked out in floating point from the microseconds, which is
+    /// where the last digits of the widest timestamps come from: the microseconds of a moment past
+    /// the year 200000 do not fit a double exactly, so the Julian day of one comes back as
+    /// 107754599.99998842 rather than a round number. That is upstream's answer as well, because it
+    /// is upstream's arithmetic in the same order.
+    ///
+    /// # Errors
+    ///
+    /// If the part is one a timestamp does not have, or if it needs the date and the timestamp is
+    /// outside the range a date covers.
+    pub(crate) fn double_of_micros(self, micros: i64) -> Result<f64> {
+        Ok(match self {
+            Self::Epoch => micros as f64 / MICROS_PER_SECOND as f64,
+            Self::Julian => micros as f64 / MICROS_PER_DAY as f64 + JULIAN_AT_EPOCH as f64,
+            _ => self.of_micros(micros)? as f64,
+        })
+    }
+
+    /// The part of an interval as a double.
+    ///
+    /// A year is three hundred and sixty five and a quarter days here and a month is thirty of
+    /// them, which is how upstream turns a length with months in it into a count of seconds.
+    /// `INTERVAL '1 year'` is 31557600 seconds and `INTERVAL '12 months'` is the same, while
+    /// `INTERVAL '11 months'` is 28512000, so the years are counted first and the leftover months
+    /// after them. All measured.
+    ///
+    /// # Errors
+    ///
+    /// If the part is one an interval does not have, which the caller was supposed to have refused
+    /// already.
+    pub(crate) fn double_of_interval(self, months: i32, days: i32, micros: i64) -> Result<f64> {
+        if self == Self::Epoch {
+            let years = f64::from(months / 12) * 31_557_600.0;
+            let rest = f64::from(months % 12) * 2_592_000.0;
+            let days = f64::from(days) * 86_400.0;
+            return Ok(years + rest + days + micros as f64 / MICROS_PER_SECOND as f64);
+        }
+        Ok(self.of_interval(months, days, micros)? as f64)
+    }
+
     /// A date truncated to the part.
     ///
     /// # Errors
@@ -242,7 +316,8 @@ impl Part {
             | Self::DayOfWeek
             | Self::IsoDayOfWeek
             | Self::DayOfYear
-            | Self::Epoch => days,
+            | Self::Epoch
+            | Self::Julian => days,
             Self::Week | Self::YearWeek => days - (iso_weekday(days) - 1),
             Self::Month => days_from_civil(year, month, 1),
             Self::Quarter => days_from_civil(year, (month - 1) / 3 * 3 + 1, 1),
@@ -344,12 +419,10 @@ impl Part {
             // five months is the zeroth. It is upstream's arithmetic rather than a number anybody
             // would name.
             Self::Quarter => months % 12 / 3 + 1,
-            // The same overload the date path is waiting for, since seconds with a fraction on them
-            // are not a bigint whatever they are counted from.
+            // A double, the same as it is over a date, so a call that asks for it is a double call
+            // and lands in `double_of_interval` rather than here.
             Self::Epoch => {
-                return Err(Error::not_implemented(
-                    "date_part('epoch', ...), which DuckDB answers as a double",
-                ));
+                return Err(Error::internal(format!("{self:?} is a double and this is not")));
             }
             _ => {
                 return Err(Error::internal(format!(
@@ -411,7 +484,9 @@ impl Part {
             Self::Quarter => (whole(3), 0, 0),
             Self::Month => (months, 0, 0),
             Self::Week | Self::YearWeek => (months, days - days % 7, 0),
-            Self::Day | Self::DayOfWeek | Self::IsoDayOfWeek | Self::DayOfYear => (months, days, 0),
+            Self::Day | Self::DayOfWeek | Self::IsoDayOfWeek | Self::DayOfYear | Self::Julian => {
+                (months, days, 0)
+            }
             Self::Hour => (months, days, clipped(MICROS_PER_HOUR)),
             Self::Minute => (months, days, clipped(MICROS_PER_MINUTE)),
             Self::Second | Self::Epoch => (months, days, clipped(MICROS_PER_SECOND)),
@@ -1501,11 +1576,14 @@ mod tests {
         assert_eq!(Part::parse("mins").expect("a part"), Part::Minute);
     }
 
-    /// The two DuckDB refuses, and it refuses them at different places for different reasons, so
-    /// neither message is invented here.
+    /// An era does not truncate and DuckDB says so in words worth copying. The two fractional
+    /// parts do have an answer, but not a whole one, so asking the whole reader for it is a bug in
+    /// the caller rather than something a query can reach.
     #[test]
-    fn the_parts_with_no_answer_say_which_answer_is_missing() {
+    fn the_parts_with_no_whole_answer_say_which_reader_to_use() {
         let error = part("epoch").of_micros(moment()).expect_err("epoch is a double");
+        assert!(error.to_string().contains("double"), "{error}");
+        let error = part("julian").of_days(0).expect_err("a julian day is a double");
         assert!(error.to_string().contains("double"), "{error}");
         let error = part("era").truncate_micros(moment()).expect_err("an era does not truncate");
         assert!(error.to_string().contains("DATETRUNC"), "{error}");
@@ -1520,6 +1598,56 @@ mod tests {
         assert_eq!(part("day").truncate_micros(moment).expect("a truncation"), -MICROS_PER_DAY);
         assert_eq!(part("second").of_micros(moment).expect("a part"), 58);
         assert_eq!(part("day").of_micros(moment).expect("a part"), 31);
+    }
+
+    /// The two parts that carry a fraction, over a moment and over a day, against the numbers the
+    /// binary prints. The last case is far enough out that a julian day no longer fits a double to
+    /// the microsecond, and the digits that fall off there are upstream's digits as well.
+    #[test]
+    fn the_two_fractional_parts_count_seconds_and_days() {
+        let day = days_from_civil(2020, 1, 1);
+        let epoch = |micros| part("epoch").double_of_micros(micros).expect("seconds");
+        let julian = |micros| part("julian").double_of_micros(micros).expect("days");
+        assert_eq!(epoch(i64::from(day) * MICROS_PER_DAY + 500_000), 1_577_836_800.5);
+        assert_eq!(epoch(-500_000), -0.5);
+        assert_eq!(julian(i64::from(day) * MICROS_PER_DAY + 6 * MICROS_PER_HOUR), 2_458_850.25);
+        assert_eq!(julian(-6 * MICROS_PER_HOUR), 2_440_587.75);
+        assert_eq!(part("epoch").double_of_days(day).expect("seconds"), 1_577_836_800.0);
+        assert_eq!(part("jd").double_of_days(day).expect("days"), 2_458_850.0);
+        assert_eq!(part("epoch").double_of_days(-1).expect("seconds"), -86_400.0);
+        let far = i64::from(days_from_civil(290_309, 12, 21)) * MICROS_PER_DAY + 86_399_000_000;
+        assert_eq!(julian(far), 107_754_599.999_988_42);
+    }
+
+    /// A part that is whole is still a double when the specifier was a column, since nothing at
+    /// binding time could look at it, and the number has to come out the same either way.
+    #[test]
+    fn a_whole_part_read_as_a_double_is_the_same_number() {
+        let day = days_from_civil(2020, 3, 15);
+        assert_eq!(part("year").double_of_days(day).expect("a year"), 2_020.0);
+        let noon = i64::from(day) * MICROS_PER_DAY;
+        assert_eq!(part("month").double_of_micros(noon).expect("a month"), 3.0);
+        assert_eq!(part("month").double_of_interval(14, 0, 0).expect("months"), 2.0);
+    }
+
+    /// The seconds a length is worth, where a year is three hundred and sixty five and a quarter
+    /// days and a month is thirty, so twelve months and one year are the same number and eleven
+    /// months are not eleven twelfths of it.
+    #[test]
+    fn the_seconds_in_a_length_count_the_years_first() {
+        let epoch = |months, days, micros| {
+            part("epoch").double_of_interval(months, days, micros).expect("seconds")
+        };
+        assert_eq!(
+            epoch(14, 3, 4 * MICROS_PER_HOUR + 5 * MICROS_PER_MINUTE + 6 * 1_000_000),
+            37_015_506.0
+        );
+        assert_eq!(epoch(12, 0, 0), 31_557_600.0);
+        assert_eq!(epoch(1, 0, 0), 2_592_000.0);
+        assert_eq!(epoch(13, 0, 0), 34_149_600.0);
+        assert_eq!(epoch(-14, 0, 0), -36_741_600.0);
+        assert_eq!(epoch(0, 0, 1_500_000), 1.5);
+        assert_eq!(epoch(0, 0, -1_500_000), -1.5);
     }
 
     /// `INTERVAL '1 year 2 months 3 days 04:05:06.7'`, which has something in all three fields.

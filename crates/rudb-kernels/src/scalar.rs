@@ -1273,13 +1273,14 @@ fn date_of(
         return Ok(None);
     };
     let truncating = name == "date_trunc";
-    // A truncation keeps the type it was given and a part is always a bigint, and anything else is
-    // a cast the binder put there, which the row at a time path handles and counts.
+    // A truncation keeps the type it was given, and a part is a bigint or the double the two
+    // fractional parts make it. Anything else is a cast the binder put there, which the row at a
+    // time path handles and counts.
     if truncating {
         if returns != when.logical_type() {
             return Ok(None);
         }
-    } else if *returns != LogicalType::BigInt {
+    } else if !matches!(returns, LogicalType::BigInt | LogicalType::Double) {
         return Ok(None);
     }
     let part = Part::parse(spelling)?;
@@ -1333,7 +1334,36 @@ fn date_runs<A: Fn(usize) -> usize>(
     when: &Vector,
     truncating: bool,
 ) -> Result<Option<Vector>> {
+    // A part that is read rather than truncated comes back as the type the binder decided, which is
+    // a double when the part carries a fraction and a double as well when the specifier was not a
+    // constant it could look at. So the reading arms come in pairs.
+    let doubled = *returns == LogicalType::Double && !truncating;
     match (when.logical_type(), data, truncating) {
+        (LogicalType::Date, Data::Int32(days), false) if doubled => {
+            let mut out = vec![0f64; rows];
+            let validity = over_valid(rows, base, |index| {
+                out[index] = part.double_of_days(days[at(index)])?;
+                Ok(())
+            })?;
+            finish(returns, Data::Float64(out.into()), validity)
+        }
+        (LogicalType::Timestamp, Data::Int64(micros), false) if doubled => {
+            let mut out = vec![0f64; rows];
+            let validity = over_valid(rows, base, |index| {
+                out[index] = part.double_of_micros(micros[at(index)])?;
+                Ok(())
+            })?;
+            finish(returns, Data::Float64(out.into()), validity)
+        }
+        (LogicalType::Interval, Data::Interval(fields), false) if doubled => {
+            let mut out = vec![0f64; rows];
+            let validity = over_valid(rows, base, |index| {
+                let (months, days, micros) = fields[at(index)];
+                out[index] = part.double_of_interval(months, days, micros)?;
+                Ok(())
+            })?;
+            finish(returns, Data::Float64(out.into()), validity)
+        }
         (LogicalType::Date, Data::Int32(days), false) => {
             let mut out = vec![0i64; rows];
             let validity = over_valid(rows, base, |index| {
@@ -1389,12 +1419,25 @@ fn date_runs<A: Fn(usize) -> usize>(
 }
 
 /// `date_part` and `date_trunc` on one row.
-fn date_value(name: &str, spec: &Value, when: &Value) -> Result<Value> {
+///
+/// The answer type is passed in rather than worked out here, because a part that is read is a
+/// bigint or a double and which one it is was decided at binding time. See `narrowed_part` in
+/// `rudb-bind`.
+fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> Result<Value> {
     let Value::Varchar(spelling) = spec else {
         return Err(Error::internal(format!("{name} of a {} part", spec.logical_type())));
     };
     let part = Part::parse(spelling)?;
+    let doubled = *returns == LogicalType::Double;
     match (name == "date_trunc", when) {
+        (false, Value::Date(days)) if doubled => part.double_of_days(*days).map(Value::Double),
+        (false, Value::Timestamp(micros)) if doubled => {
+            part.double_of_micros(*micros).map(Value::Double)
+        }
+        (false, Value::Interval { months, days, micros }) if doubled => part
+            .of_an_interval(spelling)?
+            .double_of_interval(*months, *days, *micros)
+            .map(Value::Double),
         (false, Value::Date(days)) => part.of_days(*days).map(Value::BigInt),
         (false, Value::Timestamp(micros)) => part.of_micros(*micros).map(Value::BigInt),
         (false, Value::Interval { months, days, micros }) => {
@@ -1606,7 +1649,7 @@ pub fn call_values(
         ("!~~", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, false))),
         ("~~*", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, true))),
         ("!~~*", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, true))),
-        ("date_part" | "date_trunc", [spec, when]) => date_value(name, spec, when),
+        ("date_part" | "date_trunc", [spec, when]) => date_value(name, spec, when, returns),
         ("trunc", [only]) => truncated(only),
         (_, [count]) if datetime::is_interval(name) => interval_value(name, count),
         ("make_date", [days]) => made_date_value(days),
