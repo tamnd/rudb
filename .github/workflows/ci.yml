@@ -174,6 +174,42 @@ jobs:
       - name: cargo xtask bench
         run: cargo xtask bench
 
+  # The committed corpus in tamnd/rudb-compat, which says what rudb can do today and is never
+  # allowed to go down. It runs there too, against the published pin, and that run finds out about
+  # a regression days after the commit that caused it. This one runs against the tree in front of
+  # it: the shell it just built, and the library patched to the same tree rather than to the pin.
+  #
+  # The upstream sqllogictest percentage is not here and should not be. That is a measurement over
+  # files this project does not control, it is published in the other repository, and a number that
+  # moves when somebody else adds a file cannot be a required check.
+  conform:
+    name: the committed corpus still passes
+    needs: quick
+    runs-on: ubuntu-24.04
+    # The harness is somebody else's crate as far as this gate is concerned, and a new rustc that
+    # warns about something in it is not a reason to fail a change to the engine. The corpus either
+    # passes or it does not, and that is the answer this job is here for.
+    env:
+      RUSTFLAGS: ""
+      RUSTDOCFLAGS: ""
+    steps:
+      # Both checkouts go under the workspace and next to each other, because that is where the
+      # task looks for the harness and because actions/checkout will not write outside it.
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: rudb
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: tamnd/rudb-compat
+          path: rudb-compat
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: rudb
+          key: conform
+      - name: cargo xtask conform
+        working-directory: rudb
+        run: cargo xtask conform
+
   audit:
     name: supply chain
     needs: quick
@@ -205,7 +241,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [quick, test, docs, msrv, determinism, bench, audit]
+    needs: [quick, test, docs, msrv, determinism, bench, conform, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: fail if anything upstream failed
