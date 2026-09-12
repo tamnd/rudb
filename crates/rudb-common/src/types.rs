@@ -252,6 +252,55 @@ impl LogicalType {
         }
     }
 
+    /// The name DuckDB's messages give this type, which is the integer it is stored in rather than
+    /// the type it is written as.
+    ///
+    /// An overflow says `INT32` and not `INTEGER`, a failed cast says `INT8` and not `TINYINT`, and
+    /// a boolean is `BOOL` in both. A decimal carries the width of the integer behind it rather
+    /// than the width that was declared, so a DECIMAL(18,8) and a DECIMAL(11,0) are both
+    /// `DECIMAL(18)`. Everything that is not a number is written the way it is spelled.
+    #[must_use]
+    pub fn physical_name(&self) -> String {
+        if let Some(width) = self.decimal_storage() {
+            return format!("DECIMAL({width})");
+        }
+        let name = match self {
+            Self::Boolean => "BOOL",
+            Self::TinyInt => "INT8",
+            Self::SmallInt => "INT16",
+            Self::Integer => "INT32",
+            Self::BigInt => "INT64",
+            Self::HugeInt => "INT128",
+            Self::UTinyInt => "UINT8",
+            Self::USmallInt => "UINT16",
+            Self::UInteger => "UINT32",
+            Self::UBigInt => "UINT64",
+            Self::UHugeInt => "UINT128",
+            other => return other.to_string(),
+        };
+        name.to_string()
+    }
+
+    /// The widest decimal the integer behind this one holds, or `None` when this is not a decimal.
+    ///
+    /// A decimal is stored in the narrowest of `i16`, `i32`, `i64` and `i128` that fits its width,
+    /// and a message names the bucket rather than the declaration, so a DECIMAL(18,8) and a
+    /// DECIMAL(11,0) are both `DECIMAL(18)`. The two wide buckets were measured. The two narrow
+    /// ones follow the same rule and are hard to reach, since a decimal that narrow widens before
+    /// it can overflow.
+    #[must_use]
+    pub fn decimal_storage(&self) -> Option<u8> {
+        let Self::Decimal { width, .. } = self else {
+            return None;
+        };
+        Some(match width {
+            0..=4 => 4,
+            5..=9 => 9,
+            10..=18 => 18,
+            _ => MAX_DECIMAL_WIDTH,
+        })
+    }
+
     /// Whether arithmetic applies.
     #[must_use]
     pub fn is_numeric(&self) -> bool {
@@ -1185,6 +1234,26 @@ mod tests {
         assert_eq!(LogicalType::decimal(9, 2).unwrap().physical(), PhysicalType::Int32);
         assert_eq!(LogicalType::decimal(18, 2).unwrap().physical(), PhysicalType::Int64);
         assert_eq!(LogicalType::decimal(38, 2).unwrap().physical(), PhysicalType::Int128);
+    }
+
+    /// The name a failed cast gives a type, which is the integer it is stored in. The decimal
+    /// buckets are the same ones `physical` uses, written as a width rather than as a layout,
+    /// which is why a DECIMAL(11,0) and a DECIMAL(18,8) are both DECIMAL(18).
+    #[test]
+    fn a_message_names_the_type_by_what_it_is_stored_in() {
+        assert_eq!(LogicalType::Boolean.physical_name(), "BOOL");
+        assert_eq!(LogicalType::TinyInt.physical_name(), "INT8");
+        assert_eq!(LogicalType::Integer.physical_name(), "INT32");
+        assert_eq!(LogicalType::UBigInt.physical_name(), "UINT64");
+        assert_eq!(LogicalType::HugeInt.physical_name(), "INT128");
+        assert_eq!(LogicalType::Float.physical_name(), "FLOAT");
+        assert_eq!(LogicalType::Varchar.physical_name(), "VARCHAR");
+        assert_eq!(LogicalType::Date.physical_name(), "DATE");
+        assert_eq!(LogicalType::decimal(4, 2).unwrap().physical_name(), "DECIMAL(4)");
+        assert_eq!(LogicalType::decimal(11, 0).unwrap().physical_name(), "DECIMAL(18)");
+        assert_eq!(LogicalType::decimal(18, 8).unwrap().physical_name(), "DECIMAL(18)");
+        assert_eq!(LogicalType::decimal(38, 2).unwrap().physical_name(), "DECIMAL(38)");
+        assert_eq!(LogicalType::Integer.decimal_storage(), None);
     }
 
     #[test]

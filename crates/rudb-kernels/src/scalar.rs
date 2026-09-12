@@ -1616,7 +1616,7 @@ fn overflow(op: Op, ty: &LogicalType, left: &Value, right: &Value) -> Error {
     let word = if decimal && matches!(op, Op::Subtract) { "subtract" } else { op.word() };
     Error::out_of_range(format!(
         "Overflow in {word} of {} ({left} {} {right}){}",
-        physical(ty),
+        ty.physical_name(),
         op.symbol(),
         ending(op, ty)
     ))
@@ -1666,51 +1666,14 @@ fn unscaled(value: &Value) -> String {
     }
 }
 
-/// The name the message gives a type, which is the integer it is stored in rather than the type it
-/// is written as: `INT32` for an INTEGER, `UINT16` for a USMALLINT, and `DECIMAL(18)` for a
-/// DECIMAL(18,8), carrying the width of the storage and not the width that was declared.
-fn physical(ty: &LogicalType) -> String {
-    let name = match ty {
-        LogicalType::TinyInt => "INT8",
-        LogicalType::SmallInt => "INT16",
-        LogicalType::Integer => "INT32",
-        LogicalType::BigInt => "INT64",
-        LogicalType::HugeInt => "INT128",
-        LogicalType::UTinyInt => "UINT8",
-        LogicalType::USmallInt => "UINT16",
-        LogicalType::UInteger => "UINT32",
-        LogicalType::UBigInt => "UINT64",
-        LogicalType::UHugeInt => "UINT128",
-        LogicalType::Decimal { width, .. } => return format!("DECIMAL({})", storage_width(*width)),
-        other => return other.to_string(),
-    };
-    name.to_string()
-}
-
-/// The widest decimal the integer behind this one holds.
-///
-/// A decimal is stored in the narrowest of `i16`, `i32`, `i64` and `i128` that fits its width, and
-/// the message names the bucket rather than the declaration, so a DECIMAL(18,8) and a DECIMAL(11,0)
-/// are both `DECIMAL(18)`. The two wide buckets were measured. The two narrow ones follow the same
-/// rule and are hard to reach, since a decimal that narrow widens before it can overflow.
-fn storage_width(width: u8) -> u8 {
-    match width {
-        0..=4 => 4,
-        5..=9 => 9,
-        10..=18 => 18,
-        _ => 38,
-    }
-}
-
 /// What the sentence ends on.
 ///
 /// A decimal multiplication ends on advice rather than punctuation, and which advice depends on
 /// whether there is a wider decimal to move to. At 38 digits there is not one, so the only way out
 /// is to give up scale.
 fn ending(op: Op, ty: &LogicalType) -> &'static str {
-    let width = match ty {
-        LogicalType::Decimal { width, .. } => storage_width(*width),
-        _ => return "!",
+    let Some(width) = ty.decimal_storage() else {
+        return "!";
     };
     match op {
         Op::Multiply if width == 38 => {

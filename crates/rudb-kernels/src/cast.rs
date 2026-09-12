@@ -34,8 +34,11 @@
 //! row at a time path would have written. The mask is carried across untouched.
 
 use std::cmp::Ordering;
+use std::str::FromStr;
 
-use rudb_common::{Error, ErrorCode, LogicalType, PhysicalType, Result, Value, days_from_civil};
+use rudb_common::{
+    Error, ErrorCode, LogicalType, PhysicalType, Result, Value, civil_from_days, days_from_civil,
+};
 use rudb_vector::{Data, Form, Vector};
 
 use crate::datetime::MICROS_PER_DAY;
@@ -494,16 +497,74 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
     }
 }
 
-/// The failure DuckDB reports for a value that does not fit, in the words DuckDB uses.
+/// The failure DuckDB reports for a number that does not fit, in the words DuckDB uses.
+///
+/// Both types are named the way a message names them, which is the integer they are stored in, so
+/// 300 going into a `TINYINT` is `INT32` to `INT8`. This is the sentence for a value that was
+/// already a number. A string that reads as a number too big for the target is a conversion
+/// failure instead, and a decimal and a target decimal each have their own sentence below.
 fn out_of_range(value: &Value, target: &LogicalType) -> Error {
     Error::conversion(format!(
-        "Type {} with value {value} can't be cast because the value is out of range for the destination type {target}",
-        value.logical_type()
+        "Type {} with value {value} can't be cast because the value is out of range for the destination type {}",
+        value.logical_type().physical_name(),
+        target.physical_name()
     ))
 }
 
-fn not_convertible(value: &Value, target: &LogicalType) -> Error {
-    Error::conversion(format!("Could not convert {} '{value}' to {target}", value.logical_type()))
+/// The failure DuckDB reports for a string that does not read as the target type.
+///
+/// The source is the word `string` rather than the name of a type, because the message is written
+/// where the value is already a run of bytes. A decimal target is the one that is spelled out in
+/// full with its scale, and it is also the one that quotes the value with double quotes, which
+/// looks like an accident upstream and is what the binary does.
+fn not_convertible(text: &str, target: &LogicalType) -> Error {
+    if matches!(target, LogicalType::Decimal { .. }) {
+        return Error::conversion(format!("Could not convert string \"{text}\" to {target}"));
+    }
+    Error::conversion(format!("Could not convert string '{text}' to {}", target.physical_name()))
+}
+
+/// The failure DuckDB reports for a pair of types nothing casts between, in the words DuckDB uses.
+///
+/// It is a conversion failure and not an unimplemented one, which is what makes `TRY_CAST` answer
+/// null for it the way DuckDB answers null. That does not soften what the module documentation
+/// says about not turning a missing feature into a column of nulls: this is only reached from a
+/// target that is built here, for a source DuckDB refuses as well, one measured statement at a
+/// time. A target nobody has written the code for still raises out of `convert` and `TRY_CAST`
+/// still does not swallow it.
+fn no_cast(value: &Value, target: &LogicalType) -> Error {
+    Error::conversion(format!("Unimplemented type for cast ({} -> {target})", value.logical_type()))
+}
+
+/// The failure DuckDB reports for a number that does not fit a decimal, in the words DuckDB uses.
+///
+/// There are two sentences and the source picks which one. A decimal that does not fit another
+/// decimal is the `Casting value` one, everything else is the `Could not cast value` one, and a
+/// float or a double is written with six digits after the point in it because the message is built
+/// with the C `%f` that does that.
+fn no_decimal(value: &Value, target: &LogicalType) -> Error {
+    let written = match value {
+        Value::Decimal { .. } => {
+            return Error::conversion(format!(
+                "Casting value \"{value}\" to type {target} failed: value is out of range!"
+            ));
+        }
+        Value::Float(real) => format!("{real:.6}"),
+        Value::Double(real) => format!("{real:.6}"),
+        other => other.to_string(),
+    };
+    Error::conversion(format!("Could not cast value {written} to {target}"))
+}
+
+/// The failure DuckDB reports for a decimal that does not fit an integer, in the words DuckDB uses.
+///
+/// The number in it is the whole the decimal rounded to and not the decimal that was written, so
+/// 999.9 going into a `TINYINT` is reported as 1000.
+fn no_integer(whole: i128, target: &LogicalType) -> Error {
+    Error::conversion(format!(
+        "Failed to cast decimal value {whole} to type {}",
+        target.physical_name()
+    ))
 }
 
 fn to_boolean(value: &Value) -> Result<Value> {
@@ -511,40 +572,48 @@ fn to_boolean(value: &Value) -> Result<Value> {
         return match text.trim().to_ascii_lowercase().as_str() {
             "true" | "t" | "yes" | "y" | "1" => Ok(Value::Boolean(true)),
             "false" | "f" | "no" | "n" | "0" => Ok(Value::Boolean(false)),
-            _ => Err(not_convertible(value, &LogicalType::Boolean)),
+            _ => Err(not_convertible(text, &LogicalType::Boolean)),
         };
     }
     match integral(value) {
         Some(whole) => Ok(Value::Boolean(whole != 0)),
         None => match approximate(value) {
             Some(number) => Ok(Value::Boolean(number != 0.0)),
-            None => Err(not_convertible(value, &LogicalType::Boolean)),
+            None => Err(no_cast(value, &LogicalType::Boolean)),
         },
     }
 }
 
+/// Three sources and three sentences. A string that will not read as a whole number and a string
+/// that reads as one too big for the target are the same conversion failure upstream, a decimal
+/// says which whole it rounded to, and a number that was already a number says it is out of range.
 fn to_integer(value: &Value, target: &LogicalType) -> Result<Value> {
-    let whole = match value {
-        Value::Varchar(text) => {
-            parse_integer(text).ok_or_else(|| not_convertible(value, target))?
-        }
-        _ => match integral(value) {
-            Some(whole) => whole,
-            None => rounded(value, target)?,
-        },
+    if let Value::Varchar(text) = value {
+        let whole = parse_integer(text).ok_or_else(|| not_convertible(text, target))?;
+        return fit(whole, target).ok_or_else(|| not_convertible(text, target));
+    }
+    if let Value::Decimal { unscaled, scale, .. } = *value {
+        let whole = rounded_decimal(unscaled, scale);
+        return fit(whole, target).ok_or_else(|| no_integer(whole, target));
+    }
+    let whole = match integral(value) {
+        Some(whole) => whole,
+        None => rounded(value, target)?,
     };
-    narrow(whole, value, target)
+    fit(whole, target).ok_or_else(|| out_of_range(value, target))
 }
 
-/// A float or a decimal as a whole number, rounded half away from zero the way DuckDB rounds.
+/// A decimal as a whole number, rounded half away from zero the way DuckDB rounds.
+fn rounded_decimal(unscaled: i128, scale: u8) -> i128 {
+    let factor = pow10(scale);
+    let half = factor / 2;
+    let shifted = if unscaled >= 0 { unscaled + half } else { unscaled - half };
+    shifted / factor
+}
+
+/// A float as a whole number, rounded half away from zero the way DuckDB rounds.
 fn rounded(value: &Value, target: &LogicalType) -> Result<i128> {
-    if let Value::Decimal { unscaled, scale, .. } = *value {
-        let factor = pow10(scale);
-        let half = factor / 2;
-        let shifted = if unscaled >= 0 { unscaled + half } else { unscaled - half };
-        return Ok(shifted / factor);
-    }
-    let number = approximate(value).ok_or_else(|| not_convertible(value, target))?;
+    let number = approximate(value).ok_or_else(|| no_cast(value, target))?;
     if !number.is_finite() {
         return Err(out_of_range(value, target));
     }
@@ -560,56 +629,65 @@ fn rounded(value: &Value, target: &LogicalType) -> Result<i128> {
     }
 }
 
-/// A whole number as the target integer type, or the range failure.
-fn narrow(whole: i128, value: &Value, target: &LogicalType) -> Result<Value> {
-    fit(whole, target).ok_or_else(|| out_of_range(value, target))
-}
-
 fn parse_integer(text: &str) -> Option<i128> {
     text.trim().parse::<i128>().ok()
 }
 
+/// A number too big for a float is an infinity when it was written as a string and a failure when
+/// it was already a number, which is the string parser saturating rather than two opinions about
+/// the same question. `'1e40'::FLOAT` is `inf` upstream and `1e40::FLOAT` is out of range.
 fn to_float(value: &Value) -> Result<Value> {
-    let number = match value {
-        Value::Varchar(text) => {
-            text.trim().parse::<f64>().map_err(|_| not_convertible(value, &LogicalType::Float))?
-        }
-        _ => approximate(value).ok_or_else(|| not_convertible(value, &LogicalType::Float))?,
-    };
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "narrowing to a float is what a cast to FLOAT is"
-    )]
-    let narrowed = number as f32;
-    if narrowed.is_infinite() && number.is_finite() {
+    if let Value::Varchar(text) = value {
+        let written =
+            text.trim().parse::<f64>().map_err(|_| not_convertible(text, &LogicalType::Float))?;
+        return Ok(Value::Float(narrowed(written)));
+    }
+    let number = approximate(value).ok_or_else(|| no_cast(value, &LogicalType::Float))?;
+    let single = narrowed(number);
+    if single.is_infinite() && number.is_finite() {
         return Err(out_of_range(value, &LogicalType::Float));
     }
-    Ok(Value::Float(narrowed))
+    Ok(Value::Float(single))
+}
+
+/// A double as a float, which is where a number too big to be one becomes an infinity.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "narrowing to a float is what a cast to FLOAT is"
+)]
+fn narrowed(number: f64) -> f32 {
+    number as f32
 }
 
 fn to_double(value: &Value) -> Result<Value> {
     let number = match value {
         Value::Varchar(text) => {
-            text.trim().parse::<f64>().map_err(|_| not_convertible(value, &LogicalType::Double))?
+            text.trim().parse::<f64>().map_err(|_| not_convertible(text, &LogicalType::Double))?
         }
-        _ => approximate(value).ok_or_else(|| not_convertible(value, &LogicalType::Double))?,
+        _ => approximate(value).ok_or_else(|| no_cast(value, &LogicalType::Double))?,
     };
     Ok(Value::Double(number))
 }
 
 fn to_decimal(value: &Value, width: u8, scale: u8) -> Result<Value> {
     let target = LogicalType::Decimal { width, scale };
+    if let Value::Varchar(text) = value {
+        // A string keeps the conversion sentence whether it failed to read at all or read as a
+        // number with too many digits, which is one sentence where a number gets two.
+        let unscaled = parse_decimal(text, scale).ok_or_else(|| not_convertible(text, &target))?;
+        if digits(unscaled) > width {
+            return Err(not_convertible(text, &target));
+        }
+        return Ok(Value::Decimal { unscaled, width, scale });
+    }
     let unscaled = match value {
         Value::Decimal { unscaled, scale: from, .. } => rescale(*unscaled, *from, scale),
-        Value::Varchar(text) => {
-            Some(parse_decimal(text, scale).ok_or_else(|| not_convertible(value, &target))?)
-        }
         _ => match integral(value) {
             Some(whole) => whole.checked_mul(pow10(scale)),
             None => {
-                let number = approximate(value).ok_or_else(|| not_convertible(value, &target))?;
+                let number = approximate(value).ok_or_else(|| no_cast(value, &target))?;
                 if !number.is_finite() {
-                    return Err(out_of_range(value, &target));
+                    return Err(no_decimal(value, &target));
                 }
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -620,9 +698,9 @@ fn to_decimal(value: &Value, width: u8, scale: u8) -> Result<Value> {
             }
         },
     };
-    let unscaled = unscaled.ok_or_else(|| out_of_range(value, &target))?;
+    let unscaled = unscaled.ok_or_else(|| no_decimal(value, &target))?;
     if digits(unscaled) > width {
-        return Err(out_of_range(value, &target));
+        return Err(no_decimal(value, &target));
     }
     Ok(Value::Decimal { unscaled, width, scale })
 }
@@ -659,7 +737,7 @@ fn parse_decimal(text: &str, scale: u8) -> Option<i128> {
 /// would quietly turn a two byte character into two bytes of a blob that nothing wrote.
 fn to_blob(value: &Value) -> Result<Value> {
     let Value::Varchar(text) = value else {
-        return Err(not_convertible(value, &LogicalType::Blob));
+        return Err(no_cast(value, &LogicalType::Blob));
     };
     let escape = |what: &str| {
         Error::conversion(format!(
@@ -715,78 +793,172 @@ fn to_date(value: &Value) -> Result<Value> {
         Value::Timestamp(micros) => i32::try_from(micros.div_euclid(MICROS_PER_DAY))
             .map(Value::Date)
             .map_err(|_| out_of_range(value, &LogicalType::Date)),
-        Value::Varchar(text) => match parse_date(text.trim()) {
-            Some(days) => Ok(Value::Date(days)),
-            None => Err(not_convertible(value, &LogicalType::Date)),
+        Value::Varchar(text) => match parse_date(text) {
+            Ok(days) => Ok(Value::Date(days)),
+            Err(fault) => Err(fault.said("date", text, "(YYYY-MM-DD)")),
         },
-        _ => Err(not_convertible(value, &LogicalType::Date)),
+        _ => Err(no_cast(value, &LogicalType::Date)),
     }
 }
 
 fn to_timestamp(value: &Value) -> Result<Value> {
     match value {
         Value::Date(days) => Ok(Value::Timestamp(i64::from(*days) * MICROS_PER_DAY)),
-        Value::Varchar(text) => match parse_timestamp(text.trim()) {
-            Some(micros) => Ok(Value::Timestamp(micros)),
-            None => Err(not_convertible(value, &LogicalType::Timestamp)),
+        Value::Varchar(text) => match parse_timestamp(text) {
+            Ok(micros) => Ok(Value::Timestamp(micros)),
+            Err(fault) => Err(fault.said("timestamp", text, TIMESTAMP_FORMAT)),
         },
-        _ => Err(not_convertible(value, &LogicalType::Timestamp)),
+        _ => Err(no_cast(value, &LogicalType::Timestamp)),
     }
 }
 
-/// `YYYY-MM-DD` as days since the epoch.
-fn parse_date(text: &str) -> Option<i32> {
-    let mut parts = text.split('-');
-    let year: i32 = parts.next()?.parse().ok()?;
-    let month: u32 = parts.next()?.parse().ok()?;
-    let day: u32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
+/// What the timestamp message says the format should have been, including the parts of it this
+/// parser does not read yet, because the sentence is upstream's and not a description of this.
+const TIMESTAMP_FORMAT: &str = "(YYYY-MM-DD HH:MM[:SS[.US]][±HH[:MM[:SS]]| ZONE])";
+
+/// A read of a written date or time that says which way it went wrong when it did.
+type Parsed<T> = std::result::Result<T, Fault>;
+
+/// Which way a written date or timestamp was wrong, because DuckDB has a sentence for each.
+///
+/// Text that is not three numbers with dashes between them is a format failure and the message
+/// says what the format should have been. Three numbers naming a day that does not exist is a
+/// range failure and the message does not repeat the format. The time after a date follows the
+/// same split and it is not the split anybody would guess: an hour past 24 is a range failure and
+/// a minute past 59 is a format one, so `'2020-01-01 25:00:00'` and `'2020-01-01 10:61:00'` are
+/// two different sentences upstream and are two different sentences here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    Format,
+    Range,
+}
+
+impl Fault {
+    /// The failure in DuckDB's words, where `what` is the word it uses for the type.
+    fn said(self, what: &str, text: &str, format: &str) -> Error {
+        match self {
+            Self::Format => Error::conversion(format!(
+                "invalid {what} field format: \"{text}\", expected format is {format}"
+            )),
+            Self::Range => {
+                Error::conversion(format!("{what} field value out of range: \"{text}\""))
+            }
+        }
     }
-    Some(days_from_civil(year, month, day))
+}
+
+/// `YYYY-MM-DD` as days since the epoch, with a time after it allowed and thrown away.
+///
+/// The time still has to be a time for the date to be a date, which is why `'2020-01-01 10:00'`
+/// is the first of January and `'2020-01-01 abc'` is a format failure rather than a date with
+/// something ignored after it.
+fn parse_date(text: &str) -> Parsed<i32> {
+    let (date, time) = split_time(text.trim());
+    let days = parse_day(date)?;
+    if let Some(time) = time {
+        parse_time(time)?;
+    }
+    Ok(days)
 }
 
 /// `YYYY-MM-DD` with an optional `HH:MM:SS[.ffffff]` after it, as microseconds since the epoch.
-fn parse_timestamp(text: &str) -> Option<i64> {
-    let (date, time) = match text.split_once([' ', 'T']) {
-        Some((date, time)) => (date, Some(time)),
-        None => (text, None),
-    };
-    let days = i64::from(parse_date(date)?);
+fn parse_timestamp(text: &str) -> Parsed<i64> {
+    let (date, time) = split_time(text.trim());
+    let days = i64::from(parse_day(date)?);
     let micros = match time {
         None => 0,
         Some(time) => parse_time(time)?,
     };
-    Some(days * MICROS_PER_DAY + micros)
+    days.checked_mul(MICROS_PER_DAY).and_then(|start| start.checked_add(micros)).ok_or(Fault::Range)
+}
+
+/// The date and the time in a written timestamp, which are separated by a space or by a `T`.
+fn split_time(text: &str) -> (&str, Option<&str>) {
+    match text.split_once([' ', 'T']) {
+        Some((date, time)) => (date, Some(time)),
+        None => (text, None),
+    }
+}
+
+/// `YYYY-MM-DD` as days since the epoch.
+fn parse_day(text: &str) -> Parsed<i32> {
+    let mut parts = text.split('-');
+    let year: i32 = field(parts.next())?;
+    let month: u32 = field(parts.next())?;
+    let day: u32 = field(parts.next())?;
+    if parts.next().is_some() {
+        return Err(Fault::Format);
+    }
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return Err(Fault::Range);
+    }
+    let days = days_from_civil(year, month, day);
+    // The two ends of the `i32` are what DuckDB keeps for its infinities, and past them
+    // `days_from_civil` has wrapped, which the round trip is what catches. So the year that does
+    // not fit says its day is out of range rather than answering with some other day.
+    if days == i32::MAX || days == i32::MIN || civil_from_days(days) != (year, month, day) {
+        return Err(Fault::Range);
+    }
+    Ok(days)
+}
+
+/// One field of a written date, which has to be there and has to be a number.
+fn field<T: FromStr>(part: Option<&str>) -> Parsed<T> {
+    part.ok_or(Fault::Format)?.parse().map_err(|_| Fault::Format)
+}
+
+/// How many days that month of that year has.
+///
+/// A date that names the thirty first of April is out of range upstream and was the first of May
+/// here, which is a wrong answer and not only a wrong message.
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        _ => 28,
+    }
 }
 
 /// `HH:MM:SS[.ffffff]` as microseconds since midnight.
-fn parse_time(text: &str) -> Option<i64> {
+///
+/// Midnight at the end of the day is a time, so `'2020-01-01 24:00:00'` is the second of January,
+/// and anything past it is out of range rather than badly written.
+fn parse_time(text: &str) -> Parsed<i64> {
     let (clock, fraction) = match text.split_once('.') {
         Some((clock, fraction)) => (clock, Some(fraction)),
         None => (text, None),
     };
     let mut parts = clock.split(':');
-    let hours: i64 = parts.next()?.parse().ok()?;
-    let minutes: i64 = parts.next()?.parse().ok()?;
-    let seconds: i64 = parts.next().unwrap_or("0").parse().ok()?;
-    if parts.next().is_some() || !(0..24).contains(&hours) {
-        return None;
+    let hours: i64 = field(parts.next())?;
+    let minutes: i64 = field(parts.next())?;
+    let seconds: i64 = field(parts.next().or(Some("0")))?;
+    if parts.next().is_some() {
+        return Err(Fault::Format);
+    }
+    // The hour is checked before the arithmetic below rather than after it, because a written hour
+    // is only bounded by what an `i64` holds and the multiply would be the one that overflowed.
+    if !(0..=24).contains(&hours) {
+        return Err(Fault::Range);
     }
     if !(0..60).contains(&minutes) || !(0..60).contains(&seconds) {
-        return None;
+        return Err(Fault::Format);
     }
     let micros = match fraction {
         None => 0,
         Some(digits) => {
             if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-                return None;
+                return Err(Fault::Format);
             }
             let padded = format!("{digits:0<6}");
-            padded.get(..6)?.parse::<i64>().ok()?
+            padded.get(..6).ok_or(Fault::Format)?.parse::<i64>().map_err(|_| Fault::Format)?
         }
     };
-    Some(((hours * 60 + minutes) * 60 + seconds) * 1_000_000 + micros)
+    let since_midnight = ((hours * 60 + minutes) * 60 + seconds) * 1_000_000 + micros;
+    if since_midnight > MICROS_PER_DAY {
+        return Err(Fault::Range);
+    }
+    Ok(since_midnight)
 }
 
 #[cfg(test)]
@@ -876,6 +1048,78 @@ mod tests {
     fn a_decimal_that_needs_more_digits_than_its_width_is_caught() {
         let target = LogicalType::decimal(3, 2).expect("a legal decimal");
         let error = cast_to(Value::Integer(100), &target).expect_err("100.00 needs five digits");
+        assert_eq!(error.message(), "Could not cast value 100 to DECIMAL(3,2)");
+    }
+
+    /// Seven sentences, one per shape, every one of them read off `v2.0.0-dev84237 (cc7e7bac7f)`
+    /// one statement at a time. The type names in them are the physical ones, which is why nothing
+    /// here says INTEGER or TINYINT.
+    #[test]
+    fn a_failed_cast_says_the_sentence_duckdb_says() {
+        let decimal = LogicalType::decimal(4, 1).expect("a legal decimal");
+        let said = |value: Value, target: &LogicalType| {
+            cast_to(value, target).expect_err("this does not cast").message().to_string()
+        };
+        assert_eq!(
+            said(Value::Varchar("abc".into()), &LogicalType::TinyInt),
+            "Could not convert string 'abc' to INT8"
+        );
+        assert_eq!(
+            said(Value::Varchar("300".into()), &LogicalType::TinyInt),
+            "Could not convert string '300' to INT8"
+        );
+        assert_eq!(
+            said(Value::Varchar("abc".into()), &decimal),
+            "Could not convert string \"abc\" to DECIMAL(4,1)"
+        );
+        assert_eq!(
+            said(Value::Integer(300), &LogicalType::TinyInt),
+            "Type INT32 with value 300 can't be cast because the value is out of range for the destination type INT8"
+        );
+        assert_eq!(
+            said(Value::Decimal { unscaled: 9999, width: 4, scale: 1 }, &LogicalType::TinyInt),
+            "Failed to cast decimal value 1000 to type INT8"
+        );
+        assert_eq!(
+            said(Value::Integer(200_000), &decimal),
+            "Could not cast value 200000 to DECIMAL(4,1)"
+        );
+        assert_eq!(
+            said(Value::Double(1.5e30), &decimal),
+            "Could not cast value 1499999999999999889089448902656.000000 to DECIMAL(4,1)"
+        );
+        assert_eq!(
+            said(Value::Decimal { unscaled: 2_000_005, width: 7, scale: 1 }, &decimal),
+            "Casting value \"200000.5\" to type DECIMAL(4,1) failed: value is out of range!"
+        );
+        assert_eq!(
+            said(Value::Date(0), &LogicalType::Integer),
+            "Unimplemented type for cast (DATE -> INTEGER)"
+        );
+    }
+
+    /// A pair with no cast between it is a conversion failure here because it is one upstream, and
+    /// upstream answers null for it under `TRY_CAST`. A target nobody has built is still the other
+    /// kind, which is the distinction the module documentation is about.
+    #[test]
+    fn a_pair_with_no_cast_is_null_under_try_cast_and_a_missing_target_is_not() {
+        let refused = cast_value(&Value::Date(0), &LogicalType::Integer, true)
+            .expect("try_cast swallows a pair duckdb has no cast for");
+        assert_eq!(refused, Value::Null);
+        let error = cast_value(&Value::Integer(1), &LogicalType::Interval, true)
+            .expect_err("try_cast does not invent an interval");
+        assert_eq!(error.code(), ErrorCode::NotImplemented);
+    }
+
+    /// The number that does not fit a float is an infinity when it was written down and a failure
+    /// when it was already a number, which is the string parser saturating rather than two
+    /// opinions about the same question.
+    #[test]
+    fn a_written_number_too_big_for_a_float_is_an_infinity() {
+        let written = cast_to(Value::Varchar("1e40".into()), &LogicalType::Float).expect("inf");
+        assert_eq!(written, Value::Float(f32::INFINITY));
+        let error =
+            cast_to(Value::Double(1e40), &LogicalType::Float).expect_err("1e40 is not a float");
         assert!(error.message().contains("out of range"), "{error}");
     }
 
@@ -897,10 +1141,85 @@ mod tests {
 
     #[test]
     fn a_date_that_is_not_a_date_is_refused_rather_than_guessed_at() {
-        for text in ["2013-13-01", "2013-07", "yesterday", "2013-07-15-01"] {
+        for text in ["2013-07", "yesterday", "2013-07-15-01"] {
             let error = cast_to(Value::Varchar(text.into()), &LogicalType::Date)
                 .expect_err("this is not a date");
-            assert!(error.message().contains("Could not convert"), "{text}: {error}");
+            assert_eq!(
+                error.message(),
+                format!("invalid date field format: \"{text}\", expected format is (YYYY-MM-DD)")
+            );
+        }
+        for text in ["2013-13-01", "2021-02-29", "2021-04-31"] {
+            let error =
+                cast_to(Value::Varchar(text.into()), &LogicalType::Date).expect_err("no such day");
+            assert_eq!(error.message(), format!("date field value out of range: \"{text}\""));
+        }
+    }
+
+    /// A written date is allowed to carry a time, which is thrown away, but it still has to be a
+    /// time. The year that is a leap year has the day the year after it does not.
+    #[test]
+    fn a_date_takes_a_time_it_does_not_keep() {
+        let kept = cast_to(Value::Varchar(" 2020-02-29 10:30:00 ".into()), &LogicalType::Date)
+            .expect("a leap day with a time on it");
+        assert_eq!(kept, Value::Date(days_from_civil(2020, 2, 29)));
+        let error = cast_to(Value::Varchar("2020-02-29 10:70:00".into()), &LogicalType::Date)
+            .expect_err("seventy minutes past ten is not a time");
+        assert_eq!(
+            error.message(),
+            "invalid date field format: \"2020-02-29 10:70:00\", expected format is (YYYY-MM-DD)"
+        );
+    }
+
+    /// Midnight at the end of the day is a time, and one second past it is not a time at all. The
+    /// date keeps the day it was written with rather than the day that time rolls into, which the
+    /// timestamp below does not.
+    #[test]
+    fn the_end_of_the_day_is_a_time_and_a_moment_after_it_is_not() {
+        let midnight = cast_to(Value::Varchar("2020-01-01 24:00:00".into()), &LogicalType::Date)
+            .expect("the end of the first is still the first");
+        assert_eq!(midnight, Value::Date(days_from_civil(2020, 1, 1)));
+        for (text, said) in [
+            ("2020-01-01 24:00:01", "date field value out of range: \"2020-01-01 24:00:01\""),
+            ("2020-01-01 25:00:00", "date field value out of range: \"2020-01-01 25:00:00\""),
+            (
+                "2020-01-01 10:00:60",
+                "invalid date field format: \"2020-01-01 10:00:60\", expected format is (YYYY-MM-DD)",
+            ),
+        ] {
+            let error = cast_to(Value::Varchar(text.into()), &LogicalType::Date)
+                .expect_err("this is not a time");
+            assert_eq!(error.message(), said);
+        }
+    }
+
+    /// The timestamp says the same two things about itself that the date does, in its own words
+    /// and with the long format string, and it does roll into the next day at the end of this one.
+    #[test]
+    fn a_timestamp_that_is_not_one_says_so_in_its_own_words() {
+        let rolled = cast_to(Value::Varchar("2020-01-01 24:00:00".into()), &LogicalType::Timestamp)
+            .expect("the end of the first is the start of the second");
+        assert_eq!(
+            rolled,
+            Value::Timestamp(i64::from(days_from_civil(2020, 1, 2)) * MICROS_PER_DAY)
+        );
+        let missing = cast_to(Value::Varchar("2020-01-01".into()), &LogicalType::Timestamp)
+            .expect("a day with no time on it is midnight");
+        assert_eq!(
+            missing,
+            Value::Timestamp(i64::from(days_from_civil(2020, 1, 1)) * MICROS_PER_DAY)
+        );
+        for (text, said) in [
+            ("2020-01-01 24:00:01", "timestamp field value out of range: \"2020-01-01 24:00:01\""),
+            ("2021-02-29 10:00:00", "timestamp field value out of range: \"2021-02-29 10:00:00\""),
+            (
+                "abc",
+                "invalid timestamp field format: \"abc\", expected format is (YYYY-MM-DD HH:MM[:SS[.US]][±HH[:MM[:SS]]| ZONE])",
+            ),
+        ] {
+            let error = cast_to(Value::Varchar(text.into()), &LogicalType::Timestamp)
+                .expect_err("this is not a timestamp");
+            assert_eq!(error.message(), said);
         }
     }
 

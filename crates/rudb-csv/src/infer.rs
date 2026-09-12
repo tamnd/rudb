@@ -9,7 +9,8 @@
 //! The order was read off duckdb v1.4.1 rather than chosen. `BOOLEAN` before `BIGINT` matters,
 //! because a column of `true` and `false` is a boolean and not a pair of words. `BIGINT` before
 //! `DOUBLE` matters, because a column of whole numbers should be whole. `DATE` before `TIMESTAMP`
-//! is the order the binary uses and nothing in it overlaps, so the order is only visible here.
+//! is the order the binary uses, and those two do overlap because a cast to `DATE` reads a time on
+//! the end and throws it away, so `timed` below keeps a timestamp off the `DATE` rung.
 //!
 //! `TIME` is a rung DuckDB has and this does not, and the gap is deliberate rather than forgotten.
 //! `rudb-kernels` has no cast from `VARCHAR` to `TIME`, so a column sniffed as one would be a column
@@ -17,12 +18,13 @@
 //! `VARCHAR` it falls through to. The rung goes in when the cast does, and the test below says so in
 //! both directions so that adding the cast without adding the rung fails.
 //!
-//! Two of the tests are the sniffer's rather than the cast's, and both were measured. `007` is a
-//! `VARCHAR` here although `CAST('007' AS BIGINT)` is 7, because a column of zero padded numbers is
-//! a column of codes and adding them up is not what anybody meant. `+1` is a `VARCHAR` for the same
-//! sort of reason. Everything else defers to the cast, which is the point: a string the sniffer
-//! calls a `BIGINT` is a string the reader then casts to `BIGINT`, so a test that disagreed with the
-//! cast would produce a column whose declared type its own values do not fit.
+//! Three of the rules are the sniffer's rather than the cast's, and all three were measured. `007`
+//! is a `VARCHAR` here although `CAST('007' AS BIGINT)` is 7, because a column of zero padded
+//! numbers is a column of codes and adding them up is not what anybody meant. `+1` is a `VARCHAR`
+//! for the same sort of reason. A day with a time on it is a `TIMESTAMP` and not a `DATE`, although
+//! the cast to `DATE` takes it. Everything else defers to the cast, which is the point: a string
+//! the sniffer calls a `BIGINT` is a string the reader then casts to `BIGINT`, so a test that
+//! disagreed with the cast would produce a column whose declared type its own values do not fit.
 
 use rudb_common::{LogicalType, Value};
 use rudb_kernels::cast_value;
@@ -69,11 +71,21 @@ pub fn fits(text: &str, candidate: &LogicalType) -> bool {
         LogicalType::Boolean => is_boolean(text),
         LogicalType::BigInt if !numeric(text) => false,
         LogicalType::Double if !numeric(text) => false,
+        LogicalType::Date if timed(text) => false,
         _ => {
             let value = Value::Varchar(text.to_string());
             matches!(cast_value(&value, candidate, true), Ok(converted) if !converted.is_null())
         }
     }
+}
+
+/// Whether a written day carries a time on the end of it.
+///
+/// The third rule that is not the cast's. `CAST('2013-07-15 10:00:00' AS DATE)` is a date upstream,
+/// the time is read and thrown away, so the two rungs do overlap and the sniffer has to tell them
+/// apart itself or every timestamp column would come back as a `DATE`.
+fn timed(text: &str) -> bool {
+    text.trim().contains([' ', 'T'])
 }
 
 /// The spellings DuckDB's sniffer reads as a boolean.
@@ -133,6 +145,21 @@ mod tests {
         assert!(
             cast_value(&value, &LogicalType::Time, true).is_err(),
             "the cast exists now, so TIME belongs back in the ladder"
+        );
+    }
+
+    /// The `DATE` rung would swallow this column otherwise, because the cast under it takes a time
+    /// on the end of a day and throws it away, so the column would be declared a `DATE` and every
+    /// value in it would lose its time.
+    #[test]
+    fn a_column_of_timestamps_does_not_stop_at_the_date_rung() {
+        assert_eq!(of(&["2020-01-02 03:04:05", "2020-01-03 00:00:00"]), LogicalType::Timestamp);
+        assert_eq!(of(&["2020-01-02T03:04:05"]), LogicalType::Timestamp);
+        assert_eq!(of(&["2020-01-02", "2020-01-03 03:04:05"]), LogicalType::Timestamp);
+        let date = Value::Varchar("2020-01-02 03:04:05".into());
+        assert!(
+            cast_value(&date, &LogicalType::Date, true).is_ok_and(|value| !value.is_null()),
+            "the cast still takes it, which is why the rung has a rule of its own"
         );
     }
 
