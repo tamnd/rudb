@@ -52,7 +52,7 @@ The failure mode being avoided is a crate tree that looks modular and is not: fo
 
 `rudb-pipeline`, the push operator interface, the pipeline, and the single threaded driver. Source, stream and sink, the four reasons an operator can be blocked, the one pull adapter at the root of the query, and the instrumentation shim that wraps an operator of any of the three kinds so that measuring one is not something an operator can forget to do. Rank 4, because it is plumbing over chunks and knows nothing about a schema, a plan or a binding, which is what lets an operator be tested with a source made of two literal chunks and no planner anywhere in the picture. Depends on `rudb-common`, `rudb-vector` and `rudb-metrics`.
 
-`rudb-exec`, operators, morsels, the scheduler, hash tables, sorting, spilling.
+`rudb-exec`, operators, morsels, the scheduler, hash tables, sorting, spilling. It is also where the shim gets put around every operator, because building the tree is the one walk that sees all of them, and that is where an operator's id and its pipeline number come from.
 
 `rudb-ir`, the expression IR from document 8.5.
 

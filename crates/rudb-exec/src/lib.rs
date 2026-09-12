@@ -112,7 +112,7 @@ mod written;
 #[cfg(test)]
 mod tests;
 
-pub use build::{build, build_with};
+pub use build::{build, build_measured, build_with};
 pub use expr::{evaluate, evaluate_all};
 pub use operator::Operator;
 pub use prepared::{Prepared, Scratch};

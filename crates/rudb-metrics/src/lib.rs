@@ -49,6 +49,12 @@
 //! [`Counters::snapshot`] is the only way a counter becomes a row, so an operator that was measured
 //! and an operator that was written by hand into a test produce the same shape.
 //!
+//! [`Report`] is the other end of all those counters. Whoever builds an execution registers each
+//! operator with one as it is made and says which pipeline depends on which, and at the end
+//! [`Report::fill`] puts the rows into the document. That is the piece that makes the ids and the
+//! pipeline numbers come from the shape of the plan rather than from anything an operator says
+//! about itself.
+//!
 //! # The one unsafe block
 //!
 //! Per thread CPU time is a system call and there is no dependency here to make it for us, so
@@ -60,6 +66,7 @@ mod clock;
 mod counters;
 mod document;
 mod json;
+mod report;
 mod warn;
 
 pub use clock::{Span, thread_cpu_ns};
@@ -68,6 +75,7 @@ pub use document::{
     Blocked, Document, Engine, Machine, Memory, Operator, Outcome, Pipeline, Query, Resource,
     Settings, Strategy, Timing,
 };
+pub use report::Report;
 
 /// The version of the document this crate writes.
 ///
