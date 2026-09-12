@@ -565,6 +565,14 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     if !entry.arity.accepts(arguments.len()) {
         return Err(no_match(entry.name, arguments));
     }
+    if let Some(returns) = shifted(entry.name, arguments) {
+        return Ok(Resolved {
+            name: entry.name,
+            kind: entry.kind,
+            arguments: arguments.to_vec(),
+            returns,
+        });
+    }
     if entry.numeric_only {
         for ty in arguments {
             // A null literal has no type yet and every function accepts one, since the alternative
@@ -739,6 +747,29 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
 ///
 /// The trailing newline is the reference's too. Its message ends after the last candidate with a
 /// line break, which is visible as the second blank line before the shell prints the offending SQL.
+/// What `+` and `-` return when one side of them is an interval.
+///
+/// The one place in this file where the argument types pick the overload rather than the name
+/// picking one shape. The table above says a name has exactly one shape and that a second row for
+/// a name needs a rule for which one wins, and this is the rule: an interval next to a date, a
+/// timestamp or a time is date arithmetic, and everything else is the numeric row.
+///
+/// A date plus an interval is a timestamp and not a date, because the interval carries a time of
+/// day. A time plus an interval is a time, since the months and the days have nowhere to go and it
+/// wraps at midnight. Taking a date off an interval is not a thing on either engine, so only the
+/// commuted addition is here.
+fn shifted(name: &str, arguments: &[LogicalType]) -> Option<LogicalType> {
+    use LogicalType::{Date, Interval, Time, Timestamp};
+    let [left, right] = arguments else { return None };
+    match (name, left, right) {
+        ("+" | "-", Date | Timestamp, Interval) | ("+", Interval, Date | Timestamp) => {
+            Some(Timestamp)
+        }
+        ("+" | "-", Time, Interval) | ("+", Interval, Time) => Some(Time),
+        _ => None,
+    }
+}
+
 fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
     let types = arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
     let mut message = format!(
