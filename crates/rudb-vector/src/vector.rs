@@ -5,9 +5,16 @@
 //! is written before the first operator rather than after the fifth.
 //!
 //! A vector is a type, a length of at most [`VECTOR_SIZE`], a physical form, a validity
-//! representation and some data. The four forms are the ones in `spec/04-architecture.md` section
-//! 4.3: flat, constant, sequence and dictionary. Encoded, the fifth, is the M3 work and it arrives
-//! with the specialization contract rather than before it.
+//! representation and some data. Four of the forms are the ones in `spec/04-architecture.md`
+//! section 4.3: flat, constant, sequence and dictionary. Run length is the fifth and it is the first
+//! of the encoded ones, which arrive one at a time with the kernels that read them rather than all
+//! at once ahead of anything that can use them.
+//!
+//! Dictionary and run length are the pair worth understanding together, because they answer
+//! different questions about the same column. A dictionary says which distinct values there are, so
+//! it wins on low cardinality however the rows are ordered. Run length says where the values stop,
+//! so it wins on a clustered column however many distinct values it has. A column can want either
+//! one without wanting the other, and `hits` has columns of both kinds.
 //!
 //! **What is not here yet.** Buffers are owned. Section 7.1 says a vector borrowed from a buffer
 //! managed page carries a pin, and there is no buffer manager until M2, so there is nothing to pin
@@ -54,6 +61,13 @@ pub enum Form {
     Sequence,
     /// Codes into a smaller vector of distinct values.
     Dictionary,
+    /// One value per run, with the row each run ends at.
+    ///
+    /// The form a clustered column is in. `hits` is written in time order, so `EventDate` is a few
+    /// hundred runs over a hundred million rows, and a sum over it is a few hundred multiplications
+    /// rather than a hundred million additions. Dictionary says which distinct values there are and
+    /// this says where they stop, and a column can want either one without wanting the other.
+    Rle,
 }
 
 /// The values of a flat vector, one Rust vector per physical type.
@@ -225,6 +239,18 @@ enum Body {
         codes: Vec<u32>,
         values: Arc<Vector>,
     },
+    /// One value per run, with the row each run ends at, exclusive and increasing.
+    ///
+    /// Ends rather than lengths, because every reader of this wants to know which run holds a row
+    /// and ends answer that with a binary search while lengths answer it with a running total. The
+    /// two are the same information and only one of them is the one that gets asked for.
+    ///
+    /// The values are behind an `Arc` for the reason the dictionary's are: a page is cut into chunk
+    /// sized pieces and the values are the same values every time.
+    Runs {
+        ends: Vec<u32>,
+        values: Arc<Vector>,
+    },
 }
 
 impl Vector {
@@ -335,6 +361,81 @@ impl Vector {
         })
     }
 
+    /// A vector of runs, one value each, with the row each run ends at.
+    ///
+    /// `ends` is exclusive and strictly increasing, so run `i` covers the rows from `ends[i - 1]` to
+    /// `ends[i]` and run zero starts at nothing. The length of the vector is the last end.
+    ///
+    /// The depth is one, the same way a dictionary's is, and for a sharper reason. Every kernel that
+    /// wants runs wants the value of a run without another search, and a run length vector over a
+    /// run length vector turns one search into two and then into three. Rather than compose, this
+    /// refuses: nothing in the engine builds a stacked one, because [`Self::run_encoded`] only ever
+    /// reads a flat body, so a stacked one is a caller doing something by hand and the useful answer
+    /// is to say so rather than to quietly do a pass of work they did not ask for.
+    ///
+    /// A run over a dictionary is fine and is not that case. The two forms answer different
+    /// questions and a column that is both clustered and low cardinality genuinely wants both.
+    ///
+    /// # Errors
+    ///
+    /// If there is not exactly one value per run, if the ends do not increase, or if the values are
+    /// themselves run length encoded.
+    pub fn runs(ends: Vec<u32>, values: Vector) -> Result<Self> {
+        if matches!(values.body, Body::Runs { .. }) {
+            return Err(Error::internal("runs of runs, which is two searches to read one row"));
+        }
+        if ends.len() != values.len() {
+            return Err(Error::internal(format!(
+                "{} runs and {} values to put in them",
+                ends.len(),
+                values.len()
+            )));
+        }
+        if ends.windows(2).any(|pair| pair[0] >= pair[1]) || ends.first() == Some(&0) {
+            return Err(Error::internal("run ends that do not increase"));
+        }
+        let len = ends.last().copied().unwrap_or(0) as usize;
+        Ok(Self {
+            ty: values.ty.clone(),
+            len,
+            validity: Validity::AllValid,
+            body: Body::Runs { ends, values: Arc::new(values) },
+        })
+    }
+
+    /// The same values as runs, when there are few enough runs for that to be smaller.
+    ///
+    /// Costs one pass over the column to find out, which is why this is a call somebody makes rather
+    /// than something a constructor does. The decision is the same arithmetic every time: a row in
+    /// flat form costs one value, a run costs one value plus the four bytes of its end, so runs are
+    /// smaller once there are fewer than about half as many runs as rows, and the narrower the
+    /// column the more runs it takes. `RUNS_PAY_AT` is that ratio, written down rather than spelt
+    /// into an `if`, because it is the number a sweep will want to move.
+    ///
+    /// Only a flat body is looked at. A constant and a sequence are already one value and two
+    /// numbers, so there is nothing to win, and a dictionary that is also clustered is a real case
+    /// that wants its codes run length encoded rather than its values, which is a different function
+    /// and not this one.
+    ///
+    /// Two adjacent nulls are one run. Two adjacent equal values with a null between them are three,
+    /// because the null is a value of the column as far as anything reading it is concerned.
+    ///
+    /// # Errors
+    ///
+    /// If the type has no flat layout, which today means the nested types.
+    pub fn run_encoded(&self) -> Result<Self> {
+        let Body::Flat(data) = &self.body else {
+            return Ok(self.clone());
+        };
+        let ends = boundaries(data, &self.validity, self.len);
+        if ends.len().saturating_mul(RUNS_PAY_AT) >= self.len {
+            return Ok(self.clone());
+        }
+        let starts: Vec<u32> =
+            std::iter::once(0).chain(ends.iter().copied()).take(ends.len()).collect();
+        Self::runs(ends, self.gather(&starts)?)
+    }
+
     /// The same vector with a different validity.
     #[must_use]
     pub fn with_validity(mut self, validity: Validity) -> Self {
@@ -380,6 +481,7 @@ impl Vector {
             Body::Dictionary { codes, values } => {
                 codes.capacity() * size_of::<u32>() + values.footprint()
             }
+            Body::Runs { ends, values } => ends.capacity() * size_of::<u32>() + values.footprint(),
         };
         size_of::<Self>() + self.validity.footprint() + body
     }
@@ -398,6 +500,7 @@ impl Vector {
             Body::Constant(_) => Form::Constant,
             Body::Sequence { .. } => Form::Sequence,
             Body::Dictionary { .. } => Form::Dictionary,
+            Body::Runs { .. } => Form::Rle,
         }
     }
 
@@ -448,6 +551,23 @@ impl Vector {
         }
     }
 
+    /// The run ends and the run values, for a run length vector, and `None` for any other form.
+    ///
+    /// The ends are exclusive and increasing, and there is exactly one value per run, so a kernel
+    /// that wants to walk this walks the pairs and never asks which run a row is in. That is the
+    /// whole argument for the form: an aggregate over a clustered column is one multiply per run
+    /// instead of one add per row, and there is no way to write that loop without seeing the ends.
+    ///
+    /// The nulls are in the values, the way a dictionary's are, so a caller deciding whether row `i`
+    /// is null asks the value vector about the run rather than asking this vector about `i`.
+    #[must_use]
+    pub fn run_parts(&self) -> Option<(&[u32], &Self)> {
+        match &self.body {
+            Body::Runs { ends, values } => Some((ends, values.as_ref())),
+            _ => None,
+        }
+    }
+
     /// The start and the step, for a sequence vector, and `None` for any other form.
     #[must_use]
     pub fn sequence_parts(&self) -> Option<(i64, i64)> {
@@ -474,6 +594,10 @@ impl Vector {
                 Some(&code) => values.value_at(code as usize),
                 None => Value::Null,
             },
+            Body::Runs { ends, values } => match run_holding(ends, index) {
+                Some(run) => values.value_at(run),
+                None => Value::Null,
+            },
             Body::Flat(data) => value_from(&self.ty, data, index),
         }
     }
@@ -497,6 +621,7 @@ impl Vector {
             Body::Dictionary { codes, values } => {
                 values.text_at(usize::try_from(*codes.get(index)?).ok()?)
             }
+            Body::Runs { ends, values } => values.text_at(run_holding(ends, index)?),
             _ => None,
         }
     }
@@ -544,6 +669,23 @@ impl Vector {
             Body::Dictionary { codes, values } => {
                 Body::Dictionary { codes: codes[at..end].to_vec(), values: Arc::clone(values) }
             }
+            // Only the runs the range touches survive, the first and last of them cut back to where
+            // the range starts and stops, and every end moved to be relative to the new row zero. A
+            // cut of a hundred rows out of a column of a hundred million is a handful of runs, which
+            // is the reason this form is worth cutting as itself rather than copying out.
+            Body::Runs { ends, values } if len > 0 => {
+                let first = run_holding(ends, at).unwrap_or(0);
+                let last = run_holding(ends, end - 1).unwrap_or(first);
+                let cut: Vec<u32> = ends[first..=last]
+                    .iter()
+                    .map(|&stop| stop.min(end as u32) - at as u32)
+                    .collect();
+                let values = values.slice(first, last - first + 1)?;
+                Body::Runs { ends: cut, values: Arc::new(values) }
+            }
+            // An empty cut has no run to point at and an empty run length body would be a vector of
+            // no runs claiming a length, so it comes back as the empty flat vector instead.
+            Body::Runs { .. } => return self.gather(&[]),
             // The one form with nowhere to point, so its range is copied out. A gather is the
             // right tool here and does no more than this would: a flat body has no dictionary
             // under it for the gather to flatten.
@@ -636,9 +778,12 @@ impl Vector {
                 return Ok(Self::constant(self.ty.clone(), Value::Null, rows));
             }
             Body::Flat(data) => Body::Flat(copy_of(data, &at)),
-            // Unreachable, because `resolve` stops at the first body that is not a dictionary.
-            Body::Dictionary { .. } => {
-                return Err(Error::internal("a dictionary survived being resolved"));
+            // Unreachable, because `resolve` walks past both of the forms that point at another
+            // vector and stops at the first body that does not.
+            Body::Dictionary { .. } | Body::Runs { .. } => {
+                return Err(Error::internal(
+                    "a form that points somewhere survived being resolved",
+                ));
             }
         };
         Ok(Self { ty: self.ty.clone(), len: rows, validity, body })
@@ -657,16 +802,27 @@ impl Vector {
                     *slot = NOWHERE;
                 }
             }
-            let Body::Dictionary { codes, values } = &source.body else {
-                return (at, source);
+            source = match &source.body {
+                Body::Dictionary { codes, values } => {
+                    for slot in &mut at {
+                        *slot = match codes.get(*slot) {
+                            Some(&code) => code as usize,
+                            None => NOWHERE,
+                        };
+                    }
+                    values.as_ref()
+                }
+                // A run length body is a dictionary whose code is worked out from the position
+                // rather than stored, so the walk down is the same walk with a search where the
+                // lookup was. `NOWHERE` searches for nothing and stays `NOWHERE`.
+                Body::Runs { ends, values } => {
+                    for slot in &mut at {
+                        *slot = run_holding(ends, *slot).unwrap_or(NOWHERE);
+                    }
+                    values.as_ref()
+                }
+                _ => return (at, source),
             };
-            for slot in &mut at {
-                *slot = match codes.get(*slot) {
-                    Some(&code) => code as usize,
-                    None => NOWHERE,
-                };
-            }
-            source = values.as_ref();
         }
     }
 }
@@ -716,6 +872,76 @@ fn compose(codes: Vec<u32>, values: Vector) -> (Vec<u32>, Vector) {
         }
         body => (codes, Vector { ty, len, validity, body }),
     }
+}
+
+/// How many rows a run has to cover on average before run length encoding is smaller.
+///
+/// A run costs its value plus the four bytes of its end, so on a four byte column a run of two rows
+/// breaks even and a run of three wins. Wider columns win sooner and narrower ones later, and this
+/// is the one ratio for all of them because a threshold per width is a table that has to be right
+/// nine times rather than once. It is a constant with a name so that the sweep that eventually moves
+/// it has something to move.
+const RUNS_PAY_AT: usize = 2;
+
+/// Which run holds `row`, given ends that are exclusive and increasing.
+///
+/// A binary search rather than a scan, because the callers that ask this are the ones that are not
+/// walking the runs in order: a single value read out of a result set, or a gather at scattered
+/// positions. Anything walking in order should be reading [`Vector::run_parts`] instead, which is
+/// what the form is for.
+fn run_holding(ends: &[u32], row: usize) -> Option<usize> {
+    let row = u32::try_from(row).ok()?;
+    let run = match ends.binary_search(&row) {
+        // The ends are exclusive, so landing exactly on one means the row is the first of the next.
+        Ok(at) => at + 1,
+        Err(at) => at,
+    };
+    (run < ends.len()).then_some(run)
+}
+
+/// The row each run ends at, for a flat body read alongside the validity that goes with it.
+///
+/// Two adjacent nulls are one run, because a reader of either gets a null and cannot tell them
+/// apart. A null between two equal values is three runs for the same reason, since the null is a
+/// value of the column as far as anything reading it is concerned.
+///
+/// The comparison is per layout rather than per `Value`, which is the whole reason this is a macro.
+/// A `Value` a row would allocate a string per row on a `VARCHAR` column and would be the exact
+/// defect `cargo xtask rowloop` exists to fail the build on.
+fn boundaries(data: &Data, validity: &Validity, len: usize) -> Vec<u32> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let breaks = |ends: &mut Vec<u32>, mut differs: Box<dyn FnMut(usize, usize) -> bool + '_>| {
+        for row in 1..len {
+            let same = match (validity.is_valid(row), validity.is_valid(row - 1)) {
+                (false, false) => true,
+                (true, true) => !differs(row, row - 1),
+                _ => false,
+            };
+            if !same {
+                ends.push(u32::try_from(row).unwrap_or(u32::MAX));
+            }
+        }
+        ends.push(u32::try_from(len).unwrap_or(u32::MAX));
+    };
+    let mut ends = Vec::new();
+    macro_rules! walked {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                // No values at all, so every row is the same null and the column is one run.
+                Data::Empty => ends.push(u32::try_from(len).unwrap_or(u32::MAX)),
+                $(Data::$variant(values) => {
+                    breaks(&mut ends, Box::new(|a, b| values.get(a) != values.get(b)));
+                })+
+                Data::Varlen(values) => {
+                    breaks(&mut ends, Box::new(|a, b| values.bytes(a) != values.bytes(b)));
+                }
+            }
+        };
+    }
+    crate::for_each_layout!(fixed, walked);
+    ends
 }
 
 /// The position of a value that is not anywhere, because it is null or out of range.
@@ -978,6 +1204,121 @@ mod tests {
 
     fn integers(values: &[i32]) -> Vector {
         Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into())).unwrap()
+    }
+
+    #[test]
+    fn a_clustered_column_becomes_runs_and_reads_back_the_same() {
+        let mut values = Vec::new();
+        for (value, times) in [(7, 400), (8, 300), (7, 324)] {
+            values.extend(std::iter::repeat_n(value, times));
+        }
+        let flat = integers(&values);
+        let runs = flat.run_encoded().unwrap();
+        assert_eq!(runs.form(), Form::Rle);
+        assert_eq!(runs.run_parts().expect("runs").0, [400, 700, 1024]);
+        assert_eq!(runs.len(), flat.len());
+        assert_eq!(runs.iter().collect::<Vec<_>>(), flat.iter().collect::<Vec<_>>());
+        assert!(
+            runs.footprint() * 10 < flat.footprint(),
+            "three runs against a thousand rows: {} against {}",
+            runs.footprint(),
+            flat.footprint()
+        );
+    }
+
+    /// The check is worth having in both directions. A form that is only ever bigger than what it
+    /// replaced is a form that costs a pass over the column to decide not to use.
+    #[test]
+    fn a_column_that_does_not_repeat_is_left_flat() {
+        let flat = integers(&(0..1024).collect::<Vec<i32>>());
+        assert_eq!(flat.run_encoded().unwrap().form(), Form::Flat);
+        // Two runs over four rows is exactly break even on a four byte column, and break even is
+        // not a reason to change form.
+        assert_eq!(integers(&[1, 1, 2, 2]).run_encoded().unwrap().form(), Form::Flat);
+        assert_eq!(integers(&[1, 1, 1, 2, 2]).run_encoded().unwrap().form(), Form::Rle);
+    }
+
+    #[test]
+    fn two_nulls_beside_each_other_are_one_run_and_a_null_between_two_equals_is_a_break() {
+        let mut values = vec![Value::Integer(4), Value::Integer(4)];
+        values.extend([Value::Null, Value::Null, Value::Null]);
+        values.extend(std::iter::repeat_n(Value::Integer(4), 5));
+        let flat = Vector::from_values(LogicalType::Integer, &values).unwrap();
+        let runs = flat.run_encoded().unwrap();
+        assert_eq!(runs.run_parts().expect("runs").0, [2, 5, 10]);
+        assert_eq!(runs.iter().collect::<Vec<_>>(), values);
+    }
+
+    #[test]
+    fn slicing_runs_keeps_them_runs_and_cuts_the_first_and_last_one_back() {
+        let flat = integers(&[1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+        let runs = flat.run_encoded().unwrap();
+        let piece = runs.slice(3, 6).unwrap();
+        assert_eq!(piece.form(), Form::Rle, "the form is the whole point");
+        assert_eq!(piece.run_parts().expect("runs").0, [1, 5, 6]);
+        assert_eq!(
+            piece.iter().collect::<Vec<_>>(),
+            flat.slice(3, 6).unwrap().iter().collect::<Vec<_>>()
+        );
+        assert_eq!(runs.slice(0, 0).unwrap().len(), 0);
+        assert_eq!(runs.slice(0, 12).unwrap().form(), Form::Rle);
+    }
+
+    #[test]
+    fn gathering_out_of_runs_walks_to_the_values_the_way_it_walks_a_dictionary() {
+        let mut values = vec![Value::Varchar("red".into()); 4];
+        values.extend([Value::Null, Value::Null, Value::Null]);
+        values.extend(vec![Value::Varchar("blue".into()); 4]);
+        let runs =
+            Vector::from_values(LogicalType::Varchar, &values).unwrap().run_encoded().unwrap();
+        assert_eq!(runs.form(), Form::Rle);
+        let picked = runs.gather(&[8, 0, 5, 2]).unwrap();
+        assert_eq!(picked.form(), Form::Flat, "a gather copies, whatever it gathered from");
+        assert_eq!(
+            picked.iter().collect::<Vec<_>>(),
+            [values[8].clone(), values[0].clone(), Value::Null, values[2].clone()]
+        );
+        assert_eq!(runs.text_at(1), Some("red"));
+        assert_eq!(runs.text_at(5), None, "a null has no text");
+        assert_eq!(runs.flatten().unwrap().iter().collect::<Vec<_>>(), values);
+    }
+
+    /// A run length vector over a run length vector turns one search per row into two, and there is
+    /// nothing in the engine that builds one, so it is refused rather than composed.
+    #[test]
+    fn runs_of_runs_are_refused_and_runs_of_a_dictionary_are_not() {
+        let inner = integers(&[1, 1, 1, 1, 2]).run_encoded().unwrap();
+        assert_eq!(inner.form(), Form::Rle);
+        let error = Vector::runs(vec![2, 8], inner).unwrap_err();
+        assert!(error.to_string().contains("runs of runs"), "{error}");
+
+        let words = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("red".into()), Value::Varchar("blue".into())],
+        )
+        .unwrap();
+        let dictionary = Vector::dictionary(vec![1, 0], words).unwrap();
+        let stacked = Vector::runs(vec![4, 9], dictionary).unwrap();
+        assert_eq!(stacked.len(), 9);
+        assert_eq!(stacked.value_at(3), Value::Varchar("blue".into()));
+        assert_eq!(stacked.value_at(4), Value::Varchar("red".into()));
+    }
+
+    #[test]
+    fn run_ends_have_to_increase_and_there_is_one_value_for_each_of_them() {
+        let values = integers(&[1, 2]);
+        assert!(Vector::runs(vec![4], values.clone()).is_err(), "two values and one run");
+        assert!(Vector::runs(vec![4, 4], values.clone()).is_err(), "an end that repeats");
+        assert!(Vector::runs(vec![4, 2], values.clone()).is_err(), "an end that goes backwards");
+        assert!(Vector::runs(vec![0, 2], values.clone()).is_err(), "a first run holding no rows");
+        assert_eq!(Vector::runs(vec![4, 9], values).unwrap().len(), 9);
+    }
+
+    #[test]
+    fn a_form_that_is_already_compact_is_left_where_it_is() {
+        let constant = Vector::constant(LogicalType::Integer, Value::Integer(1), 1000);
+        assert_eq!(constant.run_encoded().unwrap().form(), Form::Constant);
+        assert_eq!(Vector::sequence(0, 1, 1000).run_encoded().unwrap().form(), Form::Sequence);
     }
 
     #[test]
