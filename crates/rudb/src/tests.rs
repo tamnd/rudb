@@ -1009,6 +1009,70 @@ fn a_cast_that_cannot_hold_the_value_is_an_error_and_try_cast_is_null() {
     assert_eq!(rows(&db, "SELECT TRY_CAST('oops' AS INTEGER)"), vec![vec![Value::Null]]);
 }
 
+/// What a failed cast says, per #322, which is a different sentence for each shape of failure and
+/// names the types by the integer they are stored in rather than by the way they are written.
+///
+/// A pair DuckDB has no cast for is a conversion error and not a missing feature, which is why the
+/// last line here answers null instead of raising: `TRY_CAST` swallows a conversion error.
+#[test]
+fn a_failed_cast_says_what_duckdb_says() {
+    let db = database();
+    assert_eq!(failure(&db, "SELECT 'abc'::TINYINT"), "Could not convert string 'abc' to INT8");
+    assert_eq!(failure(&db, "SELECT '300'::TINYINT"), "Could not convert string '300' to INT8");
+    assert_eq!(
+        failure(&db, "SELECT 'abc'::DECIMAL(4,1)"),
+        "Could not convert string \"abc\" to DECIMAL(4,1)"
+    );
+    assert_eq!(
+        failure(&db, "SELECT 300::INTEGER::TINYINT"),
+        "Type INT32 with value 300 can't be cast because the value is out of range for the \
+         destination type INT8"
+    );
+    assert_eq!(
+        failure(&db, "SELECT 999.9::DECIMAL(4,1)::TINYINT"),
+        "Failed to cast decimal value 1000 to type INT8"
+    );
+    assert_eq!(
+        failure(&db, "SELECT 200000::DECIMAL(4,1)"),
+        "Could not cast value 200000 to DECIMAL(4,1)"
+    );
+    assert_eq!(
+        failure(&db, "SELECT 200000.5::DECIMAL(7,1)::DECIMAL(4,1)"),
+        "Casting value \"200000.5\" to type DECIMAL(4,1) failed: value is out of range!"
+    );
+    assert_eq!(
+        failure(&db, "SELECT DATE '1970-01-01'::INTEGER"),
+        "Unimplemented type for cast (DATE -> INTEGER)"
+    );
+    assert_eq!(rows(&db, "SELECT TRY_CAST(DATE '1970-01-01' AS INTEGER)"), vec![vec![Value::Null]]);
+}
+
+/// A written date that names a day that does not exist, per #322.
+///
+/// This one was a wrong answer and not only a wrong message: the thirty first of April used to
+/// come back as the first of May. The time on the end of a date is thrown away but still has to be
+/// a time, and the two sentences are the format one and the range one.
+#[test]
+fn a_written_day_that_does_not_exist_is_refused() {
+    let db = database();
+    assert_eq!(
+        failure(&db, "SELECT '2021-04-31'::DATE"),
+        "date field value out of range: \"2021-04-31\""
+    );
+    assert_eq!(
+        failure(&db, "SELECT '2021-02-29 10:00:00'::TIMESTAMP"),
+        "timestamp field value out of range: \"2021-02-29 10:00:00\""
+    );
+    assert_eq!(
+        failure(&db, "SELECT 'yesterday'::DATE"),
+        "invalid date field format: \"yesterday\", expected format is (YYYY-MM-DD)"
+    );
+    assert_eq!(
+        rows(&db, "SELECT '2020-02-29 10:30:00'::DATE"),
+        vec![vec![Value::Date(days_from_civil(2020, 2, 29))]]
+    );
+}
+
 /// The third spelling of a cast, the one TPC-H q14 is written in.
 ///
 /// The keyword is not a keyword the way `CAST` is, it is the type name, so the check that matters
