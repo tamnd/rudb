@@ -9,8 +9,10 @@
 //! writes one: the writer knows whether the value it is about to write is the first in its object
 //! or its array, and that is the whole of the bookkeeping.
 //!
-//! The output is indented rather than compact. It is read by people as often as by programs, a
-//! metrics document is a few kilobytes, and a diff of two of them is only useful line by line.
+//! The output is indented by default. It is read by people as often as by programs, a metrics
+//! document is a few kilobytes, and a diff of two of them is only useful line by line. The compact
+//! form exists for the one caller that needs a document to be one line, which is the file the shell
+//! appends to under `--metrics`, where the line is the record separator.
 
 /// A JSON document being built.
 #[derive(Debug)]
@@ -20,14 +22,23 @@ pub(crate) struct Writer {
     /// Whether the next value is the first one in the object or array being written, which is the
     /// only thing that decides whether it needs a comma in front of it.
     first: bool,
+    /// Whether a value goes on its own line, indented to its depth.
+    indent: bool,
 }
 
 impl Writer {
     /// Builds one object and returns it with the newline that ends the file.
     pub(crate) fn document(fill: impl FnOnce(&mut Self)) -> String {
-        let mut writer = Self { out: String::new(), depth: 0, first: true };
+        let mut writer = Self { out: String::new(), depth: 0, first: true, indent: true };
         writer.object(fill);
         writer.out.push('\n');
+        writer.out
+    }
+
+    /// The same object on one line, with no newline of its own.
+    pub(crate) fn one_line(fill: impl FnOnce(&mut Self)) -> String {
+        let mut writer = Self { out: String::new(), depth: 0, first: true, indent: false };
+        writer.object(fill);
         writer.out
     }
 
@@ -61,7 +72,7 @@ impl Writer {
     pub(crate) fn key(&mut self, name: &str) {
         self.comma();
         self.string(name);
-        self.out.push_str(": ");
+        self.out.push_str(if self.indent { ": " } else { ":" });
     }
 
     /// The start of the next element of an array, followed by whatever the caller writes next.
@@ -125,6 +136,9 @@ impl Writer {
     }
 
     fn line(&mut self) {
+        if !self.indent {
+            return;
+        }
         self.out.push('\n');
         for _ in 0..self.depth {
             self.out.push_str("  ");

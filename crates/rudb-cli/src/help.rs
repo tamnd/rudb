@@ -25,6 +25,7 @@ Options:
   -header, -noheader     turn column names on or off
   -init FILENAME         run a file of SQL before reading input
   -interactive           show a prompt even when input is not a terminal
+  --metrics FILENAME     write what each statement measured, one JSON document per line
   -newline SEP           what goes between rows in the separated modes
   -nullvalue TEXT        what a null prints as
   -readonly              open without allowing writes

@@ -63,129 +63,141 @@ impl Document {
     /// terminal rather than for a parser.
     #[must_use]
     pub fn render(&self) -> String {
-        Writer::document(|out| {
-            out.count("schema", u64::from(SCHEMA));
-            out.key("query");
-            out.object(|out| {
-                out.words("sql", &self.query.sql);
-                out.words("hash", &self.query.hash);
-                out.maybe_words("suite", self.query.suite.as_deref());
-                out.maybe_words("id", self.query.id.as_deref());
-            });
-            out.key("engine");
-            out.object(|out| {
-                out.words("version", &self.engine.version);
-                out.maybe_words("commit", self.engine.commit.as_deref());
-                out.words("build", &self.engine.build);
-            });
-            out.key("machine");
-            out.object(|out| {
-                out.maybe_words("name", self.machine.name.as_deref());
-                out.count("cores", u64::from(self.machine.cores));
-                out.maybe_count("memory", self.machine.memory);
-                out.words("os", &self.machine.os);
-            });
-            out.key("settings");
-            out.object(|out| {
-                out.maybe_count("memory_limit", self.settings.memory_limit);
-                out.count("threads", u64::from(self.settings.threads));
-            });
-            out.key("outcome");
-            out.object(|out| {
-                out.words("state", self.outcome.state());
-                out.maybe_words("message", self.outcome.message());
-            });
-            out.key("timing");
-            out.object(|out| {
-                out.count("parse_ns", self.timing.parse_ns);
-                out.count("bind_ns", self.timing.bind_ns);
-                out.count("optimize_ns", self.timing.optimize_ns);
-                out.count("physical_ns", self.timing.physical_ns);
-                out.count("execute_ns", self.timing.execute_ns);
-                out.count("total_ns", self.timing.total_ns);
-            });
-            out.key("resource");
-            out.object(|out| {
-                out.count("cpu_ns", self.resource.cpu_ns);
-                out.count("peak_bytes", self.resource.peak_bytes);
-                out.count("bytes_read", self.resource.bytes_read);
-                out.count("bytes_decoded", self.resource.bytes_decoded);
-                out.count("bytes_spilled", self.resource.bytes_spilled);
-                out.count("bytes_read_back", self.resource.bytes_read_back);
-                out.count("io_requests", self.resource.io_requests);
-            });
-            out.key("strategies");
-            out.array(|out| {
-                for strategy in &self.strategies {
-                    out.item();
-                    out.object(|out| {
-                        out.words("seam", &strategy.seam);
-                        out.words("chosen", &strategy.chosen);
-                        out.words("by", &strategy.by);
-                        out.maybe_words("provenance", strategy.provenance.as_deref());
+        Writer::document(|out| self.write(out))
+    }
+
+    /// The same document on one line, which is what the shell appends under `--metrics`.
+    ///
+    /// A document per line makes a file of many of them readable a record at a time, which is what a
+    /// harness wants when it ran a setup statement and a query and only cares about the second.
+    #[must_use]
+    pub fn one_line(&self) -> String {
+        Writer::one_line(|out| self.write(out))
+    }
+
+    /// The keys, in the order the schema lists them, in whichever shape the writer is in.
+    fn write(&self, out: &mut Writer) {
+        out.count("schema", u64::from(SCHEMA));
+        out.key("query");
+        out.object(|out| {
+            out.words("sql", &self.query.sql);
+            out.words("hash", &self.query.hash);
+            out.maybe_words("suite", self.query.suite.as_deref());
+            out.maybe_words("id", self.query.id.as_deref());
+        });
+        out.key("engine");
+        out.object(|out| {
+            out.words("version", &self.engine.version);
+            out.maybe_words("commit", self.engine.commit.as_deref());
+            out.words("build", &self.engine.build);
+        });
+        out.key("machine");
+        out.object(|out| {
+            out.maybe_words("name", self.machine.name.as_deref());
+            out.count("cores", u64::from(self.machine.cores));
+            out.maybe_count("memory", self.machine.memory);
+            out.words("os", &self.machine.os);
+        });
+        out.key("settings");
+        out.object(|out| {
+            out.maybe_count("memory_limit", self.settings.memory_limit);
+            out.count("threads", u64::from(self.settings.threads));
+        });
+        out.key("outcome");
+        out.object(|out| {
+            out.words("state", self.outcome.state());
+            out.maybe_words("message", self.outcome.message());
+        });
+        out.key("timing");
+        out.object(|out| {
+            out.count("parse_ns", self.timing.parse_ns);
+            out.count("bind_ns", self.timing.bind_ns);
+            out.count("optimize_ns", self.timing.optimize_ns);
+            out.count("physical_ns", self.timing.physical_ns);
+            out.count("execute_ns", self.timing.execute_ns);
+            out.count("total_ns", self.timing.total_ns);
+        });
+        out.key("resource");
+        out.object(|out| {
+            out.count("cpu_ns", self.resource.cpu_ns);
+            out.count("peak_bytes", self.resource.peak_bytes);
+            out.count("bytes_read", self.resource.bytes_read);
+            out.count("bytes_decoded", self.resource.bytes_decoded);
+            out.count("bytes_spilled", self.resource.bytes_spilled);
+            out.count("bytes_read_back", self.resource.bytes_read_back);
+            out.count("io_requests", self.resource.io_requests);
+        });
+        out.key("strategies");
+        out.array(|out| {
+            for strategy in &self.strategies {
+                out.item();
+                out.object(|out| {
+                    out.words("seam", &strategy.seam);
+                    out.words("chosen", &strategy.chosen);
+                    out.words("by", &strategy.by);
+                    out.maybe_words("provenance", strategy.provenance.as_deref());
+                });
+            }
+        });
+        out.key("pipelines");
+        out.array(|out| {
+            for pipeline in &self.pipelines {
+                out.item();
+                out.object(|out| {
+                    out.count("id", u64::from(pipeline.id));
+                    out.count("instances", u64::from(pipeline.instances));
+                    out.key("depends_on");
+                    out.array(|out| {
+                        for on in &pipeline.depends_on {
+                            out.item();
+                            out.number(u64::from(*on));
+                        }
                     });
-                }
-            });
-            out.key("pipelines");
-            out.array(|out| {
-                for pipeline in &self.pipelines {
-                    out.item();
+                    out.count("wall_ns", pipeline.wall_ns);
+                    out.count("cpu_ns", pipeline.cpu_ns);
+                    out.key("blocked_ns");
                     out.object(|out| {
-                        out.count("id", u64::from(pipeline.id));
-                        out.count("instances", u64::from(pipeline.instances));
-                        out.key("depends_on");
-                        out.array(|out| {
-                            for on in &pipeline.depends_on {
-                                out.item();
-                                out.number(u64::from(*on));
-                            }
-                        });
-                        out.count("wall_ns", pipeline.wall_ns);
-                        out.count("cpu_ns", pipeline.cpu_ns);
-                        out.key("blocked_ns");
-                        out.object(|out| {
-                            out.count("io", pipeline.blocked.io_ns);
-                            out.count("memory", pipeline.blocked.memory_ns);
-                            out.count("dependency", pipeline.blocked.dependency_ns);
-                            out.count("downstream", pipeline.blocked.downstream_ns);
-                        });
+                        out.count("io", pipeline.blocked.io_ns);
+                        out.count("memory", pipeline.blocked.memory_ns);
+                        out.count("dependency", pipeline.blocked.dependency_ns);
+                        out.count("downstream", pipeline.blocked.downstream_ns);
                     });
-                }
-            });
-            out.key("operators");
-            out.array(|out| {
-                for operator in &self.operators {
-                    out.item();
+                });
+            }
+        });
+        out.key("operators");
+        out.array(|out| {
+            for operator in &self.operators {
+                out.item();
+                out.object(|out| {
+                    out.count("id", u64::from(operator.id));
+                    out.count("pipeline", u64::from(operator.pipeline));
+                    out.words("kind", &operator.kind);
+                    out.maybe_words("detail", operator.detail.as_deref());
+                    out.count("rows_in", operator.rows_in);
+                    out.count("rows_out", operator.rows_out);
+                    out.maybe_count("estimated_rows", operator.estimated_rows);
+                    out.count("wall_ns", operator.wall_ns);
+                    out.count("cpu_ns", operator.cpu_ns);
+                    out.count("bytes_read", operator.bytes_read);
+                    out.count("bytes_decoded", operator.bytes_decoded);
+                    out.count("bytes_spilled", operator.bytes_spilled);
+                    out.key("memory");
                     out.object(|out| {
-                        out.count("id", u64::from(operator.id));
-                        out.count("pipeline", u64::from(operator.pipeline));
-                        out.words("kind", &operator.kind);
-                        out.maybe_words("detail", operator.detail.as_deref());
-                        out.count("rows_in", operator.rows_in);
-                        out.count("rows_out", operator.rows_out);
-                        out.maybe_count("estimated_rows", operator.estimated_rows);
-                        out.count("wall_ns", operator.wall_ns);
-                        out.count("cpu_ns", operator.cpu_ns);
-                        out.count("bytes_read", operator.bytes_read);
-                        out.count("bytes_decoded", operator.bytes_decoded);
-                        out.count("bytes_spilled", operator.bytes_spilled);
-                        out.key("memory");
-                        out.object(|out| {
-                            out.count("reserved", operator.memory.reserved);
-                            out.count("high_water", operator.memory.high_water);
-                        });
-                        out.flag("reference_impl", operator.reference_impl);
+                        out.count("reserved", operator.memory.reserved);
+                        out.count("high_water", operator.memory.high_water);
                     });
-                }
-            });
-            out.key("warnings");
-            out.array(|out| {
-                for warning in self.warnings() {
-                    out.item();
-                    out.text(&warning);
-                }
-            });
-        })
+                    out.flag("reference_impl", operator.reference_impl);
+                });
+            }
+        });
+        out.key("warnings");
+        out.array(|out| {
+            for warning in self.warnings() {
+                out.item();
+                out.text(&warning);
+            }
+        });
     }
 }
 
@@ -623,6 +635,24 @@ mod tests {
     #[test]
     fn the_document_renders_as_schema_one() {
         assert_eq!(sample().render(), include_str!("../schema/1.json"));
+    }
+
+    /// The same document, on one line, with the same keys in the same order.
+    ///
+    /// Whitespace is the only difference, which is what makes a file of one document per line
+    /// readable a record at a time without a second schema to describe it.
+    #[test]
+    fn the_one_line_form_is_the_indented_one_with_the_whitespace_taken_out() {
+        let document = sample();
+        let line = document.one_line();
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.starts_with("{\"schema\":1,"), "{line}");
+        assert!(line.ends_with('}'), "{line}");
+        let flattened: String =
+            document.render().chars().filter(|character| !character.is_whitespace()).collect();
+        let compared: String =
+            line.chars().filter(|character| !character.is_whitespace()).collect();
+        assert_eq!(flattened, compared);
     }
 
     #[test]

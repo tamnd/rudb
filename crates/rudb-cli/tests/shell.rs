@@ -462,3 +462,37 @@ fn an_unknown_option_says_so_rather_than_opening_a_file_of_that_name() {
     assert!(failed);
     assert!(err.contains("unknown option -csvv"), "{err}");
 }
+
+#[test]
+fn the_metrics_flag_writes_one_document_per_statement_that_measured_itself() {
+    // One line per document, because a harness that ran a setup statement and then the query it
+    // timed wants to read the second one without parsing the first.
+    let path = std::env::temp_dir().join("rudb-shell-metrics-test.json");
+    let _ = std::fs::remove_file(&path);
+    let sql = "SELECT 1 AS a; SELECT 2 AS a;";
+    let (_, err, failed) = run(&["--metrics", &path.display().to_string(), "-c", sql]);
+    assert!(!failed, "{err}");
+    let written = std::fs::read_to_string(&path).expect("the file was written");
+    let lines: Vec<&str> = written.lines().collect();
+    assert_eq!(lines.len(), 2, "{written}");
+    for line in &lines {
+        assert!(line.starts_with("{\"schema\":1,"), "{line}");
+        assert!(line.ends_with('}'), "{line}");
+    }
+    assert!(lines[0].contains("\"sql\":\"SELECT 1 AS a\""), "{}", lines[0]);
+    assert!(lines[1].contains("\"sql\":\"SELECT 2 AS a\""), "{}", lines[1]);
+    // Every run starts a new file rather than appending to whatever was there, so a second run of a
+    // suite does not read as a first run with twice the queries.
+    let (_, err, failed) = run(&["--metrics", &path.display().to_string(), "-c", "SELECT 3"]);
+    assert!(!failed, "{err}");
+    assert_eq!(std::fs::read_to_string(&path).expect("rewritten").lines().count(), 1);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_metrics_file_that_cannot_be_written_is_said_once_and_fails_the_run() {
+    let path = std::env::temp_dir().join("rudb-shell-metrics-nodir/deeper/run.json");
+    let (_, err, failed) = run(&["--metrics", &path.display().to_string(), "-c", "SELECT 1"]);
+    assert!(failed);
+    assert_eq!(err.matches("cannot write metrics").count(), 1, "{err}");
+}
