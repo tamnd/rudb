@@ -1457,6 +1457,17 @@ pub fn call_values(
         // started. Promotion only ever widens, so this cast cannot fail and cannot lose anything.
         return cast::cast_value(left, returns, false);
     }
+    // `concat` is the third one above the null rule and the only one of the three that is an
+    // ordinary function rather than sugar. It drops a null argument rather than answering null for
+    // the whole call, so `concat('a', 1, NULL)` is `a1` upstream, and the arguments reaching here
+    // have already been cast to strings by the signature.
+    if name == "concat" {
+        let mut out = String::new();
+        for value in args.iter().filter(|value| !value.is_null()) {
+            out.push_str(&value.to_string());
+        }
+        return Ok(Value::Varchar(out));
+    }
     if args.iter().any(Value::is_null) {
         return Ok(Value::Null);
     }
@@ -1484,6 +1495,9 @@ pub fn call_values(
             text::substring(held, start, Some(length))
         }
         ("position" | "strpos" | "instr", [haystack, needle]) => text::position(haystack, needle),
+        ("left" | "right", [held, count]) => text::end(name, held, count),
+        ("replace", [held, needle, replacement]) => text::replace(held, needle, replacement),
+        ("chr", [code]) => text::chr(code),
         ("trim" | "ltrim" | "rtrim", [only]) => text::trim(name, only, None),
         ("trim" | "ltrim" | "rtrim", [only, characters]) => {
             text::trim(name, only, Some(characters))
