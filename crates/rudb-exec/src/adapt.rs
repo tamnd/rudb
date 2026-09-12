@@ -1,24 +1,86 @@
 //! Driving a push operator from the pull tree, until there is no pull tree left.
 //!
-//! The operators move behind the push traits one at a time rather than in one commit, which means
-//! there is a period where a [`Stream`] has to sit in a tree whose other nodes still have
+//! The operators moved behind the push traits one at a time rather than in one commit, which meant
+//! there was a period where a [`Stream`] had to sit in a tree whose other nodes still had
 //! [`Operator::next`]. This is the one place that knows how to do that. It pulls a chunk from
 //! below, pushes it through the stream, and hands back whatever came out.
 //!
-//! It is temporary and it is not a second interface. When the last operator has moved, the tree is
-//! built as a pipeline, [`rudb_pipeline::run_serial`] runs it, and this file goes away with the
-//! rest of the pull side. What survives is the [`Stream`] implementations, which is the point of
+//! Every operator has moved now, so what is left of the pull tree is these adapters and the
+//! [`Operator`] trait they are written against. The shape of the tree is still a tree: a node owns
+//! its children and the root is pulled from. Turning that into a list of pipelines the driver runs
+//! is the next thing, and it deletes this file rather than changing it.
+//!
+//! What survives is the [`Source`], [`Stream`] and [`Sink`] implementations, which is the point of
 //! moving them first.
 
 use std::fmt;
 
 use rudb_common::{Error, Result};
-use rudb_pipeline::{Progress, Sink, Stream};
+use rudb_pipeline::{Morsel, Progress, Sink, Source, Stream};
 use rudb_vector::Chunk;
 
 use crate::buffer::Buffered;
 use crate::operator::Operator;
 use crate::schema::Schema;
+
+/// One source at the bottom of the pull tree.
+///
+/// A source hands out morsels and fills a chunk from one, and the tree above it asks for a chunk at
+/// a time, so this is the loop between the two: take a morsel, read from it until it is drained,
+/// take the next one, stop when there are none left. It is the same loop the serial driver runs, on
+/// one morsel at a time rather than on the whole pipeline, which is what makes it a faithful
+/// stand in until the driver is what runs the tree.
+///
+/// One morsel is in flight here because there is one thread here. Nothing about the source says so,
+/// which is the point: the same object is what F4 hands to several threads at once.
+pub(crate) struct Pulled<S: Source> {
+    source: S,
+    schema: Schema,
+    /// The morsel being read, kept between calls because a morsel holds more than a chunk.
+    morsel: Option<Morsel>,
+    done: bool,
+}
+
+impl<S: Source> Pulled<S> {
+    /// `schema` is what the source produces.
+    pub(crate) fn new(source: S, schema: Schema) -> Self {
+        Self { source, schema, morsel: None, done: false }
+    }
+}
+
+impl<S: Source> fmt::Debug for Pulled<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pulled").field("source", &self.source).finish_non_exhaustive()
+    }
+}
+
+impl<S: Source> Operator for Pulled<S> {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        while !self.done {
+            let Some(mut morsel) = self.morsel.take().or_else(|| self.source.morsel()) else {
+                self.done = true;
+                break;
+            };
+            let mut chunk = Chunk::empty(&[]);
+            match self.source.read(&mut morsel, &mut chunk)? {
+                Progress::Blocked(blocked) => return Err(parked(&blocked)),
+                // Done is the call that drained the morsel, so the next one comes from the source.
+                Progress::Done => {}
+                _ => self.morsel = Some(morsel),
+            }
+            // An empty chunk is the end of a file or a morsel that held nothing, and handing it on
+            // would be a call's worth of work at every level of the tree for no rows.
+            if !chunk.is_empty() {
+                return Ok(Some(chunk));
+            }
+        }
+        Ok(None)
+    }
+}
 
 /// One streaming operator with the tree below it.
 pub(crate) struct Streamed<'a, S: Stream> {
