@@ -70,7 +70,7 @@ mod shape;
 pub use expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
 pub use node::{JoinKind, Node, SetOpKind};
 pub use plan::Plan;
-pub use shape::Shape;
+pub use shape::{ROOT, Shape};
 
 /// A reference to an expression in [`Plan`]'s expression arena.
 pub type ExprRef = u32;

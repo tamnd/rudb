@@ -26,14 +26,23 @@ const Q_ERROR: u128 = 10;
 /// slow, and those are two different problems with two different fixes.
 const BLOCKED_SHARE: u64 = 2;
 
+/// How much of the CPU in the pipelines can go on driving them before it is worth saying so, in
+/// percent.
+///
+/// A quarter. The loop that runs a pipeline takes a morsel, allocates the chunk its source fills,
+/// hands it up the tree and drops it, and that is real work rather than the cost of measuring. A
+/// query that spends more than a quarter of itself there is one whose operators are not what makes
+/// it slow, and it is the first thing to look at before anybody optimizes one of them.
+const DRIVING_SHARE: u64 = 25;
+
 /// How close to the memory limit counts as against it, in percent.
 const NEAR_LIMIT: u64 = 95;
 
-/// How far the operators may be from the process CPU time, in percent.
+/// How far the pipelines may be from the CPU time the execution took, in percent.
 ///
-/// Five, which is the same tolerance the harness applies against the external number from `wait4`.
-/// Missing this one means either that time is going somewhere no operator covers or that the
-/// instrumentation counts something twice, and both are worth knowing.
+/// Five, which is the same tolerance `rudb-bench` applies to the same two numbers out of the
+/// document this crate writes. Missing it means either that time is going somewhere no pipeline
+/// covers or that the instrumentation counts something twice, and both are worth knowing.
 const CPU_TOLERANCE: u64 = 5;
 
 impl Document {
@@ -46,6 +55,7 @@ impl Document {
         self.references(&mut warnings);
         self.estimates(&mut warnings);
         self.waiting(&mut warnings);
+        self.driving(&mut warnings);
         self.limit(&mut warnings);
         self.accounting(&mut warnings);
         warnings
@@ -132,6 +142,24 @@ impl Document {
         }
     }
 
+    /// A pipeline's time is its driver's time, and the difference between that and the operators in
+    /// it is what the driving cost. Saying so once for the whole query rather than once per
+    /// pipeline, because the answer is about how chunks move through a tree and that is the same
+    /// answer for every pipeline in it.
+    fn driving(&self, warnings: &mut Vec<String>) {
+        let pipelines = self.pipelines.iter().fold(0u64, |sum, at| sum.saturating_add(at.cpu_ns));
+        let operators = self.operators.iter().fold(0u64, |sum, at| sum.saturating_add(at.cpu_ns));
+        let driving = pipelines.saturating_sub(operators);
+        if pipelines == 0 || driving <= pipelines / 100 * DRIVING_SHARE {
+            return;
+        }
+        warnings.push(format!(
+            "{} of the {} of CPU in the pipelines went on driving them rather than on the operators in them",
+            duration(driving),
+            duration(pipelines)
+        ));
+    }
+
     /// A query that came within a few percent of its limit did not fail, and the next one on a
     /// slightly larger input will.
     fn limit(&self, warnings: &mut Vec<String>) {
@@ -146,21 +174,34 @@ impl Document {
         ));
     }
 
-    /// The same cross check the harness makes against the operating system, made here against the
-    /// engine's own total, because it needs no external source and it catches the same two bugs.
+    /// The same cross check `rudb-bench` makes on this document, made here as well, because it
+    /// needs nothing external and the engine should be the first to know.
+    ///
+    /// The pipelines against the execution, not the operators against the whole run. A pipeline is
+    /// the unit that is driven, and its driver is charged for the loop as well as for the operator
+    /// calls the loop makes, so the pipelines are what can add up to the execution and the
+    /// operators are always short of it by whatever the driving cost. The build is off the right
+    /// hand side for the same reason from the other end: opening a file and allocating a tree
+    /// happen before there is a pipeline to charge.
+    ///
+    /// A document with no pipelines falls back to the operators, which is what a hand written one
+    /// in a test has and what a caller that built a tree without a report gets.
     fn accounting(&self, warnings: &mut Vec<String>) {
-        let total = self.resource.cpu_ns;
+        let total = self.resource.cpu_ns.saturating_sub(self.resource.build_cpu_ns);
         if self.operators.is_empty() || total == 0 {
             return;
         }
-        let counted =
-            self.operators.iter().fold(0u64, |sum, operator| sum.saturating_add(operator.cpu_ns));
+        let (what, counted) = if self.pipelines.is_empty() {
+            ("operators", self.operators.iter().fold(0u64, |sum, at| sum.saturating_add(at.cpu_ns)))
+        } else {
+            ("pipelines", self.pipelines.iter().fold(0u64, |sum, at| sum.saturating_add(at.cpu_ns)))
+        };
         let gap = counted.abs_diff(total);
         if gap <= total / 100 * CPU_TOLERANCE {
             return;
         }
         warnings.push(format!(
-            "the operators account for {} of the {} of CPU this query used",
+            "the {what} account for {} of the {} of CPU this query spent executing",
             duration(counted),
             duration(total)
         ));
@@ -295,7 +336,58 @@ mod tests {
         metrics.operators.push(scan);
         assert_eq!(
             metrics.warnings(),
-            vec!["the operators account for 4.000s of the 10.000s of CPU this query used"]
+            vec![
+                "the operators account for 4.000s of the 10.000s of CPU this query spent executing"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_document_with_pipelines_is_checked_against_the_pipelines() {
+        let mut metrics = document();
+        metrics.resource.cpu_ns = 11_000_000_000;
+        metrics.resource.build_cpu_ns = 1_000_000_000;
+        let mut scan = Operator::new(0, 0, "Scan");
+        scan.cpu_ns = 9_000_000_000;
+        metrics.operators.push(scan);
+        let mut pipeline = Pipeline::new(0);
+        pipeline.cpu_ns = 9_800_000_000;
+        metrics.pipelines.push(pipeline);
+        assert!(
+            metrics.warnings().is_empty(),
+            "the operator is short of the execution and the pipeline that drove it is not"
+        );
+    }
+
+    #[test]
+    fn the_time_spent_building_is_not_time_the_pipelines_have_to_account_for() {
+        let mut metrics = document();
+        metrics.resource.cpu_ns = 10_000_000_000;
+        metrics.resource.build_cpu_ns = 4_000_000_000;
+        let mut scan = Operator::new(0, 0, "Scan");
+        scan.cpu_ns = 5_600_000_000;
+        metrics.operators.push(scan);
+        let mut pipeline = Pipeline::new(0);
+        pipeline.cpu_ns = 6_000_000_000;
+        metrics.pipelines.push(pipeline);
+        assert!(metrics.warnings().is_empty());
+    }
+
+    #[test]
+    fn a_query_that_spent_its_time_driving_rather_than_in_its_operators_says_so() {
+        let mut metrics = document();
+        metrics.resource.cpu_ns = 10_000_000_000;
+        let mut scan = Operator::new(0, 0, "Scan");
+        scan.cpu_ns = 6_000_000_000;
+        metrics.operators.push(scan);
+        let mut pipeline = Pipeline::new(0);
+        pipeline.cpu_ns = 10_000_000_000;
+        metrics.pipelines.push(pipeline);
+        assert_eq!(
+            metrics.warnings(),
+            vec![
+                "4.000s of the 10.000s of CPU in the pipelines went on driving them rather than on the operators in them"
+            ]
         );
     }
 

@@ -35,6 +35,7 @@
   },
   "resource": {
     "cpu_ns": 9880000000,
+    "build_cpu_ns": 44000,
     "peak_bytes": 894000000,
     "bytes_read": 1420000000,
     "bytes_decoded": 210000000,
