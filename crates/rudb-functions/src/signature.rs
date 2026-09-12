@@ -103,6 +103,14 @@ enum Shape {
     /// The first argument is a string or a list, the rest are the bounds, and the result is the first
     /// argument's own type. `array_slice`.
     Sliced,
+    /// Every argument promotes, and the result is the first argument's own type. `nullif`.
+    ///
+    /// The promotion is for the comparison and not for the answer, which is what makes this its own
+    /// shape: `typeof(nullif(1, 2.5))` is INTEGER upstream and the comparison behind it is still
+    /// `1 = 2.5`, so the two arguments have to meet somewhere and the answer has to come back from
+    /// where it started. Comparing at the first argument's type instead would round the second one
+    /// and answer `nullif(2, 2.5)` with null.
+    PromotedToFirst,
 }
 
 /// The return types a signature can name outright.
@@ -262,6 +270,20 @@ const TABLE: &[Entry] = &[
         kind: FunctionKind::Scalar,
         arity: Arity::at_least(1),
         shape: Shape::Promoted,
+        numeric_only: false,
+    },
+    // `nullif(a, b)` is a macro upstream, `CASE WHEN a = b THEN NULL ELSE a END`, and it is a
+    // function here because the column it produces is named after the call rather than after the
+    // expansion. What that costs is the message for the wrong number of arguments: upstream's is a
+    // binder error about a macro listing `"nullif"(a, b)` under `Candidate macros:`, and the one
+    // below is the ordinary sentence about a function. Both refuse, and the reachable spelling of the
+    // mistake is the quoted `"nullif"(1)`, since the grammar has NULLIF with exactly two arguments
+    // and refuses any other count before the binder sees it.
+    Entry {
+        name: "nullif",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::PromotedToFirst,
         numeric_only: false,
     },
     // Dates and times. `EXTRACT(minute FROM x)` is spelled `date_part('minute', x)` by the time it
@@ -527,6 +549,15 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let mut cast_to = vec![LogicalType::BigInt; arguments.len()];
             cast_to[0] = target.clone();
             (cast_to, target.clone())
+        }
+        Shape::PromotedToFirst => {
+            let common = promote_all(name, arguments)?;
+            // An untyped null keeps nothing to hand back, so it takes the promoted type the way
+            // every other shape here does. Upstream says NULL for `typeof(nullif(NULL, NULL))`
+            // because it has a type for a null literal and this engine does not, which is #244.
+            let first = &arguments[0];
+            let returns = if *first == LogicalType::Null { common.clone() } else { first.clone() };
+            (vec![common; arguments.len()], returns)
         }
     };
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
@@ -1169,6 +1200,27 @@ mod tests {
         let resolved =
             resolve("+", &[LogicalType::Null, LogicalType::Null]).expect("null plus null");
         assert_eq!(resolved.returns, LogicalType::Integer);
+    }
+
+    /// `nullif` compares at one type and answers at another, both read off the pinned binary with
+    /// `typeof`. Per #306.
+    #[test]
+    fn nullif_answers_the_first_argument_and_compares_at_the_promotion() {
+        let resolved =
+            resolve("nullif", &[LogicalType::Integer, LogicalType::Decimal { width: 2, scale: 1 }])
+                .expect("an integer and a decimal compare");
+        assert_eq!(resolved.returns, LogicalType::Integer);
+        let wide = LogicalType::Decimal { width: 11, scale: 1 };
+        assert_eq!(resolved.arguments, vec![wide.clone(), wide]);
+        let resolved = resolve("nullif", &[LogicalType::BigInt, LogicalType::SmallInt])
+            .expect("two integers compare");
+        assert_eq!(resolved.returns, LogicalType::BigInt);
+        let resolved =
+            resolve("nullif", &[LogicalType::Null, LogicalType::Null]).expect("two nulls compare");
+        assert_eq!(resolved.returns, LogicalType::Integer, "there is nothing else to hand back");
+        let error = resolve("nullif", &[LogicalType::Varchar, LogicalType::Integer])
+            .expect_err("a string and a number have nothing in common here");
+        assert!(error.message().contains("No function matches"), "{error}");
     }
 
     #[test]
