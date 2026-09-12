@@ -35,8 +35,8 @@
 
 use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
 use rudb_kernels::{
-    Comparison, Connective, Members, Recipe, cast, combine, compare, in_set, is_true, refine,
-    refine_flags, selection,
+    Comparison, Connective, Held, Members, Recipe, cast, combine, compare_prepared, in_set,
+    is_true, refine_flags, refine_prepared, selection,
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Chunk, Selection, Vector};
@@ -114,6 +114,14 @@ enum Step {
         left: usize,
         /// The right operand's step.
         right: usize,
+        /// The side that is a literal, in the one row column the comparison loops read it through,
+        /// and `None` when neither side is one.
+        ///
+        /// Built here because the loops read both sides through a slice, so the constant side has
+        /// to become a column somewhere, and the plan says which side that is. For a string it is
+        /// also where the four byte prefix comes from, which is what almost every row of a string
+        /// comparison is decided by.
+        held: Option<Held>,
     },
     /// An `AND` or `OR` over a run of [`Prepared::operands`].
     Conjunction {
@@ -295,6 +303,15 @@ impl Prepared {
     #[must_use]
     pub fn len(&self) -> usize {
         self.roots.len()
+    }
+
+    /// How many comparisons have their literal side already built.
+    ///
+    /// For the tests, for the same reason as [`Self::sets`]: an answer that moved would be a bug,
+    /// so the only thing a test can look at is whether the building happened.
+    #[cfg(test)]
+    fn literals_built(&self) -> usize {
+        self.steps.iter().filter(|step| matches!(step, Step::Compare { held: Some(_), .. })).count()
     }
 
     /// How many of the steps are an `IN` list folded back up.
@@ -582,14 +599,15 @@ impl Prepared {
         for step in begin..index {
             self.run_step(step, chunk, scratch)?;
         }
-        if let Step::Compare { op, left, right } = self.steps[index] {
-            let left = self.operand(left, chunk, &scratch.slots)?;
-            let right = self.operand(right, chunk, &scratch.slots)?;
+        if let Step::Compare { op, left, right, held } = &self.steps[index] {
+            let one = self.operand(*left, chunk, &scratch.slots)?;
+            let other = self.operand(*right, chunk, &scratch.slots)?;
+            let held = held.as_ref();
             return match live {
                 // The first operand has every row in play, and asking the threaded kernel for that
                 // would be a pass over an identity selection the unthreaded one does not need.
-                None => Ok(selection(&compare(op, left, right)?, chunk.len())),
-                Some(live) => refine(op, left, right, live),
+                None => Ok(selection(&compare_prepared(*op, one, other, held)?, chunk.len())),
+                Some(live) => refine_prepared(*op, one, other, live, held),
             };
         }
         self.run_step(index, chunk, scratch)?;
@@ -637,10 +655,11 @@ impl Prepared {
             Step::Cast { input, try_cast } => {
                 Some(cast(self.operand(*input, chunk, slots)?, ty, *try_cast)?)
             }
-            Step::Compare { op, left, right } => Some(compare(
+            Step::Compare { op, left, right, held } => Some(compare_prepared(
                 *op,
                 self.operand(*left, chunk, slots)?,
                 self.operand(*right, chunk, slots)?,
+                held.as_ref(),
             )?),
             Step::Conjunction { op, start, len } => {
                 Some(
@@ -804,11 +823,11 @@ impl Prepared {
             Expr::Cast { input, try_cast } => {
                 Step::Cast { input: self.push(plan, input, schema)?, try_cast }
             }
-            Expr::Compare { op, left, right } => Step::Compare {
-                op: comparison(op),
-                left: self.push(plan, left, schema)?,
-                right: self.push(plan, right, schema)?,
-            },
+            Expr::Compare { op, left, right } => {
+                let left = self.push(plan, left, schema)?;
+                let right = self.push(plan, right, schema)?;
+                Step::Compare { op: comparison(op), left, right, held: self.held(left, right) }
+            }
             Expr::Conjunction { op, children } => {
                 let list = plan.expr_list(children).to_vec();
                 match self.membership(plan, connective(op), &list, schema)? {
@@ -918,6 +937,22 @@ impl Prepared {
             return Ok(None);
         };
         Ok(Some(Step::InSet { input: self.push(plan, subject, schema)?, members }))
+    }
+
+    /// The literal side of a comparison, in the one row column the comparison reads it through.
+    ///
+    /// The right side first, because that is the side the binder puts a literal on and the side the
+    /// loops are written for. Two literals is a comparison the optimizer folded, and if it did not
+    /// then the kernel answers it once for the whole vector and never reads either column, so
+    /// neither side is built here.
+    fn held(&self, left: usize, right: usize) -> Option<Held> {
+        let (at, other) = match (&self.steps[left], &self.steps[right]) {
+            (Step::Constant(_), Step::Constant(_)) => return None,
+            (_, Step::Constant(value)) => (right, value),
+            (Step::Constant(value), _) => (left, value),
+            _ => return None,
+        };
+        Held::of(&self.types[at], other)
     }
 
     /// The literal behind each argument in a run of the operand list, and `None` for an argument
@@ -1677,6 +1712,28 @@ mod tests {
             "(((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)\
              ::BOOLEAN AND (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN)::BOOLEAN",
         );
+    }
+
+    /// The literal side of a comparison is turned into a column when the pipeline is built.
+    #[test]
+    fn a_comparison_against_a_literal_builds_it_once() {
+        let (schema, _) = input();
+        for (expr, built) in [
+            ("(#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN AS p", 1),
+            ("(#0.0::INTEGER > 1::INTEGER)::BOOLEAN AS p", 1),
+            // The literal on the left, which is the same comparison written the other way round.
+            ("(1::INTEGER < #0.0::INTEGER)::BOOLEAN AS p", 1),
+            // Two columns, which has no literal side to build.
+            ("(#0.0::INTEGER = #0.0::INTEGER)::BOOLEAN AS p", 0),
+            // Two literals, which the kernel answers once for the whole vector without reading a
+            // column, so building one would be work that nothing reads.
+            ("(1::INTEGER = 2::INTEGER)::BOOLEAN AS p", 0),
+        ] {
+            let (plan, list) = projection(expr);
+            let prepared = Prepared::new(&plan, &list, &schema).expect("the expression resolves");
+            assert_eq!(prepared.literals_built(), built, "`{expr}`");
+            agrees(expr);
+        }
     }
 
     /// A pattern that does not compile still fails where the query said it does.

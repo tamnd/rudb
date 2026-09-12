@@ -27,10 +27,12 @@
 //! compile stays unhoisted rather than failing here, so the error still comes out of the chunk that
 //! reaches it and reads exactly as it did before.
 
-use rudb_common::Value;
+use rudb_common::{LogicalType, Value};
+use rudb_vector::Vector;
 
 use crate::regexp;
 use crate::scalar;
+use crate::shape::single;
 
 /// A scalar call with whatever does not change from chunk to chunk already worked out.
 ///
@@ -96,6 +98,48 @@ impl Recipe {
     /// What was lifted, for the kernels that look.
     pub(crate) fn hoisted(&self) -> &Hoisted {
         &self.hoisted
+    }
+}
+
+/// A literal with the one row column a comparison reads it through already built.
+///
+/// The comparison loops read both sides through a slice, so the constant side is turned into a one
+/// row column and read at position zero. That column is what carries a string's four byte prefix,
+/// which is the thing the string comparison resolves almost every row from, and building it costs a
+/// couple of allocations. Doing that once for the query rather than once per chunk is what this is.
+///
+/// It matters least where a chunk is full and most where it is not. A second conjunct handed the
+/// eleven rows the first one kept pays the same setup as one handed two thousand, so on a selective
+/// filter the setup was a real part of the call rather than a rounding error on it.
+#[derive(Debug)]
+pub struct Held {
+    value: Value,
+    single: Vector,
+}
+
+impl Held {
+    /// The one row column for `value` read as `ty`, or `None` for a type with no column layout.
+    ///
+    /// A nested type answers `None` and the comparison does what it always did, which is decide per
+    /// chunk and fall through to the row at a time path if it has to.
+    #[must_use]
+    pub fn of(ty: &LogicalType, value: &Value) -> Option<Self> {
+        Some(Self { value: value.clone(), single: single(ty, value)? })
+    }
+
+    /// Whether this was built for the side a kernel is about to read.
+    ///
+    /// The type and the value are both checked, which costs one comparison of two literals per
+    /// chunk against the allocations it saves. The caller that builds one of these takes it from the
+    /// step it is going to hand it back with, so the answer is yes, and the check is here so that a
+    /// caller which gets that wrong is slow rather than wrong.
+    pub(crate) fn matches(&self, ty: &LogicalType, value: &Value) -> bool {
+        self.single.logical_type() == ty && self.value == *value
+    }
+
+    /// The one row column.
+    pub(crate) fn single(&self) -> &Vector {
+        &self.single
     }
 }
 
