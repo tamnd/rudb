@@ -49,7 +49,7 @@ The three concrete mechanisms this thesis cashes out to, developed in documents 
 
 **SQL dialect.** rudb passes the DuckDB SQL logic test corpus at 99 percent or better with every failure enumerated and categorized in a checked-in file, not hidden. The number is produced by `rudb-compat` on every commit. Document 14.
 
-**What this axis explicitly does not claim.** Bug-for-bug compatibility on undefined behaviour, identical error message text, identical `EXPLAIN` output, or identical floating point results where DuckDB's result depends on aggregation order. Document 14.4 enumerates the permitted divergences and requires each one to be justified in writing.
+**What this axis explicitly does not claim.** Bug-for-bug compatibility on undefined behaviour, identical error message text, identical `EXPLAIN` output, or identical floating point results where DuckDB's result depends on aggregation order. Document 14.10 is the ledger of permitted divergences and requires each one to carry a reproduction and a written argument for why it is not matched.
 
 ## 2.4 Axis 2: aggregate performance
 

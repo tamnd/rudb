@@ -85,3 +85,25 @@ It compares against DuckDB's behaviour, so where DuckDB has a bug, matching it i
 It cannot test what it does not generate. A grammar-based generator explores the space its grammar describes, and the bugs that matter most are often in the corners the grammar author did not think of. This is a known limitation of the technique and the mitigation is the real-query corpus, which contains shapes nobody would have generated.
 
 It cannot measure performance compatibility. A query that returns the right answer 50 times slower than DuckDB is a passing test and a failed product. That is document 15's job and the two suites should be read together.
+
+## 14.10 The divergence ledger
+
+Section 14.9 says the suite rewards matching a DuckDB bug and section 02.4 says bug-for-bug compatibility is not claimed on undefined behaviour, error message text, `EXPLAIN` output or order-dependent floating point. Between those two there is a third case, which is a place where DuckDB is plainly and reproducibly wrong about a defined answer. This section is the list of those, it is the only place a divergence is allowed to be recorded, and a divergence that is not in it is a bug in `rudb`.
+
+**An entry is only an entry if it carries a reproduction.** A minimal query and the data to run it on, the exact DuckDB version it was seen on, both answers, and the argument for which one is right that does not appeal to our own implementation. Usually that argument is DuckDB disagreeing with itself, since a second formulation of the same question in the same binary is the cheapest evidence there is and the hardest to wave away.
+
+**An entry says why we are not matching.** The default is to match, because a user migrating depends on the behaviour they have. Not matching has to be argued, and the argument has to be about something other than taste. A wrong answer that a user could act on is the usual one.
+
+**An entry names where it is tracked.** An issue here and, where the behaviour is not deliberate upstream, a report there. An entry with no upstream report is an entry nobody has finished.
+
+**An entry is temporary by default.** When upstream fixes it, the entry is deleted and the query goes back into the ordinary comparison. The ledger getting shorter is the healthy direction.
+
+### 14.10.1 `SUM` over a `BIGINT` column read from parquet
+
+On `v2.0.0-dev84237 (Development Version) cc7e7bac7f`, the ungrouped sum of a `BIGINT` column taken straight off a parquet scan drops carries out of the high word of its 128 bit accumulator. Over the ClickBench file it is short by `282 * 2^64`, which moves `AVG(UserID)` in the fifth significant figure and is what makes ClickBench query 4 disagree.
+
+The reduction is two statements over the public file. `COPY (SELECT UserID AS x FROM read_parquet('hits.parquet') LIMIT 1000001) TO 'repro.parquet' (FORMAT PARQUET)` and then `SELECT SUM(x), SUM(x::HUGEINT) FROM read_parquet('repro.parquet')`, which differ by `6 * 2^64` in a 1.3 MB file of one column.
+
+The evidence that we are right is DuckDB against itself. `SUM(x::HUGEINT)`, `SUM(x::DECIMAL(38,0))`, the same column summed after being read into a table, and the sum of its own per-`CounterID` group sums all give our answer and all disagree with its ungrouped parquet sum. It is deterministic across thread counts and row group layouts, so it is neither a race nor the parallel combine, and it only appears when the column arrives dictionary encoded, so it is about the vector the scan hands over rather than the values in it.
+
+We do not match it because reproducing it means writing a broken carry into the aggregate on purpose, keeping it there until upstream fixes it, and remembering to take it out. A silently wrong sum is also the one kind of wrong answer a user cannot see, which is the opposite of what the end to end claim is for. Tracked in issue #332.
