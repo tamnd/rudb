@@ -563,3 +563,122 @@ fn a_budget_too_small_for_the_rows_stops_the_operator_that_buffers_them() {
     drop(operator);
     assert_eq!(memory.used(), 0, "the failed operator gave everything back");
 }
+
+/// A table whose grouping does not fit in a small budget: `groups` distinct keys, each of them
+/// twice, with a string beside the number.
+///
+/// The string is there so that a spilled key has a buffer in it. A key of nothing but fixed width
+/// values is written and read back without the allocator being asked anything, and the path worth
+/// testing is the one where it is.
+fn crowd(groups: i32) -> Catalog {
+    let mut catalog = Catalog::new();
+    let name = QualifiedName::new("memory", "main", "crowd");
+    catalog
+        .create_table(
+            name.clone(),
+            vec![Field::new("x", LogicalType::Integer), Field::new("s", LogicalType::Varchar)],
+        )
+        .expect("a fresh table");
+    let rows: Vec<Vec<Value>> = (0..groups * 2)
+        .map(|at| {
+            let key = at % groups;
+            vec![Value::Integer(key), Value::Varchar(format!("key number {key}"))]
+        })
+        .collect();
+    catalog
+        .table_mut(&name)
+        .expect("the table just created")
+        .rows_mut()
+        .append_rows(&rows)
+        .expect("two rows of the table's own types per group");
+    catalog
+}
+
+/// Runs a plan under a given budget and hands back its rows in a settled order.
+///
+/// Sorted by the debug spelling of the row, which is not an order anybody would want to look at and
+/// is the only one available here, because a `Value` is not ordered and the point is to compare two
+/// runs of the same query rather than to read the answer.
+fn under(catalog: &Catalog, text: &str, memory: &Memory) -> Vec<Vec<Value>> {
+    let plan = Plan::parse(text).expect("a well formed plan");
+    plan.validate().expect("the plan holds together");
+    let mut operator =
+        build_with(&plan, catalog, &Cancel::new(), memory).expect("the operators build");
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    while let Some(chunk) = operator.next().expect("the query runs") {
+        for row in 0..chunk.len() {
+            rows.push(chunk.row(row).collect());
+        }
+    }
+    rows.sort_by_key(|row| format!("{row:?}"));
+    rows
+}
+
+#[test]
+fn a_group_by_that_outgrows_its_budget_spills_and_answers_anyway() {
+    // #220. A table that cannot hold every group used to reach the allocator and die there, which
+    // is what ten of the forty three ClickBench queries did. It now keeps the groups it has and
+    // writes the rest of the rows to a file, so the same query answers over as many passes as the
+    // budget needs.
+    const GROUPS: i32 = 4096;
+    const QUERY: &str = "Aggregate #1 groups=[#0.0::INTEGER, #0.1::VARCHAR] \
+         aggregates=[count_star()::BIGINT, sum(#0.0::INTEGER)::HUGEINT]\n  \
+         Get memory.main.crowd AS crowd #0 [x::INTEGER, s::VARCHAR]\n";
+    let catalog = crowd(GROUPS);
+    let open = Memory::unlimited();
+    let want = under(&catalog, QUERY, &open);
+    assert_eq!(want.len(), GROUPS as usize, "one row per group");
+
+    // Three quarters of what the query took when nothing was stopping it. It has to be under the
+    // whole, or the query never spills and this tests nothing, and it has to be over what the
+    // answer costs, because the rows every pass finished are held until the last pass ends and no
+    // amount of spilling makes an answer that does not fit fit. Three quarters is between the two
+    // here, and the proof that it is under the whole is that the old code needed the whole and this
+    // one gets an answer.
+    let tight = Memory::with_limit(open.peak() / 4 * 3);
+    let got = under(&catalog, QUERY, &tight);
+    assert_eq!(got, want, "the same answer, over as many passes as the budget needed");
+    assert_eq!(tight.used(), 0, "every pass gave back what it held");
+}
+
+#[test]
+fn a_spilled_row_carries_its_distinct_argument_and_its_filter() {
+    // The two columns a spilled row has that the group key does not. A `DISTINCT` needs the
+    // argument itself, because the set that decides whether a value has been counted is rebuilt in
+    // the pass that finishes the group, and a `FILTER` needs the answer the predicate already gave,
+    // because the row it was evaluated against is not written out and cannot be evaluated again.
+    const GROUPS: i32 = 4096;
+    const QUERY: &str = "Aggregate #1 groups=[#0.0::INTEGER] \
+         aggregates=[count(DISTINCT #0.1::VARCHAR)::BIGINT, \
+         count_star(FILTER (#0.0::INTEGER > 1000::INTEGER)::BOOLEAN)::BIGINT]\n  \
+         Get memory.main.crowd AS crowd #0 [x::INTEGER, s::VARCHAR]\n";
+    let catalog = crowd(GROUPS);
+    let open = Memory::unlimited();
+    let want = under(&catalog, QUERY, &open);
+    assert_eq!(want.len(), GROUPS as usize, "one row per group");
+
+    let tight = Memory::with_limit(open.peak() / 4 * 3);
+    let got = under(&catalog, QUERY, &tight);
+    assert_eq!(got, want, "the same answer, over as many passes as the budget needed");
+    assert_eq!(tight.used(), 0, "every pass gave back what it held");
+}
+
+#[test]
+fn a_budget_too_small_for_one_group_says_so_rather_than_running_forever() {
+    // The other end of the same change. Spilling turns a budget that is merely too small into more
+    // passes, and there is a budget too small for even that, and the thing it must not do is loop
+    // handing the same rows from one pass to the next.
+    let catalog = crowd(64);
+    let plan = Plan::parse(
+        "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]\n  \
+         Get memory.main.crowd AS crowd #0 [x::INTEGER, s::VARCHAR]\n",
+    )
+    .expect("a well formed plan");
+    let memory = Memory::with_limit(1);
+    let mut operator = build_with(&plan, &catalog, &Cancel::new(), &memory)
+        .expect("the operators build, because nothing is held yet");
+    let error = operator.next().expect_err("one byte is not enough for a group");
+    assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
+    drop(operator);
+    assert_eq!(memory.used(), 0, "the failed operator gave everything back");
+}

@@ -18,13 +18,14 @@
 use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Accumulator, is_true};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
-use rudb_vector::{Chunk, Vector};
+use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::expr::{evaluate, evaluate_all};
 use crate::key::{Key, RowMap, RowSet};
 use crate::operator::Operator;
 use crate::rows;
 use crate::schema::Schema;
+use crate::spill::{Reader, Spill};
 
 /// One aggregate call, taken apart once when the operator is built.
 #[derive(Debug, Clone)]
@@ -119,11 +120,86 @@ impl<'a> Aggregate<'a> {
         })
     }
 
-    /// Reads the whole input and builds the hash table.
+    /// Reads the whole input and builds the hash table, over as many passes as the budget needs.
+    ///
+    /// One pass is what this used to be and is what almost every query still does: read everything,
+    /// put every group in a table, turn the table into rows. What is new is what happens when the
+    /// table cannot hold every group, which is #220, and which on the ClickBench file is `GROUP BY
+    /// UserID` and its seventeen million of them.
+    ///
+    /// A pass that runs out of room keeps the groups it already has and writes any row whose key is
+    /// not one of them to a file. Nothing already in the table ever goes to the file, so a key is
+    /// either finished in this pass or absent from it entirely, and that is the whole of why this
+    /// works: the next pass can aggregate the file on its own, knowing nothing about the rows that
+    /// came before, because no group is split across the two.
+    ///
+    /// It is also why no aggregate state is written out. Splitting the input by row rather than by
+    /// key would leave a partial state on each side to be merged, and a merge needs a serialize and
+    /// a combine per aggregate, which `spec/engine/07-aggregate.md` section 7.8 names as debt not
+    /// yet paid. Splitting by key means there is nothing to merge and every aggregate keeps working
+    /// unchanged.
+    ///
+    /// Each pass gives its table and the rows it made back before the next one starts, so what is
+    /// carried between passes is the finished chunks and nothing else. A query whose answer on its
+    /// own fills the budget still runs out, which is correct: there is no way to hold seventeen
+    /// million rows in room that does not hold them.
     fn build(&mut self) -> Result<()> {
-        // The keys and the rows made out of them, charged separately from the chunks those produce,
-        // because these are given back when the last group has been finished and the chunks are
-        // not.
+        // Borrowed field by field rather than as `&self`, because the first pass holds the input
+        // out of the same struct and the two borrows have to be disjoint.
+        let pass = Pass {
+            plan: self.plan,
+            input_schema: &self.input_schema,
+            schema: &self.schema,
+            groups: &self.groups,
+            calls: &self.calls,
+            memory: &self.memory,
+        };
+        let mut source = Source::Input(&mut *self.input);
+        let mut left = pass.once(&mut source, &mut self.chunks, &mut self.held)?;
+        while let Some(mut file) = left {
+            // The file is read back through the same `once` the input went through, so there is one
+            // row loop, one table and one set of charges however many passes a query takes.
+            let mut source = Source::Spilled(Spilled::new(file.read()?, pass.spilled_types()));
+            left = pass.once(&mut source, &mut self.chunks, &mut self.held)?;
+        }
+        Ok(())
+    }
+}
+
+/// The parts of an [`Aggregate`] one pass over the rows needs.
+///
+/// A struct of borrows rather than a method on the operator, so that the first pass can hold the
+/// input operator mutably while the pass holds everything else.
+struct Pass<'p> {
+    plan: &'p Plan,
+    input_schema: &'p Schema,
+    schema: &'p Schema,
+    groups: &'p [ExprRef],
+    calls: &'p [Call],
+    memory: &'p Memory,
+}
+
+impl Pass<'_> {
+    /// One pass: fill a table until it cannot take another group, then spill what is left.
+    ///
+    /// The chunks the finished groups make are appended to `chunks` and charged against `held`,
+    /// which the operator holds for as long as it holds them. What comes back is the file the rows
+    /// that did not fit went to, and `None` when every row fit, which is the ordinary case and the
+    /// only case before #220.
+    ///
+    /// The rows are turned into chunks here rather than once at the end for the memory rather than
+    /// for the tidiness. A row and the chunk built from it are two copies of the same values, and
+    /// keeping the rows of every pass until the last pass ended would hold both copies of the whole
+    /// answer at once. Ending the pass with the chunks alone means the second copy is only ever of
+    /// what one pass finished.
+    fn once(
+        &self,
+        source: &mut Source<'_, '_>,
+        chunks: &mut Vec<Chunk>,
+        held: &mut Reservation,
+    ) -> Result<Option<Spill>> {
+        // The keys and the rows made out of them, given back when this pass ends, because by then
+        // they are in the chunks.
         let mut scratch = self.memory.reservation();
         // The three containers and the sets a `DISTINCT` fills, which are gone before the chunks
         // are built rather than after. Their own reservation so that their charge can go when they
@@ -164,22 +240,18 @@ impl<'a> Aggregate<'a> {
         // per row. Only a row that turns out to be a group nobody has seen is copied out of them.
         let mut key = Key(Vec::new());
         let mut given: Vec<Key> = vec![Key(Vec::new()); calls];
-        while let Some(chunk) = self.input.next()? {
-            let keys = evaluate_all(self.plan, &self.groups, &self.input_schema, &chunk)?;
+        // The file the rows that do not fit go to, made the first time the budget says the table
+        // has to stop growing and `None` for as long as it does not. One row of it, kept between
+        // rows so that writing does not go to the allocator per row.
+        let mut over: Option<Spill> = None;
+        let mut away: Vec<Value> = Vec::new();
+        while let Some(seen_rows) = source.next(self)? {
+            let Rows { keys, arguments, filters, rows: length } = &seen_rows;
             let mut taken = 0;
             let mut aside = 0;
-            let mut arguments = Vec::with_capacity(self.calls.len());
-            let mut filters = Vec::with_capacity(self.calls.len());
-            for call in &self.calls {
-                arguments.push(evaluate_all(self.plan, &call.args, &self.input_schema, &chunk)?);
-                filters.push(match call.filter {
-                    Some(filter) => Some(evaluate(self.plan, filter, &self.input_schema, &chunk)?),
-                    None => None,
-                });
-            }
             for at in 0..calls {
                 if by_vector[at] {
-                    states[at].update_run(&arguments[at], chunk.len())?;
+                    states[at].update_run(&arguments[at], *length)?;
                 }
             }
             if alone && every {
@@ -189,14 +261,23 @@ impl<'a> Aggregate<'a> {
             // 2f (#60) gives it a table that hashes a column at a time and probes a vector at a
             // time, and 2g (#61) gives the aggregate an update that takes a vector and a run of
             // slots, at which point neither the key nor the argument is a `Value` any more.
-            for row in 0..chunk.len() {
+            for row in 0..*length {
                 let slot = if alone {
                     0
                 } else {
-                    fill(&mut key, &keys, row);
+                    fill(&mut key, keys, row);
                     match slots.get(&key) {
                         Some(&slot) => slot,
                         None => {
+                            if let Some(file) = over.as_mut() {
+                                // The table is as large as the budget will let it be and this key
+                                // is not in it, so the row goes out whole. Every later row with
+                                // this key goes out too, because the key is never inserted here,
+                                // and that is what lets the next pass finish the group without
+                                // knowing anything about this one.
+                                put_away(file, &seen_rows, row, &mut away)?;
+                                continue;
+                            }
                             let slot = groups;
                             groups += 1;
                             // A group costs the copy of its key that the table takes, and its own
@@ -253,41 +334,81 @@ impl<'a> Aggregate<'a> {
             containers.grow(aside)?;
             let now = tables(&slots, &states, &seen);
             rows::capacity(now, &mut charged, &mut containers)?;
-        }
-        // Turning the table into rows is where this operator holds the most and used to charge the
-        // least. `out` is a vector header per group, and each row is the key's own vector with the
-        // aggregate results pushed onto it, which asks the allocator for a block wider than the key
-        // was given. Both are asked for before they are taken rather than charged after, because
-        // the whole of it is taken between one charge and the next and a limit that is told
-        // afterwards has not done anything. What a result owns away from itself is not knowable
-        // until it has been asked for, so that part is charged as it arrives. Per #272.
-        let each = width_of(size_of::<Vec<Value>>() + calls * size_of::<Value>());
-        scratch.grow(width_of(groups).saturating_mul(each))?;
-        let mut out: Vec<Vec<Value>> = vec![Vec::new(); groups];
-        for (key, slot) in slots {
-            out[slot] = key.0;
-        }
-        let mut taken = 0;
-        for (slot, row) in out.iter_mut().enumerate() {
-            // Room for every result at once, so that the row's block is asked for at the width it
-            // ends up at rather than at the width a doubling picks, which is the width charged
-            // above.
-            row.reserve_exact(calls);
-            for accumulator in &states[slot * calls..slot * calls + calls] {
-                let value = accumulator.finish()?;
-                taken += rows::owned(&value);
-                row.push(value);
+            // Asked after the chunk has been folded in and not before, so that a pass always takes
+            // at least one chunk of groups whatever the budget says. That is what makes the loop in
+            // `build` finish: a pass that could spill from its first row would spill every row and
+            // hand back a file the same size as what it was given.
+            match over.as_ref() {
+                None if !alone && crowded(self.memory) => {
+                    over = Some(Spill::new("aggregate", self.spilled_types())?);
+                }
+                Some(file) => hopeless(file, groups)?,
+                None => {}
             }
         }
-        scratch.grow(taken)?;
-        // The table went with the loop that drained it and the accumulators are finished, so the
-        // charge for all of it goes here and not at the end of this function. The chunks are the
-        // second copy of the rows and this is the room they are built in.
-        drop(states);
+        // Turning the table into rows is where this operator holds the most and used to charge the
+        // least. The keys are moved out of the table rather than copied, so what this asks for is a
+        // vector header per group, and it is asked for before it is taken rather than charged after,
+        // because the whole of it is taken between one charge and the next and a limit that is told
+        // afterwards has not done anything. Per #272.
+        scratch.grow(width_of(groups).saturating_mul(width_of(size_of::<Vec<Value>>())))?;
+        let mut made: Vec<Vec<Value>> = vec![Vec::new(); groups];
+        for (key, slot) in slots {
+            made[slot] = key.0;
+        }
+        // The buckets went with the map that loop consumed and the distinct sets go here, so the
+        // charge for both goes now rather than after the chunks are built, which is the whole
+        // difference between converting inside the budget and converting on top of it. What is left
+        // charged is the accumulators, which are still alive and are read below.
         drop(seen);
+        let alive = width_of(states.capacity() * size_of::<Accumulator>());
+        containers.shrink(containers.bytes().saturating_sub(alive));
+        // A chunk's worth at a time rather than all of it. A finished row is the key's own vector
+        // with the aggregate results pushed onto it, which asks the allocator for a block wider than
+        // the key was given, and doing every group first and then building the chunks holds two
+        // copies of the whole answer at once. A batch at a time holds two copies of a thousand rows,
+        // and the rows go as soon as the chunk built from them is standing.
+        let each = width_of(size_of::<Vec<Value>>() + calls * size_of::<Value>());
+        scratch.grow(width_of(VECTOR_SIZE.min(groups)).saturating_mul(each))?;
+        let mut batch: Vec<Vec<Value>> = Vec::new();
+        for start in (0..groups).step_by(VECTOR_SIZE) {
+            let end = (start + VECTOR_SIZE).min(groups);
+            // What a result owns away from itself is not knowable until it has been asked for, so
+            // that part is charged as it arrives and given back with the batch that held it.
+            let mut taken = 0;
+            for slot in start..end {
+                let mut row = std::mem::take(&mut made[slot]);
+                // Room for every result at once, so that the row's block is asked for at the width
+                // it ends up at rather than at the width a doubling picks.
+                row.reserve_exact(calls);
+                for accumulator in &states[slot * calls..slot * calls + calls] {
+                    let value = accumulator.finish()?;
+                    taken += rows::owned(&value);
+                    row.push(value);
+                }
+                batch.push(row);
+            }
+            scratch.grow(taken)?;
+            chunks.append(&mut rows::chunks(&self.schema.types(), &batch, held)?);
+            batch.clear();
+            scratch.shrink(taken);
+        }
+        drop(states);
         containers.release();
-        self.chunks = rows::chunks(&self.schema.types(), &out, &mut self.held)?;
-        Ok(())
+        match over {
+            // A pass that put nothing in its table and still wrote rows out would hand back what it
+            // was given and the next pass would do the same. It cannot happen, because the spill
+            // only opens after a chunk has gone in, and it is checked rather than assumed because
+            // the alternative to an error here is a loop that never ends.
+            Some(file) if groups == 0 && file.rows() > 0 => Err(Error::out_of_memory(format!(
+                "the memory limit does not leave room for a single group of this aggregate, \
+                 {} rows and {} bytes went to a spill file and none of them could be finished",
+                file.rows(),
+                file.bytes()
+            ))),
+            Some(file) if file.rows() > 0 => Ok(Some(file)),
+            _ => Ok(None),
+        }
     }
 
     /// A fresh accumulator per call, appended for the group that has just arrived.
@@ -296,10 +417,238 @@ impl<'a> Aggregate<'a> {
     /// push and not a trip to the allocator. The accumulators of the group in `slot` are the run of
     /// `calls` entries starting at `slot * calls`.
     fn fresh(&self, states: &mut Vec<Accumulator>) -> Result<()> {
-        for call in &self.calls {
+        for call in self.calls {
             states.push(Accumulator::new(&call.name, &call.returns)?);
         }
         Ok(())
+    }
+
+    /// The columns a spilled row is made of, in the order [`put_away`] writes them.
+    ///
+    /// The group key, then every argument of every call, then one column per call that has a
+    /// `FILTER`. What goes out is what the row loop reads and not the input row, because the input
+    /// row is wider than this almost always and because a second pass over a spilled row would
+    /// otherwise have to evaluate the group and argument expressions again against a chunk it would
+    /// have to rebuild first.
+    ///
+    /// The types come off the plan rather than off the vectors that were evaluated, so the file is
+    /// described the same way whether or not any row has been written to it yet.
+    fn spilled_types(&self) -> Vec<LogicalType> {
+        let mut types = Vec::new();
+        for &group in self.groups {
+            types.push(self.plan.expr_type(group).clone());
+        }
+        for call in self.calls {
+            for &argument in &call.args {
+                types.push(self.plan.expr_type(argument).clone());
+            }
+        }
+        for call in self.calls {
+            if let Some(filter) = call.filter {
+                types.push(self.plan.expr_type(filter).clone());
+            }
+        }
+        types
+    }
+}
+
+/// One chunk of rows, in the vectors the row loop reads them out of.
+///
+/// The same shape whether the rows came from the operator below or from a spill file, which is what
+/// lets one loop serve both.
+struct Rows {
+    keys: Vec<Vector>,
+    arguments: Vec<Vec<Vector>>,
+    filters: Vec<Option<Vector>>,
+    rows: usize,
+}
+
+impl Rows {
+    /// How many columns one of these rows is written out as, which is [`Pass::spilled_types`] long.
+    fn width(&self) -> usize {
+        self.keys.len()
+            + self.arguments.iter().map(Vec::len).sum::<usize>()
+            + self.filters.iter().flatten().count()
+    }
+}
+
+/// Where the rows a pass folds are coming from.
+///
+/// The first pass reads the operator below it and every pass after that reads the file the pass
+/// before it wrote. Writing it as one enum with one `next` rather than as two loops is the whole
+/// reason the table, the row loop, the `DISTINCT` sets and the memory charging are written once:
+/// neither case knows which one it is.
+enum Source<'s, 'o> {
+    Input(&'s mut (dyn Operator + 'o)),
+    Spilled(Spilled<'s>),
+}
+
+impl Source<'_, '_> {
+    /// The next chunk of rows, or `None` at the end of the input or the file.
+    fn next(&mut self, pass: &Pass<'_>) -> Result<Option<Rows>> {
+        match self {
+            Source::Input(input) => {
+                let Some(chunk) = input.next()? else {
+                    return Ok(None);
+                };
+                let rows = chunk.len();
+                let keys = evaluate_all(pass.plan, pass.groups, pass.input_schema, &chunk)?;
+                let mut arguments = Vec::with_capacity(pass.calls.len());
+                let mut filters = Vec::with_capacity(pass.calls.len());
+                for call in pass.calls {
+                    arguments.push(evaluate_all(pass.plan, &call.args, pass.input_schema, &chunk)?);
+                    filters.push(match call.filter {
+                        Some(filter) => {
+                            Some(evaluate(pass.plan, filter, pass.input_schema, &chunk)?)
+                        }
+                        None => None,
+                    });
+                }
+                Ok(Some(Rows { keys, arguments, filters, rows }))
+            }
+            Source::Spilled(spilled) => spilled.next(pass),
+        }
+    }
+}
+
+/// A spill file being read back, and the buffers reading it fills.
+///
+/// The file is rows and the row loop wants columns, so something has to turn one into the other, and
+/// this is it. The buffers are kept between chunks so that a string read out of the file goes into
+/// the block the string before it used rather than into a new one.
+struct Spilled<'s> {
+    reader: Reader<'s>,
+    types: Vec<LogicalType>,
+    row: Vec<Value>,
+    columns: Vec<Vec<Value>>,
+}
+
+impl<'s> Spilled<'s> {
+    fn new(reader: Reader<'s>, types: Vec<LogicalType>) -> Self {
+        let columns = vec![Vec::new(); types.len()];
+        Self { reader, types, row: Vec::new(), columns }
+    }
+
+    /// Up to [`VECTOR_SIZE`] rows, turned back into the vectors they were written out of.
+    fn next(&mut self, pass: &Pass<'_>) -> Result<Option<Rows>> {
+        // Field by field, because the row being read and the columns it is being moved into are two
+        // borrows of this and the loop below holds both.
+        let Self { reader, types, row, columns } = self;
+        for column in columns.iter_mut() {
+            column.clear();
+        }
+        let mut rows = 0;
+        while rows < VECTOR_SIZE && reader.next_into(row)? {
+            // Moved rather than cloned. The buffer a string was read into is handed to the column
+            // and the row keeps a null in its place, so the string is allocated once and copied
+            // never, which is the same trade the reader itself makes.
+            for (at, value) in row.iter_mut().enumerate() {
+                columns[at].push(std::mem::replace(value, Value::Null));
+            }
+            rows += 1;
+        }
+        if rows == 0 {
+            return Ok(None);
+        }
+        let mut built = Vec::with_capacity(columns.len());
+        for (values, ty) in columns.iter().zip(&*types) {
+            built.push(Vector::from_values(ty.clone(), values)?);
+        }
+        // Taken apart in the order `spilled_types` put them together in. A miscount here would hand
+        // an argument to the wrong call rather than fail, so the two are written next to each other
+        // on purpose.
+        let mut taking = built.into_iter();
+        let keys: Vec<Vector> = taking.by_ref().take(pass.groups.len()).collect();
+        let mut arguments = Vec::with_capacity(pass.calls.len());
+        for call in pass.calls {
+            arguments.push(taking.by_ref().take(call.args.len()).collect());
+        }
+        let mut filters = Vec::with_capacity(pass.calls.len());
+        for call in pass.calls {
+            filters.push(if call.filter.is_some() { taking.next() } else { None });
+        }
+        Ok(Some(Rows { keys, arguments, filters, rows }))
+    }
+}
+
+/// Writes one row of `seen` out whole.
+///
+/// `away` is the buffer the row goes through, kept by the caller across rows for the reason
+/// [`fill`] gives: a `Value::Varchar` owns its bytes, and a spill that took a fresh buffer per
+/// string would ask the allocator once per string per row.
+fn put_away(file: &mut Spill, seen: &Rows, row: usize, away: &mut Vec<Value>) -> Result<()> {
+    let columns = seen
+        .keys
+        .iter()
+        .chain(seen.arguments.iter().flatten())
+        .chain(seen.filters.iter().flatten());
+    away.truncate(seen.width());
+    for (at, column) in columns.enumerate() {
+        match away.get_mut(at) {
+            Some(slot) => set(slot, column, row),
+            None => away.push(column.value_at(row)),
+        }
+    }
+    file.write(away)
+}
+
+/// How many more passes over a spill file are worth starting.
+///
+/// Sixty four, and the number is a bound on wasted reading rather than a guess about anything. A
+/// query that fits in the budget makes one pass, a query that needs a few times the budget makes a
+/// few, and a query that would read its own spill file sixty four more times is one whose answer
+/// does not fit and which is going to say so eventually anyway, having read a hundred gigabytes off
+/// a disk first.
+const PASSES: u64 = 64;
+
+/// Stops a pass whose spill file has grown past what the passes after it could get through.
+///
+/// The rows in the file are an upper bound on the keys left to finish, since a key cannot be in more
+/// rows than there are, and each pass after this one finishes at most about as many keys as this one
+/// did. That second half is the part that makes this a floor and not a guess: what a pass finishes
+/// is held for the rest of the query, so every pass starts with less room than the one before it and
+/// none of them gets faster.
+///
+/// # Errors
+///
+/// [`rudb_common::ErrorCode::OutOfMemory`], because that is what it is. The budget is too small for
+/// this aggregation by a factor large enough that spilling does not close it, and saying so while
+/// the file is a few megabytes is better than saying it after the file is the size of the input.
+fn hopeless(file: &Spill, groups: usize) -> Result<()> {
+    let left = file.rows() / width_of(groups).max(1);
+    if left > PASSES {
+        return Err(Error::out_of_memory(format!(
+            "the memory limit leaves room for {groups} groups at a time and {} rows have already \
+             gone to a spill file, which is more passes over it than this will finish in",
+            file.rows()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether the table has taken enough of the budget that it should stop growing.
+///
+/// Half rather than all of it, and the half that is left is not slack. A pass has to turn its table
+/// into rows before it can give the table back, and both are alive while it does. The rows are
+/// cheaper than the table they came from, because the key is moved out of the table rather than
+/// copied and what is added is a row header and the aggregate results, but cheaper is not free, and
+/// a pass that grew its table until the budget was gone would fail on the conversion having already
+/// done all of the work. Three quarters was tried and is where that happens.
+///
+/// What this does not do is bound the answer. The rows every pass finished are held until the last
+/// pass ends, so a query whose output does not fit still runs out of memory, and one whose output
+/// nearly fits gets fewer groups per pass and so more passes over a file it reads again each time.
+/// Splitting the spill by a hash of the key, so that each part is aggregated once and independently,
+/// is what makes that linear, and handing the finished rows out as they are made rather than at the
+/// end is what makes the output stop counting. Both are larger than this and neither is needed to
+/// stop the ten queries that fail today from failing.
+///
+/// A database opened without a limit never spills, which is the same answer it gives everywhere
+/// else: no limit means the machine is the limit and the allocator is what says so.
+fn crowded(memory: &Memory) -> bool {
+    match memory.limit() {
+        Some(limit) => memory.used() >= limit / 2,
+        None => false,
     }
 }
 
