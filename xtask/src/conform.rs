@@ -14,7 +14,9 @@
 //! The corpus links rudb as a library too, and that side is pointed at this tree with a patch
 //! rather than left on the pin, so both ways into the engine are the code in front of you. Nothing
 //! is written to either manifest to do it, because a gate that edits the tree it is checking is a
-//! gate that leaves a dirty checkout behind on the run that fails.
+//! gate that leaves a dirty checkout behind on the run that fails. The harness's lock file is the
+//! one exception and it has to be, since a lock that pins an older version of rudb is what makes
+//! cargo drop the patch in the first place. See `pointed`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -56,6 +58,8 @@ fn corpus(root: &Path, harness: &Path) -> Result<(), String> {
         return Err(format!("built rudb-cli and then could not find {}", shell.display()));
     }
 
+    pointed(root, harness)?;
+
     println!("cargo test --test corpus in {}", harness.display());
     let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .args(["test", "--test", "corpus"])
@@ -75,6 +79,77 @@ fn corpus(root: &Path, harness: &Path) -> Result<(), String> {
     } else {
         Err("the committed corpus did not pass, see the output above".to_string())
     }
+}
+
+/// Makes sure the rudb the harness is about to link is the one in this tree, and says so.
+///
+/// The patch alone does not do it. `rudb-compat/Cargo.lock` pins rudb at a git revision and a
+/// version, and when the patch offers a different version cargo keeps the locked entry, prints
+/// `patch was not used in the crate graph` in the middle of a compile and carries on. The step then
+/// passes three tests about whatever was last merged and prints `corpus ok`, which is worse than a
+/// step that does nothing, because a green measured against the wrong tree hides exactly the
+/// changes this step exists to catch. Per #343.
+///
+/// So this asks cargo which rudb it resolved, repoints the lock when the answer is not this tree,
+/// and asks again. Writing the harness's lock is a change to the checkout, which the rest of this
+/// file goes out of its way to avoid, and it is the right trade here: a lock is not a manifest, it
+/// is meant to follow main, and a stale one is the bug. What is not a trade is the second question.
+/// A step that cannot say which engine it conformed refuses to print anything at all.
+fn pointed(root: &Path, harness: &Path) -> Result<(), String> {
+    let package = root.join("crates").join("rudb");
+    if points_at(&resolved(harness, root)?, &package) {
+        return Ok(());
+    }
+    println!("cargo update -p rudb in {}", harness.display());
+    let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["update", "-p", "rudb"])
+        .arg(format!("--config={}", patch(root)))
+        .current_dir(harness)
+        .env_remove("CARGO_MANIFEST_DIR")
+        .env_remove("CARGO_PKG_NAME")
+        .env_remove("CARGO_PKG_VERSION")
+        .status()
+        .map_err(|e| format!("could not run cargo: {e}"))?;
+    if !status.success() {
+        return Err(format!("could not repoint {} at this tree", harness.display()));
+    }
+    let after = resolved(harness, root)?;
+    if points_at(&after, &package) {
+        return Ok(());
+    }
+    Err(format!(
+        "the corpus would have run against {}, which is not this tree, so it was not run",
+        after.trim()
+    ))
+}
+
+/// Whether the line cargo printed for rudb names the package directory in this tree.
+///
+/// The path is compared as this platform writes it, and not through the forward slashes `patch`
+/// needs, because this is reading what cargo printed rather than writing TOML for it to read.
+fn points_at(resolved: &str, package: &Path) -> bool {
+    resolved.contains(&package.display().to_string())
+}
+
+/// Which rudb the harness resolves to, as the one line `cargo tree` prints for it.
+///
+/// `cargo tree` rather than `cargo metadata`, because the answer wanted here is one line naming a
+/// version and a source and that is what it prints, where the metadata is a JSON document this task
+/// would have to grow a parser for to read one field out of.
+fn resolved(harness: &Path, root: &Path) -> Result<String, String> {
+    let out = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["tree", "--invert", "rudb", "--depth", "0"])
+        .arg(format!("--config={}", patch(root)))
+        .current_dir(harness)
+        .env_remove("CARGO_MANIFEST_DIR")
+        .env_remove("CARGO_PKG_NAME")
+        .env_remove("CARGO_PKG_VERSION")
+        .output()
+        .map_err(|e| format!("could not run cargo: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("could not ask {} which rudb it resolves to", harness.display()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// The one line of TOML that points the harness's rudb dependency at this tree.
@@ -124,7 +199,7 @@ fn beside(root: &Path) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{beside, patch};
+    use super::{beside, patch, points_at};
     use std::path::Path;
 
     #[test]
@@ -143,5 +218,19 @@ mod tests {
             "patch.\"https://github.com/tamnd/rudb\".rudb.path=\"/home/dev/rudb/crates/rudb\""
         );
         assert!(!line.contains('\\'), "{line}");
+    }
+
+    /// The two lines cargo actually printed for rudb before and after #343 was fixed.
+    #[test]
+    fn the_resolved_rudb_is_read_off_the_line_cargo_prints_for_it() {
+        let package = Path::new("/root/gate/rudb").join("crates").join("rudb");
+        assert!(points_at("rudb v0.2.30 (/root/gate/rudb/crates/rudb)\n", &package));
+        assert!(!points_at(
+            "rudb v0.2.29 (https://github.com/tamnd/rudb?branch=main#ab1510cc)\n",
+            &package
+        ));
+        // A checkout somewhere else is not this one, which is the case a plain version comparison
+        // would have said yes to.
+        assert!(!points_at("rudb v0.2.30 (/home/dev/rudb/crates/rudb)\n", &package));
     }
 }
