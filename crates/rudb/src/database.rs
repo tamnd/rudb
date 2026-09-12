@@ -366,7 +366,7 @@ impl Shared {
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let catalog = self.read();
         let _seams = self.seams(sql)?;
-        let plan = planned(sql, &catalog, &self.optimizer()?)?;
+        let plan = planned(sql, &catalog, &self.optimizer(&catalog)?)?;
         run(&plan, &catalog, cancel, &self.inner.memory)
     }
 
@@ -385,13 +385,29 @@ impl Shared {
         Ok(seams)
     }
 
-    /// The passes this database's queries run, as `SET disabled_optimizers` has left them.
+    /// The passes this database's queries run, as `SET disabled_optimizers` has left them, with
+    /// the row counts the catalog holds.
     ///
     /// Rebuilt for each statement rather than held, because the statement before this one may have
-    /// been the `SET`. It cannot fail: the names were checked when they were set, and the `?` is
-    /// here because nothing stops a later version from having a pass that goes away.
-    fn optimizer(&self) -> Result<rudb_opt::pass::Context> {
-        rudb_opt::pass::Context::without(&self.inner.settings.disabled_optimizers())
+    /// been the `SET` and the statement before that may have been an `INSERT`. It cannot fail: the
+    /// names were checked when they were set, and the `?` is here because nothing stops a later
+    /// version from having a pass that goes away.
+    ///
+    /// The catalog comes in as an argument rather than being read from the lock here, because
+    /// every caller is already holding that lock and one of them is holding it for writing. This
+    /// is also the seam that stops the optimizer from reaching the catalog on its own: what it
+    /// gets is a copy of the counts, which is the whole of what estimation reads today.
+    fn optimizer(&self, catalog: &Catalog) -> Result<rudb_opt::pass::Context> {
+        let mut context =
+            rudb_opt::pass::Context::without(&self.inner.settings.disabled_optimizers())?;
+        let mut statistics = rudb_opt::estimate::Statistics::new();
+        for table in catalog.tables() {
+            let name = table.name();
+            let rows = u64::try_from(table.rows().len()).unwrap_or(u64::MAX);
+            statistics.record(&name.catalog, &name.schema, &name.table, rows);
+        }
+        context.measure(statistics);
+        Ok(context)
     }
 
     /// The query timeout this database was opened with.
@@ -412,7 +428,8 @@ impl Shared {
 
     /// The plan a query runs.
     pub(crate) fn plan(&self, sql: &str) -> Result<String> {
-        Ok(planned(sql, &self.read(), &self.optimizer()?)?.to_string())
+        let catalog = self.read();
+        Ok(planned(sql, &catalog, &self.optimizer(&catalog)?)?.to_string())
     }
 
     /// Runs one statement, which may change the database.
@@ -438,7 +455,7 @@ impl Shared {
         cancel: &Cancel,
     ) -> Result<QueryResult> {
         let mut catalog = self.write();
-        let context = self.optimizer()?;
+        let context = self.optimizer(&catalog)?;
         match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
