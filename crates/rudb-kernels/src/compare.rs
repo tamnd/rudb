@@ -72,7 +72,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use rudb_common::{Error, LogicalType, Result, Value, interval_micros};
-use rudb_vector::{Data, Form, Selection, StringColumn, Validity, Vector};
+use rudb_vector::{Data, Form, Packed, Selection, StringColumn, Validity, Vector};
 
 use crate::fallback::{self, Kernel};
 use crate::logic::is_true;
@@ -379,6 +379,21 @@ where
     if let (Some(one), Some(other)) = (left.data(), right.data()) {
         return dispatch(op, len, one, map, other, map, left_valid, right_valid, map);
     }
+    // A bit packed column against a literal, which is the pair the form was added for. The literal
+    // is turned into a code once and then the loop compares codes, so nothing is unpacked at all,
+    // and a literal outside what the width can hold answers the whole vector without a bit of it
+    // being read. Only the six comparisons that go null on a null side come here, because the other
+    // two want the null rule inside the loop and this loop does not have it.
+    if !op.is_total() {
+        if let (Some(packed), Some(value)) = (left.packed_parts(), right.constant_value()) {
+            let wanted = exact(held, left.logical_type(), value)?;
+            return Some(packed_against(op, &packed, wanted, len, map));
+        }
+        if let (Some(value), Some(packed)) = (left.constant_value(), right.packed_parts()) {
+            let wanted = exact(held, right.logical_type(), value)?;
+            return Some(packed_against(op.swapped(), &packed, wanted, len, map));
+        }
+    }
     if let (Some(one), Some(value)) = (left.data(), right.constant_value()) {
         let column = readied(held, left.logical_type(), value)?;
         let other = column.data()?;
@@ -420,6 +435,62 @@ where
         return dispatch(op.swapped(), len, other, at, one, map, right_valid, left_valid, map);
     }
     None
+}
+
+/// A literal as the whole number it is, and `None` for one that is not a whole number.
+///
+/// It goes through [`readied`] rather than reading the [`Value`] apart, so that a literal written
+/// as `900` against a `SMALLINT` column is narrowed by the same cast path every other comparison
+/// narrows it with. Reading the value apart here would be a second cast path with its own rounding
+/// and its own overflow rule, which is how two comparisons of the same literal end up disagreeing.
+fn exact(held: Option<&Held>, ty: &LogicalType, value: &Value) -> Option<i128> {
+    let column = readied(held, ty, value)?;
+    let data = column.data()?;
+    data.signed_at(0).or_else(|| data.unsigned_at(0).and_then(|value| i128::try_from(value).ok()))
+}
+
+/// A bit packed column against a literal, compared in the code space the column is already in.
+///
+/// The translation is one subtraction done once. After it the loop is a shift, a mask and a compare
+/// of two `u64`, which is what the flat loop would have been doing anyway minus the unpacking, so
+/// the form costs nothing on the operation a filter spends most of its time in.
+fn packed_against<M>(
+    op: Comparison,
+    packed: &Packed<'_>,
+    wanted: i128,
+    len: usize,
+    map: M,
+) -> Vec<bool>
+where
+    M: Fn(usize) -> usize + Copy,
+{
+    let Some(code) = packed.code_of(wanted) else {
+        // The literal is outside the range the width can hold, so every row answers the same way
+        // and the answer is arithmetic on two numbers rather than a pass over the column.
+        let above = wanted > packed.ceiling();
+        let same = match op {
+            Comparison::Equal | Comparison::NotDistinctFrom => false,
+            Comparison::NotEqual | Comparison::DistinctFrom => true,
+            Comparison::Less | Comparison::LessOrEqual => above,
+            Comparison::Greater | Comparison::GreaterOrEqual => !above,
+        };
+        return vec![same; len];
+    };
+    // The operator is decided before the loop rather than inside it, which is the same reason the
+    // generated loops take it as a function rather than matching per row.
+    let test: fn(u64, u64) -> bool = match op {
+        Comparison::Equal | Comparison::NotDistinctFrom => |found, want| found == want,
+        Comparison::NotEqual | Comparison::DistinctFrom => |found, want| found != want,
+        Comparison::Less => |found, want| found < want,
+        Comparison::LessOrEqual => |found, want| found <= want,
+        Comparison::Greater => |found, want| found > want,
+        Comparison::GreaterOrEqual => |found, want| found >= want,
+    };
+    let mut answers = Vec::with_capacity(len);
+    for row in 0..len {
+        answers.push(test(packed.code(map(row)), code));
+    }
+    answers
 }
 
 /// One loop per physical layout, generated rather than written out.
@@ -1413,5 +1484,83 @@ mod tests {
         let answer = compare_prepared(Comparison::Equal, &column, &constant, Some(&other))
             .expect("compares");
         assert_eq!(answer, compare(Comparison::Equal, &column, &constant).expect("compares"));
+    }
+
+    /// A bit packed column against a literal is compared in code space, which has to reach the
+    /// oracle's answer on all eight comparisons and with the literal on either side.
+    #[test]
+    fn a_packed_column_against_a_constant_answers_what_the_oracle_answers() {
+        let values: Vec<i32> = (0..64).map(|row| 1000 + (row * 37) % 500).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into()))
+            .expect("integers are an i32 layout");
+        let packed = flat.bit_packed().expect("a five hundred wide range packs");
+        assert_eq!(packed.form(), Form::BitPacked);
+        for literal in [999, 1000, 1200, 1499, 1500, 2000] {
+            let constant = Vector::constant(LogicalType::Integer, Value::Integer(literal), 64);
+            for op in EVERY {
+                agrees(op, &packed, &constant);
+                agrees(op, &constant, &packed);
+            }
+        }
+    }
+
+    /// The nulls of a packed column live in its validity rather than in its bits, so a comparison
+    /// has to blank them the way it blanks a flat column's, and the bits under them are whatever
+    /// the packing wrote there.
+    #[test]
+    fn a_packed_column_with_nulls_answers_what_the_oracle_answers() {
+        let values: Vec<i32> = (0..32).map(|row| 40 + row * 3).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into()))
+            .expect("integers are an i32 layout")
+            .with_validity(Validity::from_iter(32, |row| row % 5 != 0));
+        let packed = flat.bit_packed().expect("packs");
+        let constant = Vector::constant(LogicalType::Integer, Value::Integer(80), 32);
+        for op in EVERY {
+            agrees(op, &packed, &constant);
+        }
+    }
+
+    /// A literal the width cannot hold answers every row without a bit being read, and the answer
+    /// still has to be the one the oracle gives.
+    #[test]
+    fn a_literal_outside_the_packed_range_answers_the_whole_vector_at_once() {
+        let before = fallback::count(Kernel::Compare, Form::BitPacked, Form::Constant);
+        let values: Vec<i32> = (0..16).map(|row| 500 + row).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into()))
+            .expect("integers are an i32 layout");
+        let packed = flat.bit_packed().expect("packs");
+        let literals = [-1, 0, 499, 516, 100_000];
+        for literal in literals {
+            let constant = Vector::constant(LogicalType::Integer, Value::Integer(literal), 16);
+            for op in EVERY {
+                agrees(op, &packed, &constant);
+            }
+        }
+        // The six ordinary comparisons have a loop for this pair and the two that never go null do
+        // not, because those want the null rule inside the loop and the code space loop does not
+        // carry one. They take the row at a time path and count themselves, which is the counter
+        // doing its job rather than a gap being hidden.
+        let total = EVERY.iter().filter(|op| op.is_total()).count();
+        assert_eq!(
+            fallback::count(Kernel::Compare, Form::BitPacked, Form::Constant) - before,
+            (literals.len() * total) as u64,
+            "only the two total comparisons fall through"
+        );
+    }
+
+    /// The conjunct path reads the rows an earlier conjunct kept, so the code space loop has to be
+    /// reached through the selection rather than through the row number.
+    #[test]
+    fn refining_a_selection_over_a_packed_column_keeps_the_same_rows() {
+        let values: Vec<i32> = (0..64).map(|row| 200 + (row * 11) % 128).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.clone().into()))
+            .expect("integers are an i32 layout");
+        let packed = flat.bit_packed().expect("packs");
+        let kept = Selection::from_predicate(64, |row| row % 3 == 0);
+        let constant = Vector::constant(LogicalType::Integer, Value::Integer(260), 64);
+        let packed_rows = refine(Comparison::Greater, &packed, &constant, &kept).expect("refines");
+        let flat_rows = refine(Comparison::Greater, &flat, &constant, &kept).expect("refines");
+        assert_eq!(packed_rows.indices(), flat_rows.indices());
+        assert!(!packed_rows.is_empty(), "the literal is inside the range");
     }
 }

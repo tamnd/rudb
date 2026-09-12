@@ -54,4 +54,4 @@ pub use chunk::Chunk;
 pub use selection::Selection;
 pub use string::{INLINE_LIMIT, StringColumn, StringView};
 pub use validity::{Bitmap, Validity};
-pub use vector::{Data, Form, VECTOR_SIZE, Vector};
+pub use vector::{Data, Form, PACKED_WIDTH_MAX, PACKING_PAYS_AT, Packed, VECTOR_SIZE, Vector};

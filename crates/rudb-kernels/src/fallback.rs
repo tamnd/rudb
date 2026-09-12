@@ -1,11 +1,11 @@
 //! How often a kernel took the row at a time path, and for which shape of input.
 //!
 //! `spec/engine/03-data-plane.md` asks for this by name, and the reason is that the alternative to
-//! counting is guessing. There are four physical forms, so sixteen form pairs per kernel, and
-//! writing a hand tuned loop for all sixteen is both a lot of code and a lot of places for a wrong
-//! answer to hide. Writing three of them and a correct slow path for the rest is the right amount
-//! of code, but only if there is a way to find out that the fourth is on the hot path of a real
-//! query. That way is this.
+//! counting is guessing. There are six physical forms, so thirty six form pairs per kernel, and
+//! writing a hand tuned loop for all of them is both a lot of code and a lot of places for a wrong
+//! answer to hide. Writing the handful a real query hits and a correct slow path for the rest is
+//! the right amount of code, but only if there is a way to find out that one of the rest is on the
+//! hot path of a real query. That way is this.
 //!
 //! What gets counted is the fall through, not the fast path. A counter on the fast path would cost
 //! an atomic increment per vector on the loop this whole layer exists to make fast, and it would
@@ -95,7 +95,8 @@ impl Kernel {
 }
 
 /// Every physical form, in the order the table prints them.
-const FORMS: [Form; 4] = [Form::Flat, Form::Constant, Form::Sequence, Form::Dictionary];
+const FORMS: [Form; 6] =
+    [Form::Flat, Form::Constant, Form::Sequence, Form::Dictionary, Form::Rle, Form::BitPacked];
 
 /// The name of a form, for the report.
 fn form_name(form: Form) -> &'static str {
@@ -104,14 +105,16 @@ fn form_name(form: Form) -> &'static str {
         Form::Constant => "constant",
         Form::Sequence => "sequence",
         Form::Dictionary => "dictionary",
-        // `Form` is not exhaustive as far as this crate is concerned, and layer three adds
-        // `Encoded` to it. A name rather than a panic means the day that lands is a day the report
-        // says `other` for a while, not a day the report aborts the process.
+        Form::Rle => "rle",
+        Form::BitPacked => "bit-packed",
+        // `Form` is not exhaustive as far as this crate is concerned, and more encodings are coming
+        // to it. A name rather than a panic means the day one lands is a day the report says
+        // `other` for a while, not a day the report aborts the process.
         _ => "other",
     }
 }
 
-/// The position of a form in [`FORMS`], or four for one this build does not know about.
+/// The position of a form in [`FORMS`], or the slot past the end for one this build does not know.
 fn form_index(form: Form) -> usize {
     FORMS.iter().position(|&known| known == form).unwrap_or(FORMS.len())
 }
