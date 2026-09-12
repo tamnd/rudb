@@ -188,21 +188,64 @@ pub(crate) fn finish(
 }
 
 /// A one argument call, for the functions with a loop.
+///
+/// The argument is read through an index mapping rather than out of a slice, for the reason given on
+/// `by_form!`: a string column out of Parquet is dictionary encoded, and asking for `Vector::data`
+/// here meant every one of these functions fell out of its loop and took the row at a time path on
+/// the only files anybody runs. That was the second half of #288, and on the ClickBench file it is
+/// `length`, `strlen` and the `lower` in front of a `LIKE`.
 fn unary(name: &str, arg: &Vector, returns: &LogicalType, rows: usize) -> Result<Option<Vector>> {
-    let Some(data) = arg.data() else {
-        return Ok(None);
-    };
     let base = nulls_of(arg);
-    match name {
-        "not" => not_of(data, base, rows, returns),
-        "-" | "abs" if arg.logical_type() == returns => {
-            sign_of(name, data, base, rows, returns, arg)
+    match arg.form() {
+        Form::Flat => {
+            let Some(data) = arg.data() else {
+                return Ok(None);
+            };
+            one_of(name, data, identity, base, rows, returns, arg)
         }
-        "length" => length_of(data, base, rows, returns),
-        "strlen" => bytes_of(data, base, rows, returns),
-        "lower" | "upper" => fold_of(name, data, base, rows, returns),
-        "make_date" => made_date(data, base, rows, returns),
-        "epoch_ms" => made_timestamp(data, base, rows, returns),
+        Form::Dictionary => {
+            let Some((codes, values)) = arg.dictionary_parts() else {
+                return Ok(None);
+            };
+            if codes.len() < rows {
+                return Ok(None);
+            }
+            let Some(data) = values.data() else {
+                return Ok(None);
+            };
+            // Every code is inside the dictionary because `Vector::dictionary` checks that on the
+            // way in, so the gather needs no bound of its own.
+            one_of(name, data, move |index| codes[index] as usize, base, rows, returns, arg)
+        }
+        // There is no constant arm, and there is no point in one. A function whose every argument is
+        // constant is answered by `call` in a single row before it reaches here, and a one argument
+        // function has only the one argument to be constant. A sequence is a run of integers and
+        // none of these is worth a loop over one of those, `abs` being the closest and nobody
+        // writing it.
+        _ => Ok(None),
+    }
+}
+
+/// Which one argument function this is, once the argument's form has been turned into a mapping.
+fn one_of<A: Fn(usize) -> usize>(
+    name: &str,
+    data: &Data,
+    at: A,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+    arg: &Vector,
+) -> Result<Option<Vector>> {
+    match name {
+        "not" => not_of(data, at, base, rows, returns),
+        "-" | "abs" if arg.logical_type() == returns => {
+            sign_of(name, data, at, base, rows, returns, arg)
+        }
+        "length" => length_of(data, at, base, rows, returns),
+        "strlen" => bytes_of(data, at, base, rows, returns),
+        "lower" | "upper" => fold_of(name, data, at, base, rows, returns),
+        "make_date" => made_date(data, at, base, rows, returns),
+        "epoch_ms" => made_timestamp(data, at, base, rows, returns),
         _ => Ok(None),
     }
 }
@@ -212,10 +255,11 @@ fn unary(name: &str, arg: &Vector, returns: &LogicalType, rows: usize) -> Result
 /// A date is days since the epoch in an `i32` and so is the argument, so the whole function is the
 /// logical type changing and the run of values staying exactly as it was. It is here rather than
 /// left to the row at a time path because the ClickBench entry wraps a hundred million row column in
-/// it, and a copy is the difference between that costing a memcpy and costing a hundred million
-/// boxed values.
-fn made_date(
+/// it, and a copy is the difference between that costing one pass over a run of integers and costing
+/// a hundred million boxed values.
+fn made_date<A: Fn(usize) -> usize>(
     data: &Data,
+    at: A,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
@@ -223,12 +267,14 @@ fn made_date(
     let (Data::Int32(days), LogicalType::Date) = (data, returns) else {
         return Ok(None);
     };
-    finish(returns, Data::Int32(days[..rows].to_vec().into()), base.normalize(rows))
+    let out: Vec<i32> = (0..rows).map(|index| days[at(index)]).collect();
+    finish(returns, Data::Int32(out.into()), base.normalize(rows))
 }
 
 /// `epoch_ms(milliseconds)`, which is one multiply per row.
-fn made_timestamp(
+fn made_timestamp<A: Fn(usize) -> usize>(
     data: &Data,
+    at: A,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
@@ -238,7 +284,7 @@ fn made_timestamp(
     };
     let mut out = vec![0i64; rows];
     let validity = over_valid(rows, base, |index| {
-        out[index] = micros_of_millis(millis[index])?;
+        out[index] = micros_of_millis(millis[at(index)])?;
         Ok(())
     })?;
     finish(returns, Data::Int64(out.into()), validity)
@@ -255,8 +301,9 @@ fn micros_of_millis(millis: i64) -> Result<i64> {
 }
 
 /// `NOT`, which is one pass over a run of bytes.
-fn not_of(
+fn not_of<A: Fn(usize) -> usize>(
     data: &Data,
+    at: A,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
@@ -266,16 +313,17 @@ fn not_of(
     };
     let mut out = vec![false; rows];
     let validity = over_valid(rows, base, |index| {
-        out[index] = !held[index];
+        out[index] = !held[at(index)];
         Ok(())
     })?;
     finish(returns, Data::Bool(out.into()), validity)
 }
 
 /// Unary minus and `abs`, where the argument and the result are the same type.
-fn sign_of(
+fn sign_of<A: Fn(usize) -> usize>(
     name: &str,
     data: &Data,
+    at: A,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
@@ -291,7 +339,7 @@ fn sign_of(
                     Data::$variant(held) => {
                         let mut out = vec![0; rows];
                         let validity = over_valid(rows, base, |index| {
-                            let value = held[index];
+                            let value = held[at(index)];
                             let computed =
                                 if negating { value.checked_neg() } else { value.checked_abs() };
                             match computed {
@@ -314,7 +362,8 @@ fn sign_of(
                 Data::Float32(held) => {
                     let mut out = vec![0.0f32; rows];
                     let validity = over_valid(rows, base, |index| {
-                        out[index] = if negating { -held[index] } else { held[index].abs() };
+                        let value = held[at(index)];
+                        out[index] = if negating { -value } else { value.abs() };
                         Ok(())
                     })?;
                     finish(returns, Data::Float32(out.into()), validity)
@@ -322,7 +371,8 @@ fn sign_of(
                 Data::Float64(held) => {
                     let mut out = vec![0.0f64; rows];
                     let validity = over_valid(rows, base, |index| {
-                        out[index] = if negating { -held[index] } else { held[index].abs() };
+                        let value = held[at(index)];
+                        out[index] = if negating { -value } else { value.abs() };
                         Ok(())
                     })?;
                     finish(returns, Data::Float64(out.into()), validity)
@@ -338,8 +388,9 @@ fn sign_of(
 }
 
 /// `length`, which counts characters rather than bytes.
-fn length_of(
+fn length_of<A: Fn(usize) -> usize>(
     data: &Data,
+    at: A,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
@@ -349,7 +400,7 @@ fn length_of(
     };
     let mut out = vec![0i64; rows];
     let validity = over_valid(rows, base, |index| {
-        let bytes = column.bytes(index).unwrap_or_default();
+        let bytes = column.bytes(at(index)).unwrap_or_default();
         // A character in UTF-8 is one lead byte and some continuation bytes, and a continuation
         // byte is the ones matching `0b10xx_xxxx`. Counting the bytes that are not continuations is
         // the same number `chars().count()` reaches and it never decodes anything.
@@ -366,8 +417,9 @@ fn length_of(
 /// which is why this is a function of its own upstream rather than another name for `length`.
 /// ClickBench queries 28 and 29 are `AVG(STRLEN(URL))` and `AVG(STRLEN(Referer))` over a hundred
 /// million rows, so it gets the vectorized path for the same reason `length` has one.
-fn bytes_of(
+fn bytes_of<A: Fn(usize) -> usize>(
     data: &Data,
+    at: A,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
@@ -377,7 +429,7 @@ fn bytes_of(
     };
     let mut out = vec![0i64; rows];
     let validity = over_valid(rows, base, |index| {
-        let bytes = column.bytes(index).unwrap_or_default();
+        let bytes = column.bytes(at(index)).unwrap_or_default();
         out[index] = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
         Ok(())
     })?;
@@ -385,9 +437,10 @@ fn bytes_of(
 }
 
 /// `lower` and `upper`.
-fn fold_of(
+fn fold_of<A: Fn(usize) -> usize>(
     name: &str,
     data: &Data,
+    at: A,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
@@ -397,7 +450,7 @@ fn fold_of(
     };
     let lowering = name == "lower";
     let out = each_string(rows, &base, |index, into| {
-        let text = column.get(index).unwrap_or_default();
+        let text = column.get(at(index)).unwrap_or_default();
         // `str::to_lowercase` rather than folding the characters into a buffer that is reused
         // across the vector, which would save the allocation. It is not the same function: the
         // string form knows that a final sigma lowercases to a different letter than a medial one
@@ -1097,19 +1150,10 @@ fn like_of(
             let at = move |index: usize| codes[index] as usize;
             like_run(column, at, &compiled, base, rows, returns, fold_case, negated)
         }
-        // A constant text under a constant pattern is a thing the binder folds before it gets here,
-        // and it is one row of work if it does not, but it costs a line to keep the fall through
-        // count honest about what it is counting.
-        Form::Constant => {
-            let Some(value) = text.constant_value() else {
-                return Ok(None);
-            };
-            let held = single(text.logical_type(), value);
-            let Some(Data::Varlen(column)) = held.as_ref().and_then(Vector::data) else {
-                return Ok(None);
-            };
-            like_run(column, first, &compiled, base, rows, returns, fold_case, negated)
-        }
+        // There is no constant arm and there cannot be a useful one. This function needs the pattern
+        // to be constant to get this far, so a constant text here would be a call whose every
+        // argument is constant, and `call` answers one of those in a single row before it reaches
+        // any of this.
         _ => Ok(None),
     }
 }
@@ -1214,6 +1258,10 @@ impl Pattern {
 ///
 /// ClickBench query 43 groups a hundred million rows by `DATE_TRUNC('minute', EventTime)`, so this
 /// is a loop whose shape shows up in a number somebody publishes.
+///
+/// The days or the microseconds are read through an index mapping for the same reason `unary` reads
+/// its argument through one, which is #288: a date column out of Parquet can be dictionary encoded
+/// and a date column that a filter has been through usually is.
 fn date_of(
     name: &str,
     spec: &Vector,
@@ -1221,7 +1269,7 @@ fn date_of(
     returns: &LogicalType,
     rows: usize,
 ) -> Result<Option<Vector>> {
-    let (Some(Value::Varchar(spelling)), Some(data)) = (spec.constant_value(), when.data()) else {
+    let Some(Value::Varchar(spelling)) = spec.constant_value() else {
         return Ok(None);
     };
     let truncating = name == "date_trunc";
@@ -1236,11 +1284,54 @@ fn date_of(
     }
     let part = Part::parse(spelling)?;
     let base = nulls_of(when).and(&nulls_of(spec), rows);
+    match when.form() {
+        Form::Flat => {
+            let Some(data) = when.data() else {
+                return Ok(None);
+            };
+            date_runs(part, data, identity, base, rows, returns, when, truncating)
+        }
+        Form::Dictionary => {
+            let Some((codes, values)) = when.dictionary_parts() else {
+                return Ok(None);
+            };
+            if codes.len() < rows {
+                return Ok(None);
+            }
+            let Some(data) = values.data() else {
+                return Ok(None);
+            };
+            let at = move |index: usize| codes[index] as usize;
+            date_runs(part, data, at, base, rows, returns, when, truncating)
+        }
+        // No constant arm, because the part is constant in every query that reaches this at all and
+        // a constant date under a constant part is one row of work that `call` has already done.
+        _ => Ok(None),
+    }
+}
+
+/// The four `date_part` and `date_trunc` loops, once the form has been turned into a mapping.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the part, the days or microseconds and their mapping, the nulls, the row count, the \
+              type of the answer, the vector whose type picks the arm and which of the two \
+              functions this is"
+)]
+fn date_runs<A: Fn(usize) -> usize>(
+    part: Part,
+    data: &Data,
+    at: A,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+    when: &Vector,
+    truncating: bool,
+) -> Result<Option<Vector>> {
     match (when.logical_type(), data, truncating) {
         (LogicalType::Date, Data::Int32(days), false) => {
             let mut out = vec![0i64; rows];
             let validity = over_valid(rows, base, |index| {
-                out[index] = part.of_days(days[index])?;
+                out[index] = part.of_days(days[at(index)])?;
                 Ok(())
             })?;
             finish(returns, Data::Int64(out.into()), validity)
@@ -1248,7 +1339,7 @@ fn date_of(
         (LogicalType::Date, Data::Int32(days), true) => {
             let mut out = vec![0i32; rows];
             let validity = over_valid(rows, base, |index| {
-                out[index] = part.truncate_days(days[index])?;
+                out[index] = part.truncate_days(days[at(index)])?;
                 Ok(())
             })?;
             finish(returns, Data::Int32(out.into()), validity)
@@ -1256,7 +1347,7 @@ fn date_of(
         (LogicalType::Timestamp, Data::Int64(micros), false) => {
             let mut out = vec![0i64; rows];
             let validity = over_valid(rows, base, |index| {
-                out[index] = part.of_micros(micros[index])?;
+                out[index] = part.of_micros(micros[at(index)])?;
                 Ok(())
             })?;
             finish(returns, Data::Int64(out.into()), validity)
@@ -1264,7 +1355,7 @@ fn date_of(
         (LogicalType::Timestamp, Data::Int64(micros), true) => {
             let mut out = vec![0i64; rows];
             let validity = over_valid(rows, base, |index| {
-                out[index] = part.truncate_micros(micros[index])?;
+                out[index] = part.truncate_micros(micros[at(index)])?;
                 Ok(())
             })?;
             finish(returns, Data::Int64(out.into()), validity)
@@ -2110,13 +2201,69 @@ mod tests {
             [Value::Boolean(true), Value::Boolean(false), Value::Null, Value::Boolean(true)]
         );
 
-        // The constant text is the other arm, and the property test cannot reach it either: a
-        // constant text under a constant pattern is the one form pair `pairings` leaves out.
+        // A constant text is not the other arm, because there is no other arm. `call` answers a
+        // call whose every argument is constant in one row, and a constant text under a pattern
+        // that is not constant does not get past the pattern check.
         let text = Vector::constant(LogicalType::Varchar, Value::Varchar("google".into()), 4);
-        let answer = binary("~~", &text, &pattern, &LogicalType::Boolean, 4, None)
+        assert!(
+            binary("~~", &text, &pattern, &LogicalType::Boolean, 4, None)
+                .expect("the call is written")
+                .is_none()
+        );
+        assert_eq!(
+            call("~~", &[text, pattern], &LogicalType::Boolean, None)
+                .expect("the call is written")
+                .value_at(0),
+            Value::Boolean(true)
+        );
+    }
+
+    /// The one argument kernels and the date ones enter their loop on a dictionary.
+    ///
+    /// The same argument as the `LIKE` test above. `agrees` is satisfied when the row at a time path
+    /// answers for both sides, which is the bug rather than the test of it, so this asserts the loop
+    /// is entered at all. Per #288 `strlen` is the one ClickBench cares about most here, since q28
+    /// and q29 are `AVG(STRLEN(URL))` and `AVG(STRLEN(Referer))` and both of those columns are
+    /// dictionary encoded in the published file.
+    #[test]
+    fn a_dictionary_argument_reaches_the_one_argument_loops() {
+        let values = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("héllo".into()), Value::Varchar(String::new()), Value::Null],
+        )
+        .expect("builds");
+        let arg = Vector::dictionary(vec![0, 1, 2, 0], values).expect("codes are in range");
+        let read = |name: &str| {
+            let answer = unary(name, &arg, &LogicalType::BigInt, 4)
+                .expect("the call is written")
+                .expect("a dictionary argument has a loop of its own");
+            (0..4).map(|row| answer.value_at(row)).collect::<Vec<_>>()
+        };
+        // `length` counts characters and `strlen` counts bytes, and the first word is five of one
+        // and six of the other, so this says which loop ran as well as that one did.
+        assert_eq!(
+            read("length"),
+            [Value::BigInt(5), Value::BigInt(0), Value::Null, Value::BigInt(5)]
+        );
+        assert_eq!(
+            read("strlen"),
+            [Value::BigInt(6), Value::BigInt(0), Value::Null, Value::BigInt(6)]
+        );
+
+        let days = Vector::from_values(
+            LogicalType::Date,
+            &[Value::Date(0), Value::Date(16_000), Value::Null],
+        )
+        .expect("builds");
+        let when = Vector::dictionary(vec![0, 1, 2, 1], days).expect("codes are in range");
+        let part = Vector::constant(LogicalType::Varchar, Value::Varchar("year".into()), 4);
+        let years = date_of("date_part", &part, &when, &LogicalType::BigInt, 4)
             .expect("the call is written")
-            .expect("a constant text has a loop of its own");
-        assert!((0..4).all(|row| answer.value_at(row) == Value::Boolean(true)), "{answer:?}");
+            .expect("a dictionary date has a loop of its own");
+        assert_eq!(
+            (0..4).map(|row| years.value_at(row)).collect::<Vec<_>>(),
+            [Value::BigInt(1970), Value::BigInt(2013), Value::Null, Value::BigInt(2013)]
+        );
     }
 
     #[test]
@@ -2286,6 +2433,18 @@ mod tests {
     /// rows in order. Its last entry is deliberately unreferenced, which is the case where computing
     /// once per distinct value and computing once per row are allowed to disagree about whether
     /// something overflowed.
+    /// The one argument forms that have a loop, as a vector each, over the one column.
+    ///
+    /// A constant is not here, and the reason is the one `pairings` gives for leaving out constant
+    /// against constant. A call whose every argument is constant is answered by `call` in a single
+    /// row and comes back as a constant vector, which is right without being equal to the flat
+    /// vector the oracle builds, so `agrees` is the wrong test for it.
+    fn forms(arg: &Vector) -> Vec<Vector> {
+        let rows = arg.len();
+        let codes: Vec<u32> = (0..rows).map(|index| (rows - 1 - index) as u32 / 2).collect();
+        vec![arg.clone(), Vector::dictionary(codes, arg.clone()).expect("codes are in range")]
+    }
+
     fn pairings(left: &Vector, right: &Vector) -> Vec<(Vector, Vector)> {
         let rows = left.len();
         let as_constant = |vector: &Vector| {
@@ -2329,7 +2488,9 @@ mod tests {
                     }
                 }
                 for name in ["-", "abs"] {
-                    agrees(name, std::slice::from_ref(&left), ty);
+                    for arg in forms(&left) {
+                        agrees(name, std::slice::from_ref(&arg), ty);
+                    }
                 }
                 if matches!(ty, LogicalType::Double) {
                     for (one, other) in pairings(&left, &right) {
@@ -2346,11 +2507,13 @@ mod tests {
         for nulls in [0, 7, 1] {
             let left = sample(&LogicalType::Varchar, 96, nulls, &mut rng);
             let right = sample(&LogicalType::Varchar, 96, nulls, &mut rng);
-            for name in ["length", "strlen"] {
-                agrees(name, std::slice::from_ref(&left), &LogicalType::BigInt);
-            }
-            for name in ["lower", "upper"] {
-                agrees(name, std::slice::from_ref(&left), &LogicalType::Varchar);
+            for arg in forms(&left) {
+                for name in ["length", "strlen"] {
+                    agrees(name, std::slice::from_ref(&arg), &LogicalType::BigInt);
+                }
+                for name in ["lower", "upper"] {
+                    agrees(name, std::slice::from_ref(&arg), &LogicalType::Varchar);
+                }
             }
             for (one, other) in pairings(&left, &right) {
                 agrees("||", &[one, other], &LogicalType::Varchar);
@@ -2372,7 +2535,9 @@ mod tests {
                 }
             }
             let flags = sample(&LogicalType::Boolean, 96, nulls, &mut rng);
-            agrees("not", std::slice::from_ref(&flags), &LogicalType::Boolean);
+            for arg in forms(&flags) {
+                agrees("not", std::slice::from_ref(&arg), &LogicalType::Boolean);
+            }
         }
     }
 
@@ -2414,8 +2579,10 @@ mod tests {
                         Value::Varchar((*spelling).to_owned()),
                         96,
                     );
-                    agrees("date_part", &[part.clone(), when.clone()], &LogicalType::BigInt);
-                    agrees("date_trunc", &[part, when.clone()], &ty);
+                    for arg in forms(&when) {
+                        agrees("date_part", &[part.clone(), arg.clone()], &LogicalType::BigInt);
+                        agrees("date_trunc", &[part.clone(), arg], &ty);
+                    }
                 }
             }
         }
@@ -2567,16 +2734,22 @@ mod tests {
             &[Value::Integer(0), Value::Null, Value::Integer(16_000), Value::Integer(-1)],
         )
         .expect("four days");
-        agrees("make_date", &[days], &LogicalType::Date);
+        for arg in forms(&days) {
+            agrees("make_date", &[arg], &LogicalType::Date);
+        }
         let millis = Vector::from_values(
             LogicalType::BigInt,
             &[Value::BigInt(0), Value::Null, Value::BigInt(1_600_000_000_000), Value::BigInt(-1)],
         )
         .expect("four stamps");
-        agrees("epoch_ms", &[millis], &LogicalType::Timestamp);
+        for arg in forms(&millis) {
+            agrees("epoch_ms", &[arg], &LogicalType::Timestamp);
+        }
         let overflowing =
             Vector::from_values(LogicalType::BigInt, &[Value::BigInt(i64::MAX)]).expect("one row");
-        agrees("epoch_ms", &[overflowing], &LogicalType::Timestamp);
+        for arg in forms(&overflowing) {
+            agrees("epoch_ms", &[arg], &LogicalType::Timestamp);
+        }
     }
 
     #[test]
