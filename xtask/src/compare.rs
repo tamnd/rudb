@@ -128,7 +128,7 @@ fn build_harness(harness: &Path) -> Result<PathBuf, String> {
 /// is as strict as the workflow. This is not a gate. A warning in a dependency of the harness is
 /// not a reason to refuse to produce a measurement, and somebody who cannot get a number because of
 /// a lint is somebody who stops asking for numbers.
-fn build(at: &Path, args: &[&str], what: &str) -> Result<(), String> {
+pub(crate) fn build(at: &Path, args: &[&str], what: &str) -> Result<(), String> {
     println!("cargo {} in {}", args.join(" "), at.display());
     let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .args(args)
