@@ -301,15 +301,11 @@ impl<'a> Transform<'a> {
     /// prints, and a `SET` has no plan. An `INSERT` has a plan for its source and showing that
     /// would answer a question nobody asked, since the source is not what the statement does.
     ///
-    /// `ANALYZE` and the option list are refusals. `EXPLAIN ANALYZE` is per operator timing over a
-    /// query that actually ran, which needs the instrumentation `spec/engine/10-scheduler.md`
-    /// section 10.7 specifies, and answering it with a plan and no timings would be answering a
-    /// different question quietly.
+    /// The option list is a refusal. `EXPLAIN (FORMAT JSON)` asks for the plan in a shape nothing
+    /// here writes, and answering it with the text form would be answering a different question
+    /// quietly.
     fn explain_statement(&mut self, node: u32) -> Result<Statement> {
-        let analyze = self.find(node, "AnalyzeKeyword");
-        if analyze != NONE {
-            return self.unsupported(analyze);
-        }
+        let analyze = self.find(node, "AnalyzeKeyword") != NONE;
         let options = self.find(node, "ExplainOptionList");
         if options != NONE {
             return self.unsupported(options);
@@ -319,7 +315,7 @@ impl<'a> Transform<'a> {
             return self.unsupported(inner);
         }
         let query = self.query(self.find(inner, "SelectStatementInternal"))?;
-        Ok(Statement::Explain(query))
+        Ok(Statement::Explain { query, analyze })
     }
 
     /// `SetStatement <- 'SET' SetAssignmentOrTimeZone`.
@@ -2907,7 +2903,10 @@ mod tests {
                 };
                 format!("RESET{scope} {}", ast.string(setting.name))
             }
-            Statement::Explain(index) => format!("EXPLAIN {}", show_query(&ast, index)),
+            Statement::Explain { query, analyze } => {
+                let analyze = if analyze { "ANALYZE " } else { "" };
+                format!("EXPLAIN {analyze}{}", show_query(&ast, query))
+            }
         }
     }
 
@@ -2918,14 +2917,14 @@ mod tests {
             "EXPLAIN SELECT a FROM t WHERE (a Gt 1)"
         );
         assert_eq!(round_statement("explain select 1"), "EXPLAIN SELECT 1");
+        assert_eq!(round_statement("explain analyze select 1"), "EXPLAIN ANALYZE SELECT 1");
     }
 
     #[test]
     fn the_parts_of_an_explain_that_are_not_the_query_are_refused_by_name() {
-        // A plan with no timings on it is an answer to a different question, and an option list
-        // that chooses a format is a promise about the output this does not keep.
+        // An option list that chooses a format is a promise about the output this does not keep,
+        // and a statement that is not a query has no plan to show.
         for (query, named) in [
-            ("EXPLAIN ANALYZE SELECT 1", "AnalyzeKeyword"),
             ("EXPLAIN (FORMAT JSON) SELECT 1", "ExplainOptionList"),
             ("EXPLAIN INSERT INTO t VALUES (1)", "InsertStatement"),
             ("EXPLAIN CREATE TABLE u (a INTEGER)", "CreateStatement"),
