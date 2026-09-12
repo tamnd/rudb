@@ -24,6 +24,7 @@ rudb-catalog.workspace = true
 rudb-txn.workspace = true
 rudb-storage.workspace = true
 rudb-vector.workspace = true
+rudb-metrics.workspace = true
 rudb-arrow.workspace = true
 rudb-io.workspace = true
 

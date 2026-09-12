@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use rudb_arrow::{DataType, Field, RecordBatch, Schema};
 use rudb_common::{LogicalType, Memory, Reservation, Result, Value};
+use rudb_metrics::Document;
 use rudb_vector::Chunk;
 
 /// The rows a query produced, with the names and types of its columns.
@@ -36,6 +37,9 @@ pub struct QueryResult {
     /// to another thread has not doubled its data in any sense it would recognize, and refusing its
     /// next query because it did would be a worse answer than the one it gets.
     held: Arc<Reservation>,
+    /// What the execution that produced these rows measured about itself, when it was an execution
+    /// at all.
+    metrics: Option<Document>,
 }
 
 impl QueryResult {
@@ -54,7 +58,14 @@ impl QueryResult {
             rows += chunk.len();
         }
         starts.push(rows);
-        Self { names, types, chunks, starts, rows, held: Arc::new(held) }
+        Self { names, types, chunks, starts, rows, held: Arc::new(held), metrics: None }
+    }
+
+    /// The same result, carrying the document the execution that produced it filled in.
+    #[must_use]
+    pub(crate) fn measured(mut self, metrics: Document) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// A result of no columns and no rows, which is what a statement that writes hands back.
@@ -88,6 +99,22 @@ impl QueryResult {
     #[must_use]
     pub fn footprint(&self) -> u64 {
         self.held.bytes()
+    }
+
+    /// What the execution measured about itself, for a result that came from one.
+    ///
+    /// There is nothing here for a statement that ran no plan, which is a `SET`, a `CREATE` with no
+    /// query in it, or an `EXPLAIN`, since none of those execute anything to measure. Everything
+    /// else carries a document with a row per operator and a row per pipeline, which is what
+    /// `EXPLAIN ANALYZE` prints and what `--metrics` writes out as JSON.
+    ///
+    /// It hangs off the result rather than off the connection because a result outlives the query
+    /// and two of them can be held at once. Numbers kept on the connection would be the numbers of
+    /// whichever query ran most recently, which is not a question anybody is asking when they are
+    /// holding the result of a particular one.
+    #[must_use]
+    pub fn metrics(&self) -> Option<&Document> {
+        self.metrics.as_ref()
     }
 
     /// How many columns.

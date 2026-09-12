@@ -2444,3 +2444,97 @@ fn rudb_strategies_takes_no_arguments() {
         "a call with an argument is a binder error rather than an ignored argument"
     );
 }
+
+/// The operator of this kind, for a test that wants to look at one.
+fn operator<'a>(metrics: &'a rudb_metrics::Document, kind: &str) -> &'a rudb_metrics::Operator {
+    metrics
+        .operators
+        .iter()
+        .find(|operator| operator.kind == kind)
+        .unwrap_or_else(|| panic!("a {kind} in {:?}", metrics.operators))
+}
+
+#[test]
+fn a_query_reports_what_every_operator_in_it_did() {
+    let db = database();
+    let result = db.query("SELECT x FROM t WHERE x > 1").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    assert_eq!(metrics.query.sql, "SELECT x FROM t WHERE x > 1");
+    let scan = operator(metrics, "Scan");
+    let filter = operator(metrics, "Filter");
+    assert_eq!(scan.detail.as_deref(), Some("t"), "a scan says what it read");
+    assert_eq!(scan.rows_out, 4, "the table has four rows and the scan produced them");
+    assert_eq!(filter.rows_in, 4, "what the scan produced is what the filter was handed");
+    assert_eq!(filter.rows_out, 2, "two rows are over one");
+    assert_eq!(filter.pipeline, scan.pipeline, "nothing here breaks a pipeline");
+    assert!(metrics.timing.execute_ns > 0, "running it took longer than nothing");
+    assert!(
+        metrics.operators.iter().all(|operator| operator.reference_impl),
+        "everything at tier 0 is the reference implementation and the document says so"
+    );
+}
+
+#[test]
+fn every_operator_has_its_own_id_and_a_parent_is_numbered_before_its_children() {
+    let db = database();
+    let result = db.query("SELECT count(*) FROM t WHERE x > 1").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let ids: Vec<u32> = metrics.operators.iter().map(|operator| operator.id).collect();
+    assert_eq!(ids, (0..u32::try_from(ids.len()).unwrap()).collect::<Vec<_>>());
+    let scan = operator(metrics, "Scan");
+    let filter = operator(metrics, "Filter");
+    assert!(filter.id < scan.id, "the filter is above the scan, so it is numbered first");
+}
+
+#[test]
+fn a_sort_is_a_pipeline_that_the_one_above_it_waits_for() {
+    let db = database();
+    let result = db.query("SELECT x FROM t ORDER BY x").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let sort = operator(metrics, "Sort");
+    assert_eq!(metrics.pipelines.len(), 2, "a sort breaks the pipeline in two");
+    assert_eq!(metrics.pipelines[0].id, 0);
+    assert_eq!(metrics.pipelines[0].depends_on, vec![1], "the root waits for the sort");
+    assert_eq!(sort.pipeline, 1, "the sort ends the pipeline below");
+    assert_eq!(sort.rows_in, 4, "every row went into it");
+    assert!(metrics.pipelines[1].wall_ns > 0, "a pipeline's time is its operators' time");
+}
+
+#[test]
+fn a_join_is_three_pipelines_in_the_order_they_have_to_run() {
+    let db = database();
+    let result = db.query("SELECT t.x FROM t JOIN t AS u ON t.x = u.x").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    assert_eq!(metrics.pipelines.len(), 3, "one to gather the build side, one to probe, one above");
+    let gather = operator(metrics, "Gather");
+    let join = operator(metrics, "Join");
+    assert_eq!(
+        metrics.pipelines[0].depends_on,
+        vec![join.pipeline],
+        "the root waits for the probe"
+    );
+    assert_eq!(
+        metrics.pipelines[usize::try_from(join.pipeline).unwrap()].depends_on,
+        vec![gather.pipeline],
+        "the probe waits for the side that is gathered first"
+    );
+    assert_eq!(gather.rows_in, 4, "the whole right side was gathered");
+}
+
+#[test]
+fn a_statement_that_runs_no_plan_has_nothing_to_report() {
+    let db = database();
+    assert!(db.query("EXPLAIN SELECT 1").unwrap().metrics().is_none(), "explain runs nothing");
+    assert!(db.execute("SET threads = 2").unwrap().metrics().is_none(), "a setting runs nothing");
+}
+
+#[test]
+fn the_document_a_query_produces_is_the_json_a_harness_reads() {
+    let db = database();
+    let result = db.query("SELECT count(*) FROM t").unwrap();
+    let written = result.metrics().expect("a query that ran has metrics").render();
+    assert!(written.starts_with("{\n  \"schema\": 1,"), "{written}");
+    assert!(written.contains("\"sql\": \"SELECT count(*) FROM t\""), "{written}");
+    assert!(written.contains("\"kind\": \"Scan\""), "{written}");
+    assert!(written.contains("\"reference_impl\": true"), "{written}");
+}

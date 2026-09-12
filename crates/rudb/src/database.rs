@@ -5,6 +5,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rudb_bind::{Bound, Parameters};
 use rudb_catalog::{Catalog, Entry, View};
 use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Value};
+use rudb_metrics::{Document, Report, Span};
 
 use rudb_parse::ast::Ast;
 use rudb_vector::{Chunk, Vector};
@@ -378,7 +379,7 @@ impl Shared {
         match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new())? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                run(&plan, &catalog, cancel, &self.inner.memory)
+                run(sql, &plan, &catalog, cancel, &self.inner.memory)
             }
             Bound::Explain(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
@@ -459,7 +460,7 @@ impl Shared {
     pub(crate) fn execute(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let ast = rudb_parse::parse_ast(sql)?;
         let _seams = self.seams(sql)?;
-        self.execute_ast(&ast, &Parameters::new(), cancel)
+        self.execute_ast(&ast, sql, &Parameters::new(), cancel)
     }
 
     /// Runs one parsed statement, with values for its parameters.
@@ -469,6 +470,7 @@ impl Shared {
     pub(crate) fn execute_ast(
         &self,
         ast: &Ast,
+        sql: &str,
         parameters: &Parameters,
         cancel: &Cancel,
     ) -> Result<QueryResult> {
@@ -477,7 +479,7 @@ impl Shared {
         match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                run(&plan, &catalog, cancel, &self.inner.memory)
+                run(sql, &plan, &catalog, cancel, &self.inner.memory)
             }
             Bound::Explain(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
@@ -494,7 +496,7 @@ impl Shared {
                 Ok(QueryResult::empty())
             }
             Bound::CreateTable(create) => {
-                create_table(create, &mut catalog, cancel, &self.inner.memory, &context)?;
+                create_table(sql, create, &mut catalog, cancel, &self.inner.memory, &context)?;
                 Ok(QueryResult::empty())
             }
             Bound::CreateView(create) => {
@@ -516,7 +518,7 @@ impl Shared {
                 // and a version of this that appended chunk by chunk would either read its own
                 // output forever or depend on how the scan holds its chunks.
                 rudb_opt::optimize_with(&mut insert.source, &context)?;
-                let result = run(&insert.source, &catalog, cancel, &self.inner.memory)?;
+                let result = run(sql, &insert.source, &catalog, cancel, &self.inner.memory)?;
                 let table = catalog.table_mut(&insert.name)?;
                 for chunk in result.into_chunks() {
                     table.append(chunk)?;
@@ -548,17 +550,33 @@ fn planned(
 /// The result is materialized, so it is charged, and the charge is handed to the result and
 /// released when the result is dropped. That is what makes a program holding ten results at once
 /// count as holding ten results: the limit is on the database and a result outlives the query.
+///
+/// This is also the one place a metrics document is made. Everything in it below the top level
+/// comes out of the report the builder filled, and the two spans here are the two things only this
+/// function knows: how long the tree took to build and how long it took to drain. Parsing, binding
+/// and optimizing happened before this was called and their timings stay at zero until the clock
+/// moves up to the statement path.
+///
+/// A query that fails part way through has a document too, and it is thrown away here, because an
+/// error is a [`rudb_common::Error`] and that type is two ranks below the one the document lives
+/// in. Carrying it out of a failure is worth doing and it is a change to how an error is reported
+/// rather than a change to this function.
 fn run(
+    sql: &str,
     plan: &rudb_plan::Plan,
     catalog: &Catalog,
     cancel: &Cancel,
     memory: &Memory,
 ) -> Result<QueryResult> {
-    let mut root = rudb_exec::build_with(plan, catalog, cancel, memory)?;
+    let report = Report::new();
+    let building = Span::start();
+    let mut root = rudb_exec::build_measured(plan, catalog, cancel, memory, &report)?;
+    let (built_wall, built_cpu) = building.stop();
     let names = root.schema().names();
     let types = root.schema().types();
     let mut held = memory.reservation();
     let mut chunks = Vec::new();
+    let running = Span::start();
     while let Some(chunk) = root.next()? {
         if chunk.is_empty() {
             continue;
@@ -567,7 +585,16 @@ fn run(
         held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
         chunks.push(chunk);
     }
-    Ok(QueryResult::new(names, types, chunks, held))
+    let (ran_wall, ran_cpu) = running.stop();
+    let mut metrics = Document::new(sql);
+    metrics.settings.memory_limit = memory.limit();
+    metrics.settings.threads = 1;
+    metrics.timing.physical_ns = built_wall;
+    metrics.timing.execute_ns = ran_wall;
+    metrics.timing.total_ns = built_wall.saturating_add(ran_wall);
+    metrics.resource.cpu_ns = built_cpu.saturating_add(ran_cpu);
+    report.fill(&mut metrics);
+    Ok(QueryResult::new(names, types, chunks, held).measured(metrics))
 }
 
 /// One row of two strings, which is the result set `EXPLAIN` hands back.
@@ -608,6 +635,7 @@ fn create_view(create: rudb_bind::CreateView, catalog: &mut Catalog) -> Result<(
 
 /// The `CREATE TABLE` half of a statement.
 fn create_table(
+    sql: &str,
     mut create: rudb_bind::CreateTable,
     catalog: &mut Catalog,
     cancel: &Cancel,
@@ -622,7 +650,7 @@ fn create_table(
     let rows = match &mut create.source {
         Some(plan) => {
             rudb_opt::optimize_with(plan, context)?;
-            Some(run(plan, catalog, cancel, memory)?)
+            Some(run(sql, plan, catalog, cancel, memory)?)
         }
         None => None,
     };
