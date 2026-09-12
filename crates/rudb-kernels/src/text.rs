@@ -1,5 +1,6 @@
-//! The four string functions that have a grammar rule of their own: `substring`, `position`,
-//! `trim` and `overlay`, plus the aliases upstream answers the same way.
+//! The string functions that work a character at a time: `substring`, `position`, `trim` and
+//! `overlay`, which have a grammar rule of their own, plus `left`, `right`, `replace` and `chr`,
+//! which do not, plus the aliases upstream answers the same way.
 //!
 //! Every rule below was measured against `v2.0.0-dev84237` one statement at a time, because none of
 //! it follows from the others. Indices are characters and not bytes, so `substring('héllo', 2, 2)`
@@ -17,6 +18,12 @@
 //! which was measured with `length(trim(chr(9) || 'a'))` coming back 2, so this is not a rule about
 //! whitespace. With characters named it strips any of them, as a set of characters rather than as a
 //! prefix, so `trim('xyaxy', 'xy')` is `a`.
+//!
+//! `left`, `right` and `replace` are the three that have no rule and no surprises in the ordinary
+//! direction, and one each in the other. A negative count to `left` or `right` counts from the far
+//! end instead of raising, and an empty needle to `replace` changes nothing instead of matching
+//! everywhere. `chr` is a code point rather than a byte and it raises on a code point that is not
+//! one.
 //!
 //! `overlay` is a prefix, the replacement and a suffix. The suffix starts at `start + length` and
 //! never before the first character, and a negative length means the length of the replacement
@@ -108,6 +115,52 @@ pub(crate) fn overlay(
     out.push_str(replacement);
     out.extend(&characters[after..]);
     Ok(Value::Varchar(out))
+}
+
+/// `left(text, count)` and `right(text, count)` on one row.
+///
+/// Characters and not bytes, clamped at both ends, and a negative count is a count from the other
+/// end rather than an error or an empty answer: `left('abc', -1)` is `ab` and `right('abc', -1)` is
+/// `bc`, so each of them drops that many characters off the end it does not start at.
+pub(crate) fn end(name: &str, text: &Value, count: &Value) -> Result<Value> {
+    let characters: Vec<char> = string(text)?.chars().collect();
+    let total = characters.len() as i128;
+    let count = whole(count)?;
+    let kept = if count < 0 { (total + count).max(0) } else { count.min(total) } as usize;
+    let kept: String = if name == "left" {
+        characters[..kept].iter().collect()
+    } else {
+        characters[characters.len() - kept..].iter().collect()
+    };
+    Ok(Value::Varchar(kept))
+}
+
+/// `replace(text, needle, replacement)` on one row.
+///
+/// An empty needle changes nothing, which is worth writing down because the obvious loop writes an
+/// infinite one and because `str::replace` would answer `xaxaxax` to `replace('aaa', '', 'x')`
+/// where upstream answers `aaa`.
+pub(crate) fn replace(text: &Value, needle: &Value, replacement: &Value) -> Result<Value> {
+    let (text, needle, replacement) = (string(text)?, string(needle)?, string(replacement)?);
+    if needle.is_empty() {
+        return Ok(Value::Varchar(text.to_string()));
+    }
+    Ok(Value::Varchar(text.replace(needle, replacement)))
+}
+
+/// `chr(code)` on one row.
+///
+/// A code point and not a byte, so `chr(233)` is `é` and one character long. A code point that is
+/// not one raises, in upstream's words, and that includes the surrogates, which are code points that
+/// no string may hold. Zero is not one of them: `chr(0)` is a string one character long holding a
+/// null, which is what `length(chr(0))` says upstream.
+pub(crate) fn chr(code: &Value) -> Result<Value> {
+    let code = whole(code)?;
+    let character = u32::try_from(code).ok().and_then(char::from_u32);
+    match character {
+        Some(character) => Ok(Value::Varchar(character.to_string())),
+        None => Err(Error::invalid_input(format!("Invalid UTF8 Codepoint {code}"))),
+    }
 }
 
 /// The string an argument is, which the binder has already cast to a VARCHAR.
@@ -233,5 +286,53 @@ mod tests {
         // before the first one.
         assert_eq!(case("XY", -1, Some(2)), "XYabcdef");
         assert_eq!(case("XY", -5, Some(2)), "XYabcdef");
+    }
+
+    #[test]
+    fn a_negative_count_to_left_or_right_counts_from_the_other_end() {
+        let case = |name: &str, held: &str, count: i64| shown(end(name, &text(held), &at(count)));
+        assert_eq!(case("left", "abcdef", 2), "ab");
+        assert_eq!(case("right", "abcdef", 2), "ef");
+        assert_eq!(case("left", "abc", 0), "");
+        assert_eq!(case("right", "abc", 0), "");
+        // Characters and not bytes, which is the rule the whole of this module follows.
+        assert_eq!(case("left", "héllo", 2), "hé");
+        assert_eq!(case("right", "héllo", 2), "lo");
+        // A negative count drops that many off the end it does not start at, and both clamp rather
+        // than raise once the count is past the string.
+        assert_eq!(case("left", "abc", -1), "ab");
+        assert_eq!(case("right", "abc", -1), "bc");
+        assert_eq!(case("left", "abc", -99), "");
+        assert_eq!(case("right", "abc", -99), "");
+        assert_eq!(case("left", "abc", 99), "abc");
+        assert_eq!(case("right", "abc", 99), "abc");
+    }
+
+    #[test]
+    fn an_empty_needle_to_replace_changes_nothing() {
+        let case = |held: &str, needle: &str, with: &str| {
+            shown(replace(&text(held), &text(needle), &text(with)))
+        };
+        assert_eq!(case("abc", "b", "x"), "axc");
+        assert_eq!(case("aaa", "a", "xy"), "xyxyxy");
+        assert_eq!(case("abc", "z", "x"), "abc");
+        // `str::replace` would answer `xaxaxax` here, which is the whole reason this is written
+        // down rather than left to the standard library.
+        assert_eq!(case("aaa", "", "x"), "aaa");
+        assert_eq!(case("abc", "b", ""), "ac");
+    }
+
+    #[test]
+    fn chr_is_a_code_point_and_raises_on_one_that_is_not() {
+        assert_eq!(shown(chr(&Value::Integer(65))), "A");
+        assert_eq!(shown(chr(&Value::Integer(233))), "é");
+        // Zero is a code point like any other and the string it makes is one character long.
+        assert_eq!(shown(chr(&Value::Integer(0))).chars().count(), 1);
+        // A surrogate is a code point no string may hold, so it is refused with the same sentence
+        // as a negative one and one past the end.
+        for code in [-1, 55_296, 1_114_112] {
+            let why = chr(&Value::Integer(code)).expect_err("that is not a code point");
+            assert_eq!(why.message(), format!("Invalid UTF8 Codepoint {code}"));
+        }
     }
 }
