@@ -490,6 +490,7 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
         LogicalType::Varchar => Ok(Value::Varchar(value.to_string())),
         LogicalType::Blob => to_blob(value),
         LogicalType::Date => to_date(value),
+        LogicalType::Time => to_time(value),
         LogicalType::Timestamp => to_timestamp(value),
         other => {
             Err(Error::not_implemented(format!("a cast from {} to {other}", value.logical_type())))
@@ -801,6 +802,27 @@ fn to_date(value: &Value) -> Result<Value> {
     }
 }
 
+/// A `TIME`, which reads a written clock with far more slack than a date or a timestamp does.
+///
+/// The parser is upstream's and it is a different parser, not the same one with a different
+/// message. There is one sentence for every way of failing, the seconds and the fraction are both
+/// optional, a date in front is read and thrown away, and whatever is after the numbers is
+/// ignored, so `'12:34:56 UTC'` and `'12:34:56abc'` are both twelve thirty four.
+fn to_time(value: &Value) -> Result<Value> {
+    match value {
+        Value::Timestamp(micros) => Ok(Value::Time(micros.rem_euclid(MICROS_PER_DAY))),
+        Value::Varchar(text) => parse_clock(text).map(Value::Time).ok_or_else(|| bad_time(text)),
+        _ => Err(no_cast(value, &LogicalType::Time)),
+    }
+}
+
+/// The one failure a written time has, which says the format even though it is the range sentence.
+fn bad_time(text: &str) -> Error {
+    Error::conversion(format!(
+        "time field value out of range: \"{text}\", expected format is ([YYYY-MM-DD ]HH:MM:SS[.MS])"
+    ))
+}
+
 fn to_timestamp(value: &Value) -> Result<Value> {
     match value {
         Value::Date(days) => Ok(Value::Timestamp(i64::from(*days) * MICROS_PER_DAY)),
@@ -959,6 +981,85 @@ fn parse_time(text: &str) -> Parsed<i64> {
         return Err(Fault::Range);
     }
     Ok(since_midnight)
+}
+
+/// `[YYYY-MM-DD ]HH:MM[:SS[.ffffff]]` as microseconds since midnight, ignoring what follows.
+///
+/// This is the `TIME` parser and it is deliberately not `parse_time` above, because the rules are
+/// not the same ones. A date in front is read and thrown away and a bare date is midnight, so
+/// `'2020-01-02'` is `00:00:00`, but a date with nothing after the separator is refused, which is
+/// why `'2020-01-02 '` fails and `' 12:34:56 '` does not. Every one of these was measured.
+fn parse_clock(text: &str) -> Option<i64> {
+    let text = text.trim_start();
+    let clock = match split_time(text) {
+        // A dash is a date only when it comes before any clock, because the offset on the end of
+        // `'12:34:56-05'` is a dash too and that is a time and not a day.
+        (day, rest) if day.contains('-') && !day.contains(':') => {
+            parse_day(day).ok()?;
+            match rest {
+                // A day on its own is midnight, and a day with a separator and nothing after it is
+                // a time that was not written.
+                None => return Some(0),
+                Some(rest) => rest,
+            }
+        }
+        _ => text,
+    };
+    clock_micros(clock)
+}
+
+/// The clock itself, once any date in front of it has been dealt with.
+fn clock_micros(text: &str) -> Option<i64> {
+    let mut rest = text;
+    let hours = number(&mut rest)?;
+    if !eat(&mut rest, b':') {
+        return None;
+    }
+    let minutes = number(&mut rest)?;
+    let mut seconds = 0;
+    let mut micros = 0;
+    // A colon with nothing after it is not a failure, so `'12:34:'` is twelve thirty four, but a
+    // colon with something after it that is not a number is. The dot is slacker still and anything
+    // at all can follow it, which is how `'12:34:56.abc'` comes back as twelve thirty four and six.
+    if eat(&mut rest, b':') && !rest.is_empty() {
+        seconds = number(&mut rest)?;
+        if eat(&mut rest, b'.') {
+            micros = fraction(rest);
+        }
+    }
+    if !(0..=24).contains(&hours) || !(0..60).contains(&minutes) || !(0..60).contains(&seconds) {
+        return None;
+    }
+    let since_midnight = ((hours * 60 + minutes) * 60 + seconds) * 1_000_000 + micros;
+    (since_midnight <= MICROS_PER_DAY).then_some(since_midnight)
+}
+
+/// The number at the front of `rest`, which is moved past it. A number too long to hold is `None`
+/// rather than a wrap, which is the same answer an hour of 25 gets.
+fn number(rest: &mut &str) -> Option<i64> {
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let (number, tail) = rest.split_at(digits);
+    *rest = tail;
+    number.parse().ok()
+}
+
+/// Whether `rest` starts with `byte`, which is moved past when it does.
+fn eat(rest: &mut &str, byte: u8) -> bool {
+    let Some(tail) = rest.strip_prefix(byte as char) else {
+        return false;
+    };
+    *rest = tail;
+    true
+}
+
+/// The microseconds a written fraction of a second is worth, reading six digits at the most and
+/// throwing away whatever is after them, so `.1234567` is `.123456` and `.5` is half a second.
+fn fraction(text: &str) -> i64 {
+    let digits: String = text.chars().take_while(char::is_ascii_digit).take(6).collect();
+    if digits.is_empty() {
+        return 0;
+    }
+    format!("{digits:0<6}").parse().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1220,6 +1321,91 @@ mod tests {
             let error = cast_to(Value::Varchar(text.into()), &LogicalType::Timestamp)
                 .expect_err("this is not a timestamp");
             assert_eq!(error.message(), said);
+        }
+    }
+
+    /// Every rule the TIME parser has, per #228, all of them measured against the pinned binary.
+    ///
+    /// The slack is the point. The seconds and the fraction are optional, a colon with nothing
+    /// after it is not a failure, the fraction is cut at six digits rather than refused, a date in
+    /// front is thrown away, and whatever is behind the numbers is ignored, which is what makes
+    /// `'12:34:56 UTC'` a time here.
+    #[test]
+    fn a_written_time_is_read_with_all_the_slack_duckdb_reads_it_with() {
+        let at = |hours: i64, minutes: i64, seconds: i64, micros: i64| {
+            Value::Time(((hours * 60 + minutes) * 60 + seconds) * 1_000_000 + micros)
+        };
+        for (text, expected) in [
+            ("12:34:56", at(12, 34, 56, 0)),
+            ("12:34:56.123456", at(12, 34, 56, 123_456)),
+            ("12:34:56.5", at(12, 34, 56, 500_000)),
+            ("12:34:56.1234567", at(12, 34, 56, 123_456)),
+            ("12:34", at(12, 34, 0, 0)),
+            ("12:34:", at(12, 34, 0, 0)),
+            ("12:34:56.", at(12, 34, 56, 0)),
+            ("12:34:56.abc", at(12, 34, 56, 0)),
+            ("1:2:3", at(1, 2, 3, 0)),
+            ("0:0:0", at(0, 0, 0, 0)),
+            (" 12:34:56 ", at(12, 34, 56, 0)),
+            ("24:00:00", at(24, 0, 0, 0)),
+            ("12:34:56 UTC", at(12, 34, 56, 0)),
+            ("12:34:56+05:30", at(12, 34, 56, 0)),
+            ("12:34:56-05", at(12, 34, 56, 0)),
+            ("12:34:56abc", at(12, 34, 56, 0)),
+            ("2024-01-02 03:04:05", at(3, 4, 5, 0)),
+            ("2024-01-02T03:04:05", at(3, 4, 5, 0)),
+            ("2020-01-02", at(0, 0, 0, 0)),
+        ] {
+            let time = cast_to(Value::Varchar(text.into()), &LogicalType::Time);
+            assert_eq!(time.as_ref().ok(), Some(&expected), "{text}: {time:?}");
+        }
+    }
+
+    /// One sentence for every way a written time can be wrong, which is not the split the date and
+    /// the timestamp have, and it carries the format although it is the range wording.
+    #[test]
+    fn a_written_time_that_is_not_one_says_the_only_thing_duckdb_says_about_it() {
+        for text in [
+            "abc",
+            "12",
+            "24:00:01",
+            "25:00:00",
+            "10:70:00",
+            "10:00:60",
+            "12::56",
+            "1234:56",
+            "12:34:abc",
+            "-01:00:00",
+            "24:00:00.000001",
+            "2024-13-02 03:04:05",
+            "2020-01-02 ",
+        ] {
+            let error = cast_to(Value::Varchar(text.into()), &LogicalType::Time)
+                .expect_err("this is not a time");
+            assert_eq!(
+                error.message(),
+                format!(
+                    "time field value out of range: \"{text}\", expected format is ([YYYY-MM-DD ]HH:MM:SS[.MS])"
+                )
+            );
+        }
+    }
+
+    /// A timestamp keeps the clock and drops the day, and everything else has no cast at all.
+    #[test]
+    fn a_timestamp_casts_to_the_time_of_day_it_is() {
+        let stamp = Value::Timestamp(i64::from(days_from_civil(2024, 1, 2)) * MICROS_PER_DAY + 5);
+        assert_eq!(cast_to(stamp, &LogicalType::Time).expect("a time"), Value::Time(5));
+        let before = Value::Timestamp(-1);
+        assert_eq!(
+            cast_to(before, &LogicalType::Time).expect("a time"),
+            Value::Time(MICROS_PER_DAY - 1),
+            "the last microsecond of 1969 is the last microsecond of the day"
+        );
+        for value in [Value::Date(0), Value::Integer(1)] {
+            let written = value.logical_type();
+            let error = cast_to(value, &LogicalType::Time).expect_err("no cast for this");
+            assert_eq!(error.message(), format!("Unimplemented type for cast ({written} -> TIME)"));
         }
     }
 
