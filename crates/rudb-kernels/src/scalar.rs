@@ -1375,6 +1375,15 @@ fn date_runs<A: Fn(usize) -> usize>(
             })?;
             finish(returns, Data::Int64(out.into()), validity)
         }
+        (LogicalType::Interval, Data::Interval(fields), true) => {
+            let mut out = vec![(0i32, 0i32, 0i64); rows];
+            let validity = over_valid(rows, base, |index| {
+                let (months, days, micros) = fields[at(index)];
+                out[index] = part.truncate_interval(months, days, micros)?;
+                Ok(())
+            })?;
+            finish(returns, Data::Interval(out.into()), validity)
+        }
         _ => Ok(None),
     }
 }
@@ -1393,9 +1402,13 @@ fn date_value(name: &str, spec: &Value, when: &Value) -> Result<Value> {
         }
         (true, Value::Date(days)) => part.truncate_days(*days).map(Value::Date),
         (true, Value::Timestamp(micros)) => part.truncate_micros(*micros).map(Value::Timestamp),
-        // DuckDB has overloads for a time, an interval and a timestamp with a time zone as well,
-        // and refuses anything else at binding. This refuses the same set a step later, because the
-        // signature table has one row per name and no way to say which types the row accepts.
+        (true, Value::Interval { months, days, micros }) => {
+            let (months, days, micros) = part.truncate_interval(*months, *days, *micros)?;
+            Ok(Value::Interval { months, days, micros })
+        }
+        // DuckDB has overloads for a time and for a timestamp with a time zone as well, and refuses
+        // anything else at binding. This refuses the same set a step later, because the signature
+        // table has one row per name and no way to say which types the row accepts.
         _ => Err(Error::binder(format!(
             "No function matches the given name and argument types '{name}(VARCHAR, {})'. You might need to add explicit type casts.",
             when.logical_type()
