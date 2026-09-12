@@ -100,7 +100,7 @@ enum Shape {
     /// The arguments are whatever they are and the result is fixed. `count(x)` over anything.
     AnyTo(Fixed),
     /// The first `n` arguments are cast to one fixed type, the rest are left alone, and the result
-    /// is fixed. `date_part('minute', x)` is a bigint whatever `x` is, and
+    /// is fixed. `date_part('minute', x)` reads a part of whatever `x` is, and
     /// `regexp_extract(s, p, 2)` takes two strings and then a number that has to stay one.
     LeadingFixedTo(usize, Fixed, Fixed),
     /// The first argument is cast to one fixed type, the rest are left alone, and the result is the
@@ -385,11 +385,14 @@ const TABLE: &[Entry] = &[
     // gets here, because that is what DuckDB's own parser does with it, so there is one entry for
     // the two spellings. The part is a string and the thing it is a part of is left alone, which is
     // what the two leading shapes are for: there is nothing to promote a timestamp towards.
+    // The answer is a double here and a bigint by the time the binder is finished with it, for
+    // every part but the two that carry a fraction. See `narrowed_part` in `rudb-bind`, which is
+    // where the value of the first argument gets to decide the type of the call.
     Entry {
         name: "date_part",
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(2),
-        shape: Shape::LeadingFixedTo(1, Fixed::Varchar, Fixed::BigInt),
+        shape: Shape::LeadingFixedTo(1, Fixed::Varchar, Fixed::Double),
         numeric_only: false,
     },
     Entry {
@@ -549,6 +552,27 @@ const fn aggregate(name: &'static str, arity: Arity, shape: Shape, numeric_only:
 #[must_use]
 pub fn kind_of(name: &str) -> Option<FunctionKind> {
     find(name).map(|entry| entry.kind)
+}
+
+/// What `date_part` answers with when the specifier is known at binding time.
+///
+/// `epoch` counts seconds and `julian` counts days, and both of them carry a fraction, so those two
+/// are doubles and every other part is a whole number. A specifier that names no part at all is a
+/// double as well, since the call is going to fail anyway and the sentence about it belongs to the
+/// one place that knows every spelling.
+///
+/// This is the only place a call's type comes from the value of an argument rather than the type of
+/// one, and it is upstream's rule rather than an optimization: the declared overload there is a
+/// double and the binder narrows it, which is why `date_part(p, ts)` over a column of specifiers is
+/// a double even when every row of it says `year`.
+#[must_use]
+pub fn part_type(spelling: &str) -> LogicalType {
+    let fraction = ["epoch", "julian", "jd"];
+    if fraction.iter().any(|name| name.eq_ignore_ascii_case(spelling)) {
+        LogicalType::Double
+    } else {
+        LogicalType::BigInt
+    }
 }
 
 /// Resolves a call.
@@ -1417,13 +1441,15 @@ mod tests {
         assert_eq!(resolve("count_star", &[]).expect("counts rows").returns, LogicalType::BigInt);
     }
 
-    /// `date_part` says bigint whatever it reads and `date_trunc` hands back the type it was given,
-    /// which is two answers that one shape cannot give and is why there are two new ones.
+    /// `date_part` says double whatever it reads and `date_trunc` hands back the type it was given,
+    /// which is two answers that one shape cannot give and is why there are two new ones. A double
+    /// rather than a bigint because that is upstream's declared overload, and the narrowing to a
+    /// bigint happens in the binder, where the specifier can be looked at.
     #[test]
     fn a_date_function_fixes_the_part_and_leaves_the_date_alone() {
         let part = resolve("date_part", &[LogicalType::Varchar, LogicalType::Timestamp])
             .expect("a part of a timestamp");
-        assert_eq!(part.returns, LogicalType::BigInt);
+        assert_eq!(part.returns, LogicalType::Double);
         assert_eq!(part.arguments, vec![LogicalType::Varchar, LogicalType::Timestamp]);
         let truncated = resolve("date_trunc", &[LogicalType::Varchar, LogicalType::Date])
             .expect("a truncated date");
