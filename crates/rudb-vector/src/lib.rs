@@ -8,7 +8,7 @@
 //!
 //! Six pieces:
 //!
-//! - [`Vector`], a typed run of at most [`VECTOR_SIZE`] values in one of four physical forms.
+//! - [`Vector`], a typed run of at most [`VECTOR_SIZE`] values in one of five physical forms.
 //! - [`Chunk`], some vectors of the same length, which is what one operator hands the next.
 //! - [`Validity`], which is three cases rather than a bitmap, because knowing there are no nulls is
 //!   worth a measurable amount and costs one branch per vector to know.
