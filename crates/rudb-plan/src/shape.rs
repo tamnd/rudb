@@ -232,7 +232,11 @@ impl Shape {
 }
 
 /// The pipeline the root of a plan produces into.
-const ROOT: PipelineRef = 0;
+///
+/// Public because it is the one pipeline nothing drains. Every other pipeline ends in a sink and is
+/// run by the loop that fills that sink, and this one is pulled from by whoever wanted the answer,
+/// so whoever that is has to know which pipeline the loop they are writing belongs to.
+pub const ROOT: PipelineRef = 0;
 
 #[cfg(test)]
 mod tests {

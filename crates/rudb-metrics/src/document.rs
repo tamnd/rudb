@@ -120,6 +120,7 @@ impl Document {
         out.key("resource");
         out.object(|out| {
             out.count("cpu_ns", self.resource.cpu_ns);
+            out.count("build_cpu_ns", self.resource.build_cpu_ns);
             out.count("peak_bytes", self.resource.peak_bytes);
             out.count("bytes_read", self.resource.bytes_read);
             out.count("bytes_decoded", self.resource.bytes_decoded);
@@ -362,6 +363,14 @@ pub struct Timing {
 pub struct Resource {
     /// CPU time across every thread. This is the axis that cannot be bought with threads.
     pub cpu_ns: u64,
+    /// The part of `cpu_ns` that went on building the operator tree rather than running it.
+    ///
+    /// Split out because no operator can ever account for it. Opening a file, reading its schema,
+    /// deciding which implementation runs at each seam and allocating the tree all happen before
+    /// there is an operator to charge, so a check that compared the operators against `cpu_ns`
+    /// would read the whole of this as time that went missing. `cpu_ns` minus this is the span the
+    /// pipelines are inside of, and that is what the cross check in `rudb-bench` compares against.
+    pub build_cpu_ns: u64,
     /// The high water mark of memory the engine accounted for.
     pub peak_bytes: u64,
     /// Bytes read at the point of the system call.
@@ -577,6 +586,7 @@ mod tests {
         metrics.timing.execute_ns = 1_323_000_000;
         metrics.timing.total_ns = 1_323_483_000;
         metrics.resource.cpu_ns = 9_880_000_000;
+        metrics.resource.build_cpu_ns = 44_000;
         metrics.resource.peak_bytes = 894_000_000;
         metrics.resource.bytes_read = 1_420_000_000;
         metrics.resource.bytes_decoded = 210_000_000;

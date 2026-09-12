@@ -49,6 +49,12 @@
 //! [`Counters::snapshot`] is the only way a counter becomes a row, so an operator that was measured
 //! and an operator that was written by hand into a test produce the same shape.
 //!
+//! [`Driver`] is the same idea one level up. The loop that runs a pipeline is not an operator and
+//! nothing else measures it, so a chunk that costs four operator calls also costs a trip round a
+//! loop that allocated the chunk and dropped it, and on a query that moves ten thousand chunks that
+//! adds up to a third of the execution. A pipeline's time is its driver's time, and the `driver`
+//! module explains how pipelines that run inside each other avoid counting the same time twice.
+//!
 //! [`Report`] is the other end of all those counters. Whoever builds an execution registers each
 //! operator with one as it is made and says which pipeline depends on which, and at the end
 //! [`Report::fill`] puts the rows into the document. That is the piece that makes the ids and the
@@ -65,6 +71,7 @@
 mod clock;
 mod counters;
 mod document;
+mod driver;
 mod json;
 mod report;
 mod warn;
@@ -75,6 +82,7 @@ pub use document::{
     Blocked, Document, Engine, Machine, Memory, Operator, Outcome, Pipeline, Query, Resource,
     Settings, Strategy, Timing,
 };
+pub use driver::{Driver, Running};
 pub use report::Report;
 
 /// The version of the document this crate writes.

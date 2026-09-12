@@ -604,7 +604,13 @@ fn run(
     let types = root.schema().types();
     let mut held = memory.reservation();
     let mut chunks = Vec::new();
-    let running = Span::start();
+    // This loop is the root pipeline's driver. Every other pipeline is drained by the loop that
+    // fills its sink and that loop reports its own time, and this one is pulled from here, so this
+    // is the only place that can report it. The span it hands back is the whole execution including
+    // the pipelines that ran inside it, which is what `execute_ns` is; what the driver keeps for
+    // itself is that minus what they charged.
+    let driver = report.driving(rudb_plan::ROOT);
+    let driving = driver.running();
     while let Some(chunk) = root.next()? {
         if chunk.is_empty() {
             continue;
@@ -613,7 +619,7 @@ fn run(
         held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
         chunks.push(chunk);
     }
-    let (ran_wall, ran_cpu) = running.stop();
+    let (ran_wall, ran_cpu) = driving.stop();
     let mut metrics = Document::new(sql);
     metrics.settings.memory_limit = memory.limit();
     metrics.settings.threads = 1;
@@ -621,6 +627,7 @@ fn run(
     metrics.timing.execute_ns = ran_wall;
     metrics.timing.total_ns = built_wall.saturating_add(ran_wall);
     metrics.resource.cpu_ns = built_cpu.saturating_add(ran_cpu);
+    metrics.resource.build_cpu_ns = built_cpu;
     report.fill(&mut metrics);
     rudb_opt::explain::record_estimates(plan, statistics, &mut metrics);
     Ok(QueryResult::new(names, types, chunks, held).measured(metrics))
