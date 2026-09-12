@@ -518,6 +518,28 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
     }
 }
 
+/// An identifier as a generated name writes it, which is quoted when it has to be.
+///
+/// DuckDB writes every identifier inside a generated name through its deparser, and the deparser
+/// quotes on two grounds. One is that the word is a keyword in a class, so
+/// `SELECT min(name)` comes back as `min("name")` and `SELECT trim(' a ')` as `"trim"(' a ')`,
+/// while `SELECT min(alias)` comes back bare because `alias` is spelled by a rule and is in no
+/// class at all. The other is that the text is not one word the tokenizer would read back, so
+/// `"my col"`, `"9x"` and `"é"` keep their quotes.
+///
+/// What it does not quote on is case. `min(UserID)` comes back exactly like that upstream even
+/// though reading it again folds it, which is the whole reason ClickBench's column names agree
+/// between the two engines, so this does not quote on case either. Per #251.
+fn quoted(text: &str) -> String {
+    let mut bytes = text.bytes();
+    let plain = matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if plain && rudb_parse::classes(rudb_parse::lookup(text)) == 0 {
+        return text.to_string();
+    }
+    format!("\"{}\"", text.replace('"', "\"\""))
+}
+
 /// The name a target gets when the query did not give it one.
 ///
 /// DuckDB uses the text the user wrote. The tokens are gone by the time the binder runs, so this
@@ -538,7 +560,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
                 format!("{}.*", ast.name_text(qualifier))
             }
         }
-        ast::Expr::Column { name } => ast.name(name).last().unwrap_or_default().to_string(),
+        ast::Expr::Column { name } => quoted(ast.name(name).last().unwrap_or_default()),
         ast::Expr::Literal { kind, text } => match kind {
             LiteralKind::Null => "NULL".to_string(),
             LiteralKind::True => "true".to_string(),
@@ -621,7 +643,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef) -> String {
             let name = if rudb_catalog::same_name(written, "coalesce") {
                 "COALESCE".to_string()
             } else {
-                written.to_ascii_lowercase()
+                quoted(&written.to_ascii_lowercase())
             };
             // `DISTINCT` is part of the name because it is part of what was computed.
             // `count(UserID)` and `count(DISTINCT UserID)` are two different answers and a result
