@@ -53,6 +53,7 @@ impl Document {
         self.ending(&mut warnings);
         self.spills(&mut warnings);
         self.references(&mut warnings);
+        self.fallbacks(&mut warnings);
         self.estimates(&mut warnings);
         self.waiting(&mut warnings);
         self.driving(&mut warnings);
@@ -97,6 +98,34 @@ impl Document {
                 self.operators.len()
             ));
         }
+    }
+
+    /// A row at a time path is what this engine exists to not take, so the count of them is a work
+    /// list rather than a complaint.
+    ///
+    /// One line for the query naming the operator with the most against it, in the same shape as the
+    /// reference implementation line above and for the same reason: for the first year the honest
+    /// answer is most of them, and a warning per operator would be a wall of text nobody reads. The
+    /// operator and the cause are there because those two are what somebody would go and act on.
+    fn fallbacks(&self, warnings: &mut Vec<String>) {
+        let total: u64 = self
+            .operators
+            .iter()
+            .fold(0, |sum, operator| sum.saturating_add(operator.fallbacks.total()));
+        if total == 0 {
+            return;
+        }
+        let blamed = self
+            .operators
+            .iter()
+            .max_by_key(|operator| operator.fallbacks.total())
+            .and_then(|operator| {
+                operator.fallbacks.worst().map(|(cause, seen)| {
+                    format!(", {} of them {} in {}", commas(seen), cause.name(), operator.named())
+                })
+            })
+            .unwrap_or_default();
+        warnings.push(format!("{} calls took the row at a time path{blamed}", commas(total)));
     }
 
     /// An estimate an order of magnitude out is how a bad plan explains itself.
@@ -220,6 +249,8 @@ fn ratio(high: u128, low: u128) -> String {
 
 #[cfg(test)]
 mod tests {
+    use rudb_common::{Cause, Tally};
+
     use crate::document::{Document, Operator, Outcome, Pipeline};
 
     fn document() -> Document {
@@ -243,6 +274,30 @@ mod tests {
         let warnings = metrics.warnings();
         assert_eq!(warnings[0], "the query was cancelled, so every number here is partial");
         assert_eq!(warnings[1], "operator 0 (Scan) spilled 2.0 KiB");
+    }
+
+    #[test]
+    fn the_row_at_a_time_paths_are_totalled_and_the_worst_one_is_named() {
+        let mut metrics = document();
+        let mut scan = Operator::new(0, 0, "Scan");
+        scan.fallbacks.add(Tally::of(Cause::Flatten, 12));
+        let mut filter = Operator::new(1, 0, "Filter");
+        filter.fallbacks.add(Tally::of(Cause::Compare, 4000));
+        filter.fallbacks.add(Tally::of(Cause::Cast, 90));
+        metrics.operators.extend([scan, filter]);
+        assert_eq!(
+            metrics.warnings(),
+            vec![
+                "4,102 calls took the row at a time path, 4,000 of them compare in operator 1 (Filter)"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_execution_that_never_gave_up_on_a_column_says_nothing_about_it() {
+        let mut metrics = document();
+        metrics.operators.push(Operator::new(0, 0, "Scan"));
+        assert!(metrics.warnings().is_empty());
     }
 
     #[test]

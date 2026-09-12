@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Cause, Error, LogicalType, Result, Value, slow};
 
 use crate::buffer::Buffer;
 use crate::string::{StringColumn, StringView};
@@ -563,6 +563,11 @@ impl Vector {
     /// this. It is here for the operators that genuinely cannot do better and for the tests that
     /// check the other forms against it.
     ///
+    /// A call that copies counts itself against [`Cause::Flatten`], because a flatten on a hot path
+    /// is the most expensive thing in this crate and the only way to find one is to have the number.
+    /// A call on a vector that is already flat does not count, since it neither copies nor gives
+    /// anything up.
+    ///
     /// # Errors
     ///
     /// If the type is one this crate cannot store flat yet, which today means the nested types.
@@ -570,6 +575,7 @@ impl Vector {
         if let Body::Flat(_) = self.body {
             return Ok(self.clone());
         }
+        slow::took(Cause::Flatten);
         self.copied((0..self.len).collect(), false)
     }
 

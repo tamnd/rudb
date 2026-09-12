@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rudb_common::{Cancel, ErrorCode, LogicalType, Value};
+use rudb_common::{Cancel, Cause, ErrorCode, LogicalType, Value, slow};
 use rudb_metrics::Counters;
 use rudb_vector::{Chunk, Vector};
 
@@ -460,6 +460,51 @@ fn a_watched_pipeline_counts_the_rows_and_the_time_at_every_operator() {
     assert_eq!(summed.rows_in, 5);
     assert!(read.wall_ns > 0, "reading ten rows took longer than nothing");
     assert!(kept.wall_ns > 0, "filtering them took longer than nothing");
+}
+
+/// A stream that gives up on the compact form of every chunk it is handed, and says so.
+///
+/// This is what the real ones look like from the shim's point of view: it does not know what a
+/// kernel is or what a flatten is, it only knows that the count went up while this call was on the
+/// stack.
+#[derive(Debug)]
+struct GivesUp;
+
+impl Stream for GivesUp {
+    type Local = ();
+
+    fn local(&self) {}
+
+    fn push(&self, _chunk: &mut Chunk, (): &mut ()) -> rudb_common::Result<Progress> {
+        slow::took(Cause::Flatten);
+        slow::took(Cause::Compare);
+        Ok(Progress::More)
+    }
+}
+
+#[test]
+fn falling_back_is_charged_to_the_operator_that_did_it_and_to_no_other() {
+    slow::reset();
+    let scan = Arc::new(Counters::new(0, 0, "Counting"));
+    let giving_up = Arc::new(Counters::new(1, 0, "GivesUp"));
+    let total = Arc::new(Counters::new(2, 0, "Total"));
+    let source = Arc::new(Watched::new(Counting::new((1..=10).collect(), 4, 4), Arc::clone(&scan)));
+    let stream = Arc::new(Watched::new(GivesUp, Arc::clone(&giving_up)));
+    let sink = Arc::new(Watched::new(Total::default(), Arc::clone(&total)));
+    let built = Pipeline::new(PipelineId(0), source, sink as Arc<dyn DynSink>)
+        .then(stream as Arc<dyn DynStream>);
+
+    run_serial(&built, &Cancel::new()).expect("the pipeline runs");
+
+    let gave_up = giving_up.snapshot();
+    let chunks = gave_up.fallbacks.get(Cause::Flatten);
+    assert!(chunks > 0, "the stream was called at least once");
+    assert_eq!(gave_up.fallbacks.get(Cause::Compare), chunks, "both were counted every time");
+    assert_eq!(gave_up.fallbacks.total(), chunks * 2);
+    assert_eq!(gave_up.fallbacks.worst(), Some((Cause::Flatten, chunks)), "ties go to the first");
+    assert!(scan.snapshot().fallbacks.is_empty(), "the source never gave up on anything");
+    assert!(total.snapshot().fallbacks.is_empty(), "neither did the sink");
+    slow::reset();
 }
 
 #[test]

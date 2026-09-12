@@ -9,6 +9,10 @@
 //! around a call that handles two thousand rows is not a measurement anybody can feel. Two clock
 //! readings per row would be the measurement rather than the thing measured.
 //!
+//! It also reads the slow path counter on either side of the call, and the difference is what that
+//! operator gave up on inside that chunk. That is the whole reason the counter is per thread: a
+//! difference around a call only means something if nothing else was counting into it at the time.
+//!
 //! What it does not do is count bytes or memory. A wrapper cannot see a read or a reservation, it
 //! can only see chunks going past, so [`Counters::read`], [`Counters::decoded`],
 //! [`Counters::spilled`] and [`Counters::holding`] are reported by whoever does those things,
@@ -16,7 +20,7 @@
 
 use std::sync::Arc;
 
-use rudb_common::Result;
+use rudb_common::{Result, Tally, slow};
 use rudb_metrics::{Counters, Span};
 use rudb_vector::Chunk;
 
@@ -55,10 +59,9 @@ impl<S: Source> Source for Watched<S> {
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
-        let span = Span::start();
+        let measure = Measure::start();
         let progress = self.inner.read(morsel, out);
-        let (wall, cpu) = span.stop();
-        self.counters.spent(wall, cpu);
+        measure.stop(&self.counters);
         // A failed read still cost the time it took, which is why the time is recorded above
         // whatever happened. The rows are only there to count if the call produced any.
         if progress.is_ok() {
@@ -80,10 +83,9 @@ impl<S: Stream> Stream for Watched<S> {
         // and the rows it produced after it. A filter that keeps a tenth of its input is the
         // difference between those two numbers and nothing else records it.
         let taken = rows(chunk);
-        let span = Span::start();
+        let measure = Measure::start();
         let progress = self.inner.push(chunk, local);
-        let (wall, cpu) = span.stop();
-        self.counters.spent(wall, cpu);
+        measure.stop(&self.counters);
         if progress.is_ok() {
             self.counters.took(taken);
             self.counters.made(rows(chunk));
@@ -101,10 +103,9 @@ impl<K: Sink> Sink for Watched<K> {
 
     fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress> {
         let taken = rows(chunk);
-        let span = Span::start();
+        let measure = Measure::start();
         let progress = self.inner.sink(chunk, local);
-        let (wall, cpu) = span.stop();
-        self.counters.spent(wall, cpu);
+        measure.stop(&self.counters);
         if progress.is_ok() {
             self.counters.took(taken);
         }
@@ -114,10 +115,9 @@ impl<K: Sink> Sink for Watched<K> {
     /// Measured, because merging one thread's state into the global one is work and on an aggregate
     /// it is a lot of it.
     fn combine(&self, local: Self::Local) -> Result<()> {
-        let span = Span::start();
+        let measure = Measure::start();
         let combined = self.inner.combine(local);
-        let (wall, cpu) = span.stop();
-        self.counters.spent(wall, cpu);
+        measure.stop(&self.counters);
         combined
     }
 
@@ -129,11 +129,38 @@ impl<K: Sink> Sink for Watched<K> {
     /// finished state, and that source is measured in its own right, so counting them in both
     /// places would put the same rows in the document twice.
     fn finalize(&self) -> Result<()> {
-        let span = Span::start();
+        let measure = Measure::start();
         let finished = self.inner.finalize();
-        let (wall, cpu) = span.stop();
-        self.counters.spent(wall, cpu);
+        measure.stop(&self.counters);
         finished
+    }
+}
+
+/// A clock and a slow path reading, started together and reported together.
+///
+/// One type rather than two pairs of lines in five methods, because the two are always taken at the
+/// same two moments and a method that started one and forgot the other would be a method whose
+/// operator looks like it never falls back.
+struct Measure {
+    span: Span,
+    before: Tally,
+}
+
+impl Measure {
+    /// Reads both, with the clock last so that as little as possible sits between it and the call.
+    fn start() -> Self {
+        let before = slow::here();
+        Self { span: Span::start(), before }
+    }
+
+    /// Reads both again and charges the difference to the operator.
+    ///
+    /// The time is charged whatever happened, because a call that failed still cost what it took.
+    /// So is the falling back, for the same reason.
+    fn stop(self, counters: &Counters) {
+        let (wall, cpu) = self.span.stop();
+        counters.spent(wall, cpu);
+        counters.fell_back(slow::here().since(self.before));
     }
 }
 

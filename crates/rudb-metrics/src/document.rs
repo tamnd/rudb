@@ -9,6 +9,8 @@
 //! purpose: this is the shape the numbers are reported in, and the code that produces them is the
 //! instrumentation shim that sits around the push operators.
 
+use rudb_common::Tally;
+
 use crate::SCHEMA;
 use crate::json::Writer;
 
@@ -183,6 +185,13 @@ impl Document {
                     out.count("bytes_read", operator.bytes_read);
                     out.count("bytes_decoded", operator.bytes_decoded);
                     out.count("bytes_spilled", operator.bytes_spilled);
+                    out.key("fallbacks");
+                    out.object(|out| {
+                        out.count("total", operator.fallbacks.total());
+                        for (cause, times) in operator.fallbacks.taken() {
+                            out.count(cause.name(), times);
+                        }
+                    });
                     out.key("memory");
                     out.object(|out| {
                         out.count("reserved", operator.memory.reserved);
@@ -512,6 +521,14 @@ pub struct Operator {
     pub bytes_decoded: u64,
     /// Bytes it spilled.
     pub bytes_spilled: u64,
+    /// How many times something inside it took a path written to be correct rather than fast.
+    ///
+    /// This is the one number in the row that is a work list rather than a measurement. Every count
+    /// in it is a kernel that met a pair of forms nobody has written a loop for yet, or a column
+    /// that was copied out of its compact form because whoever was handed it could not read it. Both
+    /// are the difference between what the engine does and what the data plane was designed to do,
+    /// and F7 is meant to be this list sorted by cost rather than a guess about where to look.
+    pub fallbacks: Tally,
     /// What it held.
     pub memory: Memory,
     /// Whether what ran was the reference implementation rather than a fast one.
@@ -535,6 +552,7 @@ impl Operator {
             bytes_read: 0,
             bytes_decoded: 0,
             bytes_spilled: 0,
+            fallbacks: Tally::none(),
             memory: Memory::default(),
             reference_impl: false,
         }
@@ -559,6 +577,8 @@ pub struct Memory {
 
 #[cfg(test)]
 mod tests {
+    use rudb_common::{Cause, Tally};
+
     use super::{Document, Engine, Machine, Operator, Outcome, Pipeline, Strategy};
 
     /// A document with every part of it filled in, which is what the golden file holds.
@@ -625,12 +645,15 @@ mod tests {
         group.wall_ns = 360_000_000;
         group.cpu_ns = 2_800_000_000;
         group.memory.high_water = 894_000_000;
+        group.fallbacks.add(Tally::of(Cause::Flatten, 48_827));
+        group.fallbacks.add(Tally::of(Cause::Aggregate, 48_827));
         let mut sort = Operator::new(7, 1, "Sort");
         sort.rows_in = 41_983_110;
         sort.rows_out = 10;
         sort.wall_ns = 343_000_000;
         sort.cpu_ns = 2_280_000_000;
         sort.bytes_spilled = 12_000_000;
+        sort.fallbacks.add(Tally::of(Cause::Compare, 12));
         sort.reference_impl = true;
         metrics.operators.extend([read, group, sort]);
         metrics

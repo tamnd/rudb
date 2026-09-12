@@ -12,6 +12,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rudb_common::{Cause, Tally};
+
 use crate::document::{Memory, Operator};
 
 /// The counters for one operator.
@@ -32,6 +34,11 @@ pub struct Counters {
     bytes_spilled: AtomicU64,
     reserved: AtomicU64,
     high_water: AtomicU64,
+    /// One counter per [`Cause`], in the order [`Cause::ALL`] lists them.
+    ///
+    /// A fixed array rather than a map, because the shim adds to this around every operator call
+    /// and a map would be a hash per call to store a number that is almost always zero.
+    fallbacks: [AtomicU64; Cause::ALL.len()],
 }
 
 impl Counters {
@@ -54,6 +61,7 @@ impl Counters {
             bytes_spilled: AtomicU64::new(0),
             reserved: AtomicU64::new(0),
             high_water: AtomicU64::new(0),
+            fallbacks: [const { AtomicU64::new(0) }; Cause::ALL.len()],
         }
     }
 
@@ -109,6 +117,21 @@ impl Counters {
         self.bytes_spilled.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Slow paths taken inside one call of this operator.
+    ///
+    /// The shim reads [`rudb_common::slow::here`] before the call and after it and hands over the
+    /// difference, so what arrives here is what that operator did on that thread and nothing else.
+    /// Adding rather than storing, because the operator is called once per chunk and the number
+    /// worth having is the one for the whole query.
+    pub fn fell_back(&self, tally: Tally) {
+        if tally.is_empty() {
+            return;
+        }
+        for (cause, times) in tally.taken() {
+            self.fallbacks[cause.slot()].fetch_add(times, Ordering::Relaxed);
+        }
+    }
+
     /// What this operator holds now, which also moves the high water mark when it is a new most.
     ///
     /// Reported rather than added, because memory is a level and not a total. An operator that
@@ -133,6 +156,10 @@ impl Counters {
         operator.bytes_read = self.bytes_read.load(Ordering::Relaxed);
         operator.bytes_decoded = self.bytes_decoded.load(Ordering::Relaxed);
         operator.bytes_spilled = self.bytes_spilled.load(Ordering::Relaxed);
+        for cause in Cause::ALL {
+            let seen = self.fallbacks[cause.slot()].load(Ordering::Relaxed);
+            operator.fallbacks.add(Tally::of(cause, seen));
+        }
         operator.memory = Memory {
             reserved: self.reserved.load(Ordering::Relaxed),
             high_water: self.high_water.load(Ordering::Relaxed),
@@ -146,7 +173,30 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    use rudb_common::{Cause, Tally};
+
     use super::Counters;
+
+    #[test]
+    fn falling_back_adds_up_across_the_calls_and_comes_out_split_by_cause() {
+        let counters = Counters::new(0, 0, "Filter");
+        counters.fell_back(Tally::of(Cause::Compare, 3));
+        counters.fell_back(Tally::none());
+        let mut both = Tally::of(Cause::Compare, 1);
+        both.add(Tally::of(Cause::Flatten, 10));
+        counters.fell_back(both);
+        let operator = counters.snapshot();
+        assert_eq!(operator.fallbacks.get(Cause::Compare), 4);
+        assert_eq!(operator.fallbacks.get(Cause::Flatten), 10);
+        assert_eq!(operator.fallbacks.get(Cause::Cast), 0);
+        assert_eq!(operator.fallbacks.total(), 14);
+        assert_eq!(operator.fallbacks.worst(), Some((Cause::Flatten, 10)));
+    }
+
+    #[test]
+    fn an_operator_that_never_gave_up_reports_nothing_rather_than_a_row_of_zeroes() {
+        assert!(Counters::new(0, 0, "Scan").snapshot().fallbacks.is_empty());
+    }
 
     #[test]
     fn a_snapshot_carries_what_was_counted_and_what_was_known() {

@@ -239,7 +239,15 @@ fn actually(measured: &Document, id: OperatorRef) -> String {
     };
     let held = operator.memory.high_water;
     let memory = if held == 0 { String::new() } else { format!(", {} held", bytes(held)) };
-    format!("  [{} rows, {}{memory}]", operator.rows_out, duration(operator.wall_ns))
+    // The fall backs are on the operator line rather than only in the totals, because the number
+    // is only worth having if a reader can see which node it belongs to without counting rows.
+    let slow = match operator.fallbacks.worst() {
+        None => String::new(),
+        Some((cause, _)) => {
+            format!(", {} fell back, most of it {}", operator.fallbacks.total(), cause.name())
+        }
+    };
+    format!("  [{} rows, {}{memory}{slow}]", operator.rows_out, duration(operator.wall_ns))
 }
 
 /// The operator row with this id.

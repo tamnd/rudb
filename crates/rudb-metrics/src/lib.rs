@@ -34,10 +34,10 @@
 //! and reproducibility is the whole reason the seams exist.
 //!
 //! Warnings are generated rather than written. Anything the engine knows it did badly, which is a
-//! spill, a reference implementation, an estimate off by an order of magnitude, time spent blocked
-//! or CPU that no operator accounts for, becomes a line in [`Document::warnings`] from the numbers
-//! themselves. Nothing calls a warn function, so nothing can forget to. The warnings list is what
-//! somebody reads first.
+//! spill, a reference implementation, a row at a time path, an estimate off by an order of
+//! magnitude, time spent blocked or CPU that no operator accounts for, becomes a line in
+//! [`Document::warnings`] from the numbers themselves. Nothing calls a warn function, so nothing
+//! can forget to. The warnings list is what somebody reads first.
 //!
 //! # What fills it in
 //!
@@ -48,6 +48,14 @@
 //!
 //! [`Counters::snapshot`] is the only way a counter becomes a row, so an operator that was measured
 //! and an operator that was written by hand into a test produce the same shape.
+//!
+//! One of the things [`Counters`] holds is not counted here at all. [`rudb_common::slow`] is a per
+//! thread count of every path the engine took that was written to be correct rather than fast, a
+//! kernel that met a pair of forms nobody specialized or a compact column that got copied out flat,
+//! and the shim reads it before an operator call and after it so that the difference lands against
+//! the operator that did it. That count is the F1 work list, and the reason it is at rank 0 rather
+//! than in this crate is that the two things that increment it are at rank 1 and rank 3 and cannot
+//! see each other or this.
 //!
 //! [`Driver`] is the same idea one level up. The loop that runs a pipeline is not an operator and
 //! nothing else measures it, so a chunk that costs four operator calls also costs a trip round a
