@@ -101,6 +101,9 @@
       "bytes_read": 1420000000,
       "bytes_decoded": 210000000,
       "bytes_spilled": 0,
+      "fallbacks": {
+        "total": 0
+      },
       "memory": {
         "reserved": 0,
         "high_water": 0
@@ -120,6 +123,11 @@
       "bytes_read": 0,
       "bytes_decoded": 0,
       "bytes_spilled": 0,
+      "fallbacks": {
+        "total": 97654,
+        "flatten": 48827,
+        "aggregate": 48827
+      },
       "memory": {
         "reserved": 0,
         "high_water": 894000000
@@ -139,6 +147,10 @@
       "bytes_read": 0,
       "bytes_decoded": 0,
       "bytes_spilled": 12000000,
+      "fallbacks": {
+        "total": 12,
+        "compare": 12
+      },
       "memory": {
         "reserved": 0,
         "high_water": 0
@@ -149,6 +161,7 @@
   "warnings": [
     "operator 7 (Sort) spilled 11.4 MiB",
     "1 of the 3 operators ran a reference implementation, which is the slow path kept for differential testing",
+    "97,666 calls took the row at a time path, 48,827 of them flatten in operator 5 (HashAggregate)",
     "operator 5 (HashAggregate) was estimated at 2,400,000 rows and produced 41,983,110 (q-error 17.5)"
   ]
 }
