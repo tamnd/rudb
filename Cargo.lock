@@ -241,6 +241,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-pipeline"
+version = "0.2.31"
+dependencies = [
+ "rudb-common",
+ "rudb-vector",
+]
+
+[[package]]
 name = "rudb-plan"
 version = "0.2.31"
 dependencies = [
