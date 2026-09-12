@@ -76,10 +76,13 @@ mod text;
 
 pub use aggregate::{Accumulator, NOWHERE, update_scattered};
 pub use cast::{cast, cast_value};
-pub use compare::{Comparison, compare, compare_values, order, order_with_nulls, refine};
+pub use compare::{
+    Comparison, compare, compare_prepared, compare_values, order, order_with_nulls, refine,
+    refine_prepared,
+};
 pub use fallback::Kernel;
 pub use logic::{Connective, combine, is_true};
 pub use membership::{Members, in_set};
-pub use prepare::Recipe;
+pub use prepare::{Held, Recipe};
 pub use scalar::{call, call_prepared, call_values};
 pub use select::{refine as refine_flags, selection};
