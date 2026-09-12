@@ -95,6 +95,7 @@ mod group;
 mod join;
 mod key;
 mod operator;
+mod ordering;
 mod prepared;
 mod register;
 mod rows;
