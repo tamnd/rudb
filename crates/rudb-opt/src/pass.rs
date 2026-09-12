@@ -42,15 +42,20 @@ pub trait Pass {
 
 /// What the passes are given besides the plan.
 ///
-/// Only the settings today. The catalog, the statistics and the planning deadline are the other
-/// three things `spec/engine/11-optimizer.md` puts in here, and each arrives with the first pass
-/// that reads it: the statistics with cardinality estimation, the deadline with join ordering,
-/// which is the only search in the plan and so the only thing that can spend real time. A field
-/// that no pass reads is a field whose meaning nobody has had to decide yet, and deciding it early
-/// is how it ends up wrong.
+/// The settings and the statistics. The catalog and the planning deadline are the other two things
+/// `spec/engine/11-optimizer.md` puts in here, and each arrives with the first pass that reads it:
+/// the deadline with join ordering, which is the only search in the plan and so the only thing
+/// that can spend real time. A field that no pass reads is a field whose meaning nobody has had to
+/// decide yet, and deciding it early is how it ends up wrong.
+///
+/// The statistics are a copy of the row counts rather than a handle on the catalog, which keeps a
+/// lifetime out of this type and out of everything that builds one. What it costs is that a
+/// context built before a table grows estimates against the size the table was, and a context is
+/// built per statement, so the window is one statement wide.
 #[derive(Debug, Clone, Default)]
 pub struct Context {
     disabled: Vec<&'static str>,
+    statistics: crate::estimate::Statistics,
 }
 
 impl Context {
@@ -105,6 +110,22 @@ impl Context {
     #[must_use]
     pub fn is_disabled(&self, name: &str) -> bool {
         self.disabled.contains(&name)
+    }
+
+    /// Hands the optimizer what is known about how large the tables are.
+    ///
+    /// Whoever builds the context does this, because the catalog lives a layer above the optimizer
+    /// and is not going to be reached from inside it. A context nobody told is a context that
+    /// estimates nothing, which is the right answer for the optimizer's own tests and for a plan
+    /// that arrived as text.
+    pub fn measure(&mut self, statistics: crate::estimate::Statistics) {
+        self.statistics = statistics;
+    }
+
+    /// What is known about how large the tables are.
+    #[must_use]
+    pub fn statistics(&self) -> &crate::estimate::Statistics {
+        &self.statistics
     }
 }
 
