@@ -8,64 +8,107 @@
 //!
 //! The output columns are the left side's, under the set operation's own table index. Both sides
 //! were made type compatible by the binder, so nothing here casts anything.
+//!
+//! # Two pipelines and an edge
+//!
+//! This is the first operator with two inputs to move behind the push traits, and two inputs is two
+//! pipelines. The right side ends in a [`Gather`](crate::gather::Gather), which holds its rows and
+//! nothing else, and the left side ends here. The order is not a choice: every arm below needs the
+//! whole right side before it can say anything about one left row, which is the dependency edge the
+//! scheduler will read off the plan. Until there is a scheduler, `adapt::Paired` runs the two in
+//! that order.
 
-use rudb_common::{Memory, Reservation, Result, Value};
+use std::sync::Mutex;
+
+use rudb_common::{Error, Memory, Reservation, Result, Value};
+use rudb_pipeline::{Progress, Sink};
 use rudb_plan::SetOpKind;
 use rudb_vector::Chunk;
 
+use crate::buffer::Buffered;
+use crate::gather::{self, Gathering, Rows};
 use crate::key::{Key, RowMap, RowSet};
-use crate::operator::Operator;
 use crate::rows;
 use crate::schema::Schema;
 
 /// A set operation over two inputs.
 #[derive(Debug)]
-pub(crate) struct SetOp<'a> {
-    left: Box<dyn Operator + 'a>,
-    right: Box<dyn Operator + 'a>,
+pub(crate) struct SetOp {
     kind: SetOpKind,
     all: bool,
     schema: Schema,
-    built: bool,
-    chunks: Vec<Chunk>,
-    at: usize,
     memory: Memory,
-    /// What the finished chunks are charged, held for as long as this operator holds them.
-    held: Reservation,
+    /// The right side, filled by the pipeline this one depends on.
+    right: Rows,
+    /// The left side, as every instance gathered it.
+    left: Mutex<Vec<Vec<Value>>>,
+    /// What the left side is charged, given back once the finished chunks are charged instead.
+    charged: Mutex<Vec<Reservation>>,
+    /// What the finished chunks are charged, held for as long as they are readable.
+    held: Mutex<Reservation>,
+    out: Buffered,
 }
 
-impl<'a> SetOp<'a> {
+impl SetOp {
+    /// The sink for the left side, and the source the answer comes out of.
+    ///
+    /// `left` is the left input's schema, whose fields become the output's under `index`, and
+    /// `right` is the handle on the rows the other pipeline gathered.
     pub(crate) fn new(
-        left: Box<dyn Operator + 'a>,
-        right: Box<dyn Operator + 'a>,
+        left: &Schema,
+        right: Rows,
         kind: SetOpKind,
         all: bool,
         index: u32,
         memory: &Memory,
-    ) -> Self {
-        let schema = Schema::numbered(left.schema().fields().to_vec(), index);
-        Self {
-            left,
-            right,
+    ) -> (Self, Buffered) {
+        let out = Buffered::new();
+        let setop = Self {
             kind,
             all,
-            schema,
-            built: false,
-            chunks: Vec::new(),
-            at: 0,
+            schema: Schema::numbered(left.fields().to_vec(), index),
             memory: memory.clone(),
-            held: memory.reservation(),
-        }
+            right,
+            left: Mutex::new(Vec::new()),
+            charged: Mutex::new(Vec::new()),
+            held: Mutex::new(memory.reservation()),
+            out: out.clone(),
+        };
+        (setop, out)
     }
 
-    fn build(&mut self) -> Result<()> {
+    /// What this operator produces, which is the left side's columns under its own table index.
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+}
+
+impl Sink for SetOp {
+    type Local = Gathering;
+
+    fn local(&self) -> Gathering {
+        gather::gathering(&self.memory)
+    }
+
+    fn sink(&self, chunk: &Chunk, local: &mut Gathering) -> Result<Progress> {
+        gather::take(chunk, local)?;
+        Ok(Progress::More)
+    }
+
+    fn combine(&self, local: Gathering) -> Result<()> {
+        let (rows, charged) = gather::into_parts(local);
+        self.left.lock().map_err(poisoned)?.extend(rows);
+        self.charged.lock().map_err(poisoned)?.push(charged);
+        Ok(())
+    }
+
+    fn finalize(&self) -> Result<()> {
         // Both sides at once, which is what every arm below needs, and the counting tables on top
         // of them. The tables are not charged separately, because a count per distinct row is
         // bounded by the rows that are already charged and charging it twice would refuse a query
         // that fits.
-        let mut scratch = self.memory.reservation();
-        let left = rows::collect(self.left.as_mut(), &mut scratch)?;
-        let right = rows::collect(self.right.as_mut(), &mut scratch)?;
+        let left = std::mem::take(&mut *self.left.lock().map_err(poisoned)?);
+        let right = self.right.take()?;
         let out = match (self.kind, self.all) {
             (SetOpKind::Union, true) => {
                 let mut out = left;
@@ -92,28 +135,16 @@ impl<'a> SetOp<'a> {
                 )
             }
         };
-        self.chunks = rows::chunks(&self.schema.types(), &out, &mut self.held)?;
+        let mut held = self.held.lock().map_err(poisoned)?;
+        let chunks = rows::chunks(&self.schema.types(), &out, &mut held)?;
+        self.out.fill(chunks)?;
+        self.charged.lock().map_err(poisoned)?.clear();
         Ok(())
     }
 }
 
-impl Operator for SetOp<'_> {
-    fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        if !self.built {
-            self.build()?;
-            self.built = true;
-        }
-        if self.at >= self.chunks.len() {
-            return Ok(None);
-        }
-        let chunk = self.chunks[self.at].clone();
-        self.at += 1;
-        Ok(Some(chunk))
-    }
+fn poisoned<T>(_: T) -> Error {
+    Error::internal("a thread panicked while holding the rows a set operation gathered")
 }
 
 /// How many times each row appears.

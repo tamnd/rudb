@@ -16,8 +16,9 @@ use rudb_common::{Cancel, Memory, Result};
 use rudb_functions::TableFunction;
 use rudb_plan::{Node, NodeRef, Plan};
 
-use crate::adapt::{Broken, Streamed};
+use crate::adapt::{Broken, Paired, Streamed};
 use crate::cancel::Guarded;
+use crate::gather::Gather;
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Join};
 use crate::operator::Operator;
@@ -126,7 +127,10 @@ fn node<'a>(
             Box::new(Broken::new(input, top, out, schema))
         }
         Node::Distinct { input, on } => {
-            Box::new(Distinct::new(plan, node(plan, catalog, cancel, memory, input)?, on, memory))
+            let input = node(plan, catalog, cancel, memory, input)?;
+            let schema = input.schema().clone();
+            let (distinct, out) = Distinct::new(plan, &schema, on, memory)?;
+            Box::new(Broken::new(input, distinct, out, schema))
         }
         Node::Join { left, right, kind, conditions } => Box::new(Join::new(
             plan,
@@ -142,14 +146,16 @@ fn node<'a>(
             node(plan, catalog, cancel, memory, right)?,
             memory,
         )),
-        Node::SetOp { left, right, kind, all, index } => Box::new(SetOp::new(
-            node(plan, catalog, cancel, memory, left)?,
-            node(plan, catalog, cancel, memory, right)?,
-            kind,
-            all,
-            index,
-            memory,
-        )),
+        Node::SetOp { left, right, kind, all, index } => {
+            let left = node(plan, catalog, cancel, memory, left)?;
+            let right = node(plan, catalog, cancel, memory, right)?;
+            // The right side runs first, because nothing can be said about a left row until the
+            // whole right side has been counted. That is the dependency edge, spelled out.
+            let (gather, gathered) = Gather::new(memory);
+            let (setop, out) = SetOp::new(left.schema(), gathered, kind, all, index, memory);
+            let schema = setop.schema().clone();
+            Box::new(Paired::new(right, gather, left, setop, out, schema))
+        }
     };
     Ok(Box::new(Guarded::new(inner, cancel.clone())))
 }
