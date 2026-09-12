@@ -15,6 +15,7 @@ dependencies = [
  "rudb-opt",
  "rudb-parse",
  "rudb-plan",
+ "rudb-seam",
  "rudb-storage",
  "rudb-txn",
  "rudb-vector",

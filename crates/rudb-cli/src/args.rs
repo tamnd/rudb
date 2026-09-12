@@ -51,6 +51,13 @@ pub struct Options {
     pub bail: bool,
     /// Open without allowing writes.
     pub readonly: bool,
+    /// What `--set name=value` asked for, in the order it was given.
+    ///
+    /// Kept apart from [`Options::commands`] rather than pushed in as SQL, because these run
+    /// before everything else whatever position they were written in. A flag that configures the
+    /// engine and a flag that runs a query are two different things, and a benchmark script that
+    /// puts its `--set` at the end of the line means the same thing as one that puts it first.
+    pub sets: Vec<String>,
     /// How results are printed, and everything that goes with it.
     pub settings: crate::format::Settings,
 }
@@ -65,6 +72,7 @@ impl Default for Options {
             echo: false,
             bail: false,
             readonly: false,
+            sets: Vec::new(),
             settings: crate::format::Settings::default(),
         }
     }
@@ -115,6 +123,18 @@ pub fn parse(arguments: &[String]) -> Action {
             },
             "-init" => match next(argument) {
                 Ok(path) => options.commands.push(Command::File(PathBuf::from(path))),
+                Err(why) => return Action::Wrong(why),
+            },
+            // Two dashes, like `--print-config`, because DuckDB has no flag of this name and the
+            // single dash forms in this list are the ones a script written against `duckdb`
+            // already uses. A name that is ours should look like it.
+            "--set" => match next(argument) {
+                Ok(pair) => match pair.split_once('=') {
+                    Some(_) => options.sets.push(pair),
+                    None => {
+                        return Action::Wrong(format!("--set is written name=value, not {pair}"));
+                    }
+                },
                 Err(why) => return Action::Wrong(why),
             },
             "-separator" => match next(argument) {
@@ -293,6 +313,22 @@ mod tests {
     fn a_separator_given_after_the_mode_wins() {
         let parsed = options(&["-csv", "-separator", ";"]);
         assert_eq!(parsed.settings.separator, ";");
+    }
+
+    #[test]
+    fn every_set_flag_is_kept_in_order_and_apart_from_the_sql() {
+        let parsed = options(&["--set", "hash.table=unchained", "-c", "SELECT 1", "--set", "x=y"]);
+        assert_eq!(parsed.sets, ["hash.table=unchained", "x=y"]);
+        assert_eq!(parsed.commands, [Command::Sql("SELECT 1".to_string())]);
+    }
+
+    #[test]
+    fn a_set_flag_without_a_value_says_how_it_is_written() {
+        assert!(matches!(
+            parse(&["--set".to_string(), "hash.table".to_string()]),
+            Action::Wrong(why) if why.contains("name=value")
+        ));
+        assert!(matches!(parse(&["--set".to_string()]), Action::Wrong(_)));
     }
 
     #[test]

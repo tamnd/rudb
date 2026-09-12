@@ -15,6 +15,7 @@ readme.workspace = true
 [dependencies]
 rudb-common.workspace = true
 rudb-parse.workspace = true
+rudb-seam.workspace = true
 rudb-bind.workspace = true
 rudb-plan.workspace = true
 rudb-opt.workspace = true

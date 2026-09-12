@@ -271,6 +271,37 @@ fn the_policy_is_set_through_the_same_door_as_everything_else() {
 }
 
 #[test]
+fn a_hint_pins_as_many_seams_as_it_names_and_only_for_the_one_query() {
+    let mut settings = Settings::new();
+    settings.hint("hash.table(unchained) sort(radix)").unwrap();
+    assert_eq!(settings.pinned(SeamId::HashTable), Some("unchained"));
+    assert_eq!(settings.pinned(SeamId::Sort), Some("radix"));
+
+    // Commas rather than spaces, and quotes around the value, are both what somebody who has just
+    // written a `SET` will type.
+    let mut commas = Settings::new();
+    commas.hint("hash.table('unchained'), policy(reference)").unwrap();
+    assert_eq!(commas.pinned(SeamId::HashTable), Some("unchained"));
+    assert_eq!(commas.mode(), PolicyMode::Reference);
+}
+
+#[test]
+fn a_hint_that_is_not_written_as_a_call_says_so() {
+    let mut settings = Settings::new();
+    let error = settings.hint("hash.table=unchained").unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidInput);
+    assert!(error.message().contains("seam(implementation)"), "{}", error.message());
+
+    let unclosed = settings.hint("hash.table(unchained").unwrap_err();
+    assert_eq!(unclosed.code(), ErrorCode::InvalidInput);
+
+    // The name is checked the same way it is checked on the way in from a `SET`, because it is the
+    // same function doing the checking.
+    let mistyped = settings.hint("hash.tabel(unchained)").unwrap_err();
+    assert_eq!(mistyped.code(), ErrorCode::Catalog);
+}
+
+#[test]
 fn a_mistyped_seam_name_is_an_error_rather_than_a_setting_nobody_reads() {
     let mut settings = Settings::new();
     let error = settings.set("seam.hash.tabel", "unchained").unwrap_err();

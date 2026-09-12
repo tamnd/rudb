@@ -132,6 +132,17 @@ pub use syntax::{RowOrder, accepts, line_and_column, parses, row_order, split, w
 pub use rudb_common::{Cancel, Error, ErrorCode, Field, LogicalType, Result, Span, Value};
 pub use rudb_vector::Chunk;
 
+/// The seams, which are the parts of the engine there is more than one published way to build.
+///
+/// A module rather than a flat re-export, because `Settings` here is which implementation runs at
+/// each seam and `Settings` in `rudb-cli` is how a result is printed, and a name that has to be
+/// read in context is a name worth qualifying. [`Database::seams`] is what hands one back.
+pub mod seam {
+    pub use rudb_seam::{
+        ChoiceReason, Determinism, Policy, PolicyMode, Provenance, SEAM_PREFIX, SeamId, Settings,
+    };
+}
+
 /// Arrow interchange, which is what [`QueryResult::to_arrow`] hands back.
 ///
 /// A module rather than a flat re-export because Arrow has a `Field` and a `Schema` of its own and

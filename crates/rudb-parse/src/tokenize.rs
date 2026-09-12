@@ -34,7 +34,30 @@ use crate::token::{Flags, Kind, NOT_A_KEYWORD, Token};
 /// quoted identifier `""`. An unterminated dollar quoted string is not one of them and comes back
 /// as a token with [`Flags::UNTERMINATED`] set.
 pub fn tokenize(query: &str) -> Result<Vec<Token>> {
-    Tokenizer::new(query).run()
+    Ok(Tokenizer::new(query).run()?.0)
+}
+
+/// The body of every `/*+ ... */` hint in `query`, in the order they were written.
+///
+/// A hint is a block comment whose first character is a plus, which is how Oracle, MySQL and Spark
+/// all spell one, and what comes back is the text between the plus and the closing `*/` with
+/// nothing done to it. What a hint means is not a question for the tokenizer: `rudb_seam` reads the
+/// body, through the same function a `SET` goes through.
+///
+/// The tokenizer runs rather than a second scanner over the text, because `/*+` inside a string
+/// literal is not a hint and a second scanner is a second opinion about where a literal ends. It
+/// only runs when the text has `/*+` in it at all, so a query without a hint pays for one substring
+/// search.
+///
+/// # Errors
+///
+/// The four the tokenizer throws, since it is the tokenizer doing the work.
+pub fn hints(query: &str) -> Result<Vec<&str>> {
+    if !query.contains("/*+") {
+        return Ok(Vec::new());
+    }
+    let (_, spans) = Tokenizer::new(query).run()?;
+    Ok(spans.iter().map(|span| &query[span.start as usize..span.end as usize]).collect())
 }
 
 /// Where the scan is.
@@ -63,6 +86,8 @@ struct Tokenizer<'a> {
     /// A block comment ended here. Used to set [`Flags::BLOCK_COMMENT`] on the next token, which
     /// is the whole reason comments are tracked rather than skipped.
     block_comment_at: Option<usize>,
+    /// The body of each `/*+ ... */`, for [`hints`]. Empty for almost every query there is.
+    hints: Vec<Span>,
     /// Set by an `E` prefix, which is the only one of the four that changes how the body is read.
     escape_string: bool,
     /// The tag between the dollars, as a span, so that closing it is a slice comparison.
@@ -80,13 +105,14 @@ impl<'a> Tokenizer<'a> {
             tokens: Vec::with_capacity(query.len() / 4 + 4),
             last: 0,
             block_comment_at: None,
+            hints: Vec::new(),
             escape_string: false,
             dollar_tag: Span::new(0, 0),
             depth: 0,
         }
     }
 
-    fn run(mut self) -> Result<Vec<Token>> {
+    fn run(mut self) -> Result<(Vec<Token>, Vec<Span>)> {
         let mut state = State::Standard;
         let mut i = 0;
         while i < self.bytes.len() {
@@ -118,7 +144,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// The end of the input, which is a different decision per state and not a loop exit.
-    fn finish(mut self, state: State) -> Result<Vec<Token>> {
+    fn finish(mut self, state: State) -> Result<(Vec<Token>, Vec<Span>)> {
         let end = self.bytes.len();
         match state {
             State::LineComment => {
@@ -159,7 +185,7 @@ impl<'a> Tokenizer<'a> {
             start: end as u32,
             end: end as u32,
         });
-        Ok(self.tokens)
+        Ok((self.tokens, self.hints))
     }
 
     /// The dispatch at the top of a token. Returns the state to move to, if it changes.
@@ -462,9 +488,16 @@ impl<'a> Tokenizer<'a> {
     /// Record a comment. Nothing is pushed, because a comment is not a token anywhere the parser
     /// can see, but where the block ones were has to be remembered so the next token can say it
     /// was preceded by one.
+    ///
+    /// A block comment that opens `/*+` is a hint and its body is kept as well. It stays a comment
+    /// in every other respect, so a query that hints something DuckDB has never heard of parses
+    /// there too, which is what makes a hint safe to leave in a file two engines read.
     fn comment(&mut self, start: usize, end: usize) {
         if end >= start + 2 && &self.bytes[start..start + 2] == b"/*" {
             self.block_comment_at = Some(start);
+            if end >= start + 5 && self.bytes[start + 2] == b'+' {
+                self.hints.push(Span::new(start as u32 + 3, end as u32 - 2));
+            }
         }
     }
 
@@ -829,6 +862,25 @@ mod tests {
         let tokens = all("SELECT --x\n1");
         assert!(!tokens[1].flags.has(Flags::BLOCK_COMMENT));
         assert!(tokens[1].flags.has(Flags::NEWLINE));
+    }
+
+    #[test]
+    fn a_hint_is_a_comment_that_can_be_read_back() {
+        assert_eq!(
+            super::hints("SELECT /*+ hash.table(unchained) */ 1").unwrap(),
+            [" hash.table(unchained) "]
+        );
+        // Still a comment, so the tokens are what they would have been without it.
+        assert_eq!(texts("SELECT /*+ hash.table(unchained) */ 1"), ["SELECT", "1"]);
+
+        // Two of them, in the order they were written, from anywhere in the statement.
+        assert_eq!(super::hints("SELECT /*+ a(b) */ 1 /*+ c(d) */").unwrap(), [" a(b) ", " c(d) "]);
+
+        // A comment without the plus is not a hint, and neither is one inside a string literal,
+        // which is the case a scanner that did not know about literals would get wrong.
+        assert!(super::hints("SELECT /* hash.table(unchained) */ 1").unwrap().is_empty());
+        assert!(super::hints("SELECT '/*+ hash.table(unchained) */'").unwrap().is_empty());
+        assert!(super::hints("SELECT 1").unwrap().is_empty());
     }
 
     #[test]

@@ -14,6 +14,25 @@ use crate::seam::SeamId;
 /// collides with its own extension points is a compatibility surface that gets changed later.
 pub const SEAM_PREFIX: &str = "seam.";
 
+/// The seam a settings key names, or `None` when nothing is called that.
+///
+/// Three spellings arrive here and all three mean one seam. `seam.hash.table` is the one to write
+/// in a script. `hash.table` is the one in the milestone document and the one a person says out
+/// loud. `seam_hash_table` is the one that fits through `SET`, because the statement takes an
+/// identifier and DuckDB's grammar has no dot in one, so the dotted form has to be quoted and the
+/// underscored form does not. Being strict about which of the three is correct would buy nothing
+/// and cost somebody an afternoon.
+#[must_use]
+pub fn seam_named(key: &str) -> Option<SeamId> {
+    let name = key.strip_prefix(SEAM_PREFIX).unwrap_or(key);
+    if let Some(seam) = SeamId::from_name(name) {
+        return Some(seam);
+    }
+    let dotted = name.replace('_', ".");
+    let name = dotted.strip_prefix(SEAM_PREFIX).unwrap_or(&dotted);
+    SeamId::from_name(name)
+}
+
 /// What the session has been told about seam selection.
 ///
 /// Three surfaces reach this and they agree because they are the same code. A process flag on the
@@ -54,8 +73,8 @@ impl Settings {
     /// the list of seams in the message, because a mistyped seam name is the commonest way to get
     /// a run that measured the wrong thing.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
-        let name = key.strip_prefix(SEAM_PREFIX).unwrap_or(key);
-        let Some(seam) = SeamId::from_name(name) else {
+        let Some(seam) = seam_named(key) else {
+            let name = key.strip_prefix(SEAM_PREFIX).unwrap_or(key);
             return Err(Error::catalog(format!(
                 "no seam called {name}, see rudb_strategies() for the list"
             )));
@@ -79,6 +98,36 @@ impl Settings {
         Ok(())
     }
 
+    /// Apply the body of one `/*+ ... */` hint, which is the third of the three surfaces.
+    ///
+    /// The body is a list of `seam(implementation)` items separated by spaces or commas, so
+    /// `/*+ hash.table(linear-chained) sort.algorithm(radix) */` pins two seams for one query.
+    /// `policy(reference)` is the same special case it is everywhere else, because the policy is
+    /// the seam that chooses at every other seam.
+    ///
+    /// Parentheses rather than an equals sign, which is what Oracle, MySQL and Spark all spell a
+    /// hint with, and the value may be quoted or bare because somebody who has just written
+    /// `SET seam.hash.table = 'linear-chained'` will write the quotes here out of habit.
+    ///
+    /// Every item goes through [`Settings::set`], so a hint and a `SET` cannot come to disagree
+    /// about what a name means or about what the message is when it is wrong.
+    ///
+    /// # Errors
+    ///
+    /// For an item that is not `name(value)`, and for everything [`Settings::set`] refuses.
+    pub fn hint(&mut self, body: &str) -> Result<()> {
+        for item in body.split([',', ' ', '\t', '\n', '\r']).filter(|item| !item.is_empty()) {
+            let (name, rest) = item.split_once('(').ok_or_else(|| {
+                Error::invalid_input(format!("a hint is written seam(implementation), not {item}"))
+            })?;
+            let value = rest.strip_suffix(')').ok_or_else(|| {
+                Error::invalid_input(format!("the hint {item} is missing its closing bracket"))
+            })?;
+            self.set(name.trim(), value.trim().trim_matches('\''))?;
+        }
+        Ok(())
+    }
+
     /// What a setting currently reads back as.
     ///
     /// An unpinned seam reads back as `default` rather than as nothing, because that is what
@@ -86,8 +135,7 @@ impl Settings {
     /// is a settings surface somebody reports as a bug.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<String> {
-        let name = key.strip_prefix(SEAM_PREFIX).unwrap_or(key);
-        let seam = SeamId::from_name(name)?;
+        let seam = seam_named(key)?;
         if seam == SeamId::Policy {
             return Some(self.mode.to_string());
         }

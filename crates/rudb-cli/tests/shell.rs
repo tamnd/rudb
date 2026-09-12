@@ -441,6 +441,21 @@ fn version_and_help_and_config_print_and_stop() {
     assert!(out.contains("threads: "), "{out}");
 }
 
+/// The process flag half of the three surfaces, which is a `SET` the shell runs for you.
+#[test]
+fn a_set_flag_runs_before_the_sql_whatever_order_it_was_written_in() {
+    let (out, err, failed) =
+        run(&["-noheader", "-list", "-c", "SELECT 1", "--set", "hash.table=unchained"]);
+    assert!(!failed, "{err}");
+    assert_eq!(out, "1\n");
+
+    // A seam nobody has is refused by the statement the flag ran, which is the same sentence the
+    // same `SET` typed at the prompt would have printed.
+    let (_, err, failed) = run(&["-c", "SELECT 1", "--set", "seam.hash.tabel=unchained"]);
+    assert!(failed);
+    assert!(err.contains("no seam called hash.tabel"), "{err}");
+}
+
 #[test]
 fn an_unknown_option_says_so_rather_than_opening_a_file_of_that_name() {
     let (_, err, failed) = run(&["-csvv"]);
