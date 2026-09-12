@@ -102,16 +102,7 @@ impl<'a, K: Sink> Broken<'a, K> {
     }
 
     fn build(&mut self) -> Result<()> {
-        let mut local = self.sink.local();
-        while let Some(chunk) = self.input.next()? {
-            match self.sink.sink(&chunk, &mut local)? {
-                Progress::Done => break,
-                Progress::Blocked(blocked) => return Err(parked(&blocked)),
-                _ => {}
-            }
-        }
-        self.sink.combine(local)?;
-        self.sink.finalize()
+        drain(self.input.as_mut(), &self.sink)
     }
 }
 
@@ -140,6 +131,90 @@ impl<K: Sink> Operator for Broken<'_, K> {
         }
         Ok(chunk)
     }
+}
+
+/// Two pipeline breakers where the second one needs the first one's answer.
+///
+/// A set operation reads the whole right side before it can decide anything about a left row, and a
+/// hash join builds from one side before it probes with the other. In push terms that is two
+/// pipelines with a dependency edge between them, and the edge means one order: everything into
+/// `aside`, and only then everything into `sink`. The scheduler is what enforces that later, from
+/// the same edge, which is why this runs them in the order it does rather than in whatever order is
+/// convenient here.
+pub(crate) struct Paired<'a, F: Sink, K: Sink> {
+    first: Box<dyn Operator + 'a>,
+    aside: F,
+    second: Box<dyn Operator + 'a>,
+    sink: K,
+    out: Buffered,
+    schema: Schema,
+    built: bool,
+    at: usize,
+}
+
+impl<'a, F: Sink, K: Sink> Paired<'a, F, K> {
+    /// `first` and `aside` are the side that has to be finished first, `second` and `sink` are the
+    /// side that uses it, and `out` is what `sink` finalises into.
+    pub(crate) fn new(
+        first: Box<dyn Operator + 'a>,
+        aside: F,
+        second: Box<dyn Operator + 'a>,
+        sink: K,
+        out: Buffered,
+        schema: Schema,
+    ) -> Self {
+        Self { first, aside, second, sink, out, schema, built: false, at: 0 }
+    }
+
+    fn build(&mut self) -> Result<()> {
+        drain(self.first.as_mut(), &self.aside)?;
+        drain(self.second.as_mut(), &self.sink)
+    }
+}
+
+impl<F: Sink, K: Sink> fmt::Debug for Paired<'_, F, K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Paired")
+            .field("sink", &self.sink)
+            .field("aside", &self.aside)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: Sink, K: Sink> Operator for Paired<'_, F, K> {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        if !self.built {
+            self.build()?;
+            self.built = true;
+        }
+        let chunk = self.out.at(self.at)?;
+        if chunk.is_some() {
+            self.at += 1;
+        }
+        Ok(chunk)
+    }
+}
+
+/// Runs one whole pipeline into one sink, the way the serial driver will.
+///
+/// One instance, because there is one thread here. `combine` takes it by value and `finalize`
+/// happens once after it, which is the contract every sink is written against, so the only thing
+/// that changes when there are several threads is how many times the first three lines happen.
+fn drain<K: Sink>(input: &mut dyn Operator, sink: &K) -> Result<()> {
+    let mut local = sink.local();
+    while let Some(chunk) = input.next()? {
+        match sink.sink(&chunk, &mut local)? {
+            Progress::Done => break,
+            Progress::Blocked(blocked) => return Err(parked(&blocked)),
+            _ => {}
+        }
+    }
+    sink.combine(local)?;
+    sink.finalize()
 }
 
 /// The error a blocked stream gets here.
