@@ -178,6 +178,21 @@ fn a_grouped_expression_is_recognised_wherever_it_is_written_again() {
     assert!(text.contains("[#1.0::INTEGER AS \"(counter + 1)\""), "{text}");
 }
 
+/// `typeof` is answered here, so what reaches the plan is the name of the type. Per #229.
+#[test]
+fn typeof_is_the_name_of_a_type_rather_than_a_call() {
+    let text = plan("SELECT typeof(counter) FROM hits");
+    assert!(text.contains("'INTEGER'::VARCHAR AS \"typeof(counter)\""), "{text}");
+    // The only `typeof` left in the plan is the column's name, which is the call as it was written.
+    assert!(!text.contains("typeof(#"), "nothing is left for the executor to do: {text}");
+    // The argument is still an expression where it was written, so it follows the rules about what
+    // can be selected next to an aggregate. Upstream refuses this one for the same reason.
+    let message = failure("SELECT typeof(url), count(*) FROM hits");
+    assert!(message.contains("must appear in the GROUP BY clause"), "{message}");
+    let text = plan("SELECT typeof(url) FROM hits GROUP BY url");
+    assert!(text.contains("'VARCHAR'::VARCHAR"), "{text}");
+}
+
 #[test]
 fn group_by_can_name_a_target_by_position_or_by_alias() {
     let by_position = plan("SELECT url, count(*) FROM hits GROUP BY 1");
