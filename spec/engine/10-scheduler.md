@@ -108,6 +108,8 @@ Iteration limits and cycle detection matter here for a practical reason: an unte
 
 A query has to be interruptible, which means every operator checks a cancellation flag at chunk granularity, which is cheap because it is once per thousand rows rather than once per row.
 
+Chunk granularity is the rule and it is not the whole rule, because an operator that loops over rows it has already read produces no chunks while it is doing so. A nested loop join is the case: the join runs to the end before its first chunk exists, so a check between chunks is a check at the end. An operator like that checks inside its own loop, at whatever unit of work it has that is smaller than the whole operator and larger than a row.
+
 Progress reporting, meaning the fraction of morsels consumed across the source pipelines, is nearly free once the dispatcher exists and it is what a CLI progress bar and a client's cancel button need.
 
 `EXPLAIN ANALYZE` reports per pipeline and per operator: rows in, rows out, wall time, CPU time, peak memory, and blocked time by reason. The blocked time by reason is the part that is unusual and it is the most useful number in the whole system for diagnosing a slow query, because it distinguishes an operator that is slow from an operator that is waiting.

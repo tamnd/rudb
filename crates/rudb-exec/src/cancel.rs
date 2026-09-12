@@ -21,6 +21,17 @@ use crate::schema::Schema;
 /// is the trade `spec/engine/10-scheduler.md` section 10.9 asks for in as many words: every
 /// operator checks a cancellation flag at chunk granularity, because once per thousand rows is
 /// cheap and once per row is not.
+///
+/// What this cannot see is work an operator does inside one call to `next`. Pulling from a child is
+/// not that, because the child is wrapped too, so an operator that reads its whole input is checked
+/// all the way through the reading. An operator that then loops over what it read is, and [`Join`]
+/// is the one that does: the nested loop runs to the end inside the first `next`, and a hundred
+/// thousand left rows against thirty thousand right ones is a minute with nothing looking at the
+/// token. So that loop holds the token as well and checks it once per left row. The rule is still
+/// the one above, with a sentence after it: every operator is checked between its chunks, and an
+/// operator whose own loop can outlive a chunk checks inside it.
+///
+/// [`Join`]: crate::join::Join
 #[derive(Debug)]
 pub(crate) struct Guarded<'a> {
     inner: Box<dyn Operator + 'a>,
