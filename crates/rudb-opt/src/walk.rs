@@ -181,6 +181,83 @@ fn any_volatile(plan: &Plan, slice: Slice) -> bool {
     plan.expr_list(slice).iter().any(|&expr| volatile(plan, expr))
 }
 
+/// Whether the value for a row is decided by that row on its own.
+///
+/// The question every pass that moves an expression to a different operator has to answer, because
+/// an operator is where the set of rows an expression is evaluated over is decided. An elementwise
+/// expression does not care which rows it is evaluated beside, so a pass may put it above a filter
+/// or below one and get the same answer for the rows that survive. An aggregate is the opposite: it
+/// is a value per group, so a group by with one fewer row in a group answers differently.
+///
+/// This is not the volatility question. `random()` is elementwise and is not safe to copy, and an
+/// aggregate is safe to copy and is not elementwise, so a pass that moves a copy of an expression
+/// has to ask both. [`volatile`] is the other one.
+///
+/// It is false for an aggregate today and that is the whole of the list, because an aggregate is
+/// the only expression rudb has whose value reads more than one row. A window function is the next
+/// one and there is none yet. The binder puts every aggregate in a [`Node::Aggregate`] rather than
+/// leaving one in a projection, so nothing a query produces today can make this false, and it is
+/// asked anyway: the first pass to believe the invariant without checking it is the pass that
+/// pushes a filter through a window function and answers the wrong query.
+///
+/// [`Node::Aggregate`]: rudb_plan::Node::Aggregate
+pub(crate) fn elementwise(plan: &Plan, expr: ExprRef) -> bool {
+    match *plan.expr(expr) {
+        Expr::Column(_) | Expr::Constant(_) => true,
+        Expr::Aggregate { .. } => false,
+        Expr::Cast { input, .. } => elementwise(plan, input),
+        Expr::Compare { left, right, .. } => elementwise(plan, left) && elementwise(plan, right),
+        Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
+            all_elementwise(plan, children)
+        }
+        Expr::Case { arms, otherwise } => {
+            plan.arm_list(arms)
+                .iter()
+                .all(|arm| elementwise(plan, arm.when) && elementwise(plan, arm.then))
+                && otherwise.is_none_or(|inner| elementwise(plan, inner))
+        }
+    }
+}
+
+/// Whether every expression in the run is elementwise.
+fn all_elementwise(plan: &Plan, slice: Slice) -> bool {
+    plan.expr_list(slice).iter().all(|&expr| elementwise(plan, expr))
+}
+
+/// Whether the expression has the same value for every row.
+///
+/// It reads no column, calls nothing [`volatile`] and holds no aggregate, so its value is decided
+/// before the first row is read. That is a wider question than whether it is already a literal:
+/// `CAST('abc' AS INTEGER) > 1` is constant and folding leaves it alone, because a fold that raises
+/// is abandoned so that the error still comes from running the query.
+///
+/// An aggregate is false rather than true. It is one value per group, which is constant within a
+/// group and not across the input, and the difference between those two is not one this answer can
+/// carry, so it says the safe of the two.
+pub(crate) fn constant(plan: &Plan, expr: ExprRef) -> bool {
+    match *plan.expr(expr) {
+        Expr::Constant(_) => true,
+        Expr::Column(_) | Expr::Aggregate { .. } => false,
+        Expr::Cast { input, .. } => constant(plan, input),
+        Expr::Compare { left, right, .. } => constant(plan, left) && constant(plan, right),
+        Expr::Conjunction { children, .. } => all_constant(plan, children),
+        Expr::Function { name, args } => {
+            !VOLATILE.contains(&plan.string(name)) && all_constant(plan, args)
+        }
+        Expr::Case { arms, otherwise } => {
+            plan.arm_list(arms)
+                .iter()
+                .all(|arm| constant(plan, arm.when) && constant(plan, arm.then))
+                && otherwise.is_none_or(|inner| constant(plan, inner))
+        }
+    }
+}
+
+/// Whether every expression in the run has the same value for every row.
+fn all_constant(plan: &Plan, slice: Slice) -> bool {
+    plan.expr_list(slice).iter().all(|&expr| constant(plan, expr))
+}
+
 /// Whether two expressions are the same expression written out.
 ///
 /// The arena does not share anything, so an expression built twice is two references to two copies
@@ -268,5 +345,84 @@ fn same_option(plan: &Plan, one: Option<ExprRef>, other: Option<ExprRef>) -> boo
         (None, None) => true,
         (Some(left), Some(right)) => same(plan, left, right),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rudb_plan::{Expr, ExprRef, Node, Plan};
+
+    use super::{constant, elementwise, volatile};
+
+    /// The predicate of the filter at the root.
+    fn predicate(plan: &Plan) -> ExprRef {
+        match *plan.node(plan.root()) {
+            Node::Filter { predicate, .. } => predicate,
+            _ => panic!("the root is not a filter"),
+        }
+    }
+
+    /// A plan whose root is a filter holding `text` over a one column scan.
+    fn filtered(text: &str) -> Plan {
+        let text = format!("Filter {text}\n  Get memory.main.t AS t #0 [a::INTEGER]\n");
+        Plan::parse(&text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"))
+    }
+
+    #[test]
+    fn a_column_is_elementwise_and_is_not_constant() {
+        let plan = filtered("(#0.0::INTEGER > 1::INTEGER)::BOOLEAN");
+        let predicate = predicate(&plan);
+        assert!(elementwise(&plan, predicate));
+        assert!(!constant(&plan, predicate));
+    }
+
+    #[test]
+    fn a_comparison_of_two_literals_is_both() {
+        // Written the way an abandoned fold leaves it, which is where a constant predicate over no
+        // column actually comes from once the rewriter has been over the plan.
+        let plan = filtered("(1::INTEGER > 2::INTEGER)::BOOLEAN");
+        let predicate = predicate(&plan);
+        assert!(elementwise(&plan, predicate));
+        assert!(constant(&plan, predicate));
+    }
+
+    #[test]
+    fn a_volatile_call_is_elementwise_and_is_not_constant() {
+        // The two questions come apart here. `random()` is decided by nothing, which is what makes
+        // it not constant, and it is still one call per row, which is what makes it elementwise.
+        let plan = filtered("(random()::DOUBLE > 0.5::DOUBLE)::BOOLEAN");
+        let predicate = predicate(&plan);
+        assert!(volatile(&plan, predicate));
+        assert!(elementwise(&plan, predicate));
+        assert!(!constant(&plan, predicate));
+    }
+
+    #[test]
+    fn an_aggregate_is_neither_however_constant_its_arguments_are() {
+        let text = concat!(
+            "Aggregate #1 groups=[] aggregates=[sum(1::INTEGER)::HUGEINT]\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER]\n",
+        );
+        let plan = Plan::parse(text).expect("an aggregate");
+        let Node::Aggregate { aggregates, .. } = *plan.node(plan.root()) else {
+            panic!("the root is not an aggregate");
+        };
+        let call = plan.expr_list(aggregates)[0];
+        assert!(matches!(plan.expr(call), Expr::Aggregate { .. }));
+        assert!(!elementwise(&plan, call));
+        assert!(!constant(&plan, call));
+    }
+
+    #[test]
+    fn a_case_answers_for_the_whole_of_itself_and_not_for_the_branch_that_runs() {
+        let both =
+            filtered("CASE WHEN TRUE::BOOLEAN THEN TRUE::BOOLEAN ELSE FALSE::BOOLEAN END::BOOLEAN");
+        assert!(constant(&both, predicate(&both)));
+        // One branch reading a column is enough, because which branch runs is a per row answer.
+        let one = filtered(
+            "CASE WHEN TRUE::BOOLEAN THEN TRUE::BOOLEAN ELSE (#0.0::INTEGER > 1::INTEGER)::BOOLEAN END::BOOLEAN",
+        );
+        assert!(!constant(&one, predicate(&one)));
+        assert!(elementwise(&one, predicate(&one)));
     }
 }

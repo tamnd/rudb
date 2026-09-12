@@ -44,6 +44,7 @@ use rudb_common::Result;
 use rudb_plan::{Node, NodeRef, Plan};
 
 use crate::pass::{Context, Pass, top_down};
+use crate::walk;
 
 /// Moves every limit below the projection above it.
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +87,12 @@ fn swap(plan: &mut Plan, at: NodeRef, shared: &[NodeRef]) -> Option<NodeRef> {
         return None;
     };
     if shared.contains(&input) {
+        return None;
+    }
+    // One row out per row in is what makes the two orders the same rows, and an expression that
+    // reads more than its own row does not have that property: ten rows into an aggregate is a
+    // different answer from ten rows out of one. The binder cannot build that projection today.
+    if !plan.expr_list(exprs).iter().all(|&expr| walk::elementwise(plan, expr)) {
         return None;
     }
     *plan.node_mut(input) = Node::Limit { input: under, count, offset };
