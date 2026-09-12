@@ -9,18 +9,22 @@
 //! This file is where a researcher who has written an implementation adds their one line. The rest
 //! of their work is one file in one crate behind one seam trait.
 //!
-//! # Why it is empty
+//! # What is registered
 //!
-//! Nothing is registered yet. Twenty seven seams are named in `SeamId` and none of them has two
-//! implementations in the tree, because F0 is the skeleton and every seam's first two
-//! implementations belong to a later milestone, which [`SeamId::milestone`](rudb_seam::SeamId) says
-//! for each of them. `rudb_strategies()` prints those twenty seven rows with the implementation
-//! columns null, which is the honest state of the project and is meant to be read as a list of what
-//! is planned rather than as an empty table.
+//! One seam of the twenty seven. `chunk.compaction` has three implementations in `rudb-pipeline`
+//! and this is where they are put in front of the engine. The other twenty six are named in
+//! `SeamId` with the milestone that owes them written on each, which
+//! [`SeamId::milestone`](rudb_seam::SeamId) answers and `rudb_strategies()` prints, so that table
+//! reads as a list of what is planned rather than as an empty one.
+//!
+//! A seam that is registered here is also a seam a query can pin, which means the typed registry
+//! has to be reachable by the operator that chooses from it as well as by the erased list that
+//! `EXPLAIN` prints. That is why each one gets a named accessor next to the line that adds it.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-use rudb_seam::Registries;
+use rudb_pipeline::Compaction;
+use rudb_seam::{Registries, Registry};
 
 /// Every registry in the process, assembled the first time somebody asks.
 ///
@@ -36,11 +40,17 @@ pub fn registries() -> &'static Registries {
     REGISTRIES.get_or_init(assemble)
 }
 
+/// The chunk compaction seam, which is what a filter chooses from once per query.
+///
+/// The same object the erased list holds, so what `EXPLAIN` prints and what runs cannot drift.
+pub(crate) fn compaction() -> &'static Arc<Registry<dyn Compaction>> {
+    static COMPACTION: OnceLock<Arc<Registry<dyn Compaction>>> = OnceLock::new();
+    COMPACTION.get_or_init(|| Arc::new(rudb_pipeline::compaction()))
+}
+
 /// One line per crate that owns implementations of a seam.
 fn assemble() -> Registries {
-    // Each line below will read `registries.add(Arc::new(rudb_vector::register()))` or its
-    // equivalent for the crate that owns the seam. The first of them arrives with F1, which owes
-    // the vector form, compare, filter and expression evaluation seams their first two
-    // implementations each.
-    Registries::new()
+    let mut registries = Registries::new();
+    registries.add(compaction().clone());
+    registries
 }
