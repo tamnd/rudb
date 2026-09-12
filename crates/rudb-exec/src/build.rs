@@ -20,7 +20,7 @@ use crate::adapt::{Broken, Paired, Streamed};
 use crate::cancel::Guarded;
 use crate::gather::Gather;
 use crate::group::{Aggregate, Distinct};
-use crate::join::{CrossProduct, Join};
+use crate::join::{CrossProduct, Gathered, Join};
 use crate::operator::Operator;
 use crate::setop::SetOp;
 use crate::sort::Sort;
@@ -131,15 +131,19 @@ fn node<'a>(
             let (distinct, out) = Distinct::new(plan, &schema, on, memory)?;
             Box::new(Broken::new(input, distinct, out, schema))
         }
-        Node::Join { left, right, kind, conditions } => Box::new(Join::new(
-            plan,
-            node(plan, catalog, cancel, memory, left)?,
-            node(plan, catalog, cancel, memory, right)?,
-            kind,
-            conditions,
-            cancel,
-            memory,
-        )),
+        Node::Join { left, right, kind, conditions } => {
+            let left = node(plan, catalog, cancel, memory, left)?;
+            let right = node(plan, catalog, cancel, memory, right)?;
+            // The right side runs first, because no left row can be answered until every right row
+            // it might match has been seen. That is the dependency edge, and it is the same one the
+            // hash join builds on.
+            let (gather, gathered) = Gather::new(memory);
+            let side = Gathered { schema: right.schema(), rows: gathered };
+            let (join, out) =
+                Join::new(plan, left.schema(), side, kind, conditions, cancel, memory);
+            let schema = join.schema().clone();
+            Box::new(Paired::new(right, gather, left, join, out, schema))
+        }
         Node::CrossProduct { left, right } => Box::new(CrossProduct::new(
             node(plan, catalog, cancel, memory, left)?,
             node(plan, catalog, cancel, memory, right)?,

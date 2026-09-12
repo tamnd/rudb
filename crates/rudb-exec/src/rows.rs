@@ -7,15 +7,15 @@
 //! compare it against. Sorting, grouping and joining are the three places a database is most often
 //! subtly wrong, and none of those bugs are about the row layout.
 //!
-//! It is also why the memory limit is charged here. These two functions are where an unbounded
-//! amount of memory is taken, so they are where the limit has to be asked, and a limit charged in
-//! one place per crate is one somebody can believe rather than one that has to be re-audited every
-//! time an operator is added.
+//! It is also why the memory limit is charged here. Turning chunks into rows and rows back into
+//! chunks is where an unbounded amount of memory is taken, so this is where the limit has to be
+//! asked, and a limit charged in one place per crate is one somebody can believe rather than one
+//! that has to be re-audited every time an operator is added. The reading half of it lives in
+//! `gather` now, because that is the sink every operator that holds its input ends in, and it
+//! charges through the helpers here rather than counting anything itself.
 
 use rudb_common::{ALLOCATION, LogicalType, Reservation, Result, Value};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
-
-use crate::operator::Operator;
 
 /// What one buffered row costs, counting the values and the vector holding them.
 pub(crate) fn footprint(row: &[Value]) -> u64 {
@@ -84,39 +84,6 @@ pub(crate) fn capacity(now: u64, charged: &mut u64, held: &mut Reservation) -> R
 /// for each of eight sevenths of what `capacity` says.
 pub(crate) fn buckets(entries: usize) -> u64 {
     u64::try_from(entries).unwrap_or(u64::MAX).saturating_mul(8).div_ceil(7)
-}
-
-/// Drains an operator into rows, charging what they take against the budget.
-///
-/// The charge happens once per input chunk rather than once per row, so a query passes its limit by
-/// up to a chunk of rows before it is told. That is the same granularity the cancellation check
-/// runs at and for the same reason: a thousand rows is a bounded overshoot and a check per row is a
-/// branch in the row loop.
-///
-/// Two charges rather than one. Each row is charged what it owns, and the vector holding the rows is
-/// charged what it has taken from the allocator rather than what it has put in it, which is up to
-/// twice as much because a `Vec` doubles.
-///
-/// # Errors
-///
-/// Anything the operator reports while producing its input, and
-/// [`rudb_common::ErrorCode::OutOfMemory`] when the rows pass the limit the database was opened
-/// with.
-pub(crate) fn collect(input: &mut dyn Operator, held: &mut Reservation) -> Result<Vec<Vec<Value>>> {
-    let mut rows = Vec::new();
-    let mut charged = 0;
-    while let Some(chunk) = input.next()? {
-        let mut taken = 0;
-        for row in 0..chunk.len() {
-            let values: Vec<Value> = chunk.row(row).collect();
-            taken += heap(&values);
-            rows.push(values);
-        }
-        held.grow(taken)?;
-        let slots = u64::try_from(rows.capacity() * size_of::<Vec<Value>>()).unwrap_or(u64::MAX);
-        capacity(slots, &mut charged, held)?;
-    }
-    Ok(rows)
 }
 
 /// Rows back into chunks of at most [`VECTOR_SIZE`], in the order given.
