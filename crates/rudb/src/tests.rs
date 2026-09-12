@@ -513,6 +513,21 @@ fn the_regular_expression_functions_answer_the_way_duckdb_does() {
     );
 }
 
+/// A dollar quoted string is the text between the tags and nothing else. Per #276.
+///
+/// The comparison is the test worth having. The literal on its own looked plausible in the shell
+/// output, and what the bug really did was make a dollar quoted string unequal to the same string
+/// written the ordinary way, with nothing raising and nothing looking odd in the plan.
+#[test]
+fn a_dollar_quoted_string_is_the_text_between_the_tags() {
+    let db = Database::new();
+    assert_eq!(rows(&db, "SELECT $$dollar quoted$$"), vec![vec![text("dollar quoted")]]);
+    assert_eq!(rows(&db, "SELECT $tag$body$tag$"), vec![vec![text("body")]]);
+    assert_eq!(rows(&db, "SELECT $$a$$ = 'a'"), vec![vec![Value::Boolean(true)]]);
+    // The name a column gets is rendered from the value, so it comes right with it.
+    assert_eq!(db.query("SELECT $$a$$").unwrap().names(), &["'a'".to_string()]);
+}
+
 /// A string that will not read as the other type raises, rather than quietly comparing as text and
 /// answering false.
 #[test]
