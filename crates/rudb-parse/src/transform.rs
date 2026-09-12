@@ -783,7 +783,7 @@ impl<'a> Transform<'a> {
         let name = match self.name(inner) {
             "DescribeBaseTableName" => self.name_parts(self.find(inner, "BaseTableName")),
             "DescribeStringLiteral" => {
-                let text = self.string_value(self.find(inner, "StringLiteral"));
+                let text = self.string_value(self.find(inner, "StringLiteral"))?;
                 let part = self.intern(&text);
                 self.part_slice(vec![part])
             }
@@ -1331,11 +1331,7 @@ impl<'a> Transform<'a> {
                     let text = self.intern(&text);
                     return Ok(self.push(Expr::Literal { kind: LiteralKind::Number, text }));
                 }
-                "StringLiteral" => {
-                    let text = self.string_value(node);
-                    let text = self.intern(&text);
-                    return Ok(self.push(Expr::Literal { kind: LiteralKind::String, text }));
-                }
+                "StringLiteral" => return self.string_literal(node),
                 "NullLiteral" | "TrueLiteral" | "FalseLiteral" => {
                     let kind = match name {
                         "NullLiteral" => LiteralKind::Null,
@@ -2021,7 +2017,7 @@ impl<'a> Transform<'a> {
         }
         let argument = self.first(self.first(arguments));
         let part = match self.name(argument) {
-            "ExtractStringArgument" => self.string_value(argument),
+            "ExtractStringArgument" => self.string_value(argument)?,
             // A keyword or an identifier, both taken as written. Which specifier names are legal is
             // not a question about syntax, so the answer to it lives with the function.
             "ExtractDatePartArgument" | "ExtractIdentifierArgument" => {
@@ -2200,25 +2196,179 @@ impl<'a> Transform<'a> {
     /// A literal can be several tokens. `'a' 'b'` on two lines is one literal that is `ab`, which is
     /// the SQL standard's rule and DuckDB's, so the node is decoded token by token rather than by
     /// taking its text and stripping the outside.
-    fn string_value(&self, node: u32) -> String {
+    fn string_value(&self, node: u32) -> Result<String> {
         let span = self.tree.node(node);
         let mut value = String::new();
         for token in &self.tokens[span.start as usize..span.end as usize] {
-            if token.kind != Kind::String {
-                continue;
-            }
-            let text = token.text(self.query);
-            if let Some(body) = dollar_body(text) {
-                value.push_str(body);
-                continue;
-            }
-            match text.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')) {
-                Some(body) => value.push_str(&body.replace("''", "'")),
-                None => value.push_str(text),
+            if token.kind == Kind::String {
+                value.push_str(&string_token(token.text(self.query))?);
             }
         }
-        value
+        Ok(value)
     }
+
+    /// The prefix letter a string literal was written with, for the token that opens it.
+    ///
+    /// Only the first token is asked, because a prefixed literal is one token: `E'a' 'b'` is a
+    /// syntax error upstream rather than a concatenation, so there is no second prefix to disagree
+    /// with this one.
+    fn string_prefix(&self, node: u32) -> Option<u8> {
+        let span = self.tree.node(node);
+        let token = self.tokens[span.start as usize..span.end as usize]
+            .iter()
+            .find(|token| token.kind == Kind::String)?;
+        match token.text(self.query).as_bytes() {
+            [first, b'\'', ..] => Some(*first),
+            _ => None,
+        }
+    }
+
+    /// A string literal as an expression, which is the value plus what the prefix makes of it.
+    ///
+    /// `N'abc'` is a cast of the string to VARCHAR upstream and not a plain string, and the column
+    /// name is the proof: the pinned binary answers it in a column called `CAST('abc' AS VARCHAR)`.
+    /// So it is written here as the cast it is, and then there is nothing left to keep in step.
+    fn string_literal(&mut self, node: u32) -> Result<ExprRef> {
+        let value = self.string_value(node)?;
+        let text = self.intern(&value);
+        let literal = self.push(Expr::Literal { kind: LiteralKind::String, text });
+        if matches!(self.string_prefix(node), Some(b'N' | b'n')) {
+            let ty = self.intern("VARCHAR");
+            return Ok(self.push(Expr::Cast { operand: literal, ty, try_cast: false }));
+        }
+        Ok(literal)
+    }
+}
+
+/// The value of one string token, with the quotes gone and whatever the prefix means resolved.
+///
+/// There is no fall through that keeps the source text. That arm is what answered `SELECT E'a'`
+/// with the four characters `E'a'`, and a default that silently answers with the query is a default
+/// that will do this again with the next spelling somebody adds, so a spelling this does not know
+/// raises instead. Per #329.
+fn string_token(text: &str) -> Result<String> {
+    if let Some(body) = dollar_body(text) {
+        return Ok(body.to_string());
+    }
+    if let Some(body) = quoted_body(text) {
+        return Ok(body.replace("''", "'"));
+    }
+    let Some(body) = text.get(1..).and_then(quoted_body) else {
+        return Ok(text.to_string());
+    };
+    match text.as_bytes()[0] {
+        b'E' | b'e' => escaped(body),
+        // `N'abc'` is the string and nothing else. The cast that makes the name is put on outside.
+        b'N' | b'n' => Ok(body.replace("''", "'")),
+        // Not a bit string, whatever the spelling suggests. Upstream answers `B'101'` with the four
+        // characters `b101` as a VARCHAR, and `B''` with the one character `b`, which is measured
+        // and not guessed. Nothing else is done with the body.
+        b'B' | b'b' => Ok(format!("b{}", body.replace("''", "'"))),
+        _ => Err(Error::not_implemented(format!("the string literal {text} is not supported yet"))),
+    }
+}
+
+/// The body of a single quoted string, for the tokens that are one.
+///
+/// An unterminated token has nothing to take off the end and keeps every byte it was given, which
+/// is why the closing quote has to be a quote that is not also the opening one.
+fn quoted_body(text: &str) -> Option<&str> {
+    text.strip_prefix('\'').filter(|rest| !rest.is_empty()).and_then(|rest| rest.strip_suffix('\''))
+}
+
+/// The body of an `E'...'` literal, with the C style escapes resolved.
+///
+/// Every rule here was read off the pinned binary one at a time. The named escapes are `\n`, `\t`,
+/// `\r`, `\b` and `\f`, and `\v` is not one of them. `\x` takes one or two hex digits and `\0`
+/// through `\7` take one to three octal digits, both of which write a byte and not a character, so
+/// `\xc3\xa9` is one `é` and `\377` is not a string at all. `\uHHHH` takes exactly four hex digits
+/// and writes the character they name. Anything else, including a `\u` that is short or names a
+/// surrogate half or a NUL, drops the backslash and keeps the character, so `\q` is `q` and `\u41`
+/// is `u41`.
+///
+/// The result is bytes until the end because the escapes write bytes, and the two ways of writing
+/// something that is not a string both raise the way upstream raises them.
+fn escaped(body: &str) -> Result<String> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        at += 1;
+        if byte == b'\'' && bytes.get(at) == Some(&b'\'') {
+            out.push(b'\'');
+            at += 1;
+            continue;
+        }
+        if byte != b'\\' || at == bytes.len() {
+            out.push(byte);
+            continue;
+        }
+        let escape = bytes[at];
+        at += 1;
+        match escape {
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'r' => out.push(b'\r'),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'x' => match digits(bytes, &mut at, 16, 2) {
+                Some(value) => out.push(value as u8),
+                None => out.push(b'x'),
+            },
+            b'0'..=b'7' => {
+                at -= 1;
+                let value = digits(bytes, &mut at, 8, 3).unwrap_or(0);
+                out.push(value as u8);
+            }
+            b'u' => match four_hex(bytes, at).and_then(char::from_u32).filter(|c| *c != '\0') {
+                Some(c) => {
+                    at += 4;
+                    out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+                None => out.push(b'u'),
+            },
+            other => out.push(other),
+        }
+    }
+    if out.contains(&0) {
+        return Err(Error::parser("Null character not permitted in escape string literal"));
+    }
+    String::from_utf8(out).map_err(|error| {
+        Error::parser(format!(
+            "Invalid UTF-8 in escape string literal at byte offset {}: byte mismatch",
+            error.utf8_error().valid_up_to()
+        ))
+    })
+}
+
+/// Up to `most` digits in `radix` starting at `at`, moving `at` past the ones that were taken.
+///
+/// `None` means there were none at all, which is the case where the escape was not an escape:
+/// `\x` on its own is the letter `x` upstream and not a zero byte.
+fn digits(bytes: &[u8], at: &mut usize, radix: u32, most: usize) -> Option<u32> {
+    let mut value = None;
+    for _ in 0..most {
+        let Some(digit) = bytes.get(*at).and_then(|byte| (*byte as char).to_digit(radix)) else {
+            break;
+        };
+        value = Some(value.unwrap_or(0) * radix + digit);
+        *at += 1;
+    }
+    value
+}
+
+/// The four hex digits of a `\uHHHH`, which has to be all four of them or it is not one.
+///
+/// Nothing is consumed here, because the digits are only digits if the whole escape works out. A
+/// surrogate half is not a character and upstream does not pair it up either, so `😀` is
+/// the ten characters it was written as, which is what the caller falls back to.
+fn four_hex(bytes: &[u8], at: usize) -> Option<u32> {
+    let digits = bytes.get(at..at + 4)?;
+    if !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
 }
 
 /// The body of a dollar quoted string, for the tokens that are one.
@@ -3057,6 +3207,80 @@ mod tests {
         assert_eq!(round("SELECT $tag$it''s $other$ fine$tag$"), "SELECT 'it''s $other$ fine'");
         // An unterminated one has no closing tag to take off and keeps every byte it was given.
         assert_eq!(round("SELECT $$open"), "SELECT '$$open'");
+    }
+
+    /// Per #329, where every prefixed spelling came back as the source text it was written as.
+    ///
+    /// The escapes are the ones the pinned binary takes, read off it one at a time. The two that
+    /// are easy to get wrong are `\v`, which is not an escape and is the letter, and `\u`, which
+    /// wants all four digits and otherwise drops the backslash and keeps the letter.
+    #[test]
+    fn an_escape_string_resolves_its_backslashes() {
+        assert_eq!(round("SELECT E'a\\nb'"), "SELECT 'a\nb'");
+        assert_eq!(round("SELECT e'a\\tb'"), "SELECT 'a\tb'", "the prefix is a letter, not a name");
+        assert_eq!(round("SELECT E'a\\rb'"), "SELECT 'a\rb'");
+        assert_eq!(round("SELECT E'a\\bb'"), "SELECT 'a\u{8}b'");
+        assert_eq!(round("SELECT E'a\\fb'"), "SELECT 'a\u{c}b'");
+        assert_eq!(round("SELECT E'a\\\\b'"), "SELECT 'a\\b'");
+        assert_eq!(round("SELECT E'a\\'b'"), "SELECT 'a'b'", "a quote, the same as ''");
+        assert_eq!(round("SELECT E'a''b'"), "SELECT 'a'b'", "and '' still means a quote here");
+        // A backslash in front of anything else is dropped and the character is kept, which is what
+        // makes \v the letter v.
+        assert_eq!(round("SELECT E'a\\vb'"), "SELECT 'avb'");
+        assert_eq!(round("SELECT E'a\\qb'"), "SELECT 'aqb'");
+    }
+
+    /// The escapes that write a byte rather than a character, and the one that writes a character.
+    #[test]
+    fn a_numeric_escape_writes_the_byte_or_the_character_it_names() {
+        assert_eq!(round("SELECT E'\\x41'"), "SELECT 'A'");
+        assert_eq!(round("SELECT E'\\x4142'"), "SELECT 'A42'", "two digits at the most");
+        assert_eq!(
+            round("SELECT E'a\\x'"),
+            "SELECT 'ax'",
+            "and one at the least, or it is a letter"
+        );
+        assert_eq!(round("SELECT E'\\101'"), "SELECT 'A'");
+        assert_eq!(round("SELECT E'\\1011'"), "SELECT 'A1'", "three digits at the most");
+        assert_eq!(round("SELECT E'\\8'"), "SELECT '8'", "8 is not an octal digit");
+        // Bytes and not characters, so two of them make one character and one of them makes none.
+        assert_eq!(round("SELECT E'\\xc3\\xa9'"), "SELECT 'é'");
+        assert_eq!(round("SELECT E'\\u00e9'"), "SELECT 'é'");
+        assert_eq!(round("SELECT E'a\\u41'"), "SELECT 'au41'", "four digits or it is a letter");
+        assert_eq!(round("SELECT E'a\\uZZZZ'"), "SELECT 'auZZZZ'");
+        assert_eq!(
+            round("SELECT E'\\ud83d\\ude00'"),
+            "SELECT 'ud83dude00'",
+            "surrogates are not it"
+        );
+    }
+
+    /// The two ways an escape string is not a string at all, both with the message upstream gives.
+    #[test]
+    fn an_escape_string_that_is_not_a_string_raises() {
+        let error = parse_ast("SELECT E'a\\x00'").unwrap_err().to_string();
+        assert_eq!(error, "Parser Error: Null character not permitted in escape string literal");
+        let error = parse_ast("SELECT E'a\\377'").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Parser Error: Invalid UTF-8 in escape string literal at byte offset 1: byte mismatch",
+            "the offset is where the bytes stop being a string, not where the escape was written"
+        );
+    }
+
+    /// The other prefixes, all of them measured against the pinned binary rather than assumed.
+    #[test]
+    fn the_other_string_prefixes_are_what_upstream_makes_of_them() {
+        // N is the string and a cast of it to VARCHAR, which is where the column name comes from.
+        assert_eq!(round("SELECT N'abc'"), "SELECT CAST('abc' AS VARCHAR)");
+        assert_eq!(round("SELECT n'abc'"), "SELECT CAST('abc' AS VARCHAR)");
+        // B is not a bit string. It is the letter b in front of the body, untouched.
+        assert_eq!(round("SELECT B'101'"), "SELECT 'b101'");
+        assert_eq!(round("SELECT b'abc'"), "SELECT 'babc'");
+        assert_eq!(round("SELECT B''"), "SELECT 'b'", "an empty one is the letter on its own");
+        // X is a blob and a blob is not a string, so it raises until there is one to answer with.
+        let error = parse_ast("SELECT x'ff'").unwrap_err().to_string();
+        assert_eq!(error, "Not implemented Error: the string literal x'ff' is not supported yet");
     }
 
     #[test]
