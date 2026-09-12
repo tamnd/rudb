@@ -169,6 +169,16 @@ pub mod seam {
     };
 }
 
+/// What one execution reported about itself, which is what [`QueryResult::metrics`] hands back.
+///
+/// A module rather than a flat re-export, for the same reason the seams are one: `Operator` here is
+/// a row of measurements and `Operator` in the executor is a thing that runs, and the two want
+/// telling apart at a call site. The shell writes [`metrics::Document::render`] out under
+/// `--metrics`, which is the file `rudb-bench` reads.
+pub mod metrics {
+    pub use rudb_metrics::{Document, Operator, Pipeline};
+}
+
 /// Arrow interchange, which is what [`QueryResult::to_arrow`] hands back.
 ///
 /// A module rather than a flat re-export because Arrow has a `Field` and a `Schema` of its own and
