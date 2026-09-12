@@ -565,13 +565,8 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     if !entry.arity.accepts(arguments.len()) {
         return Err(no_match(entry.name, arguments));
     }
-    if let Some(returns) = shifted(entry.name, arguments) {
-        return Ok(Resolved {
-            name: entry.name,
-            kind: entry.kind,
-            arguments: arguments.to_vec(),
-            returns,
-        });
+    if let Some((cast_to, returns)) = temporal(entry.name, arguments) {
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
     }
     if entry.numeric_only {
         for ty in arguments {
@@ -738,6 +733,52 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
 }
 
+/// What the arithmetic operators return when an interval is one of the arguments.
+///
+/// The one place in this file where the argument types pick the overload rather than the name
+/// picking one shape. The table above says a name has exactly one shape and that a second row for
+/// a name needs a rule for which one wins, and this is the rule: an interval next to a date, a
+/// timestamp, a time, another interval or a number is temporal arithmetic, and everything else is
+/// the numeric row. The answer is the types to cast the arguments to and the type that comes back.
+///
+/// A date plus an interval is a timestamp and not a date, because the interval carries a time of
+/// day. A time plus an interval is a time, since the months and the days have nowhere to go and it
+/// wraps at midnight. Taking a date off an interval is not a thing on either engine, so only the
+/// commuted addition is here.
+///
+/// Two intervals add and subtract field by field, and a number scales one, in either order for the
+/// multiplication and with the interval on the left for the division.
+///
+/// The multiplication has two overloads of its own and the difference between them shows. A whole
+/// number goes in as a `BIGINT` and multiplies the three fields as they are, and everything else
+/// goes in as a `DOUBLE` and moves what is left over on a field down to the next one. `HUGEINT` and
+/// `UBIGINT` take the double as well, since neither of them fits a `BIGINT` to begin with. Dividing
+/// has only the double, which is why an integer count divided into an interval reports its division
+/// by zero as `0.0`.
+fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{
+        BigInt, Date, Double, HugeInt, Interval, Time, Timestamp, UBigInt, UHugeInt,
+    };
+    let kept = |returns| Some((arguments.to_vec(), returns));
+    // A null literal has no type yet, so it counts as the number and the cast to a double is what
+    // turns the whole call into a null.
+    let number = |ty: &LogicalType| ty.is_numeric() || *ty == LogicalType::Null;
+    let counted = |ty: &LogicalType| ty.is_integer() && !matches!(ty, HugeInt | UHugeInt | UBigInt);
+    match (name, arguments) {
+        ("-", [Interval]) => kept(Interval),
+        ("+" | "-", [Date | Timestamp, Interval]) | ("+", [Interval, Date | Timestamp]) => {
+            kept(Timestamp)
+        }
+        ("+" | "-", [Time, Interval]) | ("+", [Interval, Time]) => kept(Time),
+        ("+" | "-", [Interval, Interval]) => kept(Interval),
+        ("*", [Interval, count]) if counted(count) => Some((vec![Interval, BigInt], Interval)),
+        ("*", [count, Interval]) if counted(count) => Some((vec![BigInt, Interval], Interval)),
+        ("*" | "/", [Interval, scale]) if number(scale) => Some((vec![Interval, Double], Interval)),
+        ("*", [scale, Interval]) if number(scale) => Some((vec![Double, Interval], Interval)),
+        _ => None,
+    }
+}
+
 /// The error for a call that names a real function and does not fit any of its overloads.
 ///
 /// The sentence is DuckDB's, and so is the block under it when there is one. A message that says a
@@ -747,29 +788,6 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
 ///
 /// The trailing newline is the reference's too. Its message ends after the last candidate with a
 /// line break, which is visible as the second blank line before the shell prints the offending SQL.
-/// What `+` and `-` return when one side of them is an interval.
-///
-/// The one place in this file where the argument types pick the overload rather than the name
-/// picking one shape. The table above says a name has exactly one shape and that a second row for
-/// a name needs a rule for which one wins, and this is the rule: an interval next to a date, a
-/// timestamp or a time is date arithmetic, and everything else is the numeric row.
-///
-/// A date plus an interval is a timestamp and not a date, because the interval carries a time of
-/// day. A time plus an interval is a time, since the months and the days have nowhere to go and it
-/// wraps at midnight. Taking a date off an interval is not a thing on either engine, so only the
-/// commuted addition is here.
-fn shifted(name: &str, arguments: &[LogicalType]) -> Option<LogicalType> {
-    use LogicalType::{Date, Interval, Time, Timestamp};
-    let [left, right] = arguments else { return None };
-    match (name, left, right) {
-        ("+" | "-", Date | Timestamp, Interval) | ("+", Interval, Date | Timestamp) => {
-            Some(Timestamp)
-        }
-        ("+" | "-", Time, Interval) | ("+", Interval, Time) => Some(Time),
-        _ => None,
-    }
-}
-
 fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
     let types = arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
     let mut message = format!(
