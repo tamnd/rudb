@@ -309,8 +309,12 @@ impl Real for f64 {
 /// is C's `%g` rule and it is what DuckDB's formatter implements, checked against the binary rather
 /// than read out of its source.
 fn write_float<T: Real>(f: &mut fmt::Formatter<'_>, value: T) -> fmt::Result {
+    // The sign bit and nothing else, because no comparison against a nan says anything about it.
+    // An invalid operation on x86 produces a nan with the bit set and DuckDB prints that as `-nan`,
+    // where the nan a string parses to has the bit clear and prints as `nan`. Rust prints `NaN` for
+    // both.
     if value.is_nan() {
-        return f.write_str("nan");
+        return f.write_str(if value.is_sign_negative() { "-nan" } else { "nan" });
     }
     if value.is_infinite() {
         return f.write_str(if value.is_sign_negative() { "-inf" } else { "inf" });
@@ -575,6 +579,12 @@ mod tests {
         assert_eq!(Value::Double(f64::INFINITY).to_string(), "inf");
         assert_eq!(Value::Double(f64::NEG_INFINITY).to_string(), "-inf");
         assert_eq!(Value::Double(f64::NAN).to_string(), "nan");
+        // A nan carries a sign bit and DuckDB prints it, per #266. Written as a negation of a nan
+        // rather than as the nan an invalid operation produces, because which one of those the
+        // hardware hands back is the hardware's business: x86 sets the bit on `0.0 / 0.0` and
+        // aarch64 does not, and this is about the printing.
+        assert_eq!(Value::Double(-f64::NAN).to_string(), "-nan");
+        assert_eq!(Value::Float(-f32::NAN).to_string(), "-nan");
     }
 
     #[test]
