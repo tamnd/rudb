@@ -18,10 +18,18 @@
 //!
 //! # What is here
 //!
-//! A parser in `parse`, a compiler in `compile` and Pike's virtual machine in `vm`. The
-//! machine runs every possibility at once rather than backtracking, so a match costs the length of
-//! the text times the size of the program and no pattern can be made to take exponential time. That
-//! matters in a database, where the pattern can come out of the data.
+//! A parser in `parse`, a compiler in `compile` and two machines that run the same program. Pike's
+//! virtual machine in `vm` runs every possibility at once rather than backtracking, and a
+//! backtracker with a memo in `bitstate` walks one possibility at a time and remembers which pairs
+//! of instruction and position it has already tried. Both cost the length of the text times the size
+//! of the program in the worst case, so no pattern can be made to take exponential time in either.
+//! That matters in a database, where the pattern can come out of the data.
+//!
+//! Which one runs is decided by size and by nothing else. The memo is a bit per instruction per
+//! position and something has to cap it, so a small pattern over a short string, which is every
+//! pattern a query writes over every string a column holds, goes to the backtracker, and anything
+//! larger goes to the machine that needs no memo. The two are held to giving the same answer, down
+//! to every capture slot, by a test in `bitstate`.
 //!
 //! The syntax is RE2's, less the parts of it nothing in SQL reaches: literals, `.`, character sets
 //! with ranges, negation, the Perl classes and the POSIX names, the anchors `^`, `$`, `\A`, `\z`,
@@ -41,11 +49,14 @@
 //!
 //! # What is not here
 //!
-//! No DFA and no literal prefilter. RE2 has both and they are most of why it is fast: a search for a
-//! pattern that must start with `https` should find the `h` with a memory scan rather than by
-//! stepping the machine over every character. The machine is the correct answer to measure the fast
-//! paths against, and it is what the kernel calls today, so the ClickBench number it produces is a
-//! real number to improve on rather than an estimate.
+//! No DFA. RE2 has one and it is most of why RE2 is fast, and the machines here are what a DFA
+//! would be measured against when there is one.
+//!
+//! The prefilter is the byte a match has to begin with and not the literal string it has to begin
+//! with. `yandex` skips to the next `y` and then runs the machine, where RE2 would look for the
+//! whole word. A pattern whose first byte is common in the data gets less out of it than one whose
+//! first byte is rare, and the way to close that is a substring search, which is the next thing to
+//! write here.
 //!
 //! No `\p{...}` Unicode classes, so `\w` and the POSIX names are ASCII, which is what RE2 does by
 //! default anyway. Case folding covers ASCII and every character whose fold is a single character,
@@ -53,6 +64,7 @@
 
 #![deny(unsafe_code)]
 
+mod bitstate;
 mod compile;
 mod parse;
 mod vm;
@@ -147,19 +159,30 @@ impl Regex {
     /// `start` is zero, which is what makes a global replacement of an anchored pattern replace once.
     #[must_use]
     pub fn find_at(&self, text: &str, start: usize) -> Option<Captures> {
-        vm::search(&self.program, text, start, false).map(|slots| Captures { slots })
+        self.search(text, start, false).map(|slots| Captures { slots })
     }
 
     /// Whether the pattern matches anywhere in the text, which is `regexp_matches`.
     #[must_use]
     pub fn is_match(&self, text: &str) -> bool {
-        vm::search(&self.program, text, 0, false).is_some()
+        self.search(text, 0, false).is_some()
     }
 
     /// Whether the pattern matches the whole text, which is `regexp_full_match`.
     #[must_use]
     pub fn is_full_match(&self, text: &str) -> bool {
-        vm::search(&self.program, text, 0, true).is_some()
+        self.search(text, 0, true).is_some()
+    }
+
+    /// Runs whichever machine suits the size of the problem.
+    ///
+    /// This is the only place the choice is made and it is made on size alone, because the two
+    /// machines give the same answer and differ only in what they spend to get it.
+    fn search(&self, text: &str, start: usize, whole: bool) -> Option<Vec<Option<usize>>> {
+        if bitstate::fits(&self.program, text) {
+            return bitstate::search(&self.program, text, start, whole);
+        }
+        vm::search(&self.program, text, start, whole)
     }
 
     /// The text of one group of the first match, which is `regexp_extract`.
@@ -183,20 +206,35 @@ impl Regex {
     /// DuckDB then prints.
     #[must_use]
     pub fn replace(&self, text: &str, rewrite: &str, global: bool) -> String {
-        let Some(rewrite) = Rewrite::parse(rewrite, self.groups()) else {
-            return text.to_string();
-        };
-        if !global {
-            let Some(found) = self.find_at(text, 0) else {
-                return text.to_string();
-            };
-            let mut out = String::with_capacity(text.len());
-            out.push_str(&text[..found.start()]);
-            rewrite.apply(&mut out, text, &found);
-            out.push_str(&text[found.end()..]);
-            return out;
+        let mut out = String::with_capacity(text.len());
+        self.replace_into(&mut out, text, &Rewrite::new(rewrite, self.groups()), global);
+        out
+    }
+
+    /// The same replacement, appended to a buffer the caller owns and with a rewrite the caller has
+    /// already read.
+    ///
+    /// This is the form a column wants. Taking the rewrite apart is a parse and an allocation, and
+    /// over a hundred million rows of the same call it is the same parse and the same allocation a
+    /// hundred million times, so the caller does it once and hands the answer in. The buffer is the
+    /// other half of the same point: a string builder that is cleared and refilled per row is one
+    /// allocation that grows to the longest value, not one per row.
+    pub fn replace_into(&self, out: &mut String, text: &str, rewrite: &Rewrite, global: bool) {
+        if rewrite.refused {
+            out.push_str(text);
+            return;
         }
-        self.replace_all(text, &rewrite)
+        if global {
+            self.replace_all(out, text, rewrite);
+            return;
+        }
+        let Some(found) = self.find_at(text, 0) else {
+            out.push_str(text);
+            return;
+        };
+        out.push_str(&text[..found.start()]);
+        rewrite.apply(out, text, &found);
+        out.push_str(&text[found.end()..]);
     }
 
     /// Every match replaced, which is RE2's global replacement down to how it steps over an empty
@@ -206,8 +244,7 @@ impl Regex {
     /// '-', 'g')` is `-a-a-a-` in DuckDB: the machine matches the empty string before every
     /// character and once at the end, and the rule that keeps it from matching the empty string
     /// twice in the same place is that an empty match where the last one ended is skipped over.
-    fn replace_all(&self, text: &str, rewrite: &Rewrite) -> String {
-        let mut out = String::with_capacity(text.len());
+    fn replace_all(&self, out: &mut String, text: &str, rewrite: &Rewrite) {
         let mut at = 0;
         let mut last_end: Option<usize> = None;
         while at <= text.len() {
@@ -225,12 +262,11 @@ impl Regex {
                 at += ch.len_utf8();
                 continue;
             }
-            rewrite.apply(&mut out, text, &found);
+            rewrite.apply(out, text, &found);
             at = found.end();
             last_end = Some(at);
         }
         out.push_str(&text[at..]);
-        out
     }
 }
 
@@ -264,8 +300,15 @@ impl Captures {
 
 /// A replacement string, taken apart once rather than once per row.
 #[derive(Debug, Clone)]
-struct Rewrite {
+pub struct Rewrite {
     pieces: Vec<Piece>,
+    /// Whether RE2 would refuse to run this.
+    ///
+    /// A rewrite that asks for a group the pattern does not have, and one that carries an escape
+    /// that is not a digit or a backslash, are both refused, and what RE2 does about it is return
+    /// false and leave the text alone. That is a state of the rewrite rather than an error, and
+    /// carrying it here is what lets a caller read the rewrite once without having to know the rule.
+    refused: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -275,8 +318,10 @@ enum Piece {
 }
 
 impl Rewrite {
-    /// Reads a replacement, or `None` if RE2 would refuse it.
-    fn parse(rewrite: &str, groups: usize) -> Option<Self> {
+    /// Reads a replacement against a pattern with this many capturing groups.
+    #[must_use]
+    pub fn new(rewrite: &str, groups: usize) -> Self {
+        let refused = Self { pieces: Vec::new(), refused: true };
         let mut pieces = Vec::new();
         let mut text = String::new();
         let mut chars = rewrite.chars();
@@ -290,7 +335,7 @@ impl Rewrite {
                 Some(digit) if digit.is_ascii_digit() => {
                     let index = digit as usize - '0' as usize;
                     if index > groups {
-                        return None;
+                        return refused;
                     }
                     if !text.is_empty() {
                         pieces.push(Piece::Text(std::mem::take(&mut text)));
@@ -299,13 +344,13 @@ impl Rewrite {
                 }
                 // A backslash in front of anything else, and a trailing backslash, are both
                 // rewrites RE2 will not run.
-                _ => return None,
+                _ => return refused,
             }
         }
         if !text.is_empty() {
             pieces.push(Piece::Text(text));
         }
-        Some(Self { pieces })
+        Self { pieces, refused: false }
     }
 
     fn apply(&self, out: &mut String, text: &str, found: &Captures) {

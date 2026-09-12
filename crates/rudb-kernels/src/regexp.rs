@@ -17,7 +17,7 @@
 //! distinct values that the dictionary form may never appear on it.
 
 use rudb_common::{Error, LogicalType, Result, Value};
-use rudb_regex::{Options, Regex};
+use rudb_regex::{Options, Regex, Rewrite};
 use rudb_vector::{Data, StringColumn, Vector};
 
 use crate::number::integral;
@@ -55,8 +55,13 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
     let base = nulls_of(text);
     match (name, returns) {
         ("regexp_replace", LogicalType::Varchar) => {
+            // One buffer for the whole vector rather than a fresh `String` per row. It grows to the
+            // longest value in the column once and then stays there.
+            let mut buffer = String::new();
             let out = each_string(rows, &base, |index, into| {
-                into.push(&call.regex.replace(source.get(index), &call.rewrite, call.global));
+                buffer.clear();
+                call.regex.replace_into(&mut buffer, source.get(index), &call.rewrite, call.global);
+                into.push(&buffer);
             });
             finish(returns, Data::Varlen(out), base.normalize(rows))
         }
@@ -91,7 +96,11 @@ pub(crate) fn value(name: &str, args: &[Value]) -> Result<Value> {
         return Err(Error::internal(format!("{name} with arguments it does not have")));
     };
     Ok(match name {
-        "regexp_replace" => Value::Varchar(call.regex.replace(text, &call.rewrite, call.global)),
+        "regexp_replace" => {
+            let mut out = String::with_capacity(text.len());
+            call.regex.replace_into(&mut out, text, &call.rewrite, call.global);
+            Value::Varchar(out)
+        }
         "regexp_extract" => {
             Value::Varchar(call.regex.extract(text, call.group).unwrap_or_default().to_string())
         }
@@ -103,8 +112,9 @@ pub(crate) fn value(name: &str, args: &[Value]) -> Result<Value> {
 /// Everything a call needs that does not change from row to row.
 struct Call {
     regex: Regex,
-    /// The replacement, for `regexp_replace` and empty for the rest.
-    rewrite: String,
+    /// The replacement, taken apart here rather than per row, and empty for everything that is not
+    /// `regexp_replace`.
+    rewrite: Rewrite,
     /// Whether the replacement replaces every match, which is the `g` option.
     global: bool,
     /// Which group `regexp_extract` wants, where zero is the whole match.
@@ -122,13 +132,13 @@ impl Call {
         let Some(Value::Varchar(pattern)) = constants.first().copied() else {
             return Ok(None);
         };
-        let mut rewrite = String::new();
+        let mut replacement = "";
         let mut rest = &constants[1..];
         if name == "regexp_replace" {
             let Some(Value::Varchar(held)) = rest.first().copied() else {
                 return Ok(None);
             };
-            rewrite = held.clone();
+            replacement = held;
             rest = &rest[1..];
         }
         // What is left is the group index, the option string, both or neither, and which is which
@@ -151,6 +161,7 @@ impl Call {
         }
         let options = Options::parse(spelling)?;
         let regex = Regex::with_options(pattern, options)?;
+        let rewrite = Rewrite::new(replacement, regex.groups());
         Ok(Some(Self { regex, rewrite, global: options.global, group }))
     }
 }
