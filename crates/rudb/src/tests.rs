@@ -628,14 +628,15 @@ fn the_string_keywords_answer_the_way_duckdb_does() {
         vec![vec![text("a")], vec![Value::Null], vec![text("c")], vec![text("a")]]
     );
     // The names upstream gives these columns, which are the lowered calls and not what was written.
-    // Upstream quotes the four that are keywords and that quoting is #251.
+    // Three of the four are keywords and are quoted, which is #251, and `ltrim` is not a keyword
+    // and is not quoted, which is the same rule and is why the last one looks different.
     assert_eq!(
         db.query("SELECT substring(s FROM 2 FOR 3) FROM t").unwrap().names(),
-        &["substring(s, 2, 3)".to_string()]
+        &["\"substring\"(s, 2, 3)".to_string()]
     );
     assert_eq!(
         db.query("SELECT position('c' IN s) FROM t").unwrap().names(),
-        &["position(s, 'c')".to_string()]
+        &["\"position\"(s, 'c')".to_string()]
     );
     assert_eq!(
         db.query("SELECT trim(LEADING FROM s) FROM t").unwrap().names(),
@@ -646,6 +647,43 @@ fn the_string_keywords_answer_the_way_duckdb_does() {
     assert!(message.contains("\"substring\"(col0 VARCHAR, col1 BIGINT, col2 BIGINT) -> VARCHAR"));
     assert!(failure(&db, "SELECT trim(123)").contains("\"trim\"(col0 VARCHAR) -> VARCHAR"));
     assert!(failure(&db, "SELECT strpos('abcdef')").contains("strpos(col0 VARCHAR, col1 VARCHAR)"));
+}
+
+/// An identifier inside a generated column name is quoted where upstream quotes it. Per #251.
+///
+/// Every name below was read off the pinned binary. The rule turns out to be two rules and neither
+/// of them is the obvious one. A word is quoted when it is a keyword in one of the grammar's
+/// classes, so `name` and `action` are quoted and `alias` is not, even though `alias` is in the
+/// keyword table, because it is spelled by a rule and belongs to no class. And a word is quoted
+/// when it is not one plain ASCII word, so a space, a leading digit and an accent all keep their
+/// quotes.
+///
+/// What is not a reason is case. `UserID` comes back unquoted from upstream even though reading
+/// that name again would fold it to `userid`, and that is the case ClickBench is made of.
+#[test]
+fn a_generated_name_quotes_an_identifier_where_duckdb_quotes_one() {
+    let db = Database::new();
+    let fields = ["name", "alias", "UserID", "my col", "9x"]
+        .iter()
+        .map(|name| Field::new(*name, LogicalType::Integer))
+        .collect();
+    db.create_table("q", fields).unwrap();
+    let names = |sql: &str| db.query(sql).unwrap().names().to_vec();
+    assert_eq!(names("SELECT min(name) FROM q"), &["min(\"name\")".to_string()]);
+    assert_eq!(names("SELECT min(alias) FROM q"), &["min(alias)".to_string()]);
+    assert_eq!(names("SELECT min(\"UserID\") FROM q"), &["min(UserID)".to_string()]);
+    assert_eq!(names("SELECT min(\"my col\") FROM q"), &["min(\"my col\")".to_string()]);
+    assert_eq!(names("SELECT min(\"9x\") FROM q"), &["min(\"9x\")".to_string()]);
+    // The column on its own is not a generated name at all. It comes from the catalog, so it is
+    // the spelling the table was created with and nothing quotes it.
+    assert_eq!(names("SELECT name FROM q"), &["name".to_string()]);
+    // The same rule everywhere a name is generated, and not only inside an aggregate.
+    assert_eq!(names("SELECT name + 1 FROM q"), &["(\"name\" + 1)".to_string()]);
+    assert_eq!(
+        names("SELECT CAST(name AS VARCHAR) FROM q"),
+        &["CAST(\"name\" AS VARCHAR)".to_string()]
+    );
+    assert_eq!(names("SELECT name IS NULL FROM q"), &["(\"name\" IS NULL)".to_string()]);
 }
 
 /// The three spellings of a null check, end to end. Per #306.
@@ -712,11 +750,11 @@ fn the_null_checks_answer_the_way_duckdb_does() {
         db.query("SELECT IFNULL(x, 1) FROM t").unwrap().names(),
         &["COALESCE(x, 1)".to_string()]
     );
-    // Upstream quotes this one, because NULLIF is a keyword and the name it prints is the macro's.
-    // The quoting is #251 and the call is the same call.
+    // This one is quoted because NULLIF is a keyword, and `COALESCE` above it is not because that
+    // one is an operator upstream rather than a name the deparser ever writes. Per #251.
     assert_eq!(
         db.query("SELECT NULLIF(x, 1) FROM t").unwrap().names(),
-        &["nullif(x, 1)".to_string()]
+        &["\"nullif\"(x, 1)".to_string()]
     );
     // The counts the grammar refuses, and the one upstream's parser refuses itself.
     assert!(failure(&db, "SELECT nullif(1)").contains("syntax error at or near \")\""));
