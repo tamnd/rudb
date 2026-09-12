@@ -22,4 +22,6 @@ pub use file::{
 };
 pub use rudb_csv::Given;
 pub use signature::{FunctionKind, Resolved, kind_of, resolve};
-pub use table::{Columns, ResolvedTable, TableFunction, resolve_table, series, series_length};
+pub use table::{
+    Columns, ResolvedTable, TableFunction, resolve_table, series, series_length, strategy_fields,
+};
