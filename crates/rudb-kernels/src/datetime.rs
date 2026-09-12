@@ -281,6 +281,93 @@ impl Part {
     }
 }
 
+/// The thirteen functions that build an interval out of a count of one unit.
+///
+/// These are what `INTERVAL 1 DAY` is by the time the transformer is finished with it, since
+/// DuckDB rewrites the literal into an ordinary call and names the column after the call. So the
+/// literal and a handwritten `to_days(1)` are the same expression and cannot drift apart.
+///
+/// An interval keeps months, days and microseconds in three separate fields and never converts
+/// between them, which is the whole reason a month plus a day is not a number of anything. Each
+/// function below lands in exactly one of the three, so a week is seven days rather than 604800
+/// seconds, and `to_weeks(3)` prints `21 days` rather than `3 weeks`.
+///
+/// The counts that do not fit are upstream's sentence, and it names the unit that was asked for
+/// rather than the field it lands in, so overflowing `to_years` says years and not months. Two of
+/// the thirteen take their count as a DOUBLE and keep the fraction, `to_seconds(2.7)` being
+/// `00:00:02.7`, so the multiply for those happens in floating point and the truncation happens
+/// after it. That is also why their message prints six digits after the point: it is the count that
+/// was passed and not the integer it ends up as.
+pub(crate) fn interval(name: &str, count: Count) -> Result<(i32, i32, i64)> {
+    let unit = name.strip_prefix("to_").unwrap_or(name);
+    let (field, scale) = match unit {
+        "years" => (Field::Months, 12),
+        "months" => (Field::Months, 1),
+        "quarters" => (Field::Months, 3),
+        "decades" => (Field::Months, 120),
+        "centuries" => (Field::Months, 1_200),
+        "millennia" => (Field::Months, 12_000),
+        "days" => (Field::Days, 1),
+        "weeks" => (Field::Days, 7),
+        "hours" => (Field::Micros, i128::from(MICROS_PER_HOUR)),
+        "minutes" => (Field::Micros, i128::from(MICROS_PER_MINUTE)),
+        "seconds" => (Field::Micros, i128::from(MICROS_PER_SECOND)),
+        "milliseconds" => (Field::Micros, 1_000),
+        "microseconds" => (Field::Micros, 1),
+        _ => return Err(Error::internal(format!("{name} is not an interval constructor"))),
+    };
+    let written = match count {
+        Count::Whole(whole) => whole.to_string(),
+        Count::Real(real) => format!("{real:.6}"),
+    };
+    let refuse = || Error::out_of_range(format!("Interval value {written} {unit} out of range"));
+    let total = match count {
+        Count::Whole(whole) => whole.checked_mul(scale).ok_or_else(refuse)?,
+        // A double that has gone past `i128` comes back as the saturated bound, which is out of
+        // every field's range as well, so the check below catches it without a case of its own.
+        Count::Real(real) => (real * scale as f64).trunc() as i128,
+    };
+    match field {
+        Field::Months => Ok((i32::try_from(total).map_err(|_| refuse())?, 0, 0)),
+        Field::Days => Ok((0, i32::try_from(total).map_err(|_| refuse())?, 0)),
+        Field::Micros => Ok((0, 0, i64::try_from(total).map_err(|_| refuse())?)),
+    }
+}
+
+/// A count of one unit, as the type the function that was called takes it as.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Count {
+    Whole(i128),
+    Real(f64),
+}
+
+/// Which of an interval's three fields a constructor lands in.
+enum Field {
+    Months,
+    Days,
+    Micros,
+}
+
+/// Whether a name is one of the interval constructors above.
+pub(crate) fn is_interval(name: &str) -> bool {
+    matches!(
+        name,
+        "to_years"
+            | "to_months"
+            | "to_quarters"
+            | "to_decades"
+            | "to_centuries"
+            | "to_millennia"
+            | "to_days"
+            | "to_weeks"
+            | "to_hours"
+            | "to_minutes"
+            | "to_seconds"
+            | "to_milliseconds"
+            | "to_microseconds"
+    )
+}
+
 /// The day a timestamp falls on.
 ///
 /// A floor and not a truncation towards zero, so that a time before the epoch lands on the day it
@@ -506,5 +593,54 @@ mod tests {
         assert_eq!(part("day").truncate_micros(moment).expect("a truncation"), -MICROS_PER_DAY);
         assert_eq!(part("second").of_micros(moment).expect("a part"), 58);
         assert_eq!(part("day").of_micros(moment).expect("a part"), 31);
+    }
+
+    fn built(name: &str, count: i128) -> (i32, i32, i64) {
+        interval(name, Count::Whole(count)).expect("an interval")
+    }
+
+    /// A unit lands in one field and nothing converts between them, so a week is days and an hour
+    /// is microseconds and neither of them is ever a month.
+    #[test]
+    fn every_unit_lands_in_the_one_field_that_holds_it() {
+        assert_eq!(built("to_years", 1), (12, 0, 0));
+        assert_eq!(built("to_months", 13), (13, 0, 0));
+        assert_eq!(built("to_quarters", 5), (15, 0, 0));
+        assert_eq!(built("to_decades", 1), (120, 0, 0));
+        assert_eq!(built("to_centuries", -1), (-1_200, 0, 0));
+        assert_eq!(built("to_millennia", 1), (12_000, 0, 0));
+        assert_eq!(built("to_days", 1), (0, 1, 0));
+        assert_eq!(built("to_weeks", 3), (0, 21, 0));
+        assert_eq!(built("to_hours", 25), (0, 0, 25 * MICROS_PER_HOUR));
+        assert_eq!(built("to_minutes", -90), (0, 0, -90 * MICROS_PER_MINUTE));
+        assert_eq!(built("to_microseconds", 1_500_000), (0, 0, 1_500_000));
+    }
+
+    /// The two that take a DOUBLE keep what is after the point, which is the only reason they are
+    /// not integer functions like the other eleven.
+    #[test]
+    fn seconds_and_milliseconds_keep_their_fraction() {
+        let real = |name, count| interval(name, Count::Real(count)).expect("an interval");
+        assert_eq!(real("to_seconds", 2.7), (0, 0, 2_700_000));
+        assert_eq!(real("to_milliseconds", 1.5), (0, 0, 1_500));
+        assert_eq!(real("to_seconds", -100.0), (0, 0, -100_000_000));
+    }
+
+    /// Upstream's own sentence, which names the unit that was asked for rather than the field the
+    /// count landed in, and prints a DOUBLE count with six digits after the point.
+    #[test]
+    fn a_count_that_does_not_fit_says_which_unit_it_was_counting() {
+        let error = interval("to_years", Count::Whole(2_147_483_647)).expect_err("out of range");
+        assert_eq!(
+            error.to_string(),
+            "Out of Range Error: Interval value 2147483647 years out of range"
+        );
+        let error = interval("to_hours", Count::Whole(i64::MAX.into())).expect_err("out of range");
+        assert!(error.to_string().ends_with("9223372036854775807 hours out of range"), "{error}");
+        let error = interval("to_seconds", Count::Real(1e30)).expect_err("out of range");
+        assert!(
+            error.to_string().contains("1000000000000000019884624838656.000000 seconds"),
+            "{error}"
+        );
     }
 }

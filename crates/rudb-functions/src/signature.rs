@@ -87,6 +87,16 @@ enum Shape {
     /// `chr(col0 INTEGER)` is the only overload upstream has and it refuses `chr(65.9)` and
     /// `chr(65::BIGINT)` rather than narrowing either of them.
     Exact(Fixed, Fixed),
+    /// Every argument has to reach that type by widening and the result is fixed. `to_days`.
+    ///
+    /// Between [`Shape::Exact`] and [`Shape::FixedTo`], and it is where the interval constructors
+    /// sit. `to_hours(25)` is an INTEGER reaching a BIGINT and upstream answers it, `to_seconds(1.5)`
+    /// is a DECIMAL reaching a DOUBLE and upstream answers that too, and `to_days(1.7)` is a
+    /// DECIMAL that would have to lose its fraction to reach an INTEGER, which upstream refuses with
+    /// a binder error naming both overloads. So the question is whether promotion gets there and not
+    /// whether the type is already right, and not whether a cast exists, since a cast exists for
+    /// every one of the three.
+    Widened(Fixed, Fixed),
     /// The arguments are whatever they are and the result is fixed. `count(x)` over anything.
     AnyTo(Fixed),
     /// The first `n` arguments are cast to one fixed type, the rest are left alone, and the result
@@ -138,6 +148,7 @@ enum Fixed {
     Varchar,
     Date,
     Timestamp,
+    Interval,
 }
 
 impl Fixed {
@@ -150,6 +161,7 @@ impl Fixed {
             Self::Varchar => LogicalType::Varchar,
             Self::Date => LogicalType::Date,
             Self::Timestamp => LogicalType::Timestamp,
+            Self::Interval => LogicalType::Interval,
         }
     }
 }
@@ -415,6 +427,37 @@ const TABLE: &[Entry] = &[
         shape: Shape::FixedTo(Fixed::BigInt, Fixed::Timestamp),
         numeric_only: true,
     },
+    // The thirteen ways to build an interval out of a count of one unit, which is what
+    // `INTERVAL 1 DAY` is once the transformer has rewritten it, and `to_days(1)` written out by
+    // hand is the same call. Eleven of them count whole units and the two that can carry a fraction
+    // take a DOUBLE, so `INTERVAL 2.7 SECOND` is two and seven tenths of a second while
+    // `INTERVAL 1.5 DAY` is one day.
+    //
+    // Upstream declares the eight that land in months or days twice, once over an INTEGER and once
+    // over a BIGINT, and only the first is here, for the reason the head of this table gives: one
+    // row per name, and a second row needs a rule for which one wins. The rewrite always casts to
+    // the width the row below wants, so the literal is unaffected and what is missing is a
+    // handwritten `to_days(3::BIGINT)`, which is refused here and answered there. The three that
+    // land in microseconds have the BIGINT overload and no INTEGER one, so those rows are exact.
+    built("to_years", Fixed::Integer),
+    built("to_months", Fixed::Integer),
+    built("to_quarters", Fixed::Integer),
+    built("to_decades", Fixed::Integer),
+    built("to_centuries", Fixed::Integer),
+    built("to_millennia", Fixed::Integer),
+    built("to_days", Fixed::Integer),
+    built("to_weeks", Fixed::Integer),
+    built("to_hours", Fixed::BigInt),
+    built("to_minutes", Fixed::BigInt),
+    built("to_microseconds", Fixed::BigInt),
+    built("to_seconds", Fixed::Double),
+    built("to_milliseconds", Fixed::Double),
+    // `trunc` is here because the interval rewrite writes it, and it is an ordinary function anybody
+    // can write as well. Upstream has twenty six overloads and every one of them gives back the type
+    // it was handed, which is what `Shape::Promoted` says over one argument. The exception is the
+    // decimal, where upstream drops the scale and gives `DECIMAL(2,0)` for `trunc(1.7)` and this
+    // keeps `DECIMAL(2,1)` holding 1.0, since no shape in this table drops a scale.
+    number("trunc", Arity::exactly(1), Shape::Promoted),
     // Regular expressions. The pattern is a string like the text is, so three of the four are the
     // plain string shape. `regexp_extract` is not, because its third argument is the group number
     // and casting that to a string and reading it back would be a way to accept `'two'`.
@@ -480,6 +523,17 @@ const fn text(name: &'static str, arity: Arity, returns: Fixed) -> Entry {
         kind: FunctionKind::Scalar,
         arity,
         shape: Shape::Exact(Fixed::Varchar, returns),
+        numeric_only: false,
+    }
+}
+
+/// An interval constructor, which takes one count of one unit and gives back an interval.
+const fn built(name: &'static str, count: Fixed) -> Entry {
+    Entry {
+        name,
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Widened(count, Fixed::Interval),
         numeric_only: false,
     }
 }
@@ -579,6 +633,17 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
                 // `length(NULL)` with NULL rather than refusing it, because a null has no type to
                 // pick an overload with and every overload would return null anyway.
                 if *ty != wanted && *ty != LogicalType::Null {
+                    return Err(no_match(entry.name, arguments));
+                }
+            }
+            (vec![wanted; arguments.len()], result.ty())
+        }
+        Shape::Widened(argument, result) => {
+            let wanted = argument.ty();
+            for ty in arguments {
+                // A null is accepted here for the reason it is accepted above, and it is the only
+                // type that does not have to promote anywhere, since it has nothing to promote.
+                if *ty != LogicalType::Null && ty.promote(&wanted).as_ref() != Some(&wanted) {
                     return Err(no_match(entry.name, arguments));
                 }
             }
@@ -776,6 +841,37 @@ const CANDIDATES: &[(&str, &[&str])] = &[
             "regexp_full_match(string VARCHAR, regex VARCHAR, \"options\" VARCHAR) -> BOOLEAN",
         ],
     ),
+    // Both overloads of each interval constructor, including the BIGINT one this engine does not
+    // have a row for, because the list is what DuckDB accepts and somebody reading it is being told
+    // what to write rather than what is built here.
+    ("to_years", &["to_years(col0 INTEGER) -> INTERVAL", "to_years(col0 BIGINT) -> INTERVAL"]),
+    ("to_months", &["to_months(col0 INTEGER) -> INTERVAL", "to_months(col0 BIGINT) -> INTERVAL"]),
+    (
+        "to_quarters",
+        &["to_quarters(col0 INTEGER) -> INTERVAL", "to_quarters(col0 BIGINT) -> INTERVAL"],
+    ),
+    (
+        "to_decades",
+        &["to_decades(col0 INTEGER) -> INTERVAL", "to_decades(col0 BIGINT) -> INTERVAL"],
+    ),
+    (
+        "to_centuries",
+        &["to_centuries(col0 INTEGER) -> INTERVAL", "to_centuries(col0 BIGINT) -> INTERVAL"],
+    ),
+    (
+        "to_millennia",
+        &["to_millennia(col0 INTEGER) -> INTERVAL", "to_millennia(col0 BIGINT) -> INTERVAL"],
+    ),
+    ("to_days", &["to_days(col0 INTEGER) -> INTERVAL", "to_days(col0 BIGINT) -> INTERVAL"]),
+    ("to_weeks", &["to_weeks(col0 INTEGER) -> INTERVAL", "to_weeks(col0 BIGINT) -> INTERVAL"]),
+    // The five that have one overload each, which is why they are not in the pattern above. The
+    // three that land in microseconds are declared over a BIGINT and never over an INTEGER, since
+    // an hour of INTEGER hours does not fit the field anyway.
+    ("to_hours", &["to_hours(col0 BIGINT) -> INTERVAL"]),
+    ("to_minutes", &["to_minutes(col0 BIGINT) -> INTERVAL"]),
+    ("to_microseconds", &["to_microseconds(col0 BIGINT) -> INTERVAL"]),
+    ("to_seconds", &["to_seconds(col0 DOUBLE) -> INTERVAL"]),
+    ("to_milliseconds", &["to_milliseconds(col0 DOUBLE) -> INTERVAL"]),
     // Four overloads of which this engine has two. The STRUCT one is `x.y`, which the transformer
     // writes as `struct_extract`, and a TUPLE is the positional half of the same idea.
     (
@@ -1389,7 +1485,7 @@ mod tests {
                 // A shape that names the type it wants is asked for it, since `chr` wants an
                 // INTEGER and refuses a string the way upstream does.
                 let ty = match (entry.numeric_only, entry.shape) {
-                    (_, Shape::Exact(argument, _)) => argument.ty(),
+                    (_, Shape::Exact(argument, _) | Shape::Widened(argument, _)) => argument.ty(),
                     (true, _) => LogicalType::Integer,
                     (false, _) => LogicalType::Varchar,
                 };

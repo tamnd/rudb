@@ -733,6 +733,54 @@ fn the_five_string_functions_answer_the_way_duckdb_does() {
     assert!(failure(&db, "SELECT concat()").contains("concat(col0 ANY, [ANY...]) -> ANY"));
 }
 
+/// The interval literal, end to end, which is a function call by the time anything binds it.
+/// Per #360.
+///
+/// The column names are the argument that this is the same rewrite DuckDB does rather than one that
+/// happens to agree on the values, so they are asserted next to the answers rather than separately.
+/// Every one of them was read off the pinned binary.
+#[test]
+fn an_interval_literal_is_the_call_duckdb_rewrites_it_into() {
+    let db = database();
+    let interval = |months, days, micros| Value::Interval { months, days, micros };
+    assert_eq!(
+        db.query("SELECT INTERVAL 1 DAY").unwrap().names(),
+        &["to_days(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))".to_string()]
+    );
+    assert_eq!(
+        db.query("SELECT INTERVAL 90 SECOND").unwrap().names(),
+        &["to_seconds(CAST(90 AS DOUBLE))".to_string()]
+    );
+    assert_eq!(rows(&db, "SELECT INTERVAL 1 DAY"), vec![vec![interval(0, 1, 0)]]);
+    assert_eq!(rows(&db, "SELECT INTERVAL 1 DAYS"), vec![vec![interval(0, 1, 0)]]);
+    assert_eq!(rows(&db, "SELECT INTERVAL 2 MONTHS"), vec![vec![interval(2, 0, 0)]]);
+    assert_eq!(rows(&db, "SELECT INTERVAL 1 WEEK"), vec![vec![interval(0, 7, 0)]]);
+    assert_eq!(rows(&db, "SELECT INTERVAL 1 MILLENNIUM"), vec![vec![interval(12_000, 0, 0)]]);
+    assert_eq!(rows(&db, "SELECT INTERVAL (1+1) DAY"), vec![vec![interval(0, 2, 0)]]);
+    assert_eq!(rows(&db, "SELECT INTERVAL (-1) DAY"), vec![vec![interval(0, -1, 0)]]);
+    // The truncation is in the rewrite rather than in the function, so a day and a half is a day,
+    // and the two units that keep their fraction do not go through it at all.
+    assert_eq!(rows(&db, "SELECT INTERVAL 1.5 DAY"), vec![vec![interval(0, 1, 0)]]);
+    assert_eq!(rows(&db, "SELECT INTERVAL 2.7 SECOND"), vec![vec![interval(0, 0, 2_700_000)]]);
+    assert_eq!(rows(&db, "SELECT INTERVAL 1 MILLISECOND"), vec![vec![interval(0, 0, 1_000)]]);
+    // Written out by hand it is the same call, which is what the rewrite being a rewrite means.
+    assert_eq!(rows(&db, "SELECT to_days(1)"), vec![vec![interval(0, 1, 0)]]);
+    assert_eq!(rows(&db, "SELECT to_quarters(5)"), vec![vec![interval(15, 0, 0)]]);
+    assert_eq!(rows(&db, "SELECT to_days(NULL)"), vec![vec![Value::Null]]);
+    // A count reaches its type by widening, so an INTEGER count of hours and a DECIMAL count of
+    // seconds both bind, and a DECIMAL count of days does not, because it would have to narrow.
+    assert_eq!(rows(&db, "SELECT to_hours(25)"), vec![vec![interval(0, 0, 90_000_000_000)]]);
+    assert_eq!(rows(&db, "SELECT to_seconds(1.5)"), vec![vec![interval(0, 0, 1_500_000)]]);
+    assert!(failure(&db, "SELECT to_days(1.7)").contains("to_days(col0 INTEGER) -> INTERVAL"));
+    // The seven range forms parse and then refuse in upstream's own words, with the units spelled
+    // the canonical way rather than the way they were written.
+    assert_eq!(failure(&db, "SELECT INTERVAL 1 DAYS TO HOURS"), "DAY TO HOUR is not supported");
+    assert_eq!(
+        failure(&db, "SELECT to_years(2147483647)"),
+        "Interval value 2147483647 years out of range"
+    );
+}
+
 /// The three spellings of a null check, end to end. Per #306.
 ///
 /// Every answer and every column name below was read off the pinned binary. `nullif` is a macro

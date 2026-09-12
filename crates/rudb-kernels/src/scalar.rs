@@ -53,7 +53,7 @@ use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
 
 use crate::cast;
 use crate::compare::{self, Comparison};
-use crate::datetime::Part;
+use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
 use crate::regexp;
@@ -1422,6 +1422,42 @@ fn made_civil_value(year: &Value, month: &Value, day: &Value) -> Result<Value> {
     Ok(Value::Date(days))
 }
 
+/// One of the thirteen interval constructors on one row.
+///
+/// The signature has already cast the count to the type the function takes, so a DOUBLE here means
+/// `to_seconds` or `to_milliseconds` and an integer means one of the other eleven, and the field the
+/// count lands in is [`datetime::interval`]'s business rather than this one's.
+fn interval_value(name: &str, count: &Value) -> Result<Value> {
+    let count = match count {
+        Value::Double(real) => Count::Real(*real),
+        other => match integral(other) {
+            Some(whole) => Count::Whole(whole),
+            None => return Err(Error::internal(format!("{name} of a {}", other.logical_type()))),
+        },
+    };
+    let (months, days, micros) = datetime::interval(name, count)?;
+    Ok(Value::Interval { months, days, micros })
+}
+
+/// `trunc`, which drops what is after the point rather than rounding it.
+///
+/// The one difference from upstream is the decimal. `trunc(1.7)` is a `DECIMAL(2,0)` there and is a
+/// `DECIMAL(2,1)` holding 1.0 here, because this table has one shape per name and no shape in it
+/// drops a scale. Same number, and the interval rewrite never reaches that arm anyway, since every
+/// call it writes goes through a DOUBLE.
+fn truncated(value: &Value) -> Result<Value> {
+    match value {
+        Value::Float(real) => Ok(Value::Float(real.trunc())),
+        Value::Double(real) => Ok(Value::Double(real.trunc())),
+        Value::Decimal { unscaled, width, scale } => {
+            let step = pow10(*scale);
+            Ok(Value::Decimal { unscaled: unscaled / step * step, width: *width, scale: *scale })
+        }
+        _ if integral(value).is_some() => Ok(value.clone()),
+        _ => Err(Error::not_implemented(format!("trunc of a {}", value.logical_type()))),
+    }
+}
+
 /// `epoch_ms(milliseconds)` on one row.
 fn made_timestamp_value(millis: &Value) -> Result<Value> {
     let Some(millis) = millis.as_i64() else {
@@ -1511,6 +1547,8 @@ pub fn call_values(
         ("~~*", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, true))),
         ("!~~*", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, true))),
         ("date_part" | "date_trunc", [spec, when]) => date_value(name, spec, when),
+        ("trunc", [only]) => truncated(only),
+        (_, [count]) if datetime::is_interval(name) => interval_value(name, count),
         ("make_date", [days]) => made_date_value(days),
         ("make_date", [year, month, day]) => made_civil_value(year, month, day),
         ("epoch_ms", [millis]) => made_timestamp_value(millis),
