@@ -34,6 +34,13 @@
 //! where it can be used and tested with a source made of two literal chunks and no planner
 //! anywhere in the picture.
 //!
+//! # Measuring without asking the operators to
+//!
+//! [`Watched`] is a wrapper that goes around any of the three, reading a clock and counting rows on
+//! every call. Nothing inside an operator mentions a counter, so an operator written next year is
+//! measured the day it is written by somebody who never read that module. It is per call, which is
+//! per chunk, which is the granularity rule.
+//!
 //! It also does not know about threads. The scheduler is F4. What it knows is that an operator can
 //! report [`Progress::Blocked`] for exactly four reasons, which is what makes the wait for graph
 //! finite and a deadlock a bug report with the cycle in it rather than a hang.
@@ -47,6 +54,7 @@ mod progress;
 mod root;
 mod serial;
 mod traits;
+mod watch;
 
 #[cfg(test)]
 mod tests;
@@ -58,3 +66,4 @@ pub use progress::{Blocked, BlockedReason, BufferId, IoToken, MemoryToken, Pipel
 pub use root::{RootReader, RootSink, root};
 pub use serial::run_serial;
 pub use traits::{Sink, Source, Stream};
+pub use watch::Watched;

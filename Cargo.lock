@@ -255,6 +255,7 @@ name = "rudb-pipeline"
 version = "0.2.34"
 dependencies = [
  "rudb-common",
+ "rudb-metrics",
  "rudb-vector",
 ]
 

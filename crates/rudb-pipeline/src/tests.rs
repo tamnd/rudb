@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_common::{Cancel, ErrorCode, LogicalType, Value};
+use rudb_metrics::Counters;
 use rudb_vector::{Chunk, Vector};
 
 use crate::dynamic::{DynSink, DynStream, LocalState};
@@ -13,6 +14,7 @@ use crate::progress::{Blocked, BlockedReason, BufferId, IoToken, PipelineId, Pro
 use crate::root::root;
 use crate::serial::run_serial;
 use crate::traits::{Sink, Source, Stream};
+use crate::watch::Watched;
 
 /// A source over a list of integers, handing out one morsel per group of `per_morsel` values and
 /// reading them out `per_chunk` at a time, so that the repeated read of one morsel is exercised
@@ -434,4 +436,43 @@ fn every_blocked_reason_has_a_name_and_there_are_four_of_them() {
     }
     assert_eq!(Blocked::Io(IoToken(0)).reason(), BlockedReason::Io);
     assert_eq!(Blocked::Downstream(BufferId(0)).reason(), BlockedReason::Downstream);
+}
+
+#[test]
+fn a_watched_pipeline_counts_the_rows_and_the_time_at_every_operator() {
+    let scan = Arc::new(Counters::new(0, 0, "Counting"));
+    let filter = Arc::new(Counters::new(1, 0, "Evens"));
+    let total = Arc::new(Counters::new(2, 0, "Total"));
+    let source = Arc::new(Watched::new(Counting::new((1..=10).collect(), 4, 4), Arc::clone(&scan)));
+    let stream = Arc::new(Watched::new(Evens, Arc::clone(&filter)));
+    let sink = Arc::new(Watched::new(Total::default(), Arc::clone(&total)));
+    let built = Pipeline::new(PipelineId(0), source, sink as Arc<dyn DynSink>)
+        .then(stream as Arc<dyn DynStream>);
+
+    run_serial(&built, &Cancel::new()).expect("the pipeline runs");
+
+    let read = scan.snapshot();
+    let kept = filter.snapshot();
+    let summed = total.snapshot();
+    assert_eq!(read.rows_out, 10);
+    assert_eq!(kept.rows_in, 10);
+    assert_eq!(kept.rows_out, 5, "half of one to ten is even");
+    assert_eq!(summed.rows_in, 5);
+    assert!(read.wall_ns > 0, "reading ten rows took longer than nothing");
+    assert!(kept.wall_ns > 0, "filtering them took longer than nothing");
+}
+
+#[test]
+fn a_call_that_produced_no_rows_is_still_measured() {
+    let counters = Arc::new(Counters::new(0, 0, "AlwaysBlocked"));
+    let source = Arc::new(Watched::new(AlwaysBlocked, Arc::clone(&counters)));
+    let sink: Arc<dyn DynSink> = Arc::new(Total::default());
+    let built = Pipeline::new(PipelineId(0), source, sink);
+
+    let error = run_serial(&built, &Cancel::new()).expect_err("a blocked source has nowhere to go");
+
+    assert_eq!(error.code(), ErrorCode::NotImplemented);
+    let blocked = counters.snapshot();
+    assert_eq!(blocked.rows_out, 0);
+    assert_eq!(blocked.kind, "AlwaysBlocked");
 }

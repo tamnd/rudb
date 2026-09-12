@@ -41,17 +41,29 @@
 //!
 //! # What fills it in
 //!
-//! Almost nothing yet. This crate is the document and the writer, it has no clocks and no counters
-//! in it, and the shim that reads a monotonic clock and a per thread CPU clock around every chunk
-//! is the next piece. The rank is 1 so that the shim can live in `rudb-pipeline` at rank 4 and
-//! report into this without either of them depending on the other way round.
+//! [`Counters`] is what one operator counts into while it runs, and [`Span`] is the pair of clock
+//! readings that one call costs. Both are here rather than next to the operators because the rank
+//! is 1: the shim that wraps every operator lives in `rudb-pipeline` at rank 4 and reports into
+//! this, and so will the buffer manager and the file readers, none of which can see each other.
+//!
+//! [`Counters::snapshot`] is the only way a counter becomes a row, so an operator that was measured
+//! and an operator that was written by hand into a test produce the same shape.
+//!
+//! # The one unsafe block
+//!
+//! Per thread CPU time is a system call and there is no dependency here to make it for us, so
+//! `clock` declares `clock_gettime` and calls it. That is the whole of the unsafe in this crate, it
+//! is compiled only on the two operating systems whose `timespec` the declaration matches, and
+//! everywhere else the clock reports nothing rather than a guess.
 
-#![forbid(unsafe_code)]
-
+mod clock;
+mod counters;
 mod document;
 mod json;
 mod warn;
 
+pub use clock::{Span, thread_cpu_ns};
+pub use counters::Counters;
 pub use document::{
     Blocked, Document, Engine, Machine, Memory, Operator, Outcome, Pipeline, Query, Resource,
     Settings, Strategy, Timing,
