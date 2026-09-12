@@ -121,9 +121,15 @@ impl<'a> Aggregate<'a> {
 
     /// Reads the whole input and builds the hash table.
     fn build(&mut self) -> Result<()> {
-        // The hash table, charged separately from the chunks it produces, because it is given back
-        // when the last group has been finished and they are not.
+        // The keys and the rows made out of them, charged separately from the chunks those produce,
+        // because these are given back when the last group has been finished and the chunks are
+        // not.
         let mut scratch = self.memory.reservation();
+        // The three containers and the sets a `DISTINCT` fills, which are gone before the chunks
+        // are built rather than after. Their own reservation so that their charge can go when they
+        // do, which is what leaves room for the chunks. A key is not in here, because a key is moved
+        // into the rows and outlives all of it. Per #272.
+        let mut containers = self.memory.reservation();
         let mut charged = 0;
         let mut slots: RowMap<usize> = RowMap::default();
         let mut states: Vec<Accumulator> = Vec::new();
@@ -161,6 +167,7 @@ impl<'a> Aggregate<'a> {
         while let Some(chunk) = self.input.next()? {
             let keys = evaluate_all(self.plan, &self.groups, &self.input_schema, &chunk)?;
             let mut taken = 0;
+            let mut aside = 0;
             let mut arguments = Vec::with_capacity(self.calls.len());
             let mut filters = Vec::with_capacity(self.calls.len());
             for call in &self.calls {
@@ -236,25 +243,49 @@ impl<'a> Aggregate<'a> {
                         }
                         // The copy and not the buffer, for the reason the group key above gives.
                         let stored = args.clone();
-                        taken += rows::footprint(&stored.0);
+                        aside += rows::footprint(&stored.0);
                         set.insert(stored);
                     }
                     states[slot * calls + at].update(&args.0)?;
                 }
             }
             scratch.grow(taken)?;
+            containers.grow(aside)?;
             let now = tables(&slots, &states, &seen);
-            rows::capacity(now, &mut charged, &mut scratch)?;
+            rows::capacity(now, &mut charged, &mut containers)?;
         }
+        // Turning the table into rows is where this operator holds the most and used to charge the
+        // least. `out` is a vector header per group, and each row is the key's own vector with the
+        // aggregate results pushed onto it, which asks the allocator for a block wider than the key
+        // was given. Both are asked for before they are taken rather than charged after, because
+        // the whole of it is taken between one charge and the next and a limit that is told
+        // afterwards has not done anything. What a result owns away from itself is not knowable
+        // until it has been asked for, so that part is charged as it arrives. Per #272.
+        let each = width_of(size_of::<Vec<Value>>() + calls * size_of::<Value>());
+        scratch.grow(width_of(groups).saturating_mul(each))?;
         let mut out: Vec<Vec<Value>> = vec![Vec::new(); groups];
         for (key, slot) in slots {
             out[slot] = key.0;
         }
+        let mut taken = 0;
         for (slot, row) in out.iter_mut().enumerate() {
+            // Room for every result at once, so that the row's block is asked for at the width it
+            // ends up at rather than at the width a doubling picks, which is the width charged
+            // above.
+            row.reserve_exact(calls);
             for accumulator in &states[slot * calls..slot * calls + calls] {
-                row.push(accumulator.finish()?);
+                let value = accumulator.finish()?;
+                taken += rows::owned(&value);
+                row.push(value);
             }
         }
+        scratch.grow(taken)?;
+        // The table went with the loop that drained it and the accumulators are finished, so the
+        // charge for all of it goes here and not at the end of this function. The chunks are the
+        // second copy of the rows and this is the room they are built in.
+        drop(states);
+        drop(seen);
+        containers.release();
         self.chunks = rows::chunks(&self.schema.types(), &out, &mut self.held)?;
         Ok(())
     }
@@ -408,7 +439,11 @@ impl<'a> Distinct<'a> {
 
     fn build(&mut self) -> Result<()> {
         let mut scratch = self.memory.reservation();
+        // The table, which is gone before the chunks are built, unlike the rows it decided to keep.
+        // Per #272, the same split the aggregate above makes and for the same reason.
+        let mut table = self.memory.reservation();
         let mut charged = 0;
+        let mut charged_table = 0;
         let mut seen: RowSet = RowSet::default();
         let mut kept: Vec<Vec<Value>> = Vec::new();
         let mut key = Key(Vec::new());
@@ -419,6 +454,7 @@ impl<'a> Distinct<'a> {
                 evaluate_all(self.plan, &self.on, &self.schema, &chunk)?
             };
             let mut taken = 0;
+            let mut aside = 0;
             // row at a time: `DISTINCT` is a grouping that keeps no aggregate, so it gets its
             // answer from the same table 2f (#60) builds and stops building a key here then.
             for row in 0..chunk.len() {
@@ -440,15 +476,22 @@ impl<'a> Distinct<'a> {
                 // them is charged below, once per chunk. The copy is charged and not the buffer it
                 // came from, for the reason the group key in `build` above gives.
                 let stored = key.clone();
-                taken += rows::heap(&stored.0) + rows::heap(&values);
+                taken += rows::heap(&values);
+                aside += rows::heap(&stored.0);
                 seen.insert(stored);
                 kept.push(values);
             }
             scratch.grow(taken)?;
-            let now = rows::buckets(seen.capacity()) * (width_of(size_of::<Key>()) + 1)
-                + width_of(kept.capacity() * size_of::<Vec<Value>>());
-            rows::capacity(now, &mut charged, &mut scratch)?;
+            table.grow(aside)?;
+            let rows = width_of(kept.capacity() * size_of::<Vec<Value>>());
+            rows::capacity(rows, &mut charged, &mut scratch)?;
+            let now = rows::buckets(seen.capacity()) * (width_of(size_of::<Key>()) + 1);
+            rows::capacity(now, &mut charged_table, &mut table)?;
         }
+        // The table is not needed to build the chunks and the rows are, so it goes first and its
+        // charge goes with it, which is the room the chunks are built in.
+        drop(seen);
+        table.release();
         self.chunks = rows::chunks(&self.schema.types(), &kept, &mut self.held)?;
         Ok(())
     }

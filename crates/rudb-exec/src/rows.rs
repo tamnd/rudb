@@ -40,6 +40,16 @@ pub(crate) fn heap(row: &[Value]) -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
+/// What one value owns away from itself, which is its footprint without its own bytes.
+///
+/// For a value going into room that has been charged already, where charging the footprint would
+/// charge that room twice. A group by asks for the room its aggregate results need before it has
+/// them, because by the time it has them it has taken the memory, and then it has only what each
+/// result owns left to charge.
+pub(crate) fn owned(value: &Value) -> u64 {
+    u64::try_from(value.footprint() - size_of::<Value>()).unwrap_or(u64::MAX)
+}
+
 /// [`ALLOCATION`] in the type the sizes around it are in.
 const ALLOCATION_USIZE: usize = ALLOCATION as usize;
 
