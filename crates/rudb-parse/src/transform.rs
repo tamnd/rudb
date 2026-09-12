@@ -1928,6 +1928,10 @@ impl<'a> Transform<'a> {
                 continue;
             }
             let text = token.text(self.query);
+            if let Some(body) = dollar_body(text) {
+                value.push_str(body);
+                continue;
+            }
             match text.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')) {
                 Some(body) => value.push_str(&body.replace("''", "'")),
                 None => value.push_str(text),
@@ -1935,6 +1939,21 @@ impl<'a> Transform<'a> {
         }
         value
     }
+}
+
+/// The body of a dollar quoted string, for the tokens that are one.
+///
+/// The tag is whatever sits between the opening pair of dollars and may be empty, so `$$a$$` and
+/// `$tag$a$tag$` both arrive here, and nothing inside the body is escaped, which is the whole reason
+/// the spelling exists. The tokenizer has already found the closing tag, which is the part that takes
+/// work, so this says where the body starts and ends and no more. A token that is not dollar quoted
+/// gives `None` and so does an unterminated one, which has no closing tag to take off and keeps every
+/// byte it was given, the way the matcher already treats it. Per #276.
+fn dollar_body(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('$')?;
+    let close = rest.find('$')?;
+    let (tag, body) = (&rest[..close], &rest[close + 1..]);
+    body.strip_suffix(&format!("${tag}$"))
 }
 
 /// Strip the quoting off an identifier.
@@ -2745,6 +2764,19 @@ mod tests {
     fn a_string_literal_is_decoded_and_adjacent_ones_are_joined() {
         assert_eq!(round("SELECT 'it''s'"), "SELECT 'it's'");
         assert_eq!(round("SELECT 'a'\n'b'"), "SELECT 'ab'", "the standard's adjacency rule");
+    }
+
+    /// Per #276, where the tag and the dollars were coming through as part of the value.
+    #[test]
+    fn a_dollar_quoted_string_loses_its_dollars_and_its_tag() {
+        assert_eq!(round("SELECT $$dollar quoted$$"), "SELECT 'dollar quoted'");
+        assert_eq!(round("SELECT $tag$body$tag$"), "SELECT 'body'");
+        assert_eq!(round("SELECT $$$$"), "SELECT ''", "an empty tag and an empty body");
+        // Nothing in the body is escaped, which is what the spelling is for, so a quote is a quote
+        // and a dollar that is not the closing tag is a dollar.
+        assert_eq!(round("SELECT $tag$it''s $other$ fine$tag$"), "SELECT 'it''s $other$ fine'");
+        // An unterminated one has no closing tag to take off and keeps every byte it was given.
+        assert_eq!(round("SELECT $$open"), "SELECT '$$open'");
     }
 
     #[test]
