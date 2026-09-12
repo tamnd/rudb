@@ -733,13 +733,15 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
 }
 
-/// What the arithmetic operators return when an interval is one of the arguments.
+/// What the arithmetic operators return when a date, a time, a timestamp or an interval is one of
+/// the arguments.
 ///
 /// The one place in this file where the argument types pick the overload rather than the name
 /// picking one shape. The table above says a name has exactly one shape and that a second row for
-/// a name needs a rule for which one wins, and this is the rule: an interval next to a date, a
-/// timestamp, a time, another interval or a number is temporal arithmetic, and everything else is
-/// the numeric row. The answer is the types to cast the arguments to and the type that comes back.
+/// a name needs a rule for which one wins, and this is the rule: a date, a time, a timestamp or an
+/// interval next to one of those, or next to a number, is temporal arithmetic, and everything else
+/// is the numeric row. The answer is the types to cast the arguments to and the type that comes
+/// back.
 ///
 /// A date plus an interval is a timestamp and not a date, because the interval carries a time of
 /// day. A time plus an interval is a time, since the months and the days have nowhere to go and it
@@ -755,15 +757,33 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
 /// `UBIGINT` take the double as well, since neither of them fits a `BIGINT` to begin with. Dividing
 /// has only the double, which is why an integer count divided into an interval reports its division
 /// by zero as `0.0`.
+///
+/// A plain number next to a date is a count of days and the answer stays a date, which is the one
+/// shape here that does not become a timestamp. The count is an `INTEGER` and nothing wider, so a
+/// `BIGINT` next to a date has no overload to reach at all, and taking a date off a number is not a
+/// thing. One date taken off another is a count of days as a `BIGINT` and one timestamp taken off
+/// another is an interval, and a date on either side of that subtraction becomes a timestamp first.
+/// A date plus a time is the timestamp they name together, in either order, and taking a time off a
+/// date is refused upstream.
+///
+/// An untyped null next to a date is the count of days and next to a timestamp is the interval,
+/// which is measured rather than picked: `typeof(DATE '2020-01-01' + NULL)` is `DATE` and
+/// `typeof(TIMESTAMP '2020-01-01' - NULL)` is `TIMESTAMP`. A null next to a time or next to an
+/// interval is ambiguous upstream and refused, which we refuse too, with the wrong sentence for now
+/// because the sentence for an ambiguous call is #395.
 fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
     use LogicalType::{
-        BigInt, Date, Double, HugeInt, Interval, Time, Timestamp, UBigInt, UHugeInt,
+        BigInt, Date, Double, HugeInt, Integer, Interval, Null, SmallInt, Time, Timestamp, TinyInt,
+        UBigInt, UHugeInt, USmallInt, UTinyInt,
     };
     let kept = |returns| Some((arguments.to_vec(), returns));
     // A null literal has no type yet, so it counts as the number and the cast to a double is what
     // turns the whole call into a null.
-    let number = |ty: &LogicalType| ty.is_numeric() || *ty == LogicalType::Null;
+    let number = |ty: &LogicalType| ty.is_numeric() || *ty == Null;
     let counted = |ty: &LogicalType| ty.is_integer() && !matches!(ty, HugeInt | UHugeInt | UBigInt);
+    // The days a date moves by are an `INTEGER`, so this is the set of types that widen into one.
+    let days =
+        |ty: &LogicalType| matches!(ty, TinyInt | SmallInt | Integer | UTinyInt | USmallInt | Null);
     match (name, arguments) {
         ("-", [Interval]) => kept(Interval),
         ("+" | "-", [Date | Timestamp, Interval]) | ("+", [Interval, Date | Timestamp]) => {
@@ -771,6 +791,15 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         }
         ("+" | "-", [Time, Interval]) | ("+", [Interval, Time]) => kept(Time),
         ("+" | "-", [Interval, Interval]) => kept(Interval),
+        ("-", [Date, Date]) => kept(BigInt),
+        ("-", [Timestamp, Timestamp]) => kept(Interval),
+        ("-", [Date, Timestamp] | [Timestamp, Date]) => {
+            Some((vec![Timestamp, Timestamp], Interval))
+        }
+        ("+", [Date, Time] | [Time, Date]) => kept(Timestamp),
+        ("+" | "-", [Date, count]) if days(count) => Some((vec![Date, Integer], Date)),
+        ("+", [count, Date]) if days(count) => Some((vec![Integer, Date], Date)),
+        ("+" | "-", [Timestamp, Null]) | ("+", [Null, Timestamp]) => kept(Timestamp),
         ("*", [Interval, count]) if counted(count) => Some((vec![Interval, BigInt], Interval)),
         ("*", [count, Interval]) if counted(count) => Some((vec![BigInt, Interval], Interval)),
         ("*" | "/", [Interval, scale]) if number(scale) => Some((vec![Interval, Double], Interval)),
