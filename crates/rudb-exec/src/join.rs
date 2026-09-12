@@ -15,7 +15,7 @@
 //! than one right row at a time, which keeps the evaluator on its batch interface and makes the
 //! left side's columns constant vectors that cost one value each.
 
-use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Value};
+use rudb_common::{Cancel, Error, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Connective, combine, is_true};
 use rudb_plan::{ExprRef, JoinKind, Plan, Slice};
 use rudb_vector::{Chunk, Vector};
@@ -41,6 +41,12 @@ pub(crate) struct Join<'a> {
     chunks: Vec<Chunk>,
     at: usize,
     memory: Memory,
+    /// The same token the `cancel` module wraps every node in, held here as well.
+    ///
+    /// This is the one operator that needs it. The wrapper checks between calls to `next` and the
+    /// whole join happens inside the first of them, so a nested loop over a hundred thousand left
+    /// rows and thirty thousand right ones runs for a minute with nothing looking at the token.
+    cancel: Cancel,
     /// What the joined chunks are charged, held for as long as this operator holds them.
     held: Reservation,
 }
@@ -52,6 +58,7 @@ impl<'a> Join<'a> {
         right: Box<dyn Operator + 'a>,
         kind: JoinKind,
         conditions: Slice,
+        cancel: &Cancel,
         memory: &Memory,
     ) -> Self {
         let left_schema = left.schema().clone();
@@ -75,6 +82,7 @@ impl<'a> Join<'a> {
             chunks: Vec::new(),
             at: 0,
             memory: memory.clone(),
+            cancel: cancel.clone(),
             held: memory.reservation(),
         }
     }
@@ -101,6 +109,10 @@ impl<'a> Join<'a> {
         scratch.grow(u64::try_from(right_rows.len()).unwrap_or(u64::MAX))?;
         let mut out: Vec<Vec<Value>> = Vec::new();
         for left_row in &left_rows {
+            // Once per left row, in the same place and for the same reason as the reservation at
+            // the bottom of the loop. What a query can run past its clock by is one pass over the
+            // right side, which is the smallest unit this loop has that is not the inner one.
+            self.cancel.check()?;
             let before = out.len();
             let hits = self.matching(left_row, &left_types, &right_chunks)?;
             for &hit in &hits {
