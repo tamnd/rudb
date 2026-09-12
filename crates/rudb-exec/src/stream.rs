@@ -4,12 +4,19 @@
 //! input, none of them can block, and each one either hands its chunk on, narrows it or replaces
 //! its columns. That is the property the morsel driven scheduler in section 7.2 needs, because a
 //! morsel is a run of a scan pushed through every streaming operator above it by one thread.
+//!
+//! All three are [`Stream`] implementations, which means they take `&self` and are handed the
+//! mutable part separately. A filter's mutable part is the scratch space its predicate evaluates
+//! into and a limit's is the two counters, and naming them is what lets one of these be
+//! instantiated on thirty two threads later without copying the predicate thirty two times. The
+//! tree in `build.rs` is still a pull tree, so [`Streamed`](crate::adapt::Streamed) drives them
+//! from above until the whole engine pushes.
 
-use rudb_common::Result;
+use rudb_common::{Field, Result};
+use rudb_pipeline::{Progress, Stream};
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Selection};
 
-use crate::operator::Operator;
 use crate::prepared::{Prepared, Scratch};
 use crate::schema::Schema;
 
@@ -26,64 +33,48 @@ use crate::schema::Schema;
 /// The kept rows become a selection over the chunk rather than a copy of it, which is section 7.1's
 /// rule: a filter that keeps one row in a thousand costs the selection and not the payload. The
 /// copying alternative is [`Chunk::compact`], and its documentation has the measurement that says
-/// why a streaming filter is not the caller for it. A chunk that keeps nothing is skipped here
-/// rather than handed on, because an empty chunk travelling up a deep pipeline is work every
-/// operator above does for no rows.
+/// why a streaming filter is not the caller for it. A chunk that keeps nothing is left empty rather
+/// than passed on with rows in it, and whoever is driving skips it, because an empty chunk
+/// travelling up a deep pipeline is work every operator above does for no rows.
 #[derive(Debug)]
-pub(crate) struct Filter<'a> {
-    input: Box<dyn Operator + 'a>,
+pub(crate) struct Filter {
     predicate: Prepared,
-    scratch: Scratch,
-    schema: Schema,
 }
 
-impl<'a> Filter<'a> {
+impl Filter {
     /// # Errors
     ///
     /// If the predicate does not resolve against the input's schema, which is a failure of the plan
-    /// and is now found when the operator is built rather than on the first chunk.
-    pub(crate) fn new(
-        plan: &'a Plan,
-        input: Box<dyn Operator + 'a>,
-        predicate: ExprRef,
-    ) -> Result<Self> {
-        let schema = input.schema().clone();
-        let predicate = Prepared::one(plan, predicate, &schema)?;
-        let scratch = predicate.scratch();
-        Ok(Self { input, predicate, scratch, schema })
+    /// and is found when the operator is built rather than on the first chunk.
+    pub(crate) fn new(plan: &Plan, predicate: ExprRef, input: &Schema) -> Result<Self> {
+        Ok(Self { predicate: Prepared::one(plan, predicate, input)? })
     }
 }
 
-impl Operator for Filter<'_> {
-    fn schema(&self) -> &Schema {
-        &self.schema
+impl Stream for Filter {
+    type Local = Scratch;
+
+    fn local(&self) -> Scratch {
+        self.predicate.scratch()
     }
 
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        while let Some(chunk) = self.input.next()? {
-            let kept = self.predicate.evaluate_filter(&chunk, &mut self.scratch)?;
-            if kept.is_empty() {
-                continue;
-            }
-            if kept.len() == chunk.len() {
-                return Ok(Some(chunk));
-            }
-            return Ok(Some(chunk.select(&kept)?));
+    fn push(&self, chunk: &mut Chunk, scratch: &mut Scratch) -> Result<Progress> {
+        let kept = self.predicate.evaluate_filter(chunk, scratch)?;
+        if kept.len() != chunk.len() {
+            keep(chunk, &kept)?;
         }
-        Ok(None)
+        Ok(Progress::More)
     }
 }
 
 /// Replaces the input's columns with a list of expressions.
 #[derive(Debug)]
-pub(crate) struct Project<'a> {
-    input: Box<dyn Operator + 'a>,
+pub(crate) struct Project {
     exprs: Prepared,
-    scratch: Scratch,
     schema: Schema,
 }
 
-impl<'a> Project<'a> {
+impl Project {
     /// A projection producing the plan's expressions under the plan's names.
     ///
     /// # Errors
@@ -92,8 +83,8 @@ impl<'a> Project<'a> {
     /// which is checked again here because this operator would otherwise produce a schema that is
     /// silently short.
     pub(crate) fn new(
-        plan: &'a Plan,
-        input: Box<dyn Operator + 'a>,
+        plan: &Plan,
+        input: &Schema,
         index: u32,
         exprs: Slice,
         names: Slice,
@@ -110,29 +101,30 @@ impl<'a> Project<'a> {
         let fields = exprs
             .iter()
             .zip(names)
-            .map(|(&expr, &name)| {
-                rudb_common::Field::new(plan.string(name), plan.expr_type(expr).clone())
-            })
+            .map(|(&expr, &name)| Field::new(plan.string(name), plan.expr_type(expr).clone()))
             .collect();
-        let input_schema = input.schema().clone();
-        let exprs = Prepared::new(plan, &exprs, &input_schema)?;
-        let scratch = exprs.scratch();
-        Ok(Self { input, exprs, scratch, schema: Schema::numbered(fields, index) })
+        let exprs = Prepared::new(plan, &exprs, input)?;
+        Ok(Self { exprs, schema: Schema::numbered(fields, index) })
+    }
+
+    /// The columns this projection produces.
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
     }
 }
 
-impl Operator for Project<'_> {
-    fn schema(&self) -> &Schema {
-        &self.schema
+impl Stream for Project {
+    type Local = Scratch;
+
+    fn local(&self) -> Scratch {
+        self.exprs.scratch()
     }
 
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        let Some(chunk) = self.input.next()? else {
-            return Ok(None);
-        };
+    fn push(&self, chunk: &mut Chunk, scratch: &mut Scratch) -> Result<Progress> {
         let mut columns = Vec::with_capacity(self.exprs.len());
-        self.exprs.evaluate(&chunk, &mut self.scratch, &mut columns)?;
-        Ok(Some(Chunk::with_rows(columns, chunk.len())?))
+        self.exprs.evaluate(chunk, scratch, &mut columns)?;
+        *chunk = Chunk::with_rows(columns, chunk.len())?;
+        Ok(Progress::More)
     }
 }
 
@@ -140,63 +132,152 @@ impl Operator for Project<'_> {
 ///
 /// The offset is consumed a row at a time rather than a chunk at a time, because an offset that
 /// falls in the middle of a chunk is the ordinary case and rounding it to a chunk boundary is a
-/// wrong answer. When the count is reached the input is dropped rather than drained, which is what
-/// makes `LIMIT 10` over a large table stop early instead of scanning it.
+/// wrong answer. The chunk that reaches the count comes back with [`Progress::Done`] on it, which
+/// is how `LIMIT 10` over a large table stops the scan instead of reading rows in order to throw
+/// them away.
 #[derive(Debug)]
-pub(crate) struct Limit<'a> {
-    input: Box<dyn Operator + 'a>,
-    schema: Schema,
+pub(crate) struct Limit {
     count: Option<u64>,
     offset: u64,
+}
+
+/// How much of the limit one instance has used up.
+#[derive(Debug, Default)]
+pub(crate) struct Taken {
     skipped: u64,
     emitted: u64,
 }
 
-impl<'a> Limit<'a> {
-    pub(crate) fn new(input: Box<dyn Operator + 'a>, count: Option<u64>, offset: u64) -> Self {
-        let schema = input.schema().clone();
-        Self { input, schema, count, offset, skipped: 0, emitted: 0 }
+impl Limit {
+    pub(crate) fn new(count: Option<u64>, offset: u64) -> Self {
+        Self { count, offset }
     }
 
-    /// How many rows of a chunk are still wanted, given what has already been emitted.
-    fn room(&self) -> Option<u64> {
-        self.count.map(|count| count.saturating_sub(self.emitted))
+    /// How many rows are still wanted, given what has already been emitted.
+    fn room(&self, taken: &Taken) -> Option<u64> {
+        self.count.map(|count| count.saturating_sub(taken.emitted))
     }
 }
 
-impl Operator for Limit<'_> {
-    fn schema(&self) -> &Schema {
-        &self.schema
+impl Stream for Limit {
+    type Local = Taken;
+
+    fn local(&self) -> Taken {
+        Taken::default()
     }
 
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        loop {
-            if self.room() == Some(0) {
-                return Ok(None);
-            }
-            let Some(chunk) = self.input.next()? else {
-                return Ok(None);
-            };
-            let rows = chunk.len() as u64;
-            let skipping = (self.offset - self.skipped).min(rows);
-            self.skipped += skipping;
-            let available = rows - skipping;
-            if available == 0 {
-                continue;
-            }
-            let taking = match self.room() {
-                Some(room) => room.min(available),
-                None => available,
-            };
-            self.emitted += taking;
-            if skipping == 0 && taking == rows {
-                return Ok(Some(chunk));
-            }
+    fn push(&self, chunk: &mut Chunk, taken: &mut Taken) -> Result<Progress> {
+        let rows = chunk.len() as u64;
+        let skipping = (self.offset - taken.skipped).min(rows);
+        taken.skipped += skipping;
+        let available = rows - skipping;
+        let taking = match self.room(taken) {
+            Some(room) => room.min(available),
+            None => available,
+        };
+        taken.emitted += taking;
+        if skipping != 0 || taking != rows {
             let mut kept = Selection::with_capacity(taking as usize);
             for row in skipping..skipping + taking {
                 kept.push(row as usize);
             }
-            return Ok(Some(chunk.select(&kept)?));
+            keep(chunk, &kept)?;
         }
+        match self.room(taken) {
+            Some(0) => Ok(Progress::Done),
+            _ => Ok(Progress::More),
+        }
+    }
+}
+
+/// Narrow a chunk to the rows a selection kept, in place.
+///
+/// [`Chunk::select`] takes the chunk by value, because taking it by value is what lets it move the
+/// payload into the new vectors rather than copy it, and a push operator has a `&mut` and not a
+/// value. So the chunk is swapped out for an empty one, narrowed, and put back. The empty one is
+/// never observed, since a failure here fails the query.
+fn keep(chunk: &mut Chunk, kept: &Selection) -> Result<()> {
+    let whole = std::mem::replace(chunk, Chunk::empty(&[]));
+    *chunk = whole.select(kept)?;
+    Ok(())
+}
+
+/// The limit driven through the trait rather than through a plan.
+///
+/// The plan level tests are in `tests.rs` and they go through `build`, which is the right place to
+/// check that `LIMIT 3 OFFSET 1` answers with the rows it should. These check the part only the
+/// trait has, which is when [`Progress::Done`] comes back, because that is the signal that stops a
+/// scan and nothing above the operator can see it once the answer has been assembled.
+#[cfg(test)]
+mod tests {
+    use rudb_common::{LogicalType, Value};
+    use rudb_vector::{Data, Vector};
+
+    use super::{Limit, Progress, Stream};
+    use rudb_vector::Chunk;
+
+    fn chunk(values: &[i32]) -> Chunk {
+        let column = Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into()))
+            .expect("integers are an i32 layout");
+        Chunk::new(vec![column]).expect("one column is one length")
+    }
+
+    fn rows(chunk: &Chunk) -> Vec<Value> {
+        (0..chunk.len()).map(|row| chunk.value_at(row, 0)).collect()
+    }
+
+    #[test]
+    fn the_chunk_that_fills_the_count_is_the_one_that_says_done() {
+        let limit = Limit::new(Some(3), 0);
+        let mut taken = limit.local();
+
+        let mut first = chunk(&[1, 2]);
+        assert_eq!(limit.push(&mut first, &mut taken).expect("two rows fit"), Progress::More);
+        assert_eq!(rows(&first), vec![Value::Integer(1), Value::Integer(2)]);
+
+        let mut second = chunk(&[3, 4]);
+        assert_eq!(limit.push(&mut second, &mut taken).expect("one row fits"), Progress::Done);
+        assert_eq!(rows(&second), vec![Value::Integer(3)]);
+    }
+
+    #[test]
+    fn an_offset_that_falls_inside_a_chunk_is_counted_in_rows() {
+        let limit = Limit::new(None, 3);
+        let mut taken = limit.local();
+
+        let mut first = chunk(&[1, 2]);
+        assert_eq!(limit.push(&mut first, &mut taken).expect("all skipped"), Progress::More);
+        assert!(first.is_empty());
+
+        let mut second = chunk(&[3, 4, 5]);
+        assert_eq!(limit.push(&mut second, &mut taken).expect("one more skipped"), Progress::More);
+        assert_eq!(rows(&second), vec![Value::Integer(4), Value::Integer(5)]);
+    }
+
+    /// `LIMIT 0` is a query that reads nothing, and it is worth its own test because the count is
+    /// reached before a row has been seen, which is the one path where the operator is finished on
+    /// the call that starts it.
+    #[test]
+    fn a_limit_of_nothing_is_done_on_the_first_chunk() {
+        let limit = Limit::new(Some(0), 0);
+        let mut taken = limit.local();
+        let mut first = chunk(&[1, 2]);
+        assert_eq!(limit.push(&mut first, &mut taken).expect("nothing wanted"), Progress::Done);
+        assert!(first.is_empty());
+    }
+
+    /// An instance's counters are its own, which is what makes the operator shareable. Two locals
+    /// off one limit both get their own three rows.
+    #[test]
+    fn two_instances_of_one_limit_do_not_share_a_count() {
+        let limit = Limit::new(Some(3), 0);
+        let mut one = limit.local();
+        let mut two = limit.local();
+
+        let mut first = chunk(&[1, 2, 3]);
+        assert_eq!(limit.push(&mut first, &mut one).expect("three rows"), Progress::Done);
+        let mut second = chunk(&[4, 5, 6]);
+        assert_eq!(limit.push(&mut second, &mut two).expect("three rows"), Progress::Done);
+        assert_eq!(rows(&second), vec![Value::Integer(4), Value::Integer(5), Value::Integer(6)]);
     }
 }
