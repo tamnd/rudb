@@ -342,16 +342,14 @@ where
         let one = held.data()?;
         return dispatch(op.swapped(), len, other, map, one, first, right_valid, left_valid, map);
     }
-    if let (Some((codes, values)), Some(value)) = (left.dictionary_parts(), right.constant_value())
-    {
+    if let (Some((codes, values)), Some(value)) = (left.positions(), right.constant_value()) {
         let one = values.data()?;
         let held = single(left.logical_type(), value)?;
         let other = held.data()?;
         let at = |index: usize| codes[map(index)] as usize;
         return dispatch(op, len, one, at, other, first, left_valid, right_valid, map);
     }
-    if let (Some(value), Some((codes, values))) = (left.constant_value(), right.dictionary_parts())
-    {
+    if let (Some(value), Some((codes, values))) = (left.constant_value(), right.positions()) {
         let other = values.data()?;
         let held = single(right.logical_type(), value)?;
         let one = held.data()?;
@@ -363,12 +361,12 @@ where
     // against constant pair beside it, on the same data and the same operator. It is not a rare
     // shape either: it is what a filtered column compared against an unfiltered one is, which is
     // every conjunct after the first.
-    if let (Some((codes, values)), Some(other)) = (left.dictionary_parts(), right.data()) {
+    if let (Some((codes, values)), Some(other)) = (left.positions(), right.data()) {
         let one = values.data()?;
         let at = |index: usize| codes[map(index)] as usize;
         return dispatch(op, len, one, at, other, map, left_valid, right_valid, map);
     }
-    if let (Some(one), Some((codes, values))) = (left.data(), right.dictionary_parts()) {
+    if let (Some(one), Some((codes, values))) = (left.data(), right.positions()) {
         let other = values.data()?;
         let at = |index: usize| codes[map(index)] as usize;
         return dispatch(op.swapped(), len, other, at, one, map, right_valid, left_valid, map);
@@ -938,6 +936,12 @@ mod tests {
                     (0..len).map(|_| rng.below(left.len() as u64) as u32).collect();
                 let dictionary =
                     Vector::dictionary(codes, left.clone()).expect("codes are in range");
+                // Runs over the same values, with the last one cut short so that a run boundary
+                // does not land on the end of the vector.
+                let ends: Vec<u32> = (1..=left.len())
+                    .map(|run| ((run * len) / left.len()).max(run) as u32)
+                    .collect();
+                let runs = Vector::runs(ends, left.clone()).expect("one value for each run");
 
                 for op in EVERY {
                     agrees(op, &left, &right);
@@ -952,6 +956,13 @@ mod tests {
                     // disagree with the oracle and the one that got a loop last.
                     agrees(op, &dictionary, &right);
                     agrees(op, &right, &dictionary);
+                    // The same four pairings for run length, which reaches the same loops through
+                    // the same accessor, so what is being checked is that the positions it works
+                    // out are the positions the row at a time path reads.
+                    agrees(op, &runs, &constant);
+                    agrees(op, &constant, &runs);
+                    agrees(op, &runs, &right);
+                    agrees(op, &right, &runs);
                 }
             }
         }

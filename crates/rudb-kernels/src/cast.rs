@@ -114,8 +114,8 @@ fn swept(input: &Vector, target: &LogicalType) -> Option<Vector> {
             }
             convert_run(data, identity, rows, from, into, physical)?
         }
-        Form::Dictionary => {
-            let (codes, values) = input.dictionary_parts()?;
+        Form::Dictionary | Form::Rle => {
+            let (codes, values) = input.positions()?;
             if codes.len() < rows {
                 return None;
             }

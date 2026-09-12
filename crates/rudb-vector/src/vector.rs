@@ -22,6 +22,7 @@
 //! are not stored yet either, for the same reason: a `LIST(STRUCT(...))` is offsets plus child
 //! column chunks, and child column chunks are storage.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use rudb_common::{Cause, Error, LogicalType, Result, Value, slow};
@@ -564,6 +565,37 @@ impl Vector {
     pub fn run_parts(&self) -> Option<(&[u32], &Self)> {
         match &self.body {
             Body::Runs { ends, values } => Some((ends, values.as_ref())),
+            _ => None,
+        }
+    }
+
+    /// Where each row's value is, for the two forms that keep their values somewhere else.
+    ///
+    /// A dictionary and a run length vector are the same shape seen from a kernel: a run of
+    /// positions and a vector to read them out of. The difference is that a dictionary stores the
+    /// positions and a run length vector works them out, and a kernel writing `values[at[row]]` does
+    /// not care which. So every specialization written against [`Self::dictionary_parts`] covers
+    /// both forms by asking this instead, and the day a third form with an indirection arrives it
+    /// covers that one too without any of those kernels being reopened.
+    ///
+    /// The run length side costs an allocation of one position per row and a pass to fill it, which
+    /// is the same four bytes a row a dictionary was already carrying and is paid once per kernel
+    /// call rather than once per row. That is the price of this being one accessor rather than a
+    /// second arm in eighteen kernels, and it is not the last word: a kernel that wants a run at a
+    /// time reads [`Self::run_parts`] and pays nothing, which is the specialization this makes it
+    /// possible to skip writing until a sweep says it is worth it.
+    #[must_use]
+    pub fn positions(&self) -> Option<(Cow<'_, [u32]>, &Self)> {
+        match &self.body {
+            Body::Dictionary { codes, values } => Some((Cow::Borrowed(codes), values.as_ref())),
+            Body::Runs { ends, values } => {
+                let mut at = Vec::with_capacity(self.len);
+                for (run, &stop) in ends.iter().enumerate() {
+                    let run = u32::try_from(run).unwrap_or(u32::MAX);
+                    at.resize(stop as usize, run);
+                }
+                Some((Cow::Owned(at), values.as_ref()))
+            }
             _ => None,
         }
     }
@@ -1319,6 +1351,30 @@ mod tests {
         let constant = Vector::constant(LogicalType::Integer, Value::Integer(1), 1000);
         assert_eq!(constant.run_encoded().unwrap().form(), Form::Constant);
         assert_eq!(Vector::sequence(0, 1, 1000).run_encoded().unwrap().form(), Form::Sequence);
+    }
+
+    /// What makes one accessor cover both forms. A dictionary hands back the codes it stores and a
+    /// run length vector works the same numbers out, and a kernel writing `values[at[row]]` reads
+    /// the same rows out of either.
+    #[test]
+    fn both_forms_that_point_somewhere_hand_back_a_position_per_row() {
+        let words = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("red".into()), Value::Varchar("blue".into())],
+        )
+        .unwrap();
+        let runs = Vector::runs(vec![3, 5], words.clone()).unwrap();
+        let (at, values) = runs.positions().expect("runs point somewhere");
+        assert_eq!(at.as_ref(), [0, 0, 0, 1, 1]);
+        assert_eq!(values.value_at(at[3] as usize), runs.value_at(3));
+
+        let dictionary = Vector::dictionary(vec![1, 0, 1], words).unwrap();
+        let (at, values) = dictionary.positions().expect("a dictionary points somewhere");
+        assert_eq!(at.as_ref(), [1, 0, 1]);
+        assert_eq!(values.value_at(at[0] as usize), dictionary.value_at(0));
+
+        assert!(integers(&[1, 2, 3]).positions().is_none(), "a flat vector points at itself");
+        assert!(Vector::sequence(0, 1, 4).positions().is_none(), "a sequence stores nothing");
     }
 
     #[test]

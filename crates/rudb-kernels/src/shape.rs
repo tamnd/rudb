@@ -17,13 +17,18 @@ use rudb_vector::{Validity, Vector};
 
 /// Which rows of a vector are not null, as a kernel needs to read it.
 ///
-/// A dictionary has two places to keep a null and `Vector::value_at` reads both, so this reads both
-/// too. A kernel that read only `Vector::validity` would report every row of a dictionary valid
-/// wherever the nulls are in the values, and a null would come out as whatever sits at code zero.
-/// A kernel that read only the values would miss the other kind. Every kernel that takes a
-/// dictionary path has to come through here. `Vector::flatten` and `Vector::dictionary_parts` both
-/// carry the same warning, because this is a wrong answer that needs a filter, a null and one
-/// specific form to reproduce and is correspondingly hard to find later.
+/// A form that reads its values through positions has two places to keep a null and
+/// `Vector::value_at` reads both, so this reads both too. A kernel that read only `Vector::validity`
+/// would report every row of a dictionary valid wherever the nulls are in the values, and a null
+/// would come out as whatever sits at code zero. A kernel that read only the values would miss the
+/// other kind. Every kernel that takes one of those paths has to come through here.
+/// `Vector::flatten` and `Vector::positions` both carry the same warning, because this is a wrong
+/// answer that needs a filter, a null and one specific form to reproduce and is correspondingly
+/// hard to find later.
+///
+/// Run length is the same shape and gets the same treatment for free, which is the point of asking
+/// `Vector::positions` rather than asking for a dictionary. A run length column out of a clustered
+/// scan keeps its nulls in the run values, exactly where a filtered dictionary keeps them.
 ///
 /// Both kinds are real. A dictionary built from a filtered column points at values that already
 /// carry the nulls, which is the common one. A dictionary out of the Parquet reader is the other:
@@ -32,7 +37,7 @@ use rudb_vector::{Validity, Vector};
 /// until a Parquet file could reach a kernel, and then `s IS NULL` over a dictionary encoded column
 /// with 586 nulls in it answered zero.
 pub(crate) fn nulls_of(vector: &Vector) -> Validity {
-    let Some((codes, values)) = vector.dictionary_parts() else {
+    let Some((codes, values)) = vector.positions() else {
         return vector.validity().clone();
     };
     let inside = match values.validity() {
