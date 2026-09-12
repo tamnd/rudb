@@ -1350,6 +1350,7 @@ impl<'a> Transform<'a> {
                 "ExtractExpression" => return self.extract(node),
                 "CastExpression" => return self.cast(node),
                 "TypeLiteral" => return self.typed_literal(node),
+                "IntervalLiteral" => return self.interval_literal(node),
                 "CaseExpression" => return self.case(node),
                 "ParenthesisExpression" => return self.row(node),
                 // `ParensExpression <- Parens(Expression)` covers more text than its child and
@@ -2108,6 +2109,60 @@ impl<'a> Transform<'a> {
         Ok(self.push(Expr::Cast { operand, ty, try_cast: false }))
     }
 
+    /// `IntervalLiteral <- 'INTERVAL' IntervalParameter Interval?`, which is a function call.
+    ///
+    /// There is no interval node and there does not need to be one, because DuckDB's own
+    /// transformer rewrites the literal into a call and the column name says so: `INTERVAL 1 DAY`
+    /// comes back from the pinned binary in a column called
+    /// `to_days(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))`. So the literal and a handwritten
+    /// `to_days(1)` are the same expression from here on and the two cannot drift apart.
+    ///
+    /// Every unit goes through a DOUBLE on the way in, which is what makes `INTERVAL 1.5 DAY` one
+    /// day rather than a day and a half: the truncation is in the rewrite and not in the function.
+    /// The two units that can carry a fraction skip the truncation and stay a DOUBLE all the way,
+    /// so `INTERVAL 2.7 SECOND` really is two and seven tenths of a second.
+    ///
+    /// A literal with no unit is the cast written the other way round, so `INTERVAL '1 day'` is
+    /// `CAST('1 day' AS INTERVAL)`. That arm also catches a word the grammar does not read as a
+    /// unit, since `INTERVAL 1 d` parses as this rule with no `Interval` child and a column alias
+    /// after it, which is why upstream answers it with a cast error about an INTEGER.
+    fn interval_literal(&mut self, node: u32) -> Result<ExprRef> {
+        let parameter = self.find(node, "IntervalParameter");
+        if parameter == NONE {
+            return self.unsupported(node);
+        }
+        let operand = self.expr(self.first(parameter))?;
+        let unit = self.find(node, "Interval");
+        if unit == NONE {
+            let ty = self.intern("INTERVAL");
+            return Ok(self.push(Expr::Cast { operand, ty, try_cast: false }));
+        }
+        let spelling = self.name(self.first(unit));
+        // The seven range forms parse and then refuse, in upstream's words, with the unit names
+        // spelled the canonical way rather than the way they were written: `interval 1 days to
+        // hours` is `DAY TO HOUR` there as well.
+        if spelling == "IntervalToInterval" {
+            let pair = self.name(self.first(self.first(unit)));
+            return Err(Error::parser(format!("{} is not supported", worded(pair))));
+        }
+        let Some(&(_, function, width)) = UNITS.iter().find(|(rule, _, _)| *rule == spelling)
+        else {
+            return self.unsupported(unit);
+        };
+        let double = self.intern("DOUBLE");
+        let mut count = self.push(Expr::Cast { operand, ty: double, try_cast: false });
+        if let Some(width) = width {
+            let name = self.function_name("trunc");
+            let args = self.expr_slice(vec![count]);
+            let whole = self.push(Expr::Function { name, args, distinct: false });
+            let ty = self.intern(width);
+            count = self.push(Expr::Cast { operand: whole, ty, try_cast: false });
+        }
+        let name = self.function_name(function);
+        let args = self.expr_slice(vec![count]);
+        Ok(self.push(Expr::Function { name, args, distinct: false }))
+    }
+
     /// `CaseExpression <- 'CASE' Expression? CaseWhenThen+ CaseElse? 'END'`.
     fn case(&mut self, node: u32) -> Result<ExprRef> {
         let mut operand = NONE;
@@ -2250,6 +2305,41 @@ impl<'a> Transform<'a> {
         }
         Ok(literal)
     }
+}
+
+/// Each unit an interval literal can be written in, as the grammar rule that spells it, the
+/// function it becomes, and the width the count is truncated to on the way there.
+///
+/// A width of `None` is the pair that keeps what is after the point. Those two stay a DOUBLE and
+/// never see `trunc`, which is the whole of the difference between `INTERVAL 2.7 SECOND` being two
+/// and seven tenths of a second and `INTERVAL 1.5 DAY` being one day. Every entry, both spellings
+/// of every keyword and the width of each one was read off the pinned binary's column names.
+const UNITS: &[(&str, &str, Option<&str>)] = &[
+    ("YearKeyword", "to_years", Some("INTEGER")),
+    ("MonthKeyword", "to_months", Some("INTEGER")),
+    ("QuarterKeyword", "to_quarters", Some("INTEGER")),
+    ("DecadeKeyword", "to_decades", Some("INTEGER")),
+    ("CenturyKeyword", "to_centuries", Some("INTEGER")),
+    ("MillenniumKeyword", "to_millennia", Some("INTEGER")),
+    ("DayKeyword", "to_days", Some("INTEGER")),
+    ("WeekKeyword", "to_weeks", Some("INTEGER")),
+    ("HourKeyword", "to_hours", Some("BIGINT")),
+    ("MinuteKeyword", "to_minutes", Some("BIGINT")),
+    ("MicrosecondKeyword", "to_microseconds", Some("BIGINT")),
+    ("SecondKeyword", "to_seconds", None),
+    ("MillisecondKeyword", "to_milliseconds", None),
+];
+
+/// A grammar rule name like `DayToHour` as the words upstream puts in the message for it.
+fn worded(rule: &str) -> String {
+    let mut out = String::new();
+    for character in rule.chars() {
+        if character.is_ascii_uppercase() && !out.is_empty() {
+            out.push(' ');
+        }
+        out.push(character.to_ascii_uppercase());
+    }
+    out
 }
 
 /// The value of one string token, with the quotes gone and whatever the prefix means resolved.
