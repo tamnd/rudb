@@ -289,6 +289,10 @@ impl Chunk {
     pub fn flatten(&self) -> Result<Self> {
         let mut columns = Vec::with_capacity(self.columns.len());
         for column in &self.columns {
+            // flatten: this is the chunk wide version of the vector call and it exists so that the
+            // one caller at the top of a query can say it once instead of per column. Whether the
+            // copy is deserved is decided where this is called from, which today is one line in
+            // `rudb::database`, and that line says why.
             columns.push(column.flatten()?);
         }
         Self::with_rows(columns, self.rows)
