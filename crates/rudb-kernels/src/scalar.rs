@@ -1050,6 +1050,12 @@ where
 ///
 /// A pattern that varies per row is possible in SQL and is vanishingly rare, and it falls through
 /// to the row at a time path where it is counted. Everything that matters is a literal.
+///
+/// The text is read through an index mapping and not straight out of a slice, for the reason given
+/// on `by_form!`: a dictionary encoded column is the normal shape of a string column read out of
+/// Parquet, and every string column in the published ClickBench file is one. Asking for a flat
+/// vector here meant the real file never reached this loop at all. That was #288, and it cost six
+/// times the whole predicate.
 fn like_of(
     text: &Vector,
     pattern: &Vector,
@@ -1061,9 +1067,7 @@ fn like_of(
     if !matches!(returns, LogicalType::Boolean) {
         return Ok(None);
     }
-    let (Some(Value::Varchar(spelling)), Some(Data::Varlen(column))) =
-        (pattern.constant_value(), text.data())
-    else {
+    let Some(Value::Varchar(spelling)) = pattern.constant_value() else {
         return Ok(None);
     };
     // The pattern is compiled once for the whole vector. This is the difference between ClickBench
@@ -1071,11 +1075,65 @@ fn like_of(
     let spelling = if fold_case { spelling.to_lowercase() } else { spelling.clone() };
     let compiled = Pattern::compile(&spelling);
     let base = nulls_of(text).and(&nulls_of(pattern), rows);
+    match text.form() {
+        Form::Flat => {
+            let Some(Data::Varlen(column)) = text.data() else {
+                return Ok(None);
+            };
+            like_run(column, identity, &compiled, base, rows, returns, fold_case, negated)
+        }
+        Form::Dictionary => {
+            let Some((codes, values)) = text.dictionary_parts() else {
+                return Ok(None);
+            };
+            if codes.len() < rows {
+                return Ok(None);
+            }
+            let Some(Data::Varlen(column)) = values.data() else {
+                return Ok(None);
+            };
+            // Every code is inside the dictionary because `Vector::dictionary` checks that on the
+            // way in, so the gather indexes without a bound of its own.
+            let at = move |index: usize| codes[index] as usize;
+            like_run(column, at, &compiled, base, rows, returns, fold_case, negated)
+        }
+        // A constant text under a constant pattern is a thing the binder folds before it gets here,
+        // and it is one row of work if it does not, but it costs a line to keep the fall through
+        // count honest about what it is counting.
+        Form::Constant => {
+            let Some(value) = text.constant_value() else {
+                return Ok(None);
+            };
+            let held = single(text.logical_type(), value);
+            let Some(Data::Varlen(column)) = held.as_ref().and_then(Vector::data) else {
+                return Ok(None);
+            };
+            like_run(column, first, &compiled, base, rows, returns, fold_case, negated)
+        }
+        _ => Ok(None),
+    }
+}
 
+/// The `LIKE` loop itself, once per form the text can arrive in.
+///
+/// The mapping is a generic parameter for the reason spelled out on [`by_form`], which is that a
+/// function pointer here is an indirect call per row and this loop is one of the two or three that
+/// ClickBench spends real time in.
+#[expect(clippy::too_many_arguments, reason = "one loop, and every argument is what it needs")]
+fn like_run<A: Fn(usize) -> usize>(
+    column: &StringColumn,
+    at: A,
+    compiled: &Pattern,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+    fold_case: bool,
+    negated: bool,
+) -> Result<Option<Vector>> {
     let mut out = vec![false; rows];
     let mut characters: Vec<char> = Vec::new();
     let validity = over_valid(rows, base, |index| {
-        let text = column.get(index).unwrap_or_default();
+        let text = column.get(at(index)).unwrap_or_default();
         // `str::to_lowercase` and not a character by character fold, for the same reason the
         // `lower` kernel uses it: the two functions disagree about a final sigma, and the oracle
         // this is checked against calls the string one.
@@ -2023,6 +2081,44 @@ mod tests {
         assert_eq!(called("!~~", &[text, pattern], &LogicalType::Boolean), Value::Boolean(true));
     }
 
+    /// A dictionary encoded text reaches the compiled loop instead of falling out of it.
+    ///
+    /// This is the one thing the property test cannot say, because `agrees` is happy when the row at
+    /// a time path answers for both sides. Per #288 every string column in the published ClickBench
+    /// file is dictionary encoded, so `like_of` handing back `None` here is the difference between
+    /// the predicate costing a compiled walk and costing a `Value` per row, which over twenty
+    /// million rows was measured at 13.8 seconds against 2.2.
+    #[test]
+    fn a_dictionary_or_constant_text_reaches_the_compiled_like() {
+        let values = Vector::from_values(
+            LogicalType::Varchar,
+            &[
+                Value::Varchar("a google search".into()),
+                Value::Varchar("goggle".into()),
+                Value::Null,
+            ],
+        )
+        .expect("builds");
+        let text = Vector::dictionary(vec![0, 1, 2, 0], values).expect("codes are in range");
+        let pattern = Vector::constant(LogicalType::Varchar, Value::Varchar("%google%".into()), 4);
+        let answer = binary("~~", &text, &pattern, &LogicalType::Boolean, 4, None)
+            .expect("the call is written")
+            .expect("a dictionary text has a loop of its own");
+        let rows: Vec<Value> = (0..4).map(|row| answer.value_at(row)).collect();
+        assert_eq!(
+            rows,
+            [Value::Boolean(true), Value::Boolean(false), Value::Null, Value::Boolean(true)]
+        );
+
+        // The constant text is the other arm, and the property test cannot reach it either: a
+        // constant text under a constant pattern is the one form pair `pairings` leaves out.
+        let text = Vector::constant(LogicalType::Varchar, Value::Varchar("google".into()), 4);
+        let answer = binary("~~", &text, &pattern, &LogicalType::Boolean, 4, None)
+            .expect("the call is written")
+            .expect("a constant text has a loop of its own");
+        assert!((0..4).all(|row| answer.value_at(row) == Value::Boolean(true)), "{answer:?}");
+    }
+
     #[test]
     fn a_function_nobody_has_written_says_which_one() {
         let error = call_values("sqrt", &[Value::Double(4.0)], &LogicalType::Double, None)
@@ -2260,12 +2356,19 @@ mod tests {
                 agrees("||", &[one, other], &LogicalType::Varchar);
             }
             // One of each pattern shape, so that the compiled form and the general walk are both
-            // checked against the walk the oracle always takes.
+            // checked against the walk the oracle always takes. Through `pairings` because a text
+            // that is a dictionary has a loop of its own now, and per #288 the form a ClickBench
+            // string column actually arrives in is that one and not the flat one.
             for spelling in ["google", "goo%", "%gle", "%oog%", "g_ogle", "%g%l%", "%", ""] {
-                let pattern =
-                    Vector::constant(LogicalType::Varchar, Value::Varchar(spelling.into()), 96);
+                // A flat column of the one spelling, and `pairings` is what makes it constant. A
+                // pattern that arrives here already constant would ask `pairings` for constant
+                // against constant, which is the one pair it leaves out.
+                let column = vec![Value::Varchar(spelling.into()); 96];
+                let pattern = Vector::from_values(LogicalType::Varchar, &column).expect("builds");
                 for name in ["~~", "!~~", "~~*", "!~~*"] {
-                    agrees(name, &[left.clone(), pattern.clone()], &LogicalType::Boolean);
+                    for (text, pattern) in pairings(&left, &pattern) {
+                        agrees(name, &[text, pattern], &LogicalType::Boolean);
+                    }
                 }
             }
             let flags = sample(&LogicalType::Boolean, 96, nulls, &mut rng);
