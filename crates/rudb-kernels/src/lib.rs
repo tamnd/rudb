@@ -70,6 +70,7 @@ pub mod scalar;
 pub mod select;
 mod shape;
 mod subscript;
+mod text;
 
 pub use aggregate::Accumulator;
 pub use cast::{cast, cast_value};
