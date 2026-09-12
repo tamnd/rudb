@@ -58,6 +58,13 @@ pub struct Options {
     /// engine and a flag that runs a query are two different things, and a benchmark script that
     /// puts its `--set` at the end of the line means the same thing as one that puts it first.
     pub sets: Vec<String>,
+    /// Where `--metrics` writes what each statement reported about itself, one document per line.
+    ///
+    /// One per line rather than one array, because a statement's document is written the moment
+    /// that statement finishes and a run that dies half way through still leaves the ones that did
+    /// finish. A harness reading this wants the line for the query it timed, and a file it has to
+    /// read to the end before it can parse any of it is a file it cannot get that from.
+    pub metrics: Option<PathBuf>,
     /// How results are printed, and everything that goes with it.
     pub settings: crate::format::Settings,
 }
@@ -73,6 +80,7 @@ impl Default for Options {
             bail: false,
             readonly: false,
             sets: Vec::new(),
+            metrics: None,
             settings: crate::format::Settings::default(),
         }
     }
@@ -135,6 +143,11 @@ pub fn parse(arguments: &[String]) -> Action {
                         return Action::Wrong(format!("--set is written name=value, not {pair}"));
                     }
                 },
+                Err(why) => return Action::Wrong(why),
+            },
+            // Two dashes for the same reason `--set` has two: DuckDB has no flag of this name.
+            "--metrics" => match next(argument) {
+                Ok(path) => options.metrics = Some(PathBuf::from(path)),
                 Err(why) => return Action::Wrong(why),
             },
             "-separator" => match next(argument) {
@@ -329,6 +342,19 @@ mod tests {
             Action::Wrong(why) if why.contains("name=value")
         ));
         assert!(matches!(parse(&["--set".to_string()]), Action::Wrong(_)));
+    }
+
+    #[test]
+    fn the_metrics_flag_names_the_file_the_documents_go_to() {
+        let parsed = options(&["--metrics", "run.json", "-c", "SELECT 1"]);
+        assert_eq!(parsed.metrics, Some(std::path::PathBuf::from("run.json")));
+        assert_eq!(parsed.commands, [Command::Sql("SELECT 1".to_string())]);
+        assert!(matches!(parse(&["--metrics".to_string()]), Action::Wrong(_)));
+    }
+
+    #[test]
+    fn nothing_is_written_unless_the_metrics_flag_asks_for_it() {
+        assert_eq!(options(&["-c", "SELECT 1"]).metrics, None);
     }
 
     #[test]

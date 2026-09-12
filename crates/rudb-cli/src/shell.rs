@@ -1,7 +1,7 @@
 //! The shell itself: read a line, decide whether it is SQL or a dot command, run it, print it.
 
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -66,6 +66,12 @@ pub struct Shell {
     echo: bool,
     bail: bool,
     failed: bool,
+    /// Where each statement's metrics document goes, and whether the file has been started yet.
+    ///
+    /// Opened on the first document rather than at startup, so that a run which never executes
+    /// anything does not leave an empty file behind for a harness to trip over.
+    metrics: Option<PathBuf>,
+    started: bool,
 }
 
 impl std::fmt::Debug for Shell {
@@ -97,6 +103,8 @@ impl Shell {
             echo: options.echo,
             bail: options.bail,
             failed: false,
+            metrics: options.metrics.clone(),
+            started: false,
         }
     }
 
@@ -225,6 +233,7 @@ impl Shell {
             let started = Instant::now();
             match self.connection.execute(statement.sql()) {
                 Ok(result) => {
+                    self.record(&result);
                     self.print(&result);
                     if self.timer {
                         let _ = writeln!(
@@ -241,6 +250,40 @@ impl Shell {
             }
         }
         Stop::Done
+    }
+
+    /// Appends what a statement reported about itself to the `--metrics` file.
+    ///
+    /// A statement that reported nothing writes nothing. `CREATE TABLE` goes through a path that
+    /// does not build an operator tree, so there is no document to write and a line of nulls would
+    /// be a worse answer than no line.
+    ///
+    /// A file that cannot be written to is an error like any other, and it is reported once rather
+    /// than once per statement, because a whole benchmark run reporting a full disk on every query
+    /// is how the one line that mattered gets scrolled away.
+    fn record(&mut self, result: &QueryResult) {
+        let (Some(path), Some(document)) = (self.metrics.clone(), result.metrics()) else {
+            return;
+        };
+        let opened = if self.started {
+            OpenOptions::new().append(true).open(&path)
+        } else {
+            File::create(&path)
+        };
+        let written = opened.and_then(|mut file| writeln!(file, "{}", document.one_line()));
+        match written {
+            Ok(()) => self.started = true,
+            Err(problem) => {
+                self.metrics = None;
+                let _ = writeln!(
+                    self.err,
+                    "Error: cannot write metrics to \"{}\": {problem}",
+                    path.display()
+                );
+                let _ = self.err.flush();
+                self.failed = true;
+            }
+        }
     }
 
     /// Prints a result, unless it is the empty one a writing statement hands back.
