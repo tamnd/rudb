@@ -1746,12 +1746,20 @@ fn like(text: &[char], pattern: &[char]) -> bool {
     let (mut at, mut against) = (0usize, 0usize);
     let (mut star, mut resume) = (None, 0usize);
     while at < text.len() {
-        if against < pattern.len() && (pattern[against] == '_' || pattern[against] == text[at]) {
-            at += 1;
-            against += 1;
-        } else if against < pattern.len() && pattern[against] == '%' {
+        // The wildcard is tested before the literal, and the order is the whole of the correctness
+        // here. A `%` in a pattern is always a wildcard, so a pattern `%` sitting over a string that
+        // happens to hold a `%` must not take the equal branch and eat one character of each. It did
+        // for a while, and the effect was that `'a%b' LIKE '%a%'` came back false, which is issue
+        // #279. Encoded URLs are full of percent signs, so the queries it was wrong for were the
+        // ordinary ones.
+        if against < pattern.len() && pattern[against] == '%' {
             star = Some(against);
             resume = at;
+            against += 1;
+        } else if against < pattern.len()
+            && (pattern[against] == '_' || pattern[against] == text[at])
+        {
+            at += 1;
             against += 1;
         } else if let Some(back) = star {
             against = back + 1;
@@ -1940,6 +1948,61 @@ mod tests {
         let text = Value::Varchar("aaaaaaab".into());
         let held = called("~~", &[text, Value::Varchar("%a%a%b".into())], &LogicalType::Boolean);
         assert_eq!(held, Value::Boolean(true));
+    }
+
+    /// A percent sign in the string is a character and a percent sign in the pattern is a wildcard.
+    ///
+    /// Every pattern below is one the compiled shapes in [`Pattern`] do not cover, so every one of
+    /// them reaches the backtracking walk, which is the only place this was ever wrong. The pairs
+    /// worth reading together are `ax%b` against `a%b`, where the match is at the same offset and
+    /// the only difference is the character after it, and `a%` against `a%b`, where the pattern is
+    /// the same and the string grows by one.
+    #[test]
+    fn a_percent_sign_in_the_string_is_a_character_and_not_a_wildcard() {
+        for (text, pattern, expected) in [
+            ("a%b", "%a%", true),
+            ("ax%b", "%a%", true),
+            ("a%%b", "%a%", true),
+            ("a%b", "a%", true),
+            ("a%", "a%", true),
+            ("%a", "%", true),
+            ("%%", "%", true),
+            ("%", "%", true),
+            ("a%b", "%b%", true),
+            ("a%b", "%a%b%", true),
+            ("a%b", "_%_", true),
+            ("http://x/google%2F12.15", "%google%", true),
+            ("a%", "%a", false),
+            ("a%b", "%a", false),
+            ("%b", "a%", false),
+        ] {
+            let held = called(
+                "~~",
+                &[Value::Varchar(text.into()), Value::Varchar(pattern.into())],
+                &LogicalType::Boolean,
+            );
+            assert_eq!(held, Value::Boolean(expected), "{text} LIKE {pattern}");
+        }
+    }
+
+    /// The compiled shapes and the walk have to agree, since a query reaches one or the other
+    /// depending only on whether the pattern is a literal the binder could fold.
+    ///
+    /// `%a%` compiles to a substring search and `%a%%` does not, and they are the same question.
+    /// That pair is what #279 was: the fast path was right and the walk was wrong, so the answer
+    /// depended on where the pattern came from rather than on what it said.
+    #[test]
+    fn the_compiled_shapes_and_the_walk_answer_the_same_question() {
+        let mut characters = Vec::new();
+        for text in ["a%b", "ax%b", "%ab", "ab%", "a%", "%", "ab", ""] {
+            for (fast, slow) in [("%a%", "%a%%"), ("a%", "a%%"), ("%b", "%%b"), ("ab", "ab")] {
+                assert_eq!(
+                    Pattern::compile(fast).holds(text, &mut characters),
+                    Pattern::compile(slow).holds(text, &mut characters),
+                    "{text:?} against {fast} and {slow}"
+                );
+            }
+        }
     }
 
     #[test]
