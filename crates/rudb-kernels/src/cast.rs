@@ -42,7 +42,7 @@ use rudb_common::{
 };
 use rudb_vector::{Data, Form, Vector};
 
-use crate::datetime::MICROS_PER_DAY;
+use crate::datetime::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SECOND};
 use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
 use crate::shape::{identity, nulls_of};
@@ -468,8 +468,12 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
 }
 
 /// Whether `TRY_CAST` turns this failure into a null.
+///
+/// Invalid input is here for the two range failures a written interval has, which upstream throws
+/// as a different exception from the same sentence a conversion failure uses, and which upstream
+/// swallows the same way. Nothing else in this file raises one.
 fn recoverable(error: &Error) -> bool {
-    matches!(error.code(), ErrorCode::Conversion | ErrorCode::OutOfRange)
+    matches!(error.code(), ErrorCode::Conversion | ErrorCode::OutOfRange | ErrorCode::InvalidInput)
 }
 
 fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
@@ -493,6 +497,7 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
         LogicalType::Date => to_date(value),
         LogicalType::Time => to_time(value),
         LogicalType::Timestamp => to_timestamp(value),
+        LogicalType::Interval => to_interval(value),
         other => {
             Err(Error::not_implemented(format!("a cast from {} to {other}", value.logical_type())))
         }
@@ -1292,6 +1297,340 @@ fn fraction(text: &str) -> i64 {
     format!("{digits:0<6}").parse().unwrap_or(0)
 }
 
+/// An `INTERVAL` read from a string, which is the whole of `INTERVAL '1 day'` as well.
+///
+/// The parser turns an interval literal into a cast of the text behind it, so the grammar below is
+/// what decides whether the literal runs, not anything in the parser. Every rule here was measured
+/// against the pinned binary one statement at a time, because the shape of it is not what anybody
+/// would guess and because nothing else in this file is as far from its documentation.
+///
+/// A string is a run of items. An item is an optional `-`, then digits, then optionally a point and
+/// more digits, then a unit word, and the spaces between the number and the word are optional both
+/// ways, so `'1day2hours'` and `'1  day'` are the same two items written twice. Items add up
+/// without being normalised, so `'1 day 1 day'` is two days and `'1 day -2 hours'` keeps a sign per
+/// item. A number at the end of the string with no unit behind it is seconds, but only when it is
+/// the first item, so `'5'` is five seconds and `'1 day 5'` is a failure. `ago` at the very end
+/// negates the whole interval once.
+///
+/// A colon after the first number turns the rest into a clock, `HH:MM[:SS[.frac]]`, and the parse
+/// stops there and throws away whatever follows, which is why `'01:02:03 ago'` is not negated.
+/// Minutes and seconds are under sixty and hours are unbounded.
+///
+/// The fraction behind a count is read to nanoseconds and then spread, and where it lands is
+/// different for almost every unit. A year and everything longer than one puts it in months and
+/// drops what is left, so `'1.1 years'` is thirteen months. A month and a quarter carry into months
+/// and then into days at thirty days to a month, and the quarter rounds there while the month
+/// keeps going into microseconds, so `'1.01 quarters'` is a day and `'1.01 months'` is seven hours
+/// and twelve minutes. A week and a day go to days and then to microseconds. An hour and everything
+/// shorter than one rounds into microseconds. A microsecond ignores its fraction.
+fn to_interval(value: &Value) -> Result<Value> {
+    match value {
+        Value::Varchar(text) => parse_interval(text),
+        _ => Err(no_cast(value, &LogicalType::Interval)),
+    }
+}
+
+/// Nanoseconds to the second, which is the precision a written fraction of a unit is read at.
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// The length of a month wherever an interval has to put a fraction of one into days.
+const DAYS_PER_MONTH: i64 = 30;
+
+/// What one unit word counts, and how the fraction behind the count is spread.
+#[derive(Clone, Copy)]
+enum Unit {
+    /// Months, and the fraction reaches months and no further.
+    Years(i64),
+    /// Three months, and the fraction carries into months and then rounds into days.
+    Quarter,
+    /// One month, and the fraction goes to days and then to microseconds.
+    Month,
+    /// Days, and the fraction goes to days and then to microseconds.
+    Days(i64),
+    /// Microseconds, with the fraction rounded into them.
+    Micros(i64),
+    /// Microseconds, with the fraction thrown away.
+    Microsecond,
+}
+
+/// The unit words DuckDB reads, matched without case, every one of them measured.
+///
+/// The shorthands are the part worth knowing: `m` is a minute and not a month, `mo` is not a month
+/// at all, `c` is a century, `cent` is a century and `cents` is not a word, and there is no
+/// nanosecond of any spelling. Two of these are not unit words at all upstream but date part names
+/// that happen to mean a week and a day, and they are read here because they are read there.
+fn unit_of(word: &str) -> Option<Unit> {
+    let unit = match word.to_ascii_lowercase().as_str() {
+        "millennium" | "millennia" | "millenniums" | "mil" | "mils" => Unit::Years(12_000),
+        "century" | "centuries" | "cent" | "c" => Unit::Years(1_200),
+        "decade" | "decades" | "dec" | "decs" => Unit::Years(120),
+        "year" | "years" | "yr" | "yrs" | "y" => Unit::Years(12),
+        "quarter" | "quarters" => Unit::Quarter,
+        "month" | "months" | "mon" | "mons" => Unit::Month,
+        "week" | "weeks" | "weekofyear" | "w" => Unit::Days(7),
+        "day" | "days" | "dayofmonth" | "d" => Unit::Days(1),
+        "hour" | "hours" | "hr" | "hrs" | "h" => Unit::Micros(MICROS_PER_HOUR),
+        "minute" | "minutes" | "min" | "mins" | "m" => Unit::Micros(MICROS_PER_MINUTE),
+        "second" | "seconds" | "sec" | "secs" | "s" => Unit::Micros(MICROS_PER_SECOND),
+        "millisecond" | "milliseconds" | "msec" | "msecs" | "ms" => Unit::Micros(1_000),
+        "microsecond" | "microseconds" | "usec" | "usecs" | "us" => Unit::Microsecond,
+        _ => return None,
+    };
+    Some(unit)
+}
+
+/// The date part words that name a part of a date nothing can be counted in, which have a sentence
+/// of their own rather than the one an unknown word gets.
+const UNCOUNTABLE: &[&str] = &[
+    "dayofweek",
+    "dayofyear",
+    "dow",
+    "doy",
+    "epoch",
+    "era",
+    "isodow",
+    "isoyear",
+    "jd",
+    "julian",
+    "timezone",
+    "weekday",
+    "yearweek",
+];
+
+/// The three counts an interval is, filled in one item at a time.
+///
+/// Months and days are 32 bits and microseconds are 64, and the two sentences a count too big gets
+/// are not the same sentence. One item whose own count does not fit is an invalid input and the
+/// message names the number, and a sum that stops fitting once another item is added to it is a
+/// range failure that names nothing. `TRY_CAST` answers null for both.
+#[derive(Default)]
+struct Counts {
+    months: i32,
+    days: i32,
+    micros: i64,
+}
+
+impl Counts {
+    /// Adds one item, whose three counts carry the sign of the number that was written.
+    fn add(&mut self, (months, days, micros): (i64, i64, i64), negative: bool) -> Result<()> {
+        let signed = |count: i64| if negative { -count } else { count };
+        self.months = self.months.checked_add(narrow(signed(months))?).ok_or_else(too_wide)?;
+        self.days = self.days.checked_add(narrow(signed(days))?).ok_or_else(too_wide)?;
+        self.micros = self.micros.checked_add(signed(micros)).ok_or_else(too_wide)?;
+        Ok(())
+    }
+
+    /// The interval itself, negated when `ago` closed the string.
+    fn value(self, ago: bool) -> Result<Value> {
+        let Self { months, days, micros } = self;
+        if !ago {
+            return Ok(Value::Interval { months, days, micros });
+        }
+        Ok(Value::Interval {
+            months: months.checked_neg().ok_or_else(too_wide)?,
+            days: days.checked_neg().ok_or_else(too_wide)?,
+            micros: micros.checked_neg().ok_or_else(too_wide)?,
+        })
+    }
+}
+
+/// A count of months or days as the 32 bits it is stored in, in DuckDB's words when it does not fit.
+///
+/// The sentence is the one a number that does not fit a narrower number gets everywhere else, and
+/// the error code is not. Everywhere else it is a conversion failure and here it is an invalid
+/// input, which is upstream throwing a different exception from the same message, and it is why
+/// `recoverable` covers invalid input at all.
+fn narrow(count: i64) -> Result<i32> {
+    i32::try_from(count).map_err(|_| {
+        Error::invalid_input(format!(
+            "Type INT64 with value {count} can't be cast because the value is out of range for the destination type INT32"
+        ))
+    })
+}
+
+/// The failure a sum of items that stops fitting gets, which names no number at all.
+fn too_wide() -> Error {
+    Error::out_of_range("interval value is out of range")
+}
+
+/// A written interval as its three counts, or the failure DuckDB reports for it.
+fn parse_interval(text: &str) -> Result<Value> {
+    let refused = || not_convertible(text, &LogicalType::Interval);
+    let mut rest = text;
+    let mut counts = Counts::default();
+    let mut items = 0usize;
+    loop {
+        trim(&mut rest);
+        if rest.is_empty() {
+            // A string with nothing in it is not an interval of nothing, it is not an interval.
+            if items == 0 {
+                return Err(refused());
+            }
+            return counts.value(false);
+        }
+        // `ago` is only a word at the start of an item and only when the string ends there, so
+        // `'1 ago'` is an unknown unit and `'1 day ago 2 hours'` is not an interval at all.
+        if items > 0 {
+            let word = run(rest, char::is_ascii_alphabetic);
+            if word.eq_ignore_ascii_case("ago") {
+                let mut after = &rest[word.len()..];
+                trim(&mut after);
+                if after.is_empty() {
+                    return counts.value(true);
+                }
+            }
+        }
+        let negative = eat(&mut rest, b'-');
+        let written = run(rest, char::is_ascii_digit);
+        if written.is_empty() {
+            return Err(refused());
+        }
+        rest = &rest[written.len()..];
+        let count: i64 = written.parse().map_err(|_| {
+            Error::invalid_input(format!("Could not convert string '{written}' to INT64"))
+        })?;
+        let mut fraction = 0;
+        let pointed = eat(&mut rest, b'.');
+        if pointed {
+            fraction = nanos(&mut rest);
+        }
+        // A clock is only a clock when the number in front of the colon was written whole.
+        if !pointed && eat(&mut rest, b':') {
+            let micros = clock(&mut rest, count).ok_or_else(refused)?;
+            counts.add((0, 0, micros), negative)?;
+            return counts.value(false);
+        }
+        trim(&mut rest);
+        let word = run(rest, char::is_ascii_alphabetic);
+        rest = &rest[word.len()..];
+        let unit = match (word, items, rest.is_empty()) {
+            // The only number that is allowed to have no unit behind it is the first one, and it
+            // is seconds.
+            ("", 0, true) => Unit::Micros(MICROS_PER_SECOND),
+            ("", _, true) => return Err(unknown_unit("")),
+            ("", _, false) => return Err(refused()),
+            (word, _, _) => unit_of(word).ok_or_else(|| unknown_unit(word))?,
+        };
+        counts.add(spread(unit, count, fraction)?, negative)?;
+        items += 1;
+    }
+}
+
+/// The failure a word that is not a unit gets, in whichever of the two sentences fits it.
+fn unknown_unit(word: &str) -> Error {
+    if UNCOUNTABLE.contains(&word.to_ascii_lowercase().as_str()) {
+        return Error::conversion(format!(
+            "extract specifier \"{word}\" not supported for interval"
+        ));
+    }
+    Error::conversion(format!("extract specifier \"{word}\" not recognized"))
+}
+
+/// What one item counts in months, days and microseconds, all three of them without a sign.
+fn spread(unit: Unit, count: i64, fraction: i64) -> Result<(i64, i64, i64)> {
+    let whole = |per: i64| count.checked_mul(per).ok_or_else(too_wide);
+    let counted = match unit {
+        Unit::Years(per) => {
+            (whole(per)?.checked_add(fraction * per / NANOS_PER_SECOND).ok_or_else(too_wide)?, 0, 0)
+        }
+        Unit::Quarter => {
+            let carried = fraction * 3;
+            let months = whole(3)?.checked_add(carried / NANOS_PER_SECOND).ok_or_else(too_wide)?;
+            let left = i128::from(carried % NANOS_PER_SECOND * DAYS_PER_MONTH);
+            (months, divided(left, i128::from(NANOS_PER_SECOND)), 0)
+        }
+        Unit::Month => {
+            let (days, micros) = poured(fraction * DAYS_PER_MONTH);
+            (count, days, micros)
+        }
+        Unit::Days(per) => {
+            let (days, micros) = poured(fraction * per);
+            (0, whole(per)?.checked_add(days).ok_or_else(too_wide)?, micros)
+        }
+        Unit::Micros(per) => {
+            let fraction = divided(i128::from(fraction * per), i128::from(NANOS_PER_SECOND));
+            (0, 0, whole(per)?.checked_add(fraction).ok_or_else(too_wide)?)
+        }
+        Unit::Microsecond => (0, 0, count),
+    };
+    Ok(counted)
+}
+
+/// A fraction written in nanosecond days as whole days and then the microseconds left over.
+fn poured(nanos: i64) -> (i64, i64) {
+    let left = i128::from(nanos % NANOS_PER_SECOND) * i128::from(MICROS_PER_DAY);
+    (nanos / NANOS_PER_SECOND, divided(left, i128::from(NANOS_PER_SECOND)))
+}
+
+/// A division with the half rounded up, on counts that are never negative here.
+///
+/// The saturation is unreachable. Everything divided here is a fraction of one unit, so the answer
+/// is at most a day of microseconds, and the width is only an `i128` because the multiplication
+/// that gets there is what does not fit in 64 bits.
+fn divided(numerator: i128, by: i128) -> i64 {
+    i64::try_from((numerator + by / 2) / by).unwrap_or(i64::MAX)
+}
+
+/// `HH:MM[:SS[.frac]]` as microseconds, once the hours have been read.
+///
+/// The fraction truncates here and rounds everywhere else in this parser, which is upstream reading
+/// a clock with the code that reads a time rather than with the code that reads an interval. The
+/// slack a time has is here as well, so a colon with nothing behind it counts as a zero and
+/// `'1:2:'` is two minutes past one, while `'1:2: '` is not an interval at all.
+fn clock(rest: &mut &str, hours: i64) -> Option<i64> {
+    let minutes = counted(rest)?;
+    let mut seconds = 0;
+    let mut micros = 0;
+    if eat(rest, b':') {
+        seconds = counted(rest)?;
+        if eat(rest, b'.') {
+            micros = fraction(rest);
+        }
+    }
+    if !(0..60).contains(&minutes) || !(0..60).contains(&seconds) {
+        return None;
+    }
+    hours
+        .checked_mul(3_600)?
+        .checked_add(minutes * 60 + seconds)?
+        .checked_mul(MICROS_PER_SECOND)?
+        .checked_add(micros)
+}
+
+/// One number of a clock, which is a zero when the string ends where the number should have been.
+fn counted(rest: &mut &str) -> Option<i64> {
+    if rest.is_empty() {
+        return Some(0);
+    }
+    number(rest)
+}
+
+/// The nanoseconds a written fraction of a unit is worth, nine digits at the most.
+///
+/// The count moves past every digit and not just the nine that are read, so the tenth digit of
+/// `'0.1234567891 s'` is thrown away rather than left behind to be read as another item.
+fn nanos(rest: &mut &str) -> i64 {
+    let written = run(rest, char::is_ascii_digit);
+    *rest = &rest[written.len()..];
+    let read: String = written.chars().take(9).collect();
+    if read.is_empty() {
+        return 0;
+    }
+    format!("{read:0<9}").parse().unwrap_or(0)
+}
+
+/// The run of characters at the front of `text` that pass, which is how a number and a unit word
+/// are told apart without a character of lookahead anywhere.
+fn run(text: &str, keep: fn(&char) -> bool) -> &str {
+    let end = text.find(|character: char| !keep(&character)).unwrap_or(text.len());
+    &text[..end]
+}
+
+/// Moves past the spaces at the front, counting the same characters as a space that DuckDB does.
+fn trim(rest: &mut &str) {
+    *rest = rest.trim_start_matches(|character: char| character.is_ascii_whitespace());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1324,8 +1663,8 @@ mod tests {
         let fitted = cast_value(&Value::BigInt(40_000), &LogicalType::SmallInt, true)
             .expect("try_cast swallows the range failure");
         assert_eq!(fitted, Value::Null);
-        let error = cast_value(&Value::Integer(1), &LogicalType::Interval, true)
-            .expect_err("try_cast does not invent an interval");
+        let error = cast_value(&Value::Integer(1), &LogicalType::Bit, true)
+            .expect_err("try_cast does not invent a bit string");
         assert_eq!(error.code(), ErrorCode::NotImplemented);
     }
 
@@ -1556,8 +1895,8 @@ mod tests {
         let refused = cast_value(&Value::Date(0), &LogicalType::Integer, true)
             .expect("try_cast swallows a pair duckdb has no cast for");
         assert_eq!(refused, Value::Null);
-        let error = cast_value(&Value::Integer(1), &LogicalType::Interval, true)
-            .expect_err("try_cast does not invent an interval");
+        let error = cast_value(&Value::Integer(1), &LogicalType::Bit, true)
+            .expect_err("try_cast does not invent a bit string");
         assert_eq!(error.code(), ErrorCode::NotImplemented);
     }
 
@@ -2138,5 +2477,141 @@ mod tests {
         assert_eq!(widened.value_at(1), Value::Null);
         assert_eq!(widened.value_at(2), Value::BigInt(7));
         assert_eq!(widened.value_at(3), Value::Null);
+    }
+
+    /// Every spelling in here was measured against the pinned binary one statement at a time, and
+    /// the expected text is what that binary printed, which is why these read as a table.
+    fn written(text: &str) -> String {
+        cast_to(Value::Varchar(text.into()), &LogicalType::Interval)
+            .unwrap_or_else(|error| panic!("{text} is an interval: {error}"))
+            .to_string()
+    }
+
+    /// The counts and the unit words, per #370, which is the whole of `INTERVAL '1 day'`.
+    #[test]
+    fn an_interval_reads_the_counts_and_the_unit_words_written_inside_the_string() {
+        for (text, expected) in [
+            ("1 day", "1 day"),
+            ("1 Days", "1 day"),
+            ("1 c", "100 years"),
+            ("1 cent", "100 years"),
+            ("1 centuries", "100 years"),
+            ("1 microseconds", "00:00:00.000001"),
+            ("1 weekofyear", "7 days"),
+            ("1 dayofmonth", "1 day"),
+            ("5", "00:00:05"),
+            ("1.5", "00:00:01.5"),
+            ("-1.5", "-00:00:01.5"),
+            ("1 day 1 day", "2 days"),
+            ("1.5 day 1.5 day", "2 days 24:00:00"),
+            ("1 day -2 hours", "1 day -02:00:00"),
+            ("1000 months 1000 months", "166 years 8 months"),
+            ("1 DAY AGO", "-1 day"),
+            ("1 day  ago", "-1 day"),
+            ("-1 day ago", "1 day"),
+        ] {
+            assert_eq!(written(text), expected, "{text}");
+        }
+    }
+
+    /// Where the fraction behind a count lands, which is a different answer for almost every unit.
+    ///
+    /// The two lines worth reading twice are the quarter and the month. A quarter of a day rounds
+    /// and stops there, so `'1.01 quarters'` is a whole day, and the same fraction of a month keeps
+    /// going into the clock instead.
+    #[test]
+    fn an_intervals_fraction_lands_where_the_unit_it_was_written_on_says_it_lands() {
+        for (text, expected) in [
+            ("1.1 years", "1 year 1 month"),
+            ("1.5 years", "1 year 6 months"),
+            ("-1.1 years", "-1 year -1 month"),
+            ("0.1 months", "3 days"),
+            ("0.5 months", "15 days"),
+            ("1.01 months", "1 month 07:12:00"),
+            ("1.25 months", "1 month 7 days 12:00:00"),
+            ("0.033333333 months", "23:59:59.999136"),
+            ("0.999999999 months", "29 days 23:59:59.997408"),
+            ("-1.25 months", "-1 month -7 days -12:00:00"),
+            ("1.01 quarters", "3 months 1 day"),
+            ("1.1 quarters", "3 months 9 days"),
+            ("1.25 quarters", "3 months 23 days"),
+            ("0.9 quarters", "2 months 21 days"),
+            ("-1.25 quarters", "-3 months -23 days"),
+            ("1.5 weeks", "10 days 12:00:00"),
+            ("0.999999999 weeks", "6 days 23:59:59.999395"),
+            ("0.9 days", "21:36:00"),
+            ("0.999999999 days", "23:59:59.999914"),
+            ("0.999999999 hours", "00:59:59.999996"),
+            ("0.9999995 s", "00:00:01"),
+            ("0.9999994 s", "00:00:00.999999"),
+            ("-0.9999995 s", "-00:00:01"),
+            ("0.1234567891 s", "00:00:00.123457"),
+            ("1.5 ms", "00:00:00.0015"),
+            ("0.5 ms", "00:00:00.0005"),
+            ("2.5 us", "00:00:00.000002"),
+            ("1.999999999 microseconds", "00:00:00.000001"),
+        ] {
+            assert_eq!(written(text), expected, "{text}");
+        }
+    }
+
+    /// A colon turns the rest of the string into a clock and the parse stops at the end of it,
+    /// which is how `'1:2:3 ago'` keeps its sign and `'1 day 1:2:3 2 hours'` loses two hours.
+    #[test]
+    fn an_interval_with_a_clock_in_it_reads_the_clock_and_ignores_whatever_follows() {
+        for (text, expected) in [
+            ("1:02", "01:02:00"),
+            ("0:0:0.5", "00:00:00.5"),
+            ("1:2:3.", "01:02:03"),
+            ("1:", "01:00:00"),
+            ("1:2:", "01:02:00"),
+            ("1:2:3.123456789", "01:02:03.123456"),
+            ("1:2:3.9999999", "01:02:03.999999"),
+            ("1:2:3:4", "01:02:03"),
+            ("24:00:00", "24:00:00"),
+            ("100:00:00", "100:00:00"),
+            ("1:2:3 ago", "01:02:03"),
+            ("-1:2:3", "-01:02:03"),
+            ("1 day 01:02:03", "1 day 01:02:03"),
+            ("1 day 1:2:3 2 hours", "1 day 01:02:03"),
+        ] {
+            assert_eq!(written(text), expected, "{text}");
+        }
+    }
+
+    /// The four sentences a written interval fails with, word for word, and the null `TRY_CAST`
+    /// answers for every one of them.
+    #[test]
+    fn a_string_that_is_not_an_interval_fails_in_duckdbs_words_and_try_casts_to_null() {
+        for (text, expected) in [
+            ("", "Could not convert string '' to INTERVAL"),
+            (" ", "Could not convert string ' ' to INTERVAL"),
+            ("1,2 days", "Could not convert string '1,2 days' to INTERVAL"),
+            ("99:99:99", "Could not convert string '99:99:99' to INTERVAL"),
+            ("1.5:2:3", "Could not convert string '1.5:2:3' to INTERVAL"),
+            ("1:2: ", "Could not convert string '1:2: ' to INTERVAL"),
+            ("1 day ago ago", "Could not convert string '1 day ago ago' to INTERVAL"),
+            ("1 day 5", "extract specifier \"\" not recognized"),
+            ("1 ago", "extract specifier \"ago\" not recognized"),
+            ("1 XyZ", "extract specifier \"XyZ\" not recognized"),
+            ("1 DOW", "extract specifier \"DOW\" not supported for interval"),
+            (
+                "2147483648 days",
+                "Type INT64 with value 2147483648 can't be cast because the value is out of range for the destination type INT32",
+            ),
+            (
+                "2000000000 weeks",
+                "Type INT64 with value 14000000000 can't be cast because the value is out of range for the destination type INT32",
+            ),
+            ("9223372036854775808 us", "Could not convert string '9223372036854775808' to INT64"),
+            ("1073741824 days 1073741824 days", "interval value is out of range"),
+            ("9223372036854775807 years", "interval value is out of range"),
+        ] {
+            let value = Value::Varchar(text.into());
+            let error = cast_to(value.clone(), &LogicalType::Interval).expect_err(text);
+            assert_eq!(error.message(), expected, "{text}");
+            let tried = cast_value(&value, &LogicalType::Interval, true).expect(text);
+            assert_eq!(tried, Value::Null, "{text}");
+        }
     }
 }
