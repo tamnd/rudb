@@ -970,6 +970,12 @@ fn an_overflow_says_what_duckdb_says() {
         ("abs((-2147483648)::INTEGER)", "Overflow on abs(-2147483648)"),
         ("abs((-32768)::SMALLINT)", "Overflow on abs(-32768)"),
         ("abs((-9223372036854775808)::BIGINT)", "Overflow on abs(-9223372036854775808)"),
+        // Negation names neither the type nor the value, per #264. A HUGEINT is the only width that
+        // reaches it as a constant, because the folder widens the other four instead.
+        (
+            "-((-170141183460469231731687303715884105728)::HUGEINT)",
+            "Overflow in negation of numeric value!",
+        ),
     ];
     for (expression, expected) in cases {
         assert_eq!(failure(&db, &format!("SELECT {expression}")), expected, "{expression}");
@@ -986,6 +992,43 @@ fn an_overflow_says_what_duckdb_says() {
     assert_eq!(failure(&db, &sql), expected);
     let sql = "SELECT abs(a::INTEGER) FROM range(-2147483648, -2147483647) t(a)";
     assert_eq!(failure(&db, sql), "Overflow on abs(-2147483648)");
+    let sql = "SELECT -(a::INTEGER) FROM range(-2147483648, -2147483647) t(a)";
+    assert_eq!(failure(&db, sql), "Overflow in negation of numeric value!");
+}
+
+/// Negating the smallest value of a signed type widens by a step instead of raising. Per #264.
+///
+/// The type of the answer depends on the value, which is why it is the constant folder that does it
+/// and why a column keeps the type it has: nothing knows what is in the column until the loop is
+/// running, and upstream keeps the type there too. Measured on the pinned binary, where
+/// `typeof(-((-128)::TINYINT))` is SMALLINT and `typeof(-((-127)::TINYINT))` is TINYINT.
+#[test]
+fn negating_the_smallest_value_of_a_type_widens_by_one_step() {
+    let db = Database::new();
+    let widened = [
+        ("(-128)::TINYINT", LogicalType::SmallInt, Value::SmallInt(128)),
+        ("(-32768)::SMALLINT", LogicalType::Integer, Value::Integer(32768)),
+        ("(-2147483648)::INTEGER", LogicalType::BigInt, Value::BigInt(2147483648)),
+        (
+            "(-9223372036854775808)::BIGINT",
+            LogicalType::HugeInt,
+            Value::HugeInt(9223372036854775808),
+        ),
+    ];
+    for (argument, ty, answer) in widened {
+        let sql = format!("SELECT -({argument}) AS n");
+        assert_eq!(db.query(&sql).unwrap().types(), &[ty], "{argument}");
+        assert_eq!(rows(&db, &sql), vec![vec![answer]], "{argument}");
+    }
+    // Every other value keeps the type it was written with, so the widening is about the one value
+    // in each type that has no negative and not about the type.
+    let sql = "SELECT -((-127)::TINYINT) AS n";
+    assert_eq!(db.query(sql).unwrap().types(), &[LogicalType::TinyInt]);
+    assert_eq!(rows(&db, sql), vec![vec![Value::TinyInt(127)]]);
+    // A column keeps its type as well, and the row that has no negative in it raises instead.
+    let sql = "SELECT -(a::INTEGER) AS n FROM range(-2147483647, -2147483646) t(a)";
+    assert_eq!(db.query(sql).unwrap().types(), &[LogicalType::Integer]);
+    assert_eq!(rows(&db, sql), vec![vec![Value::Integer(2147483647)]]);
 }
 
 /// A zero divisor is three different things, one per operator. Per #262.
