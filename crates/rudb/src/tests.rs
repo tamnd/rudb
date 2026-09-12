@@ -513,6 +513,48 @@ fn the_regular_expression_functions_answer_the_way_duckdb_does() {
     );
 }
 
+/// `typeof` names the type of an expression, which is decided before a row moves. Per #229.
+///
+/// Every answer here was read off the pinned binary. The one worth pointing at is `typeof(NULL)`,
+/// which is six characters and not four: the quotes are part of the name upstream prints and the
+/// reason is visible in `typeof([])`, which comes back as `"NULL"[]`.
+#[test]
+fn typeof_answers_the_name_of_the_type() {
+    let db = database();
+    let named = |sql: &str| match rows(&db, sql).as_slice() {
+        [row] => row.clone(),
+        other => panic!("one row, not {}", other.len()),
+    };
+    assert_eq!(
+        named("SELECT typeof(1), typeof(1.5), typeof('a'), typeof(TRUE), typeof(NULL)"),
+        vec![
+            text("INTEGER"),
+            text("DECIMAL(2,1)"),
+            text("VARCHAR"),
+            text("BOOLEAN"),
+            text("\"NULL\"")
+        ]
+    );
+    assert_eq!(
+        named("SELECT typeof(1::BIGINT), typeof('2024-01-01'::DATE), typeof(1 + 2), typeof(1 / 2)"),
+        vec![text("BIGINT"), text("DATE"), text("INTEGER"), text("DOUBLE")]
+    );
+    // Over a table, where the type is the column's and the rows are all the same.
+    assert_eq!(
+        named("SELECT DISTINCT typeof(x), typeof(s), typeof(x + 1) FROM t"),
+        vec![text("INTEGER"), text("VARCHAR"), text("INTEGER")]
+    );
+    // And over an aggregate, where the type is the one the aggregate accumulates in.
+    assert_eq!(
+        named("SELECT typeof(count(*)), typeof(sum(x)), typeof(avg(x)) FROM t"),
+        vec![text("BIGINT"), text("HUGEINT"), text("DOUBLE")]
+    );
+    // The name a column gets is the call as it was written, which is what upstream calls it too.
+    assert_eq!(db.query("SELECT typeof(x) FROM t").unwrap().names(), &["typeof(x)".to_string()]);
+    // One argument, and the sentence for the other counts is the table's own.
+    assert!(failure(&db, "SELECT typeof(1, 2)").contains("typeof(col0 ANY) -> VARCHAR"));
+}
+
 /// Brackets on a string, which the transformer writes as `array_extract` and `array_slice` and the
 /// binder then resolves like any other call. Per #278.
 #[test]
