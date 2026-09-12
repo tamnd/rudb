@@ -918,9 +918,23 @@ fn a_prefix_in_front_of_a_string_decides_how_the_string_is_read() {
     // plain string of the same value has. An N string is named as the cast it is.
     let result = db.query("SELECT E'ab', N'ab'").unwrap();
     assert_eq!(result.names(), &["'ab'", "CAST('ab' AS VARCHAR)"]);
-    // A blob literal is a blob and a blob is not a string, so it raises rather than answering with
-    // something of the wrong type.
-    assert!(failure(&db, "SELECT x'ff'").contains("not supported yet"));
+}
+
+/// A hex string is a blob, per #329, which is the prefix that changes the type and not the value.
+#[test]
+fn a_hex_string_answers_with_the_bytes_it_names() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT x'ff'"), vec![vec![Value::Blob(vec![0xff])]]);
+    assert_eq!(rows(&db, "SELECT X'4142'"), vec![vec![Value::Blob(b"AB".to_vec())]]);
+    assert_eq!(rows(&db, "SELECT x''"), vec![vec![Value::Blob(Vec::new())]]);
+    // The same blob written the other way round, which is the cast this literal is built on.
+    assert_eq!(rows(&db, "SELECT x'ff' = '\\xFF'::BLOB"), vec![vec![Value::Boolean(true)]]);
+    let result = db.query("SELECT x'ff41'").unwrap();
+    assert_eq!(result.names(), &["'\\xFFA'::BLOB"]);
+    assert_eq!(result.types(), &[LogicalType::Blob]);
+    // The digits are not looked at until the cast, so this is a conversion error and not a syntax
+    // one, and it is the message the same cast written the other way round gives.
+    assert!(failure(&db, "SELECT x'41zz'").contains("string -> blob conversion of string"));
 }
 
 #[test]

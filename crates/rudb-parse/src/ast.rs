@@ -627,6 +627,8 @@ pub enum LiteralKind {
     Number,
     /// A string.
     String,
+    /// A blob, kept as the text a blob prints as, which is the text a cast reads it back from.
+    Blob,
     /// `NULL`.
     Null,
     /// `TRUE`.
