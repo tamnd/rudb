@@ -615,6 +615,10 @@ fn run(
         if chunk.is_empty() {
             continue;
         }
+        // flatten: this is the top of the query and the chunk is about to become a result set that
+        // somebody outside the engine reads. A caller holding a `Result` gets a value at a time, so
+        // a dictionary or a constant here would be a form every one of them has to understand to
+        // read a row. The decode stops at this line and nothing below it sees a flat column.
         let chunk = chunk.flatten()?;
         held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
         chunks.push(chunk);
