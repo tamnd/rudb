@@ -1746,12 +1746,20 @@ fn like(text: &[char], pattern: &[char]) -> bool {
     let (mut at, mut against) = (0usize, 0usize);
     let (mut star, mut resume) = (None, 0usize);
     while at < text.len() {
-        if against < pattern.len() && (pattern[against] == '_' || pattern[against] == text[at]) {
-            at += 1;
-            against += 1;
-        } else if against < pattern.len() && pattern[against] == '%' {
+        // The wildcard is looked at before the literal comparison, and the order is the whole of
+        // what makes this correct on a text that contains a `%` of its own. Per #270: with the
+        // comparison first, a `%` in the pattern sitting over a `%` in the text matched it as a
+        // literal and the run it stood for was gone, so `google%2F12` was not `%google%`. Nothing
+        // brings the wildcard back either, because the backtrack goes to the last star before it,
+        // which is a different position in the pattern.
+        if against < pattern.len() && pattern[against] == '%' {
             star = Some(against);
             resume = at;
+            against += 1;
+        } else if against < pattern.len()
+            && (pattern[against] == '_' || pattern[against] == text[at])
+        {
+            at += 1;
             against += 1;
         } else if let Some(back) = star {
             against = back + 1;
@@ -1936,6 +1944,32 @@ mod tests {
     }
 
     #[test]
+    fn a_percent_in_the_text_is_a_character_and_not_a_wildcard() {
+        // #270, found on ClickBench q21, where `%google%` came back false for five distinct URLs
+        // and all five had a `%` immediately after the `google`. The text is a character string and
+        // nothing in it is special, so the only `%` that means anything is the one in the pattern.
+        // The second string here is one of those five, cut down to the part that matters.
+        for text in ["agoogle%b", "amalgama-lab.com.ua/google%2F12.15&he=900&Select"] {
+            let held = called(
+                "~~",
+                &[Value::Varchar(text.into()), Value::Varchar("%google%".into())],
+                &LogicalType::Boolean,
+            );
+            assert_eq!(held, Value::Boolean(true), "{text}");
+        }
+        // And the other way around: a `%` in the text stands for itself there too, so it does not
+        // stand in for the `gl` the pattern is asking for.
+        for pattern in ["google", "%google%"] {
+            let held = called(
+                "~~",
+                &[Value::Varchar("goo%gle".into()), Value::Varchar(pattern.into())],
+                &LogicalType::Boolean,
+            );
+            assert_eq!(held, Value::Boolean(false), "{pattern}");
+        }
+    }
+
+    #[test]
     fn like_backtracks_rather_than_giving_up_at_the_first_star() {
         let text = Value::Varchar("aaaaaaab".into());
         let held = called("~~", &[text, Value::Varchar("%a%a%b".into())], &LogicalType::Boolean);
@@ -2079,6 +2113,11 @@ mod tests {
 
     /// A string, chosen so that the inline limit, the empty string, multi byte characters and the
     /// substring the `LIKE` patterns look for all turn up often.
+    ///
+    /// Two of these have a `%` or a `_` in them, which is what the pattern characters are, because
+    /// the text is not a pattern and nothing in it is special. That the list had neither is why #270
+    /// got past this test: the general walk and the compiled forms disagreed about a `%` in the text
+    /// and there was no text here to disagree over.
     fn text(rng: &mut Rng) -> String {
         let words = [
             "",
@@ -2091,6 +2130,8 @@ mod tests {
             "thirteen bytes",
             "π is two bytes and this string is not inline at all",
             "g",
+            "google%2F12",
+            "goo_gle%",
         ];
         words[rng.below(words.len() as u64) as usize].to_owned()
     }
