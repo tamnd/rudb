@@ -85,6 +85,12 @@ pub enum Statement {
     Set(SettingRef),
     /// `RESET name`, which is the same shape with nothing on the right of it.
     Reset(SettingRef),
+    /// `EXPLAIN` over a query.
+    ///
+    /// The query rather than a statement, because the grammar lets every statement be explained
+    /// and a plan is the only thing there is to show. `EXPLAIN INSERT` is a refusal rather than a
+    /// plan of the source, since the source is not what the statement does.
+    Explain(QueryRef),
 }
 
 /// `SET name = value` and `RESET name`.

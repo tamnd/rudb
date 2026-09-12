@@ -4,9 +4,10 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rudb_bind::{Bound, Parameters};
 use rudb_catalog::{Catalog, Entry, View};
-use rudb_common::{Cancel, Error, Field, Memory, Result, Value};
+use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Value};
 
 use rudb_parse::ast::Ast;
+use rudb_vector::{Chunk, Vector};
 
 use crate::config::Config;
 use crate::connection::{Connection, single};
@@ -321,9 +322,10 @@ impl Database {
     /// The plan for a query, in the textual form `spec/07-execution.md` describes, without running
     /// it.
     ///
-    /// This is `EXPLAIN` before there is an `EXPLAIN`, and it is what the plan tests and the
-    /// optimizer work read. The text round trips: `rudb_plan::Plan::parse` of this string gives
-    /// back the plan it was printed from.
+    /// The same plan `EXPLAIN` prints, without the estimates and as a `String` rather than a result
+    /// set, which is what the plan tests and the optimizer work read. The text round trips:
+    /// `rudb_plan::Plan::parse` of this string gives back the plan it was printed from, and that is
+    /// why the estimates are not on it.
     ///
     /// # Errors
     ///
@@ -363,11 +365,27 @@ impl Shared {
     }
 
     /// Runs one query and returns every row it produced.
+    ///
+    /// `EXPLAIN` comes through here as well as through [`Shared::execute`], because it answers with
+    /// rows and this is the path that reads rows back. It takes the read lock like any other query,
+    /// since printing a plan changes nothing. A statement that writes is refused here rather than
+    /// run under a read lock.
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let catalog = self.read();
         let _seams = self.seams(sql)?;
-        let plan = planned(sql, &catalog, &self.optimizer(&catalog)?)?;
-        run(&plan, &catalog, cancel, &self.inner.memory)
+        let context = self.optimizer(&catalog)?;
+        let ast = rudb_parse::parse_ast(sql)?;
+        match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new())? {
+            Bound::Query(mut plan) => {
+                rudb_opt::optimize_with(&mut plan, &context)?;
+                run(&plan, &catalog, cancel, &self.inner.memory)
+            }
+            Bound::Explain(mut plan) => {
+                rudb_opt::optimize_with(&mut plan, &context)?;
+                explained(&rudb_opt::explain::explain(&plan, context.statistics()))
+            }
+            _ => Err(Error::not_implemented("a statement that is not a query, on the query path")),
+        }
     }
 
     /// The seam settings a statement runs under, which is the session's with its hints on top.
@@ -461,6 +479,10 @@ impl Shared {
                 rudb_opt::optimize_with(&mut plan, &context)?;
                 run(&plan, &catalog, cancel, &self.inner.memory)
             }
+            Bound::Explain(mut plan) => {
+                rudb_opt::optimize_with(&mut plan, &context)?;
+                explained(&rudb_opt::explain::explain(&plan, context.statistics()))
+            }
             Bound::Setting(setting) => {
                 let value = setting.value.as_ref();
                 self.inner.settings.apply(
@@ -507,9 +529,10 @@ impl Shared {
 
 /// A query bound and then optimized, which is the plan that runs.
 ///
-/// Both of the ways in are through here, so that what a plan dump shows is what the query does. A
-/// dump of the bound plan and a run of the optimized one would make the dump a description of
-/// something nobody executes, which is the one thing a plan dump must not be.
+/// What [`Database::plan`] dumps, and it optimizes rather than stopping at the bound plan because a
+/// dump of the bound plan next to a run of the optimized one would make the dump a description of
+/// something nobody executes, which is the one thing a plan dump must not be. `EXPLAIN` and the
+/// query path do the same two steps in that order for the same reason.
 fn planned(
     sql: &str,
     catalog: &Catalog,
@@ -545,6 +568,28 @@ fn run(
         chunks.push(chunk);
     }
     Ok(QueryResult::new(names, types, chunks, held))
+}
+
+/// One row of two strings, which is the result set `EXPLAIN` hands back.
+///
+/// The column names and the shape are DuckDB's, `explain_key` and `explain_value`, because a
+/// client reading a result set has to cope with whatever comes out and there is no reason to make
+/// it cope with something new. The text in the second column is ours, since
+/// `spec/12-duckdb-compat.md` section 12.5 excludes explain output from the guarantee.
+///
+/// One row rather than one per operator. DuckDB puts its whole tree in a single value and every
+/// shell prints it as a block, and splitting it into rows would mean a shell's column width
+/// deciding where a plan wraps.
+fn explained(text: &str) -> Result<QueryResult> {
+    let key =
+        Vector::from_values(LogicalType::Varchar, &[Value::Varchar("logical_plan".to_owned())])?;
+    let value = Vector::from_values(LogicalType::Varchar, &[Value::Varchar(text.to_owned())])?;
+    Ok(QueryResult::new(
+        vec!["explain_key".to_owned(), "explain_value".to_owned()],
+        vec![LogicalType::Varchar, LogicalType::Varchar],
+        vec![Chunk::new(vec![key, value])?],
+        Memory::unlimited().reservation(),
+    ))
 }
 
 /// The `CREATE VIEW` half of a statement.
