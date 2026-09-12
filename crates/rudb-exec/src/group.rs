@@ -5,15 +5,21 @@
 //! one would be two answers to the same question, and the only way to be sure that never happens is
 //! for both to ask the same type.
 //!
-//! The table is a `HashMap` from key to slot, and the slot is the number of groups that were seen
-//! before this one, so the output comes out in the order the groups were first seen. SQL does not
-//! promise that and DuckDB does not either, but a deterministic order costs nothing here and makes a
-//! failing test a diff instead of an investigation.
+//! Grouping goes through [`Table`], which is a hash table from a row of key columns to a slot, and
+//! the slot is the number of groups that were seen before this one, so the output comes out in the
+//! order the groups were first seen. SQL does not promise that and DuckDB does not either, but a
+//! deterministic order costs nothing here and makes a failing test a diff instead of an
+//! investigation.
 //!
 //! The state of every group lives in flat vectors indexed by that slot rather than in a vector of
 //! its own, so a group that arrives costs a push and not a trip to the allocator, and the key of a
-//! row that is not a new group is written into a buffer this keeps rather than into a new one. What
-//! is left per row is the hash and the probe, which is what #237 was about.
+//! row that is not a new group is never copied anywhere at all. What is left per row is the probe,
+//! with the hash of the whole chunk taken a column at a time before the row loop starts, which is
+//! what #237 was about.
+//!
+//! `DISTINCT` is still a `HashSet<Key>` per group per call, which is the one place left where a row
+//! is built to be asked about. It is asked about once per row, so it matters, and it is not this
+//! change because a set per group is a different shape from a table over the whole input.
 
 use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Accumulator, is_true};
@@ -21,11 +27,12 @@ use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::expr::{evaluate, evaluate_all};
-use crate::key::{Key, RowMap, RowSet};
+use crate::key::{Key, RowSet};
 use crate::operator::Operator;
 use crate::rows;
 use crate::schema::Schema;
 use crate::spill::{Reader, Spill};
+use crate::table::{Probe, Table};
 
 /// One aggregate call, taken apart once when the operator is built.
 #[derive(Debug, Clone)]
@@ -207,7 +214,11 @@ impl Pass<'_> {
         // into the rows and outlives all of it. Per #272.
         let mut containers = self.memory.reservation();
         let mut charged = 0;
-        let mut slots: RowMap<usize> = RowMap::default();
+        // What the keys the table has taken a copy of own away from themselves, charged against the
+        // scratch rather than against the containers because those strings move into the rows and
+        // outlive the table. `charged` and this one are the same arrangement over two reservations.
+        let mut charged_keys = 0;
+        let mut table = Table::new(self.groups.len());
         let mut states: Vec<Accumulator> = Vec::new();
         let mut seen: Vec<RowSet> = Vec::new();
         let calls = self.calls.len();
@@ -235,11 +246,13 @@ impl Pass<'_> {
             .map(|call| alone && !call.distinct && call.filter.is_none())
             .collect();
         let every = by_vector.iter().all(|&yes| yes);
-        // One row of the group key and one row of arguments per call, filled again for each input
-        // row and kept between rows so that the buffers behind them are asked for once and not once
-        // per row. Only a row that turns out to be a group nobody has seen is copied out of them.
-        let mut key = Key(Vec::new());
+        // One row of arguments per call, filled again for each input row and kept between rows so
+        // that the buffers behind them are asked for once and not once per row. Only a row that
+        // turns out to be new to a `DISTINCT` is copied out of one.
         let mut given: Vec<Key> = vec![Key(Vec::new()); calls];
+        // One hash per row of the chunk in hand, built a column at a time before the row loop
+        // starts. Kept between chunks for the reason the buffers above are.
+        let mut hashes: Vec<u64> = Vec::new();
         // The file the rows that do not fit go to, made the first time the budget says the table
         // has to stop growing and `None` for as long as it does not. One row of it, kept between
         // rows so that writing does not go to the allocator per row.
@@ -247,7 +260,6 @@ impl Pass<'_> {
         let mut away: Vec<Value> = Vec::new();
         while let Some(seen_rows) = source.next(self)? {
             let Rows { keys, arguments, filters, rows: length } = &seen_rows;
-            let mut taken = 0;
             let mut aside = 0;
             for at in 0..calls {
                 if by_vector[at] {
@@ -257,18 +269,26 @@ impl Pass<'_> {
             if alone && every {
                 continue;
             }
-            // row at a time: the worst one in the tree, because grouping is where the rows are.
-            // 2f (#60) gives it a table that hashes a column at a time and probes a vector at a
-            // time, and 2g (#61) gives the aggregate an update that takes a vector and a run of
-            // slots, at which point neither the key nor the argument is a `Value` any more.
+            // The column at a time half of #237. One pass over each key column turns the whole
+            // chunk into one hash per row, with the type of the column matched on once rather than
+            // once per value, and the row loop below is then a probe with the hash already in hand.
+            if !alone {
+                crate::table::hash(keys, *length, &mut hashes);
+            }
+            #[expect(
+                clippy::needless_range_loop,
+                reason = "hashes is empty when there is no key to hash, and every other thing in \
+                          the body is indexed by the row as well"
+            )]
+            // row at a time: what is left of it. 2g (#61) gives the aggregate an update that takes
+            // a vector and a run of slots, at which point the argument stops being a `Value` too.
             for row in 0..*length {
                 let slot = if alone {
                     0
                 } else {
-                    fill(&mut key, keys, row);
-                    match slots.get(&key) {
-                        Some(&slot) => slot,
-                        None => {
+                    match table.probe(hashes[row], keys, row) {
+                        Probe::Found(slot) => slot,
+                        Probe::Vacant(bucket) => {
                             if let Some(file) = over.as_mut() {
                                 // The table is as large as the budget will let it be and this key
                                 // is not in it, so the row goes out whole. Every later row with
@@ -278,22 +298,14 @@ impl Pass<'_> {
                                 put_away(file, &seen_rows, row, &mut away)?;
                                 continue;
                             }
-                            let slot = groups;
-                            groups += 1;
                             // A group costs the copy of its key that the table takes, and its own
-                            // accumulators and distinct sets in the two vectors beside it. What
-                            // those three containers took to have room for all of that is charged
-                            // separately, below and once per chunk, because it is a property of the
-                            // containers rather than of this group.
-                            //
-                            // The copy is what gets charged and not the buffer it was copied from,
-                            // which is the whole reason it is made before the charge rather than
-                            // after. `key` is filled again for every row and a string in it keeps
-                            // whatever the longest string it has held needed, so charging that
-                            // charges every group in the table for the longest key in the table.
-                            let stored = key.clone();
-                            taken += rows::heap(&stored.0);
-                            slots.insert(stored, slot);
+                            // accumulators and distinct sets in the two vectors beside it. What all
+                            // of those took to have room for it is charged below and once per
+                            // chunk, because it is a property of the containers rather than of this
+                            // group, and what the key owns away from itself the table adds up as it
+                            // goes and is charged the same way.
+                            let slot = table.insert(bucket, hashes[row], keys, row)?;
+                            groups = table.len();
                             self.fresh(&mut states)?;
                             if sets {
                                 seen.resize_with(seen.len() + calls, RowSet::default);
@@ -330,9 +342,9 @@ impl Pass<'_> {
                     states[slot * calls + at].update(&args.0)?;
                 }
             }
-            scratch.grow(taken)?;
+            rows::capacity(table.owned(), &mut charged_keys, &mut scratch)?;
             containers.grow(aside)?;
-            let now = tables(&slots, &states, &seen);
+            let now = tables(&table, &states, &seen);
             rows::capacity(now, &mut charged, &mut containers)?;
             // Asked after the chunk has been folded in and not before, so that a pass always takes
             // at least one chunk of groups whatever the budget says. That is what makes the loop in
@@ -346,54 +358,59 @@ impl Pass<'_> {
                 None => {}
             }
         }
-        // Turning the table into rows is where this operator holds the most and used to charge the
-        // least. The keys are moved out of the table rather than copied, so what this asks for is a
-        // vector header per group, and it is asked for before it is taken rather than charged after,
-        // because the whole of it is taken between one charge and the next and a limit that is told
-        // afterwards has not done anything. Per #272.
-        scratch.grow(width_of(groups).saturating_mul(width_of(size_of::<Vec<Value>>())))?;
-        let mut made: Vec<Vec<Value>> = vec![Vec::new(); groups];
-        for (key, slot) in slots {
-            made[slot] = key.0;
-        }
-        // The buckets went with the map that loop consumed and the distinct sets go here, so the
-        // charge for both goes now rather than after the chunks are built, which is the whole
-        // difference between converting inside the budget and converting on top of it. What is left
-        // charged is the accumulators, which are still alive and are read below.
+        // The distinct sets are finished with and the table and the accumulators are not, so the
+        // charge for the sets goes here rather than after the chunks are built, which is part of
+        // the room the chunks are built in.
         drop(seen);
-        let alive = width_of(states.capacity() * size_of::<Accumulator>());
+        let alive = table.footprint() + width_of(states.capacity() * size_of::<Accumulator>());
         containers.shrink(containers.bytes().saturating_sub(alive));
-        // A chunk's worth at a time rather than all of it. A finished row is the key's own vector
-        // with the aggregate results pushed onto it, which asks the allocator for a block wider than
-        // the key was given, and doing every group first and then building the chunks holds two
-        // copies of the whole answer at once. A batch at a time holds two copies of a thousand rows,
-        // and the rows go as soon as the chunk built from them is standing.
-        let each = width_of(size_of::<Vec<Value>>() + calls * size_of::<Value>());
-        scratch.grow(width_of(VECTOR_SIZE.min(groups)).saturating_mul(each))?;
-        let mut batch: Vec<Vec<Value>> = Vec::new();
+        // The answer is built straight out of the table, a chunk of groups at a time.
+        //
+        // This used to go through `Vec<Vec<Value>>`, which meant every group was a block from the
+        // allocator, the keys were transposed out of the table into rows and then transposed back
+        // into columns to make a chunk, and each key value was cloned on the way. On the ClickBench
+        // queries that group on something close to one group per row that was most of what the
+        // operator did, and none of it was work: the table already holds the keys one column at a
+        // time, which is the shape a chunk wants.
+        //
+        // A chunk at a time and not all of it, so what is held at once is the answer plus one
+        // chunk. The ungrouped case falls out of the same loop with no key columns and one group.
+        let types = self.schema.types();
+        let width = self.groups.len();
+        // The one buffer the results of a call go through on their way into a vector, kept between
+        // chunks and charged once.
+        scratch.grow(width_of(VECTOR_SIZE.min(groups) * size_of::<Value>()))?;
+        let mut results: Vec<Value> = Vec::new();
+        // row at a time: the outer loop steps a chunk at a time and the key columns are copied a
+        // column at a time out of the table, so the only thing left here that is per group is asking
+        // each accumulator for its result, which is 2g (#61).
         for start in (0..groups).step_by(VECTOR_SIZE) {
             let end = (start + VECTOR_SIZE).min(groups);
-            // What a result owns away from itself is not knowable until it has been asked for, so
-            // that part is charged as it arrives and given back with the batch that held it.
-            let mut taken = 0;
-            for slot in start..end {
-                let mut row = std::mem::take(&mut made[slot]);
-                // Room for every result at once, so that the row's block is asked for at the width
-                // it ends up at rather than at the width a doubling picks.
-                row.reserve_exact(calls);
-                for accumulator in &states[slot * calls..slot * calls + calls] {
-                    let value = accumulator.finish()?;
-                    taken += rows::owned(&value);
-                    row.push(value);
-                }
-                batch.push(row);
+            let mut columns = Vec::with_capacity(width + calls);
+            for (at, ty) in types.iter().take(width).enumerate() {
+                columns.push(Vector::from_values(ty.clone(), &table.column(at)[start..end])?);
             }
-            scratch.grow(taken)?;
-            chunks.append(&mut rows::chunks(&self.schema.types(), &batch, held)?);
-            batch.clear();
-            scratch.shrink(taken);
+            for (at, ty) in types.iter().skip(width).enumerate() {
+                // What a result owns away from itself is not knowable until it has been asked for,
+                // so that part is charged as it arrives and given back once it is in the vector.
+                let mut taken = 0;
+                results.clear();
+                for slot in start..end {
+                    let value = states[slot * calls + at].finish()?;
+                    taken += rows::owned(&value);
+                    results.push(value);
+                }
+                scratch.grow(taken)?;
+                columns.push(Vector::from_values(ty.clone(), &results)?);
+                scratch.shrink(taken);
+            }
+            let chunk = Chunk::with_rows(columns, end - start)?;
+            held.grow(width_of(chunk.footprint()))?;
+            chunks.push(chunk);
         }
+        drop(results);
         drop(states);
+        drop(table);
         containers.release();
         match over {
             // A pass that put nothing in its table and still wrote rows out would hand back what it
@@ -701,26 +718,22 @@ impl Operator for Aggregate<'_> {
 /// What the three containers have taken from the allocator between them.
 ///
 /// Capacity rather than length in all three, which is the point of #227. A `Vec` doubles and so sits
-/// between half empty and full, and a `HashMap` fills to seven eighths before doubling as well, so
-/// a table of seventeen million groups has paid for somewhere between seventeen and thirty four
-/// million slots and the old charge counted seventeen.
+/// between half empty and full, so a table of seventeen million groups has paid for somewhere
+/// between seventeen and thirty four million slots and the old charge counted seventeen.
+/// [`Table::footprint`] has the same arithmetic over the three parts a group table is made of.
 ///
-/// The hash table also has a control byte per bucket beside the buckets themselves, which is how it
-/// answers a lookup without touching the keys, and there are more buckets than the capacity it
-/// reports. [`rows::buckets`] has that arithmetic.
-///
-/// What the keys own away from the table is not counted here. That is charged as each group arrives,
-/// by [`rows::heap`] over the key, and the two have to divide the group between them without
+/// What the keys own away from the table is not counted here. That is [`Table::owned`], charged
+/// against the scratch instead, and the two have to divide the group between them without
 /// overlapping.
 ///
 /// An accumulator is charged as its own width and not as what it holds. That is a knowing undercount
 /// and it is the one left: what a `list()` or a `string_agg()` holds grows with the input and there
 /// is no way to ask one how large it has become.
-fn tables(slots: &RowMap<usize>, states: &Vec<Accumulator>, seen: &Vec<RowSet>) -> u64 {
+fn tables(table: &Table, states: &Vec<Accumulator>, seen: &Vec<RowSet>) -> u64 {
     let width = |count: usize, size: usize| {
         u64::try_from(count).unwrap_or(u64::MAX).saturating_mul(width_of(size))
     };
-    rows::buckets(slots.capacity()) * (width_of(size_of::<(Key, usize)>()) + 1)
+    table.footprint()
         + width(states.capacity(), size_of::<Accumulator>())
         + width(seen.capacity(), size_of::<RowSet>())
 }
