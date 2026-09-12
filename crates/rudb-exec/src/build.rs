@@ -101,14 +101,13 @@ fn node<'a>(
             let schema = project.schema().clone();
             Box::new(Streamed::new(input, project, schema))
         }
-        Node::Aggregate { input, index, groups, aggregates } => Box::new(Aggregate::new(
-            plan,
-            node(plan, catalog, cancel, memory, input)?,
-            index,
-            groups,
-            aggregates,
-            memory,
-        )?),
+        Node::Aggregate { input, index, groups, aggregates } => {
+            let input = node(plan, catalog, cancel, memory, input)?;
+            let (aggregate, out) =
+                Aggregate::new(plan, input.schema(), index, groups, aggregates, memory)?;
+            let schema = aggregate.schema().clone();
+            Box::new(Broken::new(input, aggregate, out, schema))
+        }
         Node::Sort { input, keys } => {
             let input = node(plan, catalog, cancel, memory, input)?;
             let schema = input.schema().clone();
