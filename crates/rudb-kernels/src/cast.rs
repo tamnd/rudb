@@ -33,6 +33,7 @@
 //! these loops, so the run that comes out already holds at every null position the same zero the
 //! row at a time path would have written. The mask is carried across untouched.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::str::FromStr;
 
@@ -630,8 +631,142 @@ fn rounded(value: &Value, target: &LogicalType) -> Result<i128> {
     }
 }
 
+/// A written number as a whole number, rounded half away from zero.
+///
+/// A string that spells a number is not only a run of digits upstream. It can be written with a
+/// point, with an exponent, with underscores between the digits, or as hexadecimal or binary, and
+/// all of those are read here because a CSV column of `1e3` is a `BIGINT` column there and would
+/// otherwise be a `VARCHAR` column here.
+///
+/// The work is done on the digits rather than through a double, which is what makes
+/// `'9223372036854775807.4'` the largest `BIGINT` rather than the number above it that a double
+/// would have rounded it to first.
 fn parse_integer(text: &str) -> Option<i128> {
-    text.trim().parse::<i128>().ok()
+    if let Some(whole) = parse_radix(text) {
+        return Some(whole);
+    }
+    shifted(&written_number(text)?, 0)
+}
+
+/// `0x` and `0b`, which are whole number spellings only.
+///
+/// Neither a double nor a decimal takes one, neither takes a sign in front of it, so `'-0x10'` is
+/// refused where `'-16'` is not, and neither takes the spaces around it that every other spelling
+/// is trimmed of, so `' 0x10 '` is refused where `' 16 '` is not. There is no `0o` for octal, which
+/// reads like an oversight upstream and is reproduced rather than tidied up, because a spelling we
+/// accept and DuckDB refuses is as much of a difference as one we refuse and it accepts.
+fn parse_radix(text: &str) -> Option<i128> {
+    let (radix, digits) = match text.get(..2)? {
+        "0x" | "0X" => (16, &text[2..]),
+        "0b" | "0B" => (2, &text[2..]),
+        _ => return None,
+    };
+    let digits = without_separators(digits, u8::is_ascii_alphanumeric)?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        // `from_str_radix` reads a sign of its own and there is no sign allowed here, which is what
+        // the second half of that is for.
+        return None;
+    }
+    i128::from_str_radix(&digits, radix).ok()
+}
+
+/// A written number pulled apart into the pieces that decide what it is worth.
+///
+/// The digits are the ones on both sides of the point with the point taken out, the scale is how
+/// many of them were behind it, and the exponent is what was written after the `e`. So `1.5e2` is
+/// digits `15`, scale one and exponent two, which is worth 150 at any target scale.
+struct Written {
+    negative: bool,
+    digits: String,
+    scale: i32,
+    exponent: i32,
+}
+
+/// A written number read into its pieces, or `None` when it is not one.
+fn written_number(text: &str) -> Option<Written> {
+    let text = without_separators(text.trim(), u8::is_ascii_digit)?;
+    let (negative, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(&text)),
+    };
+    let (body, exponent) = match body.split_once(['e', 'E']) {
+        Some((body, written)) => (body, written.parse::<i32>().ok()?),
+        None => (body, 0),
+    };
+    let (whole, fraction) = match body.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (body, ""),
+    };
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !whole.bytes().chain(fraction.bytes()).all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(Written {
+        negative,
+        digits: format!("{whole}{fraction}"),
+        scale: i32::try_from(fraction.len()).ok()?,
+        exponent,
+    })
+}
+
+/// The text with the digit separators taken out, or `None` when one of them is not between two
+/// digits. `'1_000'` is a thousand and `'_100'`, `'1_'` and `'1__0'` are none of them a number.
+fn without_separators(text: &str, digit: fn(&u8) -> bool) -> Option<Cow<'_, str>> {
+    if !text.contains('_') {
+        return Some(Cow::Borrowed(text));
+    }
+    let bytes = text.as_bytes();
+    for (at, byte) in bytes.iter().enumerate() {
+        if *byte != b'_' {
+            continue;
+        }
+        let before = at.checked_sub(1).and_then(|before| bytes.get(before));
+        let between = matches!((before, bytes.get(at + 1)), (Some(before), Some(after)) if digit(before) && digit(after));
+        if !between {
+            return None;
+        }
+    }
+    Some(Cow::Owned(text.replace('_', "")))
+}
+
+/// A written number at the scale `places`, rounded half away from zero.
+///
+/// This is both the cast to a whole number, which asks for no places at all, and the cast to a
+/// decimal, which asks for the decimal's scale. They are the same question because an integer is a
+/// decimal whose scale is zero, which is the pivot this whole file is built around.
+fn shifted(written: &Written, places: i32) -> Option<i128> {
+    let digits = written.digits.trim_start_matches('0');
+    let shift = written.exponent.checked_sub(written.scale)?.checked_add(places)?;
+    let whole = if digits.is_empty() {
+        0
+    } else if let Ok(zeros) = usize::try_from(shift) {
+        // An `i128` holds thirty nine digits, so a number longer than that has already left the
+        // range of every target, and checking it first keeps the string below from being enormous.
+        if digits.len() + zeros > 39 {
+            return None;
+        }
+        format!("{digits}{}", "0".repeat(zeros)).parse().ok()?
+    } else {
+        cut(digits, usize::try_from(shift.checked_neg()?).ok()?)?
+    };
+    Some(if written.negative { -whole } else { whole })
+}
+
+/// The digits with the last `dropped` of them taken off, rounded half away from zero.
+///
+/// Away from zero and not to even, so `'0.5'` is one and `'-0.5'` is minus one, which is the rule
+/// the decimal to integer cast in this file already follows and the rule DuckDB follows everywhere.
+fn cut(digits: &str, dropped: usize) -> Option<i128> {
+    let Some(kept) = digits.len().checked_sub(dropped) else {
+        // Everything was dropped and the first digit that went is not the one that decides, so the
+        // number is smaller than a half of whatever it was.
+        return Some(0);
+    };
+    let whole: i128 = if kept == 0 { 0 } else { digits[..kept].parse().ok()? };
+    let rounds_up = digits.as_bytes().get(kept).is_some_and(|digit| *digit >= b'5');
+    whole.checked_add(i128::from(rounds_up))
 }
 
 /// A number too big for a float is an infinity when it was written as a string and a failure when
@@ -640,7 +775,7 @@ fn parse_integer(text: &str) -> Option<i128> {
 fn to_float(value: &Value) -> Result<Value> {
     if let Value::Varchar(text) = value {
         let written =
-            text.trim().parse::<f64>().map_err(|_| not_convertible(text, &LogicalType::Float))?;
+            parse_approximate(text).ok_or_else(|| not_convertible(text, &LogicalType::Float))?;
         return Ok(Value::Float(narrowed(written)));
     }
     let number = approximate(value).ok_or_else(|| no_cast(value, &LogicalType::Float))?;
@@ -663,11 +798,20 @@ fn narrowed(number: f64) -> f32 {
 fn to_double(value: &Value) -> Result<Value> {
     let number = match value {
         Value::Varchar(text) => {
-            text.trim().parse::<f64>().map_err(|_| not_convertible(text, &LogicalType::Double))?
+            parse_approximate(text).ok_or_else(|| not_convertible(text, &LogicalType::Double))?
         }
         _ => approximate(value).ok_or_else(|| no_cast(value, &LogicalType::Double))?,
     };
     Ok(Value::Double(number))
+}
+
+/// A written float or double, which is the one number parser that stays a double all the way.
+///
+/// The separators come out first and the rest is Rust's own reading, which already takes the point,
+/// the exponent, `inf`, `infinity` and `nan` the way DuckDB takes them. A radix spelling is not on
+/// the list, so `'0x10'::DOUBLE` is refused where `'0x10'::INTEGER` is sixteen.
+fn parse_approximate(text: &str) -> Option<f64> {
+    without_separators(text.trim(), u8::is_ascii_digit)?.parse().ok()
 }
 
 fn to_decimal(value: &Value, width: u8, scale: u8) -> Result<Value> {
@@ -707,25 +851,12 @@ fn to_decimal(value: &Value, width: u8, scale: u8) -> Result<Value> {
 }
 
 /// A written decimal at the given scale, with digits past the scale rounded away.
+///
+/// A decimal takes every spelling a whole number takes apart from the two radix ones, so `'1e3'` and
+/// `'1_000'` both read as a thousand here while `'0x10'` reads as nothing. It is the same question
+/// the whole number cast asks with the target's scale in place of zero.
 fn parse_decimal(text: &str, scale: u8) -> Option<i128> {
-    let text = text.trim();
-    let (sign, body) = match text.strip_prefix('-') {
-        Some(rest) => (-1i128, rest),
-        None => (1i128, text.strip_prefix('+').unwrap_or(text)),
-    };
-    let (whole, fraction) = match body.split_once('.') {
-        Some((whole, fraction)) => (whole, fraction),
-        None => (body, ""),
-    };
-    if whole.is_empty() && fraction.is_empty() {
-        return None;
-    }
-    if !whole.bytes().chain(fraction.bytes()).all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let written: i128 = format!("{whole}{fraction}").parse().ok()?;
-    let scaled = rescale(written, u8::try_from(fraction.len()).ok()?, scale)?;
-    Some(sign * scaled)
+    shifted(&written_number(text)?, i32::from(scale))
 }
 
 /// Text to bytes, which is not the bytes of the text.
@@ -1219,6 +1350,125 @@ mod tests {
         let error = cast_to(Value::Varchar("nope".into()), &LogicalType::Integer)
             .expect_err("nope is not a number");
         assert!(error.message().contains("Could not convert"), "{error}");
+    }
+
+    /// The five other ways a string spells a whole number, per #369, every one of them measured
+    /// against the pinned binary one statement at a time.
+    ///
+    /// A point rounds half away from zero, an exponent shifts the digits, an underscore between two
+    /// digits is a separator, and `0x` and `0b` are a radix. The rounding is done on the digits and
+    /// not through a double, which is what the last two of these are for: the largest BIGINT with a
+    /// fraction behind it is still the largest BIGINT rather than the number above it a double
+    /// would have landed on, and forty nines round to two.
+    #[test]
+    fn a_string_spells_a_whole_number_with_a_point_an_exponent_a_separator_or_a_radix() {
+        for (text, expected) in [
+            ("1.5", 2),
+            ("2.5", 3),
+            ("-2.5", -3),
+            ("1.4", 1),
+            ("1.", 1),
+            (".5", 1),
+            ("-.5", -1),
+            ("9223372036854775807.4", 9_223_372_036_854_775_807),
+            ("1e3", 1000),
+            ("1E3", 1000),
+            ("1e+3", 1000),
+            ("1.5e2", 150),
+            ("1e-3", 0),
+            ("5e-1", 1),
+            ("-5e-1", -1),
+            ("0e100", 0),
+            ("1e18", 1_000_000_000_000_000_000),
+            ("1_000", 1000),
+            ("1_0_0", 100),
+            ("1_000.5", 1001),
+            ("1e1_0", 10_000_000_000),
+            ("1_0e2", 1000),
+            ("0x10", 16),
+            ("0X10", 16),
+            ("0xa_b", 171),
+            ("0b101", 5),
+            ("0B1_01", 5),
+            (" 1 ", 1),
+            (" 1e3", 1000),
+            ("1e3 ", 1000),
+        ] {
+            let whole = cast_to(Value::Varchar(text.into()), &LogicalType::BigInt);
+            assert_eq!(whole.as_ref().ok(), Some(&Value::BigInt(expected)), "{text}: {whole:?}");
+        }
+        let nines = format!("1.{}", "9".repeat(40));
+        assert_eq!(
+            cast_to(Value::Varchar(nines), &LogicalType::BigInt).expect("forty nines round up"),
+            Value::BigInt(2)
+        );
+        assert_eq!(
+            cast_to(Value::Varchar("1e30".into()), &LogicalType::HugeInt).expect("a hugeint"),
+            Value::HugeInt(1_000_000_000_000_000_000_000_000_000_000)
+        );
+    }
+
+    /// The other side of the same rules. An exponent with nothing after it, a separator that is not
+    /// between two digits, and a radix with a sign or a space around it are all refused, and a
+    /// spelling that reads fine but lands outside the target is refused by the target rather than
+    /// by the parser.
+    #[test]
+    fn a_string_that_spells_a_whole_number_badly_is_still_refused() {
+        for text in [
+            "1e",
+            "1e3.5",
+            "1.5e",
+            ".",
+            "-",
+            "_100",
+            "1_",
+            "1__0",
+            "0x_10",
+            "0x10_",
+            "-0x10",
+            "+0x10",
+            "0o10",
+            "0x",
+            " 0x10 ",
+            "0x8000000000000000",
+            "1e39",
+        ] {
+            let error = cast_to(Value::Varchar(text.into()), &LogicalType::BigInt)
+                .expect_err("this is not a whole number");
+            assert_eq!(error.message(), format!("Could not convert string '{text}' to INT64"));
+        }
+        for (text, target) in [
+            ("1e18", LogicalType::Integer),
+            ("127.5", LogicalType::TinyInt),
+            ("1e39", LogicalType::HugeInt),
+        ] {
+            cast_to(Value::Varchar(text.into()), &target).expect_err("this does not fit");
+        }
+    }
+
+    /// A double and a decimal take the point, the exponent and the separator that a whole number
+    /// takes, and neither of them takes a radix, which is the one place the parsers disagree.
+    #[test]
+    fn a_written_double_and_a_written_decimal_take_every_spelling_but_the_radix() {
+        let target = LogicalType::decimal(10, 2).expect("a legal decimal");
+        for (text, expected) in [
+            ("1e3", 100_000),
+            ("1_000", 100_000),
+            ("1.5e2", 15_000),
+            ("1e-3", 0),
+            ("-1_0.005", -1001),
+        ] {
+            let written = cast_to(Value::Varchar(text.into()), &target);
+            let expected = Value::Decimal { unscaled: expected, width: 10, scale: 2 };
+            assert_eq!(written.as_ref().ok(), Some(&expected), "{text}: {written:?}");
+        }
+        assert_eq!(
+            cast_to(Value::Varchar("1_000".into()), &LogicalType::Double).expect("a double"),
+            Value::Double(1000.0)
+        );
+        for target in [LogicalType::Double, target] {
+            cast_to(Value::Varchar("0x10".into()), &target).expect_err("no radix out here");
+        }
     }
 
     #[test]
