@@ -63,11 +63,13 @@
 mod expr;
 mod node;
 mod parse;
+mod pipeline;
 mod plan;
 mod print;
 
 pub use expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
 pub use node::{JoinKind, Node, SetOpKind};
+pub use pipeline::Pipelines;
 pub use plan::Plan;
 
 /// A reference to an expression in [`Plan`]'s expression arena.
@@ -78,6 +80,9 @@ pub type NodeRef = u32;
 
 /// A reference to an interned string in [`Plan`]'s string table.
 pub type StrRef = u32;
+
+/// One pipeline of a plan, numbered from the root's outwards by [`Pipelines`].
+pub type PipelineRef = u32;
 
 /// A reference to a constant in [`Plan`]'s value table.
 pub type ValueRef = u32;

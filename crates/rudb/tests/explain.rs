@@ -7,6 +7,11 @@
 use rudb::Database;
 use rudb_common::{LogicalType, Value};
 
+/// The lines of the plan tree, which is everything above the first blank line.
+fn tree(text: &str) -> Vec<&str> {
+    text.lines().take_while(|line| !line.is_empty()).collect()
+}
+
 /// The explain text for a query against a database with one table of `rows` rows.
 fn explained(database: &Database, sql: &str) -> String {
     let result = database.query(sql).expect("the explain ran");
@@ -37,8 +42,8 @@ fn explain_answers_with_the_plan_and_an_estimate_on_every_line() {
     // The scan knows its size because the catalog does, and the filter is a fifth of it.
     assert!(text.contains("[~1000 rows]"), "{text}");
     assert!(text.contains("[~200 rows]"), "{text}");
-    for line in text.lines() {
-        assert!(line.ends_with(" rows]"), "a line with no estimate on it: {line}");
+    for line in tree(&text) {
+        assert!(line.contains(" rows]"), "a line with no estimate on it: {line}");
     }
 }
 
@@ -50,11 +55,11 @@ fn the_plan_explain_shows_is_the_plan_that_would_have_run() {
     let database = with_rows(100);
     let text = explained(&database, "EXPLAIN SELECT a FROM t WHERE a > 5");
     let ran = database.plan("SELECT a FROM t WHERE a > 5").expect("plans");
-    let without_estimates: Vec<String> = text
-        .lines()
-        .map(|line| line.rsplit_once("  [").map_or(line, |(head, _)| head).to_owned())
+    let bare: Vec<&str> = tree(&text)
+        .into_iter()
+        .map(|line| line.rsplit_once("  [").map_or(line, |(head, _)| head))
         .collect();
-    assert_eq!(without_estimates.join("\n"), ran.trim_end(), "{text}\n---\n{ran}");
+    assert_eq!(bare.join("\n"), ran.trim_end(), "{text}\n{ran}");
 }
 
 #[test]
@@ -72,6 +77,32 @@ fn an_ungrouped_count_is_one_row_over_a_table_of_any_size() {
     let text = explained(&database, "EXPLAIN SELECT count(*) FROM t");
     assert!(text.contains("[~1 rows]"), "{text}");
     assert!(text.contains("[~5000 rows]"), "{text}");
+}
+
+#[test]
+fn explain_prints_the_pipelines_a_plan_breaks_into_and_the_edges_between_them() {
+    // The same decomposition the executor numbers its operators with, printed before anything runs.
+    // A sort is two pipelines, and the one the answer comes out of cannot start until the other has
+    // finished, which is the fact somebody reading a slow query is looking for.
+    let database = with_rows(100);
+    let text = explained(&database, "EXPLAIN SELECT a FROM t ORDER BY a");
+    let lines = tree(&text);
+    assert!(lines[0].contains("[pipeline 1]"), "{text}");
+    assert!(text.contains("  pipeline 0 waits for 1"), "{text}");
+    assert!(text.contains("  pipeline 1 waits for nothing"), "{text}");
+}
+
+#[test]
+fn explain_marks_every_line_that_is_running_a_reference_implementation() {
+    // Which at F0 is all of them, and that is the point of printing it. A number measured against
+    // the simplest correct version of an operator is not a number to quote as the engine's.
+    let database = with_rows(100);
+    let text = explained(&database, "EXPLAIN SELECT a FROM t WHERE a > 5");
+    for line in tree(&text) {
+        assert!(line.ends_with("[reference]"), "a line with no marker on it: {line}");
+    }
+    assert!(text.contains("\nSeams\n"), "{text}");
+    assert!(text.contains("27 seams have nothing registered"), "{text}");
 }
 
 #[test]
