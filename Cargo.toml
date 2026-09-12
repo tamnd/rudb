@@ -46,6 +46,7 @@ rudb-parquet = { version = "=0.2.31", path = "crates/rudb-parquet" }
 rudb-parse = { version = "=0.2.31", path = "crates/rudb-parse" }
 rudb-plan = { version = "=0.2.31", path = "crates/rudb-plan" }
 rudb-regex = { version = "=0.2.31", path = "crates/rudb-regex" }
+rudb-seam = { version = "=0.2.31", path = "crates/rudb-seam" }
 rudb-storage = { version = "=0.2.31", path = "crates/rudb-storage" }
 rudb-txn = { version = "=0.2.31", path = "crates/rudb-txn" }
 rudb-vector = { version = "=0.2.31", path = "crates/rudb-vector" }

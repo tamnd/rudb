@@ -16,6 +16,8 @@ The failure mode being avoided is a crate tree that looks modular and is not: fo
 
 **Data representation.**
 
+`rudb-seam`, the seam machinery: the `Strategy` trait, the registries, the provenance a strategy cites, the session settings that pin one, and the policy that picks one when nobody has. It holds no implementation of anything. Rank 2, which is low enough that every crate with a swappable mechanism in it can reach the registry and high enough that the planning context can grow a vector form field without the rank moving. Depends on `rudb-common`.
+
 `rudb-vector`, vectors, physical forms, validity, selection vectors, string representation, and the type-specific buffers. This is the widest interface in the system per document 7.1 and it is the crate with the strongest stability requirement inside the workspace.
 
 `rudb-encoding`, every encoding from document 06: the kernels, the cascade machinery, the cost model, the multi-column detection. **This is the most important boundary in the tree.** A new encoding from a paper is a new module here plus a row in the candidate table, and nothing above this crate changes. If adding ALP's successor requires editing the execution engine, this boundary was drawn wrong.

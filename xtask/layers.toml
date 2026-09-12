@@ -27,6 +27,10 @@ rudb-regex = 1
 # them, so a new encoding from a paper is a module here and nothing above changes.
 rudb-encoding = 2
 rudb-ir = 2
+# The seam machinery. Rank 2 so that it can see a vector when F1 gives `Context` the forms field,
+# and no higher, because everything from the kernels upward has a seam in it and a registry that
+# sits above its own users is a registry nobody below can reach.
+rudb-seam = 2
 rudb-kernels = 3
 rudb-jit = 4
 
