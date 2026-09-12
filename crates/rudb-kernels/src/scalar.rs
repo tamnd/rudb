@@ -59,6 +59,7 @@ use crate::number::{approximate, digits, fit, integral, pow10, rescale};
 use crate::regexp;
 use crate::shape::{first, identity, nulls_of, single};
 use crate::subscript;
+use crate::text;
 
 /// How the call being evaluated is written, for the one error that quotes it.
 ///
@@ -1478,6 +1479,19 @@ pub fn call_values(
         ("upper", [only]) => Ok(Value::Varchar(only.to_string().to_uppercase())),
         ("length", [only]) => Ok(Value::BigInt(count_characters(only))),
         ("strlen", [only]) => Ok(Value::BigInt(count_bytes(only))),
+        ("substring" | "substr", [held, start]) => text::substring(held, start, None),
+        ("substring" | "substr", [held, start, length]) => {
+            text::substring(held, start, Some(length))
+        }
+        ("position" | "strpos" | "instr", [haystack, needle]) => text::position(haystack, needle),
+        ("trim" | "ltrim" | "rtrim", [only]) => text::trim(name, only, None),
+        ("trim" | "ltrim" | "rtrim", [only, characters]) => {
+            text::trim(name, only, Some(characters))
+        }
+        ("overlay", [held, replacement, start]) => text::overlay(held, replacement, start, None),
+        ("overlay", [held, replacement, start, length]) => {
+            text::overlay(held, replacement, start, Some(length))
+        }
         ("~~", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, false))),
         ("!~~", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, false))),
         ("~~*", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, true))),
