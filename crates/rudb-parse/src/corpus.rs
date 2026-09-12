@@ -25,7 +25,7 @@ pub(crate) const CORPUS: [&str; 65] = [
     "SELECT CASE WHEN a THEN 1 WHEN b THEN 2 ELSE 3 END FROM t",
     "SELECT CAST(a AS INTEGER), a::VARCHAR, try_cast(a AS DOUBLE) FROM t",
     "SELECT DATE '1992-01-01', TIMESTAMP '1992-01-01 12:00:00' FROM t",
-    "SELECT E'a\\tb', N'abc', B'101' FROM t",
+    "SELECT E'a\\tb', N'abc', B'101', x'4142' FROM t",
     "SELECT [1, 2, 3], {'a': 1}, struct_pack(a := 1)",
     "SELECT a[1], a[1:2], a.b.c FROM t",
     "SELECT * FROM read_parquet('x.parquet')",
