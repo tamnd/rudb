@@ -68,6 +68,7 @@
 //! length on the identity path, and that wants the benchmark suite to exist first so that the
 //! change is a number rather than a belief.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use rudb_common::{Error, LogicalType, Result, Value, interval_micros};
@@ -76,6 +77,7 @@ use rudb_vector::{Data, Form, Selection, StringColumn, Validity, Vector};
 use crate::fallback::{self, Kernel};
 use crate::logic::is_true;
 use crate::number::{approximate, integral};
+use crate::prepare::Held;
 use crate::shape::{first, identity, nulls_of, single};
 
 /// Which comparison.
@@ -130,6 +132,24 @@ impl Comparison {
 ///
 /// If the two sides are not the same length, or if the two types cannot be compared.
 pub fn compare(op: Comparison, left: &Vector, right: &Vector) -> Result<Vector> {
+    compare_prepared(op, left, right, None)
+}
+
+/// [`compare`], with the constant side already turned into the column the loops read it through.
+///
+/// The same body and the same answer. A caller that built the plan knows which side is a literal
+/// and can hand a [`Held`] built once for the query, which saves the allocations that building it
+/// per chunk costs. A caller that has no plan in front of it passes `None` and nothing changes.
+///
+/// # Errors
+///
+/// The same ones [`compare`] gives.
+pub fn compare_prepared(
+    op: Comparison,
+    left: &Vector,
+    right: &Vector,
+    held: Option<&Held>,
+) -> Result<Vector> {
     if left.len() != right.len() {
         return Err(Error::internal(format!(
             "a comparison of a {} row vector with a {} row one",
@@ -154,7 +174,9 @@ pub fn compare(op: Comparison, left: &Vector, right: &Vector) -> Result<Vector> 
         return boolean(vec![false; len], Validity::AllInvalid, len);
     }
 
-    if let Some(answers) = specialized(op, left, right, &left_valid, &right_valid, len, identity) {
+    if let Some(answers) =
+        specialized(op, left, right, &left_valid, &right_valid, len, identity, held)
+    {
         let validity =
             if op.is_total() { Validity::AllValid } else { left_valid.and(&right_valid, len) };
         return boolean(blank_the_nulls(answers, &validity), validity, len);
@@ -193,6 +215,25 @@ pub fn refine(
     right: &Vector,
     kept: &Selection,
 ) -> Result<Selection> {
+    refine_prepared(op, left, right, kept, None)
+}
+
+/// [`refine`], with the constant side already built, for the reason [`compare_prepared`] gives.
+///
+/// This is the one that gains the most from it. A conjunct after the first reads the rows the ones
+/// before it kept, so the loop can be eleven rows long while the setup is the same size it would be
+/// for a full chunk.
+///
+/// # Errors
+///
+/// The same ones [`refine`] gives.
+pub fn refine_prepared(
+    op: Comparison,
+    left: &Vector,
+    right: &Vector,
+    kept: &Selection,
+    held: Option<&Held>,
+) -> Result<Selection> {
     if left.len() != right.len() {
         return Err(Error::internal(format!(
             "a comparison of a {} row vector with a {} row one",
@@ -223,7 +264,8 @@ pub fn refine(
 
     let rows = kept.indices();
     let map = |slot: usize| rows[slot] as usize;
-    if let Some(answers) = specialized(op, left, right, &left_valid, &right_valid, kept.len(), map)
+    if let Some(answers) =
+        specialized(op, left, right, &left_valid, &right_valid, kept.len(), map, held)
     {
         // A total comparison has the nulls in the answer already, and two all valid sides have no
         // null to drop, so both of those get the loop with nothing in it but the flag.
@@ -309,6 +351,11 @@ fn blank_the_nulls(mut answers: Vec<bool>, validity: &Validity) -> Vec<bool> {
 /// `spec/engine/03-data-plane.md` records as the first performance lesson of this layer: an index
 /// mapping the compiler cannot see through is an indirect call per row, and one of those in a loop
 /// that is otherwise three instructions is the whole loop.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "two sides, two validities, the operator, the length, the index mapping and the \
+              literal that was built early, all of which the branches below need"
+)]
 fn specialized<M>(
     op: Comparison,
     left: &Vector,
@@ -317,6 +364,7 @@ fn specialized<M>(
     right_valid: &Validity,
     len: usize,
     map: M,
+    held: Option<&Held>,
 ) -> Option<Vec<bool>>
 where
     M: Fn(usize) -> usize + Copy,
@@ -332,27 +380,27 @@ where
         return dispatch(op, len, one, map, other, map, left_valid, right_valid, map);
     }
     if let (Some(one), Some(value)) = (left.data(), right.constant_value()) {
-        let held = single(left.logical_type(), value)?;
-        let other = held.data()?;
+        let column = readied(held, left.logical_type(), value)?;
+        let other = column.data()?;
         return dispatch(op, len, one, map, other, first, left_valid, right_valid, map);
     }
     if let (Some(value), Some(other)) = (left.constant_value(), right.data()) {
         // The same loop with the comparison turned around, rather than a second loop.
-        let held = single(right.logical_type(), value)?;
-        let one = held.data()?;
+        let column = readied(held, right.logical_type(), value)?;
+        let one = column.data()?;
         return dispatch(op.swapped(), len, other, map, one, first, right_valid, left_valid, map);
     }
     if let (Some((codes, values)), Some(value)) = (left.positions(), right.constant_value()) {
         let one = values.data()?;
-        let held = single(left.logical_type(), value)?;
-        let other = held.data()?;
+        let column = readied(held, left.logical_type(), value)?;
+        let other = column.data()?;
         let at = |index: usize| codes[map(index)] as usize;
         return dispatch(op, len, one, at, other, first, left_valid, right_valid, map);
     }
     if let (Some(value), Some((codes, values))) = (left.constant_value(), right.positions()) {
         let other = values.data()?;
-        let held = single(right.logical_type(), value)?;
-        let one = held.data()?;
+        let column = readied(held, right.logical_type(), value)?;
+        let one = column.data()?;
         let at = |index: usize| codes[map(index)] as usize;
         return dispatch(op.swapped(), len, other, at, one, first, right_valid, left_valid, map);
     }
@@ -463,6 +511,18 @@ where
         };
     }
     rudb_vector::for_each_layout!(ordered, layouts)
+}
+
+/// The one row column for a constant, either the one that was built early or one built here.
+///
+/// Borrowed when a caller handed one over for this side and this value, owned when it did not, and
+/// the loop below cannot tell the two apart. `None` is a type with no column layout, which is what
+/// sends the whole comparison to the row at a time path.
+fn readied<'a>(held: Option<&'a Held>, ty: &LogicalType, value: &Value) -> Option<Cow<'a, Vector>> {
+    match held {
+        Some(held) if held.matches(ty, value) => Some(Cow::Borrowed(held.single())),
+        _ => Some(Cow::Owned(single(ty, value)?)),
+    }
 }
 
 /// Two strings in byte order, resolved from the four byte prefix where it can be.
@@ -1280,5 +1340,78 @@ mod tests {
         let right = Vector::constant(LogicalType::Integer, Value::Integer(1), 0);
         let result = compare(Comparison::Equal, &left, &right).expect("compares");
         assert_eq!(result.len(), 0);
+    }
+
+    /// Six strings, three of them sharing a prefix, and a null, which is the column the two tests
+    /// below read.
+    fn words() -> Vector {
+        Vector::from_values(
+            LogicalType::Varchar,
+            &[
+                Value::Varchar("http://a".into()),
+                Value::Varchar("http://b".into()),
+                Value::Null,
+                Value::Varchar("ab".into()),
+                Value::Varchar("http://a".into()),
+                Value::Varchar("z".into()),
+            ],
+        )
+        .expect("six rows")
+    }
+
+    /// A literal built early answers what a literal built per chunk answers.
+    ///
+    /// Every operator and both entry points, because the whole claim of the prepared literal is
+    /// that it changes nothing, and the string column is the one where it changes the most work:
+    /// what it carries is the four byte prefix the comparison resolves almost every row from.
+    #[test]
+    fn a_literal_built_early_answers_what_one_built_here_answers() {
+        let column = words();
+        let value = Value::Varchar("http://b".into());
+        let constant = Vector::constant(LogicalType::Varchar, value.clone(), column.len());
+        let held = Held::of(&LogicalType::Varchar, &value).expect("a varchar has a column");
+        let kept = Selection::from_indices(vec![0, 1, 3, 5]);
+        for op in [
+            Comparison::Equal,
+            Comparison::NotEqual,
+            Comparison::Less,
+            Comparison::LessOrEqual,
+            Comparison::Greater,
+            Comparison::GreaterOrEqual,
+            Comparison::DistinctFrom,
+            Comparison::NotDistinctFrom,
+        ] {
+            let prepared = compare_prepared(op, &column, &constant, Some(&held)).expect("compares");
+            assert_eq!(prepared, compare(op, &column, &constant).expect("compares"), "{op:?}");
+            // And with the literal on the left, which is the same loop turned around.
+            let flipped = compare_prepared(op, &constant, &column, Some(&held)).expect("compares");
+            assert_eq!(flipped, compare(op, &constant, &column).expect("compares"), "{op:?}");
+            let refined =
+                refine_prepared(op, &column, &constant, &kept, Some(&held)).expect("refines");
+            assert_eq!(refined, refine(op, &column, &constant, &kept).expect("refines"), "{op:?}");
+        }
+    }
+
+    /// A literal built for something else is ignored rather than believed.
+    ///
+    /// The caller in `rudb-exec` takes the value out of the step it hands the answer back with, so
+    /// this cannot happen there, and the kernel is public. A wrong answer is a much worse failure
+    /// than a column built per chunk, so the check is a value comparison per chunk and this is what
+    /// says it works.
+    #[test]
+    fn a_literal_built_for_another_value_is_ignored() {
+        let column = words();
+        let constant = Vector::constant(LogicalType::Varchar, Value::Varchar("z".into()), 6);
+        let wrong = Held::of(&LogicalType::Varchar, &Value::Varchar("ab".into()))
+            .expect("a varchar has a column");
+        let answer = compare_prepared(Comparison::Equal, &column, &constant, Some(&wrong))
+            .expect("compares");
+        assert_eq!(answer, compare(Comparison::Equal, &column, &constant).expect("compares"));
+        // And one built for another type, which is what a comparison across two types would hand
+        // over if the caller took it from the wrong side.
+        let other = Held::of(&LogicalType::Integer, &Value::Integer(1)).expect("an integer column");
+        let answer = compare_prepared(Comparison::Equal, &column, &constant, Some(&other))
+            .expect("compares");
+        assert_eq!(answer, compare(Comparison::Equal, &column, &constant).expect("compares"));
     }
 }
