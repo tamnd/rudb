@@ -62,6 +62,14 @@ pub enum Form {
     Sequence,
     /// Codes into a smaller vector of distinct values.
     Dictionary,
+    /// Integers stored in as many bits as the range of the column needs, offset from a base.
+    ///
+    /// The form a narrow integer column is in. A ClickBench `ResolutionWidth` is a `SMALLINT` whose
+    /// values live between 0 and 2560, which is twelve bits, so the column is three quarters of the
+    /// size it was and the pages behind it are three quarters of the reads. What it costs is a shift
+    /// and a mask per value, which is why this is worth it at storage and at rest and is not a form
+    /// anything should be building in the middle of a pipeline.
+    BitPacked,
     /// One value per run, with the row each run ends at.
     ///
     /// The form a clustered column is in. `hits` is written in time order, so `EventDate` is a few
@@ -239,6 +247,22 @@ enum Body {
     Dictionary {
         codes: Vec<u32>,
         values: Arc<Vector>,
+    },
+    /// Integer codes of `width` bits each, packed end to end, each one an offset from `base`.
+    ///
+    /// Row `r` is the `width` bits starting at bit `(offset + r) * width`, read little end first, so
+    /// a code that straddles a word boundary has its low bits in the earlier word. `offset` is what
+    /// lets a cut of a packed column be free: the bits are not byte aligned, so a slice either
+    /// repacks or remembers where it starts, and remembering is one addition per read.
+    ///
+    /// The words are behind an `Arc` for the reason the dictionary's values are. A page is packed
+    /// once and cut into chunk sized pieces, and copying the words per cut would undo most of what
+    /// the packing saved.
+    Packed {
+        words: Arc<Vec<u64>>,
+        width: u32,
+        base: i128,
+        offset: usize,
     },
     /// One value per run, with the row each run ends at, exclusive and increasing.
     ///
@@ -437,6 +461,110 @@ impl Vector {
         Self::runs(ends, self.gather(&starts)?)
     }
 
+    /// A vector of `len` integers packed `width` bits each, every one an offset from `base`.
+    ///
+    /// The way in for a reader that already has the packed bits, which is what a column file holds
+    /// and what a network frame carries. Nothing unpacks on the way in, so a scan of a packed column
+    /// hands the bits straight to the chunk and the cost of the form is paid by whoever reads a
+    /// value rather than by the scan.
+    ///
+    /// The range check is on the two ends rather than on every code, which is the whole check. A
+    /// code is between zero and `2^width - 1` by construction, so if `base` and `base + 2^width - 1`
+    /// both fit the column's layout then every value does, and that is two comparisons instead of
+    /// one per row.
+    ///
+    /// # Errors
+    ///
+    /// If the type is not one of the integer layouts, if the width is not between one and
+    /// [`PACKED_WIDTH_MAX`], if there are not enough words for the length, or if either end of the
+    /// range would not fit the type.
+    pub fn packed(
+        ty: LogicalType,
+        words: Vec<u64>,
+        width: u32,
+        base: i128,
+        len: usize,
+    ) -> Result<Self> {
+        let Some((low, high)) = layout_range(&ty) else {
+            return Err(Error::internal(format!("a {ty} vector has no integer layout to pack")));
+        };
+        if width == 0 || width > PACKED_WIDTH_MAX {
+            return Err(Error::internal(format!(
+                "a packed width of {width}, which is outside 1 to {PACKED_WIDTH_MAX}"
+            )));
+        }
+        let needed = words_for(len, width);
+        if words.len() < needed {
+            return Err(Error::internal(format!(
+                "{} words for {len} values of {width} bits, which needs {needed}",
+                words.len()
+            )));
+        }
+        let top = base + i128::from(u64::MAX >> (64 - width));
+        if base < low || top > high {
+            return Err(Error::internal(format!(
+                "packed values from {base} to {top}, which a {ty} cannot hold"
+            )));
+        }
+        Ok(Self {
+            ty,
+            len,
+            validity: Validity::AllValid,
+            body: Body::Packed { words: Arc::new(words), width, base, offset: 0 },
+        })
+    }
+
+    /// The same values bit packed, when the range of the column makes that smaller.
+    ///
+    /// Costs one pass to find the range and one to write the bits, which is why this is a call
+    /// somebody makes rather than something a constructor does. It is the counterpart of
+    /// [`Self::run_encoded`] and the decision has the same shape: a row flat costs the width of its
+    /// layout, a row packed costs the bits the column's range needs, and the form is worth having
+    /// only when the second is a good deal smaller than the first. [`PACKING_PAYS_AT`] is that
+    /// ratio, written down rather than spelt into an `if`, because it is the number a sweep will
+    /// want to move.
+    ///
+    /// Only a flat integer body is looked at. A constant and a sequence are already smaller than any
+    /// packing of them, a dictionary's codes are the thing that would want packing rather than its
+    /// values, and a float has no range to pack into since the bits of an `f64` are not an integer
+    /// that arithmetic on the column agrees with.
+    ///
+    /// The range is taken over every slot including the null ones, which hold a zero. A column of
+    /// large values with one null in it therefore packs a range that reaches down to zero and comes
+    /// out wider than it needed to be. The alternative is a pass that consults the validity per slot
+    /// to find the range and a second rule for what to write into a null slot, and this form exists
+    /// to make reads cheap rather than to squeeze the last bit out of a sparse column.
+    ///
+    /// A column whose values are all the same packs to nothing at all, and rather than invent a zero
+    /// bit code this declines and leaves it to [`Self::run_encoded`], which turns that column into
+    /// one run and is smaller than any packing of it.
+    ///
+    /// # Errors
+    ///
+    /// If the packed bits and the length disagree, which would be a bug here rather than a caller
+    /// doing something wrong.
+    pub fn bit_packed(&self) -> Result<Self> {
+        let Body::Flat(data) = &self.body else {
+            return Ok(self.clone());
+        };
+        let Some((low, high)) = span_of(data, self.len) else {
+            return Ok(self.clone());
+        };
+        let Some(range) = high.checked_sub(low).and_then(|range| u64::try_from(range).ok()) else {
+            return Ok(self.clone());
+        };
+        let width = u64::BITS - range.leading_zeros();
+        if width == 0 || width > PACKED_WIDTH_MAX {
+            return Ok(self.clone());
+        }
+        if words_for(self.len, width) * size_of::<u64>() * PACKING_PAYS_AT > data.footprint() {
+            return Ok(self.clone());
+        }
+        let words = pack(data, self.len, low, width);
+        let packed = Self::packed(self.ty.clone(), words, width, low, self.len)?;
+        Ok(packed.with_validity(self.validity.clone()))
+    }
+
     /// The same vector with a different validity.
     #[must_use]
     pub fn with_validity(mut self, validity: Validity) -> Self {
@@ -482,6 +610,7 @@ impl Vector {
             Body::Dictionary { codes, values } => {
                 codes.capacity() * size_of::<u32>() + values.footprint()
             }
+            Body::Packed { words, .. } => words.capacity() * size_of::<u64>(),
             Body::Runs { ends, values } => ends.capacity() * size_of::<u32>() + values.footprint(),
         };
         size_of::<Self>() + self.validity.footprint() + body
@@ -501,6 +630,7 @@ impl Vector {
             Body::Constant(_) => Form::Constant,
             Body::Sequence { .. } => Form::Sequence,
             Body::Dictionary { .. } => Form::Dictionary,
+            Body::Packed { .. } => Form::BitPacked,
             Body::Runs { .. } => Form::Rle,
         }
     }
@@ -600,6 +730,23 @@ impl Vector {
         }
     }
 
+    /// The bits and what they mean, for a bit packed vector, and `None` for any other form.
+    ///
+    /// What a kernel needs to stay in code space. A comparison against a literal is the case that
+    /// pays: `column > 900` over a column packed from a base of 40 is `code > 860`, which is the
+    /// same shift and mask the read was going to do anyway and no unpacking at all, and a literal
+    /// outside the packed range answers the whole vector without reading a bit of it. None of that
+    /// can be written without seeing the width and the base.
+    #[must_use]
+    pub fn packed_parts(&self) -> Option<Packed<'_>> {
+        match &self.body {
+            Body::Packed { words, width, base, offset } => {
+                Some(Packed { words, width: *width, base: *base, offset: *offset })
+            }
+            _ => None,
+        }
+    }
+
     /// The start and the step, for a sequence vector, and `None` for any other form.
     #[must_use]
     pub fn sequence_parts(&self) -> Option<(i64, i64)> {
@@ -630,6 +777,15 @@ impl Vector {
                 Some(run) => values.value_at(run),
                 None => Value::Null,
             },
+            // One value unpacked into a run of one, so that what a packed value means is decided in
+            // the same place a flat one is rather than in a second copy of the type mapping that
+            // could drift from it. It allocates, which this path is allowed to do and the typed
+            // unpack in `copied` is not, and it is the reason anything about to read a packed
+            // column a row at a time should flatten it once instead.
+            Body::Packed { words, width, base, offset } => {
+                unpack(&self.ty, words, *offset, *width, *base, &[index])
+                    .map_or(Value::Null, |data| value_from(&self.ty, &data, 0))
+            }
             Body::Flat(data) => value_from(&self.ty, data, index),
         }
     }
@@ -701,6 +857,15 @@ impl Vector {
             Body::Dictionary { codes, values } => {
                 Body::Dictionary { codes: codes[at..end].to_vec(), values: Arc::clone(values) }
             }
+            // The bits are not byte aligned, so a cut either repacks them or moves the row the
+            // reading starts at. Moving it is one addition and repacking is a pass, and a page is
+            // cut into chunk sized pieces often enough that the difference is the form.
+            Body::Packed { words, width, base, offset } => Body::Packed {
+                words: Arc::clone(words),
+                width: *width,
+                base: *base,
+                offset: offset + at,
+            },
             // Only the runs the range touches survive, the first and last of them cut back to where
             // the range starts and stops, and every end moved to be relative to the new row zero. A
             // cut of a hundred rows out of a column of a hundred million is a handful of runs, which
@@ -810,6 +975,12 @@ impl Vector {
                 return Ok(Self::constant(self.ty.clone(), Value::Null, rows));
             }
             Body::Flat(data) => Body::Flat(copy_of(data, &at)),
+            // The one form whose copy is arithmetic rather than a move of bytes. It goes through a
+            // typed loop per layout the way the flat copy does, because the alternative is a `Value`
+            // per row and this is the path a flatten of a scanned column takes.
+            Body::Packed { words, width, base, offset } => {
+                Body::Flat(unpack(&self.ty, words, *offset, *width, *base, &at)?)
+            }
             // Unreachable, because `resolve` walks past both of the forms that point at another
             // vector and stops at the first body that does not.
             Body::Dictionary { .. } | Body::Runs { .. } => {
@@ -868,6 +1039,229 @@ impl Vector {
 impl AsRef<Vector> for Vector {
     fn as_ref(&self) -> &Vector {
         self
+    }
+}
+
+/// The bits of a packed vector and what they mean, for a kernel that wants to stay in code space.
+///
+/// Borrowed from the vector rather than owning anything, so getting one costs nothing and a kernel
+/// that finds it cannot use them has given up nothing by asking.
+#[derive(Debug, Clone, Copy)]
+pub struct Packed<'a> {
+    words: &'a [u64],
+    width: u32,
+    base: i128,
+    offset: usize,
+}
+
+impl Packed<'_> {
+    /// How many bits one code takes, between one and [`PACKED_WIDTH_MAX`].
+    #[must_use]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// What zero means, so that the value of a row is the base plus its code.
+    #[must_use]
+    pub fn base(&self) -> i128 {
+        self.base
+    }
+
+    /// The largest value this vector can be holding, whatever it is actually holding.
+    ///
+    /// With [`Self::base`] this is the pair a comparison kernel wants first. A literal outside the
+    /// two answers every row of the vector the same way, which is a whole chunk decided without a
+    /// bit being read, and that is the case a zone map would have caught if there were one here.
+    #[must_use]
+    pub fn ceiling(&self) -> i128 {
+        self.base + i128::from(u64::MAX >> (u64::BITS - self.width))
+    }
+
+    /// The code of row `row`, which is its value minus [`Self::base`].
+    ///
+    /// Out of range rows read as zero rather than panicking, the way every other accessor in this
+    /// file answers for a row that is not there.
+    #[must_use]
+    pub fn code(&self, row: usize) -> u64 {
+        code_at(self.words, (self.offset + row) * self.width as usize, self.width)
+    }
+
+    /// Which code a value would have, and `None` for a value this vector cannot be holding.
+    ///
+    /// The translation a comparison does once per vector so that it does not have to unpack once per
+    /// row. `None` is the useful answer rather than a failure: it says the literal is outside the
+    /// packed range, so every row compares against it the same way.
+    #[must_use]
+    pub fn code_of(&self, value: i128) -> Option<u64> {
+        u64::try_from(value.checked_sub(self.base)?).ok().filter(|&code| code <= self.mask())
+    }
+
+    /// The largest code the width allows.
+    fn mask(&self) -> u64 {
+        u64::MAX >> (u64::BITS - self.width)
+    }
+}
+
+/// The widest a packed code is allowed to be.
+///
+/// Sixty three rather than sixty four so that a mask is `u64::MAX >> (64 - width)` with no shift of
+/// a whole word in it, and reading a code is one branch on whether it straddles rather than two. A
+/// sixty four bit code saves nothing anyway, since it is the layout it came from.
+pub const PACKED_WIDTH_MAX: u32 = 63;
+
+/// How much smaller packing has to be before it is worth the shift and the mask on every read.
+///
+/// Two, so a column packs when the bits come to half the flat size or less. A column that would save
+/// a tenth stays flat, because a tenth of a column is not worth turning every read of it into
+/// arithmetic, and the whole argument for the form is that a narrow column saves most of itself.
+pub const PACKING_PAYS_AT: usize = 2;
+
+/// How many words hold `len` codes of `width` bits.
+fn words_for(len: usize, width: u32) -> usize {
+    (len * width as usize).div_ceil(u64::BITS as usize)
+}
+
+/// The lowest and highest value a type's layout can hold, and `None` for a type with no integer one.
+///
+/// This is also the test of whether a type can be packed at all, and it is the only one, so the
+/// layouts listed here and the layouts [`pack`] and [`unpack`] know how to walk are the same list
+/// from the same macro and cannot drift apart.
+fn layout_range(ty: &LogicalType) -> Option<(i128, i128)> {
+    use rudb_common::PhysicalType as P;
+    macro_rules! ranges {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match ty.physical() {
+                $(P::$variant => Some((i128::from(<$native>::MIN), i128::from(<$native>::MAX))),)+
+                _ => None,
+            }
+        };
+    }
+    crate::for_each_layout!(exact, ranges)
+}
+
+/// The lowest and highest value in the first `len` slots of a run of integer data.
+///
+/// `None` for data that is not integers, which is what says a column cannot be packed. The null
+/// slots are in the span, holding whatever zero was written into them, which
+/// [`Vector::bit_packed`] says more about.
+fn span_of(data: &Data, len: usize) -> Option<(i128, i128)> {
+    macro_rules! spans {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => {
+                    let mut low = i128::MAX;
+                    let mut high = i128::MIN;
+                    for &value in values.as_slice().iter().take(len) {
+                        let value = i128::from(value);
+                        low = low.min(value);
+                        high = high.max(value);
+                    }
+                    (low <= high).then_some((low, high))
+                })+
+                _ => None,
+            }
+        };
+    }
+    crate::for_each_layout!(exact, spans)
+}
+
+/// The first `len` values of a run of integer data, written out as codes of `width` bits from `base`.
+fn pack(data: &Data, len: usize, base: i128, width: u32) -> Vec<u64> {
+    let mut words = vec![0u64; words_for(len, width)];
+    macro_rules! packing {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => {
+                    for (row, &value) in values.as_slice().iter().take(len).enumerate() {
+                        // In range because `base` and `width` came from the span of this same run.
+                        let code = u64::try_from(i128::from(value) - base).unwrap_or(0);
+                        write_code(&mut words, row * width as usize, width, code);
+                    }
+                })+
+                _ => {}
+            }
+        };
+    }
+    crate::for_each_layout!(exact, packing);
+    words
+}
+
+/// The codes at the given rows, unpacked into the flat layout the type calls for.
+///
+/// A row of [`NOWHERE`] writes the layout's zero, which is the rule [`copy_of`] follows for the same
+/// reason: every layout here is a parallel array to a validity mask, so a null takes a slot.
+///
+/// # Errors
+///
+/// If the type has no flat layout, which a packed vector cannot have and which is checked when one
+/// is built, so an error here is a bug rather than a caller mistake.
+fn unpack(
+    ty: &LogicalType,
+    words: &[u64],
+    offset: usize,
+    width: u32,
+    base: i128,
+    at: &[usize],
+) -> Result<Data> {
+    let mut out = empty_data_for(ty)?;
+    let value_of = |row: usize| {
+        if row == NOWHERE {
+            return None;
+        }
+        Some(base + i128::from(code_at(words, (offset + row) * width as usize, width)))
+    };
+    macro_rules! unpacking {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match &mut out {
+                $(Data::$variant(values) => {
+                    values.reserve(at.len());
+                    for &row in at {
+                        // In range because both ends of it were checked when the vector was built.
+                        let value = value_of(row)
+                            .and_then(|value| <$native>::try_from(value).ok())
+                            .unwrap_or($zero);
+                        values.push(value);
+                    }
+                })+
+                _ => {
+                    return Err(Error::internal(format!(
+                        "a {ty} vector was packed, which no integer layout allows"
+                    )));
+                }
+            }
+        };
+    }
+    crate::for_each_layout!(exact, unpacking);
+    Ok(out)
+}
+
+/// The `width` bits starting at `bit`, low end first.
+///
+/// Zero for bits past the end of the words, which keeps a read of a row that is not there from
+/// panicking and matches what every other accessor here does with one.
+fn code_at(words: &[u64], bit: usize, width: u32) -> u64 {
+    let word = bit / u64::BITS as usize;
+    let shift = (bit % u64::BITS as usize) as u32;
+    let mask = u64::MAX >> (u64::BITS - width);
+    let low = words.get(word).copied().unwrap_or(0) >> shift;
+    let taken = u64::BITS - shift;
+    if taken >= width {
+        return low & mask;
+    }
+    // The code straddles two words, and `taken` is under the width here so it is under sixty four,
+    // which is what makes the shift below one the hardware will do rather than one it refuses.
+    let high = words.get(word + 1).copied().unwrap_or(0) << taken;
+    (low | high) & mask
+}
+
+/// Writes `width` bits of `code` starting at `bit`, over words that started out zero.
+fn write_code(words: &mut [u64], bit: usize, width: u32, code: u64) {
+    let word = bit / u64::BITS as usize;
+    let shift = (bit % u64::BITS as usize) as u32;
+    words[word] |= code << shift;
+    let taken = u64::BITS - shift;
+    if taken < width {
+        words[word + 1] |= code >> taken;
     }
 }
 
@@ -1944,5 +2338,145 @@ mod tests {
             spilled.footprint(),
             short.footprint()
         );
+    }
+
+    /// The cases worth checking are the widths where a code straddles a word boundary, which is
+    /// every width that does not divide sixty four, and the two ends of the range.
+    #[test]
+    fn a_narrow_column_packs_and_reads_back_the_same_at_every_width() {
+        for width in 1..=20u32 {
+            let span = (1i64 << width) - 1;
+            let values: Vec<i64> =
+                (0..1000).map(|row| 1_000_000 + (row * 7919) % (span + 1)).collect();
+            let flat =
+                Vector::flat(LogicalType::BigInt, Data::Int64(values.clone().into())).unwrap();
+            let packed = flat.bit_packed().unwrap();
+            assert_eq!(packed.len(), flat.len());
+            assert_eq!(
+                packed.iter().collect::<Vec<_>>(),
+                flat.iter().collect::<Vec<_>>(),
+                "width {width} read back differently"
+            );
+        }
+    }
+
+    #[test]
+    fn the_width_is_the_bits_the_range_needs_and_not_the_bits_the_type_has() {
+        let values: Vec<i32> = (0..1024).map(|row| 40 + (row * 2560) / 1023).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into())).unwrap();
+        let packed = flat.bit_packed().unwrap();
+        assert_eq!(packed.form(), Form::BitPacked);
+        let parts = packed.packed_parts().expect("packed");
+        assert_eq!(parts.width(), 12, "0 to 2560 is twelve bits");
+        assert_eq!(parts.base(), 40);
+        assert!(
+            packed.footprint() * 2 < flat.footprint(),
+            "twelve bits against thirty two: {} against {}",
+            packed.footprint(),
+            flat.footprint()
+        );
+    }
+
+    /// The check is worth having in both directions, the way the run length one is. A form that is
+    /// only ever bigger than what it replaced costs a pass over the column to decide not to use.
+    #[test]
+    fn a_column_that_uses_its_whole_type_is_left_flat() {
+        let values: Vec<i32> = (0..1024).map(|row| row * 2_000_000 - 1_000_000_000).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into())).unwrap();
+        assert_eq!(flat.bit_packed().unwrap().form(), Form::Flat);
+    }
+
+    /// A column of one value would pack to no bits at all, and one run is smaller than any packing
+    /// of it, so the two forms do not fight over that column.
+    #[test]
+    fn a_column_of_one_value_is_left_to_the_run_length_form() {
+        let flat = integers(&[9; 1024]);
+        assert_eq!(flat.bit_packed().unwrap().form(), Form::Flat);
+        assert_eq!(flat.run_encoded().unwrap().form(), Form::Rle);
+    }
+
+    #[test]
+    fn a_string_column_has_no_range_to_pack() {
+        let text = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("red".into()), Value::Varchar("blue".into())],
+        )
+        .unwrap();
+        assert_eq!(text.bit_packed().unwrap().form(), Form::Flat);
+    }
+
+    /// The cut is the reason the form carries a row to start reading at. It stays packed, it shares
+    /// the same words, and it reads the rows the range asked for.
+    #[test]
+    fn a_cut_of_a_packed_column_stays_packed_and_shares_its_bits() {
+        let values: Vec<i32> = (0..1024).map(|row| 100 + row % 300).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into())).unwrap();
+        let packed = flat.bit_packed().unwrap();
+        let cut = packed.slice(500, 24).unwrap();
+        assert_eq!(cut.form(), Form::BitPacked);
+        assert_eq!(cut.len(), 24);
+        assert_eq!(
+            cut.iter().collect::<Vec<_>>(),
+            flat.slice(500, 24).unwrap().iter().collect::<Vec<_>>()
+        );
+        assert!(
+            cut.footprint() >= packed.footprint(),
+            "a cut shares the words rather than copying a piece of them"
+        );
+    }
+
+    #[test]
+    fn a_gather_of_a_packed_column_comes_out_flat_and_keeps_the_nulls() {
+        let values: Vec<i32> = (0..64).map(|row| 10 + row).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into())).unwrap();
+        let packed =
+            flat.bit_packed().unwrap().with_validity(Validity::from_iter(64, |row| row % 3 != 0));
+        let taken = packed.gather(&[0, 1, 2, 3, 62]).unwrap();
+        assert_eq!(taken.form(), Form::Flat);
+        assert_eq!(
+            taken.iter().collect::<Vec<_>>(),
+            vec![
+                Value::Null,
+                Value::Integer(11),
+                Value::Integer(12),
+                Value::Null,
+                Value::Integer(72)
+            ]
+        );
+    }
+
+    /// The pair a comparison kernel asks for before it reads a bit. A literal inside the range has a
+    /// code and a literal outside it does not, which answers the whole vector at once.
+    #[test]
+    fn a_literal_outside_the_packed_range_has_no_code() {
+        let values: Vec<i32> = (0..256).map(|row| 1000 + row).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into())).unwrap();
+        let packed = flat.bit_packed().unwrap();
+        let parts = packed.packed_parts().expect("packed");
+        assert_eq!(parts.code_of(1000), Some(0));
+        assert_eq!(parts.code_of(1100), Some(100));
+        assert_eq!(parts.code_of(999), None);
+        assert!(parts.ceiling() >= 1255);
+        assert_eq!(parts.code_of(parts.ceiling() + 1), None);
+    }
+
+    /// The bits arriving from a file rather than from a flat vector, which is what the form is for.
+    #[test]
+    fn packed_bits_can_be_handed_in_without_a_flat_vector_to_start_from() {
+        let packed = Vector::packed(LogicalType::SmallInt, vec![0x0000_0000_0000_4321], 4, 7, 4)
+            .expect("four codes of four bits");
+        assert_eq!(
+            packed.iter().collect::<Vec<_>>(),
+            vec![Value::SmallInt(8), Value::SmallInt(9), Value::SmallInt(10), Value::SmallInt(11)]
+        );
+    }
+
+    #[test]
+    fn packed_bits_that_could_not_hold_what_they_claim_are_refused() {
+        assert!(Vector::packed(LogicalType::Varchar, vec![0], 4, 0, 4).is_err(), "not an integer");
+        assert!(Vector::packed(LogicalType::Integer, vec![0], 0, 0, 4).is_err(), "no width");
+        assert!(Vector::packed(LogicalType::Integer, vec![0], 64, 0, 4).is_err(), "too wide");
+        assert!(Vector::packed(LogicalType::Integer, vec![0], 8, 0, 9).is_err(), "too few words");
+        assert!(Vector::packed(LogicalType::TinyInt, vec![0], 8, 100, 8).is_err(), "would not fit");
     }
 }
