@@ -44,6 +44,7 @@ rudb-kernels = { version = "=0.2.31", path = "crates/rudb-kernels" }
 rudb-opt = { version = "=0.2.31", path = "crates/rudb-opt" }
 rudb-parquet = { version = "=0.2.31", path = "crates/rudb-parquet" }
 rudb-parse = { version = "=0.2.31", path = "crates/rudb-parse" }
+rudb-pipeline = { version = "=0.2.31", path = "crates/rudb-pipeline" }
 rudb-plan = { version = "=0.2.31", path = "crates/rudb-plan" }
 rudb-regex = { version = "=0.2.31", path = "crates/rudb-regex" }
 rudb-seam = { version = "=0.2.31", path = "crates/rudb-seam" }

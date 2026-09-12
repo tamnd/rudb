@@ -33,6 +33,10 @@ rudb-ir = 2
 rudb-seam = 2
 rudb-kernels = 3
 rudb-jit = 4
+# The push operator interface and the serial driver. Rank 4 because it is plumbing over chunks and
+# knows nothing about a schema, a plan or a binding, which is what lets an operator be tested with a
+# source made of two literal chunks and no planner anywhere in the picture.
+rudb-pipeline = 4
 
 # Storage and the format readers. None of these depends on the execution engine, which is what
 # keeps each of them usable and testable on its own.
