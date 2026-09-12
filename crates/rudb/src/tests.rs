@@ -686,6 +686,53 @@ fn a_generated_name_quotes_an_identifier_where_duckdb_quotes_one() {
     assert_eq!(names("SELECT name IS NULL FROM q"), &["(\"name\" IS NULL)".to_string()]);
 }
 
+/// The five string functions a corpus file reaches for constantly, end to end. Per #330.
+///
+/// Every answer below was read off the pinned binary, because none of it follows from the names.
+/// The three that are worth pinning are `concat` dropping a null instead of propagating it, a
+/// negative count to `left` counting from the other end instead of raising, and an empty needle to
+/// `replace` changing nothing instead of matching everywhere.
+#[test]
+fn the_five_string_functions_answer_the_way_duckdb_does() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT chr(65), chr(233)"), vec![vec![text("A"), text("é")]]);
+    assert_eq!(rows(&db, "SELECT length(chr(0))"), vec![vec![Value::BigInt(1)]]);
+    assert_eq!(
+        rows(&db, "SELECT left('héllo', 2), right('héllo', 2)"),
+        vec![vec![text("hé"), text("lo")]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT left('abc', -1), right('abc', -1), left('abc', 0), right('abc', 99)"),
+        vec![vec![text("ab"), text("bc"), text(""), text("abc")]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT replace('abc', 'b', 'x'), replace('aaa', '', 'x')"),
+        vec![vec![text("axc"), text("aaa")]]
+    );
+    // `concat` is above the null rule and the other four are not, which is the one line of this
+    // that a reader would otherwise have to go and measure.
+    assert_eq!(rows(&db, "SELECT concat('a', 1, NULL)"), vec![vec![text("a1")]]);
+    assert_eq!(rows(&db, "SELECT concat(NULL)"), vec![vec![text("")]]);
+    assert_eq!(
+        rows(&db, "SELECT replace('abc', 'b', NULL), left(NULL, 2), chr(NULL)"),
+        vec![vec![Value::Null, Value::Null, Value::Null]]
+    );
+    // The names upstream gives these columns. Three of the five are keywords and are quoted.
+    assert_eq!(
+        db.query("SELECT LEFT('abc', 2), chr(65)").unwrap().names(),
+        &["\"left\"('abc', 2)".to_string(), "chr(65)".to_string()]
+    );
+    // A code point that is no code point, and the counts and types the signature refuses. `chr`
+    // has one overload upstream and it narrows nothing to reach it.
+    assert_eq!(failure(&db, "SELECT chr(55296)"), "Invalid UTF8 Codepoint 55296");
+    assert!(failure(&db, "SELECT chr(65.9)").contains("chr(col0 INTEGER) -> VARCHAR"));
+    assert!(
+        failure(&db, "SELECT left('abc')")
+            .contains("\"left\"(col0 VARCHAR, col1 BIGINT) -> VARCHAR")
+    );
+    assert!(failure(&db, "SELECT concat()").contains("concat(col0 ANY, [ANY...]) -> ANY"));
+}
+
 /// The three spellings of a null check, end to end. Per #306.
 ///
 /// Every answer and every column name below was read off the pinned binary. `nullif` is a macro

@@ -74,14 +74,19 @@ enum Shape {
     PromotedTo(Fixed),
     /// Every argument is cast to one fixed type and the result is another. `||` over strings.
     FixedTo(Fixed, Fixed),
-    /// Every argument has to be a string already and the result is fixed. `lower`, `length`, `LIKE`.
+    /// Every argument has to be that type already and the result is fixed. `lower`, `length`,
+    /// `LIKE`, `chr`.
     ///
-    /// The difference from [`Shape::FixedTo`] with a VARCHAR argument is the word already. DuckDB
-    /// refuses `lower(123)`, `length(DATE '2020-01-01')` and `123 LIKE '1%'` with a binder error
-    /// naming the overloads it does have, and it refuses a BLOB as well, so the rule is VARCHAR
-    /// rather than anything a cast can reach. `||` is the one string function that really does take
-    /// anything, since `1 || 'a'` is `1a` upstream, and it keeps [`Shape::FixedTo`] for that reason.
-    Text(Fixed),
+    /// The difference from [`Shape::FixedTo`] is the word already. DuckDB refuses `lower(123)`,
+    /// `length(DATE '2020-01-01')` and `123 LIKE '1%'` with a binder error naming the overloads it
+    /// does have, and it refuses a BLOB as well, so the rule is VARCHAR rather than anything a cast
+    /// can reach. `||` is the one string function that really does take anything, since `1 || 'a'`
+    /// is `1a` upstream, and it keeps [`Shape::FixedTo`] for that reason.
+    ///
+    /// The argument type is part of the shape because the same rule holds away from strings.
+    /// `chr(col0 INTEGER)` is the only overload upstream has and it refuses `chr(65.9)` and
+    /// `chr(65::BIGINT)` rather than narrowing either of them.
+    Exact(Fixed, Fixed),
     /// The arguments are whatever they are and the result is fixed. `count(x)` over anything.
     AnyTo(Fixed),
     /// The first `n` arguments are cast to one fixed type, the rest are left alone, and the result
@@ -281,6 +286,46 @@ const TABLE: &[Entry] = &[
         shape: Shape::TextThenIndex(2, Fixed::Varchar),
         numeric_only: false,
     },
+    // `left` and `right` count characters and clamp, and a negative count is a count from the other
+    // end rather than an error, so `left('abc', -1)` is `ab`. Both are declared
+    // `(VARCHAR, BIGINT)` upstream and neither casts its count, which is what
+    // [`Shape::TextThenIndex`] already says.
+    Entry {
+        name: "left",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::TextThenIndex(1, Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "right",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::TextThenIndex(1, Fixed::Varchar),
+        numeric_only: false,
+    },
+    text("replace", Arity::exactly(3), Fixed::Varchar),
+    // `chr` is a code point and not a byte, so `chr(233)` is one character and not two bytes of
+    // something else. Its one overload upstream takes an INTEGER and it narrows nothing to reach
+    // it: `chr(65::BIGINT)` and `chr(65.9)` are both binder errors there.
+    Entry {
+        name: "chr",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Integer, Fixed::Varchar),
+        numeric_only: false,
+    },
+    // `concat` takes anything, joins it and drops the nulls instead of propagating them, so
+    // `concat('a', 1, NULL)` is `a1`. That last part is what makes it a third exception to the null
+    // in null out rule, next to `coalesce` and `nullif`, and it is the only one of the three that is
+    // an ordinary function rather than sugar for something else.
+    Entry {
+        name: "concat",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(1),
+        shape: Shape::FixedTo(Fixed::Varchar, Fixed::Varchar),
+        numeric_only: false,
+    },
     text("position", Arity::exactly(2), Fixed::BigInt),
     text("strpos", Arity::exactly(2), Fixed::BigInt),
     text("instr", Arity::exactly(2), Fixed::BigInt),
@@ -434,7 +479,7 @@ const fn text(name: &'static str, arity: Arity, returns: Fixed) -> Entry {
         name,
         kind: FunctionKind::Scalar,
         arity,
-        shape: Shape::Text(returns),
+        shape: Shape::Exact(Fixed::Varchar, returns),
         numeric_only: false,
     }
 }
@@ -527,16 +572,17 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             (vec![common; arguments.len()], fixed.ty())
         }
         Shape::FixedTo(argument, result) => (vec![argument.ty(); arguments.len()], result.ty()),
-        Shape::Text(result) => {
+        Shape::Exact(argument, result) => {
+            let wanted = argument.ty();
             for ty in arguments {
                 // An untyped null is accepted the way it is everywhere else here. DuckDB answers
                 // `length(NULL)` with NULL rather than refusing it, because a null has no type to
                 // pick an overload with and every overload would return null anyway.
-                if *ty != LogicalType::Varchar && *ty != LogicalType::Null {
+                if *ty != wanted && *ty != LogicalType::Null {
                     return Err(no_match(entry.name, arguments));
                 }
             }
-            (vec![LogicalType::Varchar; arguments.len()], result.ty())
+            (vec![wanted; arguments.len()], result.ty())
         }
         Shape::AnyTo(result) => (arguments.to_vec(), result.ty()),
         Shape::LeadingFixedTo(count, first, result) => {
@@ -667,6 +713,14 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("strlen", &["strlen(col0 VARCHAR) -> BIGINT"]),
+    ("chr", &["chr(col0 INTEGER) -> VARCHAR"]),
+    ("left", &["\"left\"(col0 VARCHAR, col1 BIGINT) -> VARCHAR"]),
+    ("right", &["\"right\"(col0 VARCHAR, col1 BIGINT) -> VARCHAR"]),
+    ("replace", &["\"replace\"(col0 VARCHAR, col1 VARCHAR, col2 VARCHAR) -> VARCHAR"]),
+    // The one overload upstream prints with a repeated parameter in it, which is how it writes a
+    // variadic. Reachable with no arguments at all, since the grammar has nothing to say about the
+    // count of an ordinary call.
+    ("concat", &["concat(col0 ANY, [ANY...]) -> ANY"]),
     (
         "substring",
         &[
@@ -1332,8 +1386,13 @@ mod tests {
     fn every_entry_resolves_at_every_count_it_accepts() {
         for entry in TABLE {
             for count in entry.arity.counts() {
-                let ty =
-                    if entry.numeric_only { LogicalType::Integer } else { LogicalType::Varchar };
+                // A shape that names the type it wants is asked for it, since `chr` wants an
+                // INTEGER and refuses a string the way upstream does.
+                let ty = match (entry.numeric_only, entry.shape) {
+                    (_, Shape::Exact(argument, _)) => argument.ty(),
+                    (true, _) => LogicalType::Integer,
+                    (false, _) => LogicalType::Varchar,
+                };
                 let mut arguments = vec![ty; count];
                 // A subscript and a substring are the shapes whose arguments are not all alike. The
                 // leading ones are the string or the list and everything after them is a whole
