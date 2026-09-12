@@ -513,6 +513,19 @@ fn the_regular_expression_functions_answer_the_way_duckdb_does() {
     );
 }
 
+/// `trim` was the wrong answer this engine was quietest about, so it is asserted where it was seen
+/// rather than only in the transformer. Per #313.
+#[test]
+fn a_function_that_is_not_implemented_does_not_answer_its_own_argument() {
+    let db = database();
+    // `TRIM` is a grammar rule rather than a call, and a rule that wrote a keyword was stepped
+    // through as if it were a precedence level, which left the argument behind as the answer.
+    let message = failure(&db, "SELECT trim('  a  ')");
+    assert!(message.contains("not supported yet"), "{message}");
+    assert!(message.ends_with("TrimExpression"), "{message}");
+    assert!(failure(&db, "SELECT length(trim('  a  '))").contains("not supported yet"));
+}
+
 /// The three spellings of a null check, end to end. Per #306.
 ///
 /// Every answer and every column name below was read off the pinned binary. `nullif` is a macro
