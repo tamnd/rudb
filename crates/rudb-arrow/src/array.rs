@@ -42,6 +42,10 @@ impl Array {
     /// For a type with no Arrow counterpart, and for a vector whose values are not the layout its
     /// type says they are.
     pub fn of(vector: &Vector) -> Result<Self> {
+        // flatten: Arrow is somebody else's format and this function's whole job is to hand data
+        // over in it. The doc above says why the export is always flat rather than sometimes a
+        // dictionary, and that decision is what makes this copy the point of the function instead
+        // of a cost it failed to avoid.
         let flat = vector.flatten()?;
         let data_type = DataType::of(flat.logical_type())?;
         let len = flat.len();

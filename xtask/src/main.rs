@@ -17,6 +17,7 @@ mod compare;
 mod compress;
 mod conform;
 mod differential;
+mod flatten;
 mod focus;
 mod grammar;
 mod io;
@@ -26,6 +27,7 @@ mod rowloop;
 mod ruletable;
 mod sha256;
 mod smoke;
+mod source;
 mod style;
 mod timing;
 mod vendor;
@@ -37,6 +39,7 @@ fn main() -> ExitCode {
         Some("layers") => layers::check(&root()),
         Some("style") => style::check(&root()),
         Some("rowloop") => rowloop::check(&root()),
+        Some("flatten") => flatten::check(&root()),
         Some("msrv") => msrv(),
         Some("grammar") => vendor::verify(),
         Some("gen-grammar") => {
@@ -100,6 +103,7 @@ fn usage() {
     println!(
         "  rowloop  no loop over the rows of a vector builds a Value, unless it says it means to"
     );
+    println!("  flatten  every place a compact column is copied out flat says why it has to be");
     println!("  msrv     the workspace still builds on the oldest Rust the manifest claims");
     println!("  grammar  the vendored DuckDB grammar is byte for byte what VENDOR recorded");
     println!(
@@ -166,6 +170,7 @@ fn ci(full: bool) -> Result<(), String> {
     let whole = Instant::now();
     step("layers", || layers::check(&root))?;
     step("row loops", || rowloop::check(&root))?;
+    step("flattens", || flatten::check(&root))?;
     step("version", || version::locked(&root))?;
     if focus.prose {
         step("prose", || style::check(&root))?;
