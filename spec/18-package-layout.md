@@ -14,6 +14,8 @@ The failure mode being avoided is a crate tree that looks modular and is not: fo
 
 `rudb-compress`, the block compression codecs, written rather than depended on because the zero dependency rule in 18.4 leaves no alternative. Snappy first, since Snappy is what almost every Parquet writer emits. Depends on `rudb-common`. Rank 1 and not higher because a codec turns bytes into bytes and knows nothing about a vector or a page, so everything between it and the format readers that use it is free to not know it exists.
 
+`rudb-metrics`, the document one execution reports about itself and the JSON it is written as: the timings, the resources it used, the strategy chosen at every seam, a row per pipeline, a row per operator, and a list of warnings generated from those numbers rather than written by hand. Rank 1 and not higher, because everything with a number to report is above it, starting with the instrumentation shim in `rudb-pipeline` at rank 4, and a crate that collects from the whole engine has to sit under all of it rather than beside the first part that reports into it. Depends on `rudb-common`.
+
 **Data representation.**
 
 `rudb-seam`, the seam machinery: the `Strategy` trait, the registries, the provenance a strategy cites, the session settings that pin one, and the policy that picks one when nobody has. It holds no implementation of anything. Rank 2, which is low enough that every crate with a swappable mechanism in it can reach the registry and high enough that the planning context can grow a vector form field without the rank moving. Depends on `rudb-common`.
