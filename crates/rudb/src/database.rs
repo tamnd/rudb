@@ -379,7 +379,7 @@ impl Shared {
         match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new())? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                run(sql, &plan, &catalog, cancel, &self.inner.memory, context.statistics())
+                run(sql, &plan, &catalog, cancel, &self.inner.memory, context.statistics(), &seams)
             }
             Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
@@ -489,7 +489,7 @@ impl Shared {
         match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                run(sql, &plan, &catalog, cancel, &self.inner.memory, context.statistics())
+                run(sql, &plan, &catalog, cancel, &self.inner.memory, context.statistics(), &seams)
             }
             Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
@@ -516,7 +516,15 @@ impl Shared {
                 Ok(QueryResult::empty())
             }
             Bound::CreateTable(create) => {
-                create_table(sql, create, &mut catalog, cancel, &self.inner.memory, &context)?;
+                create_table(
+                    sql,
+                    create,
+                    &mut catalog,
+                    cancel,
+                    &self.inner.memory,
+                    &context,
+                    &seams,
+                )?;
                 Ok(QueryResult::empty())
             }
             Bound::CreateView(create) => {
@@ -545,6 +553,7 @@ impl Shared {
                     cancel,
                     &self.inner.memory,
                     context.statistics(),
+                    &seams,
                 )?;
                 let table = catalog.table_mut(&insert.name)?;
                 for chunk in result.into_chunks() {
@@ -595,10 +604,11 @@ fn run(
     cancel: &Cancel,
     memory: &Memory,
     statistics: &rudb_opt::estimate::Statistics,
+    seams: &rudb_seam::Settings,
 ) -> Result<QueryResult> {
     let report = Report::new();
     let building = Span::start();
-    let mut root = rudb_exec::build_measured(plan, catalog, cancel, memory, &report)?;
+    let mut root = rudb_exec::build_measured(plan, catalog, cancel, memory, seams, &report)?;
     let (built_wall, built_cpu) = building.stop();
     let names = root.schema().names();
     let types = root.schema().types();
@@ -665,7 +675,7 @@ fn explaining(
             &rudb_opt::explain::explain_with(plan, statistics, seams),
         );
     }
-    let result = run(sql, plan, catalog, cancel, memory, statistics)?;
+    let result = run(sql, plan, catalog, cancel, memory, statistics, seams.settings())?;
     let measured = result.metrics().expect("a query that ran reports what it did");
     let text = rudb_opt::explain::analyzed(plan, statistics, seams, measured);
     explained("analyzed_plan", &text)
@@ -714,6 +724,7 @@ fn create_table(
     cancel: &Cancel,
     memory: &Memory,
     context: &rudb_opt::pass::Context,
+    seams: &rudb_seam::Settings,
 ) -> Result<()> {
     if create.if_not_exists && catalog.table(&create.name).is_ok() {
         return Ok(());
@@ -723,7 +734,7 @@ fn create_table(
     let rows = match &mut create.source {
         Some(plan) => {
             rudb_opt::optimize_with(plan, context)?;
-            Some(run(sql, plan, catalog, cancel, memory, context.statistics())?)
+            Some(run(sql, plan, catalog, cancel, memory, context.statistics(), seams)?)
         }
         None => None,
     };

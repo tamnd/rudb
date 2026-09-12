@@ -2488,7 +2488,7 @@ fn the_settings_a_database_was_opened_with_are_what_reset_goes_back_to() {
 #[test]
 fn rudb_strategies_lists_every_seam_with_the_milestone_that_owes_it() {
     let db = database();
-    let listed = rows(&db, "SELECT seam, milestone FROM rudb_strategies() ORDER BY seam");
+    let listed = rows(&db, "SELECT DISTINCT seam, milestone FROM rudb_strategies() ORDER BY seam");
     assert_eq!(listed.len(), 27, "the seam list is closed and this is its length");
     for row in &listed {
         let Value::Varchar(milestone) = &row[1] else { panic!("a milestone per seam") };
@@ -2504,7 +2504,35 @@ fn a_seam_nobody_has_implemented_reads_back_as_planned_rather_than_missing() {
         "SELECT count(*) FROM rudb_strategies() WHERE implementation IS NULL AND seam_description \
          IS NOT NULL",
     );
-    assert_eq!(listed, vec![vec![Value::BigInt(27)]], "nothing is registered yet, and it says so");
+    assert_eq!(
+        listed,
+        vec![vec![Value::BigInt(26)]],
+        "one seam has implementations and the rest say what milestone owes them"
+    );
+}
+
+/// The first seam with implementations in the tree, as the table function shows it.
+///
+/// Three rows rather than one, the reference marked, and the description of what each one does,
+/// which is what somebody deciding whether to sweep this seam reads before they do.
+#[test]
+fn the_compaction_seam_lists_its_three_implementations() {
+    let db = database();
+    let listed = rows(
+        &db,
+        "SELECT implementation, is_reference FROM rudb_strategies() WHERE seam = \
+         'chunk.compaction'",
+    );
+    let names: Vec<&Value> = listed.iter().map(|row| &row[0]).collect();
+    assert_eq!(
+        names,
+        vec![
+            &Value::Varchar("never".to_owned()),
+            &Value::Varchar("fixed-threshold".to_owned()),
+            &Value::Varchar("learned-gain".to_owned()),
+        ]
+    );
+    assert_eq!(listed[0][1], Value::Boolean(true), "the one that copies nothing is the reference");
 }
 
 #[test]

@@ -13,11 +13,13 @@
 //! from above until the whole engine pushes.
 
 use rudb_common::{Field, Result};
-use rudb_pipeline::{Progress, Stream};
-use rudb_plan::{ExprRef, Plan, Slice};
+use rudb_pipeline::{Compaction, Gauge, Progress, Stream, narrow};
+use rudb_plan::{ExprRef, Node, NodeRef, Plan, Slice};
+use rudb_seam::{Context, SeamId, Settings};
 use rudb_vector::{Chunk, Selection};
 
 use crate::prepared::{Prepared, Scratch};
+use crate::register::compaction;
 use crate::schema::Schema;
 
 /// Keeps the rows where a predicate is true.
@@ -30,40 +32,115 @@ use crate::schema::Schema;
 /// the moment nothing is left. The difference on a four conjunct predicate is the difference between
 /// reading every row four times and reading it once.
 ///
-/// The kept rows become a selection over the chunk rather than a copy of it, which is section 7.1's
-/// rule: a filter that keeps one row in a thousand costs the selection and not the payload. The
-/// copying alternative is [`Chunk::compact`], and its documentation has the measurement that says
-/// why a streaming filter is not the caller for it. A chunk that keeps nothing is left empty rather
-/// than passed on with rows in it, and whoever is driving skips it, because an empty chunk
-/// travelling up a deep pipeline is work every operator above does for no rows.
+/// What happens to the kept rows is the `chunk.compaction` seam. They become a selection over the
+/// chunk, which is section 7.1's rule and costs the selection and not the payload, or they are
+/// copied out into a chunk of their own, which costs the copy and saves every later read a
+/// redirection. The implementation that never copies is the reference and the default, so the
+/// engine does what it did before this seam existed until a sweep says otherwise. A chunk that
+/// keeps nothing is left empty rather than passed on with rows in it, and whoever is driving skips
+/// it, because an empty chunk travelling up a deep pipeline is work every operator above does for
+/// no rows.
 #[derive(Debug)]
 pub(crate) struct Filter {
     predicate: Prepared,
+    compaction: &'static dyn Compaction,
+    passes: u32,
+}
+
+/// Everything one instance of a filter mutates, which is the predicate's scratch and the seam's.
+#[derive(Debug)]
+pub(crate) struct Filtering {
+    scratch: Scratch,
+    gauge: Gauge,
 }
 
 impl Filter {
     /// # Errors
     ///
     /// If the predicate does not resolve against the input's schema, which is a failure of the plan
-    /// and is found when the operator is built rather than on the first chunk.
-    pub(crate) fn new(plan: &Plan, predicate: ExprRef, input: &Schema) -> Result<Self> {
-        Ok(Self { predicate: Prepared::one(plan, predicate, input)? })
+    /// and is found when the operator is built rather than on the first chunk. Also if the session
+    /// has pinned the compaction seam to something that cannot run over these columns, which is an
+    /// error rather than a quiet fall back, because a run that did not do what the setting asked
+    /// for is a run whose number says something other than what it means.
+    pub(crate) fn new(
+        plan: &Plan,
+        node: NodeRef,
+        predicate: ExprRef,
+        input: &Schema,
+        seams: &Settings,
+    ) -> Result<Self> {
+        let types = input.types();
+        let context = Context::new(SeamId::ChunkCompaction, seams).with_types(&types);
+        let compaction = compaction().choose(&context)?.strategy();
+        Ok(Self {
+            predicate: Prepared::one(plan, predicate, input)?,
+            compaction,
+            passes: later_passes(plan, node),
+        })
     }
 }
 
 impl Stream for Filter {
-    type Local = Scratch;
+    type Local = Filtering;
 
-    fn local(&self) -> Scratch {
-        self.predicate.scratch()
+    fn local(&self) -> Filtering {
+        Filtering { scratch: self.predicate.scratch(), gauge: Gauge::new(self.passes) }
     }
 
-    fn push(&self, chunk: &mut Chunk, scratch: &mut Scratch) -> Result<Progress> {
-        let kept = self.predicate.evaluate_filter(chunk, scratch)?;
+    fn push(&self, chunk: &mut Chunk, local: &mut Filtering) -> Result<Progress> {
+        let kept = self.predicate.evaluate_filter(chunk, &mut local.scratch)?;
         if kept.len() != chunk.len() {
-            keep(chunk, &kept)?;
+            narrow(self.compaction, chunk, &kept, &mut local.gauge)?;
         }
         Ok(Progress::More)
+    }
+}
+
+/// How many more times the rows a filter keeps will be read, counted from the plan above it.
+///
+/// This is the number the gain function is written in terms of, and the measurement in
+/// [`Chunk::compact`] is why: compacting loses at every selectivity when there is one later pass
+/// over the kept rows and wins at every selectivity when there are sixteen. A filter that cannot
+/// find itself in the plan is treated as having one pass above it, which is the answer that makes
+/// the gain function say no.
+fn later_passes(plan: &Plan, filter: NodeRef) -> u32 {
+    passes_between(plan, plan.root(), filter).unwrap_or(1)
+}
+
+/// The reads on the path from `node` down to `filter`, or `None` when the filter is not under it.
+fn passes_between(plan: &Plan, node: NodeRef, filter: NodeRef) -> Option<u32> {
+    if node == filter {
+        return Some(0);
+    }
+    let here = reads(plan.node(node));
+    for child in plan.node(node).children().into_iter().flatten() {
+        if let Some(below) = passes_between(plan, child, filter) {
+            return Some(below + here);
+        }
+    }
+    None
+}
+
+/// How many times an operator reads the rows that reach it.
+///
+/// Coarse on purpose. What the gain function needs is the difference between an operator that hands
+/// its chunk on and one that holds it, since the second kind reads the rows again after storing
+/// them and is where the paper's ten percent comes from. The numbers themselves are first estimates
+/// and the sweep over this seam is what turns them into measurements, which is the same status the
+/// nanosecond constants in the gain function have.
+fn reads(node: &Node) -> u32 {
+    match node {
+        // A limit hands rows on without looking at them, and a source is never above a filter.
+        Node::Limit { .. }
+        | Node::Get { .. }
+        | Node::Dummy
+        | Node::Values { .. }
+        | Node::TableFunction { .. } => 0,
+        Node::Filter { .. } | Node::Project { .. } => 1,
+        Node::Aggregate { .. } | Node::Distinct { .. } | Node::SetOp { .. } => 2,
+        Node::TopN { .. } | Node::CrossProduct { .. } => 2,
+        Node::Join { .. } => 3,
+        Node::Sort { .. } => 3,
     }
 }
 

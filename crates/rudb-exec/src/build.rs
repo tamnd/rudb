@@ -33,6 +33,7 @@ use rudb_functions::TableFunction;
 use rudb_metrics::{Counters, Report};
 use rudb_pipeline::{Source, Watched};
 use rudb_plan::{Node, NodeRef, Plan, Shape};
+use rudb_seam::Settings;
 
 use crate::adapt::{Broken, Fed, Paired, Pulled, Streamed};
 use crate::cancel::Guarded;
@@ -50,12 +51,15 @@ use crate::topn::TopN;
 
 /// Builds the operator tree for a plan's root, for a query nothing will stop.
 ///
+/// Every seam is left at its default, which is what a caller with no session behind it wants and is
+/// what the tests in this crate are written against.
+///
 /// # Errors
 ///
 /// If the plan names a table or a column the catalog does not have, if an expression is malformed
 /// in a way [`Plan::validate`] would have caught, or anything an operator's construction reports.
 pub fn build<'a>(plan: &'a Plan, catalog: &'a Catalog) -> Result<Box<dyn Operator + 'a>> {
-    build_with(plan, catalog, &Cancel::new(), &Memory::unlimited())
+    build_with(plan, catalog, &Cancel::new(), &Memory::unlimited(), &Settings::new())
 }
 
 /// Builds the operator tree for a plan's root, stoppable through this token and held to this
@@ -74,6 +78,11 @@ pub fn build<'a>(plan: &'a Plan, catalog: &'a Catalog) -> Result<Box<dyn Operato
 /// two builders that drift apart, and a pair of clock readings per chunk is not a cost worth
 /// avoiding by having a second one.
 ///
+/// The seam settings are the session's with the statement's hints on top, and they are read here
+/// rather than looked up later, because a choice made while the tree is built is a choice `EXPLAIN`
+/// can print before the query runs. An operator that sits on a seam chooses once, in its
+/// constructor, and holds what it chose.
+///
 /// # Errors
 ///
 /// The same as [`build`].
@@ -82,8 +91,9 @@ pub fn build_with<'a>(
     catalog: &'a Catalog,
     cancel: &Cancel,
     memory: &Memory,
+    seams: &Settings,
 ) -> Result<Box<dyn Operator + 'a>> {
-    build_measured(plan, catalog, cancel, memory, &Report::new())
+    build_measured(plan, catalog, cancel, memory, seams, &Report::new())
 }
 
 /// Builds the operator tree, reporting what every operator in it did into `report`.
@@ -100,6 +110,7 @@ pub fn build_measured<'a>(
     catalog: &'a Catalog,
     cancel: &Cancel,
     memory: &Memory,
+    seams: &Settings,
     report: &Report,
 ) -> Result<Box<dyn Operator + 'a>> {
     let shape = Shape::of(plan);
@@ -109,7 +120,7 @@ pub fn build_measured<'a>(
             report.depends(pipeline, *waits_for);
         }
     }
-    let building = Building { plan, catalog, cancel, memory, report, shape };
+    let building = Building { plan, catalog, cancel, memory, seams, report, shape };
     building.node(plan.root())
 }
 
@@ -119,6 +130,7 @@ struct Building<'a, 'b> {
     catalog: &'a Catalog,
     cancel: &'b Cancel,
     memory: &'b Memory,
+    seams: &'b Settings,
     report: &'b Report,
     shape: Shape,
 }
@@ -202,7 +214,7 @@ impl<'a> Building<'a, '_> {
             Node::Filter { input, predicate } => {
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
-                let filter = Filter::new(plan, predicate, &schema)?;
+                let filter = Filter::new(plan, reference, predicate, &schema, self.seams)?;
                 let counters = self.watch(id, pipeline, "Filter", None);
                 Box::new(Streamed::new(input, Watched::new(filter, counters), schema))
             }

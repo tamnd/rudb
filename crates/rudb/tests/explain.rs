@@ -94,15 +94,33 @@ fn explain_prints_the_pipelines_a_plan_breaks_into_and_the_edges_between_them() 
 
 #[test]
 fn explain_marks_every_line_that_is_running_a_reference_implementation() {
-    // Which at F0 is all of them, and that is the point of printing it. A number measured against
-    // the simplest correct version of an operator is not a number to quote as the engine's.
+    // Which is still every line, because the one seam with implementations defaults to its
+    // reference, and that is the point of printing it. A number measured against the simplest
+    // correct version of an operator is not a number to quote as the engine's.
     let database = with_rows(100);
     let text = explained(&database, "EXPLAIN SELECT a FROM t WHERE a > 5");
     for line in tree(&text) {
         assert!(line.ends_with("[reference]"), "a line with no marker on it: {line}");
     }
     assert!(text.contains("\nSeams\n"), "{text}");
-    assert!(text.contains("27 seams have nothing registered"), "{text}");
+    assert!(text.contains("  chunk.compaction = never (default)"), "{text}");
+    assert!(text.contains("26 seams have nothing registered"), "{text}");
+}
+
+/// What a session that has moved off the reference sees.
+///
+/// The pin is printed, and the filter loses its reference marker while the operators that do not
+/// sit on this seam keep theirs. That marker is the whole reason the seam section exists: a number
+/// from a pinned run and a number from a default run are different numbers.
+#[test]
+fn explain_says_when_a_seam_has_been_pinned_off_its_reference() {
+    let database = with_rows(100);
+    database.execute("SET seam_chunk_compaction = 'learned-gain'").expect("a seam takes a pin");
+    let text = explained(&database, "EXPLAIN SELECT a FROM t WHERE a > 5");
+    assert!(text.contains("  chunk.compaction = learned-gain (pinned)"), "{text}");
+    let lines = tree(&text);
+    assert!(lines[0].ends_with("[reference]"), "the projection is not on this seam: {}", lines[0]);
+    assert!(!lines[1].ends_with("[reference]"), "the filter is: {}", lines[1]);
 }
 
 #[test]

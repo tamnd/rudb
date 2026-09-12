@@ -68,6 +68,17 @@ impl<'a> Seams<'a> {
         Self { settings, registries }
     }
 
+    /// The settings the statement runs under.
+    ///
+    /// The builder needs them, because an operator that sits on a seam chooses in its constructor,
+    /// and `EXPLAIN ANALYZE` runs the query through the same path an ordinary statement takes. This
+    /// hands back the same settings this was made from, so the plan that is printed and the tree
+    /// that ran chose from the same pins.
+    #[must_use]
+    pub fn settings(&self) -> &'a Settings {
+        self.settings
+    }
+
     /// The name of what runs at this seam, and whether that thing is the reference.
     ///
     /// `None` when the seam has no registry, which at F0 is all twenty seven of them. That is not
@@ -378,7 +389,12 @@ fn seams_of(node: &Node) -> &'static [SeamId] {
     const HASHED: &[SeamId] = &[SeamId::HashKey, SeamId::HashFunction, SeamId::HashTable];
     match node {
         Node::Get { .. } => &[SeamId::VectorForm, SeamId::ScanMaterialisation],
-        Node::Filter { .. } => &[SeamId::ExprEval, SeamId::KernelCompare, SeamId::KernelFilter],
+        Node::Filter { .. } => &[
+            SeamId::ExprEval,
+            SeamId::KernelCompare,
+            SeamId::KernelFilter,
+            SeamId::ChunkCompaction,
+        ],
         Node::Project { .. } => &[SeamId::ExprEval],
         Node::Aggregate { .. } => &[
             SeamId::HashKey,

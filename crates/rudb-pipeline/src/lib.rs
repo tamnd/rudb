@@ -34,6 +34,14 @@
 //! where it can be used and tested with a source made of two literal chunks and no planner
 //! anywhere in the picture.
 //!
+//! # The one seam it does own
+//!
+//! [`Compaction`] is the `chunk.compaction` seam, and it is here because what happens to a chunk
+//! between two operators is exactly what this crate is about. An operator that has narrowed a chunk
+//! calls [`narrow`] and the seam decides whether the kept rows are copied out or left as a
+//! selection over what they came from. The decision is per chunk, never per row, and the three
+//! implementations in the tree disagree about it on purpose.
+//!
 //! # Measuring without asking the operators to
 //!
 //! [`Watched`] is a wrapper that goes around any of the three, reading a clock and counting rows on
@@ -47,6 +55,7 @@
 
 #![forbid(unsafe_code)]
 
+mod compact;
 mod dynamic;
 mod morsel;
 mod pipeline;
@@ -59,6 +68,7 @@ mod watch;
 #[cfg(test)]
 mod tests;
 
+pub use compact::{Compaction, Copied, Gauge, compaction, narrow};
 pub use dynamic::{DynSink, DynStream, LocalState};
 pub use morsel::Morsel;
 pub use pipeline::{Locals, Pipeline};
