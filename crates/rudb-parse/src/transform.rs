@@ -1282,9 +1282,18 @@ impl<'a> Transform<'a> {
     /// One expression, from wherever in the precedence chain it starts.
     ///
     /// The loop is the whole design. A rule that says something gets an arm, a rule with exactly
-    /// one child said nothing and is stepped through, and anything else is an error naming itself.
+    /// one child that said nothing is stepped through, and anything else is an error naming itself.
     /// The chain rules never get an arm for their one child case, which is why adding a precedence
     /// level upstream costs nothing here.
+    ///
+    /// Said nothing means covered no text of its own. A keyword is not a child of the node that
+    /// spells it, so `TRIM(x)` is a rule with one child and that child is `x`, and stepping through
+    /// on the child count alone threw the `TRIM` away and answered the untrimmed string. Comparing
+    /// the two spans is what tells the two cases apart: a precedence rule with one child covers
+    /// exactly what its child covers, and a rule that wrote a keyword or a bracket covers more.
+    /// That is the rule rather than a list of the names it happened to be wrong about, because the
+    /// grammar has eleven hundred rules and the ones with a keyword and one child are not enumerable
+    /// by reading the ones that are wrong today.
     fn expr(&mut self, node: u32) -> Result<ExprRef> {
         let mut node = node;
         loop {
@@ -1342,13 +1351,21 @@ impl<'a> Transform<'a> {
                 "CastExpression" => return self.cast(node),
                 "CaseExpression" => return self.case(node),
                 "ParenthesisExpression" => return self.row(node),
+                // `ParensExpression <- Parens(Expression)` covers more text than its child and
+                // still says nothing about the value, because the brackets are grouping. It is the
+                // one rule of that shape, which is why it is an arm rather than a second rule in
+                // the step below. `ParenthesisExpression` is not this: it holds a list, and a list
+                // of more than one is a row.
+                "ParensExpression" if count == 1 => node = self.first(node),
                 "BoundedListExpression" => return self.list(node),
                 "QuestionMarkNumberedParameter"
                 | "AnonymousParameter"
                 | "NumberedParameter"
                 | "ColLabelParameter" => return self.parameter(node),
                 "SubqueryExpression" => return self.subquery(node),
-                _ if count == 1 => node = self.first(node),
+                _ if count == 1 && self.text(self.first(node)) == self.text(node) => {
+                    node = self.first(node);
+                }
                 _ => return self.unsupported(node),
             }
         }
@@ -2981,6 +2998,26 @@ mod tests {
     fn an_empty_subscript_is_not_a_subscript() {
         let error = parse_ast("SELECT a[]").expect_err("an empty subscript");
         assert_eq!(error.message(), "Empty subscript '[]' is not allowed");
+    }
+
+    /// A rule that wrote a keyword is not a rule that said nothing, however few children it has.
+    /// Per #313.
+    #[test]
+    fn a_keyword_is_not_stepped_through_on_the_way_to_its_one_argument() {
+        for (sql, rule) in [
+            ("SELECT trim('  a  ')", "TrimExpression"),
+            ("SELECT row(1)", "RowExpression"),
+            ("SELECT try(1)", "TryExpression"),
+            ("SELECT unpack([1])", "UnpackExpression"),
+            ("SELECT columns('a')", "ColumnsExpression"),
+        ] {
+            let error = parse_ast(sql).expect_err(sql);
+            assert!(error.message().ends_with(rule), "{sql}: {error}");
+        }
+        // Grouping brackets really do say nothing, and that is the one rule of this shape that is
+        // stepped through rather than refused.
+        assert_eq!(round("SELECT (1 + 2) * 3"), "SELECT ((1 Add 2) Multiply 3)");
+        assert_eq!(round("SELECT -(7)"), "SELECT (Negate 7)");
     }
 
     /// The three spellings of a null check, two of which are their own grammar rule. Per #306.
