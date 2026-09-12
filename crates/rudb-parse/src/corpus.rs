@@ -9,7 +9,7 @@
 //! It lives in its own module rather than in one test module because more than one part of the
 //! crate is checked against it, and a second copy of a corpus is a corpus that drifts.
 
-pub(crate) const CORPUS: [&str; 64] = [
+pub(crate) const CORPUS: [&str; 65] = [
     "SELECT 1",
     "SELECT 1 + 2 * 3 - 4 / 5 % 6",
     "SELECT a, b, c FROM t WHERE a = 1 AND b > 2 OR NOT c",
@@ -25,6 +25,7 @@ pub(crate) const CORPUS: [&str; 64] = [
     "SELECT CASE WHEN a THEN 1 WHEN b THEN 2 ELSE 3 END FROM t",
     "SELECT CAST(a AS INTEGER), a::VARCHAR, try_cast(a AS DOUBLE) FROM t",
     "SELECT DATE '1992-01-01', TIMESTAMP '1992-01-01 12:00:00' FROM t",
+    "SELECT E'a\\tb', N'abc', B'101' FROM t",
     "SELECT [1, 2, 3], {'a': 1}, struct_pack(a := 1)",
     "SELECT a[1], a[1:2], a.b.c FROM t",
     "SELECT * FROM read_parquet('x.parquet')",

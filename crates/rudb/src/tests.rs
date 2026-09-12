@@ -901,6 +901,28 @@ fn a_type_in_front_of_a_string_is_a_cast_of_that_string() {
     assert!(failure(&db, "SELECT DATE 'nope'").contains("nope"));
 }
 
+/// A prefix in front of a string picks a different decoding, per #329.
+///
+/// The prefix is not part of the value and never was, so the thing to check end to end is that the
+/// value is the decoded one and the column name is the name the pinned binary gives it. The escapes
+/// themselves are checked one at a time where they are decoded, in the parser.
+#[test]
+fn a_prefix_in_front_of_a_string_decides_how_the_string_is_read() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT E'a\\tb'"), vec![vec![text("a\tb")]]);
+    assert_eq!(rows(&db, "SELECT e'a\\u00e9b'"), vec![vec![text("aéb")]]);
+    assert_eq!(rows(&db, "SELECT N'abc'"), vec![vec![text("abc")]]);
+    assert_eq!(rows(&db, "SELECT B'101'"), vec![vec![text("b101")]], "not a bit string upstream");
+    assert_eq!(rows(&db, "SELECT length(E'a\\nb')"), vec![vec![Value::BigInt(3)]]);
+    // An escape string is named after the value and not the spelling, so it ends up with the name a
+    // plain string of the same value has. An N string is named as the cast it is.
+    let result = db.query("SELECT E'ab', N'ab'").unwrap();
+    assert_eq!(result.names(), &["'ab'", "CAST('ab' AS VARCHAR)"]);
+    // A blob literal is a blob and a blob is not a string, so it raises rather than answering with
+    // something of the wrong type.
+    assert!(failure(&db, "SELECT x'ff'").contains("not supported yet"));
+}
+
 #[test]
 fn a_missing_table_names_the_table() {
     let db = database();
