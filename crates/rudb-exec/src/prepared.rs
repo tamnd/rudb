@@ -35,8 +35,8 @@
 
 use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
 use rudb_kernels::{
-    Comparison, Connective, Recipe, cast, combine, compare, is_true, refine, refine_flags,
-    selection,
+    Comparison, Connective, Members, Recipe, cast, combine, compare, in_set, is_true, refine,
+    refine_flags, selection,
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Chunk, Selection, Vector};
@@ -145,6 +145,20 @@ enum Step {
         /// How many arguments it has.
         len: usize,
     },
+    /// A membership test over a list the query wrote out.
+    ///
+    /// The binder has no `IN` node: `x IN (1, 2, 3)` arrives as an `OR` of three equalities and
+    /// `x NOT IN (1, 2, 3)` as an `AND` of three inequalities. That is the right shape for a binder
+    /// to produce, because nothing after it then needs a second set of rules for null, and it is the
+    /// wrong shape to run, because it is a pass over the column and an output vector per entry.
+    /// This is that shape folded back up, and folding it here rather than after the operands are
+    /// pushed is what keeps the equalities from being run anyway.
+    InSet {
+        /// The step being tested.
+        input: usize,
+        /// The list, as a set, with the null rule and the direction it is read in.
+        members: Members,
+    },
     /// A searched `CASE`, whose branches are prepared expressions of their own.
     ///
     /// Nested rather than flattened into the same array because a branch is not evaluated over the
@@ -246,7 +260,7 @@ impl Prepared {
         match &self.steps[index] {
             // A case's branches are arrays of their own and read nothing out of this one.
             Step::Column(_) | Step::Constant(_) | Step::Case { .. } => {}
-            Step::Cast { input, .. } => visit(*input),
+            Step::Cast { input, .. } | Step::InSet { input, .. } => visit(*input),
             Step::Compare { left, right, .. } => {
                 visit(*left);
                 visit(*right);
@@ -281,6 +295,15 @@ impl Prepared {
     #[must_use]
     pub fn len(&self) -> usize {
         self.roots.len()
+    }
+
+    /// How many of the steps are an `IN` list folded back up.
+    ///
+    /// For the tests, which cannot see the fold in an answer because an answer that changed would
+    /// be a bug.
+    #[cfg(test)]
+    fn sets(&self) -> usize {
+        self.steps.iter().filter(|step| matches!(step, Step::InSet { .. })).count()
     }
 
     /// How many of the function steps worked something out when this was built.
@@ -524,6 +547,9 @@ impl Prepared {
             Step::Conjunction { .. } => 0.0,
             Step::Cast { input, .. } => 2.0 * touching(&self.types[*input]),
             Step::Compare { left, .. } => touching(&self.types[*left]),
+            // One hash and one probe a row, whatever the list holds, which is the point of it. It
+            // is dearer than a comparison and much cheaper than the chain of them it replaced.
+            Step::InSet { input, .. } => 2.0 * touching(&self.types[*input]),
             Step::Function { start, len, .. } => {
                 let widest = self.operands[*start..*start + *len]
                     .iter()
@@ -627,6 +653,9 @@ impl Prepared {
                 Some(self.with_operands(*start, *len, chunk, slots, |args| {
                     rudb_kernels::call_prepared(recipe, args, ty, Some(&|| written.clone()))
                 })?)
+            }
+            Step::InSet { input, members } => {
+                Some(in_set(self.operand(*input, chunk, slots)?, members, ty)?)
             }
             Step::Case { arms, otherwise } => {
                 Some(self.case(chunk, arms, otherwise.as_ref(), ty)?)
@@ -781,8 +810,14 @@ impl Prepared {
                 right: self.push(plan, right, schema)?,
             },
             Expr::Conjunction { op, children } => {
-                let (start, len) = self.push_list(plan, plan.expr_list(children), schema)?;
-                Step::Conjunction { op: connective(op), start, len }
+                let list = plan.expr_list(children).to_vec();
+                match self.membership(plan, connective(op), &list, schema)? {
+                    Some(step) => step,
+                    None => {
+                        let (start, len) = self.push_list(plan, &list, schema)?;
+                        Step::Conjunction { op: connective(op), start, len }
+                    }
+                }
             }
             Expr::Function { name, args } => {
                 let (start, len) = self.push_list(plan, plan.expr_list(args), schema)?;
@@ -839,6 +874,52 @@ impl Prepared {
         Ok((start, len))
     }
 
+    /// This connective folded back into the `IN` the user wrote, or `None` when it is not one.
+    ///
+    /// What the binder writes for `x IN (1, 2, 3)` is `x = 1 OR x = 2 OR x = 3`, and for
+    /// `x NOT IN (1, 2, 3)` it is `x <> 1 AND x <> 2 AND x <> 3`. So the shape looked for is every
+    /// child a comparison of the one direction, every left the same expression, and every right a
+    /// literal. Anything else is left alone, which covers the `OR` that was written as an `OR` and
+    /// the one where an `IN` has been flattened together with another branch. The second is a fold
+    /// this could make and does not, and it is worth having later out of a query that wants it
+    /// rather than now out of a guess.
+    ///
+    /// This runs before the children are pushed, and that is the whole reason it is here rather than
+    /// as a pass over the finished array. A step that nothing reads is still a step the walk runs,
+    /// because the walk over a subtree is a range and not a graph, so folding after the fact would
+    /// leave every equality in place and running.
+    fn membership(
+        &mut self,
+        plan: &Plan,
+        op: Connective,
+        children: &[ExprRef],
+        schema: &Schema,
+    ) -> Result<Option<Step>> {
+        let wanted = match op {
+            Connective::Or => CompareOp::Equal,
+            Connective::And => CompareOp::NotEqual,
+        };
+        let mut subject: Option<ExprRef> = None;
+        let mut values = Vec::with_capacity(children.len());
+        for &child in children {
+            let Expr::Compare { op: found, left, right } = *plan.expr(child) else {
+                return Ok(None);
+            };
+            if found != wanted || !same(plan, *subject.get_or_insert(left), left) {
+                return Ok(None);
+            }
+            let Expr::Constant(reference) = *plan.expr(right) else {
+                return Ok(None);
+            };
+            values.push(plan.value(reference).clone());
+        }
+        let (Some(subject), Some(members)) = (subject, Members::of(&values, op == Connective::And))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Step::InSet { input: self.push(plan, subject, schema)?, members }))
+    }
+
     /// The literal behind each argument in a run of the operand list, and `None` for an argument
     /// that is anything else.
     ///
@@ -855,6 +936,44 @@ impl Prepared {
                 _ => None,
             })
             .collect()
+    }
+}
+
+/// Whether two expressions of one plan are the same expression, written once or written twice.
+///
+/// The binder binds the subject of an `IN` once and points every comparison it writes at that one
+/// reference, so the answer is almost always the first line. A plan that has been through a rewrite,
+/// and a plan read back from its own text, hold two copies of the same tree instead, and for the
+/// fold in [`Prepared::membership`] those are the same expression.
+///
+/// The four shapes handled are what an `IN` is written over: a column, a literal, a cast of either,
+/// and a call, which is TPC-H query 22 asking whether the first two digits of a phone number are in
+/// a list. Anything else answers no, which costs a fold that could have happened rather than a wrong
+/// one. The walk is bounded by the size of the subject and a subject is small.
+fn same(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
+    if left == right {
+        return true;
+    }
+    if plan.expr_type(left) != plan.expr_type(right) {
+        return false;
+    }
+    match (plan.expr(left), plan.expr(right)) {
+        (Expr::Column(one), Expr::Column(other)) => one == other,
+        (Expr::Constant(one), Expr::Constant(other)) => plan.value(*one) == plan.value(*other),
+        (
+            Expr::Cast { input: one, try_cast: first },
+            Expr::Cast { input: other, try_cast: second },
+        ) => first == second && same(plan, *one, *other),
+        (
+            Expr::Function { name: one, args: first },
+            Expr::Function { name: other, args: second },
+        ) => {
+            let (first, second) = (plan.expr_list(*first), plan.expr_list(*second));
+            plan.string(*one) == plan.string(*other)
+                && first.len() == second.len()
+                && first.iter().zip(second).all(|(&one, &other)| same(plan, one, other))
+        }
+        _ => false,
     }
 }
 
@@ -1451,6 +1570,113 @@ mod tests {
     #[test]
     fn a_function_with_no_prepare_step_prepares_nothing() {
         prepares("\"upper\"(#0.1::VARCHAR)::VARCHAR", 0);
+    }
+
+    /// How many of an expression's steps are a folded `IN`, and whether the answer still agrees.
+    fn folds(expr: &str, sets: usize) {
+        let (schema, _) = input();
+        let projected = format!("{expr} AS a");
+        let (plan, list) = projection(&projected);
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the expression resolves");
+        assert_eq!(prepared.sets(), sets, "`{expr}`");
+        agrees(&projected);
+    }
+
+    /// What the binder writes for `x IN (1, 3)`, folded back into one lookup.
+    ///
+    /// The test goes through the plan's text, where the three mentions of the column are three
+    /// expressions rather than one, which is the case `same` exists for. A plan the binder built has
+    /// one mention and takes the first line of it.
+    #[test]
+    fn an_in_list_becomes_one_lookup() {
+        folds(
+            "((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)\
+             ::BOOLEAN",
+            1,
+        );
+        folds(
+            "((#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN OR (#0.1::VARCHAR = 'z'::VARCHAR)::BOOLEAN)\
+             ::BOOLEAN",
+            1,
+        );
+    }
+
+    /// `NOT IN`, which the binder writes as an `AND` of inequalities and which reads the same
+    /// lookup the other way round.
+    #[test]
+    fn a_not_in_list_becomes_the_same_lookup() {
+        folds(
+            "((#0.0::INTEGER <> 1::INTEGER)::BOOLEAN AND (#0.0::INTEGER <> 3::INTEGER)::BOOLEAN)\
+             ::BOOLEAN",
+            1,
+        );
+    }
+
+    /// A list with a null in it, which is the rule that makes an `IN` not a set lookup.
+    ///
+    /// A row that is not in the list is null rather than false, because it might have equalled the
+    /// value the null stands for. `agrees` is what says the fold kept that, since the `OR` of
+    /// comparisons it is checked against gets it from three valued logic for free.
+    #[test]
+    fn a_list_with_a_null_in_it_folds_and_keeps_the_null_rule() {
+        folds(
+            "((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = NULL::INTEGER)::BOOLEAN \
+             OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)::BOOLEAN",
+            1,
+        );
+        folds(
+            "((#0.0::INTEGER <> 1::INTEGER)::BOOLEAN AND (#0.0::INTEGER <> NULL::INTEGER)\
+             ::BOOLEAN AND (#0.0::INTEGER <> 3::INTEGER)::BOOLEAN)::BOOLEAN",
+            1,
+        );
+    }
+
+    /// The connectives that are not an `IN`, each for its own reason.
+    #[test]
+    fn a_connective_that_is_not_an_in_list_is_left_alone() {
+        // Two different columns.
+        folds(
+            "((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN)\
+             ::BOOLEAN",
+            0,
+        );
+        // One equality and one of something else.
+        folds(
+            "((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER > 3::INTEGER)::BOOLEAN)\
+             ::BOOLEAN",
+            0,
+        );
+        // The right hand side is a column rather than a literal.
+        folds(
+            "((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = #0.0::INTEGER)::BOOLEAN)\
+             ::BOOLEAN",
+            0,
+        );
+        // An `AND` of equalities is not a `NOT IN`, it is a predicate that is false unless the two
+        // literals are the same. Folding it as one would answer true where it answers false.
+        folds(
+            "((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)\
+             ::BOOLEAN",
+            0,
+        );
+    }
+
+    /// The same thing in a filter, which is the shape it is written in.
+    #[test]
+    fn an_in_list_filters_the_same_rows() {
+        filters(
+            "((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)\
+             ::BOOLEAN",
+        );
+        filters(
+            "((#0.0::INTEGER <> 1::INTEGER)::BOOLEAN AND (#0.0::INTEGER <> 3::INTEGER)::BOOLEAN)\
+             ::BOOLEAN",
+        );
+        // Inside a larger predicate, where the fold is one operand of the connective above it.
+        filters(
+            "(((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)\
+             ::BOOLEAN AND (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN)::BOOLEAN",
+        );
     }
 
     /// A pattern that does not compile still fails where the query said it does.
