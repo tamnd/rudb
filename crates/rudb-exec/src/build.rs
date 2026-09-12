@@ -16,6 +16,7 @@ use rudb_common::{Cancel, Memory, Result};
 use rudb_functions::TableFunction;
 use rudb_plan::{Node, NodeRef, Plan};
 
+use crate::adapt::Streamed;
 use crate::cancel::Guarded;
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Join};
@@ -88,15 +89,17 @@ fn node<'a>(
             }
         }
         Node::Filter { input, predicate } => {
-            Box::new(Filter::new(plan, node(plan, catalog, cancel, memory, input)?, predicate)?)
+            let input = node(plan, catalog, cancel, memory, input)?;
+            let schema = input.schema().clone();
+            let filter = Filter::new(plan, predicate, &schema)?;
+            Box::new(Streamed::new(input, filter, schema))
         }
-        Node::Project { input, index, exprs, names } => Box::new(Project::new(
-            plan,
-            node(plan, catalog, cancel, memory, input)?,
-            index,
-            exprs,
-            names,
-        )?),
+        Node::Project { input, index, exprs, names } => {
+            let input = node(plan, catalog, cancel, memory, input)?;
+            let project = Project::new(plan, input.schema(), index, exprs, names)?;
+            let schema = project.schema().clone();
+            Box::new(Streamed::new(input, project, schema))
+        }
         Node::Aggregate { input, index, groups, aggregates } => Box::new(Aggregate::new(
             plan,
             node(plan, catalog, cancel, memory, input)?,
@@ -109,7 +112,9 @@ fn node<'a>(
             Box::new(Sort::new(plan, node(plan, catalog, cancel, memory, input)?, keys, memory))
         }
         Node::Limit { input, count, offset } => {
-            Box::new(Limit::new(node(plan, catalog, cancel, memory, input)?, count, offset))
+            let input = node(plan, catalog, cancel, memory, input)?;
+            let schema = input.schema().clone();
+            Box::new(Streamed::new(input, Limit::new(count, offset), schema))
         }
         Node::TopN { input, keys, count, offset } => Box::new(TopN::new(
             plan,
