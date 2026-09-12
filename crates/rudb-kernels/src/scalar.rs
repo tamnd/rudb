@@ -2150,11 +2150,17 @@ mod tests {
     /// A string, chosen so that the inline limit, the empty string, multi byte characters and the
     /// substring the `LIKE` patterns look for all turn up often.
     ///
-    /// Two of these hold a `%` or a `_`, which are the pattern characters, because a text is not a
+    /// Three of these hold a `%` or a `_`, which are the pattern characters, because a text is not a
     /// pattern and nothing in it is special. That the list held neither is why #279 got past this
     /// test for as long as it did. The compiled forms and the general walk disagreed about a `%` in
     /// the text and there was no text here to disagree over, so a property test that compares the
     /// two forms against each other on every string it can think of never thought of one.
+    ///
+    /// Holding a `%` somewhere is not enough on its own, which is why `goo%gle` is here as well.
+    /// The two forms only part company when the pattern's `%` lands on the text's `%`, and against
+    /// the patterns this test uses that needs the text to have one exactly where `goo%` has one. The
+    /// other two go through all eight patterns agreeing either way, so with those alone the wildcard
+    /// branch can be moved back below the literal one and this test still passes.
     fn text(rng: &mut Rng) -> String {
         let words = [
             "",
@@ -2169,6 +2175,7 @@ mod tests {
             "g",
             "google%2F12",
             "goo_gle%",
+            "goo%gle",
         ];
         words[rng.below(words.len() as u64) as usize].to_owned()
     }
