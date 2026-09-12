@@ -14,14 +14,16 @@
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{Cancel, Memory, Result};
 use rudb_functions::TableFunction;
+use rudb_pipeline::Source;
 use rudb_plan::{Node, NodeRef, Plan};
 
-use crate::adapt::{Broken, Fed, Paired, Streamed};
+use crate::adapt::{Broken, Fed, Paired, Pulled, Streamed};
 use crate::cancel::Guarded;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join};
 use crate::operator::Operator;
+use crate::schema::Schema;
 use crate::setop::SetOp;
 use crate::sort::Sort;
 use crate::source::{Dummy, FileScan, Scan, Series, Values};
@@ -74,19 +76,38 @@ fn node<'a>(
         Node::Get { catalog: database, schema, table, index, columns, .. } => {
             let name =
                 QualifiedName::new(plan.string(database), plan.string(schema), plan.string(table));
-            Box::new(Scan::new(plan, catalog.table(&name)?, index, columns)?)
+            let scan = Scan::new(plan, catalog.table(&name)?, index, columns)?;
+            let schema = scan.schema().clone();
+            pulled(scan, schema)
         }
-        Node::Dummy => Box::new(Dummy::new()),
-        Node::Values { index, columns, rows } => Box::new(Values::new(plan, index, columns, rows)?),
+        Node::Dummy => {
+            let dummy = Dummy::new();
+            let schema = dummy.schema().clone();
+            pulled(dummy, schema)
+        }
+        Node::Values { index, columns, rows } => {
+            let values = Values::new(plan, index, columns, rows)?;
+            let schema = values.schema().clone();
+            pulled(values, schema)
+        }
         Node::TableFunction { index, function, args, options, settings, columns } => {
             match TableFunction::lookup(plan.string(function)) {
-                Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => Box::new(
-                    FileScan::new(plan, index, function, args, options, settings, columns)?,
-                ),
-                Some(TableFunction::RudbStrategies) => {
-                    Box::new(Strategies::new(plan, index, columns)?)
+                Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
+                    let scan =
+                        FileScan::new(plan, index, function, args, options, settings, columns)?;
+                    let schema = scan.schema().clone();
+                    pulled(scan, schema)
                 }
-                _ => Box::new(Series::new(plan, index, plan.string(function), args)?),
+                Some(TableFunction::RudbStrategies) => {
+                    let table = Strategies::new(plan, index, columns)?;
+                    let schema = table.schema().clone();
+                    pulled(table, schema)
+                }
+                _ => {
+                    let series = Series::new(plan, index, plan.string(function), args)?;
+                    let schema = series.schema().clone();
+                    pulled(series, schema)
+                }
             }
         }
         Node::Filter { input, predicate } => {
@@ -167,4 +188,14 @@ fn node<'a>(
         }
     };
     Ok(Box::new(Guarded::new(inner, cancel.clone())))
+}
+
+/// A leaf source with the adapter that pulls chunks out of it.
+///
+/// Every leaf is a [`Source`] and everything above it still pulls, so this is
+/// where the two meet. The schema is passed in rather than asked for through a trait, because a
+/// source says what it produces on its own type and adding a trait method to say it again would be
+/// a second answer to the same question.
+fn pulled<'a, S: Source + 'a>(source: S, schema: Schema) -> Box<dyn Operator + 'a> {
+    Box::new(Pulled::new(source, schema))
 }
