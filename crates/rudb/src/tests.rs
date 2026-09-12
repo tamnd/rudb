@@ -513,17 +513,111 @@ fn the_regular_expression_functions_answer_the_way_duckdb_does() {
     );
 }
 
-/// `trim` was the wrong answer this engine was quietest about, so it is asserted where it was seen
-/// rather than only in the transformer. Per #313.
+/// `trim` was the wrong answer this engine was quietest about, so the rules of its shape are
+/// asserted where it was seen rather than only in the transformer. Per #313.
+///
+/// `trim` itself answers now and that is #314. The other rules of the shape still refuse, and the
+/// refusal is the point: a rule that wrote a keyword was stepped through as if it were a precedence
+/// level, which left the argument behind as the answer.
 #[test]
 fn a_function_that_is_not_implemented_does_not_answer_its_own_argument() {
     let db = database();
-    // `TRIM` is a grammar rule rather than a call, and a rule that wrote a keyword was stepped
-    // through as if it were a precedence level, which left the argument behind as the answer.
-    let message = failure(&db, "SELECT trim('  a  ')");
+    let message = failure(&db, "SELECT row(1)");
     assert!(message.contains("not supported yet"), "{message}");
-    assert!(message.ends_with("TrimExpression"), "{message}");
-    assert!(failure(&db, "SELECT length(trim('  a  '))").contains("not supported yet"));
+    assert!(message.ends_with("RowExpression"), "{message}");
+    assert!(failure(&db, "SELECT length(try('a'))").contains("not supported yet"));
+}
+
+/// The four string functions with a grammar rule of their own, end to end. Per #314.
+///
+/// Every answer below was read off the pinned binary one statement at a time, because the index
+/// rules are not guessable from each other. The two worth pointing at are a start of zero, which
+/// leaves a window that begins before the string and so answers one character short, and a negative
+/// length, which runs the window backwards from the start instead of being empty.
+#[test]
+fn the_string_keywords_answer_the_way_duckdb_does() {
+    let db = database();
+    let one = |sql: &str| match rows(&db, sql).as_slice() {
+        [row] => row.clone(),
+        other => panic!("one row, not {}", other.len()),
+    };
+    assert_eq!(
+        one("SELECT substring('abcdef', 2, 3), substring('abcdef' FROM 2 FOR 3)"),
+        vec![text("bcd"), text("bcd")]
+    );
+    assert_eq!(
+        one("SELECT substring('abcdef', 2), substring('abcdef' FOR 3), substr('abcdef', 2, 3)"),
+        vec![text("bcdef"), text("abc"), text("bcd")]
+    );
+    assert_eq!(
+        one(
+            "SELECT substring('abcdef', 0, 3), substring('abcdef', -1, 3), substring('abcdef', 4, -2)"
+        ),
+        vec![text("ab"), text("f"), text("bc")]
+    );
+    assert_eq!(
+        one(
+            "SELECT substring('abcdef', 10, 3), substring('abcdef', -10, 3), substring('abcdef', -10)"
+        ),
+        vec![text(""), text(""), text("abcdef")]
+    );
+    assert_eq!(
+        one("SELECT position('c' IN 'abcdef'), strpos('abcdef', 'z'), instr('abcdef', 'abc')"),
+        vec![Value::BigInt(3), Value::BigInt(0), Value::BigInt(1)]
+    );
+    assert_eq!(
+        one("SELECT trim('  a  '), trim(BOTH 'x' FROM 'xxaxx'), trim('xyaxy', 'xy')"),
+        vec![text("a"), text("a"), text("a")]
+    );
+    assert_eq!(
+        one("SELECT trim(LEADING FROM '  a  '), trim(TRAILING FROM '  a  '), ltrim('xxaxx', 'x')"),
+        vec![text("a  "), text("  a"), text("axx")]
+    );
+    assert_eq!(
+        one(
+            "SELECT overlay('abcdef' PLACING 'X' FROM 2 FOR 1), overlay('abcdef' PLACING 'XY' FROM 2)"
+        ),
+        vec![text("aXcdef"), text("aXYdef")]
+    );
+    assert_eq!(
+        one(
+            "SELECT overlay('abcdef' PLACING 'XY' FROM 2 FOR 0), overlay('abcdef' PLACING 'XY' FROM 2 FOR -1)"
+        ),
+        vec![text("aXYbcdef"), text("aXYdef")]
+    );
+    // A null anywhere is a null answer, and the types are the ones upstream declares.
+    assert_eq!(
+        one("SELECT substring(NULL, 1, 2), trim(NULL), strpos('a', NULL)"),
+        vec![Value::Null, Value::Null, Value::Null]
+    );
+    assert_eq!(
+        one("SELECT typeof(substring('abcdef', 2)), typeof(strpos('a', 'b'))"),
+        vec![text("VARCHAR"), text("BIGINT")]
+    );
+    // Over a column, including the null row.
+    assert_eq!(
+        rows(&db, "SELECT substring(s, 1, 1) FROM t"),
+        vec![vec![text("a")], vec![Value::Null], vec![text("c")], vec![text("a")]]
+    );
+    // The names upstream gives these columns, which are the lowered calls and not what was written.
+    // Upstream quotes the four that are keywords and that quoting is #251.
+    assert_eq!(
+        db.query("SELECT substring(s FROM 2 FOR 3) FROM t").unwrap().names(),
+        &["substring(s, 2, 3)".to_string()]
+    );
+    assert_eq!(
+        db.query("SELECT position('c' IN s) FROM t").unwrap().names(),
+        &["position(s, 'c')".to_string()]
+    );
+    assert_eq!(
+        db.query("SELECT trim(LEADING FROM s) FROM t").unwrap().names(),
+        &["ltrim(s)".to_string()]
+    );
+    // An index has to be a whole number already, which is upstream's rule rather than a rounding.
+    let message = failure(&db, "SELECT substring('abcdef', 2.5, 3)");
+    assert!(message.contains("\"substring\"(col0 VARCHAR, col1 BIGINT, col2 BIGINT) -> VARCHAR"));
+    assert!(failure(&db, "SELECT trim(123)").contains("\"trim\"(col0 VARCHAR) -> VARCHAR"));
+    assert!(failure(&db, "SELECT strpos('abcdef')").contains("strpos(col0 VARCHAR, col1 VARCHAR)"));
 }
 
 /// The three spellings of a null check, end to end. Per #306.

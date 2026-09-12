@@ -103,6 +103,13 @@ enum Shape {
     /// The first argument is a string or a list, the rest are the bounds, and the result is the first
     /// argument's own type. `array_slice`.
     Sliced,
+    /// The first `n` arguments have to be strings already, the rest are indexes, and the result is
+    /// fixed. `substring(s, a, b)` and `overlay(s, r, a, b)`.
+    ///
+    /// An index is a BIGINT and nothing is cast to one, which is the same rule
+    /// [`Shape::Extracted`] follows and is upstream's: `substring('abcdef', 2.5, 3)` is a binder
+    /// error there listing the two overloads rather than a substring from the second character.
+    TextThenIndex(usize, Fixed),
     /// Every argument promotes, and the result is the first argument's own type. `nullif`.
     ///
     /// The promotion is for the comparison and not for the answer, which is what makes this its own
@@ -249,6 +256,37 @@ const TABLE: &[Entry] = &[
     // that has only `length` cannot run that board at all without the SQL being changed, and the
     // whole point of the comparison is that it is not changed.
     text("strlen", Arity::exactly(1), Fixed::BigInt),
+    // The four SQL string functions that have a grammar rule of their own, plus the aliases upstream
+    // answers the same call with. Each alias is a row rather than a pointer at one, because the
+    // column a query gets back is named after the name that was written: `substr('abcdef', 2)` comes
+    // back as `substr('abcdef', 2)` upstream and not as a substring of anything.
+    Entry {
+        name: "substring",
+        kind: FunctionKind::Scalar,
+        arity: Arity::one_of(&[2, 3]),
+        shape: Shape::TextThenIndex(1, Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "substr",
+        kind: FunctionKind::Scalar,
+        arity: Arity::one_of(&[2, 3]),
+        shape: Shape::TextThenIndex(1, Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "overlay",
+        kind: FunctionKind::Scalar,
+        arity: Arity::one_of(&[3, 4]),
+        shape: Shape::TextThenIndex(2, Fixed::Varchar),
+        numeric_only: false,
+    },
+    text("position", Arity::exactly(2), Fixed::BigInt),
+    text("strpos", Arity::exactly(2), Fixed::BigInt),
+    text("instr", Arity::exactly(2), Fixed::BigInt),
+    text("trim", Arity::between(1, 2), Fixed::Varchar),
+    text("ltrim", Arity::between(1, 2), Fixed::Varchar),
+    text("rtrim", Arity::between(1, 2), Fixed::Varchar),
     // Pattern matching. The transformer emits the operator spellings, so those are the names, and
     // `LIKE` is one of them rather than a keyword the binder has to know about separately.
     text("~~", Arity::exactly(2), Fixed::Boolean),
@@ -550,6 +588,24 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             cast_to[0] = target.clone();
             (cast_to, target.clone())
         }
+        Shape::TextThenIndex(count, result) => {
+            let (text, indexes) = arguments.split_at(count.min(arguments.len()));
+            for ty in text {
+                if *ty != LogicalType::Varchar && *ty != LogicalType::Null {
+                    return Err(no_match(entry.name, arguments));
+                }
+            }
+            for ty in indexes {
+                if !ty.is_integer() && *ty != LogicalType::Null {
+                    return Err(no_match(entry.name, arguments));
+                }
+            }
+            let mut cast_to = vec![LogicalType::BigInt; arguments.len()];
+            for slot in &mut cast_to[..text.len()] {
+                *slot = LogicalType::Varchar;
+            }
+            (cast_to, result.ty())
+        }
         Shape::PromotedToFirst => {
             let common = promote_all(name, arguments)?;
             // An untyped null keeps nothing to hand back, so it takes the promoted type the way
@@ -611,6 +667,36 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("strlen", &["strlen(col0 VARCHAR) -> BIGINT"]),
+    (
+        "substring",
+        &[
+            "\"substring\"(col0 VARCHAR, col1 BIGINT, col2 BIGINT) -> VARCHAR",
+            "\"substring\"(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+        ],
+    ),
+    (
+        "substr",
+        &[
+            "substr(col0 VARCHAR, col1 BIGINT, col2 BIGINT) -> VARCHAR",
+            "substr(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+        ],
+    ),
+    (
+        "overlay",
+        &[
+            "\"overlay\"(col0 VARCHAR, col1 VARCHAR, col2 BIGINT) -> VARCHAR",
+            "\"overlay\"(col0 VARCHAR, col1 VARCHAR, col2 BIGINT, col3 BIGINT) -> VARCHAR",
+        ],
+    ),
+    ("position", &["\"position\"(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("strpos", &["strpos(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("instr", &["instr(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    (
+        "trim",
+        &["\"trim\"(col0 VARCHAR) -> VARCHAR", "\"trim\"(col0 VARCHAR, col1 VARCHAR) -> VARCHAR"],
+    ),
+    ("ltrim", &["ltrim(col0 VARCHAR) -> VARCHAR", "ltrim(col0 VARCHAR, col1 VARCHAR) -> VARCHAR"]),
+    ("rtrim", &["rtrim(col0 VARCHAR) -> VARCHAR", "rtrim(col0 VARCHAR, col1 VARCHAR) -> VARCHAR"]),
     ("~~", &["\"~~\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
     ("!~~", &["\"!~~\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
     ("~~*", &["\"~~*\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
@@ -1249,13 +1335,17 @@ mod tests {
                 let ty =
                     if entry.numeric_only { LogicalType::Integer } else { LogicalType::Varchar };
                 let mut arguments = vec![ty; count];
-                // A subscript is the one shape whose arguments are not all alike. The first is the
-                // string or the list and everything after it is a whole number, so a row of strings
-                // is not a call it accepts and not a call worth asserting it accepts.
-                if matches!(entry.shape, Shape::Extracted | Shape::Sliced) {
-                    for bound in arguments.iter_mut().skip(1) {
-                        *bound = LogicalType::BigInt;
-                    }
+                // A subscript and a substring are the shapes whose arguments are not all alike. The
+                // leading ones are the string or the list and everything after them is a whole
+                // number, so a row of strings is not a call either one accepts and not a call worth
+                // asserting it accepts.
+                let leading = match entry.shape {
+                    Shape::Extracted | Shape::Sliced => 1,
+                    Shape::TextThenIndex(leading, _) => leading,
+                    _ => count,
+                };
+                for bound in arguments.iter_mut().skip(leading) {
+                    *bound = LogicalType::BigInt;
                 }
                 resolve(entry.name, &arguments).unwrap_or_else(|error| {
                     panic!("{} does not resolve at {count} arguments: {error}", entry.name)

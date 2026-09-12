@@ -1347,6 +1347,10 @@ impl<'a> Transform<'a> {
                 "FunctionExpression" => return self.function(node),
                 "CoalesceExpression" => return self.coalesce(node),
                 "NullIfExpression" => return self.null_if(node),
+                "SubstringExpression" => return self.substring(node),
+                "PositionExpression" => return self.position(node),
+                "TrimExpression" => return self.trim(node),
+                "OverlayExpression" => return self.overlay(node),
                 "ExtractExpression" => return self.extract(node),
                 "CastExpression" => return self.cast(node),
                 "CaseExpression" => return self.case(node),
@@ -1874,6 +1878,131 @@ impl<'a> Transform<'a> {
         let args = self.expr_slice(args);
         let name = self.function_name("nullif");
         Ok(self.push(Expr::Function { name, args, distinct: false }))
+    }
+
+    /// `SubstringExpression <- 'SUBSTRING' Parens(SubstringArguments)` and
+    /// `SubstringArguments <- SubstringParameters / SubstringExpressionList`.
+    ///
+    /// Both spellings are the same call and DuckDB's parser writes both of them back out as one:
+    /// `substring(s FROM a FOR b)` comes back as the column `"substring"(s, a, b)` there, and so does
+    /// `substring(s, a, b)`. The `FOR` on its own is the one worth pointing at, since it is not the
+    /// two argument call it looks like. `substring('abcdef' FOR 3)` is `"substring"('abcdef', 1, 3)`
+    /// upstream, so the start is filled in with a literal 1 here rather than left out.
+    fn substring(&mut self, node: u32) -> Result<ExprRef> {
+        let shape = self.first(self.first(node));
+        let mut args = Vec::new();
+        match self.name(shape) {
+            "SubstringExpressionList" => {
+                for kid in self.kids(shape) {
+                    args.push(self.expr(kid)?);
+                }
+            }
+            "SubstringParameters" => {
+                args.push(self.expr(self.first(shape))?);
+                // `SubstringFromFor <- SubstringFromOptionalFor / SubstringFor`, and both of those
+                // hold the bounds as `FromExpression` and `ForExpression`, so finding them by name
+                // reads either shape and neither one has to be told apart from the other.
+                let bounds = self.first(self.nth(shape, 1));
+                let from = self.find(bounds, "FromExpression");
+                let start =
+                    if from == NONE { self.number("1") } else { self.expr(self.first(from))? };
+                args.push(start);
+                let count = self.find(bounds, "ForExpression");
+                if count != NONE {
+                    args.push(self.expr(self.first(count))?);
+                }
+            }
+            _ => return self.unsupported(shape),
+        }
+        let args = self.expr_slice(args);
+        let name = self.function_name("substring");
+        Ok(self.push(Expr::Function { name, args, distinct: false }))
+    }
+
+    /// `PositionExpression <- 'POSITION' Parens(PositionArguments)` and
+    /// `PositionArguments <- OtherOperatorExpression 'IN' Expression`.
+    ///
+    /// The two arguments swap. `position('c' IN 'abcdef')` is `"position"('abcdef', 'c')` upstream,
+    /// which is the same order `strpos` and `instr` are written in, so the haystack comes first in
+    /// the call and second in the query.
+    fn position(&mut self, node: u32) -> Result<ExprRef> {
+        let arguments = self.first(node);
+        if self.count(arguments) != 2 {
+            return self.unsupported(arguments);
+        }
+        let needle = self.expr(self.first(arguments))?;
+        let haystack = self.expr(self.nth(arguments, 1))?;
+        let args = self.expr_slice(vec![haystack, needle]);
+        let name = self.function_name("position");
+        Ok(self.push(Expr::Function { name, args, distinct: false }))
+    }
+
+    /// `TrimExpression <- 'TRIM' Parens(TrimArguments)` and
+    /// `TrimArguments <- TrimDirection? TrimSource? List(Expression)`.
+    ///
+    /// The direction is not an argument, it is the function: `LEADING` is `ltrim` upstream and
+    /// `TRAILING` is `rtrim`, while `BOTH` and the bare form are both `trim`. The characters to strip
+    /// are the last argument whichever way they were written, so `trim(BOTH 'x' FROM 'xxaxx')` and
+    /// `trim('xxaxx', 'x')` are the same call, which is why the source goes on the end of the list
+    /// rather than in front of it.
+    fn trim(&mut self, node: u32) -> Result<ExprRef> {
+        let arguments = self.first(node);
+        let direction = self.find(arguments, "TrimDirection");
+        let name = match direction {
+            NONE => "trim",
+            held => match self.name(self.first(held)) {
+                "TrimLeading" => "ltrim",
+                "TrimTrailing" => "rtrim",
+                _ => "trim",
+            },
+        };
+        let mut args = Vec::new();
+        for kid in self.kids(arguments) {
+            if matches!(self.name(kid), "TrimDirection" | "TrimSource") {
+                continue;
+            }
+            args.push(self.expr(kid)?);
+        }
+        // `TrimSource <- Expression? 'FROM'`, so `trim(LEADING FROM s)` has the node with nothing
+        // under it and there is no second argument to add.
+        let source = self.find(arguments, "TrimSource");
+        if source != NONE && self.count(source) == 1 {
+            args.push(self.expr(self.first(source))?);
+        }
+        let args = self.expr_slice(args);
+        let name = self.function_name(name);
+        Ok(self.push(Expr::Function { name, args, distinct: false }))
+    }
+
+    /// `OverlayExpression <- 'OVERLAY' Parens(OverlayArguments)` and
+    /// `OverlayArguments <- OverlayParameters / OverlayExpressionList`, where
+    /// `OverlayParameters <- Expression 'PLACING' Expression FromExpression ForExpression?`.
+    ///
+    /// The arguments are already in the order the call takes them, so the keyword spelling is the
+    /// list spelling with `PLACING`, `FROM` and `FOR` where the commas would be:
+    /// `overlay('abcdef' PLACING 'X' FROM 2 FOR 1)` is `"overlay"('abcdef', 'X', 2, 1)` upstream.
+    fn overlay(&mut self, node: u32) -> Result<ExprRef> {
+        let shape = self.first(self.first(node));
+        if !matches!(self.name(shape), "OverlayParameters" | "OverlayExpressionList") {
+            return self.unsupported(shape);
+        }
+        let mut args = Vec::new();
+        for kid in self.kids(shape) {
+            let kid = match self.name(kid) {
+                "FromExpression" | "ForExpression" => self.first(kid),
+                _ => kid,
+            };
+            args.push(self.expr(kid)?);
+        }
+        let args = self.expr_slice(args);
+        let name = self.function_name("overlay");
+        Ok(self.push(Expr::Function { name, args, distinct: false }))
+    }
+
+    /// A number literal the query did not write, for the one place a lowering has to supply one.
+    fn number(&mut self, text: &str) -> ExprRef {
+        let text = self.intern(text);
+        self.push(Expr::Literal { kind: LiteralKind::Number, text })
     }
 
     /// `ExtractExpression <- 'EXTRACT' Parens(ExtractArguments)` and
@@ -3005,7 +3134,6 @@ mod tests {
     #[test]
     fn a_keyword_is_not_stepped_through_on_the_way_to_its_one_argument() {
         for (sql, rule) in [
-            ("SELECT trim('  a  ')", "TrimExpression"),
             ("SELECT row(1)", "RowExpression"),
             ("SELECT try(1)", "TryExpression"),
             ("SELECT unpack([1])", "UnpackExpression"),
@@ -3035,6 +3163,34 @@ mod tests {
         assert_eq!(error.message(), "Wrong number of arguments to IFNULL.");
         let error = parse_ast("SELECT ifnull(a, b, c)").expect_err("three arguments to ifnull");
         assert_eq!(error.message(), "Wrong number of arguments to IFNULL.");
+    }
+
+    /// The four string functions with a grammar rule of their own, written back out as the calls
+    /// DuckDB's parser writes them as. Per #314.
+    #[test]
+    fn the_string_keywords_are_the_calls_duckdb_prints() {
+        assert_eq!(round("SELECT substring(s, 2, 3)"), "SELECT substring(s, 2, 3)");
+        assert_eq!(round("SELECT SUBSTRING(s FROM 2 FOR 3)"), "SELECT substring(s, 2, 3)");
+        assert_eq!(round("SELECT substring(s FROM 2)"), "SELECT substring(s, 2)");
+        // The `FOR` on its own is three arguments and not two, with the start filled in.
+        assert_eq!(round("SELECT substring(s FOR 3)"), "SELECT substring(s, 1, 3)");
+        // The haystack comes first in the call and second in the query.
+        assert_eq!(round("SELECT position('c' IN s)"), "SELECT position(s, 'c')");
+        assert_eq!(round("SELECT trim(s)"), "SELECT trim(s)");
+        assert_eq!(round("SELECT trim(BOTH 'x' FROM s)"), "SELECT trim(s, 'x')");
+        assert_eq!(round("SELECT trim(BOTH FROM s)"), "SELECT trim(s)");
+        assert_eq!(round("SELECT trim(s, 'xy')"), "SELECT trim(s, 'xy')");
+        // A direction is a different function and not a different argument.
+        assert_eq!(round("SELECT trim(LEADING FROM s)"), "SELECT ltrim(s)");
+        assert_eq!(round("SELECT trim(TRAILING FROM s)"), "SELECT rtrim(s)");
+        assert_eq!(round("SELECT trim(LEADING 'x' FROM s)"), "SELECT ltrim(s, 'x')");
+        assert_eq!(round("SELECT trim(TRAILING 'x' FROM s)"), "SELECT rtrim(s, 'x')");
+        assert_eq!(
+            round("SELECT overlay(s PLACING 'X' FROM 2 FOR 1)"),
+            "SELECT overlay(s, 'X', 2, 1)"
+        );
+        assert_eq!(round("SELECT overlay(s PLACING 'X' FROM 2)"), "SELECT overlay(s, 'X', 2)");
+        assert_eq!(round("SELECT overlay(s, 'X', 2, 1)"), "SELECT overlay(s, 'X', 2, 1)");
     }
 
     #[test]
