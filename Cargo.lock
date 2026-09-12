@@ -230,6 +230,7 @@ dependencies = [
  "rudb-functions",
  "rudb-kernels",
  "rudb-plan",
+ "rudb-seam",
  "rudb-storage",
  "rudb-vector",
 ]
