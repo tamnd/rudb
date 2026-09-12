@@ -18,21 +18,33 @@
 //! time. That is what `spec/07-execution.md` calls a pipeline breaker and it is the boundary the
 //! morsel driven scheduler will later cut pipelines at.
 //!
-//! What this is not is the scheduler. There is one thread, there are no morsels, there is no
-//! spilling and the hash join is a nested loop. Every one of those is M1 or later work and every
+//! What this is not is the scheduler. There is one thread, the morsels a source hands out are all
+//! read by it, and the hash join is a nested loop. Every one of those is M1 or later work and every
 //! one of them replaces an operator here without changing the tree that builds it, because the
 //! thing that builds the tree is [`build`] and the thing it builds against is a trait with two
 //! methods.
 //!
 //! # The move to push
 //!
-//! The interface every operator ends up behind is in `rudb-pipeline`, and they are moving to it one
-//! at a time rather than in one commit. The filter, the projection, the limit and the cross product
-//! are [`Stream`](rudb_pipeline::Stream) implementations, and the sort, the top N, the distinct, the
-//! set operations, the aggregate and the join are [`Sink`](rudb_pipeline::Sink) implementations. All
-//! of them take `&self` and are handed the mutable part separately, so one of them can be
-//! instantiated on as many threads as F4 wants without copying its predicate or its key list. What
-//! is left pulling is the leaf sources.
+//! The interface every operator ends up behind is in `rudb-pipeline`, and they moved to it one at a
+//! time rather than in one commit. Every one of them is there now. The table scan, the dummy scan,
+//! the series, the file scan, the values list and the strategies table are
+//! [`Source`](rudb_pipeline::Source) implementations, the filter, the projection, the limit and the
+//! cross product are [`Stream`](rudb_pipeline::Stream) implementations, and the sort, the top N, the
+//! distinct, the set operations, the aggregate and the join are [`Sink`](rudb_pipeline::Sink)
+//! implementations. All of them take `&self` and are handed the mutable part separately, so one of
+//! them can be instantiated on as many threads as F4 wants without copying its predicate or its key
+//! list.
+//!
+//! A source is the one of the three that is shared rather than instanced, so the position it is up
+//! to is an atomic and a morsel goes to whoever asks for it first. What a morsel covers is each
+//! source's own business: one stored chunk for a table scan, a run of sixteen chunks for a series
+//! because those rows are worked out rather than read, and the whole file list for a file scan,
+//! since both file readers are a position in a file and cannot be asked for the tenth chunk without
+//! having read the nine before it.
+//!
+//! What is left of the pull side is the shape of the tree and the adapters that drive it, which is
+//! `adapt` and nothing else.
 //!
 //! Being in the shape is not the same as being parallel. The aggregate holds its hash table in the
 //! instance, which is where it has to be, and merging two of those tables needs a serialize and a
@@ -56,9 +68,10 @@
 //! chunks back out, rather than handing them back from `finalize`. That split is what makes the
 //! parallel read possible later and it costs nothing now.
 //!
-//! Everything else in here is still a pull operator, and `adapt` is the one thing that knows how to
-//! put a pushing operator in a pulling tree. It goes away with the rest of the pull side when the
-//! last operator has moved.
+//! `adapt` is the one thing that knows how to put a pushing operator in a pulling tree, and now
+//! that every operator has moved it is the whole of the pull side. What it does not do yet is cut
+//! the tree into pipelines and hand them to [`run_serial`](rudb_pipeline::run_serial), which is the
+//! next step and the one that deletes this file rather than changing it.
 //!
 //! # Why a schema per operator
 //!

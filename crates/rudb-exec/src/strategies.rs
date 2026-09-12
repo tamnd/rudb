@@ -10,20 +10,21 @@
 
 use rudb_common::{Error, Result, Value};
 use rudb_functions::strategy_fields;
+use rudb_pipeline::{Morsel, Progress, Source};
 use rudb_plan::{Plan, Slice};
 use rudb_seam::{SeamId, StrategyRow};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
-use crate::operator::Operator;
 use crate::register::registries;
 use crate::schema::Schema;
+use crate::source::{Handout, position};
 
 /// The rows of `rudb_strategies()`.
 #[derive(Debug)]
 pub(crate) struct Strategies {
     schema: Schema,
     chunks: Vec<Chunk>,
-    at: usize,
+    handout: Handout,
 }
 
 impl Strategies {
@@ -81,19 +82,28 @@ impl Strategies {
             chunks.push(Chunk::with_rows(built, end - start)?);
             start = end;
         }
-        Ok(Self { schema, chunks, at: 0 })
+        let handout = Handout::new(chunks.len());
+        Ok(Self { schema, chunks, handout })
+    }
+
+    /// The columns of the table, in the order the plan asked for them.
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
     }
 }
 
-impl Operator for Strategies {
-    fn schema(&self) -> &Schema {
-        &self.schema
+impl Source for Strategies {
+    fn morsel(&self) -> Option<Morsel> {
+        self.handout.take()
     }
 
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        let chunk = self.chunks.get(self.at).cloned();
-        self.at += 1;
-        Ok(chunk)
+    fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
+        *out = match self.chunks.get(position(morsel)) {
+            Some(chunk) => chunk.clone(),
+            None => Chunk::empty(&self.schema.types()),
+        };
+        morsel.advance(1);
+        Ok(Progress::Done)
     }
 }
 
