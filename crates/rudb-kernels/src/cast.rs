@@ -42,7 +42,10 @@ use rudb_common::{
 };
 use rudb_vector::{Data, Form, Vector};
 
-use crate::datetime::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SECOND};
+use crate::datetime::{
+    MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SECOND, NEWEST_TIMESTAMP,
+    OLDEST_TIMESTAMP, days_in_month,
+};
 use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
 use crate::shape::{identity, nulls_of};
@@ -1045,7 +1048,16 @@ fn parse_timestamp(text: &str) -> Parsed<i64> {
         None => 0,
         Some(time) => parse_time(time)?,
     };
-    days.checked_mul(MICROS_PER_DAY).and_then(|start| start.checked_add(micros)).ok_or(Fault::Range)
+    let stamp = days
+        .checked_mul(MICROS_PER_DAY)
+        .and_then(|start| start.checked_add(micros))
+        .ok_or(Fault::Range)?;
+    // The top of the `i64` is `infinity` upstream, the same way the top of the `i32` is for a date,
+    // so the newest timestamp that can be written down is the one below it.
+    if !(OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(&stamp) {
+        return Err(Fault::Range);
+    }
+    Ok(stamp)
 }
 
 /// The date and the time in a written timestamp, which are separated by a space or by a `T`.
@@ -1133,19 +1145,6 @@ fn field<T: FromStr>(part: Option<&str>) -> Parsed<T> {
         return Err(Fault::Format);
     }
     part.parse().map_err(|_| Fault::Format)
-}
-
-/// How many days that month of that year has.
-///
-/// A date that names the thirty first of April is out of range upstream and was the first of May
-/// here, which is a wrong answer and not only a wrong message.
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        _ => 28,
-    }
 }
 
 /// `HH:MM:SS[.ffffff]` with an optional zone after it, as microseconds since midnight.

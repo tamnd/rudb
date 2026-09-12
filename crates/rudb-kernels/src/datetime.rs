@@ -21,7 +21,7 @@
 //! What is missing is `timezone`, `timezone_hour` and `timezone_minute`, which need a session time
 //! zone before they mean anything, and the interval overloads of both functions.
 
-use rudb_common::{Error, Result, civil_from_days, days_from_civil};
+use rudb_common::{Error, Result, Value, civil_from_days, days_from_civil};
 
 /// Microseconds in a day, which is the conversion between the two representations here.
 pub(crate) const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
@@ -401,6 +401,147 @@ fn iso_year_start(year: i32) -> i32 {
     fourth - (iso_weekday(fourth) - 1)
 }
 
+/// How many days that month of that year has.
+///
+/// A date that names the thirty first of April is out of range upstream and was the first of May
+/// here, which is a wrong answer and not only a wrong message.
+pub(crate) fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        _ => 28,
+    }
+}
+
+/// The oldest and the newest timestamp, which is not the whole of an `i64` of microseconds.
+///
+/// The top of the `i64` is `infinity` upstream, so the newest timestamp is the one below it, which
+/// is `294247-01-10 04:00:54.775806`. The oldest is the first midnight that fits, which is
+/// `290309-12-22 (BC) 00:00:00`, because the day before it does not fit at all and a timestamp is
+/// a whole day plus a time inside it.
+pub(crate) const OLDEST_TIMESTAMP: i64 = -9_223_372_022_400_000_000;
+
+pub(crate) const NEWEST_TIMESTAMP: i64 = i64::MAX - 1;
+
+/// The oldest and the newest date, which is the `i32` with the two infinities and one more taken
+/// off it. `5877642-06-25 (BC)` and `5881580-07-10`.
+const OLDEST_DATE: i32 = i32::MIN + 2;
+
+const NEWEST_DATE: i32 = i32::MAX - 1;
+
+/// The years the date range covers, which is the gate the month arithmetic passes before it counts
+/// any days, because a year far outside this is a day count that does not fit an `i32` at all.
+const YEARS: std::ops::RangeInclusive<i64> = -5_877_641..=5_881_580;
+
+/// Whether a pair of values is date arithmetic rather than the numeric kind.
+///
+/// One side is an interval and the other is a date, a timestamp or a time. The signature has
+/// already refused everything else that shares the spelling, so this only has to tell the two
+/// apart and not police them.
+pub(crate) fn is_shift(left: &Value, right: &Value) -> bool {
+    let when =
+        |value: &Value| matches!(value, Value::Date(_) | Value::Timestamp(_) | Value::Time(_));
+    let interval = |value: &Value| matches!(value, Value::Interval { .. });
+    (interval(left) && when(right)) || (when(left) && interval(right))
+}
+
+/// A date, a timestamp or a time with an interval added to it or taken off it.
+///
+/// The three fields are applied one at a time, months then days then microseconds, which is
+/// upstream's order and is visible whenever a month lands on a day the next month does not have.
+/// Adding a month to the thirty first of January is the twenty ninth of February in a leap year,
+/// so the day clamps rather than spilling into March, and adding a month and a day to it is the
+/// first of March rather than the second, because the clamp happens before the day is added.
+///
+/// A date comes back as a timestamp and not as a date, since the interval can carry a time of day,
+/// and a time comes back as a time that wraps at midnight and ignores the months and the days,
+/// both of which were measured rather than assumed.
+pub(crate) fn shift(left: &Value, right: &Value, subtract: bool) -> Result<Value> {
+    let (when, interval) = match (left, right) {
+        (when, Value::Interval { months, days, micros }) => (when, (months, days, micros)),
+        (Value::Interval { months, days, micros }, when) => (when, (months, days, micros)),
+        _ => return Err(Error::internal(format!("{left} and {right} are not a shift"))),
+    };
+    let sign = if subtract { -1 } else { 1 };
+    let (months, days, micros) = interval;
+    let months = i64::from(*months) * sign;
+    let days = i64::from(*days) * sign;
+    let micros = i128::from(*micros) * i128::from(sign);
+    match when {
+        Value::Date(day) => {
+            // The date becomes a timestamp before anything is added to it, which is upstream's
+            // order and is why a date too old or too new to be a moment fails as a moment rather
+            // than as a date, even at the newest date there is with one day added to it.
+            moved(*day, 0, 0)?;
+            Ok(Value::Timestamp(moved(shifted_days(*day, months, days)?, 0, micros)?))
+        }
+        Value::Timestamp(stamp) => {
+            let day =
+                i32::try_from(stamp.div_euclid(MICROS_PER_DAY)).map_err(|_| not_in_range())?;
+            let within = stamp.rem_euclid(MICROS_PER_DAY);
+            Ok(Value::Timestamp(moved(shifted_days(day, months, days)?, within, micros)?))
+        }
+        // A time is a clock and not a point in history, so the whole days go nowhere and what is
+        // left wraps. `TIME '10:00:00' + INTERVAL '-1 day 1 hour'` is eleven in the morning.
+        Value::Time(clock) => {
+            let day = i128::from(MICROS_PER_DAY);
+            let wrapped = (i128::from(*clock) + micros).rem_euclid(day);
+            Ok(Value::Time(i64::try_from(wrapped).map_err(|_| not_in_range())?))
+        }
+        other => Err(Error::internal(format!("{other} takes no interval"))),
+    }
+}
+
+/// The day an interval's months and days land on, which is where both of the date range failures
+/// are and where upstream has a different sentence for each of them.
+fn shifted_days(day: i32, months: i64, days: i64) -> Result<i32> {
+    let day = if months == 0 { day } else { shifted_months(day, months)? };
+    let moved = i64::from(day) + days;
+    match i32::try_from(moved) {
+        Ok(moved) if (OLDEST_DATE..=NEWEST_DATE).contains(&moved) => Ok(moved),
+        _ => Err(Error::out_of_range("Date out of range")),
+    }
+}
+
+/// The calendar add, which is the one piece of this that is not a count.
+fn shifted_months(day: i32, months: i64) -> Result<i32> {
+    let (year, month, day) = civil_from_days(day);
+    let total = i64::from(year) * 12 + i64::from(month) - 1 + months;
+    let (year, month) = (total.div_euclid(12), total.rem_euclid(12) + 1);
+    #[expect(clippy::cast_possible_truncation, reason = "a month of the year is one of twelve")]
+    let month = month as u32;
+    // The message names the day the clamp produced, so it is worked out before the range is
+    // checked, and it is printed the way upstream prints it, which is unpadded and signed rather
+    // than in the era a date prints in.
+    let year_holds = YEARS.contains(&year);
+    #[expect(clippy::cast_possible_truncation, reason = "the range above fits an i32")]
+    let narrow = year as i32;
+    let day = day.min(days_in_month(narrow, month));
+    let out_of_range = || Error::conversion(format!("Date out of range: {year}-{month}-{day}"));
+    if !year_holds {
+        return Err(out_of_range());
+    }
+    let moved = days_from_civil(narrow, month, day);
+    if !(OLDEST_DATE..=NEWEST_DATE).contains(&moved) {
+        return Err(out_of_range());
+    }
+    Ok(moved)
+}
+
+/// The day, the time inside it and the interval's own microseconds, as one timestamp.
+fn moved(day: i32, within: i64, micros: i128) -> Result<i64> {
+    let stamp = i128::from(day) * i128::from(MICROS_PER_DAY) + i128::from(within) + micros;
+    match i64::try_from(stamp) {
+        Ok(stamp) if (OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(&stamp) => Ok(stamp),
+        _ => Err(not_in_range()),
+    }
+}
+
+fn not_in_range() -> Error {
+    Error::conversion("Date and time not in timestamp range")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +557,125 @@ mod tests {
 
     fn part(spelling: &str) -> Part {
         Part::parse(spelling).expect("a part this file knows")
+    }
+
+    fn day(year: i32, month: u32, day: u32) -> Value {
+        Value::Date(days_from_civil(year, month, day))
+    }
+
+    fn stamp(year: i32, month: u32, day: u32, micros: i64) -> Value {
+        Value::Timestamp(i64::from(days_from_civil(year, month, day)) * MICROS_PER_DAY + micros)
+    }
+
+    fn every(months: i32, days: i32, micros: i64) -> Value {
+        Value::Interval { months, days, micros }
+    }
+
+    /// What the shift prints, which is what the statement it came from prints.
+    fn shown(left: &Value, right: &Value, subtract: bool) -> String {
+        shift(left, right, subtract).expect("the shift lands in range").to_string()
+    }
+
+    /// Every row here is a statement that was run against the pinned binary for #393.
+    ///
+    /// The clamp is the rule worth naming. A month added to the thirty first of January is the end
+    /// of February and not the first or the second of March, and it clamps whichever way the month
+    /// moves, which is why the third row goes backwards.
+    #[test]
+    fn a_date_or_a_timestamp_and_an_interval_make_a_timestamp() {
+        let date = day(2020, 1, 1);
+        assert_eq!(shown(&date, &every(1, 0, 0), false), "2020-02-01 00:00:00");
+        assert_eq!(shown(&every(1, 0, 0), &date, false), "2020-02-01 00:00:00");
+        assert_eq!(shown(&date, &every(0, 1, 0), true), "2019-12-31 00:00:00");
+        assert_eq!(
+            shown(&date, &every(0, 0, 90 * MICROS_PER_MINUTE), false),
+            "2020-01-01 01:30:00"
+        );
+        assert_eq!(shown(&date, &every(0, 0, 0), false), "2020-01-01 00:00:00");
+        let end = day(2020, 1, 31);
+        assert_eq!(shown(&end, &every(1, 0, 0), false), "2020-02-29 00:00:00");
+        assert_eq!(shown(&day(2020, 3, 31), &every(1, 0, 0), true), "2020-02-29 00:00:00");
+        assert_eq!(shown(&day(2019, 2, 28), &every(12, 0, 0), false), "2020-02-28 00:00:00");
+        assert_eq!(shown(&day(2020, 2, 29), &every(12, 0, 0), false), "2021-02-28 00:00:00");
+        assert_eq!(shown(&day(0, 1, 1), &every(0, 1, 0), false), "0001-01-02 (BC) 00:00:00");
+        let ten = stamp(2020, 1, 1, 10 * MICROS_PER_HOUR);
+        assert_eq!(shown(&ten, &every(0, 0, 90 * MICROS_PER_MINUTE), true), "2020-01-01 08:30:00");
+        assert_eq!(
+            shown(&stamp(2020, 1, 31, 10 * MICROS_PER_HOUR), &every(1, 0, 0), false),
+            "2020-02-29 10:00:00"
+        );
+        assert_eq!(
+            shown(&stamp(2020, 1, 1, 0), &every(0, 0, -1), false),
+            "2019-12-31 23:59:59.999999"
+        );
+    }
+
+    /// The months land first, then the days, then the microseconds.
+    ///
+    /// The order only shows when a month lands on a day that does not exist, which is what both of
+    /// these are. A month and a day added to the thirty first of January is the first of March,
+    /// because the clamp to the twenty ninth of February happens before the day is added, and a
+    /// month applied twice over would be the second.
+    #[test]
+    fn the_three_fields_are_applied_in_the_order_they_are_written_in() {
+        assert_eq!(shown(&day(2020, 1, 31), &every(1, 1, 0), false), "2020-03-01 00:00:00");
+        assert_eq!(
+            shown(
+                &stamp(2020, 1, 31, 23 * MICROS_PER_HOUR),
+                &every(1, 0, 2 * MICROS_PER_HOUR),
+                false
+            ),
+            "2020-03-01 01:00:00"
+        );
+    }
+
+    /// A time is a clock and not a point in history, so it wraps and the whole days go nowhere.
+    #[test]
+    fn a_time_wraps_at_midnight_and_keeps_only_the_microseconds() {
+        let ten = Value::Time(10 * MICROS_PER_HOUR);
+        assert_eq!(shown(&ten, &every(0, 0, MICROS_PER_HOUR), false), "11:00:00");
+        assert_eq!(shown(&every(0, 0, MICROS_PER_HOUR), &ten, false), "11:00:00");
+        assert_eq!(shown(&ten, &every(1, 0, 0), false), "10:00:00");
+        assert_eq!(shown(&ten, &every(0, -1, MICROS_PER_HOUR), false), "11:00:00");
+        assert_eq!(shown(&ten, &every(0, 0, i64::MAX), false), "14:00:54.775807");
+        let late = Value::Time(23 * MICROS_PER_HOUR + 30 * MICROS_PER_MINUTE);
+        assert_eq!(shown(&late, &every(0, 0, MICROS_PER_HOUR), false), "00:30:00");
+        let early = Value::Time(30 * MICROS_PER_MINUTE);
+        assert_eq!(shown(&early, &every(0, 0, MICROS_PER_HOUR), true), "23:30:00");
+    }
+
+    /// Three ways out of range and three sentences, which are upstream's three.
+    ///
+    /// The months and the days each have a range of their own to leave, and the answer has the
+    /// timestamp range on top of both, so a shift that stays inside the calendar can still be a
+    /// moment that cannot be written down.
+    #[test]
+    fn each_way_out_of_range_says_what_upstream_says() {
+        let date = day(2020, 1, 1);
+        let error = shift(&date, &every(i32::MIN, 0, 0), false).expect_err("no such year");
+        assert_eq!(error.to_string(), "Conversion Error: Date out of range: -178954951-5-1");
+        let error = shift(&date, &every(0, i32::MAX, 0), false).expect_err("no such day");
+        assert_eq!(error.to_string(), "Out of Range Error: Date out of range");
+        let error = shift(&date, &every(0, 0, i64::MAX), false).expect_err("no such moment");
+        assert_eq!(error.to_string(), "Conversion Error: Date and time not in timestamp range");
+        let newest = day(294_247, 1, 10);
+        let error = shift(&newest, &every(0, 1, 0), false).expect_err("no such moment");
+        assert_eq!(error.to_string(), "Conversion Error: Date and time not in timestamp range");
+        // The newest date there is, which is a long way past the newest moment there is, so it is
+        // the moment that is reported and not the day even though a day was what was added.
+        let far = Value::Date(i32::MAX - 1);
+        let error = shift(&far, &every(0, 1, 0), false).expect_err("no such moment");
+        assert_eq!(error.to_string(), "Conversion Error: Date and time not in timestamp range");
+        assert_eq!(shown(&day(294_247, 1, 9), &every(0, 1, 0), false), "294247-01-10 00:00:00");
+    }
+
+    /// The two ends of the timestamp range, which are not the two ends of the `i64` that holds it.
+    #[test]
+    fn the_timestamp_range_stops_one_short_of_the_infinity_above_it() {
+        assert_eq!(NEWEST_TIMESTAMP, i64::MAX - 1);
+        assert_eq!(OLDEST_TIMESTAMP, i64::from(days_from_civil(-290_308, 12, 22)) * MICROS_PER_DAY);
+        assert_eq!(Value::Timestamp(NEWEST_TIMESTAMP).to_string(), "294247-01-10 04:00:54.775806");
+        assert_eq!(Value::Timestamp(OLDEST_TIMESTAMP).to_string(), "290309-12-22 (BC) 00:00:00");
     }
 
     /// Every one of these is what the DuckDB binary on `server3` answered for this timestamp.
