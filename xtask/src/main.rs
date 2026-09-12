@@ -14,6 +14,7 @@ mod bench;
 mod codegen;
 mod compare;
 mod compress;
+mod conform;
 mod differential;
 mod focus;
 mod grammar;
@@ -69,6 +70,10 @@ fn main() -> ExitCode {
         // What a megabyte of Snappy costs to decompress, which only means anything next to the
         // read rate in the table above it.
         Some("compress") => compress::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        // The committed corpus from tamnd/rudb-compat, against the shell this tree builds. Not
+        // `differential` above, which compares two engines over a file somebody downloaded. This
+        // one has its answers written down in the repository that owns them.
+        Some("conform") => conform::run(&root()),
         Some("smoke") => smoke::run(),
         Some("ci") => ci(std::env::args().nth(2).as_deref() == Some("--full")),
         Some("help" | "--help" | "-h") | None => {
@@ -100,6 +105,9 @@ fn usage() {
         "  gen-grammar [--check]  regenerate crates/rudb-parse/src/generated from that grammar"
     );
     println!("  smoke    the query in M0's exit criterion, run on this host, answers checked");
+    println!("  conform  the committed corpus in tamnd/rudb-compat, through this tree's shell and");
+    println!("           through this tree's library. needs a checkout beside this one, or");
+    println!("           RUDB_COMPAT_REPO. the gate runs it and says so when it is not there");
     println!("  ci       the per-commit gate, narrowed to the crates the change can have broken");
     println!("           it prints what it skipped and why, every time");
     println!("  ci --full              the same list with nothing narrowed, which is what the");
@@ -189,6 +197,10 @@ fn ci(full: bool) -> Result<(), String> {
     cargo(&doc)?;
 
     msrv_scoped(&scope)?;
+    // Last because it is the slowest and because everything above it is about this repository
+    // alone. A change that broke the corpus broke it in a way the tests here did not see, which is
+    // the whole reason the corpus lives in the other repository.
+    conform::check(&root)?;
     println!("everything the gate runs is green");
     Ok(())
 }
