@@ -16,14 +16,22 @@
 //! anything `DATE` takes, so the position between those two is not observable and the rung above it
 //! is, which is the one that matters.
 //!
-//! Four of the rules are the sniffer's rather than the cast's, and all four were measured. `007`
+//! Six of the rules are the sniffer's rather than the cast's, and all six were measured. `007`
 //! is a `VARCHAR` here although `CAST('007' AS BIGINT)` is 7, because a column of zero padded
 //! numbers is a column of codes and adding them up is not what anybody meant. `+1` is a `VARCHAR`
 //! for the same sort of reason. A day with a time on it is a `TIMESTAMP` and not a `DATE`, and a
 //! clock with anything else around it is a `VARCHAR` and not a `TIME`, although the casts to `DATE`
-//! and to `TIME` take both. Everything else defers to the cast, which is the point: a string
-//! the sniffer calls a `BIGINT` is a string the reader then casts to `BIGINT`, so a test that
-//! disagreed with the cast would produce a column whose declared type its own values do not fit.
+//! and to `TIME` take both. A point or an exponent keeps a value off the `BIGINT` rung, so a column
+//! of `1.5` is a `DOUBLE` column although the cast reads that as two, and a separator keeps it off
+//! both number rungs, so a column of `1_000` is a `VARCHAR` column although the cast reads that as a
+//! thousand. Everything else defers to the cast, which is the point: a string the sniffer calls a
+//! `BIGINT` is a string the reader then casts to `BIGINT`, so a test that disagreed with the cast
+//! would produce a column whose declared type its own values do not fit.
+//!
+//! There is one column where upstream does disagree with itself and this does not follow it. A
+//! column holding both `0x10` and `1.5` sniffs as `DOUBLE` there, because its `DOUBLE` rung takes a
+//! radix that its cast to `DOUBLE` then refuses, so reading the file raises. Here the rung defers to
+//! the cast, the column comes out `VARCHAR`, and the file reads.
 
 use rudb_common::{LogicalType, Value};
 use rudb_kernels::cast_value;
@@ -69,7 +77,7 @@ pub fn column(values: &[Option<&str>]) -> LogicalType {
 pub fn fits(text: &str, candidate: &LogicalType) -> bool {
     match candidate {
         LogicalType::Boolean => is_boolean(text),
-        LogicalType::BigInt if !numeric(text) => false,
+        LogicalType::BigInt if !numeric(text) || !whole(text) => false,
         LogicalType::Double if !numeric(text) => false,
         LogicalType::Date if timed(text) => false,
         LogicalType::Time if !clock(text) => false,
@@ -114,19 +122,35 @@ fn is_boolean(text: &str) -> bool {
 
 /// Whether a number written like this is a number to the sniffer.
 ///
-/// The two rules that are not the cast's. A leading `+` is refused, and so is a leading zero with
-/// another digit behind it, which is how a column of `007` stays a column of `007` rather than
+/// Three of the rules that are not the cast's. A leading `+` is refused, and so is a leading zero
+/// with another digit behind it, which is how a column of `007` stays a column of `007` rather than
 /// becoming a column of sevens. The sign is looked past for neither of them, because the binary does
 /// not look past it either: `-007` really is a `BIGINT` there and this reproduces that rather than
-/// tidying it up.
+/// tidying it up. A separator is refused on both rungs, so a column of `1_000` is a `VARCHAR` column
+/// although `CAST('1_000' AS BIGINT)` is a thousand.
 fn numeric(text: &str) -> bool {
     let text = text.trim();
+    if text.contains('_') {
+        return false;
+    }
     let mut bytes = text.bytes();
     match bytes.next() {
         Some(b'+') => false,
         Some(b'0') => !matches!(bytes.next(), Some(byte) if byte.is_ascii_digit()),
         _ => true,
     }
+}
+
+/// Whether a whole number written like this is one to the sniffer.
+///
+/// The sixth rule that is not the cast's, and the one the rest of #369 turned up. The cast reads
+/// `'1.5'` as two and `'1e3'` as a thousand, and upstream sniffs a column of either as `DOUBLE`, so
+/// the rung above `DOUBLE` has to refuse a point and an exponent itself or every column of written
+/// decimals would come back rounded. A radix is looked at first, because `0x1e` is thirty and the
+/// `e` in the middle of it is a digit.
+fn whole(text: &str) -> bool {
+    let text = text.trim();
+    matches!(text.get(..2), Some("0x" | "0X" | "0b" | "0B")) || !text.contains(['.', 'e', 'E'])
 }
 
 #[cfg(test)]
@@ -146,6 +170,28 @@ mod tests {
         assert_eq!(of(&["2020-01-02", "2021-03-04"]), LogicalType::Date);
         assert_eq!(of(&["2020-01-02 03:04:05"]), LogicalType::Timestamp);
         assert_eq!(of(&["1", "x"]), LogicalType::Varchar);
+    }
+
+    /// The spellings the cast learned in #369 and what the sniffer does with each of them, all of
+    /// it read off the pinned binary one file at a time. A radix stays on the `BIGINT` rung, a
+    /// point and an exponent drop to `DOUBLE`, and a separator drops all the way.
+    #[test]
+    fn a_column_of_numbers_written_the_other_ways_lands_on_the_rung_duckdb_puts_it_on() {
+        assert_eq!(of(&["0x10"]), LogicalType::BigInt);
+        assert_eq!(of(&["0X10"]), LogicalType::BigInt);
+        assert_eq!(of(&["0x1e"]), LogicalType::BigInt);
+        assert_eq!(of(&["0b101"]), LogicalType::BigInt);
+        assert_eq!(of(&["1.5"]), LogicalType::Double);
+        assert_eq!(of(&["1."]), LogicalType::Double);
+        assert_eq!(of(&[".5"]), LogicalType::Double);
+        assert_eq!(of(&["1e3"]), LogicalType::Double);
+        assert_eq!(of(&["1E3"]), LogicalType::Double);
+        assert_eq!(of(&["1e-3"]), LogicalType::Double);
+        assert_eq!(of(&["1e18"]), LogicalType::Double);
+        assert_eq!(of(&["1_000"]), LogicalType::Varchar);
+        assert_eq!(of(&["1_000", "1"]), LogicalType::Varchar);
+        assert_eq!(of(&["1.5", "1_0.5"]), LogicalType::Varchar);
+        assert_eq!(of(&["1e"]), LogicalType::Varchar);
     }
 
     /// The `TIME` rung, and the two values next to it that the binary leaves alone although the
