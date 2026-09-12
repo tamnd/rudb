@@ -253,6 +253,17 @@ impl Binder<'_> {
         for arg in arguments {
             bound.push(self.bind_expr(ast, arg, scope)?);
         }
+        // `typeof` is answered here rather than by a kernel, because the type is settled the moment
+        // its argument is bound and nothing about it changes per row. The argument still has to be
+        // a legal expression where it was written, so it goes through the aggregate rules first and
+        // is then dropped: upstream refuses `SELECT typeof(x), count(*) FROM t` for the same reason
+        // it refuses a bare `x` there, even though neither of them reads a value. Any other number
+        // of arguments falls through to the ordinary path and gets the arity error from the table.
+        if rudb_catalog::same_name(&written, "typeof") && bound.len() == 1 {
+            self.over_aggregate(bound[0], scope)?;
+            let named = self.plan().expr_type(bound[0]).to_string();
+            return Ok(self.plan_mut().add_constant(Value::Varchar(named)));
+        }
         self.call(&written, bound)
     }
 

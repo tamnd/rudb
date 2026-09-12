@@ -344,6 +344,16 @@ const TABLE: &[Entry] = &[
         shape: Shape::Sliced,
         numeric_only: false,
     },
+    // The type of an expression, as a string. Nothing is cast and nothing runs: the binder folds
+    // this to the name of the type it just decided, so the argument is only ever looked at and the
+    // executor never sees the call.
+    Entry {
+        name: "typeof",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
     // Aggregates.
     aggregate("count_star", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt), false),
     aggregate("count", Arity::exactly(1), Shape::AnyTo(Fixed::BigInt), false),
@@ -613,6 +623,7 @@ const CANDIDATES: &[(&str, &[&str])] = &[
             "array_slice(col0 ANY, col1 ANY, col2 ANY, col3 BIGINT) -> ANY",
         ],
     ),
+    ("typeof", &["typeof(col0 ANY) -> VARCHAR"]),
 ];
 
 /// What one element of a subscripted value is, or `None` for a value that cannot be subscripted.
