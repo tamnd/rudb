@@ -723,6 +723,92 @@ fn moment(value: f64, divide: bool) -> Result<i64> {
     if (-LIMIT..LIMIT).contains(&value) { Ok(value as i64) } else { Err(too_big(divide)) }
 }
 
+/// Whether a pair of values is a date with a count of days next to it.
+///
+/// The count is an `INTEGER` and nothing else, because the signature casts it to one and refuses
+/// every width that does not fit there, so this only has to tell the pair apart from two numbers.
+pub(crate) fn is_counted(left: &Value, right: &Value) -> bool {
+    matches!(
+        (left, right),
+        (Value::Date(_), Value::Integer(_)) | (Value::Integer(_), Value::Date(_))
+    )
+}
+
+/// A date with a count of days added to it or taken off it, which is still a date.
+///
+/// The one shape of date arithmetic that answers a date rather than a timestamp, since a count of
+/// days carries no time of day. The range failure is the date one and not the timestamp one, which
+/// is the other way round from a date with an interval on it, because nothing here turns the date
+/// into a moment on the way past.
+pub(crate) fn counted(left: &Value, right: &Value, subtract: bool) -> Result<Value> {
+    let (day, count) = match (left, right) {
+        (Value::Date(day), Value::Integer(count)) | (Value::Integer(count), Value::Date(day)) => {
+            (*day, i64::from(*count))
+        }
+        _ => return Err(Error::internal(format!("{left} and {right} are not a date and a count"))),
+    };
+    Ok(Value::Date(shifted_days(day, 0, if subtract { -count } else { count })?))
+}
+
+/// One date taken off another, or one timestamp taken off another.
+///
+/// Two dates answer a count of days as a `BIGINT`, which is why the oldest date taken off the newest
+/// one is a number and not a failure. Two timestamps answer an interval of days and microseconds,
+/// never of months, because a month is not a length that a pair of moments can name.
+///
+/// The interval is worked out in microseconds first and that subtraction has to fit an `i64`, so the
+/// widest pair of timestamps fails even though the interval it would name has room for the answer.
+/// That is upstream's order and upstream's sentence.
+pub(crate) fn apart(left: &Value, right: &Value) -> Result<Value> {
+    match (left, right) {
+        (Value::Date(late), Value::Date(early)) => {
+            Ok(Value::BigInt(i64::from(*late) - i64::from(*early)))
+        }
+        (Value::Timestamp(late), Value::Timestamp(early)) => {
+            let apart = late.checked_sub(*early).ok_or_else(too_far)?;
+            // The day count of a difference that fits an `i64` of microseconds is about a hundred
+            // million, so the narrowing cannot fail, and it reports the same sentence rather than
+            // panicking if it ever does.
+            let days = i32::try_from(apart / MICROS_PER_DAY).map_err(|_| too_far())?;
+            Ok(Value::Interval { months: 0, days, micros: apart % MICROS_PER_DAY })
+        }
+        _ => Err(Error::internal(format!("{left} and {right} are not two of the same"))),
+    }
+}
+
+fn too_far() -> Error {
+    Error::conversion("Timestamp difference is out of bounds")
+}
+
+/// Whether a pair of values is a date and a time of day.
+pub(crate) fn is_joined(left: &Value, right: &Value) -> bool {
+    matches!((left, right), (Value::Date(_), Value::Time(_)) | (Value::Time(_), Value::Date(_)))
+}
+
+/// A date and a time of day as the one moment they name together.
+///
+/// A time runs to `24:00:00` rather than stopping below midnight, so the last hour of the range is a
+/// timestamp on the next day, and there is nothing to wrap because the day comes from the date.
+///
+/// The sentence for a moment that does not fit is `Timestamp out of range` here and
+/// `Date and time not in timestamp range` for a date with an interval on it. The two are different
+/// paths upstream and they were measured rather than shared.
+pub(crate) fn joined(left: &Value, right: &Value) -> Result<Value> {
+    let (day, clock) = match (left, right) {
+        (Value::Date(day), Value::Time(clock)) | (Value::Time(clock), Value::Date(day)) => {
+            (*day, *clock)
+        }
+        _ => return Err(Error::internal(format!("{left} and {right} are not a date and a time"))),
+    };
+    let stamp = i128::from(day) * i128::from(MICROS_PER_DAY) + i128::from(clock);
+    match i64::try_from(stamp) {
+        Ok(stamp) if (OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(&stamp) => {
+            Ok(Value::Timestamp(stamp))
+        }
+        _ => Err(Error::out_of_range("Timestamp out of range")),
+    }
+}
+
 /// One sentence each for the two operators, and the punctuation on the end of them is upstream's.
 fn too_big(divide: bool) -> Error {
     if divide {
@@ -773,6 +859,21 @@ mod tests {
     /// What a scaled interval prints as.
     fn times(interval: &Value, factor: &Value, divide: bool) -> String {
         scaled(interval, factor, divide).expect("the fields have room").to_string()
+    }
+
+    /// What a date with a count of days on it prints as.
+    fn plus_days(date: &Value, count: i32, subtract: bool) -> String {
+        counted(date, &Value::Integer(count), subtract).expect("in range").to_string()
+    }
+
+    /// What one date taken off another, or one timestamp taken off another, prints as.
+    fn between(left: &Value, right: &Value) -> String {
+        apart(left, right).expect("close enough together").to_string()
+    }
+
+    /// What a date with a time of day on it prints as.
+    fn at(date: &Value, clock: i64) -> String {
+        joined(date, &Value::Time(clock)).expect("in range").to_string()
     }
 
     /// What the shift prints, which is what the statement it came from prints.
@@ -1033,6 +1134,66 @@ mod tests {
         // Dividing by an infinity is nothing at all rather than a failure, since every field lands
         // on zero and zero fits.
         assert_eq!(times(&day, &Value::Double(f64::INFINITY), true), "00:00:00");
+    }
+
+    /// Every row here is a statement that was run against the pinned binary for #393.
+    ///
+    /// A count of days keeps the date a date, in either order for the addition, and the count that
+    /// walks off the end of the calendar says so as a date and not as a timestamp.
+    #[test]
+    fn a_count_of_days_moves_a_date_and_leaves_it_a_date() {
+        let date = day(2020, 1, 1);
+        assert_eq!(plus_days(&date, 1, false), "2020-01-02");
+        assert_eq!(plus_days(&date, 0, false), "2020-01-01");
+        assert_eq!(plus_days(&date, -1, false), "2019-12-31");
+        assert_eq!(plus_days(&date, 1, true), "2019-12-31");
+        assert_eq!(
+            counted(&Value::Integer(1), &date, false).expect("in range").to_string(),
+            "2020-01-02"
+        );
+        assert_eq!(plus_days(&date, i32::MAX, true), "5877592-06-23 (BC)");
+        let error = counted(&date, &Value::Integer(i32::MAX), false).expect_err("past the end");
+        assert_eq!(error.to_string(), "Out of Range Error: Date out of range");
+    }
+
+    /// Two dates are a count and two timestamps are an interval, and neither answers in months.
+    #[test]
+    fn one_date_taken_off_another_is_days_and_one_timestamp_is_an_interval() {
+        assert_eq!(between(&day(2020, 3, 1), &day(2020, 2, 1)), "29");
+        assert_eq!(between(&day(2020, 2, 1), &day(2020, 3, 1)), "-29");
+        assert_eq!(between(&day(2020, 1, 1), &day(2020, 1, 1)), "0");
+        // The whole range, which is why the count is a `BIGINT` and not the `i32` a date is held in.
+        assert_eq!(between(&Value::Date(NEWEST_DATE), &Value::Date(OLDEST_DATE)), "4294967292");
+        let late = stamp(2020, 1, 2, 10 * MICROS_PER_HOUR);
+        let early = stamp(2020, 1, 1, 8 * MICROS_PER_HOUR);
+        assert_eq!(between(&late, &early), "1 day 02:00:00");
+        assert_eq!(between(&early, &late), "-1 day -02:00:00");
+        assert_eq!(between(&stamp(2020, 1, 1, 123_456), &stamp(2020, 1, 1, 0)), "00:00:00.123456");
+    }
+
+    /// The difference is worked out in microseconds, so the widest pair of moments has no answer.
+    #[test]
+    fn a_timestamp_difference_that_does_not_fit_an_i64_says_so() {
+        let error = apart(&Value::Timestamp(OLDEST_TIMESTAMP), &stamp(2020, 1, 1, 0))
+            .expect_err("too far apart");
+        assert_eq!(error.to_string(), "Conversion Error: Timestamp difference is out of bounds");
+    }
+
+    /// A date and a time of day, with the range failure that is not the one an interval gets.
+    #[test]
+    fn a_date_and_a_time_are_the_one_moment_they_name() {
+        let date = day(2020, 1, 1);
+        assert_eq!(at(&date, 10 * MICROS_PER_HOUR), "2020-01-01 10:00:00");
+        assert_eq!(
+            joined(&Value::Time(10 * MICROS_PER_HOUR), &date).expect("in range").to_string(),
+            "2020-01-01 10:00:00"
+        );
+        // A time runs to midnight inclusive, so the top of it is the day after.
+        assert_eq!(at(&date, MICROS_PER_DAY), "2020-01-02 00:00:00");
+        let error = joined(&Value::Date(NEWEST_DATE), &Value::Time(0)).expect_err("no such moment");
+        assert_eq!(error.to_string(), "Out of Range Error: Timestamp out of range");
+        let error = joined(&Value::Date(OLDEST_DATE), &Value::Time(0)).expect_err("no such moment");
+        assert_eq!(error.to_string(), "Out of Range Error: Timestamp out of range");
     }
 
     /// The two ends of the timestamp range, which are not the two ends of the `i64` that holds it.
