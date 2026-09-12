@@ -7,83 +7,143 @@
 //! The sort is Rust's `sort_by`, which is stable. Stability is not something SQL promises and it is
 //! kept anyway, because `ORDER BY a` over rows that tie on `a` producing a different order on two
 //! runs of the same query is the kind of difference that makes a compatibility diff useless.
+//!
+//! # The shape a sink has
+//!
+//! [`Sort`] is a [`Sink`], so the rows arrive through `sink`, one instance's rows are handed over
+//! through `combine`, and `finalize` does the sort once after every instance has combined. On one
+//! thread that is the same work in the same order as reading the input in a loop would be. On
+//! several it is the shape that makes the sort possible at all, and having it now is why F4 changes
+//! no operator.
+//!
+//! The finished chunks go into a [`Buffered`], which is a separate source rather than something
+//! `finalize` hands back, for the reason [`Sink::finalize`] gives.
 
 use std::cmp::Ordering;
+use std::sync::Mutex;
 
-use rudb_common::{Error, Memory, Reservation, Result, Value};
+use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Value};
+use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::Chunk;
 
-use crate::expr::evaluate_all;
-use crate::operator::Operator;
+use crate::buffer::Buffered;
+use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 
+/// One row on its way through a sort: the values of its keys, and the row itself.
+///
+/// row at a time: 2i (#63) sorts a normalized key that is one comparable byte string a row rather
+/// than a `Vec<Value>`, and moves the payload by index at the end instead of carrying a copy of
+/// every row through the sort.
+type Sortable = (Vec<Value>, Vec<Value>);
+
 /// An ordering over the input.
 #[derive(Debug)]
-pub(crate) struct Sort<'a> {
-    input: Box<dyn Operator + 'a>,
-    plan: &'a Plan,
+pub(crate) struct Sort {
     keys: Vec<SortKey>,
-    schema: Schema,
-    built: bool,
-    chunks: Vec<Chunk>,
-    at: usize,
+    /// The key expressions, evaluated against the input's schema.
+    exprs: Prepared,
+    /// The input's types, which are also the output's, since a sort changes no column.
+    types: Vec<LogicalType>,
     memory: Memory,
-    /// What the sorted chunks are charged, held for as long as this operator holds them.
-    held: Reservation,
+    /// Every instance's rows, waiting for the sort.
+    rows: Mutex<Vec<Sortable>>,
+    /// What those rows are charged, taken from the instances that gathered them and given back
+    /// once the sorted chunks have been charged instead.
+    charged: Mutex<Vec<Reservation>>,
+    /// What the sorted chunks are charged, held for as long as they are readable.
+    held: Mutex<Reservation>,
+    out: Buffered,
 }
 
-impl<'a> Sort<'a> {
+/// What one instance of a sort gathers before it combines.
+#[derive(Debug)]
+pub(crate) struct Gathered {
+    rows: Vec<Sortable>,
+    scratch: Scratch,
+    charged: Reservation,
+}
+
+impl Sort {
+    /// # Errors
+    ///
+    /// If a sort key does not resolve against the input's schema, which is a failure of the plan
+    /// and is found here rather than on the first chunk.
     pub(crate) fn new(
-        plan: &'a Plan,
-        input: Box<dyn Operator + 'a>,
+        plan: &Plan,
+        input: &Schema,
         keys: Slice,
         memory: &Memory,
-    ) -> Self {
-        let schema = input.schema().clone();
-        Self {
-            input,
-            plan,
-            keys: plan.sort_key_list(keys).to_vec(),
-            schema,
-            built: false,
-            chunks: Vec::new(),
-            at: 0,
+    ) -> Result<(Self, Buffered)> {
+        let keys = plan.sort_key_list(keys).to_vec();
+        let exprs: Vec<_> = keys.iter().map(|key| key.expr).collect();
+        let out = Buffered::new();
+        let sort = Self {
+            exprs: Prepared::new(plan, &exprs, input)?,
+            keys,
+            types: input.types(),
             memory: memory.clone(),
-            held: memory.reservation(),
+            rows: Mutex::new(Vec::new()),
+            charged: Mutex::new(Vec::new()),
+            held: Mutex::new(memory.reservation()),
+            out: out.clone(),
+        };
+        Ok((sort, out))
+    }
+}
+
+impl Sink for Sort {
+    type Local = Gathered;
+
+    fn local(&self) -> Gathered {
+        Gathered {
+            rows: Vec::new(),
+            scratch: self.exprs.scratch(),
+            charged: self.memory.reservation(),
         }
     }
 
-    fn build(&mut self) -> Result<()> {
-        let exprs: Vec<_> = self.keys.iter().map(|key| key.expr).collect();
-        // The keys and the rows waiting to be sorted, charged separately from the sorted chunks
-        // below, because this one is given back the moment the sort is done with it and the other
-        // is held for as long as anybody can ask this operator for a chunk.
-        let mut scratch = self.memory.reservation();
-        let mut sortable: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
-        while let Some(chunk) = self.input.next()? {
-            let keys = evaluate_all(self.plan, &exprs, &self.schema, &chunk)?;
-            let mut taken = 0;
-            // row at a time: 2i (#63) sorts a normalized key that is one comparable byte string a
-            // row rather than a `Vec<Value>`, and moves the payload by index at the end instead of
-            // carrying a copy of every row through the sort.
-            for row in 0..chunk.len() {
-                let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
-                let values: Vec<Value> = chunk.row(row).collect();
-                taken += rows::footprint(&key) + rows::footprint(&values);
-                sortable.push((key, values));
-            }
-            scratch.grow(taken)?;
+    fn sink(&self, chunk: &Chunk, local: &mut Gathered) -> Result<Progress> {
+        let mut keys = Vec::with_capacity(self.keys.len());
+        self.exprs.evaluate(chunk, &mut local.scratch, &mut keys)?;
+        let mut taken = 0;
+        // row at a time: see `Sortable`.
+        for row in 0..chunk.len() {
+            let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
+            let values: Vec<Value> = chunk.row(row).collect();
+            taken += rows::footprint(&key) + rows::footprint(&values);
+            local.rows.push((key, values));
         }
+        local.charged.grow(taken)?;
+        Ok(Progress::More)
+    }
+
+    fn combine(&self, local: Gathered) -> Result<()> {
+        let mut rows = self.rows.lock().map_err(poisoned)?;
+        // Appended rather than merged, because the sort has not happened yet. What order the
+        // instances combine in is what decides how rows that tie on every key come out, which is
+        // why F4 will have to combine in a fixed order and not in the order threads finish.
+        rows.extend(local.rows);
+        self.charged.lock().map_err(poisoned)?.push(local.charged);
+        Ok(())
+    }
+
+    fn finalize(&self) -> Result<()> {
+        let mut sortable = std::mem::take(&mut *self.rows.lock().map_err(poisoned)?);
         let mut failure: Option<Error> = None;
-        let keys = &self.keys;
-        sortable.sort_by(|left, right| compare(keys, &left.0, &right.0, &mut failure));
+        sortable.sort_by(|left, right| compare(&self.keys, &left.0, &right.0, &mut failure));
         if let Some(error) = failure {
             return Err(error);
         }
         let ordered: Vec<Vec<Value>> = sortable.into_iter().map(|(_, row)| row).collect();
-        self.chunks = rows::chunks(&self.schema.types(), &ordered, &mut self.held)?;
+        let mut held = self.held.lock().map_err(poisoned)?;
+        let chunks = rows::chunks(&self.types, &ordered, &mut held)?;
+        self.out.fill(chunks)?;
+        // The gathered rows are gone and the chunks are charged instead, so what the instances
+        // took is given back here and not before.
+        self.charged.lock().map_err(poisoned)?.clear();
         Ok(())
     }
 }
@@ -136,21 +196,6 @@ fn rank(left: &Value, right: &Value, key: SortKey) -> Result<Ordering> {
     }
 }
 
-impl Operator for Sort<'_> {
-    fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        if !self.built {
-            self.build()?;
-            self.built = true;
-        }
-        if self.at >= self.chunks.len() {
-            return Ok(None);
-        }
-        let chunk = self.chunks[self.at].clone();
-        self.at += 1;
-        Ok(Some(chunk))
-    }
+fn poisoned<T>(_: T) -> Error {
+    Error::internal("a thread panicked while holding the rows a sort is gathering")
 }

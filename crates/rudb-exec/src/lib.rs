@@ -27,12 +27,19 @@
 //! # The move to push
 //!
 //! The interface every operator ends up behind is in `rudb-pipeline`, and they are moving to it one
-//! at a time rather than in one commit. The filter, the projection and the limit are there now:
-//! they are [`Stream`](rudb_pipeline::Stream) implementations that take `&self` and are handed the
-//! mutable part beside the chunk, so one of them can be instantiated on as many threads as F4 wants
-//! without copying its predicate. Everything else in here is still a pull operator, and
-//! `adapt::Streamed` is the one thing that knows how to put a pushing operator in a pulling tree.
-//! It goes away with the rest of the pull side when the last operator has moved.
+//! at a time rather than in one commit. The filter, the projection and the limit are
+//! [`Stream`](rudb_pipeline::Stream) implementations, and the sort and the top N are
+//! [`Sink`](rudb_pipeline::Sink) implementations. All of them take `&self` and are handed the
+//! mutable part separately, so one of them can be instantiated on as many threads as F4 wants
+//! without copying its predicate or its key list.
+//!
+//! A sink finalises into a `buffer::Buffered`, which is a separate source that reads the finished
+//! chunks back out, rather than handing them back from `finalize`. That split is what makes the
+//! parallel read possible later and it costs nothing now.
+//!
+//! Everything else in here is still a pull operator, and `adapt` is the one thing that knows how to
+//! put a pushing operator in a pulling tree. It goes away with the rest of the pull side when the
+//! last operator has moved.
 //!
 //! # Why a schema per operator
 //!
@@ -47,6 +54,7 @@
 #![forbid(unsafe_code)]
 
 mod adapt;
+mod buffer;
 mod build;
 mod cancel;
 mod expr;
