@@ -44,7 +44,7 @@ The failure mode being avoided is a crate tree that looks modular and is not: fo
 
 **Optimization and planning.**
 
-`rudb-plan`, the logical and physical plan representations, their textual forms, and Substrait conversion.
+`rudb-plan`, the logical and physical plan representations, their textual forms, and Substrait conversion. The one walk that decides where a plan breaks into pipelines is here too, because the executor numbers its operators from it and `EXPLAIN` prints it, and a rule with two implementations of it is a printed plan that stops matching the one that ran.
 
 `rudb-opt`, the rewrite passes, cardinality estimation, join ordering, RPT, layout adaptation. Each pass is a module with a uniform interface, which is what makes document 9.1's per-pass disabling and document 14.2's automatic bisection possible.
 

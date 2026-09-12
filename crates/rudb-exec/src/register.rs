@@ -27,7 +27,11 @@ use rudb_seam::Registries;
 /// Built once and immutable after. A registry that could gain an entry after a query has planned
 /// against it is a registry that makes two runs of the same query incomparable, and comparing runs
 /// is the entire point of having one.
-pub(crate) fn registries() -> &'static Registries {
+///
+/// Public because `EXPLAIN` prints the seam section out of it and `EXPLAIN` is rendered above this
+/// crate, in `rudb`. The optimizer cannot reach it, being under this crate in the layer rule, so the
+/// caller that has both hands it over.
+pub fn registries() -> &'static Registries {
     static REGISTRIES: OnceLock<Registries> = OnceLock::new();
     REGISTRIES.get_or_init(assemble)
 }

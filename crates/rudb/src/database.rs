@@ -373,7 +373,7 @@ impl Shared {
     /// run under a read lock.
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let catalog = self.read();
-        let _seams = self.seams(sql)?;
+        let seams = self.seams(sql)?;
         let context = self.optimizer(&catalog)?;
         let ast = rudb_parse::parse_ast(sql)?;
         match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new())? {
@@ -383,7 +383,11 @@ impl Shared {
             }
             Bound::Explain(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                explained(&rudb_opt::explain::explain(&plan, context.statistics()))
+                explained(&rudb_opt::explain::explain_with(
+                    &plan,
+                    context.statistics(),
+                    rudb_opt::explain::Seams::new(&seams, rudb_exec::registries()),
+                ))
             }
             _ => Err(Error::not_implemented("a statement that is not a query, on the query path")),
         }
@@ -393,9 +397,9 @@ impl Shared {
     ///
     /// What the settings choose goes nowhere yet, because no seam has a second implementation to
     /// choose between until F1 and every one of the twenty seven is unregistered. What they do
-    /// today is fail a statement whose hint names a seam nobody has, which is the half of the
-    /// behaviour worth having before the other half arrives: a hint that is quietly ignored is a
-    /// measurement of the wrong thing.
+    /// today is fail a statement whose hint names a seam nobody has, and feed the seam section of
+    /// `EXPLAIN`, which is the half of the behaviour worth having before the other half arrives: a
+    /// hint that is quietly ignored is a measurement of the wrong thing.
     pub(crate) fn seams(&self, sql: &str) -> Result<rudb_seam::Settings> {
         let mut seams = self.inner.settings.seams();
         for hint in rudb_parse::hints(sql)? {
@@ -459,7 +463,6 @@ impl Shared {
     /// whatever the table had become in between.
     pub(crate) fn execute(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let ast = rudb_parse::parse_ast(sql)?;
-        let _seams = self.seams(sql)?;
         self.execute_ast(&ast, sql, &Parameters::new(), cancel)
     }
 
@@ -474,6 +477,7 @@ impl Shared {
         parameters: &Parameters,
         cancel: &Cancel,
     ) -> Result<QueryResult> {
+        let seams = self.seams(sql)?;
         let mut catalog = self.write();
         let context = self.optimizer(&catalog)?;
         match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
@@ -483,7 +487,11 @@ impl Shared {
             }
             Bound::Explain(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                explained(&rudb_opt::explain::explain(&plan, context.statistics()))
+                explained(&rudb_opt::explain::explain_with(
+                    &plan,
+                    context.statistics(),
+                    rudb_opt::explain::Seams::new(&seams, rudb_exec::registries()),
+                ))
             }
             Bound::Setting(setting) => {
                 let value = setting.value.as_ref();
