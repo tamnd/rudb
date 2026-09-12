@@ -21,14 +21,19 @@
 //! is built to be asked about. It is asked about once per row, so it matters, and it is not this
 //! change because a set per group is a different shape from a table over the whole input.
 
+use std::sync::Mutex;
+
 use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Accumulator, NOWHERE, is_true, update_scattered};
+use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
+use crate::buffer::Buffered;
 use crate::expr::{evaluate, evaluate_all};
 use crate::key::{Key, RowSet};
 use crate::operator::Operator;
+use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 use crate::spill::{Reader, Spill};
@@ -821,116 +826,266 @@ fn group_name(plan: &Plan, group: ExprRef, input: &Schema, at: usize) -> String 
 /// input's columns and not the key's. Plain `DISTINCT` is the same operator with the key being
 /// every column, and writing it that way rather than as a separate path is what keeps the two from
 /// disagreeing about nulls.
+///
+/// # Deduplicating twice
+///
+/// As a [`Sink`], an instance holds a table of what it has seen and the rows it decided to keep.
+/// Two instances that both saw a row both kept it, because neither can see the other's table
+/// without a lock in the row loop, so `combine` asks the same question again against one table and
+/// drops what is already there. That is the standard shape for a distinct in a parallel engine and
+/// the reason the instance keeps the key beside the row: the second pass needs it and rebuilding it
+/// would mean evaluating the expressions again.
+///
+/// On one thread there is one instance, the second pass finds nothing, and the work is what it was.
 #[derive(Debug)]
-pub(crate) struct Distinct<'a> {
-    input: Box<dyn Operator + 'a>,
-    plan: &'a Plan,
-    on: Vec<ExprRef>,
-    schema: Schema,
-    built: bool,
-    chunks: Vec<Chunk>,
-    at: usize,
+pub(crate) struct Distinct {
+    /// The expressions `DISTINCT ON` names, empty for a plain `DISTINCT`.
+    on: Prepared,
+    /// Whether the key is the whole row, which is what a plain `DISTINCT` is.
+    whole: bool,
+    /// The input's types, which are also the output's, since a distinct drops rows and not columns.
+    types: Vec<LogicalType>,
     memory: Memory,
-    /// What the kept chunks are charged, held for as long as this operator holds them.
-    held: Reservation,
+    /// What every instance has combined into.
+    global: Mutex<Held>,
+    /// What the kept rows are charged, given back once the chunks are charged instead.
+    charged: Mutex<Vec<Reservation>>,
+    /// What the kept chunks are charged, held for as long as they are readable.
+    held: Mutex<Reservation>,
+    out: Buffered,
 }
 
-impl<'a> Distinct<'a> {
+/// The one table and the one list of rows that survive, and what they are charged.
+#[derive(Debug)]
+struct Held {
+    seen: RowSet,
+    kept: Vec<Vec<Value>>,
+    /// What the table has been charged for the room it took.
+    counted: u64,
+    table: Reservation,
+    /// What the list of kept rows has been charged for the room it took.
+    counted_rows: u64,
+    slots: Reservation,
+}
+
+/// What one instance of a distinct holds while it runs.
+#[derive(Debug)]
+pub(crate) struct Keeping {
+    seen: RowSet,
+    /// The rows this instance kept, with the key each of them was kept for.
+    kept: Vec<(Key, Vec<Value>)>,
+    scratch: Scratch,
+    /// The buffer the key of the row being looked at is built in, reused per row.
+    key: Key,
+    rows: Reservation,
+    table: Reservation,
+    counted: u64,
+    counted_table: u64,
+}
+
+impl Distinct {
+    /// The sink, and the source its rows come out of.
+    ///
+    /// # Errors
+    ///
+    /// If an expression in `on` does not resolve against the input's schema.
     pub(crate) fn new(
-        plan: &'a Plan,
-        input: Box<dyn Operator + 'a>,
+        plan: &Plan,
+        input: &Schema,
         on: Slice,
         memory: &Memory,
-    ) -> Self {
-        let schema = input.schema().clone();
-        Self {
-            input,
-            plan,
-            on: plan.expr_list(on).to_vec(),
-            schema,
-            built: false,
-            chunks: Vec::new(),
-            at: 0,
+    ) -> Result<(Self, Buffered)> {
+        let on = plan.expr_list(on).to_vec();
+        let out = Buffered::new();
+        let distinct = Self {
+            whole: on.is_empty(),
+            on: Prepared::new(plan, &on, input)?,
+            types: input.types(),
             memory: memory.clone(),
-            held: memory.reservation(),
+            global: Mutex::new(Held {
+                seen: RowSet::default(),
+                kept: Vec::new(),
+                counted: 0,
+                // The table, which is gone before the chunks are built, unlike the rows it decided
+                // to keep. Per #272, the same split the aggregate above makes and for the same
+                // reason.
+                table: memory.reservation(),
+                counted_rows: 0,
+                slots: memory.reservation(),
+            }),
+            charged: Mutex::new(Vec::new()),
+            held: Mutex::new(memory.reservation()),
+            out: out.clone(),
+        };
+        Ok((distinct, out))
+    }
+}
+
+impl Sink for Distinct {
+    type Local = Keeping;
+
+    fn local(&self) -> Keeping {
+        Keeping {
+            seen: RowSet::default(),
+            kept: Vec::new(),
+            scratch: self.on.scratch(),
+            key: Key(Vec::new()),
+            rows: self.memory.reservation(),
+            table: self.memory.reservation(),
+            counted: 0,
+            counted_table: 0,
         }
     }
 
-    fn build(&mut self) -> Result<()> {
-        let mut scratch = self.memory.reservation();
-        // The table, which is gone before the chunks are built, unlike the rows it decided to keep.
-        // Per #272, the same split the aggregate above makes and for the same reason.
-        let mut table = self.memory.reservation();
-        let mut charged = 0;
-        let mut charged_table = 0;
-        let mut seen: RowSet = RowSet::default();
-        let mut kept: Vec<Vec<Value>> = Vec::new();
-        let mut key = Key(Vec::new());
-        while let Some(chunk) = self.input.next()? {
-            let keys = if self.on.is_empty() {
-                Vec::new()
+    fn sink(&self, chunk: &Chunk, local: &mut Keeping) -> Result<Progress> {
+        let mut keys = Vec::with_capacity(self.on.len());
+        self.on.evaluate(chunk, &mut local.scratch, &mut keys)?;
+        let mut taken = 0;
+        let mut aside = 0;
+        // row at a time: `DISTINCT` is a grouping that keeps no aggregate, so it gets its answer
+        // from the same table 2f (#60) builds and stops building a key here then.
+        for row in 0..chunk.len() {
+            if self.whole {
+                local.key.0.clear();
+                local.key.0.extend(chunk.row(row));
             } else {
-                evaluate_all(self.plan, &self.on, &self.schema, &chunk)?
-            };
-            let mut taken = 0;
-            let mut aside = 0;
-            // row at a time: `DISTINCT` is a grouping that keeps no aggregate, so it gets its
-            // answer from the same table 2f (#60) builds and stops building a key here then.
-            for row in 0..chunk.len() {
-                if self.on.is_empty() {
-                    key.0.clear();
-                    key.0.extend(chunk.row(row));
-                } else {
-                    fill(&mut key, &keys, row);
-                }
-                // Asked before anything is copied, because a row that has been seen is a row this
-                // has no further use for, and most rows of a `DISTINCT` worth running have been.
-                if seen.contains(&key) {
-                    continue;
-                }
-                let values: Vec<Value> =
-                    if self.on.is_empty() { key.0.clone() } else { chunk.row(row).collect() };
-                // The row is kept twice, once as the key in the table and once in the output, and
-                // each copy is its own block. What the table and the output took to have room for
-                // them is charged below, once per chunk. The copy is charged and not the buffer it
-                // came from, for the reason the group key in `build` above gives.
-                let stored = key.clone();
-                taken += rows::heap(&values);
-                aside += rows::heap(&stored.0);
-                seen.insert(stored);
-                kept.push(values);
+                fill(&mut local.key, &keys, row);
             }
-            scratch.grow(taken)?;
-            table.grow(aside)?;
-            let rows = width_of(kept.capacity() * size_of::<Vec<Value>>());
-            rows::capacity(rows, &mut charged, &mut scratch)?;
-            let now = rows::buckets(seen.capacity()) * (width_of(size_of::<Key>()) + 1);
-            rows::capacity(now, &mut charged_table, &mut table)?;
+            // Asked before anything is copied, because a row that has been seen is a row this has
+            // no further use for, and most rows of a `DISTINCT` worth running have been.
+            if local.seen.contains(&local.key) {
+                continue;
+            }
+            let values: Vec<Value> =
+                if self.whole { local.key.0.clone() } else { chunk.row(row).collect() };
+            // The row is kept twice, once as the key in the table and once in the output, and each
+            // copy is its own block. What the table and the output took to have room for them is
+            // charged below, once per chunk. The copy is charged and not the buffer it came from,
+            // for the reason the group key in `build` above gives.
+            let stored = local.key.clone();
+            taken += rows::heap(&values) + rows::heap(&stored.0);
+            aside += rows::heap(&stored.0);
+            local.seen.insert(stored.clone());
+            local.kept.push((stored, values));
         }
-        // The table is not needed to build the chunks and the rows are, so it goes first and its
-        // charge goes with it, which is the room the chunks are built in.
+        local.rows.grow(taken)?;
+        local.table.grow(aside)?;
+        let held = width_of(local.kept.capacity() * size_of::<(Key, Vec<Value>)>());
+        rows::capacity(held, &mut local.counted, &mut local.rows)?;
+        let now = rows::buckets(local.seen.capacity()) * (width_of(size_of::<Key>()) + 1);
+        rows::capacity(now, &mut local.counted_table, &mut local.table)?;
+        Ok(Progress::More)
+    }
+
+    fn combine(&self, local: Keeping) -> Result<()> {
+        let Keeping { seen, kept, rows, mut table, .. } = local;
+        // The instance's table has answered its last question, and the one below is about to be
+        // asked the same one, so it goes now rather than being held until the operator is dropped.
         drop(seen);
         table.release();
-        self.chunks = rows::chunks(&self.schema.types(), &kept, &mut self.held)?;
+        let mut global = self.global.lock().map_err(poisoned)?;
+        let global = &mut *global;
+        let mut aside = 0;
+        for (key, values) in kept {
+            let cost = rows::heap(&key.0);
+            if global.seen.insert(key) {
+                aside += cost;
+                global.kept.push(values);
+            }
+        }
+        global.table.grow(aside)?;
+        let now = rows::buckets(global.seen.capacity()) * (width_of(size_of::<Key>()) + 1);
+        rows::capacity(now, &mut global.counted, &mut global.table)?;
+        let held = width_of(global.kept.capacity() * size_of::<Vec<Value>>());
+        rows::capacity(held, &mut global.counted_rows, &mut global.slots)?;
+        self.charged.lock().map_err(poisoned)?.push(rows);
+        Ok(())
+    }
+
+    fn finalize(&self) -> Result<()> {
+        let mut global = self.global.lock().map_err(poisoned)?;
+        let kept = std::mem::take(&mut global.kept);
+        // The table is not needed to build the chunks and the rows are, so it goes first and its
+        // charge goes with it, which is the room the chunks are built in.
+        global.seen = RowSet::default();
+        global.counted = 0;
+        global.table.release();
+        let mut held = self.held.lock().map_err(poisoned)?;
+        let chunks = rows::chunks(&self.types, &kept, &mut held)?;
+        self.out.fill(chunks)?;
+        global.counted_rows = 0;
+        global.slots.release();
+        self.charged.lock().map_err(poisoned)?.clear();
         Ok(())
     }
 }
 
-impl Operator for Distinct<'_> {
-    fn schema(&self) -> &Schema {
-        &self.schema
+fn poisoned<T>(_: T) -> Error {
+    Error::internal("a thread panicked while holding the rows a distinct is keeping")
+}
+
+#[cfg(test)]
+mod tests {
+    use rudb_common::{Field, LogicalType, Memory, Value};
+    use rudb_pipeline::Sink;
+    use rudb_plan::{Plan, Slice};
+    use rudb_vector::{Chunk, Data, Vector};
+
+    use super::Distinct;
+    use crate::buffer::Buffered;
+    use crate::schema::Schema;
+
+    fn chunk(values: &[i32]) -> Chunk {
+        let column = Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into()))
+            .expect("integers are an i32 layout");
+        Chunk::new(vec![column]).expect("one column is one length")
     }
 
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        if !self.built {
-            self.build()?;
-            self.built = true;
-        }
-        if self.at >= self.chunks.len() {
-            return Ok(None);
-        }
-        let chunk = self.chunks[self.at].clone();
-        self.at += 1;
-        Ok(Some(chunk))
+    /// A plain `DISTINCT` over one integer column, which is the whole row case.
+    fn distinct() -> (Distinct, Buffered) {
+        let schema = Schema::numbered(vec![Field::new("a", LogicalType::Integer)], 0);
+        Distinct::new(&Plan::new(), &schema, Slice::EMPTY, &Memory::unlimited())
+            .expect("there are no expressions to resolve")
+    }
+
+    fn column(out: &Buffered) -> Vec<Value> {
+        let chunk = out.at(0).expect("readable").expect("one chunk");
+        (0..chunk.len()).map(|row| chunk.value_at(row, 0)).collect()
+    }
+
+    #[test]
+    fn one_instance_keeps_the_first_of_each_row() {
+        let (distinct, out) = distinct();
+        let mut local = distinct.local();
+        distinct.sink(&chunk(&[1, 2, 1, 3, 2]), &mut local).expect("five rows");
+        distinct.combine(local).expect("the one instance");
+        distinct.finalize().expect("the answer");
+
+        assert_eq!(column(&out), [Value::Integer(1), Value::Integer(2), Value::Integer(3)]);
+    }
+
+    /// The point of the second pass. Neither instance can see the other's table while it runs, so
+    /// both of them keep the row they share, and `combine` is what makes it one row again.
+    #[test]
+    fn two_instances_that_both_kept_a_row_keep_one_of_it_between_them() {
+        let (distinct, out) = distinct();
+        let mut left = distinct.local();
+        let mut right = distinct.local();
+        distinct.sink(&chunk(&[1, 2]), &mut left).expect("two rows");
+        distinct.sink(&chunk(&[2, 3]), &mut right).expect("two rows");
+        distinct.combine(left).expect("the first instance");
+        distinct.combine(right).expect("the second instance");
+        distinct.finalize().expect("the answer");
+
+        assert_eq!(column(&out), [Value::Integer(1), Value::Integer(2), Value::Integer(3)]);
+    }
+
+    #[test]
+    fn a_distinct_over_nothing_produces_nothing() {
+        let (distinct, out) = distinct();
+        distinct.combine(distinct.local()).expect("an instance that saw no chunks");
+        distinct.finalize().expect("the answer");
+
+        assert_eq!(out.len().expect("readable"), 0);
     }
 }

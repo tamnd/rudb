@@ -28,10 +28,15 @@
 //!
 //! The interface every operator ends up behind is in `rudb-pipeline`, and they are moving to it one
 //! at a time rather than in one commit. The filter, the projection and the limit are
-//! [`Stream`](rudb_pipeline::Stream) implementations, and the sort and the top N are
-//! [`Sink`](rudb_pipeline::Sink) implementations. All of them take `&self` and are handed the
-//! mutable part separately, so one of them can be instantiated on as many threads as F4 wants
-//! without copying its predicate or its key list.
+//! [`Stream`](rudb_pipeline::Stream) implementations, and the sort, the top N, the distinct and the
+//! set operations are [`Sink`](rudb_pipeline::Sink) implementations. All of them take `&self` and
+//! are handed the mutable part separately, so one of them can be instantiated on as many threads as
+//! F4 wants without copying its predicate or its key list.
+//!
+//! An operator with two inputs is two pipelines with an edge between them, and the set operation is
+//! the first one of those to move. The side that has to finish first ends in a `gather::Gather`,
+//! which holds its rows and does nothing else, and the side that uses it reads them through a
+//! handle. The join gets the same treatment when it moves.
 //!
 //! A sink finalises into a `buffer::Buffered`, which is a separate source that reads the finished
 //! chunks back out, rather than handing them back from `finalize`. That split is what makes the
@@ -58,6 +63,7 @@ mod buffer;
 mod build;
 mod cancel;
 mod expr;
+mod gather;
 mod group;
 mod join;
 mod key;
