@@ -19,13 +19,12 @@
 //! out: an arm that forgets to wrap is an arm that does not compile, because the id it was handed
 //! has to go somewhere.
 //!
-//! The ids are allocated as the match walks down, so operator 0 is the root and a child always has
-//! a larger id than its parent. The pipeline numbers are not worked out here. They come from
-//! [`Pipelines`], which is a walk over the plan in `rudb-plan`, because `EXPLAIN` prints the same
-//! decomposition without building anything and two versions of that rule would be right on the day
-//! they were written and disagree some time after.
+//! Neither the ids nor the pipeline numbers are worked out here. They come from [`Shape`], which is
+//! one walk over the plan in `rudb-plan`, because `EXPLAIN` prints the same numbering and the same
+//! decomposition without building anything, and two versions of that rule would be right on the day
+//! they were written and disagree some time after. What this module does is ask which operator a
+//! node is and wrap it.
 
-use std::cell::Cell;
 use std::sync::Arc;
 
 use rudb_catalog::{Catalog, QualifiedName};
@@ -33,7 +32,7 @@ use rudb_common::{Cancel, Memory, Result};
 use rudb_functions::TableFunction;
 use rudb_metrics::{Counters, Report};
 use rudb_pipeline::{Source, Watched};
-use rudb_plan::{Node, NodeRef, Pipelines, Plan};
+use rudb_plan::{Node, NodeRef, Plan, Shape};
 
 use crate::adapt::{Broken, Fed, Paired, Pulled, Streamed};
 use crate::cancel::Guarded;
@@ -103,48 +102,43 @@ pub fn build_measured<'a>(
     memory: &Memory,
     report: &Report,
 ) -> Result<Box<dyn Operator + 'a>> {
-    let pipelines = Pipelines::of(plan);
-    for pipeline in pipelines.all() {
+    let shape = Shape::of(plan);
+    for pipeline in shape.all() {
         report.pipeline(pipeline);
-        for waits_for in pipelines.waits_for(pipeline) {
+        for waits_for in shape.waits_for(pipeline) {
             report.depends(pipeline, *waits_for);
         }
     }
-    let building =
-        Building { plan, catalog, cancel, memory, report, pipelines, next_operator: Cell::new(0) };
+    let building = Building { plan, catalog, cancel, memory, report, shape };
     building.node(plan.root())
 }
 
 /// What the walk down the plan carries with it.
-///
-/// The operator counter is a cell rather than a mutable borrow because every arm of the match below
-/// recurses while it is holding something it made, and threading a `&mut` through that would mean
-/// building each node in two halves for no reason a reader of the arms would enjoy.
 struct Building<'a, 'b> {
     plan: &'a Plan,
     catalog: &'a Catalog,
     cancel: &'b Cancel,
     memory: &'b Memory,
     report: &'b Report,
-    pipelines: Pipelines,
-    next_operator: Cell<u32>,
+    shape: Shape,
 }
 
 impl<'a> Building<'a, '_> {
-    /// The id for the next operator, taken before its children are built so that a parent's id is
-    /// smaller than every id below it.
-    fn id(&self) -> u32 {
-        let id = self.next_operator.get();
-        self.next_operator.set(id + 1);
-        id
-    }
-
     /// The counters for one operator, registered with the report.
     ///
     /// Everything built here is marked as a reference implementation, because at tier 0 everything
     /// built here is one. That is not a placeholder: the marker is what stops a number measured
     /// against the simplest correct version of an operator from being quoted as if it came from the
     /// fast one, and it comes off an operator on the day that operator gets a second tier.
+    /// The id of the operator holding the side of this node that has to finish first.
+    ///
+    /// # Panics
+    ///
+    /// If the node has one input, which is a node whose arm below should not have called this.
+    fn gathered(&self, node: NodeRef) -> u32 {
+        self.shape.gathered(node).expect("a node with two inputs has a second operator")
+    }
+
     fn watch(&self, id: u32, pipeline: u32, kind: &str, detail: Option<&str>) -> Arc<Counters> {
         let counters = Counters::new(id, pipeline, kind).reference();
         let counters = match detail {
@@ -157,10 +151,10 @@ impl<'a> Building<'a, '_> {
     fn node(&self, reference: NodeRef) -> Result<Box<dyn Operator + 'a>> {
         let plan = self.plan;
         let memory = self.memory;
-        let pipeline = self.pipelines.pipeline(reference);
+        let id = self.shape.operator(reference);
+        let pipeline = self.shape.pipeline(reference);
         let inner: Box<dyn Operator + 'a> = match *plan.node(reference) {
             Node::Get { catalog: database, schema, table, index, columns, .. } => {
-                let id = self.id();
                 let name = QualifiedName::new(
                     plan.string(database),
                     plan.string(schema),
@@ -172,19 +166,16 @@ impl<'a> Building<'a, '_> {
                 pulled(Watched::new(scan, counters), schema)
             }
             Node::Dummy => {
-                let id = self.id();
                 let dummy = Dummy::new();
                 let schema = dummy.schema().clone();
                 pulled(Watched::new(dummy, self.watch(id, pipeline, "Dummy", None)), schema)
             }
             Node::Values { index, columns, rows } => {
-                let id = self.id();
                 let values = Values::new(plan, index, columns, rows)?;
                 let schema = values.schema().clone();
                 pulled(Watched::new(values, self.watch(id, pipeline, "Values", None)), schema)
             }
             Node::TableFunction { index, function, args, options, settings, columns } => {
-                let id = self.id();
                 let name = plan.string(function);
                 match TableFunction::lookup(name) {
                     Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
@@ -209,7 +200,6 @@ impl<'a> Building<'a, '_> {
                 }
             }
             Node::Filter { input, predicate } => {
-                let id = self.id();
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let filter = Filter::new(plan, predicate, &schema)?;
@@ -217,7 +207,6 @@ impl<'a> Building<'a, '_> {
                 Box::new(Streamed::new(input, Watched::new(filter, counters), schema))
             }
             Node::Project { input, index, exprs, names } => {
-                let id = self.id();
                 let input = self.node(input)?;
                 let project = Project::new(plan, input.schema(), index, exprs, names)?;
                 let schema = project.schema().clone();
@@ -225,7 +214,6 @@ impl<'a> Building<'a, '_> {
                 Box::new(Streamed::new(input, Watched::new(project, counters), schema))
             }
             Node::Aggregate { input, index, groups, aggregates } => {
-                let id = self.id();
                 let input = self.node(input)?;
                 let (aggregate, out) =
                     Aggregate::new(plan, input.schema(), index, groups, aggregates, memory)?;
@@ -234,7 +222,6 @@ impl<'a> Building<'a, '_> {
                 Box::new(Broken::new(input, Watched::new(aggregate, counters), out, schema))
             }
             Node::Sort { input, keys } => {
-                let id = self.id();
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let (sort, out) = Sort::new(plan, &schema, keys, memory)?;
@@ -242,7 +229,6 @@ impl<'a> Building<'a, '_> {
                 Box::new(Broken::new(input, Watched::new(sort, counters), out, schema))
             }
             Node::Limit { input, count, offset } => {
-                let id = self.id();
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let limit = Limit::new(count, offset);
@@ -250,7 +236,6 @@ impl<'a> Building<'a, '_> {
                 Box::new(Streamed::new(input, Watched::new(limit, counters), schema))
             }
             Node::TopN { input, keys, count, offset } => {
-                let id = self.id();
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
@@ -258,7 +243,6 @@ impl<'a> Building<'a, '_> {
                 Box::new(Broken::new(input, Watched::new(top, counters), out, schema))
             }
             Node::Distinct { input, on } => {
-                let id = self.id();
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let (distinct, out) = Distinct::new(plan, &schema, on, memory)?;
@@ -266,14 +250,13 @@ impl<'a> Building<'a, '_> {
                 Box::new(Broken::new(input, Watched::new(distinct, counters), out, schema))
             }
             Node::Join { left, right, kind, conditions } => {
-                let id = self.id();
-                let gather_id = self.id();
                 // The right side runs first, because no left row can be answered until every right
                 // row it might match has been seen. That is the dependency edge, and it is the same
                 // one the hash join builds on. The probing side is a pipeline of its own rather than
                 // part of the one above it, because it ends in a sink, and it waits for the build
                 // side.
-                let gathering = self.pipelines.pipeline(right);
+                let gather_id = self.gathered(reference);
+                let gathering = self.shape.pipeline(right);
                 let right = self.node(right)?;
                 let left = self.node(left)?;
                 let (gather, gathered) = Gather::new(memory);
@@ -293,13 +276,12 @@ impl<'a> Building<'a, '_> {
                 ))
             }
             Node::CrossProduct { left, right } => {
-                let id = self.id();
-                let keep_id = self.id();
                 // The right side runs first and is kept as the chunks it arrived in, because it is
                 // replayed once per left row. The left side streams, which is the whole point of
                 // this operator: the product is produced a chunk at a time and never held, so the
                 // product stays in the pipeline the left rows came from rather than starting one.
-                let aside = self.pipelines.pipeline(right);
+                let keep_id = self.gathered(reference);
+                let aside = self.shape.pipeline(right);
                 let right = self.node(right)?;
                 let left = self.node(left)?;
                 let (keep, kept) = Keep::new(memory);
@@ -314,11 +296,10 @@ impl<'a> Building<'a, '_> {
                 ))
             }
             Node::SetOp { left, right, kind, all, index } => {
-                let id = self.id();
-                let gather_id = self.id();
                 // The right side runs first, because nothing can be said about a left row until the
                 // whole right side has been counted. That is the dependency edge, spelled out.
-                let counting = self.pipelines.pipeline(right);
+                let gather_id = self.gathered(reference);
+                let counting = self.shape.pipeline(right);
                 let right = self.node(right)?;
                 let left = self.node(left)?;
                 let (gather, gathered) = Gather::new(memory);

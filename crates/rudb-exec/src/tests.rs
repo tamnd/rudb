@@ -718,3 +718,33 @@ fn the_strategies_table_hands_back_the_columns_it_was_asked_for() {
     assert_eq!(first[0], text("F1"), "the milestone column, not the first column of the table");
     assert_eq!(first[1], text("vector.form"));
 }
+
+#[test]
+fn the_ids_the_builder_tags_its_counters_with_are_the_ones_the_plan_says() {
+    // The point of the numbering living in `rudb-plan` is that `EXPLAIN` can print an operator's id
+    // without building the operator. That only holds if what gets built agrees, so this checks the
+    // two against each other over a plan with a node of two inputs in it, which is the shape where
+    // there are more operators than there are nodes.
+    let text = concat!(
+        "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+        "  Get memory.main.t AS t #0 [x::INTEGER]\n",
+        "  Get memory.main.empty AS empty #1 [x::INTEGER]\n",
+    );
+    let plan = Plan::parse(text).expect("the plan parses");
+    let shape = rudb_plan::Shape::of(&plan);
+    let report = rudb_metrics::Report::new();
+    let catalog = catalog();
+    let mut root =
+        crate::build_measured(&plan, &catalog, &Cancel::new(), &Memory::unlimited(), &report)
+            .expect("the tree builds");
+    while root.next().expect("the query runs").is_some() {}
+    let mut document = rudb_metrics::Document::new(text);
+    report.fill(&mut document);
+    let ids: Vec<u32> = document.operators.iter().map(|operator| operator.id).collect();
+    assert_eq!(ids, (0..shape.operators()).collect::<Vec<_>>(), "every id and no other");
+    let join = document.operators.iter().find(|operator| operator.kind == "Join").expect("a join");
+    assert_eq!(join.id, shape.operator(plan.root()));
+    let gather =
+        document.operators.iter().find(|operator| operator.kind == "Gather").expect("a gather");
+    assert_eq!(gather.id, shape.gathered(plan.root()).expect("two inputs, two operators"));
+}
