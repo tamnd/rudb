@@ -109,8 +109,8 @@ fn swept_within(flags: &Vector, kept: &Selection) -> Option<Selection> {
             }
             Some(picked_within(values, identity, kept.indices(), &nulls_of(flags)))
         }
-        Form::Dictionary => {
-            let (codes, inner) = flags.dictionary_parts()?;
+        Form::Dictionary | Form::Rle => {
+            let (codes, inner) = flags.positions()?;
             if codes.len() < flags.len() {
                 return None;
             }
@@ -181,8 +181,8 @@ fn swept(flags: &Vector, rows: usize) -> Option<Selection> {
             }
             Some(picked(values, identity, rows, &nulls_of(flags)))
         }
-        Form::Dictionary => {
-            let (codes, inner) = flags.dictionary_parts()?;
+        Form::Dictionary | Form::Rle => {
+            let (codes, inner) = flags.positions()?;
             if codes.len() < rows {
                 return None;
             }

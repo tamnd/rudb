@@ -208,8 +208,8 @@ fn unary(name: &str, arg: &Vector, returns: &LogicalType, rows: usize) -> Result
             };
             one_of(name, data, identity, base, rows, returns, arg)
         }
-        Form::Dictionary => {
-            let Some((codes, values)) = arg.dictionary_parts() else {
+        Form::Dictionary | Form::Rle => {
+            let Some((codes, values)) = arg.positions() else {
                 return Ok(None);
             };
             if codes.len() < rows {
@@ -562,18 +562,18 @@ macro_rules! by_form {
             let Some(one) = held.data() else { return Ok(None) };
             return $body(one, first, other, identity, $($rest),*);
         }
-        if let (Some((codes, values)), Some(other)) = ($left.dictionary_parts(), $right.data()) {
+        if let (Some((codes, values)), Some(other)) = ($left.positions(), $right.data()) {
             let Some(one) = values.data() else { return Ok(None) };
             let at = move |index: usize| codes[index] as usize;
             return $body(one, at, other, identity, $($rest),*);
         }
-        if let (Some(one), Some((codes, values))) = ($left.data(), $right.dictionary_parts()) {
+        if let (Some(one), Some((codes, values))) = ($left.data(), $right.positions()) {
             let Some(other) = values.data() else { return Ok(None) };
             let at = move |index: usize| codes[index] as usize;
             return $body(one, identity, other, at, $($rest),*);
         }
         if let (Some((codes, values)), Some(value)) =
-            ($left.dictionary_parts(), $right.constant_value())
+            ($left.positions(), $right.constant_value())
         {
             let Some(one) = values.data() else { return Ok(None) };
             let Some(held) = single($right.logical_type(), value) else { return Ok(None) };
@@ -582,7 +582,7 @@ macro_rules! by_form {
             return $body(one, at, other, first, $($rest),*);
         }
         if let (Some(value), Some((codes, values))) =
-            ($left.constant_value(), $right.dictionary_parts())
+            ($left.constant_value(), $right.positions())
         {
             let Some(other) = values.data() else { return Ok(None) };
             let Some(held) = single($left.logical_type(), value) else { return Ok(None) };
@@ -1135,8 +1135,8 @@ fn like_of(
             };
             like_run(column, identity, &compiled, base, rows, returns, fold_case, negated)
         }
-        Form::Dictionary => {
-            let Some((codes, values)) = text.dictionary_parts() else {
+        Form::Dictionary | Form::Rle => {
+            let Some((codes, values)) = text.positions() else {
                 return Ok(None);
             };
             if codes.len() < rows {
@@ -1298,8 +1298,8 @@ fn date_of(
             };
             date_runs(part, data, identity, base, rows, returns, when, truncating)
         }
-        Form::Dictionary => {
-            let Some((codes, values)) = when.dictionary_parts() else {
+        Form::Dictionary | Form::Rle => {
+            let Some((codes, values)) = when.positions() else {
                 return Ok(None);
             };
             if codes.len() < rows {
