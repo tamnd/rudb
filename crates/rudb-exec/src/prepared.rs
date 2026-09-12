@@ -33,13 +33,14 @@
 //! `spec/engine/04-expressions.md` gives: once the tree walk is gone what is left to save is pass
 //! count, and at 1024 rows the intermediate vectors are eight kilobytes and stay in L1.
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
 use rudb_kernels::{
     Comparison, Connective, cast, combine, compare, is_true, refine, refine_flags, selection,
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Chunk, Selection, Vector};
 
+use crate::ordering::Ordering;
 use crate::schema::Schema;
 use crate::written::written;
 
@@ -172,6 +173,24 @@ pub struct Scratch {
     /// What each step produced, or `None` for a step that produces nothing and for one that has not
     /// run yet.
     slots: Vec<Option<Vector>>,
+    /// What each connective step has learned about its operands, indexed by step.
+    ///
+    /// Empty for every step that is not a connective and for a connective a filter has not reached
+    /// yet, since it is built the first time one runs and the shape it needs is not known before
+    /// then. This is the mutable half of the adaptive ordering and it is here rather than in
+    /// [`Prepared`] because a prepared expression is shared by every thread running the pipeline.
+    orders: Vec<Option<Ordering>>,
+}
+
+impl Scratch {
+    /// The order a connective's operands are run in.
+    ///
+    /// For the tests that say the learning reached the walk. Nothing in the engine asks a scratch
+    /// this, because the walk is the only thing that reads an ordering and it reads its own.
+    #[cfg(test)]
+    fn order(&self, step: usize) -> Option<&[usize]> {
+        self.orders[step].as_ref().map(Ordering::order)
+    }
 }
 
 impl Prepared {
@@ -246,7 +265,10 @@ impl Prepared {
     /// Working space sized for this expression.
     #[must_use]
     pub fn scratch(&self) -> Scratch {
-        Scratch { slots: (0..self.steps.len()).map(|_| None).collect() }
+        Scratch {
+            slots: (0..self.steps.len()).map(|_| None).collect(),
+            orders: (0..self.steps.len()).map(|_| None).collect(),
+        }
     }
 
     /// How many expressions this was built from.
@@ -323,8 +345,9 @@ impl Prepared {
     ///
     /// So the conjuncts of a top level `AND` are run one at a time, each over the rows the ones
     /// before it left, and the moment nothing is left the rest of the predicate is not run at all.
-    /// The order is the order the plan gives, which is the optimizer's business rather than this
-    /// one's until the adaptive reordering of #57 lands.
+    /// The order they run in starts as the order the plan gives and then moves, because which
+    /// conjunct is worth running first is a question about the data and the scan is the thing
+    /// holding the answer. The `ordering` module has what is measured and how.
     ///
     /// A top level `OR` is threaded the same way against the complement. A row the first branch
     /// accepts is a row the filter keeps whatever the rest of the predicate says about it, so each
@@ -389,24 +412,39 @@ impl Prepared {
     /// four threaded comparisons rather than two threaded ones and two flag passes.
     fn branches(
         &self,
-        op: Connective,
-        operands: &[usize],
+        index: usize,
         begin: usize,
         chunk: &Chunk,
         scratch: &mut Scratch,
         live: Option<&Selection>,
     ) -> Result<Selection> {
+        let Step::Conjunction { op, start, len } = self.steps[index] else {
+            return Err(Error::internal("a connective walk over a step that is not a connective"));
+        };
+        let operands = &self.operands[start..start + len];
         let rows = chunk.len();
-        // The array is in post order and an operand's whole subtree sits between the operand before
-        // it and the operand itself. That is what makes running an operand at a time a matter of
-        // walking the same array in the same order rather than of holding a second structure.
-        let mut begin = begin;
+        // Out of the scratch for the length of the walk, because the walk runs steps and running a
+        // step wants the scratch. It goes back at the end, which is also where it learns. A walk
+        // that fails leaves the slot empty and the next chunk starts the connective over, which is
+        // a history lost on a query that is about to stop running anyway.
+        let mut order = scratch.orders[index]
+            .take()
+            .unwrap_or_else(|| Ordering::new(op, self.weights(operands, begin)));
         let mut carried: Option<Selection> = live.cloned();
-        for &operand in operands {
+        for slot in 0..len {
             if carried.as_ref().is_some_and(Selection::is_empty) {
                 break;
             }
-            let answered = self.thread(operand, begin, chunk, scratch, carried.as_ref())?;
+            let which = order.at(slot);
+            let operand = operands[which];
+            // The array is in post order and an operand's whole subtree sits between the operand
+            // before it and the operand itself, which is a range the run order cannot move. That is
+            // what lets the operands run in any order at all without a second structure to say
+            // where each one starts.
+            let from = if which == 0 { begin } else { operands[which - 1] + 1 };
+            let given = carried.as_ref().map_or(rows, Selection::len);
+            let answered = self.thread(operand, from, chunk, scratch, carried.as_ref())?;
+            order.observed(which, given, answered.len());
             carried = Some(match (op, carried) {
                 (Connective::And, _) => answered,
                 (Connective::Or, None) => answered.complement(rows),
@@ -414,11 +452,12 @@ impl Prepared {
             });
             // An operand's subtree is its own, because nothing here looks for a common subexpression
             // and so no step outside the range is reading one inside it.
-            for index in begin..=operand {
-                scratch.slots[index] = None;
+            for step in from..=operand {
+                scratch.slots[step] = None;
             }
-            begin = operand + 1;
         }
+        order.relearn();
+        scratch.orders[index] = Some(order);
         Ok(match (op, carried) {
             // A connective with no operands, which the binder does not build and which is answered
             // here rather than left to index arithmetic: an empty `AND` is every row and an empty
@@ -433,6 +472,54 @@ impl Prepared {
         })
     }
 
+    /// What each operand of a connective costs to run over a chunk, for the ordering to divide by.
+    ///
+    /// An operand costs what its whole subtree costs, which is the steps from where the operand
+    /// before it ended up to the operand itself.
+    fn weights(&self, operands: &[usize], begin: usize) -> Vec<f64> {
+        let mut costs = Vec::with_capacity(operands.len());
+        let mut from = begin;
+        for &operand in operands {
+            costs.push((from..=operand).map(|step| self.weight(step)).sum());
+            from = operand + 1;
+        }
+        costs
+    }
+
+    /// Roughly what one step costs to run over a chunk, against a comparison of two fixed width
+    /// columns as the unit.
+    ///
+    /// A ranking rather than a prediction. Nothing downstream reads the number itself, only which
+    /// of two of them is larger, and the differences that decide an order are the big ones: a
+    /// column reference costs nothing because it is read in place, a string function costs many
+    /// times what an integer comparison costs, and a comparison over a variable length type costs
+    /// several times what the same comparison over a fixed width one costs. Everything finer than
+    /// that is below the noise of what the window is measuring anyway.
+    fn weight(&self, index: usize) -> f64 {
+        match &self.steps[index] {
+            // Read straight out of the chunk at the point an operand is wanted, so there is no step
+            // to run and nothing to charge for.
+            Step::Column(_) => 0.0,
+            // One vector built per chunk, however many rows the chunk has.
+            Step::Constant(_) => 0.25,
+            // The operands carry the cost of a connective, and they are steps of their own.
+            Step::Conjunction { .. } => 0.0,
+            Step::Cast { input, .. } => 2.0 * touching(&self.types[*input]),
+            Step::Compare { left, .. } => touching(&self.types[*left]),
+            Step::Function { start, len, .. } => {
+                let widest = self.operands[*start..*start + *len]
+                    .iter()
+                    .map(|&argument| touching(&self.types[argument]))
+                    .fold(1.0, f64::max);
+                4.0 * widest
+            }
+            // A branch per arm, each of which is a prepared expression of its own that this does
+            // not look inside. Charging for the arms alone understates it and says the right thing
+            // about the order, which is that a `CASE` is not what you want in front.
+            Step::Case { arms, .. } => 4.0 * arms.len() as f64,
+        }
+    }
+
     /// One operand of a connective, over the rows it is still worth asking about.
     ///
     /// `begin` is the first step of the operand's subtree, which the caller knows because the steps
@@ -445,9 +532,8 @@ impl Prepared {
         scratch: &mut Scratch,
         live: Option<&Selection>,
     ) -> Result<Selection> {
-        if let Step::Conjunction { op, start, len } = self.steps[index] {
-            let operands = &self.operands[start..start + len];
-            return self.branches(op, operands, begin, chunk, scratch, live);
+        if matches!(self.steps[index], Step::Conjunction { .. }) {
+            return self.branches(index, begin, chunk, scratch, live);
         }
         for step in begin..index {
             self.run_step(step, chunk, scratch)?;
@@ -733,6 +819,20 @@ impl Prepared {
         let len = indices.len();
         self.operands.extend(indices);
         Ok((start, len))
+    }
+}
+
+/// What touching a value of this type costs, against a fixed width one as the unit.
+///
+/// A variable length value is a pointer to follow and a length that is not the same twice, and a
+/// nested one is that per element. Four is not measured, and what it has to be is large enough that
+/// the ordering puts a fixed width comparison in front of a string one and small enough that it does
+/// not put one in front of a string comparison that rejects every row.
+fn touching(ty: &LogicalType) -> f64 {
+    match ty.physical() {
+        PhysicalType::Varlen => 4.0,
+        PhysicalType::List | PhysicalType::Array | PhysicalType::Struct => 8.0,
+        _ => 1.0,
     }
 }
 
@@ -1075,6 +1175,53 @@ mod tests {
         // And the same predicate evaluated as an expression does divide by zero, which is what says
         // the test is testing the threading rather than a predicate that happens not to raise.
         evaluate(&plan, list[0], &schema, &chunk).expect_err("the tree walk divides by zero");
+    }
+
+    /// The conjunct that rejects the most rows ends up in front of the one that rejects none.
+    ///
+    /// The predicate is written the wrong way round on purpose. The plan order costs two passes a
+    /// chunk where one would do, and after a chunk of watching it the filter runs the selective one
+    /// first and the other one stops running at all.
+    #[test]
+    fn a_filter_learns_which_conjunct_to_run_first() {
+        let (schema, chunk) = input();
+        let predicate = "((#0.0::INTEGER > 0::INTEGER)::BOOLEAN AND (#0.0::INTEGER > 9::INTEGER)\
+                         ::BOOLEAN)::BOOLEAN";
+        let (plan, list) = projection(&format!("{predicate} AS p"));
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+        let mut scratch = prepared.scratch();
+        let root = prepared.roots[0];
+        assert_eq!(scratch.order(root), None, "nothing has run yet");
+        let kept = prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs");
+        assert!(kept.is_empty());
+        assert_eq!(scratch.order(root), Some(&[1, 0][..]), "the second conjunct rejects the most");
+        // And it stays there, because the conjunct that now runs first empties the selection and
+        // the one behind it keeps the history it already had rather than losing it.
+        let kept = prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs again");
+        assert!(kept.is_empty());
+        assert_eq!(scratch.order(root), Some(&[1, 0][..]));
+    }
+
+    /// Whatever order it settles on, the rows are the rows.
+    ///
+    /// Run for longer than the window is wide, because an order that changes halfway through a scan
+    /// is the shape where a walk that got the subtree bookkeeping wrong would start reading the
+    /// wrong steps, and the first chunk would not show it.
+    #[test]
+    fn reordering_never_changes_which_rows_survive() {
+        let (schema, chunk) = input();
+        let predicate = "((#0.0::INTEGER >= 1::INTEGER)::BOOLEAN AND \
+                         (\"+\"(#0.0::INTEGER, 1::INTEGER)::INTEGER < 4::INTEGER)::BOOLEAN AND \
+                         (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN)::BOOLEAN";
+        let (plan, list) = projection(&format!("{predicate} AS p"));
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+        let mut scratch = prepared.scratch();
+        let flags = evaluate(&plan, list[0], &schema, &chunk).expect("the tree walk runs");
+        let expected = Selection::from_predicate(chunk.len(), |row| is_true(&flags.value_at(row)));
+        for round in 0..40 {
+            let kept = prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs");
+            assert_eq!(kept, expected, "round {round}");
+        }
     }
 
     /// A nested connective is threaded rather than evaluated into flags.
