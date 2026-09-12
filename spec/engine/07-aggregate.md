@@ -109,6 +109,10 @@ An aggregate that does not fit in memory has to spill, DuckDB v2.0 shipped aggre
 
 What this layer owes is `serialize` in the interface from section 7.3 and the guarantee that every aggregate state written can be read back into an equal state, tested by round trip. Without it the memory work later has to revisit every aggregate function, which is exactly the retrofit cost document 00 exists to avoid. With it, spilling is a change to the operator and not to the functions.
 
+Tier 0 spills without it, and the trick is worth writing down because it constrains nothing here. A pass that runs out of room keeps the groups already in its table and writes any row whose key is not one of them to a file, whole and unfolded. Nothing already in the table ever goes out, so a key is either finished in that pass or absent from it entirely, no group is ever split across two passes, and there is nothing to merge. The cost is that a row is written rather than folded first, which is the wrong trade for ten groups and the right one for seventeen million, and seventeen million is the case that did not run at all. It is #220 and it is `crates/rudb-exec/src/spill.rs`.
+
+That does not pay the debt. Splitting by key means rereading the spilled rows once per pass, and the number of passes is decided by how much of the answer the budget already holds, so a query whose output nearly fills the budget gets many passes over a file it reads again each time. Partitioning the spill by a hash of the key, so each part is read once, is what makes it linear, and `serialize` is what lets a partial state go out instead of a row and turns the whole thing into one pass. Both are still owed.
+
 ## 7.11 The test gate
 
 The existing `Accumulator` is the oracle. Every vectorized `update` is checked against folding the same rows one at a time through the old code, over random data with random nulls, for every aggregate and every input type.

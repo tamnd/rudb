@@ -255,6 +255,20 @@ impl Reservation {
         Ok(())
     }
 
+    /// Gives `bytes` of it back, or everything if that is more than this is holding.
+    ///
+    /// For an operator that charged several things against one reservation and has dropped one of
+    /// them. The aggregate charges its hash table, its accumulators and its distinct sets together,
+    /// and then hands the keys out of the table into the rows it is building, at which point the
+    /// table is gone and the accumulators are not. Waiting for the whole reservation would charge a
+    /// table that no longer exists for the whole of the conversion, which is exactly the moment the
+    /// operator is holding the most.
+    pub fn shrink(&mut self, bytes: u64) {
+        let given = bytes.min(self.bytes);
+        self.memory.give(given);
+        self.bytes -= given;
+    }
+
     /// Gives everything back now rather than at the end of the scope.
     ///
     /// For an operator that has finished with its buffer and is about to hand out what it built
@@ -325,6 +339,22 @@ mod tests {
         drop(held);
         assert_eq!(memory.used(), 0);
         assert_eq!(memory.peak(), 4096);
+    }
+
+    #[test]
+    fn a_shrink_gives_back_part_and_never_more_than_it_holds() {
+        let memory = Memory::with_limit(1000);
+        let mut held = memory.reserve(800).expect("room for this");
+        held.shrink(300);
+        assert_eq!(held.bytes(), 500);
+        assert_eq!(memory.used(), 500, "the budget got the difference back");
+        memory.reserve(400).expect("which is room for something else");
+        // A reservation that is asked for more than it has gives what it has. The alternative is an
+        // arithmetic overflow in an operator that miscounted, and the operator that miscounted is
+        // the one that would never find out.
+        held.shrink(u64::MAX);
+        assert_eq!(held.bytes(), 0);
+        assert_eq!(memory.used(), 0);
     }
 
     #[test]

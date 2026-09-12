@@ -1391,29 +1391,34 @@ fn one_long_group_key_does_not_charge_every_short_one_for_its_length() {
     assert_eq!(loose.query("SELECT s, count(*) FROM k GROUP BY s").unwrap().len(), 201);
 }
 
-/// A group by is charged for the rows it builds out of its table and not only for the chunks it
-/// builds out of those. Per #272.
+/// A group by whose table does not fit the budget spills and answers anyway. Per #220.
+///
+/// This used to be the test for #272, which is the charge for the rows a group by builds out of its
+/// table, and the way it asserted that charge was that a million groups did not fit in three
+/// hundred megabytes. They do now, because a table that cannot grow any further stops growing and
+/// the rows that would have gone into it go to a file instead. The charge is still there and is
+/// still what decides when that happens, so the boundary this test sits on is the same one, and
+/// what is on the far side of it has changed from an error to an answer.
 #[test]
-fn a_group_by_is_charged_for_the_rows_it_makes_out_of_its_table() {
-    // A million groups. The rows are a vector header and two values each and come to seventy
-    // megabytes, on top of the two hundred and seventy the table and the keys and the chunks come
-    // to between them. Three hundred sits between the two, so this query fits if the rows are free
-    // and does not if they are charged, which is the whole of what is being tested. It is a
-    // narrower margin than a test likes and it is the honest one: the rows are a quarter of what
-    // this query holds, so a limit that tells them apart is a limit within a quarter of the truth.
+fn a_group_by_too_large_for_its_budget_spills_rather_than_stopping() {
+    // A million groups against three hundred megabytes, where the table and the rows and the chunks
+    // come to more than that between them.
     let db = Database::with_config(Config::new().with_memory_limit(300 << 20));
     let query = "SELECT range, count(*) FROM range(1000000) GROUP BY range";
-    // The error rather than `expect_err`, because the result this is asking not to get is a million
-    // rows and printing it is not how anybody wants to find out that it came back.
-    let error = db
-        .query(query)
-        .err()
-        .unwrap_or_else(|| panic!("the rows should not have fit beside the rest"));
+    assert_eq!(db.query(query).expect("it spills rather than stopping").len(), 1_000_000);
+    assert!(
+        db.memory().peak() <= 300 << 20,
+        "{} was held to get there, against a limit of {}",
+        db.memory().peak(),
+        300 << 20
+    );
+    // And a budget that does not hold the answer still refuses, quickly. Spilling moves the rows
+    // out of the table and not out of the result, so there is a size of budget no number of passes
+    // gets a query under, and the aggregate says so while its spill file is small rather than after
+    // it has written the whole input out and read it back sixty four times.
+    let tight = Database::with_config(Config::new().with_memory_limit(SMALL));
+    let error = tight.query(query).err().unwrap_or_else(|| panic!("a megabyte holds none of this"));
     assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
-    // And with room for them it answers, so what is being tested is the accounting rather than the
-    // grouping.
-    let loose = Database::with_config(Config::new().with_memory_limit(512 << 20));
-    assert_eq!(loose.query(query).unwrap().len(), 1_000_000);
 }
 
 #[test]
