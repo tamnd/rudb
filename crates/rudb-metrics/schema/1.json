@@ -1,0 +1,153 @@
+{
+  "schema": 1,
+  "query": {
+    "sql": "select ClientIP, count(*) from hits group by 1",
+    "hash": "d7f3297a264014b2",
+    "suite": "clickbench",
+    "id": "q32"
+  },
+  "engine": {
+    "version": "0.3.0",
+    "commit": "ab1510c",
+    "build": "release"
+  },
+  "machine": {
+    "name": "server3",
+    "cores": 8,
+    "memory": 24696061952,
+    "os": "linux"
+  },
+  "settings": {
+    "memory_limit": 1073741824,
+    "threads": 8
+  },
+  "outcome": {
+    "state": "succeeded",
+    "message": null
+  },
+  "timing": {
+    "parse_ns": 41000,
+    "bind_ns": 88000,
+    "optimize_ns": 310000,
+    "physical_ns": 44000,
+    "execute_ns": 1323000000,
+    "total_ns": 1323483000
+  },
+  "resource": {
+    "cpu_ns": 9880000000,
+    "peak_bytes": 894000000,
+    "bytes_read": 1420000000,
+    "bytes_decoded": 210000000,
+    "bytes_spilled": 0,
+    "bytes_read_back": 0,
+    "io_requests": 1180
+  },
+  "strategies": [
+    {
+      "seam": "hash.table",
+      "chosen": "unchained",
+      "by": "default",
+      "provenance": "Birler et al., DaMoN 2024"
+    },
+    {
+      "seam": "topk",
+      "chosen": "heavy-hitter-two-pass",
+      "by": "pinned",
+      "provenance": null
+    }
+  ],
+  "pipelines": [
+    {
+      "id": 0,
+      "instances": 8,
+      "depends_on": [],
+      "wall_ns": 980000000,
+      "cpu_ns": 7600000000,
+      "blocked_ns": {
+        "io": 120000000,
+        "memory": 0,
+        "dependency": 0,
+        "downstream": 3000000
+      }
+    },
+    {
+      "id": 1,
+      "instances": 1,
+      "depends_on": [
+        0
+      ],
+      "wall_ns": 343000000,
+      "cpu_ns": 2280000000,
+      "blocked_ns": {
+        "io": 0,
+        "memory": 0,
+        "dependency": 0,
+        "downstream": 0
+      }
+    }
+  ],
+  "operators": [
+    {
+      "id": 3,
+      "pipeline": 0,
+      "kind": "Scan",
+      "detail": "hits",
+      "rows_in": 0,
+      "rows_out": 99997497,
+      "estimated_rows": 99997497,
+      "wall_ns": 620000000,
+      "cpu_ns": 4800000000,
+      "bytes_read": 1420000000,
+      "bytes_decoded": 210000000,
+      "bytes_spilled": 0,
+      "memory": {
+        "reserved": 0,
+        "high_water": 0
+      },
+      "reference_impl": false
+    },
+    {
+      "id": 5,
+      "pipeline": 0,
+      "kind": "HashAggregate",
+      "detail": "ClientIP",
+      "rows_in": 99997497,
+      "rows_out": 41983110,
+      "estimated_rows": 2400000,
+      "wall_ns": 360000000,
+      "cpu_ns": 2800000000,
+      "bytes_read": 0,
+      "bytes_decoded": 0,
+      "bytes_spilled": 0,
+      "memory": {
+        "reserved": 0,
+        "high_water": 894000000
+      },
+      "reference_impl": false
+    },
+    {
+      "id": 7,
+      "pipeline": 1,
+      "kind": "Sort",
+      "detail": null,
+      "rows_in": 41983110,
+      "rows_out": 10,
+      "estimated_rows": null,
+      "wall_ns": 343000000,
+      "cpu_ns": 2280000000,
+      "bytes_read": 0,
+      "bytes_decoded": 0,
+      "bytes_spilled": 12000000,
+      "memory": {
+        "reserved": 0,
+        "high_water": 0
+      },
+      "reference_impl": true
+    }
+  ],
+  "warnings": [
+    "operator 7 (Sort) spilled 11.4 MiB",
+    "1 of the 3 operators ran a reference implementation, which is the slow path kept for differential testing",
+    "operator 5 (HashAggregate) was estimated at 2,400,000 rows and produced 41,983,110 (q-error 17.5)"
+  ]
+}

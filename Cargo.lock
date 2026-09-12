@@ -213,6 +213,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-metrics"
+version = "0.2.34"
+dependencies = [
+ "rudb-common",
+]
+
+[[package]]
 name = "rudb-opt"
 version = "0.2.34"
 dependencies = [
