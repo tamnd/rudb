@@ -34,18 +34,38 @@ pub fn run_serial(pipeline: &Pipeline, cancel: &Cancel) -> Result<()> {
             };
 
             let mut finished = false;
-            for (stream, local) in pipeline.streams().iter().zip(&mut locals.streams) {
-                match stream.push_state(&mut chunk, local)? {
+            // The operators that have more output in the chunk they were already given, which is a
+            // cross product and nothing else today. Each one is asked again only after the chunk it
+            // produced has been all the way through the sink, so there is one chunk in flight at a
+            // time whatever any operator is in the middle of.
+            let mut again: Vec<usize> = Vec::new();
+            let mut from = 0;
+            loop {
+                for (at, (stream, local)) in
+                    pipeline.streams().iter().zip(&mut locals.streams).enumerate().skip(from)
+                {
+                    match stream.push_state(&mut chunk, local)? {
+                        Progress::Blocked(blocked) => return Err(parked(pipeline, blocked)),
+                        Progress::Done => finished = true,
+                        Progress::Again => again.push(at),
+                        Progress::More => {}
+                    }
+                }
+
+                match pipeline.sink().sink_state(&chunk, &mut locals.sink)? {
                     Progress::Blocked(blocked) => return Err(parked(pipeline, blocked)),
                     Progress::Done => finished = true,
-                    Progress::More => {}
+                    // A sink produces nothing, so there is nothing for it to have more of.
+                    Progress::More | Progress::Again => {}
                 }
-            }
 
-            match pipeline.sink().sink_state(&chunk, &mut locals.sink)? {
-                Progress::Blocked(blocked) => return Err(parked(pipeline, blocked)),
-                Progress::Done => finished = true,
-                Progress::More => {}
+                // The last one to ask is the one nearest the sink, and it goes first because the
+                // operators above it have already seen what it produced. Going the other way round
+                // would hand them a second chunk built from an input they were half way through.
+                match again.pop() {
+                    Some(at) if !finished => from = at,
+                    _ => break,
+                }
             }
 
             if finished {

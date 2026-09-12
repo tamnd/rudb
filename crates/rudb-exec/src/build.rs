@@ -16,9 +16,9 @@ use rudb_common::{Cancel, Memory, Result};
 use rudb_functions::TableFunction;
 use rudb_plan::{Node, NodeRef, Plan};
 
-use crate::adapt::{Broken, Paired, Streamed};
+use crate::adapt::{Broken, Fed, Paired, Streamed};
 use crate::cancel::Guarded;
-use crate::gather::Gather;
+use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join};
 use crate::operator::Operator;
@@ -144,11 +144,17 @@ fn node<'a>(
             let schema = join.schema().clone();
             Box::new(Paired::new(right, gather, left, join, out, schema))
         }
-        Node::CrossProduct { left, right } => Box::new(CrossProduct::new(
-            node(plan, catalog, cancel, memory, left)?,
-            node(plan, catalog, cancel, memory, right)?,
-            memory,
-        )),
+        Node::CrossProduct { left, right } => {
+            let left = node(plan, catalog, cancel, memory, left)?;
+            let right = node(plan, catalog, cancel, memory, right)?;
+            // The right side runs first and is kept as the chunks it arrived in, because it is
+            // replayed once per left row. The left side streams, which is the whole point of this
+            // operator: the product is produced a chunk at a time and never held.
+            let (keep, kept) = Keep::new(memory);
+            let cross = CrossProduct::new(left.schema(), right.schema(), kept);
+            let schema = cross.schema().clone();
+            Box::new(Fed::new(right, keep, Streamed::new(left, cross, schema)))
+        }
         Node::SetOp { left, right, kind, all, index } => {
             let left = node(plan, catalog, cancel, memory, left)?;
             let right = node(plan, catalog, cancel, memory, right)?;
