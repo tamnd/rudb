@@ -2259,6 +2259,26 @@ fn set_disabled_optimizers_turns_a_pass_off_for_the_statements_that_follow() {
 }
 
 #[test]
+fn every_name_the_pass_list_publishes_is_a_name_the_statement_accepts() {
+    // The two have to agree or the corpus cannot turn the optimizer off, since the way it does
+    // that is to join this list with commas and hand it to the statement. A pass added without a
+    // name the setting knows would fail here rather than in another repository.
+    let names = crate::optimizers();
+    assert!(names.len() >= 6, "{names:?}");
+    let db = Database::new();
+    for name in &names {
+        db.execute(&format!("SET disabled_optimizers = '{name}'")).expect(name);
+    }
+    let all = names.join(",");
+    db.execute(&format!("SET disabled_optimizers = '{all}'")).expect("every pass off at once");
+    assert_eq!(db.setting("disabled_optimizers").unwrap(), all);
+    // And with all of them off the query still answers, out of the plan the binder produced.
+    assert_eq!(db.value("SELECT 1 + 2").unwrap(), Value::Integer(3));
+    let unoptimized = db.plan("SELECT 1 + 2").unwrap();
+    assert!(unoptimized.contains("\"+\""), "{unoptimized}");
+}
+
+#[test]
 fn a_pass_that_nobody_has_is_refused_by_the_statement_that_named_it() {
     let db = Database::new();
     let error = db.execute("SET disabled_optimizers = 'no_such_pass'").unwrap_err();

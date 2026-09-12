@@ -132,6 +132,32 @@ pub use syntax::{RowOrder, accepts, line_and_column, parses, row_order, split, w
 pub use rudb_common::{Cancel, Error, ErrorCode, Field, LogicalType, Result, Span, Value};
 pub use rudb_vector::Chunk;
 
+/// Every optimizer pass, by the name `SET disabled_optimizers` knows it by, in the order they run.
+///
+/// What a caller does with it is turn the optimizer off: `SET disabled_optimizers` takes DuckDB's
+/// comma separated spelling, and the whole list joined by commas is every rewrite off and the bound
+/// plan running as the binder produced it. `spec/09-optimizer.md` section 9.1 makes that a gate
+/// rather than a curiosity, because the unoptimized answer is the right answer by construction and
+/// any query that answers differently with the passes on is a pass that changed an answer. The
+/// corpus in `tamnd/rudb-compat` runs both ways and compares, and it needs the names to do it.
+///
+/// DuckDB spells the same question `SELECT name FROM duckdb_optimizers()`, which is a table
+/// function rudb does not have yet. When it arrives it reads this.
+///
+/// ```
+/// use rudb::Database;
+///
+/// let db = Database::new();
+/// db.execute(&format!("SET disabled_optimizers = '{}'", rudb::optimizers().join(",")))?;
+/// // The bound plan, with nothing folded, so the addition is still a call.
+/// assert!(db.plan("SELECT 1 + 2")?.contains("\"+\""));
+/// # Ok::<(), rudb::Error>(())
+/// ```
+#[must_use]
+pub fn optimizers() -> Vec<&'static str> {
+    rudb_opt::PASSES.iter().map(|pass| pass.name()).collect()
+}
+
 /// The seams, which are the parts of the engine there is more than one published way to build.
 ///
 /// A module rather than a flat re-export, because `Settings` here is which implementation runs at
