@@ -34,6 +34,24 @@ impl fmt::Display for Plan {
     }
 }
 
+impl Plan {
+    /// One operator's own line, with no indent, no newline and none of its children.
+    ///
+    /// What `EXPLAIN` walks, since it puts something of its own after each line and so cannot use
+    /// the whole plan's text. It is the same text the whole plan's text has on that line, written
+    /// by the same code, which is the property that matters: two printers that drift are two
+    /// formats, and the plan reader only knows one.
+    #[must_use]
+    pub fn operator(&self, node: NodeRef) -> String {
+        let mut out = String::new();
+        let held = self.node(node);
+        // Both of these write into a `String`, which cannot fail, so there is nothing to report.
+        let _ = out.write_str(held.keyword());
+        let _ = write_arguments(self, &mut out, held);
+        out
+    }
+}
+
 fn write_node<W: Write>(plan: &Plan, out: &mut W, node: NodeRef, depth: usize) -> fmt::Result {
     for _ in 0..depth {
         out.write_str("  ")?;

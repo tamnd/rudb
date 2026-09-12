@@ -13,6 +13,7 @@
 pub mod columns;
 pub mod empty;
 pub mod estimate;
+pub mod explain;
 pub mod filter;
 pub mod fold;
 pub mod limit;
