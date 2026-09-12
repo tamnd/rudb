@@ -258,19 +258,41 @@ fn ranks(root: &Path) -> BTreeMap<String, u32> {
     crate::layers::read_ranks(root).unwrap_or_default()
 }
 
-/// The commit to diff against: the merge base with the trunk, or the previous commit when the
-/// checkout is the trunk.
+/// The commit to diff against: the merge base with the trunk, or the previous commit when there is
+/// nothing on top of the trunk to measure.
 fn base(root: &Path) -> Option<String> {
+    let head = git(root, &["rev-parse", "HEAD"])?.trim().to_string();
+    let dirty = git(root, &["status", "--porcelain", "--untracked-files=all"])
+        .is_some_and(|out| !out.trim().is_empty());
     for trunk in ["origin/main", "main"] {
         if let Some(merge_base) = git(root, &["merge-base", trunk, "HEAD"]) {
-            let merge_base = merge_base.trim().to_string();
-            let head = git(root, &["rev-parse", "HEAD"])?.trim().to_string();
-            if merge_base != head {
-                return Some(merge_base);
+            if let Some(chosen) = against(Some(merge_base.trim()), &head, dirty) {
+                return Some(chosen);
             }
         }
     }
     git(root, &["rev-parse", "HEAD~1"]).map(|out| out.trim().to_string())
+}
+
+/// Which commit to measure against, given the merge base with the trunk, the head, and whether the
+/// working tree has anything uncommitted in it. `None` means the answer is the commit before head,
+/// which only git can supply.
+///
+/// The case this is written for is a merge base equal to head, which means nothing is committed on
+/// top of the trunk. With uncommitted work in the tree, that work is the whole of the change and
+/// head is what to measure it against, so the diff comes out empty and the file list is whatever
+/// `git status` says. With a clean tree there is no other reading than "what did the last commit
+/// do", and only then is the previous commit right.
+///
+/// Getting this wrong was the slowest thing about the gate. A fresh branch holding one uncommitted
+/// markdown file fell through to the previous commit, so it saw every file of the pull request that
+/// had just merged, and it rebuilt and retested two crates and everything above them to check a
+/// paragraph.
+fn against(merge_base: Option<&str>, head: &str, dirty: bool) -> Option<String> {
+    match merge_base {
+        Some(base) if base != head || dirty => Some(base.to_string()),
+        _ => None,
+    }
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
@@ -284,7 +306,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{closure, from_paths, manifest_of, members};
+    use super::{against, closure, from_paths, manifest_of, members};
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -357,6 +379,32 @@ mod tests {
         assert!(focus.crates.contains("xtask"));
         assert!(focus.prose);
         assert!(focus.grammar);
+    }
+
+    /// The bug this is here for cost more time than every other thing in this module saved. A
+    /// branch with nothing committed on it yet fell through to the previous commit and measured the
+    /// pull request that had just been merged, so the first gate run on any new branch paid for
+    /// recompiling and retesting whatever landed last.
+    #[test]
+    fn a_branch_with_only_uncommitted_work_is_measured_against_where_it_is() {
+        assert_eq!(against(Some("abc"), "abc", true).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn a_clean_tree_with_nothing_on_top_of_the_trunk_falls_back_to_the_commit_before() {
+        assert_eq!(against(Some("abc"), "abc", false), None);
+    }
+
+    #[test]
+    fn a_branch_with_commits_on_it_is_measured_against_where_it_branched_from() {
+        assert_eq!(against(Some("abc"), "def", false).as_deref(), Some("abc"));
+        assert_eq!(against(Some("abc"), "def", true).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn no_merge_base_is_not_an_answer() {
+        assert_eq!(against(None, "abc", true), None);
+        assert_eq!(against(None, "abc", false), None);
     }
 
     #[test]

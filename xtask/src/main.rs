@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Instant;
 
 mod bench;
 mod codegen;
@@ -162,20 +163,21 @@ fn ci(full: bool) -> Result<(), String> {
         if full { focus::Focus::everything("--full was asked for") } else { focus::detect(&root) };
     focus.report();
 
-    layers::check(&root)?;
-    rowloop::check(&root)?;
-    version::locked(&root)?;
+    let whole = Instant::now();
+    step("layers", || layers::check(&root))?;
+    step("row loops", || rowloop::check(&root))?;
+    step("version", || version::locked(&root))?;
     if focus.prose {
-        style::check(&root)?;
+        step("prose", || style::check(&root))?;
     }
     if focus.grammar {
-        vendor::verify()?;
-        codegen::generate(true)?;
+        step("grammar", vendor::verify)?;
+        step("grammar codegen", || codegen::generate(true))?;
     }
-    cargo(&["fmt", "--all", "--check"])?;
+    step("fmt", || fmt(&focus))?;
 
     if focus.no_code() {
-        println!("nothing to compile, the gate is green on what changed");
+        println!("nothing to compile, the gate is green on what changed in {}", took(whole));
         return Ok(());
     }
 
@@ -184,25 +186,87 @@ fn ci(full: bool) -> Result<(), String> {
     let mut clippy = vec!["clippy"];
     clippy.extend(scope.iter().map(String::as_str));
     clippy.extend(["--all-targets", "--all-features"]);
-    cargo(&clippy)?;
+    step("clippy", || cargo(&clippy))?;
 
     let mut test = vec!["test"];
     test.extend(scope.iter().map(String::as_str));
     test.push("--all-features");
-    cargo(&test)?;
+    step("test", || cargo(&test))?;
 
     let mut doc = vec!["doc"];
     doc.extend(scope.iter().map(String::as_str));
     doc.extend(["--all-features", "--no-deps"]);
-    cargo(&doc)?;
+    step("doc", || cargo(&doc))?;
 
-    msrv_scoped(&scope)?;
+    step("msrv", || msrv_scoped(&scope))?;
     // Last because it is the slowest and because everything above it is about this repository
     // alone. A change that broke the corpus broke it in a way the tests here did not see, which is
     // the whole reason the corpus lives in the other repository.
-    conform::check(&root)?;
-    println!("everything the gate runs is green");
+    step("corpus", || conform::check(&root))?;
+    println!("everything the gate runs is green in {}", took(whole));
     Ok(())
+}
+
+/// The format check, over the crates that changed rather than over the whole workspace.
+///
+/// `cargo fmt --all --check` costs about twelve seconds here and costs it whether anything changed
+/// or not, because almost all of it is reading thirty manifests and starting a rustfmt per target
+/// rather than the formatting itself. That twelve seconds sat under every single run of the gate,
+/// including the runs with no Rust in them at all, where it was the largest thing left.
+///
+/// Narrowing is sound for what this check catches. A file that is not formatted got that way in a
+/// commit that touched it, so it is in the diff, so it is in a crate named here. What narrowing
+/// gives up is a file that was already unformatted before this change, and that one was already
+/// getting through.
+///
+/// The crates named are the ones whose own files changed and not the dependency closure, because
+/// formatting does not propagate the way a compile error does.
+fn fmt(focus: &focus::Focus) -> Result<(), String> {
+    if focus.everything {
+        return cargo(&["fmt", "--all", "--check"]);
+    }
+    let mut owners: Vec<String> = focus
+        .paths
+        .iter()
+        .filter(|path| path.ends_with(".rs"))
+        .filter_map(|path| match path.split_once('/') {
+            Some(("xtask", _)) => Some("xtask".to_string()),
+            Some(("crates", rest)) => rest.split_once('/').map(|(name, _)| name.to_string()),
+            _ => None,
+        })
+        .collect();
+    owners.sort();
+    owners.dedup();
+    if owners.is_empty() {
+        println!("no Rust file changed, so there is nothing to check the formatting of");
+        return Ok(());
+    }
+    let mut args = vec!["fmt"];
+    for name in &owners {
+        args.push("-p");
+        args.push(name);
+    }
+    args.push("--check");
+    cargo(&args)
+}
+
+/// Runs one part of the gate and says afterwards how long it took.
+///
+/// The gate is the thing everybody waits for, so "why is it slow" is the question asked about it
+/// more than any other, and until this was here the only available answer was a guess. A line per
+/// part costs nothing next to the part itself and turns the guess into a measurement, which is the
+/// difference between optimizing the gate and redecorating it.
+fn step<T>(name: &str, run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let started = Instant::now();
+    let out = run();
+    println!("  {:>8}  {name}", took(started));
+    out
+}
+
+/// How long something took, in whichever unit reads without counting digits.
+fn took(since: Instant) -> String {
+    let seconds = since.elapsed().as_secs_f64();
+    if seconds < 60.0 { format!("{seconds:.1}s") } else { format!("{:.1}m", seconds / 60.0) }
 }
 
 /// Checks the workspace against the oldest Rust the manifest claims to support.

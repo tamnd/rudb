@@ -1790,7 +1790,13 @@ fn a_join_that_runs_too_long_is_stopped_partway_through_its_own_loop() {
     // produces its first chunk only after the whole join is done. Fifty thousand left rows against
     // twenty thousand right ones is a billion comparisons and about a minute, all of it inside one
     // call, so without a check in the loop itself the clock below is read once, at the end.
-    let db = Database::with_config(Config::new().with_query_timeout(Duration::from_millis(50)));
+    // A second rather than the fifty milliseconds the other limit tests use, because the limit is
+    // on the database and not on the query, so the two statements below are run under it too. They
+    // are a few milliseconds of work on an idle machine and they were over fifty on a busy one,
+    // which failed the gate here on a setup line rather than on anything this test is about. A
+    // second is two hundred times what the setup needs and a sixtieth of what the join needs, so it
+    // still proves the only thing at issue, which is that the join is stopped inside its own loop.
+    let db = Database::with_config(Config::new().with_query_timeout(Duration::from_secs(1)));
     db.execute("CREATE TABLE l AS SELECT i AS k FROM range(50000) t(i)").unwrap();
     db.execute("CREATE TABLE r AS SELECT i * 2 AS k FROM range(20000) t(i)").unwrap();
     let started = std::time::Instant::now();

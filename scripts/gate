@@ -38,11 +38,27 @@ rsync -a --delete \
   --rsync-path "mkdir -p ~/$remote && rsync" \
   "$root/" "$host:$remote/"
 
-# The merge base with the trunk when there is one, so a branch is measured against what it branched
-# from rather than against its own first commit, and the previous commit when this is the trunk.
+# The merge base with the trunk, so a branch is measured against what it branched from rather than
+# against its own first commit.
 base=$(git -C "$root" merge-base origin/main HEAD 2>/dev/null || true)
+if [ -z "$base" ]; then
+  base=$(git -C "$root" merge-base main HEAD 2>/dev/null || true)
+fi
 head=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)
-if [ -z "$base" ] || [ "$base" = "$head" ]; then
+dirty=$(git -C "$root" status --porcelain --untracked-files=all 2>/dev/null || true)
+
+# When the base is already HEAD there is nothing committed on top of the trunk, and the question
+# splits in two. With uncommitted work, that work is the whole of the change and the base stays at
+# HEAD, which makes the diff below empty and leaves the file list entirely to `git status`. With a
+# clean tree there is no other reading than "what did the last commit do", so the previous commit is
+# what to measure against.
+#
+# That first case is the one the gate is run in most often and it used to be the slowest one. A
+# fresh branch holding a single uncommitted markdown file was measured against `HEAD~1`, so it saw
+# every file of the pull request that had just been merged and rebuilt and retested two crates and
+# everything above them in order to check a paragraph. Narrowing it to nothing is worth more than
+# every other saving in here put together.
+if [ -z "$base" ] || { [ "$base" = "$head" ] && [ -z "$dirty" ]; }; then
   base=$(git -C "$root" rev-parse HEAD~1 2>/dev/null || true)
 fi
 
@@ -53,7 +69,7 @@ if [ -n "$base" ]; then
   changed=$(
     {
       git -C "$root" diff --name-only "$base...HEAD"
-      git -C "$root" status --porcelain --untracked-files=all | cut -c4- | sed 's/.* -> //' | tr -d '"'
+      printf '%s\n' "$dirty" | cut -c4- | sed 's/.* -> //' | tr -d '"'
     } | sed '/^$/d' | sort -u
   )
 fi
