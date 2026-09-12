@@ -796,7 +796,9 @@ fn to_date(value: &Value) -> Result<Value> {
             .map_err(|_| out_of_range(value, &LogicalType::Date)),
         Value::Varchar(text) => match parse_date(text) {
             Ok(days) => Ok(Value::Date(days)),
-            Err(fault) => Err(fault.said("date", text, "(YYYY-MM-DD)")),
+            // A zone that is written like an offset and is not one has a sentence of its own for a
+            // timestamp and has none for a date, which says the format instead.
+            Err(fault) => Err(fault.for_date().said("date", text, "(YYYY-MM-DD)")),
         },
         _ => Err(no_cast(value, &LogicalType::Date)),
     }
@@ -849,10 +851,15 @@ type Parsed<T> = std::result::Result<T, Fault>;
 /// same split and it is not the split anybody would guess: an hour past 24 is a range failure and
 /// a minute past 59 is a format one, so `'2020-01-01 25:00:00'` and `'2020-01-01 10:61:00'` are
 /// two different sentences upstream and are two different sentences here.
+///
+/// The third one is the zone on the end. It only comes up when what is there starts with a sign,
+/// because that is the only shape upstream commits to reading as an offset, and a name it cannot
+/// make sense of is not an error at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fault {
     Format,
     Range,
+    Zone,
 }
 
 impl Fault {
@@ -865,6 +872,17 @@ impl Fault {
             Self::Range => {
                 Error::conversion(format!("{what} field value out of range: \"{text}\""))
             }
+            Self::Zone => Error::conversion(format!(
+                "{what} field value \"{text}\" has a timestamp that is not UTC."
+            )),
+        }
+    }
+
+    /// The same failure as a date reports it, which has two sentences where a timestamp has three.
+    fn for_date(self) -> Self {
+        match self {
+            Self::Zone => Self::Format,
+            other => other,
         }
     }
 }
@@ -942,11 +960,87 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-/// `HH:MM:SS[.ffffff]` as microseconds since midnight.
+/// `HH:MM:SS[.ffffff]` with an optional zone after it, as microseconds since midnight.
 ///
 /// Midnight at the end of the day is a time, so `'2020-01-01 24:00:00'` is the second of January,
-/// and anything past it is out of range rather than badly written.
+/// and anything past it is out of range rather than badly written. The clock is read before the
+/// zone is looked at, which is the order upstream reports them in: `'2020-01-01 25:00:00+2'` has
+/// two things wrong with it and the sentence it gets is the one about the hour.
 fn parse_time(text: &str) -> Parsed<i64> {
+    let (clock, zone) = split_zone(text);
+    let micros = parse_clock_fields(clock)?;
+    parse_zone(zone)?;
+    Ok(micros)
+}
+
+/// The clock and whatever was written after it.
+///
+/// The clock is digits, colons and a dot, so the zone starts at the first character that is none of
+/// those. A sign is one of them, which is why `'2020-01-01 -05:00'` is a timestamp with an empty
+/// clock and a zone rather than a timestamp with an hour of minus five.
+fn split_zone(text: &str) -> (&str, &str) {
+    let end =
+        text.find(|c: char| !c.is_ascii_digit() && c != ':' && c != '.').unwrap_or(text.len());
+    text.split_at(end)
+}
+
+/// The zone on the end of a written time, which is read to check it and then thrown away.
+///
+/// A `TIMESTAMP` has no zone to keep it in, so every one of these is accepted and none of them
+/// moves the clock: `'2020-01-01 10:00:00+05'` is ten in the morning and so is
+/// `'2020-01-01 10:00:00 Asia/Ho_Chi_Minh'`. What is worth reproducing is which ones are refused.
+/// One space and one word is a zone name and the word is not looked up, so `zzz` is as good as
+/// `UTC`, but two words is not and neither is two spaces. A `Z` on its own is UTC and a lower case
+/// `z` is not. An offset has to be a sign and two digits, with two more after each colon, and an
+/// offset that starts and then stops is the one failure with its own sentence.
+fn parse_zone(text: &str) -> Parsed<()> {
+    let zone = text.trim_end();
+    let Some(first) = zone.chars().next() else {
+        return Ok(());
+    };
+    if let Some(name) = zone.strip_prefix(' ') {
+        return if name.is_empty() || name.contains(' ') { Err(Fault::Format) } else { Ok(()) };
+    }
+    if zone == "Z" {
+        return Ok(());
+    }
+    if first != '+' && first != '-' {
+        return Err(Fault::Format);
+    }
+    match offset_width(zone) {
+        None => Err(Fault::Zone),
+        Some(width) if width < zone.len() => Err(Fault::Format),
+        Some(_) => Ok(()),
+    }
+}
+
+/// How much of `text` a written offset takes up, or `None` when the sign is not followed by one.
+///
+/// Nothing about the offset is range checked, because upstream does not check it either: `+99:00`
+/// and `+05:70` are both offsets and both ignored.
+fn offset_width(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = 1 + two_digits(bytes.get(1..)?)?;
+    // The minutes and then the seconds, and no more than that, so the fourth field of
+    // `'+05:30:15:20'` is left over and the whole thing is a format failure.
+    for _ in 0..2 {
+        if bytes.get(at) != Some(&b':') {
+            break;
+        }
+        at += 1 + two_digits(bytes.get(at + 1..)?)?;
+    }
+    Some(at)
+}
+
+/// Two digits at the front of `bytes`, which is how wide every field of an offset has to be. A
+/// single digit is not one, which is why `'+5'` and `'+05:3'` are both refused.
+fn two_digits(bytes: &[u8]) -> Option<usize> {
+    matches!(bytes, [first, second, ..] if first.is_ascii_digit() && second.is_ascii_digit())
+        .then_some(2)
+}
+
+/// The clock itself, once the zone has been split off the end of it.
+fn parse_clock_fields(text: &str) -> Parsed<i64> {
     let (clock, fraction) = match text.split_once('.') {
         Some((clock, fraction)) => (clock, Some(fraction)),
         None => (text, None),
@@ -989,6 +1083,11 @@ fn parse_time(text: &str) -> Parsed<i64> {
 /// not the same ones. A date in front is read and thrown away and a bare date is midnight, so
 /// `'2020-01-02'` is `00:00:00`, but a date with nothing after the separator is refused, which is
 /// why `'2020-01-02 '` fails and `' 12:34:56 '` does not. Every one of these was measured.
+///
+/// The slack is only for a bare clock. Once there is a date in front, the rest of the string is
+/// read the way a timestamp reads it and the time of day is taken off the answer, so
+/// `'12:34:56 zzz junk'` is twelve thirty four and `'2020-01-01 12:34:56 zzz junk'` is refused, and
+/// `'2020-01-01 24:00:00'` is midnight because the timestamp it came from is the second of January.
 fn parse_clock(text: &str) -> Option<i64> {
     let text = text.trim_start();
     let clock = match split_time(text) {
@@ -1000,7 +1099,7 @@ fn parse_clock(text: &str) -> Option<i64> {
                 // A day on its own is midnight, and a day with a separator and nothing after it is
                 // a time that was not written.
                 None => return Some(0),
-                Some(rest) => rest,
+                Some(rest) => return parse_time(rest).ok().map(|micros| micros % MICROS_PER_DAY),
             }
         }
         _ => text,
@@ -1324,6 +1423,96 @@ mod tests {
         }
     }
 
+    /// Every rule the zone on the end of a written timestamp has, per #371, all of them measured.
+    ///
+    /// None of them moves the clock, because a `TIMESTAMP` has nowhere to put a zone, so the whole
+    /// of this is about what is accepted and what is not. The morning is ten in the morning in
+    /// every one of the first group.
+    #[test]
+    fn a_zone_on_the_end_of_a_written_timestamp_is_read_and_thrown_away() {
+        let morning = Value::Timestamp(
+            i64::from(days_from_civil(2020, 1, 1)) * MICROS_PER_DAY + 10 * 3_600_000_000,
+        );
+        for zone in [
+            "",
+            " ",
+            "  ",
+            "Z",
+            "Z ",
+            "+05",
+            "+05 ",
+            "-05:30",
+            "+05:30:15",
+            "+99:00",
+            "+05:70",
+            " +05",
+            " 05",
+            " zzz",
+            " zzz ",
+            " Asia/Ho_Chi_Minh",
+            " +",
+            " z",
+        ] {
+            let text = format!("2020-01-01 10:00:00{zone}");
+            let stamp = cast_to(Value::Varchar(text.clone()), &LogicalType::Timestamp);
+            assert_eq!(stamp.as_ref().ok(), Some(&morning), "{text}: {stamp:?}");
+            let day = cast_to(Value::Varchar(text.clone()), &LogicalType::Date);
+            assert_eq!(
+                day.as_ref().ok(),
+                Some(&Value::Date(days_from_civil(2020, 1, 1))),
+                "{text}"
+            );
+        }
+        // A sign that starts an offset and does not finish one is the third sentence, which is a
+        // timestamp's alone. The date has two sentences and says the format instead.
+        for zone in ["+2", "-0", "+05:", "+05:3"] {
+            let text = format!("2020-01-01 10:00:00{zone}");
+            let error = cast_to(Value::Varchar(text.clone()), &LogicalType::Timestamp)
+                .expect_err("this is not an offset");
+            assert_eq!(
+                error.message(),
+                format!("timestamp field value \"{text}\" has a timestamp that is not UTC.")
+            );
+            let error = cast_to(Value::Varchar(text.clone()), &LogicalType::Date)
+                .expect_err("this is not an offset");
+            assert_eq!(
+                error.message(),
+                format!("invalid date field format: \"{text}\", expected format is (YYYY-MM-DD)")
+            );
+        }
+        // Everything else on the end is a format failure, including a second word after the zone
+        // name, a second space in front of it, and an offset with something left over after it.
+        for zone in
+            ["x", "z", "Zx", "+123", "+05x", "+05 zzz", "  zzz", " UTC junk", "+05:30:15:20"]
+        {
+            let text = format!("2020-01-01 10:00:00{zone}");
+            let error = cast_to(Value::Varchar(text.clone()), &LogicalType::Timestamp)
+                .expect_err("this is not a zone");
+            assert_eq!(
+                error.message(),
+                format!(
+                    "invalid timestamp field format: \"{text}\", expected format is {TIMESTAMP_FORMAT}"
+                )
+            );
+        }
+        // The clock is read first, so a timestamp with two things wrong with it says the one about
+        // the clock, and a time field that starts with a sign is a format failure and not an hour.
+        for (text, said) in [
+            (
+                "2020-01-01 25:00:00+2",
+                "timestamp field value out of range: \"2020-01-01 25:00:00+2\"",
+            ),
+            (
+                "2020-01-01 -05:00",
+                "invalid timestamp field format: \"2020-01-01 -05:00\", expected format is (YYYY-MM-DD HH:MM[:SS[.US]][±HH[:MM[:SS]]| ZONE])",
+            ),
+        ] {
+            let error = cast_to(Value::Varchar(text.into()), &LogicalType::Timestamp)
+                .expect_err("this is not a timestamp");
+            assert_eq!(error.message(), said);
+        }
+    }
+
     /// Every rule the TIME parser has, per #228, all of them measured against the pinned binary.
     ///
     /// The slack is the point. The seconds and the fraction are optional, a colon with nothing
@@ -1355,6 +1544,13 @@ mod tests {
             ("2024-01-02 03:04:05", at(3, 4, 5, 0)),
             ("2024-01-02T03:04:05", at(3, 4, 5, 0)),
             ("2020-01-02", at(0, 0, 0, 0)),
+            // The slack stops once there is a date in front, because the rest is then read the way
+            // a timestamp reads it, and the time that rolls into the next day comes back as
+            // midnight rather than as the end of the day a bare `'24:00:00'` comes back as.
+            ("2020-01-01 10:00:00 zzz", at(10, 0, 0, 0)),
+            ("2020-01-01 10:00:00+05:30", at(10, 0, 0, 0)),
+            ("2020-01-01 10:00:00.123456789 zzz", at(10, 0, 0, 123_456)),
+            ("2020-01-01 24:00:00", at(0, 0, 0, 0)),
         ] {
             let time = cast_to(Value::Varchar(text.into()), &LogicalType::Time);
             assert_eq!(time.as_ref().ok(), Some(&expected), "{text}: {time:?}");
@@ -1379,6 +1575,9 @@ mod tests {
             "24:00:00.000001",
             "2024-13-02 03:04:05",
             "2020-01-02 ",
+            "2020-01-01 10:00:00+2",
+            "2020-01-01 10:00:00  zzz",
+            "2020-01-01 zzz",
         ] {
             let error = cast_to(Value::Varchar(text.into()), &LogicalType::Time)
                 .expect_err("this is not a time");
