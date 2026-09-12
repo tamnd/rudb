@@ -16,6 +16,7 @@ readme.workspace = true
 rudb-common.workspace = true
 rudb-io.workspace = true
 rudb-seam.workspace = true
+rudb-pipeline.workspace = true
 rudb-vector.workspace = true
 rudb-encoding.workspace = true
 rudb-kernels.workspace = true
