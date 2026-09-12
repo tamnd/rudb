@@ -1336,6 +1336,8 @@ impl<'a> Transform<'a> {
                     return Ok(self.push(Expr::Literal { kind, text: NONE }));
                 }
                 "FunctionExpression" => return self.function(node),
+                "CoalesceExpression" => return self.coalesce(node),
+                "NullIfExpression" => return self.null_if(node),
                 "ExtractExpression" => return self.extract(node),
                 "CastExpression" => return self.cast(node),
                 "CaseExpression" => return self.case(node),
@@ -1797,8 +1799,64 @@ impl<'a> Transform<'a> {
                 args.push(self.argument(kid)?);
             }
         }
+        // `IFNULL` is an ordinary call in the grammar and is not one by the time DuckDB's parser is
+        // done with it: `ifnull(NULL, 3)` comes back named `COALESCE(NULL, 3)` there, and so does
+        // `main.ifnull(NULL, 3)`, so the qualifier goes with the rewrite. The count is checked here
+        // because that is where upstream checks it, with the sentence below rather than the binder's
+        // arity error, and it is checked before the two arguments are looked at.
+        if self.ast.name(name).last().is_some_and(|part| part.eq_ignore_ascii_case("ifnull")) {
+            if args.len() != 2 {
+                return Err(Error::parser("Wrong number of arguments to IFNULL."));
+            }
+            let args = self.expr_slice(args);
+            let name = self.function_name("coalesce");
+            return Ok(self.push(Expr::Function { name, args, distinct }));
+        }
         let args = self.expr_slice(args);
         Ok(self.push(Expr::Function { name, args, distinct }))
+    }
+
+    /// `CoalesceExpression <- 'COALESCE' Parens(List(Expression))`.
+    ///
+    /// A keyword is not a child and the two wrappers are transparent, so the children are the
+    /// arguments. One of them is enough for the grammar and none of them is a syntax error, which is
+    /// why there is no count checked here.
+    ///
+    /// The call is written with the canonical name rather than the one the query used, since there is
+    /// nothing else to keep: the keyword is the name. Upstream prints the column in capitals whatever
+    /// case was written, because `COALESCE` is an operator there and not a function name that its
+    /// parser folded, and the binder is where that is decided here.
+    fn coalesce(&mut self, node: u32) -> Result<ExprRef> {
+        let mut args = Vec::new();
+        for kid in self.kids(node) {
+            args.push(self.expr(kid)?);
+        }
+        let args = self.expr_slice(args);
+        let name = self.function_name("coalesce");
+        Ok(self.push(Expr::Function { name, args, distinct: false }))
+    }
+
+    /// `NullIfExpression <- 'NULLIF' Parens(NullIfArguments)` and
+    /// `NullIfArguments <- Expression ',' Expression`.
+    ///
+    /// Exactly two arguments, because the rule says so: `nullif(1)` and `nullif(1, 2, 3)` are syntax
+    /// errors upstream and are syntax errors here for the same reason, so there is no arity to check
+    /// after the parse.
+    ///
+    /// It stays a function called `nullif` rather than becoming the `CASE` upstream's macro expands
+    /// to, since the column it produces is named after the call and not after the expansion.
+    fn null_if(&mut self, node: u32) -> Result<ExprRef> {
+        let arguments = self.find(node, "NullIfArguments");
+        if arguments == NONE {
+            return self.unsupported(node);
+        }
+        let mut args = Vec::new();
+        for kid in self.kids(arguments) {
+            args.push(self.expr(kid)?);
+        }
+        let args = self.expr_slice(args);
+        let name = self.function_name("nullif");
+        Ok(self.push(Expr::Function { name, args, distinct: false }))
     }
 
     /// `ExtractExpression <- 'EXTRACT' Parens(ExtractArguments)` and
@@ -2923,6 +2981,23 @@ mod tests {
     fn an_empty_subscript_is_not_a_subscript() {
         let error = parse_ast("SELECT a[]").expect_err("an empty subscript");
         assert_eq!(error.message(), "Empty subscript '[]' is not allowed");
+    }
+
+    /// The three spellings of a null check, two of which are their own grammar rule. Per #306.
+    #[test]
+    fn the_null_checks_are_calls_by_the_names_duckdb_prints() {
+        // The keyword is the name, so the call is written with the canonical spelling of it whichever
+        // case the query used. What the column is called is the binder's to decide.
+        assert_eq!(round("SELECT COALESCE(a, b, 1)"), "SELECT coalesce(a, b, 1)");
+        assert_eq!(round("SELECT coalesce(a)"), "SELECT coalesce(a)");
+        assert_eq!(round("SELECT NULLIF(a, 1)"), "SELECT nullif(a, 1)");
+        // `IFNULL` is a plain call that upstream's parser turns into the operator, qualifier and all.
+        assert_eq!(round("SELECT ifnull(a, 1)"), "SELECT coalesce(a, 1)");
+        assert_eq!(round("SELECT main.ifnull(a, 1)"), "SELECT coalesce(a, 1)");
+        let error = parse_ast("SELECT ifnull(a)").expect_err("one argument to ifnull");
+        assert_eq!(error.message(), "Wrong number of arguments to IFNULL.");
+        let error = parse_ast("SELECT ifnull(a, b, c)").expect_err("three arguments to ifnull");
+        assert_eq!(error.message(), "Wrong number of arguments to IFNULL.");
     }
 
     #[test]
