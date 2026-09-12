@@ -1077,6 +1077,50 @@ fn negating_the_smallest_value_of_a_type_widens_by_one_step() {
     assert_eq!(rows(&db, sql), vec![vec![Value::Integer(2147483647)]]);
 }
 
+/// Something written where a number goes that is not one, and the three answers upstream has. Per
+/// #277.
+///
+/// `SELECT 1e` is a refusal on the pinned binary as well, which is worth writing down because it
+/// looks like it should be `1` aliased `e`. It is that one byte later. The tokenizer gives the
+/// exponent marker back when there is anything at all behind it to give it back into, and at the end
+/// of the input there is not. So what was wrong here was the class and the words rather than the
+/// refusal, and all four of these were read off the binary.
+#[test]
+fn a_number_that_is_not_a_number_says_what_duckdb_says() {
+    let db = Database::new();
+    let cases = [
+        ("SELECT 1e", "Invalid Input Error", "Could not convert string '1e' to DOUBLE"),
+        ("SELECT 1e-", "Invalid Input Error", "Could not convert string '1e-' to DOUBLE"),
+        ("SELECT 1e2e", "Parser Error", "Already found scientific notation"),
+        (
+            "SELECT 1.2.3",
+            "Invalid Input Error",
+            "Failed to cast value: Could not convert string \"1.2.3\" to DECIMAL(4,1)",
+        ),
+    ];
+    for (sql, class, message) in cases {
+        let error = db.query(sql).unwrap_err();
+        assert_eq!(error.code().duckdb_name(), class, "{sql}");
+        assert_eq!(error.message(), message, "{sql}");
+    }
+}
+
+/// An underscore between two digits is a separator and not part of the number. Per #277.
+///
+/// The tokenizer has taken these as one number token since it was written, and the binder then
+/// refused every one of them, so nothing could be written with a separator in it at all. The type
+/// counts digits, so the separator has to be gone before the counting rather than after it.
+#[test]
+fn an_underscore_in_a_number_is_a_separator() {
+    let db = Database::new();
+    assert_eq!(rows(&db, "SELECT 1_000"), vec![vec![integer(1000)]]);
+    assert_eq!(rows(&db, "SELECT 1_000_000"), vec![vec![integer(1_000_000)]]);
+    assert_eq!(rows(&db, "SELECT 1e1_0"), vec![vec![Value::Double(1e10)]]);
+    let sql = "SELECT 1_0.5_0";
+    assert_eq!(db.query(sql).unwrap().types(), &[LogicalType::Decimal { width: 4, scale: 2 }]);
+    assert_eq!(rows(&db, sql), vec![vec![Value::Decimal { unscaled: 1050, width: 4, scale: 2 }]]);
+}
+
 /// A zero divisor is three different things, one per operator. Per #262.
 ///
 /// `/` never raises, because the binder has already promoted both sides to DOUBLE and IEEE

@@ -42,6 +42,11 @@ impl<'a> Statement<'a> {
 /// A script of nothing but comments and whitespace gives back no statements rather than one empty
 /// one, so a caller can run what comes back without checking each entry for emptiness.
 ///
+/// Trimming the text to the last token has one visible cost, which is #297. The parser tokenizes the
+/// slice again, and a number literal that ends in an exponent marker is at the end of the input there
+/// even when it was not at the end of the script, so `SELECT 1e;` refuses where upstream answers a
+/// row.
+///
 /// # Errors
 ///
 /// A tokenizer error, which is an unterminated string or a byte that cannot start a token.
