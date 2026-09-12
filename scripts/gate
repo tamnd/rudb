@@ -16,7 +16,12 @@ set -e
 
 host=server3
 case "$1" in
-  server1 | server2 | server3 | gamingpc) host=$1; shift ;;
+  server1 | server2 | server3) host=$1; shift ;;
+  # The Linux on the gaming pc is a WSL2 distro, and the machine's own name answers on the Windows
+  # sshd, where rsync gets a cmd.exe and says the syntax of the command is incorrect. The way in is
+  # the `gpc` alias, whose proxy starts the distro and holds it up for the length of the session.
+  # Both spellings are accepted because both get typed.
+  gamingpc | gpc) host=gpc; shift ;;
 esac
 
 root=$(cd "$(dirname "$0")/.." && pwd)
