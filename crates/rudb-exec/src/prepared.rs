@@ -326,12 +326,30 @@ impl Prepared {
     /// The order is the order the plan gives, which is the optimizer's business rather than this
     /// one's until the adaptive reordering of #57 lands.
     ///
-    /// What is threaded is the conjunct's own comparison rather than the whole of its subtree. A
+    /// A top level `OR` is threaded the same way against the complement. A row the first branch
+    /// accepts is a row the filter keeps whatever the rest of the predicate says about it, so each
+    /// branch is run over the rows no branch before it accepted, and the moment every row has been
+    /// accepted the rest of the predicate is not run either. That is the mirror of the `AND` case
+    /// and not an approximation of it: the answer is the same set of rows, because `OR` over three
+    /// valued logic is true wherever any branch is true and nothing a later branch says can take a
+    /// row back. It is worth less than the `AND` case in practice, since an `OR` of selective
+    /// branches leaves almost every row in play for the branch after, and it is worth having anyway
+    /// because the cost of finding that out is one merge per branch.
+    ///
+    /// What is threaded is the operand's own comparison rather than the whole of its subtree. A
     /// conjunct of `a + b > 5` still adds over the whole chunk, because the scalar kernels take a
     /// vector rather than a selection, and it is the comparison and everything downstream of it that
-    /// reads only the rows still in play. A conjunct that is a bare column, a function or a nested
-    /// `OR` produces flags over the chunk and is intersected with [`refine_flags`], which is what
-    /// keeps one awkward conjunct from putting the others back on the unthreaded path.
+    /// reads only the rows still in play. An operand that is a bare column or a function produces
+    /// flags over the chunk and is narrowed with [`refine_flags`], which is what keeps one awkward
+    /// operand from putting the others back on the unthreaded path. An operand that is itself a
+    /// connective recurses, so the two conjuncts of each half of `(a AND b) OR (c AND d)` are
+    /// threaded the same way the halves are.
+    ///
+    /// None of this is available to a projection. `SELECT a > 5 AND b LIKE 'x%'` wants a value per
+    /// row and the rows a selection dropped have no value in it, so [`evaluate`](Self::evaluate) and
+    /// [`evaluate_one`](Self::evaluate_one) evaluate the whole tree over the whole chunk and combine
+    /// flags. The two are separate entry points picked when the pipeline is built rather than one
+    /// path with a flag in it, because conflating them is a wrong answer rather than a slow one.
     ///
     /// # Errors
     ///
@@ -344,62 +362,111 @@ impl Prepared {
                 self.roots.len()
             )));
         };
-        let Step::Conjunction { op: Connective::And, start, len } = self.steps[root] else {
-            let flags = self.evaluate_one(chunk, scratch)?;
-            return Ok(selection(flags, chunk.len()));
-        };
-
         scratch.slots.clear();
         scratch.slots.resize_with(self.steps.len(), || None);
-        // The array is in post order and this expression's steps are the whole of it, so the subtree
-        // of the first conjunct starts at zero and the subtree of every other one starts just after
-        // the conjunct before it ends. That is what makes running a conjunct at a time a matter of
-        // walking the same array in the same order rather than of holding a second structure.
-        let mut begin = 0;
-        let mut kept: Option<Selection> = None;
-        for at in 0..len {
-            let conjunct = self.operands[start + at];
-            if kept.as_ref().is_some_and(Selection::is_empty) {
-                break;
-            }
-            for index in begin..conjunct {
-                self.run_step(index, chunk, scratch)?;
-            }
-            let next = self.thread(conjunct, chunk, scratch, kept.as_ref())?;
-            kept = Some(next);
-            // A conjunct's subtree is its own, because nothing here looks for a common subexpression
-            // and so no step outside the range is reading one inside it.
-            for index in begin..=conjunct {
-                scratch.slots[index] = None;
-            }
-            begin = conjunct + 1;
-        }
-        Ok(kept.unwrap_or_else(|| Selection::identity(chunk.len())))
+        // A predicate that is not a connective at all is the same walk over one operand, which is
+        // where [`thread`](Self::thread) starts: it runs the tree and turns the flags into a
+        // selection, with no narrowing to do because nothing has narrowed anything yet.
+        self.thread(root, 0, chunk, scratch, None)
     }
 
-    /// One conjunct, over the rows the conjuncts before it left, or over all of them for the first.
+    /// The operands of one connective, run in order, each over the rows the ones before it left.
+    ///
+    /// `live` is the rows this connective has to decide about and `None` means every row of the
+    /// chunk, which is not the same as a selection of all of them: it lets the first operand take
+    /// the unthreaded kernel rather than a pass over an identity selection. The answer is the rows
+    /// out of `live` the connective is true for.
+    ///
+    /// The walk is the same for both connectives and only the bookkeeping differs. `AND` carries the
+    /// rows every operand so far has kept, so each answer replaces it. `OR` carries the rows no
+    /// operand so far has accepted, so each answer comes out of it and the rows the connective keeps
+    /// are the ones that went missing along the way.
+    ///
+    /// The operand is not `steps[begin..=operand]` evaluated and then narrowed. Its subtree is run
+    /// over the whole chunk and it is the operand itself that reads only the rows in play, except
+    /// where the operand is another connective, which recurses and threads its own operands from
+    /// here rather than falling back to a flag vector. That is what makes `(a AND b) OR (c AND d)`
+    /// four threaded comparisons rather than two threaded ones and two flag passes.
+    fn branches(
+        &self,
+        op: Connective,
+        operands: &[usize],
+        begin: usize,
+        chunk: &Chunk,
+        scratch: &mut Scratch,
+        live: Option<&Selection>,
+    ) -> Result<Selection> {
+        let rows = chunk.len();
+        // The array is in post order and an operand's whole subtree sits between the operand before
+        // it and the operand itself. That is what makes running an operand at a time a matter of
+        // walking the same array in the same order rather than of holding a second structure.
+        let mut begin = begin;
+        let mut carried: Option<Selection> = live.cloned();
+        for &operand in operands {
+            if carried.as_ref().is_some_and(Selection::is_empty) {
+                break;
+            }
+            let answered = self.thread(operand, begin, chunk, scratch, carried.as_ref())?;
+            carried = Some(match (op, carried) {
+                (Connective::And, _) => answered,
+                (Connective::Or, None) => answered.complement(rows),
+                (Connective::Or, Some(carried)) => carried.without(&answered),
+            });
+            // An operand's subtree is its own, because nothing here looks for a common subexpression
+            // and so no step outside the range is reading one inside it.
+            for index in begin..=operand {
+                scratch.slots[index] = None;
+            }
+            begin = operand + 1;
+        }
+        Ok(match (op, carried) {
+            // A connective with no operands, which the binder does not build and which is answered
+            // here rather than left to index arithmetic: an empty `AND` is every row and an empty
+            // `OR` is none.
+            (Connective::And, None) => live.cloned().unwrap_or_else(|| Selection::identity(rows)),
+            (Connective::And, Some(kept)) => kept,
+            (Connective::Or, None) => Selection::empty(),
+            (Connective::Or, Some(missed)) => match live {
+                None => missed.complement(rows),
+                Some(live) => live.without(&missed),
+            },
+        })
+    }
+
+    /// One operand of a connective, over the rows it is still worth asking about.
+    ///
+    /// `begin` is the first step of the operand's subtree, which the caller knows because the steps
+    /// are in post order.
     fn thread(
         &self,
         index: usize,
+        begin: usize,
         chunk: &Chunk,
         scratch: &mut Scratch,
-        kept: Option<&Selection>,
+        live: Option<&Selection>,
     ) -> Result<Selection> {
+        if let Step::Conjunction { op, start, len } = self.steps[index] {
+            let operands = &self.operands[start..start + len];
+            return self.branches(op, operands, begin, chunk, scratch, live);
+        }
+        for step in begin..index {
+            self.run_step(step, chunk, scratch)?;
+        }
         if let Step::Compare { op, left, right } = self.steps[index] {
             let left = self.operand(left, chunk, &scratch.slots)?;
             let right = self.operand(right, chunk, &scratch.slots)?;
-            return match kept {
-                // The first conjunct has every row in play, and asking the threaded kernel for that
+            return match live {
+                // The first operand has every row in play, and asking the threaded kernel for that
                 // would be a pass over an identity selection the unthreaded one does not need.
                 None => Ok(selection(&compare(op, left, right)?, chunk.len())),
-                Some(kept) => refine(op, left, right, kept),
+                Some(live) => refine(op, left, right, live),
             };
         }
         self.run_step(index, chunk, scratch)?;
         let flags = self.operand(index, chunk, &scratch.slots)?;
-        match kept {
+        match live {
             None => Ok(selection(flags, chunk.len())),
-            Some(kept) => refine_flags(flags, kept),
+            Some(live) => refine_flags(flags, live),
         }
     }
 
@@ -959,12 +1026,128 @@ mod tests {
         );
     }
 
-    /// An `OR` at the top is not threaded, because a row the left side rejects is a row the right
-    /// side may still keep. Threading it would be the wrong answer rather than a slower one.
+    /// An `OR` at the top threads the complement: the second branch only sees the rows the first
+    /// one did not accept, and the rows it accepts are added to them rather than replacing them.
+    ///
+    /// The input has a row where the first branch is true, one where the second is, one where both
+    /// are false and one where the first is null and the second is true, which is the row that says
+    /// whether the complement was taken over "not true" or over "false".
     #[test]
-    fn an_or_at_the_top_is_not_threaded() {
+    fn an_or_at_the_top_threads_the_complement() {
         filters(
             "((#0.0::INTEGER > 2::INTEGER)::BOOLEAN OR (#0.1::VARCHAR = 'c'::VARCHAR)::BOOLEAN)\
+             ::BOOLEAN",
+        );
+        filters(
+            "((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN \
+             OR (#0.0::INTEGER > 2::INTEGER)::BOOLEAN)::BOOLEAN",
+        );
+    }
+
+    /// A branch that accepts every row, in front of one that would have accepted none. The rows are
+    /// the same either way and the point of the shape is that the second branch never runs.
+    #[test]
+    fn a_branch_that_keeps_everything_ends_the_predicate() {
+        filters(
+            "((#0.0::INTEGER IS NOT DISTINCT FROM #0.0::INTEGER)::BOOLEAN OR \
+             (#0.0::INTEGER > 9::INTEGER)::BOOLEAN)::BOOLEAN",
+        );
+    }
+
+    /// The branches after one that has accepted every row really are skipped.
+    ///
+    /// Every other test here says the threaded answer matches the unthreaded one, which it would
+    /// even if nothing were threaded at all. This one puts a division by zero behind a branch that
+    /// accepts everything, so the predicate raises if the second branch runs and does not if the
+    /// walk stopped where it was supposed to.
+    #[test]
+    fn a_branch_behind_one_that_accepted_every_row_does_not_run() {
+        let (schema, chunk) = input();
+        let predicate = "((#0.0::INTEGER IS NOT DISTINCT FROM #0.0::INTEGER)::BOOLEAN OR \
+                         (\"//\"(#0.0::INTEGER, 0::INTEGER)::INTEGER > 0::INTEGER)::BOOLEAN)\
+                         ::BOOLEAN";
+        let (plan, list) = projection(&format!("{predicate} AS p"));
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+        let mut scratch = prepared.scratch();
+        let kept =
+            prepared.evaluate_filter(&chunk, &mut scratch).expect("the second branch never runs");
+        assert_eq!(kept, Selection::identity(chunk.len()));
+        // And the same predicate evaluated as an expression does divide by zero, which is what says
+        // the test is testing the threading rather than a predicate that happens not to raise.
+        evaluate(&plan, list[0], &schema, &chunk).expect_err("the tree walk divides by zero");
+    }
+
+    /// A nested connective is threaded rather than evaluated into flags.
+    ///
+    /// The inner `AND` keeps nothing, so its second conjunct is never reached and the division by
+    /// zero in it never happens. Evaluating the branch as an expression and narrowing the flags
+    /// afterwards, which is what an operand that is not a connective still does, would have run it.
+    #[test]
+    fn a_nested_connective_stops_where_the_outer_one_would() {
+        let (schema, chunk) = input();
+        let predicate = "((#0.0::INTEGER > 9::INTEGER)::BOOLEAN OR ((#0.0::INTEGER > 9::INTEGER)\
+                         ::BOOLEAN AND (\"//\"(#0.0::INTEGER, 0::INTEGER)::INTEGER > 0::INTEGER)\
+                         ::BOOLEAN)::BOOLEAN)::BOOLEAN";
+        let (plan, list) = projection(&format!("{predicate} AS p"));
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+        let mut scratch = prepared.scratch();
+        let kept =
+            prepared.evaluate_filter(&chunk, &mut scratch).expect("the division never happens");
+        assert!(kept.is_empty());
+        evaluate(&plan, list[0], &schema, &chunk).expect_err("the tree walk divides by zero");
+    }
+
+    /// A branch that is not a comparison, which is the one that goes through the flag kernel.
+    #[test]
+    fn an_or_branch_that_is_not_a_comparison_is_threaded_too() {
+        filters(
+            "((#0.0::INTEGER > 2::INTEGER)::BOOLEAN OR \
+             \"~~\"(#0.1::VARCHAR, 'a%'::VARCHAR)::BOOLEAN)::BOOLEAN",
+        );
+        filters(
+            "(\"~~\"(#0.1::VARCHAR, 'c%'::VARCHAR)::BOOLEAN OR (#0.0::INTEGER = 1::INTEGER)\
+             ::BOOLEAN)::BOOLEAN",
+        );
+    }
+
+    /// A connective inside a connective, which recurses rather than falling back to flags.
+    ///
+    /// Both nestings, because the two carry opposite things: an `AND` under an `OR` starts from the
+    /// rows no branch has accepted, and an `OR` under an `AND` starts from the rows every conjunct
+    /// has kept, and getting either one backwards is a wrong set of rows.
+    #[test]
+    fn a_connective_inside_a_connective_threads_both_ways() {
+        filters(
+            "(((#0.0::INTEGER >= 2::INTEGER)::BOOLEAN AND (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN)\
+             ::BOOLEAN OR ((#0.0::INTEGER < 2::INTEGER)::BOOLEAN AND (#0.1::VARCHAR <> 'c'\
+             ::VARCHAR)::BOOLEAN)::BOOLEAN)::BOOLEAN",
+        );
+        filters(
+            "(((#0.1::VARCHAR = 'c'::VARCHAR)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)\
+             ::BOOLEAN AND ((#0.0::INTEGER <> 1::INTEGER)::BOOLEAN OR (#0.1::VARCHAR = 'a'\
+             ::VARCHAR)::BOOLEAN)::BOOLEAN)::BOOLEAN",
+        );
+        // Three deep, since two levels is where an off by one in the subtree bookkeeping can still
+        // be hidden by the ranges lining up.
+        filters(
+            "((#0.0::INTEGER > 9::INTEGER)::BOOLEAN OR ((#0.0::INTEGER >= 1::INTEGER)::BOOLEAN \
+             AND ((#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN OR (#0.0::INTEGER = 1::INTEGER)\
+             ::BOOLEAN)::BOOLEAN)::BOOLEAN)::BOOLEAN",
+        );
+    }
+
+    /// A predicate where one side is null and the other is true, in both orders. `OR` is true there
+    /// and a complement taken over the rows a branch rejected rather than the rows it accepted
+    /// would drop the row, which is the one way this can be wrong and is not a wrong vector but a
+    /// missing row.
+    #[test]
+    fn a_null_branch_beside_a_true_one_keeps_the_row() {
+        filters(
+            "((#0.0::INTEGER > 2::INTEGER)::BOOLEAN OR (#0.1::VARCHAR = 'c'::VARCHAR)::BOOLEAN \
+             OR (#0.0::INTEGER IS NOT DISTINCT FROM NULL::INTEGER)::BOOLEAN)::BOOLEAN",
+        );
+        filters(
+            "((#0.1::VARCHAR > 'b'::VARCHAR)::BOOLEAN OR (#0.0::INTEGER = 1::INTEGER)::BOOLEAN)\
              ::BOOLEAN",
         );
     }
