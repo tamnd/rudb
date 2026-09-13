@@ -71,7 +71,11 @@ struct Call {
 pub(crate) struct Aggregate<'a> {
     plan: &'a Plan,
     input_schema: Schema,
+    /// Group expressions that vary by row and therefore belong in the physical key.
+    keys: Vec<ExprRef>,
     groups: Vec<ExprRef>,
+    /// Constant output group values, aligned with `groups`.
+    constants: Vec<Option<Value>>,
     calls: Vec<Call>,
     schema: Schema,
     /// Whether there are no group expressions, so every row goes to the one slot.
@@ -123,6 +127,18 @@ impl<'a> Aggregate<'a> {
     ) -> Result<(Self, Buffered)> {
         let input_schema = input.clone();
         let groups: Vec<ExprRef> = plan.expr_list(groups).to_vec();
+        let constants: Vec<Option<Value>> = groups
+            .iter()
+            .map(|&group| match *plan.expr(group) {
+                Expr::Constant(value) => Some(plan.value(value).clone()),
+                _ => None,
+            })
+            .collect();
+        let keys: Vec<ExprRef> = groups
+            .iter()
+            .zip(&constants)
+            .filter_map(|(&group, value)| value.is_none().then_some(group))
+            .collect();
         let mut calls = Vec::new();
         for &reference in plan.expr_list(aggregates) {
             let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(reference) else {
@@ -156,6 +172,8 @@ impl<'a> Aggregate<'a> {
         let aggregate = Self {
             plan,
             input_schema,
+            keys,
+            constants,
             alone,
             sets: calls.iter().any(|call| call.distinct),
             every: by_vector.iter().all(|&yes| yes),
@@ -192,7 +210,7 @@ impl<'a> Aggregate<'a> {
     /// that was pushed and a chunk that was written out and read again.
     fn read(&self, chunk: &Chunk) -> Result<Rows> {
         let rows = chunk.len();
-        let keys = evaluate_all(self.plan, &self.groups, &self.input_schema, chunk)?;
+        let keys = evaluate_all(self.plan, &self.keys, &self.input_schema, chunk)?;
         let mut arguments = Vec::with_capacity(self.calls.len());
         let mut filters = Vec::with_capacity(self.calls.len());
         for call in &self.calls {
@@ -273,7 +291,7 @@ impl<'a> Aggregate<'a> {
             // rows and outlive the table. `charged` and this one are the same arrangement over two
             // reservations.
             charged_keys: 0,
-            table: Table::new(self.groups.len()),
+            table: Table::new(self.keys.len()),
             states: Vec::new(),
             seen: Vec::new(),
             groups: 0,
@@ -483,9 +501,15 @@ impl<'a> Aggregate<'a> {
         for start in (0..groups).step_by(VECTOR_SIZE) {
             let end = (start + VECTOR_SIZE).min(groups);
             let mut columns = Vec::with_capacity(width + calls);
+            let mut key = 0;
             for (at, ty) in types.iter().take(width).enumerate() {
-                let values = table.column(at, start..end);
-                columns.push(Vector::from_values(ty.clone(), &values)?);
+                if let Some(value) = &self.constants[at] {
+                    columns.push(Vector::constant(ty.clone(), value.clone(), end - start));
+                } else {
+                    let values = table.column(key, start..end);
+                    columns.push(Vector::from_values(ty.clone(), &values)?);
+                    key += 1;
+                }
             }
             for (at, ty) in types.iter().skip(width).enumerate() {
                 // What a result owns away from itself is not knowable until it has been asked for,
@@ -600,7 +624,7 @@ impl<'a> Aggregate<'a> {
     /// described the same way whether or not any row has been written to it yet.
     fn spilled_types(&self) -> Vec<LogicalType> {
         let mut types = Vec::new();
-        for &group in &self.groups {
+        for &group in &self.keys {
             types.push(self.plan.expr_type(group).clone());
         }
         for call in &self.calls {
@@ -711,7 +735,7 @@ impl<'s> Spilled<'s> {
         // an argument to the wrong call rather than fail, so the two are written next to each other
         // on purpose.
         let mut taking = built.into_iter();
-        let keys: Vec<Vector> = taking.by_ref().take(pass.groups.len()).collect();
+        let keys: Vec<Vector> = taking.by_ref().take(pass.keys.len()).collect();
         let mut arguments = Vec::with_capacity(pass.calls.len());
         for call in &pass.calls {
             arguments.push(taking.by_ref().take(call.args.len()).collect());
