@@ -40,6 +40,7 @@ use rudb_kernels::{
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Chunk, Selection, Vector};
+use std::collections::HashMap;
 
 use crate::ordering::Ordering;
 use crate::schema::Schema;
@@ -84,6 +85,9 @@ pub struct Prepared {
     last_use: Vec<usize>,
     /// The step index each expression this was built from ends at.
     roots: Vec<usize>,
+    /// The step already compiled for each shared plan expression.
+    shared: HashMap<ExprRef, usize>,
+    share: bool,
 }
 
 /// One node of a flattened expression.
@@ -231,12 +235,23 @@ impl Prepared {
     /// data, which is why they are found here, once, rather than on some chunk in the middle of a
     /// scan.
     pub fn new(plan: &Plan, exprs: &[ExprRef], schema: &Schema) -> Result<Self> {
+        Self::build(plan, exprs, schema, false)
+    }
+
+    /// Prepares expressions whose caller can evaluate a shared expression graph as one unit.
+    pub(crate) fn shared(plan: &Plan, exprs: &[ExprRef], schema: &Schema) -> Result<Self> {
+        Self::build(plan, exprs, schema, true)
+    }
+
+    fn build(plan: &Plan, exprs: &[ExprRef], schema: &Schema, share: bool) -> Result<Self> {
         let mut prepared = Self {
             steps: Vec::new(),
             types: Vec::new(),
             operands: Vec::new(),
             last_use: Vec::new(),
             roots: Vec::new(),
+            shared: HashMap::new(),
+            share,
         };
         for &expr in exprs {
             let root = prepared.push(plan, expr, schema)?;
@@ -355,13 +370,29 @@ impl Prepared {
         out: &mut Vec<Vector>,
     ) -> Result<()> {
         self.run(chunk, scratch)?;
+        let mut remaining: HashMap<usize, usize> = HashMap::new();
+        for &root in &self.roots {
+            *remaining.entry(root).or_default() += 1;
+        }
         for &root in &self.roots {
             // The one place a column is copied, and it is copied because the caller is taking
             // ownership of a vector that has to outlive the chunk it came from. `SELECT a` is that
             // shape and a projection of a bare column is the only expression where it happens.
             match self.steps[root] {
                 Step::Column(position) => out.push(chunk.column(position)?.clone()),
-                _ => out.push(scratch.slots[root].take().ok_or_else(|| missing(root))?),
+                _ => {
+                    let Some(left) = remaining.get_mut(&root) else {
+                        return Err(Error::internal("a prepared root was not counted"));
+                    };
+                    *left -= 1;
+                    if *left == 0 {
+                        out.push(scratch.slots[root].take().ok_or_else(|| missing(root))?);
+                    } else {
+                        out.push(
+                            scratch.slots[root].as_ref().ok_or_else(|| missing(root))?.clone(),
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -508,10 +539,11 @@ impl Prepared {
                 (Connective::Or, None) => answered.complement(rows),
                 (Connective::Or, Some(carried)) => carried.without(&answered),
             });
-            // An operand's subtree is its own, because nothing here looks for a common subexpression
-            // and so no step outside the range is reading one inside it.
+            // Keep a shared step alive when a later operand still reads it.
             for step in from..=operand {
-                scratch.slots[step] = None;
+                if self.last_use[step] <= operand {
+                    scratch.slots[step] = None;
+                }
             }
         }
         order.relearn();
@@ -808,6 +840,11 @@ impl Prepared {
 
     /// Flattens one expression, appending its steps and returning the index of its last one.
     fn push(&mut self, plan: &Plan, expr: ExprRef, schema: &Schema) -> Result<usize> {
+        if self.share {
+            if let Some(&step) = self.shared.get(&expr) {
+                return Ok(step);
+            }
+        }
         let ty = plan.expr_type(expr).clone();
         let step = match *plan.expr(expr) {
             Expr::Column(binding) => {
@@ -870,7 +907,11 @@ impl Prepared {
         };
         self.steps.push(step);
         self.types.push(ty);
-        Ok(self.steps.len() - 1)
+        let step = self.steps.len() - 1;
+        if self.share {
+            self.shared.insert(expr, step);
+        }
+        Ok(step)
     }
 
     /// Flattens a list of expressions and records where its operand run starts and how long it is.
@@ -1521,6 +1562,19 @@ mod tests {
         let mut twice = Vec::new();
         prepared.evaluate(&chunk, &mut scratch, &mut twice).expect("the second chunk runs");
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn a_shared_computed_root_is_compiled_once() {
+        let (schema, chunk) = input();
+        let (plan, list) = projection("\"+\"(#0.0::INTEGER, 1::INTEGER)::INTEGER AS a");
+        let prepared = Prepared::shared(&plan, &[list[0], list[0]], &schema)
+            .expect("the shared expression resolves");
+        assert_eq!(prepared.steps.len(), 3);
+        let mut scratch = prepared.scratch();
+        let mut answers = Vec::new();
+        prepared.evaluate(&chunk, &mut scratch, &mut answers).expect("both roots are returned");
+        assert_eq!(answers[0], answers[1]);
     }
 
     /// A chunk shorter than the last one, because a scan's final chunk is that and a constant

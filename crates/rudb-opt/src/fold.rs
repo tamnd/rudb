@@ -95,11 +95,14 @@ impl Pass for ExpressionRewriter {
 /// references. Sharing it afterwards is not only about the arena's size: the prepared form in the
 /// executor keys its common subexpressions by reference, so a tree that arrives unshared runs the
 /// same work twice.
-type Done = HashMap<ExprRef, ExprRef>;
+struct Done {
+    rewritten: HashMap<ExprRef, ExprRef>,
+    canonical: Vec<ExprRef>,
+}
 
 /// Rewrites every expression the plan reaches.
 fn rewrite(plan: &mut Plan) {
-    let mut done = Done::new();
+    let mut done = Done { rewritten: HashMap::new(), canonical: Vec::new() };
     for node in top_down(plan) {
         node_expressions(plan, node, &mut done);
     }
@@ -216,13 +219,25 @@ fn expr_list(plan: &mut Plan, slice: Slice, done: &mut Done) -> Option<Slice> {
 /// also what makes one pass enough: `1 + 2 + 3` folds to `6` in a single walk because by the time
 /// the outer call runs, its operand is already a constant.
 fn expression(plan: &mut Plan, expr: ExprRef, done: &mut Done) -> ExprRef {
-    if let Some(&already) = done.get(&expr) {
+    if let Some(&already) = done.rewritten.get(&expr) {
         return already;
     }
     let rebuilt = walk::rebuild(plan, expr, &mut |plan, child| expression(plan, child, done));
     let simplified = simplify(plan, rebuilt);
-    done.insert(expr, simplified);
-    simplified
+    let canonical = if walk::volatile(plan, simplified) {
+        simplified
+    } else {
+        done.canonical
+            .iter()
+            .copied()
+            .find(|&other| walk::same(plan, simplified, other))
+            .unwrap_or_else(|| {
+                done.canonical.push(simplified);
+                simplified
+            })
+    };
+    done.rewritten.insert(expr, canonical);
+    canonical
 }
 
 /// Applies every rule to one expression whose operands are already rewritten.
@@ -497,7 +512,7 @@ fn connective(op: ConjunctionOp) -> Connective {
 mod tests {
     use super::{ExpressionRewriter, VOLATILE};
     use crate::pass::{Context, Pass};
-    use rudb_plan::Plan;
+    use rudb_plan::{Expr, Node, Plan};
 
     /// The plan a text prints as after folding, which is what every assertion here reads.
     fn folded(text: &str) -> String {
@@ -692,6 +707,31 @@ mod tests {
         );
         let after = format!("Aggregate #1 groups=[] aggregates=[sum(3::INTEGER)::HUGEINT]\n{SCAN}");
         assert_eq!(folded(&before), after);
+    }
+
+    #[test]
+    fn equal_subexpressions_share_one_reference() {
+        let text = format!(
+            "Aggregate #1 groups=[] aggregates=[sum(CAST(#0.0::INTEGER)::BIGINT)::HUGEINT, \
+             sum(\"+\"(CAST(#0.0::INTEGER)::BIGINT, 1::BIGINT)::BIGINT)::HUGEINT]\n{SCAN}"
+        );
+        let mut plan = Plan::parse(&text).expect("a well formed aggregate");
+        ExpressionRewriter.run(&mut plan, &Context::new()).expect("the expressions rewrite");
+        let Node::Aggregate { aggregates, .. } = *plan.node(plan.root()) else {
+            panic!("the root is an aggregate");
+        };
+        let calls = plan.expr_list(aggregates);
+        let Expr::Aggregate { args: first, .. } = *plan.expr(calls[0]) else {
+            panic!("the first expression is an aggregate call");
+        };
+        let Expr::Aggregate { args: second, .. } = *plan.expr(calls[1]) else {
+            panic!("the second expression is an aggregate call");
+        };
+        let first = plan.expr_list(first)[0];
+        let Expr::Function { args, .. } = *plan.expr(plan.expr_list(second)[0]) else {
+            panic!("the second argument is an addition");
+        };
+        assert_eq!(first, plan.expr_list(args)[0]);
     }
 
     #[test]
