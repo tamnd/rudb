@@ -1742,6 +1742,7 @@ pub fn call_values(
         ("~~*", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, true))),
         ("!~~*", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, true))),
         ("date_part" | "date_trunc", [spec, when]) => date_value(name, spec, when, returns),
+        ("age", [later, earlier]) => datetime::age(later, earlier),
         ("trunc", [only]) => truncated(only),
         (_, [count]) if datetime::is_interval(name) => interval_value(name, count),
         ("make_date", [days]) => made_date_value(days),
