@@ -49,15 +49,13 @@
 //! there is nothing to push down until the table function exists, so the counter that would prove
 //! pruning works is here and the pruning is E2.
 
-use std::collections::VecDeque;
-
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_compress::Codec;
 use rudb_io::File;
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::chunk::Pages;
-use crate::metadata::Metadata;
+use crate::metadata::{Metadata, SchemaColumn};
 use crate::page::Body;
 
 /// A Parquet file, read as chunks.
@@ -67,7 +65,7 @@ pub struct Reader {
     metadata: Metadata,
     projection: Vec<usize>,
     group: usize,
-    ready: VecDeque<Chunk>,
+    active: Option<Group>,
     bytes: u64,
 }
 
@@ -83,7 +81,7 @@ impl Reader {
     pub fn open(file: Box<dyn File>) -> Result<Self> {
         let metadata = Metadata::read(file.as_ref())?;
         let projection = (0..metadata.schema.len()).collect();
-        Ok(Self { file, metadata, projection, group: 0, ready: VecDeque::new(), bytes: 0 })
+        Ok(Self { file, metadata, projection, group: 0, active: None, bytes: 0 })
     }
 
     /// The footer.
@@ -113,7 +111,7 @@ impl Reader {
             }
         }
         self.projection = columns.to_vec();
-        self.ready.clear();
+        self.active = None;
         Ok(())
     }
 
@@ -175,7 +173,15 @@ impl Reader {
     /// If a read fails, a page does not decode, or the file uses a codec, an encoding or a type
     /// this build does not read yet. Every one of those is named in the error.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>> {
-        while self.ready.is_empty() {
+        loop {
+            if let Some(active) = &mut self.active {
+                let (chunk, read) = active.next(self.file.as_ref())?;
+                self.bytes = self.bytes.saturating_add(read);
+                if let Some(chunk) = chunk {
+                    return Ok(Some(chunk));
+                }
+                self.active = None;
+            }
             if self.group >= self.metadata.row_groups.len() {
                 return Ok(None);
             }
@@ -183,7 +189,6 @@ impl Reader {
             self.group += 1;
             self.read_group(group)?;
         }
-        Ok(self.ready.pop_front())
     }
 
     /// Reads one row group and queues the chunks it holds.
@@ -220,9 +225,10 @@ impl Reader {
         }
         let mut columns = Vec::with_capacity(plan.len());
         for chunk in plan {
-            columns.push(Cursor::new(self.read_column(&chunk)?));
+            columns.push(self.read_column(&chunk));
         }
-        self.queue(columns, rows)
+        self.active = Some(Group { columns, rows, done: 0 });
+        Ok(())
     }
 
     /// Reads one column chunk of one row group and decodes every page of it.
@@ -230,68 +236,45 @@ impl Reader {
     /// The dictionary page is read first and kept for the whole walk, because one dictionary serves
     /// every data page of the chunk and the format puts it first for exactly that reason. It is not
     /// a row of the column and does not become a vector of its own.
-    fn read_column(&mut self, chunk: &Where) -> Result<Vec<Vector>> {
-        let mut bytes = vec![0_u8; chunk.len];
-        self.file.read_exact_at(chunk.start, &mut bytes)?;
-        self.bytes += chunk.len as u64;
-
-        let column = &self.metadata.schema[chunk.column];
-        let mut dictionary = None;
-        let mut pages = Vec::new();
-        for page in Pages::new(&bytes, chunk.codec, chunk.values) {
-            let page = page?;
-            if matches!(page.header.body, Body::Index) {
-                continue;
-            }
-            if matches!(page.header.body, Body::Dictionary(_)) {
-                if dictionary.is_some() {
-                    return Err(Error::io(format!(
-                        "a second dictionary page in the chunk for column {}",
-                        column.name
-                    )));
-                }
-                dictionary = Some(page.into_dictionary(column)?);
-                continue;
-            }
-            pages.push(page.into_vector(column, dictionary.as_ref())?);
-        }
-        Ok(pages)
+    fn read_column(&self, chunk: &Where) -> Cursor {
+        Cursor::new(
+            chunk.start,
+            chunk.len,
+            chunk.codec,
+            chunk.values,
+            self.metadata.schema[chunk.column].clone(),
+        )
     }
+}
 
-    /// Zips the decoded columns of one row group into chunks.
-    ///
-    /// A projection of no columns has no vectors to take a length from, so the lengths come from
-    /// the row count instead. That is the `SELECT count(*)` path and it is the only one where a
-    /// chunk's length is not a property of anything inside it.
-    fn queue(&mut self, mut columns: Vec<Cursor>, rows: usize) -> Result<()> {
-        if columns.is_empty() {
-            let mut left = rows;
-            while left > 0 {
-                let len = left.min(VECTOR_SIZE);
-                self.ready.push_back(Chunk::with_rows(Vec::new(), len)?);
-                left -= len;
-            }
-            return Ok(());
+#[derive(Debug)]
+struct Group {
+    columns: Vec<Cursor>,
+    rows: usize,
+    done: usize,
+}
+
+impl Group {
+    fn next(&mut self, file: &dyn File) -> Result<(Option<Chunk>, u64)> {
+        let before: u64 = self.columns.iter().map(|column| column.bytes_read).sum();
+        if self.done >= self.rows {
+            return Ok((None, 0));
         }
-        let mut done = 0;
-        while done < rows {
-            let mut len = (rows - done).min(VECTOR_SIZE);
-            for column in &mut columns {
-                len = len.min(column.left());
-            }
-            if len == 0 {
-                return Err(Error::io(format!(
-                    "a row group of {rows} rows whose columns ran out after {done} of them"
-                )));
-            }
-            let mut vectors = Vec::with_capacity(columns.len());
-            for column in &mut columns {
-                vectors.push(column.take(len)?);
-            }
-            self.ready.push_back(Chunk::with_rows(vectors, len)?);
-            done += len;
+        let mut len = (self.rows - self.done).min(VECTOR_SIZE);
+        for column in &mut self.columns {
+            len = len.min(column.left(Some(file))?);
         }
-        Ok(())
+        if len == 0 {
+            return Err(Error::io(format!(
+                "a row group of {} rows whose columns ran out after {} of them",
+                self.rows, self.done
+            )));
+        }
+        let vectors =
+            self.columns.iter_mut().map(|column| column.take(len)).collect::<Result<_>>()?;
+        self.done += len;
+        let after: u64 = self.columns.iter().map(|column| column.bytes_read).sum();
+        Ok((Some(Chunk::with_rows(vectors, len)?), after.saturating_sub(before)))
     }
 }
 
@@ -315,30 +298,104 @@ struct Where {
 /// matters only because it lets the vector be moved out instead of cloned.
 #[derive(Debug)]
 struct Cursor {
-    pages: Vec<Vector>,
+    start: u64,
+    len: usize,
     at: usize,
+    codec: Codec,
+    left: i64,
+    column: SchemaColumn,
+    dictionary: Option<Vector>,
+    page: Option<Vector>,
+    queued: Vec<Vector>,
+    offset: usize,
+    bytes_read: u64,
 }
 
 impl Cursor {
     /// A cursor over a column's pages, in order.
-    fn new(mut pages: Vec<Vector>) -> Self {
+    fn new(start: u64, len: usize, codec: Codec, left: i64, column: SchemaColumn) -> Self {
+        Self {
+            start,
+            len,
+            at: 0,
+            codec,
+            left,
+            column,
+            dictionary: None,
+            page: None,
+            queued: Vec::new(),
+            offset: 0,
+            bytes_read: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn decoded(mut pages: Vec<Vector>) -> Self {
         pages.reverse();
-        Self { pages, at: 0 }
+        Self {
+            start: 0,
+            len: 0,
+            at: 0,
+            codec: Codec::Uncompressed,
+            left: 0,
+            column: SchemaColumn {
+                name: "test".into(),
+                physical: crate::metadata::Physical::Int32,
+                ty: LogicalType::Integer,
+                optional: false,
+                width: 0,
+            },
+            dictionary: None,
+            page: None,
+            queued: pages,
+            offset: 0,
+            bytes_read: 0,
+        }
     }
 
     /// How many rows are left in the page the cursor is in, stepping over any that are empty.
     ///
     /// Zero when the column has no pages left, which the caller turns into an error, because a
     /// column that runs out before the row group does is a column shorter than the one beside it.
-    fn left(&mut self) -> usize {
-        while let Some(page) = self.pages.last() {
-            if self.at < page.len() {
-                return page.len() - self.at;
+    fn left(&mut self, file: Option<&dyn File>) -> Result<usize> {
+        while self.page.as_ref().is_none_or(|page| self.offset >= page.len()) {
+            self.page = None;
+            self.offset = 0;
+            if let Some(page) = self.queued.pop() {
+                self.page = Some(page);
+                continue;
             }
-            self.pages.pop();
-            self.at = 0;
+            if self.left <= 0 {
+                return Ok(0);
+            }
+            let file = file.ok_or_else(|| Error::internal("an encoded page with no file"))?;
+            let encoded = self.read_page(file)?;
+            let mut pages = Pages::new(&encoded, self.codec, self.left);
+            let page = pages.next().transpose()?.ok_or_else(|| {
+                Error::io(format!(
+                    "the column {} ran out with {} values left",
+                    self.column.name, self.left
+                ))
+            })?;
+            let consumed = pages.position();
+            self.at = self.at.saturating_add(consumed);
+            if matches!(page.header.body, Body::Index) {
+                continue;
+            }
+            if matches!(page.header.body, Body::Dictionary(_)) {
+                if self.dictionary.is_some() {
+                    return Err(Error::io(format!(
+                        "a second dictionary page in the chunk for column {}",
+                        self.column.name
+                    )));
+                }
+                self.dictionary = Some(page.into_dictionary(&self.column)?);
+                continue;
+            }
+            self.left -= i64::from(page.header.values());
+            self.page = Some(page.into_vector(&self.column, self.dictionary.as_ref())?);
         }
-        0
+        Ok(self.page.as_ref().map_or(0, |page| page.len() - self.offset))
     }
 
     /// The next `rows` rows, which is the whole page when that is exactly what is left.
@@ -349,16 +406,61 @@ impl Cursor {
     /// that cut affordable: it keeps a dictionary encoded page a dictionary vector, where a gather
     /// would have flattened it and thrown away the form the group by wants.
     fn take(&mut self, rows: usize) -> Result<Vector> {
-        let page = self
-            .pages
-            .last()
-            .ok_or_else(|| Error::internal("a parquet column asked for rows it has not got"))?;
-        if self.at == 0 && rows == page.len() {
-            return self.pages.pop().ok_or_else(|| Error::internal("a page that vanished"));
+        if self.page.is_none() {
+            self.page = self.queued.pop();
         }
-        let piece = page.slice(self.at, rows)?;
-        self.at += rows;
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| Error::internal("a parquet column asked for rows it has not got"))?;
+        if self.offset == 0 && rows == page.len() {
+            return self.page.take().ok_or_else(|| Error::internal("a page that vanished"));
+        }
+        let piece = page.slice(self.offset, rows)?;
+        self.offset += rows;
         Ok(piece)
+    }
+
+    /// Reads exactly one encoded page, discovering its variable-width header with bounded probes.
+    fn read_page(&mut self, file: &dyn File) -> Result<Vec<u8>> {
+        let remaining = self.len.saturating_sub(self.at);
+        if remaining == 0 {
+            return Err(Error::io(format!(
+                "the column {} ran out of page bytes",
+                self.column.name
+            )));
+        }
+        let mut width = remaining.min(256);
+        let (prefix, header, header_len) = loop {
+            let mut prefix = vec![0_u8; width];
+            file.read_exact_at(self.start + self.at as u64, &mut prefix)?;
+            match crate::page::Header::read(&prefix) {
+                Ok((header, header_len)) => break (prefix, header, header_len),
+                Err(_) if width < remaining => width = remaining.min(width.saturating_mul(2)),
+                Err(error) => return Err(error),
+            }
+        };
+        let body = header.compressed_size as usize;
+        let total = header_len.checked_add(body).ok_or_else(|| {
+            Error::io(format!("a page in column {} has an impossible size", self.column.name))
+        })?;
+        if total > remaining {
+            return Err(Error::io(format!(
+                "a page of {total} bytes with only {remaining} bytes left in column {}",
+                self.column.name
+            )));
+        }
+        let mut encoded = Vec::with_capacity(total);
+        encoded.extend_from_slice(&prefix[..prefix.len().min(total)]);
+        if encoded.len() < total {
+            let old = encoded.len();
+            encoded.resize(total, 0);
+            file.read_exact_at(self.start + self.at as u64 + old as u64, &mut encoded[old..])?;
+        } else {
+            encoded.truncate(total);
+        }
+        self.bytes_read = self.bytes_read.saturating_add(total as u64);
+        Ok(encoded)
     }
 }
 
@@ -394,47 +496,47 @@ mod tests {
 
     #[test]
     fn a_page_taken_whole_is_the_same_vector_and_not_a_copy_of_it() {
-        let mut cursor = Cursor::new(vec![ints(&[1, 2, 3])]);
-        assert_eq!(cursor.left(), 3);
+        let mut cursor = Cursor::decoded(vec![ints(&[1, 2, 3])]);
+        assert_eq!(cursor.left(None).unwrap(), 3);
         let page = cursor.take(3).expect("takes the page");
         assert_eq!(page.len(), 3);
-        assert_eq!(cursor.left(), 0, "the column has no pages left");
+        assert_eq!(cursor.left(None).unwrap(), 0, "the column has no pages left");
     }
 
     #[test]
     fn a_page_taken_in_pieces_comes_back_in_order() {
-        let mut cursor = Cursor::new(vec![ints(&[1, 2, 3, 4])]);
+        let mut cursor = Cursor::decoded(vec![ints(&[1, 2, 3, 4])]);
         let first = cursor.take(3).expect("takes three");
         assert_eq!(
             first.iter().collect::<Vec<_>>(),
             [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
         );
-        assert_eq!(cursor.left(), 1);
+        assert_eq!(cursor.left(None).unwrap(), 1);
         let second = cursor.take(1).expect("takes the rest");
         assert_eq!(second.value_at(0), Value::Integer(4));
     }
 
     #[test]
     fn the_cursor_walks_from_one_page_to_the_next() {
-        let mut cursor = Cursor::new(vec![ints(&[1, 2]), ints(&[3])]);
-        assert_eq!(cursor.left(), 2, "the first page is the one it is in");
+        let mut cursor = Cursor::decoded(vec![ints(&[1, 2]), ints(&[3])]);
+        assert_eq!(cursor.left(None).unwrap(), 2, "the first page is the one it is in");
         let _ = cursor.take(2).expect("takes the first page");
-        assert_eq!(cursor.left(), 1, "and then the second");
+        assert_eq!(cursor.left(None).unwrap(), 1, "and then the second");
         assert_eq!(cursor.take(1).expect("takes it").value_at(0), Value::Integer(3));
-        assert_eq!(cursor.left(), 0);
+        assert_eq!(cursor.left(None).unwrap(), 0);
     }
 
     #[test]
     fn an_empty_page_is_stepped_over_rather_than_returned_as_a_chunk_of_no_rows() {
-        let mut cursor = Cursor::new(vec![ints(&[]), ints(&[7])]);
-        assert_eq!(cursor.left(), 1);
+        let mut cursor = Cursor::decoded(vec![ints(&[]), ints(&[7])]);
+        assert_eq!(cursor.left(None).unwrap(), 1);
         assert_eq!(cursor.take(1).expect("takes it").value_at(0), Value::Integer(7));
     }
 
     #[test]
     fn a_column_asked_for_rows_it_does_not_have_is_an_error_and_not_a_panic() {
-        let mut cursor = Cursor::new(Vec::new());
-        assert_eq!(cursor.left(), 0);
+        let mut cursor = Cursor::decoded(Vec::new());
+        assert_eq!(cursor.left(None).unwrap(), 0);
         assert!(cursor.take(1).is_err());
     }
 }
