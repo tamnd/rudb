@@ -402,6 +402,20 @@ const TABLE: &[Entry] = &[
         shape: Shape::LeadingFixedToLast(Fixed::Varchar),
         numeric_only: false,
     },
+    // The gap between two moments counted in calendar fields. Upstream has a one argument form as
+    // well, which measures from today, and it is not here because there is no clock in the engine
+    // yet and a function that invents one would be worse than a function that is missing.
+    //
+    // Widening rather than casting is the whole overload: a DATE widens to a TIMESTAMP and upstream
+    // accepts `age(DATE, DATE)`, while a TIME and an INTERVAL do not widen anywhere and upstream
+    // refuses both of those with a binder error rather than reading them as moments.
+    Entry {
+        name: "age",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Widened(Fixed::Timestamp, Fixed::Interval),
+        numeric_only: false,
+    },
     // The two that turn a number into a date and a timestamp, which is how every ClickBench entry
     // on the board reads that data: the Parquet stores four of its columns as integers and every
     // query in the set treats them as dates and times. DuckDB's own entry wraps them in exactly

@@ -995,6 +995,71 @@ fn too_far() -> Error {
     Error::conversion("Timestamp difference is out of bounds")
 }
 
+/// The gap between two moments counted in calendar fields, which is what `age` answers and what the
+/// subtraction above does not.
+///
+/// `TIMESTAMP '2020-07-01' - TIMESTAMP '2020-02-28'` is 124 days because a month is not a length a
+/// pair of moments can name, and `age` of the same pair is 4 months 2 days because it counts the
+/// calendar out loud instead. The two answers are both right and they are answers to different
+/// questions.
+///
+/// The counting is field by field with a borrow, which is where all of the behaviour is. Microseconds
+/// short of zero borrow a day, and days short of zero borrow the number of days in the *earlier*
+/// moment's month, so the same pair of days can be worth 28, 30 or 31 depending on where the older
+/// end of the gap sits. That is why `age(TIMESTAMP '2020-03-30', TIMESTAMP '2020-01-31')` is 1 month
+/// 30 days while `age(TIMESTAMP '2020-04-30', TIMESTAMP '2020-03-31')` is 30 days with no month at
+/// all: January lends 31 days and so does March, but the months either side of them differ.
+///
+/// One borrow of each is enough, which is worth saying since upstream writes a loop. The day borrow
+/// takes the days in the earlier month and the earlier day of the month cannot be past the end of
+/// its own month, so what comes out is never short again.
+///
+/// A gap the wrong way round is measured forwards and then negated, which is not the same as
+/// measuring it backwards: the borrow has to come from the earlier moment either way, so the swap
+/// happens first and the sign goes back on at the end.
+pub(crate) fn age(left: &Value, right: &Value) -> Result<Value> {
+    let (Value::Timestamp(first), Value::Timestamp(second)) = (left, right) else {
+        return Err(Error::internal(format!("{left} and {right} are not two moments")));
+    };
+    let backwards = first < second;
+    let (late, early) = if backwards { (*second, *first) } else { (*first, *second) };
+    let late = fields_of(late)?;
+    let early = fields_of(early)?;
+    let mut months = (late.year - early.year) * 12 + late.month - early.month;
+    let mut days = late.day - early.day;
+    let mut micros = late.micros - early.micros;
+    if micros < 0 {
+        micros += MICROS_PER_DAY;
+        days -= 1;
+    }
+    if days < 0 {
+        days += early.month_length;
+        months -= 1;
+    }
+    if backwards {
+        return Ok(Value::Interval { months: -months, days: -days, micros: -micros });
+    }
+    Ok(Value::Interval { months, days, micros })
+}
+
+/// A moment taken apart for [`age`], with the month counted from one so that a gap of months is a
+/// subtraction, and with the length of that month alongside it because that is what a day borrows.
+struct Fields {
+    year: i32,
+    month: i32,
+    day: i32,
+    micros: i64,
+    month_length: i32,
+}
+
+fn fields_of(stamp: i64) -> Result<Fields> {
+    let whole = i32::try_from(stamp.div_euclid(MICROS_PER_DAY)).map_err(|_| not_in_range())?;
+    let (year, month, day) = civil_from_days(whole);
+    #[expect(clippy::cast_possible_wrap, reason = "a month, a day of it and its length are small")]
+    let (month_length, month, day) = (days_in_month(year, month) as i32, month as i32, day as i32);
+    Ok(Fields { year, month, day, micros: stamp.rem_euclid(MICROS_PER_DAY), month_length })
+}
+
 /// Whether a pair of values is a date and a time of day.
 pub(crate) fn is_joined(left: &Value, right: &Value) -> bool {
     matches!((left, right), (Value::Date(_), Value::Time(_)) | (Value::Time(_), Value::Date(_)))
@@ -1384,6 +1449,55 @@ mod tests {
         assert_eq!(between(&late, &early), "1 day 02:00:00");
         assert_eq!(between(&early, &late), "-1 day -02:00:00");
         assert_eq!(between(&stamp(2020, 1, 1, 123_456), &stamp(2020, 1, 1, 0)), "00:00:00.123456");
+    }
+
+    /// Every line here is a statement that was run against the pinned binary, and the pairs are the
+    /// ones where the borrow is visible: a day that has to come out of a month of 28, of 30 and of
+    /// 31 days, and the same pair the other way round, which borrows from the same month and not
+    /// from the other one.
+    #[test]
+    fn a_gap_counted_in_calendar_fields_borrows_from_the_earlier_month() {
+        let gap = |late: &Value, early: &Value| age(late, early).expect("two moments").to_string();
+        assert_eq!(gap(&stamp(2020, 7, 1, 0), &stamp(2020, 2, 28, 0)), "4 months 2 days");
+        assert_eq!(gap(&stamp(2020, 2, 28, 0), &stamp(2020, 7, 1, 0)), "-4 months -2 days");
+        assert_eq!(gap(&stamp(2020, 3, 30, 0), &stamp(2020, 1, 31, 0)), "1 month 30 days");
+        assert_eq!(gap(&stamp(2020, 3, 1, 0), &stamp(2020, 1, 31, 0)), "1 month 1 day");
+        assert_eq!(gap(&stamp(2020, 4, 30, 0), &stamp(2020, 3, 31, 0)), "30 days");
+        assert_eq!(gap(&stamp(2020, 5, 31, 0), &stamp(2020, 4, 30, 0)), "1 month 1 day");
+        assert_eq!(gap(&stamp(2020, 7, 1, 0), &stamp(2019, 7, 2, 0)), "11 months 30 days");
+        assert_eq!(gap(&stamp(2020, 1, 1, 0), &stamp(2020, 1, 1, 0)), "00:00:00");
+    }
+
+    /// The microseconds borrow a day before the days borrow a month, so an hour and a half short of
+    /// the clock turns a month and no days into a month short of a day, and then into the month
+    /// before it with the days the borrow paid for.
+    #[test]
+    fn a_clock_short_of_the_other_one_borrows_a_day_first() {
+        let gap = |late: &Value, early: &Value| age(late, early).expect("two moments").to_string();
+        let late = stamp(2021, 3, 1, 10 * MICROS_PER_HOUR);
+        let early = stamp(2020, 1, 31, 11 * MICROS_PER_HOUR + 30 * MICROS_PER_MINUTE);
+        assert_eq!(gap(&late, &early), "1 year 1 month 22:30:00");
+        assert_eq!(gap(&early, &late), "-1 year -1 month -22:30:00");
+        let late = stamp(2020, 3, 31, 0);
+        let early = stamp(2020, 2, 29, MICROS_PER_DAY - 1);
+        assert_eq!(gap(&late, &early), "1 month 1 day 00:00:00.000001");
+        assert_eq!(gap(&early, &late), "-1 month -1 day -00:00:00.000001");
+        let second_to = stamp(2019, 12, 31, MICROS_PER_DAY - MICROS_PER_SECOND);
+        assert_eq!(gap(&stamp(2020, 1, 1, 0), &second_to), "00:00:01");
+    }
+
+    /// The two moments furthest apart there are, which the subtraction cannot answer at all and this
+    /// can, since months and days and microseconds each stay inside their own field here.
+    #[test]
+    fn the_widest_gap_has_an_answer_even_though_the_subtraction_does_not() {
+        let oldest = Value::Timestamp(OLDEST_TIMESTAMP);
+        let newest = Value::Timestamp(NEWEST_TIMESTAMP);
+        let widest = age(&newest, &oldest).expect("two moments").to_string();
+        assert_eq!(widest, "584554 years 19 days 04:00:54.775806");
+        assert_eq!(
+            age(&oldest, &newest).expect("two moments").to_string(),
+            "-584554 years -19 days -04:00:54.775806"
+        );
     }
 
     /// The difference is worked out in microseconds, so the widest pair of moments has no answer.

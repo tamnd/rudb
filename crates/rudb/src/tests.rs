@@ -498,6 +498,31 @@ fn a_part_of_an_interval_is_one_of_its_three_fields() {
     assert_eq!(refused, "\"interval\" units \"week\" not recognized");
 }
 
+/// `age` counts a gap in calendar fields, which is not what the subtraction answers, and a day it is
+/// short by comes out of the earlier moment's month.
+///
+/// A date reaches the function by widening to a timestamp, and a time and an interval do not widen
+/// anywhere, so those two are refused here the way they are refused upstream.
+#[test]
+fn a_gap_in_calendar_fields_is_not_the_same_as_a_difference() {
+    let db = database();
+    let gap = |months: i32, days: i32| vec![vec![Value::Interval { months, days, micros: 0 }]];
+    let late = "TIMESTAMP '2020-07-01'";
+    let early = "TIMESTAMP '2020-02-28'";
+    assert_eq!(rows(&db, &format!("SELECT age({late}, {early})")), gap(4, 2));
+    assert_eq!(rows(&db, &format!("SELECT age({early}, {late})")), gap(-4, -2));
+    assert_eq!(rows(&db, &format!("SELECT {late} - {early}")), gap(0, 124));
+    assert_eq!(rows(&db, "SELECT age(DATE '2020-07-01', DATE '2020-02-28')"), gap(4, 2));
+    let moments = "FROM (VALUES (TIMESTAMP '2020-04-30', TIMESTAMP '2020-03-31'), \
+                   (TIMESTAMP '2020-01-01', NULL)) t(late, early)";
+    assert_eq!(
+        rows(&db, &format!("SELECT age(late, early) {moments}")),
+        vec![vec![Value::Interval { months: 0, days: 30, micros: 0 }], vec![Value::Null]]
+    );
+    let refused = failure(&db, "SELECT age(TIME '10:00:00', TIME '09:00:00')");
+    assert!(refused.contains("age(TIME, TIME)"), "{refused}");
+}
+
 /// `epoch` and `julian` carry a fraction, so `date_part` is declared as a double and the binder
 /// narrows it back to a bigint when the specifier is a literal naming a whole part. Midday is in
 /// here because that fraction is half a day to `julian` and half of nothing to a date.
