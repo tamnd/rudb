@@ -30,7 +30,6 @@ use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
-use crate::expr::{evaluate, evaluate_all};
 use crate::key::{Key, RowSet};
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
@@ -70,13 +69,13 @@ struct Call {
 #[derive(Debug)]
 pub(crate) struct Aggregate<'a> {
     plan: &'a Plan,
-    input_schema: Schema,
     /// Group expressions that vary by row and therefore belong in the physical key.
     keys: Vec<ExprRef>,
     groups: Vec<ExprRef>,
     /// Constant output group values, aligned with `groups`.
     constants: Vec<Option<Value>>,
     calls: Vec<Call>,
+    inputs: Prepared,
     schema: Schema,
     /// Whether there are no group expressions, so every row goes to the one slot.
     alone: bool,
@@ -165,13 +164,18 @@ impl<'a> Aggregate<'a> {
             fields.push(Field::new(call.name.clone(), call.returns.clone()));
         }
         let schema = Schema::numbered(fields, index);
+        let mut inputs = keys.clone();
+        for call in &calls {
+            inputs.extend_from_slice(&call.args);
+            inputs.extend(call.filter);
+        }
+        let inputs = Prepared::shared(plan, &inputs, &input_schema)?;
         let alone = groups.is_empty();
         let by_vector: Vec<bool> =
             calls.iter().map(|call| alone && !call.distinct && call.filter.is_none()).collect();
         let out = Buffered::new();
         let aggregate = Self {
             plan,
-            input_schema,
             keys,
             constants,
             alone,
@@ -181,6 +185,7 @@ impl<'a> Aggregate<'a> {
             by_vector,
             groups,
             calls,
+            inputs,
             schema,
             memory: memory.clone(),
             built: Mutex::new(Built {
@@ -208,17 +213,18 @@ impl<'a> Aggregate<'a> {
     ///
     /// The same shape a spill file is read back into, which is what lets one row loop serve a chunk
     /// that was pushed and a chunk that was written out and read again.
-    fn read(&self, chunk: &Chunk) -> Result<Rows> {
+    fn read(&self, chunk: &Chunk, scratch: &mut Scratch) -> Result<Rows> {
         let rows = chunk.len();
-        let keys = evaluate_all(self.plan, &self.keys, &self.input_schema, chunk)?;
+        let mut evaluated = Vec::new();
+        self.inputs.evaluate(chunk, scratch, &mut evaluated)?;
+        let mut values = evaluated.into_iter();
+        let keys = values.by_ref().take(self.keys.len()).collect();
         let mut arguments = Vec::with_capacity(self.calls.len());
         let mut filters = Vec::with_capacity(self.calls.len());
         for call in &self.calls {
-            arguments.push(evaluate_all(self.plan, &call.args, &self.input_schema, chunk)?);
-            filters.push(match call.filter {
-                Some(filter) => Some(evaluate(self.plan, filter, &self.input_schema, chunk)?),
-                None => None,
-            });
+            arguments.push(values.by_ref().take(call.args.len()).collect());
+            filters
+                .push(call.filter.map(|_| values.next().expect("a prepared filter has a value")));
         }
         Ok(Rows { keys, arguments, filters, rows })
     }
@@ -312,6 +318,7 @@ impl<'a> Aggregate<'a> {
             over: None,
             away: Vec::new(),
             failure: None,
+            expressions: self.inputs.scratch(),
         };
         if self.alone {
             local.groups = 1;
@@ -345,6 +352,7 @@ impl<'a> Aggregate<'a> {
             over,
             away,
             failure: _,
+            expressions: _,
         } = local;
         let calls = self.calls.len();
         let alone = self.alone;
@@ -686,6 +694,7 @@ pub(crate) struct Building {
     away: Vec<Value>,
     /// What went wrong before any row arrived, which there is nowhere else to report from.
     failure: Option<Error>,
+    expressions: Scratch,
 }
 
 /// A spill file being read back, and the buffers reading it fills.
@@ -867,7 +876,7 @@ impl Sink for Aggregate<'_> {
         if let Some(error) = local.failure.take() {
             return Err(error);
         }
-        let rows = self.read(chunk)?;
+        let rows = self.read(chunk, &mut local.expressions)?;
         self.fold(&rows, local)?;
         Ok(Progress::More)
     }
