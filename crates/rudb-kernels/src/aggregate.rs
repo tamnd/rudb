@@ -72,8 +72,71 @@ pub const NOWHERE: usize = usize::MAX;
 #[derive(Debug, Clone)]
 pub struct Accumulator {
     kind: Kind,
-    returns: LogicalType,
+    // A return type used to be cloned into every group. LogicalType is large enough to describe
+    // nested schemas, while an aggregate state only needs the numeric case it will emit. On a
+    // million-group query with three calls that duplicated tens of bytes three million times.
+    returns: Return,
     state: State,
+}
+
+/// The part of an aggregate return type its final value needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Return {
+    TinyInt,
+    SmallInt,
+    Integer,
+    BigInt,
+    HugeInt,
+    UTinyInt,
+    USmallInt,
+    UInteger,
+    UBigInt,
+    UHugeInt,
+    Float,
+    Double,
+    Decimal(u8),
+    /// Min and max return their held value and do not inspect the declared type.
+    Other,
+}
+
+impl Return {
+    fn new(ty: &LogicalType) -> Self {
+        match ty {
+            LogicalType::TinyInt => Self::TinyInt,
+            LogicalType::SmallInt => Self::SmallInt,
+            LogicalType::Integer => Self::Integer,
+            LogicalType::BigInt => Self::BigInt,
+            LogicalType::HugeInt => Self::HugeInt,
+            LogicalType::UTinyInt => Self::UTinyInt,
+            LogicalType::USmallInt => Self::USmallInt,
+            LogicalType::UInteger => Self::UInteger,
+            LogicalType::UBigInt => Self::UBigInt,
+            LogicalType::UHugeInt => Self::UHugeInt,
+            LogicalType::Float => Self::Float,
+            LogicalType::Double => Self::Double,
+            LogicalType::Decimal { width, .. } => Self::Decimal(*width),
+            _ => Self::Other,
+        }
+    }
+
+    fn logical(self) -> LogicalType {
+        match self {
+            Self::TinyInt => LogicalType::TinyInt,
+            Self::SmallInt => LogicalType::SmallInt,
+            Self::Integer => LogicalType::Integer,
+            Self::BigInt => LogicalType::BigInt,
+            Self::HugeInt => LogicalType::HugeInt,
+            Self::UTinyInt => LogicalType::UTinyInt,
+            Self::USmallInt => LogicalType::USmallInt,
+            Self::UInteger => LogicalType::UInteger,
+            Self::UBigInt => LogicalType::UBigInt,
+            Self::UHugeInt => LogicalType::UHugeInt,
+            Self::Float => LogicalType::Float,
+            Self::Double => LogicalType::Double,
+            Self::Decimal(width) => LogicalType::Decimal { width, scale: 0 },
+            Self::Other => LogicalType::Null,
+        }
+    }
 }
 
 /// Which aggregate.
@@ -107,11 +170,16 @@ enum State {
     /// `exact` goes false the first time a value is not a whole number, or the first time the total
     /// would overflow, and from then on `real` carries it. A column of doubles therefore lands on
     /// the same additions in the same order as before, which is what the float path has to keep.
-    Mean { whole: i128, real: f64, seen: i64, exact: bool },
+    // The exact and floating totals are mutually exclusive. The floating total's bits occupy the
+    // same word as the exact i128 after `exact` becomes false, cutting every AVG state by 16 bytes.
+    Mean { total: i128, seen: i64, exact: bool },
     /// A running total at a fixed decimal scale.
     Scaled { total: i128, scale: u8, seen: bool },
     /// The smallest or largest value so far.
-    Extreme(Option<Value>),
+    // Box the one state whose scalar representation is much wider than every numeric aggregate.
+    // Most ClickBench groups contain count/sum/avg states and should not each pay for a 64-byte
+    // Value they never hold. Min and max allocate only after they see their first non-null value.
+    Extreme(Option<Box<Value>>),
 }
 
 impl Accumulator {
@@ -134,7 +202,7 @@ impl Accumulator {
         };
         let state = match kind {
             Kind::CountStar | Kind::Count => State::Counted(0),
-            Kind::Avg => State::Mean { whole: 0, real: 0.0, seen: 0, exact: true },
+            Kind::Avg => State::Mean { total: 0, seen: 0, exact: true },
             Kind::Min | Kind::Max => State::Extreme(None),
             Kind::Sum => match returns {
                 LogicalType::Decimal { scale, .. } => {
@@ -144,7 +212,7 @@ impl Accumulator {
                 _ => State::Whole { total: 0, seen: false },
             },
         };
-        Ok(Self { kind, returns: returns.clone(), state })
+        Ok(Self { kind, returns: Return::new(returns), state })
     }
 
     /// Folds one row in.
@@ -180,21 +248,19 @@ impl Accumulator {
                 *total += approximate_or_error(value)?;
                 *seen += 1;
             }
-            State::Mean { whole, real, seen, exact } => {
+            State::Mean { total, seen, exact } => {
                 match integral(value)
                     .filter(|_| *exact)
-                    .and_then(|number| whole.checked_add(number))
+                    .and_then(|number| total.checked_add(number))
                 {
-                    Some(total) => *whole = total,
+                    Some(sum) => *total = sum,
                     None => {
                         // The first value that is not whole, or the first one that would overflow.
                         // What was counted exactly so far comes across as one conversion, and the
                         // rest of the column is added the way it always was.
-                        if *exact {
-                            *real = exactly(*whole);
-                            *exact = false;
-                        }
-                        *real += approximate_or_error(value)?;
+                        let real = if *exact { exactly(*total) } else { mean_real(*total) };
+                        *total = mean_bits(real + approximate_or_error(value)?);
+                        *exact = false;
                     }
                 }
                 *seen += 1;
@@ -216,7 +282,7 @@ impl Accumulator {
                     }
                 };
                 if replace {
-                    *held = Some(value.clone());
+                    *held = Some(Box::new(value.clone()));
                 }
             }
         }
@@ -295,8 +361,8 @@ impl Accumulator {
             // Anything else is the float path, carried on from wherever the total is now, which for
             // a mean that was exact until this vector is the exact total converted once.
             (State::Mean { exact: true, .. }, ty) if ty.is_integer() => Want::Whole,
-            (State::Mean { whole, real, exact, .. }, ty) => {
-                let from = if *exact { exactly(*whole) } else { *real };
+            (State::Mean { total, exact, .. }, ty) => {
+                let from = if *exact { exactly(*total) } else { mean_real(*total) };
                 Want::Real { scale: decimal_scale(ty), from }
             }
             // A total at the scale the column is already held at is a sum of the raw unscaled
@@ -330,19 +396,19 @@ impl Accumulator {
                 *total = carried;
                 *seen += added;
             }
-            (State::Mean { whole, seen, .. }, Contribution::Whole(sum)) => {
+            (State::Mean { total, seen, .. }, Contribution::Whole(sum)) => {
                 // An overflow here is not an error the way it is for a sum, because the row at a
                 // time loop answers an overflowing mean in floating point rather than raising. So
                 // this hands the vector back and that loop folds it in, state untouched.
-                let Some(total) = whole.checked_add(sum) else { return Ok(false) };
-                *whole = total;
+                let Some(sum) = total.checked_add(sum) else { return Ok(false) };
+                *total = sum;
                 *seen += i64::try_from(live).map_err(|_| overlong())?;
             }
             (
-                State::Mean { real, seen, exact, .. },
+                State::Mean { total, seen, exact },
                 Contribution::Real { total: carried, seen: added },
             ) => {
-                *real = carried;
+                *total = mean_bits(carried);
                 *exact = false;
                 *seen += added;
             }
@@ -358,7 +424,7 @@ impl Accumulator {
                     }
                 };
                 if replace {
-                    *held = Some(candidate);
+                    *held = Some(Box::new(candidate));
                 }
             }
             (State::Extreme(_), Contribution::Extreme(None)) => {}
@@ -381,11 +447,9 @@ impl Accumulator {
                 if !seen {
                     return Ok(Value::Null);
                 }
-                fit(*total, &self.returns).ok_or_else(|| {
-                    Error::out_of_range(format!(
-                        "a sum of {total} does not fit in {}",
-                        self.returns
-                    ))
+                let returns = self.returns.logical();
+                fit(*total, &returns).ok_or_else(|| {
+                    Error::out_of_range(format!("a sum of {total} does not fit in {}", returns))
                 })
             }
             State::Real { total, seen } => {
@@ -397,7 +461,7 @@ impl Accumulator {
                     reason = "the count of rows in one group is well inside the exact range"
                 )]
                 let answer = if self.kind == Kind::Avg { total / *seen as f64 } else { *total };
-                if matches!(self.returns, LogicalType::Float) {
+                if self.returns == Return::Float {
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "a declared FLOAT result is a FLOAT"
@@ -406,17 +470,17 @@ impl Accumulator {
                 }
                 Ok(Value::Double(answer))
             }
-            State::Mean { whole, real, seen, exact } => {
+            State::Mean { total, seen, exact } => {
                 if *seen == 0 {
                     return Ok(Value::Null);
                 }
-                let total = if *exact { exactly(*whole) } else { *real };
+                let total = if *exact { exactly(*total) } else { mean_real(*total) };
                 #[expect(
                     clippy::cast_precision_loss,
                     reason = "the count of rows in one group is well inside the exact range"
                 )]
                 let answer = total / *seen as f64;
-                if matches!(self.returns, LogicalType::Float) {
+                if self.returns == Return::Float {
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "a declared FLOAT result is a FLOAT"
@@ -430,12 +494,12 @@ impl Accumulator {
                     return Ok(Value::Null);
                 }
                 let width = match self.returns {
-                    LogicalType::Decimal { width, .. } => width,
+                    Return::Decimal(width) => width,
                     _ => rudb_common::MAX_DECIMAL_WIDTH,
                 };
                 Ok(Value::Decimal { unscaled: *total, width, scale: *scale })
             }
-            State::Extreme(held) => Ok(held.clone().unwrap_or(Value::Null)),
+            State::Extreme(held) => Ok(held.as_deref().cloned().unwrap_or(Value::Null)),
         }
     }
 }
@@ -689,15 +753,13 @@ fn fold_whole(into: &mut Accumulator, number: i128) -> Result<()> {
             *total = total.checked_add(number).ok_or_else(overflowed)?;
             *seen = true;
         }
-        State::Mean { whole, real, seen, exact } => {
-            match whole.checked_add(number).filter(|_| *exact) {
-                Some(total) => *whole = total,
+        State::Mean { total, seen, exact } => {
+            match total.checked_add(number).filter(|_| *exact) {
+                Some(sum) => *total = sum,
                 None => {
-                    if *exact {
-                        *real = exactly(*whole);
-                        *exact = false;
-                    }
-                    *real += exactly(number);
+                    let real = if *exact { exactly(*total) } else { mean_real(*total) };
+                    *total = mean_bits(real + exactly(number));
+                    *exact = false;
                 }
             }
             *seen += 1;
@@ -757,14 +819,12 @@ fn fold_real(into: &mut Accumulator, number: f64) {
             *total += number;
             *seen += 1;
         }
-        State::Mean { whole, real, seen, exact } => {
+        State::Mean { total, seen, exact } => {
             // The first value that is not whole. What was counted exactly so far comes across as
             // one conversion, and the rest of the group is added the way the float path adds.
-            if *exact {
-                *real = exactly(*whole);
-                *exact = false;
-            }
-            *real += number;
+            let real = if *exact { exactly(*total) } else { mean_real(*total) };
+            *total = mean_bits(real + number);
+            *exact = false;
             *seen += 1;
         }
         // `feed_of` chose this loop off the state, so the states left over cannot be here.
@@ -808,7 +868,7 @@ fn extreme_into<M: Fn(usize) -> usize>(
                         // arrives sorted is once and for a column that arrives shuffled is about
                         // the harmonic number of the rows in the group.
                         if replace {
-                            *held = Some(run.input.value_at(row));
+                            *held = Some(Box::new(run.input.value_at(row)));
                         }
                     }
                 })+
@@ -832,6 +892,14 @@ fn not_narrow(value: &Value) -> Error {
 )]
 fn exactly(total: i128) -> f64 {
     total as f64
+}
+
+fn mean_bits(total: f64) -> i128 {
+    i128::from(total.to_bits())
+}
+
+fn mean_real(bits: i128) -> f64 {
+    f64::from_bits(bits as u64)
 }
 
 fn approximate_or_error(value: &Value) -> Result<f64> {
@@ -1114,6 +1182,13 @@ fn extreme<M: Fn(usize) -> usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_grouped_accumulator_does_not_carry_a_full_logical_type() {
+        // A LogicalType can own a nested schema. Keeping one in every aggregate state cost more
+        // than a hundred MiB on ClickBench q33 before the return was narrowed to Return.
+        assert!(size_of::<Accumulator>() <= 48, "{} bytes", size_of::<Accumulator>());
+    }
 
     fn run(name: &str, returns: &LogicalType, rows: &[Value]) -> Value {
         let mut accumulator = Accumulator::new(name, returns).expect("a known aggregate");

@@ -73,7 +73,7 @@ pub(crate) struct Table {
     /// The stored keys, column at a time. `columns[column][slot]` is one group's value in one key
     /// column, which is the layout that lets a group be pushed without asking the allocator for a
     /// row to put it in.
-    columns: Vec<Vec<Value>>,
+    columns: Vec<Vec<Stored>>,
     /// The hash of each group's key, so that a probe compares one word before it compares a key.
     /// Worth its eight bytes on a string key, where the comparison it avoids is a memcmp.
     hashes: Vec<u64>,
@@ -128,7 +128,7 @@ impl Table {
         let buckets = self.buckets.capacity() * size_of::<u32>();
         let hashes = self.hashes.capacity() * size_of::<u64>();
         let keys: usize =
-            self.columns.iter().map(|column| column.capacity() * size_of::<Value>()).sum();
+            self.columns.iter().map(|column| column.capacity() * size_of::<Stored>()).sum();
         u64::try_from(buckets + hashes + keys).unwrap_or(u64::MAX)
     }
 
@@ -178,7 +178,7 @@ impl Table {
             // below, whose capacity `footprint` counts, and counting it here as well would charge
             // every group twice for the part of it that is not a string.
             self.owned += rows::owned(&value);
-            self.columns[at].push(value);
+            self.columns[at].push(Stored::from(value));
         }
         self.hashes.push(hash);
         self.buckets[bucket] = slot as u32;
@@ -208,7 +208,7 @@ impl Table {
     fn holds(&self, slot: usize, keys: &[Vector], row: usize) -> bool {
         for (at, column) in keys.iter().enumerate() {
             let stored = &self.columns[at][slot];
-            if let Value::Varchar(text) = stored {
+            if let Stored::Varchar(text) = stored {
                 if let Some(borrowed) = column.text_at(row) {
                     if borrowed != text.as_str() {
                         return false;
@@ -216,7 +216,7 @@ impl Table {
                     continue;
                 }
             }
-            if !same(stored, &column.value_at(row)) {
+            if !same(&stored.value(), &column.value_at(row)) {
                 return false;
             }
         }
@@ -249,8 +249,100 @@ impl Table {
     /// # Panics
     ///
     /// If `at` is not a column of the key this table was built over, which is a bug in the caller.
-    pub(crate) fn column(&self, at: usize) -> &[Value] {
-        &self.columns[at]
+    pub(crate) fn column(&self, at: usize, range: std::ops::Range<usize>) -> Vec<Value> {
+        self.columns[at][range].iter().map(Stored::value).collect()
+    }
+}
+
+/// A group key cell without the 64-byte width of the general recursive [`Value`] enum.
+///
+/// Lists and structs are uncommon grouping keys and stay behind one pointer. Primitive and string
+/// keys, which dominate analytical grouping, remain inline at half the width.
+#[derive(Debug, Clone)]
+enum Stored {
+    Null,
+    Boolean(bool),
+    TinyInt(i8),
+    SmallInt(i16),
+    Integer(i32),
+    BigInt(i64),
+    HugeInt(i128),
+    UTinyInt(u8),
+    USmallInt(u16),
+    UInteger(u32),
+    UBigInt(u64),
+    UHugeInt(u128),
+    Float(f32),
+    Double(f64),
+    Decimal { unscaled: i128, width: u8, scale: u8 },
+    Varchar(String),
+    Blob(Vec<u8>),
+    Date(i32),
+    Time(i64),
+    Timestamp(i64),
+    Interval { months: i32, days: i32, micros: i64 },
+    Other(Box<Value>),
+}
+
+impl From<Value> for Stored {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Boolean(v) => Self::Boolean(v),
+            Value::TinyInt(v) => Self::TinyInt(v),
+            Value::SmallInt(v) => Self::SmallInt(v),
+            Value::Integer(v) => Self::Integer(v),
+            Value::BigInt(v) => Self::BigInt(v),
+            Value::HugeInt(v) => Self::HugeInt(v),
+            Value::UTinyInt(v) => Self::UTinyInt(v),
+            Value::USmallInt(v) => Self::USmallInt(v),
+            Value::UInteger(v) => Self::UInteger(v),
+            Value::UBigInt(v) => Self::UBigInt(v),
+            Value::UHugeInt(v) => Self::UHugeInt(v),
+            Value::Float(v) => Self::Float(v),
+            Value::Double(v) => Self::Double(v),
+            Value::Decimal { unscaled, width, scale } => Self::Decimal { unscaled, width, scale },
+            Value::Varchar(v) => Self::Varchar(v),
+            Value::Blob(v) => Self::Blob(v),
+            Value::Date(v) => Self::Date(v),
+            Value::Time(v) => Self::Time(v),
+            Value::Timestamp(v) => Self::Timestamp(v),
+            Value::Interval { months, days, micros } => Self::Interval { months, days, micros },
+            other => Self::Other(Box::new(other)),
+        }
+    }
+}
+
+impl Stored {
+    fn value(&self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Boolean(v) => Value::Boolean(*v),
+            Self::TinyInt(v) => Value::TinyInt(*v),
+            Self::SmallInt(v) => Value::SmallInt(*v),
+            Self::Integer(v) => Value::Integer(*v),
+            Self::BigInt(v) => Value::BigInt(*v),
+            Self::HugeInt(v) => Value::HugeInt(*v),
+            Self::UTinyInt(v) => Value::UTinyInt(*v),
+            Self::USmallInt(v) => Value::USmallInt(*v),
+            Self::UInteger(v) => Value::UInteger(*v),
+            Self::UBigInt(v) => Value::UBigInt(*v),
+            Self::UHugeInt(v) => Value::UHugeInt(*v),
+            Self::Float(v) => Value::Float(*v),
+            Self::Double(v) => Value::Double(*v),
+            Self::Decimal { unscaled, width, scale } => {
+                Value::Decimal { unscaled: *unscaled, width: *width, scale: *scale }
+            }
+            Self::Varchar(v) => Value::Varchar(v.clone()),
+            Self::Blob(v) => Value::Blob(v.clone()),
+            Self::Date(v) => Value::Date(*v),
+            Self::Time(v) => Value::Time(*v),
+            Self::Timestamp(v) => Value::Timestamp(*v),
+            Self::Interval { months, days, micros } => {
+                Value::Interval { months: *months, days: *days, micros: *micros }
+            }
+            Self::Other(v) => (**v).clone(),
+        }
     }
 }
 
@@ -400,6 +492,11 @@ mod tests {
     use rudb_common::LogicalType;
 
     use super::*;
+
+    #[test]
+    fn a_stored_group_key_is_narrower_than_a_general_recursive_value() {
+        assert!(size_of::<Stored>() < size_of::<Value>());
+    }
 
     /// The hash of one column of values, in whatever form the vector is in.
     fn hashed(column: &Vector) -> Vec<u64> {
@@ -571,8 +668,9 @@ mod tests {
                 "row {row} was lost by a rehash"
             );
         }
-        assert_eq!(table.column(0).len(), values.len());
-        assert_eq!(table.column(0)[7], Value::BigInt(7));
+        let column = table.column(0, 0..values.len());
+        assert_eq!(column.len(), values.len());
+        assert_eq!(column[7], Value::BigInt(7));
     }
 
     /// The strings a key holds are charged, and they are charged once the group is in rather than

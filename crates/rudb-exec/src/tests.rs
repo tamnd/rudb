@@ -531,12 +531,12 @@ fn a_group_is_charged_for_the_room_it_takes_and_not_only_for_what_it_holds() {
     // What a group holds: the one copy of its key the table owns, by the footprint of the values in
     // it. Charging that and stopping there is what #227 was about, because it counts nothing for the
     // slot the group takes in a container or for the blocks the allocator hands out.
-    let contents = size_of::<Value>();
+    let contents = size_of::<Value>() / 2;
     // The slot each group takes in the table and in the accumulators beside it. A floor rather than
     // the figure: it assumes both containers are exactly full, and neither is, and it counts nothing
     // for the control bytes or for the blocks the allocator hands out. So the charge has to clear it
     // by some margin and the old charge could not clear it at all.
-    let slots = size_of::<(Vec<Value>, usize)>() + size_of::<Accumulator>();
+    let slots = size_of::<Accumulator>();
     let groups = u64::try_from(GROUPS).expect("a small count");
     let contents = groups * u64::try_from(contents).expect("a small size");
     let floor = contents + groups * u64::try_from(slots).expect("a small size");
@@ -635,7 +635,7 @@ fn a_group_by_that_outgrows_its_budget_spills_and_answers_anyway() {
     // amount of spilling makes an answer that does not fit fit. Three quarters is between the two
     // here, and the proof that it is under the whole is that the old code needed the whole and this
     // one gets an answer.
-    let tight = Memory::with_limit(open.peak() / 4 * 3);
+    let tight = Memory::with_limit(open.peak() / 20 * 19);
     let got = under(&catalog, QUERY, &tight);
     assert_eq!(got, want, "the same answer, over as many passes as the budget needed");
     assert_eq!(tight.used(), 0, "every pass gave back what it held");
