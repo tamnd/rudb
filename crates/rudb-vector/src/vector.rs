@@ -932,6 +932,31 @@ impl Vector {
         }
     }
 
+    /// The variable length bytes at `index`, borrowed without validating or copying them.
+    ///
+    /// String data is validated when it enters a vector. Hashing and equality only need its bytes,
+    /// so those kernels should not pay for UTF-8 validation again on every read.
+    #[must_use]
+    pub fn bytes_at(&self, index: usize) -> Option<&[u8]> {
+        if index >= self.len || !self.validity.is_valid(index) {
+            return None;
+        }
+        match &self.body {
+            Body::Constant(value) => match value.as_ref() {
+                Value::Varchar(text) => Some(text.as_bytes()),
+                Value::Blob(bytes) => Some(bytes),
+                _ => None,
+            },
+            Body::Dictionary { codes, values } => {
+                values.bytes_at(usize::try_from(*codes.get(index)?).ok()?)
+            }
+            Body::Runs { ends, values } => values.bytes_at(run_holding(ends, index)?),
+            Body::Views { views, arena } => views.get(index)?.bytes_in(arena),
+            Body::Flat(data) => data.bytes_at(index),
+            Body::Sequence { .. } | Body::Packed { .. } => None,
+        }
+    }
+
     /// Every value in order, as single values.
     pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
         (0..self.len).map(|index| self.value_at(index))
