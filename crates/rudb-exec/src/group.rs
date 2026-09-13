@@ -472,7 +472,8 @@ impl<'a> Aggregate<'a> {
             let end = (start + VECTOR_SIZE).min(groups);
             let mut columns = Vec::with_capacity(width + calls);
             for (at, ty) in types.iter().take(width).enumerate() {
-                columns.push(Vector::from_values(ty.clone(), &table.column(at)[start..end])?);
+                let values = table.column(at, start..end);
+                columns.push(Vector::from_values(ty.clone(), &values)?);
             }
             for (at, ty) in types.iter().skip(width).enumerate() {
                 // What a result owns away from itself is not knowable until it has been asked for,
