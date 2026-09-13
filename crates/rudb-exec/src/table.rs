@@ -200,17 +200,17 @@ impl Table {
     /// `value_at` on it is a copy of a few bytes and going through [`same`] keeps the one definition
     /// of what groups together.
     ///
-    /// [`Vector::text_at`] hands back nothing for the forms that do not store their text per
+    /// [`Vector::bytes_at`] hands back nothing for the forms that do not store their text per
     /// position, and a caller that reads that as a difference is a caller that never finds a group
     /// again. A nested loop join makes its left side constant vectors, so a group by on a string
     /// column from the left of a join is exactly that case, and it answered with one group per row.
-    /// So nothing from `text_at` means fall through to `value_at`, which is right for every form.
+    /// So nothing from `bytes_at` means fall through to `value_at`, which is right for every form.
     fn holds(&self, slot: usize, keys: &[Vector], row: usize) -> bool {
         for (at, column) in keys.iter().enumerate() {
             let stored = &self.columns[at][slot];
             if let Stored::Varchar(text) = stored {
-                if let Some(borrowed) = column.text_at(row) {
-                    if borrowed != text.as_str() {
+                if let Some(borrowed) = column.bytes_at(row) {
+                    if borrowed != text.as_bytes() {
                         return false;
                     }
                     continue;
@@ -418,14 +418,18 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64]) {
             _ => {}
         }
     }
-    // row at a time: every other form and every type without an arm above. A dictionary is read
-    // through `text_at` where it can be, because `value_at` on a dictionary of strings copies one
-    // per row and the form exists so that it does not have to. What is left after that is the
+    // row at a time: every other form and every type without an arm above. A dictionary string is
+    // read as bytes because the input reader already validated the column and validating the same
+    // bytes again for every row was most of the string group path. What is left after that is the
     // nested types and the intervals, which have no run of fixed width words to walk at all.
     for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-        *state = match column.text_at(row) {
-            Some(text) => mix(*state, bytes_word(text.as_bytes())),
-            None => fold_value(*state, &column.value_at(row)),
+        *state = if column.logical_type() == &rudb_common::LogicalType::Varchar {
+            match column.bytes_at(row) {
+                Some(bytes) => mix(*state, bytes_word(bytes)),
+                None => mix(*state, NOTHING),
+            }
+        } else {
+            fold_value(*state, &column.value_at(row))
         };
     }
 }
