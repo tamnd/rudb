@@ -2316,6 +2316,15 @@ fn a_result_holds_its_bytes_until_it_is_dropped() {
 }
 
 #[test]
+fn query_metrics_report_the_memory_budget_high_water_mark() {
+    let db = Database::new();
+    let result = db.query("SELECT range, count(*) FROM range(10000) GROUP BY range").unwrap();
+    let measured = result.metrics().expect("a query carries execution metrics");
+    assert!(measured.resource.peak_bytes > 0, "a buffering operator reserved memory");
+    assert_eq!(measured.resource.peak_bytes, db.memory().peak());
+}
+
+#[test]
 fn a_database_with_no_limit_counts_what_it_holds_anyway() {
     // So that a program can watch the number before it decides what limit to set. It has to ask for
     // no limit now, because a database opened the plain way has one.

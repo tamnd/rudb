@@ -7,14 +7,15 @@
 //! own business, and the four here mean four different things by it, which is why the type carries
 //! numbers and not rows.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_csv::Reader as CsvReader;
 use rudb_functions::{Given, TableFunction, csv_given, open_csv, open_parquet, series_length};
 use rudb_kernels::cast;
+use rudb_metrics::Counters;
 use rudb_parquet::Reader;
 use rudb_pipeline::{Morsel, Progress, Source};
 use rudb_plan::{ExprRef, Plan, Slice};
@@ -399,6 +400,7 @@ pub(crate) struct FileScan {
     schema: Schema,
     reading: Mutex<Reading>,
     one: Handout,
+    counters: Option<Arc<Counters>>,
 }
 
 /// Which file the scan is on and the reader that is open on it.
@@ -435,6 +437,7 @@ impl FileScan {
             schema: Schema::numbered(wanted, index),
             reading: Mutex::new(Reading { at: 0, reader: None }),
             one: Handout::new(1),
+            counters: None,
         };
         // The first file is opened now rather than on the first read, so that a file that has gone
         // missing since binding is reported where a caller is still asking a question about this
@@ -444,6 +447,12 @@ impl FileScan {
             scan.advance(&mut reading)?;
         }
         Ok(scan)
+    }
+
+    /// Connects this source's file counters to the operator row that owns it.
+    pub(crate) fn watched(mut self, counters: Arc<Counters>) -> Self {
+        self.counters = Some(counters);
+        self
     }
 
     /// What this scan produces, in the types the first file settled on.
@@ -515,7 +524,12 @@ impl Source for FileScan {
                 *out = Chunk::empty(&self.schema.types());
                 return Ok(Progress::Done);
             };
-            if let Some(chunk) = reader.next_chunk()? {
+            let before = reader.bytes_read();
+            let next = reader.next_chunk()?;
+            if let Some(counters) = &self.counters {
+                counters.read(reader.bytes_read().saturating_sub(before));
+            }
+            if let Some(chunk) = next {
                 // A file that is empty gives no chunk rather than an empty one, so this is not the
                 // place that skips it. The loop is.
                 *out = self.conform(chunk, file)?;
@@ -595,6 +609,14 @@ impl FileReader {
         match self {
             Self::Parquet(reader) => reader.next_chunk(),
             Self::Csv(reader) => reader.next_chunk(),
+        }
+    }
+
+    /// Compressed column bytes read so far, where the reader exposes that distinction.
+    fn bytes_read(&self) -> u64 {
+        match self {
+            Self::Parquet(reader) => reader.bytes_read(),
+            Self::Csv(_) => 0,
         }
     }
 }

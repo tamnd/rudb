@@ -238,7 +238,7 @@ impl Shell {
                     if self.timer {
                         let _ = writeln!(
                             self.err,
-                            "Run Time (s): real {:.3}",
+                            "Run Time (s): real {:.9}",
                             started.elapsed().as_secs_f64()
                         );
                     }

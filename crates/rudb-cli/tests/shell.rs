@@ -496,3 +496,12 @@ fn a_metrics_file_that_cannot_be_written_is_said_once_and_fails_the_run() {
     assert!(failed);
     assert_eq!(err.matches("cannot write metrics").count(), 1, "{err}");
 }
+
+#[test]
+fn timer_preserves_submillisecond_precision() {
+    let (_, err, failed) = run(&["-c", ".timer on", "-c", "SELECT 1"]);
+    assert!(!failed, "{err}");
+    let elapsed = err.trim().strip_prefix("Run Time (s): real ").expect("timer line");
+    assert_eq!(elapsed.split('.').nth(1).unwrap().len(), 9);
+    assert!(elapsed.parse::<f64>().unwrap() > 0.0);
+}

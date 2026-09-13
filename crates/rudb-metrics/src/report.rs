@@ -131,6 +131,14 @@ impl Report {
             }
         }
         pipelines.sort_by_key(|pipeline| pipeline.id);
+        document.resource.bytes_read =
+            operators.iter().fold(0, |total, operator| total.saturating_add(operator.bytes_read));
+        document.resource.bytes_decoded = operators
+            .iter()
+            .fold(0, |total, operator| total.saturating_add(operator.bytes_decoded));
+        document.resource.bytes_spilled = operators
+            .iter()
+            .fold(0, |total, operator| total.saturating_add(operator.bytes_spilled));
         document.pipelines = pipelines;
         document.operators = operators;
     }
@@ -170,8 +178,11 @@ mod tests {
         let read = report.watch(Counters::new(0, 0, "Buffered"));
         scan.made(1000);
         scan.spent(400, 380);
+        scan.read(4096);
+        scan.decoded(8192);
         sort.took(1000);
         sort.spent(600, 590);
+        sort.spilled(512);
         read.made(1000);
         read.spent(100, 90);
         let mut document = Document::new("select * from t order by a");
@@ -186,6 +197,9 @@ mod tests {
         assert!(document.pipelines[1].depends_on.is_empty());
         assert_eq!(document.pipelines[1].wall_ns, 1000);
         assert_eq!(document.pipelines[1].cpu_ns, 970);
+        assert_eq!(document.resource.bytes_read, 4096);
+        assert_eq!(document.resource.bytes_decoded, 8192);
+        assert_eq!(document.resource.bytes_spilled, 512);
     }
 
     #[test]
