@@ -191,10 +191,11 @@ impl<'a> Building<'a, '_> {
                 let name = plan.string(function);
                 match TableFunction::lookup(name) {
                     Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
-                        let scan =
-                            FileScan::new(plan, index, function, args, options, settings, columns)?;
-                        let schema = scan.schema().clone();
                         let counters = self.watch(id, pipeline, "FileScan", Some(name));
+                        let scan =
+                            FileScan::new(plan, index, function, args, options, settings, columns)?
+                                .watched(counters.clone());
+                        let schema = scan.schema().clone();
                         pulled(Watched::new(scan, counters), schema)
                     }
                     Some(TableFunction::RudbStrategies) => {

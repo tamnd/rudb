@@ -52,6 +52,21 @@ fn counting_the_rows_of_a_file_is_the_number_of_rows_in_it() {
 }
 
 #[test]
+fn file_scan_metrics_count_the_compressed_column_bytes_read() {
+    let database = Database::new();
+    let sql = format!("SELECT sum(a) FROM read_parquet({})", fixture());
+    let result = database.query(&sql).expect("runs");
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let scan = metrics
+        .operators
+        .iter()
+        .find(|operator| operator.kind == "FileScan")
+        .expect("the query contains a file scan");
+    assert!(scan.bytes_read > 0, "the scan reports the Parquet column bytes it read");
+    assert_eq!(metrics.resource.bytes_read, scan.bytes_read);
+}
+
+#[test]
 fn every_column_of_the_file_is_selectable_by_the_name_the_file_gives_it() {
     let database = Database::new();
     let sql = format!("SELECT a, b, s, d, flag, day, t FROM read_parquet({})", fixture());

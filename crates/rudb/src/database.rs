@@ -606,6 +606,12 @@ fn run(
     statistics: &rudb_opt::estimate::Statistics,
     seams: &rudb_seam::Settings,
 ) -> Result<QueryResult> {
+    // The budget is shared by the database and its high-water mark survives a query. Reset it to
+    // what is live now before measuring this execution, otherwise a metrics document either says
+    // zero forever (when nobody copies the mark) or inherits the largest earlier query. A caller
+    // with concurrent statements cannot attribute the shared budget to one query; this field is a
+    // database-level peak in that case. The CLI benchmark path has one statement in flight.
+    memory.forget_peak();
     let report = Report::new();
     let building = Span::start();
     let mut root = rudb_exec::build_measured(plan, catalog, cancel, memory, seams, &report)?;
@@ -642,6 +648,7 @@ fn run(
     metrics.timing.total_ns = built_wall.saturating_add(ran_wall);
     metrics.resource.cpu_ns = built_cpu.saturating_add(ran_cpu);
     metrics.resource.build_cpu_ns = built_cpu;
+    metrics.resource.peak_bytes = memory.peak();
     report.fill(&mut metrics);
     rudb_opt::explain::record_estimates(plan, statistics, &mut metrics);
     Ok(QueryResult::new(names, types, chunks, held).measured(metrics))
