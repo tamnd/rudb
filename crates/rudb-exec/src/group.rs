@@ -88,6 +88,8 @@ pub(crate) struct Aggregate<'a> {
     by_vector: Vec<bool>,
     /// Whether every call folds a vector at a time, which is when the row loop is skipped whole.
     every: bool,
+    /// The most groups an unordered limit above this operator can observe.
+    max_groups: Option<usize>,
     memory: Memory,
     /// The chunks the passes have finished, and what they are charged.
     built: Mutex<Built>,
@@ -157,6 +159,7 @@ impl<'a> Aggregate<'a> {
             alone,
             sets: calls.iter().any(|call| call.distinct),
             every: by_vector.iter().all(|&yes| yes),
+            max_groups: None,
             by_vector,
             groups,
             calls,
@@ -170,6 +173,12 @@ impl<'a> Aggregate<'a> {
             out: out.clone(),
         };
         Ok((aggregate, out))
+    }
+
+    /// Stops opening groups once an unordered limit above this aggregate cannot observe another.
+    pub(crate) fn limit_groups(mut self, max_groups: usize) -> Self {
+        self.max_groups = Some(max_groups);
+        self
     }
 
     /// What this operator produces, which is the group expressions followed by the aggregates.
@@ -348,6 +357,9 @@ impl<'a> Aggregate<'a> {
                 match table.probe(hashes[row], keys, row) {
                     Probe::Found(slot) => slot,
                     Probe::Vacant(bucket) => {
+                        if self.max_groups.is_some_and(|limit| table.len() >= limit) {
+                            continue;
+                        }
                         if let Some(file) = over.as_mut() {
                             // The table is as large as the budget will let it be and this key is
                             // not in it, so the row goes out whole. Every later row with this key

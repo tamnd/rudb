@@ -32,7 +32,7 @@ use rudb_common::{Cancel, Memory, Result};
 use rudb_functions::TableFunction;
 use rudb_metrics::{Counters, Report};
 use rudb_pipeline::{Source, Watched};
-use rudb_plan::{Node, NodeRef, Plan, Shape};
+use rudb_plan::{Node, NodeRef, Plan, Shape, Slice};
 use rudb_seam::Settings;
 
 use crate::adapt::{Broken, Fed, Paired, Pulled, Streamed};
@@ -160,6 +160,44 @@ impl<'a> Building<'a, '_> {
         self.report.watch(counters)
     }
 
+    fn aggregate(
+        &self,
+        reference: NodeRef,
+        input: NodeRef,
+        index: u32,
+        groups: Slice,
+        aggregates: Slice,
+        max_groups: Option<usize>,
+    ) -> Result<Box<dyn Operator + 'a>> {
+        let child = self.node(input)?;
+        let (aggregate, out) = Aggregate::new(
+            self.plan,
+            child.schema(),
+            index,
+            groups,
+            aggregates,
+            self.memory,
+        )?;
+        let aggregate = match max_groups {
+            Some(limit) => aggregate.limit_groups(limit),
+            None => aggregate,
+        };
+        let schema = aggregate.schema().clone();
+        let id = self.shape.operator(reference);
+        let pipeline = self.shape.pipeline(reference);
+        let counters = self.watch(id, pipeline, "Aggregate", None);
+        let made = Arc::clone(&counters);
+        let driver = self.report.driving(pipeline);
+        Ok(Box::new(Broken::new(
+            child,
+            Watched::new(aggregate, counters),
+            driver,
+            out,
+            made,
+            schema,
+        )))
+    }
+
     fn node(&self, reference: NodeRef) -> Result<Box<dyn Operator + 'a>> {
         let plan = self.plan;
         let memory = self.memory;
@@ -227,21 +265,7 @@ impl<'a> Building<'a, '_> {
                 Box::new(Streamed::new(input, Watched::new(project, counters), schema))
             }
             Node::Aggregate { input, index, groups, aggregates } => {
-                let input = self.node(input)?;
-                let (aggregate, out) =
-                    Aggregate::new(plan, input.schema(), index, groups, aggregates, memory)?;
-                let schema = aggregate.schema().clone();
-                let counters = self.watch(id, pipeline, "Aggregate", None);
-                let made = Arc::clone(&counters);
-                let driver = self.report.driving(pipeline);
-                Box::new(Broken::new(
-                    input,
-                    Watched::new(aggregate, counters),
-                    driver,
-                    out,
-                    made,
-                    schema,
-                ))
+                self.aggregate(reference, input, index, groups, aggregates, None)?
             }
             Node::Sort { input, keys } => {
                 let input = self.node(input)?;
@@ -260,7 +284,16 @@ impl<'a> Building<'a, '_> {
                 ))
             }
             Node::Limit { input, count, offset } => {
-                let input = self.node(input)?;
+                let max_groups = count
+                    .and_then(|count| count.checked_add(offset))
+                    .and_then(|count| usize::try_from(count).ok());
+                let input = match (plan.node(input).clone(), max_groups) {
+                    (
+                        Node::Aggregate { input: below, index, groups, aggregates },
+                        Some(max_groups),
+                    ) => self.aggregate(input, below, index, groups, aggregates, Some(max_groups))?,
+                    _ => self.node(input)?,
+                };
                 let schema = input.schema().clone();
                 let limit = Limit::new(count, offset);
                 let counters = self.watch(id, pipeline, "Limit", None);
