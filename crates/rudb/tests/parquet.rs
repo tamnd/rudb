@@ -410,3 +410,64 @@ fn a_column_the_file_does_not_have_is_the_error_a_missing_column_always_is() {
     let error = database.query(&sql).unwrap_err();
     assert!(error.message().contains("nosuch"), "{error}");
 }
+
+#[test]
+fn file_row_number_is_the_rows_ordinal_inside_its_own_file() {
+    // DuckDB v2.0.0-dev84237 over the same fixture answers 4095 and 4096 to the first query and
+    // 5, 102, 199 to the second, which is what is written down here.
+    let database = Database::new();
+    let call = format!("read_parquet({}, file_row_number=True)", fixture());
+    let sql = format!("SELECT max(file_row_number), count(*) FROM {call}");
+    let result = database.query(&sql).expect("runs");
+    assert_eq!(result.value_at(0, 0), Value::BigInt(4095));
+    assert_eq!(result.value_at(0, 1), Value::BigInt(4096));
+    assert_eq!(result.types()[0].to_string(), "BIGINT");
+
+    let sql = format!("SELECT file_row_number FROM {call} WHERE a = 5 LIMIT 3");
+    let result = database.query(&sql).expect("runs");
+    let got: Vec<Value> = (0..result.len()).map(|at| result.value_at(at, 0)).collect();
+    assert_eq!(got, [Value::BigInt(5), Value::BigInt(102), Value::BigInt(199)]);
+}
+
+#[test]
+fn the_counted_column_is_there_only_when_the_call_asks_for_it() {
+    let database = Database::new();
+    let sql = format!("SELECT file_row_number FROM read_parquet({})", fixture());
+    let error = database.query(&sql).unwrap_err();
+    assert!(error.message().contains("file_row_number"), "{error}");
+    let sql =
+        format!("SELECT file_row_number FROM read_parquet({}, file_row_number=False)", fixture());
+    let error = database.query(&sql).unwrap_err();
+    assert!(error.message().contains("file_row_number"), "{error}");
+}
+
+#[test]
+fn counting_a_column_that_is_not_in_the_file_reads_none_of_the_file() {
+    // The pruning case worth pinning. Nothing names a column of the file, so the scan opens it for
+    // its row count and reads no column data, and the counted column is still right.
+    let database = Database::new();
+    let call = format!("read_parquet({}, file_row_number=True)", fixture());
+    let sql = format!("SELECT sum(file_row_number) FROM {call}");
+    let result = database.query(&sql).expect("runs");
+    assert_eq!(result.value_at(0, 0), Value::HugeInt(4095 * 4096 / 2));
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    assert_eq!(metrics.resource.bytes_read, 0, "no column of the file was read");
+}
+
+#[test]
+fn the_count_starts_again_at_zero_in_every_file_of_a_glob() {
+    // Which is what the name says and what DuckDB does. Three rows in the first part and four in
+    // the second, and the same seven values come out of the binary over the same two files.
+    let database = Database::new();
+    let glob =
+        format!("'{}/../rudb-parquet/testdata/parts/p*.parquet'", env!("CARGO_MANIFEST_DIR"));
+    let sql = format!("SELECT file_row_number FROM read_parquet({glob}, file_row_number=True)");
+    let result = database.query(&sql).expect("runs");
+    let got: Vec<i64> = (0..result.len())
+        .map(|at| match result.value_at(at, 0) {
+            Value::BigInt(number) => number,
+            other => panic!("a BIGINT column produced {other:?}"),
+        })
+        .collect();
+    assert_eq!(got, [0, 1, 2, 0, 1, 2, 3]);
+}
