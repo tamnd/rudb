@@ -461,7 +461,7 @@ impl Column {
     /// `BIGINT` key costs a range check and a push and a `VARCHAR` key costs a copy of its bytes.
     /// Everything else builds a value, which is what all of this used to do.
     fn push_from(&mut self, column: &Vector, row: usize) -> Result<u64> {
-        if !column.validity().is_valid(row) {
+        if column.is_null_at(row) {
             return self.push(Value::Null).map(|()| 0);
         }
         let taken = match &mut self.data {
@@ -517,7 +517,7 @@ impl Column {
 
     fn holds(&self, slot: usize, column: &Vector, row: usize) -> bool {
         if !self.valid[slot] {
-            return !column.validity().is_valid(row);
+            return column.is_null_at(row);
         }
         match &self.data {
             // Read where it lies rather than through a value, because this is the one line in the
@@ -1167,6 +1167,31 @@ mod tests {
         assert!(matches!(table.probe(hashes[1], &keys, 1), Probe::Found(found) if found == slot));
         assert!(matches!(table.probe(hashes[2], &keys, 2), Probe::Vacant(_)));
         assert_eq!(table.len(), 1);
+    }
+
+    /// The same shape of mistake as the constant one below, over nulls rather than strings, and the
+    /// reason [`Vector::is_null_at`] exists. A filter that drops a row hands the rows it kept on as
+    /// dictionary vectors, and a dictionary keeps its nulls in the values its codes point at rather
+    /// than in a mask of its own, so asking the vector's own validity whether a row is null answers
+    /// no for every row of one. That put each null row of a group by in a group of its own.
+    #[test]
+    fn two_null_rows_are_one_group_when_they_arrive_behind_a_dictionary() {
+        let values = flat(LogicalType::Integer, &[Value::Null, Value::Integer(1)]);
+        let keys = [Vector::dictionary(vec![0, 0, 1], values).expect("a dictionary of those rows")];
+        let (table, slots) = one_at_a_time(&keys, 3, &[LogicalType::Integer]);
+        assert_eq!(slots, [0, 0, 1], "the two nulls did not find each other");
+        assert_eq!(table.len(), 2);
+    }
+
+    /// The other half of it. A stored null key must not swallow a row that has a value, which is
+    /// what reading the mask the other way around would do.
+    #[test]
+    fn a_null_group_does_not_take_a_row_that_has_a_value_behind_a_dictionary() {
+        let values = flat(LogicalType::Varchar, &[Value::Null, Value::Varchar("ada".into())]);
+        let keys = [Vector::dictionary(vec![0, 1, 0], values).expect("a dictionary of those rows")];
+        let (table, slots) = one_at_a_time(&keys, 3, &[LogicalType::Varchar]);
+        assert_eq!(slots, [0, 1, 0]);
+        assert_eq!(table.len(), 2);
     }
 
     /// A string column that is a constant vector is still a string column. The hash of it already
