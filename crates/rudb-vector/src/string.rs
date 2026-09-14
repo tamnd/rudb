@@ -350,9 +350,10 @@ impl StringColumn {
     /// If the range is not inside the arena, or if the bytes are not valid UTF-8. The validation is
     /// the one cost this seam does not remove, and it is here rather than skipped because
     /// [`Self::get`] hands back a `&str` and a column that cannot produce one for a string it claims
-    /// to hold is a wrong answer rather than a slow one. A scan over a page where the format
-    /// guarantees UTF-8 wants to validate the page once instead of once per string, which is a pass
-    /// the layer three reader makes and is not something this type can do on its behalf.
+    /// to hold is a wrong answer rather than a slow one. Skipping it is not an option a DuckDB
+    /// compatible reader has either: DuckDB reads a Parquet byte array that is not UTF-8 and throws
+    /// `Invalid Input Error`, so a reader that let it through would disagree about which files are
+    /// readable at all.
     pub fn push_in_place(&mut self, offset: usize, len: usize) -> Result<usize> {
         let end = offset.checked_add(len).ok_or_else(|| {
             Error::internal(format!(
@@ -365,14 +366,17 @@ impl StringColumn {
                 self.arena.len()
             ))
         })?;
-        let text = std::str::from_utf8(bytes)
-            .map_err(|_| Error::internal(format!("the bytes at {offset} are not valid UTF-8")))?;
-        let view = if len <= INLINE_LIMIT {
-            StringView::inline(text)
-        } else {
-            StringView::indirect(text, offset as u64)
-        };
-        self.views.push(view);
+        // The ASCII check first and the general validator only for what it does not settle. They
+        // answer the same question for a string of ASCII, which is what a column of this kind holds
+        // nearly all of the time, and they cost very different amounts: `is_ascii` is a compare per
+        // word with nothing in front of it, and `str::from_utf8` is an out of line call that a scan
+        // profile puts at two hundred instructions a URL, most of it prologue rather than bytes.
+        if !bytes.is_ascii() {
+            std::str::from_utf8(bytes).map_err(|_| {
+                Error::internal(format!("the bytes at {offset} are not valid UTF-8"))
+            })?;
+        }
+        self.views.push(StringView::over(bytes, offset as u64));
         Ok(self.views.len() - 1)
     }
 
@@ -601,6 +605,24 @@ mod tests {
         assert!(column.push_in_place(usize::MAX, 1).is_err());
         assert!(column.push_in_place(0, 3).is_err());
         assert_eq!(column.len(), 0);
+
+        // The ASCII check in front of the validator answers whole words at a time, so the bad byte
+        // is put past the first word and past the inline limit as well, where a check that only
+        // looked at the head or only at the payload in the view would miss it.
+        let mut page = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        page.push(0x80);
+        let len = page.len();
+        let mut column = StringColumn::over(Buffer::from_vec(page));
+        assert!(column.push_in_place(0, len).is_err());
+        assert!(column.push_in_place(0, len - 1).is_ok());
+
+        // Text that is not ASCII and is valid goes through, which is the other half of the check:
+        // the fast path decides nothing on its own, it only decides who has to look.
+        let page = "søk på nettet".as_bytes().to_vec();
+        let len = page.len();
+        let mut column = StringColumn::over(Buffer::from_vec(page));
+        column.push_in_place(0, len).expect("valid text that is not ASCII");
+        assert_eq!(column.get(0), Some("søk på nettet"));
     }
 
     /// What the seam does to equality. The same two strings, one column built by copying them in
