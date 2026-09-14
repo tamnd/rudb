@@ -6,7 +6,12 @@
 //! seven columns of a row group side by side into something the engine can execute over.
 //!
 //! The reader works a row group at a time, which is the unit the format stores and the unit the
-//! scheduler will hand out as a morsel.
+//! scheduler hands out as a morsel. [`Reader::split`] is what makes that possible: it hands back
+//! another reader over the same open file and the same parsed footer, positioned at a stretch of
+//! row groups and reading nothing outside it. The file and the footer are shared rather than
+//! reopened because a `File` here is addressed by offset and every method on it takes `&self`, so
+//! two readers on one file do not interfere, and because parsing a hundred and five columns of
+//! footer once per row group would cost more than the read it was splitting.
 //!
 //! # Projection is the point of the format
 //!
@@ -63,6 +68,7 @@
 //! there is nothing to push down until the table function exists, so the counter that would prove
 //! pruning works is here and the pruning is E2.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use rudb_common::stage::{Stage, Timing};
@@ -78,10 +84,13 @@ use crate::page::Body;
 /// A Parquet file, read as chunks.
 #[derive(Debug)]
 pub struct Reader {
-    file: Box<dyn File>,
-    metadata: Metadata,
+    file: Arc<dyn File>,
+    metadata: Arc<Metadata>,
     projection: Vec<usize>,
     group: usize,
+    /// One past the last row group this reader reads, which is the whole file until
+    /// [`Reader::split`] says otherwise.
+    end: usize,
     active: Option<Group>,
     bytes: u64,
 }
@@ -96,15 +105,60 @@ impl Reader {
     /// If the file is not Parquet, or its footer does not parse, or its schema is one this crate
     /// refuses, which today means a nested one.
     pub fn open(file: Box<dyn File>) -> Result<Self> {
+        let file: Arc<dyn File> = Arc::from(file);
         let metadata = Metadata::read(file.as_ref())?;
         let projection = (0..metadata.schema.len()).collect();
-        Ok(Self { file, metadata, projection, group: 0, active: None, bytes: 0 })
+        let end = metadata.row_groups.len();
+        Ok(Self {
+            file,
+            metadata: Arc::new(metadata),
+            projection,
+            group: 0,
+            end,
+            active: None,
+            bytes: 0,
+        })
     }
 
     /// The footer.
     #[must_use]
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
+    }
+
+    /// Another reader over the same file, reading only the row groups in `groups`.
+    ///
+    /// The open file and the parsed footer are shared, and the projection and whatever
+    /// [`Reader::as_string`] was told are carried over, so a caller splits once a reader is set up
+    /// and gets readers that are set up the same way. What is not carried over is the position and
+    /// the byte counter, which start where the split says and at zero, so a caller that adds up
+    /// [`Reader::bytes_read`] across the splits gets what the whole read cost.
+    ///
+    /// The restriction is on the sequential read alone. [`Reader::rows_at`] addresses the whole
+    /// file whichever reader it is asked of, because a row ordinal means the same thing to every
+    /// reader of one file and a fetch is not a scan.
+    ///
+    /// # Errors
+    ///
+    /// If the range runs past the end of the file, which is a mistake in the caller rather than
+    /// anything a query can cause.
+    pub fn split(&self, groups: Range<usize>) -> Result<Self> {
+        let total = self.metadata.row_groups.len();
+        if groups.start > groups.end || groups.end > total {
+            return Err(Error::internal(format!(
+                "row groups {}..{} of a parquet file with {total} of them",
+                groups.start, groups.end
+            )));
+        }
+        Ok(Self {
+            file: Arc::clone(&self.file),
+            metadata: Arc::clone(&self.metadata),
+            projection: self.projection.clone(),
+            group: groups.start,
+            end: groups.end,
+            active: None,
+            bytes: 0,
+        })
     }
 
     /// Reads only these columns, in this order.
@@ -145,8 +199,9 @@ impl Reader {
     /// the binder worked out. A flag on a column the file did not store as a byte array does
     /// nothing, since the caller is describing a file rather than asking for a conversion.
     pub fn as_string(&mut self, columns: &[bool]) {
+        let metadata = Arc::make_mut(&mut self.metadata);
         for (&at, &text) in self.projection.iter().zip(columns) {
-            let column = &mut self.metadata.schema[at];
+            let column = &mut metadata.schema[at];
             if text && column.ty == LogicalType::Blob {
                 column.ty = LogicalType::Varchar;
             }
@@ -271,7 +326,7 @@ impl Reader {
                 }
                 self.active = None;
             }
-            if self.group >= self.metadata.row_groups.len() {
+            if self.group >= self.end {
                 return Ok(None);
             }
             let group = self.group;

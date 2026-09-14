@@ -242,3 +242,75 @@ fn ordinals_out_of_order_or_past_the_end_are_errors_rather_than_wrong_rows() {
     let error = reader.rows_at(&[4096]).expect_err("past the end");
     assert!(error.to_string().contains("past the end"), "{error}");
 }
+
+/// The split is what makes a row group a morsel. Two readers over the same open file, each reading
+/// one of the fixture's two row groups, have to produce between them exactly the rows one reader
+/// over the whole file produces, in the same order, and to read the same bytes doing it.
+#[test]
+fn two_readers_over_a_row_group_each_read_what_one_reader_over_the_file_reads() {
+    let whole = reader();
+    let mut first = whole.split(0..1).expect("the file has a first row group");
+    let mut second = whole.split(1..2).expect("and a second");
+    let mut i = 0_i64;
+    for chunk in chunks(&mut first).iter().chain(&chunks(&mut second)) {
+        // row at a time: the claim is about every row of both halves and not about a sample.
+        for at in 0..chunk.len() {
+            assert_eq!(chunk.row(at).collect::<Vec<_>>(), row(i), "row {i}");
+            i += 1;
+        }
+    }
+    assert_eq!(i, 4096, "the two halves cover the file");
+    let mut all = reader();
+    let _ = chunks(&mut all);
+    assert_eq!(first.bytes_read() + second.bytes_read(), all.bytes_read());
+}
+
+/// A split reader reads nothing outside its own row groups, which is the property the scheduler
+/// needs, and the cheapest way to see it is the byte counter rather than the rows.
+#[test]
+fn a_split_reader_reads_nothing_outside_the_row_groups_it_was_given() {
+    let whole = reader();
+    let second = 1;
+    let mut none = whole.split(second..second).expect("an empty range is a reader with no work");
+    assert!(chunks(&mut none).is_empty());
+    assert_eq!(none.bytes_read(), 0);
+
+    let mut one = whole.split(0..1).expect("the first row group");
+    assert_eq!(chunks(&mut one).len(), 2, "2048 rows in chunks of 1024");
+    let mut all = reader();
+    let _ = chunks(&mut all);
+    assert!(one.bytes_read() < all.bytes_read(), "half a file is fewer bytes than all of it");
+}
+
+/// The projection and the `binary_as_string` answer are settled once, on the reader the splits come
+/// off, because a caller that had to repeat them on every split would eventually not.
+#[test]
+fn a_split_carries_the_projection_it_was_split_from() {
+    let mut whole = reader();
+    whole.project(&[1]).expect("column 1 exists");
+    let mut half = whole.split(1..2).expect("the second row group");
+    let chunks = chunks(&mut half);
+    assert_eq!(half.bytes_read(), 5435, "one chunk of column b and nothing else");
+    let mut i = 2048_i64;
+    for chunk in &chunks {
+        assert_eq!(chunk.width(), 1, "one column was projected");
+        // row at a time: a split column still has to hold the values it held unsplit.
+        for at in 0..chunk.len() {
+            assert_eq!(chunk.value_at(at, 0), Value::BigInt((i % 1000) * 1000), "row {i}");
+            i += 1;
+        }
+    }
+    assert_eq!(i, 4096);
+}
+
+/// A range the file does not have is a mistake in the caller, so it says so rather than reading
+/// whatever happens to be there.
+#[test]
+fn splitting_past_the_end_of_the_file_is_an_error() {
+    let whole = reader();
+    let error = whole.split(0..3).expect_err("the file has two row groups");
+    assert!(error.to_string().contains("row groups 0..3"), "{error}");
+    let (start, end) = (2, 1);
+    let error = whole.split(start..end).expect_err("backwards");
+    assert!(error.to_string().contains("row groups 2..1"), "{error}");
+}

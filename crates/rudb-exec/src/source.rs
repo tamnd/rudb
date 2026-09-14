@@ -7,6 +7,7 @@
 //! own business, and the four here mean four different things by it, which is why the type carries
 //! numbers and not rows.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -387,12 +388,23 @@ impl Source for Series {
 /// as it is opened rather than being allowed to use its own sample, which is what keeps a file that
 /// happens to hold nothing but whole numbers from handing up BIGINT into a stream that is DOUBLE.
 ///
-/// There is one morsel and it covers the whole list, so a second thread asking for work here gets
-/// none and the read stays on one thread. That is not a gap in this operator, it is what the readers
-/// are: both of them are a position in a file and a buffer beside it, and neither can be asked for
-/// the tenth chunk without having read the nine before it. A file per morsel is the first thing to
-/// do about that, and a Parquet row group per morsel is the real answer, and both of them are a
-/// change to the reader rather than to this.
+/// A morsel is one row group of one Parquet file, or one whole CSV file.
+///
+/// The row group is what the format stores and what a reader can be positioned at without having
+/// read what came before it, so it is the smallest unit two threads can take without one of them
+/// waiting on the other. A CSV file cannot be positioned at all, because nothing in it says where a
+/// row begins until every byte before it has been parsed, so a CSV morsel is a whole file and a
+/// query over one CSV file reads it on one thread.
+///
+/// The files are cut into morsels one file at a time rather than all at once. Cutting a file means
+/// reading its footer, and a directory of ten thousand files would be ten thousand footers read
+/// before the first row came out, which is what the paragraph above about descriptors is about and
+/// is the same answer.
+///
+/// Each morsel carries its own reader, and for Parquet those readers share one open file and one
+/// parsed footer through [`Reader::split`]. So the scan holds no lock across a read, which is the
+/// whole point: the version of this before #486 had one morsel, one reader and a mutex around it,
+/// and a second thread asking for work got none.
 #[derive(Debug)]
 pub(crate) struct FileScan {
     function: TableFunction,
@@ -406,20 +418,53 @@ pub(crate) struct FileScan {
     /// else here indexes [`Self::wanted`] and that list is the file's columns only.
     numbered: bool,
     schema: Schema,
-    reading: Mutex<Reading>,
-    one: Handout,
+    /// How far through the file list the cutting has got, and the file it is in the middle of.
+    cutting: Mutex<Cutting>,
+    /// What each morsel handed out covers, by [`Morsel::index`].
+    ///
+    /// The outer lock is held for a lookup and a clone of one handle, and the read that follows
+    /// holds the inner one, so two threads reading two row groups never wait for each other. The
+    /// entries stay after their morsel is drained, because they are three words and a dropped
+    /// reader once the rows are out and because a driver is allowed to ask again.
+    open: Mutex<HashMap<u64, Arc<Mutex<Piece>>>>,
     counters: Option<Arc<Counters>>,
 }
 
-/// Which file the scan is on and the reader that is open on it.
+/// Where the cutting has got to.
+///
+/// One file's worth of morsels is cut at a time, and the reader the Parquet splits come off is kept
+/// for as long as that file has row groups left to hand out.
 #[derive(Debug)]
-struct Reading {
+struct Cutting {
+    /// How many files have been opened, which is the next one to open.
     at: usize,
+    /// The reader the file being cut is read through, `None` between files.
     reader: Option<FileReader>,
-    /// How many rows of the file the scan is on have come out of it.
+    /// The next row group of that file to hand out, and one past its last.
+    group: usize,
+    groups: usize,
+    /// The ordinal in that file of the first row of the next morsel, which is what
+    /// `file_row_number` counts from and what keeps that column right whatever order the morsels
+    /// are read in.
+    row: i64,
+    /// How many morsels have been handed out, which is the next one's index.
+    given: u64,
+}
+
+/// What one morsel covers, and the reader open on it.
+#[derive(Debug)]
+struct Piece {
+    /// Which of the scan's paths, so that a column that will not cast names the file it came from.
+    file: usize,
+    /// The reader, taken away once it has no more chunks in it.
+    reader: Option<FileReader>,
+    /// What went wrong cutting this morsel, if anything.
     ///
-    /// Reset as each file is opened, because `file_row_number` counts inside a file rather than
-    /// across the read, which is what its name says and what DuckDB does.
+    /// [`Source::morsel`] hands back an `Option` and has nowhere to put an error, and a file that
+    /// cannot be opened half way through a scan has to be reported rather than read past. So the
+    /// handout queues a morsel that covers nothing and carries the error, and the read reports it.
+    failure: Option<Error>,
+    /// The ordinal in the file of the next row this morsel produces.
     row: i64,
 }
 
@@ -456,16 +501,23 @@ impl FileScan {
             wanted,
             numbered,
             schema: Schema::numbered(produced, index),
-            reading: Mutex::new(Reading { at: 0, reader: None, row: 0 }),
-            one: Handout::new(1),
+            cutting: Mutex::new(Cutting {
+                at: 0,
+                reader: None,
+                group: 0,
+                groups: 0,
+                row: 0,
+                given: 0,
+            }),
+            open: Mutex::new(HashMap::new()),
             counters: None,
         };
         // The first file is opened now rather than on the first read, so that a file that has gone
         // missing since binding is reported where a caller is still asking a question about this
         // scan rather than in the middle of a result.
         {
-            let mut reading = scan.reading.lock().map_err(poisoned)?;
-            scan.advance(&mut reading)?;
+            let mut cutting = scan.cutting.lock().map_err(poisoned)?;
+            scan.advance(&mut cutting)?;
         }
         Ok(scan)
     }
@@ -482,17 +534,63 @@ impl FileScan {
     }
 
     /// Opens the next file and projects it, or leaves the reader empty at the end of the list.
-    fn advance(&self, reading: &mut Reading) -> Result<()> {
-        reading.reader = None;
-        reading.row = 0;
-        let Some(path) = self.paths.get(reading.at) else { return Ok(()) };
+    fn advance(&self, cutting: &mut Cutting) -> Result<()> {
+        cutting.reader = None;
+        cutting.row = 0;
+        cutting.group = 0;
+        cutting.groups = 0;
+        let Some(path) = self.paths.get(cutting.at) else { return Ok(()) };
         let mut reader = FileReader::open(self.function, path, self.given)?;
-        let first = if reading.at == 0 { None } else { self.paths.first().map(String::as_str) };
+        let first = if cutting.at == 0 { None } else { self.paths.first().map(String::as_str) };
         reader.project(&positions(self.function, &self.wanted, &reader.fields(), path, first)?)?;
         reader.settle(&self.wanted)?;
-        reading.reader = Some(reader);
-        reading.at += 1;
+        cutting.groups = reader.row_groups();
+        cutting.reader = Some(reader);
+        cutting.at += 1;
         Ok(())
+    }
+
+    /// The next morsel's worth of the file being cut, or `None` when that file has none left.
+    ///
+    /// A Parquet file gives one per row group and takes a split of the reader it was opened with. A
+    /// CSV file gives one, which takes the reader itself, because a CSV reader cannot be positioned
+    /// and a second one over the same file would parse the same bytes to find the same rows.
+    fn cut(&self, cutting: &mut Cutting) -> Result<Option<Piece>> {
+        let file = cutting.at.saturating_sub(1);
+        let piece = match cutting.reader.as_ref() {
+            Some(FileReader::Parquet(reader)) if cutting.group < cutting.groups => {
+                let at = cutting.group;
+                let split = reader.split(at..at + 1)?;
+                cutting.group += 1;
+                let row = cutting.row;
+                cutting.row = cutting.row.saturating_add(reader.metadata().row_groups[at].rows);
+                Piece { file, reader: Some(FileReader::Parquet(split)), failure: None, row }
+            }
+            Some(FileReader::Csv(_)) => {
+                Piece { file, reader: cutting.reader.take(), failure: None, row: 0 }
+            }
+            // Either the row groups of the file being cut have all been handed out, or there is no
+            // file being cut at all, and both mean the same thing to the caller.
+            _ => return Ok(None),
+        };
+        Ok(Some(piece))
+    }
+
+    /// Registers a morsel's worth of work and hands back the morsel that covers it.
+    fn hand(&self, cutting: &mut Cutting, piece: Piece) -> Option<Morsel> {
+        let index = cutting.given;
+        cutting.given += 1;
+        let covers = u64::from(piece.failure.is_none());
+        self.open.lock().ok()?.insert(index, Arc::new(Mutex::new(piece)));
+        Some(Morsel::new(index, 0, covers))
+    }
+
+    /// What the morsel of this index covers.
+    fn piece(&self, index: u64) -> Result<Arc<Mutex<Piece>>> {
+        let open = self.open.lock().map_err(poisoned)?;
+        open.get(&index)
+            .map(Arc::clone)
+            .ok_or_else(|| Error::internal(format!("a file scan was read at morsel {index}")))
     }
 
     /// The chunk with the row number column on the end of it.
@@ -500,14 +598,14 @@ impl FileScan {
     /// Built rather than read, because no file holds it. The values are a run, and the reason this
     /// is a loop over a range rather than a sequence vector is that the scan's consumer is free to
     /// slice or gather the chunk and a flat column survives both without a case.
-    fn number(&self, chunk: Chunk, reading: &mut Reading) -> Result<Chunk> {
+    fn number(&self, chunk: Chunk, piece: &mut Piece) -> Result<Chunk> {
         let rows = chunk.len();
         let mut columns = Vec::with_capacity(chunk.width() + 1);
         for at in 0..chunk.width() {
             columns.push(chunk.column(at)?.clone());
         }
-        let first = reading.row;
-        reading.row = reading.row.saturating_add(i64::try_from(rows).unwrap_or(i64::MAX));
+        let first = piece.row;
+        piece.row = piece.row.saturating_add(i64::try_from(rows).unwrap_or(i64::MAX));
         let mut data = Vec::with_capacity(rows);
         for at in 0..rows {
             data.push(first.saturating_add(i64::try_from(at).unwrap_or(i64::MAX)));
@@ -521,8 +619,8 @@ impl FileScan {
     /// Almost always nothing, because almost always every file has the same schema, and the check is
     /// a type comparison per column per chunk rather than per row.
     ///
-    /// `file` is how far through the list the scan is, which is one past the file this chunk came
-    /// out of, and the only thing it is for is naming that file if a column will not cast.
+    /// `file` is which of the scan's paths this chunk came out of, and the only thing it is for is
+    /// naming that file if a column will not cast.
     fn conform(&self, chunk: Chunk, file: usize) -> Result<Chunk> {
         let rows = chunk.len();
         let settled = self.wanted.iter().enumerate().all(|(at, field)| {
@@ -539,7 +637,7 @@ impl FileScan {
                 continue;
             }
             columns.push(cast(column, &field.ty, false).map_err(|error| {
-                let path = self.paths.get(file.saturating_sub(1)).map_or("", String::as_str);
+                let path = self.paths.get(file).map_or("", String::as_str);
                 Error::conversion(format!(
                     "Error while reading file \"{path}\": failed to cast column \"{}\" from type \
                      {} to {}: {}",
@@ -556,14 +654,37 @@ impl FileScan {
 
 impl Source for FileScan {
     fn morsel(&self) -> Option<Morsel> {
-        self.one.take()
+        let mut cutting = self.cutting.lock().ok()?;
+        loop {
+            match self.cut(&mut cutting) {
+                Ok(Some(piece)) => return self.hand(&mut cutting, piece),
+                Ok(None) => {}
+                Err(error) => {
+                    let file = cutting.at.saturating_sub(1);
+                    let piece = Piece { file, reader: None, failure: Some(error), row: 0 };
+                    return self.hand(&mut cutting, piece);
+                }
+            }
+            if cutting.at >= self.paths.len() {
+                return None;
+            }
+            if let Err(error) = self.advance(&mut cutting) {
+                let file = cutting.at.saturating_sub(1);
+                let piece = Piece { file, reader: None, failure: Some(error), row: 0 };
+                return self.hand(&mut cutting, piece);
+            }
+        }
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
-        let mut reading = self.reading.lock().map_err(poisoned)?;
+        let piece = self.piece(morsel.index())?;
+        let mut piece = piece.lock().map_err(poisoned)?;
+        if let Some(error) = piece.failure.take() {
+            return Err(error);
+        }
         loop {
-            let file = reading.at;
-            let Some(reader) = reading.reader.as_mut() else {
+            let file = piece.file;
+            let Some(reader) = piece.reader.as_mut() else {
                 morsel.advance(1);
                 *out = Chunk::empty(&self.schema.types());
                 return Ok(Progress::Done);
@@ -573,17 +694,18 @@ impl Source for FileScan {
             if let Some(counters) = &self.counters {
                 counters.read(reader.bytes_read().saturating_sub(before));
             }
-            if let Some(chunk) = next {
+            let Some(chunk) = next else {
                 // A file that is empty gives no chunk rather than an empty one, so this is not the
-                // place that skips it. The loop is.
-                let mut chunk = self.conform(chunk, file)?;
-                if self.numbered {
-                    chunk = self.number(chunk, &mut reading)?;
-                }
-                *out = chunk;
-                return Ok(Progress::More);
+                // place that skips it. Taking the reader away and going round again is.
+                piece.reader = None;
+                continue;
+            };
+            let mut chunk = self.conform(chunk, file)?;
+            if self.numbered {
+                chunk = self.number(chunk, &mut piece)?;
             }
-            self.advance(&mut reading)?;
+            *out = chunk;
+            return Ok(Progress::More);
         }
     }
 }
@@ -657,6 +779,16 @@ impl FileReader {
         match self {
             Self::Parquet(reader) => reader.next_chunk(),
             Self::Csv(reader) => reader.next_chunk(),
+        }
+    }
+
+    /// How many row groups the file has, which is how many morsels it is worth.
+    ///
+    /// Zero for CSV, which has none, and which the scan reads as one morsel covering the file.
+    fn row_groups(&self) -> usize {
+        match self {
+            Self::Parquet(reader) => reader.metadata().row_groups.len(),
+            Self::Csv(_) => 0,
         }
     }
 
@@ -784,10 +916,12 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use rudb_common::{LogicalType, Value};
+    use rudb_functions::TableFunction;
     use rudb_pipeline::{Progress, Source};
+    use rudb_plan::{Node, Plan};
     use rudb_vector::Chunk;
 
-    use super::{Handout, RUN, Schema, Series, VECTOR_SIZE};
+    use super::{FileScan, Handout, RUN, Schema, Series, VECTOR_SIZE};
 
     /// A series without going through a plan, which is what `Series::new` is for.
     fn series(start: i64, step: i64, rows: u64) -> Series {
@@ -865,5 +999,81 @@ mod tests {
         assert_eq!(taken, [0, 1, 2]);
         assert!(handout.take().is_none());
         assert!(handout.take().is_none());
+    }
+
+    /// A scan of the `rudb-parquet` fixture, which is 4096 rows in two row groups.
+    ///
+    /// Built from a plan written as text, the way every other operator test in this crate builds
+    /// one, because the fields a table function node carries are arena slices and writing them out
+    /// by hand would be a test of the arena builders.
+    fn fixture() -> FileScan {
+        let path = format!("{}/../rudb-parquet/testdata/mixed.parquet", env!("CARGO_MANIFEST_DIR"));
+        let text = format!(
+            "TableFunction read_parquet args=['{path}'::VARCHAR] #0 [a::INTEGER, b::BIGINT]"
+        );
+        let plan = Plan::parse(&text).expect("the plan text round trips");
+        let Node::TableFunction { index, args, options, settings, columns, .. } =
+            *plan.node(plan.root())
+        else {
+            panic!("the plan is a table function");
+        };
+        FileScan::new(&plan, index, TableFunction::ReadParquet, args, options, settings, columns)
+            .expect("the fixture is there")
+    }
+
+    /// Every morsel the scan hands out, drained.
+    fn morsels(scan: &FileScan) -> Vec<usize> {
+        let mut rows = Vec::new();
+        while let Some(mut morsel) = scan.morsel() {
+            let mut chunk = Chunk::empty(&[]);
+            let mut read = 0;
+            while let Progress::More = scan.read(&mut morsel, &mut chunk).expect("decodes") {
+                read += chunk.len();
+            }
+            rows.push(read);
+        }
+        rows
+    }
+
+    /// The property the scheduler needs. A file of two row groups is two units of work, not one,
+    /// and the two between them hold every row of the file.
+    #[test]
+    fn a_parquet_file_is_one_morsel_per_row_group() {
+        let scan = fixture();
+        let rows = morsels(&scan);
+        assert_eq!(rows, [2048, 2048], "two row groups of 2048");
+    }
+
+    /// Morsels are taken until they run out, and asking after that hands back nothing rather than
+    /// starting again, which is what makes a driver loop safe to write as a `while let`.
+    #[test]
+    fn a_scan_that_has_handed_out_every_morsel_hands_out_no_more() {
+        let scan = fixture();
+        let _ = morsels(&scan);
+        assert!(scan.morsel().is_none());
+        assert!(scan.morsel().is_none());
+    }
+
+    /// Each morsel carries its own reader, so taking them all before reading any of them reads the
+    /// same rows as taking and reading them one at a time. That is the difference between a scan
+    /// two threads can share and a scan they queue behind.
+    #[test]
+    fn every_morsel_can_be_taken_before_any_of_them_is_read() {
+        let scan = fixture();
+        let mut taken = Vec::new();
+        while let Some(morsel) = scan.morsel() {
+            taken.push(morsel);
+        }
+        assert_eq!(taken.len(), 2);
+        let mut rows = Vec::new();
+        for morsel in &mut taken {
+            let mut chunk = Chunk::empty(&[]);
+            let mut read = 0;
+            while let Progress::More = scan.read(morsel, &mut chunk).expect("decodes") {
+                read += chunk.len();
+            }
+            rows.push(read);
+        }
+        assert_eq!(rows, [2048, 2048]);
     }
 }
