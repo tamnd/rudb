@@ -123,6 +123,8 @@ pub(crate) struct Aggregate<'a> {
     by_vector: Vec<bool>,
     /// Whether every call folds a vector at a time, which is when the row loop is skipped whole.
     every: bool,
+    /// A grouped `count(*)` needs one integer per group rather than a general aggregate state.
+    count_only: bool,
     /// The most groups an unordered limit above this operator can observe.
     max_groups: Option<usize>,
     memory: Memory,
@@ -219,6 +221,11 @@ impl<'a> Aggregate<'a> {
             alone,
             sets: calls.iter().any(|call| call.distinct),
             every: by_vector.iter().all(|&yes| yes),
+            count_only: !alone
+                && calls.len() == 1
+                && calls[0].name == "count_star"
+                && !calls[0].distinct
+                && calls[0].filter.is_none(),
             max_groups: None,
             by_vector,
             groups,
@@ -343,6 +350,7 @@ impl<'a> Aggregate<'a> {
                 &self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect::<Vec<_>>(),
             ),
             states: Vec::new(),
+            counts: Vec::new(),
             seen: Vec::new(),
             groups: 0,
             // One row of arguments per call, filled again for each input row and kept between rows
@@ -367,7 +375,7 @@ impl<'a> Aggregate<'a> {
         };
         if self.alone {
             local.groups = 1;
-            if let Err(error) = self.fresh(&mut local.states) {
+            if let Err(error) = self.fresh(&mut local.states, &mut local.counts) {
                 local.failure = Some(error);
             }
             if self.sets {
@@ -388,6 +396,7 @@ impl<'a> Aggregate<'a> {
             charged_keys,
             table,
             states,
+            counts,
             seen,
             groups,
             given,
@@ -458,7 +467,7 @@ impl<'a> Aggregate<'a> {
                         // charged the same way.
                         let slot = table.insert(bucket, hashes[row], keys, row)?;
                         *groups = table.len();
-                        self.fresh(states)?;
+                        self.fresh(states, counts)?;
                         if self.sets {
                             self.fresh_seen(seen);
                         }
@@ -467,10 +476,20 @@ impl<'a> Aggregate<'a> {
                 }
             };
         }
+        if self.count_only {
+            for &slot in slots.iter() {
+                if slot != NOWHERE {
+                    counts[slot] += 1;
+                }
+            }
+        }
         // The aggregate half of #61. Every call that is not `DISTINCT` folds the whole chunk in one
         // pass, with the aggregate and the layout of its argument matched on once for the chunk
         // rather than once per row, and with no `Value` built at all on the paths the kernel covers.
         for (at, call) in self.calls.iter().enumerate() {
+            if self.count_only {
+                break;
+            }
             if self.by_vector[at] || call.affine.is_some() {
                 continue;
             }
@@ -499,7 +518,7 @@ impl<'a> Aggregate<'a> {
         }
         rows::capacity(table.owned(), charged_keys, scratch)?;
         containers.grow(aside)?;
-        let now = tables(table, states, seen);
+        let now = tables(table, states, counts, seen);
         rows::capacity(now, charged, containers)?;
         // Asked after the chunk has been folded in and not before, so that a pass always takes at
         // least one chunk of groups whatever the budget says. That is what makes the loop in
@@ -538,6 +557,7 @@ impl<'a> Aggregate<'a> {
             mut containers,
             table,
             states,
+            counts,
             seen,
             groups,
             affine_rows,
@@ -549,7 +569,9 @@ impl<'a> Aggregate<'a> {
         // charge for the sets goes here rather than after the chunks are built, which is part of
         // the room the chunks are built in.
         drop(seen);
-        let alive = table.footprint() + width_of(states.capacity() * size_of::<Accumulator>());
+        let alive = table.footprint()
+            + width_of(states.capacity() * size_of::<Accumulator>())
+            + width_of(counts.capacity() * size_of::<i64>());
         containers.shrink(containers.bytes().saturating_sub(alive));
         // The answer is built straight out of the table, a chunk of groups at a time.
         //
@@ -590,11 +612,14 @@ impl<'a> Aggregate<'a> {
                 let mut taken = 0;
                 results.clear();
                 for slot in start..end {
-                    let value = match self.calls[at].affine {
-                        Some((source, offset)) => {
-                            states[slot * calls + source].finish_offset(offset, affine_rows[source])
+                    let value = if self.count_only {
+                        Ok(Value::BigInt(counts[slot]))
+                    } else {
+                        match self.calls[at].affine {
+                            Some((source, offset)) => states[slot * calls + source]
+                                .finish_offset(offset, affine_rows[source]),
+                            None => states[slot * calls + at].finish(),
                         }
-                        None => states[slot * calls + at].finish(),
                     }?;
                     taken += rows::owned(&value);
                     results.push(value);
@@ -609,6 +634,7 @@ impl<'a> Aggregate<'a> {
         }
         drop(results);
         drop(states);
+        drop(counts);
         drop(table);
         containers.release();
         match over {
@@ -704,7 +730,11 @@ impl<'a> Aggregate<'a> {
     /// One flat vector of accumulators rather than a vector per group, so that a new group costs a
     /// push and not a trip to the allocator. The accumulators of the group in `slot` are the run of
     /// `calls` entries starting at `slot * calls`.
-    fn fresh(&self, states: &mut Vec<Accumulator>) -> Result<()> {
+    fn fresh(&self, states: &mut Vec<Accumulator>, counts: &mut Vec<i64>) -> Result<()> {
+        if self.count_only {
+            counts.push(0);
+            return Ok(());
+        }
         for call in &self.calls {
             states.push(Accumulator::new(&call.name, &call.returns)?);
         }
@@ -788,6 +818,7 @@ pub(crate) struct Building {
     charged_keys: u64,
     table: Table,
     states: Vec<Accumulator>,
+    counts: Vec<i64>,
     seen: Vec<DistinctSet>,
     groups: usize,
     given: Vec<Key>,
@@ -1060,12 +1091,18 @@ impl Sink for Aggregate<'_> {
 /// An accumulator is charged as its own width and not as what it holds. That is a knowing undercount
 /// and it is the one left: what a `list()` or a `string_agg()` holds grows with the input and there
 /// is no way to ask one how large it has become.
-fn tables(table: &Table, states: &Vec<Accumulator>, seen: &Vec<DistinctSet>) -> u64 {
+fn tables(
+    table: &Table,
+    states: &Vec<Accumulator>,
+    counts: &Vec<i64>,
+    seen: &Vec<DistinctSet>,
+) -> u64 {
     let width = |count: usize, size: usize| {
         u64::try_from(count).unwrap_or(u64::MAX).saturating_mul(width_of(size))
     };
     table.footprint()
         + width(states.capacity(), size_of::<Accumulator>())
+        + width(counts.capacity(), size_of::<i64>())
         + width(seen.capacity(), size_of::<DistinctSet>())
 }
 
