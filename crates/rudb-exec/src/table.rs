@@ -58,7 +58,7 @@ const FIRST: usize = 64;
 /// A constant rather than nothing at all, so that a null in a column of zeroes does not hash as a
 /// zero. It can collide with a real value that happens to be this pattern, which costs one
 /// comparison and no correctness, because the comparison is what decides.
-const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
+pub(crate) const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// A hash table from a row of key columns to the slot its group was given.
 ///
@@ -70,15 +70,29 @@ pub(crate) struct Table {
     /// One slot per bucket, [`EMPTY`] where there is none. A power of two long, so the bucket a
     /// hash belongs to is a mask rather than a division.
     buckets: Vec<u32>,
-    /// The stored keys, column at a time. `columns[column][slot]` is one group's value in one key
-    /// column, which is the layout that lets a group be pushed without asking the allocator for a
-    /// row to put it in.
-    columns: Vec<Column>,
+    /// The stored keys, in whichever of the two shapes the key's types called for.
+    keys: Keys,
     /// The hash of each group's key, so that a probe compares one word before it compares a key.
     /// Worth its eight bytes on a string key, where the comparison it avoids is a memcmp.
     hashes: Vec<u64>,
     /// What the stored keys own away from themselves, which is the strings and blobs among them.
     owned: u64,
+}
+
+/// The two shapes a stored key comes in, chosen once from the types and never per row.
+///
+/// The choice is the whole of #490's successor item. A key of one or two columns of integers is
+/// nothing but integers, and pretending otherwise costs a body discriminant and a validity bitmap
+/// read on the one line of the aggregate that runs once per input row. Everything else is general,
+/// because a string key, a float key or a key of five columns has nowhere narrower to go.
+#[derive(Debug)]
+enum Keys {
+    /// One or two columns of integers of 64 bits or less. See `narrow.rs`.
+    Narrow(crate::narrow::Narrow),
+    /// Any number of columns of any type, kept column at a time. `columns[column][slot]` is one
+    /// group's value in one key column, which is the layout that lets a group be pushed without
+    /// asking the allocator for a row to put it in.
+    Wide(Vec<Column>),
 }
 
 /// What a probe found, which is either a group or the bucket a new one goes in.
@@ -97,11 +111,35 @@ pub(crate) enum Probe {
 impl Table {
     /// An empty table over a key of `columns` columns.
     pub(crate) fn new(types: &[rudb_common::LogicalType]) -> Self {
-        Self {
-            buckets: vec![EMPTY; FIRST],
-            columns: types.iter().map(Column::new).collect(),
-            hashes: Vec::new(),
-            owned: 0,
+        let keys = if crate::narrow::fits(types) {
+            Keys::Narrow(crate::narrow::Narrow::new(types.len()))
+        } else {
+            Keys::Wide(types.iter().map(Column::new).collect())
+        };
+        Self { buckets: vec![EMPTY; FIRST], keys, hashes: Vec::new(), owned: 0 }
+    }
+
+    /// Hashes the chunk in hand, and flattens its key columns if that is the shape this table is in.
+    ///
+    /// One call per chunk, before the row loop. It replaces the bare [`hash`] call the aggregate
+    /// used to make, because what has to happen before the row loop now depends on the shape of the
+    /// key and the table is the thing that knows the shape.
+    ///
+    /// # Errors
+    ///
+    /// Whatever flattening the key columns reports, which is an internal error and nothing else.
+    pub(crate) fn begin(
+        &mut self,
+        keys: &[Vector],
+        rows: usize,
+        hashes: &mut Vec<u64>,
+    ) -> Result<()> {
+        match &mut self.keys {
+            Keys::Narrow(narrow) => narrow.begin(keys, rows, hashes),
+            Keys::Wide(_) => {
+                hash(keys, rows, hashes);
+                Ok(())
+            }
         }
     }
 
@@ -127,7 +165,10 @@ impl Table {
     pub(crate) fn footprint(&self) -> u64 {
         let buckets = self.buckets.capacity() * size_of::<u32>();
         let hashes = self.hashes.capacity() * size_of::<u64>();
-        let keys: usize = self.columns.iter().map(Column::footprint).sum();
+        let keys = match &self.keys {
+            Keys::Narrow(narrow) => narrow.footprint(),
+            Keys::Wide(columns) => columns.iter().map(Column::footprint).sum(),
+        };
         u64::try_from(buckets + hashes + keys).unwrap_or(u64::MAX)
     }
 
@@ -171,8 +212,13 @@ impl Table {
                 "a single group by cannot hold more than {LIMIT} groups"
             )));
         }
-        for (at, column) in keys.iter().enumerate() {
-            self.owned += self.columns[at].push_from(column, row)?;
+        match &mut self.keys {
+            Keys::Narrow(narrow) => narrow.push(row),
+            Keys::Wide(columns) => {
+                for (at, column) in keys.iter().enumerate() {
+                    self.owned += columns[at].push_from(column, row)?;
+                }
+            }
         }
         self.hashes.push(hash);
         self.buckets[bucket] = slot as u32;
@@ -200,12 +246,19 @@ impl Table {
     /// column from the left of a join is exactly that case, and it answered with one group per row.
     /// So nothing from `bytes_at` means fall through to `value_at`, which is right for every form.
     fn holds(&self, slot: usize, keys: &[Vector], row: usize) -> bool {
-        for (at, column) in keys.iter().enumerate() {
-            if !self.columns[at].holds(slot, column, row) {
-                return false;
+        match &self.keys {
+            // Nothing from the chunk is read here at all, because it was read once already and is
+            // sitting in the flat buffer this asks. See `narrow.rs`.
+            Keys::Narrow(narrow) => narrow.holds(slot, row),
+            Keys::Wide(columns) => {
+                for (at, column) in keys.iter().enumerate() {
+                    if !columns[at].holds(slot, column, row) {
+                        return false;
+                    }
+                }
+                true
             }
         }
-        true
     }
 
     /// Doubles the buckets and puts every group back in one.
@@ -250,7 +303,10 @@ impl Table {
         ty: &rudb_common::LogicalType,
         range: std::ops::Range<usize>,
     ) -> Result<Vector> {
-        self.columns[at].vector(ty, range)
+        match &self.keys {
+            Keys::Narrow(narrow) => narrow.vector(at, ty, range),
+            Keys::Wide(columns) => columns[at].vector(ty, range),
+        }
     }
 }
 
@@ -727,6 +783,15 @@ mod tests {
         Vector::from_values(ty, values).expect("a flat vector of these values")
     }
 
+    /// The chunk in hand, hashed and flattened the way the aggregate does it. A table has to be told
+    /// about a chunk before a row of it is probed, because for a narrow key that call is what puts
+    /// the key where the probe reads it from.
+    fn begin(table: &mut Table, keys: &[Vector], rows: usize) -> Vec<u64> {
+        let mut hashes = Vec::new();
+        table.begin(keys, rows, &mut hashes).expect("the key columns flatten");
+        hashes
+    }
+
     /// The invariant the whole module rests on. A column read out of a parquet file is a dictionary
     /// in one chunk and flat in the next, and a group by that hashed the two differently would put
     /// the same string in two groups and return it twice.
@@ -802,10 +867,8 @@ mod tests {
         let numbers =
             flat(LogicalType::Integer, &[Value::Integer(1), Value::Integer(1), Value::Integer(1)]);
         let keys = [names, numbers];
-        let mut hashes = Vec::new();
-        hash(&keys, 3, &mut hashes);
-
         let mut table = Table::new(&[LogicalType::Varchar, LogicalType::Integer]);
+        let hashes = begin(&mut table, &keys, 3);
         let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
             panic!("an empty table found a group");
         };
@@ -825,10 +888,8 @@ mod tests {
         for text in ["ada", "", long] {
             let names = Vector::constant(LogicalType::Varchar, Value::Varchar(text.into()), 2);
             let keys = [names];
-            let mut hashes = Vec::new();
-            hash(&keys, 2, &mut hashes);
-
             let mut table = Table::new(&[LogicalType::Varchar]);
+            let hashes = begin(&mut table, &keys, 2);
             let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
                 panic!("an empty table found a group");
             };
@@ -847,18 +908,16 @@ mod tests {
     fn two_constants_of_different_strings_are_still_two_groups() {
         let ada = Vector::constant(LogicalType::Varchar, Value::Varchar("ada".into()), 1);
         let grace = Vector::constant(LogicalType::Varchar, Value::Varchar("grace".into()), 1);
-        let mut first = Vec::new();
-        let mut second = Vec::new();
-        hash(std::slice::from_ref(&ada), 1, &mut first);
-        hash(std::slice::from_ref(&grace), 1, &mut second);
-
         let mut table = Table::new(&[LogicalType::Varchar]);
         let keys = [ada];
+        let first = begin(&mut table, &keys, 1);
         let Probe::Vacant(bucket) = table.probe(first[0], &keys, 0) else {
             panic!("an empty table found a group");
         };
         table.insert(bucket, first[0], &keys, 0).expect("room for one group");
-        assert!(matches!(table.probe(second[0], &[grace], 0), Probe::Vacant(_)));
+        let other = [grace];
+        let second = begin(&mut table, &other, 1);
+        assert!(matches!(table.probe(second[0], &other, 0), Probe::Vacant(_)));
     }
 
     /// Growing is where a table stops working quietly. Every key put in before a rehash has to be
@@ -868,10 +927,8 @@ mod tests {
         let values: Vec<Value> = (0..1000).map(Value::BigInt).collect();
         let column = flat(LogicalType::BigInt, &values);
         let keys = [column];
-        let mut hashes = Vec::new();
-        hash(&keys, values.len(), &mut hashes);
-
         let mut table = Table::new(&[LogicalType::BigInt]);
+        let hashes = begin(&mut table, &keys, values.len());
         for (row, &one) in hashes.iter().enumerate() {
             let Probe::Vacant(bucket) = table.probe(one, &keys, row) else {
                 panic!("row {row} was found before it was inserted");
@@ -904,8 +961,8 @@ mod tests {
         let mut grouped = Vec::new();
         for column in [&plain, &packed] {
             let keys = std::slice::from_ref(column);
-            let hashes = hashed(column);
             let mut table = Table::new(&[LogicalType::BigInt]);
+            let hashes = begin(&mut table, keys, column.len());
             let mut slots = Vec::new();
             for (row, &one) in hashes.iter().enumerate() {
                 slots.push(match table.probe(one, keys, row) {
@@ -926,8 +983,8 @@ mod tests {
     fn a_key_column_comes_back_as_a_vector_with_its_nulls_where_they_were() {
         let values = [Value::BigInt(5), Value::Null, Value::BigInt(9)];
         let keys = [flat(LogicalType::BigInt, &values)];
-        let hashes = hashed(&keys[0]);
         let mut table = Table::new(&[LogicalType::BigInt]);
+        let hashes = begin(&mut table, &keys, values.len());
         for (row, &one) in hashes.iter().enumerate() {
             let Probe::Vacant(bucket) = table.probe(one, &keys, row) else {
                 panic!("row {row} was found before it was inserted");
@@ -948,20 +1005,19 @@ mod tests {
     fn common_numeric_keys_keep_their_physical_width() {
         let values: Vec<Value> = (0..1000).map(Value::BigInt).collect();
         let keys = [flat(LogicalType::BigInt, &values)];
-        let mut hashes = Vec::new();
-        hash(&keys, values.len(), &mut hashes);
         let mut table = Table::new(&[LogicalType::BigInt]);
+        let hashes = begin(&mut table, &keys, values.len());
         for (row, &hash) in hashes.iter().enumerate() {
             let Probe::Vacant(bucket) = table.probe(hash, &keys, row) else {
                 panic!("a unique key was already present");
             };
             table.insert(bucket, hash, &keys, row).expect("room for the group");
         }
-        let key_bytes = table.columns[0].footprint();
-        assert!(
-            key_bytes < values.len() * 9,
-            "{key_bytes} bytes stored a thousand eight-byte keys and their validity"
-        );
+        // Eight bytes of key, eight of stored hash, one of validity and four of bucket at the half
+        // load the table keeps, which is twenty one, and the round number above it leaves room for a
+        // vector that doubled past what it holds without leaving room for a second copy of the key.
+        let bytes = table.footprint();
+        assert!(bytes < values.len() as u64 * 32, "{bytes} bytes held a thousand eight-byte keys");
     }
 
     /// The strings a key holds are charged, and they are charged once the group is in rather than
@@ -971,9 +1027,8 @@ mod tests {
         let long = "a string well past the sixteen bytes a view holds inline".to_string();
         let column = flat(LogicalType::Varchar, &[Value::Varchar(long.clone())]);
         let keys = [column];
-        let mut hashes = Vec::new();
-        hash(&keys, 1, &mut hashes);
         let mut table = Table::new(&[LogicalType::Varchar]);
+        let hashes = begin(&mut table, &keys, 1);
         assert_eq!(table.owned(), 0);
         let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
             panic!("an empty table found a group");
