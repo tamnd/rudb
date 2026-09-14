@@ -204,7 +204,7 @@ const RADIX_PARTITIONS: usize = 16;
 ///
 /// Sixteen thousand groups is where an instance's table stops fitting comfortably in cache, which is
 /// also where holding one copy between the threads starts to be worth what it costs to get there.
-const PARTITION_FROM: usize = 16_384;
+const PARTITION_FROM: usize = 4_096;
 
 impl<'a> Aggregate<'a> {
     /// An aggregation over the plan's groups and aggregate calls, and the source it finishes into.
