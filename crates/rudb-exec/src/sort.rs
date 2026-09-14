@@ -184,7 +184,7 @@ pub(crate) fn compare(
 /// whole comparison would move the nulls too, and DuckDB's answer keeps them where the query put
 /// them. So the direction is applied to the comparison of two values and never to the rule that
 /// places a null.
-fn rank(left: &Value, right: &Value, key: SortKey) -> Result<Ordering> {
+pub(crate) fn rank(left: &Value, right: &Value, key: SortKey) -> Result<Ordering> {
     match (left.is_null(), right.is_null()) {
         (true, true) => Ok(Ordering::Equal),
         (true, false) => Ok(if key.nulls_first { Ordering::Less } else { Ordering::Greater }),

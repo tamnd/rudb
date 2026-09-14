@@ -22,6 +22,27 @@
 //! payload row. A large offset makes those moves expensive, so bounds above 64 keep the batched
 //! sort and trim path until normalized keys make a heap cheap.
 //!
+//! # Rejecting a chunk in one pass instead of a row at a time
+//!
+//! Almost every row of a million loses to the ten already held, and the cheap way to find that out
+//! is the comparison kernel rather than a loop. Once the candidates are full, the worst of them is
+//! a constant for the length of a chunk, so one vectorized comparison of the first key column
+//! against that constant says which rows are still worth looking at, and on `ORDER BY EventTime
+//! LIMIT 10` over ClickBench that is almost none of them after the first chunk. The rows it hands
+//! back go down the same row at a time path as before, which is what keeps the answer the same.
+//!
+//! The bound moves while the chunk is being walked, since a winner replaces the worst candidate, so
+//! what the pass produces is a superset of the rows that really win. That is the point: it is a
+//! filter and not the decision, and every row it keeps is compared again properly.
+//!
+//! Three things make it step aside and look at every row instead. A worst candidate whose first key
+//! is null, because then what beats it depends on where the query puts nulls and the comparison
+//! kernel answers null rather than true. A `NULLS FIRST` ordering over a column that has nulls, for
+//! the same reason read the other way: those rows win and a comparison against a value says nothing
+//! about them. And a comparison the kernel refuses, which is left to the row path so that the error
+//! comes out of the same place it came out of before. With more than one sort key the pass keeps
+//! ties on the first one, since the second key can still turn a tie into a win.
+//!
 //! # The shape a sink has
 //!
 //! Like the sort, this is a [`Sink`]. The difference between them is where the trimming happens: an
@@ -29,18 +50,20 @@
 //! brought, which is what keeps the bound the bound rather than the bound times the number of
 //! threads. On one thread there is one instance and the second trim does nothing.
 
+use std::cmp::Ordering;
 use std::sync::Mutex;
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Value};
+use rudb_kernels::{Comparison, refine};
 use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
-use rudb_vector::Chunk;
+use rudb_vector::{Chunk, Selection, Vector};
 
 use crate::buffer::Buffered;
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
-use crate::sort::compare;
+use crate::sort::{compare, rank};
 
 /// One row in the running: the values of its keys, and the row itself.
 type Sortable = (Vec<Value>, Vec<Value>);
@@ -133,27 +156,46 @@ impl Sink for TopN {
     fn sink(&self, chunk: &Chunk, local: &mut Running) -> Result<Progress> {
         let mut keys = Vec::with_capacity(self.keys.len());
         self.exprs.evaluate(chunk, &mut local.scratch, &mut keys)?;
+        if self.bound <= SORTED_BOUND {
+            let full = self.bound > 0 && local.kept.len() == self.bound;
+            let narrowed = full
+                .then(|| {
+                    worth_looking_at(&self.keys, &keys, &local.kept[self.bound - 1].0, chunk.len())
+                })
+                .flatten();
+            let failure = &mut local.failure;
+            match narrowed {
+                // row at a time: the rows the pass kept are the ones that can still win, and each
+                // of them has to be placed among the candidates rather than counted.
+                Some(rows) => {
+                    for row in rows.iter() {
+                        keep(&self.keys, &mut local.kept, &keys, chunk, row, self.bound, failure);
+                    }
+                }
+                // row at a time: the key still has the same Value layout the sort holds, and 2i
+                // (#63) replaces it with one normalized comparable byte string per row.
+                None => {
+                    for row in 0..chunk.len() {
+                        keep(&self.keys, &mut local.kept, &keys, chunk, row, self.bound, failure);
+                    }
+                }
+            }
+            recharge(&local.kept, &mut local.charged)?;
+            return Ok(Progress::More);
+        }
         let mut taken = 0;
         // row at a time: the key still has the same Value layout the sort holds, and 2i (#63)
         // replaces it with one normalized comparable byte string per row.
         for row in 0..chunk.len() {
             let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
-            if self.bound <= SORTED_BOUND {
-                keep(&self.keys, &mut local.kept, key, chunk, row, self.bound, &mut local.failure);
-            } else {
-                let values: Vec<Value> = chunk.row(row).collect();
-                taken += rows::footprint(&key) + rows::footprint(&values);
-                local.kept.push((key, values));
-            }
+            let values: Vec<Value> = chunk.row(row).collect();
+            taken += rows::footprint(&key) + rows::footprint(&values);
+            local.kept.push((key, values));
         }
-        if self.bound <= SORTED_BOUND {
+        local.charged.grow(taken)?;
+        if local.kept.len() > self.bound.saturating_mul(2) {
+            trim(&self.keys, &mut local.kept, self.bound, &mut local.failure);
             recharge(&local.kept, &mut local.charged)?;
-        } else {
-            local.charged.grow(taken)?;
-            if local.kept.len() > self.bound.saturating_mul(2) {
-                trim(&self.keys, &mut local.kept, self.bound, &mut local.failure);
-                recharge(&local.kept, &mut local.charged)?;
-            }
         }
         Ok(Progress::More)
     }
@@ -199,10 +241,14 @@ fn trim(keys: &[SortKey], kept: &mut Vec<Sortable>, bound: usize, failure: &mut 
 }
 
 /// Keeps one row when its key belongs in the ordered prefix.
+///
+/// The key is read out of the columns a value at a time and only as far as the first key that
+/// separates it from the worst candidate, so a row that loses on the first of three keys costs one
+/// value rather than three and never allocates the `Vec` that holds them. Almost every row loses.
 fn keep(
     keys: &[SortKey],
     kept: &mut Vec<Sortable>,
-    key: Vec<Value>,
+    columns: &[Vector],
     chunk: &Chunk,
     row: usize,
     bound: usize,
@@ -212,15 +258,67 @@ fn keep(
         return;
     }
     if kept.len() == bound
-        && compare(keys, &key, &kept[bound - 1].0, failure) != std::cmp::Ordering::Less
+        && against(keys, columns, row, &kept[bound - 1].0, failure) != Ordering::Less
     {
         return;
     }
+    let key: Vec<Value> = columns.iter().map(|column| column.value_at(row)).collect();
     let at = kept.partition_point(|candidate| {
-        compare(keys, &candidate.0, &key, failure) != std::cmp::Ordering::Greater
+        compare(keys, &candidate.0, &key, failure) != Ordering::Greater
     });
     kept.insert(at, (key, chunk.row(row).collect()));
     kept.truncate(bound);
+}
+
+/// Where one row of the key columns sits against a key already held.
+///
+/// The same answer [`compare`] gives for the same two keys, read straight out of the columns rather
+/// than out of a `Vec` built for the purpose.
+fn against(
+    keys: &[SortKey],
+    columns: &[Vector],
+    row: usize,
+    held: &[Value],
+    failure: &mut Option<Error>,
+) -> Ordering {
+    for (at, key) in keys.iter().enumerate() {
+        let ordering = match rank(&columns[at].value_at(row), &held[at], *key) {
+            Ok(ordering) => ordering,
+            Err(error) => {
+                failure.get_or_insert(error);
+                Ordering::Equal
+            }
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+/// The rows of a chunk that can still beat `worst`, or nothing when every row has to be looked at.
+///
+/// One comparison of the first key column against a constant, for the reasons in the module doc.
+fn worth_looking_at(
+    keys: &[SortKey],
+    columns: &[Vector],
+    worst: &[Value],
+    rows: usize,
+) -> Option<Selection> {
+    let key = *keys.first()?;
+    let bound = worst.first()?;
+    let column = columns.first()?;
+    if bound.is_null() || (key.nulls_first && column.validity().has_nulls(rows)) {
+        return None;
+    }
+    let op = match (key.descending, keys.len() == 1) {
+        (false, true) => Comparison::Less,
+        (false, false) => Comparison::LessOrEqual,
+        (true, true) => Comparison::Greater,
+        (true, false) => Comparison::GreaterOrEqual,
+    };
+    let against = Vector::constant(column.logical_type().clone(), bound.clone(), rows);
+    refine(op, column, &against, &Selection::identity(rows)).ok()
 }
 
 /// Charges the scratch reservation for what is still held after a trim.
