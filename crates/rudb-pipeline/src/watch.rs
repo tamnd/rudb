@@ -12,6 +12,8 @@
 //! It also reads the slow path counter on either side of the call, and the difference is what that
 //! operator gave up on inside that chunk. That is the whole reason the counter is per thread: a
 //! difference around a call only means something if nothing else was counting into it at the time.
+//! The stage clock is read the same way and for the same reason, and the difference is where a scan
+//! spent that chunk: reading, decompressing, decoding, building a dictionary or assembling.
 //!
 //! What it does not do is count bytes or memory. A wrapper cannot see a read or a reservation, it
 //! can only see chunks going past, so [`Counters::read`], [`Counters::decoded`],
@@ -20,7 +22,7 @@
 
 use std::sync::Arc;
 
-use rudb_common::{Result, Tally, slow};
+use rudb_common::{Result, Spent, Tally, slow, stage};
 use rudb_metrics::{Counters, Span};
 use rudb_vector::Chunk;
 
@@ -144,13 +146,15 @@ impl<K: Sink> Sink for Watched<K> {
 struct Measure {
     span: Span,
     before: Tally,
+    reading: Spent,
 }
 
 impl Measure {
     /// Reads both, with the clock last so that as little as possible sits between it and the call.
     fn start() -> Self {
         let before = slow::here();
-        Self { span: Span::start(), before }
+        let reading = stage::here();
+        Self { span: Span::start(), before, reading }
     }
 
     /// Reads both again and charges the difference to the operator.
@@ -161,6 +165,7 @@ impl Measure {
         let (wall, cpu) = self.span.stop();
         counters.spent(wall, cpu);
         counters.fell_back(slow::here().since(self.before));
+        counters.spent_reading(stage::here().since(self.reading));
     }
 }
 

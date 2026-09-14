@@ -25,6 +25,7 @@
 //! compressed region, so only the bytes after them are decompressed and the levels are copied
 //! across as they are.
 
+use rudb_common::stage::{Stage, Timing};
 use rudb_common::{Error, Result};
 use rudb_compress::Codec;
 
@@ -207,8 +208,20 @@ impl<'a> Pages<'a> {
         Ok(Some(Page { header, body }))
     }
 
-    /// Decompresses a page body, taking the version two level split into account.
+    /// Decompresses a page body, charging what it took to the decompression stage.
+    ///
+    /// The bytes charged are the ones that came out rather than the ones that went in, because a
+    /// decompressor's rate is usually quoted over its output and a rate is the only form of this
+    /// number that can be compared against another reader.
     fn decompress(&self, header: &Header, raw: &[u8]) -> Result<Vec<u8>> {
+        let timing = Timing::start(Stage::Decompress);
+        let body = self.decompressed(header, raw);
+        timing.stop(body.as_ref().map_or(0, |body| u64::try_from(body.len()).unwrap_or(u64::MAX)));
+        body
+    }
+
+    /// Decompresses a page body, taking the version two level split into account.
+    fn decompressed(&self, header: &Header, raw: &[u8]) -> Result<Vec<u8>> {
         let expected = header.uncompressed_size as usize;
         let (levels, compressed) = match &header.body {
             Body::DataV2(page) if page.compressed => {
