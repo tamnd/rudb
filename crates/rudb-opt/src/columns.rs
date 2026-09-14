@@ -111,7 +111,9 @@ fn narrow(
         // in the plan, so narrowing one saves reading nothing and would cost a rewrite of every row.
         // An aggregate keeps its own on purpose too: an aggregate nobody reads the result of is a
         // shape the binder does not build, and dropping one would drop whatever it counted.
-        Node::Get { index, columns, .. } | Node::TableFunction { index, columns, .. } => {
+        Node::Get { index, columns, .. }
+        | Node::TableFunction { index, columns, .. }
+        | Node::Fetch { index, columns, .. } => {
             let wanted = read.get(&index).unwrap_or(&empty);
             let held = plan.field_list(columns).len();
             if wanted.len() == held {
@@ -126,10 +128,12 @@ fn narrow(
             }
             let narrowed = plan.add_fields(&kept);
             match plan.node_mut(node) {
-                Node::Get { columns, .. } | Node::TableFunction { columns, .. } => {
+                Node::Get { columns, .. }
+                | Node::TableFunction { columns, .. }
+                | Node::Fetch { columns, .. } => {
                     *columns = narrowed;
                 }
-                _ => unreachable!("the node was one of these two a moment ago"),
+                _ => unreachable!("the node was one of these three a moment ago"),
             }
             moved.insert(index, positions(wanted, held));
         }
@@ -234,6 +238,12 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
             }
         }
         Node::TableFunction { args, .. } => list(plan, args, found),
+        // The ordinal column is read by the fetch and by nothing above it, so a pass that did not
+        // count it here would prune the column the fetch works from out of the scan under it.
+        Node::Fetch { args, row, .. } => {
+            list(plan, args, found);
+            walk(plan, row, found);
+        }
         Node::Filter { predicate, .. } => walk(plan, predicate, found),
         Node::Project { exprs, .. } => list(plan, exprs, found),
         Node::Aggregate { groups, aggregates, .. } => {

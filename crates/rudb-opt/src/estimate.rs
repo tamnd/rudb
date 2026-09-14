@@ -123,7 +123,10 @@ pub fn rows(plan: &Plan, node: NodeRef, stats: &Statistics) -> Option<u64> {
             of(input).map(|n| scale(n, kept).max(1))
         }
         // A projection changes the width and not the height, and a sort changes neither.
-        Node::Project { input, .. } | Node::Sort { input, .. } => of(input),
+        // A fetch reads a column of each row it is handed, so it is as tall as its input too.
+        Node::Project { input, .. } | Node::Sort { input, .. } | Node::Fetch { input, .. } => {
+            of(input)
+        }
         Node::Aggregate { input, groups, .. } => {
             // An aggregate with no group keys produces exactly one row, over an empty input as
             // much as over a billion, which is the one case here that is a fact rather than a
