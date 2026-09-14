@@ -26,6 +26,7 @@ use std::sync::RwLock;
 
 use rudb_common::{Error, Memory, Result, Value, human};
 use rudb_parse::ast::Scope;
+use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
 
 use crate::config::{Config, parse_size};
@@ -98,6 +99,7 @@ impl Settings {
     pub(crate) fn apply(
         &self,
         memory: &Memory,
+        pool: &Pool,
         name: &str,
         scope: Scope,
         value: Option<&Value>,
@@ -166,6 +168,10 @@ impl Settings {
                     Some(value) => threads_of(value)?,
                 };
                 self.replace(self.config().with_threads(threads)?);
+                // The config is what `SELECT current_setting('threads')` reads back and the pool is
+                // what a query actually asks for a degree, so both move or the setting is a number
+                // that nothing obeys.
+                pool.resize(threads);
             }
             _ => unreachable!("the name was one of NAMES a moment ago"),
         }
@@ -295,6 +301,7 @@ mod tests {
     use crate::config::Config;
     use rudb_common::{Memory, Value};
     use rudb_parse::ast::Scope;
+    use rudb_pipeline::Pool;
 
     /// A settings object over a database opened with no limit at all.
     ///
@@ -323,10 +330,14 @@ mod tests {
         let (settings, memory) = settings();
         assert_eq!(memory.limit(), None);
         let value = Value::Varchar("1GiB".into());
-        settings.apply(&memory, "memory_limit", Scope::Unwritten, Some(&value)).expect("a size");
+        settings
+            .apply(&memory, &Pool::default(), "memory_limit", Scope::Unwritten, Some(&value))
+            .expect("a size");
         assert_eq!(memory.limit(), Some(1 << 30));
         assert_eq!(settings.value("memory_limit").expect("a setting"), "1.0 GiB");
-        settings.apply(&memory, "memory_limit", Scope::Unwritten, None).expect("a reset");
+        settings
+            .apply(&memory, &Pool::default(), "memory_limit", Scope::Unwritten, None)
+            .expect("a reset");
         assert_eq!(memory.limit(), None, "reset goes back to what the database was opened with");
     }
 
@@ -335,7 +346,7 @@ mod tests {
         let (settings, memory) = settings();
         let value = Value::Varchar("bogus".into());
         let error = settings
-            .apply(&memory, "disabled_optimizers", Scope::Unwritten, Some(&value))
+            .apply(&memory, &Pool::default(), "disabled_optimizers", Scope::Unwritten, Some(&value))
             .expect_err("not a pass");
         assert_eq!(error.code().duckdb_name(), "Parser Error");
         assert_eq!(settings.disabled_optimizers(), "", "a refused set changed nothing");
@@ -344,8 +355,9 @@ mod tests {
     #[test]
     fn a_name_that_is_not_a_setting_says_so_with_the_names_there_are() {
         let (settings, memory) = settings();
-        let error =
-            settings.apply(&memory, "bogus", Scope::Unwritten, None).expect_err("not a setting");
+        let error = settings
+            .apply(&memory, &Pool::default(), "bogus", Scope::Unwritten, None)
+            .expect_err("not a setting");
         assert_eq!(error.code().duckdb_name(), "Catalog Error");
         assert!(
             error.message().starts_with("unrecognized configuration parameter \"bogus\""),
@@ -360,37 +372,41 @@ mod tests {
         let (settings, memory) = settings();
         let value = Value::BigInt(2);
         let error = settings
-            .apply(&memory, "threads", Scope::Local, Some(&value))
+            .apply(&memory, &Pool::default(), "threads", Scope::Local, Some(&value))
             .expect_err("no local scope");
         assert_eq!(error.message(), "SET LOCAL is not implemented.");
         let error = settings
-            .apply(&memory, "threads", Scope::Session, Some(&value))
+            .apply(&memory, &Pool::default(), "threads", Scope::Session, Some(&value))
             .expect_err("no session copy");
         assert_eq!(error.message(), "option \"threads\" cannot be set locally");
         // The word changes with the statement, because a writer who wrote `RESET` should not read a
         // sentence about `SET`.
-        let error =
-            settings.apply(&memory, "threads", Scope::Local, None).expect_err("no local scope");
+        let error = settings
+            .apply(&memory, &Pool::default(), "threads", Scope::Local, None)
+            .expect_err("no local scope");
         assert_eq!(error.message(), "RESET LOCAL is not implemented.");
-        let error =
-            settings.apply(&memory, "threads", Scope::Session, None).expect_err("no session copy");
+        let error = settings
+            .apply(&memory, &Pool::default(), "threads", Scope::Session, None)
+            .expect_err("no session copy");
         assert_eq!(error.message(), "option \"threads\" cannot be reset locally");
     }
 
     #[test]
     fn a_thread_count_is_a_whole_number_of_at_least_one() {
         let (settings, memory) = settings();
+        let pool = Pool::new(1);
         settings
-            .apply(&memory, "threads", Scope::Global, Some(&Value::BigInt(4)))
+            .apply(&memory, &pool, "threads", Scope::Global, Some(&Value::BigInt(4)))
             .expect("four threads");
         assert_eq!(settings.value("threads").expect("a setting"), "4");
+        assert_eq!(pool.threads(), 4, "the setting reached the thing that hands out threads");
         let error = settings
-            .apply(&memory, "threads", Scope::Global, Some(&Value::BigInt(0)))
+            .apply(&memory, &Pool::default(), "threads", Scope::Global, Some(&Value::BigInt(0)))
             .expect_err("no threads at all");
         assert_eq!(error.message(), "Must have at least 1 thread!");
         let text = Value::Varchar("abc".into());
         let error = settings
-            .apply(&memory, "threads", Scope::Global, Some(&text))
+            .apply(&memory, &Pool::default(), "threads", Scope::Global, Some(&text))
             .expect_err("not a number");
         assert_eq!(
             error.message(),

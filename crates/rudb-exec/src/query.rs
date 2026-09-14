@@ -6,21 +6,28 @@
 //! order that produced was right, because a breaker cannot answer until its input is finished, but
 //! it was an order the call stack happened to have rather than one anybody wrote down. Here it is
 //! written down: [`Query::run`] takes the pipelines in dependency order and runs each of them to
-//! completion, and the only reason it is still one after another is that the driver it calls is the
-//! single threaded one.
+//! completion.
 //!
-//! # What the next milestone changes
+//! # Where the threads are
 //!
-//! One line. [`run_serial`] becomes a scheduler that runs several instances of one pipeline on
-//! several threads, and it is handed the same [`Pipeline`] values this holds. Nothing about the way
-//! a query is built has to move for that, which is the whole reason for cutting the tree up now
-//! rather than at the same time.
+//! Inside one pipeline and not across them. Each pipeline runs on as many threads as
+//! [`Pipeline::degree`] says, which is bounded by what the database's [`Pool`] will lend, by
+//! whether every operator in it will run as more than one instance, and by how many morsels its
+//! source has. Then the next one starts.
+//!
+//! Running two pipelines of one query at the same time is the other kind of parallelism and it is
+//! not here. The dependency edges say which pairs could overlap, so the information is already
+//! written down, and what is missing is a scheduler that holds several pipelines at once rather
+//! than a driver that is handed one. It is also worth much less: the shapes in ClickBench are a
+//! scan feeding an aggregate feeding a sort, which is a chain, and a chain has nothing to overlap.
 
 use std::sync::Arc;
 
 use rudb_common::{Cancel, Error, Result};
 use rudb_metrics::Driver;
-use rudb_pipeline::{Pipeline, RootReader, run_serial};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use rudb_pipeline::{Pipeline, Pool, RootReader, run_parallel};
 use rudb_vector::Chunk;
 
 use crate::schema::Schema;
@@ -40,6 +47,10 @@ pub struct Query<'a> {
     reader: RootReader,
     /// What the query produces.
     schema: Schema,
+    /// CPU nanoseconds burned on threads other than the one that called [`Query::run`].
+    worker_cpu_ns: AtomicU64,
+    /// The most instances any one pipeline ran as.
+    widest: AtomicUsize,
 }
 
 impl<'a> Query<'a> {
@@ -68,7 +79,14 @@ impl<'a> Query<'a> {
                 }
             }
         }
-        Ok(Self { pipelines, drivers, reader, schema })
+        Ok(Self {
+            pipelines,
+            drivers,
+            reader,
+            schema,
+            worker_cpu_ns: AtomicU64::new(0),
+            widest: AtomicUsize::new(0),
+        })
     }
 
     /// The columns this query produces.
@@ -90,17 +108,47 @@ impl<'a> Query<'a> {
     /// round ten thousand times, and none of it sits inside an operator's own span, so without a
     /// driver it is time the metrics document cannot account for.
     ///
+    /// The lease is taken per pipeline and given back at the end of it, so a query whose scan uses
+    /// nine threads and whose sort uses one holds nine for as long as the scan and one after that,
+    /// and the threads it is not using are there for whatever else the database is running.
+    ///
     /// # Errors
     ///
     /// Whatever any operator reports, or [`ErrorCode::Interrupt`](rudb_common::ErrorCode::Interrupt)
     /// if the token says to stop. The check is per chunk, in the driver, which is why no operator
     /// here holds a token of its own except the join, whose nested loop can outlive a chunk.
-    pub fn run(&self, cancel: &Cancel) -> Result<()> {
+    pub fn run(&self, cancel: &Cancel, pool: &Pool) -> Result<()> {
         for (pipeline, driver) in self.pipelines.iter().zip(&self.drivers) {
-            let _running = driver.running();
-            run_serial(pipeline, cancel)?;
+            let lease = pool.lease(pipeline.degree(pool.threads()));
+            let degree = lease.degree();
+            let spent = {
+                let _running = driver.running();
+                run_parallel(pipeline, cancel, degree)?
+            };
+            driver.ran(degree, spent);
+            self.worker_cpu_ns.fetch_add(spent, Ordering::Relaxed);
+            self.widest.fetch_max(degree, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// CPU nanoseconds this query burned on threads other than the one that ran it.
+    ///
+    /// A caller timing the execution reads its own thread's CPU clock, which is the only clock
+    /// there is that attributes work to the thread that did it, and which therefore cannot see the
+    /// workers. This is what it missed.
+    #[must_use]
+    pub fn worker_cpu_ns(&self) -> u64 {
+        self.worker_cpu_ns.load(Ordering::Relaxed)
+    }
+
+    /// The most instances any one pipeline of this query ran as.
+    ///
+    /// Not the setting and not an average. A query whose scan ran on nine threads and whose sort ran
+    /// on one reports nine, because the question this answers is what the query was able to use.
+    #[must_use]
+    pub fn widest(&self) -> usize {
+        self.widest.load(Ordering::Relaxed)
     }
 
     /// The next chunk of the answer, or `None` when there are no more.
@@ -125,8 +173,8 @@ impl<'a> Query<'a> {
     /// # Errors
     ///
     /// The same as [`Query::run`].
-    pub fn collect(&self, cancel: &Cancel) -> Result<Vec<Chunk>> {
-        self.run(cancel)?;
+    pub fn collect(&self, cancel: &Cancel, pool: &Pool) -> Result<Vec<Chunk>> {
+        self.run(cancel, pool)?;
         let mut chunks = Vec::new();
         while let Some(chunk) = self.next_chunk()? {
             chunks.push(chunk);

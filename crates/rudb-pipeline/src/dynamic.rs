@@ -70,6 +70,9 @@ pub trait DynStream: Send + Sync + fmt::Debug {
     /// Fresh local state for one instance.
     fn local_state(&self) -> LocalState;
 
+    /// Whether more than one instance of this operator may run at once.
+    fn parallel(&self) -> bool;
+
     /// Transform `chunk` in place.
     ///
     /// # Errors
@@ -83,6 +86,10 @@ impl<S: Stream> DynStream for S {
         LocalState::new(self.local())
     }
 
+    fn parallel(&self) -> bool {
+        Stream::parallel(self)
+    }
+
     fn push_state(&self, chunk: &mut Chunk, local: &mut LocalState) -> Result<Progress> {
         self.push(chunk, local.downcast_mut::<S::Local>()?)
     }
@@ -92,6 +99,9 @@ impl<S: Stream> DynStream for S {
 pub trait DynSink: Send + Sync + fmt::Debug {
     /// Fresh local state for one instance.
     fn local_state(&self) -> LocalState;
+
+    /// Whether more than one instance of this operator may run at once.
+    fn parallel(&self) -> bool;
 
     /// Told which morsel the chunks that come next were read from.
     ///
@@ -125,6 +135,10 @@ pub trait DynSink: Send + Sync + fmt::Debug {
 impl<S: Sink> DynSink for S {
     fn local_state(&self) -> LocalState {
         LocalState::new(self.local())
+    }
+
+    fn parallel(&self) -> bool {
+        Sink::parallel(self)
     }
 
     fn at_state(&self, morsel: &Morsel, local: &mut LocalState) -> Result<()> {

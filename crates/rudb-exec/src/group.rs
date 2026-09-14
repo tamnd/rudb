@@ -1146,6 +1146,27 @@ impl Sink for Aggregate<'_> {
         self.start()
     }
 
+    /// Refused for a `DISTINCT` call and for a limit pushed down into the grouping.
+    ///
+    /// Both are cases where [`Aggregate::merge`] cannot put two instances back together. A
+    /// `DISTINCT` call refuses in `merge` with a message saying so, and asking here instead means a
+    /// query that would have failed at the end of the scan never starts more than one instance in
+    /// the first place.
+    ///
+    /// A pushed down limit is worse than a refusal, because it would answer. `max_groups` stops the
+    /// table opening groups once an unordered limit above cannot observe another, and every
+    /// instance would stop at its own tenth group while the rows of the groups it dropped kept
+    /// arriving, so `count(*)` would come back short. That is #474's trick, which is worth keeping,
+    /// and the price of keeping it is that the aggregate under it runs on one thread.
+    ///
+    /// Spilling cannot be asked about here, because whether a pass runs out of room is not known
+    /// until it has. An instance that spills is refused by `merge` and the query fails rather than
+    /// answering wrongly. Radix partitioning is what fixes that, and it is the next item on the
+    /// roadmap.
+    fn parallel(&self) -> bool {
+        !self.sets && self.max_groups.is_none()
+    }
+
     fn sink(&self, chunk: &Chunk, local: &mut Building) -> Result<Progress> {
         if let Some(error) = local.failure.take() {
             return Err(error);
@@ -1407,6 +1428,17 @@ impl Distinct {
 
 impl Sink for Distinct {
     type Local = Keeping;
+
+    /// Only a plain `DISTINCT`, where the key is the whole row.
+    ///
+    /// `DISTINCT ON (a) b` keeps the first row of each `a`, and with two instances the first row of
+    /// a key is whichever instance got there first. SQL does not say which row that is, so neither
+    /// answer is wrong, but it would change from run to run on the same data, and an engine that
+    /// does that gets a bug report. A plain `DISTINCT` has no such choice to make: the key is the
+    /// whole row, so the rows that survive are the same rows whoever kept them.
+    fn parallel(&self) -> bool {
+        self.whole
+    }
 
     fn local(&self) -> Keeping {
         Keeping {

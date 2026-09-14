@@ -81,6 +81,10 @@ impl Source for Buffered {
         Some(Morsel::new(index, index, index + 1))
     }
 
+    fn morsels(&self) -> Option<usize> {
+        self.len().ok()
+    }
+
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let index = morsel.cursor() as usize;
         match self.at(index)? {

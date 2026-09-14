@@ -8,6 +8,7 @@ use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Value};
 use rudb_metrics::{Document, Report, Span};
 
 use rudb_parse::ast::Ast;
+use rudb_pipeline::Pool;
 use rudb_vector::{Chunk, Vector};
 
 use crate::config::Config;
@@ -48,6 +49,7 @@ struct Inner {
     catalog: RwLock<Catalog>,
     settings: Settings,
     memory: Memory,
+    pool: Pool,
 }
 
 impl Default for Database {
@@ -67,8 +69,9 @@ impl Database {
     #[must_use]
     pub fn with_config(config: Config) -> Self {
         let memory = Memory::new(config.memory_limit());
+        let pool = Pool::new(config.threads());
         let settings = Settings::new(config);
-        let inner = Inner { catalog: RwLock::new(Catalog::new()), settings, memory };
+        let inner = Inner { catalog: RwLock::new(Catalog::new()), settings, memory, pool };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
 
@@ -365,6 +368,11 @@ impl Shared {
         self.inner.catalog.write().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The memory and the threads this database will lend a query.
+    fn budget(&self) -> Budget<'_> {
+        Budget { memory: &self.inner.memory, pool: &self.inner.pool }
+    }
+
     /// Runs one query and returns every row it produced.
     ///
     /// `EXPLAIN` comes through here as well as through [`Shared::execute`], because it answers with
@@ -379,21 +387,12 @@ impl Shared {
         match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new())? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                run(sql, &plan, &catalog, cancel, &self.inner.memory, context.statistics(), &seams)
+                run(sql, &plan, &catalog, cancel, self.budget(), context.statistics(), &seams)
             }
             Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
-                explaining(
-                    &plan,
-                    &catalog,
-                    cancel,
-                    &self.inner.memory,
-                    &context,
-                    seams,
-                    analyze,
-                    sql,
-                )
+                explaining(&plan, &catalog, cancel, self.budget(), &context, seams, analyze, sql)
             }
             _ => Err(Error::not_implemented("a statement that is not a query, on the query path")),
         }
@@ -489,26 +488,18 @@ impl Shared {
         match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                run(sql, &plan, &catalog, cancel, &self.inner.memory, context.statistics(), &seams)
+                run(sql, &plan, &catalog, cancel, self.budget(), context.statistics(), &seams)
             }
             Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
-                explaining(
-                    &plan,
-                    &catalog,
-                    cancel,
-                    &self.inner.memory,
-                    &context,
-                    seams,
-                    analyze,
-                    sql,
-                )
+                explaining(&plan, &catalog, cancel, self.budget(), &context, seams, analyze, sql)
             }
             Bound::Setting(setting) => {
                 let value = setting.value.as_ref();
                 self.inner.settings.apply(
                     &self.inner.memory,
+                    &self.inner.pool,
                     &setting.name,
                     setting.scope,
                     value,
@@ -516,15 +507,7 @@ impl Shared {
                 Ok(QueryResult::empty())
             }
             Bound::CreateTable(create) => {
-                create_table(
-                    sql,
-                    create,
-                    &mut catalog,
-                    cancel,
-                    &self.inner.memory,
-                    &context,
-                    &seams,
-                )?;
+                create_table(sql, create, &mut catalog, cancel, self.budget(), &context, &seams)?;
                 Ok(QueryResult::empty())
             }
             Bound::CreateView(create) => {
@@ -551,7 +534,7 @@ impl Shared {
                     &insert.source,
                     &catalog,
                     cancel,
-                    &self.inner.memory,
+                    self.budget(),
                     context.statistics(),
                     &seams,
                 )?;
@@ -597,15 +580,29 @@ fn planned(
 /// error is a [`rudb_common::Error`] and that type is two ranks below the one the document lives
 /// in. Carrying it out of a failure is worth doing and it is a change to how an error is reported
 /// rather than a change to this function.
+/// The two budgets a query draws on, which belong to the database rather than to the query.
+///
+/// They travel together because they are the same kind of thing. Memory is how much a query may
+/// hold and the pool is how many threads it may run on, both are shared with whatever else the
+/// database is doing at the same time, and neither is a property of the plan. Passing them as one
+/// also keeps the argument lists of the functions below from growing a slot every time a new
+/// resource turns up.
+#[derive(Clone, Copy)]
+struct Budget<'a> {
+    memory: &'a Memory,
+    pool: &'a Pool,
+}
+
 fn run(
     sql: &str,
     plan: &rudb_plan::Plan,
     catalog: &Catalog,
     cancel: &Cancel,
-    memory: &Memory,
+    budget: Budget<'_>,
     statistics: &rudb_opt::estimate::Statistics,
     seams: &rudb_seam::Settings,
 ) -> Result<QueryResult> {
+    let Budget { memory, pool } = budget;
     // The budget is shared by the database and its high-water mark survives a query. Reset it to
     // what is live now before measuring this execution, otherwise a metrics document either says
     // zero forever (when nobody copies the mark) or inherits the largest earlier query. A caller
@@ -625,7 +622,7 @@ fn run(
     // is. The loop after it is the one that turns the queued chunks into a result set, and it is
     // inside the span because a caller waiting for rows is waiting for that too.
     let driving = Span::start();
-    query.run(cancel)?;
+    query.run(cancel, pool)?;
     while let Some(chunk) = query.next_chunk()? {
         if chunk.is_empty() {
             continue;
@@ -641,10 +638,14 @@ fn run(
     let (ran_wall, ran_cpu) = driving.stop();
     let mut metrics = Document::new(sql);
     metrics.settings.memory_limit = memory.limit();
-    metrics.settings.threads = 1;
+    metrics.settings.threads = u32::try_from(pool.threads()).unwrap_or(u32::MAX);
     metrics.timing.physical_ns = built_wall;
     metrics.timing.execute_ns = ran_wall;
     metrics.timing.total_ns = built_wall.saturating_add(ran_wall);
+    // The span above reads this thread's CPU clock, which is the only clock that says which thread
+    // did the work and therefore the one clock that cannot see the workers. The query counted what
+    // they burned as they finished, so it goes on here rather than going missing.
+    let ran_cpu = ran_cpu.saturating_add(query.worker_cpu_ns());
     metrics.resource.cpu_ns = built_cpu.saturating_add(ran_cpu);
     metrics.resource.build_cpu_ns = built_cpu;
     metrics.resource.peak_bytes = memory.peak();
@@ -668,7 +669,7 @@ fn explaining(
     plan: &rudb_plan::Plan,
     catalog: &Catalog,
     cancel: &Cancel,
-    memory: &Memory,
+    budget: Budget<'_>,
     context: &rudb_opt::pass::Context,
     seams: rudb_opt::explain::Seams<'_>,
     analyze: bool,
@@ -681,7 +682,7 @@ fn explaining(
             &rudb_opt::explain::explain_with(plan, statistics, seams),
         );
     }
-    let result = run(sql, plan, catalog, cancel, memory, statistics, seams.settings())?;
+    let result = run(sql, plan, catalog, cancel, budget, statistics, seams.settings())?;
     let measured = result.metrics().expect("a query that ran reports what it did");
     let text = rudb_opt::explain::analyzed(plan, statistics, seams, measured);
     explained("analyzed_plan", &text)
@@ -728,7 +729,7 @@ fn create_table(
     mut create: rudb_bind::CreateTable,
     catalog: &mut Catalog,
     cancel: &Cancel,
-    memory: &Memory,
+    budget: Budget<'_>,
     context: &rudb_opt::pass::Context,
     seams: &rudb_seam::Settings,
 ) -> Result<()> {
@@ -740,7 +741,7 @@ fn create_table(
     let rows = match &mut create.source {
         Some(plan) => {
             rudb_opt::optimize_with(plan, context)?;
-            Some(run(sql, plan, catalog, cancel, memory, context.statistics(), seams)?)
+            Some(run(sql, plan, catalog, cancel, budget, context.statistics(), seams)?)
         }
         None => None,
     };

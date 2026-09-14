@@ -97,6 +97,10 @@ impl Source for Strategies {
         self.handout.take()
     }
 
+    fn morsels(&self) -> Option<usize> {
+        Some(self.handout.total())
+    }
+
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         *out = match self.chunks.get(position(morsel)) {
             Some(chunk) => chunk.clone(),

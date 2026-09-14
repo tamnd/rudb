@@ -1,4 +1,4 @@
-//! The push operator interface, the pipeline, and the driver that runs one on a single thread.
+//! The push operator interface, the pipeline, and the two drivers that run one.
 //!
 //! Rank 4 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
@@ -51,18 +51,30 @@
 //! measured the day it is written by somebody who never read that module. It is per call, which is
 //! per chunk, which is the granularity rule.
 //!
-//! It also does not know about threads. The scheduler is the next milestone, and what it replaces is
-//! [`run_serial`] and nothing above it: it is handed the same [`Pipeline`] values, and it runs
-//! several instances of one where the serial driver runs one. What this crate knows about waiting is
-//! that an operator can report [`Progress::Blocked`] for exactly four reasons, which is what makes
-//! the wait for graph finite and a deadlock a bug report with the cycle in it rather than a hang.
+//! It also does not know about threads, and neither does any operator. [`run_parallel`] runs
+//! several instances of the same [`Pipeline`] the serial driver runs one of, and the difference
+//! between them is the starting and the combining rather than anything an operator can see. What
+//! decides how many instances is [`Pipeline::degree`]: the pool's ceiling, whether every operator
+//! will run as more than one instance, and how many morsels the source says it has, which is what
+//! keeps a query over one chunk on one thread.
+//!
+//! [`Pool`] is the thread budget, and it belongs to the database rather than to the query, because
+//! two queries on a sixteen core machine should use sixteen threads between them. It lends a number
+//! rather than running closures, for the reason its own documentation gives.
+//!
+//! What this crate knows about waiting is that an operator can report [`Progress::Blocked`] for
+//! exactly four reasons, which is what makes the wait for graph finite and a deadlock a bug report
+//! with the cycle in it rather than a hang. Nothing reports one yet, so neither driver parks and
+//! both report it instead.
 
 #![forbid(unsafe_code)]
 
 mod compact;
 mod dynamic;
 mod morsel;
+mod parallel;
 mod pipeline;
+mod pool;
 mod progress;
 mod root;
 mod serial;
@@ -75,7 +87,9 @@ mod tests;
 pub use compact::{Compaction, Copied, Gauge, compaction, narrow};
 pub use dynamic::{DynSink, DynStream, LocalState};
 pub use morsel::Morsel;
+pub use parallel::run_parallel;
 pub use pipeline::{Locals, Pipeline};
+pub use pool::{Lease, Pool};
 pub use progress::{Blocked, BlockedReason, BufferId, IoToken, MemoryToken, PipelineId, Progress};
 pub use root::{RootPlace, RootReader, RootSink, root, root_in_order};
 pub use serial::run_serial;

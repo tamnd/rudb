@@ -9,7 +9,9 @@ use rudb_vector::{Chunk, Vector};
 
 use crate::dynamic::{DynSink, DynStream, LocalState};
 use crate::morsel::Morsel;
+use crate::parallel::run_parallel;
 use crate::pipeline::Pipeline;
+use crate::pool::Pool;
 use crate::progress::{Blocked, BlockedReason, BufferId, IoToken, PipelineId, Progress};
 use crate::root::{root, root_in_order};
 use crate::serial::run_serial;
@@ -35,6 +37,10 @@ impl Counting {
 }
 
 impl Source for Counting {
+    fn morsels(&self) -> Option<usize> {
+        Some(usize::try_from((self.values.len() as u64).div_ceil(self.per_morsel)).unwrap_or(1))
+    }
+
     fn morsel(&self) -> Option<Morsel> {
         let total = self.values.len() as u64;
         let start = self.next.fetch_add(self.per_morsel, Ordering::Relaxed);
@@ -659,4 +665,160 @@ fn a_call_that_produced_no_rows_is_still_measured() {
     let blocked = counters.snapshot();
     assert_eq!(blocked.rows_out, 0);
     assert_eq!(blocked.kind, "AlwaysBlocked");
+}
+
+/// A stream that fails on the first chunk it is given, whichever thread that is.
+#[derive(Debug)]
+struct Breaks;
+
+impl Stream for Breaks {
+    type Local = ();
+
+    fn local(&self) {}
+
+    fn push(&self, _chunk: &mut Chunk, (): &mut ()) -> rudb_common::Result<Progress> {
+        Err(rudb_common::Error::internal("this operator always gives up"))
+    }
+}
+
+/// A stream that will not run as a second instance, which is what a `LIMIT` says.
+#[derive(Debug)]
+struct OnlyOnce;
+
+impl Stream for OnlyOnce {
+    type Local = ();
+
+    fn local(&self) {}
+
+    fn parallel(&self) -> bool {
+        false
+    }
+
+    fn push(&self, _chunk: &mut Chunk, (): &mut ()) -> rudb_common::Result<Progress> {
+        Ok(Progress::More)
+    }
+}
+
+#[test]
+fn a_pool_lends_what_it_has_and_not_more() {
+    let pool = Pool::new(4);
+    assert_eq!(pool.threads(), 4);
+    let lease = pool.lease(10);
+    assert_eq!(lease.degree(), 4, "asking for ten on a pool of four gets four");
+    let second = pool.lease(4);
+    assert_eq!(second.degree(), 1, "the first lease took them all, so this one is just its caller");
+}
+
+#[test]
+fn a_lease_gives_its_threads_back_when_it_goes_away() {
+    let pool = Pool::new(8);
+    {
+        let held = pool.lease(8);
+        assert_eq!(held.degree(), 8);
+    }
+    assert_eq!(pool.lease(8).degree(), 8, "the pipeline that had them has finished");
+}
+
+#[test]
+fn a_pool_of_one_lends_one_however_many_are_asked_for() {
+    let pool = Pool::default();
+    assert_eq!(pool.lease(32).degree(), 1);
+}
+
+#[test]
+fn the_degree_of_a_pipeline_is_the_smaller_of_the_ceiling_and_the_work() {
+    let source = Arc::new(Counting::new((1..=100).collect(), 10, 4));
+    let sink = Arc::new(Total::default());
+    let built = pipeline(source as Arc<dyn Source>, sink);
+
+    assert_eq!(built.degree(4), 4, "ten morsels is more than enough for four threads");
+    assert_eq!(built.degree(32), 10, "and not enough for thirty two");
+    assert_eq!(built.degree(1), 1);
+}
+
+#[test]
+fn one_operator_that_refuses_a_second_instance_keeps_the_whole_pipeline_on_one_thread() {
+    let source = Arc::new(Counting::new((1..=100).collect(), 10, 4));
+    let sink = Arc::new(Total::default());
+    let built = Pipeline::new(
+        PipelineId(0),
+        source as Arc<dyn Source>,
+        Arc::clone(&sink) as Arc<dyn DynSink>,
+    )
+    .then(Arc::new(OnlyOnce) as Arc<dyn DynStream>);
+
+    assert!(!built.parallel());
+    assert_eq!(built.degree(32), 1);
+}
+
+#[test]
+fn the_parallel_driver_answers_what_the_serial_one_answers() {
+    let values: Vec<i64> = (1..=10_000).collect();
+    let expected: i64 = values.iter().sum();
+
+    let sink = Arc::new(Total::default());
+    let built = pipeline(
+        Arc::new(Counting::new(values.clone(), 100, 32)) as Arc<dyn Source>,
+        Arc::clone(&sink),
+    );
+    run_parallel(&built, &Cancel::new(), 8).expect("it runs");
+
+    assert_eq!(*sink.global.lock().unwrap(), expected);
+    assert_eq!(sink.combines.load(Ordering::Relaxed), 8, "one combine per instance");
+    assert_eq!(sink.finalizes.load(Ordering::Relaxed), 1, "and one finalize for all of them");
+}
+
+#[test]
+fn every_morsel_is_read_once_however_many_threads_read_them() {
+    let source = Arc::new(Counting::new((1..=10_000).collect(), 100, 100));
+    let sink = Arc::new(Total::default());
+    let built = pipeline(Arc::clone(&source) as Arc<dyn Source>, Arc::clone(&sink));
+
+    run_parallel(&built, &Cancel::new(), 8).expect("it runs");
+
+    assert_eq!(source.reads.load(Ordering::Relaxed), 100, "a hundred morsels of one chunk each");
+}
+
+#[test]
+fn a_degree_of_one_is_the_serial_driver() {
+    let sink = Arc::new(Total::default());
+    let built = pipeline(
+        Arc::new(Counting::new((1..=10).collect(), 4, 4)) as Arc<dyn Source>,
+        Arc::clone(&sink),
+    );
+
+    let spent = run_parallel(&built, &Cancel::new(), 1).expect("it runs");
+
+    assert_eq!(*sink.global.lock().unwrap(), 55);
+    assert_eq!(sink.combines.load(Ordering::Relaxed), 1);
+    assert_eq!(spent, 0, "nothing ran anywhere the caller's own clock could not see");
+}
+
+#[test]
+fn the_parallel_driver_reports_what_its_workers_burned() {
+    let sink = Arc::new(Total::default());
+    let built = pipeline(
+        Arc::new(Counting::new((1..=200_000).collect(), 1_000, 1_000)) as Arc<dyn Source>,
+        Arc::clone(&sink),
+    );
+
+    let spent = run_parallel(&built, &Cancel::new(), 4).expect("it runs");
+
+    assert!(spent > 0, "three of the four threads were not the caller's and they did something");
+}
+
+#[test]
+fn an_instance_that_fails_stops_the_others_and_the_query_says_why() {
+    let sink = Arc::new(Total::default());
+    let built = Pipeline::new(
+        PipelineId(0),
+        Arc::new(Counting::new((1..=10_000).collect(), 10, 10)) as Arc<dyn Source>,
+        Arc::clone(&sink) as Arc<dyn DynSink>,
+    )
+    .then(Arc::new(Breaks) as Arc<dyn DynStream>);
+
+    let error = run_parallel(&built, &Cancel::new(), 4).unwrap_err();
+
+    assert_eq!(error.message(), "this operator always gives up");
+    assert_eq!(sink.finalizes.load(Ordering::Relaxed), 0, "a failed pipeline has no answer");
 }

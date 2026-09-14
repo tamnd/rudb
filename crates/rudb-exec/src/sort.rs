@@ -8,6 +8,20 @@
 //! kept anyway, because `ORDER BY a` over rows that tie on `a` producing a different order on two
 //! runs of the same query is the kind of difference that makes a compatibility diff useless.
 //!
+//! # Keeping it stable on more than one thread
+//!
+//! A stable sort is stable in the order the rows were given to it, and on several threads that is
+//! the order the threads happened to finish. So every row carries where it arrived from, which is
+//! the morsel it came out of and its place in that morsel, and two rows that tie on every key are
+//! separated by that instead. Reading it lexicographically is exactly the order one thread would
+//! have produced, because one thread takes the morsels in the order they were cut and reads each
+//! one through from the start, so a parallel sort answers what a serial sort answers rather than
+//! answering something SQL also allows.
+//!
+//! A filter between the scan and the sort does not break that. The place a row carries is its place
+//! among the rows that reached the sort rather than its row number in the file, and the rows that
+//! reach the sort from one morsel still reach it in order.
+//!
 //! # The shape a sink has
 //!
 //! [`Sort`] is a [`Sink`], so the rows arrive through `sink`, one instance's rows are handed over
@@ -32,12 +46,19 @@ use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 
-/// One row on its way through a sort: the values of its keys, and the row itself.
+/// One row on its way through a sort: the values of its keys, the row itself, and where it arrived.
 ///
 /// row at a time: 2i (#63) sorts a normalized key that is one comparable byte string a row rather
 /// than a `Vec<Value>`, and moves the payload by index at the end instead of carrying a copy of
 /// every row through the sort.
-type Sortable = (Vec<Value>, Vec<Value>);
+pub(crate) type Sortable = (Vec<Value>, Vec<Value>, Arrival);
+
+/// Where a row arrived: the morsel it came from and its place among the rows of that morsel.
+///
+/// Sixteen bytes beside two `Vec` headers and whatever they point at, which is why it is carried
+/// per row rather than reconstructed. What it buys is that the answer does not depend on how many
+/// threads ran.
+pub(crate) type Arrival = (u64, u64);
 
 /// An ordering over the input.
 #[derive(Debug)]
@@ -64,6 +85,33 @@ pub(crate) struct Gathered {
     rows: Vec<Sortable>,
     scratch: Scratch,
     charged: Reservation,
+    /// The morsel this instance is reading and how many of its rows have arrived.
+    place: Place,
+}
+
+/// How far through a morsel an instance is, which is the second half of an [`Arrival`].
+#[derive(Debug, Default)]
+pub(crate) struct Place {
+    pub(crate) morsel: u64,
+    pub(crate) at: u64,
+}
+
+impl Place {
+    /// Where the row at `row` of the chunk that starts here arrived.
+    pub(crate) fn of(&self, row: usize) -> Arrival {
+        (self.morsel, self.at.saturating_add(row as u64))
+    }
+
+    /// Moves past a chunk of `rows` rows of the same morsel.
+    pub(crate) fn past(&mut self, rows: usize) {
+        self.at = self.at.saturating_add(rows as u64);
+    }
+
+    /// Starts a new morsel.
+    pub(crate) fn start(&mut self, morsel: u64) {
+        self.morsel = morsel;
+        self.at = 0;
+    }
 }
 
 impl Sort {
@@ -102,7 +150,13 @@ impl Sink for Sort {
             rows: Vec::new(),
             scratch: self.exprs.scratch(),
             charged: self.memory.reservation(),
+            place: Place::default(),
         }
+    }
+
+    fn at(&self, morsel: &rudb_pipeline::Morsel, local: &mut Gathered) -> Result<()> {
+        local.place.start(morsel.index());
+        Ok(())
     }
 
     fn sink(&self, chunk: &Chunk, local: &mut Gathered) -> Result<Progress> {
@@ -114,17 +168,18 @@ impl Sink for Sort {
             let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
             let values: Vec<Value> = chunk.row(row).collect();
             taken += rows::footprint(&key) + rows::footprint(&values);
-            local.rows.push((key, values));
+            local.rows.push((key, values, local.place.of(row)));
         }
+        local.place.past(chunk.len());
         local.charged.grow(taken)?;
         Ok(Progress::More)
     }
 
     fn combine(&self, local: Gathered) -> Result<()> {
         let mut rows = self.rows.lock().map_err(poisoned)?;
-        // Appended rather than merged, because the sort has not happened yet. What order the
-        // instances combine in is what decides how rows that tie on every key come out, which is
-        // why F4 will have to combine in a fixed order and not in the order threads finish.
+        // Appended rather than merged, because the sort has not happened yet. The order the
+        // instances combine in does not decide anything, since every row carries where it arrived
+        // and the comparison falls back to that when the keys tie.
         rows.extend(local.rows);
         self.charged.lock().map_err(poisoned)?.push(local.charged);
         Ok(())
@@ -133,11 +188,11 @@ impl Sink for Sort {
     fn finalize(&self) -> Result<()> {
         let mut sortable = std::mem::take(&mut *self.rows.lock().map_err(poisoned)?);
         let mut failure: Option<Error> = None;
-        sortable.sort_by(|left, right| compare(&self.keys, &left.0, &right.0, &mut failure));
+        sortable.sort_by(|left, right| settled(&self.keys, left, right, &mut failure));
         if let Some(error) = failure {
             return Err(error);
         }
-        let ordered: Vec<Vec<Value>> = sortable.into_iter().map(|(_, row)| row).collect();
+        let ordered: Vec<Vec<Value>> = sortable.into_iter().map(|(_, row, _)| row).collect();
         let mut held = self.held.lock().map_err(poisoned)?;
         let chunks = rows::chunks(&self.types, &ordered, &mut held)?;
         self.out.fill(chunks)?;
@@ -145,6 +200,23 @@ impl Sink for Sort {
         // took is given back here and not before.
         self.charged.lock().map_err(poisoned)?.clear();
         Ok(())
+    }
+}
+
+/// Where two rows sit relative to each other, with a tie on every key settled by where they arrived.
+///
+/// This is what makes the answer the same however many threads ran. [`compare`] on its own leaves
+/// tied rows to the stability of the sort, which is the order they were handed over, and that is the
+/// order the threads finished in.
+pub(crate) fn settled(
+    keys: &[SortKey],
+    left: &Sortable,
+    right: &Sortable,
+    failure: &mut Option<Error>,
+) -> Ordering {
+    match compare(keys, &left.0, &right.0, failure) {
+        Ordering::Equal => left.2.cmp(&right.2),
+        ordering => ordering,
     }
 }
 

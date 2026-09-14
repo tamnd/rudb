@@ -2718,3 +2718,81 @@ fn related_integer_sums_keep_null_and_empty_rules() {
     let empty = format!("{query} WHERE false");
     assert_eq!(rows(&db, &empty), vec![vec![Value::Null, Value::Null]]);
 }
+
+/// A database that will run a query on `threads` of them, whatever the machine has.
+///
+/// Pinned rather than left at the default, because the default is however many cores the test
+/// runner happens to have and a parallel test that runs on one core proves nothing. Eight is enough
+/// to shuffle the order of anything that depends on it and small enough not to matter on a busy
+/// machine.
+fn threaded(threads: usize) -> Database {
+    Database::with_config(Config::new().with_threads(threads).unwrap())
+}
+
+#[test]
+fn a_query_on_eight_threads_answers_what_it_answers_on_one() {
+    let sql = "SELECT count(*), sum(range), min(range), max(range) \
+               FROM range(1000000) WHERE range % 7 = 0";
+    assert_eq!(rows(&threaded(8), sql), rows(&threaded(1), sql));
+}
+
+#[test]
+fn a_group_by_on_eight_threads_finds_every_group_exactly_once() {
+    let sql = "SELECT range % 1000 AS k, count(*), sum(range) FROM range(1000000) GROUP BY k";
+    let mut many = rows(&threaded(8), sql);
+    let mut one = rows(&threaded(1), sql);
+    many.sort_by_key(|row| format!("{:?}", row[0]));
+    one.sort_by_key(|row| format!("{:?}", row[0]));
+    assert_eq!(many.len(), 1000);
+    assert_eq!(many, one);
+}
+
+#[test]
+fn a_query_with_no_order_by_keeps_the_source_order_on_eight_threads() {
+    let rows = rows(&threaded(8), "SELECT range FROM range(200000) WHERE range % 3 = 0");
+    let read: Vec<Value> = rows.into_iter().map(|row| row[0].clone()).collect();
+    let expected: Vec<Value> = (0..200_000i64).step_by(3).map(Value::BigInt).collect();
+    assert_eq!(read, expected, "the scan was cut into morsels and put back together in order");
+}
+
+#[test]
+fn an_order_by_on_eight_threads_is_still_in_order() {
+    let rows = rows(
+        &threaded(8),
+        "SELECT range FROM range(100000) WHERE range % 1000 = 0 ORDER BY range DESC LIMIT 5",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::BigInt(99000)],
+            vec![Value::BigInt(98000)],
+            vec![Value::BigInt(97000)],
+            vec![Value::BigInt(96000)],
+            vec![Value::BigInt(95000)],
+        ]
+    );
+}
+
+#[test]
+fn a_query_on_several_threads_says_so_in_its_metrics() {
+    let db = threaded(8);
+    let result =
+        db.query("SELECT count(*), sum(range) FROM range(2000000) WHERE range % 7 = 0").unwrap();
+    let metrics = result.metrics().unwrap();
+    assert_eq!(metrics.settings.threads, 8, "the document says what the query was allowed");
+    let widest = metrics.pipelines.iter().map(|pipeline| pipeline.instances).max().unwrap();
+    assert_eq!(widest, 8, "and the scan says it used all of them");
+    assert!(metrics.resource.cpu_ns > 0);
+}
+
+#[test]
+fn setting_threads_changes_what_the_next_query_may_use() {
+    let db = threaded(8);
+    db.execute("SET threads = 1").unwrap();
+    assert_eq!(db.config().threads(), 1);
+    let metrics = db.query("SELECT count(*) FROM range(1000000)").unwrap();
+    let metrics = metrics.metrics().unwrap();
+    assert_eq!(metrics.settings.threads, 1);
+    let widest = metrics.pipelines.iter().map(|pipeline| pipeline.instances).max().unwrap();
+    assert_eq!(widest, 1, "a setting nothing obeys is not a setting");
+}

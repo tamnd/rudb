@@ -90,6 +90,12 @@ impl Sink for SetOp {
         gather::gathering(&self.memory)
     }
 
+    /// Not yet. Every arm of a set operation produces its rows in the order the left side arrived
+    /// in, so which instance got which morsel would show up in the answer.
+    fn parallel(&self) -> bool {
+        false
+    }
+
     fn sink(&self, chunk: &Chunk, local: &mut Gathering) -> Result<Progress> {
         gather::take(chunk, local)?;
         Ok(Progress::More)
