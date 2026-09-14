@@ -72,11 +72,11 @@ impl Page {
         let total = usize::try_from(self.header.values())
             .map_err(|_| Error::io("a page with a negative value count".to_string()))?;
         let (levels, at) = self.definitions(column.optional)?;
-        let valid = valid_count(&levels, total);
+        let (validity, valid) = presence(&levels, total);
         match encoding {
             Encoding::Plain => {
                 let data = plain(column, &mut self.body, at, valid, &levels, total)?;
-                Ok(Vector::flat(column.ty.clone(), data)?.with_validity(validity(&levels, total)))
+                Ok(Vector::flat(column.ty.clone(), data)?.with_validity(validity))
             }
             Encoding::PlainDictionary | Encoding::RleDictionary => {
                 let dictionary = dictionary.ok_or_else(|| {
@@ -85,15 +85,14 @@ impl Page {
                     )
                 })?;
                 let codes = codes(&self.body, at, valid, &levels, total, dictionary.len())?;
-                Ok(Vector::dictionary(codes, dictionary.clone())?
-                    .with_validity(validity(&levels, total)))
+                Ok(Vector::dictionary(codes, dictionary.clone())?.with_validity(validity))
             }
             Encoding::DeltaBinaryPacked
             | Encoding::DeltaLengthByteArray
             | Encoding::DeltaByteArray
             | Encoding::ByteStreamSplit => {
                 let data = delta(column, encoding, &mut self.body, at, valid, &levels, total)?;
-                Ok(Vector::flat(column.ty.clone(), data)?.with_validity(validity(&levels, total)))
+                Ok(Vector::flat(column.ty.clone(), data)?.with_validity(validity))
             }
             other => {
                 Err(Error::io(format!("a page in {other:?}, which this reader does not read yet")))
@@ -127,17 +126,21 @@ impl Page {
     }
 }
 
-/// How many of the values in a page of `total` are actually there.
-fn valid_count(levels: &[u32], total: usize) -> usize {
-    if levels.is_empty() { total } else { levels.iter().filter(|&&level| level == 1).count() }
-}
-
-/// The validity a run of definition levels describes.
-fn validity(levels: &[u32], total: usize) -> Validity {
-    if levels.is_empty() || levels.iter().all(|&level| level == 1) {
-        return Validity::AllValid;
+/// The validity a run of definition levels describes, and how many values are actually in the page.
+///
+/// Both from one pass. They were two functions and each walked the levels, which for a nullable
+/// column with nothing null in it is two passes over four bytes a row to find out that every one of
+/// them says the same thing. The count is what the page needs to know how many values to read and
+/// the validity is what the vector carries, so they are always wanted together.
+fn presence(levels: &[u32], total: usize) -> (Validity, usize) {
+    if levels.is_empty() {
+        return (Validity::AllValid, total);
     }
-    Validity::from_iter(total, |index| levels.get(index) == Some(&1))
+    let valid = levels.iter().filter(|&&level| level == 1).count();
+    if valid == levels.len() {
+        return (Validity::AllValid, total);
+    }
+    (Validity::from_iter(total, |index| levels.get(index) == Some(&1)), valid)
 }
 
 /// Spreads dense values over the positions the levels say are not null.
@@ -179,23 +182,23 @@ fn plain(
             Ok(Data::Bool(Buffer::from_vec(spread(dense, levels, total))))
         }
         Physical::Int32 => {
-            let dense = fixed::<4>(tail(body, at)?, count)?;
-            narrow(target, dense.into_iter().map(i32::from_le_bytes), levels, total)
+            let bytes = fixed::<4>(tail(body, at)?, count)?;
+            narrow(target, count, words::<4>(bytes).map(i32::from_le_bytes), levels, total)
         }
         Physical::Int64 => {
-            let dense = fixed::<8>(tail(body, at)?, count)?;
-            narrow(target, dense.into_iter().map(i64::from_le_bytes), levels, total)
+            let bytes = fixed::<8>(tail(body, at)?, count)?;
+            narrow(target, count, words::<8>(bytes).map(i64::from_le_bytes), levels, total)
         }
         Physical::Float => {
-            let dense: Vec<f32> =
-                fixed::<4>(tail(body, at)?, count)?.into_iter().map(f32::from_le_bytes).collect();
             expect(target, PhysicalType::Float32, &column.ty)?;
+            let bytes = fixed::<4>(tail(body, at)?, count)?;
+            let dense: Vec<f32> = words::<4>(bytes).map(f32::from_le_bytes).collect();
             Ok(Data::Float32(Buffer::from_vec(spread(dense, levels, total))))
         }
         Physical::Double => {
-            let dense: Vec<f64> =
-                fixed::<8>(tail(body, at)?, count)?.into_iter().map(f64::from_le_bytes).collect();
             expect(target, PhysicalType::Float64, &column.ty)?;
+            let bytes = fixed::<8>(tail(body, at)?, count)?;
+            let dense: Vec<f64> = words::<8>(bytes).map(f64::from_le_bytes).collect();
             Ok(Data::Float64(Buffer::from_vec(spread(dense, levels, total))))
         }
         Physical::ByteArray => {
@@ -233,7 +236,7 @@ fn delta(
                 )));
             }
             let (dense, _) = crate::delta::binary_packed(tail(body, at)?, count)?;
-            narrow(target, dense.into_iter(), levels, total)
+            narrow(target, count, dense.into_iter(), levels, total)
         }
         Encoding::DeltaLengthByteArray => {
             text(column)?;
@@ -377,18 +380,26 @@ fn expect(target: PhysicalType, wanted: PhysicalType, ty: &LogicalType) -> Resul
     Err(Error::io(format!("a {ty} column stored in a parquet type it cannot come from")))
 }
 
-/// Reads `count` values of `WIDTH` bytes each.
-fn fixed<const WIDTH: usize>(bytes: &[u8], count: usize) -> Result<Vec<[u8; WIDTH]>> {
+/// The bytes of `count` values of `WIDTH` bytes each, still in the page.
+///
+/// A slice rather than a vector of arrays, which is what this used to hand back. A plain page is
+/// already the values laid out end to end, so copying it into a second buffer to then walk that one
+/// is a copy of the whole column for nothing. The callers walk it in place with `chunks_exact`.
+fn fixed<const WIDTH: usize>(bytes: &[u8], count: usize) -> Result<&[u8]> {
     let wanted = count.checked_mul(WIDTH).ok_or_else(|| {
         Error::io(format!("a page claiming {count} values of {WIDTH} bytes each"))
     })?;
-    let bytes = bytes.get(..wanted).ok_or_else(|| {
+    bytes.get(..wanted).ok_or_else(|| {
         Error::io(format!(
             "a page needing {wanted} bytes of values with {} left in it",
             bytes.len()
         ))
-    })?;
-    Ok(bytes.chunks_exact(WIDTH).map(|chunk| chunk.try_into().expect("chunks_exact")).collect())
+    })
+}
+
+/// The `WIDTH` byte little-endian words of a plain page, in order.
+fn words<const WIDTH: usize>(bytes: &[u8]) -> impl Iterator<Item = [u8; WIDTH]> + '_ {
+    bytes.chunks_exact(WIDTH).map(|chunk| chunk.try_into().expect("chunks_exact"))
 }
 
 /// Reads `count` plain encoded booleans, which are one bit each with the first in the low bit.
@@ -446,6 +457,7 @@ fn strings(
 /// file that cannot be read as what it says it is, and reading it as 44 would be a wrong answer.
 fn narrow<T>(
     target: PhysicalType,
+    count: usize,
     wire: impl Iterator<Item = T>,
     levels: &[u32],
     total: usize,
@@ -467,7 +479,9 @@ where
         ($(($layout:ident, $variant:ident, $native:ty)),+ $(,)?) => {
             match target {
                 $(PhysicalType::$layout => {
-                    let mut dense = Vec::new();
+                    // Sized up front. A page is twenty thousand values and growing into it doubles
+                    // fifteen times, which is fifteen copies of most of a column per page.
+                    let mut dense = Vec::with_capacity(count);
                     for value in wire {
                         let narrowed = <$native>::try_from(value).map_err(|_| {
                             Error::io(format!(
