@@ -170,14 +170,8 @@ impl<'a> Building<'a, '_> {
         max_groups: Option<usize>,
     ) -> Result<Box<dyn Operator + 'a>> {
         let child = self.node(input)?;
-        let (aggregate, out) = Aggregate::new(
-            self.plan,
-            child.schema(),
-            index,
-            groups,
-            aggregates,
-            self.memory,
-        )?;
+        let (aggregate, out) =
+            Aggregate::new(self.plan, child.schema(), index, groups, aggregates, self.memory)?;
         let aggregate = match max_groups {
             Some(limit) => aggregate.limit_groups(limit),
             None => aggregate,
@@ -291,7 +285,9 @@ impl<'a> Building<'a, '_> {
                     (
                         Node::Aggregate { input: below, index, groups, aggregates },
                         Some(max_groups),
-                    ) => self.aggregate(input, below, index, groups, aggregates, Some(max_groups))?,
+                    ) => {
+                        self.aggregate(input, below, index, groups, aggregates, Some(max_groups))?
+                    }
                     _ => self.node(input)?,
                 };
                 let schema = input.schema().clone();

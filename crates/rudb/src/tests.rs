@@ -135,9 +135,8 @@ fn a_group_by_produces_one_row_per_distinct_value() {
 #[test]
 fn an_unordered_limit_keeps_only_the_groups_it_can_return() {
     let db = database();
-    let full = db
-        .query("SELECT range % 10000 AS k, count(*) FROM range(100000) GROUP BY k")
-        .unwrap();
+    let full =
+        db.query("SELECT range % 10000 AS k, count(*) FROM range(100000) GROUP BY k").unwrap();
     let full_peak = full.metrics().unwrap().resource.peak_bytes;
     drop(full);
     let limited = db
