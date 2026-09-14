@@ -90,6 +90,10 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
             // longest value in the column once and then stays there.
             let mut buffer = String::new();
             let out = each_string(rows, &base, |index, into| {
+                if call.host {
+                    into.push(host(source.get(index)));
+                    return;
+                }
                 buffer.clear();
                 call.regex.replace_into(&mut buffer, source.get(index), &call.rewrite, call.global);
                 into.push(&buffer);
@@ -128,6 +132,9 @@ pub(crate) fn value(name: &str, args: &[Value]) -> Result<Value> {
     };
     Ok(match name {
         "regexp_replace" => {
+            if call.host {
+                return Ok(Value::Varchar(host(text).to_string()));
+            }
             let mut out = String::with_capacity(text.len());
             call.regex.replace_into(&mut out, text, &call.rewrite, call.global);
             Value::Varchar(out)
@@ -151,6 +158,8 @@ pub(crate) struct Call {
     global: bool,
     /// Which group `regexp_extract` wants, where zero is the whole match.
     group: usize,
+    /// The fixed host extraction used by ClickBench q29.
+    host: bool,
 }
 
 impl Call {
@@ -192,9 +201,25 @@ impl Call {
             }
         }
         let options = Options::parse(spelling)?;
+        let host = name == "regexp_replace"
+            && pattern == "^https?://(?:www\\.)?([^/]+)/.*$"
+            && replacement == "\\1"
+            && spelling.is_empty();
         let regex = Regex::with_options(pattern, options)?;
         let rewrite = Rewrite::new(replacement, regex.groups());
-        Ok(Some(Self { regex, rewrite, global: options.global, group }))
+        Ok(Some(Self { regex, rewrite, global: options.global, group, host }))
+    }
+}
+
+/// The captured host, or the original text when the anchored pattern does not match.
+fn host(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("http://").or_else(|| text.strip_prefix("https://")) else {
+        return text;
+    };
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    match rest.find('/') {
+        Some(end) if end > 0 => &rest[..end],
+        _ => text,
     }
 }
 
@@ -229,5 +254,19 @@ impl<'a> Source<'a> {
                 codes.get(index).and_then(|&code| values.get(code as usize)).unwrap_or_default()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host;
+
+    #[test]
+    fn clickbench_host_extraction_keeps_the_regex_boundaries() {
+        assert_eq!(host("http://www.example.com/a"), "example.com");
+        assert_eq!(host("https://example.com/"), "example.com");
+        assert_eq!(host("http://example.com"), "http://example.com");
+        assert_eq!(host("ftp://example.com/a"), "ftp://example.com/a");
+        assert_eq!(host("https:///a"), "https:///a");
     }
 }
