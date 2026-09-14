@@ -235,14 +235,20 @@ impl Table {
             walk.same.extend(walk.here.iter().zip(&walk.seen).map(|(step, &slot)| {
                 slot != EMPTY && self.hashes[slot as usize] == hashes[step.row]
             }));
-            // The keys, which is the only pass that branches per row and the only one that can end a
-            // row's walk. A row that is neither a hit nor a vacancy moves along one bucket and comes
-            // back around, so a run of collisions costs passes rather than a serial walk per row.
+            // The keys, one column at a time, so the type of the stored column and the form of the
+            // vector it is compared against are matched on once for the batch rather than once for
+            // every row and every column. Each column narrows what the pass above left marked.
+            for (at, column) in keys.iter().enumerate() {
+                self.columns[at].holds_run(&walk.here, &walk.seen, column, &mut walk.same);
+            }
+            // What is left, which is the only pass that branches per row and the only one that can
+            // end a row's walk. A row that is neither a hit nor a vacancy moves along one bucket and
+            // comes back around, so a run of collisions costs passes rather than a walk per row.
             walk.next.clear();
             for ((step, &slot), &same) in walk.here.iter().zip(&walk.seen).zip(&walk.same) {
                 if slot == EMPTY {
                     walk.pending.push(step.row);
-                } else if same && self.holds(slot as usize, keys, step.row) {
+                } else if same {
                     slots[step.row] = slot as usize;
                 } else {
                     walk.next.push(Step { row: step.row, at: (step.at + 1) & mask });
@@ -532,6 +538,72 @@ impl Column {
                 |value| value == values.get(slot),
             ),
             StoredData::Other(values) => same(&values[slot].value(), &column.value_at(row)),
+        }
+    }
+
+    /// The same question asked of a whole batch of rows at once, one column at a time.
+    ///
+    /// [`Self::holds`] matches on the stored column's type, then asks the vector for one row in a way
+    /// that matches on the vector's form, and then widens both sides to something they can be
+    /// compared in. All three of those are per row and per key column, and none of them depend on the
+    /// row. A batch has its rows in hand, so this does the two matches once for the batch and the arm
+    /// underneath compares two runs of the same width where they lie. It is the same move [`fold`]
+    /// makes for the hash, applied to the comparison that follows it.
+    ///
+    /// `same` comes in marked true for the rows whose stored hash matched, and each column narrows it
+    /// rather than replacing it, so calling this for every key column in turn leaves exactly the rows
+    /// whose whole key is the group they landed on. A row already ruled out by an earlier column is
+    /// skipped, which is what makes a wide key cost less than its width on the rows that differ early.
+    ///
+    /// Every arm is [`Self::holds`] with the dispatch lifted out and nothing else. Anything the arms
+    /// do not cover, which is every form that is not flat and every type without a run of its own,
+    /// falls through to `holds` a row at a time, exactly as it did before.
+    fn holds_run(&self, here: &[Step], seen: &[u32], column: &Vector, same: &mut [bool]) {
+        let validity = column.validity();
+        /// One pass over a run of values of the same width as the run the table stored.
+        macro_rules! run {
+            ($stored:expr, $values:expr) => {{
+                let stored = $stored;
+                let values = $values.as_slice();
+                for ((step, &slot), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                    if !*flag {
+                        continue;
+                    }
+                    let slot = slot as usize;
+                    *flag = match values.get(step.row) {
+                        _ if !self.valid[slot] => !validity.is_valid(step.row),
+                        Some(value) => validity.is_valid(step.row) && *value == stored[slot],
+                        None => self.holds(slot, column, step.row),
+                    };
+                }
+                return;
+            }};
+        }
+        if let Some(data) = column.data() {
+            match (&self.data, data) {
+                (StoredData::Integer(stored), Data::Int32(values)) => run!(stored, values),
+                (StoredData::BigInt(stored), Data::Int64(values)) => run!(stored, values),
+                (StoredData::Varchar(stored), Data::Varlen(strings)) => {
+                    for ((step, &slot), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                        if !*flag {
+                            continue;
+                        }
+                        let slot = slot as usize;
+                        *flag = match strings.bytes(step.row) {
+                            _ if !self.valid[slot] => !validity.is_valid(step.row),
+                            Some(bytes) => validity.is_valid(step.row) && bytes == stored.get(slot),
+                            None => self.holds(slot, column, step.row),
+                        };
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        for ((step, &slot), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+            if *flag {
+                *flag = self.holds(slot as usize, column, step.row);
+            }
         }
     }
 
@@ -977,6 +1049,66 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(was.len(), now.len());
         assert!(now.buckets.len() > HOT, "the test has to reach the batched path");
+    }
+
+    /// The values as a dictionary of `seen`, with the nulls in the validity beside the codes rather
+    /// than in the values, which is the shape the parquet reader hands a column over in.
+    fn dictionary_of(ty: LogicalType, seen: &[Value], codes: Vec<u32>, values: &[Value]) -> Vector {
+        let valid =
+            rudb_vector::Validity::from_iter(values.len(), |row| values[row] != Value::Null);
+        Vector::dictionary(codes, flat(ty, seen))
+            .expect("a dictionary of those values")
+            .with_validity(valid)
+    }
+
+    /// The batched compare is [`Column::holds`] with its two type matches lifted out of the row loop,
+    /// so what has to be shown is that it did not change its mind about anything on the way up. An
+    /// integer and a string cover both runs it has an arm for, the nulls cover the validity half of
+    /// each arm, and the same values as a dictionary cover the form it has no arm for and falls
+    /// through on. All three have to put the same rows in the same groups in the same order.
+    #[test]
+    fn the_batched_key_compare_agrees_with_the_one_at_a_time_one_on_every_form() {
+        let rows = 30_000;
+        let number = |row: i64| (row * 7919) % 5003;
+        let word = |row: i64| (row * 104_729) % 4001;
+        let numbers: Vec<Value> = (0..rows)
+            .map(|row| match row % 61 {
+                0 => Value::Null,
+                _ => Value::Integer(number(row) as i32),
+            })
+            .collect();
+        let words: Vec<Value> = (0..rows)
+            .map(|row| match row % 37 {
+                0 => Value::Null,
+                _ => Value::Varchar(format!("row {}", word(row))),
+            })
+            .collect();
+        let types = [LogicalType::Integer, LogicalType::Varchar];
+        let flatly = [flat(LogicalType::Integer, &numbers), flat(LogicalType::Varchar, &words)];
+        let (was, before) = one_at_a_time(&flatly, numbers.len(), &types);
+        let (now, after) = a_batch_at_a_time(&flatly, numbers.len(), &types);
+        assert_eq!(before, after);
+        assert_eq!(was.len(), now.len());
+        assert!(now.buckets.len() > HOT, "the test has to reach the batched path");
+
+        let digits: Vec<Value> = (0..5003).map(Value::Integer).collect();
+        let phrases: Vec<Value> = (0..4001).map(|at| Value::Varchar(format!("row {at}"))).collect();
+        let indirect = [
+            dictionary_of(
+                LogicalType::Integer,
+                &digits,
+                (0..rows).map(|row| number(row) as u32).collect(),
+                &numbers,
+            ),
+            dictionary_of(
+                LogicalType::Varchar,
+                &phrases,
+                (0..rows).map(|row| word(row) as u32).collect(),
+                &words,
+            ),
+        ];
+        let (_, through) = a_batch_at_a_time(&indirect, numbers.len(), &types);
+        assert_eq!(before, through);
     }
 
     /// The reason a vacancy cannot be filled inside the batch. Every row of this batch is the first
