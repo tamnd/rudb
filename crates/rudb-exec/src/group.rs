@@ -161,24 +161,12 @@ struct Built {
     held: Reservation,
     /// How many instances have combined, which is one per thread the pipeline ran on.
     instances: usize,
-    /// The one table that has nobody to be merged with right now, waiting for somebody to merge it.
+    /// The table every instance is folded into, kept until `finalize` turns it into rows.
     ///
-    /// An instance that arrives when this is empty leaves itself here and is done. One that arrives
-    /// when it is full takes what is there, merges it into its own, and goes round again with the
-    /// result, which is why this holds at most one table however many threads are combining: a
-    /// thread only ever puts something here after finding nothing.
-    ///
-    /// That is what makes the merging a tree rather than a queue. Thirty two instances merged one
-    /// after another on one thread is thirty one merges in a row, and merged this way it is five
-    /// rounds of merges that happen beside each other, because [`run_parallel`] now combines on the
-    /// thread that filled the state rather than back in the caller. The total work is the same and
-    /// the time it takes is not.
-    ///
-    /// A single instance still leaves itself here and is never merged with anything, so the
-    /// ordinary one thread query pays nothing for any of this.
-    ///
-    /// [`run_parallel`]: rudb_pipeline::run_parallel
-    pending: Option<Building>,
+    /// The first instance to combine is put here whole rather than merged into an empty table, so
+    /// that the ordinary one thread query does exactly what it did before and pays nothing for the
+    /// merge existing.
+    keeping: Option<Building>,
 }
 
 impl<'a> Aggregate<'a> {
@@ -275,7 +263,7 @@ impl<'a> Aggregate<'a> {
                 chunks: Vec::new(),
                 held: memory.reservation(),
                 instances: 0,
-                pending: None,
+                keeping: None,
             }),
             out: out.clone(),
         };
@@ -1235,51 +1223,34 @@ impl Sink for Aggregate<'_> {
     /// own fills the budget still runs out, which is correct: there is no way to hold seventeen
     /// million rows in room that does not hold them.
     ///
-    /// The end of one instance, which pairs off with whatever other instance is waiting.
+    /// The end of one instance, which is now either the first table or one to fold into it.
     ///
-    /// An instance that finds nothing waiting leaves itself waiting and is done. One that finds a
-    /// table waiting takes it, merges it into its own, and looks again, so two threads finishing at
-    /// the same time merge two pairs beside each other rather than one after the other. Thirty two
-    /// instances come together in five rounds instead of thirty one merges in a row, which is what
-    /// the group bys with several hundred thousand groups were spending most of their time on. The
-    /// total work is unchanged and what changes is how much of it happens at once.
+    /// The first instance to arrive is kept whole. Every one after it is folded into the kept one by
+    /// [`Aggregate::merge`], which probes each of its groups against the kept table and adds the
+    /// accumulators behind them, so what is left when the last instance has combined is one table
+    /// holding every group exactly once.
     ///
-    /// At most one table is ever waiting, because a thread only leaves one there after finding
-    /// nothing, and both the looking and the leaving happen under the same lock. The lock is held
-    /// for the swap and not for the merge, which is the point: a merge of half a million groups
-    /// under the lock that every other thread is queueing on would be the thing this is trying to
-    /// stop.
+    /// Turning that table into rows happens in `finalize` and not here, because here is per instance
+    /// and there is one table's worth of answer however many instances there were. That is a change
+    /// from when a second instance was refused and one combine was the end of everything.
     ///
-    /// The smaller table is merged into the larger one, since a merge probes every group of one
-    /// against the other and probing the short side is the cheaper way round.
-    ///
-    /// Turning what is left into rows happens in `finalize` and not here, because here is per
-    /// instance and there is one table's worth of answer however many instances there were.
+    /// The lock is held across the merge and not just across the swap, so two instances never merge
+    /// at the same time. That is on purpose for now: merging two tables into one at once needs the
+    /// kept table split into partitions that a thread can take one at a time, which is #510, and
+    /// without that a second merger would be probing a table the first one is inserting into. What
+    /// the parallel driver gives this today is overlap with the fold rather than with another merge,
+    /// since an instance that finishes early now merges while the others are still reading rows.
     fn combine(&self, local: Building) -> Result<()> {
         if let Some(error) = local.failure {
             return Err(error);
         }
-        let mut carrying = local;
-        self.built.lock().map_err(poisoned)?.instances += 1;
-        loop {
-            let waiting = {
-                let mut built = self.built.lock().map_err(poisoned)?;
-                match built.pending.take() {
-                    None => {
-                        built.pending = Some(carrying);
-                        return Ok(());
-                    }
-                    Some(waiting) => waiting,
-                }
-            };
-            let (from, mut into) = if waiting.groups > carrying.groups {
-                (carrying, waiting)
-            } else {
-                (waiting, carrying)
-            };
-            self.merge(from, &mut into)?;
-            carrying = into;
+        let mut built = self.built.lock().map_err(poisoned)?;
+        built.instances += 1;
+        match &mut built.keeping {
+            None => built.keeping = Some(local),
+            Some(kept) => self.merge(local, kept)?,
         }
+        Ok(())
     }
 
     /// Every instance has combined, so the one table left becomes the answer.
@@ -1295,7 +1266,7 @@ impl Sink for Aggregate<'_> {
     /// arrives.
     fn finalize(&self) -> Result<()> {
         let mut built = self.built.lock().map_err(poisoned)?;
-        if let Some(kept) = built.pending.take() {
+        if let Some(kept) = built.keeping.take() {
             let Built { chunks, held, .. } = &mut *built;
             let mut left = self.finish(kept, chunks, held)?;
             while let Some(mut file) = left {

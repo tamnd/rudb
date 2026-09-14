@@ -2802,12 +2802,12 @@ fn a_count_distinct_over_strings_on_eight_threads_counts_each_string_once() {
     assert_eq!(rows(&threaded(8), sql), rows(&threaded(1), sql));
 }
 
-/// Eight instances of a group by with more groups than any one of them sees, merged in a tree.
+/// Eight instances of a group by, merged on the threads that built them rather than on the caller's.
 ///
-/// Every instance holds part of every group, so each of the eight tables has to be folded into
-/// another one and the folding pairs off rather than going in a line. What the answer checks is that
-/// pairing off loses nothing: the count of groups, the total of the counts and the total of the sums
-/// all come out as if one thread had done it.
+/// Every instance holds part of every group, so each of the eight tables has to be folded into the
+/// kept one, and each of those folds now happens on the thread whose table it is while the other
+/// threads are still reading rows. What the answer checks is that moving the fold there loses
+/// nothing: the number of groups, the counts and the sums all come out as if one thread had done it.
 #[test]
 fn a_high_cardinality_group_by_on_eight_threads_merges_to_the_same_answer() {
     let sql = "SELECT range % 50000 AS g, count(*), sum(range) FROM range(400000) GROUP BY g";
