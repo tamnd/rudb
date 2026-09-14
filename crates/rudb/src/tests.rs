@@ -2802,6 +2802,31 @@ fn a_count_distinct_over_strings_on_eight_threads_counts_each_string_once() {
     assert_eq!(rows(&threaded(8), sql), rows(&threaded(1), sql));
 }
 
+/// Eight instances of a group by with more groups than any one of them sees, merged in a tree.
+///
+/// Every instance holds part of every group, so each of the eight tables has to be folded into
+/// another one and the folding pairs off rather than going in a line. What the answer checks is that
+/// pairing off loses nothing: the count of groups, the total of the counts and the total of the sums
+/// all come out as if one thread had done it.
+#[test]
+fn a_high_cardinality_group_by_on_eight_threads_merges_to_the_same_answer() {
+    let sql = "SELECT range % 50000 AS g, count(*), sum(range) FROM range(400000) GROUP BY g";
+    let many = rows(&threaded(8), sql);
+    assert_eq!(many.len(), 50_000);
+    let mut sorted = many.clone();
+    sorted.sort_by_key(|row| match row[0] {
+        Value::BigInt(key) => key,
+        _ => unreachable!("the key is a BIGINT"),
+    });
+    assert_eq!(sorted[0], vec![Value::BigInt(0), Value::BigInt(8), Value::HugeInt(1_400_000)]);
+    let mut one = rows(&threaded(1), sql);
+    one.sort_by_key(|row| match row[0] {
+        Value::BigInt(key) => key,
+        _ => unreachable!("the key is a BIGINT"),
+    });
+    assert_eq!(sorted, one);
+}
+
 #[test]
 fn a_query_with_no_order_by_keeps_the_source_order_on_eight_threads() {
     let rows = rows(&threaded(8), "SELECT range FROM range(200000) WHERE range % 3 = 0");
