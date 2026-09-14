@@ -228,11 +228,24 @@ fn decompress_within(input: &[u8], expected: usize, header: usize, out: &mut [u8
                 // Overruns on purpose. See [`WIDE`]. The offset is what makes it sound as well as
                 // fast: reaching back at least sixteen means the sixteen bytes read end at or
                 // before `pos`, so this is a copy of two registers and not an overlapping one.
-                out.copy_within(from..from + WIDE, pos);
+                //
+                // Through a register sized array rather than through `copy_within`, because that
+                // one is the overlapping move and the compiler leaves it as a call into libc even
+                // where the length is the constant sixteen. On a ClickBench page nine copies in ten
+                // land here, so that call was being paid per element: seven million of them for one
+                // column of a million rows, against a pair of loads and a pair of stores.
+                let mut wide = [0u8; WIDE];
+                wide.copy_from_slice(&out[from..from + WIDE]);
+                out[pos..pos + WIDE].copy_from_slice(&wide);
             } else if offset >= len {
-                // Nothing overlaps, so it is one `memmove`. What lands here now is the long copy
-                // and the one too near the end of the block to write wide.
-                out.copy_within(from..from + len, pos);
+                // Nothing overlaps, so the two halves can be split apart and copied the non
+                // overlapping way, which is the one the compiler inlines. What lands here is the
+                // long copy and the one too near the end of the block to write wide.
+                //
+                // Reaching back at least `len` is what makes the split sound: `from + len` is at
+                // most `pos`, so the bytes being read are all on the left of it.
+                let (before, after) = out.split_at_mut(pos);
+                after[..len].copy_from_slice(&before[from..from + len]);
             } else {
                 // The pattern repeats. Write it once, then keep doubling what has been written,
                 // because every byte already at `pos` is a byte this copy may read. Doubling
