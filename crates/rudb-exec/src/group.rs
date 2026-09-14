@@ -100,24 +100,16 @@ fn mark_affine_sums(plan: &Plan, calls: &mut [Call]) {
 /// arrives, which is the whole of the difference between `SELECT count(*) FROM empty` answering
 /// zero and answering nothing.
 ///
-/// # One table per instance, merged at the end
+/// # Radix partition ownership
 ///
-/// As a [`Sink`], the table and everything beside it live in the instance rather than in here, which
-/// is where they have to be: a table shared between threads would be a lock per probe. What that
-/// leaves is `combine`, and combining two aggregate instances means merging two tables.
-/// [`Aggregate::merge`] does it, by probing each group of the incoming table against the kept one
-/// and folding the accumulators behind the ones that match, which is the same probe the fold already
-/// does and needed only [`Accumulator::combine`] underneath it.
+/// A grouped aggregate hashes a chunk once and divides its rows by the high four hash bits. Each of
+/// the sixteen partitions owns one table behind its own lock. Workers can update different tables
+/// together, while equal keys always reach the same table and are stored once. This avoids both the
+/// duplicate table memory and the second probe that a merge of per-worker tables requires.
 ///
-/// A `DISTINCT` call merges too. Each of its groups holds a set of the values already accepted, and
-/// two of those go together by offering the incoming set's values to the kept one and folding in
-/// only the ones it did not have, which is what the fold does with a row and so gives the same
-/// answer for every aggregate rather than only for counting.
-///
-/// One shape is still refused, which is an instance that spilled, because spilling rests on a key
-/// being either finished in a pass or absent from it, and that holds within one instance and not
-/// across two. Radix partitioning is what fixes it, since it puts a whole partition in one thread
-/// and gives the invariant back.
+/// The rows of a partition are gathered into typed vectors before they are folded. That keeps the
+/// existing column kernels and table probe intact. An ungrouped aggregate and a grouping under a
+/// pushed limit keep the single local table path because neither benefits from partitioning.
 #[derive(Debug)]
 pub(crate) struct Aggregate<'a> {
     plan: &'a Plan,
@@ -150,6 +142,9 @@ pub(crate) struct Aggregate<'a> {
     memory: Memory,
     /// The chunks the passes have finished, and what they are charged.
     built: Mutex<Built>,
+    /// One final table per radix partition. Different workers can merge different partitions at
+    /// the same time, and no final table spanning every group is needed.
+    merged: Vec<Mutex<Option<Building>>>,
     out: Buffered,
 }
 
@@ -161,13 +156,9 @@ struct Built {
     held: Reservation,
     /// How many instances have combined, which is one per thread the pipeline ran on.
     instances: usize,
-    /// The table every instance is folded into, kept until `finalize` turns it into rows.
-    ///
-    /// The first instance to combine is put here whole rather than merged into an empty table, so
-    /// that the ordinary one thread query does exactly what it did before and pays nothing for the
-    /// merge existing.
-    keeping: Option<Building>,
 }
+
+const RADIX_PARTITIONS: usize = 16;
 
 impl<'a> Aggregate<'a> {
     /// An aggregation over the plan's groups and aggregate calls, and the source it finishes into.
@@ -263,8 +254,8 @@ impl<'a> Aggregate<'a> {
                 chunks: Vec::new(),
                 held: memory.reservation(),
                 instances: 0,
-                keeping: None,
             }),
+            merged: (0..RADIX_PARTITIONS).map(|_| Mutex::new(None)).collect(),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -398,7 +389,6 @@ impl<'a> Aggregate<'a> {
             over: None,
             away: Vec::new(),
             failure: None,
-            expressions: self.inputs.scratch(),
         };
         if self.alone {
             local.groups = 1;
@@ -434,7 +424,6 @@ impl<'a> Aggregate<'a> {
             over,
             away,
             failure: _,
-            expressions: _,
         } = local;
         let calls = self.calls.len();
         let alone = self.alone;
@@ -961,6 +950,35 @@ impl Rows {
             + self.arguments.iter().map(Vec::len).sum::<usize>()
             + self.filters.iter().flatten().count()
     }
+
+    /// Copy the selected rows into vectors one radix partition can fold independently.
+    fn gather(&self, rows: &[u32]) -> Result<Self> {
+        Ok(Self {
+            keys: self.keys.iter().map(|column| column.gather(rows)).collect::<Result<_>>()?,
+            arguments: self
+                .arguments
+                .iter()
+                .map(|arguments| {
+                    arguments.iter().map(|column| column.gather(rows)).collect::<Result<_>>()
+                })
+                .collect::<Result<_>>()?,
+            filters: self
+                .filters
+                .iter()
+                .map(|filter| filter.as_ref().map(|column| column.gather(rows)).transpose())
+                .collect::<Result<_>>()?,
+            rows: rows.len(),
+        })
+    }
+}
+
+/// The radix tables and scratch owned by one pipeline instance.
+#[derive(Debug)]
+pub(crate) struct Partitioned {
+    tables: Vec<Building>,
+    expressions: Scratch,
+    hashes: Vec<u64>,
+    rows: Vec<Vec<u32>>,
 }
 
 /// What one instance of an aggregate holds while it folds.
@@ -989,7 +1007,6 @@ pub(crate) struct Building {
     away: Vec<Value>,
     /// What went wrong before any row arrived, which there is nowhere else to report from.
     failure: Option<Error>,
-    expressions: Scratch,
 }
 
 /// A spill file being read back, and the buffers reading it fills.
@@ -1168,10 +1185,16 @@ fn set(slot: &mut Value, column: &Vector, row: usize) {
 }
 
 impl Sink for Aggregate<'_> {
-    type Local = Building;
+    type Local = Partitioned;
 
-    fn local(&self) -> Building {
-        self.start()
+    fn local(&self) -> Partitioned {
+        let partitions = if self.alone || self.max_groups.is_some() { 1 } else { RADIX_PARTITIONS };
+        Partitioned {
+            tables: (0..partitions).map(|_| self.start()).collect(),
+            expressions: self.inputs.scratch(),
+            hashes: Vec::new(),
+            rows: (0..partitions).map(|_| Vec::new()).collect(),
+        }
     }
 
     /// Refused for a limit pushed down into the grouping, and for nothing else.
@@ -1190,65 +1213,59 @@ impl Sink for Aggregate<'_> {
         self.max_groups.is_none()
     }
 
-    fn sink(&self, chunk: &Chunk, local: &mut Building) -> Result<Progress> {
-        if let Some(error) = local.failure.take() {
-            return Err(error);
+    fn sink(&self, chunk: &Chunk, local: &mut Partitioned) -> Result<Progress> {
+        for table in &mut local.tables {
+            if let Some(error) = table.failure.take() {
+                return Err(error);
+            }
         }
         let rows = self.read(chunk, &mut local.expressions)?;
-        self.fold(&rows, local)?;
+        if local.tables.len() == 1 {
+            self.fold(&rows, &mut local.tables[0])?;
+            return Ok(Progress::More);
+        }
+        crate::table::hash(&rows.keys, rows.rows, &mut local.hashes);
+        for partition in &mut local.rows {
+            partition.clear();
+        }
+        for (row, &hash) in local.hashes.iter().enumerate() {
+            let bits = local.tables.len().ilog2();
+            let partition = (hash >> (u64::BITS - bits)) as usize;
+            local.rows[partition].push(row as u32);
+        }
+        for partition in 0..local.tables.len() {
+            if local.rows[partition].is_empty() {
+                continue;
+            }
+            let selected = rows.gather(&local.rows[partition])?;
+            let mut table = self.merged[partition].lock().map_err(poisoned)?;
+            if table.is_none() {
+                *table = Some(self.start());
+            }
+            self.fold(&selected, table.as_mut().expect("the partition was opened"))?;
+        }
         Ok(Progress::More)
     }
 
-    /// The end of one instance, and as many more passes as the budget needs.
-    ///
-    /// One pass is what this used to be and is what almost every query still does: read everything,
-    /// put every group in a table, turn the table into rows. What is new is what happens when the
-    /// table cannot hold every group, which is #220, and which on the ClickBench file is `GROUP BY
-    /// UserID` and its seventeen million of them.
-    ///
-    /// A pass that runs out of room keeps the groups it already has and writes any row whose key is
-    /// not one of them to a file. Nothing already in the table ever goes to the file, so a key is
-    /// either finished in this pass or absent from it entirely, and that is the whole of why this
-    /// works: the next pass can aggregate the file on its own, knowing nothing about the rows that
-    /// came before, because no group is split across the two.
-    ///
-    /// It is also why no aggregate state is written out. Splitting the input by row rather than by
-    /// key would leave a partial state on each side to be merged, and splitting by key means there
-    /// is nothing to merge and every aggregate keeps working unchanged. There is a combine now, so
-    /// this could be done the other way, but a spill file of states is a serialize per aggregate and
-    /// splitting by key costs nothing, so it stays as it is.
-    ///
-    /// Each pass gives its table and the rows it made back before the next one starts, so what is
-    /// carried between passes is the finished chunks and nothing else. A query whose answer on its
-    /// own fills the budget still runs out, which is correct: there is no way to hold seventeen
-    /// million rows in room that does not hold them.
-    ///
-    /// The end of one instance, which is now either the first table or one to fold into it.
-    ///
-    /// The first instance to arrive is kept whole. Every one after it is folded into the kept one by
-    /// [`Aggregate::merge`], which probes each of its groups against the kept table and adds the
-    /// accumulators behind them, so what is left when the last instance has combined is one table
-    /// holding every group exactly once.
-    ///
-    /// Turning that table into rows happens in `finalize` and not here, because here is per instance
-    /// and there is one table's worth of answer however many instances there were. That is a change
-    /// from when a second instance was refused and one combine was the end of everything.
-    ///
-    /// The lock is held across the merge and not just across the swap, so two instances never merge
-    /// at the same time. That is on purpose for now: merging two tables into one at once needs the
-    /// kept table split into partitions that a thread can take one at a time, which is #510, and
-    /// without that a second merger would be probing a table the first one is inserting into. What
-    /// the parallel driver gives this today is overlap with the fold rather than with another merge,
-    /// since an instance that finishes early now merges while the others are still reading rows.
-    fn combine(&self, local: Building) -> Result<()> {
-        if let Some(error) = local.failure {
-            return Err(error);
+    /// A partitioned instance has already put its rows in the shared tables, so combining it only
+    /// records completion. The one-table path is combined as before.
+    fn combine(&self, local: Partitioned) -> Result<()> {
+        let Partitioned { mut tables, .. } = local;
+        self.built.lock().map_err(poisoned)?.instances += 1;
+        let partitions = tables.len();
+        if partitions > 1 {
+            return Ok(());
         }
-        let mut built = self.built.lock().map_err(poisoned)?;
-        built.instances += 1;
-        match &mut built.keeping {
-            None => built.keeping = Some(local),
-            Some(kept) => self.merge(local, kept)?,
+        for (partition, table) in tables.iter_mut().enumerate() {
+            let arriving = std::mem::replace(table, self.start());
+            if let Some(error) = arriving.failure {
+                return Err(error);
+            }
+            let mut kept = self.merged[partition].lock().map_err(poisoned)?;
+            match kept.as_mut() {
+                None => *kept = Some(arriving),
+                Some(kept) => self.merge(arriving, kept)?,
+            }
         }
         Ok(())
     }
@@ -1266,11 +1283,14 @@ impl Sink for Aggregate<'_> {
     /// arrives.
     fn finalize(&self) -> Result<()> {
         let mut built = self.built.lock().map_err(poisoned)?;
-        if let Some(kept) = built.keeping.take() {
-            let Built { chunks, held, .. } = &mut *built;
-            let mut left = self.finish(kept, chunks, held)?;
-            while let Some(mut file) = left {
-                left = self.again(&mut file, chunks, held)?;
+        for partition in &self.merged {
+            let mut partition = partition.lock().map_err(poisoned)?;
+            if let Some(kept) = partition.take() {
+                let Built { chunks, held, .. } = &mut *built;
+                let mut left = self.finish(kept, chunks, held)?;
+                while let Some(mut file) = left {
+                    left = self.again(&mut file, chunks, held)?;
+                }
             }
         }
         let chunks = std::mem::take(&mut built.chunks);

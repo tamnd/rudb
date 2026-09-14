@@ -13,7 +13,6 @@
 
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{Cancel, Field, LogicalType, Memory, Value};
-use rudb_kernels::Accumulator;
 use rudb_pipeline::Pool;
 use rudb_plan::Plan;
 use rudb_seam::Settings;
@@ -581,11 +580,11 @@ fn a_group_is_charged_for_the_room_it_takes_and_not_only_for_what_it_holds() {
     // it. Charging that and stopping there is what #227 was about, because it counts nothing for the
     // slot the group takes in a container or for the blocks the allocator hands out.
     let contents = size_of::<Value>() / 2;
-    // The slot each group takes in the table and in the accumulators beside it. A floor rather than
+    // The slot each group takes in the table and in the count vector beside it. A floor rather than
     // the figure: it assumes both containers are exactly full, and neither is, and it counts nothing
     // for the control bytes or for the blocks the allocator hands out. So the charge has to clear it
     // by some margin and the old charge could not clear it at all.
-    let slots = size_of::<Accumulator>();
+    let slots = size_of::<i64>();
     let groups = u64::try_from(GROUPS).expect("a small count");
     let contents = groups * u64::try_from(contents).expect("a small size");
     let floor = contents + groups * u64::try_from(slots).expect("a small size");
