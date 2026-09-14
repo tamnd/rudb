@@ -176,7 +176,9 @@ impl Table {
             // What it owns and not what it is. The `Value` itself is in one of the column vectors
             // below, whose capacity `footprint` counts, and counting it here as well would charge
             // every group twice for the part of it that is not a string.
-            self.owned += rows::owned(&value);
+            if !self.columns[at].stores_payload() {
+                self.owned += rows::owned(&value);
+            }
             self.columns[at].push(value)?;
         }
         self.hashes.push(hash);
@@ -259,7 +261,7 @@ struct Column {
 enum StoredData {
     Integer(Vec<i32>),
     BigInt(Vec<i64>),
-    Varchar(Vec<String>),
+    Varchar(StringColumn),
     Other(Vec<Stored>),
 }
 
@@ -268,7 +270,7 @@ impl Column {
         let data = match ty {
             rudb_common::LogicalType::Integer => StoredData::Integer(Vec::new()),
             rudb_common::LogicalType::BigInt => StoredData::BigInt(Vec::new()),
-            rudb_common::LogicalType::Varchar => StoredData::Varchar(Vec::new()),
+            rudb_common::LogicalType::Varchar => StoredData::Varchar(StringColumn::default()),
             _ => StoredData::Other(Vec::new()),
         };
         Self { valid: Vec::new(), data }
@@ -281,8 +283,8 @@ impl Column {
             (StoredData::Integer(values), Value::Null) => values.push(0),
             (StoredData::BigInt(values), Value::BigInt(value)) => values.push(value),
             (StoredData::BigInt(values), Value::Null) => values.push(0),
-            (StoredData::Varchar(values), Value::Varchar(value)) => values.push(value),
-            (StoredData::Varchar(values), Value::Null) => values.push(String::new()),
+            (StoredData::Varchar(values), Value::Varchar(value)) => values.push(value.as_bytes()),
+            (StoredData::Varchar(values), Value::Null) => values.push(&[]),
             (StoredData::Other(values), value) => values.push(Stored::from(value)),
             (_, value) => {
                 return Err(Error::internal(format!(
@@ -298,7 +300,7 @@ impl Column {
         let values = match &self.data {
             StoredData::Integer(values) => values.capacity() * size_of::<i32>(),
             StoredData::BigInt(values) => values.capacity() * size_of::<i64>(),
-            StoredData::Varchar(values) => values.capacity() * size_of::<String>(),
+            StoredData::Varchar(values) => values.footprint(),
             StoredData::Other(values) => values.capacity() * size_of::<Stored>(),
         };
         values + self.valid.capacity().div_ceil(8)
@@ -316,8 +318,8 @@ impl Column {
                 matches!(column.value_at(row), Value::BigInt(value) if value == values[slot])
             }
             StoredData::Varchar(values) => column.bytes_at(row).map_or_else(
-                || same(&Value::Varchar(values[slot].clone()), &column.value_at(row)),
-                |value| value == values[slot].as_bytes(),
+                || same(&Value::Varchar(values.string(slot)), &column.value_at(row)),
+                |value| value == values.get(slot),
             ),
             StoredData::Other(values) => same(&values[slot].value(), &column.value_at(row)),
         }
@@ -332,11 +334,42 @@ impl Column {
                 match &self.data {
                     StoredData::Integer(values) => Value::Integer(values[slot]),
                     StoredData::BigInt(values) => Value::BigInt(values[slot]),
-                    StoredData::Varchar(values) => Value::Varchar(values[slot].clone()),
+                    StoredData::Varchar(values) => Value::Varchar(values.string(slot)),
                     StoredData::Other(values) => values[slot].value(),
                 }
             })
             .collect()
+    }
+
+    fn stores_payload(&self) -> bool {
+        matches!(self.data, StoredData::Varchar(_))
+    }
+}
+
+/// UTF-8 group keys packed into one allocation, with one end offset per group.
+#[derive(Debug, Default)]
+struct StringColumn {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl StringColumn {
+    fn push(&mut self, value: &[u8]) {
+        self.bytes.extend_from_slice(value);
+        self.ends.push(self.bytes.len());
+    }
+
+    fn get(&self, slot: usize) -> &[u8] {
+        let start = slot.checked_sub(1).map_or(0, |before| self.ends[before]);
+        &self.bytes[start..self.ends[slot]]
+    }
+
+    fn string(&self, slot: usize) -> String {
+        String::from_utf8(self.get(slot).to_vec()).expect("a VARCHAR group key is valid UTF-8")
+    }
+
+    fn footprint(&self) -> usize {
+        self.bytes.capacity() + self.ends.capacity() * size_of::<usize>()
     }
 }
 
@@ -786,7 +819,7 @@ mod tests {
     /// The strings a key holds are charged, and they are charged once the group is in rather than
     /// per row, since a row that is not a new group copies nothing.
     #[test]
-    fn what_the_keys_own_is_counted() {
+    fn string_key_bytes_are_counted_in_the_column() {
         let long = "a string well past the sixteen bytes a view holds inline".to_string();
         let column = flat(LogicalType::Varchar, &[Value::Varchar(long.clone())]);
         let keys = [column];
@@ -798,6 +831,10 @@ mod tests {
             panic!("an empty table found a group");
         };
         table.insert(bucket, hashes[0], &keys, 0).expect("room");
-        assert!(table.owned() >= long.len() as u64, "{} is not the string", table.owned());
+        assert!(
+            table.footprint() >= long.len() as u64,
+            "{} bytes do not include the string",
+            table.footprint()
+        );
     }
 }
