@@ -93,12 +93,18 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         let block = compress(&payload.raw);
         let expected = payload.raw.clone();
         let time = time(|| {
-            let out = snappy::decompress(&block).expect("a block this file built did not decode");
+            let out = snappy::decompress(&block, expected.len())
+                .expect("a block this file built did not decode");
             std::hint::black_box(&out);
         });
         // Checked once outside the timed loop, because a decoder that is fast and wrong is not a
         // result and this table should not be the place that fails to notice.
-        assert_eq!(snappy::decompress(&block).unwrap(), expected, "{}", payload.name);
+        assert_eq!(
+            snappy::decompress(&block, expected.len()).unwrap(),
+            expected,
+            "{}",
+            payload.name
+        );
         rows.push((payload.name, block.len(), payload.raw.len(), time));
     }
 
@@ -225,7 +231,7 @@ mod tests {
         // decode and nobody would find out until somebody ran the table.
         for payload in payloads() {
             let block = compress(&payload.raw);
-            let out = snappy::decompress(&block)
+            let out = snappy::decompress(&block, payload.raw.len())
                 .unwrap_or_else(|e| panic!("{} did not decode: {e}", payload.name));
             assert_eq!(out, payload.raw, "{}", payload.name);
         }

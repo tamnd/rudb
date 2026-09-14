@@ -21,6 +21,10 @@
 
 use rudb_compress::{Codec, snappy};
 
+/// What the damaged and truncated cases say their block holds, which is far more than any of them
+/// does. These are about the elements rather than about the length in front of them.
+const ROOM: usize = 64 << 20;
+
 /// A block from `tests/data`, by name.
 macro_rules! block {
     ($name:literal) => {
@@ -44,7 +48,8 @@ fn random(n: usize) -> Vec<u8> {
 
 /// Checks a real block against the bytes it should hold, through both entry points.
 fn check(block: &[u8], expected: &[u8]) {
-    let out = snappy::decompress(block).expect("a real Snappy block did not decompress");
+    let out =
+        snappy::decompress(block, expected.len()).expect("a real Snappy block did not decompress");
     assert_eq!(out.len(), expected.len(), "wrong length");
     assert_eq!(out, expected, "wrong bytes");
     // And through `Codec`, because that is the path a page reader takes and the length check it
@@ -127,7 +132,7 @@ fn a_real_block_with_a_byte_changed_is_caught_rather_than_decoded() {
     for at in [1usize, 5, 50, 200, 400, 593] {
         let mut damaged = original.to_vec();
         damaged[at] ^= 0xff;
-        match snappy::decompress(&damaged) {
+        match snappy::decompress(&damaged, ROOM) {
             Ok(out) => {
                 assert_eq!(out.len(), 11400, "a block that decoded should be the right size")
             }
@@ -140,7 +145,7 @@ fn a_real_block_with_a_byte_changed_is_caught_rather_than_decoded() {
 fn a_real_block_truncated_anywhere_is_an_error_and_never_a_hang() {
     let original = block!("runs");
     for cut in 1..original.len() {
-        let result = snappy::decompress(&original[..cut]);
+        let result = snappy::decompress(&original[..cut], ROOM);
         // A prefix can only ever produce fewer bytes than the header promised, so every one of
         // these must be refused. The one that would be silently wrong is a short page handed to a
         // reader as if it were whole.

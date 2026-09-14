@@ -124,7 +124,7 @@ impl Codec {
     pub fn decompress(self, input: &[u8], expected: usize) -> Result<Vec<u8>> {
         let out = match self {
             Self::Uncompressed => input.to_vec(),
-            Self::Snappy => snappy::decompress(input)?,
+            Self::Snappy => snappy::decompress(input, expected)?,
             Self::Zstd => zstd::decompress(input)?,
             other => {
                 return Err(rudb_common::Error::not_implemented(format!(
