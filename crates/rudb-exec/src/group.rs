@@ -100,15 +100,21 @@ fn mark_affine_sums(plan: &Plan, calls: &mut [Call]) {
 /// arrives, which is the whole of the difference between `SELECT count(*) FROM empty` answering
 /// zero and answering nothing.
 ///
-/// # One table for now
+/// # One table per instance, merged at the end
 ///
 /// As a [`Sink`], the table and everything beside it live in the instance rather than in here, which
 /// is where they have to be: a table shared between threads would be a lock per probe. What that
-/// leaves is `combine`, and combining two aggregate instances means merging two tables, which needs
-/// a serialize and a combine per aggregate that `spec/engine/07-aggregate.md` section 7.8 names as
-/// debt not yet paid. So a second instance is refused rather than answered wrongly, and until that
-/// debt is paid an aggregate is one instance however many threads the pipeline has. Everything else
-/// about it is already in the shape F4 wants, including the spilling.
+/// leaves is `combine`, and combining two aggregate instances means merging two tables.
+/// [`Aggregate::merge`] does it, by probing each group of the incoming table against the kept one
+/// and folding the accumulators behind the ones that match, which is the same probe the fold already
+/// does and needed only [`Accumulator::combine`] underneath it.
+///
+/// Two shapes are still refused, each for its own reason and each with its own message. A `DISTINCT`
+/// call, because merging two of its groups means taking the union of the values each has already
+/// accepted. An instance that spilled, because spilling rests on a key being either finished in a
+/// pass or absent from it, which holds within one instance and not across two. Radix partitioning is
+/// what fixes the second, since it puts a whole partition in one thread and gives the invariant
+/// back.
 #[derive(Debug)]
 pub(crate) struct Aggregate<'a> {
     plan: &'a Plan,
@@ -150,8 +156,14 @@ struct Built {
     chunks: Vec<Chunk>,
     /// What those chunks are charged, held for as long as they are readable.
     held: Reservation,
-    /// How many instances have combined, because the second one is not supported.
+    /// How many instances have combined, which is one per thread the pipeline ran on.
     instances: usize,
+    /// The table every instance is folded into, kept until `finalize` turns it into rows.
+    ///
+    /// The first instance to combine is put here whole rather than merged into an empty table, so
+    /// that the ordinary one thread query does exactly what it did before and pays nothing for the
+    /// merge existing.
+    keeping: Option<Building>,
 }
 
 impl<'a> Aggregate<'a> {
@@ -248,6 +260,7 @@ impl<'a> Aggregate<'a> {
                 chunks: Vec::new(),
                 held: memory.reservation(),
                 instances: 0,
+                keeping: None,
             }),
             out: out.clone(),
         };
@@ -303,10 +316,10 @@ impl<'a> Aggregate<'a> {
     /// came before, because no group is split across the two.
     ///
     /// It is also why no aggregate state is written out. Splitting the input by row rather than by
-    /// key would leave a partial state on each side to be merged, and a merge needs a serialize and
-    /// a combine per aggregate, which `spec/engine/07-aggregate.md` section 7.8 names as debt not
-    /// yet paid. Splitting by key means there is nothing to merge and every aggregate keeps working
-    /// unchanged.
+    /// key would leave a partial state on each side to be merged, and splitting by key means there
+    /// is nothing to merge and every aggregate keeps working unchanged. There is a combine now, so
+    /// this could be done the other way, but a spill file of states is a serialize per aggregate and
+    /// splitting by key costs nothing, so it stays as it is.
     ///
     /// Each pass gives its table and the rows it made back before the next one starts, so what is
     /// carried between passes is the finished chunks and nothing else. A query whose answer on its
@@ -661,6 +674,114 @@ impl<'a> Aggregate<'a> {
             Some(file) if file.rows() > 0 => Ok(Some(file)),
             _ => Ok(None),
         }
+    }
+
+    /// Folds one instance's table into another's, so that an aggregate can run on more than one
+    /// thread.
+    ///
+    /// The key half is the probe the fold already does. Every group the incoming table holds is
+    /// looked up in the kept one, and the hash it is looked up by is the hash the incoming table
+    /// stored when the group went in, because both tables came from this operator and so hashed the
+    /// same way. A group that is already there has its accumulators folded in by
+    /// [`Accumulator::combine`]. A group that is not is inserted, which copies its key across, and
+    /// gets a fresh set of accumulators to fold into.
+    ///
+    /// The keys come out a chunk at a time and a column at a time, which is the shape the table
+    /// already holds them in and the shape the probe wants, so the only thing per group here is the
+    /// probe itself and the run of accumulator merges after it.
+    ///
+    /// # What is refused
+    ///
+    /// A `DISTINCT` aggregate, because merging two groups means taking the union of the two sets of
+    /// values they have already accepted and nothing does that yet.
+    ///
+    /// An instance that spilled, because spilling rests on a key being either finished in this pass
+    /// or absent from it entirely, and that holds within one instance and not across two. A key can
+    /// be in one instance's table and in another instance's file at the same time, and the later
+    /// pass over that file would then finish a group that is already finished. Radix partitioning
+    /// is what fixes this, because a partition is finished by one thread and the invariant comes
+    /// back, and that is the next item on the roadmap rather than this one.
+    ///
+    /// # Errors
+    ///
+    /// [`rudb_common::ErrorCode::NotImplemented`] for either of those two. Whatever the probe, the
+    /// insert or an accumulator merge reports otherwise.
+    fn merge(&self, from: Building, into: &mut Building) -> Result<()> {
+        if self.sets {
+            return Err(Error::not_implemented(
+                "two instances of an aggregate with a DISTINCT in it, because merging two groups \
+                 means taking the union of the values each has already accepted",
+            ));
+        }
+        if from.over.is_some() || into.over.is_some() {
+            return Err(Error::not_implemented(
+                "two instances of an aggregate that spilled, because a key can be in one \
+                 instance's table and in another instance's spill file at once, which radix \
+                 partitioning is what fixes",
+            ));
+        }
+        let Building {
+            scratch,
+            containers,
+            table: source,
+            states: taken,
+            counts: tallies,
+            groups: found,
+            affine_rows: counted,
+            ..
+        } = from;
+        let calls = self.calls.len();
+        for (at, rows) in counted.iter().enumerate() {
+            into.affine_rows[at] += rows;
+        }
+        if self.alone {
+            // One slot each and no key at all, so there is nothing to look up and the merge is the
+            // states on their own.
+            merge_slot(self.count_only, calls, 0, 0, &taken, &tallies, into)?;
+        } else {
+            let types: Vec<LogicalType> =
+                self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
+            for start in (0..found).step_by(VECTOR_SIZE) {
+                let end = (start + VECTOR_SIZE).min(found);
+                let mut keys = Vec::with_capacity(types.len());
+                for (at, ty) in types.iter().enumerate() {
+                    keys.push(source.column(at, ty, start..end)?);
+                }
+                // row at a time: the keys came out a column at a time above, so what is left per
+                // group is one probe and the accumulators behind it, which is 2g (#61).
+                for slot in start..end {
+                    let row = slot - start;
+                    let hash = source.hash_of(slot);
+                    let target = match into.table.probe(hash, &keys, row) {
+                        Probe::Found(target) => target,
+                        Probe::Vacant(bucket) => {
+                            // The same cap the fold applies, for the same reason: a limit above an
+                            // unordered group by only ever looks at so many groups, and one that is
+                            // dropped here would have been dropped there.
+                            if self.max_groups.is_some_and(|limit| into.table.len() >= limit) {
+                                continue;
+                            }
+                            let target = into.table.insert(bucket, hash, &keys, row)?;
+                            into.groups = into.table.len();
+                            self.fresh(&mut into.states, &mut into.counts)?;
+                            target
+                        }
+                    };
+                    merge_slot(self.count_only, calls, slot, target, &taken, &tallies, into)?;
+                }
+            }
+        }
+        drop(taken);
+        drop(tallies);
+        drop(source);
+        // The incoming instance is spent, so its charge goes back, and what the kept one grew to
+        // taking is charged in its place. Both in that order, because the merge held the two at once
+        // and the peak really was the sum.
+        drop(scratch);
+        drop(containers);
+        rows::capacity(into.table.owned(), &mut into.charged_keys, &mut into.scratch)?;
+        let now = tables(&into.table, &into.states, &into.counts, &into.seen);
+        rows::capacity(now, &mut into.charged, &mut into.containers)
     }
 
     /// One `DISTINCT` call over a chunk, which is the one shape that still needs a value per row.
@@ -1048,43 +1169,90 @@ impl Sink for Aggregate<'_> {
     /// came before, because no group is split across the two.
     ///
     /// It is also why no aggregate state is written out. Splitting the input by row rather than by
-    /// key would leave a partial state on each side to be merged, and a merge needs a serialize and
-    /// a combine per aggregate, which `spec/engine/07-aggregate.md` section 7.8 names as debt not
-    /// yet paid. Splitting by key means there is nothing to merge and every aggregate keeps working
-    /// unchanged.
+    /// key would leave a partial state on each side to be merged, and splitting by key means there
+    /// is nothing to merge and every aggregate keeps working unchanged. There is a combine now, so
+    /// this could be done the other way, but a spill file of states is a serialize per aggregate and
+    /// splitting by key costs nothing, so it stays as it is.
     ///
     /// Each pass gives its table and the rows it made back before the next one starts, so what is
     /// carried between passes is the finished chunks and nothing else. A query whose answer on its
     /// own fills the budget still runs out, which is correct: there is no way to hold seventeen
     /// million rows in room that does not hold them.
     ///
-    /// The later passes happen here rather than in `finalize`, because they are this instance's
-    /// rows and nobody else's. A second instance would be a second table to merge with this one,
-    /// which is the debt above, so it is refused.
+    /// The end of one instance, which is now either the first table or one to fold into it.
+    ///
+    /// The first instance to arrive is kept whole. Every one after it is folded into the kept one by
+    /// [`Aggregate::merge`], which probes each of its groups against the kept table and adds the
+    /// accumulators behind them, so what is left when the last instance has combined is one table
+    /// holding every group exactly once.
+    ///
+    /// Turning that table into rows happens in `finalize` and not here, because here is per instance
+    /// and there is one table's worth of answer however many instances there were. That is a change
+    /// from when a second instance was refused and one combine was the end of everything.
     fn combine(&self, local: Building) -> Result<()> {
         if let Some(error) = local.failure {
             return Err(error);
         }
         let mut built = self.built.lock().map_err(poisoned)?;
         built.instances += 1;
-        if built.instances > 1 {
-            return Err(Error::not_implemented(
-                "two instances of one aggregate are two hash tables, and merging them needs a \
-                 serialize and a combine per aggregate that nothing implements yet",
-            ));
-        }
-        let Built { chunks, held, .. } = &mut *built;
-        let mut left = self.finish(local, chunks, held)?;
-        while let Some(mut file) = left {
-            left = self.again(&mut file, chunks, held)?;
+        match &mut built.keeping {
+            None => built.keeping = Some(local),
+            Some(kept) => self.merge(local, kept)?,
         }
         Ok(())
     }
 
+    /// Every instance has combined, so the one table left becomes the answer.
+    ///
+    /// The later passes of a spilled aggregate happen here. They used to happen in `combine`, which
+    /// was the same moment when one instance was all there could be, and they cannot stay there now
+    /// that an instance may be one of several: a pass over a spill file is a pass over the whole
+    /// aggregate's leftovers and not over one thread's.
+    ///
+    /// An aggregate whose pipeline took no morsel at all has nothing kept and nothing to finish,
+    /// which is an empty answer and not an error. An ungrouped aggregate never gets there, because
+    /// its one group is made when the instance is, and an instance is made whether or not a row
+    /// arrives.
     fn finalize(&self) -> Result<()> {
-        let chunks = std::mem::take(&mut self.built.lock().map_err(poisoned)?.chunks);
+        let mut built = self.built.lock().map_err(poisoned)?;
+        if let Some(kept) = built.keeping.take() {
+            let Built { chunks, held, .. } = &mut *built;
+            let mut left = self.finish(kept, chunks, held)?;
+            while let Some(mut file) = left {
+                left = self.again(&mut file, chunks, held)?;
+            }
+        }
+        let chunks = std::mem::take(&mut built.chunks);
+        drop(built);
         self.out.fill(chunks)
     }
+}
+
+/// Folds the aggregates of one group of one instance into the same group of another.
+///
+/// Free rather than a method because the caller holds a disjoint borrow of the incoming instance's
+/// states and the kept instance's, and there is no way to say that from inside either of them.
+///
+/// A grouped `count(*)` is one integer per group and not an accumulator, which is #61, so it adds
+/// rather than combining. Everything else is a run of `calls` accumulators starting at the group's
+/// slot, and the two runs line up because both instances were built from the same call list.
+fn merge_slot(
+    count_only: bool,
+    calls: usize,
+    slot: usize,
+    target: usize,
+    taken: &[Accumulator],
+    tallies: &[i64],
+    into: &mut Building,
+) -> Result<()> {
+    if count_only {
+        into.counts[target] += tallies[slot];
+        return Ok(());
+    }
+    for at in 0..calls {
+        into.states[target * calls + at].combine(&taken[slot * calls + at])?;
+    }
+    Ok(())
 }
 
 /// What the three containers have taken from the allocator between them.
@@ -1412,20 +1580,115 @@ mod tests {
         assert_eq!(out.at(0).expect("readable").expect("one chunk").len(), 1);
     }
 
-    /// The debt, spelled out as a test. Two tables cannot be merged without a serialize and a
-    /// combine per aggregate, and saying so is better than adding the two group totals up and
-    /// calling that an answer.
-    #[test]
-    fn a_second_instance_of_an_aggregate_is_refused() {
-        let plan = Plan::new();
-        let schema = Schema::numbered(vec![Field::new("a", LogicalType::Integer)], 0);
-        let (aggregate, _) =
-            Aggregate::new(&plan, &schema, 1, Slice::EMPTY, Slice::EMPTY, &Memory::unlimited())
-                .expect("no aggregates to take apart");
+    /// A plan holding one aggregate over one integer column, parsed from its textual form because
+    /// that is three lines instead of thirty of arena building and because it is the notation a plan
+    /// dump already uses.
+    fn parsed(text: &str) -> Plan {
+        Plan::parse(&format!("{text}\n  Get memory.main.t AS t #0 [x::INTEGER]"))
+            .expect("a plan this crate's own notation describes")
+    }
 
+    /// The aggregate at the root of such a plan, wired to a buffer to answer into.
+    fn aggregate(plan: &Plan) -> (Aggregate<'_>, Buffered) {
+        let schema = Schema::numbered(vec![Field::new("x", LogicalType::Integer)], 0);
+        let (groups, aggregates) = match *plan.node(plan.root()) {
+            rudb_plan::Node::Aggregate { groups, aggregates, .. } => (groups, aggregates),
+            ref other => panic!("the plan's root is {other:?} and not an aggregate"),
+        };
+        Aggregate::new(plan, &schema, 1, groups, aggregates, &Memory::unlimited())
+            .expect("the aggregates are ones this crate implements")
+    }
+
+    /// The rows an aggregate answered, as values, in the order it produced them.
+    fn answer(out: &Buffered) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        for at in 0.. {
+            let Some(chunk) = out.at(at).expect("readable") else { break };
+            // row at a time: reading a handful of answer rows back out in a test, where a kernel
+            // would be more code than the thing it checks.
+            for row in 0..chunk.len() {
+                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+            }
+        }
+        rows
+    }
+
+    /// The point of the whole thing. Two instances see different rows of the same group, and what
+    /// comes out is one row for that group with both instances' rows counted in it.
+    #[test]
+    fn two_instances_of_a_grouped_aggregate_answer_one_row_a_group() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, out) = aggregate(&plan);
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        aggregate.sink(&chunk(&[1, 2, 1]), &mut left).expect("three rows");
+        aggregate.sink(&chunk(&[2, 3, 2]), &mut right).expect("three rows");
+        aggregate.combine(left).expect("the first instance");
+        aggregate.combine(right).expect("the second instance");
+        aggregate.finalize().expect("the answer");
+
+        let mut rows = answer(&out);
+        rows.sort_by_key(|row| format!("{:?}", row[0]));
+        assert_eq!(
+            rows,
+            [
+                vec![Value::Integer(1), Value::BigInt(2)],
+                vec![Value::Integer(2), Value::BigInt(3)],
+                vec![Value::Integer(3), Value::BigInt(1)],
+            ]
+        );
+    }
+
+    /// An ungrouped aggregate has no key to probe, so the merge is the accumulators on their own and
+    /// it is worth its own test that it takes that path and gets the same total.
+    #[test]
+    fn two_instances_of_an_ungrouped_aggregate_add_up_to_one_total() {
+        let plan = parsed(
+            "Aggregate #1 groups=[] aggregates=[sum(#0.0::INTEGER)::HUGEINT, min(#0.0::INTEGER)::INTEGER, max(#0.0::INTEGER)::INTEGER, count_star()::BIGINT]",
+        );
+        let (aggregate, out) = aggregate(&plan);
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        aggregate.sink(&chunk(&[4, 7]), &mut left).expect("two rows");
+        aggregate.sink(&chunk(&[2, 9]), &mut right).expect("two rows");
+        aggregate.combine(left).expect("the first instance");
+        aggregate.combine(right).expect("the second instance");
+        aggregate.finalize().expect("the answer");
+
+        assert_eq!(
+            answer(&out),
+            [vec![Value::HugeInt(22), Value::Integer(2), Value::Integer(9), Value::BigInt(4)]]
+        );
+    }
+
+    /// An instance that took no morsel still combines, and an empty table folded into a full one has
+    /// to leave the full one alone rather than answering nothing or answering twice.
+    #[test]
+    fn an_instance_that_saw_no_rows_changes_nothing_when_it_combines() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, out) = aggregate(&plan);
+        let mut seen = aggregate.local();
+        aggregate.sink(&chunk(&[5, 5]), &mut seen).expect("two rows");
+        aggregate.combine(aggregate.local()).expect("an instance that saw nothing");
+        aggregate.combine(seen).expect("the one that saw something");
+        aggregate.combine(aggregate.local()).expect("another that saw nothing");
+        aggregate.finalize().expect("the answer");
+
+        assert_eq!(answer(&out), [vec![Value::Integer(5), Value::BigInt(2)]]);
+    }
+
+    /// The debt that is left, spelled out. Merging two groups of a `DISTINCT` means taking the union
+    /// of the values each has already accepted, and saying so is better than adding the two counts
+    /// up and calling that an answer.
+    #[test]
+    fn a_second_instance_of_a_distinct_aggregate_is_still_refused() {
+        let plan = parsed(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count(DISTINCT #0.0::INTEGER)::BIGINT]",
+        );
+        let (aggregate, _) = aggregate(&plan);
         aggregate.combine(aggregate.local()).expect("the first instance");
         let why = aggregate.combine(aggregate.local()).expect_err("and not the second");
-        assert!(why.to_string().contains("two hash tables"), "{why}");
+        assert!(why.to_string().contains("DISTINCT"), "{why}");
     }
 
     #[test]

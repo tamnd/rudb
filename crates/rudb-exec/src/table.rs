@@ -110,6 +110,19 @@ impl Table {
         self.hashes.len()
     }
 
+    /// The hash of the group in `slot`.
+    ///
+    /// Only wanted by a merge of two tables, which probes this table's groups against another one
+    /// and would otherwise hash keys that were hashed once already. The two tables came from the
+    /// same operator and so hashed the same way, which is what makes reusing the number sound.
+    ///
+    /// # Panics
+    ///
+    /// If `slot` is not a group in this table, which is a bug in the caller.
+    pub(crate) fn hash_of(&self, slot: usize) -> u64 {
+        self.hashes[slot]
+    }
+
     /// What the stored keys own away from themselves.
     ///
     /// Charged separately from [`Self::footprint`] because it is charged for longer. The strings a
