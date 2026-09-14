@@ -16,6 +16,7 @@ publish = false
 rudb.workspace = true
 rudb-common.workspace = true
 rudb-compress.workspace = true
+rudb-encoding.workspace = true
 rudb-exec.workspace = true
 rudb-io.workspace = true
 rudb-kernels.workspace = true
