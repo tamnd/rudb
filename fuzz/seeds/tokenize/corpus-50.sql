@@ -1,0 +1,1 @@
+SELECT a FROM t QUALIFY row_number() OVER () = 1

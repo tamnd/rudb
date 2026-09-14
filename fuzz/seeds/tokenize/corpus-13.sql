@@ -1,0 +1,1 @@
+SELECT CAST(a AS INTEGER), a::VARCHAR, try_cast(a AS DOUBLE) FROM t

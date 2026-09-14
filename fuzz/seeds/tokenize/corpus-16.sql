@@ -1,0 +1,1 @@
+SELECT [1, 2, 3], {'a': 1}, struct_pack(a := 1)

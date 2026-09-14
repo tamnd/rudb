@@ -1,0 +1,1 @@
+COPY t FROM 'in.csv' (HEADER, DELIMITER ',')

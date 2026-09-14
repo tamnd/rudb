@@ -1,0 +1,1 @@
+SELECT x FROM t WHERE x IN (SELECT y FROM u)

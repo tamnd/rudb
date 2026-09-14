@@ -1,0 +1,1 @@
+SELECT E'a\tb', N'abc', B'101', x'4142' FROM t

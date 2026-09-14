@@ -1,0 +1,26 @@
+[package]
+name = "rudb-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace, which is what keeps the nightly only dependency out of the one the gate
+# builds. Nothing in the workspace next door has to know this directory exists.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rudb-parse = { path = "../crates/rudb-parse" }
+
+[[bin]]
+name = "tokenize"
+path = "fuzz_targets/tokenize.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true

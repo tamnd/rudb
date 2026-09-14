@@ -1,0 +1,1 @@
+SET memory_limit = '1GB'
