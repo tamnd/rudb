@@ -20,6 +20,7 @@ readme = "README.md"
 # section 18.3. Internal crates are pinned exactly so that a partial publish cannot produce a
 # mixed-version build.
 [workspace.dependencies]
+memchr = "2.7.6"
 rudb = { version = "=0.3.4", path = "crates/rudb" }
 rudb-arrow = { version = "=0.3.4", path = "crates/rudb-arrow" }
 rudb-bind = { version = "=0.3.4", path = "crates/rudb-bind" }

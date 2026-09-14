@@ -13,6 +13,7 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
+memchr.workspace = true
 rudb-common.workspace = true
 rudb-vector.workspace = true
 rudb-encoding.workspace = true
