@@ -1126,6 +1126,56 @@ impl Vector {
         }
     }
 
+    /// The signed integer at `index`, widened, read without building a [`Value`].
+    ///
+    /// The integer sibling of [`Self::bytes_at`], and it is here for the same caller. A group by on
+    /// an integer column compares one key per input row against the group it probed, and doing that
+    /// through [`Self::value_at`] built and dropped a sixty four byte value a row at a time for a
+    /// number that was already sitting in the column.
+    ///
+    /// Widened to `i128` because that is what [`Data::signed_at`] hands back underneath, and one
+    /// method that covers every signed width is worth more than five that do not. A caller that
+    /// wants a narrower type narrows it, which is a range check against a value in a register.
+    ///
+    /// The types this answers for are the ones whose flat data is read through `signed_at`, so the
+    /// five signed integer widths and the decimal, date, time and timestamp types that are stored
+    /// in them. A decimal answers with its unscaled value, which is the number the column holds.
+    ///
+    /// `None` for a null, for an index past the end, for a column of any other type, and for the
+    /// packed and compressed forms, whose rows are not stored as integers anywhere a read can reach
+    /// without unpacking. A caller that gets `None` falls back to [`Self::value_at`], which is
+    /// correct for all of those.
+    #[must_use]
+    pub fn signed_at(&self, index: usize) -> Option<i128> {
+        if index >= self.len || !self.validity.is_valid(index) {
+            return None;
+        }
+        match &self.body {
+            Body::Flat(data) => data.signed_at(index),
+            Body::Constant(value) => match value.as_ref() {
+                Value::TinyInt(x) => Some(i128::from(*x)),
+                Value::SmallInt(x) => Some(i128::from(*x)),
+                Value::Integer(x) | Value::Date(x) => Some(i128::from(*x)),
+                Value::BigInt(x) | Value::Time(x) | Value::Timestamp(x) => Some(i128::from(*x)),
+                Value::HugeInt(x) | Value::Decimal { unscaled: x, .. } => Some(*x),
+                _ => None,
+            },
+            // The same arithmetic [`Self::value_at`] does on a sequence, so the two agree about a
+            // sequence that runs off the end of the width it is stored in.
+            Body::Sequence { start, step } => {
+                Some(i128::from(start.wrapping_add(step.wrapping_mul(index as i64))))
+            }
+            Body::Dictionary { codes, values } => {
+                values.signed_at(usize::try_from(*codes.get(index)?).ok()?)
+            }
+            Body::Runs { ends, values } => values.signed_at(run_holding(ends, index)?),
+            // The same `None` [`Self::bytes_at`] gives, for the same reason. A packed or compressed
+            // row is not an integer anywhere until it has been unpacked, and a caller that gets
+            // `None` goes to `value_at` and gets the row unpacked into a value.
+            Body::Coded { .. } | Body::Packed { .. } | Body::Views { .. } => None,
+        }
+    }
+
     /// Every value in order, as single values.
     pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
         (0..self.len).map(|index| self.value_at(index))
@@ -2477,6 +2527,75 @@ mod tests {
         bytes.push("red");
         let blob = Vector::flat(LogicalType::Blob, Data::Varlen(bytes)).unwrap();
         assert_eq!(blob.text_at(0), None, "a blob is not a varchar");
+    }
+
+    /// The accessor a group by keys an integer column through, which has to agree with `value_at`
+    /// on every position or two rows holding one number end up in two groups.
+    #[test]
+    fn a_signed_integer_is_read_where_it_already_is_for_the_forms_that_store_it() {
+        let flat = integers(&[7, -3, 0, 2]);
+        for index in 0..flat.len() {
+            assert_eq!(flat.signed_at(index), signed_of(&flat.value_at(index)), "flat {index}");
+        }
+        let dictionary = Vector::dictionary(vec![1, 0, 3, 2], flat).unwrap();
+        for index in 0..dictionary.len() {
+            assert_eq!(
+                dictionary.signed_at(index),
+                signed_of(&dictionary.value_at(index)),
+                "dictionary {index}"
+            );
+        }
+        assert_eq!(dictionary.signed_at(4), None, "past the end");
+
+        let runs = Vector::runs(vec![2, 5], integers(&[4, 9])).unwrap();
+        for index in 0..runs.len() {
+            assert_eq!(runs.signed_at(index), signed_of(&runs.value_at(index)), "run {index}");
+        }
+        let constant = Vector::constant(LogicalType::BigInt, Value::BigInt(11), 3);
+        assert_eq!(constant.signed_at(2), Some(11));
+        let sequence = Vector::sequence(100, 5, 4);
+        for index in 0..sequence.len() {
+            assert_eq!(
+                sequence.signed_at(index),
+                signed_of(&sequence.value_at(index)),
+                "sequence {index}"
+            );
+        }
+    }
+
+    /// The forms and types that have no integer to hand back, which a caller answers by falling
+    /// back to `value_at`. Reading one of these as a key that does not match rather than as a key
+    /// that has to be built is how a packed column ends up with every row in its own group.
+    #[test]
+    fn a_signed_integer_is_refused_where_it_is_not_stored_as_itself() {
+        let nulls =
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(4), Value::Null]).unwrap();
+        assert_eq!(nulls.signed_at(0), Some(4));
+        assert_eq!(nulls.signed_at(1), None, "a null is not a number");
+        let packed = integers(&[1, 2, 3, 1]).bit_packed().unwrap();
+        assert_eq!(
+            packed.signed_at(0),
+            None,
+            "a packed row is not an integer until it is unpacked"
+        );
+        let mut bytes = StringColumn::new();
+        bytes.push("red");
+        let text = Vector::flat(LogicalType::Varchar, Data::Varlen(bytes)).unwrap();
+        assert_eq!(text.signed_at(0), None, "a string is not a number");
+        let double = Vector::flat(LogicalType::Double, Data::Float64(vec![1.5].into())).unwrap();
+        assert_eq!(double.signed_at(0), None, "a double is not a signed integer");
+    }
+
+    /// The integer of a value, for comparing `signed_at` against `value_at` position by position.
+    fn signed_of(value: &Value) -> Option<i128> {
+        match value {
+            Value::TinyInt(x) => Some(i128::from(*x)),
+            Value::SmallInt(x) => Some(i128::from(*x)),
+            Value::Integer(x) | Value::Date(x) => Some(i128::from(*x)),
+            Value::BigInt(x) | Value::Time(x) | Value::Timestamp(x) => Some(i128::from(*x)),
+            Value::HugeInt(x) | Value::Decimal { unscaled: x, .. } => Some(*x),
+            _ => None,
+        }
     }
 
     /// The text of a value, for comparing `text_at` against `value_at` position by position.
