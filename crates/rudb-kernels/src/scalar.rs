@@ -48,6 +48,7 @@
 //! a backtracking automaton, and the pattern stops being converted from a `Value` to a `String` to
 //! a `Vec<char>` on every row.
 
+use memchr::memmem;
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
 
@@ -1204,6 +1205,9 @@ fn like_of(
             };
             // Every code is inside the dictionary because `Vector::dictionary` checks that on the
             // way in, so the gather indexes without a bound of its own.
+            if column.len() < rows {
+                return like_over(column, &codes, like, base, rows, returns);
+            }
             let at = move |index: usize| codes[index] as usize;
             like_run(column, at, like, base, rows, returns)
         }
@@ -1251,6 +1255,25 @@ impl Like {
         };
         Some(Self { compiled: Pattern::compile(spelling), fold_case, negated })
     }
+
+    /// Whether the string at `position` matches, negation included.
+    ///
+    /// One place rather than one per loop, because the two loops below differ in what they walk and
+    /// not in what they decide, and `characters` is the buffer the general walk reuses so that a
+    /// chunk costs one allocation and not one per value.
+    fn holds_at(&self, column: &StringColumn, position: usize, characters: &mut Vec<char>) -> bool {
+        if !self.fold_case && !matches!(self.compiled, Pattern::General(_)) {
+            let text = column.bytes(position).unwrap_or_default();
+            return self.compiled.holds_bytes(text) != self.negated;
+        }
+        let text = column.get(position).unwrap_or_default();
+        // `str::to_lowercase` and not a character by character fold, for the same reason the
+        // `lower` kernel uses it: the two functions disagree about a final sigma, and the oracle
+        // this is checked against calls the string one.
+        let folded = if self.fold_case { Some(text.to_lowercase()) } else { None };
+        let text = folded.as_deref().unwrap_or(text);
+        self.compiled.holds(text, characters) != self.negated
+    }
 }
 
 /// The `LIKE` loop itself, once per form the text can arrive in.
@@ -1269,19 +1292,39 @@ fn like_run<A: Fn(usize) -> usize>(
     let mut out = vec![false; rows];
     let mut characters: Vec<char> = Vec::new();
     let validity = over_valid(rows, base, |index| {
-        let position = at(index);
-        if !like.fold_case && !matches!(like.compiled, Pattern::General(_)) {
-            out[index] = like.compiled.holds_bytes(column.bytes(position).unwrap_or_default())
-                != like.negated;
-            return Ok(());
-        }
-        let text = column.get(position).unwrap_or_default();
-        // `str::to_lowercase` and not a character by character fold, for the same reason the
-        // `lower` kernel uses it: the two functions disagree about a final sigma, and the oracle
-        // this is checked against calls the string one.
-        let folded = if like.fold_case { Some(text.to_lowercase()) } else { None };
-        let text = folded.as_deref().unwrap_or(text);
-        out[index] = like.compiled.holds(text, &mut characters) != like.negated;
+        out[index] = like.holds_at(column, at(index), &mut characters);
+        Ok(())
+    })?;
+    finish(returns, Data::Bool(out.into()), validity)
+}
+
+/// The same loop over a dictionary, answering once per distinct value instead of once per row.
+///
+/// A substring search is the most expensive thing any of these kernels does per value, and a
+/// dictionary is a promise that the same value turns up again. ClickBench reads `URL` and `Title`
+/// against a dictionary of a few tens of thousands over chunks of a million, so this is the same
+/// answer for a fraction of the searches, and it is the difference between a filter that is linear
+/// in rows and one that is linear in distinct values.
+///
+/// The caller only sends a chunk here when the dictionary is smaller than the chunk, because a
+/// dictionary with more entries than the rows that point at it would have this searching values
+/// nobody asked about.
+fn like_over(
+    column: &StringColumn,
+    codes: &[u32],
+    like: &Like,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let mut characters: Vec<char> = Vec::new();
+    let answer: Vec<bool> =
+        (0..column.len()).map(|value| like.holds_at(column, value, &mut characters)).collect();
+    let mut out = vec![false; rows];
+    let validity = over_valid(rows, base, |index| {
+        // Every code is inside the dictionary for the reason the caller gives, so this indexes a
+        // vector built to the dictionary's length without a bound of its own.
+        out[index] = answer[codes[index] as usize];
         Ok(())
     })?;
     finish(returns, Data::Bool(out.into()), validity)
@@ -1302,7 +1345,12 @@ enum Pattern {
     /// `%abc`.
     Suffix(String),
     /// `%abc%`, which is the one ClickBench spends its time in.
-    Contains(String),
+    ///
+    /// The searcher is built here and not at the row, because `memmem::find` builds one out of the
+    /// needle before it looks at the haystack: it picks the two rarest bytes and works out the
+    /// stride from them. That is a few hundred instructions, which is more than searching a URL
+    /// with a searcher that already exists, and a scan was paying it once a row.
+    Contains(memmem::Finder<'static>),
     /// Anything else, walked with one backtracking point.
     General(Vec<char>),
 }
@@ -1315,7 +1363,7 @@ impl Pattern {
         }
         if let Some(inner) = spelling.strip_prefix('%').and_then(|rest| rest.strip_suffix('%')) {
             if plain(inner) {
-                return Self::Contains(inner.to_owned());
+                return Self::Contains(memmem::Finder::new(inner).into_owned());
             }
         }
         if let Some(rest) = spelling.strip_prefix('%') {
@@ -1338,7 +1386,7 @@ impl Pattern {
             Self::Exact(against) => text == against,
             Self::Prefix(against) => text.starts_with(against.as_str()),
             Self::Suffix(against) => text.ends_with(against.as_str()),
-            Self::Contains(against) => text.contains(against.as_str()),
+            Self::Contains(finder) => finder.find(text.as_bytes()).is_some(),
             Self::General(against) => {
                 characters.clear();
                 characters.extend(text.chars());
@@ -1352,7 +1400,7 @@ impl Pattern {
             Self::Exact(against) => text == against.as_bytes(),
             Self::Prefix(against) => text.starts_with(against.as_bytes()),
             Self::Suffix(against) => text.ends_with(against.as_bytes()),
-            Self::Contains(against) => memchr::memmem::find(text, against.as_bytes()).is_some(),
+            Self::Contains(finder) => finder.find(text).is_some(),
             Self::General(_) => false,
         }
     }
@@ -2514,6 +2562,61 @@ mod tests {
                 .value_at(0),
             Value::Boolean(true)
         );
+    }
+
+    /// Answering per distinct value and answering per row give the same column.
+    ///
+    /// Both dictionary arms are reached here, because the arm is chosen on whether the dictionary is
+    /// shorter than the chunk and the two dictionaries below are on either side of the same row
+    /// count. Both are compared against the flat answer over the same values, which is the loop that
+    /// was there before either of them.
+    #[test]
+    fn answering_a_like_per_distinct_value_agrees_with_answering_it_per_row() {
+        let seen = [
+            Value::Varchar("a google search".into()),
+            Value::Varchar("goggle".into()),
+            Value::Null,
+            Value::Varchar("GOOGLE".into()),
+            Value::Varchar("".into()),
+            Value::Varchar("google.com/google".into()),
+        ];
+        for spelling in ["%google%", "%GOOGLE%", "goggle", "g%e", "%le", "go%"] {
+            for name in ["~~", "!~~", "~~*"] {
+                let pattern =
+                    Vector::constant(LogicalType::Varchar, Value::Varchar(spelling.into()), 12);
+                let answer = |text: Vector| {
+                    let out = binary(
+                        name,
+                        &Hoisted::Nothing,
+                        &text,
+                        &pattern,
+                        &LogicalType::Boolean,
+                        12,
+                        None,
+                    )
+                    .expect("the call is written")
+                    .expect("text in this form has a loop of its own");
+                    (0..12).map(|row| out.value_at(row)).collect::<Vec<Value>>()
+                };
+                let codes: Vec<u32> = (0..12).map(|row| (row % seen.len()) as u32).collect();
+                let rows: Vec<Value> =
+                    codes.iter().map(|&code| seen[code as usize].clone()).collect();
+                let flat = Vector::from_values(LogicalType::Varchar, &rows).expect("builds");
+                let values = Vector::from_values(LogicalType::Varchar, &seen).expect("builds");
+                // Six values under twelve rows, which answers once per value and gathers.
+                let short = Vector::dictionary(codes, values).expect("codes are in range");
+                // Twelve values under twelve rows, which is not shorter than the chunk and walks it
+                // a row at a time instead.
+                let long = Vector::dictionary(
+                    (0..12).collect(),
+                    Vector::from_values(LogicalType::Varchar, &rows).expect("builds"),
+                )
+                .expect("codes are in range");
+                let want = answer(flat);
+                assert_eq!(answer(short), want, "{name} {spelling} over a short dictionary");
+                assert_eq!(answer(long), want, "{name} {spelling} over a long one");
+            }
+        }
     }
 
     /// The one argument kernels and the date ones enter their loop on a dictionary.
