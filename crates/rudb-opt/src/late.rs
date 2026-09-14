@@ -21,9 +21,9 @@
 //! A top N whose input is not a projection, since the columns that are deferred have to be
 //! somewhere to be deferred from.
 //!
-//! An ordering key that is anything but a bare column. `ORDER BY a + b` would mean rebuilding the
-//! key expression against the narrowed projection, and a rewrite that copies expression trees is a
-//! rewrite that can copy one wrong. Every ClickBench query orders by a column.
+//! An ordering key that is anything but a column of the projection directly below the top N. The
+//! binder gives a computed ordering such as `ORDER BY a + b` a hidden projected column, so the
+//! computation can still move below the top N and be replayed for fetched rows.
 //!
 //! A projection whose columns are not all columns of one `read_parquet` file. The fetch reads the
 //! whole row back from the file, so a column that is not in the file is a column it cannot produce.
@@ -48,9 +48,12 @@
 
 use rudb_common::{Field, LogicalType, Result, Value};
 use rudb_functions::FILE_ROW_NUMBER;
+use std::collections::HashMap;
+
 use rudb_plan::{ColumnBinding, Expr, Node, NodeRef, Plan, Slice, SortKey};
 
 use crate::pass::{Context, Pass};
+use crate::walk;
 
 /// The most rows a fetch is worth doing for.
 ///
@@ -175,7 +178,23 @@ fn fetch(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
 
     let chain = chain(plan, under)?;
     let scan = *chain.last()?;
-    let columns = file_columns(plan, &chain, &held)?;
+    let columns = file_columns(plan, &chain, &held);
+    let deferred_projects = if columns.is_none() {
+        let scan_index = file_index(plan, scan)?;
+        let projects = projects(plan, &chain, index, &held, &labels);
+        replayable(plan, scan_index, &projects).then_some((scan_index, projects))
+    } else {
+        None
+    };
+    if columns.is_none() && deferred_projects.is_none() {
+        return None;
+    }
+    let columns = match columns {
+        Some(columns) => columns,
+        None => {
+            (0..file_width(plan, scan)?).map(|at| u32::try_from(at).ok()).collect::<Option<_>>()?
+        }
+    };
 
     // Bottom up, because each level's new column refers to the one below it. What comes back is the
     // ordinal as the projection under the top N will produce it.
@@ -196,7 +215,106 @@ fn fetch(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
         Expr::Column(ColumnBinding::new(narrow_index(plan, narrow), wanted.len() as u32)),
         LogicalType::BigInt,
     );
-    Some(plan.add_node(Node::Fetch { input: above, index, args, columns: deferred, row: ordinal }))
+    let fetched_index = if deferred_projects.is_some() { fresh(plan) } else { index };
+    let fetched = plan.add_node(Node::Fetch {
+        input: above,
+        index: fetched_index,
+        args,
+        columns: deferred,
+        row: ordinal,
+    });
+    match deferred_projects {
+        Some((scan_index, projects)) => {
+            Some(replay(plan, fetched, fetched_index, scan_index, projects))
+        }
+        None => Some(fetched),
+    }
+}
+
+/// The table index of the raw file row.
+fn file_index(plan: &Plan, scan: NodeRef) -> Option<u32> {
+    match *plan.node(scan) {
+        Node::TableFunction { index, .. } => Some(index),
+        _ => None,
+    }
+}
+
+/// The width of the file row a scan produces before an ordinal is appended to it.
+fn file_width(plan: &Plan, scan: NodeRef) -> Option<usize> {
+    match *plan.node(scan) {
+        Node::TableFunction { columns, .. } => Some(
+            plan.field_list(columns).iter().filter(|field| field.name != FILE_ROW_NUMBER).count(),
+        ),
+        _ => None,
+    }
+}
+
+/// The projections that turn a raw file row into the row the top N used to produce.
+fn projects(
+    plan: &Plan,
+    chain: &[NodeRef],
+    outer_index: u32,
+    outer_exprs: &[u32],
+    outer_names: &[u32],
+) -> Vec<(u32, Vec<u32>, Vec<u32>)> {
+    let mut found = Vec::new();
+    for &node in chain.iter().rev() {
+        if let Node::Project { index, exprs, names, .. } = *plan.node(node) {
+            found.push((index, plan.expr_list(exprs).to_vec(), plan.name_list(names).to_vec()));
+        }
+    }
+    found.push((outer_index, outer_exprs.to_vec(), outer_names.to_vec()));
+    found
+}
+
+/// Whether every computed projection can be rebuilt from the file row below it.
+fn replayable(plan: &Plan, scan_index: u32, projects: &[(u32, Vec<u32>, Vec<u32>)]) -> bool {
+    let mut tables = std::collections::HashSet::from([scan_index]);
+    for (index, exprs, _) in projects {
+        for &expr in exprs {
+            let mut missing = false;
+            walk::columns(plan, expr, &mut |binding| missing |= !tables.contains(&binding.table));
+            if missing {
+                return false;
+            }
+        }
+        tables.insert(*index);
+    }
+    true
+}
+
+/// Rebuilds deferred computed projections over the raw rows a fetch returned.
+fn replay(
+    plan: &mut Plan,
+    mut input: NodeRef,
+    fetched_index: u32,
+    scan_index: u32,
+    projects: Vec<(u32, Vec<u32>, Vec<u32>)>,
+) -> NodeRef {
+    let mut tables = HashMap::from([(scan_index, fetched_index)]);
+    let count = projects.len();
+    for (at, (old_index, exprs, names)) in projects.into_iter().enumerate() {
+        let rewritten: Vec<u32> =
+            exprs.into_iter().map(|expr| rebase(plan, expr, &tables)).collect();
+        let exprs = plan.add_expr_list(&rewritten);
+        let names = plan.add_name_list(&names);
+        let index = if at + 1 == count { old_index } else { fresh(plan) };
+        input = plan.add_node(Node::Project { input, index, exprs, names });
+        tables.insert(old_index, index);
+    }
+    input
+}
+
+/// Copies one expression while changing the table indexes of its column references.
+fn rebase(plan: &mut Plan, expr: u32, tables: &HashMap<u32, u32>) -> u32 {
+    if let Expr::Column(binding) = *plan.expr(expr) {
+        let table = tables.get(&binding.table).copied().unwrap_or(binding.table);
+        return plan.add_expr(
+            Expr::Column(ColumnBinding::new(table, binding.column)),
+            plan.expr_type(expr).clone(),
+        );
+    }
+    walk::rebuild(plan, expr, &mut |plan, child| rebase(plan, child, tables))
 }
 
 /// The table index of the projection this pass just built.
@@ -451,6 +569,17 @@ mod tests {
         // The filter's column is read under the top N as well as the ordering one, because a row
         // that the filter drops is a row the top N never sees.
         assert!(out.contains("#1 [a::INTEGER, j::INTEGER, file_row_number::BIGINT]"), "{out}");
+    }
+
+    #[test]
+    fn computed_file_columns_are_replayed_after_the_fetch() {
+        let text = wide(&TEN, "#3.1::BIGINT ASC NULLS LAST", "")
+            .replace("#1.1::INTEGER AS b", "CAST(#1.1::INTEGER)::BIGINT AS b");
+        let out = deferred(&text);
+        assert!(out.contains("Fetch args="), "{out}");
+        assert!(out.contains("CAST(#"), "{out}");
+        assert!(out.contains("[b::INTEGER, file_row_number::BIGINT]"), "{out}");
+        assert!(out.lines().next().is_some_and(|line| line.starts_with("Project #9")), "{out}");
     }
 
     #[test]
