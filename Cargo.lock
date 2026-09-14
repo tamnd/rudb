@@ -328,6 +328,7 @@ dependencies = [
  "rudb",
  "rudb-common",
  "rudb-compress",
+ "rudb-encoding",
  "rudb-exec",
  "rudb-io",
  "rudb-kernels",
