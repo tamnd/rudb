@@ -431,6 +431,32 @@ fn an_ordered_root_puts_the_morsels_back_the_way_the_source_cut_them() {
     assert_eq!(rows(&reader.drain().unwrap()), vec![10, 20, 30, 40]);
 }
 
+/// Taking a morsel and registering it at the sink are separate calls. A worker may take morsel zero
+/// and lose the CPU before it registers, while another worker finishes morsel one and starts two.
+/// The root must keep one behind the unregistered zero even though zero is not in its local state.
+#[test]
+fn an_ordered_root_waits_for_a_morsel_that_was_taken_but_not_registered() {
+    let (sink, reader) = root_in_order(BufferId(0), None);
+    let sink: Arc<dyn DynSink> = Arc::new(sink);
+    let mut later = sink.local_state();
+
+    sink.at_state(&Morsel::new(1, 1, 2), &mut later).unwrap();
+    sink.sink_state(&numbers(&[20]), &mut later).unwrap();
+    sink.at_state(&Morsel::new(2, 2, 3), &mut later).unwrap();
+
+    assert_eq!(reader.queued().unwrap(), 0, "morsel zero has been taken but not registered yet");
+
+    let mut first = sink.local_state();
+    sink.at_state(&Morsel::new(0, 0, 1), &mut first).unwrap();
+    sink.sink_state(&numbers(&[10]), &mut first).unwrap();
+    sink.combine_state(first).unwrap();
+    sink.sink_state(&numbers(&[30]), &mut later).unwrap();
+    sink.combine_state(later).unwrap();
+    sink.finalize_state().unwrap();
+
+    assert_eq!(rows(&reader.drain().unwrap()), vec![10, 20, 30]);
+}
+
 /// The same sequence against the plain root, which is the thing the ordered one exists to differ
 /// from. A query with an `ORDER BY` under it wants this, because the operator below has already put
 /// the rows where it wants them and holding chunks back would only add latency.
