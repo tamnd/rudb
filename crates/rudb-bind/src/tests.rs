@@ -285,6 +285,18 @@ fn using_makes_the_equality_and_leaves_one_copy_of_the_column() {
 }
 
 #[test]
+fn a_using_column_named_twice_is_still_one_column() {
+    // `USING (UserID, UserID)` is legal and the reference binary treats it as `USING (UserID)`.
+    // Taking the name twice dropped the right side's copy twice, which took `duration` out of the
+    // answer here and panicked outright when the copy was the last column in the scope. The fuzz
+    // target in `fuzz/fuzz_targets/bind.rs` found it.
+    let text = plan("SELECT * FROM hits JOIN visits USING (UserID, UserID)");
+    assert!(text.contains("AS UserID"), "{text}");
+    assert!(text.contains("AS duration"), "{text}");
+    assert_eq!(text.matches("on=[").count(), 1, "{text}");
+}
+
+#[test]
 fn natural_joins_on_whatever_both_sides_call_the_same_thing() {
     let text = plan("SELECT url FROM hits NATURAL JOIN visits");
     assert!(text.contains("Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]"), "{text}");
