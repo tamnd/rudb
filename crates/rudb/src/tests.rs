@@ -2802,12 +2802,12 @@ fn a_count_distinct_over_strings_on_eight_threads_counts_each_string_once() {
     assert_eq!(rows(&threaded(8), sql), rows(&threaded(1), sql));
 }
 
-/// Eight instances of a group by, merged on the threads that built them rather than on the caller's.
+/// Eight instances of a group by, each row landing in the partition its key hashes to.
 ///
-/// Every instance holds part of every group, so each of the eight tables has to be folded into the
-/// kept one, and each of those folds now happens on the thread whose table it is while the other
-/// threads are still reading rows. What the answer checks is that moving the fold there loses
-/// nothing: the number of groups, the counts and the sums all come out as if one thread had done it.
+/// Every instance sees part of every group, so each group is reached from eight threads and has to
+/// come out holding all eight contributions exactly once. What the answer checks is that the split
+/// loses nothing and doubles nothing: the number of groups, the counts and the sums all come out as
+/// if one thread had done it.
 #[test]
 fn a_high_cardinality_group_by_on_eight_threads_merges_to_the_same_answer() {
     let sql = "SELECT range % 50000 AS g, count(*), sum(range) FROM range(400000) GROUP BY g";
@@ -2824,6 +2824,42 @@ fn a_high_cardinality_group_by_on_eight_threads_merges_to_the_same_answer() {
         Value::BigInt(key) => key,
         _ => unreachable!("the key is a BIGINT"),
     });
+    assert_eq!(sorted, one);
+}
+
+/// A distinct set split across the partitions, where the sets are the expensive half of a group.
+///
+/// Enough groups to be spread over every partition, and a `DISTINCT` inside each one so that what a
+/// partition accumulates is a set rather than just a running total. Each group holds three values
+/// and every instance offers it some of all three.
+#[test]
+fn a_grouped_count_distinct_over_many_groups_on_eight_threads_agrees_with_one_thread() {
+    let sql = "SELECT range % 30000 AS k, count(DISTINCT range % 90000), count(*) \
+               FROM range(900000) GROUP BY k";
+    let many = rows(&threaded(8), sql);
+    assert_eq!(many.len(), 30_000);
+    for row in &many {
+        assert_eq!(row[1], Value::BigInt(3), "90000 over 30000 is three values in each group");
+        assert_eq!(row[2], Value::BigInt(30), "900000 over 30000 is thirty rows in each group");
+    }
+    let mut sorted = many;
+    let mut one = rows(&threaded(1), sql);
+    sorted.sort_by_key(|row| format!("{:?}", row[0]));
+    one.sort_by_key(|row| format!("{:?}", row[0]));
+    assert_eq!(sorted, one);
+}
+
+/// The same over a string key, since a partition gathers its keys out of the chunk before folding.
+#[test]
+fn a_group_by_a_string_with_many_groups_on_eight_threads_agrees_with_one_thread() {
+    let sql = "SELECT 'k' || (range % 25000) AS k, count(*), min(range), max(range) \
+               FROM range(500000) GROUP BY k";
+    let many = rows(&threaded(8), sql);
+    assert_eq!(many.len(), 25_000);
+    let mut sorted = many;
+    let mut one = rows(&threaded(1), sql);
+    sorted.sort_by_key(|row| format!("{:?}", row[0]));
+    one.sort_by_key(|row| format!("{:?}", row[0]));
     assert_eq!(sorted, one);
 }
 
