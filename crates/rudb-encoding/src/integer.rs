@@ -265,19 +265,22 @@ fn candidates(values: &[i64], depth: u8) -> Vec<Kind> {
         // Nothing else can beat 13 bytes, so this is the whole answer rather than a candidate.
         return vec![Kind::Constant];
     }
-    if values.len() >= 2 && deltas(values).is_some() {
+    if values.len() >= 2 && deltas_fit(values) {
         kinds.push(Kind::Delta);
     }
     if run_count(values) * 4 <= values.len() * 3 {
         kinds.push(Kind::Rle);
     }
-    let distinct = distinct_values(values);
-    if distinct.len() * 2 <= values.len() {
+    // One sort answers both of the remaining questions. It used to be two, because the distinct
+    // count and the most frequent value were asked for separately and each one sorted its own copy
+    // of the chunk and threw it away.
+    let (distinct, dominant) = spread_of(values);
+    if distinct * 2 <= values.len() {
         kinds.push(Kind::Dict);
     }
     // Written as a match rather than as a chained `if let` because the minimum supported Rust
     // version is 1.85 and let chains landed in 1.88.
-    match dominant_value(values) {
+    match dominant {
         Some((_, count)) if count * 10 >= values.len() * 8 => kinds.push(Kind::Sparse),
         _ => {}
     }
@@ -331,7 +334,7 @@ fn encode_as(
             out.extend_from_slice(&encode_at(&codes, depth + 1, chooser)?);
         }
         Kind::Sparse => {
-            let Some((value, _)) = dominant_value(values) else {
+            let Some((value, _)) = spread_of(values).1 else {
                 return Ok(None);
             };
             let mut positions = Vec::new();
@@ -561,6 +564,16 @@ fn unzigzag(value: u64) -> i64 {
 /// A column holding both `i64::MIN` and `i64::MAX` has a difference that does not fit in an `i64`,
 /// and rather than widening every delta array to 128 bits for a case that does not occur in data,
 /// the encoding declines to apply. `Packed` covers it.
+/// Whether every neighbouring difference fits in an `i64`, which is the only thing the candidate
+/// list needs to know about deltas.
+///
+/// The candidate list used to answer this by building the whole delta array and checking that it
+/// came back, which is an allocation and a pass over the chunk thrown away on every chunk, and then
+/// `Kind::Delta` built it again. This is the same pass with nothing kept.
+fn deltas_fit(values: &[i64]) -> bool {
+    values.windows(2).all(|pair| i64::try_from(i128::from(pair[1]) - i128::from(pair[0])).is_ok())
+}
+
 fn deltas(values: &[i64]) -> Option<Vec<i64>> {
     let mut deltas = Vec::with_capacity(values.len().saturating_sub(1));
     for pair in values.windows(2) {
@@ -602,6 +615,39 @@ fn runs(values: &[i64]) -> (Vec<i64>, Vec<i64>) {
 /// Sorted rather than in order of first appearance, because an ordered dictionary is what lets a
 /// range predicate become a code range instead of a code set, per section 6.7, and because the
 /// codes of a clustered column then run in order and delta encode.
+/// How many distinct values there are and which one occurs most often, from one sort.
+///
+/// Both questions are about the histogram of the chunk and neither needs the histogram itself, so
+/// one sorted copy and one walk over it answers both. They used to be two functions that each sorted
+/// their own copy and threw it away, which is a chunk sorted twice on every chunk at every level of
+/// the cascade before a single candidate has been encoded.
+///
+/// No hash map, because the sort is what makes the walk a scan of equal runs, and a hash map would
+/// pay a lookup per value to learn the same thing.
+fn spread_of(values: &[i64]) -> (usize, Option<(i64, usize)>) {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mut distinct = 0;
+    let mut best: Option<(i64, usize)> = None;
+    let mut index = 0;
+    while index < sorted.len() {
+        let value = sorted[index];
+        let mut end = index;
+        while end < sorted.len() && sorted[end] == value {
+            end += 1;
+        }
+        distinct += 1;
+        let count = end - index;
+        if best.is_none_or(|(_, seen)| count > seen) {
+            best = Some((value, count));
+        }
+        index = end;
+    }
+    (distinct, best)
+}
+
+/// The distinct values in sorted order, for the same reason the string dictionary is sorted: an
+/// ordered dictionary turns a range predicate into a code range rather than a code set.
 fn distinct_values(values: &[i64]) -> Vec<i64> {
     let mut distinct = values.to_vec();
     distinct.sort_unstable();
@@ -609,6 +655,15 @@ fn distinct_values(values: &[i64]) -> Vec<i64> {
     distinct
 }
 
+/// Where each value sits in the dictionary.
+///
+/// The string side builds its dictionary and its codes together from one sort of a permutation,
+/// because the alternative there is a copy of every value onto the heap and a `memcmp` per level of
+/// a binary search per row. This side was changed to match and it measured slower, so it was changed
+/// back. An integer dictionary only exists when the distinct count is at most half the row count, so
+/// the search is over something small and cache resident, the comparison is one integer rather than
+/// a string, and carrying the source index through the sort means sorting a padded sixteen byte pair
+/// instead of an eight byte value. The search is cheaper than the wider sort.
 fn codes_over(values: &[i64], dictionary: &[i64]) -> Vec<i64> {
     values
         .iter()
@@ -618,28 +673,6 @@ fn codes_over(values: &[i64], dictionary: &[i64]) -> Vec<i64> {
                 .expect("the dictionary is the distinct values of this chunk") as i64
         })
         .collect()
-}
-
-/// The most frequent value and how often it occurs, found without a hash map because the caller
-/// only asks when the column is already suspected of being nearly constant.
-fn dominant_value(values: &[i64]) -> Option<(i64, usize)> {
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    let mut best: Option<(i64, usize)> = None;
-    let mut index = 0;
-    while index < sorted.len() {
-        let value = sorted[index];
-        let mut end = index;
-        while end < sorted.len() && sorted[end] == value {
-            end += 1;
-        }
-        let count = end - index;
-        if best.is_none_or(|(_, seen)| count > seen) {
-            best = Some((value, count));
-        }
-        index = end;
-    }
-    best
 }
 
 fn check_count(actual: usize, expected: usize) -> Result<()> {
@@ -700,6 +733,39 @@ mod tests {
             self.0 ^= self.0 << 17;
             self.0
         }
+    }
+
+    #[test]
+    fn the_dictionary_is_sorted_and_the_codes_point_back_at_the_values() {
+        let values = vec![30i64, 10, 30, 20, 10, -5];
+        let dictionary = distinct_values(&values);
+        let codes = codes_over(&values, &dictionary);
+        assert_eq!(dictionary, vec![-5, 10, 20, 30]);
+        assert_eq!(codes, vec![3, 1, 3, 2, 1, 0]);
+        for (code, value) in codes.iter().zip(&values) {
+            assert_eq!(dictionary[*code as usize], *value);
+        }
+    }
+
+    #[test]
+    fn one_sort_gives_the_distinct_count_and_the_most_frequent_value() {
+        let values = vec![7i64, 7, 7, 1, 2, 2];
+        assert_eq!(spread_of(&values), (3, Some((7, 3))));
+        assert_eq!(spread_of(&[]), (0, None));
+        assert_eq!(spread_of(&[9]), (1, Some((9, 1))));
+
+        // A tie goes to the value that sorts first, which is arbitrary but has to be stable,
+        // because Sparse writes the dominant value into the chunk and the size depends on it.
+        assert_eq!(spread_of(&[4i64, 4, 8, 8]), (2, Some((4, 2))));
+    }
+
+    #[test]
+    fn deltas_that_do_not_fit_are_refused_before_they_are_built() {
+        assert!(deltas_fit(&[1i64, 2, 3]));
+        assert!(deltas_fit(&[i64::MAX, i64::MAX]));
+        assert!(!deltas_fit(&[i64::MIN, i64::MAX]));
+        assert_eq!(deltas_fit(&[i64::MIN, i64::MAX]), deltas(&[i64::MIN, i64::MAX]).is_some());
+        assert_eq!(deltas_fit(&[1i64, 2, 3]), deltas(&[1i64, 2, 3]).is_some());
     }
 
     #[test]
