@@ -32,7 +32,7 @@ use rudb_common::{Cancel, Memory, Result};
 use rudb_functions::TableFunction;
 use rudb_metrics::{Counters, Report};
 use rudb_pipeline::{Source, Watched};
-use rudb_plan::{Node, NodeRef, Plan, Shape, Slice};
+use rudb_plan::{Node, NodeRef, Plan, Shape, Slice, seams_of};
 use rudb_seam::Settings;
 
 use crate::adapt::{Broken, Fed, Paired, Pulled, Streamed};
@@ -41,6 +41,7 @@ use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join};
 use crate::operator::Operator;
+use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
 use crate::sort::Sort;
@@ -136,12 +137,6 @@ struct Building<'a, 'b> {
 }
 
 impl<'a> Building<'a, '_> {
-    /// The counters for one operator, registered with the report.
-    ///
-    /// Everything built here is marked as a reference implementation, because at tier 0 everything
-    /// built here is one. That is not a placeholder: the marker is what stops a number measured
-    /// against the simplest correct version of an operator from being quoted as if it came from the
-    /// fast one, and it comes off an operator on the day that operator gets a second tier.
     /// The id of the operator holding the side of this node that has to finish first.
     ///
     /// # Panics
@@ -151,12 +146,37 @@ impl<'a> Building<'a, '_> {
         self.shape.gathered(node).expect("a node with two inputs has a second operator")
     }
 
-    fn watch(&self, id: u32, pipeline: u32, kind: &str, detail: Option<&str>) -> Arc<Counters> {
-        let counters = Counters::new(id, pipeline, kind).reference();
-        let counters = match detail {
-            Some(detail) => counters.detailed(detail),
-            None => counters,
-        };
+    /// The counters for one operator, registered with the report.
+    ///
+    /// The row records what this operator picked at each seam it sits on, which is `seams_of` on
+    /// its plan node crossed with what is registered and what the statement pinned. That is the
+    /// same three things `EXPLAIN` puts its reference marker from, and it is read here rather than
+    /// asserted here for a reason worth writing down: this used to mark every operator as a
+    /// reference implementation unconditionally, so every ClickBench run said 41 of 41 operators
+    /// ran the slow path no matter what had actually run, and the fold that reported it was read as
+    /// if it meant something.
+    ///
+    /// An operator that sits on no registered seam records nothing and stays marked as a reference,
+    /// because there is one implementation of it and that one is the obvious correct one. The
+    /// marker comes off by itself on the day a seam under it has something else registered and
+    /// chosen, with nothing to remember to change here.
+    fn watch(
+        &self,
+        node: NodeRef,
+        id: u32,
+        pipeline: u32,
+        kind: &str,
+        detail: Option<&str>,
+    ) -> Arc<Counters> {
+        let mut counters = Counters::new(id, pipeline, kind);
+        if let Some(detail) = detail {
+            counters = counters.detailed(detail);
+        }
+        for seam in seams_of(self.plan.node(node)) {
+            if let Some(running) = registries().running(*seam, self.seams) {
+                counters = counters.chose(seam.name(), &running.name, running.is_reference);
+            }
+        }
         self.report.watch(counters)
     }
 
@@ -179,7 +199,7 @@ impl<'a> Building<'a, '_> {
         let schema = aggregate.schema().clone();
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
-        let counters = self.watch(id, pipeline, "Aggregate", None);
+        let counters = self.watch(reference, id, pipeline, "Aggregate", None);
         let made = Arc::clone(&counters);
         let driver = self.report.driving(pipeline);
         Ok(Box::new(Broken::new(
@@ -206,24 +226,31 @@ impl<'a> Building<'a, '_> {
                 );
                 let scan = Scan::new(plan, self.catalog.table(&name)?, index, columns)?;
                 let schema = scan.schema().clone();
-                let counters = self.watch(id, pipeline, "Scan", Some(plan.string(table)));
+                let counters =
+                    self.watch(reference, id, pipeline, "Scan", Some(plan.string(table)));
                 pulled(Watched::new(scan, counters), schema)
             }
             Node::Dummy => {
                 let dummy = Dummy::new();
                 let schema = dummy.schema().clone();
-                pulled(Watched::new(dummy, self.watch(id, pipeline, "Dummy", None)), schema)
+                pulled(
+                    Watched::new(dummy, self.watch(reference, id, pipeline, "Dummy", None)),
+                    schema,
+                )
             }
             Node::Values { index, columns, rows } => {
                 let values = Values::new(plan, index, columns, rows)?;
                 let schema = values.schema().clone();
-                pulled(Watched::new(values, self.watch(id, pipeline, "Values", None)), schema)
+                pulled(
+                    Watched::new(values, self.watch(reference, id, pipeline, "Values", None)),
+                    schema,
+                )
             }
             Node::TableFunction { index, function, args, options, settings, columns } => {
                 let name = plan.string(function);
                 match TableFunction::lookup(name) {
                     Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
-                        let counters = self.watch(id, pipeline, "FileScan", Some(name));
+                        let counters = self.watch(reference, id, pipeline, "FileScan", Some(name));
                         let scan =
                             FileScan::new(plan, index, function, args, options, settings, columns)?
                                 .watched(counters.clone());
@@ -233,13 +260,13 @@ impl<'a> Building<'a, '_> {
                     Some(TableFunction::RudbStrategies) => {
                         let table = Strategies::new(plan, index, columns)?;
                         let schema = table.schema().clone();
-                        let counters = self.watch(id, pipeline, "Strategies", None);
+                        let counters = self.watch(reference, id, pipeline, "Strategies", None);
                         pulled(Watched::new(table, counters), schema)
                     }
                     _ => {
                         let series = Series::new(plan, index, name, args)?;
                         let schema = series.schema().clone();
-                        let counters = self.watch(id, pipeline, "Series", Some(name));
+                        let counters = self.watch(reference, id, pipeline, "Series", Some(name));
                         pulled(Watched::new(series, counters), schema)
                     }
                 }
@@ -248,14 +275,14 @@ impl<'a> Building<'a, '_> {
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let filter = Filter::new(plan, reference, predicate, &schema, self.seams)?;
-                let counters = self.watch(id, pipeline, "Filter", None);
+                let counters = self.watch(reference, id, pipeline, "Filter", None);
                 Box::new(Streamed::new(input, Watched::new(filter, counters), schema))
             }
             Node::Project { input, index, exprs, names } => {
                 let input = self.node(input)?;
                 let project = Project::new(plan, input.schema(), index, exprs, names)?;
                 let schema = project.schema().clone();
-                let counters = self.watch(id, pipeline, "Project", None);
+                let counters = self.watch(reference, id, pipeline, "Project", None);
                 Box::new(Streamed::new(input, Watched::new(project, counters), schema))
             }
             Node::Aggregate { input, index, groups, aggregates } => {
@@ -265,7 +292,7 @@ impl<'a> Building<'a, '_> {
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let (sort, out) = Sort::new(plan, &schema, keys, memory)?;
-                let counters = self.watch(id, pipeline, "Sort", None);
+                let counters = self.watch(reference, id, pipeline, "Sort", None);
                 let made = Arc::clone(&counters);
                 let driver = self.report.driving(pipeline);
                 Box::new(Broken::new(
@@ -292,14 +319,14 @@ impl<'a> Building<'a, '_> {
                 };
                 let schema = input.schema().clone();
                 let limit = Limit::new(count, offset);
-                let counters = self.watch(id, pipeline, "Limit", None);
+                let counters = self.watch(reference, id, pipeline, "Limit", None);
                 Box::new(Streamed::new(input, Watched::new(limit, counters), schema))
             }
             Node::TopN { input, keys, count, offset } => {
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
-                let counters = self.watch(id, pipeline, "TopN", None);
+                let counters = self.watch(reference, id, pipeline, "TopN", None);
                 let made = Arc::clone(&counters);
                 let driver = self.report.driving(pipeline);
                 Box::new(Broken::new(input, Watched::new(top, counters), driver, out, made, schema))
@@ -308,7 +335,7 @@ impl<'a> Building<'a, '_> {
                 let input = self.node(input)?;
                 let schema = input.schema().clone();
                 let (distinct, out) = Distinct::new(plan, &schema, on, memory)?;
-                let counters = self.watch(id, pipeline, "Distinct", None);
+                let counters = self.watch(reference, id, pipeline, "Distinct", None);
                 let made = Arc::clone(&counters);
                 let driver = self.report.driving(pipeline);
                 Box::new(Broken::new(
@@ -335,8 +362,8 @@ impl<'a> Building<'a, '_> {
                 let (join, out) =
                     Join::new(plan, left.schema(), side, kind, conditions, self.cancel, memory);
                 let schema = join.schema().clone();
-                let kept = self.watch(gather_id, gathering, "Gather", None);
-                let counters = self.watch(id, pipeline, "Join", None);
+                let kept = self.watch(reference, gather_id, gathering, "Gather", None);
+                let counters = self.watch(reference, id, pipeline, "Join", None);
                 let made = Arc::clone(&counters);
                 Box::new(Paired::new(
                     right,
@@ -362,8 +389,8 @@ impl<'a> Building<'a, '_> {
                 let (keep, kept) = Keep::new(memory);
                 let cross = CrossProduct::new(left.schema(), right.schema(), kept);
                 let schema = cross.schema().clone();
-                let held = self.watch(keep_id, aside, "Keep", None);
-                let counters = self.watch(id, pipeline, "CrossProduct", None);
+                let held = self.watch(reference, keep_id, aside, "Keep", None);
+                let counters = self.watch(reference, id, pipeline, "CrossProduct", None);
                 Box::new(Fed::new(
                     right,
                     Watched::new(keep, held),
@@ -381,8 +408,8 @@ impl<'a> Building<'a, '_> {
                 let (gather, gathered) = Gather::new(memory);
                 let (setop, out) = SetOp::new(left.schema(), gathered, kind, all, index, memory);
                 let schema = setop.schema().clone();
-                let kept = self.watch(gather_id, counting, "Gather", None);
-                let counters = self.watch(id, pipeline, "SetOp", None);
+                let kept = self.watch(reference, gather_id, counting, "Gather", None);
+                let counters = self.watch(reference, id, pipeline, "SetOp", None);
                 let made = Arc::clone(&counters);
                 Box::new(Paired::new(
                     right,

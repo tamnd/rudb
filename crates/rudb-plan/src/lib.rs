@@ -65,11 +65,13 @@ mod node;
 mod parse;
 mod plan;
 mod print;
+mod seams;
 mod shape;
 
 pub use expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
 pub use node::{JoinKind, Node, SetOpKind};
 pub use plan::Plan;
+pub use seams::seams_of;
 pub use shape::{ROOT, Shape};
 
 /// A reference to an expression in [`Plan`]'s expression arena.

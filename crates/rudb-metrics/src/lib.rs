@@ -87,8 +87,8 @@ mod warn;
 pub use clock::{Span, thread_cpu_ns};
 pub use counters::Counters;
 pub use document::{
-    Blocked, Document, Engine, Machine, Memory, Operator, Outcome, Pipeline, Query, Resource,
-    Settings, Strategy, Timing,
+    Blocked, Document, Engine, Implementation, Machine, Memory, Operator, Outcome, Pipeline, Query,
+    Resource, Settings, Strategy, Timing,
 };
 pub use driver::{Driver, Running};
 pub use report::Report;

@@ -276,6 +276,7 @@ name = "rudb-plan"
 version = "0.3.5"
 dependencies = [
  "rudb-common",
+ "rudb-seam",
 ]
 
 [[package]]
