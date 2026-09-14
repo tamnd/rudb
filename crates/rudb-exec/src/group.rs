@@ -1233,6 +1233,13 @@ impl Sink for Aggregate<'_> {
     /// Turning that table into rows happens in `finalize` and not here, because here is per instance
     /// and there is one table's worth of answer however many instances there were. That is a change
     /// from when a second instance was refused and one combine was the end of everything.
+    ///
+    /// The lock is held across the merge and not just across the swap, so two instances never merge
+    /// at the same time. That is on purpose for now: merging two tables into one at once needs the
+    /// kept table split into partitions that a thread can take one at a time, which is #510, and
+    /// without that a second merger would be probing a table the first one is inserting into. What
+    /// the parallel driver gives this today is overlap with the fold rather than with another merge,
+    /// since an instance that finishes early now merges while the others are still reading rows.
     fn combine(&self, local: Building) -> Result<()> {
         if let Some(error) = local.failure {
             return Err(error);

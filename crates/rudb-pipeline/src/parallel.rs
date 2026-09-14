@@ -20,12 +20,12 @@
 //! [`Query::run`](https://docs.rs/rudb-exec) still takes them one at a time and the dependency edges
 //! are what would decide which may overlap.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rudb_common::{Cancel, Error, Result};
 use rudb_metrics::Span;
 
-use crate::pipeline::{Locals, Pipeline};
+use crate::pipeline::Pipeline;
 use crate::serial::{Stop, instance, run_serial};
 
 /// Run a pipeline on `degree` threads and combine what they produced.
@@ -53,15 +53,16 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, degree: usize) -> 
     }
 
     let stop = Stop::default();
+    let failed = AtomicBool::new(false);
     let spent = AtomicU64::new(0);
-    let mut done: Vec<Result<Locals>> = Vec::with_capacity(degree);
+    let mut done: Vec<Result<()>> = Vec::with_capacity(degree);
 
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(degree - 1);
         for _ in 1..degree {
             handles.push(scope.spawn(|| {
                 let measured = Span::start();
-                let ran = one(pipeline, cancel, &stop);
+                let ran = one(pipeline, cancel, &stop, &failed);
                 let (_, cpu) = measured.stop();
                 spent.fetch_add(cpu, Ordering::Relaxed);
                 ran
@@ -69,21 +70,17 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, degree: usize) -> 
         }
         // The thread that asked runs an instance too, rather than waiting on the ones it started.
         // A degree of two that keeps one thread idle is not a degree of two.
-        done.push(one(pipeline, cancel, &stop));
+        done.push(one(pipeline, cancel, &stop, &failed));
         for handle in handles {
             done.push(handle.join().unwrap_or_else(|_| Err(panicked())));
         }
     });
 
-    let mut locals = Vec::with_capacity(done.len());
     let mut failure = None;
     for finished in done {
-        match finished {
-            Ok(local) => locals.push(local),
-            Err(error) => {
-                if failure.is_none() {
-                    failure = Some(error);
-                }
+        if let Err(error) = finished {
+            if failure.is_none() {
+                failure = Some(error);
             }
         }
     }
@@ -91,26 +88,50 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, degree: usize) -> 
         return Err(error);
     }
 
-    // After every instance, never during. An operator merging a second instance's state while a
-    // third is still filling its own would be reading half of an answer, and the combine is where
-    // a hash aggregate does the work that makes a wrong `SUM` hard to notice.
-    for local in locals {
-        pipeline.sink().combine_state(local.sink)?;
-    }
     pipeline.sink().finalize_state()?;
     Ok(spent.load(Ordering::Relaxed))
 }
 
 /// One instance, with its own local state, asking the others to stop if it fails.
-fn one(pipeline: &Pipeline<'_>, cancel: &Cancel, stop: &Stop) -> Result<Locals> {
+///
+/// The combine happens here, on the thread that filled the state, rather than back in the caller
+/// once every thread has joined. What that buys is the merge: a hash aggregate combining thirty two
+/// instances one after another on one thread is thirty two table merges in a row, and on a group by
+/// with several hundred thousand groups that is most of the query. Combining where the state was
+/// built lets an operator put two instances together while a third pair is being put together
+/// beside it, and the aggregate does exactly that.
+///
+/// It is safe for the same reason [`Sink::combine`](crate::Sink::combine) taking its state by value
+/// is safe. A local state belongs to one instance and nothing else reads it, so combining one while
+/// another is still being filled touches nothing the other thread can see. What the combines share
+/// is the operator's own global state, and an operator that said it would run as more than one
+/// instance already has to guard that.
+///
+/// An instance that fails does not combine, and neither does one that finishes after another
+/// instance has already failed. That is what `failed` is for, and it is a second flag rather than
+/// the stop flag because stopping is not always a failure: a sink that has seen everything it wants
+/// asks the others to stop too, and those instances still have to hand over what they built. Not
+/// combining after a failure is partly to save the work, since a merge of two large tables is not
+/// cheap and the query is already over, and partly so that the error a caller gets is the one that
+/// ended the query rather than whatever a half filled state ran into on the way out.
+///
+/// An instance that fails while combining reports it the same way. The others may have combined
+/// already and that is fine, because the query answers with the error and nothing reads what they
+/// built. `finalize` is what turns a sink's state into an answer and it is not called at all when
+/// anything failed.
+fn one(pipeline: &Pipeline<'_>, cancel: &Cancel, stop: &Stop, failed: &AtomicBool) -> Result<()> {
     let mut locals = pipeline.locals();
-    match instance(pipeline, cancel, stop, &mut locals) {
-        Ok(()) => Ok(locals),
-        Err(error) => {
-            stop.ask();
-            Err(error)
-        }
+    let ran = match instance(pipeline, cancel, stop, &mut locals) {
+        Ok(()) if failed.load(Ordering::Relaxed) => return Ok(()),
+        Ok(()) => pipeline.sink().combine_state(locals.sink),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = ran {
+        failed.store(true, Ordering::Relaxed);
+        stop.ask();
+        return Err(error);
     }
+    Ok(())
 }
 
 /// What a thread that panicked is reported as.
