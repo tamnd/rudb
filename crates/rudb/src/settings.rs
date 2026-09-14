@@ -146,9 +146,11 @@ impl Settings {
                     Some(value) => text_of(value),
                 };
                 // Checked here rather than when a query builds its context, because the statement
-                // that named a pass nobody has is the statement that should fail.
-                rudb_opt::pass::Context::without(&text)?;
-                *self.disabled.write().unwrap_or_else(|held| held.into_inner()) = text;
+                // that named a pass nobody has is the statement that should fail. What is kept is
+                // what was understood rather than what was written, which is what the binary reads
+                // back and so what `SELECT current_setting('disabled_optimizers')` has to say.
+                let tidy = rudb_opt::pass::Context::tidy(&text)?;
+                *self.disabled.write().unwrap_or_else(|held| held.into_inner()) = tidy;
             }
             "memory_limit" => {
                 let limit = match value {
