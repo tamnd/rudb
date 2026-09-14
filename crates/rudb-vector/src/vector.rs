@@ -436,13 +436,20 @@ impl Vector {
     /// them out of the handle and copies if anybody else is still reading them. Nothing that shares
     /// a dictionary builds a stacked one, so the two paths do not meet in practice.
     ///
+    /// The range check takes the highest code rather than stopping at the first bad one. Stopping
+    /// early sounds cheaper and is not, because a loop that can exit anywhere cannot be vectorized
+    /// and a running maximum can, and the only run that would have exited early is the one about to
+    /// fail the query anyway. Every other run reads the whole of `codes` either way. It was 5.2
+    /// percent of a ClickBench scan as a `find`.
+    ///
     /// # Errors
     ///
     /// If any code is past the end of the value vector.
     pub fn dictionary_over(codes: Vec<u32>, values: Arc<Vector>) -> Result<Self> {
-        if let Some(&bad) = codes.iter().find(|&&code| code as usize >= values.len()) {
+        let highest = codes.iter().copied().fold(0, u32::max);
+        if !codes.is_empty() && highest as usize >= values.len() {
             return Err(Error::internal(format!(
-                "dictionary code {bad} is past the end of a {} value dictionary",
+                "dictionary code {highest} is past the end of a {} value dictionary",
                 values.len()
             )));
         }
@@ -2486,6 +2493,12 @@ mod tests {
         // entire M3 design has to be careful about.
         let values = integers(&[1, 2]);
         assert!(Vector::dictionary(vec![0, 2], values).is_err());
+        // The check runs on the highest code rather than the first bad one, so it has to say that
+        // no codes at all is fine even when there are no values for them to point at either.
+        let empty = Vector::dictionary(Vec::new(), integers(&[])).expect("no codes, no values");
+        assert_eq!(empty.len(), 0);
+        // And a code of zero against an empty dictionary is still past the end.
+        assert!(Vector::dictionary(vec![0], integers(&[])).is_err());
     }
 
     #[test]
