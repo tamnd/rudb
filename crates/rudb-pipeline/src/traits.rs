@@ -19,6 +19,26 @@ pub trait Source: Send + Sync + fmt::Debug {
     /// Called concurrently from every thread running this pipeline.
     fn morsel(&self) -> Option<Morsel>;
 
+    /// How many morsels there are in total, when the source knows before it starts.
+    ///
+    /// This is how a small query stays on one thread. A scheduler that spins up thirty two
+    /// instances to read one chunk has spent more on starting them than the query was ever going to
+    /// cost, and the per query floor is one of the four axes the project is measured on. A source
+    /// that already knows how much work it has is the honest place to ask, because there is no
+    /// estimate involved: a table scan has a chunk count, a Parquet file has row groups, and a
+    /// finished operator's buffer has however many chunks it built.
+    ///
+    /// An answer that is a little wrong costs a little. Too high and an instance starts, asks for a
+    /// morsel, is told there are none and stops. Too low and some of the work runs on fewer threads
+    /// than it could have. So a source with several files may count the first one and assume the
+    /// rest look like it rather than opening all of them to be sure.
+    ///
+    /// `None` means the source does not know, and the scheduler takes that as permission to use
+    /// every thread it has, because a source that cannot count its work is not thereby small.
+    fn morsels(&self) -> Option<usize> {
+        None
+    }
+
     /// Fill `out` from `morsel`, overwriting whatever was in it.
     ///
     /// May be called many times for one morsel, returning [`Progress::More`] until the morsel is
@@ -53,6 +73,21 @@ pub trait Stream: Send + Sync + fmt::Debug {
     /// Fresh local state for one instance.
     fn local(&self) -> Self::Local;
 
+    /// Whether more than one instance of this operator may run at once.
+    ///
+    /// Almost every stream says yes and means it, because a stream transforms the chunk it is given
+    /// and its local state is scratch space. The one that says no is a `LIMIT`, whose local state
+    /// is how much of the limit it has used up, and four instances each allowed ten rows is forty
+    /// rows and a wrong answer rather than a slow one.
+    ///
+    /// An operator in a pipeline that says no puts the whole pipeline on one thread. That is the
+    /// blunt version on purpose: the alternative is a shared counter and a scan that stops when
+    /// somebody else's rows filled the limit, which is a correct `LIMIT` and also a `LIMIT` whose
+    /// answer depends on which thread got there first.
+    fn parallel(&self) -> bool {
+        true
+    }
+
     /// Transform `chunk` in place.
     ///
     /// May shrink it through its selection and may replace its columns. May not grow it past the
@@ -82,6 +117,22 @@ pub trait Sink: Send + Sync + fmt::Debug {
 
     /// Fresh local state for one instance.
     fn local(&self) -> Self::Local;
+
+    /// Whether more than one instance of this operator may run at once.
+    ///
+    /// A sink that says yes is promising two things. That [`Sink::combine`] puts two instances
+    /// together into the same state one instance would have reached, which is what the method is
+    /// for. And that the order of what it finally produces does not depend on which instance got
+    /// which morsel, either because it decides the order itself or because nothing downstream can
+    /// tell.
+    ///
+    /// The second promise is the one that is easy to break. A sink that keeps its input as it
+    /// arrives, for an operator above it to replay in that order, produces a different answer at
+    /// two threads than at one, and the difference is an order nobody asked for rather than an
+    /// error. Those say no until there is a reason and a mechanism for them to say yes.
+    fn parallel(&self) -> bool {
+        true
+    }
 
     /// Told which morsel the chunks that come next were read from.
     ///

@@ -37,6 +37,8 @@ struct Shared {
     finished: AtomicBool,
     capacity: Option<usize>,
     buffer: BufferId,
+    /// Whether this root restores the source order, kept out here so that asking costs no lock.
+    ordered: bool,
 }
 
 /// Everything the root holds under one lock.
@@ -149,10 +151,11 @@ fn build(
     order: Option<Order>,
 ) -> (RootSink, RootReader) {
     let shared = Arc::new(Shared {
-        queue: Mutex::new(Queue { ready: VecDeque::new(), order }),
         finished: AtomicBool::new(false),
         capacity,
         buffer,
+        ordered: order.is_some(),
+        queue: Mutex::new(Queue { ready: VecDeque::new(), order }),
     });
     (RootSink { shared: Arc::clone(&shared) }, RootReader { shared })
 }
@@ -162,6 +165,18 @@ impl Sink for RootSink {
 
     fn local(&self) -> RootPlace {
         RootPlace::default()
+    }
+
+    /// Only the form that restores the source order.
+    ///
+    /// A plain root hands chunks on as they arrive, which on one thread is the order the morsels
+    /// were cut and on several is the order the threads happened to finish. The engine reaches for
+    /// the plain form when the operator below has already decided the order, and that operator is a
+    /// sort or a top n whose finished rows are read back out of a buffer. Reading that buffer on
+    /// four threads and handing the chunks on as they land would take the order the sort just
+    /// produced and shuffle it, which is a wrong answer arrived at by going faster.
+    fn parallel(&self) -> bool {
+        self.shared.ordered
     }
 
     fn at(&self, morsel: &Morsel, place: &mut RootPlace) -> Result<()> {
