@@ -39,6 +39,14 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     db.query(sql).unwrap().rows().collect()
 }
 
+/// The first column of a row, for a test that sorts a grouped answer by a `BIGINT` key.
+fn first_key(row: &[Value]) -> i64 {
+    match row[0] {
+        Value::BigInt(key) => key,
+        ref other => panic!("the key of this query is a BIGINT, not {other:?}"),
+    }
+}
+
 /// The message a query fails with.
 fn failure(db: &Database, sql: &str) -> String {
     db.query(sql).unwrap_err().message().to_string()
@@ -2904,6 +2912,31 @@ fn a_grouped_count_distinct_over_many_groups_on_eight_threads_agrees_with_one_th
     assert_eq!(sorted, one);
 }
 
+/// A group by on eight threads whose budget makes it spill on the way to partitioning.
+///
+/// The awkward case, which is an instance whose own table runs out of room before it has handed its
+/// groups to the partitions. Its spill file covers every partition, so it cannot be scattered, and
+/// what happens instead is that the groups still in the table are scattered and the file is read
+/// back and spread row by row. Both halves have to land, and each row has to land once.
+///
+/// Three hundred megabytes against a million groups is the same boundary
+/// `a_group_by_too_large_for_its_budget_spills_rather_than_stopping` sits on, with eight threads
+/// under it so that the instances race for the budget rather than taking it in turn.
+#[test]
+fn a_group_by_that_spills_on_eight_threads_answers_what_it_answers_on_one() {
+    let sql = "SELECT range % 900000 AS k, count(*), sum(range) FROM range(1800000) GROUP BY k";
+    let db = Database::with_config(
+        Config::new().with_memory_limit(300 << 20).with_threads(8).expect("eight threads"),
+    );
+    let answer = db.query(sql).expect("it spills rather than stopping");
+    let mut many: Vec<Vec<Value>> = answer.rows().collect();
+    assert_eq!(many.len(), 900_000);
+    let mut one = rows(&threaded(1), sql);
+    many.sort_by_key(|row| first_key(row));
+    one.sort_by_key(|row| first_key(row));
+    assert_eq!(many, one, "every row landed once whether it went through a spill file or not");
+}
+
 /// The same over a string key, since a partition gathers its keys out of the chunk before folding.
 #[test]
 fn a_group_by_a_string_with_many_groups_on_eight_threads_agrees_with_one_thread() {
@@ -2966,4 +2999,33 @@ fn setting_threads_changes_what_the_next_query_may_use() {
     assert_eq!(metrics.settings.threads, 1);
     let widest = metrics.pipelines.iter().map(|pipeline| pipeline.instances).max().unwrap();
     assert_eq!(widest, 1, "a setting nothing obeys is not a setting");
+}
+
+/// A group by whose instances spill before they partition, so the spill files are handed over too.
+///
+/// The awkward case. An instance that runs out of budget while it still holds its groups to itself
+/// writes the rows it had no room for to a file, and that file covers every partition rather than
+/// one of them. So when the instance does partition, the groups it still holds are scattered and
+/// the file is read back and spread row by row. Both halves have to land, and each row exactly once.
+///
+/// Ten thousand groups is under the threshold, so what tips this instance into partitioning is the
+/// budget rather than the group count, which is the only way to reach the case. The distinct set is
+/// what fills the budget at so few groups: fifty values per group is fifty allocations per group
+/// where a plain count is one counter. Twenty four megabytes is in the middle of the band that
+/// crowds without running out, which on the machine this was written on runs from twelve to thirty
+/// two. A budget outside the band still gives the right answer, it just covers less.
+#[test]
+fn a_group_by_that_spills_before_it_partitions_lands_the_file_and_the_table() {
+    let sql = "SELECT range % 10000 AS k, count(DISTINCT range), count(*), sum(range) \
+               FROM range(500000) GROUP BY k";
+    let db = Database::with_config(
+        Config::new().with_memory_limit(24 << 20).with_threads(8).expect("eight threads"),
+    );
+    let answer = db.query(sql).expect("it spills rather than stopping");
+    let mut many: Vec<Vec<Value>> = answer.rows().collect();
+    assert_eq!(many.len(), 10_000);
+    let mut one = rows(&threaded(1), sql);
+    many.sort_by_key(|row| first_key(row));
+    one.sort_by_key(|row| first_key(row));
+    assert_eq!(many, one, "every row landed once whether it came back from a file or not");
 }
