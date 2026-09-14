@@ -5,6 +5,10 @@
 //! of them is interesting and all of them have a match arm per variant, so a variant added to `Expr`
 //! and forgotten about is a compile error in one file instead of four.
 //!
+//! The same argument applies one level up, to nodes, for the two passes that put a new operator
+//! somewhere other than the top: [`restack`] is the walk and [`replace_children`] is the match arm
+//! per `Node` variant.
+//!
 //! Folding replaces an operand with its value where it has one, filter pushdown replaces a column
 //! reference with whatever the operator below computes that column from, and transitive predicates
 //! replace a column reference with the column an equality says it equals. Everything except that one
@@ -18,9 +22,77 @@
 //!
 //! [`Plan::validate`]: rudb_plan::Plan::validate
 
-use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, Plan, Slice};
+use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 
 use crate::fold::VOLATILE;
+
+/// Rebuilds the tree under `at` bottom up, giving `step` the chance to put something above each node.
+///
+/// A node may only point at a node behind it in the arena, the same rule expressions follow, so a
+/// pass that wants a new operator below an existing one cannot write it in place: the new operator
+/// would be appended after the one that has to read it. What it does instead is rebuild the path
+/// from the node it changed back up to the root, which is what this walk is.
+///
+/// `step` is given a node whose children are already rewritten and hands back either nothing, for a
+/// node it has no opinion about, or whatever should stand in its place. It may append, and what it
+/// appends is behind whatever the caller appends afterwards. `changed` is set when any step fired,
+/// which is how the caller knows whether the root moved.
+pub(crate) fn restack(
+    plan: &mut Plan,
+    at: NodeRef,
+    changed: &mut bool,
+    step: &mut impl FnMut(&mut Plan, NodeRef) -> Option<NodeRef>,
+) -> NodeRef {
+    let children = plan.node(at).children();
+    let rebuilt: Vec<NodeRef> =
+        children.into_iter().flatten().map(|child| restack(plan, child, changed, step)).collect();
+    let mut here = at;
+    if children.into_iter().flatten().zip(&rebuilt).any(|(was, &now)| was != now) {
+        let mut node = plan.node(at).clone();
+        replace_children(&mut node, &rebuilt);
+        here = plan.add_node(node);
+    }
+    match step(plan, here) {
+        Some(above) => {
+            *changed = true;
+            above
+        }
+        None => here,
+    }
+}
+
+/// Points a node at a new set of children, in the order [`Node::children`] hands them back.
+pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
+    match node {
+        Node::Filter { input, .. }
+        | Node::Project { input, .. }
+        | Node::Aggregate { input, .. }
+        | Node::Sort { input, .. }
+        | Node::Limit { input, .. }
+        | Node::TopN { input, .. }
+        | Node::Fetch { input, .. }
+        | Node::Distinct { input, .. } => *input = children[0],
+        Node::Join { left, right, .. }
+        | Node::CrossProduct { left, right }
+        | Node::SetOp { left, right, .. } => {
+            *left = children[0];
+            *right = children[1];
+        }
+        Node::Get { .. } | Node::Dummy | Node::Values { .. } | Node::TableFunction { .. } => {}
+    }
+}
+
+/// A table index no node in the plan is using.
+pub(crate) fn fresh_index(plan: &Plan) -> u32 {
+    let mut next = 0;
+    for at in 0..plan.node_count() {
+        let node = plan.node(u32::try_from(at).unwrap_or(u32::MAX));
+        if let Some(index) = node.table_index() {
+            next = next.max(index + 1);
+        }
+    }
+    next
+}
 
 /// Rewrites the operands of one expression, rebuilding it only if one of them moved.
 ///
