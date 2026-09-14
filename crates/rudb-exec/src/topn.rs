@@ -9,22 +9,18 @@
 //! What has to be held is `count + offset` rows, not `count`, since the rows that are skipped still
 //! have to be found before there is anything to skip them from.
 //!
-//! # Sort and trim rather than a heap
+//! # A sorted bound rather than a heap
 //!
 //! The textbook answer is a binary heap of the bound, pushing every row and popping the worst. This
-//! collects rows until it holds twice the bound, then sorts and keeps the better half. The reason is
-//! stability. `crate::sort` promises that rows tying on every key come out in input order, because a
-//! query that returns a different order on two runs makes a compatibility diff useless, and a heap
-//! does not promise that: sifting moves equal elements past each other. Sorting and truncating keeps
-//! it, since the sort is stable and truncation keeps a prefix, and rows that arrive later are
-//! appended after the survivors so their relative order is the order they came in.
+//! keeps the candidates sorted instead. A row first compares with the worst candidate and is
+//! discarded without materializing its payload when it loses. A winner is inserted after existing
+//! equal keys, which preserves input order for ties the same way the stable full sort does.
 //!
-//! It also costs about the same. Each trim sorts `2n` rows and drops `n`, so a run of `m` rows is
-//! `m / n` sorts of `2n`, which is `O(m log n)` with the same constant a heap would pay on a row
-//! comparison that walks a `Vec<Value>` per key.
-//!
-//! What is held is twice the bound rather than the bound, so that a trim is amortized over `n` rows
-//! rather than run on every row after the first `n`.
+//! Binary search makes the comparison cost `O(m log n)`, as it is for a heap. Inserting moves `n`
+//! small row handles, but only a shrinking share of the input wins after the first `n` rows. The
+//! important saving is that almost every row pays for its key and never becomes a heap-allocated
+//! payload row. A large offset makes those moves expensive, so bounds above 64 keep the batched
+//! sort and trim path until normalized keys make a heap cheap.
 //!
 //! # The shape a sink has
 //!
@@ -48,6 +44,9 @@ use crate::sort::compare;
 
 /// One row in the running: the values of its keys, and the row itself.
 type Sortable = (Vec<Value>, Vec<Value>);
+
+/// Above this bound, moving a sorted candidate array costs more than trimming in batches.
+const SORTED_BOUND: usize = 64;
 
 /// The first rows of an ordering, without holding the rest.
 #[derive(Debug)]
@@ -135,18 +134,26 @@ impl Sink for TopN {
         let mut keys = Vec::with_capacity(self.keys.len());
         self.exprs.evaluate(chunk, &mut local.scratch, &mut keys)?;
         let mut taken = 0;
-        // row at a time: the same layout the sort holds, and 2i (#63) replaces both at once with a
-        // normalized key that is one comparable byte string a row and a payload beside it.
+        // row at a time: the key still has the same Value layout the sort holds, and 2i (#63)
+        // replaces it with one normalized comparable byte string per row.
         for row in 0..chunk.len() {
             let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
-            let values: Vec<Value> = chunk.row(row).collect();
-            taken += rows::footprint(&key) + rows::footprint(&values);
-            local.kept.push((key, values));
+            if self.bound <= SORTED_BOUND {
+                keep(&self.keys, &mut local.kept, key, chunk, row, self.bound, &mut local.failure);
+            } else {
+                let values: Vec<Value> = chunk.row(row).collect();
+                taken += rows::footprint(&key) + rows::footprint(&values);
+                local.kept.push((key, values));
+            }
         }
-        local.charged.grow(taken)?;
-        if local.kept.len() > self.bound.saturating_mul(2) {
-            trim(&self.keys, &mut local.kept, self.bound, &mut local.failure);
+        if self.bound <= SORTED_BOUND {
             recharge(&local.kept, &mut local.charged)?;
+        } else {
+            local.charged.grow(taken)?;
+            if local.kept.len() > self.bound.saturating_mul(2) {
+                trim(&self.keys, &mut local.kept, self.bound, &mut local.failure);
+                recharge(&local.kept, &mut local.charged)?;
+            }
         }
         Ok(Progress::More)
     }
@@ -188,6 +195,31 @@ fn poisoned<T>(_: T) -> Error {
 /// Orders what is held and keeps the first `bound` of it.
 fn trim(keys: &[SortKey], kept: &mut Vec<Sortable>, bound: usize, failure: &mut Option<Error>) {
     kept.sort_by(|left, right| compare(keys, &left.0, &right.0, failure));
+    kept.truncate(bound);
+}
+
+/// Keeps one row when its key belongs in the ordered prefix.
+fn keep(
+    keys: &[SortKey],
+    kept: &mut Vec<Sortable>,
+    key: Vec<Value>,
+    chunk: &Chunk,
+    row: usize,
+    bound: usize,
+    failure: &mut Option<Error>,
+) {
+    if bound == 0 {
+        return;
+    }
+    if kept.len() == bound
+        && compare(keys, &key, &kept[bound - 1].0, failure) != std::cmp::Ordering::Less
+    {
+        return;
+    }
+    let at = kept.partition_point(|candidate| {
+        compare(keys, &candidate.0, &key, failure) != std::cmp::Ordering::Greater
+    });
+    kept.insert(at, (key, chunk.row(row).collect()));
     kept.truncate(bound);
 }
 
