@@ -21,7 +21,8 @@
 //! is built to be asked about. It is asked about once per row, so it matters, and it is not this
 //! change because a set per group is a different shape from a table over the whole input.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::{Accumulator, NOWHERE, is_true, update_scattered};
@@ -100,14 +101,19 @@ fn mark_affine_sums(plan: &Plan, calls: &mut [Call]) {
 /// arrives, which is the whole of the difference between `SELECT count(*) FROM empty` answering
 /// zero and answering nothing.
 ///
-/// # One table per instance, merged at the end
+/// # One table per instance, merged into sixty four
 ///
 /// As a [`Sink`], the table and everything beside it live in the instance rather than in here, which
 /// is where they have to be: a table shared between threads would be a lock per probe. What that
 /// leaves is `combine`, and combining two aggregate instances means merging two tables.
-/// [`Aggregate::merge`] does it, by probing each group of the incoming table against the kept one
-/// and folding the accumulators behind the ones that match, which is the same probe the fold already
-/// does and needed only [`Accumulator::combine`] underneath it.
+///
+/// A query on one thread keeps the one table its one instance built. An aggregate that will see
+/// several instances and holds more groups than the merge is free over spreads each instance's
+/// table over sixty four partitions instead, by the top bits of the hash the table already stored.
+/// A group can then only be in the one partition its hash names, so two instances merging at the
+/// same time are in different tables behind different locks, every group is probed exactly once
+/// however many instances there are, and the answer comes out of sixty four smaller tables rather
+/// than out of one table holding everything. See [`Aggregate::scatter`] and #510.
 ///
 /// A `DISTINCT` call merges too. Each of its groups holds a set of the values already accepted, and
 /// two of those go together by offering the incoming set's values to the kept one and folding in
@@ -116,8 +122,8 @@ fn mark_affine_sums(plan: &Plan, calls: &mut [Call]) {
 ///
 /// One shape is still refused, which is an instance that spilled, because spilling rests on a key
 /// being either finished in a pass or absent from it, and that holds within one instance and not
-/// across two. Radix partitioning is what fixes it, since it puts a whole partition in one thread
-/// and gives the invariant back.
+/// across two. The partitions do not fix that on their own, because a spill file belongs to an
+/// instance rather than to a partition, and making it belong to a partition is what would.
 #[derive(Debug)]
 pub(crate) struct Aggregate<'a> {
     plan: &'a Plan,
@@ -150,8 +156,42 @@ pub(crate) struct Aggregate<'a> {
     memory: Memory,
     /// The chunks the passes have finished, and what they are charged.
     built: Mutex<Built>,
+    /// How many instances have asked for a local state, which is how many threads this is on.
+    ///
+    /// Read when an instance combines, to decide whether it is going to meet another one. Every
+    /// instance asks for its state when it starts and combines when it finishes, so by the time the
+    /// first one finishes this is almost always the whole degree. Almost, because a very short
+    /// pipeline could have a thread finish before another has started, and that is why a wrong
+    /// answer here has to cost speed rather than correctness. It does: a one that should have been
+    /// thirty two puts the first instance in whole and the thirty one after it go through the
+    /// partitions anyway.
+    started: AtomicUsize,
+    /// The partitions the instances merge into, made once, the first time two of them will meet.
+    ///
+    /// Radix partitioning, done at the merge rather than at the fold. A group lives in the partition
+    /// its hash names, so a thread merging its table into partition seven and a thread merging its
+    /// own into partition twelve are touching different tables and different locks, and every group
+    /// is probed exactly once however many instances there are. That is the difference from folding
+    /// them together in a line, which probes a group once per instance, and from folding them in a
+    /// tree, which probes it once per level. See #510.
+    parts: OnceLock<Vec<Mutex<Option<Building>>>>,
     out: Buffered,
 }
+
+/// How many partitions the instances merge into once they are partitioned at all.
+///
+/// A power of two, because the partition of a group is the top bits of its hash. Larger than the
+/// thread count on purpose: a thread that wants a partition another thread is holding waits, and
+/// sixty four ways of missing is better than thirty two. The tables are smaller for it too, which
+/// the probe notices.
+const PARTS: usize = 64;
+
+/// The fewest groups an instance has to hold before partitioning is worth the tables it costs.
+///
+/// Below this the merge is a formality. Sixty four tables and sixty four locks to fold four thousand
+/// groups into is more bookkeeping than merging, and the aggregates in that range are the ones where
+/// the scan is all of the query anyway.
+const PARTITION_FROM: usize = 16_384;
 
 /// What the passes have finished, which is the answer as it is assembled.
 #[derive(Debug)]
@@ -265,6 +305,8 @@ impl<'a> Aggregate<'a> {
                 instances: 0,
                 keeping: None,
             }),
+            started: AtomicUsize::new(0),
+            parts: OnceLock::new(),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -714,9 +756,9 @@ impl<'a> Aggregate<'a> {
     /// An instance that spilled, because spilling rests on a key being either finished in this pass
     /// or absent from it entirely, and that holds within one instance and not across two. A key can
     /// be in one instance's table and in another instance's file at the same time, and the later
-    /// pass over that file would then finish a group that is already finished. Radix partitioning
-    /// is what fixes this, because a partition is finished by one thread and the invariant comes
-    /// back, and that is the next item on the roadmap rather than this one.
+    /// pass over that file would then finish a group that is already finished. The partitions in
+    /// `combine` do not fix that, because a spill file still belongs to the instance that wrote it,
+    /// and it is fixed when a file belongs to a partition instead.
     ///
     /// # Errors
     ///
@@ -762,37 +804,16 @@ impl<'a> Aggregate<'a> {
         } else {
             let types: Vec<LogicalType> =
                 self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
+            let mut run: Vec<usize> = Vec::new();
             for start in (0..found).step_by(VECTOR_SIZE) {
                 let end = (start + VECTOR_SIZE).min(found);
                 let mut keys = Vec::with_capacity(types.len());
                 for (at, ty) in types.iter().enumerate() {
                     keys.push(source.column(at, ty, start..end)?);
                 }
-                // row at a time: the keys came out a column at a time above, so what is left per
-                // group is one probe and the accumulators behind it, which is 2g (#61).
-                for slot in start..end {
-                    let row = slot - start;
-                    let hash = source.hash_of(slot);
-                    let target = match into.table.probe(hash, &keys, row) {
-                        Probe::Found(target) => target,
-                        Probe::Vacant(bucket) => {
-                            // The same cap the fold applies, for the same reason: a limit above an
-                            // unordered group by only ever looks at so many groups, and one that is
-                            // dropped here would have been dropped there.
-                            if self.max_groups.is_some_and(|limit| into.table.len() >= limit) {
-                                continue;
-                            }
-                            let target = into.table.insert(bucket, hash, &keys, row)?;
-                            into.groups = into.table.len();
-                            self.fresh(&mut into.states, &mut into.counts)?;
-                            if self.sets {
-                                self.fresh_seen(&mut into.seen);
-                            }
-                            target
-                        }
-                    };
-                    aside += merge_slot(&mut coming, slot, target, into)?;
-                }
+                run.clear();
+                run.extend(start..end);
+                aside += self.fold_slots(&mut coming, &source, &keys, start, &run, into)?;
             }
         }
         // Before the incoming instance's charge goes back, because the values that moved between
@@ -810,6 +831,162 @@ impl<'a> Aggregate<'a> {
         rows::capacity(into.table.owned(), &mut into.charged_keys, &mut into.scratch)?;
         let now = tables(&into.table, &into.states, &into.counts, &into.seen);
         rows::capacity(now, &mut into.charged, &mut into.containers)
+    }
+
+    /// A run of one table's groups folded into another table, which is the inside of both merges.
+    ///
+    /// `slots` are slots of `source` and `keys` are its key columns for the chunk beginning at
+    /// `start`, so the row a probe reads is the slot less that. Taking the slots as a list rather
+    /// than as a range is what lets the partitioned merge hand over the groups of one partition out
+    /// of a chunk that holds groups of sixty four.
+    ///
+    /// What comes back is what the values that moved between two `DISTINCT` sets own away from
+    /// themselves, which the caller charges against the table it merged into.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the probe, the insert, a fresh state or an accumulator merge reports.
+    fn fold_slots(
+        &self,
+        coming: &mut Folding<'_>,
+        source: &Table,
+        keys: &[Vector],
+        start: usize,
+        slots: &[usize],
+        into: &mut Building,
+    ) -> Result<u64> {
+        let mut aside = 0;
+        // row at a time: the keys came out a column at a time above, so what is left per group is
+        // one probe and the accumulators behind it, which is 2g (#61).
+        for &slot in slots {
+            let row = slot - start;
+            let hash = source.hash_of(slot);
+            let target = match into.table.probe(hash, keys, row) {
+                Probe::Found(target) => target,
+                Probe::Vacant(bucket) => {
+                    // The same cap the fold applies, for the same reason: a limit above an
+                    // unordered group by only ever looks at so many groups, and one that is dropped
+                    // here would have been dropped there.
+                    if self.max_groups.is_some_and(|limit| into.table.len() >= limit) {
+                        continue;
+                    }
+                    let target = into.table.insert(bucket, hash, keys, row)?;
+                    into.groups = into.table.len();
+                    self.fresh(&mut into.states, &mut into.counts)?;
+                    if self.sets {
+                        self.fresh_seen(&mut into.seen);
+                    }
+                    target
+                }
+            };
+            aside += merge_slot(coming, slot, target, into)?;
+        }
+        Ok(aside)
+    }
+
+    /// One instance's table spread over the partitions, which is the merge that runs on N threads.
+    ///
+    /// A group belongs to the partition its hash names, using the top bits of the same hash the
+    /// table stored when the group went in. Two instances merging at once are therefore in different
+    /// tables behind different locks except when they happen to be on the same partition, and the
+    /// one that has to wait waits for the groups of one partition out of one chunk rather than for a
+    /// whole table.
+    ///
+    /// This is the part that makes the merge O(n) rather than O(n log n). Every group of every
+    /// instance is probed exactly once, into the one partition it can be in, so thirty two instances
+    /// of a table holding g groups cost 32g probes spread over sixty four locks. Folding them
+    /// together in a line costs the same 32g but on one thread, and folding them in a tree costs
+    /// about 5 by 16g because a group is probed again at every level. #517 measured the tree and
+    /// #518 took it out.
+    ///
+    /// The partitions are made as they are first used rather than all at once, so an aggregate that
+    /// never reaches one of them never pays for it.
+    ///
+    /// `spin` is where this instance starts going round the partitions. It is the instance's own
+    /// number, so two threads that reach the merge together do not queue on partition zero and then
+    /// on partition one behind each other.
+    ///
+    /// # Errors
+    ///
+    /// [`rudb_common::ErrorCode::NotImplemented`] for an instance that spilled, for the reason on
+    /// [`Aggregate::merge`]. Whatever the probe, the insert or an accumulator merge reports
+    /// otherwise.
+    fn scatter(
+        &self,
+        from: Building,
+        parts: &[Mutex<Option<Building>>],
+        spin: usize,
+    ) -> Result<()> {
+        if from.over.is_some() {
+            return Err(Error::not_implemented(
+                "two instances of an aggregate that spilled, because a key can be in one \
+                 instance's table and in another instance's spill file at once, which the \
+                 partitions do not fix on their own while a spill is still per instance",
+            ));
+        }
+        let Building {
+            scratch,
+            containers,
+            table: source,
+            states: taken,
+            counts: tallies,
+            seen: mut watched,
+            groups: found,
+            ..
+        } = from;
+        let calls = self.calls.len();
+        let distinct: Vec<bool> = self.calls.iter().map(|call| call.distinct).collect();
+        let mut coming = Folding {
+            count_only: self.count_only,
+            calls,
+            distinct: &distinct,
+            taken: &taken,
+            tallies: &tallies,
+            watched: &mut watched,
+        };
+        let types: Vec<LogicalType> =
+            self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
+        let shift = u64::BITS - parts.len().trailing_zeros();
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); parts.len()];
+        for start in (0..found).step_by(VECTOR_SIZE) {
+            let end = (start + VECTOR_SIZE).min(found);
+            let mut keys = Vec::with_capacity(types.len());
+            for (at, ty) in types.iter().enumerate() {
+                keys.push(source.column(at, ty, start..end)?);
+            }
+            for bucket in &mut buckets {
+                bucket.clear();
+            }
+            for slot in start..end {
+                buckets[(source.hash_of(slot) >> shift) as usize].push(slot);
+            }
+            for step in 0..parts.len() {
+                let at = (step + spin) % parts.len();
+                if buckets[at].is_empty() {
+                    continue;
+                }
+                let mut held = parts[at].lock().map_err(poisoned)?;
+                let into = held.get_or_insert_with(|| self.start());
+                let aside =
+                    self.fold_slots(&mut coming, &source, &keys, start, &buckets[at], into)?;
+                // The same charging the one table merge does, once per partition per chunk rather
+                // than once at the end, because the partition goes back behind its lock in between
+                // and the next thread to take it has to find it charged for what it holds.
+                into.containers.grow(aside)?;
+                rows::capacity(into.table.owned(), &mut into.charged_keys, &mut into.scratch)?;
+                let now = tables(&into.table, &into.states, &into.counts, &into.seen);
+                rows::capacity(now, &mut into.charged, &mut into.containers)?;
+            }
+        }
+        // The incoming instance is spent, in the order [`Aggregate::merge`] spends it in and for the
+        // same reason: the merge held both at once and the peak really was the sum.
+        drop(watched);
+        drop(taken);
+        drop(tallies);
+        drop(source);
+        drop(scratch);
+        drop(containers);
+        Ok(())
     }
 
     /// One `DISTINCT` call over a chunk, which is the one shape that still needs a value per row.
@@ -1171,6 +1348,7 @@ impl Sink for Aggregate<'_> {
     type Local = Building;
 
     fn local(&self) -> Building {
+        self.started.fetch_add(1, Ordering::Relaxed);
         self.start()
     }
 
@@ -1184,8 +1362,8 @@ impl Sink for Aggregate<'_> {
     ///
     /// Spilling cannot be asked about here, because whether a pass runs out of room is not known
     /// until it has. An instance that spills is refused by `merge` and the query fails rather than
-    /// answering wrongly. Radix partitioning is what fixes that, and it is the next item on the
-    /// roadmap.
+    /// answering wrongly. A spill file that belonged to a partition rather than to an instance is
+    /// what fixes that.
     fn parallel(&self) -> bool {
         self.max_groups.is_none()
     }
@@ -1234,23 +1412,49 @@ impl Sink for Aggregate<'_> {
     /// and there is one table's worth of answer however many instances there were. That is a change
     /// from when a second instance was refused and one combine was the end of everything.
     ///
-    /// The lock is held across the merge and not just across the swap, so two instances never merge
-    /// at the same time. That is on purpose for now: merging two tables into one at once needs the
-    /// kept table split into partitions that a thread can take one at a time, which is #510, and
-    /// without that a second merger would be probing a table the first one is inserting into. What
-    /// the parallel driver gives this today is overlap with the fold rather than with another merge,
-    /// since an instance that finishes early now merges while the others are still reading rows.
+    /// # One table or sixty four
+    ///
+    /// A query on one thread keeps the one table it built and does nothing else, which is what the
+    /// kept slot above is for and why a serial aggregate pays nothing for any of this.
+    ///
+    /// An aggregate that is going to see several instances and is large enough to be worth it goes
+    /// through the partitions instead. Each instance spreads its own table over them by the top
+    /// bits of the hash, so two instances merging at the same time are in different tables behind
+    /// different locks, and a group is probed once rather than once per instance. Whichever
+    /// instance finds the decision unmade makes it, under this lock so that it is made once, and it
+    /// carries whatever an earlier instance left in the kept slot into the partitions first.
+    ///
+    /// The decision is made on what the first instance to finish is holding, because that is the
+    /// only measurement available before the merging starts and all the instances read from the
+    /// same source, so they hold about the same number of groups as each other.
     fn combine(&self, local: Building) -> Result<()> {
         if let Some(error) = local.failure {
             return Err(error);
         }
-        let mut built = self.built.lock().map_err(poisoned)?;
-        built.instances += 1;
-        match &mut built.keeping {
-            None => built.keeping = Some(local),
-            Some(kept) => self.merge(local, kept)?,
+        let (seeded, spin) = {
+            let mut built = self.built.lock().map_err(poisoned)?;
+            built.instances += 1;
+            let spin = built.instances;
+            let split = self.parts.get().is_some()
+                || (self.started.load(Ordering::Relaxed) > 1
+                    && !self.alone
+                    && local.over.is_none()
+                    && local.groups >= PARTITION_FROM);
+            if !split {
+                match &mut built.keeping {
+                    None => built.keeping = Some(local),
+                    Some(kept) => self.merge(local, kept)?,
+                }
+                return Ok(());
+            }
+            self.parts.get_or_init(|| (0..PARTS).map(|_| Mutex::new(None)).collect());
+            (built.keeping.take(), spin)
+        };
+        let parts = self.parts.get().map_or([].as_slice(), Vec::as_slice);
+        if let Some(seeded) = seeded {
+            self.scatter(seeded, parts, 0)?;
         }
-        Ok(())
+        self.scatter(local, parts, spin)
     }
 
     /// Every instance has combined, so the one table left becomes the answer.
@@ -1272,6 +1476,15 @@ impl Sink for Aggregate<'_> {
             while let Some(mut file) = left {
                 left = self.again(&mut file, chunks, held)?;
             }
+        }
+        // A partition at a time, which is what the partitioning bought beyond the merge: the rows
+        // come out of sixty four smaller tables rather than one large one, and no table holding
+        // every group is ever built. Nothing spilled into a partition, so there is no later pass to
+        // run over one.
+        for part in self.parts.get().map_or([].as_slice(), Vec::as_slice) {
+            let Some(part) = part.lock().map_err(poisoned)?.take() else { continue };
+            let Built { chunks, held, .. } = &mut *built;
+            self.finish(part, chunks, held)?;
         }
         let chunks = std::mem::take(&mut built.chunks);
         drop(built);
