@@ -45,6 +45,23 @@ fn catalog() -> Catalog {
     catalog
         .create_table(empty, vec![Field::new("x", LogicalType::Integer)])
         .expect("a fresh table");
+    let holes = QualifiedName::new("memory", "main", "holes");
+    catalog
+        .create_table(
+            holes.clone(),
+            vec![Field::new("x", LogicalType::Integer), Field::new("y", LogicalType::Integer)],
+        )
+        .expect("a fresh table");
+    catalog
+        .table_mut(&holes)
+        .expect("the table just created")
+        .rows_mut()
+        .append_rows(&[
+            vec![Value::Null, Value::Integer(1)],
+            vec![Value::Null, Value::Integer(1)],
+            vec![Value::Integer(7), Value::Integer(2)],
+        ])
+        .expect("three rows");
     let words = QualifiedName::new("memory", "main", "words");
     catalog
         .create_table(words.clone(), vec![Field::new("s", LogicalType::Varchar)])
@@ -213,6 +230,21 @@ fn nulls_group_together() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], vec![text("a"), Value::BigInt(2)]);
     assert_eq!(rows[1], vec![Value::Null, Value::BigInt(1)]);
+}
+
+/// Two nulls are still one group after a filter has been under the aggregate, which is #540. A
+/// filter that drops a row hands the rows it kept on as dictionary vectors, those carry their nulls
+/// in the values their codes point at, and the table read the mask at the wrong level and gave every
+/// null row a group of its own. A filter that keeps every row does not narrow the chunk at all, so
+/// the third row here is what makes the test a test.
+#[test]
+fn nulls_group_together_after_a_filter_has_dropped_a_row() {
+    let rows = run(concat!(
+        "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]\n",
+        "  Filter (#0.1::INTEGER = 1::INTEGER)::BOOLEAN\n",
+        "    Get memory.main.holes AS holes #0 [x::INTEGER, y::INTEGER]"
+    ));
+    assert_eq!(rows, vec![vec![Value::Null, Value::BigInt(2)]]);
 }
 
 #[test]

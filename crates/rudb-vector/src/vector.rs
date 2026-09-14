@@ -839,10 +839,40 @@ impl Vector {
         size_of::<Self>() + self.validity.footprint() + body
     }
 
-    /// Which of the values are not null.
+    /// Which of the values are not null, at this level and no deeper.
+    ///
+    /// This is not the same question as [`Self::is_null_at`] and the difference has already cost
+    /// one wrong answer. A dictionary and a run length vector keep their nulls in the values they
+    /// point at rather than in a mask of their own, so both are built with every row marked present
+    /// here and a row whose value is null reads as valid. A caller that wants to know whether a row
+    /// is null wants the other one. A caller that wants the mask of a flat column, to copy it or to
+    /// count it, wants this one.
     #[must_use]
     pub fn validity(&self) -> &Validity {
         &self.validity
+    }
+
+    /// Whether the row at `index` is null, in whichever form the vector is in.
+    ///
+    /// Reads through a dictionary or a run to the value it stands for, which is where those two
+    /// forms keep their nulls, and answers from the mask for every other form. A row past the end
+    /// is null, the same answer [`Self::value_at`] gives it.
+    #[must_use]
+    pub fn is_null_at(&self, index: usize) -> bool {
+        if index >= self.len || !self.validity.is_valid(index) {
+            return true;
+        }
+        match &self.body {
+            Body::Dictionary { codes, values } => match codes.get(index) {
+                Some(&code) => values.is_null_at(code as usize),
+                None => true,
+            },
+            Body::Runs { ends, values } => match run_holding(ends, index) {
+                Some(run) => values.is_null_at(run),
+                None => true,
+            },
+            _ => false,
+        }
     }
 
     /// Which physical form this vector is in.
@@ -2826,6 +2856,51 @@ mod tests {
         assert_eq!(outer.value_at(0), Value::Null);
         assert_eq!(outer.value_at(1), Value::Integer(3));
         assert_eq!(outer.value_at(2), Value::Integer(1));
+    }
+
+    /// The difference between the two questions about nulls, which a group by got wrong. A filtered
+    /// chunk is dictionary vectors, those are built with every row marked present at their own
+    /// level, and the nulls are down in the values. So the mask says the row has a value and the
+    /// row does not.
+    #[test]
+    fn a_null_behind_a_dictionary_reads_as_null_even_though_the_mask_says_otherwise() {
+        let values = Vector::flat(LogicalType::Integer, Data::Int32(vec![0, 7].into()))
+            .unwrap()
+            .with_validity(Validity::from_iter(2, |index| index != 0));
+        let vector = Vector::dictionary(vec![0, 1, 0], values).unwrap();
+        assert!(vector.validity().is_valid(0), "the mask at this level says present");
+        assert!(vector.is_null_at(0));
+        assert!(!vector.is_null_at(1));
+        assert!(vector.is_null_at(2));
+        assert!(vector.is_null_at(3), "a row past the end is null");
+    }
+
+    /// The same for runs, which are built the same way and keep their nulls in the same place.
+    #[test]
+    fn a_null_inside_a_run_reads_as_null_even_though_the_mask_says_otherwise() {
+        let values = Vector::flat(LogicalType::Integer, Data::Int32(vec![0, 7].into()))
+            .unwrap()
+            .with_validity(Validity::from_iter(2, |index| index != 0));
+        let vector = Vector::runs(vec![2, 3], values).unwrap();
+        assert!(vector.validity().is_valid(0));
+        assert!(vector.is_null_at(0));
+        assert!(vector.is_null_at(1));
+        assert!(!vector.is_null_at(2));
+    }
+
+    /// Every other form keeps its nulls in its own mask, so the two answers agree there.
+    #[test]
+    fn the_forms_that_hold_their_own_nulls_answer_the_same_either_way() {
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(vec![0, 7].into()))
+            .unwrap()
+            .with_validity(Validity::from_iter(2, |index| index != 0));
+        let constant = Vector::constant(LogicalType::Integer, Value::Null, 2);
+        let sequence = Vector::sequence(10, 2, 2);
+        for vector in [flat, constant, sequence] {
+            for row in 0..vector.len() {
+                assert_eq!(vector.is_null_at(row), !vector.validity().is_valid(row));
+            }
+        }
     }
 
     #[test]
