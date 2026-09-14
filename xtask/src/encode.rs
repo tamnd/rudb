@@ -40,6 +40,7 @@ use std::time::Instant;
 
 use rudb::Database;
 use rudb_common::{LogicalType, Value};
+use rudb_encoding::chooser::{Chooser, EXHAUSTIVE, Sampled};
 use rudb_encoding::{integer, string};
 
 use crate::timing::{build_line, percentile, rebuild};
@@ -86,6 +87,22 @@ struct Column {
 }
 
 /// What one candidate cost across every chunk of every column.
+/// One column under both choosers, which is what the ablation is.
+struct Pair {
+    name: String,
+    kind: &'static str,
+    raw: usize,
+    reference: Side,
+    alternative: Side,
+}
+
+/// What one chooser did to one column.
+struct Side {
+    bytes: usize,
+    nanos: f64,
+    shape: String,
+}
+
 #[derive(Default)]
 struct Candidate {
     /// How many chunks offered it.
@@ -147,6 +164,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     }
 
     let all = args.iter().any(|arg| arg == "--all");
+    let ablate = args.iter().any(|arg| arg == "--ablate");
     let threads = threads(args)?;
     let path = match given(args) {
         Some(given) => PathBuf::from(given),
@@ -169,6 +187,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     // The per column table does not, so in that mode a column is measured and dropped, which is
     // what keeps a hundred and five columns of a big file inside a laptop.
     let mut held = Vec::new();
+    let mut pairs = Vec::new();
     let mut columns = Vec::new();
     let mut candidates: BTreeMap<(&'static str, &'static str), Candidate> = BTreeMap::new();
     let mut skipped = Vec::new();
@@ -186,6 +205,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             held.push(values);
             continue;
         }
+        if ablate {
+            pairs.push(ablate_column(name, &values)?);
+            continue;
+        }
         columns.push(measure(name, &values)?);
         attribute(&values, &mut candidates)?;
     }
@@ -195,6 +218,14 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             return Err(format!("nothing in {} could be encoded", path.display()));
         }
         return scaling(&path, &held, threads);
+    }
+    if ablate {
+        if pairs.is_empty() {
+            return Err(format!("nothing in {} could be encoded", path.display()));
+        }
+        pairs.sort_by(|a, b| b.reference.nanos.total_cmp(&a.reference.nanos));
+        ablation(&path, &pairs, &skipped, all);
+        return Ok(());
     }
     if columns.is_empty() {
         return Err(format!("nothing in {} could be encoded", path.display()));
@@ -526,17 +557,73 @@ fn chunks(rows: usize) -> usize {
     rows.div_ceil(ROW_GROUP)
 }
 
-/// One chunk of a column, through the chooser.
+/// One chunk of a column, through the exhaustive chooser, which is what `encode` has always meant.
 fn encode(values: &Values, chunk: usize) -> Result<Vec<u8>, String> {
+    encode_using(values, chunk, &EXHAUSTIVE)
+}
+
+/// One chunk of a column, through a chooser somebody named.
+fn encode_using(values: &Values, chunk: usize, chooser: &dyn Chooser) -> Result<Vec<u8>, String> {
     match values {
         Values::Text(all) => {
             let slice: Vec<&[u8]> = cut(all, chunk).iter().map(Vec::as_slice).collect();
-            string::encode(&slice).map_err(|e| e.message().to_string())
+            string::encode_with(&slice, chooser).map_err(|e| e.message().to_string())
         }
         Values::Numbers(all) => {
-            integer::encode(cut(all, chunk)).map_err(|e| e.message().to_string())
+            integer::encode_with(cut(all, chunk), chooser).map_err(|e| e.message().to_string())
         }
     }
+}
+
+/// One column under one chooser: how long it took and how big it came out.
+///
+/// [`REPEATS`] passes and the median, same as [`measure`], because the whole point of the ablation
+/// is a ratio of two times and a ratio of two noisy numbers is noisier than either.
+fn side(name: &str, values: &Values, chooser: &dyn Chooser) -> Result<Side, String> {
+    let mut passes = Vec::with_capacity(REPEATS);
+    let mut bytes = 0;
+    let mut shape = String::new();
+    for pass in 0..REPEATS {
+        let start = Instant::now();
+        let mut total = 0;
+        let mut first = String::new();
+        for chunk in 0..chunks(values.len()) {
+            let encoded = encode_using(values, chunk, chooser)?;
+            if first.is_empty() {
+                first = describe(values, &encoded)?;
+            }
+            total += encoded.len();
+        }
+        passes.push(start.elapsed().as_nanos() as f64);
+        if pass == 0 {
+            bytes = total;
+            shape = first;
+        } else if total != bytes {
+            return Err(format!(
+                "{name} under {} encoded to {total} bytes and then to {bytes}",
+                chooser.name()
+            ));
+        }
+    }
+    passes.sort_by(f64::total_cmp);
+    Ok(Side { bytes, nanos: percentile(&passes, 50), shape })
+}
+
+/// One column under both choosers, which is the whole of what the ablation measures.
+///
+/// The sampled side runs first. If it ran second it would find the column in cache with the
+/// exhaustive side's work still warm, and the thing being measured is which one is cheaper.
+fn ablate_column(name: &str, values: &Values) -> Result<Pair, String> {
+    let sampled = Sampled::new();
+    let alternative = side(name, values, &sampled)?;
+    let reference = side(name, values, &EXHAUSTIVE)?;
+    Ok(Pair {
+        name: name.to_string(),
+        kind: values.kind(),
+        raw: values.raw(),
+        reference,
+        alternative,
+    })
 }
 
 /// One chunk of a column, through one candidate. `None` when that candidate does not apply.
@@ -690,6 +777,113 @@ fn report(
     println!("  raw bytes for a string column are the value bytes and for an integer column are");
     println!("    eight a value, which is what the encoder is handed rather than what the Parquet");
     println!("    file holds. The ratio is against that and not against the file on disk.");
+}
+
+/// What the sampled chooser saves and what it gives up, per column and over the file.
+fn ablation(path: &Path, pairs: &[Pair], skipped: &[String], all: bool) {
+    let raw: usize = pairs.iter().map(|pair| pair.raw).sum();
+    let slow: f64 = pairs.iter().map(|pair| pair.reference.nanos).sum();
+    let fast: f64 = pairs.iter().map(|pair| pair.alternative.nanos).sum();
+    let big: usize = pairs.iter().map(|pair| pair.reference.bytes).sum();
+    let small: usize = pairs.iter().map(|pair| pair.alternative.bytes).sum();
+
+    println!();
+    println!("what sampling the chooser buys, over {}", path.display());
+    println!("  {}", build_line());
+    println!("  {ROW_GROUP} values a chunk, {REPEATS} passes each side, one thread");
+    println!("  the sample is {} values, in windows of {}", Sampled::new().size(), 1024);
+    println!();
+    println!(
+        "{:<24} {:>8} {:>10} {:>10} {:>8} {:>11} {:>11} {:>7}",
+        "column", "kind", "slow MiB/s", "fast MiB/s", "faster", "slow bytes", "fast bytes", "cost"
+    );
+    let mut changed = 0;
+    for pair in pairs.iter().take(if all { pairs.len() } else { SHOWN }) {
+        if pair.reference.shape != pair.alternative.shape {
+            changed += 1;
+        }
+        println!(
+            "{:<24} {:>8} {:>10.1} {:>10.1} {:>7.2}x {:>11} {:>11} {:>6.2}%",
+            cap(&pair.name, 24),
+            pair.kind,
+            rate(pair.raw, pair.reference.nanos),
+            rate(pair.raw, pair.alternative.nanos),
+            speedup(pair.reference.nanos, pair.alternative.nanos),
+            pair.reference.bytes,
+            pair.alternative.bytes,
+            cost(pair.reference.bytes, pair.alternative.bytes)
+        );
+    }
+    if !all && pairs.len() > SHOWN {
+        println!("{:<24} {} more, --all prints them", "...", pairs.len() - SHOWN);
+    }
+    println!(
+        "{:<24} {:>8} {:>10.1} {:>10.1} {:>7.2}x {:>11} {:>11} {:>6.2}%",
+        "the whole file",
+        "",
+        rate(raw, slow),
+        rate(raw, fast),
+        speedup(slow, fast),
+        big,
+        small,
+        cost(big, small)
+    );
+    println!();
+    println!(
+        "  ratio is {:.2} to one exhaustive and {:.2} to one sampled, over {:.2} raw MiB",
+        ratio(raw, big),
+        ratio(raw, small),
+        mib(raw)
+    );
+    println!(
+        "  the two choosers picked a different top level shape on {changed} of the {} columns \
+         printed",
+        pairs.len().min(if all { pairs.len() } else { SHOWN })
+    );
+    if !skipped.is_empty() {
+        println!();
+        println!("not encoded, because neither encoder takes the type: {}", skipped.join(", "));
+    }
+
+    println!();
+    println!("caveats");
+    println!("  rule two: every MiB/s here is the median of {REPEATS} passes. The two sides are");
+    println!(
+        "    measured in the same process over the same values in memory, so the ratio between"
+    );
+    println!("    them is the number to trust and the absolute rates are the ones to compare only");
+    println!("    against each other.");
+    println!("  rule seven: one machine and one file. Which candidates apply depends on the data,");
+    println!(
+        "    so a file with different columns in it gives a different answer and not a scaled"
+    );
+    println!("    version of this one.");
+    println!("  rule ten: the end to end number is F2's first exit criterion, ClickBench hits in");
+    println!("    under 252 seconds. The faster column is what the encoder's share of that budget");
+    println!("    divides by and the cost column is what it is paid for in file size.");
+    println!(
+        "  cost is how much bigger the sampled output is, so zero means the sample agreed with"
+    );
+    println!("    the full search on every chunk and a negative number means it did better, which");
+    println!("    happens because the exhaustive chooser is greedy per level and not globally");
+    println!("    optimal over the cascade.");
+    println!(
+        "  the sampled side runs first on each column so the exhaustive side cannot be the one"
+    );
+    println!("    that pays for the cache misses.");
+}
+
+/// How many times faster the second is than the first.
+fn speedup(slow: f64, fast: f64) -> f64 {
+    if fast == 0.0 { 0.0 } else { slow / fast }
+}
+
+/// How much bigger the sampled output is, as a percentage of the exhaustive one.
+fn cost(reference: usize, alternative: usize) -> f64 {
+    if reference == 0 {
+        return 0.0;
+    }
+    (alternative as f64 - reference as f64) / reference as f64 * 100.0
 }
 
 fn mib(bytes: usize) -> f64 {

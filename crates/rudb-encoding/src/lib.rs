@@ -7,11 +7,14 @@
 //! them from section 6.3, which is where the ratios actually are. [`fsst`] is one string against
 //! one symbol table and [`string`] is a column of them, which is where most of ClickBench `hits`
 //! lives. [`sketch`] is how a write path answers a question about a column it cannot hold in
-//! memory, which is where every decision in sections 6.4 and 6.5 starts.
+//! memory, which is where every decision in sections 6.4 and 6.5 starts. [`chooser`] is the search
+//! over all of that, held apart from the encodings themselves so that how long the writer is willing
+//! to spend deciding is a knob rather than a property of the format.
 
 #![forbid(unsafe_code)]
 
 pub mod bitpack;
+pub mod chooser;
 pub mod integer;
 pub mod multi;
 mod reader;
