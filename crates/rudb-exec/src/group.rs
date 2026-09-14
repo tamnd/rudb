@@ -45,6 +45,38 @@ struct Call {
     distinct: bool,
     filter: Option<ExprRef>,
     returns: LogicalType,
+    affine: Option<(usize, i64)>,
+}
+
+/// Marks `sum(SMALLINT + INTEGER literal)` calls that can reuse an earlier sum of the same column.
+fn mark_affine_sums(plan: &Plan, calls: &mut [Call]) {
+    for at in 0..calls.len() {
+        if calls[at].name != "sum" || calls[at].distinct || calls[at].filter.is_some() {
+            continue;
+        }
+        let [argument] = calls[at].args.as_slice() else { continue };
+        let Expr::Function { name, args } = *plan.expr(*argument) else { continue };
+        if plan.string(name) != "+" || plan.expr_type(*argument) != &LogicalType::Integer {
+            continue;
+        }
+        let [left, right] = plan.expr_list(args) else { continue };
+        let Expr::Cast { input: base, try_cast: false } = *plan.expr(*left) else { continue };
+        if plan.expr_type(base) != &LogicalType::SmallInt {
+            continue;
+        }
+        let Expr::Constant(value) = *plan.expr(*right) else { continue };
+        let Value::Integer(offset) = *plan.value(value) else { continue };
+        let source = (0..at).find(|&source| {
+            calls[source].name == "sum"
+                && !calls[source].distinct
+                && calls[source].filter.is_none()
+                && calls[source].returns == LogicalType::HugeInt
+                && calls[source].args.as_slice() == [base]
+        });
+        if let Some(source) = source {
+            calls[at].affine = Some((source, i64::from(offset)));
+        }
+    }
 }
 
 /// A grouped or ungrouped aggregation.
@@ -151,7 +183,11 @@ impl<'a> Aggregate<'a> {
                 distinct,
                 filter,
                 returns: plan.expr_type(reference).clone(),
+                affine: None,
             });
+        }
+        if groups.is_empty() {
+            mark_affine_sums(plan, &mut calls);
         }
         let mut fields = Vec::with_capacity(groups.len() + calls.len());
         for (at, &group) in groups.iter().enumerate() {
@@ -166,7 +202,9 @@ impl<'a> Aggregate<'a> {
         let schema = Schema::numbered(fields, index);
         let mut inputs = keys.clone();
         for call in &calls {
-            inputs.extend_from_slice(&call.args);
+            if call.affine.is_none() {
+                inputs.extend_from_slice(&call.args);
+            }
             inputs.extend(call.filter);
         }
         let inputs = Prepared::shared(plan, &inputs, &input_schema)?;
@@ -222,7 +260,11 @@ impl<'a> Aggregate<'a> {
         let mut arguments = Vec::with_capacity(self.calls.len());
         let mut filters = Vec::with_capacity(self.calls.len());
         for call in &self.calls {
-            arguments.push(values.by_ref().take(call.args.len()).collect());
+            arguments.push(if call.affine.is_none() {
+                values.by_ref().take(call.args.len()).collect()
+            } else {
+                Vec::new()
+            });
             filters
                 .push(call.filter.map(|_| values.next().expect("a prepared filter has a value")));
         }
@@ -312,6 +354,7 @@ impl<'a> Aggregate<'a> {
             // scatter consumes, and the same slots with a call's `FILTER` folded into them.
             slots: Vec::new(),
             kept: Vec::new(),
+            affine_rows: vec![0; calls],
             // The file the rows that do not fit go to, made the first time the budget says the
             // table has to stop growing and `None` for as long as it does not. One row of it, kept
             // between rows so that writing does not go to the allocator per row.
@@ -349,6 +392,7 @@ impl<'a> Aggregate<'a> {
             hashes,
             slots,
             kept,
+            affine_rows,
             over,
             away,
             failure: _,
@@ -359,8 +403,17 @@ impl<'a> Aggregate<'a> {
         let Rows { keys, arguments, filters, rows: length } = seen_rows;
         let mut aside = 0;
         for at in 0..calls {
+            if self.calls[at].affine.is_some() {
+                continue;
+            }
             if self.by_vector[at] {
                 states[at].update_run(&arguments[at], *length)?;
+                if self.calls.iter().any(|call| call.affine.is_some_and(|(source, _)| source == at))
+                {
+                    affine_rows[at] +=
+                        i64::try_from(arguments[at][0].validity().count_valid(*length))
+                            .map_err(|_| Error::out_of_range("too many rows in an aggregate"))?;
+                }
             }
         }
         if alone && self.every {
@@ -416,7 +469,7 @@ impl<'a> Aggregate<'a> {
         // pass, with the aggregate and the layout of its argument matched on once for the chunk
         // rather than once per row, and with no `Value` built at all on the paths the kernel covers.
         for (at, call) in self.calls.iter().enumerate() {
-            if self.by_vector[at] {
+            if self.by_vector[at] || call.affine.is_some() {
                 continue;
             }
             if call.distinct {
@@ -478,7 +531,17 @@ impl<'a> Aggregate<'a> {
         chunks: &mut Vec<Chunk>,
         held: &mut Reservation,
     ) -> Result<Option<Spill>> {
-        let Building { mut scratch, mut containers, table, states, seen, groups, over, .. } = local;
+        let Building {
+            mut scratch,
+            mut containers,
+            table,
+            states,
+            seen,
+            groups,
+            affine_rows,
+            over,
+            ..
+        } = local;
         let calls = self.calls.len();
         // The distinct sets are finished with and the table and the accumulators are not, so the
         // charge for the sets goes here rather than after the chunks are built, which is part of
@@ -525,7 +588,12 @@ impl<'a> Aggregate<'a> {
                 let mut taken = 0;
                 results.clear();
                 for slot in start..end {
-                    let value = states[slot * calls + at].finish()?;
+                    let value = match self.calls[at].affine {
+                        Some((source, offset)) => {
+                            states[slot * calls + source].finish_offset(offset, affine_rows[source])
+                        }
+                        None => states[slot * calls + at].finish(),
+                    }?;
                     taken += rows::owned(&value);
                     results.push(value);
                 }
@@ -690,6 +758,7 @@ pub(crate) struct Building {
     hashes: Vec<u64>,
     slots: Vec<usize>,
     kept: Vec<usize>,
+    affine_rows: Vec<i64>,
     over: Option<Spill>,
     away: Vec<Value>,
     /// What went wrong before any row arrived, which there is nowhere else to report from.

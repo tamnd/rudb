@@ -502,6 +502,15 @@ impl Accumulator {
             State::Extreme(held) => Ok(held.as_deref().cloned().unwrap_or(Value::Null)),
         }
     }
+
+    /// Finishes an integer sum after adding one constant for every nonnull input row.
+    pub fn finish_offset(&self, offset: i64, rows: i64) -> Result<Value> {
+        let Value::HugeInt(total) = self.finish()? else {
+            return Ok(Value::Null);
+        };
+        let added = i128::from(offset).checked_mul(i128::from(rows)).ok_or_else(overflowed)?;
+        Ok(Value::HugeInt(total.checked_add(added).ok_or_else(overflowed)?))
+    }
 }
 
 /// Folds one vector into many accumulators, each row into the one its slot points at.
