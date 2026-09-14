@@ -30,7 +30,7 @@ use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
-use crate::key::{Key, RowSet};
+use crate::key::{BigIntSet, Key, RowSet};
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
@@ -371,7 +371,7 @@ impl<'a> Aggregate<'a> {
                 local.failure = Some(error);
             }
             if self.sets {
-                local.seen.resize_with(calls, RowSet::default);
+                self.fresh_seen(&mut local.seen);
             }
         }
         local
@@ -460,7 +460,7 @@ impl<'a> Aggregate<'a> {
                         *groups = table.len();
                         self.fresh(states)?;
                         if self.sets {
-                            seen.resize_with(seen.len() + calls, RowSet::default);
+                            self.fresh_seen(seen);
                         }
                         slot
                     }
@@ -639,7 +639,7 @@ impl<'a> Aggregate<'a> {
     fn distinct(
         &self,
         states: &mut [Accumulator],
-        seen: &mut [RowSet],
+        seen: &mut [DistinctSet],
         rows: &Rows,
         slots: &[usize],
         at: usize,
@@ -658,13 +658,34 @@ impl<'a> Aggregate<'a> {
                     continue;
                 }
             }
+            if let (DistinctSet::BigInt(set), [column]) =
+                (&mut seen[slot * calls + at], rows.arguments[at].as_slice())
+            {
+                match column.value_at(row) {
+                    Value::Null => continue,
+                    Value::BigInt(value) => {
+                        if set.insert(value) {
+                            aside += width_of(size_of::<i64>() * 2);
+                            states[slot * calls + at].update(&[Value::BigInt(value)])?;
+                        }
+                        continue;
+                    }
+                    value => {
+                        return Err(Error::internal(format!(
+                            "a BIGINT distinct set was given {value:?}"
+                        )));
+                    }
+                }
+            }
             let args = &mut given[at];
             fill(args, &rows.arguments[at], row);
             // Asked before it is added, because the answer is usually that it is there already and
             // a set that is asked never takes a copy of what it was asked about. A
             // `count(DISTINCT x)` over a million rows and a thousand values copies a thousand times
             // rather than a million.
-            let set = &mut seen[slot * calls + at];
+            let DistinctSet::Row(set) = &mut seen[slot * calls + at] else {
+                return Err(Error::internal("a distinct set did not match its argument"));
+            };
             if set.contains(args) {
                 continue;
             }
@@ -688,6 +709,19 @@ impl<'a> Aggregate<'a> {
             states.push(Accumulator::new(&call.name, &call.returns)?);
         }
         Ok(())
+    }
+
+    fn fresh_seen(&self, seen: &mut Vec<DistinctSet>) {
+        for call in &self.calls {
+            let big_int = call.distinct
+                && call.args.len() == 1
+                && self.plan.expr_type(call.args[0]) == &LogicalType::BigInt;
+            if big_int {
+                seen.push(DistinctSet::BigInt(BigIntSet::default()));
+            } else {
+                seen.push(DistinctSet::Row(RowSet::default()));
+            }
+        }
     }
 
     /// The columns a spilled row is made of, in the order [`put_away`] writes them.
@@ -754,7 +788,7 @@ pub(crate) struct Building {
     charged_keys: u64,
     table: Table,
     states: Vec<Accumulator>,
-    seen: Vec<RowSet>,
+    seen: Vec<DistinctSet>,
     groups: usize,
     given: Vec<Key>,
     hashes: Vec<u64>,
@@ -778,6 +812,13 @@ struct Spilled<'s> {
     types: Vec<LogicalType>,
     row: Vec<Value>,
     columns: Vec<Vec<Value>>,
+}
+
+/// Values already accepted by one `DISTINCT` aggregate in one group.
+#[derive(Debug)]
+enum DistinctSet {
+    BigInt(BigIntSet),
+    Row(RowSet),
 }
 
 impl<'s> Spilled<'s> {
@@ -1019,13 +1060,13 @@ impl Sink for Aggregate<'_> {
 /// An accumulator is charged as its own width and not as what it holds. That is a knowing undercount
 /// and it is the one left: what a `list()` or a `string_agg()` holds grows with the input and there
 /// is no way to ask one how large it has become.
-fn tables(table: &Table, states: &Vec<Accumulator>, seen: &Vec<RowSet>) -> u64 {
+fn tables(table: &Table, states: &Vec<Accumulator>, seen: &Vec<DistinctSet>) -> u64 {
     let width = |count: usize, size: usize| {
         u64::try_from(count).unwrap_or(u64::MAX).saturating_mul(width_of(size))
     };
     table.footprint()
         + width(states.capacity(), size_of::<Accumulator>())
-        + width(seen.capacity(), size_of::<RowSet>())
+        + width(seen.capacity(), size_of::<DistinctSet>())
 }
 
 /// A `size_of` in the width the budget is counted in.
