@@ -145,6 +145,8 @@ fn usage() {
     println!("           fixture, and --all prints every column rather than the slowest twenty");
     println!("           --threads <n> prints the scaling sweep instead, one chunk of one column");
     println!("           at a time, which is the unit F2's parallel write path would hand out");
+    println!("           --ablate runs the sampled chooser against the exhaustive one and prints");
+    println!("           what the sample saves in time and what it gives up in size");
     println!("  bench <suite>          the whole comparison, against every engine on this machine");
     println!("                         builds rudb and the harness, then runs the suite. needs a");
     println!("                         tamnd/rudb-bench checkout beside this one, or");
