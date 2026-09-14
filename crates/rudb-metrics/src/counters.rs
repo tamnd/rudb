@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rudb_common::{Cause, Tally};
+use rudb_common::{Cause, Spent, Stage, Tally};
 
 use crate::document::{Memory, Operator};
 
@@ -39,6 +39,12 @@ pub struct Counters {
     /// A fixed array rather than a map, because the shim adds to this around every operator call
     /// and a map would be a hash per call to store a number that is almost always zero.
     fallbacks: [AtomicU64; Cause::ALL.len()],
+    /// One clock and one byte count per [`Stage`], in the order [`Stage::ALL`] lists them.
+    ///
+    /// Only a scan fills these in. Everything else reports a row of zeroes, which costs nothing to
+    /// carry and means the split is there the day another reader starts charging itself.
+    stages: [AtomicU64; Stage::ALL.len()],
+    stage_bytes: [AtomicU64; Stage::ALL.len()],
 }
 
 impl Counters {
@@ -62,6 +68,8 @@ impl Counters {
             reserved: AtomicU64::new(0),
             high_water: AtomicU64::new(0),
             fallbacks: [const { AtomicU64::new(0) }; Cause::ALL.len()],
+            stages: [const { AtomicU64::new(0) }; Stage::ALL.len()],
+            stage_bytes: [const { AtomicU64::new(0) }; Stage::ALL.len()],
         }
     }
 
@@ -132,6 +140,22 @@ impl Counters {
         }
     }
 
+    /// Time spent in each stage of a read inside one call of this operator.
+    ///
+    /// The same shape as [`Self::fell_back`] and for the same reason: the shim takes a reading on
+    /// either side of the call and hands over the difference, so what lands here is what this
+    /// operator did on this thread. An operator that reads nothing hands over a row of zeroes and
+    /// returns immediately.
+    pub fn spent_reading(&self, spent: Spent) {
+        if spent.is_empty() {
+            return;
+        }
+        for (stage, nanos, bytes) in spent.taken() {
+            self.stages[stage.slot()].fetch_add(nanos, Ordering::Relaxed);
+            self.stage_bytes[stage.slot()].fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
     /// What this operator holds now, which also moves the high water mark when it is a new most.
     ///
     /// Reported rather than added, because memory is a level and not a total. An operator that
@@ -160,6 +184,11 @@ impl Counters {
             let seen = self.fallbacks[cause.slot()].load(Ordering::Relaxed);
             operator.fallbacks.add(Tally::of(cause, seen));
         }
+        for stage in Stage::ALL {
+            let nanos = self.stages[stage.slot()].load(Ordering::Relaxed);
+            let bytes = self.stage_bytes[stage.slot()].load(Ordering::Relaxed);
+            operator.stages.add(Spent::of(stage, nanos, bytes));
+        }
         operator.memory = Memory {
             reserved: self.reserved.load(Ordering::Relaxed),
             high_water: self.high_water.load(Ordering::Relaxed),
@@ -173,7 +202,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use rudb_common::{Cause, Tally};
+    use rudb_common::{Cause, Spent, Stage, Tally};
 
     use super::Counters;
 
@@ -196,6 +225,29 @@ mod tests {
     #[test]
     fn an_operator_that_never_gave_up_reports_nothing_rather_than_a_row_of_zeroes() {
         assert!(Counters::new(0, 0, "Scan").snapshot().fallbacks.is_empty());
+    }
+
+    #[test]
+    fn the_stages_of_a_read_add_up_across_the_calls_and_come_out_split() {
+        let counters = Counters::new(0, 0, "FileScan");
+        counters.spent_reading(Spent::of(Stage::Read, 400, 65_536));
+        counters.spent_reading(Spent::none());
+        let mut both = Spent::of(Stage::Read, 100, 16_384);
+        both.add(Spent::of(Stage::Decompress, 9_000, 262_144));
+        counters.spent_reading(both);
+        let operator = counters.snapshot();
+        assert_eq!(operator.stages.nanos(Stage::Read), 500);
+        assert_eq!(operator.stages.bytes(Stage::Read), 81_920);
+        assert_eq!(operator.stages.nanos(Stage::Decompress), 9_000);
+        assert_eq!(operator.stages.nanos(Stage::Decode), 0);
+        assert_eq!(operator.stages.total(), 9_500);
+        // The whole point of the split, which is that the answer is a stage rather than a scan.
+        assert_eq!(operator.stages.worst(), Some((Stage::Decompress, 9_000)));
+    }
+
+    #[test]
+    fn an_operator_that_reads_nothing_keeps_the_stages_out_of_the_document() {
+        assert!(Counters::new(0, 0, "Filter").snapshot().stages.is_empty());
     }
 
     #[test]

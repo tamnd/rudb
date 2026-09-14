@@ -9,7 +9,7 @@
 //! purpose: this is the shape the numbers are reported in, and the code that produces them is the
 //! instrumentation shim that sits around the push operators.
 
-use rudb_common::Tally;
+use rudb_common::{Spent, Tally};
 
 use crate::SCHEMA;
 use crate::json::Writer;
@@ -192,6 +192,18 @@ impl Document {
                             out.count(cause.name(), times);
                         }
                     });
+                    if !operator.stages.is_empty() {
+                        out.key("stages");
+                        out.object(|out| {
+                            for (stage, nanos, bytes) in operator.stages.taken() {
+                                out.key(stage.name());
+                                out.object(|out| {
+                                    out.count("wall_ns", nanos);
+                                    out.count("bytes", bytes);
+                                });
+                            }
+                        });
+                    }
                     out.key("memory");
                     out.object(|out| {
                         out.count("reserved", operator.memory.reserved);
@@ -529,6 +541,14 @@ pub struct Operator {
     /// are the difference between what the engine does and what the data plane was designed to do,
     /// and F7 is meant to be this list sorted by cost rather than a guess about where to look.
     pub fallbacks: Tally,
+    /// Where the time went inside a read, when this operator does any reading.
+    ///
+    /// Written only by a scan, and missing from the document entirely for every operator that does
+    /// not read, because a row of five zeroes under a filter says nothing and costs a reader the
+    /// time it takes to work out that it says nothing. The stages do not have to add up to the
+    /// operator's own time: what is left over is the scan's own bookkeeping, and how much of it
+    /// there is is worth knowing on its own.
+    pub stages: Spent,
     /// What it held.
     pub memory: Memory,
     /// Whether what ran was the reference implementation rather than a fast one.
@@ -553,6 +573,7 @@ impl Operator {
             bytes_decoded: 0,
             bytes_spilled: 0,
             fallbacks: Tally::none(),
+            stages: Spent::none(),
             memory: Memory::default(),
             reference_impl: false,
         }
@@ -577,7 +598,7 @@ pub struct Memory {
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::{Cause, Tally};
+    use rudb_common::{Cause, Spent, Stage, Tally};
 
     use super::{Document, Engine, Machine, Operator, Outcome, Pipeline, Strategy};
 
@@ -637,6 +658,11 @@ mod tests {
         read.cpu_ns = 4_800_000_000;
         read.bytes_read = 1_420_000_000;
         read.bytes_decoded = 210_000_000;
+        read.stages.add(Spent::of(Stage::Read, 120_000_000, 1_420_000_000));
+        read.stages.add(Spent::of(Stage::Decompress, 210_000_000, 210_000_000));
+        read.stages.add(Spent::of(Stage::Decode, 240_000_000, 210_000_000));
+        read.stages.add(Spent::of(Stage::Dictionary, 9_000_000, 1_400_000));
+        read.stages.add(Spent::of(Stage::Assemble, 22_000_000, 0));
         let mut group = Operator::new(5, 0, "HashAggregate");
         group.detail = Some("ClientIP".to_string());
         group.rows_in = 99_997_497;
