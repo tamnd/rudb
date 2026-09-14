@@ -15,8 +15,8 @@
 use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_functions::{
-    Columns, Given, TableFunction, csv_fields, csv_given, files, is_file, is_pattern,
-    parquet_fields, resolve, resolve_table,
+    Columns, FILE_ROW_NUMBER, Given, TableFunction, csv_fields, csv_given, files, is_file,
+    is_pattern, parquet_fields, resolve, resolve_table,
 };
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, parse_ast};
@@ -1138,6 +1138,20 @@ impl<'a> Binder<'a> {
                         }
                     }
                 }
+                if options.file_row_number {
+                    // Not a column of the file, so it goes on the end where a projection cannot be
+                    // confused about which one it is, and the executor counts it as the rows come
+                    // out. A file that already has a column of that name is the one case where the
+                    // option cannot be honoured, and saying so is better than handing back two
+                    // columns with the same name and letting a reference to it pick one.
+                    if fields.iter().any(|field| field.name == FILE_ROW_NUMBER) {
+                        return Err(Error::binder(format!(
+                            "Duplicate column name \"{FILE_ROW_NUMBER}\": the file already has a \
+                             column of that name, so file_row_number cannot add one"
+                        )));
+                    }
+                    fields.push(Field::required(FILE_ROW_NUMBER.to_string(), LogicalType::BigInt));
+                }
                 cast = paths.iter().map(|path| self.path_constant(path)).collect();
                 fields
             }
@@ -1669,6 +1683,11 @@ struct Options {
     binary_as_string: bool,
     /// `all_varchar`, which reads every column of a CSV file as text rather than sniffing a type.
     all_varchar: bool,
+    /// `file_row_number`, which adds a column holding each row's ordinal inside its own file.
+    ///
+    /// The one Parquet option here that the executor has to act on rather than the binder, since
+    /// the column is not in the file and has to be counted as the rows come out of it.
+    file_row_number: bool,
     /// `delim`, `sep`, `quote`, `escape` and `header`, which are what the sniffer would decide.
     given: Given,
 }
@@ -1686,6 +1705,7 @@ impl Options {
             match (*parameter, value) {
                 ("binary_as_string", Value::Boolean(on)) => options.binary_as_string = *on,
                 ("all_varchar", Value::Boolean(on)) => options.all_varchar = *on,
+                ("file_row_number", Value::Boolean(on)) => options.file_row_number = *on,
                 _ => {}
             }
         }

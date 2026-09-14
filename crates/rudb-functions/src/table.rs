@@ -44,6 +44,14 @@ pub enum TableFunction {
     RudbStrategies,
 }
 
+/// The name of the column `file_row_number=True` adds.
+///
+/// Here rather than in the binder because the executor is the half that fills it in and the two
+/// have to agree on the spelling. It is DuckDB's name for it, and the column is a row's ordinal
+/// inside its own file rather than inside the read, so a glob of three files counts from zero three
+/// times.
+pub const FILE_ROW_NUMBER: &str = "file_row_number";
+
 impl TableFunction {
     /// The name the plan records and an error message says.
     #[must_use]
@@ -83,7 +91,10 @@ impl TableFunction {
     /// candidates on a misspelling are read out of and the binary prints both of them.
     #[must_use]
     pub fn parameters(self) -> &'static [(&'static str, LogicalType)] {
-        static READ_PARQUET: &[(&str, LogicalType)] = &[("binary_as_string", LogicalType::Boolean)];
+        static READ_PARQUET: &[(&str, LogicalType)] = &[
+            ("binary_as_string", LogicalType::Boolean),
+            ("file_row_number", LogicalType::Boolean),
+        ];
         static READ_CSV: &[(&str, LogicalType)] = &[
             ("all_varchar", LogicalType::Boolean),
             ("delim", LogicalType::Varchar),

@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_csv::Reader as CsvReader;
-use rudb_functions::{Given, TableFunction, csv_given, open_csv, open_parquet, series_length};
+use rudb_functions::{
+    FILE_ROW_NUMBER, Given, TableFunction, csv_given, open_csv, open_parquet, series_length,
+};
 use rudb_kernels::cast;
 use rudb_metrics::Counters;
 use rudb_parquet::Reader;
@@ -397,6 +399,12 @@ pub(crate) struct FileScan {
     paths: Vec<String>,
     given: Given,
     wanted: Vec<Field>,
+    /// Whether the last column the scan produces is the row's ordinal inside its own file.
+    ///
+    /// `file_row_number=True`, which is a column no file holds and the scan counts. It is last
+    /// because the binder puts it last, and it is a flag rather than a position because everything
+    /// else here indexes [`Self::wanted`] and that list is the file's columns only.
+    numbered: bool,
     schema: Schema,
     reading: Mutex<Reading>,
     one: Handout,
@@ -408,6 +416,11 @@ pub(crate) struct FileScan {
 struct Reading {
     at: usize,
     reader: Option<FileReader>,
+    /// How many rows of the file the scan is on have come out of it.
+    ///
+    /// Reset as each file is opened, because `file_row_number` counts inside a file rather than
+    /// across the read, which is what its name says and what DuckDB does.
+    row: i64,
 }
 
 impl FileScan {
@@ -428,14 +441,22 @@ impl FileScan {
     ) -> Result<Self> {
         let paths = file_arguments(plan, args, function)?;
         let given = csv_options(plan, options, settings)?;
-        let wanted = plan.field_list(columns).to_vec();
+        let produced = plan.field_list(columns).to_vec();
+        // The binder puts the counted column last and nothing between here and there reorders a
+        // scan's columns, so the flag is whether the last one is it. Pruning can drop it, in which
+        // case there is nothing to count, and pruning can drop everything else, in which case the
+        // file is opened for its row count and no column of it is read.
+        let numbered = produced.last().is_some_and(|field| field.name == FILE_ROW_NUMBER);
+        let wanted =
+            if numbered { produced[..produced.len() - 1].to_vec() } else { produced.clone() };
         let scan = Self {
             function,
             paths,
             given,
-            wanted: wanted.clone(),
-            schema: Schema::numbered(wanted, index),
-            reading: Mutex::new(Reading { at: 0, reader: None }),
+            wanted,
+            numbered,
+            schema: Schema::numbered(produced, index),
+            reading: Mutex::new(Reading { at: 0, reader: None, row: 0 }),
             one: Handout::new(1),
             counters: None,
         };
@@ -463,6 +484,7 @@ impl FileScan {
     /// Opens the next file and projects it, or leaves the reader empty at the end of the list.
     fn advance(&self, reading: &mut Reading) -> Result<()> {
         reading.reader = None;
+        reading.row = 0;
         let Some(path) = self.paths.get(reading.at) else { return Ok(()) };
         let mut reader = FileReader::open(self.function, path, self.given)?;
         let first = if reading.at == 0 { None } else { self.paths.first().map(String::as_str) };
@@ -471,6 +493,27 @@ impl FileScan {
         reading.reader = Some(reader);
         reading.at += 1;
         Ok(())
+    }
+
+    /// The chunk with the row number column on the end of it.
+    ///
+    /// Built rather than read, because no file holds it. The values are a run, and the reason this
+    /// is a loop over a range rather than a sequence vector is that the scan's consumer is free to
+    /// slice or gather the chunk and a flat column survives both without a case.
+    fn number(&self, chunk: Chunk, reading: &mut Reading) -> Result<Chunk> {
+        let rows = chunk.len();
+        let mut columns = Vec::with_capacity(chunk.width() + 1);
+        for at in 0..chunk.width() {
+            columns.push(chunk.column(at)?.clone());
+        }
+        let first = reading.row;
+        reading.row = reading.row.saturating_add(i64::try_from(rows).unwrap_or(i64::MAX));
+        let mut data = Vec::with_capacity(rows);
+        for at in 0..rows {
+            data.push(first.saturating_add(i64::try_from(at).unwrap_or(i64::MAX)));
+        }
+        columns.push(Vector::flat(LogicalType::BigInt, Data::Int64(data.into()))?);
+        Chunk::with_rows(columns, rows)
     }
 
     /// The chunk with every column in the type the first file gave it.
@@ -533,7 +576,11 @@ impl Source for FileScan {
             if let Some(chunk) = next {
                 // A file that is empty gives no chunk rather than an empty one, so this is not the
                 // place that skips it. The loop is.
-                *out = self.conform(chunk, file)?;
+                let mut chunk = self.conform(chunk, file)?;
+                if self.numbered {
+                    chunk = self.number(chunk, &mut reading)?;
+                }
+                *out = chunk;
                 return Ok(Progress::More);
             }
             self.advance(&mut reading)?;
