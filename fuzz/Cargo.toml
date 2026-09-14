@@ -12,12 +12,24 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
+arbitrary = "1"
 libfuzzer-sys = "0.4"
+rudb-bind = { path = "../crates/rudb-bind" }
+rudb-catalog = { path = "../crates/rudb-catalog" }
+rudb-common = { path = "../crates/rudb-common" }
+rudb-opt = { path = "../crates/rudb-opt" }
 rudb-parse = { path = "../crates/rudb-parse" }
 
 [[bin]]
 name = "tokenize"
 path = "fuzz_targets/tokenize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bind"
+path = "fuzz_targets/bind.rs"
 test = false
 doc = false
 bench = false

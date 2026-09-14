@@ -93,7 +93,7 @@ use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 
 use crate::pass::{Context, Pass};
 use crate::tables::{TableSet, Tables, produced};
-use crate::{nulls, transitive, walk};
+use crate::{fold, nulls, transitive, walk};
 
 /// Moves every predicate as far down the plan as it can go.
 #[derive(Debug, Clone, Copy)]
@@ -140,7 +140,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         Node::Project { input, index, exprs, names } => {
             let held = plan.expr_list(exprs).to_vec();
             let (down, stay) = partition(plan, pending, index, &held);
-            let moved = down.into_iter().map(|part| substitute(plan, part, index, &held));
+            let moved = down.into_iter().map(|part| substituted(plan, part, index, &held));
             let moved: Vec<ExprRef> = moved.collect();
             let rebuilt = node(plan, input, moved, tables);
             let above = if rebuilt == input {
@@ -154,10 +154,20 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         // The output is the group expressions and then the aggregates, so a predicate over an
         // aggregate names a column past the end of the group list and `partition` refuses it on the
         // bounds check rather than on a rule of its own.
+        //
+        // With no group expressions at all the aggregate answers one row whatever goes in, even when
+        // nothing does, so a predicate below it decides what that row is computed from and a
+        // predicate above it decides whether the row is there. Those are different questions and
+        // moving the predicate across swaps one for the other, which is how `SELECT 1 HAVING FALSE`
+        // came back with a row.
         Node::Aggregate { input, index, groups, aggregates } => {
             let keys = plan.expr_list(groups).to_vec();
-            let (down, stay) = partition(plan, pending, index, &keys);
-            let moved = down.into_iter().map(|part| substitute(plan, part, index, &keys));
+            let (down, stay) = if keys.is_empty() {
+                (Vec::new(), pending)
+            } else {
+                partition(plan, pending, index, &keys)
+            };
+            let moved = down.into_iter().map(|part| substituted(plan, part, index, &keys));
             let moved: Vec<ExprRef> = moved.collect();
             let rebuilt = node(plan, input, moved, tables);
             let above = if rebuilt == input {
@@ -363,6 +373,34 @@ fn sides(
 /// nothing simply never goes back in.
 fn filter(plan: &mut Plan, input: NodeRef, parts: Vec<ExprRef>) -> NodeRef {
     let parts: Vec<ExprRef> = parts.into_iter().filter(|&part| !always(plan, part)).collect();
+    // A conjunct that keeps no row decides the whole filter, so the others do not go back in. The
+    // answer is the same either way, since a filter that keeps nothing keeps nothing whatever else
+    // it is asked. What is not the same is the plan: without this the pass rebuilds a filter as a
+    // conjunction of constants, which is work for the expression rewriter, and the rewriter runs
+    // before this pass and has already had its turn. The sequence then does not settle, which is
+    // how this was found, from a query the AST fuzz target built that reduces to
+    // `SELECT * FROM (SELECT * FROM t WHERE NULL) s WHERE NULL`: two filters the rewriter had each
+    // already folded to a constant meet at the scan and come back out as `NULL AND NULL`.
+    if let Some(&decided) = parts.iter().find(|&&part| never(plan, part)) {
+        return plan.add_node(Node::Filter { input, predicate: decided });
+    }
+    // The same question twice is one question, and asking it again costs an evaluation per row for
+    // an answer that is already known. It is also the other way a run of this pass over its own
+    // output differs from the first run: `crate::transitive` writes a predicate down from an
+    // equality, the predicate is pushed to the side that reads it, and the next run writes the same
+    // one down again and lands it next to the copy. A volatile call is not the same question twice,
+    // so two of those stay two.
+    let mut parts = parts;
+    let mut held = 0;
+    while held < parts.len() {
+        let part = parts[held];
+        let earlier = parts[..held].iter().any(|&other| walk::same(plan, other, part));
+        if earlier && !walk::volatile(plan, part) {
+            parts.remove(held);
+        } else {
+            held += 1;
+        }
+    }
     let predicate = match parts.len() {
         0 => return input,
         1 => parts[0],
@@ -385,6 +423,19 @@ fn always(plan: &Plan, predicate: ExprRef) -> bool {
         return false;
     };
     plan.value(value).as_bool() == Some(true)
+}
+
+/// Whether a predicate keeps no row it is given.
+///
+/// The constant again, and both of the two ways of not being true: a false one keeps nothing and a
+/// null one keeps nothing either, since a row survives a filter only when the predicate is true of
+/// it. The two are the same answer here and are not the same answer anywhere else, which is why
+/// this asks the question it means rather than asking for false.
+fn never(plan: &Plan, predicate: ExprRef) -> bool {
+    let Expr::Constant(value) = *plan.expr(predicate) else {
+        return false;
+    };
+    plan.value(value).as_bool() != Some(true)
 }
 
 /// Adds every conjunct of `predicate` to `into`.
@@ -442,6 +493,17 @@ fn substitutable(plan: &Plan, expr: ExprRef, index: u32, held: &[ExprRef]) -> bo
         };
     });
     answer
+}
+
+/// [`substitute`], and then the expression rules over what came out of it.
+///
+/// A column standing for a constant leaves a predicate this pass built and the expression rewriter
+/// never saw, such as the `CAST(NULL AS BOOLEAN)` that `WHERE CAST(x AS BOOLEAN)` becomes over a
+/// group key of `NULL`. The rewriter runs before this pass, so nothing would fold it, and the
+/// sequence would not settle. See [`fold::rewritten`].
+fn substituted(plan: &mut Plan, expr: ExprRef, index: u32, held: &[ExprRef]) -> ExprRef {
+    let substituted = substitute(plan, expr, index, held);
+    fold::rewritten(plan, substituted)
 }
 
 /// Rewrites every column of `index` in `expr` into what `held` computes it from.
@@ -542,6 +604,87 @@ Filter (#1.1::BIGINT > 2::BIGINT)::BOOLEAN
   Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]
     Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN
       Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_predicate_that_substitution_turns_into_a_constant_is_folded_on_the_way_down() {
+        let before = "\
+Filter CAST(#1.0::\"NULL\")::BOOLEAN
+  Project #1 [NULL::\"NULL\" AS a]
+    Get memory.main.t AS t #0 [a::INTEGER]
+";
+        let after = "\
+Project #1 [NULL::\"NULL\" AS a]
+  Filter NULL::BOOLEAN
+    Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn nothing_crosses_an_aggregate_that_has_no_group_keys() {
+        // `SELECT 1 HAVING FALSE` is no rows in the binary and was one row here, because the filter
+        // went under an aggregate that answers a row whether or not it was given any.
+        let text = "\
+Filter FALSE::BOOLEAN
+  Aggregate #1 groups=[] aggregates=[count_star()::BIGINT]
+    Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(text), text);
+    }
+
+    #[test]
+    fn a_filter_that_keeps_nothing_leaves_the_rest_of_the_conjunction_out() {
+        let before = "\
+Filter (FALSE::BOOLEAN AND (#0.0::INTEGER > 1::INTEGER)::BOOLEAN)::BOOLEAN
+  Get memory.main.t AS t #0 [a::INTEGER]
+";
+        let after = "\
+Filter FALSE::BOOLEAN
+  Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn the_same_predicate_twice_comes_out_once() {
+        let before = "\
+Filter ((#0.0::INTEGER > 1::INTEGER)::BOOLEAN AND (#0.0::INTEGER > 1::INTEGER)::BOOLEAN)::BOOLEAN
+  Get memory.main.t AS t #0 [a::INTEGER]
+";
+        let after = "\
+Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN
+  Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn two_volatile_predicates_that_read_the_same_stay_two() {
+        // Two calls are two numbers, so this is not the same question asked twice.
+        let text = "\
+Filter ((random()::DOUBLE > 0.5::DOUBLE)::BOOLEAN AND (random()::DOUBLE > 0.5::DOUBLE)::BOOLEAN)::BOOLEAN
+  Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(text), text);
+    }
+
+    #[test]
+    fn two_filters_that_keep_nothing_come_out_as_one() {
+        // The pass takes both apart and puts them back together in the same place, and `NULL AND
+        // NULL` is not what the expression rewriter left behind, so the sequence stopped settling.
+        let before = "\
+Filter NULL::BOOLEAN
+  Project #1 [#0.0::INTEGER AS a]
+    Filter NULL::BOOLEAN
+      Get memory.main.t AS t #0 [a::INTEGER]
+";
+        let after = "\
+Project #1 [#0.0::INTEGER AS a]
+  Filter NULL::BOOLEAN
+    Get memory.main.t AS t #0 [a::INTEGER]
 ";
         assert_eq!(pushed(before), after);
     }
