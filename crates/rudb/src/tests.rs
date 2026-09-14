@@ -2747,6 +2747,61 @@ fn a_group_by_on_eight_threads_finds_every_group_exactly_once() {
     assert_eq!(many, one);
 }
 
+/// The nine ClickBench queries that did not get faster when pipelines learned to run wide all have
+/// one of these in them, because the aggregate refused a second instance and the refusal dropped the
+/// scan under it back to one thread. See #509.
+#[test]
+fn a_count_distinct_on_eight_threads_counts_each_value_once() {
+    let sql = "SELECT count(DISTINCT range % 977) FROM range(200000)";
+    assert_eq!(rows(&threaded(8), sql), [vec![Value::BigInt(977)]]);
+    assert_eq!(rows(&threaded(8), sql), rows(&threaded(1), sql));
+}
+
+/// Distinct sets merge by offering their values to the kept set, so an aggregate other than a count
+/// gets the same answer rather than only the counting one being right.
+#[test]
+fn every_distinct_aggregate_on_eight_threads_answers_what_it_answers_on_one() {
+    let sql = "SELECT sum(DISTINCT range % 1009), min(DISTINCT range % 1009), \
+               max(DISTINCT range % 1009), count(DISTINCT range % 1009) FROM range(300000)";
+    let total: i64 = (0..1009i64).sum();
+    assert_eq!(
+        rows(&threaded(8), sql),
+        [vec![
+            Value::HugeInt(i128::from(total)),
+            Value::BigInt(0),
+            Value::BigInt(1008),
+            Value::BigInt(1009)
+        ]]
+    );
+    assert_eq!(rows(&threaded(8), sql), rows(&threaded(1), sql));
+}
+
+/// A distinct count inside a group by, where the sets being merged belong to groups that may or may
+/// not be in the table they are merged into.
+#[test]
+fn a_grouped_count_distinct_on_eight_threads_finds_every_group_and_every_value() {
+    let sql = "SELECT range % 13 AS k, count(DISTINCT range % 91), count(*) \
+               FROM range(400000) GROUP BY k";
+    let mut many = rows(&threaded(8), sql);
+    let mut one = rows(&threaded(1), sql);
+    many.sort_by_key(|row| format!("{:?}", row[0]));
+    one.sort_by_key(|row| format!("{:?}", row[0]));
+    assert_eq!(many.len(), 13);
+    for row in &many {
+        assert_eq!(row[1], Value::BigInt(7), "91 over 13 is seven values in each group");
+    }
+    assert_eq!(many, one);
+}
+
+/// A distinct over a string, which takes the other set in the operator, since a BIGINT argument gets
+/// a set of integers and everything else gets a set of rows.
+#[test]
+fn a_count_distinct_over_strings_on_eight_threads_counts_each_string_once() {
+    let sql = "SELECT count(DISTINCT 'tag' || (range % 641)) FROM range(200000)";
+    assert_eq!(rows(&threaded(8), sql), [vec![Value::BigInt(641)]]);
+    assert_eq!(rows(&threaded(8), sql), rows(&threaded(1), sql));
+}
+
 #[test]
 fn a_query_with_no_order_by_keeps_the_source_order_on_eight_threads() {
     let rows = rows(&threaded(8), "SELECT range FROM range(200000) WHERE range % 3 = 0");
