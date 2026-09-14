@@ -16,6 +16,7 @@ use std::fmt;
 use rudb_common::{Error, Result};
 use rudb_vector::Chunk;
 
+use crate::morsel::Morsel;
 use crate::progress::Progress;
 use crate::traits::{Sink, Stream};
 
@@ -92,6 +93,13 @@ pub trait DynSink: Send + Sync + fmt::Debug {
     /// Fresh local state for one instance.
     fn local_state(&self) -> LocalState;
 
+    /// Told which morsel the chunks that come next were read from.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the typed operator reports, plus an internal error if the state is the wrong one.
+    fn at_state(&self, morsel: &Morsel, local: &mut LocalState) -> Result<()>;
+
     /// Take one chunk into the local state.
     ///
     /// # Errors
@@ -117,6 +125,10 @@ pub trait DynSink: Send + Sync + fmt::Debug {
 impl<S: Sink> DynSink for S {
     fn local_state(&self) -> LocalState {
         LocalState::new(self.local())
+    }
+
+    fn at_state(&self, morsel: &Morsel, local: &mut LocalState) -> Result<()> {
+        self.at(morsel, local.downcast_mut::<S::Local>()?)
     }
 
     fn sink_state(&self, chunk: &Chunk, local: &mut LocalState) -> Result<Progress> {

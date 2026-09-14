@@ -73,7 +73,7 @@ pub use dynamic::{DynSink, DynStream, LocalState};
 pub use morsel::Morsel;
 pub use pipeline::{Locals, Pipeline};
 pub use progress::{Blocked, BlockedReason, BufferId, IoToken, MemoryToken, PipelineId, Progress};
-pub use root::{RootReader, RootSink, root};
+pub use root::{RootPlace, RootReader, RootSink, root, root_in_order};
 pub use serial::run_serial;
 pub use traits::{Sink, Source, Stream};
 pub use watch::Watched;
