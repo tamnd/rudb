@@ -71,11 +71,6 @@ pub const NOWHERE: usize = usize::MAX;
 /// A running aggregate.
 #[derive(Debug, Clone)]
 pub struct Accumulator {
-    kind: Kind,
-    // A return type used to be cloned into every group. LogicalType is large enough to describe
-    // nested schemas, while an aggregate state only needs the numeric case it will emit. On a
-    // million-group query with three calls that duplicated tens of bytes three million times.
-    returns: Return,
     state: State,
 }
 
@@ -154,11 +149,11 @@ enum Kind {
 #[derive(Debug, Clone)]
 enum State {
     /// A row count, for `count` and `count(*)`.
-    Counted(i64),
+    Counted { count: i64, star: bool },
     /// A whole running total and whether anything landed in it.
-    Whole { total: i128, seen: bool },
+    Whole { total: i128, seen: bool, returns: Return },
     /// A running total in floating point, and the count `avg` divides by.
-    Real { total: f64, seen: i64 },
+    Real { total: f64, seen: i64, kind: Kind, returns: Return },
     /// A running total for `avg`, exact while every value folded in is a whole number.
     ///
     /// `avg` over an integer column has to add the column up exactly and divide once at the end.
@@ -172,17 +167,50 @@ enum State {
     /// the same additions in the same order as before, which is what the float path has to keep.
     // The exact and floating totals are mutually exclusive. The floating total's bits occupy the
     // same word as the exact i128 after `exact` becomes false, cutting every AVG state by 16 bytes.
-    Mean { total: i128, seen: i64, exact: bool },
+    Mean { total: i128, seen: i64, exact: bool, returns: Return },
     /// A running total at a fixed decimal scale.
-    Scaled { total: i128, scale: u8, seen: bool },
+    Scaled { total: i128, scale: u8, seen: bool, returns: Return },
     /// The smallest or largest value so far.
     // Box the one state whose scalar representation is much wider than every numeric aggregate.
     // Most ClickBench groups contain count/sum/avg states and should not each pay for a 64-byte
     // Value they never hold. Min and max allocate only after they see their first non-null value.
-    Extreme(Option<Box<Value>>),
+    Extreme { held: Option<Box<Value>>, least: bool },
 }
 
 impl Accumulator {
+    fn kind(&self) -> Kind {
+        match self.state {
+            State::Counted { star, .. } => {
+                if star {
+                    Kind::CountStar
+                } else {
+                    Kind::Count
+                }
+            }
+            State::Whole { .. } | State::Scaled { .. } => Kind::Sum,
+            State::Real { kind, .. } => kind,
+            State::Mean { .. } => Kind::Avg,
+            State::Extreme { least, .. } => {
+                if least {
+                    Kind::Min
+                } else {
+                    Kind::Max
+                }
+            }
+        }
+    }
+
+    fn returns(&self) -> Return {
+        match self.state {
+            State::Counted { .. } => Return::BigInt,
+            State::Whole { returns, .. }
+            | State::Real { returns, .. }
+            | State::Mean { returns, .. }
+            | State::Scaled { returns, .. } => returns,
+            State::Extreme { .. } => Return::Other,
+        }
+    }
+
     /// A fresh accumulator for a named aggregate returning `returns`.
     ///
     /// # Errors
@@ -200,19 +228,26 @@ impl Accumulator {
                 return Err(Error::not_implemented(format!("the {other} aggregate")));
             }
         };
+        let scale = match returns {
+            LogicalType::Decimal { scale, .. } => *scale,
+            _ => 0,
+        };
+        let returns = Return::new(returns);
         let state = match kind {
-            Kind::CountStar | Kind::Count => State::Counted(0),
-            Kind::Avg => State::Mean { total: 0, seen: 0, exact: true },
-            Kind::Min | Kind::Max => State::Extreme(None),
+            Kind::CountStar | Kind::Count => {
+                State::Counted { count: 0, star: kind == Kind::CountStar }
+            }
+            Kind::Avg => State::Mean { total: 0, seen: 0, exact: true, returns },
+            Kind::Min | Kind::Max => State::Extreme { held: None, least: kind == Kind::Min },
             Kind::Sum => match returns {
-                LogicalType::Decimal { scale, .. } => {
-                    State::Scaled { total: 0, scale: *scale, seen: false }
+                Return::Decimal(_) => State::Scaled { total: 0, scale, seen: false, returns },
+                Return::Float | Return::Double => {
+                    State::Real { total: 0.0, seen: 0, kind, returns }
                 }
-                LogicalType::Float | LogicalType::Double => State::Real { total: 0.0, seen: 0 },
-                _ => State::Whole { total: 0, seen: false },
+                _ => State::Whole { total: 0, seen: false, returns },
             },
         };
-        Ok(Self { kind, returns: Return::new(returns), state })
+        Ok(Self { state })
     }
 
     /// Folds one row in.
@@ -222,8 +257,8 @@ impl Accumulator {
     /// If the argument count is wrong for the aggregate, if the value is not one the aggregate can
     /// accumulate, or if a whole running total overflows.
     pub fn update(&mut self, args: &[Value]) -> Result<()> {
-        if self.kind == Kind::CountStar {
-            if let State::Counted(count) = &mut self.state {
+        if self.kind() == Kind::CountStar {
+            if let State::Counted { count, .. } = &mut self.state {
                 *count += 1;
             }
             return Ok(());
@@ -238,17 +273,17 @@ impl Accumulator {
             return Ok(());
         }
         match &mut self.state {
-            State::Counted(count) => *count += 1,
-            State::Whole { total, seen } => {
+            State::Counted { count, .. } => *count += 1,
+            State::Whole { total, seen, .. } => {
                 let whole = integral(value).ok_or_else(|| not_narrow(value))?;
                 *total = total.checked_add(whole).ok_or_else(overflowed)?;
                 *seen = true;
             }
-            State::Real { total, seen } => {
+            State::Real { total, seen, .. } => {
                 *total += approximate_or_error(value)?;
                 *seen += 1;
             }
-            State::Mean { total, seen, exact } => {
+            State::Mean { total, seen, exact, .. } => {
                 match integral(value)
                     .filter(|_| *exact)
                     .and_then(|number| total.checked_add(number))
@@ -265,20 +300,17 @@ impl Accumulator {
                 }
                 *seen += 1;
             }
-            State::Scaled { total, scale, seen } => {
+            State::Scaled { total, scale, seen, .. } => {
                 let unscaled = at_scale(value, *scale).ok_or_else(|| not_narrow(value))?;
                 *total = total.checked_add(unscaled).ok_or_else(overflowed)?;
                 *seen = true;
             }
-            State::Extreme(held) => {
+            State::Extreme { held, least } => {
                 let replace = match held {
                     None => true,
                     Some(current) => {
                         let ordering = order(value, current)?;
-                        match self.kind {
-                            Kind::Min => ordering.is_lt(),
-                            _ => ordering.is_gt(),
-                        }
+                        if *least { ordering.is_lt() } else { ordering.is_gt() }
                     }
                 };
                 if replace {
@@ -305,8 +337,8 @@ impl Accumulator {
     ///
     /// The same errors [`Accumulator::update`] raises, for the same reasons.
     pub fn update_run(&mut self, args: &[Vector], rows: usize) -> Result<()> {
-        if self.kind == Kind::CountStar {
-            if let State::Counted(count) = &mut self.state {
+        if self.kind() == Kind::CountStar {
+            if let State::Counted { count, .. } = &mut self.state {
                 *count += i64::try_from(rows).map_err(|_| overlong())?;
             }
             return Ok(());
@@ -347,11 +379,11 @@ impl Accumulator {
         let nulls = nulls_of(input);
         // Both counts are answered by the mask on its own, whatever the form is and whatever the
         // type is, so they come back before there is any question of which loop to run.
-        if let State::Counted(count) = &mut self.state {
+        if let State::Counted { count, .. } = &mut self.state {
             *count += i64::try_from(nulls.count_valid(rows)).map_err(|_| overlong())?;
             return Ok(true);
         }
-        let least = self.kind == Kind::Min;
+        let least = self.kind() == Kind::Min;
         let want = match (&self.state, input.logical_type()) {
             (State::Whole { .. }, _) => Want::Whole,
             (State::Real { total, .. }, ty) => {
@@ -377,8 +409,8 @@ impl Accumulator {
                 Want::Whole
             }
             (State::Scaled { .. }, _) => return Ok(false),
-            (State::Extreme(_), _) => Want::Extreme(least),
-            (State::Counted(_), _) => return Ok(false),
+            (State::Extreme { .. }, _) => Want::Extreme(least),
+            (State::Counted { .. }, _) => return Ok(false),
         };
         let Some(contribution) = gather(input, rows, &nulls, want) else {
             return Ok(false);
@@ -386,13 +418,16 @@ impl Accumulator {
         let live = nulls.count_valid(rows);
         match (&mut self.state, contribution) {
             (
-                State::Whole { total, seen } | State::Scaled { total, seen, .. },
+                State::Whole { total, seen, .. } | State::Scaled { total, seen, .. },
                 Contribution::Whole(sum),
             ) => {
                 *total = total.checked_add(sum).ok_or_else(overflowed)?;
                 *seen |= live > 0;
             }
-            (State::Real { total, seen }, Contribution::Real { total: carried, seen: added }) => {
+            (
+                State::Real { total, seen, .. },
+                Contribution::Real { total: carried, seen: added },
+            ) => {
                 *total = carried;
                 *seen += added;
             }
@@ -405,14 +440,14 @@ impl Accumulator {
                 *seen += i64::try_from(live).map_err(|_| overlong())?;
             }
             (
-                State::Mean { total, seen, exact },
+                State::Mean { total, seen, exact, .. },
                 Contribution::Real { total: carried, seen: added },
             ) => {
                 *total = mean_bits(carried);
                 *exact = false;
                 *seen += added;
             }
-            (State::Extreme(held), Contribution::Extreme(Some(index))) => {
+            (State::Extreme { held, .. }, Contribution::Extreme(Some(index))) => {
                 // One `Value` for the whole vector and one call into the comparison kernel, rather
                 // than one of each per row. The row that won is found on the numbers.
                 let candidate = input.value_at(index);
@@ -427,7 +462,7 @@ impl Accumulator {
                     *held = Some(Box::new(candidate));
                 }
             }
-            (State::Extreme(_), Contribution::Extreme(None)) => {}
+            (State::Extreme { .. }, Contribution::Extreme(None)) => {}
             // The `want` above picks the contribution, so the pairs left over are ones that cannot
             // be built. Falling through costs a slow loop and a wrong answer costs a lot more.
             _ => return Ok(false),
@@ -442,17 +477,17 @@ impl Accumulator {
     /// If the running total does not fit the declared return type.
     pub fn finish(&self) -> Result<Value> {
         match &self.state {
-            State::Counted(count) => Ok(Value::BigInt(*count)),
-            State::Whole { total, seen } => {
+            State::Counted { count, .. } => Ok(Value::BigInt(*count)),
+            State::Whole { total, seen, .. } => {
                 if !seen {
                     return Ok(Value::Null);
                 }
-                let returns = self.returns.logical();
+                let returns = self.returns().logical();
                 fit(*total, &returns).ok_or_else(|| {
                     Error::out_of_range(format!("a sum of {total} does not fit in {}", returns))
                 })
             }
-            State::Real { total, seen } => {
+            State::Real { total, seen, .. } => {
                 if *seen == 0 {
                     return Ok(Value::Null);
                 }
@@ -460,8 +495,8 @@ impl Accumulator {
                     clippy::cast_precision_loss,
                     reason = "the count of rows in one group is well inside the exact range"
                 )]
-                let answer = if self.kind == Kind::Avg { total / *seen as f64 } else { *total };
-                if self.returns == Return::Float {
+                let answer = if self.kind() == Kind::Avg { total / *seen as f64 } else { *total };
+                if self.returns() == Return::Float {
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "a declared FLOAT result is a FLOAT"
@@ -470,7 +505,7 @@ impl Accumulator {
                 }
                 Ok(Value::Double(answer))
             }
-            State::Mean { total, seen, exact } => {
+            State::Mean { total, seen, exact, .. } => {
                 if *seen == 0 {
                     return Ok(Value::Null);
                 }
@@ -480,7 +515,7 @@ impl Accumulator {
                     reason = "the count of rows in one group is well inside the exact range"
                 )]
                 let answer = total / *seen as f64;
-                if self.returns == Return::Float {
+                if self.returns() == Return::Float {
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "a declared FLOAT result is a FLOAT"
@@ -489,17 +524,17 @@ impl Accumulator {
                 }
                 Ok(Value::Double(answer))
             }
-            State::Scaled { total, scale, seen } => {
+            State::Scaled { total, scale, seen, .. } => {
                 if !seen {
                     return Ok(Value::Null);
                 }
-                let width = match self.returns {
+                let width = match self.returns() {
                     Return::Decimal(width) => width,
                     _ => rudb_common::MAX_DECIMAL_WIDTH,
                 };
                 Ok(Value::Decimal { unscaled: *total, width, scale: *scale })
             }
-            State::Extreme(held) => Ok(held.as_deref().cloned().unwrap_or(Value::Null)),
+            State::Extreme { held, .. } => Ok(held.as_deref().cloned().unwrap_or(Value::Null)),
         }
     }
 
@@ -554,13 +589,13 @@ pub fn update_scattered(
             states.len()
         )));
     };
-    let kind = first.kind;
+    let kind = first.kind();
     let into = Where { slots, stride, offset };
     // `count(*)` reads nothing, so it never asks for the argument it does not have.
     if kind == Kind::CountStar {
         for row in 0..rows {
             let Some(index) = into.index(row) else { continue };
-            if let State::Counted(count) = &mut states[index].state {
+            if let State::Counted { count, .. } = &mut states[index].state {
                 *count += 1;
             }
         }
@@ -635,7 +670,7 @@ enum Feed {
 /// same order and the comments there are the comments here.
 fn feed_of(first: &Accumulator, ty: &LogicalType) -> Option<Feed> {
     match (&first.state, ty) {
-        (State::Counted(_), _) => Some(Feed::Counted),
+        (State::Counted { .. }, _) => Some(Feed::Counted),
         (State::Whole { .. }, _) => Some(Feed::Whole),
         (State::Scaled { scale, .. }, LogicalType::Decimal { scale: held, .. })
             if held == scale =>
@@ -649,8 +684,10 @@ fn feed_of(first: &Accumulator, ty: &LogicalType) -> Option<Feed> {
         }
         // A number is compared as a number and anything else is compared the way the comparison
         // kernel says, which a run of `i128` cannot do for a float, a string or a date.
-        (State::Extreme(_), ty) if ty.is_integer() => Some(Feed::Extreme(first.kind == Kind::Min)),
-        (State::Extreme(_), _) => None,
+        (State::Extreme { .. }, ty) if ty.is_integer() => {
+            Some(Feed::Extreme(first.kind() == Kind::Min))
+        }
+        (State::Extreme { .. }, _) => None,
     }
 }
 
@@ -671,7 +708,7 @@ fn spread(
                 continue;
             }
             let Some(index) = into.index(row) else { continue };
-            if let State::Counted(count) = &mut states[index].state {
+            if let State::Counted { count, .. } = &mut states[index].state {
                 *count += 1;
             }
         }
@@ -758,11 +795,11 @@ fn whole_into<M: Fn(usize) -> usize>(
 /// One exact number into one accumulator, which is [`Accumulator::update`] with the `Value` gone.
 fn fold_whole(into: &mut Accumulator, number: i128) -> Result<()> {
     match &mut into.state {
-        State::Whole { total, seen } | State::Scaled { total, seen, .. } => {
+        State::Whole { total, seen, .. } | State::Scaled { total, seen, .. } => {
             *total = total.checked_add(number).ok_or_else(overflowed)?;
             *seen = true;
         }
-        State::Mean { total, seen, exact } => {
+        State::Mean { total, seen, exact, .. } => {
             match total.checked_add(number).filter(|_| *exact) {
                 Some(sum) => *total = sum,
                 None => {
@@ -824,11 +861,11 @@ fn real_into<M: Fn(usize) -> usize>(
 /// One approximate number into one accumulator.
 fn fold_real(into: &mut Accumulator, number: f64) {
     match &mut into.state {
-        State::Real { total, seen } => {
+        State::Real { total, seen, .. } => {
             *total += number;
             *seen += 1;
         }
-        State::Mean { total, seen, exact } => {
+        State::Mean { total, seen, exact, .. } => {
             // The first value that is not whole. What was counted exactly so far comes across as
             // one conversion, and the rest of the group is added the way the float path adds.
             let real = if *exact { exactly(*total) } else { mean_real(*total) };
@@ -863,7 +900,7 @@ fn extreme_into<M: Fn(usize) -> usize>(
                         }
                         let Some(index) = into.index(row) else { continue };
                         let number = i128::from(values[at(row)]);
-                        let State::Extreme(held) = &mut states[index].state else {
+                        let State::Extreme { held, .. } = &mut states[index].state else {
                             return Err(Error::internal("an extreme into a total".to_string()));
                         };
                         let replace = match held {
@@ -1196,7 +1233,7 @@ mod tests {
     fn a_grouped_accumulator_does_not_carry_a_full_logical_type() {
         // A LogicalType can own a nested schema. Keeping one in every aggregate state cost more
         // than a hundred MiB on ClickBench q33 before the return was narrowed to Return.
-        assert!(size_of::<Accumulator>() <= 48, "{} bytes", size_of::<Accumulator>());
+        assert!(size_of::<Accumulator>() <= 32, "{} bytes", size_of::<Accumulator>());
     }
 
     fn run(name: &str, returns: &LogicalType, rows: &[Value]) -> Value {
