@@ -1,0 +1,95 @@
+# The harness
+
+`spec/14-rudb-compat.md` says what the harness is for. This says what it is, measured at `995f0e8`, and what has to be added before the numbers in documents 01, 08 and 11 can be computed at all.
+
+## 9.1 What exists
+
+`rudb-compat` is a binary with eight working subcommands: `duckdb`, `parse`, `query`, `run`, `slt`, `slt-one`, `vendor` and `levels`. Two more, `reduce` and `report`, parse their arguments and print that they are not built yet.
+
+It pins DuckDB by commit, `PINNED_COMMIT = "cc7e7bac7fcb6e0994359965a87ac4f6a96f2e17"`, and `vendor` fetches the upstream test suite at `v2.0-cyanoptera` into `target/corpus`.
+
+It compares full result sets in `src/compare.rs`: column count, column names, column types, row count and every cell, with the sorted or as written decision taken from a real parse of the statement through `rudb::row_order` rather than from a string search. Cells are compared as the text each engine printed. Section 1.3 already said this is the right set of decisions and they are the ones most likely to be quietly weakened later.
+
+It runs each file in a child process with a ten second and two gigabyte default and a `BACKSTOP` of twelve seconds outside that, so one hanging file cannot take the run down.
+
+It classifies every failure into nine reasons: `Stopped`, `Syntax`, `NotImplemented`, `Unbound`, `Runtime`, `WrongAnswer`, `MissedError`, `ErrorClass`, `ErrorText`.
+
+Against the upstream corpus that gives 4096 files, 13868 records passed, 50925 failed, 21.4 percent of attempted, and 14314 skipped of which 13392 the file turned off itself. The committed corpus is 8 files, 1152 lines, 192 records, gated at zero failures and zero skips.
+
+There is no fuzzing, no query generation, no reducer and no bisector.
+
+## 9.2 Two corpora with opposite rules, and a third that does not exist
+
+This is the most important structural thing the harness already gets right and it is worth stating as a rule so it survives.
+
+**The committed corpus is a gate.** Zero failures and zero skips, checked on every change. A record enters it only when it passes. Its purpose is that a regression is impossible to merge.
+
+**The upstream corpus is a measurement.** It fails by tens of thousands of records and must never become a gate, because a corpus that has to pass is a corpus that gets trimmed. Its purpose is to produce a number that goes up. The only thing gated about it is the number itself: a change that lowers the pass rate has to say why.
+
+**The real query corpus does not exist**, and section 1.1 makes it the denominator's weights and section 2.8 says every percentage in this folder is unweighted until it does. It is queries people actually run: the ones in DuckDB's documentation examples, the benchmark suites, the queries in the issue tracker, the ones in tutorials and blog posts. Its rule is neither of the other two: it is not a gate and its pass rate is secondary to its histogram, because what it is for is telling us which of the 1159 names and 36 statements are worth anything.
+
+Building it is the first item in document 12 for that reason. Everything else in this folder is ordered by numbers that it supplies.
+
+## 9.3 The skip count is the number to attack first
+
+13392 records the file turned off itself is a third of the corpus never attempted, and section 1.1 already said that a corpus where a third of the records never ran can improve without anything improving.
+
+Those skips are mostly the sqllogictest dialect rather than the SQL. The format has `require` for an extension or a feature, `skipif` and `onlyif` on an engine name, `mode` lines, `loop` and `foreach` and `concurrentloop`, `restart`, `halt`, `hash-threshold`, three sort modes, result labels, and the `<REGEX>:` and `<FILE>:` comparison forms. Every one of those that is unimplemented turns into a skip that looks like a DuckDB feature gap and is not.
+
+So the first harness change is to count and publish skips by reason, separating "this file needs an extension we do not have", which is a real gap, from "this file uses `foreach`", which is a harness gap that hides real records behind it. That split is a day of work and it is the difference between a pass rate that means something and one that does not.
+
+The hash modes deserve a decision rather than an implementation. `hash-threshold` exists so a test file can store a hash instead of a large expected result, and section 1.3 says comparing a hash is the most common way a differential harness reports success it has not earned. We run those files against the live binary and compare the full result, and we use the stored hash only as a second opinion.
+
+## 9.4 Two oracles, and what it means when they disagree
+
+Every record in the upstream corpus has an expected result written in the file, and section 14.2 says a claim is always checked against a real binary of a named version. So there are two oracles and they are both available.
+
+Run both. When rudb and the pinned binary agree and the file disagrees with both, the file is stale or the pin has moved and that is a note, not a failure. When rudb and the file agree and the binary disagrees, we are running the record differently from how the file means it to be run, and that is a harness bug and a valuable one, because it usually means a `require` or a `mode` line was ignored.
+
+That second case is invisible to a harness with one oracle, and it is exactly the case that quietly inflates a pass rate.
+
+## 9.5 The reducer
+
+`reduce` prints that it is not built yet, and it is the highest leverage missing piece, because the cost of a compatibility project is not finding differences, it is the human minutes spent per difference.
+
+The algorithm is published and old: delta debugging, Zeller and Hildebrandt, "Simplifying and Isolating Failure-Inducing Input", 2002, the `ddmin` procedure. The refinement that matters for SQL is that reduction on characters produces garbage, so the reducer works on the parse tree: drop a select item, drop a join, replace a subquery by a constant, drop a `WHERE` conjunct, shrink a literal, drop a table column and the corresponding values. Every step re parses and re runs, and keeps the step if the difference survives.
+
+We have the parse tree and an arena AST, so a tree aware reducer is a few hundred lines rather than a project. The requirement it earns: no failure reaches a human unreduced. That is the rule that makes a corpus with fifty thousand failures workable, because fifty thousand failures reduce to a few hundred distinct minimal cases and those are a week of reading rather than a year.
+
+## 9.6 The pass bisector
+
+`crates/rudb-opt/src/lib.rs` line 67 has six passes, in a `PASSES` array. Upstream `duckdb_optimizers()` has 44 rows and upstream has a `disabled_optimizers` setting that takes a list of names.
+
+Add the same setting here, by name, over the same array. Then when a record disagrees the harness re runs it with each pass disabled in turn and reports which pass, if any, changes the answer. With six passes that is six extra runs on a failing record only, which is free, and it turns "wrong answer" into "wrong answer, and the filter pushdown pass causes it" without anybody reading a plan.
+
+The version of this for the other side is the same trick against the pinned binary, since `disabled_optimizers` already exists upstream, which tells us whether the difference is in our optimizer or in our semantics.
+
+## 9.7 What every run records besides the answer
+
+Section 1.7 puts the resource axis in this harness rather than only in the benchmark suite. This is the mechanism.
+
+Every record already runs on both engines in a child process with a deadline and a memory cap. That child is where the numbers come from: wall clock around the statement, CPU seconds for the process, and peak resident set, on both sides, recorded per record. On Linux that is `getrusage` with `ru_maxrss` and `ru_utime` plus `ru_stime`, which the harness can read for a child it already waits on, so no profiler and no instrumentation inside either engine is involved.
+
+Three ratios come out, rudb over DuckDB: time, CPU and peak memory. Each is a median of at least five runs with the interquartile range beside it, never a minimum, following the reporting rules in `spec/15-rudb-bench.md` section 15.1. The five runs only happen for records that are candidates, which is the ones that pass on both sides and are above the noise floor, so the cost of this is bounded by the interesting fraction of the corpus rather than by all of it.
+
+The exclusions are written down rather than applied by feel. A record that fails on either side is not timed, because timing an error path measures the error path. A record under a few milliseconds on both engines is not timed, because process startup dominates and the ratio is noise. Setup records, `PRAGMA` and the error message cases, are not timed because they are not work.
+
+Two things make this worth more than a benchmark run. It is per record, so a regression names the file that regressed and therefore the feature that caused it, which is the same argument as the reducer and the pass bisector. And it runs on the corpus rather than on a chosen suite, so it covers the shapes nobody chose, which is where a feature that is fast on the benchmark and quadratic on the long tail shows up.
+
+The numbers go on the report page as their own block, per record, rolled up per feature and per milestone. `spec/15-rudb-bench.md` stays the place whole query suites against whole engines are run and is still where any number anybody quotes in public comes from. This is the early warning, not the benchmark.
+
+## 9.8 Where it runs
+
+Locally means server1, server2, server3 or the gaming machine, and the harness should assume that. 4096 files over a machine with 32 cores is a sharding problem and nothing more: `cargo nextest` already partitions with `hash:m/n` and `slice:m/n`, and the per file child process model already makes the run embarrassingly parallel.
+
+What the run has to record so a number is reproducible: the rudb commit, the rudb-compat commit, the DuckDB commit and the hash of the actual binary, the corpus commit, the machine, the seed for anything generated, and the wall clock. A published percentage without those six is a rumour.
+
+## 9.9 What it reports
+
+One machine readable artifact per run, appended to a series so the numbers have a history rather than a current value. It carries the three level two denominators from section 1.1, the five error levels from section 8.2, the skip counts by reason from section 9.3, the failure counts by the nine reasons, the three resource ratios from section 9.7 at record, feature and milestone granularity, and the list of minimal reduced cases from section 9.5.
+
+`report` being unbuilt is the reason the sentence "rudb-compat levels prints the four levels and says none of them has been measured yet" is still true, and that sentence is what this whole folder was written to end.
+
+## 9.10 What it cannot do
+
+Section 14.9 already lists the limits and they do not change: a differential harness proves agreement on what was tried, and nothing about what was not. It cannot tell you that an untested input agrees, it cannot find a bug both engines share, and it cannot measure anything about performance, durability under crash, or concurrency, each of which has its own document. Document 10 is about making "what was tried" much larger, which is the only honest answer to the first limit.

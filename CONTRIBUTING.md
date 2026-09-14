@@ -57,6 +57,26 @@ The minimum supported Rust version check needs that toolchain installed, which i
 
 **A new `#[ignore]` or corpus exclusion comes with an issue number.** No test is deleted to make CI green. It is marked, given an issue, and counted in a report that is visible.
 
+## Compatibility work
+
+The D series milestones are DuckDB compatibility and they have their own rules, because the first month of that work was done one function at a time and at that rate the function table alone is twenty years. [`spec/sql/duckdb/`](spec/sql/duckdb/) is the plan and [`spec/sql/duckdb/12-the-order-of-work.md`](spec/sql/duckdb/12-the-order-of-work.md) is the order.
+
+**No pull request that adds one function name**, unless that function closes a family or unblocks a milestone item. The pinned binary answers `duckdb_functions()` with 3245 overload rows and the harness measures all of them in one run, so a day spent measuring one function by hand is a day spent doing something a program does better. Families, not names.
+
+**Nothing goes on the compatibility page that the harness did not compute**, and there is no single headline compatibility percentage anywhere, in the README or in a release note. Eleven numbers with eleven denominators and provenance on each, per [`spec/sql/duckdb/11-the-number.md`](spec/sql/duckdb/11-the-number.md). A number without the rudb commit, the rudb-compat commit, the DuckDB commit and binary hash, the corpus commit, the machine and the seed is a rumour.
+
+**The number is allowed to go down.** A function counts as implemented only while every overload row of it passes the signature differential, and it stops counting the day a boundary input disagrees. A coverage number that can only go up is a count of pull requests wearing a percentage sign.
+
+**Every feature comes with its resource ratios.** Time, CPU seconds and peak resident set, rudb over DuckDB, on the records the feature newly makes passable, recorded by the harness rather than by a person. The goal is 0.1 on all three and the per milestone gate is weaker than the goal on purpose. This is in the compatibility harness and not only in `rudb-bench` because ordering a year of work by corpus records with nobody watching the engine is the mistake that produced `spec/engine/`.
+
+**No failure reaches a human unreduced**, once the reducer exists. Fifty thousand corpus failures are a few hundred distinct minimal cases, and the difference between those two numbers is whether the queue gets read.
+
+**A DuckDB bug gets reproduced and filed in [`tamnd/duckdb`](https://github.com/tamnd/duckdb), never upstream.** Reduce it, write it up with the statement, both answers and the pinned commit, and file it in the fork. We are reimplementing their engine and reading their test suite, and a stream of bug reports from that position is not a contribution anybody asked for. Reporting one upstream is a deliberate decision somebody makes on purpose, not a side effect of running a harness.
+
+**No dialect enters the registry** without a corpus in the harness, a fuzz target and a published pass rate, on the same terms as SQL. ClickHouse shipped a `kusto` and a `prql` dialect and marked both experimental in 25.1 after parser crash bugs, having shipped them without the coverage its main parser gets. A dialect with a parser and no conformance suite is worse than no dialect, because a user who hits a crash has learned something about the whole engine rather than about one setting.
+
+**The pin moves in one change.** The vendored grammar with its sha256 manifest, the DuckDB binary the harness runs, and the upstream corpus, together, with both sets of numbers published for one release. That is what separates "the number moved because upstream changed" from "the number moved because we did", which is the only question anybody reading the page has.
+
 ## The layer rule
 
 The workspace is 27 crates and each has a rank in `xtask/layers.toml`. A crate may depend only on crates of strictly lower rank, and `cargo xtask layers` is a required CI job. If your change needs an edge that goes the wrong way, that is a design conversation and not a rank edit. Usually the answer is that a type belongs further down than where it currently lives.
