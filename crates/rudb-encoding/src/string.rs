@@ -195,6 +195,32 @@ pub fn candidate_sizes(values: &[&[u8]]) -> Result<Vec<(Kind, usize)>> {
     Ok(sizes)
 }
 
+/// Which candidates [`encode`] would try on this chunk, in the order it tries them.
+///
+/// The chooser is exhaustive, so this is also the list of encodes it pays for to return one of
+/// them. A caller measuring where the encode time goes needs the list separately from the sizes,
+/// because a candidate that is offered and turns out not to apply still costs whatever it spent
+/// finding that out.
+#[must_use]
+pub fn offered(values: &[&[u8]]) -> Vec<Kind> {
+    candidates(values, 0)
+}
+
+/// One candidate on its own, which is what the chooser calls once per entry in [`offered`].
+///
+/// `None` when the encoding does not apply, which is what the chooser treats as a candidate that
+/// did not run rather than as a failure. This is here so that the time the chooser spends can be
+/// attributed to the candidate that spent it, which is the measurement F2 wants before anybody
+/// replaces the exhaustive search with a sampled one. It is not how a writer encodes a chunk:
+/// [`encode`] is, and picking a kind by hand gives up the only thing the chooser is for.
+///
+/// # Errors
+///
+/// As [`encode`].
+pub fn encode_only(kind: Kind, values: &[&[u8]]) -> Result<Option<Vec<u8>>> {
+    encode_as(kind, values, 0)
+}
+
 /// The shape a chunk was encoded as, as a line of text like `DICT(FSST, RLE(...))`.
 ///
 /// # Errors
@@ -626,6 +652,29 @@ mod tests {
 
     fn kind_of(bytes: &[u8]) -> Kind {
         Kind::from_tag(bytes[0]).unwrap()
+    }
+
+    #[test]
+    fn what_the_chooser_returns_is_the_smallest_of_what_it_was_offered() {
+        // `offered` and `encode_only` are what `cargo xtask encode` splits the chooser's seconds
+        // with, so they have to describe the chooser that actually runs rather than a second copy
+        // of its rules that drifts. This is the assertion that keeps the two the same thing: walk
+        // the list, encode each one alone, and the smallest has to be byte for byte what `encode`
+        // came back with.
+        for values in [urls(400), keyed(urls(400)), vec![b"same".to_vec(); 50], Vec::new()] {
+            let borrowed = borrow(&values);
+            let chosen = encode(&borrowed).unwrap();
+            let mut smallest: Option<Vec<u8>> = None;
+            for kind in offered(&borrowed) {
+                let Some(bytes) = encode_only(kind, &borrowed).unwrap() else {
+                    continue;
+                };
+                if smallest.as_ref().is_none_or(|best| bytes.len() < best.len()) {
+                    smallest = Some(bytes);
+                }
+            }
+            assert_eq!(smallest.as_deref(), Some(chosen.as_slice()), "{}", values.len());
+        }
     }
 
     fn raw_size(values: &[Vec<u8>]) -> usize {

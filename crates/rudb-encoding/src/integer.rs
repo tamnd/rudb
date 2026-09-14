@@ -177,6 +177,31 @@ pub fn candidate_sizes(values: &[i64]) -> Result<Vec<(Kind, usize)>> {
     Ok(sizes)
 }
 
+/// Which candidates [`encode`] would try on this chunk, in the order it tries them.
+///
+/// The chooser is exhaustive, so this is also the list of encodes it pays for to return one of
+/// them. A caller measuring where the encode time goes needs the list separately from the sizes,
+/// because a candidate that is offered and turns out not to apply still costs whatever it spent
+/// finding that out.
+#[must_use]
+pub fn offered(values: &[i64]) -> Vec<Kind> {
+    candidates(values, 0)
+}
+
+/// One candidate on its own, which is what the chooser calls once per entry in [`offered`].
+///
+/// `None` when the encoding does not apply. This is here so that the time the chooser spends can be
+/// attributed to the candidate that spent it, which is the measurement F2 wants before anybody
+/// replaces the exhaustive search with a sampled one. It is not how a writer encodes a chunk:
+/// [`encode`] is, and picking a kind by hand gives up the only thing the chooser is for.
+///
+/// # Errors
+///
+/// As [`encode`].
+pub fn encode_only(kind: Kind, values: &[i64]) -> Result<Option<Vec<u8>>> {
+    encode_as(kind, values, 0)
+}
+
 /// The cascade a chunk was encoded as, as a line of text like `DICT(PACKED, PACKED)`.
 ///
 /// # Errors
@@ -646,6 +671,30 @@ mod tests {
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             self.0
+        }
+    }
+
+    #[test]
+    fn what_the_chooser_returns_is_the_smallest_of_what_it_was_offered() {
+        // `offered` and `encode_only` are what `cargo xtask encode` splits the chooser's seconds
+        // with, so they have to describe the chooser that actually runs rather than a second copy
+        // of its rules that drifts. This is the assertion that keeps the two the same thing.
+        let mut random = Random::new();
+        let noise: Vec<i64> = (0..2000).map(|_| (random.next() % 5000) as i64).collect();
+        let runs: Vec<i64> = (0..2000).map(|index: i64| index / 100).collect();
+        let climbing: Vec<i64> = (0..2000).map(|index| 1_700_000_000 + index).collect();
+        for values in [noise, runs, climbing, vec![7; 300], Vec::new()] {
+            let chosen = encode(&values).unwrap();
+            let mut smallest: Option<Vec<u8>> = None;
+            for kind in offered(&values) {
+                let Some(bytes) = encode_only(kind, &values).unwrap() else {
+                    continue;
+                };
+                if smallest.as_ref().is_none_or(|best| bytes.len() < best.len()) {
+                    smallest = Some(bytes);
+                }
+            }
+            assert_eq!(smallest.as_deref(), Some(chosen.as_slice()), "{}", values.len());
         }
     }
 

@@ -17,6 +17,7 @@ mod compare;
 mod compress;
 mod conform;
 mod differential;
+mod encode;
 mod flatten;
 mod focus;
 mod grammar;
@@ -76,6 +77,10 @@ fn main() -> ExitCode {
         // What a megabyte of Snappy costs to decompress, which only means anything next to the
         // read rate in the table above it.
         Some("compress") => compress::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        // What the encoder costs on a real column, per candidate. The layer above `compress`, and
+        // the one F2's load time criterion is actually about, since a file only gets compressed
+        // once it has been encoded.
+        Some("encode") => encode::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         // The committed corpus from tamnd/rudb-compat, against the shell this tree builds. Not
         // `differential` above, which compares two engines over a file somebody downloaded. This
         // one has its answers written down in the repository that owns them.
@@ -134,6 +139,10 @@ fn usage() {
     println!("           and it is the column that means anything. --bytes <n> sizes the file");
     println!("  compress what a megabyte of Snappy costs to decompress, per payload shape. The");
     println!("           number only means anything next to the read rate from `io` above");
+    println!("  encode [file] [--all]  what the encoder costs on the columns of a Parquet file,");
+    println!("           as megabytes a second per column and as the seconds each candidate the");
+    println!("           chooser tried spent. defaults to the committed ten thousand row hits");
+    println!("           fixture, and --all prints every column rather than the slowest twenty");
     println!("  bench <suite>          the whole comparison, against every engine on this machine");
     println!("                         builds rudb and the harness, then runs the suite. needs a");
     println!("                         tamnd/rudb-bench checkout beside this one, or");
