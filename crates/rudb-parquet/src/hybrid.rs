@@ -238,6 +238,18 @@ impl<'a> Hybrid<'a> {
 /// Bits past the end of `bytes` read as zero rather than as an error. The last group of a run is
 /// padded out to eight values whether or not the file has the bytes for them, and the values the
 /// caller did not ask for are the ones the padding covers.
+///
+/// # It reads the stream once, not once per value
+///
+/// The obvious way to write this is to work out which byte each value starts in and read a window
+/// around it, and that is what this was. It costs nine bounds checked byte loads and nine shifts a
+/// value, and for a ten million row dictionary column that is ninety million loads over bytes that
+/// were already in a register from the value before.
+///
+/// So the bits go through a 128 bit accumulator instead. Eight bytes come in at a time, values come
+/// off the low end, and a byte is read once no matter how many values it holds part of. At sixteen
+/// bits, which is what a `hits` dictionary index is, that is one load per four values rather than
+/// nine per value.
 pub(crate) fn unpack(
     bytes: &[u8],
     width: u8,
@@ -254,24 +266,54 @@ pub(crate) fn unpack(
         }
         return;
     }
-    let width = usize::from(width);
+    let width = u32::from(width);
     let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
-    let mut bit = skip * width;
-    for _ in 0..count {
-        let byte = bit / 8;
-        let shift = bit % 8;
-        // Nine bytes at most, because a 64 bit value starting at bit seven of a byte ends in the
-        // ninth one. Reading them into a u128 and shifting is one branch instead of a loop with a
-        // carry in it. A narrower width reads bytes it does not need and masks them off, which is
-        // cheaper than working out how many it needed.
-        let mut window = 0u128;
-        for i in 0..9 {
-            if let Some(&b) = bytes.get(byte + i) {
-                window |= u128::from(b) << (8 * i);
+    let bit = skip * width as usize;
+    let mut at = bit / 8;
+    // The bits already read and not yet handed out, low end first, and how many of them are real.
+    // Never more than 128 and never refilled above 64, so a whole word always has room.
+    let mut held = 0u128;
+    let mut bits = 0u32;
+
+    // Written as a macro rather than a closure because the accumulator is three locals and a
+    // closure over them borrows all three for as long as `push` is alive.
+    macro_rules! fill {
+        () => {
+            while bits <= 64 {
+                if let Some(word) = bytes.get(at..at + 8) {
+                    let word = u64::from_le_bytes(word.try_into().expect("eight bytes"));
+                    held |= u128::from(word) << bits;
+                    at += 8;
+                    bits += 64;
+                } else if let Some(&byte) = bytes.get(at) {
+                    held |= u128::from(byte) << bits;
+                    at += 1;
+                    bits += 8;
+                } else {
+                    // Past the end, where the format says a reader finds zeros. The accumulator is
+                    // already zero up there, so claiming the bits is the whole of it, and claiming
+                    // all of them stops this loop running again per value at the end of a run.
+                    bits = 128;
+                    break;
+                }
             }
+        };
+    }
+
+    fill!();
+    // The first value does not have to start on a byte boundary, so drop what belongs to the values
+    // being skipped over. At most seven bits, and the fill above left at least fifty seven.
+    let ahead = (bit % 8) as u32;
+    held >>= ahead;
+    bits -= ahead;
+
+    for _ in 0..count {
+        if bits < width {
+            fill!();
         }
-        push(((window >> shift) as u64) & mask);
-        bit += width;
+        push((held as u64) & mask);
+        held >>= width;
+        bits -= width;
     }
 }
 
@@ -285,7 +327,7 @@ pub(crate) fn width_for(max: u32) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hybrid, width_for};
+    use super::{Hybrid, unpack, width_for};
 
     /// A run of `times` copies of `value`, at `width` bits.
     fn repeat(times: u64, value: u32, width: u8) -> Vec<u8> {
@@ -474,6 +516,67 @@ mod tests {
             let mut out = Vec::new();
             let result = Hybrid::new(&bytes[..cut], 1).expect("allowed").read(&mut out, 372);
             assert!(result.is_err(), "a stream cut at {cut} produced 372 values anyway");
+        }
+    }
+
+    /// The obvious unpacker, one window per value, kept as the thing the real one has to match.
+    ///
+    /// This is what `unpack` used to be, and it is short enough to read and slow enough that nobody
+    /// would ship it. Leaving it here is cheaper than arguing about whether the accumulator in the
+    /// real one is right: the two are compared over every width, every starting offset and every
+    /// length of buffer below.
+    fn window(bytes: &[u8], width: u8, skip: usize, count: usize) -> Vec<u64> {
+        if width == 0 {
+            return vec![0; count];
+        }
+        let width = usize::from(width);
+        let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+        let mut bit = skip * width;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut value = 0u128;
+            for i in 0..9 {
+                if let Some(&byte) = bytes.get(bit / 8 + i) {
+                    value |= u128::from(byte) << (8 * i);
+                }
+            }
+            out.push(((value >> (bit % 8)) as u64) & mask);
+            bit += width;
+        }
+        out
+    }
+
+    #[test]
+    fn the_accumulator_reads_the_same_values_a_window_per_value_would() {
+        // Every width the format allows, started at every offset inside the first two groups, over
+        // bytes that mean nothing in particular. The widths past 32 are the delta encodings, which
+        // call this directly rather than through `Hybrid`.
+        let bytes: Vec<u8> = (0..256u32).map(|i| (i.wrapping_mul(167) >> 1) as u8).collect();
+        for width in 1..=64u8 {
+            for skip in 0..17 {
+                let wanted = window(&bytes, width, skip, 40);
+                let mut got = Vec::new();
+                unpack(&bytes, width, skip, 40, |value| got.push(value));
+                assert_eq!(got, wanted, "width {width} from {skip}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_that_runs_off_the_end_finds_zeroes_rather_than_stopping() {
+        // The last group of a packed run is padded to eight values whether or not the file has the
+        // bytes, so a reader that asked for the padding gets zeros. This is the case the
+        // accumulator has to get right in two places at once, since it claims the bits past the end
+        // in one go rather than one value at a time.
+        let bytes: Vec<u8> = (0..24u8).collect();
+        for width in [1u8, 3, 7, 8, 12, 16, 17, 32, 64] {
+            for cut in 0..=bytes.len() {
+                let short = &bytes[..cut];
+                let wanted = window(short, width, 0, 30);
+                let mut got = Vec::new();
+                unpack(short, width, 0, 30, |value| got.push(value));
+                assert_eq!(got, wanted, "width {width} over {cut} bytes");
+            }
         }
     }
 
