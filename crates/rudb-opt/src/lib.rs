@@ -63,18 +63,27 @@ pub const RANK: u8 = 11;
 /// and that pair is what top N fuses, so running the two the other way around would leave the fusion
 /// with a plan it cannot see the shape of.
 ///
-/// The distinct aggregate rewrite is first, because it is the one pass that changes what an aggregate
-/// is rather than where it sits. Every other pass here is written against a single aggregate node,
-/// and running this one ahead of them means none of them has to know that `COUNT(DISTINCT x)` has a
-/// second spelling. In particular the limit that fuses into an aggregate has to fuse into the outer
-/// one, and after this pass the outer one is the only one it can see.
+/// The distinct aggregate rewrite is second, ahead of everything that moves an operator around,
+/// because it is the one pass that changes what an aggregate is rather than where it sits. Every
+/// other pass here is written against a single aggregate node, and running this one ahead of them
+/// means none of them has to know that `COUNT(DISTINCT x)` has a second spelling. In particular the
+/// limit that fuses into an aggregate has to fuse into the outer one, and after this pass the outer
+/// one is the only one it can see.
+///
+/// What it is not ahead of is folding, and that order is the other way round for a reason the AST
+/// fuzz target found. The rewrite fires only when every `DISTINCT` call in a node has the same
+/// argument, and whether two arguments are the same is a question folding answers: `max(DISTINCT
+/// 1 + 1)` and `min(DISTINCT 2)` are two arguments before it and one after it. With the rewrite
+/// first the pass sees the unfolded pair, refuses, and a second run of the sequence over its own
+/// output fires, which is the idempotence assertion below failing. Folding has no opinion about
+/// either spelling of an aggregate, so nothing is given up by putting it in front.
 ///
 /// Top N is last, because it is the one pass that fuses two operators into one rather than moving
 /// something around. Everything before it is written against a sort and a limit, and a pass that had
 /// to know about both spellings of the same plan is a pass with two of every rule in it.
 pub static PASSES: [&(dyn Pass + Sync); 8] = [
-    &distinct::DistinctAggregateRewrite,
     &fold::ExpressionRewriter,
+    &distinct::DistinctAggregateRewrite,
     &filter::FilterPushdown,
     &empty::EmptyResultPullup,
     &columns::UnusedColumns,
@@ -391,6 +400,26 @@ mod tests {
         assert_eq!(
             optimized(text),
             "Project #1 [#0.0::INTEGER AS n]\n  Get memory.main.t AS t #0 [a::INTEGER]\n"
+        );
+    }
+
+    /// Folding before the distinct aggregate rewrite, which is the other half of that order. The
+    /// rewrite wants every `DISTINCT` call in a node to have the same argument, and these two have
+    /// the same argument only once folding has run, so with the passes the other way around the
+    /// rewrite refuses here and fires on a second run over its own output.
+    #[test]
+    fn folding_runs_first_so_that_the_distinct_rewrite_sees_one_argument_rather_than_two() {
+        let text = concat!(
+            "Aggregate #1 groups=[] aggregates=[max(DISTINCT \"+\"(1::INTEGER, 1::INTEGER)::INTEGER)::INTEGER, min(DISTINCT 2::INTEGER)::INTEGER]\n",
+            "  Dummy\n",
+        );
+        assert_eq!(
+            optimized(text),
+            concat!(
+                "Aggregate #1 groups=[] aggregates=[max(#2.0::INTEGER)::INTEGER, min(#2.0::INTEGER)::INTEGER]\n",
+                "  Aggregate #2 groups=[2::INTEGER] aggregates=[]\n",
+                "    Dummy\n",
+            )
         );
     }
 }
