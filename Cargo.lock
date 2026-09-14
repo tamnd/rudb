@@ -18,6 +18,7 @@ dependencies = [
  "rudb-common",
  "rudb-exec",
  "rudb-io",
+ "rudb-kernels",
  "rudb-metrics",
  "rudb-opt",
  "rudb-parse",
