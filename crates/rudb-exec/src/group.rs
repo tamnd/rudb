@@ -21,6 +21,7 @@
 //! is built to be asked about. It is asked about once per row, so it matters, and it is not this
 //! change because a set per group is a different shape from a table over the whole input.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
@@ -144,7 +145,15 @@ pub(crate) struct Aggregate<'a> {
     built: Mutex<Built>,
     /// One final table per radix partition. Different workers can merge different partitions at
     /// the same time, and no final table spanning every group is needed.
-    merged: Vec<Mutex<Option<Building>>>,
+    merged: Vec<Mutex<Partition>>,
+    /// How many instances have started, which is how an instance knows whether partitioning could
+    /// buy it anything at all.
+    ///
+    /// A heuristic and nothing more. It is read while the instances are still starting, so it can
+    /// be low, and an instance that reads it low keeps its own table a little longer than it had to.
+    /// That costs speed and never an answer, because what makes partitioning safe is the flag in
+    /// [`Built`] and not this.
+    started: AtomicUsize,
     out: Buffered,
 }
 
@@ -156,9 +165,46 @@ struct Built {
     held: Reservation,
     /// How many instances have combined, which is one per thread the pipeline ran on.
     instances: usize,
+    /// Whether the groups now live in the partitions rather than in one table per instance.
+    ///
+    /// Read and written only under this lock, and that is what makes the switch safe. Once it is
+    /// true every table has to be scattered, including one belonging to an instance that never grew
+    /// large enough to switch on its own, because a group that is in `merged[0]` whole and in
+    /// `merged[5]` as part of a partition comes out of `finalize` twice.
+    partitioning: bool,
+}
+
+/// One radix partition: the groups that hash to it, and the ones that arrived too late to join them.
+///
+/// The second half is what [`Aggregate::scatter`] leaves behind. A table that has started spilling
+/// sends every key it does not already hold to its file, so inserting a scattered group into it
+/// would put that group in the table and its rows in the file at once, and the group would come out
+/// of `finalize` twice. Those groups wait here instead and are folded into the pass that reads the
+/// file back, where their rows are, which is the one place they can meet without being counted
+/// twice.
+///
+/// Empty on every ordinary query. It takes an aggregate that spills before its instances have
+/// handed their groups over to reach it, which means a budget tight enough to crowd while the
+/// instances are still small.
+#[derive(Debug, Default)]
+struct Partition {
+    table: Option<Building>,
+    carried: Option<Building>,
 }
 
 const RADIX_PARTITIONS: usize = 16;
+
+/// How many groups an instance holds before it stops keeping them to itself.
+///
+/// Partitioning is not free. Every chunk is hashed, split, and gathered into one set of vectors per
+/// partition, which is a copy of every column it carries, and then sixteen locks are taken to fold
+/// the pieces. On a small aggregate that is all cost: ClickBench at a thousand rows ran 41 percent
+/// slower and at ten thousand rows 19 percent slower when every grouped aggregate partitioned from
+/// its first chunk, because none of those tables is large enough for the sharing to pay for itself.
+///
+/// Sixteen thousand groups is where an instance's table stops fitting comfortably in cache, which is
+/// also where holding one copy between the threads starts to be worth what it costs to get there.
+const PARTITION_FROM: usize = 16_384;
 
 impl<'a> Aggregate<'a> {
     /// An aggregation over the plan's groups and aggregate calls, and the source it finishes into.
@@ -254,8 +300,10 @@ impl<'a> Aggregate<'a> {
                 chunks: Vec::new(),
                 held: memory.reservation(),
                 instances: 0,
+                partitioning: false,
             }),
-            merged: (0..RADIX_PARTITIONS).map(|_| Mutex::new(None)).collect(),
+            merged: (0..RADIX_PARTITIONS).map(|_| Mutex::new(Partition::default())).collect(),
+            started: AtomicUsize::new(0),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -327,6 +375,7 @@ impl<'a> Aggregate<'a> {
     fn again(
         &self,
         file: &mut Spill,
+        carried: Option<Building>,
         chunks: &mut Vec<Chunk>,
         held: &mut Reservation,
     ) -> Result<Option<Spill>> {
@@ -334,6 +383,9 @@ impl<'a> Aggregate<'a> {
         let mut local = self.start();
         if let Some(error) = local.failure.take() {
             return Err(error);
+        }
+        if let Some(carried) = carried {
+            self.merge(carried, &mut local)?;
         }
         while let Some(rows) = spilled.next(self)? {
             self.fold(&rows, &mut local, None)?;
@@ -724,10 +776,10 @@ impl<'a> Aggregate<'a> {
     /// an accumulator merge reports otherwise.
     fn merge(&self, from: Building, into: &mut Building) -> Result<()> {
         if from.over.is_some() || into.over.is_some() {
-            return Err(Error::not_implemented(
-                "two instances of an aggregate that spilled, because a key can be in one \
-                 instance's table and in another instance's spill file at once, which radix \
-                 partitioning is what fixes",
+            return Err(Error::internal(
+                "two tables of an aggregate were merged with a spill file between them, where a \
+                 key can be in one table and in the other's file at once, which the callers avoid \
+                 by partitioning instead",
             ));
         }
         let Building {
@@ -762,37 +814,16 @@ impl<'a> Aggregate<'a> {
         } else {
             let types: Vec<LogicalType> =
                 self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
+            let mut run: Vec<usize> = Vec::with_capacity(VECTOR_SIZE);
             for start in (0..found).step_by(VECTOR_SIZE) {
                 let end = (start + VECTOR_SIZE).min(found);
                 let mut keys = Vec::with_capacity(types.len());
                 for (at, ty) in types.iter().enumerate() {
                     keys.push(source.column(at, ty, start..end)?);
                 }
-                // row at a time: the keys came out a column at a time above, so what is left per
-                // group is one probe and the accumulators behind it, which is 2g (#61).
-                for slot in start..end {
-                    let row = slot - start;
-                    let hash = source.hash_of(slot);
-                    let target = match into.table.probe(hash, &keys, row) {
-                        Probe::Found(target) => target,
-                        Probe::Vacant(bucket) => {
-                            // The same cap the fold applies, for the same reason: a limit above an
-                            // unordered group by only ever looks at so many groups, and one that is
-                            // dropped here would have been dropped there.
-                            if self.max_groups.is_some_and(|limit| into.table.len() >= limit) {
-                                continue;
-                            }
-                            let target = into.table.insert(bucket, hash, &keys, row)?;
-                            into.groups = into.table.len();
-                            self.fresh(&mut into.states, &mut into.counts)?;
-                            if self.sets {
-                                self.fresh_seen(&mut into.seen);
-                            }
-                            target
-                        }
-                    };
-                    aside += merge_slot(&mut coming, slot, target, into)?;
-                }
+                run.clear();
+                run.extend(start..end);
+                aside += self.fold_slots(&mut coming, &source, &keys, start, &run, into)?;
             }
         }
         // Before the incoming instance's charge goes back, because the values that moved between
@@ -810,6 +841,273 @@ impl<'a> Aggregate<'a> {
         rows::capacity(into.table.owned(), &mut into.charged_keys, &mut into.scratch)?;
         let now = tables(&into.table, &into.states, &into.counts, &into.seen);
         rows::capacity(now, &mut into.charged, &mut into.containers)
+    }
+
+    /// Some of one table's groups folded into another, given the keys of the run they are in.
+    ///
+    /// `slots` are slots of `source`, all of them inside `start .. start + keys.len()`, because
+    /// `keys` is the columns of that run and a probe wants a row of it rather than a slot. A merge
+    /// hands this the whole run. A scatter hands it only the slots belonging to one partition.
+    ///
+    /// What comes back is what the values that moved own away from themselves, which the caller
+    /// charges once rather than once per group.
+    fn fold_slots(
+        &self,
+        coming: &mut Folding<'_>,
+        source: &Table,
+        keys: &[Vector],
+        start: usize,
+        slots: &[usize],
+        into: &mut Building,
+    ) -> Result<u64> {
+        let mut aside = 0;
+        // row at a time: the keys came out a column at a time above, so what is left per group is
+        // one probe and the accumulators behind it, which is 2g (#61).
+        for &slot in slots {
+            let row = slot - start;
+            let hash = source.hash_of(slot);
+            let target = match into.table.probe(hash, keys, row) {
+                Probe::Found(target) => target,
+                Probe::Vacant(bucket) => {
+                    // The same cap the fold applies, for the same reason: a limit above an
+                    // unordered group by only ever looks at so many groups, and one that is dropped
+                    // here would have been dropped there.
+                    if self.max_groups.is_some_and(|limit| into.table.len() >= limit) {
+                        continue;
+                    }
+                    let target = into.table.insert(bucket, hash, keys, row)?;
+                    into.groups = into.table.len();
+                    self.fresh(&mut into.states, &mut into.counts)?;
+                    if self.sets {
+                        self.fresh_seen(&mut into.seen);
+                    }
+                    target
+                }
+            };
+            aside += merge_slot(coming, slot, target, into)?;
+        }
+        Ok(aside)
+    }
+
+    /// One table's groups broken up into the shared partitions, group by group.
+    ///
+    /// The in memory half of [`Aggregate::hand_over`], which is the only caller, because what the
+    /// table spilled has to be put back a row at a time and this puts groups. Each group ends up in
+    /// the one partition its hash picks, which is what stops it living in two places at once and
+    /// coming out of `finalize` twice.
+    ///
+    /// The partitions are taken from a rotating start for the reason [`Aggregate::spread`] takes
+    /// them that way, and each is held only for the groups that belong to it.
+    ///
+    /// A partition that has started spilling takes only the groups whose keys it already holds. The
+    /// rest go into [`Partition::carried`], because the file the partition is filling holds rows for
+    /// every key it does not hold, and a group put in the table here would then be finished once out
+    /// of the table and once out of the file.
+    fn scatter(&self, from: Building, spin: usize) -> Result<()> {
+        debug_assert!(from.over.is_none(), "a spill file is drained by hand_over, not scattered");
+        let Building {
+            scratch,
+            containers,
+            table: source,
+            states: taken,
+            counts: tallies,
+            seen: mut watched,
+            groups: found,
+            ..
+        } = from;
+        let calls = self.calls.len();
+        let distinct: Vec<bool> = self.calls.iter().map(|call| call.distinct).collect();
+        let mut coming = Folding {
+            count_only: self.count_only,
+            calls,
+            distinct: &distinct,
+            taken: &taken,
+            tallies: &tallies,
+            watched: &mut watched,
+        };
+        let types: Vec<LogicalType> =
+            self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
+        let shift = u64::BITS - RADIX_PARTITIONS.ilog2();
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); RADIX_PARTITIONS];
+        // The two halves a spilling partition splits its share into, kept out here so that the rare
+        // path asks the allocator once rather than once per chunk of groups.
+        let mut here: Vec<usize> = Vec::new();
+        let mut late: Vec<usize> = Vec::new();
+        // `affine_rows` is not carried over the way `merge` carries it, because it is only ever
+        // filled on the vector at a time path, that path is only taken when the aggregate is
+        // ungrouped, and an ungrouped aggregate never gets here. A grouped table's counts are zero.
+        for start in (0..found).step_by(VECTOR_SIZE) {
+            let end = (start + VECTOR_SIZE).min(found);
+            let mut keys = Vec::with_capacity(types.len());
+            for (at, ty) in types.iter().enumerate() {
+                keys.push(source.column(at, ty, start..end)?);
+            }
+            for bucket in &mut buckets {
+                bucket.clear();
+            }
+            for slot in start..end {
+                buckets[(source.hash_of(slot) >> shift) as usize].push(slot);
+            }
+            for step in 0..RADIX_PARTITIONS {
+                let at = (step + spin) % RADIX_PARTITIONS;
+                if buckets[at].is_empty() {
+                    continue;
+                }
+                let mut held = self.merged[at].lock().map_err(poisoned)?;
+                let Partition { table, carried } = &mut *held;
+                let into = table.get_or_insert_with(|| self.start());
+                if into.over.is_none() {
+                    let grown =
+                        self.fold_slots(&mut coming, &source, &keys, start, &buckets[at], into)?;
+                    charge(into, grown)?;
+                    continue;
+                }
+                // The partition has started spilling, so a key it does not already hold is one whose
+                // rows went to its file, and putting the group in the table here would mean the
+                // table answers for it and the file answers for it again. Those groups go aside.
+                // Which ones they are is asked once, out here, so that the fold below is the same
+                // fold every other path runs.
+                here.clear();
+                late.clear();
+                for &slot in &buckets[at] {
+                    match into.table.probe(source.hash_of(slot), &keys, slot - start) {
+                        Probe::Found(_) => here.push(slot),
+                        Probe::Vacant(_) => late.push(slot),
+                    }
+                }
+                let grown = self.fold_slots(&mut coming, &source, &keys, start, &here, into)?;
+                charge(into, grown)?;
+                let waiting = carried.get_or_insert_with(|| self.start());
+                let grown = self.fold_slots(&mut coming, &source, &keys, start, &late, waiting)?;
+                charge(waiting, grown)?;
+            }
+        }
+        drop(watched);
+        drop(taken);
+        drop(tallies);
+        drop(source);
+        drop(scratch);
+        drop(containers);
+        Ok(())
+    }
+
+    /// Whether an instance holding this table should hand it to the partitions and stop keeping one.
+    ///
+    /// Four things have to hold. There has to be more than one instance, because sharing a table
+    /// with nobody is all cost. There has to be no pushed down limit, since that path is refused a
+    /// second instance anyway and counts groups against a cap that a partition cannot see. The
+    /// aggregate has to be grouped, because an ungrouped one has a single slot and no key to hash.
+    /// And the table has to be large enough to be worth the split, which is [`PARTITION_FROM`].
+    ///
+    /// A crowded budget counts as large enough whatever the group count says. An instance that is
+    /// about to be told to spill is better off in the partitions, because sixteen shared tables hold
+    /// what N instance tables held and the room that frees may be all that was needed. It also keeps
+    /// the ordinary case away from the awkward one: a table that spills before it is handed over has
+    /// a file covering every partition, and [`Aggregate::hand_over`] has to drain it row by row.
+    fn ought_to_partition(&self, table: &Building) -> bool {
+        !self.alone
+            && self.max_groups.is_none()
+            && self.started.load(Ordering::Relaxed) > 1
+            && (table.groups >= PARTITION_FROM || crowded(&self.memory))
+    }
+
+    /// Turns partitioning on for every instance, and puts whatever was already combined where it
+    /// now belongs.
+    ///
+    /// Called by the first instance to outgrow [`PARTITION_FROM`]. By then another instance may
+    /// already have finished and left its whole table in partition zero, and that table covers every
+    /// partition, so it has to be handed over before anything else lands beside it.
+    ///
+    /// Doing nothing when the flag is already set is not just an optimisation. Two instances can
+    /// cross the threshold at the same moment, and the second one must not scatter what the first
+    /// one has started folding into.
+    fn begin_partitioning(&self, spreading: &mut Spreading) -> Result<()> {
+        let mut built = self.built.lock().map_err(poisoned)?;
+        if built.partitioning {
+            return Ok(());
+        }
+        built.partitioning = true;
+        let seeded = self.merged[0].lock().map_err(poisoned)?.table.take();
+        drop(built);
+        match seeded {
+            Some(seeded) => self.hand_over(seeded, spreading),
+            None => Ok(()),
+        }
+    }
+
+    /// One instance's own table given up to the partitions, spill file and all.
+    ///
+    /// The groups still in the table are scattered, which puts each of them in the one partition its
+    /// hash picks. What was written out because the table could not hold it is read back and spread
+    /// the same way the chunks are, because a spill file holds rows rather than aggregate states and
+    /// a row is a row wherever it came from.
+    ///
+    /// That is the whole of why the file can be drained here rather than being a refusal. The rows
+    /// in it are exactly the rows whose key the table had no room for, so folding them into the
+    /// partitions adds each of them once, to the same group they would have joined had there been
+    /// room. A partition may well spill again afterwards, and that is fine, because a partition's
+    /// file only ever holds keys of that partition and `finalize` knows how to finish it.
+    fn hand_over(&self, mut from: Building, spreading: &mut Spreading) -> Result<()> {
+        let leftover = from.over.take();
+        self.scatter(from, spreading.spin)?;
+        let Some(mut file) = leftover else { return Ok(()) };
+        let mut spilled = Spilled::new(file.read()?, self.spilled_types());
+        while let Some(rows) = spilled.next(self)? {
+            self.spread(&rows, spreading)?;
+        }
+        Ok(())
+    }
+
+    /// One batch of rows split by the high bits of its group hash and folded into the partitions.
+    ///
+    /// The two sweeps are what makes this scale. Gathering a partition's rows out of the batch is a
+    /// copy of every column and it happens before any lock is taken, so an instance never holds a
+    /// partition while it copies. Then the partitions are tried in turn from a rotating start, and
+    /// one that is already being folded into is put aside rather than waited for. The second sweep
+    /// waits for what is left, by which time whoever held it has usually moved on. Without this,
+    /// every instance asked for partition zero first and thirty two threads queued behind one lock
+    /// before doing any work at all.
+    fn spread(&self, rows: &Rows, spreading: &mut Spreading) -> Result<()> {
+        let Spreading { hashes, picks, keyed, spin, waiting } = spreading;
+        crate::table::hash(&rows.keys, rows.rows, hashes);
+        for pick in picks.iter_mut() {
+            pick.clear();
+        }
+        for hashed in keyed.iter_mut() {
+            hashed.clear();
+        }
+        let shift = u64::BITS - RADIX_PARTITIONS.ilog2();
+        for (row, &hash) in hashes.iter().enumerate() {
+            let partition = (hash >> shift) as usize;
+            picks[partition].push(row as u32);
+            keyed[partition].push(hash);
+        }
+        let mut ready: Vec<Option<Rows>> = Vec::with_capacity(RADIX_PARTITIONS);
+        for pick in picks.iter() {
+            ready.push(if pick.is_empty() { None } else { Some(rows.gather(pick)?) });
+        }
+        *spin = (*spin + 1) % RADIX_PARTITIONS;
+        waiting.clear();
+        for step in 0..RADIX_PARTITIONS {
+            let partition = (step + *spin) % RADIX_PARTITIONS;
+            let Some(selected) = &ready[partition] else { continue };
+            match self.merged[partition].try_lock() {
+                Ok(mut held) => {
+                    let table = held.table.get_or_insert_with(|| self.start());
+                    self.fold(selected, table, Some(&keyed[partition]))?;
+                }
+                Err(TryLockError::WouldBlock) => waiting.push(partition),
+                Err(TryLockError::Poisoned(error)) => return Err(poisoned(error)),
+            }
+        }
+        for &partition in waiting.iter() {
+            let selected =
+                ready[partition].as_ref().expect("only a filled partition was put aside");
+            let mut held = self.merged[partition].lock().map_err(poisoned)?;
+            let table = held.table.get_or_insert_with(|| self.start());
+            self.fold(selected, table, Some(&keyed[partition]))?;
+        }
+        Ok(())
     }
 
     /// One `DISTINCT` call over a chunk, which is the one shape that still needs a value per row.
@@ -986,12 +1284,20 @@ impl Rows {
 /// The scratch one pipeline instance keeps between chunks, and its table when it has one of its own.
 #[derive(Debug)]
 pub(crate) struct Partitioned {
-    /// The table this instance folds into when it is not partitioning, which is an ungrouped
-    /// aggregate or a grouping under a pushed down limit. `None` when the shared partitions own
-    /// every group, because then an instance holds no table at all and a chunk is split into them
-    /// directly.
+    /// The table this instance folds into while it still keeps its groups to itself.
+    ///
+    /// Every instance starts with one, because splitting a chunk sixteen ways is not free and a
+    /// small aggregate never earns it back. It goes when [`Aggregate::ought_to_partition`] says the
+    /// table has grown enough to be worth sharing, and from then on this is `None` and the chunks go
+    /// straight into the partitions.
     single: Option<Building>,
     expressions: Scratch,
+    spreading: Spreading,
+}
+
+/// The scratch that splitting a chunk across the partitions needs, kept between chunks.
+#[derive(Debug)]
+struct Spreading {
     hashes: Vec<u64>,
     /// The rows of the chunk belonging to each partition, and their hashes alongside so the fold
     /// does not hash the same keys a second time.
@@ -1002,11 +1308,23 @@ pub(crate) struct Partitioned {
     /// Every instance used to walk them in the order zero to fifteen, so thirty two threads holding
     /// thirty two chunks all queued on partition zero, then all queued on partition one behind
     /// whoever won the first. Starting each chunk one partition further along spreads the first
-    /// attempt, and [`Sink::sink`] then takes the ones that were busy on a second pass rather than
-    /// waiting for them in place.
+    /// attempt, and [`Aggregate::spread`] then takes the ones that were busy on a second pass rather
+    /// than waiting for them in place.
     spin: usize,
     /// The partitions a sweep found locked, kept here so the second pass does not allocate.
     waiting: Vec<usize>,
+}
+
+impl Spreading {
+    fn new() -> Self {
+        Self {
+            hashes: Vec::new(),
+            picks: vec![Vec::new(); RADIX_PARTITIONS],
+            keyed: vec![Vec::new(); RADIX_PARTITIONS],
+            spin: 0,
+            waiting: Vec::new(),
+        }
+    }
 }
 
 /// What one instance of an aggregate holds while it folds.
@@ -1216,15 +1534,11 @@ impl Sink for Aggregate<'_> {
     type Local = Partitioned;
 
     fn local(&self) -> Partitioned {
-        let partitioning = !self.alone && self.max_groups.is_none();
+        self.started.fetch_add(1, Ordering::Relaxed);
         Partitioned {
-            single: if partitioning { None } else { Some(self.start()) },
+            single: Some(self.start()),
             expressions: self.inputs.scratch(),
-            hashes: Vec::new(),
-            picks: vec![Vec::new(); RADIX_PARTITIONS],
-            keyed: vec![Vec::new(); RADIX_PARTITIONS],
-            spin: 0,
-            waiting: Vec::new(),
+            spreading: Spreading::new(),
         }
     }
 
@@ -1244,9 +1558,14 @@ impl Sink for Aggregate<'_> {
         self.max_groups.is_none()
     }
 
-    /// One chunk, split by the high bits of its group hash and folded into the shared partitions.
+    /// One chunk, either into this instance's own table or split across the shared partitions.
     ///
-    /// The two sweeps are the whole of what makes this scale. Gathering a partition's rows out of
+    /// An instance starts with a table of its own, because splitting a chunk is not free and a small
+    /// aggregate never earns it back. It keeps that table until it holds [`PARTITION_FROM`] groups
+    /// and there is more than one instance to share with, and then hands what it has to the
+    /// partitions and folds into them from that point on.
+    ///
+    /// The two sweeps are what makes the partitioned half scale. Gathering a partition's rows out of
     /// the chunk is a copy of every column and it happens before any lock is taken, so an instance
     /// never holds a partition while it copies. Then the partitions are tried in turn from a rotating
     /// start, and one that is already being folded into is put aside rather than waited for. The
@@ -1254,71 +1573,71 @@ impl Sink for Aggregate<'_> {
     /// on. Without this, every instance asked for partition zero first and thirty two threads queued
     /// behind one lock before doing any work at all.
     fn sink(&self, chunk: &Chunk, local: &mut Partitioned) -> Result<Progress> {
-        let Partitioned { single, expressions, hashes, picks, keyed, spin, waiting } = local;
+        let Partitioned { single, expressions, spreading } = local;
+        let rows = self.read(chunk, expressions)?;
         if let Some(table) = single {
             if let Some(error) = table.failure.take() {
                 return Err(error);
             }
-            let rows = self.read(chunk, expressions)?;
             self.fold(&rows, table, None)?;
+            if !self.ought_to_partition(table) {
+                return Ok(Progress::More);
+            }
+            let handing = single.take().expect("the table was there a moment ago");
+            self.begin_partitioning(spreading)?;
+            self.hand_over(handing, spreading)?;
             return Ok(Progress::More);
         }
-        let rows = self.read(chunk, expressions)?;
-        crate::table::hash(&rows.keys, rows.rows, hashes);
-        for pick in picks.iter_mut() {
-            pick.clear();
-        }
-        for hashed in keyed.iter_mut() {
-            hashed.clear();
-        }
-        let shift = u64::BITS - RADIX_PARTITIONS.ilog2();
-        for (row, &hash) in hashes.iter().enumerate() {
-            let partition = (hash >> shift) as usize;
-            picks[partition].push(row as u32);
-            keyed[partition].push(hash);
-        }
-        let mut ready: Vec<Option<Rows>> = Vec::with_capacity(RADIX_PARTITIONS);
-        for pick in picks.iter() {
-            ready.push(if pick.is_empty() { None } else { Some(rows.gather(pick)?) });
-        }
-        *spin = (*spin + 1) % RADIX_PARTITIONS;
-        waiting.clear();
-        for step in 0..RADIX_PARTITIONS {
-            let partition = (step + *spin) % RADIX_PARTITIONS;
-            let Some(selected) = &ready[partition] else { continue };
-            match self.merged[partition].try_lock() {
-                Ok(mut held) => {
-                    let table = held.get_or_insert_with(|| self.start());
-                    self.fold(selected, table, Some(&keyed[partition]))?;
-                }
-                Err(TryLockError::WouldBlock) => waiting.push(partition),
-                Err(TryLockError::Poisoned(error)) => return Err(poisoned(error)),
-            }
-        }
-        for &partition in waiting.iter() {
-            let selected =
-                ready[partition].as_ref().expect("only a filled partition was put aside");
-            let mut held = self.merged[partition].lock().map_err(poisoned)?;
-            let table = held.get_or_insert_with(|| self.start());
-            self.fold(selected, table, Some(&keyed[partition]))?;
-        }
+        self.spread(&rows, spreading)?;
         Ok(Progress::More)
     }
 
-    /// A partitioned instance has already put its rows in the shared tables, so combining it only
-    /// records that it finished. An instance holding a table of its own is merged into partition
-    /// zero, which is where the unpartitioned paths keep everything.
+    /// The end of one instance, which is nothing at all if it was already partitioning.
+    ///
+    /// An instance that still holds a table has to give it up here, and where it goes depends on
+    /// whether anybody has started partitioning. If nobody has, it goes into partition zero whole or
+    /// is merged into what is already there, which is the line merge this had before any of this and
+    /// is what a query small enough never to partition still does. If somebody has, it is scattered,
+    /// because a group sitting in partition zero whole while a copy of it sits in partition five as
+    /// part of a split would be two rows in the answer.
+    ///
+    /// The `built` lock is held across all of it. That is what decides the race: an instance reading
+    /// the flag and an instance setting it cannot both be between the read and the deposit at once,
+    /// so a table is never left whole in partition zero after the switch.
     fn combine(&self, local: Partitioned) -> Result<()> {
-        self.built.lock().map_err(poisoned)?.instances += 1;
-        let Some(arriving) = local.single else { return Ok(()) };
+        let Partitioned { single, mut spreading, .. } = local;
+        let mut built = self.built.lock().map_err(poisoned)?;
+        built.instances += 1;
+        let Some(arriving) = single else { return Ok(()) };
         if let Some(error) = arriving.failure {
             return Err(error);
         }
-        let mut kept = self.merged[0].lock().map_err(poisoned)?;
-        match kept.as_mut() {
-            None => *kept = Some(arriving),
-            Some(kept) => self.merge(arriving, kept)?,
+        if built.partitioning {
+            drop(built);
+            return self.hand_over(arriving, &mut spreading);
         }
+        let mut kept = self.merged[0].lock().map_err(poisoned)?;
+        if kept.table.is_none() {
+            kept.table = Some(arriving);
+            return Ok(());
+        }
+        // Two tables cannot be merged when either of them has spilled, because a key can be in one
+        // table and in the other's file at once, and the merge would finish a group the file is
+        // still holding rows for. Partitioning is the answer to that, so the pair turns it on here
+        // rather than the merge refusing. It takes an instance that filled its budget without ever
+        // reaching a chunk that would have made it partition on its own, which is rare and used to
+        // be a not implemented error.
+        let spilled =
+            arriving.over.is_some() || kept.table.as_ref().is_some_and(|held| held.over.is_some());
+        if spilled {
+            let seeded = kept.table.take().expect("the table was there a moment ago");
+            built.partitioning = true;
+            drop(kept);
+            drop(built);
+            self.hand_over(seeded, &mut spreading)?;
+            return self.hand_over(arriving, &mut spreading);
+        }
+        self.merge(arriving, kept.table.as_mut().expect("the table was there a moment ago"))?;
         Ok(())
     }
 
@@ -1337,18 +1656,42 @@ impl Sink for Aggregate<'_> {
         let mut built = self.built.lock().map_err(poisoned)?;
         for partition in &self.merged {
             let mut partition = partition.lock().map_err(poisoned)?;
-            if let Some(kept) = partition.take() {
-                let Built { chunks, held, .. } = &mut *built;
-                let mut left = self.finish(kept, chunks, held)?;
-                while let Some(mut file) = left {
-                    left = self.again(&mut file, chunks, held)?;
+            let Partition { table, carried } = &mut *partition;
+            let Some(kept) = table.take() else {
+                debug_assert!(
+                    carried.is_none(),
+                    "nothing is set aside from a partition with no table"
+                );
+                continue;
+            };
+            let Built { chunks, held, .. } = &mut *built;
+            let mut left = self.finish(kept, chunks, held)?;
+            // The groups set aside join the first pass that reads the file back, because that pass
+            // is where their rows are. A table that opened a file and then never had a row to write
+            // to it hands back no file, and then the set aside groups are whole on their own and
+            // finish as a table of their own. Either way each of them is finished once, because a
+            // group is only ever set aside by a partition that did not hold its key.
+            if left.is_none() {
+                if let Some(whole) = carried.take() {
+                    left = self.finish(whole, chunks, held)?;
                 }
+            }
+            while let Some(mut file) = left {
+                left = self.again(&mut file, carried.take(), chunks, held)?;
             }
         }
         let chunks = std::mem::take(&mut built.chunks);
         drop(built);
         self.out.fill(chunks)
     }
+}
+
+/// Charges a table for what folding groups into it grew, which is the same three sums every time.
+fn charge(into: &mut Building, grown: u64) -> Result<()> {
+    into.containers.grow(grown)?;
+    rows::capacity(into.table.owned(), &mut into.charged_keys, &mut into.scratch)?;
+    let now = tables(&into.table, &into.states, &into.counts, &into.seen);
+    rows::capacity(now, &mut into.charged, &mut into.containers)
 }
 
 /// The instance being folded into another, which is five things that only travel together.
