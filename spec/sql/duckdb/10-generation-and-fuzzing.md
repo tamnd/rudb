@@ -48,6 +48,24 @@ TLP is a direct test of three valued logic, which is where a young engine is wro
 
 NoREC is a direct test of the optimizer against itself and pairs exactly with the pass bisector in section 9.6. If disabling a pass changes an answer, that is the same signal NoREC is built to produce, and the two together mean an optimizer bug names its own pass.
 
+## 10.4.1 What TLP came out as, and what the first run said
+
+It is `rudb-compat tlp`, it generates a predicate over a table fixed in the source, and it runs the query four times: with no predicate, with the predicate, with its negation, and with the case where the predicate is neither true nor false because something in it was NULL. Two decisions in it are worth keeping written down because both went against the paper.
+
+The three parts are run as three queries and added up in the harness rather than written as one union the way the paper does it. It is the same property and it fails in fewer places: a bug in `UNION ALL` would break every case in a run and say nothing about any predicate, which is the one outcome an oracle exists to avoid. The single statement form is printed beside every failure, so nothing is lost for the person who has to reproduce it.
+
+The table is a constant rather than something generated from the seed. A run then replays from the seed alone, and the rows get chosen for the job instead of sampled. What the job needs is rows on both sides of every boundary a generated predicate might draw, and one row per column that is NULL in that column and ordinary in every other, because that is the row a predicate on one column is unknown about while the rest of the expression around it is well defined.
+
+The first run is twenty thousand predicates against rudb with nothing found and nothing refused, and sixteen thousand of those divided the table rather than putting every row in one part. That second number is printed for a reason. A predicate that puts every row in one part passed without testing anything, so a generator that drifted into writing those would produce a run that is green and empty, and the two numbers beside each other is what makes that visible.
+
+Nothing found is a smaller claim than it looks and the page should say so. It bounds the predicate surface the generator reaches, which is comparisons, IS NULL, BETWEEN, IN, IS DISTINCT FROM, LIKE, a bare boolean column, AND, OR, NOT, a nested IS NULL, and terms wrapped in the functions that return NULL for a NULL argument. That is a narrower surface than sqlsmith reaches and deliberately so, since the oracle is about three valued logic rather than grammar coverage, and it says nothing about the features the milestone is still missing.
+
+Zero refusals means every form the generator writes is one rudb implements. The same predicates were put to the pinned binary, which holds on all of them and refuses none, and that is the check an oracle with one engine in it cannot do without: a generator writing trivially partitionable SQL would produce exactly the same green run.
+
+rudb passing everything leaves the failure path with no run to exercise it, so it is tested against an engine written for the purpose that answers every partition with the rows where the predicate is true, which is what an engine that treats unknown as false does. An oracle whose failure path never runs is a test of its own generator.
+
+What is left of this box is the two oracles the paper has beside the WHERE one, the aggregate form and the GROUP BY with HAVING form. They come after NoREC rather than before it, because NoREC uses the same generator and pairs with the pass bisector that already exists.
+
 ## 10.5 The loop
 
 A generator without reduction produces a pile. The loop is: generate, run both engines, compare, and on a difference immediately reduce with the tree aware reducer from section 9.5, hash the reduced case to deduplicate, and file it if it is new. Nothing in that loop needs a person, and the output of it is a few dozen distinct minimal cases a week rather than a queue nobody opens.
