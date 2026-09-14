@@ -72,7 +72,9 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use rudb_common::{Error, LogicalType, Result, Value, interval_micros};
-use rudb_vector::{Data, Form, Packed, Selection, StringColumn, StringView, Validity, Vector};
+use rudb_vector::{
+    Coded, Data, Form, Packed, Selection, StringColumn, StringView, Validity, Vector,
+};
 
 use crate::fallback::{self, Kernel};
 use crate::logic::is_true;
@@ -405,6 +407,20 @@ where
         let one = column.data()?;
         return dispatch(op.swapped(), len, other, map, one, first, right_valid, left_valid, map);
     }
+    // A compressed column against a literal, tested in the code space the column is already in.
+    // Only equality, because a symbol code says nothing about where its symbol sorts, so an ordering
+    // comparison has to decompress and does. Equality does not: compressing is a function of the
+    // table and the bytes, so two strings have the same codes exactly when they are the same string.
+    if matches!(op, Comparison::Equal | Comparison::NotEqual) {
+        if let (Some(coded), Some(value)) = (left.coded_parts(), right.constant_value()) {
+            let wanted = encoded(&coded, held, left.logical_type(), value)?;
+            return Some(coded_against(op, &coded, &wanted, len, map));
+        }
+        if let (Some(value), Some(coded)) = (left.constant_value(), right.coded_parts()) {
+            let wanted = encoded(&coded, held, right.logical_type(), value)?;
+            return Some(coded_against(op, &coded, &wanted, len, map));
+        }
+    }
     // A string column against another one or against a literal, with the views read where they are.
     // It catches the string view form, whose bytes live in an arena the vector shares and so has no
     // data slice for the branches above to find, and it catches the flat form as well so that the
@@ -494,6 +510,45 @@ fn exact(held: Option<&Held>, ty: &LogicalType, value: &Value) -> Option<i128> {
     let column = readied(held, ty, value)?;
     let data = column.data()?;
     data.signed_at(0).or_else(|| data.unsigned_at(0).and_then(|value| i128::try_from(value).ok()))
+}
+
+/// A literal in the code space a compressed column is in, and `None` for one with no bytes.
+///
+/// It goes through [`readied`] for the reason [`exact`] does: the literal is narrowed to the column
+/// type by the same path every other comparison narrows it with, rather than by a second reading of
+/// the [`Value`] that could disagree with the first.
+fn encoded(
+    coded: &Coded<'_>,
+    held: Option<&Held>,
+    ty: &LogicalType,
+    value: &Value,
+) -> Option<Vec<u8>> {
+    let column = readied(held, ty, value)?;
+    let (views, arena) = column.text_parts()?;
+    Some(coded.encode(views.first()?.bytes_in(arena)?))
+}
+
+/// A compressed column against a literal, tested without decompressing a row of it.
+///
+/// The comparison is a byte slice against a byte slice, which is what it would have been on the
+/// strings, over half as many bytes and with no decompression before it. A row whose codes are a
+/// different length is settled by the length alone, which on a column of URLs is most of them.
+fn coded_against<M>(
+    op: Comparison,
+    coded: &Coded<'_>,
+    wanted: &[u8],
+    len: usize,
+    map: M,
+) -> Vec<bool>
+where
+    M: Fn(usize) -> usize + Copy,
+{
+    let same = op == Comparison::Equal;
+    let mut answers = Vec::with_capacity(len);
+    for row in 0..len {
+        answers.push((coded.row(map(row)) == Some(wanted)) == same);
+    }
+    answers
 }
 
 /// A bit packed column against a literal, compared in the code space the column is already in.
@@ -1682,6 +1737,68 @@ mod tests {
             Vector::constant(LogicalType::Varchar, Value::Varchar("http://example3".into()), 32);
         for op in EVERY {
             agrees(op, &shared, &constant);
+        }
+    }
+
+    #[test]
+    fn a_compressed_column_against_a_literal_answers_what_the_oracle_answers() {
+        let before = fallback::count(Kernel::Compare, Form::Fsst, Form::Constant);
+        let flat = urls(64);
+        let coded = flat.clone().compressed().expect("compresses");
+        assert_eq!(coded.form(), Form::Fsst);
+        let present = match coded.value_at(9) {
+            Value::Varchar(text) => text,
+            other => panic!("a string column reads back strings, not {other:?}"),
+        };
+        for literal in [present.as_str(), "http://example3.test/nothing/like/it", ""] {
+            let value = Value::Varchar(literal.to_owned());
+            let constant = Vector::constant(LogicalType::Varchar, value, 64);
+            for op in EVERY {
+                agrees(op, &coded, &constant);
+                agrees(op, &constant, &coded);
+            }
+        }
+        // Equality has a loop in code space and the six comparisons that need an order do not,
+        // because a symbol code says nothing about where its symbol sorts. Those decompress a row at
+        // a time and count themselves, which is the counter doing its job rather than a gap hiding.
+        let ordered = EVERY.len() - 2;
+        assert_eq!(
+            fallback::count(Kernel::Compare, Form::Fsst, Form::Constant) - before,
+            (3 * ordered) as u64,
+            "only the comparisons that need an order fall through"
+        );
+    }
+
+    /// Equality in code space is only right if compressing is a function, so the same string always
+    /// has the same codes and two different strings never do. This is that claim as a test.
+    #[test]
+    fn every_row_of_a_compressed_column_matches_itself_and_nothing_else() {
+        let flat = urls(48);
+        let coded = flat.clone().compressed().expect("compresses");
+        for row in 0..48 {
+            let constant = Vector::constant(LogicalType::Varchar, flat.value_at(row), 48);
+            let equal = compare(Comparison::Equal, &coded, &constant).expect("compares");
+            for other in 0..48 {
+                let want = flat.value_at(other) == flat.value_at(row);
+                assert_eq!(
+                    equal.value_at(other),
+                    Value::Boolean(want),
+                    "row {row} against {other}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_nulls_of_a_compressed_column_are_the_nulls_the_oracle_sees() {
+        let coded = urls(32)
+            .with_validity(Validity::from_iter(32, |row| row % 3 != 0))
+            .compressed()
+            .expect("compresses");
+        let value = coded.value_at(1);
+        let constant = Vector::constant(LogicalType::Varchar, value, 32);
+        for op in EVERY {
+            agrees(op, &coded, &constant);
         }
     }
 

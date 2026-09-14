@@ -12,9 +12,20 @@
 #![forbid(unsafe_code)]
 
 pub mod bitpack;
-pub mod fsst;
 pub mod integer;
 pub mod multi;
 mod reader;
 pub mod sketch;
 pub mod string;
+
+/// The symbol table and the code, which live a layer down now that a vector can be in FSST form.
+///
+/// They were written here, because this is where compression is. They moved to `rudb-vector` when
+/// the vector gained the form, because a vector that holds FSST codes has to be able to read one and
+/// this crate is above it in the layer rule. What stayed here is everything that decides to use it:
+/// [`string`] trains a table on a column and picks between this and the other string encodings, and
+/// [`multi`] looks for one table that suits several columns.
+///
+/// The re-export is so that a caller that had `rudb_encoding::fsst::SymbolTable` still has it. There
+/// is one implementation and it is over there.
+pub use rudb_vector::fsst;
