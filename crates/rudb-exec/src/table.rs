@@ -172,14 +172,7 @@ impl Table {
             )));
         }
         for (at, column) in keys.iter().enumerate() {
-            let value = column.value_at(row);
-            // What it owns and not what it is. The `Value` itself is in one of the column vectors
-            // below, whose capacity `footprint` counts, and counting it here as well would charge
-            // every group twice for the part of it that is not a string.
-            if !self.columns[at].stores_payload() {
-                self.owned += rows::owned(&value);
-            }
-            self.columns[at].push(value)?;
+            self.owned += self.columns[at].push_from(column, row)?;
         }
         self.hashes.push(hash);
         self.buckets[bucket] = slot as u32;
@@ -232,17 +225,32 @@ impl Table {
         self.buckets = buckets;
     }
 
-    /// One key column of every group, in slot order.
+    /// One key column of a range of groups, in slot order, as a vector.
     ///
     /// This is the whole reason the keys are stored a column at a time rather than a row at a time.
-    /// A chunk of the answer wants a column, so the operator above cuts a range out of this and
-    /// hands it to a vector, and no group is ever a row of its own on the way out.
+    /// A chunk of the answer wants a column, so the operator above cuts a range out of this, and no
+    /// group is ever a row of its own on the way out.
+    ///
+    /// It builds the vector rather than handing back values for the operator to build one from,
+    /// because the two widths that most grouping keys are stored in are the same two a flat vector
+    /// holds. Going out through a `Vec<Value>` copied every group into a tagged value and then
+    /// straight back out of one, which on a group by with a million groups was the single largest
+    /// line in the profile of the operator that finishes them.
+    ///
+    /// # Errors
+    ///
+    /// If the type does not match what the column was built to store, which is a bug in the caller.
     ///
     /// # Panics
     ///
     /// If `at` is not a column of the key this table was built over, which is a bug in the caller.
-    pub(crate) fn column(&self, at: usize, range: std::ops::Range<usize>) -> Vec<Value> {
-        self.columns[at].values(range)
+    pub(crate) fn column(
+        &self,
+        at: usize,
+        ty: &rudb_common::LogicalType,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vector> {
+        self.columns[at].vector(ty, range)
     }
 }
 
@@ -296,6 +304,61 @@ impl Column {
         Ok(())
     }
 
+    /// Adds the key that `column` holds at `row`, taking it where it lies when the widths agree.
+    ///
+    /// What comes back is what the key owns away from this column, which the table adds to its own
+    /// total. It is what the key owns and not what it is: the value itself is in one of the runs
+    /// below, whose capacity `footprint` counts, and counting it here as well would charge every
+    /// group twice for the part of it that is not a string.
+    ///
+    /// The three stored widths read the row straight out of the vector, so an `INTEGER` or a
+    /// `BIGINT` key costs a range check and a push and a `VARCHAR` key costs a copy of its bytes.
+    /// Everything else builds a value, which is what all of this used to do.
+    fn push_from(&mut self, column: &Vector, row: usize) -> Result<u64> {
+        if !column.validity().is_valid(row) {
+            return self.push(Value::Null).map(|()| 0);
+        }
+        let taken = match &mut self.data {
+            StoredData::Integer(values) => {
+                match column.signed_at(row).and_then(|value| i32::try_from(value).ok()) {
+                    Some(value) => {
+                        values.push(value);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            StoredData::BigInt(values) => {
+                match column.signed_at(row).and_then(|value| i64::try_from(value).ok()) {
+                    Some(value) => {
+                        values.push(value);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            StoredData::Varchar(values) => match column.bytes_at(row) {
+                Some(bytes) => {
+                    values.push(bytes);
+                    true
+                }
+                None => false,
+            },
+            StoredData::Other(_) => false,
+        };
+        if taken {
+            self.valid.push(true);
+            return Ok(0);
+        }
+        // A form that does not hand its rows over where they lie, which is the packed one and the
+        // compressed one, or a type wider than the three runs above. The row becomes a value and
+        // the general path takes it.
+        let value = column.value_at(row);
+        let owned = if self.stores_payload() { 0 } else { rows::owned(&value) };
+        self.push(value)?;
+        Ok(owned)
+    }
+
     fn footprint(&self) -> usize {
         let values = match &self.data {
             StoredData::Integer(values) => values.capacity() * size_of::<i32>(),
@@ -311,18 +374,50 @@ impl Column {
             return !column.validity().is_valid(row);
         }
         match &self.data {
-            StoredData::Integer(values) => {
-                matches!(column.value_at(row), Value::Integer(value) if value == values[slot])
-            }
-            StoredData::BigInt(values) => {
-                matches!(column.value_at(row), Value::BigInt(value) if value == values[slot])
-            }
+            // Read where it lies rather than through a value, because this is the one line in the
+            // whole aggregate that runs once per input row per probe step. The fallback is not
+            // decoration: a form that cannot hand its rows over as integers answers `None` here,
+            // and treating that as a key that does not match would put every row of a packed
+            // column in a group of its own.
+            StoredData::Integer(values) => match column.signed_at(row) {
+                Some(value) => value == i128::from(values[slot]),
+                None => same(&Value::Integer(values[slot]), &column.value_at(row)),
+            },
+            StoredData::BigInt(values) => match column.signed_at(row) {
+                Some(value) => value == i128::from(values[slot]),
+                None => same(&Value::BigInt(values[slot]), &column.value_at(row)),
+            },
             StoredData::Varchar(values) => column.bytes_at(row).map_or_else(
                 || same(&Value::Varchar(values.string(slot)), &column.value_at(row)),
                 |value| value == values.get(slot),
             ),
             StoredData::Other(values) => same(&values[slot].value(), &column.value_at(row)),
         }
+    }
+
+    /// A range of groups of this column as a vector, built from the run rather than through values.
+    ///
+    /// The two fixed widths are stored as exactly what a flat vector holds, so the slice is copied
+    /// and the validity is read off the bits beside it. Everything else goes the long way, which is
+    /// the string keys and the types that did not earn a run of their own. Strings are not here
+    /// because the arena a group key lives in and the arena a vector reads are offset differently,
+    /// and rebasing one onto the other is a change of its own rather than a line of this one.
+    fn vector(
+        &self,
+        ty: &rudb_common::LogicalType,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vector> {
+        let (start, len) = (range.start, range.len());
+        let data = match &self.data {
+            StoredData::Integer(values) => Data::Int32(values[range.clone()].to_vec().into()),
+            StoredData::BigInt(values) => Data::Int64(values[range.clone()].to_vec().into()),
+            StoredData::Varchar(_) | StoredData::Other(_) => {
+                return Vector::from_values(ty.clone(), &self.values(range));
+            }
+        };
+        let valid = &self.valid;
+        let validity = rudb_vector::Validity::from_iter(len, |index| valid[start + index]);
+        Ok(Vector::flat(ty.clone(), data)?.with_validity(validity))
     }
 
     fn values(&self, range: std::ops::Range<usize>) -> Vec<Value> {
@@ -791,9 +886,62 @@ mod tests {
                 "row {row} was lost by a rehash"
             );
         }
-        let column = table.column(0, 0..values.len());
+        let column = table.column(0, &LogicalType::BigInt, 0..values.len()).expect("a bigint key");
         assert_eq!(column.len(), values.len());
-        assert_eq!(column[7], Value::BigInt(7));
+        assert_eq!(column.value_at(7), Value::BigInt(7));
+    }
+
+    /// The fallback in `holds` and `push_from`, which is the risk the two fast paths carry. A packed
+    /// column cannot hand a row over as an integer, and a probe that read that `None` as a key that
+    /// did not match would put every row of one in a group of its own.
+    #[test]
+    fn a_packed_integer_column_groups_the_same_as_the_flat_one_it_stands_for() {
+        let values: Vec<Value> = (0..256).map(|row| Value::BigInt(row % 7)).collect();
+        let plain = flat(LogicalType::BigInt, &values);
+        let packed = plain.bit_packed().expect("a column of seven small values packs");
+        assert!(packed.signed_at(0).is_none(), "a packed row is not an integer a read can reach");
+
+        let mut grouped = Vec::new();
+        for column in [&plain, &packed] {
+            let keys = std::slice::from_ref(column);
+            let hashes = hashed(column);
+            let mut table = Table::new(&[LogicalType::BigInt]);
+            let mut slots = Vec::new();
+            for (row, &one) in hashes.iter().enumerate() {
+                slots.push(match table.probe(one, keys, row) {
+                    Probe::Found(slot) => slot,
+                    Probe::Vacant(bucket) => table.insert(bucket, one, keys, row).expect("room"),
+                });
+            }
+            assert_eq!(table.len(), 7, "seven distinct keys whichever form they arrived in");
+            grouped.push(slots);
+        }
+        assert_eq!(grouped[0], grouped[1]);
+    }
+
+    /// What `column` has to keep right now that it builds the vector itself rather than handing back
+    /// values for the operator above to build one from. The second range is the part that is easy to
+    /// get wrong, because the validity of a slice starts at the slice and not at the table.
+    #[test]
+    fn a_key_column_comes_back_as_a_vector_with_its_nulls_where_they_were() {
+        let values = [Value::BigInt(5), Value::Null, Value::BigInt(9)];
+        let keys = [flat(LogicalType::BigInt, &values)];
+        let hashes = hashed(&keys[0]);
+        let mut table = Table::new(&[LogicalType::BigInt]);
+        for (row, &one) in hashes.iter().enumerate() {
+            let Probe::Vacant(bucket) = table.probe(one, &keys, row) else {
+                panic!("row {row} was found before it was inserted");
+            };
+            table.insert(bucket, one, &keys, row).expect("room");
+        }
+        let whole = table.column(0, &LogicalType::BigInt, 0..3).expect("a bigint key");
+        assert_eq!(whole.value_at(0), Value::BigInt(5));
+        assert_eq!(whole.value_at(1), Value::Null);
+        assert_eq!(whole.value_at(2), Value::BigInt(9));
+        let tail = table.column(0, &LogicalType::BigInt, 1..3).expect("a bigint key");
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail.value_at(0), Value::Null);
+        assert_eq!(tail.value_at(1), Value::BigInt(9));
     }
 
     #[test]

@@ -612,8 +612,7 @@ impl<'a> Aggregate<'a> {
                 if let Some(value) = &self.constants[at] {
                     columns.push(Vector::constant(ty.clone(), value.clone(), end - start));
                 } else {
-                    let values = table.column(key, start..end);
-                    columns.push(Vector::from_values(ty.clone(), &values)?);
+                    columns.push(table.column(key, ty, start..end)?);
                     key += 1;
                 }
             }
