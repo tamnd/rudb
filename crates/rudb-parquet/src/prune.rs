@@ -86,7 +86,7 @@ impl Op {
 /// takes: a bound this cannot read, a type it does not know, a writer that emitted the wrong width.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bound {
-    /// Every integer, date, time and timestamp, widened.
+    /// Every integer and date, widened.
     Int(i128),
     /// `FLOAT` and `DOUBLE`.
     Real(f64),
@@ -100,6 +100,15 @@ impl Bound {
     /// A `NULL` answers `None` on purpose. A comparison against null is null, so a filter holding one
     /// keeps no rows at all, and that is a fact about the whole scan rather than about one row group.
     /// Deciding it here would be deciding it in the wrong place.
+    ///
+    /// A time and a timestamp answer `None` as well, and that one is a gap rather than a decision. A
+    /// [`Value::Timestamp`] is microseconds, a file is free to store the same column in milliseconds
+    /// or nanoseconds, and the statistics are at the file's unit. Comparing the two would rule out
+    /// row groups holding rows the query wants. A column stated as UTC loses its unit on the way into
+    /// [`LogicalType`] as well, so the unit cannot be recovered here at all, and closing this means
+    /// carrying it on the test rather than guessing at it.
+    ///
+    /// [`LogicalType`]: rudb_common::LogicalType
     #[must_use]
     pub fn of_value(value: &Value) -> Option<Self> {
         Some(match value {
@@ -115,8 +124,6 @@ impl Bound {
             Value::UBigInt(number) => Self::Int(i128::from(*number)),
             Value::UHugeInt(number) => Self::Int(i128::try_from(*number).ok()?),
             Value::Date(days) => Self::Int(i128::from(*days)),
-            Value::Time(micros) => Self::Int(i128::from(*micros)),
-            Value::Timestamp(micros) => Self::Int(i128::from(*micros)),
             Value::Float(number) => Self::Real(f64::from(*number)),
             Value::Double(number) => Self::Real(*number),
             Value::Varchar(text) => Self::Bytes(text.as_bytes().to_vec()),
@@ -241,7 +248,7 @@ fn read(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::LogicalType;
+    use rudb_common::{LogicalType, Value};
 
     use super::{Bound, Op, Test, skips};
     use crate::metadata::{ColumnChunk, Encoding, Physical, RowGroup, SchemaColumn, Stats};
@@ -353,6 +360,30 @@ mod tests {
     #[test]
     fn no_tests_skip_nothing() {
         assert!(!skips(&[], &group(Some(5), Some(15)), &schema()));
+    }
+
+    /// The bug this was written to stop. Parquet keeps a `UINTEGER` in a physical `INT32` and orders
+    /// its statistics as unsigned, so a group running from three billion to four billion has a
+    /// minimum whose bytes read as a negative number if the annotation is ignored. Read that way the
+    /// group looks like it holds small values and a filter for large ones throws it away.
+    #[test]
+    fn an_unsigned_column_is_read_as_unsigned() {
+        let mut schema = schema();
+        schema[0].ty = LogicalType::UInteger;
+        let bytes = |number: u32| i32::from_le_bytes(number.to_le_bytes());
+        let group = group(Some(bytes(3_000_000_000)), Some(bytes(4_000_000_000)));
+        let test = vec![Test { column: 0, op: Op::Greater, value: Bound::Int(2_000_000_000) }];
+        assert!(!skips(&test, &group, &schema), "the group is entirely above two billion");
+    }
+
+    /// The gap [`Bound::of_value`] documents, pinned so that closing it is a test that changes rather
+    /// than a behaviour that quietly appears. A timestamp constant is microseconds and the file's
+    /// statistics are at whatever unit the file chose, so no test is made from one at all.
+    #[test]
+    fn a_timestamp_constant_makes_no_test() {
+        assert_eq!(Bound::of_value(&Value::Timestamp(1)), None);
+        assert_eq!(Bound::of_value(&Value::Time(1)), None);
+        assert_eq!(Bound::of_value(&Value::Date(1)), Some(Bound::Int(1)));
     }
 
     #[test]
