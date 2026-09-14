@@ -73,7 +73,7 @@ pub(crate) struct Table {
     /// The stored keys, column at a time. `columns[column][slot]` is one group's value in one key
     /// column, which is the layout that lets a group be pushed without asking the allocator for a
     /// row to put it in.
-    columns: Vec<Vec<Stored>>,
+    columns: Vec<Column>,
     /// The hash of each group's key, so that a probe compares one word before it compares a key.
     /// Worth its eight bytes on a string key, where the comparison it avoids is a memcmp.
     hashes: Vec<u64>,
@@ -96,10 +96,10 @@ pub(crate) enum Probe {
 
 impl Table {
     /// An empty table over a key of `columns` columns.
-    pub(crate) fn new(columns: usize) -> Self {
+    pub(crate) fn new(types: &[rudb_common::LogicalType]) -> Self {
         Self {
             buckets: vec![EMPTY; FIRST],
-            columns: vec![Vec::new(); columns],
+            columns: types.iter().map(Column::new).collect(),
             hashes: Vec::new(),
             owned: 0,
         }
@@ -127,8 +127,7 @@ impl Table {
     pub(crate) fn footprint(&self) -> u64 {
         let buckets = self.buckets.capacity() * size_of::<u32>();
         let hashes = self.hashes.capacity() * size_of::<u64>();
-        let keys: usize =
-            self.columns.iter().map(|column| column.capacity() * size_of::<Stored>()).sum();
+        let keys: usize = self.columns.iter().map(Column::footprint).sum();
         u64::try_from(buckets + hashes + keys).unwrap_or(u64::MAX)
     }
 
@@ -178,7 +177,7 @@ impl Table {
             // below, whose capacity `footprint` counts, and counting it here as well would charge
             // every group twice for the part of it that is not a string.
             self.owned += rows::owned(&value);
-            self.columns[at].push(Stored::from(value));
+            self.columns[at].push(value)?;
         }
         self.hashes.push(hash);
         self.buckets[bucket] = slot as u32;
@@ -207,16 +206,7 @@ impl Table {
     /// So nothing from `bytes_at` means fall through to `value_at`, which is right for every form.
     fn holds(&self, slot: usize, keys: &[Vector], row: usize) -> bool {
         for (at, column) in keys.iter().enumerate() {
-            let stored = &self.columns[at][slot];
-            if let Stored::Varchar(text) = stored {
-                if let Some(borrowed) = column.bytes_at(row) {
-                    if borrowed != text.as_bytes() {
-                        return false;
-                    }
-                    continue;
-                }
-            }
-            if !same(&stored.value(), &column.value_at(row)) {
+            if !self.columns[at].holds(slot, column, row) {
                 return false;
             }
         }
@@ -250,7 +240,103 @@ impl Table {
     ///
     /// If `at` is not a column of the key this table was built over, which is a bug in the caller.
     pub(crate) fn column(&self, at: usize, range: std::ops::Range<usize>) -> Vec<Value> {
-        self.columns[at][range].iter().map(Stored::value).collect()
+        self.columns[at].values(range)
+    }
+}
+
+/// One key column in its common physical width.
+///
+/// ClickBench's high-cardinality keys are mostly `BIGINT`, `INTEGER`, and `VARCHAR`. Keeping those
+/// in a general tagged value made every number 32 bytes wide. The validity is separate because a
+/// nullable integer represented as `Option<i64>` is 16 bytes, while `Vec<bool>` uses one bit.
+#[derive(Debug)]
+struct Column {
+    valid: Vec<bool>,
+    data: StoredData,
+}
+
+#[derive(Debug)]
+enum StoredData {
+    Integer(Vec<i32>),
+    BigInt(Vec<i64>),
+    Varchar(Vec<String>),
+    Other(Vec<Stored>),
+}
+
+impl Column {
+    fn new(ty: &rudb_common::LogicalType) -> Self {
+        let data = match ty {
+            rudb_common::LogicalType::Integer => StoredData::Integer(Vec::new()),
+            rudb_common::LogicalType::BigInt => StoredData::BigInt(Vec::new()),
+            rudb_common::LogicalType::Varchar => StoredData::Varchar(Vec::new()),
+            _ => StoredData::Other(Vec::new()),
+        };
+        Self { valid: Vec::new(), data }
+    }
+
+    fn push(&mut self, value: Value) -> Result<()> {
+        let present = !matches!(value, Value::Null);
+        match (&mut self.data, value) {
+            (StoredData::Integer(values), Value::Integer(value)) => values.push(value),
+            (StoredData::Integer(values), Value::Null) => values.push(0),
+            (StoredData::BigInt(values), Value::BigInt(value)) => values.push(value),
+            (StoredData::BigInt(values), Value::Null) => values.push(0),
+            (StoredData::Varchar(values), Value::Varchar(value)) => values.push(value),
+            (StoredData::Varchar(values), Value::Null) => values.push(String::new()),
+            (StoredData::Other(values), value) => values.push(Stored::from(value)),
+            (_, value) => {
+                return Err(Error::internal(format!(
+                    "a group key column was given a value of the wrong type: {value:?}"
+                )));
+            }
+        }
+        self.valid.push(present);
+        Ok(())
+    }
+
+    fn footprint(&self) -> usize {
+        let values = match &self.data {
+            StoredData::Integer(values) => values.capacity() * size_of::<i32>(),
+            StoredData::BigInt(values) => values.capacity() * size_of::<i64>(),
+            StoredData::Varchar(values) => values.capacity() * size_of::<String>(),
+            StoredData::Other(values) => values.capacity() * size_of::<Stored>(),
+        };
+        values + self.valid.capacity().div_ceil(8)
+    }
+
+    fn holds(&self, slot: usize, column: &Vector, row: usize) -> bool {
+        if !self.valid[slot] {
+            return !column.validity().is_valid(row);
+        }
+        match &self.data {
+            StoredData::Integer(values) => {
+                matches!(column.value_at(row), Value::Integer(value) if value == values[slot])
+            }
+            StoredData::BigInt(values) => {
+                matches!(column.value_at(row), Value::BigInt(value) if value == values[slot])
+            }
+            StoredData::Varchar(values) => column.bytes_at(row).map_or_else(
+                || same(&Value::Varchar(values[slot].clone()), &column.value_at(row)),
+                |value| value == values[slot].as_bytes(),
+            ),
+            StoredData::Other(values) => same(&values[slot].value(), &column.value_at(row)),
+        }
+    }
+
+    fn values(&self, range: std::ops::Range<usize>) -> Vec<Value> {
+        range
+            .map(|slot| {
+                if !self.valid[slot] {
+                    return Value::Null;
+                }
+                match &self.data {
+                    StoredData::Integer(values) => Value::Integer(values[slot]),
+                    StoredData::BigInt(values) => Value::BigInt(values[slot]),
+                    StoredData::Varchar(values) => Value::Varchar(values[slot].clone()),
+                    StoredData::Other(values) => values[slot].value(),
+                }
+            })
+            .collect()
     }
 }
 
@@ -591,7 +677,7 @@ mod tests {
         let mut hashes = Vec::new();
         hash(&keys, 3, &mut hashes);
 
-        let mut table = Table::new(2);
+        let mut table = Table::new(&[LogicalType::Varchar, LogicalType::Integer]);
         let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
             panic!("an empty table found a group");
         };
@@ -614,7 +700,7 @@ mod tests {
             let mut hashes = Vec::new();
             hash(&keys, 2, &mut hashes);
 
-            let mut table = Table::new(1);
+            let mut table = Table::new(&[LogicalType::Varchar]);
             let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
                 panic!("an empty table found a group");
             };
@@ -638,7 +724,7 @@ mod tests {
         hash(std::slice::from_ref(&ada), 1, &mut first);
         hash(std::slice::from_ref(&grace), 1, &mut second);
 
-        let mut table = Table::new(1);
+        let mut table = Table::new(&[LogicalType::Varchar]);
         let keys = [ada];
         let Probe::Vacant(bucket) = table.probe(first[0], &keys, 0) else {
             panic!("an empty table found a group");
@@ -657,7 +743,7 @@ mod tests {
         let mut hashes = Vec::new();
         hash(&keys, values.len(), &mut hashes);
 
-        let mut table = Table::new(1);
+        let mut table = Table::new(&[LogicalType::BigInt]);
         for (row, &one) in hashes.iter().enumerate() {
             let Probe::Vacant(bucket) = table.probe(one, &keys, row) else {
                 panic!("row {row} was found before it was inserted");
@@ -677,6 +763,26 @@ mod tests {
         assert_eq!(column[7], Value::BigInt(7));
     }
 
+    #[test]
+    fn common_numeric_keys_keep_their_physical_width() {
+        let values: Vec<Value> = (0..1000).map(Value::BigInt).collect();
+        let keys = [flat(LogicalType::BigInt, &values)];
+        let mut hashes = Vec::new();
+        hash(&keys, values.len(), &mut hashes);
+        let mut table = Table::new(&[LogicalType::BigInt]);
+        for (row, &hash) in hashes.iter().enumerate() {
+            let Probe::Vacant(bucket) = table.probe(hash, &keys, row) else {
+                panic!("a unique key was already present");
+            };
+            table.insert(bucket, hash, &keys, row).expect("room for the group");
+        }
+        let key_bytes = table.columns[0].footprint();
+        assert!(
+            key_bytes < values.len() * 9,
+            "{key_bytes} bytes stored a thousand eight-byte keys and their validity"
+        );
+    }
+
     /// The strings a key holds are charged, and they are charged once the group is in rather than
     /// per row, since a row that is not a new group copies nothing.
     #[test]
@@ -686,7 +792,7 @@ mod tests {
         let keys = [column];
         let mut hashes = Vec::new();
         hash(&keys, 1, &mut hashes);
-        let mut table = Table::new(1);
+        let mut table = Table::new(&[LogicalType::Varchar]);
         assert_eq!(table.owned(), 0);
         let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
             panic!("an empty table found a group");
