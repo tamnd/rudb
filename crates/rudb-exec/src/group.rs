@@ -36,7 +36,7 @@ use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 use crate::spill::{Reader, Spill};
-use crate::table::{Probe, Table};
+use crate::table::{Probe, Table, Walk};
 
 /// One aggregate call, taken apart once when the operator is built.
 #[derive(Debug, Clone)]
@@ -442,6 +442,7 @@ impl<'a> Aggregate<'a> {
             // One slot per row of the chunk in hand, which is what the probe produces and what the
             // scatter consumes, and the same slots with a call's `FILTER` folded into them.
             slots: Vec::new(),
+            walk: Walk::default(),
             kept: Vec::new(),
             affine_rows: vec![0; calls],
             // The file the rows that do not fit go to, made the first time the budget says the
@@ -485,6 +486,7 @@ impl<'a> Aggregate<'a> {
             given,
             hashes,
             slots,
+            walk,
             kept,
             affine_rows,
             over,
@@ -527,42 +529,49 @@ impl<'a> Aggregate<'a> {
         // The probe, and nothing else. What comes out of it is one slot per row, which is what the
         // scatter below needs and what the row loop used to consume as it went.
         slots.clear();
-        slots.resize(*length, NOWHERE);
-        for row in 0..*length {
-            slots[row] = if alone {
-                0
-            } else {
-                match table.probe(hashes[row], keys, row) {
-                    Probe::Found(slot) => slot,
-                    Probe::Vacant(bucket) => {
-                        if self.max_groups.is_some_and(|limit| table.len() >= limit) {
-                            continue;
-                        }
-                        if let Some(file) = over.as_mut() {
-                            // The table is as large as the budget will let it be and this key is
-                            // not in it, so the row goes out whole. Every later row with this key
-                            // goes out too, because the key is never inserted here, and that is
-                            // what lets the next pass finish the group without knowing anything
-                            // about this one.
-                            put_away(file, seen_rows, row, away)?;
-                            continue;
-                        }
-                        // A group costs the copy of its key that the table takes, and its own
-                        // accumulators and distinct sets in the two vectors beside it. What all of
-                        // those took to have room for it is charged below and once per chunk,
-                        // because it is a property of the containers rather than of this group, and
-                        // what the key owns away from itself the table adds up as it goes and is
-                        // charged the same way.
-                        let slot = table.insert(bucket, hashes[row], keys, row)?;
-                        *groups = table.len();
-                        self.fresh(states, counts)?;
-                        if self.sets {
-                            self.fresh_seen(seen);
-                        }
-                        slot
+        slots.resize(*length, if alone { 0 } else { NOWHERE });
+        // A batch at a time, because a probe of a table larger than the cache is three dependent
+        // misses on a row and the only way to overlap them is to have several rows in flight at once.
+        // What comes back is every row whose key is already a group, filled in, and the rest in row
+        // order. Those go one at a time: a key that is not in the table either starts a group or goes
+        // out to the spill file, and both of them change what the row after would have found.
+        let mut from = 0;
+        while !alone && from < *length {
+            let upto = (from + crate::table::BATCH).min(*length);
+            table.probe_run(hashes, keys, from, upto, slots, walk);
+            from = upto;
+            for &row in walk.pending() {
+                let bucket = match table.probe(hashes[row], keys, row) {
+                    // An earlier row of the same batch started this group.
+                    Probe::Found(slot) => {
+                        slots[row] = slot;
+                        continue;
                     }
+                    Probe::Vacant(bucket) => bucket,
+                };
+                if self.max_groups.is_some_and(|limit| table.len() >= limit) {
+                    continue;
                 }
-            };
+                if let Some(file) = over.as_mut() {
+                    // The table is as large as the budget will let it be and this key is not in it,
+                    // so the row goes out whole. Every later row with this key goes out too, because
+                    // the key is never inserted here, and that is what lets the next pass finish the
+                    // group without knowing anything about this one.
+                    put_away(file, seen_rows, row, away)?;
+                    continue;
+                }
+                // A group costs the copy of its key that the table takes, and its own accumulators
+                // and distinct sets in the two vectors beside it. What all of those took to have room
+                // for it is charged below and once per chunk, because it is a property of the
+                // containers rather than of this group, and what the key owns away from itself the
+                // table adds up as it goes and is charged the same way.
+                slots[row] = table.insert(bucket, hashes[row], keys, row)?;
+                *groups = table.len();
+                self.fresh(states, counts)?;
+                if self.sets {
+                    self.fresh_seen(seen);
+                }
+            }
         }
         if self.count_only {
             for &slot in slots.iter() {
@@ -1356,6 +1365,8 @@ pub(crate) struct Building {
     given: Vec<Key>,
     hashes: Vec<u64>,
     slots: Vec<usize>,
+    /// What the batched probe walks with, kept so that a chunk allocates nothing for it.
+    walk: Walk,
     kept: Vec<usize>,
     affine_rows: Vec<i64>,
     over: Option<Spill>,

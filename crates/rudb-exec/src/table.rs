@@ -53,6 +53,21 @@ const LIMIT: usize = EMPTY as usize;
 /// in the twenty steps that a table with many of them needs.
 const FIRST: usize = 64;
 
+/// How many rows [`Table::probe_run`] walks at once.
+///
+/// Large enough that the misses it issues together fill the queue a core keeps outstanding, and small
+/// enough that the four buffers it walks with, and the buckets it touched on the way, are still in
+/// the first level of cache when the caller comes back for the rows that missed.
+pub(crate) const BATCH: usize = 64;
+
+/// Below this many buckets a table is small enough to probe a row at a time.
+///
+/// The batch below buys one thing, which is cache misses that overlap instead of queueing. A table
+/// of eight thousand buckets is thirty two kilobytes and there are no misses to overlap, so what is
+/// left is the cost of the batch, and a group by over a handful of groups is a query where that is
+/// the whole of the time.
+const HOT: usize = 8 * 1024;
+
 /// The word a null contributes to the hash.
 ///
 /// A constant rather than nothing at all, so that a null in a column of zeroes does not hash as a
@@ -166,6 +181,80 @@ impl Table {
         }
     }
 
+    /// Looks for a run of rows at once, which is where the time in a group by goes.
+    ///
+    /// [`Self::probe`] is three loads deep on every row. It reads the bucket, then the stored hash of
+    /// whatever slot was in it, then the key beside that slot, and each address is only known once
+    /// the load before it has landed. On a table larger than the cache all three are misses, so a row
+    /// costs three trips to memory end to end and the core has nothing to get on with while it waits.
+    /// A probe of a single `INTEGER` key measured at seventy two nanoseconds a row that way, which is
+    /// not work, it is waiting.
+    ///
+    /// Rows are independent of each other, so this walks [`BATCH`] of them together and does one kind
+    /// of load at a time across all of them: every bucket, then every stored hash, then every key.
+    /// Inside a pass every address is known before the pass starts, so the misses are all outstanding
+    /// at once and the batch waits about as long as one row used to.
+    ///
+    /// Rows whose walk reaches an empty bucket go on `pending` in row order instead of being
+    /// inserted here. An insert moves the table under the rest of the batch, and two rows in one
+    /// batch can be the first two rows of one group, so both have to go through one path that sees
+    /// them in order. The caller finishes them with [`Self::probe`] and [`Self::insert`], and the
+    /// second probe is cheap because the buckets it walks are the ones this just read.
+    ///
+    /// `slots` is left alone for a pending row, so the caller's own idea of what an unfilled slot
+    /// means is what survives.
+    pub(crate) fn probe_run(
+        &self,
+        hashes: &[u64],
+        keys: &[Vector],
+        from: usize,
+        upto: usize,
+        slots: &mut [usize],
+        walk: &mut Walk,
+    ) {
+        let mask = self.buckets.len() - 1;
+        walk.pending.clear();
+        if self.buckets.len() <= HOT {
+            for row in from..upto {
+                match self.probe(hashes[row], keys, row) {
+                    Probe::Found(slot) => slots[row] = slot,
+                    Probe::Vacant(_) => walk.pending.push(row),
+                }
+            }
+            return;
+        }
+        walk.here.clear();
+        walk.here.extend((from..upto).map(|row| Step { row, at: (hashes[row] as usize) & mask }));
+        while !walk.here.is_empty() {
+            // The bucket of every row still walking, and the only pass that is one load deep.
+            walk.seen.clear();
+            walk.seen.extend(walk.here.iter().map(|step| self.buckets[step.at]));
+            // The stored hash of every bucket that holds a group. The slot each one reads came out of
+            // the pass above, so these are independent of each other even though they depend on it.
+            walk.same.clear();
+            walk.same.extend(walk.here.iter().zip(&walk.seen).map(|(step, &slot)| {
+                slot != EMPTY && self.hashes[slot as usize] == hashes[step.row]
+            }));
+            // The keys, which is the only pass that branches per row and the only one that can end a
+            // row's walk. A row that is neither a hit nor a vacancy moves along one bucket and comes
+            // back around, so a run of collisions costs passes rather than a serial walk per row.
+            walk.next.clear();
+            for ((step, &slot), &same) in walk.here.iter().zip(&walk.seen).zip(&walk.same) {
+                if slot == EMPTY {
+                    walk.pending.push(step.row);
+                } else if same && self.holds(slot as usize, keys, step.row) {
+                    slots[step.row] = slot as usize;
+                } else {
+                    walk.next.push(Step { row: step.row, at: (step.at + 1) & mask });
+                }
+            }
+            std::mem::swap(&mut walk.here, &mut walk.next);
+        }
+        // In row order, because the slot a group is given is the order the answer comes out in, and
+        // the passes above reach a vacancy in whatever order the walks happen to end.
+        walk.pending.sort_unstable();
+    }
+
     /// Adds the key that `keys` holds at `row` in the bucket a probe of the same row left vacant.
     ///
     /// # Errors
@@ -264,6 +353,44 @@ impl Table {
         range: std::ops::Range<usize>,
     ) -> Result<Vector> {
         self.columns[at].vector(ty, range)
+    }
+}
+
+/// One row part way through a batched probe.
+#[derive(Debug, Clone, Copy)]
+struct Step {
+    /// Its row in the chunk, which is where its hash and its key are.
+    row: usize,
+    /// The bucket its walk is looking at now.
+    at: usize,
+}
+
+/// The buffers [`Table::probe_run`] walks a batch with.
+///
+/// Held by the caller and reused, so a chunk of a thousand rows asks the allocator for nothing. All
+/// four are [`BATCH`] long at the most, which is a couple of kilobytes between them and small enough
+/// that charging it against a memory budget would be noise.
+#[derive(Debug, Default)]
+pub(crate) struct Walk {
+    /// The rows whose walk has not ended.
+    here: Vec<Step>,
+    /// The ones that are still walking after this pass, swapped into `here` at the end of it.
+    next: Vec<Step>,
+    /// What each row's bucket holds.
+    seen: Vec<u32>,
+    /// Whether each row's hash matches the hash stored for what its bucket holds.
+    same: Vec<bool>,
+    /// The rows of the last batch whose key was not in the table, in row order.
+    pending: Vec<usize>,
+}
+
+impl Walk {
+    /// The rows the last batch could not finish, in row order.
+    ///
+    /// Row order because the caller inserts them in this order and a group's slot is the order it was
+    /// first seen in, which is the order the answer comes out in.
+    pub(crate) fn pending(&self) -> &[usize] {
+        &self.pending
     }
 }
 
@@ -781,6 +908,88 @@ mod tests {
         let left = flat(LogicalType::Double, &[Value::Double(f64::NAN), Value::Double(0.0)]);
         let right = flat(LogicalType::Double, &[Value::Double(-f64::NAN), Value::Double(-0.0)]);
         assert_eq!(hashed(&left), hashed(&right));
+    }
+
+    /// Fills a table one row at a time, which is what a probe did before there was a batched one.
+    fn one_at_a_time(keys: &[Vector], rows: usize, types: &[LogicalType]) -> (Table, Vec<usize>) {
+        let mut table = Table::new(types);
+        let mut hashes = Vec::new();
+        hash(keys, rows, &mut hashes);
+        let mut slots = Vec::new();
+        for (row, &hash) in hashes.iter().enumerate() {
+            slots.push(match table.probe(hash, keys, row) {
+                Probe::Found(slot) => slot,
+                Probe::Vacant(bucket) => {
+                    table.insert(bucket, hash, keys, row).expect("room for this group")
+                }
+            });
+        }
+        (table, slots)
+    }
+
+    /// Fills a table the way the aggregate does now, a batch at a time with the misses finished off
+    /// one at a time.
+    fn a_batch_at_a_time(
+        keys: &[Vector],
+        rows: usize,
+        types: &[LogicalType],
+    ) -> (Table, Vec<usize>) {
+        let mut table = Table::new(types);
+        let mut hashes = Vec::new();
+        hash(keys, rows, &mut hashes);
+        let mut slots = vec![usize::MAX; rows];
+        let mut walk = Walk::default();
+        let mut from = 0;
+        while from < rows {
+            let upto = (from + BATCH).min(rows);
+            table.probe_run(&hashes, keys, from, upto, &mut slots, &mut walk);
+            from = upto;
+            for &row in walk.pending() {
+                slots[row] = match table.probe(hashes[row], keys, row) {
+                    Probe::Found(slot) => slot,
+                    Probe::Vacant(bucket) => {
+                        table.insert(bucket, hashes[row], keys, row).expect("room for this group")
+                    }
+                };
+            }
+        }
+        (table, slots)
+    }
+
+    /// The whole of what the batch has to promise. A slot is the order a group was first seen in and
+    /// the operator above turns slots into the answer's rows, so a batch that agreed about which
+    /// rows group together but not about their order would reorder every grouped query.
+    ///
+    /// Twelve thousand keys so that the table is past [`HOT`] and the batch is really taken, spread
+    /// so that a batch of sixty four rows holds both repeats and new groups, with nulls among them.
+    #[test]
+    fn a_batch_at_a_time_finds_the_groups_one_at_a_time_found_in_the_order_it_found_them() {
+        let values: Vec<Value> = (0..40_000)
+            .map(|row: i64| match row % 97 {
+                0 => Value::Null,
+                _ => Value::BigInt((row * 7919) % 12_007),
+            })
+            .collect();
+        let keys = [flat(LogicalType::BigInt, &values)];
+        let types = [LogicalType::BigInt];
+        let (was, before) = one_at_a_time(&keys, values.len(), &types);
+        let (now, after) = a_batch_at_a_time(&keys, values.len(), &types);
+        assert_eq!(before, after);
+        assert_eq!(was.len(), now.len());
+        assert!(now.buckets.len() > HOT, "the test has to reach the batched path");
+    }
+
+    /// The reason a vacancy cannot be filled inside the batch. Every row of this batch is the first
+    /// row of one group as far as the batched pass can tell, because none of them were in the table
+    /// when it read the buckets, and they are one group.
+    #[test]
+    fn rows_of_one_new_group_in_one_batch_get_one_slot() {
+        let values = vec![Value::Integer(4); BATCH * 3];
+        let keys = [flat(LogicalType::Integer, &values)];
+        let types = [LogicalType::Integer];
+        let (table, slots) = a_batch_at_a_time(&keys, values.len(), &types);
+        assert_eq!(table.len(), 1);
+        assert!(slots.iter().all(|&slot| slot == 0));
     }
 
     /// A null is a word of its own rather than nothing at all, or a null would group with a zero.
