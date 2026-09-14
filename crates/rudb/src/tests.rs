@@ -2690,3 +2690,13 @@ fn the_document_a_query_produces_is_the_json_a_harness_reads() {
     assert!(written.contains("\"kind\": \"Scan\""), "{written}");
     assert!(written.contains("\"reference_impl\": true"), "{written}");
 }
+
+#[test]
+fn related_integer_sums_keep_null_and_empty_rules() {
+    let db = database();
+    let query = "SELECT sum(x), sum(x + 1) FROM \
+                 (VALUES (1::SMALLINT), (NULL::SMALLINT), (3::SMALLINT)) AS v(x)";
+    assert_eq!(rows(&db, query), vec![vec![Value::HugeInt(4), Value::HugeInt(6)]]);
+    let empty = format!("{query} WHERE false");
+    assert_eq!(rows(&db, &empty), vec![vec![Value::Null, Value::Null]]);
+}
