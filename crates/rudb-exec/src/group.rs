@@ -336,7 +336,7 @@ impl<'a> Aggregate<'a> {
             return Err(error);
         }
         while let Some(rows) = spilled.next(self)? {
-            self.fold(&rows, &mut local)?;
+            self.fold(&rows, &mut local, None)?;
         }
         self.finish(local, chunks, held)
     }
@@ -403,7 +403,12 @@ impl<'a> Aggregate<'a> {
     }
 
     /// One chunk of rows folded into the table.
-    fn fold(&self, seen_rows: &Rows, local: &mut Building) -> Result<()> {
+    fn fold(
+        &self,
+        seen_rows: &Rows,
+        local: &mut Building,
+        prehashed: Option<&[u64]>,
+    ) -> Result<()> {
         // Field by field, because the `DISTINCT` path below holds four of them at once and they
         // have to be disjoint borrows.
         let Building {
@@ -450,7 +455,13 @@ impl<'a> Aggregate<'a> {
         // into one hash per row, with the type of the column matched on once rather than once per
         // value, and the row loop below is then a probe with the hash already in hand.
         if !alone {
-            crate::table::hash(keys, *length, hashes);
+            match prehashed {
+                Some(prehashed) => {
+                    hashes.clear();
+                    hashes.extend_from_slice(prehashed);
+                }
+                None => crate::table::hash(keys, *length, hashes),
+            }
         }
         // The probe, and nothing else. What comes out of it is one slot per row, which is what the
         // scatter below needs and what the row loop used to consume as it went.
@@ -979,6 +990,7 @@ pub(crate) struct Partitioned {
     expressions: Scratch,
     hashes: Vec<u64>,
     rows: Vec<Vec<u32>>,
+    partition_hashes: Vec<Vec<u64>>,
 }
 
 /// What one instance of an aggregate holds while it folds.
@@ -1194,6 +1206,7 @@ impl Sink for Aggregate<'_> {
             expressions: self.inputs.scratch(),
             hashes: Vec::new(),
             rows: (0..partitions).map(|_| Vec::new()).collect(),
+            partition_hashes: (0..partitions).map(|_| Vec::new()).collect(),
         }
     }
 
@@ -1221,17 +1234,21 @@ impl Sink for Aggregate<'_> {
         }
         let rows = self.read(chunk, &mut local.expressions)?;
         if local.tables.len() == 1 {
-            self.fold(&rows, &mut local.tables[0])?;
+            self.fold(&rows, &mut local.tables[0], None)?;
             return Ok(Progress::More);
         }
         crate::table::hash(&rows.keys, rows.rows, &mut local.hashes);
         for partition in &mut local.rows {
             partition.clear();
         }
+        for hashes in &mut local.partition_hashes {
+            hashes.clear();
+        }
         for (row, &hash) in local.hashes.iter().enumerate() {
             let bits = local.tables.len().ilog2();
             let partition = (hash >> (u64::BITS - bits)) as usize;
             local.rows[partition].push(row as u32);
+            local.partition_hashes[partition].push(hash);
         }
         for partition in 0..local.tables.len() {
             if local.rows[partition].is_empty() {
@@ -1242,7 +1259,11 @@ impl Sink for Aggregate<'_> {
             if table.is_none() {
                 *table = Some(self.start());
             }
-            self.fold(&selected, table.as_mut().expect("the partition was opened"))?;
+            self.fold(
+                &selected,
+                table.as_mut().expect("the partition was opened"),
+                Some(&local.partition_hashes[partition]),
+            )?;
         }
         Ok(Progress::More)
     }
