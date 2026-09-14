@@ -63,6 +63,7 @@
 
 use rudb_common::{Error, Result};
 
+use crate::chooser::{Chooser, EXHAUSTIVE};
 use crate::fsst::SymbolTable;
 use crate::integer;
 use crate::reader::Reader;
@@ -129,12 +130,29 @@ impl Kind {
 
 /// Encodes a chunk of strings, choosing whatever comes out smallest.
 ///
+/// Every candidate that applies is encoded in full and the smallest is kept, which is what this has
+/// always done and is what every size this crate has reported came out of. [`encode_with`] is the
+/// same thing with the search made swappable.
+///
 /// # Errors
 ///
 /// If the chunk is longer than `u32::MAX` values, or if an encoding produces something its own
 /// decoder would not accept.
 pub fn encode(values: &[&[u8]]) -> Result<Vec<u8>> {
-    encode_at(values, 0)
+    encode_with(values, &EXHAUSTIVE)
+}
+
+/// [`encode`] with somebody else deciding which candidates are worth encoding in full.
+///
+/// A chooser narrows the list and nothing else. It cannot offer a candidate that does not apply, so
+/// whatever it picks still has to encode the whole chunk and still has to decode, and the worst a
+/// bad one can do is come out bigger than [`encode`] would have.
+///
+/// # Errors
+///
+/// As [`encode`].
+pub fn encode_with(values: &[&[u8]], chooser: &dyn Chooser) -> Result<Vec<u8>> {
+    encode_at(values, 0, chooser)
 }
 
 /// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
@@ -188,7 +206,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
 pub fn candidate_sizes(values: &[&[u8]]) -> Result<Vec<(Kind, usize)>> {
     let mut sizes = Vec::new();
     for kind in candidates(values, 0) {
-        if let Some(bytes) = encode_as(kind, values, 0)? {
+        if let Some(bytes) = encode_as(kind, values, 0, &EXHAUSTIVE)? {
             sizes.push((kind, bytes.len()));
         }
     }
@@ -218,7 +236,15 @@ pub fn offered(values: &[&[u8]]) -> Vec<Kind> {
 ///
 /// As [`encode`].
 pub fn encode_only(kind: Kind, values: &[&[u8]]) -> Result<Option<Vec<u8>>> {
-    encode_as(kind, values, 0)
+    encode_as(kind, values, 0, &EXHAUSTIVE)
+}
+
+/// How big one candidate comes out, which is all a sampling chooser needs from it.
+///
+/// The bytes are thrown away, so this says nothing [`encode_only`] does not. It is `pub(crate)` and
+/// separate so that the sampler in [`crate::chooser`] is not handing back buffers it will not read.
+pub(crate) fn size_as(kind: Kind, values: &[&[u8]], depth: u8) -> Result<Option<usize>> {
+    Ok(encode_as(kind, values, depth, &EXHAUSTIVE)?.map(|bytes| bytes.len()))
 }
 
 /// The shape a chunk was encoded as, as a line of text like `DICT(FSST, RLE(...))`.
@@ -231,10 +257,11 @@ pub fn describe(bytes: &[u8]) -> Result<String> {
     describe_chunk(&mut reader)
 }
 
-fn encode_at(values: &[&[u8]], depth: u8) -> Result<Vec<u8>> {
+fn encode_at(values: &[&[u8]], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u8>> {
+    let offered = candidates(values, depth);
     let mut best: Option<Vec<u8>> = None;
-    for kind in candidates(values, depth) {
-        let Some(bytes) = encode_as(kind, values, depth)? else {
+    for kind in chooser.narrow_strings(values, &offered, depth) {
+        let Some(bytes) = encode_as(kind, values, depth, chooser)? else {
             continue;
         };
         if best.as_ref().is_none_or(|current| bytes.len() < current.len()) {
@@ -334,7 +361,12 @@ fn total_len(values: &[&[u8]]) -> usize {
     values.iter().map(|value| value.len()).sum()
 }
 
-fn encode_as(kind: Kind, values: &[&[u8]], depth: u8) -> Result<Option<Vec<u8>>> {
+fn encode_as(
+    kind: Kind,
+    values: &[&[u8]],
+    depth: u8,
+    chooser: &dyn Chooser,
+) -> Result<Option<Vec<u8>>> {
     let mut out = vec![kind.tag()];
     put_u32(&mut out, u32::try_from(values.len()).map_err(|_| too_long(values.len()))?);
     match kind {
@@ -349,7 +381,7 @@ fn encode_as(kind: Kind, values: &[&[u8]], depth: u8) -> Result<Option<Vec<u8>>>
             out.extend_from_slice(first);
         }
         Kind::Plain => {
-            out.extend_from_slice(&encode_lengths(values)?);
+            out.extend_from_slice(&encode_lengths(values, chooser)?);
             for value in values {
                 out.extend_from_slice(value);
             }
@@ -368,7 +400,7 @@ fn encode_as(kind: Kind, values: &[&[u8]], depth: u8) -> Result<Option<Vec<u8>>>
                 lengths.push((compressed.len() - before) as i64);
             }
             table.serialize(&mut out);
-            out.extend_from_slice(&integer::encode(&lengths)?);
+            out.extend_from_slice(&integer::encode_with(&lengths, chooser)?);
             out.extend_from_slice(&compressed);
         }
         Kind::Dict => {
@@ -378,13 +410,13 @@ fn encode_as(kind: Kind, values: &[&[u8]], depth: u8) -> Result<Option<Vec<u8>>>
             }
             let codes = codes_over(values, &dictionary);
             let entries: Vec<&[u8]> = dictionary.iter().map(Vec::as_slice).collect();
-            out.extend_from_slice(&encode_at(&entries, depth + 1)?);
-            out.extend_from_slice(&integer::encode(&codes)?);
+            out.extend_from_slice(&encode_at(&entries, depth + 1, chooser)?);
+            out.extend_from_slice(&integer::encode_with(&codes, chooser)?);
         }
         Kind::Front => {
             let (prefixes, suffixes) = front_code(values);
-            out.extend_from_slice(&integer::encode(&prefixes)?);
-            out.extend_from_slice(&encode_at(&suffixes, depth + 1)?);
+            out.extend_from_slice(&integer::encode_with(&prefixes, chooser)?);
+            out.extend_from_slice(&encode_at(&suffixes, depth + 1, chooser)?);
         }
     }
     Ok(Some(out))
@@ -497,9 +529,9 @@ fn describe_lengths(reader: &mut Reader<'_>, count: usize) -> Result<(String, Ve
     Ok((shape, lengths))
 }
 
-fn encode_lengths(values: &[&[u8]]) -> Result<Vec<u8>> {
+fn encode_lengths(values: &[&[u8]], chooser: &dyn Chooser) -> Result<Vec<u8>> {
     let lengths: Vec<i64> = values.iter().map(|value| value.len() as i64).collect();
-    integer::encode(&lengths)
+    integer::encode_with(&lengths, chooser)
 }
 
 fn decode_lengths(reader: &mut Reader<'_>, count: usize) -> Result<Vec<usize>> {
@@ -811,7 +843,7 @@ mod tests {
         let values: Vec<Vec<u8>> =
             (0..100_000).map(|index| format!("{index:024}").into_bytes()).collect();
         let borrowed = borrow(&values);
-        let bytes = encode_as(Kind::Plain, &borrowed, 0).unwrap().unwrap();
+        let bytes = encode_only(Kind::Plain, &borrowed).unwrap().unwrap();
         assert_eq!(bytes.len(), 5 + 13 + 100_000 * 24);
     }
 
@@ -833,7 +865,7 @@ mod tests {
         let applicable = candidates(&borrowed, 0);
         assert!(applicable.len() >= 2, "{applicable:?}");
         for kind in applicable {
-            let bytes = encode_as(kind, &borrowed, 0).unwrap().unwrap();
+            let bytes = encode_only(kind, &borrowed).unwrap().unwrap();
             assert_eq!(decode(&bytes).unwrap(), values, "{}", kind.name());
         }
     }

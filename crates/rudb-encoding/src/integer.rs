@@ -43,6 +43,7 @@
 
 use rudb_common::{Error, Result};
 
+use crate::chooser::{Chooser, EXHAUSTIVE};
 use crate::reader::Reader;
 
 use crate::bitpack::{self, VALUES};
@@ -114,7 +115,20 @@ impl Kind {
 /// If the chunk is longer than `u32::MAX`, or if an encoding produces something its own decoder
 /// would not accept, which is an internal inconsistency rather than a caller error.
 pub fn encode(values: &[i64]) -> Result<Vec<u8>> {
-    encode_at(values, 0)
+    encode_with(values, &EXHAUSTIVE)
+}
+
+/// [`encode`] with somebody else deciding which candidates are worth encoding in full.
+///
+/// A chooser narrows the list and nothing else. It cannot offer a candidate that does not apply, so
+/// whatever it picks still has to encode the whole chunk and still has to decode, and the worst a
+/// bad one can do is come out bigger than [`encode`] would have.
+///
+/// # Errors
+///
+/// As [`encode`].
+pub fn encode_with(values: &[i64], chooser: &dyn Chooser) -> Result<Vec<u8>> {
+    encode_at(values, 0, chooser)
 }
 
 /// Decodes a chunk written by [`encode`].
@@ -170,7 +184,7 @@ pub fn describe_prefix(bytes: &[u8]) -> Result<(String, usize)> {
 pub fn candidate_sizes(values: &[i64]) -> Result<Vec<(Kind, usize)>> {
     let mut sizes = Vec::new();
     for kind in candidates(values, 0) {
-        if let Some(bytes) = encode_as(kind, values, 0)? {
+        if let Some(bytes) = encode_as(kind, values, 0, &EXHAUSTIVE)? {
             sizes.push((kind, bytes.len()));
         }
     }
@@ -199,7 +213,15 @@ pub fn offered(values: &[i64]) -> Vec<Kind> {
 ///
 /// As [`encode`].
 pub fn encode_only(kind: Kind, values: &[i64]) -> Result<Option<Vec<u8>>> {
-    encode_as(kind, values, 0)
+    encode_as(kind, values, 0, &EXHAUSTIVE)
+}
+
+/// How big one candidate comes out, which is all a sampling chooser needs from it.
+///
+/// The bytes are thrown away, so this says nothing [`encode_only`] does not. It is `pub(crate)` and
+/// separate so that the sampler in [`crate::chooser`] is not handing back buffers it will not read.
+pub(crate) fn size_as(kind: Kind, values: &[i64], depth: u8) -> Result<Option<usize>> {
+    Ok(encode_as(kind, values, depth, &EXHAUSTIVE)?.map(|bytes| bytes.len()))
 }
 
 /// The cascade a chunk was encoded as, as a line of text like `DICT(PACKED, PACKED)`.
@@ -212,10 +234,11 @@ pub fn describe(bytes: &[u8]) -> Result<String> {
     describe_chunk(&mut reader)
 }
 
-fn encode_at(values: &[i64], depth: u8) -> Result<Vec<u8>> {
+fn encode_at(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u8>> {
+    let offered = candidates(values, depth);
     let mut best: Option<Vec<u8>> = None;
-    for kind in candidates(values, depth) {
-        let Some(bytes) = encode_as(kind, values, depth)? else {
+    for kind in chooser.narrow_integers(values, &offered, depth) {
+        let Some(bytes) = encode_as(kind, values, depth, chooser)? else {
             continue;
         };
         if best.as_ref().is_none_or(|current| bytes.len() < current.len()) {
@@ -263,7 +286,12 @@ fn candidates(values: &[i64], depth: u8) -> Vec<Kind> {
 
 /// `None` when the encoding does not apply to this input, which the caller treats as a candidate
 /// that did not run rather than as a failure.
-fn encode_as(kind: Kind, values: &[i64], depth: u8) -> Result<Option<Vec<u8>>> {
+fn encode_as(
+    kind: Kind,
+    values: &[i64],
+    depth: u8,
+    chooser: &dyn Chooser,
+) -> Result<Option<Vec<u8>>> {
     let mut out = Vec::new();
     put_u8(&mut out, kind.tag());
     put_u32(&mut out, u32::try_from(values.len()).map_err(|_| too_long(values.len()))?);
@@ -283,15 +311,15 @@ fn encode_as(kind: Kind, values: &[i64], depth: u8) -> Result<Option<Vec<u8>>> {
                 return Ok(None);
             };
             put_i64(&mut out, values[0]);
-            out.extend_from_slice(&encode_at(&deltas, depth + 1)?);
+            out.extend_from_slice(&encode_at(&deltas, depth + 1, chooser)?);
         }
         Kind::Rle => {
             let (run_values, run_lengths) = runs(values);
             if run_values.is_empty() {
                 return Ok(None);
             }
-            out.extend_from_slice(&encode_at(&run_values, depth + 1)?);
-            out.extend_from_slice(&encode_at(&run_lengths, depth + 1)?);
+            out.extend_from_slice(&encode_at(&run_values, depth + 1, chooser)?);
+            out.extend_from_slice(&encode_at(&run_lengths, depth + 1, chooser)?);
         }
         Kind::Dict => {
             let dictionary = distinct_values(values);
@@ -299,8 +327,8 @@ fn encode_as(kind: Kind, values: &[i64], depth: u8) -> Result<Option<Vec<u8>>> {
                 return Ok(None);
             }
             let codes = codes_over(values, &dictionary);
-            out.extend_from_slice(&encode_at(&dictionary, depth + 1)?);
-            out.extend_from_slice(&encode_at(&codes, depth + 1)?);
+            out.extend_from_slice(&encode_at(&dictionary, depth + 1, chooser)?);
+            out.extend_from_slice(&encode_at(&codes, depth + 1, chooser)?);
         }
         Kind::Sparse => {
             let Some((value, _)) = dominant_value(values) else {
@@ -319,8 +347,8 @@ fn encode_as(kind: Kind, values: &[i64], depth: u8) -> Result<Option<Vec<u8>>> {
                 &mut out,
                 u32::try_from(positions.len()).map_err(|_| too_long(positions.len()))?,
             );
-            out.extend_from_slice(&encode_at(&positions, depth + 1)?);
-            out.extend_from_slice(&encode_at(&exceptions, depth + 1)?);
+            out.extend_from_slice(&encode_at(&positions, depth + 1, chooser)?);
+            out.extend_from_slice(&encode_at(&exceptions, depth + 1, chooser)?);
         }
     }
     Ok(Some(out))
@@ -826,7 +854,7 @@ mod tests {
         // whether it holds them or not, so this would be 5 KB, and every nested array in a cascade
         // is this short. It is 15 bytes of payload and 14 of header.
         let values = vec![1i64 << 39, (1 << 39) + 7, 1 << 38];
-        let bytes = encode_as(Kind::Packed, &values, 0).unwrap().unwrap();
+        let bytes = encode_only(Kind::Packed, &values).unwrap().unwrap();
         assert_eq!(bytes.len(), 5 + 9 + 15);
         assert_eq!(decode(&bytes).unwrap(), values);
     }
@@ -838,7 +866,7 @@ mod tests {
         // whole chunk spans on every value in it.
         let values: Vec<i64> =
             (0..4096i64).map(|index| (index / 1024) * 1_000_000 + (index % 1024)).collect();
-        let bytes = encode_as(Kind::Packed, &values, 0).unwrap().unwrap();
+        let bytes = encode_only(Kind::Packed, &values).unwrap().unwrap();
         assert_eq!(describe(&bytes).unwrap(), "FOR+BITPACK[10]");
         assert_eq!(decode(&bytes).unwrap(), values);
     }
@@ -857,7 +885,7 @@ mod tests {
         let applicable = candidates(&values, 0);
         assert!(applicable.len() >= 4, "{applicable:?}");
         for kind in applicable {
-            let bytes = encode_as(kind, &values, 0).unwrap().unwrap();
+            let bytes = encode_only(kind, &values).unwrap().unwrap();
             assert_eq!(decode(&bytes).unwrap(), values, "{}", kind.name());
         }
     }
