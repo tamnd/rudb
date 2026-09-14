@@ -109,12 +109,15 @@ fn mark_affine_sums(plan: &Plan, calls: &mut [Call]) {
 /// and folding the accumulators behind the ones that match, which is the same probe the fold already
 /// does and needed only [`Accumulator::combine`] underneath it.
 ///
-/// Two shapes are still refused, each for its own reason and each with its own message. A `DISTINCT`
-/// call, because merging two of its groups means taking the union of the values each has already
-/// accepted. An instance that spilled, because spilling rests on a key being either finished in a
-/// pass or absent from it, which holds within one instance and not across two. Radix partitioning is
-/// what fixes the second, since it puts a whole partition in one thread and gives the invariant
-/// back.
+/// A `DISTINCT` call merges too. Each of its groups holds a set of the values already accepted, and
+/// two of those go together by offering the incoming set's values to the kept one and folding in
+/// only the ones it did not have, which is what the fold does with a row and so gives the same
+/// answer for every aggregate rather than only for counting.
+///
+/// One shape is still refused, which is an instance that spilled, because spilling rests on a key
+/// being either finished in a pass or absent from it, and that holds within one instance and not
+/// across two. Radix partitioning is what fixes it, since it puts a whole partition in one thread
+/// and gives the invariant back.
 #[derive(Debug)]
 pub(crate) struct Aggregate<'a> {
     plan: &'a Plan,
@@ -690,10 +693,23 @@ impl<'a> Aggregate<'a> {
     /// already holds them in and the shape the probe wants, so the only thing per group here is the
     /// probe itself and the run of accumulator merges after it.
     ///
-    /// # What is refused
+    /// # The `DISTINCT` half
     ///
-    /// A `DISTINCT` aggregate, because merging two groups means taking the union of the two sets of
-    /// values they have already accepted and nothing does that yet.
+    /// A `DISTINCT` call keeps a set of the values it has already accepted, one set per group per
+    /// call, so merging two of those groups means putting the two sets together. That is done by
+    /// offering the incoming set's values to the kept one and folding in only the ones it did not
+    /// already have, which is the same thing the fold does with a row and gives the same answer for
+    /// every aggregate rather than only for counting. The incoming set is moved rather than read,
+    /// so a value that is new is handed over and a value that is not is dropped, and neither is
+    /// copied.
+    ///
+    /// It costs a pass over the smaller table's sets, which is proportional to the distinct values
+    /// in them rather than to the rows that were read, and it is what lets a query with a
+    /// `COUNT(DISTINCT ...)` in it run its scan on more than one thread at all. That mattered:
+    /// nine of the 43 ClickBench queries have one, and until this they held their whole pipeline on
+    /// one thread and were 43 percent of the time the suite took at ten million rows. See #509.
+    ///
+    /// # What is refused
     ///
     /// An instance that spilled, because spilling rests on a key being either finished in this pass
     /// or absent from it entirely, and that holds within one instance and not across two. A key can
@@ -704,15 +720,9 @@ impl<'a> Aggregate<'a> {
     ///
     /// # Errors
     ///
-    /// [`rudb_common::ErrorCode::NotImplemented`] for either of those two. Whatever the probe, the
-    /// insert or an accumulator merge reports otherwise.
+    /// [`rudb_common::ErrorCode::NotImplemented`] for that one. Whatever the probe, the insert or
+    /// an accumulator merge reports otherwise.
     fn merge(&self, from: Building, into: &mut Building) -> Result<()> {
-        if self.sets {
-            return Err(Error::not_implemented(
-                "two instances of an aggregate with a DISTINCT in it, because merging two groups \
-                 means taking the union of the values each has already accepted",
-            ));
-        }
         if from.over.is_some() || into.over.is_some() {
             return Err(Error::not_implemented(
                 "two instances of an aggregate that spilled, because a key can be in one \
@@ -726,6 +736,7 @@ impl<'a> Aggregate<'a> {
             table: source,
             states: taken,
             counts: tallies,
+            seen: mut watched,
             groups: found,
             affine_rows: counted,
             ..
@@ -734,10 +745,20 @@ impl<'a> Aggregate<'a> {
         for (at, rows) in counted.iter().enumerate() {
             into.affine_rows[at] += rows;
         }
+        let distinct: Vec<bool> = self.calls.iter().map(|call| call.distinct).collect();
+        let mut coming = Folding {
+            count_only: self.count_only,
+            calls,
+            distinct: &distinct,
+            taken: &taken,
+            tallies: &tallies,
+            watched: &mut watched,
+        };
+        let mut aside = 0;
         if self.alone {
             // One slot each and no key at all, so there is nothing to look up and the merge is the
             // states on their own.
-            merge_slot(self.count_only, calls, 0, 0, &taken, &tallies, into)?;
+            aside += merge_slot(&mut coming, 0, 0, into)?;
         } else {
             let types: Vec<LogicalType> =
                 self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
@@ -764,13 +785,20 @@ impl<'a> Aggregate<'a> {
                             let target = into.table.insert(bucket, hash, &keys, row)?;
                             into.groups = into.table.len();
                             self.fresh(&mut into.states, &mut into.counts)?;
+                            if self.sets {
+                                self.fresh_seen(&mut into.seen);
+                            }
                             target
                         }
                     };
-                    merge_slot(self.count_only, calls, slot, target, &taken, &tallies, into)?;
+                    aside += merge_slot(&mut coming, slot, target, into)?;
                 }
             }
         }
+        // Before the incoming instance's charge goes back, because the values that moved between
+        // the two sets were held by both for as long as the move took.
+        into.containers.grow(aside)?;
+        drop(watched);
         drop(taken);
         drop(tallies);
         drop(source);
@@ -1146,12 +1174,7 @@ impl Sink for Aggregate<'_> {
         self.start()
     }
 
-    /// Refused for a `DISTINCT` call and for a limit pushed down into the grouping.
-    ///
-    /// Both are cases where [`Aggregate::merge`] cannot put two instances back together. A
-    /// `DISTINCT` call refuses in `merge` with a message saying so, and asking here instead means a
-    /// query that would have failed at the end of the scan never starts more than one instance in
-    /// the first place.
+    /// Refused for a limit pushed down into the grouping, and for nothing else.
     ///
     /// A pushed down limit is worse than a refusal, because it would answer. `max_groups` stops the
     /// table opening groups once an unordered limit above cannot observe another, and every
@@ -1164,7 +1187,7 @@ impl Sink for Aggregate<'_> {
     /// answering wrongly. Radix partitioning is what fixes that, and it is the next item on the
     /// roadmap.
     fn parallel(&self) -> bool {
-        !self.sets && self.max_groups.is_none()
+        self.max_groups.is_none()
     }
 
     fn sink(&self, chunk: &Chunk, local: &mut Building) -> Result<Progress> {
@@ -1249,31 +1272,85 @@ impl Sink for Aggregate<'_> {
     }
 }
 
+/// The instance being folded into another, which is five things that only travel together.
+struct Folding<'a> {
+    count_only: bool,
+    calls: usize,
+    /// Which calls keep a set of the values they have accepted, so that a slot knows whether to
+    /// combine two accumulators or to put two sets together.
+    distinct: &'a [bool],
+    taken: &'a [Accumulator],
+    tallies: &'a [i64],
+    /// Taken by a mutable borrow because the sets are emptied as they are folded in, which is what
+    /// keeps a value that moves from one set to the other from being copied.
+    watched: &'a mut [DistinctSet],
+}
+
 /// Folds the aggregates of one group of one instance into the same group of another.
 ///
 /// Free rather than a method because the caller holds a disjoint borrow of the incoming instance's
 /// states and the kept instance's, and there is no way to say that from inside either of them.
 ///
 /// A grouped `count(*)` is one integer per group and not an accumulator, which is #61, so it adds
-/// rather than combining. Everything else is a run of `calls` accumulators starting at the group's
-/// slot, and the two runs line up because both instances were built from the same call list.
+/// rather than combining. A `DISTINCT` call is its set of accepted values put together with the kept
+/// group's, folding in only what the kept set did not already have. Everything else is a run of
+/// `calls` accumulators starting at the group's slot, and the two runs line up because both
+/// instances were built from the same call list.
+///
+/// What comes back is what the kept sets took from the allocator for the values that moved into
+/// them, which the caller charges once for the whole merge.
 fn merge_slot(
-    count_only: bool,
-    calls: usize,
+    from: &mut Folding<'_>,
     slot: usize,
     target: usize,
-    taken: &[Accumulator],
-    tallies: &[i64],
     into: &mut Building,
-) -> Result<()> {
-    if count_only {
-        into.counts[target] += tallies[slot];
-        return Ok(());
+) -> Result<u64> {
+    if from.count_only {
+        into.counts[target] += from.tallies[slot];
+        return Ok(0);
     }
+    let calls = from.calls;
+    let mut aside = 0;
     for at in 0..calls {
-        into.states[target * calls + at].combine(&taken[slot * calls + at])?;
+        if !from.distinct[at] {
+            into.states[target * calls + at].combine(&from.taken[slot * calls + at])?;
+            continue;
+        }
+        // Taken out rather than read, so that a value the kept set does not have is moved into it
+        // and one it does have is dropped. Either way nothing is copied, which is the same trade
+        // the fold makes when it asks a set before it adds to it.
+        let arriving = std::mem::replace(
+            &mut from.watched[slot * calls + at],
+            DistinctSet::Row(RowSet::default()),
+        );
+        let state = &mut into.states[target * calls + at];
+        match (&mut into.seen[target * calls + at], arriving) {
+            (DistinctSet::BigInt(kept), DistinctSet::BigInt(arriving)) => {
+                for value in arriving {
+                    if kept.insert(value) {
+                        aside += width_of(size_of::<i64>() * 2);
+                        state.update(&[Value::BigInt(value)])?;
+                    }
+                }
+            }
+            (DistinctSet::Row(kept), DistinctSet::Row(arriving)) => {
+                for key in arriving {
+                    if kept.contains(&key) {
+                        continue;
+                    }
+                    state.update(&key.0)?;
+                    aside += rows::footprint(&key.0);
+                    kept.insert(key);
+                }
+            }
+            _ => {
+                return Err(Error::internal(
+                    "two instances of one DISTINCT aggregate disagree about what their sets hold",
+                ));
+            }
+        }
     }
-    Ok(())
+    Ok(aside)
 }
 
 /// What the three containers have taken from the allocator between them.
@@ -1709,18 +1786,28 @@ mod tests {
         assert_eq!(answer(&out), [vec![Value::Integer(5), Value::BigInt(2)]]);
     }
 
-    /// The debt that is left, spelled out. Merging two groups of a `DISTINCT` means taking the union
-    /// of the values each has already accepted, and saying so is better than adding the two counts
-    /// up and calling that an answer.
+    /// Two instances of a `DISTINCT` aggregate where the same value reached both of them. Adding the
+    /// two counts would answer two, and the union answers one, which is what the query asked.
     #[test]
-    fn a_second_instance_of_a_distinct_aggregate_is_still_refused() {
+    fn two_instances_of_a_distinct_aggregate_count_a_shared_value_once() {
         let plan = parsed(
             "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count(DISTINCT #0.0::INTEGER)::BIGINT]",
         );
-        let (aggregate, _) = aggregate(&plan);
-        aggregate.combine(aggregate.local()).expect("the first instance");
-        let why = aggregate.combine(aggregate.local()).expect_err("and not the second");
-        assert!(why.to_string().contains("DISTINCT"), "{why}");
+        let (aggregate, out) = aggregate(&plan);
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        aggregate.sink(&chunk(&[3, 3]), &mut left).expect("two rows of one group");
+        aggregate.sink(&chunk(&[3, 4]), &mut right).expect("the same group and another");
+        aggregate.combine(left).expect("the first instance");
+        aggregate.combine(right).expect("the second instance");
+        aggregate.finalize().expect("the answer");
+
+        let mut rows = answer(&out);
+        rows.sort_by_key(|row| format!("{:?}", row[0]));
+        assert_eq!(
+            rows,
+            [vec![Value::Integer(3), Value::BigInt(1)], vec![Value::Integer(4), Value::BigInt(1)]]
+        );
     }
 
     #[test]
