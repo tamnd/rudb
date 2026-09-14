@@ -153,6 +153,32 @@ fn a_where_clause_over_a_file_filters_the_rows_it_read() {
 }
 
 #[test]
+fn a_where_clause_no_row_group_can_satisfy_reads_none_of_the_file() {
+    // The integer column runs 0 to 96 and the footer says so per row group, so a filter asking for
+    // values above a thousand is answered out of the footer. The answer has to be right and the
+    // bytes read have to be zero: a scan that read the pages and then filtered them would pass the
+    // first half of this and fail the second.
+    let database = Database::new();
+    let sql = format!("SELECT count(*) FROM read_parquet({}) WHERE a > 1000", fixture());
+    let result = database.query(&sql).expect("runs");
+    assert_eq!(result.value_at(0, 0), Value::BigInt(0));
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    assert_eq!(metrics.resource.bytes_read, 0, "no page of a ruled out row group was read");
+}
+
+#[test]
+fn a_where_clause_the_row_groups_can_satisfy_still_reads_them() {
+    // The other half. Bounds that overlap the column rule nothing out, and the rows still come back
+    // through the filter as they always did.
+    let database = Database::new();
+    let sql = format!("SELECT count(*) FROM read_parquet({}) WHERE a > 90", fixture());
+    let result = database.query(&sql).expect("runs");
+    assert_eq!(result.value_at(0, 0), Value::BigInt(252));
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    assert!(metrics.resource.bytes_read > 0, "the groups that could match were read");
+}
+
+#[test]
 fn an_aggregate_over_a_dictionary_column_groups_by_its_values() {
     let database = Database::new();
     let sql = format!(

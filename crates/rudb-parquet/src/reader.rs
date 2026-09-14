@@ -64,9 +64,11 @@
 //! slice so that it fits that shape without changing. Wiring it is the next change rather than this
 //! one.
 //!
-//! Row group statistics are in the footer and are not consulted. Pruning needs a predicate and
-//! there is nothing to push down until the table function exists, so the counter that would prove
-//! pruning works is here and the pruning is E2.
+//! Row group statistics are read but not acted on here. Deciding which groups to skip is
+//! [`crate::skips`], and handing out only the groups that survive is the scan in `rudb-exec`,
+//! because the predicate lives up there and this reader is handed a range of groups rather than a
+//! question. Page level skipping, which is the same idea a level down using the page index, is
+//! still to come and belongs here rather than up there.
 
 use std::ops::Range;
 use std::sync::Arc;

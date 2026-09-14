@@ -19,7 +19,7 @@ use rudb_functions::{
 };
 use rudb_kernels::cast;
 use rudb_metrics::Counters;
-use rudb_parquet::Reader;
+use rudb_parquet::{Bound, Op, Reader, Test, skips};
 use rudb_pipeline::{Morsel, Progress, Source};
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
@@ -435,6 +435,17 @@ pub(crate) struct FileScan {
     /// else here indexes [`Self::wanted`] and that list is the file's columns only.
     numbered: bool,
     schema: Schema,
+    /// The comparisons a row group's bounds can be checked against before it is handed out.
+    ///
+    /// Written in terms of this scan's own output positions, because that is what the filter above
+    /// it is written in terms of and what the builder can read without knowing which file is open.
+    /// [`Self::advance`] turns them into the file's column numbers, once per file, since two files
+    /// of one glob are allowed to hold the same columns in a different order.
+    ///
+    /// Empty when there is no filter above the scan, when the filter has no conjunct a bound can
+    /// answer, or when the source is a CSV, and empty means every row group is handed out, which is
+    /// what every scan did before this existed.
+    tests: Vec<(usize, Op, Bound)>,
     /// How far through the file list the cutting has got, and the file it is in the middle of.
     cutting: Mutex<Cutting>,
     /// What each morsel handed out covers, by [`Morsel::index`].
@@ -460,6 +471,14 @@ struct Cutting {
     /// The next row group of that file to hand out, and one past its last.
     group: usize,
     groups: usize,
+    /// [`FileScan::tests`] against the column numbers of the file being cut.
+    skipping: Vec<Test>,
+    /// How many row groups the bounds have ruled out so far, over every file of the scan.
+    ///
+    /// Nothing downstream needs this. It is here because a pruning that silently stops working
+    /// costs time and nothing else, so the tests read it to prove groups are actually being
+    /// skipped rather than read and filtered.
+    skipped: usize,
     /// The ordinal in that file of the first row of the next morsel, which is what
     /// `file_row_number` counts from and what keeps that column right whatever order the morsels
     /// are read in.
@@ -492,6 +511,10 @@ impl FileScan {
     ///
     /// If the first file is gone or unreadable since it was bound, or if it no longer has a column
     /// the plan asked for, which is what a file replaced between binding and running looks like.
+    ///
+    /// All but the last of these are the plan and the fields of one node of it, and bundling them
+    /// into a struct on the way in would only spell the same node a second way.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         plan: &Plan,
         index: u32,
@@ -500,6 +523,7 @@ impl FileScan {
         options: Slice,
         settings: Slice,
         columns: Slice,
+        tests: Vec<(usize, Op, Bound)>,
     ) -> Result<Self> {
         let paths = file_arguments(plan, args, function)?;
         let given = csv_options(plan, options, settings)?;
@@ -518,11 +542,14 @@ impl FileScan {
             wanted,
             numbered,
             schema: Schema::numbered(produced, index),
+            tests,
             cutting: Mutex::new(Cutting {
                 at: 0,
                 reader: None,
                 group: 0,
                 groups: 0,
+                skipping: Vec::new(),
+                skipped: 0,
                 row: 0,
                 given: 0,
             }),
@@ -556,12 +583,21 @@ impl FileScan {
         cutting.row = 0;
         cutting.group = 0;
         cutting.groups = 0;
+        cutting.skipping = Vec::new();
         let Some(path) = self.paths.get(cutting.at) else { return Ok(()) };
         let mut reader = FileReader::open(self.function, path, self.given)?;
         let first = if cutting.at == 0 { None } else { self.paths.first().map(String::as_str) };
-        reader.project(&positions(self.function, &self.wanted, &reader.fields(), path, first)?)?;
+        let held = positions(self.function, &self.wanted, &reader.fields(), path, first)?;
+        reader.project(&held)?;
         reader.settle(&self.wanted)?;
         cutting.groups = reader.row_groups();
+        cutting.skipping = self
+            .tests
+            .iter()
+            .filter_map(|(at, op, value)| {
+                Some(Test { column: *held.get(*at)?, op: *op, value: value.clone() })
+            })
+            .collect();
         cutting.reader = Some(reader);
         cutting.at += 1;
         Ok(())
@@ -574,6 +610,22 @@ impl FileScan {
     /// and a second one over the same file would parse the same bytes to find the same rows.
     fn cut(&self, cutting: &mut Cutting) -> Result<Option<Piece>> {
         let file = cutting.at.saturating_sub(1);
+        if let Some(FileReader::Parquet(reader)) = cutting.reader.as_ref() {
+            // Row groups the filter above this scan has already ruled out are stepped over here
+            // rather than handed out and thrown away downstream, which is the whole point: the data
+            // pages of a skipped group are never read, never decompressed and never decoded. The row
+            // counter still moves, because a later group's rows keep the numbers the file gives them.
+            let metadata = reader.metadata();
+            while cutting.group < cutting.groups {
+                let Some(group) = metadata.row_groups.get(cutting.group) else { break };
+                if !skips(&cutting.skipping, group, &metadata.schema) {
+                    break;
+                }
+                cutting.group += 1;
+                cutting.row = cutting.row.saturating_add(group.rows);
+                cutting.skipped = cutting.skipped.saturating_add(1);
+            }
+        }
         let piece = match cutting.reader.as_ref() {
             Some(FileReader::Parquet(reader)) if cutting.group < cutting.groups => {
                 let at = cutting.group;
@@ -956,7 +1008,7 @@ mod tests {
     use rudb_plan::{Node, Plan};
     use rudb_vector::Chunk;
 
-    use super::{FileScan, Handout, RUN, Schema, Series, VECTOR_SIZE};
+    use super::{Bound, FileScan, Handout, Op, RUN, Schema, Series, VECTOR_SIZE};
 
     /// A series without going through a plan, which is what `Series::new` is for.
     fn series(start: i64, step: i64, rows: u64) -> Series {
@@ -1042,6 +1094,11 @@ mod tests {
     /// one, because the fields a table function node carries are arena slices and writing them out
     /// by hand would be a test of the arena builders.
     fn fixture() -> FileScan {
+        pruned(Vec::new())
+    }
+
+    /// The same scan with bounds tests on it, which is what a filter above the scan compiles to.
+    fn pruned(tests: Vec<(usize, Op, Bound)>) -> FileScan {
         let path = format!("{}/../rudb-parquet/testdata/mixed.parquet", env!("CARGO_MANIFEST_DIR"));
         let text = format!(
             "TableFunction read_parquet args=['{path}'::VARCHAR] #0 [a::INTEGER, b::BIGINT]"
@@ -1052,8 +1109,17 @@ mod tests {
         else {
             panic!("the plan is a table function");
         };
-        FileScan::new(&plan, index, TableFunction::ReadParquet, args, options, settings, columns)
-            .expect("the fixture is there")
+        FileScan::new(
+            &plan,
+            index,
+            TableFunction::ReadParquet,
+            args,
+            options,
+            settings,
+            columns,
+            tests,
+        )
+        .expect("the fixture is there")
     }
 
     /// Every morsel the scan hands out, drained.
@@ -1077,6 +1143,42 @@ mod tests {
         let scan = fixture();
         let rows = morsels(&scan);
         assert_eq!(rows, [2048, 2048], "two row groups of 2048");
+    }
+
+    /// The point of the bounds tests. The integer column of the fixture runs 0 to 96, so a filter
+    /// asking for rows above a thousand cannot be satisfied by either row group, and neither group
+    /// is handed out at all. No morsel means no page was read, which is the whole saving.
+    #[test]
+    fn a_row_group_whose_bounds_rule_out_the_filter_is_never_handed_out() {
+        let scan = pruned(vec![(0, Op::Greater, Bound::Int(1_000))]);
+
+        let rows = morsels(&scan);
+
+        assert_eq!(rows, Vec::<usize>::new(), "both row groups are ruled out");
+        let cutting = scan.cutting.lock().expect("the lock holds");
+        assert_eq!(cutting.skipped, 2, "and both were skipped rather than read");
+    }
+
+    /// The other half of it. A bound that overlaps the column leaves the scan exactly as it was,
+    /// because a row group the statistics cannot rule out has to be read and filtered as usual.
+    #[test]
+    fn a_row_group_whose_bounds_overlap_the_filter_is_handed_out_as_usual() {
+        let scan = pruned(vec![(0, Op::Greater, Bound::Int(50))]);
+
+        let rows = morsels(&scan);
+
+        assert_eq!(rows, [2048, 2048], "nothing is ruled out");
+        let cutting = scan.cutting.lock().expect("the lock holds");
+        assert_eq!(cutting.skipped, 0);
+    }
+
+    /// A test naming a column the scan does not produce is dropped rather than misread as column
+    /// zero, which would skip row groups holding rows the query wants.
+    #[test]
+    fn a_test_against_a_position_the_scan_does_not_produce_rules_nothing_out() {
+        let scan = pruned(vec![(7, Op::Greater, Bound::Int(1_000))]);
+
+        assert_eq!(morsels(&scan), [2048, 2048]);
     }
 
     /// Morsels are taken until they run out, and asking after that hands back nothing rather than
