@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod columns;
+pub mod distinct;
 pub mod empty;
 pub mod estimate;
 pub mod explain;
@@ -62,10 +63,17 @@ pub const RANK: u8 = 11;
 /// and that pair is what top N fuses, so running the two the other way around would leave the fusion
 /// with a plan it cannot see the shape of.
 ///
+/// The distinct aggregate rewrite is first, because it is the one pass that changes what an aggregate
+/// is rather than where it sits. Every other pass here is written against a single aggregate node,
+/// and running this one ahead of them means none of them has to know that `COUNT(DISTINCT x)` has a
+/// second spelling. In particular the limit that fuses into an aggregate has to fuse into the outer
+/// one, and after this pass the outer one is the only one it can see.
+///
 /// Top N is last, because it is the one pass that fuses two operators into one rather than moving
 /// something around. Everything before it is written against a sort and a limit, and a pass that had
 /// to know about both spellings of the same plan is a pass with two of every rule in it.
-pub static PASSES: [&(dyn Pass + Sync); 7] = [
+pub static PASSES: [&(dyn Pass + Sync); 8] = [
+    &distinct::DistinctAggregateRewrite,
     &fold::ExpressionRewriter,
     &filter::FilterPushdown,
     &empty::EmptyResultPullup,

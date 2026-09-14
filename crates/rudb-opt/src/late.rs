@@ -94,7 +94,7 @@ impl Pass for LateMaterialization {
 /// columns are the ordering ones and there is nothing left to defer.
 pub fn defer(plan: &mut Plan) {
     let mut deferred = false;
-    let root = rewrite(plan, plan.root(), &mut deferred);
+    let root = walk::restack(plan, plan.root(), &mut deferred, &mut fetch);
     if !deferred {
         return;
     }
@@ -103,48 +103,6 @@ pub fn defer(plan: &mut Plan) {
     // projection this leaves under the top N into a scan of two columns rather than a scan of a
     // hundred and five with a projection over it.
     crate::columns::prune(plan);
-}
-
-/// Rewrites the subtree at `at`, handing back whatever is at its top afterwards.
-fn rewrite(plan: &mut Plan, at: NodeRef, deferred: &mut bool) -> NodeRef {
-    let children = plan.node(at).children();
-    let rebuilt: Vec<NodeRef> =
-        children.into_iter().flatten().map(|child| rewrite(plan, child, deferred)).collect();
-    let mut here = at;
-    let moved = children.into_iter().flatten().zip(&rebuilt).any(|(was, &now)| was != now);
-    if moved {
-        let mut node = plan.node(at).clone();
-        replace_children(&mut node, &rebuilt);
-        here = plan.add_node(node);
-    }
-    match fetch(plan, here) {
-        Some(above) => {
-            *deferred = true;
-            above
-        }
-        None => here,
-    }
-}
-
-/// Points a node at a new set of children, in the order [`Node::children`] hands them back.
-fn replace_children(node: &mut Node, children: &[NodeRef]) {
-    match node {
-        Node::Filter { input, .. }
-        | Node::Project { input, .. }
-        | Node::Aggregate { input, .. }
-        | Node::Sort { input, .. }
-        | Node::Limit { input, .. }
-        | Node::TopN { input, .. }
-        | Node::Fetch { input, .. }
-        | Node::Distinct { input, .. } => *input = children[0],
-        Node::Join { left, right, .. }
-        | Node::CrossProduct { left, right }
-        | Node::SetOp { left, right, .. } => {
-            *left = children[0];
-            *right = children[1];
-        }
-        Node::Get { .. } | Node::Dummy | Node::Values { .. } | Node::TableFunction { .. } => {}
-    }
 }
 
 /// The rewritten top of `at` when it is a top N this applies to, and nothing when it is not.
@@ -215,7 +173,7 @@ fn fetch(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
         Expr::Column(ColumnBinding::new(narrow_index(plan, narrow), wanted.len() as u32)),
         LogicalType::BigInt,
     );
-    let fetched_index = if deferred_projects.is_some() { fresh(plan) } else { index };
+    let fetched_index = if deferred_projects.is_some() { walk::fresh_index(plan) } else { index };
     let fetched = plan.add_node(Node::Fetch {
         input: above,
         index: fetched_index,
@@ -298,7 +256,7 @@ fn replay(
             exprs.into_iter().map(|expr| rebase(plan, expr, &tables)).collect();
         let exprs = plan.add_expr_list(&rewritten);
         let names = plan.add_name_list(&names);
-        let index = if at + 1 == count { old_index } else { fresh(plan) };
+        let index = if at + 1 == count { old_index } else { walk::fresh_index(plan) };
         input = plan.add_node(Node::Project { input, index, exprs, names });
         tables.insert(old_index, index);
     }
@@ -324,7 +282,7 @@ fn narrow_index(plan: &Plan, node: NodeRef) -> u32 {
 
 /// The projection that goes under the top N: the ordering columns and then the ordinal.
 fn narrow(plan: &mut Plan, input: NodeRef, wanted: &[(u32, u32)], row: u32) -> NodeRef {
-    let index = fresh(plan);
+    let index = walk::fresh_index(plan);
     let mut exprs: Vec<u32> = wanted.iter().map(|&(expr, _)| expr).collect();
     let mut names: Vec<u32> = wanted.iter().map(|&(_, name)| name).collect();
     exprs.push(row);
@@ -483,18 +441,6 @@ fn carry(plan: &mut Plan, node: NodeRef, below: ColumnBinding) -> ColumnBinding 
         _ => return below,
     }
     ColumnBinding::new(index, at)
-}
-
-/// A table index no node in the plan is using.
-fn fresh(plan: &Plan) -> u32 {
-    let mut next = 0;
-    for at in 0..plan.node_count() {
-        let node = plan.node(u32::try_from(at).unwrap_or(u32::MAX));
-        if let Some(index) = node.table_index() {
-            next = next.max(index + 1);
-        }
-    }
-    next
 }
 
 #[cfg(test)]
