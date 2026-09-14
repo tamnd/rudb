@@ -63,6 +63,8 @@
 //! there is nothing to push down until the table function exists, so the counter that would prove
 //! pruning works is here and the pruning is E2.
 
+use std::sync::Arc;
+
 use rudb_common::stage::{Stage, Timing};
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_compress::Codec;
@@ -322,7 +324,13 @@ struct Cursor {
     codec: Codec,
     left: i64,
     column: SchemaColumn,
-    dictionary: Option<Vector>,
+    /// The chunk's dictionary page, decoded once and shared with every data page in it.
+    ///
+    /// Behind a handle rather than held by value because every page of the chunk builds a vector
+    /// pointing at it, and that vector holds its values in an `Arc` whatever the cursor does. So a
+    /// cursor holding the dictionary by value meant copying the whole thing per page on the way
+    /// into a handle nothing else was holding.
+    dictionary: Option<Arc<Vector>>,
     page: Option<Vector>,
     queued: Vec<Vector>,
     offset: usize,
@@ -431,7 +439,7 @@ impl Cursor {
                 let built = page.decode_dictionary(&self.column);
                 timing.stop(bytes);
                 self.spare = page.body;
-                self.dictionary = Some(built?);
+                self.dictionary = Some(Arc::new(built?));
                 continue;
             }
             self.left -= i64::from(page.header.values());
