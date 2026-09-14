@@ -614,20 +614,19 @@ fn run(
     memory.forget_peak();
     let report = Report::new();
     let building = Span::start();
-    let mut root = rudb_exec::build_measured(plan, catalog, cancel, memory, seams, &report)?;
+    let query = rudb_exec::build_measured(plan, catalog, cancel, memory, seams, &report)?;
     let (built_wall, built_cpu) = building.stop();
-    let names = root.schema().names();
-    let types = root.schema().types();
+    let names = query.schema().names();
+    let types = query.schema().types();
     let mut held = memory.reservation();
     let mut chunks = Vec::new();
-    // This loop is the root pipeline's driver. Every other pipeline is drained by the loop that
-    // fills its sink and that loop reports its own time, and this one is pulled from here, so this
-    // is the only place that can report it. The span it hands back is the whole execution including
-    // the pipelines that ran inside it, which is what `execute_ns` is; what the driver keeps for
-    // itself is that minus what they charged.
-    let driver = report.driving(rudb_plan::ROOT);
-    let driving = driver.running();
-    while let Some(chunk) = root.next()? {
+    // Every pipeline the query runs is timed against its own driver inside `run`, so what is left
+    // for this span to say is how long the whole of the execution took, which is what `execute_ns`
+    // is. The loop after it is the one that turns the queued chunks into a result set, and it is
+    // inside the span because a caller waiting for rows is waiting for that too.
+    let driving = Span::start();
+    query.run(cancel)?;
+    while let Some(chunk) = query.next_chunk()? {
         if chunk.is_empty() {
             continue;
         }

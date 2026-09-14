@@ -15,8 +15,8 @@
 //! pipelines. The right side ends in a [`Gather`](crate::gather::Gather), which holds its rows and
 //! nothing else, and the left side ends here. The order is not a choice: every arm below needs the
 //! whole right side before it can say anything about one left row, which is the dependency edge the
-//! scheduler will read off the plan. Until there is a scheduler, `adapt::Paired` runs the two in
-//! that order.
+//! builder records on the pipeline. [`Query::run`](crate::Query::run) takes its order from that
+//! edge, so the right side's pipeline has finalised before this one starts.
 
 use std::sync::Mutex;
 

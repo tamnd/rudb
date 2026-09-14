@@ -190,7 +190,7 @@ impl Source for AlwaysBlocked {
     }
 }
 
-fn pipeline(source: Arc<dyn Source>, sink: Arc<Total>) -> Pipeline {
+fn pipeline(source: Arc<dyn Source>, sink: Arc<Total>) -> Pipeline<'static> {
     Pipeline::new(PipelineId(0), source, sink as Arc<dyn DynSink>)
 }
 
