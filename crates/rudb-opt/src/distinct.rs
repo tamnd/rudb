@@ -13,9 +13,11 @@
 //! one and none of it went to the second, so the cheapest way to make `DISTINCT` fast is to stop
 //! having a second implementation of it.
 //!
-//! Eight of the forty three ClickBench queries count distinct values and this rewrite covers six of
-//! them. On ten million rows, `SELECT COUNT(DISTINCT SearchPhrase) FROM hits` was the single worst
-//! query in the suite against the pinned DuckDB binary, 0.39 seconds against 0.09.
+//! Eight of the forty three ClickBench queries count distinct values. This rewrite fires on two of
+//! them, which are the two it is worth anything on, and the table below is why the other six are
+//! left alone. One of the two was the single worst query in the suite against the pinned DuckDB
+//! binary: on ten million rows `SELECT COUNT(DISTINCT SearchPhrase) FROM hits` took 0.39 seconds
+//! against DuckDB's 0.09, and it now takes 0.14.
 //!
 //! DuckDB calls this optimizer `distinct_aggregate_rewrite` and so does this, because
 //! `SET disabled_optimizers = 'distinct_aggregate_rewrite'` has to turn off the pass it names.
@@ -61,13 +63,42 @@
 //! that accepts `DISTINCT` is in [`SET_DETERMINED`]; the list is written out rather than assumed so
 //! that adding an order dependent aggregate later is a decision somebody makes here.
 //!
+//! A grouped `COUNT(DISTINCT x)` where `x` is a single `BIGINT`, which is the one shape the row loop
+//! is already good at, for the reason the table below gives.
+//!
+//! # Where the win is, measured
+//!
+//! Ten million ClickBench rows on thirty two threads, best of three, seconds. `alone` is an
+//! aggregate with no group key and `grouped` is `GROUP BY RegionID`.
+//!
+//! | case | argument | before | after | DuckDB |
+//! |---|---|---|---|---|
+//! | alone | SearchPhrase | 0.37 | 0.15 | 0.10 |
+//! | alone | UserID | 0.18 | 0.16 | 0.11 |
+//! | grouped | URL | 2.96 | 0.59 | 0.32 |
+//! | grouped | SearchPhrase | 0.55 | 0.15 | 0.12 |
+//! | grouped | ResolutionWidth | 0.08 | 0.08 | 0.06 |
+//! | grouped | UserID | 0.19 | 0.20 | 0.11 |
+//!
+//! The rewrite trades a set per group for a wider grouping key, so what it is worth depends on which
+//! set it is replacing. Against the general one, which keys on an encoded row, it is worth between
+//! two and five times. Against the specialised one for a single `BIGINT`, which is already about as
+//! cheap as a hash insert gets, it is a wash and the wider key makes it slightly worse. The one place
+//! the specialised set loses anyway is an aggregate with no group key, where the old path keeps a
+//! single set for the whole query, never partitions it and merges it by walking it.
+//!
+//! The last row is the one this pass leaves alone, and the reason it is still behind DuckDB is not
+//! `DISTINCT`. It is that the inner grouping key is two columns, which is the same thing that makes
+//! `GROUP BY WatchID, ClientIP` and `GROUP BY ClientIP, ClientIP - 1, ...` slow, and that is a change
+//! to how a multi column key is encoded rather than a change to what an aggregate is.
+//!
 //! # Rebuilding rather than writing in place
 //!
 //! Two nodes go where one was and a node has to come after its children in the arena, so there is no
 //! slot to write the inner aggregate into. The walk rebuilds the path from the root down to
 //! whatever changed, which is what late materialisation does for the same reason.
 
-use rudb_common::Result;
+use rudb_common::{LogicalType, Result};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 
 use crate::pass::{Context, Pass};
@@ -114,6 +145,9 @@ fn stage(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     let calls = plan.expr_list(aggregates).to_vec();
     let args = shared_arguments(plan, &calls)?;
     let keys = plan.expr_list(groups).to_vec();
+    if !keys.is_empty() && already_cheap(plan, &args) {
+        return None;
+    }
 
     let mut below = keys.clone();
     below.extend_from_slice(&args);
@@ -192,6 +226,22 @@ fn shared_arguments(plan: &Plan, calls: &[ExprRef]) -> Option<Vec<ExprRef>> {
         }
     }
     shared
+}
+
+/// Whether the row loop already has a set for these arguments that is as cheap as a grouping.
+///
+/// One `BIGINT`, which is the case `fresh_seen` in `rudb-exec`'s `group.rs` gives a set of `i64`
+/// rather than a set of encoded rows. An `i64` set insert is a hash and a compare of one word, so
+/// there is nothing for the rewrite to win back and the wider grouping key it leaves behind costs
+/// more than it saves. Every other argument shape goes to the general set, which keys on an encoded
+/// row and is what the rewrite beats by between two and five times.
+///
+/// This mirrors a decision made in the operator rather than one made here, which is the honest place
+/// for it: the pass is choosing between two implementations and has to know which one it is up
+/// against. A release that gives grouping a cheaper multi column key, or that drops the specialised
+/// set, should come back and delete this.
+fn already_cheap(plan: &Plan, args: &[ExprRef]) -> bool {
+    matches!(args, [only] if plan.expr_type(*only) == &LogicalType::BigInt)
 }
 
 #[cfg(test)]
@@ -288,6 +338,47 @@ mod tests {
             "  Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER, c::BOOLEAN]\n",
         );
         assert_eq!(staged(text), text);
+    }
+
+    #[test]
+    fn a_grouped_count_distinct_over_one_bigint_is_left_alone() {
+        let text = concat!(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count(DISTINCT #0.1::BIGINT)::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER, b::BIGINT]\n",
+        );
+        assert_eq!(staged(text), text, "the row loop has a set of i64 for exactly this");
+    }
+
+    #[test]
+    fn an_ungrouped_count_distinct_over_one_bigint_is_rewritten_anyway() {
+        assert_eq!(
+            staged(concat!(
+                "Aggregate #1 groups=[] aggregates=[count(DISTINCT #0.1::BIGINT)::BIGINT]\n",
+                "  Get memory.main.t AS t #0 [a::INTEGER, b::BIGINT]\n",
+            )),
+            concat!(
+                "Aggregate #1 groups=[] aggregates=[count(#2.0::BIGINT)::BIGINT]\n",
+                "  Aggregate #2 groups=[#0.1::BIGINT] aggregates=[]\n",
+                "    Get memory.main.t AS t #0 [a::INTEGER, b::BIGINT]\n",
+            ),
+            "one set for the whole query is one set that never partitions"
+        );
+    }
+
+    #[test]
+    fn a_grouped_count_distinct_over_two_bigints_is_rewritten() {
+        assert_eq!(
+            staged(concat!(
+                "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count(DISTINCT #0.1::BIGINT, #0.0::INTEGER)::BIGINT]\n",
+                "  Get memory.main.t AS t #0 [a::INTEGER, b::BIGINT]\n",
+            )),
+            concat!(
+                "Aggregate #1 groups=[#2.0::INTEGER] aggregates=[count(#2.1::BIGINT, #2.2::INTEGER)::BIGINT]\n",
+                "  Aggregate #2 groups=[#0.0::INTEGER, #0.1::BIGINT, #0.0::INTEGER] aggregates=[]\n",
+                "    Get memory.main.t AS t #0 [a::INTEGER, b::BIGINT]\n",
+            ),
+            "two arguments are an encoded row either way"
+        );
     }
 
     #[test]
