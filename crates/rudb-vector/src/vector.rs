@@ -1085,7 +1085,10 @@ impl Vector {
             Body::Runs { ends, values } => values.bytes_at(run_holding(ends, index)?),
             Body::Views { views, arena } => views.get(index)?.bytes_in(arena),
             Body::Flat(data) => data.bytes_at(index),
-            Body::Sequence { .. } | Body::Packed { .. } => None,
+            // The same `None` [`Self::text_at`] gives, for the same reason. A compressed row is not
+            // anywhere in its plain bytes, so there is nothing here to hand back a borrow of, and a
+            // caller that gets `None` goes to `value_at` and gets the row decompressed into a value.
+            Body::Coded { .. } | Body::Sequence { .. } | Body::Packed { .. } => None,
         }
     }
 
