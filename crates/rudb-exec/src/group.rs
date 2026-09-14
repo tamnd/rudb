@@ -339,7 +339,9 @@ impl<'a> Aggregate<'a> {
             // rows and outlive the table. `charged` and this one are the same arrangement over two
             // reservations.
             charged_keys: 0,
-            table: Table::new(self.keys.len()),
+            table: Table::new(
+                &self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect::<Vec<_>>(),
+            ),
             states: Vec::new(),
             seen: Vec::new(),
             groups: 0,
