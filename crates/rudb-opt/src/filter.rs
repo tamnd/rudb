@@ -93,7 +93,7 @@ use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 
 use crate::pass::{Context, Pass};
 use crate::tables::{TableSet, Tables, produced};
-use crate::{nulls, transitive, walk};
+use crate::{fold, nulls, transitive, walk};
 
 /// Moves every predicate as far down the plan as it can go.
 #[derive(Debug, Clone, Copy)]
@@ -140,7 +140,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         Node::Project { input, index, exprs, names } => {
             let held = plan.expr_list(exprs).to_vec();
             let (down, stay) = partition(plan, pending, index, &held);
-            let moved = down.into_iter().map(|part| substitute(plan, part, index, &held));
+            let moved = down.into_iter().map(|part| substituted(plan, part, index, &held));
             let moved: Vec<ExprRef> = moved.collect();
             let rebuilt = node(plan, input, moved, tables);
             let above = if rebuilt == input {
@@ -167,7 +167,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             } else {
                 partition(plan, pending, index, &keys)
             };
-            let moved = down.into_iter().map(|part| substitute(plan, part, index, &keys));
+            let moved = down.into_iter().map(|part| substituted(plan, part, index, &keys));
             let moved: Vec<ExprRef> = moved.collect();
             let rebuilt = node(plan, input, moved, tables);
             let above = if rebuilt == input {
@@ -478,6 +478,17 @@ fn substitutable(plan: &Plan, expr: ExprRef, index: u32, held: &[ExprRef]) -> bo
     answer
 }
 
+/// [`substitute`], and then the expression rules over what came out of it.
+///
+/// A column standing for a constant leaves a predicate this pass built and the expression rewriter
+/// never saw, such as the `CAST(NULL AS BOOLEAN)` that `WHERE CAST(x AS BOOLEAN)` becomes over a
+/// group key of `NULL`. The rewriter runs before this pass, so nothing would fold it, and the
+/// sequence would not settle. See [`fold::rewritten`].
+fn substituted(plan: &mut Plan, expr: ExprRef, index: u32, held: &[ExprRef]) -> ExprRef {
+    let substituted = substitute(plan, expr, index, held);
+    fold::rewritten(plan, substituted)
+}
+
 /// Rewrites every column of `index` in `expr` into what `held` computes it from.
 ///
 /// The indexing is checked by [`substitutable`], which is the only thing that says an expression may
@@ -576,6 +587,21 @@ Filter (#1.1::BIGINT > 2::BIGINT)::BOOLEAN
   Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]
     Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN
       Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_predicate_that_substitution_turns_into_a_constant_is_folded_on_the_way_down() {
+        let before = "\
+Filter CAST(#1.0::\"NULL\")::BOOLEAN
+  Project #1 [NULL::\"NULL\" AS a]
+    Get memory.main.t AS t #0 [a::INTEGER]
+";
+        let after = "\
+Project #1 [NULL::\"NULL\" AS a]
+  Filter NULL::BOOLEAN
+    Get memory.main.t AS t #0 [a::INTEGER]
 ";
         assert_eq!(pushed(before), after);
     }

@@ -100,6 +100,25 @@ struct Done {
     canonical: Vec<ExprRef>,
 }
 
+/// Rewrites one expression, for a pass that built it after this one had already run.
+///
+/// This pass runs early and every rule in it assumes the expressions it is given are the ones the
+/// binder produced. A later pass that builds a new expression out of two old ones can hand back
+/// something this would have folded, and nothing folds it: `WHERE CAST(x AS BOOLEAN)` over a group
+/// key of `NULL` becomes `CAST(NULL AS BOOLEAN)` when filter pushdown puts the predicate under the
+/// grouping, which is a constant nobody has evaluated. The plan that comes out of the sequence is
+/// then not the plan a second run of the sequence produces, and the idempotence assertion in
+/// [`crate::optimize_with`] says so. So a pass that substitutes into an expression asks for the
+/// rules to be applied to what it built, here, rather than leaving it for a run that does not
+/// happen.
+///
+/// The sharing table is per call, which is the difference between this and [`rewrite`]. One
+/// expression is cheap to walk twice and the table only pays for itself over a whole plan.
+pub(crate) fn rewritten(plan: &mut Plan, expr: ExprRef) -> ExprRef {
+    let mut done = Done { rewritten: HashMap::new(), canonical: Vec::new() };
+    expression(plan, expr, &mut done)
+}
+
 /// Rewrites every expression the plan reaches.
 fn rewrite(plan: &mut Plan) {
     let mut done = Done { rewritten: HashMap::new(), canonical: Vec::new() };
