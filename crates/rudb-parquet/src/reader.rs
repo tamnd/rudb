@@ -1,7 +1,7 @@
 //! Reading a whole Parquet file as a run of chunks.
 //!
 //! This is the layer above the page walker. [`Pages`] turns one column chunk's bytes into pages and
-//! `Page::into_vector` turns one page into a vector, and what is left is everything that is about
+//! `Page::decode` turns one page into a vector, and what is left is everything that is about
 //! the file rather than about a page: which columns to read, where their chunks are, and how to put
 //! seven columns of a row group side by side into something the engine can execute over.
 //!
@@ -327,6 +327,17 @@ struct Cursor {
     queued: Vec<Vector>,
     offset: usize,
     bytes_read: u64,
+    /// The last page body this column decoded, to read the next page into.
+    ///
+    /// A column chunk is a few thousand pages of roughly one size, and a body on a real file is
+    /// megabytes. Handing the same buffer back to the walker each time is worth more than anything
+    /// inside the decompressor, because a body that size comes fresh from the kernel and is faulted
+    /// in a four kilobyte page at a time before the codec has written a byte of it.
+    ///
+    /// Empty whenever the last decode kept the body, which is what a string column does: its values
+    /// are the page, pointed at rather than copied. So this fills up on a column of integers and
+    /// stays empty on a column of strings that is not dictionary encoded.
+    spare: Vec<u8>,
 }
 
 impl Cursor {
@@ -344,6 +355,7 @@ impl Cursor {
             queued: Vec::new(),
             offset: 0,
             bytes_read: 0,
+            spare: Vec::new(),
         }
     }
 
@@ -368,6 +380,7 @@ impl Cursor {
             queued: pages,
             offset: 0,
             bytes_read: 0,
+            spare: Vec::new(),
         }
     }
 
@@ -394,7 +407,8 @@ impl Cursor {
             );
             let encoded = encoded?;
             let mut pages = Pages::new(&encoded, self.codec, self.left);
-            let page = pages.next().transpose()?.ok_or_else(|| {
+            pages.recycle(std::mem::take(&mut self.spare));
+            let mut page = pages.next().transpose()?.ok_or_else(|| {
                 Error::io(format!(
                     "the column {} ran out with {} values left",
                     self.column.name, self.left
@@ -414,16 +428,18 @@ impl Cursor {
                 }
                 let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
                 let timing = Timing::start(Stage::Dictionary);
-                let built = page.into_dictionary(&self.column);
+                let built = page.decode_dictionary(&self.column);
                 timing.stop(bytes);
+                self.spare = page.body;
                 self.dictionary = Some(built?);
                 continue;
             }
             self.left -= i64::from(page.header.values());
             let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
             let timing = Timing::start(Stage::Decode);
-            let decoded = page.into_vector(&self.column, self.dictionary.as_ref());
+            let decoded = page.decode(&self.column, self.dictionary.as_ref());
             timing.stop(bytes);
+            self.spare = page.body;
             self.page = Some(decoded?);
         }
         Ok(self.page.as_ref().map_or(0, |page| page.len() - self.offset))

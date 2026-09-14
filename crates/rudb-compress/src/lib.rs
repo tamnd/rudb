@@ -133,13 +133,66 @@ impl Codec {
                 )));
             }
         };
-        if out.len() == expected {
-            Ok(out)
+        self.exactly(out.len(), expected)?;
+        Ok(out)
+    }
+
+    /// Decompresses `input` into a buffer the caller keeps, which must hold `expected` bytes.
+    ///
+    /// Same contract as [`Codec::decompress`] and the same errors, with the output written into a
+    /// buffer that survives the call rather than one allocated for it. A reader walking a column
+    /// chunk does this a few thousand times, and a page body big enough to come straight from the
+    /// kernel costs more in page faults than the codec costs in work. [`snappy::decompress_into`]
+    /// has the measurements.
+    ///
+    /// The buffer is only ever grown, so it comes back at least `expected` bytes long and the
+    /// answer is the first `expected` of them.
+    ///
+    /// Zstandard is the codec that does not write straight into it. A frame states its length as a
+    /// promise rather than a fact and the decoder builds its output as it goes, so this copies that
+    /// output across afterwards. One `memcpy` against a page fault per four kilobytes is still the
+    /// better side of the trade, and it keeps one path here rather than two at every caller.
+    ///
+    /// # Errors
+    ///
+    /// If the codec is not implemented, if the input is malformed, or if the result is not
+    /// `expected` bytes long.
+    pub fn decompress_into(self, input: &[u8], expected: usize, out: &mut Vec<u8>) -> Result<()> {
+        if self == Self::Snappy {
+            let produced = snappy::decompress_into(input, expected, out)?;
+            return self.exactly(produced, expected);
+        }
+        let frame;
+        let bytes: &[u8] = match self {
+            Self::Uncompressed => input,
+            Self::Zstd => {
+                frame = zstd::decompress(input)?;
+                &frame
+            }
+            other => {
+                return Err(rudb_common::Error::not_implemented(format!(
+                    "the {} codec is not implemented, only UNCOMPRESSED, SNAPPY and ZSTD are",
+                    other.name()
+                )));
+            }
+        };
+        self.exactly(bytes.len(), expected)?;
+        if out.len() < expected {
+            out.resize(expected, 0);
+        }
+        out[..expected].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// The check that a block produced the number of bytes its container said it would.
+    fn exactly(self, produced: usize, expected: usize) -> Result<()> {
+        if produced == expected {
+            Ok(())
         } else {
             Err(rudb_common::Error::io(format!(
-                "the metadata says this {} block is {expected} bytes and it decompressed to {}",
-                self.name(),
-                out.len()
+                "the metadata says this {} block is {expected} bytes and it decompressed to \
+                 {produced}",
+                self.name()
             )))
         }
     }

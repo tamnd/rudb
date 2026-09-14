@@ -29,12 +29,16 @@
 //! own destination. Getting this wrong produces plausible output rather than a crash, which is why
 //! there is a test for it that spells out the expected bytes.
 //!
-//! # Why the output is allocated once
+//! # Why the output is sized once
 //!
-//! The uncompressed length is the first thing in the block, so the output is allocated at its
-//! final size and written into by position. That removes every growth check from the inner loop,
-//! and more usefully it turns a corrupt length into an error at the first element that would run
-//! past the end rather than into a `Vec` that quietly grows to whatever a corrupt file asked for.
+//! The uncompressed length is the first thing in the block, so the output is sized at its final
+//! size and written into by position. That removes every growth check from the inner loop, and
+//! more usefully it turns a corrupt length into an error at the first element that would run past
+//! the end rather than into a `Vec` that quietly grows to whatever a corrupt file asked for.
+//!
+//! Sized, not allocated. [`decompress_into`] takes a buffer the caller keeps across blocks, and on
+//! a page of any real size that is worth more than anything in the inner loop, for the reason
+//! written out there.
 
 use rudb_common::{Error, Result};
 
@@ -55,13 +59,58 @@ use rudb_common::{Error, Result};
 /// number of bytes than the header said they would. Every one of those is a corrupt block, and
 /// every one of them is a case where carrying on produces bytes that look like data.
 pub fn decompress(input: &[u8], limit: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let len = decompress_into(input, limit, &mut out)?;
+    out.truncate(len);
+    Ok(out)
+}
+
+/// Decompresses a block into a buffer the caller keeps, and says how many bytes of it were filled.
+///
+/// The answer is `out[..n]`, and `out` is allowed to come back longer than `n`. That is the point
+/// of it. A reader walking a column chunk decompresses a few thousand pages, and a page that
+/// allocates its own output asks the allocator for a fresh region every time, which on any
+/// interesting page size means fresh pages from the kernel and a fault on the first write to each
+/// one. Measured with `cargo xtask compress` on `gamingpc-wsl`, sixteen megabytes through the
+/// decoder either way:
+///
+/// ```text
+/// payload                block    fresh buffer    buffer kept    (MiB/s out)
+/// incompressible            4K           37594          69764
+/// incompressible            1M           30349          43937
+/// a hits.parquet page      15K            2280           2323
+/// ```
+///
+/// The incompressible rows are a `memcpy` and nothing else, so they are the page fault cost on its
+/// own with no decoding in front of it to hide it, and it is worth 45 percent at a four kilobyte
+/// page. A real page does work per byte as well, so the same saving is a smaller share of it, and
+/// end to end on a ten million row ClickBench scan keeping the buffer took decompression from
+/// 1344.7 MB/s to 1434.7 MB/s.
+///
+/// The buffer is only ever grown, never shrunk and never re-zeroed, because zeroing the tail again
+/// on every page would be most of what keeping it saved. So the length is the high water mark of
+/// every block that has been through it and the length of this one is the return value.
+///
+/// # Errors
+///
+/// The same set as [`decompress`], which is the same function with the buffer supplied.
+pub fn decompress_into(input: &[u8], limit: usize, out: &mut Vec<u8>) -> Result<usize> {
     let (expected, header) = read_varint(input)?;
     if expected > limit {
         return Err(Error::io(format!(
             "this block claims to hold {expected} bytes, and what it came from says {limit}"
         )));
     }
-    decompress_within(input, expected, header)
+    if out.is_empty() {
+        // A buffer that has never held anything comes from the allocator already zeroed, and on
+        // any size worth talking about that means pages the kernel has not had to write to yet.
+        // Growing an empty `Vec` by hand instead would write those zeroes a second time.
+        *out = vec![0u8; expected];
+    } else if out.len() < expected {
+        out.resize(expected, 0);
+    }
+    decompress_within(input, expected, header, out)?;
+    Ok(expected)
 }
 
 /// How many bytes a short literal is copied as, regardless of how many it holds.
@@ -79,24 +128,23 @@ pub fn decompress(input: &[u8], limit: usize) -> Result<Vec<u8>> {
 /// Sixteen rather than eight because it is one SSE or NEON register, and one register move is one
 /// instruction whichever length the literal actually had.
 ///
-/// # Literals only, which was not the guess
+/// # Copies too, which took two goes to get right
 ///
-/// The same trick applies on paper to a short copy whose offset is at least sixteen, and it was
-/// written that way first. Measured on `server2` with `cargo xtask compress`, over three rounds of
-/// four builds that differed only in which paths took it:
+/// The same trick applies to a short copy whose offset is at least sixteen. It was written that
+/// way first, measured against the synthetic payloads `cargo xtask compress` used to have, found
+/// to lose 19 percent on the run heavy row, and taken out with a comment saying so.
 ///
-/// ```text
-/// payload             none    literals    copies    both     (MiB/s out, median of 3)
-/// runs of 512         3462        3695      2808    3077
-/// repeated urls       5038        5507      5200    5428
-/// near constant i32    632         717       599     695
-/// incompressible     19484       19841     19666   19220
-/// ```
+/// That measurement was on payloads that do not have a real page's element mix. Over 391 pages of
+/// the first two row groups of a ClickBench `hits.parquet`, 72.6 percent of elements are copies,
+/// 72.3 percent of those copies are four to seven bytes, 89.9 percent are at most sixteen, only 4
+/// percent have an offset under sixteen and only 1.9 percent overlap. A generator that emits long
+/// runs at an offset of one produces the opposite of that, and it was the generator being
+/// measured rather than the decoder.
 ///
-/// On literals it is worth 7 to 13 percent and it is worth it on every payload. On copies it
-/// loses 19 percent on the run heavy row and gains nothing anywhere, because the non overlapping
-/// copy is already one `memmove` and the extra test in front of it is pure cost. So the copy path
-/// does not take it, and the comment there says so rather than leaving it to be rediscovered.
+/// On the real file the wide copy is worth six percent: decompression on a ten million row scan
+/// goes from 1434.7 MB/s to 1538.5 MB/s. `crates/rudb-compress/tests/data/hits-page.snappy` is a
+/// page out of that file and it is now the first row of the table, so the next person to reach
+/// this paragraph has a payload that behaves like the engine's.
 const WIDE: usize = 16;
 
 /// How long `input` says it decompresses to, without decompressing it.
@@ -114,8 +162,13 @@ pub fn decompressed_len(input: &[u8]) -> Result<usize> {
 }
 
 /// The elements of a block whose length has already been read and accepted.
-fn decompress_within(input: &[u8], expected: usize, header: usize) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; expected];
+///
+/// `out` is at least `expected` bytes long and its contents are whatever the last block through it
+/// left behind. That is sound because every byte below `expected` is written by some element
+/// before this returns, which is what the count at the end checks, and a block that fails that
+/// check returns an error rather than the buffer.
+fn decompress_within(input: &[u8], expected: usize, header: usize, out: &mut [u8]) -> Result<()> {
+    let out = &mut out[..expected];
     let mut src = header;
     let mut pos = 0usize;
 
@@ -171,11 +224,14 @@ fn decompress_within(input: &[u8], expected: usize, header: usize) -> Result<Vec
                 return Err(overruns("a copy", len, pos, expected));
             }
             let from = pos - offset;
-            if offset >= len {
-                // Nothing overlaps, so it is one `memmove` and this is the common case by a wide
-                // margin: a copy that reaches back further than it writes. No fixed width write
-                // here even though a short copy could take one. See [`WIDE`], which was measured
-                // on this branch and made it slower.
+            if len <= WIDE && offset >= WIDE && pos + WIDE <= expected {
+                // Overruns on purpose. See [`WIDE`]. The offset is what makes it sound as well as
+                // fast: reaching back at least sixteen means the sixteen bytes read end at or
+                // before `pos`, so this is a copy of two registers and not an overlapping one.
+                out.copy_within(from..from + WIDE, pos);
+            } else if offset >= len {
+                // Nothing overlaps, so it is one `memmove`. What lands here now is the long copy
+                // and the one too near the end of the block to write wide.
                 out.copy_within(from..from + len, pos);
             } else {
                 // The pattern repeats. Write it once, then keep doubling what has been written,
@@ -195,7 +251,7 @@ fn decompress_within(input: &[u8], expected: usize, header: usize) -> Result<Vec
     }
 
     if pos == expected {
-        Ok(out)
+        Ok(())
     } else {
         Err(Error::io(format!(
             "this block says it holds {expected} bytes and its elements produced {pos}"
@@ -475,6 +531,23 @@ mod tests {
     }
 
     #[test]
+    fn a_short_copy_that_writes_wide_has_its_extra_bytes_overwritten() {
+        // The literal test's premise on the copy path. A four byte copy at an offset of 32 writes
+        // sixteen bytes, so it scribbles over the twelve bytes the following literal owns, and the
+        // literal has to win. Sixteen bytes of tail rather than four so that `pos + WIDE` still
+        // fits at the copy and the wide path is the one actually under test.
+        let head: Vec<u8> = (0..32u8).collect();
+        let tail = vec![b'z'; 16];
+        let mut body = literal(&head);
+        body.extend(copy2(4, 32));
+        body.extend(literal(&tail));
+        let out = decompress(&block(52, &body)).unwrap();
+        assert_eq!(&out[..32], &head[..]);
+        assert_eq!(&out[32..36], &head[..4]);
+        assert_eq!(&out[36..], &tail[..]);
+    }
+
+    #[test]
     fn a_short_element_at_the_very_end_of_a_block_takes_the_exact_width_path() {
         // Every length from one to twenty as the final element, which walks the block end across
         // the point where `pos + WIDE` stops fitting. Anything that wrote wide here would be
@@ -494,9 +567,9 @@ mod tests {
 
     #[test]
     fn a_short_copy_near_the_end_of_a_block_lands_exactly_where_it_should() {
-        // The copy path does not write wide, so this is a plain boundary check rather than the
-        // guard test above. It is here because the copy path did write wide for a while and this
-        // is the sweep that would catch it if somebody puts that back without the measurement.
+        // The copy path writes wide at an offset of sixteen or more and exactly below it, so this
+        // sweep walks both sides of that line and both sides of the block end guard at once. The
+        // answer has to be the same whichever path it took.
         for offset in [1usize, 4, 15, 16, 32] {
             for len in [4usize, 8, 16] {
                 let head: Vec<u8> = (0..32u8).collect();
@@ -512,6 +585,38 @@ mod tests {
                 assert_eq!(out, expected, "offset {offset} len {len}");
             }
         }
+    }
+
+    #[test]
+    fn a_buffer_that_already_holds_a_longer_block_does_not_leak_it_into_a_shorter_one() {
+        // The whole risk in keeping the buffer. Decompress something long, then something short
+        // through the same buffer, and the short answer must be the short answer. If the tail were
+        // ever read rather than written this comes back with the first block's bytes on the end,
+        // which is a plausible looking answer and the worst kind of wrong.
+        let mut buffer = Vec::new();
+        let long = vec![b'L'; 300];
+        let mut body = vec![60 << 2, 255];
+        body.extend_from_slice(&long[..256]);
+        body.extend(literal(&long[256..]));
+        let len = super::decompress_into(&block(300, &body), ROOM, &mut buffer).unwrap();
+        assert_eq!(&buffer[..len], &long[..]);
+
+        let short = literal(b"short");
+        let len = super::decompress_into(&block(5, &short), ROOM, &mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"short");
+        assert_eq!(len, 5, "the length is the block's and not the buffer's");
+        assert!(buffer.len() >= 300, "the buffer kept the room it had");
+    }
+
+    #[test]
+    fn a_block_refused_for_its_length_leaves_the_buffer_alone() {
+        // The limit check runs before anything is sized, so a caller looping over pages with one
+        // buffer does not lose it to a page it refused to read.
+        let mut buffer = vec![7u8; 64];
+        let error =
+            super::decompress_into(&[0xff, 0xff, 0xff, 0xff, 0x0f], 16, &mut buffer).unwrap_err();
+        assert!(error.message().contains("what it came from says"), "{}", error.message());
+        assert_eq!(buffer, vec![7u8; 64]);
     }
 
     #[test]

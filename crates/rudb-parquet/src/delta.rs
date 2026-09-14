@@ -484,14 +484,13 @@ mod tests {
             file.read_at(chunk.start(), &mut bytes).expect("the chunk is in the file");
             let mut dictionary = None;
             for page in Pages::new(&bytes, chunk.compression, chunk.values) {
-                let page = page.expect("every page of the fixture walks");
+                let mut page = page.expect("every page of the fixture walks");
                 if matches!(page.header.body, Body::Dictionary(_)) {
                     dictionary =
-                        Some(page.into_dictionary(&schema).expect("the dictionary decodes"));
+                        Some(page.decode_dictionary(&schema).expect("the dictionary decodes"));
                     continue;
                 }
-                let vector =
-                    page.into_vector(&schema, dictionary.as_ref()).expect("the values decode");
+                let vector = page.decode(&schema, dictionary.as_ref()).expect("the values decode");
                 out.extend(Vector::iter(&vector));
             }
         }
