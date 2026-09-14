@@ -167,6 +167,9 @@ impl Counters {
         for (stage, nanos, bytes) in spent.taken() {
             self.stages[stage.slot()].fetch_add(nanos, Ordering::Relaxed);
             self.stage_bytes[stage.slot()].fetch_add(bytes, Ordering::Relaxed);
+            if matches!(stage, Stage::Decode | Stage::Dictionary) {
+                self.bytes_decoded.fetch_add(bytes, Ordering::Relaxed);
+            }
         }
     }
 
@@ -249,13 +252,16 @@ mod tests {
         counters.spent_reading(Spent::none());
         let mut both = Spent::of(Stage::Read, 100, 16_384);
         both.add(Spent::of(Stage::Decompress, 9_000, 262_144));
+        both.add(Spent::of(Stage::Decode, 7_000, 245_760));
+        both.add(Spent::of(Stage::Dictionary, 500, 16_384));
         counters.spent_reading(both);
         let operator = counters.snapshot();
         assert_eq!(operator.stages.nanos(Stage::Read), 500);
         assert_eq!(operator.stages.bytes(Stage::Read), 81_920);
         assert_eq!(operator.stages.nanos(Stage::Decompress), 9_000);
-        assert_eq!(operator.stages.nanos(Stage::Decode), 0);
-        assert_eq!(operator.stages.total(), 9_500);
+        assert_eq!(operator.stages.nanos(Stage::Decode), 7_000);
+        assert_eq!(operator.bytes_decoded, 262_144);
+        assert_eq!(operator.stages.total(), 17_000);
         // The whole point of the split, which is that the answer is a stage rather than a scan.
         assert_eq!(operator.stages.worst(), Some((Stage::Decompress, 9_000)));
     }
