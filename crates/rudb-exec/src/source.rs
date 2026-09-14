@@ -482,15 +482,19 @@ impl FileScan {
     /// out of, and the only thing it is for is naming that file if a column will not cast.
     fn conform(&self, chunk: Chunk, file: usize) -> Result<Chunk> {
         let rows = chunk.len();
+        let settled = self.wanted.iter().enumerate().all(|(at, field)| {
+            chunk.column(at).is_ok_and(|column| column.logical_type() == &field.ty)
+        });
+        if settled {
+            return Ok(chunk);
+        }
         let mut columns = Vec::with_capacity(self.wanted.len());
-        let mut changed = false;
         for (at, field) in self.wanted.iter().enumerate() {
             let column = chunk.column(at)?;
             if column.logical_type() == &field.ty {
                 columns.push(column.clone());
                 continue;
             }
-            changed = true;
             columns.push(cast(column, &field.ty, false).map_err(|error| {
                 let path = self.paths.get(file.saturating_sub(1)).map_or("", String::as_str);
                 Error::conversion(format!(
@@ -502,9 +506,6 @@ impl FileScan {
                     error.message()
                 ))
             })?);
-        }
-        if !changed {
-            return Ok(chunk);
         }
         Chunk::with_rows(columns, rows)
     }
