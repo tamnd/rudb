@@ -9,7 +9,7 @@
 //! row group is, and a query over one column of `hits` reads a hundred and five entries of the
 //! footer and then one column's bytes. [`Pages`] walks a chunk those bytes came back as,
 //! decompressing each page and handing back its header, and [`Page::definitions`] reads the levels
-//! that say which of its rows are null. [`Page::into_vector`] turns a page's body into a vector.
+//! that say which of its rows are null. [`Page::decode`] turns a page's body into a vector.
 //! [`Reader`] is the one a scan drives: it picks the columns, walks the row groups, and puts the
 //! columns side by side into chunks.
 //!

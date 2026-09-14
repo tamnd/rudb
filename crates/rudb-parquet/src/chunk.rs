@@ -157,12 +157,38 @@ pub struct Pages<'a> {
     /// keeps asking gets the same error forever, which in a `for` loop is not an error at all but
     /// a hang.
     failed: bool,
+    /// A buffer to read the next page's body into, if a caller has given one back.
+    ///
+    /// Empty unless [`Pages::recycle`] has been called, which is what the whole mechanism rests
+    /// on: a walker on its own cannot reuse anything, because the body it produced belongs to the
+    /// page it handed over.
+    spare: Vec<u8>,
 }
 
 impl<'a> Pages<'a> {
     /// A walker over `bytes`, which is the chunk starting at its first page.
     pub fn new(bytes: &'a [u8], codec: Codec, values: i64) -> Self {
-        Self { bytes, at: 0, codec, left: values, failed: false }
+        Self { bytes, at: 0, codec, left: values, failed: false, spare: Vec::new() }
+    }
+
+    /// Hands a page body back, to be read into rather than dropped.
+    ///
+    /// A page body on a real file is megabytes, which is large enough that the allocator gets it
+    /// from the kernel and gives it straight back, so every page pays for its own memory to be
+    /// faulted in a page at a time. Walking a chunk through one buffer pays that once. The buffer
+    /// does not have to be the right size, or any size: it is grown when it is too small and left
+    /// alone when it is too big, and an empty one is the same as not calling this at all.
+    ///
+    /// A caller passes back whatever the last page left it, which is nothing when the decode kept
+    /// the body for itself. A string column's values are its page, pointed at rather than copied,
+    /// so those pages do not come back and the next one allocates.
+    ///
+    /// The larger of the two buffers is the one kept, so handing back a small one does not throw
+    /// away the room already paid for.
+    pub fn recycle(&mut self, buffer: Vec<u8>) {
+        if buffer.capacity() > self.spare.capacity() {
+            self.spare = buffer;
+        }
     }
 
     /// How many bytes of the chunk have been walked, headers included.
@@ -213,7 +239,7 @@ impl<'a> Pages<'a> {
     /// The bytes charged are the ones that came out rather than the ones that went in, because a
     /// decompressor's rate is usually quoted over its output and a rate is the only form of this
     /// number that can be compared against another reader.
-    fn decompress(&self, header: &Header, raw: &[u8]) -> Result<Vec<u8>> {
+    fn decompress(&mut self, header: &Header, raw: &[u8]) -> Result<Vec<u8>> {
         let timing = Timing::start(Stage::Decompress);
         let body = self.decompressed(header, raw);
         timing.stop(body.as_ref().map_or(0, |body| u64::try_from(body.len()).unwrap_or(u64::MAX)));
@@ -221,7 +247,7 @@ impl<'a> Pages<'a> {
     }
 
     /// Decompresses a page body, taking the version two level split into account.
-    fn decompressed(&self, header: &Header, raw: &[u8]) -> Result<Vec<u8>> {
+    fn decompressed(&mut self, header: &Header, raw: &[u8]) -> Result<Vec<u8>> {
         let expected = header.uncompressed_size as usize;
         let (levels, compressed) = match &header.body {
             Body::DataV2(page) if page.compressed => {
@@ -248,15 +274,38 @@ impl<'a> Pages<'a> {
                     raw.len()
                 )));
             }
-            return Ok(raw.to_vec());
+            let mut body = self.buffer(expected);
+            body.copy_from_slice(raw);
+            return Ok(body);
         }
         if levels == 0 {
-            return self.codec.decompress(raw, expected);
+            let mut body = std::mem::take(&mut self.spare);
+            self.codec.decompress_into(raw, expected, &mut body)?;
+            body.truncate(expected);
+            return Ok(body);
         }
+        // A version two page with its levels outside the compressed region, which is the one shape
+        // that cannot be written into the buffer in one go: the levels go in front of what the
+        // codec produces and the codec writes from the start. It allocates, as it always has. No
+        // writer this reader has met emits these, so the reuse is not worth a second buffer to
+        // shuffle between.
         let mut body = Vec::with_capacity(expected);
         body.extend_from_slice(&raw[..levels]);
         body.extend(self.codec.decompress(&raw[levels..], expected - levels)?);
         Ok(body)
+    }
+
+    /// The recycled buffer, grown to `len` and cut to it, ready to be written over.
+    ///
+    /// Grown rather than cleared and refilled, because zeroing what is about to be overwritten is
+    /// most of what keeping the buffer saved.
+    fn buffer(&mut self, len: usize) -> Vec<u8> {
+        let mut body = std::mem::take(&mut self.spare);
+        if body.len() < len {
+            body.resize(len, 0);
+        }
+        body.truncate(len);
+        body
     }
 }
 
