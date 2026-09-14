@@ -470,6 +470,98 @@ impl Accumulator {
         Ok(true)
     }
 
+    /// Folds another accumulator over the same aggregate into this one.
+    ///
+    /// This is what lets one aggregate run on more than one thread. Each thread builds its own
+    /// table, and where two of them found the same group there are two states for it, so the merge
+    /// needs a way to add one state to another that does not go back to the rows either of them was
+    /// built from. That is this, and it is the whole of what an aggregate has to provide to be
+    /// parallel, because the key side of the merge is the same probe the fold already does.
+    ///
+    /// # A sum of doubles is not associative
+    ///
+    /// Two threads that split a column of doubles add it up in a different order than one thread
+    /// does, and floating point addition does not care that the numbers are the same. So `sum` and
+    /// `avg` over a `FLOAT` or a `DOUBLE` can answer differently depending on how the work was
+    /// divided. That is not a bug being introduced here, it is the arithmetic, and it is the reason
+    /// `avg` over integers keeps an exact `i128` total and divides once, which makes the common case
+    /// of the two give the same answer whatever the division was.
+    ///
+    /// # Errors
+    ///
+    /// [`rudb_common::ErrorCode::Internal`] if the two states are not the same aggregate over the
+    /// same type, which is a caller merging two tables that did not come from the same operator.
+    /// [`rudb_common::ErrorCode::OutOfRange`] if a whole running total overflows, which is the same
+    /// answer the row at a time path gives to the same sum.
+    pub fn combine(&mut self, other: &Self) -> Result<()> {
+        match (&mut self.state, &other.state) {
+            (State::Counted { count, star }, State::Counted { count: added, star: same })
+                if star == same =>
+            {
+                *count += added;
+            }
+            (State::Whole { total, seen, .. }, State::Whole { total: added, seen: any, .. }) => {
+                *total = total.checked_add(*added).ok_or_else(overflowed)?;
+                *seen |= any;
+            }
+            (
+                State::Scaled { total, scale, seen, .. },
+                State::Scaled { total: added, scale: same, seen: any, .. },
+            ) if scale == same => {
+                *total = total.checked_add(*added).ok_or_else(overflowed)?;
+                *seen |= any;
+            }
+            (State::Real { total, seen, .. }, State::Real { total: added, seen: more, .. }) => {
+                *total += added;
+                *seen += more;
+            }
+            (
+                State::Mean { total, seen, exact, .. },
+                State::Mean { total: added, seen: more, exact: whole, .. },
+            ) => {
+                // Both sides exact and the sum still fitting is the case worth keeping exact,
+                // because it is `AVG` over an integer column and it is what gives the same answer
+                // however the rows were divided. Anything else falls to the floating total, and it
+                // falls once rather than per row, so the side that was exact is converted here and
+                // the two are added as doubles.
+                let both = if *exact && *whole { total.checked_add(*added) } else { None };
+                match both {
+                    Some(sum) => *total = sum,
+                    None => {
+                        let here = if *exact { exactly(*total) } else { mean_real(*total) };
+                        let there = if *whole { exactly(*added) } else { mean_real(*added) };
+                        *total = mean_bits(here + there);
+                        *exact = false;
+                    }
+                }
+                *seen += more;
+            }
+            (State::Extreme { held, least }, State::Extreme { held: candidate, least: same })
+                if least == same =>
+            {
+                if let Some(candidate) = candidate {
+                    let replace = match held {
+                        None => true,
+                        Some(current) => {
+                            let ordering = order(candidate, current)?;
+                            if *least { ordering.is_lt() } else { ordering.is_gt() }
+                        }
+                    };
+                    if replace {
+                        *held = Some(candidate.clone());
+                    }
+                }
+            }
+            (here, there) => {
+                return Err(Error::internal(format!(
+                    "combining a {here:?} aggregate state with a {there:?} one, which are not the \
+                     same aggregate over the same type"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The aggregate's answer.
     ///
     /// # Errors
