@@ -280,7 +280,7 @@ fn candidates(values: &[&[u8]], depth: u8) -> Vec<Kind> {
         return vec![Kind::Constant];
     }
     kinds.push(Kind::Fsst);
-    if depth < MAX_DEPTH && distinct_values(values).len() < values.len() {
+    if depth < MAX_DEPTH && has_duplicates(values) {
         kinds.push(Kind::Dict);
     }
     if depth < MAX_DEPTH && sharing_of(values) >= total_len(values) / SHARE_DIVISOR {
@@ -404,12 +404,10 @@ fn encode_as(
             out.extend_from_slice(&compressed);
         }
         Kind::Dict => {
-            let dictionary = distinct_values(values);
-            if dictionary.is_empty() {
+            let (entries, codes) = dictionary_of(values);
+            if entries.is_empty() {
                 return Ok(None);
             }
-            let codes = codes_over(values, &dictionary);
-            let entries: Vec<&[u8]> = dictionary.iter().map(Vec::as_slice).collect();
             out.extend_from_slice(&encode_at(&entries, depth + 1, chooser)?);
             out.extend_from_slice(&integer::encode_with(&codes, chooser)?);
         }
@@ -610,24 +608,81 @@ pub(crate) fn sample_bytes_of<'a>(values: &[&'a [u8]], budget: usize) -> Vec<&'a
     sample
 }
 
-/// The distinct values in sorted order, for the same reason the integer dictionary is sorted: an
-/// ordered dictionary turns a range predicate into a code range rather than a code set.
-fn distinct_values(values: &[&[u8]]) -> Vec<Vec<u8>> {
-    let mut distinct: Vec<Vec<u8>> = values.iter().map(|value| value.to_vec()).collect();
-    distinct.sort_unstable();
-    distinct.dedup();
-    distinct
+/// The distinct values in sorted order and the code of every value, in one pass over one sort.
+///
+/// The dictionary is sorted for the same reason the integer one is: an ordered dictionary turns a
+/// range predicate into a code range rather than a code set, and front coding over the entries needs
+/// them sorted anyway.
+///
+/// It sorts a permutation of indices rather than the values, which is the whole point. Sorting the
+/// values means copying every one of them onto the heap first, and the codes then have to be found
+/// by searching the dictionary back for each value, which is a binary search of string comparisons
+/// per row. Walking the permutation gives the codes away for free, because the position a value
+/// sorted to is the position its code was assigned at.
+fn dictionary_of<'a>(values: &[&'a [u8]]) -> (Vec<&'a [u8]>, Vec<i64>) {
+    let mut order: Vec<u32> = (0..values.len() as u32).collect();
+    order.sort_unstable_by(|left, right| values[*left as usize].cmp(values[*right as usize]));
+    let mut entries: Vec<&'a [u8]> = Vec::new();
+    let mut codes = vec![0i64; values.len()];
+    for &index in &order {
+        let value = values[index as usize];
+        if entries.last() != Some(&value) {
+            entries.push(value);
+        }
+        codes[index as usize] = (entries.len() - 1) as i64;
+    }
+    (entries, codes)
 }
 
-fn codes_over(values: &[&[u8]], dictionary: &[Vec<u8>]) -> Vec<i64> {
-    values
-        .iter()
-        .map(|value| {
-            dictionary
-                .binary_search_by(|entry| entry.as_slice().cmp(value))
-                .expect("the dictionary is the distinct values of this chunk") as i64
-        })
-        .collect()
+/// Whether any value appears twice, which is the only thing the candidate list wants to know.
+///
+/// This used to build the whole sorted dictionary and compare its length against the input, which
+/// is a copy of the chunk and a sort of it paid on every chunk at every level whether the dictionary
+/// was ever encoded or not. It is a linear probe over hashes instead: expected O(n), no allocation
+/// per value, and it stops at the first duplicate it finds, which on a column with any repetition at
+/// all is immediately.
+///
+/// A hash collision is resolved by comparing the bytes, so the answer is exact rather than probable.
+fn has_duplicates(values: &[&[u8]]) -> bool {
+    let Some(slots) = values.len().checked_mul(2).map(usize::next_power_of_two) else {
+        return false;
+    };
+    let mask = slots - 1;
+    let mut table = vec![u32::MAX; slots];
+    for (index, value) in values.iter().enumerate() {
+        let mut at = hash_of(value) as usize & mask;
+        loop {
+            let held = table[at];
+            if held == u32::MAX {
+                table[at] = index as u32;
+                break;
+            }
+            if values[held as usize] == *value {
+                return true;
+            }
+            at = (at + 1) & mask;
+        }
+    }
+    false
+}
+
+/// FNV-1a over the bytes, eight at a time.
+///
+/// Good enough for a table that verifies every hit, and it is not part of the format, so nothing
+/// depends on which hash this is. Eight bytes at a time because a URL column is long values and a
+/// byte at a time over a hundred bytes of every one of 122,880 rows is the loop this is here to
+/// avoid.
+fn hash_of(value: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut chunks = value.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) gives eight bytes"));
+        hash = (hash ^ word).wrapping_mul(0x1_0000_01b3);
+    }
+    for byte in chunks.remainder() {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x1_0000_01b3);
+    }
+    (hash ^ (value.len() as u64)).wrapping_mul(0x1_0000_01b3)
 }
 
 fn too_long(len: usize) -> Error {
@@ -684,6 +739,55 @@ mod tests {
 
     fn kind_of(bytes: &[u8]) -> Kind {
         Kind::from_tag(bytes[0]).unwrap()
+    }
+
+    #[test]
+    fn the_dictionary_is_sorted_and_the_codes_point_back_at_the_values() {
+        // The two things the dictionary path has to get right, and the reason it is one function
+        // now rather than a sort followed by a binary search per row.
+        let values = vec![
+            b"pear".to_vec(),
+            b"apple".to_vec(),
+            b"pear".to_vec(),
+            b"cherry".to_vec(),
+            b"apple".to_vec(),
+        ];
+        let borrowed = borrow(&values);
+        let (entries, codes) = dictionary_of(&borrowed);
+        assert_eq!(entries, vec![b"apple".as_slice(), b"cherry".as_slice(), b"pear".as_slice()]);
+        assert_eq!(codes, vec![2, 0, 2, 1, 0]);
+        for (code, value) in codes.iter().zip(&borrowed) {
+            assert_eq!(entries[*code as usize], *value);
+        }
+    }
+
+    #[test]
+    fn a_column_with_nothing_repeated_has_no_duplicates_and_one_with_anything_does() {
+        let distinct: Vec<Vec<u8>> =
+            (0..5000).map(|index| format!("value-{index}").into_bytes()).collect();
+        assert!(!has_duplicates(&borrow(&distinct)));
+
+        // One repeat at the far end, so a check that gave up early would miss it.
+        let mut repeated = distinct.clone();
+        repeated.push(b"value-0".to_vec());
+        assert!(has_duplicates(&borrow(&repeated)));
+
+        assert!(!has_duplicates(&borrow(&Vec::new())));
+        assert!(!has_duplicates(&borrow(&[b"one".to_vec()])));
+        assert!(has_duplicates(&borrow(&vec![b"same".to_vec(); 2])));
+    }
+
+    #[test]
+    fn long_values_that_differ_only_at_the_end_are_not_confused_for_each_other() {
+        // The hash is eight bytes at a time and the table verifies every hit, so this is the case
+        // that says the verify is really there rather than the hash being trusted.
+        let stem = "http://www.example.com/a/very/long/path/that/goes/on?session=";
+        let values: Vec<Vec<u8>> =
+            (0..2000).map(|index| format!("{stem}{index}").into_bytes()).collect();
+        assert!(!has_duplicates(&borrow(&values)));
+        let (entries, codes) = dictionary_of(&borrow(&values));
+        assert_eq!(entries.len(), values.len());
+        assert_eq!(codes.len(), values.len());
     }
 
     #[test]
