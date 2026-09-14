@@ -45,7 +45,7 @@
 use std::fmt::Write as _;
 
 use rudb_metrics::{Document, Operator};
-use rudb_plan::{Node, NodeRef, OperatorRef, PipelineRef, Plan, Shape};
+use rudb_plan::{Node, NodeRef, OperatorRef, PipelineRef, Plan, Shape, seams_of};
 use rudb_seam::{Registries, SeamId, Settings};
 
 use crate::estimate::{Statistics, rows};
@@ -79,24 +79,14 @@ impl<'a> Seams<'a> {
         self.settings
     }
 
-    /// The name of what runs at this seam, and whether that thing is the reference.
+    /// The name of what runs at this seam, said the way the seam section prints it.
     ///
-    /// `None` when the seam has no registry, which at F0 is all twenty seven of them. That is not
-    /// the same as nothing running: the reference implementation is compiled in and is what the
-    /// operators call. It means there is nothing to choose between and therefore nothing to print.
+    /// `None` when the seam has no registry, which is what [`Registries::running`] means by it and
+    /// is the same answer the executor gets. The formatting is this section's, the decision is not.
     fn chosen(self, seam: SeamId) -> Option<(String, bool)> {
-        if !self.registries.has(seam) {
-            return None;
-        }
-        let rows = self.registries.rows();
-        let rows = rows.iter().filter(|row| row.seam == seam);
-        if let Some(pinned) = self.settings.pinned(seam) {
-            let is_reference =
-                rows.clone().find(|row| row.name == pinned).is_some_and(|row| row.is_reference);
-            return Some((format!("{pinned} (pinned)"), is_reference));
-        }
-        let row = rows.clone().find(|row| row.is_default).or_else(|| rows.clone().next())?;
-        Some((format!("{} (default)", row.name), row.is_reference))
+        let running = self.registries.running(seam, self.settings)?;
+        let how = if running.pinned { "pinned" } else { "default" };
+        Some((format!("{} ({how})", running.name), running.is_reference))
     }
 
     /// Whether everything this node does is a reference implementation.
@@ -377,44 +367,6 @@ fn listed(pipelines: &[PipelineRef]) -> String {
 /// The children of a node, in the order they print.
 fn children(node: &Node) -> Vec<NodeRef> {
     node.children().into_iter().flatten().collect()
-}
-
-/// The seams an operator's answer depends on.
-///
-/// This is the list that decides whether a line gets the reference marker, so it is the operator's
-/// own seams rather than every seam a query touches. A scan sits on how a column is carried and on
-/// when a column is read, a join sits on how its build side is made probeable and on the three hash
-/// seams under that, and a limit sits on nothing at all because there is one way to count to ten.
-fn seams_of(node: &Node) -> &'static [SeamId] {
-    const HASHED: &[SeamId] = &[SeamId::HashKey, SeamId::HashFunction, SeamId::HashTable];
-    match node {
-        Node::Get { .. } => &[SeamId::VectorForm, SeamId::ScanMaterialisation],
-        Node::Filter { .. } => &[
-            SeamId::ExprEval,
-            SeamId::KernelCompare,
-            SeamId::KernelFilter,
-            SeamId::ChunkCompaction,
-        ],
-        Node::Project { .. } => &[SeamId::ExprEval],
-        Node::Aggregate { .. } => &[
-            SeamId::HashKey,
-            SeamId::HashFunction,
-            SeamId::HashTable,
-            SeamId::AggState,
-            SeamId::AggParallel,
-        ],
-        Node::Distinct { .. } | Node::SetOp { .. } => HASHED,
-        Node::Sort { .. } => &[SeamId::Sort],
-        Node::TopN { .. } => &[SeamId::TopK],
-        Node::Join { .. } => {
-            &[SeamId::JoinBuild, SeamId::JoinFilter, SeamId::HashKey, SeamId::HashFunction]
-        }
-        Node::Dummy
-        | Node::Values { .. }
-        | Node::TableFunction { .. }
-        | Node::Limit { .. }
-        | Node::CrossProduct { .. } => &[],
-    }
 }
 
 #[cfg(test)]

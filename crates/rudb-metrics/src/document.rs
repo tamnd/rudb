@@ -209,6 +209,19 @@ impl Document {
                         out.count("reserved", operator.memory.reserved);
                         out.count("high_water", operator.memory.high_water);
                     });
+                    if !operator.implementations.is_empty() {
+                        out.key("implementations");
+                        out.array(|out| {
+                            for chosen in &operator.implementations {
+                                out.item();
+                                out.object(|out| {
+                                    out.words("seam", &chosen.seam);
+                                    out.words("name", &chosen.name);
+                                    out.flag("is_reference", chosen.is_reference);
+                                });
+                            }
+                        });
+                    }
                     out.flag("reference_impl", operator.reference_impl);
                 });
             }
@@ -551,8 +564,33 @@ pub struct Operator {
     pub stages: Spent,
     /// What it held.
     pub memory: Memory,
-    /// Whether what ran was the reference implementation rather than a fast one.
+    /// What it picked at each of the seams it sits on that has more than one thing to pick from.
+    ///
+    /// Empty for an operator that sits on no seam, such as a limit, and empty for one whose seams
+    /// have no registry yet, which at F1 is most of them. Empty therefore means there was nothing
+    /// to choose and not that nothing ran.
+    pub implementations: Vec<Implementation>,
+    /// Whether everything this operator chose was a reference implementation.
+    ///
+    /// [`Counters::snapshot`](crate::Counters::snapshot) sets this true when
+    /// [`Operator::implementations`] is empty, on purpose and for the same reason `EXPLAIN` puts
+    /// the marker on a line with no registered seam under it. Nothing was chosen, so what ran is
+    /// the one implementation there is, and that one is the obvious correct one.
+    ///
+    /// A row built by hand rather than measured starts false, because a document assembled in a
+    /// test has made no claim either way and a warning about it would be a warning about the test.
     pub reference_impl: bool,
+}
+
+/// What one operator picked at one seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Implementation {
+    /// The seam, in its dotted name such as `chunk.compaction`.
+    pub seam: String,
+    /// What is running there.
+    pub name: String,
+    /// Whether that is the reference implementation.
+    pub is_reference: bool,
 }
 
 impl Operator {
@@ -575,6 +613,7 @@ impl Operator {
             fallbacks: Tally::none(),
             stages: Spent::none(),
             memory: Memory::default(),
+            implementations: Vec::new(),
             reference_impl: false,
         }
     }
@@ -600,7 +639,7 @@ pub struct Memory {
 mod tests {
     use rudb_common::{Cause, Spent, Stage, Tally};
 
-    use super::{Document, Engine, Machine, Operator, Outcome, Pipeline, Strategy};
+    use super::{Document, Engine, Implementation, Machine, Operator, Outcome, Pipeline, Strategy};
 
     /// A document with every part of it filled in, which is what the golden file holds.
     fn sample() -> Document {
@@ -673,6 +712,11 @@ mod tests {
         group.memory.high_water = 894_000_000;
         group.fallbacks.add(Tally::of(Cause::Flatten, 48_827));
         group.fallbacks.add(Tally::of(Cause::Aggregate, 48_827));
+        group.implementations.push(Implementation {
+            seam: "hash.table".to_string(),
+            name: "unchained".to_string(),
+            is_reference: false,
+        });
         let mut sort = Operator::new(7, 1, "Sort");
         sort.rows_in = 41_983_110;
         sort.rows_out = 10;
@@ -680,6 +724,11 @@ mod tests {
         sort.cpu_ns = 2_280_000_000;
         sort.bytes_spilled = 12_000_000;
         sort.fallbacks.add(Tally::of(Cause::Compare, 12));
+        sort.implementations.push(Implementation {
+            seam: "sort".to_string(),
+            name: "merge".to_string(),
+            is_reference: true,
+        });
         sort.reference_impl = true;
         metrics.operators.extend([read, group, sort]);
         metrics

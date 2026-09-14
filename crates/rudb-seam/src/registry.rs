@@ -10,6 +10,7 @@ use rudb_common::{Error, Result};
 use crate::context::Context;
 use crate::policy::{ChoiceReason, Policy};
 use crate::seam::SeamId;
+use crate::settings::Settings;
 use crate::strategy::{Determinism, Provenance, Strategy};
 
 /// Every implementation of one seam.
@@ -359,4 +360,49 @@ impl Registries {
     pub fn has(&self, seam: SeamId) -> bool {
         self.views.contains_key(&seam)
     }
+
+    /// What runs at this seam under these settings, without building the thing that runs.
+    ///
+    /// `None` when the seam has no registry, which at F1 is twenty six of the twenty seven. That is
+    /// not the same as nothing running. The reference implementation is compiled in and is what the
+    /// operators call. It means there is nothing to choose between, so there is nothing to print
+    /// and nothing a benchmark could have got wrong.
+    ///
+    /// This exists so that `EXPLAIN` and the metrics document answer it the same way. They ask for
+    /// different reasons, one before the query and one after, and a pair of answers that disagree
+    /// is worse than either on its own.
+    #[must_use]
+    pub fn running(&self, seam: SeamId, settings: &Settings) -> Option<Chosen> {
+        if !self.views.contains_key(&seam) {
+            return None;
+        }
+        let rows = self.rows();
+        let mut rows = rows.iter().filter(|row| row.seam == seam);
+        if let Some(pinned) = settings.pinned(seam) {
+            let found = rows.clone().find(|row| row.name == pinned);
+            return Some(Chosen {
+                name: pinned.to_string(),
+                pinned: true,
+                is_reference: found.is_some_and(|row| row.is_reference),
+            });
+        }
+        let row = rows.clone().find(|row| row.is_default).or_else(|| rows.next())?;
+        Some(Chosen { name: row.name.to_string(), pinned: false, is_reference: row.is_reference })
+    }
+}
+
+/// What runs at one seam, as [`Registries::running`] works it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chosen {
+    /// Its name in the registry.
+    ///
+    /// A `String` rather than a `&'static str` because a pin is whatever text the session set, and
+    /// a pin naming something that is not registered is a thing worth reporting rather than
+    /// silently turning back into the default.
+    pub name: String,
+    /// Whether it is running because the session asked for it by name.
+    pub pinned: bool,
+    /// Whether it is the reference implementation, which is the slow one kept so that a
+    /// differential test has something to disagree with.
+    pub is_reference: bool,
 }
