@@ -25,6 +25,8 @@
 //! Nothing is copied except the strings short enough to sit inside a view, which are copied because
 //! that is what makes them readable without going near the arena. See `StringColumn::over`.
 
+use std::sync::Arc;
+
 use rudb_common::{Error, LogicalType, PhysicalType, Result};
 use rudb_vector::{Buffer, Data, StringColumn, Validity, Vector};
 
@@ -41,12 +43,11 @@ impl Page {
     /// dictionary serves every data page of the chunk, and a page that decoded its own would be
     /// decoding the same values over and over.
     ///
-    /// It is cloned into each page's vector, which copies the dictionary's values once per page,
-    /// and that is a cost this reader will want back. `Buffer` owns its values today and has an
-    /// enum around them for exactly this reason: the second variant is a run inside a pinned page,
-    /// and it arrives with the buffer manager, which is the only thing that can hand out a pin. So
-    /// the fix is a one line change here once there is something to change it to, and doing it any
-    /// earlier means inventing a second way to share a buffer.
+    /// It arrives behind a handle rather than by value, and the handle is what goes into the page's
+    /// vector, so the dictionary is decoded once per chunk and pointed at from then on. It used to
+    /// be cloned into each page, which on a ClickBench scan was sixteen percent of the instructions
+    /// the whole query ran: a chunk of fifty pages copied its dictionary fifty times into fifty
+    /// handles that each had one holder.
     ///
     /// This takes the page by mutable reference and empties its body rather than consuming it,
     /// because the caller wants that buffer back to read the next page into. A byte array column
@@ -59,7 +60,11 @@ impl Page {
     /// read yet, if a dictionary encoded page arrives without a dictionary, or if the values run
     /// off the end of the body. Also if the column is one of the types named as not read yet:
     /// `INT96`, fixed length byte arrays, and byte arrays that are not text.
-    pub fn decode(&mut self, column: &SchemaColumn, dictionary: Option<&Vector>) -> Result<Vector> {
+    pub fn decode(
+        &mut self,
+        column: &SchemaColumn,
+        dictionary: Option<&Arc<Vector>>,
+    ) -> Result<Vector> {
         let encoding = match &self.header.body {
             Body::DataV1(page) => page.encoding,
             Body::DataV2(page) => page.encoding,
@@ -85,7 +90,7 @@ impl Page {
                     )
                 })?;
                 let codes = codes(&self.body, at, valid, &levels, total, dictionary.len())?;
-                Ok(Vector::dictionary(codes, dictionary.clone())?.with_validity(validity))
+                Ok(Vector::dictionary_over(codes, Arc::clone(dictionary))?.with_validity(validity))
             }
             Encoding::DeltaBinaryPacked
             | Encoding::DeltaLengthByteArray
@@ -544,6 +549,7 @@ fn codes(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use rudb_common::{LogicalType, Value};
     use rudb_io::{File, Filesystem, OpenMode, RealFilesystem};
@@ -580,8 +586,9 @@ mod tests {
             for page in Pages::new(&bytes, chunk.compression, chunk.values) {
                 let mut page = page.expect("every page of the fixture walks");
                 if matches!(page.header.body, Body::Dictionary(_)) {
-                    dictionary =
-                        Some(page.decode_dictionary(&schema).expect("the dictionary decodes"));
+                    dictionary = Some(Arc::new(
+                        page.decode_dictionary(&schema).expect("the dictionary decodes"),
+                    ));
                     continue;
                 }
                 out.push(page.decode(&schema, dictionary.as_ref()).expect("the values decode"));
@@ -593,6 +600,48 @@ mod tests {
     /// Every value of a column, in order, nulls included.
     fn values(at: usize) -> Vec<Value> {
         column(at).1.iter().flat_map(Vector::iter).collect()
+    }
+
+    #[test]
+    fn every_page_of_a_chunk_points_at_one_dictionary_rather_than_a_copy_of_it() {
+        // The whole reason `decode` takes a handle. This is the assertion that stops a future
+        // signature change from quietly putting the copy back, since a copy is not a wrong answer
+        // and no other test in this file would notice one.
+        let file = open();
+        let metadata = Metadata::read(file.as_ref()).expect("the footer reads");
+        let mut checked = 0;
+        for (at, schema) in metadata.schema.iter().enumerate() {
+            for group in &metadata.row_groups {
+                let chunk = &group.columns[at];
+                let mut bytes = vec![0u8; chunk.compressed_size as usize];
+                file.read_at(chunk.start(), &mut bytes).expect("the chunk is in the file");
+                let mut dictionary: Option<Arc<Vector>> = None;
+                let mut pages = Vec::new();
+                for page in Pages::new(&bytes, chunk.compression, chunk.values) {
+                    let mut page = page.expect("every page of the fixture walks");
+                    if matches!(page.header.body, Body::Dictionary(_)) {
+                        let decoded =
+                            page.decode_dictionary(schema).expect("the dictionary decodes");
+                        dictionary = Some(Arc::new(decoded));
+                        continue;
+                    }
+                    pages
+                        .push(page.decode(schema, dictionary.as_ref()).expect("the values decode"));
+                }
+                let Some(dictionary) = dictionary else { continue };
+                for page in &pages {
+                    let (_, values) = page.dictionary_parts().expect("a dictionary encoded page");
+                    assert!(
+                        std::ptr::eq(values, dictionary.as_ref()),
+                        "a page of column {} decoded its own copy of the dictionary",
+                        schema.name
+                    );
+                }
+                assert_eq!(Arc::strong_count(&dictionary), 1 + pages.len());
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the fixture has a dictionary encoded column and none was walked");
     }
 
     #[test]
@@ -755,7 +804,9 @@ mod tests {
         for page in Pages::new(&bytes, chunk.compression, chunk.values) {
             let mut page = page.expect("every page walks");
             if matches!(page.header.body, Body::Dictionary(_)) {
-                dictionary = Some(page.decode_dictionary(&schema).expect("the dictionary decodes"));
+                dictionary = Some(Arc::new(
+                    page.decode_dictionary(&schema).expect("the dictionary decodes"),
+                ));
                 continue;
             }
             let (levels, _) = page.definitions(true).expect("the levels decode");

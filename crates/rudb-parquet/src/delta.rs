@@ -486,8 +486,9 @@ mod tests {
             for page in Pages::new(&bytes, chunk.compression, chunk.values) {
                 let mut page = page.expect("every page of the fixture walks");
                 if matches!(page.header.body, Body::Dictionary(_)) {
-                    dictionary =
-                        Some(page.decode_dictionary(&schema).expect("the dictionary decodes"));
+                    dictionary = Some(std::sync::Arc::new(
+                        page.decode_dictionary(&schema).expect("the dictionary decodes"),
+                    ));
                     continue;
                 }
                 let vector = page.decode(&schema, dictionary.as_ref()).expect("the values decode");
