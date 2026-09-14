@@ -64,14 +64,19 @@ struct Queue {
 struct Order {
     /// Chunks that have arrived and cannot go yet, by morsel and place within it.
     waiting: BTreeMap<(u64, u64), Chunk>,
-    /// The morsels being read right now, one entry per instance that holds one.
-    running: BTreeSet<u64>,
+    /// Morsels that have finished but have an earlier morsel still in flight.
+    finished: BTreeSet<u64>,
+    /// The first morsel that has not finished yet.
+    next: u64,
 }
 
 impl Order {
-    /// The earliest morsel still being read, or `None` when nothing is.
-    fn earliest(&self) -> Option<u64> {
-        self.running.first().copied()
+    /// Records one completed morsel and advances across every contiguous completion.
+    fn finish(&mut self, morsel: u64) {
+        self.finished.insert(morsel);
+        while self.finished.remove(&self.next) {
+            self.next += 1;
+        }
     }
 
     /// Move every chunk whose turn has come onto the ready queue.
@@ -80,7 +85,7 @@ impl Order {
     /// morsel handed out later has a higher number than everything already waiting, which is the
     /// numbering [`Sink::at`] asks a source for and the reason this is safe rather than optimistic.
     fn release(&mut self, ready: &mut VecDeque<Chunk>) {
-        let limit = self.earliest().unwrap_or(u64::MAX);
+        let limit = self.next;
         while let Some((&key, _)) = self.waiting.iter().next() {
             if key.0 >= limit {
                 break;
@@ -186,9 +191,8 @@ impl Sink for RootSink {
             // Taking a morsel is also finishing the one before it, because an instance reads one at
             // a time, and finishing one is what lets the chunks behind it go.
             if let Some(done) = place.morsel {
-                order.running.remove(&done);
+                order.finish(done);
             }
-            order.running.insert(morsel.index());
             order.release(ready);
         }
         place.morsel = Some(morsel.index());
@@ -218,7 +222,7 @@ impl Sink for RootSink {
                 "the root was told to keep the source order by a driver that does not say which morsel a chunk came from",
             ));
         };
-        if full(order.waiting.len()) && order.earliest() != Some(morsel) {
+        if full(order.waiting.len()) && order.next != morsel {
             return Ok(Progress::Blocked(Blocked::Downstream(self.shared.buffer)));
         }
         order.waiting.insert((morsel, place.at), chunk.clone());
@@ -231,7 +235,7 @@ impl Sink for RootSink {
         let Queue { ready, order } = &mut *queue;
         if let Some(order) = order.as_mut() {
             if let Some(done) = place.morsel {
-                order.running.remove(&done);
+                order.finish(done);
             }
             order.release(ready);
         }
