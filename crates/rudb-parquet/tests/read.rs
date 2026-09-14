@@ -80,6 +80,21 @@ fn every_value_of_the_file_is_the_value_duckdb_reads() {
 }
 
 #[test]
+fn one_row_group_can_be_read_without_the_groups_before_it() {
+    let mut reader = reader();
+    reader.only_row_group(1).expect("the second row group exists");
+    let chunks = chunks(&mut reader);
+    let mut i = 2048_i64;
+    for chunk in &chunks {
+        for at in 0..chunk.len() {
+            assert_eq!(chunk.row(at).collect::<Vec<_>>(), row(i), "row {i}");
+            i += 1;
+        }
+    }
+    assert_eq!(i, 4096, "only the second row group was read");
+}
+
+#[test]
 fn the_schema_is_the_one_the_footer_describes() {
     let fields = reader().fields();
     let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();

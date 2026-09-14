@@ -82,6 +82,7 @@ pub struct Reader {
     metadata: Metadata,
     projection: Vec<usize>,
     group: usize,
+    end_group: usize,
     active: Option<Group>,
     bytes: u64,
 }
@@ -98,7 +99,8 @@ impl Reader {
     pub fn open(file: Box<dyn File>) -> Result<Self> {
         let metadata = Metadata::read(file.as_ref())?;
         let projection = (0..metadata.schema.len()).collect();
-        Ok(Self { file, metadata, projection, group: 0, active: None, bytes: 0 })
+        let end_group = metadata.row_groups.len();
+        Ok(Self { file, metadata, projection, group: 0, end_group, active: None, bytes: 0 })
     }
 
     /// The footer.
@@ -170,6 +172,28 @@ impl Reader {
                 }
             })
             .collect()
+    }
+
+    /// Restricts subsequent streaming reads to one row group.
+    ///
+    /// This is the unit a parallel scan hands to one worker. The projection and text settings stay
+    /// in place, so a worker opens and configures one reader and moves it between the row groups it
+    /// is assigned rather than reading the footer again for every morsel.
+    ///
+    /// # Errors
+    ///
+    /// If `group` is outside the file.
+    pub fn only_row_group(&mut self, group: usize) -> Result<()> {
+        if group >= self.metadata.row_groups.len() {
+            return Err(Error::io(format!(
+                "row group {group} of a parquet file with {} row groups",
+                self.metadata.row_groups.len()
+            )));
+        }
+        self.group = group;
+        self.end_group = group + 1;
+        self.active = None;
+        Ok(())
     }
 
     /// How many bytes of column data have been read.
@@ -271,7 +295,7 @@ impl Reader {
                 }
                 self.active = None;
             }
-            if self.group >= self.metadata.row_groups.len() {
+            if self.group >= self.end_group {
                 return Ok(None);
             }
             let group = self.group;
