@@ -139,7 +139,36 @@ impl std::fmt::Debug for SymbolTable {
     }
 }
 
+/// Two tables are equal when they hold the same symbols in the same order.
+///
+/// The three lookup tables are built from the symbols when a table is built and hold nothing the
+/// symbols do not, so comparing them would be comparing the same information a second time over
+/// sixty five thousand entries. A vector in FSST form carries a table, and a vector is compared for
+/// equality all over the tests, so this is on a path that gets walked.
+impl PartialEq for SymbolTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.symbols == other.symbols
+    }
+}
+
+impl Eq for SymbolTable {}
+
 impl SymbolTable {
+    /// How many bytes of memory this table is holding.
+    ///
+    /// Mostly the hash table, which is sixty five thousand slots however few symbols are in it. That
+    /// is the number a vector in FSST form reports, and it is why the form is a decision about a
+    /// page rather than about a chunk: one table over a hundred chunks is nothing per chunk and one
+    /// table per chunk is a megabyte.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        size_of::<Self>()
+            + self.symbols.capacity() * size_of::<Symbol>()
+            + self.single.capacity()
+            + self.pair.capacity() * size_of::<u16>()
+            + self.hash.capacity() * size_of::<Option<(Symbol, u8)>>()
+    }
+
     /// A table with no symbols, which escapes everything and doubles its input. The starting point
     /// of training, and what a column of nothing but unique bytes ends up with.
     #[must_use]
