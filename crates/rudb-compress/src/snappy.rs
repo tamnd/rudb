@@ -38,11 +38,31 @@
 
 use rudb_common::{Error, Result};
 
-/// The largest block this will decompress, as a guard against a corrupt length.
+/// Decompresses a Snappy block that is known to hold `limit` bytes at the outside.
 ///
-/// A Parquet page is a few megabytes at the outside. Sixty four is far above anything a writer
-/// emits and far below a number that would let a two byte corruption ask for a terabyte.
-const MAX_BLOCK: usize = 64 << 20;
+/// The limit is the guard against a corrupt length, and it is a parameter rather than a constant
+/// because the caller has a better number than this module can guess. Every container Snappy
+/// arrives in records the uncompressed size next to the compressed one, so a Parquet page passes
+/// the size its own header claims and a block that asks for more than that is refused before
+/// anything is allocated for it. It was a constant of sixty four megabytes until a ClickBench
+/// sample of ten million rows turned out to hold a page of seventy five, and a file other readers
+/// read is not a file this one gets to call implausible.
+///
+/// # Errors
+///
+/// If the block is truncated, if a tag is malformed, if a copy reaches back further than the
+/// output produced so far, if the length is above `limit`, or if the elements produce a different
+/// number of bytes than the header said they would. Every one of those is a corrupt block, and
+/// every one of them is a case where carrying on produces bytes that look like data.
+pub fn decompress(input: &[u8], limit: usize) -> Result<Vec<u8>> {
+    let (expected, header) = read_varint(input)?;
+    if expected > limit {
+        return Err(Error::io(format!(
+            "this block claims to hold {expected} bytes, and what it came from says {limit}"
+        )));
+    }
+    decompress_within(input, expected, header)
+}
 
 /// How many bytes a short literal is copied as, regardless of how many it holds.
 ///
@@ -81,24 +101,20 @@ const WIDE: usize = 16;
 
 /// How long `input` says it decompresses to, without decompressing it.
 ///
+/// This reads a varint and allocates nothing, so there is no limit on it. A caller that is about
+/// to hand the block to [`decompress`] is the one that decides whether the length is one it will
+/// pay for.
+///
 /// # Errors
 ///
-/// If the block does not begin with a well formed varint, or if the length is implausible.
+/// If the block does not begin with a well formed varint.
 pub fn decompressed_len(input: &[u8]) -> Result<usize> {
     let (len, _) = read_varint(input)?;
     Ok(len)
 }
 
-/// Decompresses a Snappy block.
-///
-/// # Errors
-///
-/// If the block is truncated, if a tag is malformed, if a copy reaches back further than the
-/// output produced so far, or if the elements produce a different number of bytes than the header
-/// said they would. Every one of those is a corrupt block, and every one of them is a case where
-/// carrying on produces bytes that look like data.
-pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
-    let (expected, header) = read_varint(input)?;
+/// The elements of a block whose length has already been read and accepted.
+fn decompress_within(input: &[u8], expected: usize, header: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; expected];
     let mut src = header;
     let mut pos = 0usize;
@@ -228,11 +244,6 @@ fn read_varint(input: &[u8]) -> Result<(usize, usize)> {
         if byte & 0x80 == 0 {
             let len = usize::try_from(value)
                 .map_err(|_| Error::io("this block's length does not fit in memory".to_string()))?;
-            if len > MAX_BLOCK {
-                return Err(Error::io(format!(
-                    "this block claims to hold {len} bytes, and {MAX_BLOCK} is the most a page can"
-                )));
-            }
             return Ok((len, i + 1));
         }
     }
@@ -256,7 +267,18 @@ fn overruns(what: &str, len: usize, pos: usize, expected: usize) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{decompress, decompressed_len};
+    use super::decompressed_len;
+    use rudb_common::Result;
+
+    /// What the tests here say a block holds, which is more than any of them builds.
+    ///
+    /// A test that wants to check the limit itself passes its own, and everything else is checking
+    /// the elements rather than the guard in front of them.
+    const ROOM: usize = 64 << 20;
+
+    fn decompress(input: &[u8]) -> Result<Vec<u8>> {
+        super::decompress(input, ROOM)
+    }
 
     /// A literal element holding all of `bytes`, for blocks built by hand.
     fn literal(bytes: &[u8]) -> Vec<u8> {
@@ -421,9 +443,24 @@ mod tests {
     #[test]
     fn a_corrupt_length_is_refused_rather_than_allocated() {
         // Five 0xff bytes with the top bits set is a varint of about four billion. Without the
-        // cap this allocates four gigabytes before discovering the block is nine bytes long.
+        // limit this allocates four gigabytes before discovering the block is nine bytes long.
         let error = decompress(&[0xff, 0xff, 0xff, 0xff, 0x0f]).unwrap_err();
-        assert!(error.message().contains("the most a page can"), "{}", error.message());
+        assert!(error.message().contains("what it came from says"), "{}", error.message());
+    }
+
+    #[test]
+    fn a_block_larger_than_the_old_constant_is_read_when_its_container_says_so() {
+        // A page of seventy five megabytes is what a ten million row ClickBench sample holds, and
+        // refusing it was refusing a file that every other reader reads. The block here is one
+        // literal of that size, so this is the length check rather than the elements.
+        let big = 79_310_925;
+        let mut body = vec![63 << 2, 0, 0, 0, 0];
+        let len = u32::try_from(big - 1).unwrap();
+        body[1..5].copy_from_slice(&len.to_le_bytes());
+        body.resize(body.len() + big, b'x');
+        assert_eq!(super::decompress(&block(big, &body), big).unwrap().len(), big);
+        let error = super::decompress(&block(big, &body), 64 << 20).unwrap_err();
+        assert!(error.message().contains("what it came from says"), "{}", error.message());
     }
 
     #[test]
