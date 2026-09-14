@@ -179,6 +179,21 @@ pub mod metrics {
     pub use rudb_metrics::{Document, Operator, Pipeline};
 }
 
+/// Which kernel calls took the row at a time path, and on which pair of physical forms.
+///
+/// The metrics document already says how many times each operator in a query fell through and
+/// which kernel did it, which answers who is paying. This answers the other question, which is
+/// what to go and write: a kernel that fell through ten million times on dictionary against
+/// constant is a specialization somebody should write, and the same count spread over eight form
+/// pairs is not. The two numbers cannot be worked out from each other, which is why there are two.
+///
+/// The counts are process wide and are not reset between queries, so a harness that wants one
+/// query's figures calls [`fallback::reset`] in front of it. A shell run prints the table at the
+/// end under `--fallbacks`.
+pub mod fallback {
+    pub use rudb_kernels::fallback::{report, reset};
+}
+
 /// Arrow interchange, which is what [`QueryResult::to_arrow`] hands back.
 ///
 /// A module rather than a flat re-export because Arrow has a `Field` and a `Schema` of its own and

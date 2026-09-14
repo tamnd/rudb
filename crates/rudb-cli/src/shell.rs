@@ -113,6 +113,16 @@ impl Shell {
         self.failed
     }
 
+    /// Writes the row at a time fall through table, which is what `--fallbacks` asks for.
+    ///
+    /// To the error stream rather than to results, because it is something about the run and not an
+    /// answer to a query, and a script doing `rudb -c "SELECT ..." | cut -f2` should not have to
+    /// know this flag exists. Once at the end rather than per statement, because the counters
+    /// behind it are process wide.
+    pub fn print_fallbacks(&mut self) {
+        let _ = writeln!(self.err, "{}", rudb::fallback::report());
+    }
+
     /// Runs everything the command line asked for, in order.
     pub fn run_commands(&mut self, commands: &[Command]) -> Stop {
         for command in commands {

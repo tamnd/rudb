@@ -65,6 +65,14 @@ pub struct Options {
     /// finish. A harness reading this wants the line for the query it timed, and a file it has to
     /// read to the end before it can parse any of it is a file it cannot get that from.
     pub metrics: Option<PathBuf>,
+    /// Print the row at a time fall through table on the way out.
+    ///
+    /// Separate from [`Options::metrics`] because it answers a different question and is counted
+    /// differently. The document says which operator in this query paid for a fall through, and it
+    /// is written per statement. This says which pair of physical forms a kernel had no
+    /// specialization for, and the counters behind it are process wide, so it is one table for the
+    /// run rather than one per statement.
+    pub fallbacks: bool,
     /// How results are printed, and everything that goes with it.
     pub settings: crate::format::Settings,
 }
@@ -81,6 +89,7 @@ impl Default for Options {
             readonly: false,
             sets: Vec::new(),
             metrics: None,
+            fallbacks: false,
             settings: crate::format::Settings::default(),
         }
     }
@@ -150,6 +159,8 @@ pub fn parse(arguments: &[String]) -> Action {
                 Ok(path) => options.metrics = Some(PathBuf::from(path)),
                 Err(why) => return Action::Wrong(why),
             },
+            // Two dashes for the same reason the two above have them.
+            "--fallbacks" => options.fallbacks = true,
             "-separator" => match next(argument) {
                 Ok(value) => options.settings.separator = value,
                 Err(why) => return Action::Wrong(why),
@@ -342,6 +353,14 @@ mod tests {
             Action::Wrong(why) if why.contains("name=value")
         ));
         assert!(matches!(parse(&["--set".to_string()]), Action::Wrong(_)));
+    }
+
+    #[test]
+    fn the_fallbacks_flag_takes_no_value_and_is_off_unless_asked_for() {
+        let parsed = options(&["--fallbacks", "-c", "SELECT 1"]);
+        assert!(parsed.fallbacks);
+        assert_eq!(parsed.commands, [Command::Sql("SELECT 1".to_string())]);
+        assert!(!options(&["-c", "SELECT 1"]).fallbacks);
     }
 
     #[test]
