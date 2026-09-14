@@ -48,9 +48,10 @@ impl Page {
     /// the fix is a one line change here once there is something to change it to, and doing it any
     /// earlier means inventing a second way to share a buffer.
     ///
-    /// This consumes the page because a byte array column's strings are left in the page and
-    /// pointed at. Handing the body over rather than borrowing it is what makes that safe without
-    /// a lifetime running through everything above.
+    /// This takes the page by mutable reference and empties its body rather than consuming it,
+    /// because the caller wants that buffer back to read the next page into. A byte array column
+    /// is the one case where it does not come back: those strings are left in the body and pointed
+    /// at, so the page becomes the column's arena and the caller gets an empty buffer.
     ///
     /// # Errors
     ///
@@ -58,7 +59,7 @@ impl Page {
     /// read yet, if a dictionary encoded page arrives without a dictionary, or if the values run
     /// off the end of the body. Also if the column is one of the types named as not read yet:
     /// `INT96`, fixed length byte arrays, and byte arrays that are not text.
-    pub fn into_vector(self, column: &SchemaColumn, dictionary: Option<&Vector>) -> Result<Vector> {
+    pub fn decode(&mut self, column: &SchemaColumn, dictionary: Option<&Vector>) -> Result<Vector> {
         let encoding = match &self.header.body {
             Body::DataV1(page) => page.encoding,
             Body::DataV2(page) => page.encoding,
@@ -74,7 +75,7 @@ impl Page {
         let valid = valid_count(&levels, total);
         match encoding {
             Encoding::Plain => {
-                let data = plain(column, self.body, at, valid, &levels, total)?;
+                let data = plain(column, &mut self.body, at, valid, &levels, total)?;
                 Ok(Vector::flat(column.ty.clone(), data)?.with_validity(validity(&levels, total)))
             }
             Encoding::PlainDictionary | Encoding::RleDictionary => {
@@ -91,7 +92,7 @@ impl Page {
             | Encoding::DeltaLengthByteArray
             | Encoding::DeltaByteArray
             | Encoding::ByteStreamSplit => {
-                let data = delta(column, encoding, self.body, at, valid, &levels, total)?;
+                let data = delta(column, encoding, &mut self.body, at, valid, &levels, total)?;
                 Ok(Vector::flat(column.ty.clone(), data)?.with_validity(validity(&levels, total)))
             }
             other => {
@@ -103,13 +104,13 @@ impl Page {
     /// The values of a dictionary page, as a vector.
     ///
     /// Its values are always plain encoded and never null, which is why this is separate rather
-    /// than a case inside [`Page::into_vector`]: a dictionary page has no levels, and asking it for
+    /// than a case inside [`Page::decode`]: a dictionary page has no levels, and asking it for
     /// any is an error there and would have to be an exception here.
     ///
     /// # Errors
     ///
-    /// If the page is not a dictionary page, or for the same reasons [`Page::into_vector`] fails.
-    pub fn into_dictionary(self, column: &SchemaColumn) -> Result<Vector> {
+    /// If the page is not a dictionary page, or for the same reasons [`Page::decode`] fails.
+    pub fn decode_dictionary(&mut self, column: &SchemaColumn) -> Result<Vector> {
         let Body::Dictionary(page) = &self.header.body else {
             return Err(Error::io("a dictionary was asked of a data page".to_string()));
         };
@@ -121,7 +122,7 @@ impl Page {
         }
         let count = usize::try_from(page.values)
             .map_err(|_| Error::io("a dictionary page with a negative count".to_string()))?;
-        let data = plain(column, self.body, 0, count, &[], count)?;
+        let data = plain(column, &mut self.body, 0, count, &[], count)?;
         Vector::flat(column.ty.clone(), data)
     }
 }
@@ -165,7 +166,7 @@ fn spread<T: Copy + Default>(dense: Vec<T>, levels: &[u32], total: usize) -> Vec
 /// Reads `count` plain encoded values out of `body` at `at`, laid out for the column's type.
 fn plain(
     column: &SchemaColumn,
-    body: Vec<u8>,
+    body: &mut Vec<u8>,
     at: usize,
     count: usize,
     levels: &[u32],
@@ -174,26 +175,26 @@ fn plain(
     let target = column.ty.physical();
     match column.physical {
         Physical::Boolean => {
-            let dense = booleans(tail(&body, at)?, count)?;
+            let dense = booleans(tail(body, at)?, count)?;
             Ok(Data::Bool(Buffer::from_vec(spread(dense, levels, total))))
         }
         Physical::Int32 => {
-            let dense = fixed::<4>(tail(&body, at)?, count)?;
+            let dense = fixed::<4>(tail(body, at)?, count)?;
             narrow(target, dense.into_iter().map(i32::from_le_bytes), levels, total)
         }
         Physical::Int64 => {
-            let dense = fixed::<8>(tail(&body, at)?, count)?;
+            let dense = fixed::<8>(tail(body, at)?, count)?;
             narrow(target, dense.into_iter().map(i64::from_le_bytes), levels, total)
         }
         Physical::Float => {
             let dense: Vec<f32> =
-                fixed::<4>(tail(&body, at)?, count)?.into_iter().map(f32::from_le_bytes).collect();
+                fixed::<4>(tail(body, at)?, count)?.into_iter().map(f32::from_le_bytes).collect();
             expect(target, PhysicalType::Float32, &column.ty)?;
             Ok(Data::Float32(Buffer::from_vec(spread(dense, levels, total))))
         }
         Physical::Double => {
             let dense: Vec<f64> =
-                fixed::<8>(tail(&body, at)?, count)?.into_iter().map(f64::from_le_bytes).collect();
+                fixed::<8>(tail(body, at)?, count)?.into_iter().map(f64::from_le_bytes).collect();
             expect(target, PhysicalType::Float64, &column.ty)?;
             Ok(Data::Float64(Buffer::from_vec(spread(dense, levels, total))))
         }
@@ -216,7 +217,7 @@ fn plain(
 fn delta(
     column: &SchemaColumn,
     encoding: Encoding,
-    body: Vec<u8>,
+    body: &mut Vec<u8>,
     at: usize,
     count: usize,
     levels: &[u32],
@@ -231,12 +232,12 @@ fn delta(
                     column.physical
                 )));
             }
-            let (dense, _) = crate::delta::binary_packed(tail(&body, at)?, count)?;
+            let (dense, _) = crate::delta::binary_packed(tail(body, at)?, count)?;
             narrow(target, dense.into_iter(), levels, total)
         }
         Encoding::DeltaLengthByteArray => {
             text(column)?;
-            let spans = crate::delta::length_byte_array(tail(&body, at)?, count)?;
+            let spans = crate::delta::length_byte_array(tail(body, at)?, count)?;
             // The spans came back relative to where the values start, and the column's arena is the
             // whole page, so every offset moves up by that much. Keeping the page whole rather than
             // slicing it is what lets the levels in front of the values stay where they are.
@@ -246,7 +247,7 @@ fn delta(
         }
         Encoding::DeltaByteArray => {
             text(column)?;
-            let built = crate::delta::byte_array(tail(&body, at)?, count)?;
+            let built = crate::delta::byte_array(tail(body, at)?, count)?;
             // The one encoding whose strings are not in the page, so this is the one column that
             // gets a fresh arena. Nothing else in this reader copies a string's bytes.
             let mut out = StringColumn::with_capacity(total);
@@ -282,8 +283,8 @@ fn delta(
             // The transpose puts the bytes back in value order, and after that it is a plain page
             // that happens to live in a different buffer. Reading it through the plain path rather
             // than repeating the type switch is the point of doing the transpose first.
-            let flat = crate::delta::stream_split(tail(&body, at)?, width, count)?;
-            plain(column, flat, 0, count, levels, total)
+            let mut flat = crate::delta::stream_split(tail(body, at)?, width, count)?;
+            plain(column, &mut flat, 0, count, levels, total)
         }
         other => Err(Error::io(format!("a page in {other:?}, which is not a delta encoding"))),
     }
@@ -296,12 +297,14 @@ fn delta(
 /// a string at all.
 fn place(
     column: &SchemaColumn,
-    body: Vec<u8>,
+    body: &mut Vec<u8>,
     spans: &[(usize, usize)],
     levels: &[u32],
     total: usize,
 ) -> Result<Data> {
-    let mut out = StringColumn::over(Buffer::from_vec(body));
+    // The page becomes the column's arena, so this is where a body stops being recyclable. The
+    // walker gets an empty buffer back and the next page of this column allocates its own.
+    let mut out = StringColumn::over(Buffer::from_vec(std::mem::take(body)));
     let mut next = 0;
     for index in 0..total {
         if !levels.is_empty() && levels.get(index) != Some(&1) {
@@ -403,7 +406,7 @@ fn booleans(bytes: &[u8], count: usize) -> Result<Vec<bool>> {
 /// Reads `count` length prefixed byte arrays, leaving their bytes in the page.
 fn strings(
     column: &SchemaColumn,
-    body: Vec<u8>,
+    body: &mut Vec<u8>,
     at: usize,
     count: usize,
     levels: &[u32],
@@ -561,15 +564,13 @@ mod tests {
             file.read_at(chunk.start(), &mut bytes).expect("the chunk is in the file");
             let mut dictionary = None;
             for page in Pages::new(&bytes, chunk.compression, chunk.values) {
-                let page = page.expect("every page of the fixture walks");
+                let mut page = page.expect("every page of the fixture walks");
                 if matches!(page.header.body, Body::Dictionary(_)) {
                     dictionary =
-                        Some(page.into_dictionary(&schema).expect("the dictionary decodes"));
+                        Some(page.decode_dictionary(&schema).expect("the dictionary decodes"));
                     continue;
                 }
-                out.push(
-                    page.into_vector(&schema, dictionary.as_ref()).expect("the values decode"),
-                );
+                out.push(page.decode(&schema, dictionary.as_ref()).expect("the values decode"));
             }
         }
         (schema, out)
@@ -738,13 +739,13 @@ mod tests {
         let mut dictionary = None;
         let mut checked = 0;
         for page in Pages::new(&bytes, chunk.compression, chunk.values) {
-            let page = page.expect("every page walks");
+            let mut page = page.expect("every page walks");
             if matches!(page.header.body, Body::Dictionary(_)) {
-                dictionary = Some(page.into_dictionary(&schema).expect("the dictionary decodes"));
+                dictionary = Some(page.decode_dictionary(&schema).expect("the dictionary decodes"));
                 continue;
             }
             let (levels, _) = page.definitions(true).expect("the levels decode");
-            let vector = page.into_vector(&schema, dictionary.as_ref()).expect("the values decode");
+            let vector = page.decode(&schema, dictionary.as_ref()).expect("the values decode");
             assert_eq!(levels.len(), vector.len());
             for (at, &level) in levels.iter().enumerate() {
                 let value = vector.value_at(at);
@@ -767,11 +768,11 @@ mod tests {
         let chunk = &metadata.row_groups[0].columns[2];
         let mut bytes = vec![0u8; chunk.compressed_size as usize];
         file.read_at(chunk.start(), &mut bytes).expect("the chunk is in the file");
-        let data = Pages::new(&bytes, chunk.compression, chunk.values)
+        let mut data = Pages::new(&bytes, chunk.compression, chunk.values)
             .map(|page| page.expect("every page walks"))
             .find(|page| !matches!(page.header.body, Body::Dictionary(_)))
             .expect("the chunk has a data page");
-        let error = data.into_vector(&schema, None).unwrap_err();
+        let error = data.decode(&schema, None).unwrap_err();
         assert!(error.message().contains("no dictionary page"), "{}", error.message());
     }
 
@@ -791,11 +792,11 @@ mod tests {
             .position(|page| matches!(page.header.body, Body::Dictionary(_)))
             .expect("the chunk has a dictionary page");
         let mut pages = pages;
-        let data = pages.remove(dictionary + 1);
-        let dictionary = pages.remove(dictionary);
-        let error = dictionary.into_vector(&schema, None).unwrap_err();
+        let mut data = pages.remove(dictionary + 1);
+        let mut dictionary = pages.remove(dictionary);
+        let error = dictionary.decode(&schema, None).unwrap_err();
         assert!(error.message().contains("holds no rows"), "{}", error.message());
-        let error = data.into_dictionary(&schema).unwrap_err();
+        let error = data.decode_dictionary(&schema).unwrap_err();
         assert!(error.message().contains("asked of a data page"), "{}", error.message());
     }
 }
