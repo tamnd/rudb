@@ -114,6 +114,14 @@ impl Chooser for Exhaustive {
 /// three of the candidates are about what a value has in common with the value before it. A sample
 /// of scattered singletons would show `FRONT` and `RLE` nothing to find and would rule them out on
 /// every column, which is the wrong answer arrived at quickly.
+///
+/// There are two guards on whether to sample at all and both of them are there because a measurement
+/// said so. A chunk with fewer values than the sample is not sampled, because encoding every
+/// candidate on something the size of the chunk and then encoding the winner on the chunk is more
+/// work than the exhaustive chooser for the same answer. A chunk holding less than a page of bytes is
+/// not sampled either, because the cost of the search scales with the bytes in the chunk and not
+/// with how many values they are spread over, so on a narrow column there is nothing to save and a
+/// sample that misses the structure gives up real size for it.
 #[derive(Debug, Clone, Copy)]
 pub struct Sampled {
     window: usize,
@@ -132,6 +140,19 @@ const WINDOW: usize = 1024;
 /// rather than taken off the front, because the front of a sorted column is one value repeated and
 /// a chooser that saw only that would pick `CONSTANT` for everything.
 const REGIONS: usize = 8;
+
+/// How few bytes a chunk can hold before sampling it is not worth the risk.
+///
+/// The ablation in #559 found `Params` at a million rows encoding to 21,782 bytes exhaustively and
+/// 128,455 bytes sampled, which is 490 percent for a column that is almost entirely empty strings.
+/// It passed the value count guard because it has a million values, and then the sample missed what
+/// little structure it had. The exhaustive search over a column that small costs almost nothing,
+/// which is the same fact from the other side, so a floor on bytes takes the whole class of column
+/// out of the sampler's hands and gives up nothing to do it.
+///
+/// 256 KiB is one page, which is the smallest unit the format moves. Below that the search is not
+/// where the time is.
+const FLOOR: usize = 256 * 1024;
 
 impl Default for Sampled {
     fn default() -> Self {
@@ -152,10 +173,16 @@ impl Sampled {
         Self { window: window.max(1), regions: regions.max(1) }
     }
 
-    /// How many values the sample holds, which is what decides whether sampling is worth doing.
+    /// How many values the sample holds, which is one of the two things that decide whether
+    /// sampling is worth doing.
     #[must_use]
     pub fn size(self) -> usize {
         self.window * self.regions
+    }
+
+    /// Whether a chunk of `count` values holding `bytes` bytes is worth sampling.
+    fn worth_it(self, count: usize, bytes: usize) -> bool {
+        count > self.size() && bytes >= FLOOR
     }
 }
 
@@ -170,7 +197,8 @@ impl Chooser for Sampled {
         offered: &[string::Kind],
         depth: u8,
     ) -> Vec<string::Kind> {
-        if offered.len() < 2 || values.len() <= self.size() {
+        let bytes = values.iter().map(|value| value.len()).sum();
+        if offered.len() < 2 || !self.worth_it(values.len(), bytes) {
             return offered.to_vec();
         }
         let sample = sample(values, self.window, self.regions);
@@ -194,7 +222,7 @@ impl Chooser for Sampled {
         offered: &[integer::Kind],
         depth: u8,
     ) -> Vec<integer::Kind> {
-        if offered.len() < 2 || values.len() <= self.size() {
+        if offered.len() < 2 || !self.worth_it(values.len(), values.len() * 8) {
             return offered.to_vec();
         }
         let sample = sample(values, self.window, self.regions);
@@ -291,10 +319,22 @@ mod tests {
     #[test]
     fn a_sampled_chooser_returns_one_of_what_it_was_offered() {
         let sampled = Sampled::over(16, 2);
-        let values: Vec<i64> = (0..4000).map(|index| index / 200).collect();
+        let values: Vec<i64> = (0..40_000).map(|index| index / 200).collect();
         let offered = [integer::Kind::Packed, integer::Kind::Rle, integer::Kind::Dict];
         let narrowed = sampled.narrow_integers(&values, &offered, 0);
         assert_eq!(narrowed.len(), 1);
         assert!(offered.contains(&narrowed[0]), "{narrowed:?}");
+    }
+
+    #[test]
+    fn a_chunk_with_plenty_of_values_and_hardly_any_bytes_is_not_sampled() {
+        // ClickBench Params at a million rows: a value per row and almost all of them empty. It
+        // passes the value count guard and the exhaustive chooser encodes it in 21,782 bytes while
+        // the sampler took 128,455, so the byte floor is what keeps it out of the sampler's hands.
+        let sampled = Sampled::over(16, 2);
+        let empty = Vec::new();
+        let values: Vec<&[u8]> = vec![empty.as_slice(); 40_000];
+        let offered = [string::Kind::Plain, string::Kind::Fsst, string::Kind::Dict];
+        assert_eq!(sampled.narrow_strings(&values, &offered, 0), offered);
     }
 }
