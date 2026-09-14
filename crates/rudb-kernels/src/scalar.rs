@@ -1269,7 +1269,13 @@ fn like_run<A: Fn(usize) -> usize>(
     let mut out = vec![false; rows];
     let mut characters: Vec<char> = Vec::new();
     let validity = over_valid(rows, base, |index| {
-        let text = column.get(at(index)).unwrap_or_default();
+        let position = at(index);
+        if !like.fold_case && !matches!(like.compiled, Pattern::General(_)) {
+            out[index] = like.compiled.holds_bytes(column.bytes(position).unwrap_or_default())
+                != like.negated;
+            return Ok(());
+        }
+        let text = column.get(position).unwrap_or_default();
         // `str::to_lowercase` and not a character by character fold, for the same reason the
         // `lower` kernel uses it: the two functions disagree about a final sigma, and the oracle
         // this is checked against calls the string one.
@@ -1338,6 +1344,16 @@ impl Pattern {
                 characters.extend(text.chars());
                 like(characters, against)
             }
+        }
+    }
+
+    fn holds_bytes(&self, text: &[u8]) -> bool {
+        match self {
+            Self::Exact(against) => text == against.as_bytes(),
+            Self::Prefix(against) => text.starts_with(against.as_bytes()),
+            Self::Suffix(against) => text.ends_with(against.as_bytes()),
+            Self::Contains(against) => memchr::memmem::find(text, against.as_bytes()).is_some(),
+            Self::General(_) => false,
         }
     }
 }
