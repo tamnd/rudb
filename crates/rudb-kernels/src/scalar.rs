@@ -1350,7 +1350,13 @@ enum Pattern {
     /// needle before it looks at the haystack: it picks the two rarest bytes and works out the
     /// stride from them. That is a few hundred instructions, which is more than searching a URL
     /// with a searcher that already exists, and a scan was paying it once a row.
-    Contains(memmem::Finder<'static>),
+    ///
+    /// Boxed because a `Finder` is 288 bytes on x86_64, where it carries the packed pair prefilter,
+    /// and every other arm of this is a `String`. Without the box the enum is 288 bytes wherever it
+    /// is held, including inside the prepared expression tree, and one allocation per `LIKE` in a
+    /// query is the cheaper of the two. It is 24 bytes on aarch64, which is why this only shows up
+    /// when the build is on a Linux machine.
+    Contains(Box<memmem::Finder<'static>>),
     /// Anything else, walked with one backtracking point.
     General(Vec<char>),
 }
@@ -1363,7 +1369,7 @@ impl Pattern {
         }
         if let Some(inner) = spelling.strip_prefix('%').and_then(|rest| rest.strip_suffix('%')) {
             if plain(inner) {
-                return Self::Contains(memmem::Finder::new(inner).into_owned());
+                return Self::Contains(Box::new(memmem::Finder::new(inner).into_owned()));
             }
         }
         if let Some(rest) = spelling.strip_prefix('%') {
