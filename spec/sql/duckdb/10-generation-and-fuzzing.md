@@ -66,6 +66,18 @@ rudb passing everything leaves the failure path with no run to exercise it, so i
 
 What is left of this box is the two oracles the paper has beside the WHERE one, the aggregate form and the GROUP BY with HAVING form. They come after NoREC rather than before it, because NoREC uses the same generator and pairs with the pass bisector that already exists.
 
+## 10.4.2 What NoREC came out as, and what it said about the optimizer
+
+It is `rudb-compat norec` and it reads from the same generator the partitioning oracle does, since a predicate worth partitioning is a predicate worth optimizing and one generator with two readers is less to maintain than two. The generator moved into its own file when the second oracle arrived and nothing in it changed.
+
+The two queries are `SELECT * FROM t WHERE (p)` and `SELECT (p) IS TRUE FROM t`, and the harness counts the rows of the first and the true cells of the second. `IS TRUE` rather than the bare predicate, because what is wanted is one value per row that is never NULL, and a column of true, false and NULL would make the harness decide what an unknown is worth. The engine already has an answer to that question and it is the one `WHERE` uses, so asking for it keeps both sides comparing the same thing.
+
+The pairing with section 9.6 is built in rather than left to the reader. When the two counts disagree, the same predicate goes to a second rudb with every optimizer pass turned off, and the report says which of two things happened. If the counts agree with the passes off, a rewrite did it and the bisector names which one. If they disagree with the passes off as well, the optimizer is not where to look and the answer is already wrong in the binder or the executor. That second sentence is the one worth having, because it is the difference between a bug report and a week of reading plans.
+
+The first run is twenty thousand predicates against rudb with nothing found and nothing refused, and fourteen thousand of those matched some rows and not all of them, which is the number that says the run tested something. Three hundred of the same predicates against the pinned binary hold as well and are refused none, in thirty seconds, which is the check that the generator is writing SQL an optimizer would actually touch.
+
+What this buys over the partitioning oracle is that the two fail on different bugs. A filter that drops the rows where the predicate is unknown is a partitioning failure and passes here, since both of these queries are filters and both drop the same rows. A pushdown that loses rows is a failure here and passes there, since the three parts are all wrong in the same direction and still add up. Running one of them and calling the box done would leave half of what the pair is for on the table.
+
 ## 10.5 The loop
 
 A generator without reduction produces a pile. The loop is: generate, run both engines, compare, and on a difference immediately reduce with the tree aware reducer from section 9.5, hash the reduced case to deduplicate, and file it if it is new. Nothing in that loop needs a person, and the output of it is a few dozen distinct minimal cases a week rather than a queue nobody opens.
