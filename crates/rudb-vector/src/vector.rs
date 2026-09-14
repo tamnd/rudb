@@ -33,6 +33,7 @@ use std::sync::Arc;
 use rudb_common::{Cause, Error, LogicalType, Result, Value, slow};
 
 use crate::buffer::Buffer;
+use crate::fsst::SymbolTable;
 use crate::string::{StringColumn, StringView};
 use crate::validity::Validity;
 
@@ -83,6 +84,14 @@ pub enum Form {
     /// arena makes the cut the views and nothing else, the way a dictionary cut is the codes and
     /// nothing else.
     StringView,
+    /// Strings compressed against one symbol table, each row on its own.
+    ///
+    /// The form a text column is in at rest. FSST is about half the bytes on the ClickBench `URL`
+    /// and `Title` columns, and unlike a block compressor it keeps random access, so reading row
+    /// four million does not decompress the four million before it. What it costs is a decompression
+    /// per row read, which is why an equality filter over it is worth writing in code space: the
+    /// literal compresses once and the rows never decompress at all.
+    Fsst,
     /// One value per run, with the row each run ends at.
     ///
     /// The form a clustered column is in. `hits` is written in time order, so `EventDate` is a few
@@ -289,6 +298,20 @@ enum Body {
     Views {
         views: Vec<StringView>,
         arena: Arc<Buffer<u8>>,
+    },
+    /// The FSST codes of every row, end to end, with one symbol table over all of them.
+    ///
+    /// A span rather than a run of offsets, because a gather keeps this form and a gather puts the
+    /// rows in an order the codes are not in. Eight bytes a row either way, and the span is the one
+    /// that survives being permuted.
+    ///
+    /// The codes and the table are shared for the reason a dictionary's values are: one table is
+    /// trained per page and every chunk cut out of it points at the same one. A table is sixty five
+    /// thousand hash slots, so a table per chunk would cost more than the compression saves.
+    Coded {
+        codes: Arc<Vec<u8>>,
+        spans: Vec<(u32, u32)>,
+        table: Arc<SymbolTable>,
     },
     /// One value per run, with the row each run ends at, exclusive and increasing.
     ///
@@ -645,6 +668,79 @@ impl Vector {
         Ok(shared.with_validity(self.validity))
     }
 
+    /// A vector of FSST codes against a table somebody else trained.
+    ///
+    /// The way in for a reader that has a page of compressed strings and the table that goes with
+    /// it. The codes are not copied and the table is not retrained, so laying several chunks over
+    /// one page costs the spans and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// If the type is not one stored as text, or if a span runs past the end of the codes.
+    pub fn coded(
+        ty: LogicalType,
+        codes: Arc<Vec<u8>>,
+        spans: Vec<(u32, u32)>,
+        table: Arc<SymbolTable>,
+    ) -> Result<Self> {
+        if ty.physical() != rudb_common::PhysicalType::Varlen {
+            return Err(Error::internal(format!("a {ty} vector cannot hold FSST codes")));
+        }
+        let end = u32::try_from(codes.len()).unwrap_or(u32::MAX);
+        if spans.iter().any(|&(from, to)| from > to || to > end) {
+            return Err(Error::internal("an FSST span runs past the end of the codes"));
+        }
+        let len = spans.len();
+        Ok(Self {
+            ty,
+            len,
+            validity: Validity::AllValid,
+            body: Body::Coded { codes, spans, table },
+        })
+    }
+
+    /// The same strings, compressed against a table trained on them.
+    ///
+    /// The counterpart of [`Self::run_encoded`] and [`Self::bit_packed`] for a text column, and it
+    /// takes `self` by value for the reason [`Self::shared_text`] does.
+    ///
+    /// The table is trained on every row rather than on a sample. A vector is at most 1024 rows, so
+    /// the sample would be most of the column anyway, and the systematic sampling
+    /// `spec/06-compression.md` section 6.3 asks for is a decision about a page and belongs to
+    /// whoever is holding one.
+    ///
+    /// It declines unless the codes are at most half the bytes the strings are. FSST gets about that
+    /// on text and rather less on anything already short or already random, and below that the
+    /// decompression per row read is not bought back. A column it declines on comes back as it was.
+    ///
+    /// # Errors
+    ///
+    /// Nothing here fails today. The result is a `Result` because the checks inside [`Self::coded`]
+    /// are worth running on what this builds rather than trusting that this built it right.
+    pub fn compressed(self) -> Result<Self> {
+        let Body::Flat(Data::Varlen(column)) = &self.body else {
+            return Ok(self);
+        };
+        let rows: Vec<&[u8]> = (0..self.len).filter_map(|row| column.bytes(row)).collect();
+        if rows.len() != self.len {
+            return Ok(self);
+        }
+        let plain: usize = rows.iter().map(|row| row.len()).sum();
+        let table = SymbolTable::train(&rows);
+        let mut codes = Vec::with_capacity(plain);
+        let mut spans = Vec::with_capacity(self.len);
+        for row in &rows {
+            let from = u32::try_from(codes.len()).unwrap_or(u32::MAX);
+            table.compress(row, &mut codes);
+            spans.push((from, u32::try_from(codes.len()).unwrap_or(u32::MAX)));
+        }
+        if codes.len() * FSST_PAYS_AT > plain {
+            return Ok(self);
+        }
+        let coded = Self::coded(self.ty.clone(), Arc::new(codes), spans, Arc::new(table))?;
+        Ok(coded.with_validity(self.validity.clone()))
+    }
+
     /// The same vector with a different validity.
     #[must_use]
     pub fn with_validity(mut self, validity: Validity) -> Self {
@@ -697,6 +793,13 @@ impl Vector {
             Body::Views { views, arena } => {
                 views.capacity() * size_of::<StringView>() + arena.footprint()
             }
+            // The table counts in full in every vector sharing it, the way a shared arena and a
+            // shared dictionary do. It is the largest of the three and the most shared of them, so
+            // this is the one place the over counting is worth saying out loud: a page of a hundred
+            // chunks reports its table a hundred times.
+            Body::Coded { codes, spans, table } => {
+                codes.capacity() + spans.capacity() * size_of::<(u32, u32)>() + table.footprint()
+            }
             Body::Runs { ends, values } => ends.capacity() * size_of::<u32>() + values.footprint(),
         };
         size_of::<Self>() + self.validity.footprint() + body
@@ -718,6 +821,7 @@ impl Vector {
             Body::Dictionary { .. } => Form::Dictionary,
             Body::Packed { .. } => Form::BitPacked,
             Body::Views { .. } => Form::StringView,
+            Body::Coded { .. } => Form::Fsst,
             Body::Runs { .. } => Form::Rle,
         }
     }
@@ -853,6 +957,21 @@ impl Vector {
         }
     }
 
+    /// The codes and the table, for an FSST vector, and `None` for any other form.
+    ///
+    /// What a kernel needs to stay in code space. An equality filter is the case that pays, and it
+    /// pays completely: the literal is compressed once against the same table and after that a row
+    /// matches exactly when its code bytes match, because compressing is a function and so is
+    /// decompressing. No row is decompressed at all. An ordering comparison cannot do that, since a
+    /// symbol code says nothing about where its symbol sorts, so those decompress and say so.
+    #[must_use]
+    pub fn coded_parts(&self) -> Option<Coded<'_>> {
+        match &self.body {
+            Body::Coded { codes, spans, table } => Some(Coded { codes, spans, table }),
+            _ => None,
+        }
+    }
+
     /// The start and the step, for a sequence vector, and `None` for any other form.
     #[must_use]
     pub fn sequence_parts(&self) -> Option<(i64, i64)> {
@@ -898,6 +1017,19 @@ impl Vector {
             Body::Views { views, arena } => {
                 match views.get(index).and_then(|v| v.bytes_in(arena)) {
                     Some(bytes) => bytes_as(&self.ty, bytes),
+                    None => Value::Null,
+                }
+            }
+            // One row decompressed on its own, which is the property the form is chosen for. It
+            // allocates, which this path is allowed to do, and it is the reason anything about to
+            // read a compressed column a row at a time should flatten it once instead.
+            Body::Coded { codes, spans, table } => {
+                match spans.get(index).and_then(|&(from, to)| {
+                    let mut out = Vec::new();
+                    table.decompress(codes.get(from as usize..to as usize)?, &mut out).ok()?;
+                    Some(out)
+                }) {
+                    Some(bytes) => bytes_as(&self.ty, &bytes),
                     None => Value::Null,
                 }
             }
@@ -993,6 +1125,14 @@ impl Vector {
             Body::Views { views, arena } => {
                 Body::Views { views: views[at..end].to_vec(), arena: Arc::clone(arena) }
             }
+            // The spans are absolute positions in the shared codes, so a cut is a run of them and
+            // nothing has to be rebased. One page of compressed strings, one table, and as many
+            // chunks over it as the reader wants.
+            Body::Coded { codes, spans, table } => Body::Coded {
+                codes: Arc::clone(codes),
+                spans: spans[at..end].to_vec(),
+                table: Arc::clone(table),
+            },
             // Only the runs the range touches survive, the first and last of them cut back to where
             // the range starts and stops, and every end moved to be relative to the new row zero. A
             // cut of a hundred rows out of a column of a hundred million is a handful of runs, which
@@ -1140,6 +1280,35 @@ impl Vector {
                 }
                 Body::Flat(Data::Varlen(out))
             }
+            // A gather keeps the form, because the codes do not move and a span survives being put
+            // in an order the codes are not in. A position that resolved to nowhere gets the empty
+            // span, which decompresses to no bytes, which is the zero every other layout writes.
+            Body::Coded { codes, spans, table } if forms_stay => Body::Coded {
+                codes: Arc::clone(codes),
+                spans: at
+                    .iter()
+                    .map(|&index| spans.get(index).copied().unwrap_or((0, 0)))
+                    .collect(),
+                table: Arc::clone(table),
+            },
+            // Flattening decompresses, which is the price of the data slice it promises. The scratch
+            // buffer is reused across rows, so this is one allocation for the whole column rather
+            // than one per row the way reading it a value at a time would be.
+            Body::Coded { codes, spans, table } => {
+                let mut out = StringColumn::with_capacity(at.len());
+                let mut scratch = Vec::new();
+                for &index in &at {
+                    scratch.clear();
+                    let span = spans
+                        .get(index)
+                        .and_then(|&(from, to)| codes.get(from as usize..to as usize));
+                    if let Some(span) = span {
+                        table.decompress(span, &mut scratch)?;
+                    }
+                    out.push_bytes(&scratch);
+                }
+                Body::Flat(Data::Varlen(out))
+            }
             // Unreachable, because `resolve` walks past both of the forms that point at another
             // vector and stops at the first body that does not.
             Body::Dictionary { .. } | Body::Runs { .. } => {
@@ -1274,6 +1443,52 @@ pub const PACKED_WIDTH_MAX: u32 = 63;
 /// a tenth stays flat, because a tenth of a column is not worth turning every read of it into
 /// arithmetic, and the whole argument for the form is that a narrow column saves most of itself.
 pub const PACKING_PAYS_AT: usize = 2;
+
+/// How much smaller compressing has to be before it is worth a decompression on every read.
+///
+/// Two, the same rule packing follows and for the same reason. FSST gets about that on text, so a
+/// column of English or of URLs compresses and a column of short codes or of random bytes does not,
+/// which is the right answer for both.
+pub const FSST_PAYS_AT: usize = 2;
+
+/// The codes of a compressed column and the table they are against.
+///
+/// Handed out by [`Vector::coded_parts`] so a kernel can work in code space. Nothing here
+/// decompresses, which is the point: [`Self::encode`] puts the literal into the same space the rows
+/// are already in, and after that an equality test is a byte slice comparison.
+#[derive(Debug, Clone, Copy)]
+pub struct Coded<'a> {
+    codes: &'a [u8],
+    spans: &'a [(u32, u32)],
+    table: &'a SymbolTable,
+}
+
+impl Coded<'_> {
+    /// The table every row in this vector is compressed against.
+    #[must_use]
+    pub fn table(&self) -> &SymbolTable {
+        self.table
+    }
+
+    /// The code bytes of one row, still compressed.
+    #[must_use]
+    pub fn row(&self, row: usize) -> Option<&[u8]> {
+        let &(from, to) = self.spans.get(row)?;
+        self.codes.get(from as usize..to as usize)
+    }
+
+    /// Some bytes in the code space this vector is in.
+    ///
+    /// The literal side of an equality filter. Compressing is a function of the table and the bytes,
+    /// so two strings compress to the same codes exactly when they are the same string, and an
+    /// equality test on the codes is an equality test on the strings with no decompression in it.
+    #[must_use]
+    pub fn encode(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        self.table.compress(bytes, &mut out);
+        out
+    }
+}
 
 /// How many words hold `len` codes of `width` bits.
 fn words_for(len: usize, width: u32) -> usize {
@@ -1798,8 +2013,9 @@ mod tests {
 
     use rudb_common::{LogicalType, Value};
 
-    use super::{Body, Data, Form, VECTOR_SIZE, Vector};
+    use super::{Body, Data, FSST_PAYS_AT, Form, VECTOR_SIZE, Vector};
     use crate::buffer::Buffer;
+    use crate::fsst::SymbolTable;
     use crate::string::{StringColumn, StringView};
     use crate::validity::Validity;
 
@@ -2776,6 +2992,130 @@ mod tests {
         let wrong = Vector::string_views(LogicalType::Integer, views, arena);
         assert!(wrong.is_err(), "an integer column has no views");
         assert_eq!(integers(&[1, 2]).shared_text().unwrap().form(), Form::Flat, "left alone");
+    }
+
+    /// A column with enough repeated structure for a symbol table to find something, which is what
+    /// a real text column has and a column of random bytes does not.
+    fn sentences(count: usize) -> Vector {
+        let values: Vec<Value> = (0..count)
+            .map(|row| {
+                Value::Varchar(format!(
+                    "http://example.test/catalogue/section/{}/item/{row}",
+                    row % 7
+                ))
+            })
+            .collect();
+        Vector::from_values(LogicalType::Varchar, &values).unwrap()
+    }
+
+    #[test]
+    fn a_compressed_column_reads_back_the_strings_that_went_into_it() {
+        let flat = sentences(64);
+        let coded = flat.clone().compressed().unwrap();
+        assert_eq!(coded.form(), Form::Fsst, "a text column compresses");
+        assert_eq!(coded.len(), 64);
+        for row in 0..64 {
+            assert_eq!(coded.value_at(row), flat.value_at(row), "row {row}");
+        }
+        assert_eq!(coded.flatten().unwrap(), flat, "flattening is the column it came from");
+    }
+
+    #[test]
+    fn compressing_halves_the_bytes_or_the_column_is_left_flat() {
+        let flat = sentences(200);
+        let coded = flat.clone().compressed().unwrap();
+        let parts = coded.coded_parts().expect("compressed");
+        // Read through the flat column, because the compressed one has no bytes to hand back where
+        // they are and answers `None` to `text_at` rather than decompressing into a borrow.
+        assert_eq!(coded.text_at(0), None, "nothing to borrow until it is flattened");
+        let plain: usize = (0..200).map(|row| flat.text_at(row).map_or(0, str::len)).sum();
+        let codes: usize = (0..200).map(|row| parts.row(row).map_or(0, <[u8]>::len)).sum();
+        assert!(codes * FSST_PAYS_AT <= plain, "{codes} codes against {plain} bytes");
+        // Text with no repeated structure in it gives a table nothing longer than a byte to find,
+        // so the codes are the bytes and the column stays where it is rather than paying a
+        // decompression per read to save nothing.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let values: Vec<Value> = (0..256)
+            .map(|_| {
+                let mut text = String::new();
+                while text.len() < 12 {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    text.push(char::from(b'!' + ((seed >> 33) % 90) as u8));
+                }
+                Value::Varchar(text)
+            })
+            .collect();
+        let noise = Vector::from_values(LogicalType::Varchar, &values).unwrap();
+        assert_eq!(noise.compressed().unwrap().form(), Form::Flat);
+    }
+
+    #[test]
+    fn a_cut_of_a_compressed_column_shares_the_codes_and_the_table() {
+        let coded = sentences(64).compressed().unwrap();
+        let cut = coded.slice(8, 16).unwrap();
+        assert_eq!(cut.form(), Form::Fsst);
+        assert_eq!(cut.len(), 16);
+        for row in 0..16 {
+            assert_eq!(cut.value_at(row), coded.value_at(8 + row), "row {row}");
+        }
+        let (whole, piece) = (coded.coded_parts().unwrap(), cut.coded_parts().unwrap());
+        assert_eq!(piece.row(0), whole.row(8), "the spans point into the same codes");
+    }
+
+    #[test]
+    fn a_gather_of_a_compressed_column_stays_compressed_and_keeps_the_nulls() {
+        let coded = sentences(32)
+            .with_validity(Validity::from_iter(32, |row| row % 5 != 2))
+            .compressed()
+            .unwrap();
+        let picked: Vec<u32> = (0..32).step_by(2).collect();
+        let gathered = coded.gather(&picked).unwrap();
+        assert_eq!(gathered.form(), Form::Fsst, "selecting rows moves spans, not bytes");
+        for (row, &from) in picked.iter().enumerate() {
+            assert_eq!(gathered.value_at(row), coded.value_at(from as usize), "row {row}");
+        }
+        assert_eq!(
+            gathered.flatten().unwrap().iter().collect::<Vec<_>>(),
+            gathered.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_literal_lands_in_the_same_codes_the_row_holding_it_does() {
+        let coded = sentences(40).compressed().unwrap();
+        let parts = coded.coded_parts().expect("compressed");
+        let text = coded.value_at(11);
+        let Value::Varchar(text) = text else { panic!("a string column reads back strings") };
+        assert_eq!(parts.encode(text.as_bytes()), parts.row(11).expect("row 11"));
+        assert_ne!(parts.encode(b"something else entirely"), parts.row(11).unwrap());
+    }
+
+    #[test]
+    fn codes_that_run_past_what_is_there_are_refused() {
+        let table = Arc::new(SymbolTable::empty());
+        let codes = Arc::new(vec![1u8, 2, 3, 4]);
+        let good = vec![(0u32, 2u32), (2, 4)];
+        assert!(
+            Vector::coded(LogicalType::Varchar, Arc::clone(&codes), good, Arc::clone(&table))
+                .is_ok()
+        );
+        let past = vec![(0u32, 9u32)];
+        assert!(
+            Vector::coded(LogicalType::Varchar, Arc::clone(&codes), past, Arc::clone(&table))
+                .is_err(),
+            "a span past the end of the codes"
+        );
+        let backwards = vec![(3u32, 1u32)];
+        assert!(
+            Vector::coded(LogicalType::Varchar, Arc::clone(&codes), backwards, Arc::clone(&table))
+                .is_err(),
+            "a span that ends before it starts"
+        );
+        let wrong = vec![(0u32, 2u32)];
+        assert!(
+            Vector::coded(LogicalType::Integer, codes, wrong, table).is_err(),
+            "an integer column has no codes"
+        );
     }
 
     #[test]
