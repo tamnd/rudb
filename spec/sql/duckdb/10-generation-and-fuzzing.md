@@ -36,6 +36,16 @@ The failure condition is any panic that is not a deliberate not implemented path
 
 Upstream's own generator is available too. DuckDB ships `CALL sqlsmith()` and runs a public fuzzer repository against itself, so the same generated statements can be pointed at both engines with no generator work on our side at all. That is the cheapest of the four and it should be running first even though it is listed third.
 
+## 10.3.1 What the plan round trip came out as
+
+The third of those three targets is in, as `crates/rudb-plan/tests/property.rs`. It is a test rather than a fuzz target because it needs no corpus and no libFuzzer: a plan is built from a seeded generator, printed, read back, printed again, and the two dumps have to be the same string. Two thousand seeds run in half a second, which is cheap enough to sit in the ordinary test run, and `RUDB_PLAN_SEED` and `RUDB_PLAN_SEEDS` turn the same test into a long run on a machine that has the time for one. A failure replays from the seed in the message and from nothing else.
+
+The generator is most of the test, so it is held to the same standard as the thing it tests. Every plan it builds is validated before it is printed, because a generator that quietly builds malformed plans is asserting that the printer does something sensible with garbage rather than that it is a fixed point. Two further tests are about the generator itself rather than about the printer. One asserts the list of operators and expression forms it reaches, so that adding a node to the plan and not to the generator fails here rather than passing quietly. The other asserts that the generated dumps contain every piece of text the printer has to escape or quote, because an operator list says the generator still builds a filter and does not say the filter still has anything hard in it. That list is the interesting half: names with a comma, a quote, a bracket or nothing at all in them, strings holding a newline, a null byte or a brace, floats with no digits such as NaN and the infinities and negative zero, blobs, decimals at every scale, structs and lists and fixed length arrays, and the types such as `BIT` and `UUID` that have no constant form and can only ever be written as a typed null.
+
+Two million generated plans round trip with no failure, which took under two minutes. That is a real answer rather than an absence of one: the printer and the reader were written together, they were tested against the shapes somebody thought of, and they turn out to hold on the shapes nobody thought of as well. The value of it now is not the bugs it found, it is that every rewrite in the optimizer from here on is diffable in a format that has been checked this way.
+
+A second property rides along with it for free. `Plan::operator` prints one operator's line on its own, which is what `EXPLAIN` walks, and the whole dump is what the round trip is about, so the test also walks each generated plan and demands the line the dump has for a node is the line the node prints alone. Two printers that drift are two formats, and the reader only knows one.
+
 ## 10.4 Metamorphic testing, and what it is actually for here
 
 Four published oracles find wrong answers in a database with no reference to compare against, by transforming a query into another query whose answer must be related in a known way.
