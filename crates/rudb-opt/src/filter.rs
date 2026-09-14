@@ -384,6 +384,23 @@ fn filter(plan: &mut Plan, input: NodeRef, parts: Vec<ExprRef>) -> NodeRef {
     if let Some(&decided) = parts.iter().find(|&&part| never(plan, part)) {
         return plan.add_node(Node::Filter { input, predicate: decided });
     }
+    // The same question twice is one question, and asking it again costs an evaluation per row for
+    // an answer that is already known. It is also the other way a run of this pass over its own
+    // output differs from the first run: `crate::transitive` writes a predicate down from an
+    // equality, the predicate is pushed to the side that reads it, and the next run writes the same
+    // one down again and lands it next to the copy. A volatile call is not the same question twice,
+    // so two of those stay two.
+    let mut parts = parts;
+    let mut held = 0;
+    while held < parts.len() {
+        let part = parts[held];
+        let earlier = parts[..held].iter().any(|&other| walk::same(plan, other, part));
+        if earlier && !walk::volatile(plan, part) {
+            parts.remove(held);
+        } else {
+            held += 1;
+        }
+    }
     let predicate = match parts.len() {
         0 => return input,
         1 => parts[0],
@@ -629,6 +646,29 @@ Filter FALSE::BOOLEAN
   Get memory.main.t AS t #0 [a::INTEGER]
 ";
         assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn the_same_predicate_twice_comes_out_once() {
+        let before = "\
+Filter ((#0.0::INTEGER > 1::INTEGER)::BOOLEAN AND (#0.0::INTEGER > 1::INTEGER)::BOOLEAN)::BOOLEAN
+  Get memory.main.t AS t #0 [a::INTEGER]
+";
+        let after = "\
+Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN
+  Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn two_volatile_predicates_that_read_the_same_stay_two() {
+        // Two calls are two numbers, so this is not the same question asked twice.
+        let text = "\
+Filter ((random()::DOUBLE > 0.5::DOUBLE)::BOOLEAN AND (random()::DOUBLE > 0.5::DOUBLE)::BOOLEAN)::BOOLEAN
+  Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(text), text);
     }
 
     #[test]
