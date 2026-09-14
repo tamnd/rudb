@@ -1,0 +1,1 @@
+SELECT * FROM a LEFT JOIN b USING (id) INNER JOIN c ON c.id = a.id

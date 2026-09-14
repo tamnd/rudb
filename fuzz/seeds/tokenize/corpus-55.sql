@@ -1,0 +1,1 @@
+SELECT 'a' || 'b', 1 <> 2, x @> y FROM t

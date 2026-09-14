@@ -1,0 +1,1 @@
+SELECT $tag$ anything ' at all $tag$

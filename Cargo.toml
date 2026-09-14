@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
+# The fuzz crate is its own workspace and stays out of this one. It needs nightly for the sanitizer
+# and it pulls in libfuzzer, and neither of those belongs in the build that has to work on 1.85.0.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.3.11"
