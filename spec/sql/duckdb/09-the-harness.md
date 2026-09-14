@@ -78,6 +78,18 @@ Two things make this worth more than a benchmark run. It is per record, so a reg
 
 The numbers go on the report page as their own block, per record, rolled up per feature and per milestone. `spec/15-rudb-bench.md` stays the place whole query suites against whole engines are run and is still where any number anybody quotes in public comes from. This is the early warning, not the benchmark.
 
+## 9.7.1 Which corpus the ratios are measured over
+
+The paragraphs above say the ratios come from the sqllogictest records and that turned out to be wrong, so here is what was built instead and why. A record in that corpus only means anything under a session that replays every statement before it, because the file makes a table, fills it and then asks questions about it. Timing the record therefore times the replay, and the replay is the harness rather than the engine. There is no arrangement that fixes it while rudb has no storage format, since the usual answer is to build the tables once into a database file and open it per record.
+
+The ratios are measured over upstream's benchmark corpus instead, which is the same 845 queries `rudb-compat queries` counts for the function histogram. Those are independent by construction: each file carries its own load and one query and nothing in it depends on the file before it. Using one corpus for the weights and the ratios is worth something on its own, because the question "which of this is worth making fast" and the question "how fast is it" are then asked about the same queries.
+
+A number is the load and the query in one process, not the query alone, for the storage format reason above. The load is measured a second time on its own with a trivial statement after it, so the share of each number that is ingestion is printed beside every ratio. Most of these are eighty percent load and a ratio read as a statement about the query would be read wrong. When F2 lands and a database file can be built once and reopened, this becomes the query alone and the two numbers stop being comparable with these, which is a thing to say on the page rather than to discover later.
+
+Row counts are cut down. The suite builds tables of a hundred million rows because it is a benchmark suite for a finished database, and every `range` and `generate_series` argument above a million is brought down to a million before either engine sees it. Nothing else is rewritten, so a modulus, a seed or a hash constant still says what its author wrote. Both engines get the same text so the ratio is still the answer, but it is a ratio at a million rows and claims nothing about a hundred million.
+
+Both engines get a wall clock limit per process, thirty seconds in the published run. A process that goes over it is stopped and the benchmark is refused rather than measured. That is not neutral and the page says so: a benchmark stopped on our side is one rudb was losing badly, so the timeouts leave the ratios rather than making them worse, and the timeout count is part of the result. Without the limit the first query rudb cannot answer takes the rest of the run with it, which is how a corpus of 845 queries produces nothing.
+
 ## 9.8 Where it runs
 
 Locally means server1, server2, server3 or the gaming machine, and the harness should assume that. 4096 files over a machine with 32 cores is a sharding problem and nothing more: `cargo nextest` already partitions with `hash:m/n` and `slice:m/n`, and the per file child process model already makes the run embarrassingly parallel.
