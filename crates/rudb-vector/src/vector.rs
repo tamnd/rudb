@@ -845,23 +845,6 @@ impl Vector {
         &self.validity
     }
 
-    /// Whether the value at `index` is present after following any encoded positions.
-    #[must_use]
-    pub fn is_valid(&self, index: usize) -> bool {
-        if index >= self.len || !self.validity.is_valid(index) {
-            return false;
-        }
-        match &self.body {
-            Body::Dictionary { codes, values } => {
-                codes.get(index).is_some_and(|&code| values.is_valid(code as usize))
-            }
-            Body::Runs { ends, values } => {
-                run_holding(ends, index).is_some_and(|run| values.is_valid(run))
-            }
-            _ => true,
-        }
-    }
-
     /// Which physical form this vector is in.
     #[must_use]
     pub fn form(&self) -> Form {
