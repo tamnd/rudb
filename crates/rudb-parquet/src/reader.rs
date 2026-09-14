@@ -37,6 +37,20 @@
 //! gets cut. Gathering would have meant no dictionary column ever reaching an operator as a
 //! dictionary, which is the form a group by over one is fast because of.
 //!
+//! # Where the time goes
+//!
+//! The reader charges itself to [`rudb_common::stage`], a clock per stage rather than one number
+//! for the whole scan. Getting the bytes off the file is `read`, the codec is `decompress`, turning
+//! a page into a vector is `decode`, building the dictionary the pages point into is `dictionary`,
+//! and cutting pages to the chunk boundary is `assemble`. The shim above reads the difference
+//! around each operator call, so the scan's row in the metrics document has a split under it and
+//! the question of which quarter of a scan to work on has an answer rather than a guess.
+//!
+//! The clock is read once per page and once per chunk. What is not charged to any stage is the walk
+//! itself, which is a page header decoded per page, and it shows up as the difference between the
+//! operator's own time and the stages under it. That difference being large would itself be worth
+//! knowing.
+//!
 //! # What this does not do yet
 //!
 //! One read per column chunk, synchronous, through `File::read_exact_at`. A row group's worth of
@@ -49,6 +63,7 @@
 //! there is nothing to push down until the table function exists, so the counter that would prove
 //! pruning works is here and the pruning is E2.
 
+use rudb_common::stage::{Stage, Timing};
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_compress::Codec;
 use rudb_io::File;
@@ -270,8 +285,11 @@ impl Group {
                 self.rows, self.done
             )));
         }
-        let vectors =
-            self.columns.iter_mut().map(|column| column.take(len)).collect::<Result<_>>()?;
+        let timing = Timing::start(Stage::Assemble);
+        let vectors: Result<Vec<_>> =
+            self.columns.iter_mut().map(|column| column.take(len)).collect();
+        timing.stop(0);
+        let vectors = vectors?;
         self.done += len;
         let after: u64 = self.columns.iter().map(|column| column.bytes_read).sum();
         Ok((Some(Chunk::with_rows(vectors, len)?), after.saturating_sub(before)))
@@ -369,7 +387,12 @@ impl Cursor {
                 return Ok(0);
             }
             let file = file.ok_or_else(|| Error::internal("an encoded page with no file"))?;
-            let encoded = self.read_page(file)?;
+            let read = Timing::start(Stage::Read);
+            let encoded = self.read_page(file);
+            read.stop(
+                encoded.as_ref().map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+            );
+            let encoded = encoded?;
             let mut pages = Pages::new(&encoded, self.codec, self.left);
             let page = pages.next().transpose()?.ok_or_else(|| {
                 Error::io(format!(
@@ -389,11 +412,19 @@ impl Cursor {
                         self.column.name
                     )));
                 }
-                self.dictionary = Some(page.into_dictionary(&self.column)?);
+                let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
+                let timing = Timing::start(Stage::Dictionary);
+                let built = page.into_dictionary(&self.column);
+                timing.stop(bytes);
+                self.dictionary = Some(built?);
                 continue;
             }
             self.left -= i64::from(page.header.values());
-            self.page = Some(page.into_vector(&self.column, self.dictionary.as_ref())?);
+            let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
+            let timing = Timing::start(Stage::Decode);
+            let decoded = page.into_vector(&self.column, self.dictionary.as_ref());
+            timing.stop(bytes);
+            self.page = Some(decoded?);
         }
         Ok(self.page.as_ref().map_or(0, |page| page.len() - self.offset))
     }

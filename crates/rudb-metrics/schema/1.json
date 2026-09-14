@@ -104,6 +104,28 @@
       "fallbacks": {
         "total": 0
       },
+      "stages": {
+        "read": {
+          "wall_ns": 120000000,
+          "bytes": 1420000000
+        },
+        "decompress": {
+          "wall_ns": 210000000,
+          "bytes": 210000000
+        },
+        "decode": {
+          "wall_ns": 240000000,
+          "bytes": 210000000
+        },
+        "dictionary": {
+          "wall_ns": 9000000,
+          "bytes": 1400000
+        },
+        "assemble": {
+          "wall_ns": 22000000,
+          "bytes": 0
+        }
+      },
       "memory": {
         "reserved": 0,
         "high_water": 0

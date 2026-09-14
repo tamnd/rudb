@@ -10,7 +10,7 @@
 //! and repeating it here would be the same assertions twice with a parser in front of them.
 
 use rudb::Database;
-use rudb_common::Value;
+use rudb_common::{Stage, Value};
 
 /// The path of the fixture, as a SQL string literal.
 fn fixture() -> String {
@@ -64,6 +64,36 @@ fn file_scan_metrics_count_the_compressed_column_bytes_read() {
         .expect("the query contains a file scan");
     assert!(scan.bytes_read > 0, "the scan reports the Parquet column bytes it read");
     assert_eq!(metrics.resource.bytes_read, scan.bytes_read);
+}
+
+#[test]
+fn a_file_scan_says_which_stage_of_the_read_its_time_went_to() {
+    let database = Database::new();
+    let sql = format!("SELECT sum(a) FROM read_parquet({})", fixture());
+    let result = database.query(&sql).expect("runs");
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let scan = metrics
+        .operators
+        .iter()
+        .find(|operator| operator.kind == "FileScan")
+        .expect("the query contains a file scan");
+    assert!(!scan.stages.is_empty(), "a scan that read a file spent time in a stage of reading");
+    assert!(scan.stages.bytes(Stage::Read) > 0, "the read stage moved the bytes off the file");
+    assert!(scan.stages.bytes(Stage::Decode) > 0, "the decode stage turned them into values");
+    assert!(
+        scan.stages.total() <= scan.wall_ns,
+        "the stages are inside the operator rather than beside it: {} against {}",
+        scan.stages.total(),
+        scan.wall_ns
+    );
+    // Only the scan reads, so nothing else in the query is allowed to be carrying a split.
+    for operator in &metrics.operators {
+        assert!(
+            operator.kind == "FileScan" || operator.stages.is_empty(),
+            "{} reported stages of a read it did not do",
+            operator.kind
+        );
+    }
 }
 
 #[test]
