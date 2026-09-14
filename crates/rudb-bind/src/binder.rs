@@ -1440,7 +1440,18 @@ impl<'a> Binder<'a> {
             }
             names
         } else {
-            ast.name(using).map(str::to_string).collect()
+            // A name written twice is one column, not two. `USING (id, id)` is legal and means what
+            // `USING (id)` means, and the reference binary agrees. Taking it twice would build the
+            // same equality twice and, worse, drop the right side's copy twice, which takes a
+            // column out of the answer that nobody named and runs off the end of the scope when the
+            // copy was the last column in it.
+            let mut names: Vec<String> = Vec::new();
+            for name in ast.name(using) {
+                if !names.iter().any(|held| same_name(held, name)) {
+                    names.push(name.to_string());
+                }
+            }
+            names
         };
 
         let mut conditions = Vec::new();

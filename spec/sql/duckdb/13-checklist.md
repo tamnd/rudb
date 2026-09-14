@@ -15,7 +15,7 @@ Baseline for every number here: rudb `e0f32d2`, rudb-compat `995f0e8`, DuckDB `v
 - [ ] `loop`, `foreach` and `require` in the sqllogictest reader, which are the three largest harness gaps
 - [ ] `CALL sqlsmith()` pointed at both engines, which is a generated query source with no generator work on our side
 - [x] Fuzz target over tokenize and match on raw bytes
-- [ ] Structure aware fuzz target over the AST using `arbitrary`
+- [x] Structure aware fuzz target over the AST using `arbitrary`
 - [x] Plan print and plan parse round trip as a property test over generated plans
 - [ ] Grammar driven statement generation, walking the same 1088 rule table in the other direction, with weighted alternatives, a recursion bound and a real catalog
 - [x] TLP as an oracle that runs on rudb alone with no DuckDB binary present, in the WHERE form
