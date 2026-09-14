@@ -25,6 +25,10 @@ pub fn run_serial(pipeline: &Pipeline, cancel: &Cancel) -> Result<()> {
     let mut chunk = Chunk::empty(&[]);
 
     'morsels: while let Some(mut morsel) = pipeline.source().morsel() {
+        // Before the first read of it rather than after the last, because a sink that puts chunks
+        // back in the order the morsels were cut has to know where a chunk came from at the moment
+        // it arrives, not once the morsel it came from is finished with.
+        pipeline.sink().at_state(&morsel, &mut locals.sink)?;
         loop {
             cancel.check()?;
 

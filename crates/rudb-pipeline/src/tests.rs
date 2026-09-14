@@ -11,7 +11,7 @@ use crate::dynamic::{DynSink, DynStream, LocalState};
 use crate::morsel::Morsel;
 use crate::pipeline::Pipeline;
 use crate::progress::{Blocked, BlockedReason, BufferId, IoToken, PipelineId, Progress};
-use crate::root::root;
+use crate::root::{root, root_in_order};
 use crate::serial::run_serial;
 use crate::traits::{Sink, Source, Stream};
 use crate::watch::Watched;
@@ -376,6 +376,145 @@ fn a_full_root_queue_reports_backpressure_through_the_same_four_reasons() {
     assert_eq!(error.code(), ErrorCode::NotImplemented);
     assert!(error.message().contains("buffer 4"), "{}", error.message());
     assert_eq!(reader.queued().unwrap(), 1);
+}
+
+/// One column of big integers, which is all the root needs to be told apart from another chunk.
+fn numbers(values: &[i64]) -> Chunk {
+    let values: Vec<Value> = values.iter().map(|value| Value::BigInt(*value)).collect();
+    Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &values).unwrap()]).unwrap()
+}
+
+/// What came out, flattened, so that a test can say what order it wanted in one line.
+fn rows(chunks: &[Chunk]) -> Vec<i64> {
+    let mut out = Vec::new();
+    for chunk in chunks {
+        // row at a time: reading a handful of test rows back out, where a kernel would be more code
+        // than the thing it tests
+        for row in 0..chunk.len() {
+            if let Value::BigInt(value) = chunk.value_at(row, 0) {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
+/// The parallel driver in miniature, because there is not one yet.
+///
+/// Two instances, morsels handed out in order and finished out of order, which is what happens the
+/// moment the thread reading the second row group is quicker than the thread reading the first.
+#[test]
+fn an_ordered_root_puts_the_morsels_back_the_way_the_source_cut_them() {
+    let (sink, reader) = root_in_order(BufferId(0), None);
+    let sink: Arc<dyn DynSink> = Arc::new(sink);
+    let mut first = sink.local_state();
+    let mut second = sink.local_state();
+
+    sink.at_state(&Morsel::new(0, 0, 2), &mut first).unwrap();
+    sink.at_state(&Morsel::new(1, 2, 4), &mut second).unwrap();
+
+    sink.sink_state(&numbers(&[30, 40]), &mut second).unwrap();
+    sink.combine_state(second).unwrap();
+    assert_eq!(reader.queued().unwrap(), 0, "morsel zero is still being read");
+
+    sink.sink_state(&numbers(&[10]), &mut first).unwrap();
+    sink.sink_state(&numbers(&[20]), &mut first).unwrap();
+    sink.combine_state(first).unwrap();
+    sink.finalize_state().unwrap();
+
+    assert_eq!(rows(&reader.drain().unwrap()), vec![10, 20, 30, 40]);
+}
+
+/// The same sequence against the plain root, which is the thing the ordered one exists to differ
+/// from. A query with an `ORDER BY` under it wants this, because the operator below has already put
+/// the rows where it wants them and holding chunks back would only add latency.
+#[test]
+fn a_plain_root_hands_chunks_on_in_the_order_they_arrive() {
+    let (sink, reader) = root(BufferId(0), None);
+    let sink: Arc<dyn DynSink> = Arc::new(sink);
+    let mut first = sink.local_state();
+    let mut second = sink.local_state();
+
+    sink.at_state(&Morsel::new(0, 0, 2), &mut first).unwrap();
+    sink.at_state(&Morsel::new(1, 2, 4), &mut second).unwrap();
+
+    sink.sink_state(&numbers(&[30, 40]), &mut second).unwrap();
+    sink.combine_state(second).unwrap();
+    sink.sink_state(&numbers(&[10, 20]), &mut first).unwrap();
+    sink.combine_state(first).unwrap();
+    sink.finalize_state().unwrap();
+
+    assert_eq!(rows(&reader.drain().unwrap()), vec![30, 40, 10, 20]);
+}
+
+/// Several chunks out of one morsel keep their order within it, which is the second half of the key
+/// and the part that a morsel wider than a chunk depends on.
+#[test]
+fn chunks_from_one_morsel_keep_the_order_they_were_read_in() {
+    let (sink, reader) = root_in_order(BufferId(0), None);
+    let source = Arc::new(Counting::new((1..=12).collect(), 12, 3));
+    let built =
+        Pipeline::new(PipelineId(0), source as Arc<dyn Source>, Arc::new(sink) as Arc<dyn DynSink>);
+
+    run_serial(&built, &Cancel::new()).unwrap();
+
+    assert!(reader.is_finished());
+    assert_eq!(rows(&reader.drain().unwrap()), (1..=12).collect::<Vec<i64>>());
+}
+
+/// A pipeline over an empty source takes no morsel at all, so nothing is ever released by taking
+/// the next one and finalising has to be the thing that lets go.
+#[test]
+fn an_ordered_root_over_an_empty_source_finishes_with_nothing_held() {
+    let (sink, reader) = root_in_order(BufferId(0), None);
+    let source = Arc::new(Counting::new(Vec::new(), 4, 4));
+    let built =
+        Pipeline::new(PipelineId(0), source as Arc<dyn Source>, Arc::new(sink) as Arc<dyn DynSink>);
+
+    run_serial(&built, &Cancel::new()).unwrap();
+
+    assert!(reader.is_finished());
+    assert!(reader.drain().unwrap().is_empty());
+}
+
+#[test]
+fn an_ordered_root_refuses_a_driver_that_does_not_say_where_a_chunk_came_from() {
+    let (sink, _reader) = root_in_order(BufferId(0), None);
+    let mut place = sink.local();
+
+    let error = sink.sink(&numbers(&[1]), &mut place).unwrap_err();
+
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert!(error.message().contains("which morsel"), "{}", error.message());
+}
+
+/// The bound on held chunks must never stop the instance whose chunks are next out, because there
+/// is nobody left who could unblock it.
+#[test]
+fn the_earliest_morsel_is_never_told_to_wait_for_the_ones_behind_it() {
+    let (sink, reader) = root_in_order(BufferId(4), Some(1));
+    let sink: Arc<dyn DynSink> = Arc::new(sink);
+    let mut first = sink.local_state();
+    let mut second = sink.local_state();
+
+    sink.at_state(&Morsel::new(0, 0, 4), &mut first).unwrap();
+    sink.at_state(&Morsel::new(1, 4, 8), &mut second).unwrap();
+
+    assert_eq!(sink.sink_state(&numbers(&[30]), &mut second).unwrap(), Progress::More);
+    let blocked = sink.sink_state(&numbers(&[40]), &mut second).unwrap();
+    assert_eq!(blocked, Progress::Blocked(Blocked::Downstream(BufferId(4))));
+    assert_eq!(sink.sink_state(&numbers(&[10]), &mut first).unwrap(), Progress::More);
+    assert_eq!(sink.sink_state(&numbers(&[20]), &mut first).unwrap(), Progress::More);
+
+    sink.combine_state(first).unwrap();
+    assert_eq!(rows(&reader.drain().unwrap()), vec![10, 20]);
+
+    // Morsel one is the earliest being read now, so the chunk it was told to wait with goes through.
+    assert_eq!(sink.sink_state(&numbers(&[40]), &mut second).unwrap(), Progress::More);
+    sink.combine_state(second).unwrap();
+    sink.finalize_state().unwrap();
+
+    assert_eq!(rows(&reader.drain().unwrap()), vec![30, 40]);
 }
 
 #[test]

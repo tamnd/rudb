@@ -103,6 +103,16 @@ impl<K: Sink> Sink for Watched<K> {
         self.inner.local()
     }
 
+    /// Measured like the rest, even though it moves no rows. It takes a lock on the ordered root and
+    /// a lock that turns out to be contended is exactly the sort of thing this wrapper exists to
+    /// show rather than leave somebody to guess at.
+    fn at(&self, morsel: &Morsel, local: &mut Self::Local) -> Result<()> {
+        let measure = Measure::start();
+        let noted = self.inner.at(morsel, local);
+        measure.stop(&self.counters);
+        noted
+    }
+
     fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress> {
         let taken = rows(chunk);
         let measure = Measure::start();

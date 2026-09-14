@@ -83,6 +83,30 @@ pub trait Sink: Send + Sync + fmt::Debug {
     /// Fresh local state for one instance.
     fn local(&self) -> Self::Local;
 
+    /// Told which morsel the chunks that come next were read from.
+    ///
+    /// Called once per morsel, by the driver, on the instance that took it, before any
+    /// [`Sink::sink`] carrying rows from it. A sink that does not care where a chunk came from
+    /// ignores this, which is the default and is every sink in the tree but one.
+    ///
+    /// The one that cares is the root. A parallel driver hands morsels out to whichever thread is
+    /// free, so the chunks come back in whatever order the threads finished, and a query that asked
+    /// for the rows in the order the file holds them would get a different answer on every run.
+    /// Knowing which morsel a chunk came from is what lets the root put them back. It is a method on
+    /// the trait rather than something the root works out for itself because the driver is the only
+    /// thing that knows which morsel an instance is on, and this is how it says so.
+    ///
+    /// A source whose morsels are meant to be put back in order has to number them in that order.
+    /// Nothing checks that, and a source that numbers them some other way gets its own numbering
+    /// back rather than a wrong answer.
+    ///
+    /// # Errors
+    ///
+    /// Whatever taking note of the morsel reports.
+    fn at(&self, _morsel: &Morsel, _local: &mut Self::Local) -> Result<()> {
+        Ok(())
+    }
+
     /// Take one chunk into the local state.
     ///
     /// [`Progress::Done`] means no more input is wanted, with the same meaning as on
