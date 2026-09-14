@@ -187,6 +187,19 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             filter(plan, above, stay)
         }
 
+        // A fetch produces an index of its own out of a file rather than out of its input, so a
+        // predicate written against what comes out cannot be rewritten into one against what goes
+        // in. It stays above and the recursion carries on underneath it.
+        Node::Fetch { input, index, args, columns, row } => {
+            let rebuilt = node(plan, input, Vec::new(), tables);
+            let above = if rebuilt == input {
+                at
+            } else {
+                plan.add_node(Node::Fetch { input: rebuilt, index, args, columns, row })
+            };
+            filter(plan, above, pending)
+        }
+
         // Nothing goes through a limit and the recursion happens anyway, because a filter that is
         // already below the limit still has somewhere to go. A top N is a limit with a sort inside
         // it, so it holds the same line.

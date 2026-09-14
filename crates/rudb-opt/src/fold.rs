@@ -141,6 +141,14 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
                 }
             }
         }
+        Node::Fetch { args, .. } => {
+            if let Some(rewritten) = expr_list(plan, args, done) {
+                match plan.node_mut(node) {
+                    Node::Fetch { args, .. } => *args = rewritten,
+                    _ => unreachable!("the node was a fetch a moment ago"),
+                }
+            }
+        }
         Node::Filter { predicate, .. } => {
             let rewritten = expression(plan, predicate, done);
             if rewritten != predicate {

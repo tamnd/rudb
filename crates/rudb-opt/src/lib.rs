@@ -16,6 +16,7 @@ pub mod estimate;
 pub mod explain;
 pub mod filter;
 pub mod fold;
+pub mod late;
 pub mod limit;
 pub mod nulls;
 pub mod pass;
@@ -64,13 +65,14 @@ pub const RANK: u8 = 11;
 /// Top N is last, because it is the one pass that fuses two operators into one rather than moving
 /// something around. Everything before it is written against a sort and a limit, and a pass that had
 /// to know about both spellings of the same plan is a pass with two of every rule in it.
-pub static PASSES: [&(dyn Pass + Sync); 6] = [
+pub static PASSES: [&(dyn Pass + Sync); 7] = [
     &fold::ExpressionRewriter,
     &filter::FilterPushdown,
     &empty::EmptyResultPullup,
     &columns::UnusedColumns,
     &limit::LimitPushdown,
     &topn::TopN,
+    &late::LateMaterialization,
 ];
 
 /// Rewrites a bound plan into the plan that runs, with every pass on.
@@ -155,7 +157,8 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
     match *plan.node(reference) {
         Node::Get { columns, .. }
         | Node::Values { columns, .. }
-        | Node::TableFunction { columns, .. } => plan.field_list(columns).len(),
+        | Node::TableFunction { columns, .. }
+        | Node::Fetch { columns, .. } => plan.field_list(columns).len(),
         Node::Project { exprs, .. } => plan.expr_list(exprs).len(),
         Node::Aggregate { groups, aggregates, .. } => {
             plan.expr_list(groups).len() + plan.expr_list(aggregates).len()

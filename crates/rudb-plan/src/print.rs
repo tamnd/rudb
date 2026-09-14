@@ -117,6 +117,14 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             write!(out, " #{index} ")?;
             write_schema(plan, out, columns)
         }
+        Node::Fetch { index, args, columns, row, .. } => {
+            out.write_str(" args=")?;
+            write_expr_list(plan, out, args)?;
+            out.write_str(" row=")?;
+            write_expr(plan, out, row)?;
+            write!(out, " #{index} ")?;
+            write_schema(plan, out, columns)
+        }
         Node::Filter { predicate, .. } => {
             out.write_char(' ')?;
             write_expr(plan, out, predicate)

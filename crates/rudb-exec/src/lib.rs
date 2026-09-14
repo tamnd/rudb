@@ -90,6 +90,7 @@ mod buffer;
 mod build;
 mod cancel;
 mod expr;
+mod fetch;
 mod gather;
 mod group;
 mod join;
