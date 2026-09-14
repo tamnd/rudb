@@ -24,6 +24,7 @@ mod grammar;
 mod io;
 mod kernels;
 mod layers;
+mod parquet;
 mod rowloop;
 mod ruletable;
 mod seams;
@@ -81,6 +82,10 @@ fn main() -> ExitCode {
         // the one F2's load time criterion is actually about, since a file only gets compressed
         // once it has been encoded.
         Some("encode") => encode::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        // What a Parquet read costs in rudb next to what it costs in duckdb, over the same file,
+        // shape by shape. `differential` above asks whether the two engines agree and this one
+        // asks how far apart they are, which needs many runs rather than one.
+        Some("parquet") => parquet::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         // The committed corpus from tamnd/rudb-compat, against the shell this tree builds. Not
         // `differential` above, which compares two engines over a file somebody downloaded. This
         // one has its answers written down in the repository that owns them.
@@ -149,6 +154,10 @@ fn usage() {
     println!("           what the sample saves in time and what it gives up in size");
     println!("           --sampled makes the thread sweep use the sampled chooser, so that what");
     println!("           the ablation buys can be checked against the cores rather than assumed");
+    println!("  parquet [files...]     what a Parquet read costs in rudb next to duckdb, over the");
+    println!("           same files and the same SQL, one row per shape from the footer alone up");
+    println!("           to every column of every row. process start is measured and subtracted");
+    println!("           from both sides. --threads <n> sets both engines to that many threads");
     println!("  bench <suite>          the whole comparison, against every engine on this machine");
     println!("                         builds rudb and the harness, then runs the suite. needs a");
     println!("                         tamnd/rudb-bench checkout beside this one, or");
