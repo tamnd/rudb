@@ -170,6 +170,39 @@ pub enum Node {
         /// How many rows to skip first.
         offset: u64,
     },
+    /// The columns of rows something below already picked out, read back from the file by ordinal.
+    ///
+    /// This is the top half of late materialisation. A `SELECT * FROM hits ORDER BY EventTime LIMIT
+    /// 10` over a hundred and five columns needs one column to decide which ten rows win and all
+    /// hundred and five of those ten rows afterwards, and a plan that carries the wide rows through
+    /// the top N reads the whole file to throw almost all of it away. The rewrite in
+    /// `rudb-opt`'s `late` module narrows the scan under the top N to the ordering columns plus the
+    /// row's ordinal inside its file, and puts this above it to read the rest for the rows that
+    /// survived.
+    ///
+    /// The ordinals come out of the input rather than being counted here, because the operator that
+    /// counted them is the scan and everything between the scan and here may have dropped rows. The
+    /// column that holds them is [`Self::Fetch::row`], and the scan produced it because the rewrite
+    /// turned `file_row_number` on.
+    ///
+    /// The produced columns are the whole row and not only the deferred part, so the answer is one
+    /// read of the file at the ordinals rather than a stitch of what was carried with what was
+    /// fetched. That costs the ordering column a second read of a few pages and saves the plan above
+    /// this from having any idea the rewrite happened.
+    Fetch {
+        /// The input, which carries each row's ordinal inside the file.
+        input: NodeRef,
+        /// The table index the produced columns bind against, which is the one the node this
+        /// replaced produced, so that nothing above has to be rebound.
+        index: u32,
+        /// The file, into the expression list pool. One constant path, because a row ordinal only
+        /// says which row when there is one file it could be in.
+        args: Slice,
+        /// The produced columns with their types, into the field pool.
+        columns: Slice,
+        /// The input column holding the ordinal, which has to be `BIGINT`.
+        row: ExprRef,
+    },
     /// Duplicate elimination, over the whole row or over named expressions.
     Distinct {
         /// The input.
@@ -233,6 +266,7 @@ impl Node {
             Self::Sort { .. } => "Sort",
             Self::Limit { .. } => "Limit",
             Self::TopN { .. } => "TopN",
+            Self::Fetch { .. } => "Fetch",
             Self::Distinct { .. } => "Distinct",
             Self::Join { .. } => "Join",
             Self::CrossProduct { .. } => "CrossProduct",
@@ -257,6 +291,7 @@ impl Node {
             | Self::Sort { input, .. }
             | Self::Limit { input, .. }
             | Self::TopN { input, .. }
+            | Self::Fetch { input, .. }
             | Self::Distinct { input, .. } => [Some(input), None],
             Self::Join { left, right, .. }
             | Self::CrossProduct { left, right }
@@ -278,6 +313,7 @@ impl Node {
             | Self::Values { index, .. }
             | Self::TableFunction { index, .. }
             | Self::Project { index, .. }
+            | Self::Fetch { index, .. }
             | Self::Aggregate { index, .. }
             | Self::SetOp { index, .. } => Some(index),
             _ => None,

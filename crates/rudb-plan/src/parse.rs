@@ -187,6 +187,17 @@ impl Reader<'_> {
                     columns,
                 }))
             }
+            "Fetch" => {
+                c.expect_word("args")?;
+                c.expect("=")?;
+                let args = read_expr_list(plan, c)?;
+                c.expect_word("row")?;
+                c.expect("=")?;
+                let row = read_expr(plan, c)?;
+                let index = read_table_index(c)?;
+                let columns = read_schema(plan, c)?;
+                Ok(Built::unary(move |input| Node::Fetch { input, index, args, columns, row }))
+            }
             "Filter" => {
                 let predicate = read_expr(plan, c)?;
                 Ok(Built::unary(move |input| Node::Filter { input, predicate }))

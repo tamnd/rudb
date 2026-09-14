@@ -37,6 +37,7 @@ use rudb_seam::Settings;
 
 use crate::adapt::{Broken, Fed, Paired, Pulled, Streamed};
 use crate::cancel::Guarded;
+use crate::fetch::Fetch;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join};
@@ -270,6 +271,14 @@ impl<'a> Building<'a, '_> {
                         pulled(Watched::new(series, counters), schema)
                     }
                 }
+            }
+            Node::Fetch { input, index, args, columns, row } => {
+                let input = self.node(input)?;
+                let counters = self.watch(reference, id, pipeline, "Fetch", None);
+                let fetch = Fetch::new(plan, input.schema(), index, args, columns, row)?
+                    .watched(counters.clone());
+                let schema = fetch.schema().clone();
+                Box::new(Streamed::new(input, Watched::new(fetch, counters), schema))
             }
             Node::Filter { input, predicate } => {
                 let input = self.node(input)?;

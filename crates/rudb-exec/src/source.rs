@@ -695,7 +695,11 @@ fn csv_options(plan: &Plan, options: Slice, settings: Slice) -> Result<Given> {
 /// The binder already refused anything that is not a constant string and already expanded whatever
 /// patterns there were, so a failure here is a plan that was built wrong rather than a statement
 /// somebody wrote wrong, and it says so.
-fn file_arguments(plan: &Plan, args: Slice, function: TableFunction) -> Result<Vec<String>> {
+pub(crate) fn file_arguments(
+    plan: &Plan,
+    args: Slice,
+    function: TableFunction,
+) -> Result<Vec<String>> {
     let exprs: Vec<ExprRef> = plan.expr_list(args).to_vec();
     let source = Schema::empty();
     let one = Chunk::with_rows(Vec::new(), 1)?;
@@ -726,7 +730,7 @@ fn file_arguments(plan: &Plan, args: Slice, function: TableFunction) -> Result<V
 /// two pieces of code that each wrote their own sentence and a compatibility test that compares
 /// output compares all of it. For CSV this is only reachable when a file changed between binding and
 /// running, since the binder sniffed every file and would have said the same thing first.
-fn positions(
+pub(crate) fn positions(
     function: TableFunction,
     wanted: &[Field],
     held: &[Field],

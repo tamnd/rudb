@@ -501,6 +501,16 @@ impl Plan {
                     }
                 }
             }
+            Node::Fetch { args, columns, row, .. } => {
+                self.checked_field_list(columns, reference)?;
+                if self.checked_expr_list(args, reference)?.len() != 1 {
+                    return fail("reads other than exactly one file, which no ordinal identifies");
+                }
+                self.checked_expr(row, reference)?;
+                if *self.expr_type(row) != LogicalType::BigInt {
+                    return fail("takes its ordinals from an expression that is not BIGINT");
+                }
+            }
             Node::Filter { predicate, .. } => {
                 self.checked_expr(predicate, reference)?;
                 if *self.expr_type(predicate) != LogicalType::Boolean {
@@ -606,6 +616,11 @@ impl Plan {
                 self.row_list(rows).iter().flat_map(|row| plain(self.expr_list(*row))).collect()
             }
             Node::TableFunction { args, .. } => plain(self.expr_list(args)),
+            Node::Fetch { args, row, .. } => {
+                let mut held = plain(self.expr_list(args));
+                held.push((row, false));
+                held
+            }
             Node::Filter { predicate, .. } => vec![(predicate, false)],
             Node::Project { exprs, .. } => plain(self.expr_list(exprs)),
             Node::Aggregate { groups, aggregates, .. } => {
