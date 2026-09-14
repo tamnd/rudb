@@ -2,18 +2,20 @@
 //!
 //! Rank 4 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! # Why push, and why now
+//! # Why push
 //!
-//! `rudb-exec` has a pull interface: an operator has `next`, and every operator drives its
-//! children. Its own doc comment says the scheduler is supposed to know only that a pipeline has a
+//! `rudb-exec` used to have a pull interface: an operator had `next`, and every operator drove its
+//! children. Its own doc comment said the scheduler was supposed to know only that a pipeline has a
 //! source, some streaming operators and a sink, which is a description of a push interface written
 //! above a pull one.
 //!
-//! The conversion is not a refactor that gets cheaper by waiting. It touches every operator, every
-//! test and every internal loop that assumed it could block, and the single threaded
-//! implementation behind the push interface is [`run_serial`], which is fifty lines with the
-//! error handling and about twenty without. So the interface is final now and the implementations
-//! behind it move one at a time.
+//! The conversion was not a refactor that got cheaper by waiting. It touched every operator, every
+//! test and every internal loop that assumed it could block, and the single threaded implementation
+//! behind the push interface is [`run_serial`], which is fifty lines with the error handling and
+//! about twenty without. So the interface went in first, the implementations behind it moved one at
+//! a time, and `rudb-exec` now builds [`Pipeline`] values and hands them to [`run_serial`]. There is
+//! no pull left inside the engine. The one at the edge is [`root`], which is what an embedded
+//! library owes a caller that owns its own loop.
 //!
 //! # The three traits
 //!
@@ -49,9 +51,11 @@
 //! measured the day it is written by somebody who never read that module. It is per call, which is
 //! per chunk, which is the granularity rule.
 //!
-//! It also does not know about threads. The scheduler is F4. What it knows is that an operator can
-//! report [`Progress::Blocked`] for exactly four reasons, which is what makes the wait for graph
-//! finite and a deadlock a bug report with the cycle in it rather than a hang.
+//! It also does not know about threads. The scheduler is the next milestone, and what it replaces is
+//! [`run_serial`] and nothing above it: it is handed the same [`Pipeline`] values, and it runs
+//! several instances of one where the serial driver runs one. What this crate knows about waiting is
+//! that an operator can report [`Progress::Blocked`] for exactly four reasons, which is what makes
+//! the wait for graph finite and a deadlock a bug report with the cycle in it rather than a hang.
 
 #![forbid(unsafe_code)]
 

@@ -62,14 +62,10 @@ fn catalog() -> Catalog {
     catalog
 }
 
-/// Runs a plan and returns its rows.
-fn run(text: &str) -> Vec<Vec<Value>> {
-    let catalog = catalog();
-    let plan = Plan::parse(text).expect("a well formed plan");
-    plan.validate().expect("the plan holds together");
-    let mut operator = build(&plan, &catalog).expect("the operators build");
+/// The rows a run of a query produced, a value at a time.
+fn rows_of(chunks: &[rudb_vector::Chunk]) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
-    while let Some(chunk) = operator.next().expect("the query runs") {
+    for chunk in chunks {
         for row in 0..chunk.len() {
             rows.push(chunk.row(row).collect());
         }
@@ -77,25 +73,32 @@ fn run(text: &str) -> Vec<Vec<Value>> {
     rows
 }
 
+/// Runs a plan and returns its rows.
+fn run(text: &str) -> Vec<Vec<Value>> {
+    let catalog = catalog();
+    let plan = Plan::parse(text).expect("a well formed plan");
+    plan.validate().expect("the plan holds together");
+    let query = build(&plan, &catalog).expect("the query builds");
+    let chunks = query.collect(&Cancel::new()).expect("the query runs");
+    rows_of(&chunks)
+}
+
 /// Runs a plan and returns the column names its root produces.
 fn names(text: &str) -> Vec<String> {
     let catalog = catalog();
     let plan = Plan::parse(text).expect("a well formed plan");
-    let operator = build(&plan, &catalog).expect("the operators build");
-    operator.schema().names()
+    let query = build(&plan, &catalog).expect("the query builds");
+    query.schema().names()
 }
 
 /// Runs a plan that is expected to fail and returns the message.
 fn failure(text: &str) -> String {
     let catalog = catalog();
     let plan = Plan::parse(text).expect("a well formed plan");
-    let mut operator = build(&plan, &catalog).expect("the operators build");
-    loop {
-        match operator.next() {
-            Ok(Some(_)) => {}
-            Ok(None) => panic!("the query was expected to fail and did not"),
-            Err(error) => return error.message().to_string(),
-        }
+    let query = build(&plan, &catalog).expect("the query builds");
+    match query.collect(&Cancel::new()) {
+        Ok(_) => panic!("the query was expected to fail and did not"),
+        Err(error) => error.message().to_string(),
     }
 }
 
@@ -450,6 +453,56 @@ fn a_table_the_catalog_does_not_have_is_caught_when_the_tree_is_built() {
     assert!(error.message().contains("nope"), "{error}");
 }
 
+/// How many pipelines a plan is cut into.
+fn pipelines(text: &str) -> usize {
+    let catalog = catalog();
+    let plan = Plan::parse(text).expect("a well formed plan");
+    build(&plan, &catalog).expect("the query builds").pipelines()
+}
+
+#[test]
+fn a_plan_with_no_breaker_in_it_is_one_pipeline() {
+    assert_eq!(pipelines(&format!("Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n  {SCAN}")), 1);
+}
+
+#[test]
+fn every_pipeline_breaker_cuts_the_plan_in_two() {
+    // The scan into the aggregate, then the groups into the sort, then the sorted rows out.
+    let text = format!(
+        "Sort [#1.0::INTEGER ASC NULLS LAST]\n  Aggregate #1 groups=[#0.0::INTEGER] \
+         aggregates=[count_star()::BIGINT]\n    {SCAN}"
+    );
+    assert_eq!(pipelines(&text), 3);
+}
+
+/// A node with two inputs is two pipelines, not one, and the one that gathers has to be first.
+#[test]
+fn the_gathered_side_of_a_join_is_a_pipeline_of_its_own_and_it_runs_first() {
+    let text = concat!(
+        "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+        "  Get memory.main.t AS t #0 [x::INTEGER]\n",
+        "  Get memory.main.empty AS empty #1 [x::INTEGER]\n",
+    );
+    // The right side into the gather, the left side into the join, and the join's rows out.
+    assert_eq!(pipelines(text), 3);
+    // If the order were wrong the join would probe a gather nobody had filled and answer with no
+    // rows rather than failing, which is why `Query::new` checks it rather than trusting the walk.
+    assert!(run(text).is_empty(), "nothing matches an empty table");
+}
+
+/// The cross product is the one two input operator that does not start a pipeline of its own, so a
+/// plan with one in it has a pipeline for the kept side and a pipeline for everything else.
+#[test]
+fn a_cross_product_stays_in_the_pipeline_its_left_rows_came_from() {
+    let text = concat!(
+        "CrossProduct\n",
+        "  Get memory.main.t AS t #0 [x::INTEGER]\n",
+        "  Get memory.main.words AS words #1 [s::VARCHAR]\n",
+    );
+    assert_eq!(pipelines(text), 2);
+    assert_eq!(run(text).len(), 12, "four rows against three");
+}
+
 /// A pipeline deeper than one operator, which is what a real query is. The answer is the two rows
 /// with the largest `x`, in descending order, which every one of the four operators has to agree
 /// about for the result to come out right.
@@ -464,14 +517,14 @@ fn a_whole_pipeline_runs_in_one_piece() {
 }
 
 #[test]
-fn a_cancelled_token_stops_the_tree_before_it_produces_a_chunk() {
+fn a_cancelled_token_stops_the_query_before_it_produces_a_chunk() {
     let catalog = catalog();
     let plan = Plan::parse(SCAN).expect("a well formed plan");
     let cancel = Cancel::new();
-    let mut operator = build_with(&plan, &catalog, &cancel, &Memory::unlimited(), &Settings::new())
-        .expect("the operators build");
+    let query = build_with(&plan, &catalog, &cancel, &Memory::unlimited(), &Settings::new())
+        .expect("the query builds");
     cancel.cancel();
-    let error = operator.next().expect_err("it was cancelled");
+    let error = query.run(&cancel).expect_err("it was cancelled");
     assert_eq!(error.code().duckdb_name(), "Interrupt Error");
 }
 
@@ -481,18 +534,13 @@ fn a_token_nothing_has_cancelled_leaves_the_answer_alone() {
     // thing worth asserting is that it changes no answer.
     let catalog = catalog();
     let plan = Plan::parse(SCAN).expect("a well formed plan");
-    let mut guarded =
-        build_with(&plan, &catalog, &Cancel::new(), &Memory::unlimited(), &Settings::new())
-            .expect("the operators build");
-    let mut plain = build(&plan, &catalog).expect("the operators build");
-    loop {
-        let (left, right) = (guarded.next().expect("runs"), plain.next().expect("runs"));
-        match (left, right) {
-            (Some(left), Some(right)) => assert_eq!(left.len(), right.len()),
-            (None, None) => break,
-            _ => panic!("one of them finished and the other did not"),
-        }
-    }
+    let cancel = Cancel::new();
+    let guarded = build_with(&plan, &catalog, &cancel, &Memory::unlimited(), &Settings::new())
+        .expect("the query builds");
+    let plain = build(&plan, &catalog).expect("the query builds");
+    let watched = guarded.collect(&cancel).expect("runs");
+    let unwatched = plain.collect(&Cancel::new()).expect("runs");
+    assert_eq!(rows_of(&watched), rows_of(&unwatched));
 }
 
 #[test]
@@ -522,12 +570,10 @@ fn a_group_is_charged_for_the_room_it_takes_and_not_only_for_what_it_holds() {
          Get memory.main.wide AS wide #0 [x::INTEGER]\n",
     )
     .expect("a well formed plan");
-    let mut operator = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
-        .expect("the operators build");
-    let mut seen = 0;
-    while let Some(chunk) = operator.next().expect("the aggregate runs") {
-        seen += chunk.len();
-    }
+    let query = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
+        .expect("the query builds");
+    let chunks = query.collect(&Cancel::new()).expect("the aggregate runs");
+    let seen: usize = chunks.iter().map(rudb_vector::Chunk::len).sum();
     assert_eq!(seen, GROUPS as usize, "one group per distinct value");
 
     // What a group holds: the one copy of its key the table owns, by the footprint of the values in
@@ -558,11 +604,11 @@ fn a_budget_too_small_for_the_rows_stops_the_operator_that_buffers_them() {
     let plan = Plan::parse(&format!("Sort [#0.0::INTEGER ASC NULLS LAST]\n  {SCAN}"))
         .expect("a well formed plan");
     let memory = Memory::with_limit(1);
-    let mut operator = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
-        .expect("the operators build, because nothing is held yet");
-    let error = operator.next().expect_err("one byte is not enough for a row");
+    let query = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
+        .expect("the query builds, because nothing is held yet");
+    let error = query.run(&Cancel::new()).expect_err("one byte is not enough for a row");
     assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
-    drop(operator);
+    drop(query);
     assert_eq!(memory.used(), 0, "the failed operator gave everything back");
 }
 
@@ -604,14 +650,10 @@ fn crowd(groups: i32) -> Catalog {
 fn under(catalog: &Catalog, text: &str, memory: &Memory) -> Vec<Vec<Value>> {
     let plan = Plan::parse(text).expect("a well formed plan");
     plan.validate().expect("the plan holds together");
-    let mut operator = build_with(&plan, catalog, &Cancel::new(), memory, &Settings::new())
-        .expect("the operators build");
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    while let Some(chunk) = operator.next().expect("the query runs") {
-        for row in 0..chunk.len() {
-            rows.push(chunk.row(row).collect());
-        }
-    }
+    let query = build_with(&plan, catalog, &Cancel::new(), memory, &Settings::new())
+        .expect("the query builds");
+    let chunks = query.collect(&Cancel::new()).expect("the query runs");
+    let mut rows = rows_of(&chunks);
     rows.sort_by_key(|row| format!("{row:?}"));
     rows
 }
@@ -677,11 +719,11 @@ fn a_budget_too_small_for_one_group_says_so_rather_than_running_forever() {
     )
     .expect("a well formed plan");
     let memory = Memory::with_limit(1);
-    let mut operator = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
-        .expect("the operators build, because nothing is held yet");
-    let error = operator.next().expect_err("one byte is not enough for a group");
+    let query = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
+        .expect("the query builds, because nothing is held yet");
+    let error = query.run(&Cancel::new()).expect_err("one byte is not enough for a group");
     assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
-    drop(operator);
+    drop(query);
     assert_eq!(memory.used(), 0, "the failed operator gave everything back");
 }
 
@@ -747,7 +789,7 @@ fn the_ids_the_builder_tags_its_counters_with_are_the_ones_the_plan_says() {
     let shape = rudb_plan::Shape::of(&plan);
     let report = rudb_metrics::Report::new();
     let catalog = catalog();
-    let mut root = crate::build_measured(
+    let query = crate::build_measured(
         &plan,
         &catalog,
         &Cancel::new(),
@@ -755,8 +797,8 @@ fn the_ids_the_builder_tags_its_counters_with_are_the_ones_the_plan_says() {
         &Settings::new(),
         &report,
     )
-    .expect("the tree builds");
-    while root.next().expect("the query runs").is_some() {}
+    .expect("the query builds");
+    query.collect(&Cancel::new()).expect("the query runs");
     let mut document = rudb_metrics::Document::new(text);
     report.fill(&mut document);
     let ids: Vec<u32> = document.operators.iter().map(|operator| operator.id).collect();

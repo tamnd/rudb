@@ -8,9 +8,9 @@
 //! All three are [`Stream`] implementations, which means they take `&self` and are handed the
 //! mutable part separately. A filter's mutable part is the scratch space its predicate evaluates
 //! into and a limit's is the two counters, and naming them is what lets one of these be
-//! instantiated on thirty two threads later without copying the predicate thirty two times. The
-//! tree in `build.rs` is still a pull tree, so [`Streamed`](crate::adapt::Streamed) drives them
-//! from above until the whole engine pushes.
+//! instantiated on thirty two threads later without copying the predicate thirty two times. What
+//! drives them is the serial driver in `rudb-pipeline`, which pushes one chunk through every stream
+//! of a pipeline in the order `build.rs` stacked them.
 
 use rudb_common::{Field, Result};
 use rudb_pipeline::{Compaction, Gauge, Progress, Stream, narrow};

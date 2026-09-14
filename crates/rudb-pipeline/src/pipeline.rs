@@ -17,25 +17,34 @@ use crate::traits::Source;
 /// The operators are behind `Arc` because a pipeline is instantiated once per thread and every
 /// instance shares the operator objects while having its own local state. At F0 there is one
 /// instance and the `Arc` costs nothing, and at F4 the count changes and nothing else does.
+///
+/// # The lifetime
+///
+/// An operator may borrow from the plan and the catalog the query was built against. A scan reads
+/// its rows out of the catalog's table rather than copying them, and an expression reads its
+/// constants and its types out of the plan's arena, so the pipeline lives as long as the plan does
+/// and no longer. That is what `'a` is, and it is why the trait objects carry it rather than being
+/// the `'static` they default to. A pipeline built from operators that own everything they touch
+/// is a `Pipeline<'static>` and nobody has to say so.
 #[derive(Debug, Clone)]
-pub struct Pipeline {
+pub struct Pipeline<'a> {
     id: PipelineId,
-    source: Arc<dyn Source>,
-    streams: Vec<Arc<dyn DynStream>>,
-    sink: Arc<dyn DynSink>,
+    source: Arc<dyn Source + 'a>,
+    streams: Vec<Arc<dyn DynStream + 'a>>,
+    sink: Arc<dyn DynSink + 'a>,
     depends_on: Vec<PipelineId>,
 }
 
-impl Pipeline {
+impl<'a> Pipeline<'a> {
     /// A pipeline with no streaming operators between the source and the sink.
     #[must_use]
-    pub fn new(id: PipelineId, source: Arc<dyn Source>, sink: Arc<dyn DynSink>) -> Self {
+    pub fn new(id: PipelineId, source: Arc<dyn Source + 'a>, sink: Arc<dyn DynSink + 'a>) -> Self {
         Self { id, source, streams: Vec::new(), sink, depends_on: Vec::new() }
     }
 
     /// Append a streaming operator. They run in the order they were added.
     #[must_use]
-    pub fn then(mut self, stream: Arc<dyn DynStream>) -> Self {
+    pub fn then(mut self, stream: Arc<dyn DynStream + 'a>) -> Self {
         self.streams.push(stream);
         self
     }
@@ -61,7 +70,7 @@ impl Pipeline {
 
     /// The streaming operators, in the order they run.
     #[must_use]
-    pub fn streams(&self) -> &[Arc<dyn DynStream>] {
+    pub fn streams(&self) -> &[Arc<dyn DynStream + 'a>] {
         &self.streams
     }
 
