@@ -18,7 +18,7 @@ Baseline for every number here: rudb `e0f32d2`, rudb-compat `995f0e8`, DuckDB `v
 - [ ] Plan print and plan parse round trip as a property test over generated plans
 - [ ] Grammar driven statement generation, walking the same 1088 rule table in the other direction, with weighted alternatives, a recursion bound and a real catalog
 - [x] TLP as an oracle that runs on rudb alone with no DuckDB binary present, in the WHERE form
-- [ ] The other two TLP forms, over an aggregate and over GROUP BY with HAVING
+- [x] The other two TLP forms, over an aggregate and over GROUP BY with HAVING
 - [x] NoREC as an oracle that runs on rudb alone with no DuckDB binary present
 - [ ] `cargo-llvm-cov` as generator feedback, not as a published number
 - [ ] Wall clock, CPU seconds and peak resident set for both engines per record, out of the child process the harness already forks
