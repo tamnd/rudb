@@ -339,3 +339,54 @@ fn reading_three_columns_of_the_clickbench_file_reads_three_columns_of_bytes() {
     while none.next_chunk().expect("counting rows decodes").is_some() {}
     assert_eq!(none.bytes_read(), 0, "counting rows read column data");
 }
+
+#[test]
+fn fetching_a_row_out_of_the_clickbench_file_reads_a_page_and_not_a_column() {
+    // The property late materialisation is built on. A query that has worked out which ten rows it
+    // wants should pay for ten rows, and the only way that is true is if a page holding none of
+    // them is stepped over on its header rather than decompressed.
+    //
+    // The bound below is a seventh of the file rather than a hundredth, and the reason is the
+    // dictionary. Every column chunk of a row group this fetch touches has its dictionary page read
+    // and decoded, because a code cannot be turned into a value without one, and on this file the
+    // dictionaries are most of what the row group is. Two rows at opposite ends of the file open two
+    // row groups out of nine and read both their dictionaries, which is where the bytes go. Reading
+    // a single dictionary entry rather than the whole page is possible for fixed width values and is
+    // not possible for the byte arrays this file is mostly made of, so the floor stays.
+    let Some(path) = hits() else {
+        eprintln!("skipped: set RUDB_CORPUS to a directory holding hits_0.parquet");
+        return;
+    };
+    // The scan first, both for the byte count to compare against and for the rows to check the
+    // fetch against. Reading the answer off the scan rather than writing values down here means the
+    // test says the two paths agree, which is the thing that has to be true.
+    let mut scan = reader(&path);
+    let mut first = Vec::new();
+    let mut last = Vec::new();
+    let mut rows = 0;
+    while let Some(part) = scan.next_chunk().expect("the whole file decodes") {
+        if rows == 0 {
+            first = (0..part.width()).map(|column| part.value_at(0, column)).collect();
+        }
+        let at = part.len() - 1;
+        last = (0..part.width()).map(|column| part.value_at(at, column)).collect();
+        rows += part.len();
+    }
+    let all = scan.bytes_read();
+
+    let mut some = reader(&path);
+    let wanted = [0, rows as u64 - 1];
+    let chunk = some.rows_at(&wanted).expect("fetches the first row and the last");
+    assert_eq!(chunk.len(), 2);
+    assert_eq!(chunk.width(), 105);
+    assert!(
+        some.bytes_read() * 5 < all,
+        "two rows read {} bytes of the {all} the file holds",
+        some.bytes_read()
+    );
+
+    let fetched: Vec<Value> = (0..chunk.width()).map(|column| chunk.value_at(0, column)).collect();
+    assert_eq!(fetched, first, "the first row of the file");
+    let fetched: Vec<Value> = (0..chunk.width()).map(|column| chunk.value_at(1, column)).collect();
+    assert_eq!(fetched, last, "the last row of the file");
+}
