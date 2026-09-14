@@ -81,6 +81,8 @@ use crate::chunk::Pages;
 use crate::metadata::{Metadata, SchemaColumn};
 use crate::page::Body;
 
+type PickedColumns = Vec<(usize, Vec<Value>)>;
+
 /// A Parquet file, read as chunks.
 #[derive(Debug)]
 pub struct Reader {
@@ -289,41 +291,57 @@ impl Reader {
                 continue;
             }
             let plan = self.locate(at)?;
-            let mut cursors: Vec<Cursor> =
-                plan.iter().map(|column| self.read_column(column)).collect();
+            let cursors: Vec<Cursor> = plan.iter().map(|column| self.read_column(column)).collect();
             let workers = std::thread::available_parallelism()
                 .map_or(1, std::num::NonZero::get)
                 .min(16)
                 .min(cursors.len());
-            let width = cursors.len().div_ceil(workers.max(1));
             let read = if workers > 1 && cursors.len() >= 8 {
+                let mut assigned: Vec<Vec<(usize, Cursor)>> =
+                    (0..workers).map(|_| Vec::new()).collect();
+                let mut loads = vec![0_usize; workers];
+                let mut ordered: Vec<(usize, Cursor)> = cursors.into_iter().enumerate().collect();
+                ordered.sort_unstable_by_key(|(_, cursor)| std::cmp::Reverse(cursor.len));
+                for column in ordered {
+                    let worker = loads
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|&(_, bytes)| bytes)
+                        .map_or(0, |(worker, _)| worker);
+                    loads[worker] = loads[worker].saturating_add(column.1.len);
+                    assigned[worker].push(column);
+                }
                 std::thread::scope(|scope| -> Result<u64> {
                     let mut jobs = Vec::with_capacity(workers);
-                    for (columns, values) in cursors.chunks_mut(width).zip(picked.chunks_mut(width))
-                    {
+                    for mut columns in assigned {
                         let file = self.file.as_ref();
                         let rows = local.as_slice();
-                        jobs.push(scope.spawn(move || -> Result<u64> {
+                        jobs.push(scope.spawn(move || -> Result<(u64, PickedColumns)> {
                             let mut read = 0_u64;
-                            for (cursor, values) in columns.iter_mut().zip(values) {
-                                values.extend(cursor.pick(file, rows)?);
+                            let mut output = Vec::with_capacity(columns.len());
+                            for (at, cursor) in &mut columns {
+                                let values = cursor.pick(file, rows)?;
                                 read = read.saturating_add(cursor.bytes_read);
+                                output.push((*at, values));
                             }
-                            Ok(read)
+                            Ok((read, output))
                         }));
                     }
                     let mut read = 0_u64;
                     for job in jobs {
-                        read =
-                            read.saturating_add(job.join().map_err(|_| {
-                                Error::internal("a Parquet fetch worker panicked")
-                            })??);
+                        let (bytes, output) = job
+                            .join()
+                            .map_err(|_| Error::internal("a Parquet fetch worker panicked"))??;
+                        read = read.saturating_add(bytes);
+                        for (at, values) in output {
+                            picked[at].extend(values);
+                        }
                     }
                     Ok(read)
                 })?
             } else {
                 let mut read = 0_u64;
-                for (cursor, values) in cursors.iter_mut().zip(&mut picked) {
+                for (mut cursor, values) in cursors.into_iter().zip(&mut picked) {
                     values.extend(cursor.pick(self.file.as_ref(), &local)?);
                     read = read.saturating_add(cursor.bytes_read);
                 }
