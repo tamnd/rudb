@@ -27,6 +27,9 @@ pub(crate) type RowMap<V> = HashMap<Key, V, BuildHasherDefault<Digest>>;
 /// A set of rows, which is what duplicate elimination and `DISTINCT` inside an aggregate both are.
 pub(crate) type RowSet = HashSet<Key, BuildHasherDefault<Digest>>;
 
+/// A set for the common one-column signed 64-bit key without a row allocation per entry.
+pub(crate) type BigIntSet = HashSet<i64, BuildHasherDefault<Digest>>;
+
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
         self.0.len() == other.0.len()
