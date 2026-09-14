@@ -289,11 +289,47 @@ impl Reader {
                 continue;
             }
             let plan = self.locate(at)?;
-            for (column, values) in plan.iter().zip(&mut picked) {
-                let mut cursor = self.read_column(column);
-                values.extend(cursor.pick(self.file.as_ref(), &local)?);
-                self.bytes = self.bytes.saturating_add(cursor.bytes_read);
-            }
+            let mut cursors: Vec<Cursor> =
+                plan.iter().map(|column| self.read_column(column)).collect();
+            let workers = std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .min(16)
+                .min(cursors.len());
+            let width = cursors.len().div_ceil(workers.max(1));
+            let read = if workers > 1 && cursors.len() >= 8 {
+                std::thread::scope(|scope| -> Result<u64> {
+                    let mut jobs = Vec::with_capacity(workers);
+                    for (columns, values) in cursors.chunks_mut(width).zip(picked.chunks_mut(width))
+                    {
+                        let file = self.file.as_ref();
+                        let rows = local.as_slice();
+                        jobs.push(scope.spawn(move || -> Result<u64> {
+                            let mut read = 0_u64;
+                            for (cursor, values) in columns.iter_mut().zip(values) {
+                                values.extend(cursor.pick(file, rows)?);
+                                read = read.saturating_add(cursor.bytes_read);
+                            }
+                            Ok(read)
+                        }));
+                    }
+                    let mut read = 0_u64;
+                    for job in jobs {
+                        read =
+                            read.saturating_add(job.join().map_err(|_| {
+                                Error::internal("a Parquet fetch worker panicked")
+                            })??);
+                    }
+                    Ok(read)
+                })?
+            } else {
+                let mut read = 0_u64;
+                for (cursor, values) in cursors.iter_mut().zip(&mut picked) {
+                    values.extend(cursor.pick(self.file.as_ref(), &local)?);
+                    read = read.saturating_add(cursor.bytes_read);
+                }
+                read
+            };
+            self.bytes = self.bytes.saturating_add(read);
         }
         if next < rows.len() {
             return Err(Error::internal(format!(
