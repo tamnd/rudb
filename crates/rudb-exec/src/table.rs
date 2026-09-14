@@ -328,7 +328,7 @@ impl Column {
     /// `BIGINT` key costs a range check and a push and a `VARCHAR` key costs a copy of its bytes.
     /// Everything else builds a value, which is what all of this used to do.
     fn push_from(&mut self, column: &Vector, row: usize) -> Result<u64> {
-        if !column.validity().is_valid(row) {
+        if !column.is_valid(row) {
             return self.push(Value::Null).map(|()| 0);
         }
         let taken = match &mut self.data {
@@ -384,7 +384,7 @@ impl Column {
 
     fn holds(&self, slot: usize, column: &Vector, row: usize) -> bool {
         if !self.valid[slot] {
-            return !column.validity().is_valid(row);
+            return !column.is_valid(row);
         }
         match &self.data {
             // Read where it lies rather than through a value, because this is the one line in the
@@ -789,6 +789,22 @@ mod tests {
         let nulls = flat(LogicalType::BigInt, &[Value::Null]);
         let zeroes = flat(LogicalType::BigInt, &[Value::BigInt(0)]);
         assert_ne!(hashed(&nulls), hashed(&zeroes));
+    }
+
+    #[test]
+    fn nulls_selected_from_a_dictionary_find_the_same_group() {
+        let values =
+            Vector::from_values(LogicalType::Varchar, &[Value::Varchar("one".into()), Value::Null])
+                .unwrap();
+        let dictionary = Vector::dictionary(vec![1, 0, 1], values).unwrap();
+        let keys = [dictionary];
+        let hashes = hashed(&keys[0]);
+        let mut table = Table::new(&[LogicalType::Varchar]);
+        let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
+            panic!("the table is empty");
+        };
+        let slot = table.insert(bucket, hashes[0], &keys, 0).unwrap();
+        assert!(matches!(table.probe(hashes[2], &keys, 2), Probe::Found(found) if found == slot));
     }
 
     /// The order of the columns is part of the key, or `GROUP BY a, b` would put `(1, 2)` and
