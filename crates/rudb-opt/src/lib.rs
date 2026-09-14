@@ -75,6 +75,69 @@ pub static PASSES: [&(dyn Pass + Sync); 7] = [
     &late::LateMaterialization,
 ];
 
+/// Every name `SET disabled_optimizers` accepts, which is every name DuckDB accepts.
+///
+/// `SELECT name FROM duckdb_optimizers()` on the pinned binary, sorted, all forty four of them.
+/// [`PASSES`] is the seven rudb has built and every name here is one rudb takes without complaint,
+/// because turning off a pass that does not exist is a thing that has already happened.
+///
+/// Accepting the other thirty seven is the whole point. Forty five files in the upstream corpus run
+/// a `SET disabled_optimizers`, and most of them name a pass rudb has not written, `join_order` and
+/// `build_side_probe_side` and `statistics_propagation` and the rest. Refusing those makes the
+/// `SET` fail, and a failed `SET` in a sqllogictest file ends the file, so every record after it
+/// goes unasked over a pass whose absence changes no answer.
+///
+/// The list is written down rather than discovered, because there is nothing to discover it from:
+/// DuckDB is a binary that may not be on the machine and this has to answer the same way when it is
+/// not. It is pinned to the same commit the rest of the compatibility work is pinned to, and a
+/// release that adds a pass adds a name here.
+pub static UPSTREAM: [&str; 44] = [
+    "aggregate_function_rewriter",
+    "aggregate_reuse",
+    "build_side_probe_side",
+    "column_lifetime",
+    "common_aggregate",
+    "common_subexpressions",
+    "common_subplan",
+    "compressed_materialization",
+    "cte_filter_pusher",
+    "cte_inlining",
+    "deliminator",
+    "distinct_aggregate_rewrite",
+    "duplicate_groups",
+    "empty_result_pullup",
+    "expression_rewriter",
+    "extension",
+    "filter_pullup",
+    "filter_pushdown",
+    "grouping_sets",
+    "in_clause",
+    "join_elimination",
+    "join_filter_pushdown",
+    "join_order",
+    "late_materialization",
+    "limit_pushdown",
+    "materialized_cte",
+    "outer_join_simplification",
+    "partial_aggregate_pushdown",
+    "partitioned_execution",
+    "projection_pullup",
+    "regex_range",
+    "remote_pushdown",
+    "reorder_filter",
+    "row_group_pruner",
+    "sampling_pushdown",
+    "scalar_fn_pushdown",
+    "statistics_propagation",
+    "top_n",
+    "top_n_window_elimination",
+    "type_pushdown",
+    "unnest_rewriter",
+    "unused_columns",
+    "window_rewriter",
+    "window_self_join",
+];
+
 /// Rewrites a bound plan into the plan that runs, with every pass on.
 ///
 /// # Errors

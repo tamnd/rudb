@@ -2394,7 +2394,11 @@ fn every_name_the_pass_list_publishes_is_a_name_the_statement_accepts() {
     }
     let all = names.join(",");
     db.execute(&format!("SET disabled_optimizers = '{all}'")).expect("every pass off at once");
-    assert_eq!(db.setting("disabled_optimizers").unwrap(), all);
+    // Read back in alphabetical order rather than in the order they run, because that is the order
+    // the binary reads them back in and the setting is a compatibility surface.
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(db.setting("disabled_optimizers").unwrap(), sorted.join(","));
     // And with all of them off the query still answers, out of the plan the binder produced.
     assert_eq!(db.value("SELECT 1 + 2").unwrap(), Value::Integer(3));
     let unoptimized = db.plan("SELECT 1 + 2").unwrap();
@@ -2407,6 +2411,57 @@ fn a_pass_that_nobody_has_is_refused_by_the_statement_that_named_it() {
     let error = db.execute("SET disabled_optimizers = 'no_such_pass'").unwrap_err();
     assert_eq!(error.code().duckdb_name(), "Parser Error");
     assert_eq!(db.setting("disabled_optimizers").unwrap(), "", "a refused set changed nothing");
+}
+
+#[test]
+fn a_pass_duckdb_has_and_rudb_has_not_built_is_taken_and_does_nothing() {
+    // Forty five files in the upstream corpus run a SET disabled_optimizers and most of them name
+    // a pass rudb has not written. Refusing those fails the SET, and a failed SET in a
+    // sqllogictest file ends the file, so every record after it goes unasked over a pass whose
+    // absence changes no answer.
+    let db = Database::new();
+    let folded = db.plan("SELECT 1 + 2").unwrap();
+    for name in ["join_order", "build_side_probe_side", "statistics_propagation"] {
+        db.execute(&format!("SET disabled_optimizers = '{name}'")).expect(name);
+        assert_eq!(db.setting("disabled_optimizers").unwrap(), name);
+        assert_eq!(db.plan("SELECT 1 + 2").unwrap(), folded, "{name} turned something off");
+    }
+}
+
+#[test]
+fn the_name_is_read_without_regard_to_case_because_two_corpus_files_shout_it() {
+    let db = Database::new();
+    db.execute("SET disabled_optimizers = 'LATE_MATERIALIZATION'").unwrap();
+    assert_eq!(db.setting("disabled_optimizers").unwrap(), "late_materialization");
+    db.execute("SET disabled_optimizers = 'Top_N'").unwrap();
+    assert_eq!(db.setting("disabled_optimizers").unwrap(), "top_n");
+}
+
+#[test]
+fn the_setting_reads_back_as_what_was_understood_rather_than_as_what_was_written() {
+    // The binary tidies the list on the way in, so ' TOP_N , join_order , top_n ,' reads back as
+    // join_order,top_n. A database that kept the text as written would answer current_setting
+    // differently for every spelling but the tidy one.
+    let db = Database::new();
+    db.execute("SET disabled_optimizers = ' TOP_N , join_order , top_n ,'").unwrap();
+    assert_eq!(db.setting("disabled_optimizers").unwrap(), "join_order,top_n");
+}
+
+#[test]
+fn every_name_the_binary_accepts_is_a_name_the_statement_accepts() {
+    // The list is written down rather than discovered, so the thing that can go wrong with it is a
+    // typo, and a typo in it is a corpus file that fails on a name the binary is happy with.
+    let db = Database::new();
+    for name in rudb_opt::UPSTREAM {
+        db.execute(&format!("SET disabled_optimizers = '{name}'")).expect(name);
+        assert_eq!(db.setting("disabled_optimizers").unwrap(), name);
+    }
+    assert_eq!(rudb_opt::UPSTREAM.len(), 44, "the pinned binary lists forty four");
+    // Every pass rudb built answers to a name the binary knows, which is what makes the corpus
+    // files mean the same thing on both engines.
+    for name in crate::optimizers() {
+        assert!(rudb_opt::UPSTREAM.contains(&name), "{name} is not a name duckdb has");
+    }
 }
 
 #[test]
