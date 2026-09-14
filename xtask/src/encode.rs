@@ -35,6 +35,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use rudb::Database;
@@ -146,7 +147,8 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     }
 
     let all = args.iter().any(|arg| arg == "--all");
-    let path = match args.iter().find(|arg| !arg.starts_with("--")) {
+    let threads = threads(args)?;
+    let path = match given(args) {
         Some(given) => PathBuf::from(given),
         None => root.join(FIXTURE),
     };
@@ -162,6 +164,11 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let names: Vec<String> = schema.names().to_vec();
     let types: Vec<LogicalType> = schema.types().to_vec();
 
+    // The scaling sweep needs every column at once, because the work it hands to threads is one
+    // chunk of one column and there have to be enough of those in hand to keep the threads busy.
+    // The per column table does not, so in that mode a column is measured and dropped, which is
+    // what keeps a hundred and five columns of a big file inside a laptop.
+    let mut held = Vec::new();
     let mut columns = Vec::new();
     let mut candidates: BTreeMap<(&'static str, &'static str), Candidate> = BTreeMap::new();
     let mut skipped = Vec::new();
@@ -174,8 +181,20 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             skipped.push(format!("{name} (no rows)"));
             continue;
         }
+        if let Some(threads) = threads {
+            let _ = threads;
+            held.push(values);
+            continue;
+        }
         columns.push(measure(name, &values)?);
         attribute(&values, &mut candidates)?;
+    }
+
+    if let Some(threads) = threads {
+        if held.is_empty() {
+            return Err(format!("nothing in {} could be encoded", path.display()));
+        }
+        return scaling(&path, &held, threads);
     }
     if columns.is_empty() {
         return Err(format!("nothing in {} could be encoded", path.display()));
@@ -184,6 +203,37 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     columns.sort_by(|a, b| b.nanos.total_cmp(&a.nanos));
     report(&path, &columns, &candidates, &skipped, all);
     Ok(())
+}
+
+/// The file somebody named, which is the one argument here that is not a flag.
+///
+/// The count after `--threads` is skipped rather than taken as a path, which is the whole reason
+/// this is a function and not a `find`.
+fn given(args: &[String]) -> Option<&String> {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--threads" {
+            rest.next();
+            continue;
+        }
+        if !arg.starts_with("--") {
+            return Some(arg);
+        }
+    }
+    None
+}
+
+/// The top of the thread sweep, when `--threads N` asked for one.
+fn threads(args: &[String]) -> Result<Option<usize>, String> {
+    let Some(at) = args.iter().position(|arg| arg == "--threads") else {
+        return Ok(None);
+    };
+    let count = args
+        .get(at + 1)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .ok_or_else(|| "--threads wants a count above zero".to_string())?;
+    Ok(Some(count))
 }
 
 /// The table expression every query in here reads from.
@@ -278,6 +328,124 @@ fn as_i64(value: &Value) -> i64 {
         Value::Date(days) => i64::from(*days),
         Value::Time(micros) | Value::Timestamp(micros) => *micros,
         _ => 0,
+    }
+}
+
+/// How the encode scales across cores, which is the assumption F2's load time rests on.
+///
+/// The arithmetic behind criterion 1 is that one core encodes `hits` in about 4,500 seconds and a
+/// budget of 252 seconds on a 32 thread machine is 8,064 core seconds, so the encoder fits with
+/// room for the rest of the loader. Every word of that depends on the encode scaling with cores,
+/// and an encoder that allocates as much as this one does is exactly the kind that does not. So the
+/// assumption gets measured rather than assumed.
+///
+/// The unit of work is one chunk of one column, which is the unit F2's own checklist names when it
+/// says the write path should be parallel by block and by column. Threads take units off a shared
+/// counter, largest first, so the tail is a small unit rather than a whole `URL` column.
+fn scaling(path: &Path, held: &[Values], threads: usize) -> Result<(), String> {
+    let mut work: Vec<(usize, usize)> = Vec::new();
+    for (column, values) in held.iter().enumerate() {
+        for chunk in 0..chunks(values.len()) {
+            work.push((column, chunk));
+        }
+    }
+    work.sort_by_key(|&(column, chunk)| std::cmp::Reverse(weight(&held[column], chunk)));
+    let raw: usize = held.iter().map(Values::raw).sum();
+
+    let mut counts = Vec::new();
+    let mut count = 1;
+    while count < threads {
+        counts.push(count);
+        count *= 2;
+    }
+    counts.push(threads);
+
+    println!();
+    println!("how the encode scales, over {}", path.display());
+    println!("  {}", build_line());
+    println!(
+        "  {ROW_GROUP} values a chunk, {} chunks over {} columns, {REPEATS} passes",
+        work.len(),
+        held.len()
+    );
+    println!();
+    println!(
+        "{:>8} {:>11} {:>11} {:>10} {:>12} {:>6}",
+        "threads", "wall s", "MiB/s", "speedup", "efficiency", "IQR"
+    );
+    let mut one = 0.0;
+    for &count in &counts {
+        let mut passes = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            passes.push(pass(held, &work, count)?);
+        }
+        passes.sort_by(f64::total_cmp);
+        let median = percentile(&passes, 50);
+        let iqr = percentile(&passes, 75) - percentile(&passes, 25);
+        if count == 1 {
+            one = median;
+        }
+        let speedup = if median == 0.0 { 0.0 } else { one / median };
+        println!(
+            "{:>8} {:>11.3} {:>11.1} {:>10.1} {:>11.0}% {:>5.0}%",
+            count,
+            median / 1e9,
+            rate(raw, median),
+            speedup,
+            speedup / count as f64 * 100.0,
+            if median == 0.0 { 0.0 } else { iqr / median * 100.0 }
+        );
+    }
+
+    println!();
+    println!("caveats");
+    println!("  rule two: every row is the median of {REPEATS} passes over the whole set.");
+    println!("  rule seven: this is one machine, so do not put it next to a number from another.");
+    println!("  rule ten: the end to end number this explains is F2's first exit criterion, which");
+    println!("    is hits loading in under 252 seconds. What this row says is how much of the");
+    println!("    single core time a loader gets to divide, and nothing about reading the Parquet");
+    println!("    or writing the blocks, neither of which happens here.");
+    println!("  the work is held in memory before the sweep starts and the read is not timed, so");
+    println!("    this is the encode on its own and not a load.");
+    println!("  efficiency below a hundred at high thread counts on a machine with fewer real");
+    println!("    cores than threads is the machine and not the encoder. Check the core count");
+    println!("    before reading anything into it.");
+    Ok(())
+}
+
+/// One pass over every chunk of every column at a given thread count, in nanoseconds.
+fn pass(held: &[Values], work: &[(usize, usize)], threads: usize) -> Result<f64, String> {
+    let next = AtomicUsize::new(0);
+    let start = Instant::now();
+    let failure: Result<(), String> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| -> Result<(), String> {
+                    loop {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(column, chunk)) = work.get(at) else {
+                            return Ok(());
+                        };
+                        let bytes = encode(&held[column], chunk)?;
+                        std::hint::black_box(&bytes);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().map_err(|_| "an encode thread panicked".to_string())??;
+        }
+        Ok(())
+    });
+    failure?;
+    Ok(start.elapsed().as_nanos() as f64)
+}
+
+/// How much of a column one chunk holds, which is what the work list is ordered by.
+fn weight(values: &Values, chunk: usize) -> usize {
+    match values {
+        Values::Text(all) => cut(all, chunk).iter().map(Vec::len).sum(),
+        Values::Numbers(all) => cut(all, chunk).len() * 8,
     }
 }
 
@@ -547,6 +715,35 @@ fn cap(text: &str, width: usize) -> String {
 mod tests {
     use super::{Values, as_i64, cap, chunks, cut, ratio};
     use rudb_common::Value;
+
+    fn args(given: &[&str]) -> Vec<String> {
+        given.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn the_count_after_threads_is_not_mistaken_for_the_file() {
+        // The one argument here that is not a flag is the path, and `--threads 32` puts a bare 32
+        // in the middle of the list, which a plain search for the first non flag would pick up and
+        // then fail to open.
+        assert_eq!(super::given(&args(&["--threads", "32"])), None);
+        assert_eq!(
+            super::given(&args(&["--threads", "32", "hits.parquet"])),
+            Some(&"hits.parquet".to_string())
+        );
+        assert_eq!(
+            super::given(&args(&["hits.parquet", "--threads", "32"])),
+            Some(&"hits.parquet".to_string())
+        );
+    }
+
+    #[test]
+    fn a_thread_count_that_is_not_a_count_is_refused_rather_than_ignored() {
+        assert_eq!(super::threads(&args(&["--all"])), Ok(None));
+        assert_eq!(super::threads(&args(&["--threads", "4"])), Ok(Some(4)));
+        assert!(super::threads(&args(&["--threads"])).is_err());
+        assert!(super::threads(&args(&["--threads", "0"])).is_err());
+        assert!(super::threads(&args(&["--threads", "lots"])).is_err());
+    }
 
     #[test]
     fn a_column_shorter_than_a_chunk_is_still_one_chunk() {

@@ -143,6 +143,8 @@ fn usage() {
     println!("           as megabytes a second per column and as the seconds each candidate the");
     println!("           chooser tried spent. defaults to the committed ten thousand row hits");
     println!("           fixture, and --all prints every column rather than the slowest twenty");
+    println!("           --threads <n> prints the scaling sweep instead, one chunk of one column");
+    println!("           at a time, which is the unit F2's parallel write path would hand out");
     println!("  bench <suite>          the whole comparison, against every engine on this machine");
     println!("                         builds rudb and the harness, then runs the suite. needs a");
     println!("                         tamnd/rudb-bench checkout beside this one, or");
