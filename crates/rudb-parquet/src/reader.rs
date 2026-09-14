@@ -66,7 +66,7 @@
 use std::sync::Arc;
 
 use rudb_common::stage::{Stage, Timing};
-use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_compress::Codec;
 use rudb_io::File;
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
@@ -183,6 +183,78 @@ impl Reader {
         self.bytes
     }
 
+    /// The projected columns of the rows at `rows`, which are ordinals into the whole file.
+    ///
+    /// Sorted and strictly increasing, because the reader walks the file forwards once and a caller
+    /// that wants them back in some other order can put them there.
+    ///
+    /// This is the fetch half of late materialisation, and what it is for is the query that reads
+    /// one column of a hundred and five to decide which ten rows matter and then wants the other
+    /// hundred and four columns of those ten rows. Scanning for them costs the whole file. Fetching
+    /// them costs a row group's footer entry plus one page per column per row, because a row group
+    /// that holds none of the wanted rows is never opened and a page that holds none of them has
+    /// its header read and its body skipped.
+    ///
+    /// The answer is one chunk however many rows were asked for, so a caller with more rows than a
+    /// chunk should hold is asking the wrong question. The rows that survive a `LIMIT` are the
+    /// caller this exists for.
+    ///
+    /// # Errors
+    ///
+    /// If the ordinals are not sorted and strictly increasing, if one of them is past the end of
+    /// the file, or if a read or a decode fails.
+    pub fn rows_at(&mut self, rows: &[u64]) -> Result<Chunk> {
+        for pair in rows.windows(2) {
+            if pair[0] >= pair[1] {
+                return Err(Error::internal(format!(
+                    "row ordinals {} and {} are not sorted and strictly increasing",
+                    pair[0], pair[1]
+                )));
+            }
+        }
+        let mut picked: Vec<Vec<Value>> =
+            self.projection.iter().map(|_| Vec::with_capacity(rows.len())).collect();
+        let mut base = 0_u64;
+        let mut next = 0;
+        for at in 0..self.metadata.row_groups.len() {
+            if next >= rows.len() {
+                break;
+            }
+            let count = u64::try_from(self.metadata.row_groups[at].rows).map_err(|_| {
+                Error::io(format!("a row group of {} rows", self.metadata.row_groups[at].rows))
+            })?;
+            let end = base.saturating_add(count);
+            let mut local = Vec::new();
+            while next < rows.len() && rows[next] < end {
+                local.push(usize::try_from(rows[next] - base).unwrap_or(usize::MAX));
+                next += 1;
+            }
+            base = end;
+            if local.is_empty() {
+                continue;
+            }
+            let plan = self.locate(at)?;
+            for (column, values) in plan.iter().zip(&mut picked) {
+                let mut cursor = self.read_column(column);
+                values.extend(cursor.pick(self.file.as_ref(), &local)?);
+                self.bytes = self.bytes.saturating_add(cursor.bytes_read);
+            }
+        }
+        if next < rows.len() {
+            return Err(Error::internal(format!(
+                "row ordinal {} is past the end of a file of {base} rows",
+                rows[next]
+            )));
+        }
+        let vectors: Result<Vec<_>> = self
+            .fields()
+            .into_iter()
+            .zip(&picked)
+            .map(|(field, values)| Vector::from_values(field.ty, values))
+            .collect();
+        Chunk::with_rows(vectors?, rows.len())
+    }
+
     /// The next chunk, or nothing when the file is done.
     ///
     /// # Errors
@@ -216,8 +288,21 @@ impl Reader {
         if rows == 0 {
             return Ok(());
         }
-        // Where every projected chunk is, worked out before any of them is read, so that the walk
-        // over the footer is done with by the time the reads start borrowing the reader mutably.
+        let plan = self.locate(at)?;
+        let mut columns = Vec::with_capacity(plan.len());
+        for chunk in plan {
+            columns.push(self.read_column(&chunk));
+        }
+        self.active = Some(Group { columns, rows, done: 0 });
+        Ok(())
+    }
+
+    /// Where every projected column chunk of one row group is.
+    ///
+    /// Worked out before any of them is read, so that the walk over the footer is done with by the
+    /// time the reads start borrowing the reader mutably.
+    fn locate(&self, at: usize) -> Result<Vec<Where>> {
+        let group = &self.metadata.row_groups[at];
         let mut plan = Vec::with_capacity(self.projection.len());
         for &wanted in &self.projection {
             let chunk =
@@ -240,12 +325,7 @@ impl Reader {
                 values: chunk.values,
             });
         }
-        let mut columns = Vec::with_capacity(plan.len());
-        for chunk in plan {
-            columns.push(self.read_column(&chunk));
-        }
-        self.active = Some(Group { columns, rows, done: 0 });
-        Ok(())
+        Ok(plan)
     }
 
     /// Reads one column chunk of one row group and decodes every page of it.
@@ -334,6 +414,12 @@ struct Cursor {
     page: Option<Vector>,
     queued: Vec<Vector>,
     offset: usize,
+    /// The ordinal, inside this column chunk, of the first value of the page at [`Self::at`].
+    ///
+    /// Only the picking walk keeps this up to date, because only the picking walk needs to know
+    /// where a page sits before deciding whether to read it. The streaming walk reads every page in
+    /// order and never asks.
+    row: usize,
     bytes_read: u64,
     /// The last page body this column decoded, to read the next page into.
     ///
@@ -362,6 +448,7 @@ impl Cursor {
             page: None,
             queued: Vec::new(),
             offset: 0,
+            row: 0,
             bytes_read: 0,
             spare: Vec::new(),
         }
@@ -387,6 +474,7 @@ impl Cursor {
             page: None,
             queued: pages,
             offset: 0,
+            row: 0,
             bytes_read: 0,
             spare: Vec::new(),
         }
@@ -476,8 +564,99 @@ impl Cursor {
         Ok(piece)
     }
 
+    /// The values at `wanted`, which are row ordinals inside this column chunk, sorted.
+    ///
+    /// The point of the method is the pages it does not read. A page header says how many values
+    /// the page holds, and a header is a couple of hundred bytes, so a cursor that has read one can
+    /// decide that nobody wants any of those rows and add the page's size to its offset. Ten rows
+    /// out of a million touch ten pages of each column and skip the rest, which is the difference
+    /// between fetching a row and scanning for it.
+    ///
+    /// The values come back as [`Value`], one per wanted row, which is the shape a fetch wants and
+    /// the wrong shape for anything large. That is deliberate. This is for the handful of rows a
+    /// `LIMIT` left standing, and a caller with a lot of rows to pick should be scanning.
+    fn pick(&mut self, file: &dyn File, wanted: &[usize]) -> Result<Vec<Value>> {
+        let mut out = Vec::with_capacity(wanted.len());
+        let mut next = 0;
+        while next < wanted.len() {
+            let (prefix, header, _, total) = self.peek(file)?;
+            if matches!(header.body, Body::Index) {
+                self.bytes_read = self.bytes_read.saturating_add(prefix.len() as u64);
+                self.at = self.at.saturating_add(total);
+                continue;
+            }
+            if matches!(header.body, Body::Dictionary(_)) {
+                if self.dictionary.is_some() {
+                    return Err(Error::io(format!(
+                        "a second dictionary page in the chunk for column {}",
+                        self.column.name
+                    )));
+                }
+                let encoded = self.body(file, prefix, total)?;
+                let mut pages = Pages::new(&encoded, self.codec, self.left);
+                let mut page = pages.next().transpose()?.ok_or_else(|| {
+                    Error::io(format!(
+                        "the dictionary page of column {} is empty",
+                        self.column.name
+                    ))
+                })?;
+                let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
+                let timing = Timing::start(Stage::Dictionary);
+                let built = page.decode_dictionary(&self.column);
+                timing.stop(bytes);
+                self.dictionary = Some(Arc::new(built?));
+                self.at = self.at.saturating_add(total);
+                continue;
+            }
+            let values = usize::try_from(header.values())
+                .map_err(|_| Error::io(format!("a page of {} values", header.values())))?;
+            let end = self.row.saturating_add(values);
+            if wanted[next] >= end {
+                self.bytes_read = self.bytes_read.saturating_add(prefix.len() as u64);
+                self.at = self.at.saturating_add(total);
+                self.row = end;
+                self.left -= i64::from(header.values());
+                continue;
+            }
+            let base = self.row;
+            let mut indices = Vec::new();
+            while next < wanted.len() && wanted[next] < end {
+                indices.push(u32::try_from(wanted[next] - base).unwrap_or(u32::MAX));
+                next += 1;
+            }
+            let encoded = self.body(file, prefix, total)?;
+            let mut pages = Pages::new(&encoded, self.codec, self.left);
+            let mut page = pages.next().transpose()?.ok_or_else(|| {
+                Error::io(format!("a data page of column {} is empty", self.column.name))
+            })?;
+            let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
+            let timing = Timing::start(Stage::Decode);
+            let decoded = page.decode(&self.column, self.dictionary.as_ref());
+            timing.stop(bytes);
+            out.extend(decoded?.gather(&indices)?.iter());
+            self.at = self.at.saturating_add(total);
+            self.row = end;
+            self.left -= i64::from(header.values());
+        }
+        Ok(out)
+    }
+
     /// Reads exactly one encoded page, discovering its variable-width header with bounded probes.
     fn read_page(&mut self, file: &dyn File) -> Result<Vec<u8>> {
+        let (prefix, _, _, total) = self.peek(file)?;
+        self.body(file, prefix, total)
+    }
+
+    /// The header of the page the cursor is sitting on, without reading its body.
+    ///
+    /// Reading the header alone is what makes skipping a page cheap. A header is a couple of
+    /// hundred bytes and says how many values the page holds, so a cursor that knows nobody wants
+    /// any of those rows can add the page's size to its offset and never touch the body at all.
+    ///
+    /// The probe is bounded because a Thrift header has no length in front of it. Two hundred and
+    /// fifty six bytes covers every header any writer emits, and the doubling is there for the one
+    /// that does not.
+    fn peek(&self, file: &dyn File) -> Result<(Vec<u8>, crate::page::Header, usize, usize)> {
         let remaining = self.len.saturating_sub(self.at);
         if remaining == 0 {
             return Err(Error::io(format!(
@@ -505,6 +684,11 @@ impl Cursor {
                 self.column.name
             )));
         }
+        Ok((prefix, header, header_len, total))
+    }
+
+    /// The whole page, given the prefix a [`Self::peek`] already read.
+    fn body(&mut self, file: &dyn File, prefix: Vec<u8>, total: usize) -> Result<Vec<u8>> {
         let mut encoded = Vec::with_capacity(total);
         encoded.extend_from_slice(&prefix[..prefix.len().min(total)]);
         if encoded.len() < total {

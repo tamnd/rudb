@@ -181,3 +181,64 @@ fn reading_the_whole_file_at_once_gives_the_same_rows() {
     assert_eq!(chunks[0].value_at(1, 2), Value::Varchar("tag1".into()));
     assert_eq!(chunks[0].value_at(7, 2), Value::Null);
 }
+
+#[test]
+fn fetching_a_few_rows_by_ordinal_gets_what_a_scan_of_the_whole_file_would() {
+    let mut reader = reader();
+    let wanted = [0_u64, 7, 2047, 2048, 4095];
+    let chunk = reader.rows_at(&wanted).expect("fetches");
+    assert_eq!(chunk.len(), wanted.len());
+    assert_eq!(chunk.width(), 7);
+    for (at, &row_number) in wanted.iter().enumerate() {
+        let got: Vec<Value> = (0..chunk.width()).map(|column| chunk.value_at(at, column)).collect();
+        assert_eq!(got, row(row_number as i64), "row {row_number}");
+    }
+}
+
+#[test]
+fn fetching_rows_never_opens_a_row_group_that_holds_none_of_them() {
+    // The fixture is two row groups of 2048 and one page per column chunk, so a page here always
+    // holds a wanted row and page skipping has nothing to do. What it can show is the level above:
+    // a fetch that stays inside the first row group never touches the second.
+    let mut both = reader();
+    let _ = both.rows_at(&[7, 2048]).expect("fetches");
+    assert_eq!(both.bytes_read(), 35262, "one row in each group is every page of the file");
+
+    let mut first = reader();
+    let _ = first.rows_at(&[0, 7, 2047]).expect("fetches");
+    assert!(
+        first.bytes_read() < 35262 / 2 + 512,
+        "three rows of the first row group read {} bytes",
+        first.bytes_read()
+    );
+}
+
+#[test]
+fn fetching_one_column_of_one_row_is_cheaper_still() {
+    let mut reader = reader();
+    reader.project(&[1]).expect("column 1 exists");
+    let chunk = reader.rows_at(&[4095]).expect("fetches");
+    assert_eq!(chunk.len(), 1);
+    assert_eq!(chunk.value_at(0, 0), Value::BigInt((4095 % 1000) * 1000));
+    // A whole scan of that one column is 10871 bytes. One row of it is a page and a header or two.
+    assert!(reader.bytes_read() < 10871, "{}", reader.bytes_read());
+}
+
+#[test]
+fn fetching_no_rows_at_all_reads_nothing() {
+    let mut reader = reader();
+    let chunk = reader.rows_at(&[]).expect("fetches nothing");
+    assert_eq!(chunk.len(), 0);
+    assert_eq!(reader.bytes_read(), 0);
+}
+
+#[test]
+fn ordinals_out_of_order_or_past_the_end_are_errors_rather_than_wrong_rows() {
+    let mut reader = reader();
+    let error = reader.rows_at(&[7, 3]).expect_err("not sorted");
+    assert!(error.to_string().contains("sorted"), "{error}");
+    let error = reader.rows_at(&[3, 3]).expect_err("not strictly increasing");
+    assert!(error.to_string().contains("sorted"), "{error}");
+    let error = reader.rows_at(&[4096]).expect_err("past the end");
+    assert!(error.to_string().contains("past the end"), "{error}");
+}
