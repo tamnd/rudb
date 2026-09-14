@@ -9,8 +9,10 @@
 //! The names are DuckDB's, because `SET disabled_optimizers = 'filter_pushdown'` appears in corpus
 //! files that were written against DuckDB and a corpus file that turns a pass off has to turn off
 //! the pass it meant. `SELECT name FROM duckdb_optimizers()` on the pinned binary lists forty four
-//! of them and rudb has two, so most of that list is a name rudb does not answer to yet rather
-//! than a name it disagrees about.
+//! of them and rudb has built seven, so most of that list is a name rudb does not answer to yet
+//! rather than a name it disagrees about. [`crate::UPSTREAM`] holds all forty four and the setting
+//! takes every one of them, because turning off a pass that is not there is a request that has
+//! already been granted and refusing it would fail the statement and end the file.
 
 use std::collections::VecDeque;
 
@@ -88,22 +90,66 @@ impl Context {
 
     /// Turns off one pass by name.
     ///
+    /// The name is matched without regard to case, because DuckDB matches it that way and two
+    /// corpus files say `LATE_MATERIALIZATION` in capitals.
+    ///
+    /// A name in [`crate::UPSTREAM`] that rudb has not built is accepted and does nothing. That is
+    /// not leniency for its own sake. Turning off a pass that is not there is a request that has
+    /// already been granted, and the alternative is a `SET` that fails and takes the rest of the
+    /// file with it.
+    ///
     /// # Errors
     ///
-    /// For a name that is not a pass.
+    /// For a name that is not an optimizer anywhere.
     pub fn disable(&mut self, name: &str) -> Result<()> {
-        let Some(found) = crate::PASSES.iter().find(|pass| pass.name() == name) else {
+        let name = name.to_ascii_lowercase();
+        if !crate::UPSTREAM.contains(&name.as_str()) {
+            // Every accepted name rather than the closest one by edit distance, which is what the
+            // binary prints. Listing a set that is not the set the caller may choose from would be
+            // worse than listing a long one, and the accepted set is now the same forty four either
+            // engine takes.
             let known: Vec<String> =
-                crate::PASSES.iter().map(|pass| format!("\"{}\"", pass.name())).collect();
+                crate::UPSTREAM.iter().map(|known| format!("\"{known}\"")).collect();
             return Err(Error::parser(format!(
                 "Optimizer type \"{name}\" not recognized\n\nCandidate optimizers: {}",
                 known.join(", ")
             )));
+        }
+        let Some(found) = crate::PASSES.iter().find(|pass| pass.name() == name) else {
+            return Ok(());
         };
-        if !self.is_disabled(name) {
+        if !self.is_disabled(&name) {
             self.disabled.push(found.name());
         }
         Ok(())
+    }
+
+    /// The setting text a list of names reads back as, which is not the text that was written.
+    ///
+    /// DuckDB stores what it understood rather than what it was given, so `' TOP_N , join_order '`
+    /// reads back as `join_order,top_n`: trimmed, lowercased, deduplicated, sorted and joined by
+    /// commas, with the empty entries a trailing comma leaves gone. A caller that stored the text
+    /// as written would answer `SELECT current_setting('disabled_optimizers')` differently from the
+    /// binary for every spelling but the tidy one.
+    ///
+    /// # Errors
+    ///
+    /// For a name that is not an optimizer anywhere, the same complaint [`Self::disable`] makes,
+    /// because this is the validating read and the two have to agree about what is a name.
+    pub fn tidy(names: &str) -> Result<String> {
+        let mut kept: Vec<String> = Vec::new();
+        for name in names.split(',') {
+            let name = name.trim().to_ascii_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            Self::new().disable(&name)?;
+            if !kept.contains(&name) {
+                kept.push(name);
+            }
+        }
+        kept.sort();
+        Ok(kept.join(","))
     }
 
     /// Whether the pass by that name has been turned off.
@@ -172,6 +218,40 @@ mod tests {
     fn naming_the_same_pass_twice_is_naming_it_once() {
         let context = Context::without("unused_columns,unused_columns").expect("the same name");
         assert!(context.is_disabled("unused_columns"));
+    }
+
+    #[test]
+    fn a_name_duckdb_has_and_rudb_has_not_built_turns_nothing_off_and_is_not_an_error() {
+        let context = Context::without("join_order,unused_columns").expect("both are names");
+        assert!(context.is_disabled("unused_columns"));
+        assert!(!context.is_disabled("join_order"), "there is no such pass to have turned off");
+    }
+
+    #[test]
+    fn the_name_is_matched_without_regard_to_case() {
+        let context = Context::without("UNUSED_COLUMNS").expect("a name in capitals");
+        assert!(context.is_disabled("unused_columns"));
+    }
+
+    #[test]
+    fn the_tidy_text_is_trimmed_lowered_deduplicated_and_sorted() {
+        assert_eq!(
+            Context::tidy(" TOP_N , join_order , top_n ,").expect("three names and a comma"),
+            "join_order,top_n"
+        );
+        assert_eq!(Context::tidy("").expect("nothing is nothing"), "");
+        assert_eq!(Context::tidy(" , ").expect("still nothing"), "");
+    }
+
+    #[test]
+    fn the_tidy_text_complains_about_the_same_names_the_toggle_does() {
+        let error = Context::tidy("top_n,bogus").expect_err("not a pass");
+        assert_eq!(error.code().duckdb_name(), "Parser Error");
+        assert!(
+            error.message().starts_with("Optimizer type \"bogus\" not recognized"),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]
