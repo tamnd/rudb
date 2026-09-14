@@ -90,14 +90,29 @@ impl Document {
     /// A reference implementation is the simplest correct version of something, kept so that the
     /// fast one has something to be tested against. One line naming how many rather than one line
     /// each, because for most of the first year the answer is all of them.
+    ///
+    /// The second half of the line is the part that makes the first half readable. An operator is
+    /// marked as a reference when everything it chose was one, and an operator that chose nothing
+    /// is marked too, so "all of them" can mean either that the seams picked badly or that the
+    /// seams had nothing to pick from. Those want different work and the count of operators that
+    /// actually chose something is what tells them apart.
     fn references(&self, warnings: &mut Vec<String>) {
         let reference = self.operators.iter().filter(|operator| operator.reference_impl).count();
-        if reference > 0 {
-            warnings.push(format!(
-                "{reference} of the {} operators ran a reference implementation, which is the slow path kept for differential testing",
-                self.operators.len()
-            ));
+        if reference == 0 {
+            return;
         }
+        let chose = self.operators.iter().filter(|operator| !operator.implementations.is_empty());
+        let chose = chose.count();
+        let how = if chose == 0 {
+            "and none of them had a seam with a second implementation registered to choose from"
+                .to_string()
+        } else {
+            format!("and {chose} of them chose from a seam that had an alternative")
+        };
+        warnings.push(format!(
+            "{reference} of the {} operators ran a reference implementation, which is the slow path kept for differential testing, {how}",
+            self.operators.len()
+        ));
     }
 
     /// A row at a time path is what this engine exists to not take, so the count of them is a work
@@ -251,7 +266,7 @@ fn ratio(high: u128, low: u128) -> String {
 mod tests {
     use rudb_common::{Cause, Tally};
 
-    use crate::document::{Document, Operator, Outcome, Pipeline};
+    use crate::document::{Document, Implementation, Operator, Outcome, Pipeline};
 
     fn document() -> Document {
         Document::new("select 1")
@@ -316,13 +331,38 @@ mod tests {
         for id in 0..3 {
             let mut operator = Operator::new(id, 0, "Sort");
             operator.reference_impl = id < 2;
+            operator.implementations.push(Implementation {
+                seam: "sort".to_string(),
+                name: if id < 2 { "merge" } else { "radix" }.to_string(),
+                is_reference: id < 2,
+            });
             metrics.operators.push(operator);
         }
         assert_eq!(
             metrics.warnings(),
             vec![
-                "2 of the 3 operators ran a reference implementation, which is the slow path kept for differential testing"
+                "2 of the 3 operators ran a reference implementation, which is the slow path kept for differential testing, and 3 of them chose from a seam that had an alternative"
             ]
+        );
+    }
+
+    #[test]
+    fn a_suite_where_nothing_had_an_alternative_says_that_rather_than_blaming_the_seams() {
+        // The state this project was actually in when the warning was first read as a work list.
+        // Every operator is a reference because one implementation of each is all there is, and a
+        // line that stopped there would have sent somebody looking for a chooser bug.
+        let mut metrics = document();
+        for id in 0..3 {
+            let mut operator = Operator::new(id, 0, "Sort");
+            operator.reference_impl = true;
+            metrics.operators.push(operator);
+        }
+        assert!(
+            metrics.warnings()[0].ends_with(
+                "and none of them had a seam with a second implementation registered to choose from"
+            ),
+            "{:?}",
+            metrics.warnings()
         );
     }
 

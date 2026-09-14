@@ -84,7 +84,9 @@ mod tests;
 
 pub use context::Context;
 pub use policy::{ChoiceReason, Policy, PolicyMode};
-pub use registry::{Choice, Registries, Registry, RegistryBuilder, RegistryView, StrategyRow};
+pub use registry::{
+    Choice, Chosen, Registries, Registry, RegistryBuilder, RegistryView, StrategyRow,
+};
 pub use seam::SeamId;
 pub use settings::{SEAM_PREFIX, Settings, seam_named};
 pub use strategy::{Determinism, Provenance, Strategy};

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rudb_common::{Cause, Spent, Stage, Tally};
 
-use crate::document::{Memory, Operator};
+use crate::document::{Implementation, Memory, Operator};
 
 /// The counters for one operator.
 #[derive(Debug)]
@@ -24,7 +24,7 @@ pub struct Counters {
     kind: String,
     detail: Option<String>,
     estimated_rows: Option<u64>,
-    reference_impl: bool,
+    implementations: Vec<Implementation>,
     rows_in: AtomicU64,
     rows_out: AtomicU64,
     wall_ns: AtomicU64,
@@ -57,7 +57,7 @@ impl Counters {
             kind: kind.to_string(),
             detail: None,
             estimated_rows: None,
-            reference_impl: false,
+            implementations: Vec::new(),
             rows_in: AtomicU64::new(0),
             rows_out: AtomicU64::new(0),
             wall_ns: AtomicU64::new(0),
@@ -87,10 +87,24 @@ impl Counters {
         self
     }
 
-    /// That what runs here is the reference implementation rather than a fast one.
+    /// What the operator picked at one of the seams it sits on.
+    ///
+    /// Called once per seam with a registry, by whoever built the operator, because that is the
+    /// only place that can see both the plan node and the settings the statement runs under. A
+    /// seam with nothing registered is not reported, since there was nothing to choose between and
+    /// a row saying so would be a row about the project rather than about the query.
+    ///
+    /// This replaced a flag that was set to true on every operator unconditionally, which meant
+    /// every ClickBench run this project has published said 41 of 41 operators ran a reference
+    /// implementation whatever the seams had actually done. A field that cannot disagree with
+    /// itself is a field nobody should read, and it was read.
     #[must_use]
-    pub fn reference(mut self) -> Self {
-        self.reference_impl = true;
+    pub fn chose(mut self, seam: &str, name: &str, is_reference: bool) -> Self {
+        self.implementations.push(Implementation {
+            seam: seam.to_string(),
+            name: name.to_string(),
+            is_reference,
+        });
         self
     }
 
@@ -172,7 +186,8 @@ impl Counters {
         let mut operator = Operator::new(self.id, self.pipeline, &self.kind);
         operator.detail.clone_from(&self.detail);
         operator.estimated_rows = self.estimated_rows;
-        operator.reference_impl = self.reference_impl;
+        operator.implementations.clone_from(&self.implementations);
+        operator.reference_impl = self.implementations.iter().all(|chosen| chosen.is_reference);
         operator.rows_in = self.rows_in.load(Ordering::Relaxed);
         operator.rows_out = self.rows_out.load(Ordering::Relaxed);
         operator.wall_ns = self.wall_ns.load(Ordering::Relaxed);
@@ -252,7 +267,11 @@ mod tests {
 
     #[test]
     fn a_snapshot_carries_what_was_counted_and_what_was_known() {
-        let counters = Counters::new(3, 0, "Scan").detailed("hits").estimated(1000).reference();
+        let counters = Counters::new(3, 0, "Scan").detailed("hits").estimated(1000).chose(
+            "vector.form",
+            "flat",
+            true,
+        );
         counters.took(0);
         counters.made(2048);
         counters.spent(620_000, 600_000);
@@ -271,6 +290,30 @@ mod tests {
         assert_eq!(operator.bytes_read, 4096);
         assert_eq!(operator.bytes_decoded, 8192);
         assert_eq!(operator.bytes_spilled, 16);
+    }
+
+    #[test]
+    fn an_operator_that_chose_something_faster_is_not_marked_as_a_reference() {
+        // The case the old flag could not express, and the reason it was worth replacing. One seam
+        // picked the fast implementation, so this operator's number is a number worth quoting even
+        // though the seam beside it did not.
+        let counters = Counters::new(1, 0, "Filter")
+            .chose("chunk.compaction", "gain", false)
+            .chose("expr.eval", "tree", true);
+        let operator = counters.snapshot();
+        assert!(!operator.reference_impl);
+        assert_eq!(operator.implementations.len(), 2);
+        assert_eq!(operator.implementations[0].seam, "chunk.compaction");
+        assert_eq!(operator.implementations[0].name, "gain");
+    }
+
+    #[test]
+    fn an_operator_that_had_nothing_to_choose_from_is_still_a_reference() {
+        // A limit sits on no seam and there is one way to count to ten, so the marker stays on and
+        // the list stays empty. Empty means there was nothing to choose, not that nothing ran.
+        let operator = Counters::new(1, 0, "Limit").snapshot();
+        assert!(operator.reference_impl);
+        assert!(operator.implementations.is_empty());
     }
 
     #[test]

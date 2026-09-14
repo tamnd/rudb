@@ -154,6 +154,13 @@
         "reserved": 0,
         "high_water": 894000000
       },
+      "implementations": [
+        {
+          "seam": "hash.table",
+          "name": "unchained",
+          "is_reference": false
+        }
+      ],
       "reference_impl": false
     },
     {
@@ -177,12 +184,19 @@
         "reserved": 0,
         "high_water": 0
       },
+      "implementations": [
+        {
+          "seam": "sort",
+          "name": "merge",
+          "is_reference": true
+        }
+      ],
       "reference_impl": true
     }
   ],
   "warnings": [
     "operator 7 (Sort) spilled 11.4 MiB",
-    "1 of the 3 operators ran a reference implementation, which is the slow path kept for differential testing",
+    "1 of the 3 operators ran a reference implementation, which is the slow path kept for differential testing, and 2 of them chose from a seam that had an alternative",
     "97,666 calls took the row at a time path, 48,827 of them flatten in operator 5 (HashAggregate)",
     "operator 5 (HashAggregate) was estimated at 2,400,000 rows and produced 41,983,110 (q-error 17.5)"
   ]

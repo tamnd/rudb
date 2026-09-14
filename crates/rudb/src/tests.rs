@@ -2623,6 +2623,25 @@ fn a_query_reports_what_every_operator_in_it_did() {
         metrics.operators.iter().all(|operator| operator.reference_impl),
         "everything at tier 0 is the reference implementation and the document says so"
     );
+    let filter = operator(metrics, "Filter");
+    assert_eq!(filter.implementations.len(), 1, "a filter sits on one registered seam");
+    assert_eq!(filter.implementations[0].seam, "chunk.compaction");
+    assert_eq!(filter.implementations[0].name, "never");
+}
+
+#[test]
+fn an_operator_that_was_pinned_off_the_reference_stops_being_marked_as_one() {
+    // What the flag was supposed to do all along and could not, because it was set to true on
+    // every operator whatever had run. The seam is pinned to something that is not the reference,
+    // so the filter's row has to say so and every other row has to be unaffected.
+    let db = database();
+    db.execute("SET seam_chunk_compaction = 'learned-gain'").unwrap();
+    let result = db.query("SELECT x FROM t WHERE x > 1").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let filter = operator(metrics, "Filter");
+    assert!(!filter.reference_impl, "{:?}", filter.implementations);
+    assert_eq!(filter.implementations[0].name, "learned-gain");
+    assert!(operator(metrics, "Scan").reference_impl, "a scan sits on no registered seam");
 }
 
 #[test]
