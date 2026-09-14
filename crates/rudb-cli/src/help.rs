@@ -21,6 +21,7 @@ Options:
   -c, -s SQL             run SQL and exit
   -cmd SQL               run SQL before reading input, and keep reading
   -echo                  print each statement before running it
+  --fallbacks            on exit, print which kernels took the row at a time path
   -f, -file FILENAME     run a file of SQL and exit
   -header, -noheader     turn column names on or off
   -init FILENAME         run a file of SQL before reading input

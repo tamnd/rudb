@@ -85,6 +85,9 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
                 stop = read_input(&mut shell, &options);
             }
             let _ = stop;
+            if options.fallbacks {
+                shell.print_fallbacks();
+            }
             if shell.failed() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
     }
