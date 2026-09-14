@@ -165,6 +165,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
 
     let all = args.iter().any(|arg| arg == "--all");
     let ablate = args.iter().any(|arg| arg == "--ablate");
+    let sampled = args.iter().any(|arg| arg == "--sampled");
     let threads = threads(args)?;
     let path = match given(args) {
         Some(given) => PathBuf::from(given),
@@ -217,7 +218,8 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         if held.is_empty() {
             return Err(format!("nothing in {} could be encoded", path.display()));
         }
-        return scaling(&path, &held, threads);
+        let chooser: &dyn Chooser = if sampled { &Sampled::new() } else { &EXHAUSTIVE };
+        return scaling(&path, &held, threads, chooser);
     }
     if ablate {
         if pairs.is_empty() {
@@ -373,7 +375,12 @@ fn as_i64(value: &Value) -> i64 {
 /// The unit of work is one chunk of one column, which is the unit F2's own checklist names when it
 /// says the write path should be parallel by block and by column. Threads take units off a shared
 /// counter, largest first, so the tail is a small unit rather than a whole `URL` column.
-fn scaling(path: &Path, held: &[Values], threads: usize) -> Result<(), String> {
+fn scaling(
+    path: &Path,
+    held: &[Values],
+    threads: usize,
+    chooser: &dyn Chooser,
+) -> Result<(), String> {
     let mut work: Vec<(usize, usize)> = Vec::new();
     for (column, values) in held.iter().enumerate() {
         for chunk in 0..chunks(values.len()) {
@@ -399,6 +406,7 @@ fn scaling(path: &Path, held: &[Values], threads: usize) -> Result<(), String> {
         work.len(),
         held.len()
     );
+    println!("  the {} chooser", chooser.name());
     println!();
     println!(
         "{:>8} {:>11} {:>11} {:>10} {:>12} {:>6}",
@@ -408,7 +416,7 @@ fn scaling(path: &Path, held: &[Values], threads: usize) -> Result<(), String> {
     for &count in &counts {
         let mut passes = Vec::with_capacity(REPEATS);
         for _ in 0..REPEATS {
-            passes.push(pass(held, &work, count)?);
+            passes.push(pass(held, &work, count, chooser)?);
         }
         passes.sort_by(f64::total_cmp);
         let median = percentile(&passes, 50);
@@ -445,7 +453,12 @@ fn scaling(path: &Path, held: &[Values], threads: usize) -> Result<(), String> {
 }
 
 /// One pass over every chunk of every column at a given thread count, in nanoseconds.
-fn pass(held: &[Values], work: &[(usize, usize)], threads: usize) -> Result<f64, String> {
+fn pass(
+    held: &[Values],
+    work: &[(usize, usize)],
+    threads: usize,
+    chooser: &dyn Chooser,
+) -> Result<f64, String> {
     let next = AtomicUsize::new(0);
     let start = Instant::now();
     let failure: Result<(), String> = std::thread::scope(|scope| {
@@ -457,7 +470,7 @@ fn pass(held: &[Values], work: &[(usize, usize)], threads: usize) -> Result<f64,
                         let Some(&(column, chunk)) = work.get(at) else {
                             return Ok(());
                         };
-                        let bytes = encode(&held[column], chunk)?;
+                        let bytes = encode_using(&held[column], chunk, chooser)?;
                         std::hint::black_box(&bytes);
                     }
                 })
