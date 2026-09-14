@@ -162,7 +162,12 @@ pub(crate) struct Aggregate<'a> {
 struct Built {
     chunks: Vec<Chunk>,
     /// What those chunks are charged, held for as long as they are readable.
-    held: Reservation,
+    ///
+    /// One per partition rather than one in total, because the partitions are finished on separate
+    /// threads and a reservation belongs to the thread growing it. Moving sixteen charges into one
+    /// at the end would mean holding both the old and the new charge for as long as the move took,
+    /// and the thing being charged for here is the whole answer.
+    held: Vec<Reservation>,
     /// How many instances have combined, which is one per thread the pipeline ran on.
     instances: usize,
     /// Whether the groups now live in the partitions rather than in one table per instance.
@@ -302,7 +307,7 @@ impl<'a> Aggregate<'a> {
             memory: memory.clone(),
             built: Mutex::new(Built {
                 chunks: Vec::new(),
-                held: memory.reservation(),
+                held: Vec::new(),
                 instances: 0,
                 partitioning: false,
             }),
@@ -1645,7 +1650,14 @@ impl Sink for Aggregate<'_> {
         Ok(())
     }
 
-    /// Every instance has combined, so the one table left becomes the answer.
+    /// Every instance has combined, so the partitions become the answer.
+    ///
+    /// On as many threads as the pipeline ran instances on, up to one per partition, because each
+    /// partition holds every row of every group that hashes to it and nothing it produces depends on
+    /// what any other partition holds. This used to be one thread walking sixteen partitions and
+    /// building the whole answer, and on ClickBench at ten million rows that one thread was half the
+    /// query: q34 spent 0.47 seconds of a 0.93 second run in here and it did not get any shorter
+    /// when the threads went from eight to thirty two.
     ///
     /// The later passes of a spilled aggregate happen here. They used to happen in `combine`, which
     /// was the same moment when one instance was all there could be, and they cannot stay there now
@@ -1658,35 +1670,109 @@ impl Sink for Aggregate<'_> {
     /// arrives.
     fn finalize(&self) -> Result<()> {
         let mut built = self.built.lock().map_err(poisoned)?;
-        for partition in &self.merged {
-            let mut partition = partition.lock().map_err(poisoned)?;
-            let Partition { table, carried } = &mut *partition;
-            let Some(kept) = table.take() else {
-                debug_assert!(
-                    carried.is_none(),
-                    "nothing is set aside from a partition with no table"
-                );
-                continue;
-            };
-            let Built { chunks, held, .. } = &mut *built;
-            let mut left = self.finish(kept, chunks, held)?;
-            // The groups set aside join the first pass that reads the file back, because that pass
-            // is where their rows are. A table that opened a file and then never had a row to write
-            // to it hands back no file, and then the set aside groups are whole on their own and
-            // finish as a table of their own. Either way each of them is finished once, because a
-            // group is only ever set aside by a partition that did not hold its key.
-            if left.is_none() {
-                if let Some(whole) = carried.take() {
-                    left = self.finish(whole, chunks, held)?;
-                }
-            }
-            while let Some(mut file) = left {
-                left = self.again(&mut file, carried.take(), chunks, held)?;
-            }
+        let degree = built.instances.clamp(1, self.merged.len());
+        let closed = if degree > 1 { self.close_together(degree)? } else { self.close_in_turn()? };
+        for part in closed {
+            let Part { mut chunks, held } = part?;
+            built.chunks.append(&mut chunks);
+            built.held.push(held);
         }
         let chunks = std::mem::take(&mut built.chunks);
         drop(built);
         self.out.fill(chunks)
+    }
+}
+
+/// One partition's share of the answer, and what holding it is charged.
+#[derive(Debug)]
+struct Part {
+    chunks: Vec<Chunk>,
+    held: Reservation,
+}
+
+impl Aggregate<'_> {
+    /// Every partition finished on this thread, which is what one instance means.
+    fn close_in_turn(&self) -> Result<Vec<Result<Part>>> {
+        Ok((0..self.merged.len()).map(|at| self.close(at)).collect())
+    }
+
+    /// Every partition finished across `degree` threads, each thread taking whichever is next.
+    ///
+    /// The threads are scoped and started here rather than taken from the driver's, because by the
+    /// time a sink finalises the driver has already joined every instance and there is nothing else
+    /// running. It is the same mechanism the parallel driver uses for the instances themselves.
+    ///
+    /// The results go into a slot apiece and are read back in partition order, so which thread got
+    /// which partition and which finished first change nothing about the answer. That is what makes
+    /// this safe to do at all: the rows come out in the order the one thread put them in. A thread
+    /// that panics leaves its slot empty, and an empty slot is reported rather than silently
+    /// dropping a partition.
+    fn close_together(&self, degree: usize) -> Result<Vec<Result<Part>>> {
+        let next = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<Result<Part>>>> =
+            (0..self.merged.len()).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(degree - 1);
+            for _ in 1..degree {
+                handles.push(scope.spawn(|| self.closing(&next, &slots)));
+            }
+            // The thread that asked finishes partitions too rather than waiting on the ones it
+            // started, for the reason the parallel driver gives for doing the same.
+            self.closing(&next, &slots);
+            for handle in handles {
+                drop(handle.join());
+            }
+        });
+        let mut closed = Vec::with_capacity(slots.len());
+        for (at, slot) in slots.into_iter().enumerate() {
+            closed.push(slot.into_inner().map_err(poisoned)?.unwrap_or_else(|| {
+                Err(Error::internal(format!("nothing finished partition {at} of an aggregate")))
+            }));
+        }
+        Ok(closed)
+    }
+
+    /// One thread taking partitions until there are none left.
+    fn closing(&self, next: &AtomicUsize, slots: &[Mutex<Option<Result<Part>>>]) {
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            let Some(slot) = slots.get(at) else { return };
+            let done = self.close(at);
+            if let Ok(mut slot) = slot.lock() {
+                *slot = Some(done);
+            }
+        }
+    }
+
+    /// One partition turned into the rows it answers for.
+    ///
+    /// The later passes of a spilled partition happen here. A partition's file only ever holds keys
+    /// belonging to that partition, so no other partition has anything to say about them and this is
+    /// the whole of finishing them.
+    fn close(&self, at: usize) -> Result<Part> {
+        let mut part = Part { chunks: Vec::new(), held: self.memory.reservation() };
+        let mut partition = self.merged[at].lock().map_err(poisoned)?;
+        let Partition { table, carried } = &mut *partition;
+        let Some(kept) = table.take() else {
+            debug_assert!(carried.is_none(), "nothing is set aside from a partition with no table");
+            return Ok(part);
+        };
+        let Part { chunks, held } = &mut part;
+        let mut left = self.finish(kept, chunks, held)?;
+        // The groups set aside join the first pass that reads the file back, because that pass is
+        // where their rows are. A table that opened a file and then never had a row to write to it
+        // hands back no file, and then the set aside groups are whole on their own and finish as a
+        // table of their own. Either way each of them is finished once, because a group is only ever
+        // set aside by a partition that did not hold its key.
+        if left.is_none() {
+            if let Some(whole) = carried.take() {
+                left = self.finish(whole, chunks, held)?;
+            }
+        }
+        while let Some(mut file) = left {
+            left = self.again(&mut file, carried.take(), chunks, held)?;
+        }
+        Ok(part)
     }
 }
 
@@ -2172,6 +2258,44 @@ mod tests {
                 vec![Value::Integer(3), Value::BigInt(1)],
             ]
         );
+    }
+
+    /// The partitioned path, finished on more than one thread, which is what a large group by takes.
+    ///
+    /// Five thousand groups is past [`PARTITION_FROM`], so the instances hand their tables to the
+    /// partitions and `finalize` finishes those partitions in parallel. What this pins is that every
+    /// group comes out exactly once. A partition finished twice doubles its counts and one nobody
+    /// finished loses its groups, and neither can happen on a table small enough to stay in one
+    /// piece, which is every other test in here.
+    #[test]
+    fn a_partitioned_aggregate_answers_every_group_once() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, out) = aggregate(&plan);
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        let values: Vec<i32> = (0..5_000).collect();
+        for part in values.chunks(1_024) {
+            aggregate.sink(&chunk(part), &mut left).expect("a chunk of groups");
+            aggregate.sink(&chunk(part), &mut right).expect("the same groups again");
+        }
+        aggregate.combine(left).expect("the first instance");
+        aggregate.combine(right).expect("the second instance");
+        assert!(
+            aggregate.built.lock().expect("readable").partitioning,
+            "five thousand groups on two instances is meant to take the partitioned path"
+        );
+        aggregate.finalize().expect("the answer");
+
+        let mut seen: Vec<i32> = Vec::new();
+        for row in answer(&out) {
+            assert_eq!(row[1], Value::BigInt(2), "{row:?} was counted on both instances");
+            match row[0] {
+                Value::Integer(key) => seen.push(key),
+                ref other => panic!("the group is {other:?} and not an integer"),
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, values);
     }
 
     /// An ungrouped aggregate has no key to probe, so the merge is the accumulators on their own and
