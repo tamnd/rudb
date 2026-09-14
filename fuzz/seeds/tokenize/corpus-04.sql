@@ -1,0 +1,1 @@
+SELECT count(*), sum(x), avg(y) FROM t GROUP BY a, b HAVING count(*) > 1

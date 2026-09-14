@@ -1,0 +1,1 @@
+SELECT "grüß" AS "日本語" FROM "t"

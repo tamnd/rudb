@@ -1,0 +1,1 @@
+SELECT * FROM read_parquet('x.parquet', binary_as_string=True, filename := false)

@@ -1,0 +1,1 @@
+SELECT x LIKE 'a%', x ILIKE 'a%', x SIMILAR TO 'a' FROM t

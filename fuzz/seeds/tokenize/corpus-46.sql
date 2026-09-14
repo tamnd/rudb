@@ -1,0 +1,1 @@
+PIVOT t ON a USING sum(b)

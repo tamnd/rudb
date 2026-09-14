@@ -32,9 +32,15 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 name=$(basename "$root")
 remote="gate/$name"
 
+# The fuzz crate is its own workspace and the gate never builds it, but a run leaves a build, a
+# corpus and any artifacts behind on the machine, and deleting those on every gate would mean
+# rebuilding before a run that is measured in hours.
 rsync -a --delete \
   --exclude '/target' \
   --exclude 'experiments/*/target' \
+  --exclude '/fuzz/target' \
+  --exclude '/fuzz/corpus' \
+  --exclude '/fuzz/artifacts' \
   --rsync-path "mkdir -p ~/$remote && rsync" \
   "$root/" "$host:$remote/"
 

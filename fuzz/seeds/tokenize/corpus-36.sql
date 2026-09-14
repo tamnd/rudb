@@ -1,0 +1,1 @@
+COPY t TO 'out.parquet' (FORMAT PARQUET)

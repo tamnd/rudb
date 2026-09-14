@@ -1,0 +1,1 @@
+SELECT a FROM t GROUP BY GROUPING SETS ((a), (b))

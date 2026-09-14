@@ -1,0 +1,1 @@
+SELECT list_transform([1,2], x -> x + 1)

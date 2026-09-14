@@ -1,0 +1,1 @@
+CREATE MACRO m(a) AS a + 1

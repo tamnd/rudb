@@ -1,0 +1,1 @@
+SELECT * FROM a ASOF JOIN b ON a.t >= b.t
