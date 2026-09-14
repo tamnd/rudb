@@ -445,7 +445,7 @@ impl<'a> Aggregate<'a> {
         // into one hash per row, with the type of the column matched on once rather than once per
         // value, and the row loop below is then a probe with the hash already in hand.
         if !alone {
-            table.begin(keys, *length, hashes)?;
+            crate::table::hash(keys, *length, hashes);
         }
         // The probe, and nothing else. What comes out of it is one slot per row, which is what the
         // scatter below needs and what the row loop used to consume as it went.

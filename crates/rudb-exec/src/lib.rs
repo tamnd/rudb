@@ -95,7 +95,6 @@ mod gather;
 mod group;
 mod join;
 mod key;
-mod narrow;
 mod operator;
 mod ordering;
 mod prepared;
