@@ -202,9 +202,13 @@ const RADIX_PARTITIONS: usize = 16;
 /// slower and at ten thousand rows 19 percent slower when every grouped aggregate partitioned from
 /// its first chunk, because none of those tables is large enough for the sharing to pay for itself.
 ///
-/// Sixteen thousand groups is where an instance's table stops fitting comfortably in cache, which is
-/// also where holding one copy between the threads starts to be worth what it costs to get there.
-const PARTITION_FROM: usize = 16_384;
+/// Four thousand is where the measurement put it. Sixteen thousand was tried first, on the argument
+/// that it is where a table stops fitting comfortably in cache, and it left a five percent loss at a
+/// million rows: an instance that holds sixteen thousand groups to itself is an instance the other
+/// threads cannot help with. At four thousand, ClickBench on gamingpc-wsl runs 2.8 times faster at a
+/// thousand rows, 1.8 times at ten thousand and 1.44 times at a million, all against main, on the
+/// same peak memory. Both numbers were measured in the same sweep and the lower one won everywhere.
+const PARTITION_FROM: usize = 4_096;
 
 impl<'a> Aggregate<'a> {
     /// An aggregation over the plan's groups and aggregate calls, and the source it finishes into.
