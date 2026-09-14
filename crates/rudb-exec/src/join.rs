@@ -247,6 +247,13 @@ impl Sink for Join<'_> {
         gather::gathering(&self.memory)
     }
 
+    /// Not yet. The nested loop walks the left rows in the order they were gathered, so the answer
+    /// comes out in that order, and two instances gather in whichever order they were scheduled.
+    /// The hash join in #62 is what stops that mattering.
+    fn parallel(&self) -> bool {
+        false
+    }
+
     fn sink(&self, chunk: &Chunk, local: &mut Gathering) -> Result<Progress> {
         gather::take(chunk, local)?;
         Ok(Progress::More)

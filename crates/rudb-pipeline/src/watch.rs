@@ -60,6 +60,10 @@ impl<S: Source> Source for Watched<S> {
         self.inner.morsel()
     }
 
+    fn morsels(&self) -> Option<usize> {
+        self.inner.morsels()
+    }
+
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let measure = Measure::start();
         let progress = self.inner.read(morsel, out);
@@ -78,6 +82,10 @@ impl<S: Stream> Stream for Watched<S> {
 
     fn local(&self) -> Self::Local {
         self.inner.local()
+    }
+
+    fn parallel(&self) -> bool {
+        self.inner.parallel()
     }
 
     fn push(&self, chunk: &mut Chunk, local: &mut Self::Local) -> Result<Progress> {
@@ -101,6 +109,10 @@ impl<K: Sink> Sink for Watched<K> {
 
     fn local(&self) -> Self::Local {
         self.inner.local()
+    }
+
+    fn parallel(&self) -> bool {
+        self.inner.parallel()
     }
 
     /// Measured like the rest, even though it moves no rows. It takes a lock on the ordered root and

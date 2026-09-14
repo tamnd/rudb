@@ -21,6 +21,7 @@ dependencies = [
  "rudb-metrics",
  "rudb-opt",
  "rudb-parse",
+ "rudb-pipeline",
  "rudb-plan",
  "rudb-seam",
  "rudb-storage",

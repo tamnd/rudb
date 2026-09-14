@@ -82,6 +82,17 @@ impl Sink for Gather {
         Gathering { rows: Vec::new(), charged: self.memory.reservation(), counted: 0 }
     }
 
+    /// Not yet, because the rows come back out in the order they went in.
+    ///
+    /// A join reads this side row by row and a set operation walks it, so the order two instances
+    /// combined in is the order of part of the answer. Nothing here is wrong with more than one
+    /// instance, it is just that the answer would come out in an order that depends on which thread
+    /// read which morsel. What unblocks it is either a hash join, which does not care what order it
+    /// built in, or a gather that keeps the morsel each row came from the way the root does.
+    fn parallel(&self) -> bool {
+        false
+    }
+
     fn sink(&self, chunk: &Chunk, local: &mut Gathering) -> Result<Progress> {
         take(chunk, local)?;
         Ok(Progress::More)
@@ -171,6 +182,12 @@ impl Sink for Keep {
 
     fn local(&self) -> Kept {
         Kept { chunks: Vec::new(), charged: self.memory.reservation() }
+    }
+
+    /// Not yet, for the reason the gather above gives. A cross product replays these chunks in the
+    /// order they were kept, so the order they were kept in is part of the answer.
+    fn parallel(&self) -> bool {
+        false
     }
 
     fn sink(&self, chunk: &Chunk, local: &mut Kept) -> Result<Progress> {

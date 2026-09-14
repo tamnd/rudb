@@ -243,6 +243,18 @@ impl Stream for Limit {
         Taken::default()
     }
 
+    /// Never, and this is the one operator in the tree that says so.
+    ///
+    /// How much of the limit has been used up is local state, and four instances each allowed to
+    /// emit ten rows emit forty. Sharing a counter between them would fix the count and not the
+    /// answer, because `LIMIT 10` with no `ORDER BY` would then return whichever ten rows the
+    /// threads got to first, which is a different ten on every run. So the pipeline a limit is in
+    /// runs on one thread, and the way a large query with a limit on it gets parallelism back is a
+    /// top n, which sorts and is a sink and combines.
+    fn parallel(&self) -> bool {
+        false
+    }
+
     fn push(&self, chunk: &mut Chunk, taken: &mut Taken) -> Result<Progress> {
         let rows = chunk.len() as u64;
         let skipping = (self.offset - taken.skipped).min(rows);

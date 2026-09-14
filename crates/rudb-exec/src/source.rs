@@ -45,6 +45,11 @@ impl Handout {
         Self { next: AtomicU64::new(0), total: u64::try_from(total).unwrap_or(u64::MAX) }
     }
 
+    /// How many positions there are in all, which is how many morsels this will ever hand out.
+    pub(crate) fn total(&self) -> usize {
+        usize::try_from(self.total).unwrap_or(usize::MAX)
+    }
+
     /// The next position, as a morsel covering it, or `None` when they are all taken.
     pub(crate) fn take(&self) -> Option<Morsel> {
         let at = self.next.fetch_add(1, Ordering::Relaxed);
@@ -123,6 +128,10 @@ impl Source for Scan<'_> {
         self.chunks.take()
     }
 
+    fn morsels(&self) -> Option<usize> {
+        Some(self.chunks.total())
+    }
+
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let at = position(morsel);
         if at >= self.table.rows().chunk_count() {
@@ -159,6 +168,10 @@ impl Dummy {
 impl Source for Dummy {
     fn morsel(&self) -> Option<Morsel> {
         self.one.take()
+    }
+
+    fn morsels(&self) -> Option<usize> {
+        Some(self.one.total())
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
@@ -333,6 +346,10 @@ impl Source for Series {
         let start = index.saturating_mul(RUN);
         (start < self.rows)
             .then(|| Morsel::new(index, start, self.rows.min(start.saturating_add(RUN))))
+    }
+
+    fn morsels(&self) -> Option<usize> {
+        Some(usize::try_from(self.rows.div_ceil(RUN)).unwrap_or(usize::MAX))
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
@@ -676,6 +693,20 @@ impl Source for FileScan {
         }
     }
 
+    /// The first file's row groups, taken as what every file in the list looks like.
+    ///
+    /// The first file is already open, because opening it is how a scan reports a file that has
+    /// gone missing since it was bound, so its row group count is there to be read without opening
+    /// anything. The rest are assumed to match, which is right for a directory written by one
+    /// writer and is the case worth being right about. A CSV file has one morsel however large it
+    /// is, since a CSV reader cannot be positioned, so a list of CSV files is as many morsels as
+    /// there are files.
+    fn morsels(&self) -> Option<usize> {
+        let cutting = self.cutting.lock().ok()?;
+        let each = cutting.groups.max(1);
+        Some(each.saturating_mul(self.paths.len().max(1)))
+    }
+
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let piece = self.piece(morsel.index())?;
         let mut piece = piece.lock().map_err(poisoned)?;
@@ -899,6 +930,10 @@ pub(crate) fn positions(
 impl Source for Values {
     fn morsel(&self) -> Option<Morsel> {
         self.handout.take()
+    }
+
+    fn morsels(&self) -> Option<usize> {
+        Some(self.handout.total())
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {

@@ -61,7 +61,9 @@ impl Report {
     /// that run inside each other are kept from counting the same time twice.
     ///
     /// Asking twice gives two drivers for one pipeline and their times add up, which is what a
-    /// pipeline run as several instances looks like. Nothing does that yet.
+    /// pipeline drained more than once looks like. A pipeline run on several threads is one driver
+    /// that was told how many instances there were, because the instances share a loop rather than
+    /// each having one.
     #[must_use]
     pub fn driving(&self, pipeline: u32) -> Arc<Driver> {
         let driver = Arc::new(Driver::new(pipeline, Arc::clone(&self.charged)));
@@ -116,13 +118,19 @@ impl Report {
         for pipeline in &mut pipelines {
             pipeline.depends_on.sort_unstable();
             let mut driven = false;
+            let mut instances: u32 = 0;
             for driver in kept.drivers.iter().filter(|driver| driver.pipeline() == pipeline.id) {
                 let (wall_ns, cpu_ns) = driver.spent();
                 pipeline.wall_ns = pipeline.wall_ns.saturating_add(wall_ns);
                 pipeline.cpu_ns = pipeline.cpu_ns.saturating_add(cpu_ns);
+                instances = instances.saturating_add(driver.instances());
                 driven = true;
             }
             if driven {
+                // A driver that does not count keeps the one this row was made with, since a
+                // pipeline that ran at all ran at least once and a zero here would read as a
+                // pipeline that did not.
+                pipeline.instances = instances.max(1);
                 continue;
             }
             for operator in operators.iter().filter(|operator| operator.pipeline == pipeline.id) {

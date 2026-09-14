@@ -86,6 +86,38 @@ impl<'a> Pipeline<'a> {
         &self.depends_on
     }
 
+    /// Whether every operator in this pipeline will run as more than one instance.
+    ///
+    /// One operator that says no is enough, because the instances of a pipeline are instances of
+    /// all of it. There is no arrangement where a `LIMIT` runs once and the scan under it runs
+    /// sixteen times, since the rows have to go through the limit on the thread that read them.
+    #[must_use]
+    pub fn parallel(&self) -> bool {
+        self.streams.iter().all(|stream| stream.parallel()) && self.sink.parallel()
+    }
+
+    /// How many instances of this pipeline to run, given the most that may run at once.
+    ///
+    /// Three things bound it and the smallest wins. The ceiling, which is what the pool will lend.
+    /// Whether the operators can be instanced at all. And how much work the source says it has,
+    /// because an instance with no morsel to read is a thread that was started, told there is
+    /// nothing for it and stopped, and on a query that was going to take two milliseconds that is
+    /// the whole query.
+    ///
+    /// That last bound is the floor F4 asks for, arrived at by counting rather than by estimating.
+    /// A scan of one stored chunk is one morsel and stays on one thread whatever the machine has,
+    /// and a Parquet file of nine row groups uses nine threads and not the sixteen it was offered.
+    #[must_use]
+    pub fn degree(&self, ceiling: usize) -> usize {
+        if ceiling <= 1 || !self.parallel() {
+            return 1;
+        }
+        match self.source.morsels() {
+            Some(work) => work.clamp(1, ceiling),
+            None => ceiling,
+        }
+    }
+
     /// Fresh local state for one instance of this pipeline.
     #[must_use]
     pub fn locals(&self) -> Locals {

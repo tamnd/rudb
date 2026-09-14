@@ -27,12 +27,20 @@
 //! not a fact about the arithmetic, and the arithmetic is the reason it is worth having anyway:
 //! what every driver reports is measured, rather than worked out by taking everything else off the
 //! number it is about to be compared against. A pipeline nobody drove falls back to the sum of its
-//! operators and comes out short. Time spent inside the execution and outside every driver shows up
-//! as a gap. And on the day pipelines run on threads of their own, the execution span stops
-//! containing them and the check has something to say again.
+//! operators and comes out short, and time spent inside the execution and outside every driver
+//! shows up as a gap.
+//!
+//! # Time on somebody else's thread
+//!
+//! A pipeline running on several threads breaks the identity above, because the clock a span reads
+//! is the calling thread's CPU and three quarters of a four thread pipeline happened somewhere
+//! else. [`Driver::worked`] is how that time gets back: the parallel driver measures each worker and
+//! reports the total, and the pipeline's CPU is what it burned rather than the share of it that
+//! happened on the thread that started the rest. Wall time is left alone, since a worker ran at the
+//! same time as its caller and the two do not add.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::clock::Span;
 
@@ -64,6 +72,7 @@ impl Charged {
 #[derive(Debug)]
 pub struct Driver {
     pipeline: u32,
+    instances: AtomicU32,
     wall_ns: AtomicU64,
     cpu_ns: AtomicU64,
     charged: Arc<Charged>,
@@ -72,7 +81,13 @@ pub struct Driver {
 impl Driver {
     /// The driver of this pipeline, sharing the running total of `charged`.
     pub(crate) fn new(pipeline: u32, charged: Arc<Charged>) -> Self {
-        Self { pipeline, wall_ns: AtomicU64::new(0), cpu_ns: AtomicU64::new(0), charged }
+        Self {
+            pipeline,
+            instances: AtomicU32::new(0),
+            wall_ns: AtomicU64::new(0),
+            cpu_ns: AtomicU64::new(0),
+            charged,
+        }
     }
 
     /// The pipeline this drives.
@@ -89,6 +104,34 @@ impl Driver {
     #[must_use]
     pub fn running(&self) -> Running<'_> {
         Running { driver: self, before: self.charged.now(), span: Some(Span::start()) }
+    }
+
+    /// Records how many instances of this pipeline ran and what the ones on other threads burned.
+    ///
+    /// A driver's own span reads `CLOCK_THREAD_CPUTIME_ID`, which is the right clock for saying
+    /// what an operator cost and the wrong one for a pipeline that ran on four threads, because it
+    /// can only see one of them. So a parallel driver measures each worker and reports the total
+    /// here, and the pipeline's CPU comes out as what it actually burned rather than as the quarter
+    /// of it that happened on the thread that started the others.
+    ///
+    /// Wall time has no equivalent and does not want one. A worker ran at the same time as the
+    /// thread that started it, so adding its wall clock would make a pipeline that got faster look
+    /// like it took longer.
+    ///
+    /// Instances add across runs for the same reason the times do: a pipeline drained twice ran
+    /// twice, and the row in the document is about the pipeline rather than about one pass over it.
+    pub fn ran(&self, instances: usize, worker_cpu_ns: u64) {
+        self.instances.fetch_add(u32::try_from(instances).unwrap_or(u32::MAX), Ordering::Relaxed);
+        self.cpu_ns.fetch_add(worker_cpu_ns, Ordering::Relaxed);
+    }
+
+    /// How many instances of this pipeline have run.
+    ///
+    /// Zero until somebody says, which is what a tree built without a driver that counts looks
+    /// like, and which the report turns into the one it used to print unconditionally.
+    #[must_use]
+    pub fn instances(&self) -> u32 {
+        self.instances.load(Ordering::Relaxed)
     }
 
     /// The wall and CPU nanoseconds this driver has charged itself.

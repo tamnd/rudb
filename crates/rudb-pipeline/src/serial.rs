@@ -1,14 +1,39 @@
-//! The single threaded driver.
+//! The single threaded driver, and the instance loop both drivers share.
 //!
 //! Written out in full because the claim that a push interface costs nothing on one thread should
-//! be checkable by reading rather than believed. This is the whole of it. The parallel driver is
-//! F4, it is several times longer, and nothing above the driver changes between the two.
+//! be checkable by reading rather than believed. [`instance`] is the whole of it. The parallel
+//! driver in `parallel` runs the same function on several threads and does the combining
+//! afterwards, so what is written here is what a thread does either way and there is no second copy
+//! of it to get wrong.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rudb_common::{Cancel, Error, Result};
 use rudb_vector::Chunk;
 
-use crate::pipeline::Pipeline;
+use crate::pipeline::{Locals, Pipeline};
 use crate::progress::{Blocked, Progress};
+
+/// Set when an instance has had everything it wants, so that the others stop taking morsels.
+///
+/// A `LIMIT` that has filled up and an operator that failed both mean the same thing to every other
+/// instance, which is that there is no point reading more. On one thread it is the `break` that was
+/// already there wearing a flag, and the read is once per morsel rather than once per chunk, so it
+/// costs nothing on the path it did not use to be on.
+#[derive(Debug, Default)]
+pub(crate) struct Stop(AtomicBool);
+
+impl Stop {
+    /// Whether somebody has said to stop.
+    pub(crate) fn asked(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Say so.
+    pub(crate) fn ask(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Run a pipeline to completion on this thread.
 ///
@@ -18,13 +43,30 @@ use crate::progress::{Blocked, Progress};
 ///
 /// Whatever any operator reports. Also an error if an operator returns
 /// [`Progress::Blocked`], because parking a task needs a scheduler to run something else
-/// meanwhile and F0 has one thread and nothing to switch to. Nothing in the tree returns `Blocked`
-/// yet. F4 replaces that arm with a park and this function stops being the one that runs.
+/// meanwhile and the driver here has one thread and nothing to switch to. Nothing in the tree
+/// returns `Blocked` yet.
 pub fn run_serial(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
+    let stop = Stop::default();
     let mut locals = pipeline.locals();
+    instance(pipeline, cancel, &stop, &mut locals)?;
+    pipeline.sink().combine_state(locals.sink)?;
+    pipeline.sink().finalize_state()
+}
+
+/// One instance of a pipeline, reading morsels until there are none left or somebody says stop.
+///
+/// It does not combine and it does not finalise, because with several instances those happen once
+/// after all of them have finished rather than once each. The state it filled is left in `locals`
+/// for whoever called it to hand over.
+pub(crate) fn instance(
+    pipeline: &Pipeline<'_>,
+    cancel: &Cancel,
+    stop: &Stop,
+    locals: &mut Locals,
+) -> Result<()> {
     let mut chunk = Chunk::empty(&[]);
 
-    'morsels: while let Some(mut morsel) = pipeline.source().morsel() {
+    'morsels: while let Some(mut morsel) = taken(pipeline, stop) {
         // Before the first read of it rather than after the last, because a sink that puts chunks
         // back in the order the morsels were cut has to know where a chunk came from at the moment
         // it arrives, not once the morsel it came from is finished with.
@@ -73,6 +115,7 @@ pub fn run_serial(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
             }
 
             if finished {
+                stop.ask();
                 break 'morsels;
             }
             if progress == Progress::Done {
@@ -81,8 +124,15 @@ pub fn run_serial(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
         }
     }
 
-    pipeline.sink().combine_state(locals.sink)?;
-    pipeline.sink().finalize_state()
+    Ok(())
+}
+
+/// The next morsel, or nothing once somebody has said to stop.
+fn taken(pipeline: &Pipeline<'_>, stop: &Stop) -> Option<crate::morsel::Morsel> {
+    if stop.asked() {
+        return None;
+    }
+    pipeline.source().morsel()
 }
 
 /// The error a blocked operator gets on the serial driver.
@@ -91,7 +141,7 @@ pub fn run_serial(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
 /// because the useful half of the report is which of the four reasons it was.
 fn parked(pipeline: &Pipeline<'_>, blocked: Blocked) -> Error {
     Error::not_implemented(format!(
-        "{} blocked {} and the serial driver has nothing else to run, which is F4",
+        "{} blocked {} and the driver has nothing else to run, which is the scheduler's job",
         pipeline.id(),
         blocked
     ))

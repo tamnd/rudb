@@ -14,6 +14,7 @@
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{Cancel, Field, LogicalType, Memory, Value};
 use rudb_kernels::Accumulator;
+use rudb_pipeline::Pool;
 use rudb_plan::Plan;
 use rudb_seam::Settings;
 
@@ -79,7 +80,7 @@ fn run(text: &str) -> Vec<Vec<Value>> {
     let plan = Plan::parse(text).expect("a well formed plan");
     plan.validate().expect("the plan holds together");
     let query = build(&plan, &catalog).expect("the query builds");
-    let chunks = query.collect(&Cancel::new()).expect("the query runs");
+    let chunks = query.collect(&Cancel::new(), &Pool::default()).expect("the query runs");
     rows_of(&chunks)
 }
 
@@ -96,7 +97,7 @@ fn failure(text: &str) -> String {
     let catalog = catalog();
     let plan = Plan::parse(text).expect("a well formed plan");
     let query = build(&plan, &catalog).expect("the query builds");
-    match query.collect(&Cancel::new()) {
+    match query.collect(&Cancel::new(), &Pool::default()) {
         Ok(_) => panic!("the query was expected to fail and did not"),
         Err(error) => error.message().to_string(),
     }
@@ -524,7 +525,7 @@ fn a_cancelled_token_stops_the_query_before_it_produces_a_chunk() {
     let query = build_with(&plan, &catalog, &cancel, &Memory::unlimited(), &Settings::new())
         .expect("the query builds");
     cancel.cancel();
-    let error = query.run(&cancel).expect_err("it was cancelled");
+    let error = query.run(&cancel, &Pool::default()).expect_err("it was cancelled");
     assert_eq!(error.code().duckdb_name(), "Interrupt Error");
 }
 
@@ -538,8 +539,8 @@ fn a_token_nothing_has_cancelled_leaves_the_answer_alone() {
     let guarded = build_with(&plan, &catalog, &cancel, &Memory::unlimited(), &Settings::new())
         .expect("the query builds");
     let plain = build(&plan, &catalog).expect("the query builds");
-    let watched = guarded.collect(&cancel).expect("runs");
-    let unwatched = plain.collect(&Cancel::new()).expect("runs");
+    let watched = guarded.collect(&cancel, &Pool::default()).expect("runs");
+    let unwatched = plain.collect(&Cancel::new(), &Pool::default()).expect("runs");
     assert_eq!(rows_of(&watched), rows_of(&unwatched));
 }
 
@@ -572,7 +573,7 @@ fn a_group_is_charged_for_the_room_it_takes_and_not_only_for_what_it_holds() {
     .expect("a well formed plan");
     let query = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
         .expect("the query builds");
-    let chunks = query.collect(&Cancel::new()).expect("the aggregate runs");
+    let chunks = query.collect(&Cancel::new(), &Pool::default()).expect("the aggregate runs");
     let seen: usize = chunks.iter().map(rudb_vector::Chunk::len).sum();
     assert_eq!(seen, GROUPS as usize, "one group per distinct value");
 
@@ -606,7 +607,8 @@ fn a_budget_too_small_for_the_rows_stops_the_operator_that_buffers_them() {
     let memory = Memory::with_limit(1);
     let query = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
         .expect("the query builds, because nothing is held yet");
-    let error = query.run(&Cancel::new()).expect_err("one byte is not enough for a row");
+    let error =
+        query.run(&Cancel::new(), &Pool::default()).expect_err("one byte is not enough for a row");
     assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
     drop(query);
     assert_eq!(memory.used(), 0, "the failed operator gave everything back");
@@ -652,7 +654,7 @@ fn under(catalog: &Catalog, text: &str, memory: &Memory) -> Vec<Vec<Value>> {
     plan.validate().expect("the plan holds together");
     let query = build_with(&plan, catalog, &Cancel::new(), memory, &Settings::new())
         .expect("the query builds");
-    let chunks = query.collect(&Cancel::new()).expect("the query runs");
+    let chunks = query.collect(&Cancel::new(), &Pool::default()).expect("the query runs");
     let mut rows = rows_of(&chunks);
     rows.sort_by_key(|row| format!("{row:?}"));
     rows
@@ -721,7 +723,9 @@ fn a_budget_too_small_for_one_group_says_so_rather_than_running_forever() {
     let memory = Memory::with_limit(1);
     let query = build_with(&plan, &catalog, &Cancel::new(), &memory, &Settings::new())
         .expect("the query builds, because nothing is held yet");
-    let error = query.run(&Cancel::new()).expect_err("one byte is not enough for a group");
+    let error = query
+        .run(&Cancel::new(), &Pool::default())
+        .expect_err("one byte is not enough for a group");
     assert_eq!(error.code().duckdb_name(), "Out of Memory Error");
     drop(query);
     assert_eq!(memory.used(), 0, "the failed operator gave everything back");
@@ -798,7 +802,7 @@ fn the_ids_the_builder_tags_its_counters_with_are_the_ones_the_plan_says() {
         &report,
     )
     .expect("the query builds");
-    query.collect(&Cancel::new()).expect("the query runs");
+    query.collect(&Cancel::new(), &Pool::default()).expect("the query runs");
     let mut document = rudb_metrics::Document::new(text);
     report.fill(&mut document);
     let ids: Vec<u32> = document.operators.iter().map(|operator| operator.id).collect();

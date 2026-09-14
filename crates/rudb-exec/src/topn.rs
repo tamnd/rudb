@@ -49,6 +49,11 @@
 //! instance trims what it holds as it goes, and `combine` trims again over what two instances
 //! brought, which is what keeps the bound the bound rather than the bound times the number of
 //! threads. On one thread there is one instance and the second trim does nothing.
+//!
+//! Every candidate carries where it arrived, for the reason the sort's own documentation gives: a
+//! tie on every key is settled by that rather than by which thread got there first, so the ten rows
+//! this hands back are the ten a single thread would have handed back. It costs sixteen bytes per
+//! candidate and the bound is ten.
 
 use std::cmp::Ordering;
 use std::sync::Mutex;
@@ -63,10 +68,10 @@ use crate::buffer::Buffered;
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
-use crate::sort::{compare, rank};
+use crate::sort::{Place, compare, rank, settled};
 
-/// One row in the running: the values of its keys, and the row itself.
-type Sortable = (Vec<Value>, Vec<Value>);
+/// One row in the running: the values of its keys, the row itself, and where it arrived.
+type Sortable = crate::sort::Sortable;
 
 /// Above this bound, moving a sorted candidate array costs more than trimming in batches.
 const SORTED_BOUND: usize = 64;
@@ -102,6 +107,8 @@ pub(crate) struct Running {
     scratch: Scratch,
     charged: Reservation,
     failure: Option<Error>,
+    /// The morsel this instance is reading and how many of its rows have arrived.
+    place: Place,
 }
 
 impl TopN {
@@ -150,7 +157,13 @@ impl Sink for TopN {
             scratch: self.exprs.scratch(),
             charged: self.memory.reservation(),
             failure: None,
+            place: Place::default(),
         }
+    }
+
+    fn at(&self, morsel: &rudb_pipeline::Morsel, local: &mut Running) -> Result<()> {
+        local.place.start(morsel.index());
+        Ok(())
     }
 
     fn sink(&self, chunk: &Chunk, local: &mut Running) -> Result<Progress> {
@@ -169,17 +182,30 @@ impl Sink for TopN {
                 // of them has to be placed among the candidates rather than counted.
                 Some(rows) => {
                     for row in rows.iter() {
-                        keep(&self.keys, &mut local.kept, &keys, chunk, row, self.bound, failure);
+                        let arrival = local.place.of(row);
+                        keep(
+                            Where { keys: &self.keys, columns: &keys, chunk, row, arrival },
+                            &mut local.kept,
+                            self.bound,
+                            failure,
+                        );
                     }
                 }
                 // row at a time: the key still has the same Value layout the sort holds, and 2i
                 // (#63) replaces it with one normalized comparable byte string per row.
                 None => {
                     for row in 0..chunk.len() {
-                        keep(&self.keys, &mut local.kept, &keys, chunk, row, self.bound, failure);
+                        let arrival = local.place.of(row);
+                        keep(
+                            Where { keys: &self.keys, columns: &keys, chunk, row, arrival },
+                            &mut local.kept,
+                            self.bound,
+                            failure,
+                        );
                     }
                 }
             }
+            local.place.past(chunk.len());
             recharge(&local.kept, &mut local.charged)?;
             return Ok(Progress::More);
         }
@@ -190,8 +216,9 @@ impl Sink for TopN {
             let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
             let values: Vec<Value> = chunk.row(row).collect();
             taken += rows::footprint(&key) + rows::footprint(&values);
-            local.kept.push((key, values));
+            local.kept.push((key, values, local.place.of(row)));
         }
+        local.place.past(chunk.len());
         local.charged.grow(taken)?;
         if local.kept.len() > self.bound.saturating_mul(2) {
             trim(&self.keys, &mut local.kept, self.bound, &mut local.failure);
@@ -221,7 +248,7 @@ impl Sink for TopN {
     fn finalize(&self) -> Result<()> {
         let kept = std::mem::take(&mut *self.rows.lock().map_err(poisoned)?);
         let wanted = kept.into_iter().skip(self.offset).take(self.count);
-        let ordered: Vec<Vec<Value>> = wanted.map(|(_, row)| row).collect();
+        let ordered: Vec<Vec<Value>> = wanted.map(|(_, row, _)| row).collect();
         let mut held = self.held.lock().map_err(poisoned)?;
         let chunks = rows::chunks(&self.types, &ordered, &mut held)?;
         self.out.fill(chunks)?;
@@ -235,8 +262,11 @@ fn poisoned<T>(_: T) -> Error {
 }
 
 /// Orders what is held and keeps the first `bound` of it.
+///
+/// Ties are settled by where the rows arrived rather than by the order they were handed over, which
+/// is what makes the trim in `combine` give the same answer whichever thread combined first.
 fn trim(keys: &[SortKey], kept: &mut Vec<Sortable>, bound: usize, failure: &mut Option<Error>) {
-    kept.sort_by(|left, right| compare(keys, &left.0, &right.0, failure));
+    kept.sort_by(|left, right| settled(keys, left, right, failure));
     kept.truncate(bound);
 }
 
@@ -246,11 +276,8 @@ fn trim(keys: &[SortKey], kept: &mut Vec<Sortable>, bound: usize, failure: &mut 
 /// separates it from the worst candidate, so a row that loses on the first of three keys costs one
 /// value rather than three and never allocates the `Vec` that holds them. Almost every row loses.
 fn keep(
-    keys: &[SortKey],
+    Where { keys, columns, chunk, row, arrival }: Where<'_>,
     kept: &mut Vec<Sortable>,
-    columns: &[Vector],
-    chunk: &Chunk,
-    row: usize,
     bound: usize,
     failure: &mut Option<Error>,
 ) {
@@ -263,11 +290,23 @@ fn keep(
         return;
     }
     let key: Vec<Value> = columns.iter().map(|column| column.value_at(row)).collect();
+    // After every candidate whose key it ties, which is where its arrival puts it too: an instance
+    // reads the morsels it is given in order and each of them from the start, so a row reaching
+    // here arrived after everything already held.
     let at = kept.partition_point(|candidate| {
         compare(keys, &candidate.0, &key, failure) != Ordering::Greater
     });
-    kept.insert(at, (key, chunk.row(row).collect()));
+    kept.insert(at, (key, chunk.row(row).collect(), arrival));
     kept.truncate(bound);
+}
+
+/// One row being offered to the candidates, which is five things that only travel together.
+struct Where<'a> {
+    keys: &'a [SortKey],
+    columns: &'a [Vector],
+    chunk: &'a Chunk,
+    row: usize,
+    arrival: crate::sort::Arrival,
 }
 
 /// Where one row of the key columns sits against a key already held.
@@ -328,7 +367,7 @@ fn worth_looking_at(
 /// operator is between two reads of its input.
 fn recharge(kept: &[Sortable], scratch: &mut Reservation) -> Result<()> {
     let footprint =
-        kept.iter().map(|(key, values)| rows::footprint(key) + rows::footprint(values)).sum();
+        kept.iter().map(|(key, values, _)| rows::footprint(key) + rows::footprint(values)).sum();
     scratch.release();
     scratch.grow(footprint)
 }
