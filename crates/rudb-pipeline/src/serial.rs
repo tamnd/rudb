@@ -20,7 +20,7 @@ use crate::progress::{Blocked, Progress};
 /// [`Progress::Blocked`], because parking a task needs a scheduler to run something else
 /// meanwhile and F0 has one thread and nothing to switch to. Nothing in the tree returns `Blocked`
 /// yet. F4 replaces that arm with a park and this function stops being the one that runs.
-pub fn run_serial(pipeline: &Pipeline, cancel: &Cancel) -> Result<()> {
+pub fn run_serial(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
     let mut locals = pipeline.locals();
     let mut chunk = Chunk::empty(&[]);
 
@@ -89,7 +89,7 @@ pub fn run_serial(pipeline: &Pipeline, cancel: &Cancel) -> Result<()> {
 ///
 /// It names the pipeline and the reason rather than saying that something is unimplemented,
 /// because the useful half of the report is which of the four reasons it was.
-fn parked(pipeline: &Pipeline, blocked: Blocked) -> Error {
+fn parked(pipeline: &Pipeline<'_>, blocked: Blocked) -> Error {
     Error::not_implemented(format!(
         "{} blocked {} and the serial driver has nothing else to run, which is F4",
         pipeline.id(),

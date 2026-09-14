@@ -1,4 +1,4 @@
-//! Turning a bound plan into a tree of operators.
+//! Turning a bound plan into the pipelines that run it.
 //!
 //! One match, one arm per logical operator, and nothing else. There is no physical plan and no cost
 //! based choice between two ways of running the same node, which is the honest description of tier
@@ -6,18 +6,35 @@
 //! physical planner that section 9.6 describes goes here, and the reason this is a separate module
 //! from the operators is so that it can grow into one without any of them moving.
 //!
-//! The tree borrows the plan and the catalog for as long as it exists. A scan reads its rows out of
-//! the catalog's table rather than copying them, and an expression reads its constants, its function
-//! names and its types out of the plan's arena, so a plan that outlives the query it built is the
-//! whole of the lifetime story here.
+//! The pipelines borrow the plan and the catalog for as long as they exist. A scan reads its rows
+//! out of the catalog's table rather than copying them, and an expression reads its constants, its
+//! function names and its types out of the plan's arena, so a plan that outlives the query it built
+//! is the whole of the lifetime story here.
+//!
+//! # How a tree becomes a list
+//!
+//! The walk is the same one it always was, down from the root, and what changed is what it carries
+//! back up. A node returns a [`Segment`], which is a source with the streaming operators stacked on
+//! it so far, and a node that is a pipeline breaker closes the segment under it into a finished
+//! [`Pipeline`] and starts a new segment over the buffer that breaker finalises into. So a plan with
+//! two breakers in it comes back as three pipelines, and they are pushed onto the list in the order
+//! they have to run, because a breaker's own pipeline is closed before the walk returns to whatever
+//! is above it.
+//!
+//! A node with two inputs closes the side that has to finish first and then walks the side that uses
+//! it, which is the same order the ids are handed out in and the same order the work happens in.
 //!
 //! # Where the measurement comes from
 //!
-//! Every operator this module makes is wrapped in [`Watched`] before it goes into the tree, and the
-//! counters it reports into are registered with the [`Report`] the caller passed in. That is the
+//! Every operator this module makes is wrapped in [`Watched`] before it goes into a pipeline, and
+//! the counters it reports into are registered with the [`Report`] the caller passed in. That is the
 //! only place the wrapping happens, which is what makes it impossible for an operator to be left
 //! out: an arm that forgets to wrap is an arm that does not compile, because the id it was handed
 //! has to go somewhere.
+//!
+//! A breaker's counters go around two objects rather than one. The sink is the operator, and the
+//! buffer the next pipeline sources from is where its rows come back out, so both are wrapped in the
+//! same counters and a sort's row count is the rows it produced rather than zero.
 //!
 //! Neither the ids nor the pipeline numbers are worked out here. They come from [`Shape`], which is
 //! one walk over the plan in `rudb-plan`, because `EXPLAIN` prints the same numbering and the same
@@ -30,18 +47,18 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{Cancel, Memory, Result};
 use rudb_functions::TableFunction;
-use rudb_metrics::{Counters, Report};
-use rudb_pipeline::{Source, Watched};
-use rudb_plan::{Node, NodeRef, Plan, Shape, Slice, seams_of};
+use rudb_metrics::{Counters, Driver, Report};
+use rudb_pipeline::{
+    BufferId, DynSink, DynStream, Pipeline, PipelineId, Source, Watched, root, root_in_order,
+};
+use rudb_plan::{Node, NodeRef, PipelineRef, Plan, ROOT, Shape, Slice, seams_of};
 use rudb_seam::Settings;
 
-use crate::adapt::{Broken, Fed, Paired, Pulled, Streamed};
-use crate::cancel::Guarded;
 use crate::fetch::Fetch;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join};
-use crate::operator::Operator;
+use crate::query::Query;
 use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
@@ -51,7 +68,7 @@ use crate::strategies::Strategies;
 use crate::stream::{Filter, Limit, Project};
 use crate::topn::TopN;
 
-/// Builds the operator tree for a plan's root, for a query nothing will stop.
+/// Builds the pipelines for a plan's root, for a query nothing will stop.
 ///
 /// Every seam is left at its default, which is what a caller with no session behind it wants and is
 /// what the tests in this crate are written against.
@@ -60,28 +77,31 @@ use crate::topn::TopN;
 ///
 /// If the plan names a table or a column the catalog does not have, if an expression is malformed
 /// in a way [`Plan::validate`] would have caught, or anything an operator's construction reports.
-pub fn build<'a>(plan: &'a Plan, catalog: &'a Catalog) -> Result<Box<dyn Operator + 'a>> {
+pub fn build<'a>(plan: &'a Plan, catalog: &'a Catalog) -> Result<Query<'a>> {
     build_with(plan, catalog, &Cancel::new(), &Memory::unlimited(), &Settings::new())
 }
 
-/// Builds the operator tree for a plan's root, stoppable through this token and held to this
-/// budget.
+/// Builds the pipelines for a plan's root, stoppable through this token and held to this budget.
 ///
-/// Every node in the tree is wrapped in a check, so the query stops at the first chunk boundary
-/// after the token says to. See the `cancel` module for why the check is uniform rather than
-/// placed in the operators that can loop.
+/// The token is checked once per chunk by the driver, so the query stops at the first chunk boundary
+/// after the token says to. It is one check in one place rather than a decision per operator,
+/// because a decision per operator is a decision somebody gets wrong when they add the twentieth
+/// one. What the driver cannot see is work an operator does inside one call, and the join is the one
+/// that can: its nested loop runs to the end inside a single push, and a hundred thousand left rows
+/// against thirty thousand right ones is a minute with nothing looking at the token, so that loop
+/// holds the token as well and checks it once per left row.
 ///
-/// The budget is not uniform, and that is the difference between the two. A streaming operator
-/// holds one chunk and gives it away again, so charging every node would count the same megabyte
-/// once per level of the tree. Only the operators that buffer without bound take a reservation, and
+/// The budget is not uniform, and that is the difference between the two. A streaming operator holds
+/// one chunk and gives it away again, so charging every operator would count the same megabyte once
+/// per level. Only the operators that buffer without bound take a reservation, and
 /// [`rudb_common::Memory`] lists which ones those are.
 ///
-/// The measurement still happens. It goes into a report nobody reads, because the alternative is
-/// two builders that drift apart, and a pair of clock readings per chunk is not a cost worth
-/// avoiding by having a second one.
+/// The measurement still happens. It goes into a report nobody reads, because the alternative is two
+/// builders that drift apart, and a pair of clock readings per chunk is not a cost worth avoiding by
+/// having a second one.
 ///
 /// The seam settings are the session's with the statement's hints on top, and they are read here
-/// rather than looked up later, because a choice made while the tree is built is a choice `EXPLAIN`
+/// rather than looked up later, because a choice made while the query is built is a choice `EXPLAIN`
 /// can print before the query runs. An operator that sits on a seam chooses once, in its
 /// constructor, and holds what it chose.
 ///
@@ -94,15 +114,15 @@ pub fn build_with<'a>(
     cancel: &Cancel,
     memory: &Memory,
     seams: &Settings,
-) -> Result<Box<dyn Operator + 'a>> {
+) -> Result<Query<'a>> {
     build_measured(plan, catalog, cancel, memory, seams, &Report::new())
 }
 
-/// Builds the operator tree, reporting what every operator in it did into `report`.
+/// Builds the pipelines, reporting what every operator in them did into `report`.
 ///
-/// The report is what the caller keeps. Once the tree has been drained,
-/// [`Report::fill`] turns it into the operator and pipeline rows of a metrics document, and that
-/// document is the same one `EXPLAIN ANALYZE` prints and `--metrics` writes.
+/// The report is what the caller keeps. Once the query has been run, [`Report::fill`] turns it into
+/// the operator and pipeline rows of a metrics document, and that document is the same one
+/// `EXPLAIN ANALYZE` prints and `--metrics` writes.
 ///
 /// # Errors
 ///
@@ -114,7 +134,7 @@ pub fn build_measured<'a>(
     memory: &Memory,
     seams: &Settings,
     report: &Report,
-) -> Result<Box<dyn Operator + 'a>> {
+) -> Result<Query<'a>> {
     let shape = Shape::of(plan);
     for pipeline in shape.all() {
         report.pipeline(pipeline);
@@ -122,8 +142,82 @@ pub fn build_measured<'a>(
             report.depends(pipeline, *waits_for);
         }
     }
-    let building = Building { plan, catalog, cancel, memory, seams, report, shape };
-    building.node(plan.root())
+    let mut building = Building {
+        plan,
+        catalog,
+        cancel,
+        memory,
+        seams,
+        report,
+        shape,
+        done: Vec::new(),
+        drivers: Vec::new(),
+    };
+    let segment = building.node(plan.root())?;
+    let schema = segment.schema.clone();
+    // A query whose rows come out of a sort or a top n is already in the order somebody asked for,
+    // and holding chunks back to restore the source order would only add latency to an order nobody
+    // is going to look at. Everything else gets the root that puts them back, because the moment
+    // several threads read the same file a plain `SELECT` would otherwise come back in a different
+    // order on every run. It costs nothing to decide here and it means the scheduler never has to.
+    let (sink, reader) = if ordered(plan, plan.root()) {
+        root(BufferId(0), None)
+    } else {
+        root_in_order(BufferId(0), None)
+    };
+    building.close(segment, ROOT, Arc::new(sink));
+    let Building { done, drivers, .. } = building;
+    Query::new(done, drivers, reader, schema)
+}
+
+/// Whether the rows reaching the root are already in an order the plan chose.
+///
+/// A sort and a top n both decide one. Everything between them and the root either keeps the order
+/// it was given or is not a node that can sit there, and the walk stops at the first node that is
+/// neither.
+fn ordered(plan: &Plan, node: NodeRef) -> bool {
+    match *plan.node(node) {
+        Node::Sort { .. } | Node::TopN { .. } => true,
+        Node::Project { input, .. }
+        | Node::Filter { input, .. }
+        | Node::Limit { input, .. }
+        | Node::Fetch { input, .. } => ordered(plan, input),
+        _ => false,
+    }
+}
+
+/// A pipeline being built from the bottom up.
+///
+/// It is not a [`Pipeline`] yet because it has no sink. What ends it is whichever node above it
+/// turns out to be a pipeline breaker, or the root of the plan, and neither is known until the walk
+/// gets back there.
+struct Segment<'a> {
+    source: Arc<dyn Source + 'a>,
+    /// In the order they run, nearest the source first.
+    streams: Vec<Arc<dyn DynStream + 'a>>,
+    /// What the segment produces as it stands, which changes as streams are added.
+    schema: Schema,
+    /// The pipelines this one cannot start before.
+    after: Vec<PipelineRef>,
+}
+
+impl<'a> Segment<'a> {
+    /// A segment that is just its source.
+    fn new(source: Arc<dyn Source + 'a>, schema: Schema) -> Self {
+        Self { source, streams: Vec::new(), schema, after: Vec::new() }
+    }
+
+    /// A segment reading what a pipeline breaker finalised into.
+    fn reading(source: Arc<dyn Source + 'a>, schema: Schema, after: PipelineRef) -> Self {
+        Self { source, streams: Vec::new(), schema, after: vec![after] }
+    }
+
+    /// Puts a streaming operator on the end, which becomes what the segment produces.
+    fn then(mut self, stream: Arc<dyn DynStream + 'a>, schema: Schema) -> Self {
+        self.streams.push(stream);
+        self.schema = schema;
+        self
+    }
 }
 
 /// What the walk down the plan carries with it.
@@ -135,6 +229,10 @@ struct Building<'a, 'b> {
     seams: &'b Settings,
     report: &'b Report,
     shape: Shape,
+    /// The pipelines closed so far, in the order they have to run.
+    done: Vec<Pipeline<'a>>,
+    /// One per entry of `done`, in the same order.
+    drivers: Vec<Arc<Driver>>,
 }
 
 impl<'a> Building<'a, '_> {
@@ -145,6 +243,19 @@ impl<'a> Building<'a, '_> {
     /// If the node has one input, which is a node whose arm below should not have called this.
     fn gathered(&self, node: NodeRef) -> u32 {
         self.shape.gathered(node).expect("a node with two inputs has a second operator")
+    }
+
+    /// Ends a segment with a sink and puts the finished pipeline on the list.
+    fn close(&mut self, segment: Segment<'a>, id: PipelineRef, sink: Arc<dyn DynSink + 'a>) {
+        let mut pipeline = Pipeline::new(PipelineId(id), segment.source, sink);
+        for stream in segment.streams {
+            pipeline = pipeline.then(stream);
+        }
+        for after in segment.after {
+            pipeline = pipeline.after(PipelineId(after));
+        }
+        self.done.push(pipeline);
+        self.drivers.push(self.report.driving(id));
     }
 
     /// The counters for one operator, registered with the report.
@@ -182,17 +293,17 @@ impl<'a> Building<'a, '_> {
     }
 
     fn aggregate(
-        &self,
+        &mut self,
         reference: NodeRef,
         input: NodeRef,
         index: u32,
         groups: Slice,
         aggregates: Slice,
         max_groups: Option<usize>,
-    ) -> Result<Box<dyn Operator + 'a>> {
-        let child = self.node(input)?;
+    ) -> Result<Segment<'a>> {
+        let below = self.node(input)?;
         let (aggregate, out) =
-            Aggregate::new(self.plan, child.schema(), index, groups, aggregates, self.memory)?;
+            Aggregate::new(self.plan, &below.schema, index, groups, aggregates, self.memory)?;
         let aggregate = match max_groups {
             Some(limit) => aggregate.limit_groups(limit),
             None => aggregate,
@@ -201,24 +312,18 @@ impl<'a> Building<'a, '_> {
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
         let counters = self.watch(reference, id, pipeline, "Aggregate", None);
-        let made = Arc::clone(&counters);
-        let driver = self.report.driving(pipeline);
-        Ok(Box::new(Broken::new(
-            child,
-            Watched::new(aggregate, counters),
-            driver,
-            out,
-            made,
-            schema,
-        )))
+        let reading = Arc::clone(&counters);
+        self.close(below, pipeline, Arc::new(Watched::new(aggregate, counters)));
+        Ok(Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline))
     }
 
-    fn node(&self, reference: NodeRef) -> Result<Box<dyn Operator + 'a>> {
+    /// The segment a node produces, closing any pipeline that ends underneath it.
+    fn node(&mut self, reference: NodeRef) -> Result<Segment<'a>> {
         let plan = self.plan;
         let memory = self.memory;
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
-        let inner: Box<dyn Operator + 'a> = match *plan.node(reference) {
+        let segment = match *plan.node(reference) {
             Node::Get { catalog: database, schema, table, index, columns, .. } => {
                 let name = QualifiedName::new(
                     plan.string(database),
@@ -229,23 +334,19 @@ impl<'a> Building<'a, '_> {
                 let schema = scan.schema().clone();
                 let counters =
                     self.watch(reference, id, pipeline, "Scan", Some(plan.string(table)));
-                pulled(Watched::new(scan, counters), schema)
+                Segment::new(Arc::new(Watched::new(scan, counters)), schema)
             }
             Node::Dummy => {
                 let dummy = Dummy::new();
                 let schema = dummy.schema().clone();
-                pulled(
-                    Watched::new(dummy, self.watch(reference, id, pipeline, "Dummy", None)),
-                    schema,
-                )
+                let counters = self.watch(reference, id, pipeline, "Dummy", None);
+                Segment::new(Arc::new(Watched::new(dummy, counters)), schema)
             }
             Node::Values { index, columns, rows } => {
                 let values = Values::new(plan, index, columns, rows)?;
                 let schema = values.schema().clone();
-                pulled(
-                    Watched::new(values, self.watch(reference, id, pipeline, "Values", None)),
-                    schema,
-                )
+                let counters = self.watch(reference, id, pipeline, "Values", None);
+                Segment::new(Arc::new(Watched::new(values, counters)), schema)
             }
             Node::TableFunction { index, function, args, options, settings, columns } => {
                 let name = plan.string(function);
@@ -256,105 +357,91 @@ impl<'a> Building<'a, '_> {
                             FileScan::new(plan, index, function, args, options, settings, columns)?
                                 .watched(counters.clone());
                         let schema = scan.schema().clone();
-                        pulled(Watched::new(scan, counters), schema)
+                        Segment::new(Arc::new(Watched::new(scan, counters)), schema)
                     }
                     Some(TableFunction::RudbStrategies) => {
                         let table = Strategies::new(plan, index, columns)?;
                         let schema = table.schema().clone();
                         let counters = self.watch(reference, id, pipeline, "Strategies", None);
-                        pulled(Watched::new(table, counters), schema)
+                        Segment::new(Arc::new(Watched::new(table, counters)), schema)
                     }
                     _ => {
                         let series = Series::new(plan, index, name, args)?;
                         let schema = series.schema().clone();
                         let counters = self.watch(reference, id, pipeline, "Series", Some(name));
-                        pulled(Watched::new(series, counters), schema)
+                        Segment::new(Arc::new(Watched::new(series, counters)), schema)
                     }
                 }
             }
             Node::Fetch { input, index, args, columns, row } => {
-                let input = self.node(input)?;
+                let below = self.node(input)?;
                 let counters = self.watch(reference, id, pipeline, "Fetch", None);
-                let fetch = Fetch::new(plan, input.schema(), index, args, columns, row)?
+                let fetch = Fetch::new(plan, &below.schema, index, args, columns, row)?
                     .watched(counters.clone());
                 let schema = fetch.schema().clone();
-                Box::new(Streamed::new(input, Watched::new(fetch, counters), schema))
+                below.then(Arc::new(Watched::new(fetch, counters)), schema)
             }
             Node::Filter { input, predicate } => {
-                let input = self.node(input)?;
-                let schema = input.schema().clone();
+                let below = self.node(input)?;
+                let schema = below.schema.clone();
                 let filter = Filter::new(plan, reference, predicate, &schema, self.seams)?;
                 let counters = self.watch(reference, id, pipeline, "Filter", None);
-                Box::new(Streamed::new(input, Watched::new(filter, counters), schema))
+                below.then(Arc::new(Watched::new(filter, counters)), schema)
             }
             Node::Project { input, index, exprs, names } => {
-                let input = self.node(input)?;
-                let project = Project::new(plan, input.schema(), index, exprs, names)?;
+                let below = self.node(input)?;
+                let project = Project::new(plan, &below.schema, index, exprs, names)?;
                 let schema = project.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Project", None);
-                Box::new(Streamed::new(input, Watched::new(project, counters), schema))
+                below.then(Arc::new(Watched::new(project, counters)), schema)
             }
             Node::Aggregate { input, index, groups, aggregates } => {
                 self.aggregate(reference, input, index, groups, aggregates, None)?
             }
             Node::Sort { input, keys } => {
-                let input = self.node(input)?;
-                let schema = input.schema().clone();
+                let below = self.node(input)?;
+                let schema = below.schema.clone();
                 let (sort, out) = Sort::new(plan, &schema, keys, memory)?;
                 let counters = self.watch(reference, id, pipeline, "Sort", None);
-                let made = Arc::clone(&counters);
-                let driver = self.report.driving(pipeline);
-                Box::new(Broken::new(
-                    input,
-                    Watched::new(sort, counters),
-                    driver,
-                    out,
-                    made,
-                    schema,
-                ))
+                let reading = Arc::clone(&counters);
+                self.close(below, pipeline, Arc::new(Watched::new(sort, counters)));
+                Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
             Node::Limit { input, count, offset } => {
                 let max_groups = count
                     .and_then(|count| count.checked_add(offset))
                     .and_then(|count| usize::try_from(count).ok());
-                let input = match (plan.node(input).clone(), max_groups) {
+                let below = match (plan.node(input).clone(), max_groups) {
                     (
-                        Node::Aggregate { input: below, index, groups, aggregates },
+                        Node::Aggregate { input: under, index, groups, aggregates },
                         Some(max_groups),
                     ) => {
-                        self.aggregate(input, below, index, groups, aggregates, Some(max_groups))?
+                        self.aggregate(input, under, index, groups, aggregates, Some(max_groups))?
                     }
                     _ => self.node(input)?,
                 };
-                let schema = input.schema().clone();
+                let schema = below.schema.clone();
                 let limit = Limit::new(count, offset);
                 let counters = self.watch(reference, id, pipeline, "Limit", None);
-                Box::new(Streamed::new(input, Watched::new(limit, counters), schema))
+                below.then(Arc::new(Watched::new(limit, counters)), schema)
             }
             Node::TopN { input, keys, count, offset } => {
-                let input = self.node(input)?;
-                let schema = input.schema().clone();
+                let below = self.node(input)?;
+                let schema = below.schema.clone();
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
                 let counters = self.watch(reference, id, pipeline, "TopN", None);
-                let made = Arc::clone(&counters);
-                let driver = self.report.driving(pipeline);
-                Box::new(Broken::new(input, Watched::new(top, counters), driver, out, made, schema))
+                let reading = Arc::clone(&counters);
+                self.close(below, pipeline, Arc::new(Watched::new(top, counters)));
+                Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
             Node::Distinct { input, on } => {
-                let input = self.node(input)?;
-                let schema = input.schema().clone();
+                let below = self.node(input)?;
+                let schema = below.schema.clone();
                 let (distinct, out) = Distinct::new(plan, &schema, on, memory)?;
                 let counters = self.watch(reference, id, pipeline, "Distinct", None);
-                let made = Arc::clone(&counters);
-                let driver = self.report.driving(pipeline);
-                Box::new(Broken::new(
-                    input,
-                    Watched::new(distinct, counters),
-                    driver,
-                    out,
-                    made,
-                    schema,
-                ))
+                let reading = Arc::clone(&counters);
+                self.close(below, pipeline, Arc::new(Watched::new(distinct, counters)));
+                Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
             Node::Join { left, right, kind, conditions } => {
                 // The right side runs first, because no left row can be answered until every right
@@ -365,26 +452,20 @@ impl<'a> Building<'a, '_> {
                 let gather_id = self.gathered(reference);
                 let gathering = self.shape.pipeline(right);
                 let right = self.node(right)?;
-                let left = self.node(left)?;
+                let right_schema = right.schema.clone();
                 let (gather, gathered) = Gather::new(memory);
-                let side = Gathered { schema: right.schema(), rows: gathered };
-                let (join, out) =
-                    Join::new(plan, left.schema(), side, kind, conditions, self.cancel, memory);
-                let schema = join.schema().clone();
                 let kept = self.watch(reference, gather_id, gathering, "Gather", None);
+                self.close(right, gathering, Arc::new(Watched::new(gather, kept)));
+                let mut left = self.node(left)?;
+                let side = Gathered { schema: &right_schema, rows: gathered };
+                let (join, out) =
+                    Join::new(plan, &left.schema, side, kind, conditions, self.cancel, memory);
+                let schema = join.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Join", None);
-                let made = Arc::clone(&counters);
-                Box::new(Paired::new(
-                    right,
-                    Watched::new(gather, kept),
-                    self.report.driving(gathering),
-                    left,
-                    Watched::new(join, counters),
-                    self.report.driving(pipeline),
-                    out,
-                    made,
-                    schema,
-                ))
+                let reading = Arc::clone(&counters);
+                left.after.push(gathering);
+                self.close(left, pipeline, Arc::new(Watched::new(join, counters)));
+                Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
             Node::CrossProduct { left, right } => {
                 // The right side runs first and is kept as the chunks it arrived in, because it is
@@ -394,18 +475,16 @@ impl<'a> Building<'a, '_> {
                 let keep_id = self.gathered(reference);
                 let aside = self.shape.pipeline(right);
                 let right = self.node(right)?;
-                let left = self.node(left)?;
+                let right_schema = right.schema.clone();
                 let (keep, kept) = Keep::new(memory);
-                let cross = CrossProduct::new(left.schema(), right.schema(), kept);
-                let schema = cross.schema().clone();
                 let held = self.watch(reference, keep_id, aside, "Keep", None);
+                self.close(right, aside, Arc::new(Watched::new(keep, held)));
+                let mut left = self.node(left)?;
+                let cross = CrossProduct::new(&left.schema, &right_schema, kept);
+                let schema = cross.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "CrossProduct", None);
-                Box::new(Fed::new(
-                    right,
-                    Watched::new(keep, held),
-                    self.report.driving(aside),
-                    Streamed::new(left, Watched::new(cross, counters), schema),
-                ))
+                left.after.push(aside);
+                left.then(Arc::new(Watched::new(cross, counters)), schema)
             }
             Node::SetOp { left, right, kind, all, index } => {
                 // The right side runs first, because nothing can be said about a left row until the
@@ -413,36 +492,19 @@ impl<'a> Building<'a, '_> {
                 let gather_id = self.gathered(reference);
                 let counting = self.shape.pipeline(right);
                 let right = self.node(right)?;
-                let left = self.node(left)?;
                 let (gather, gathered) = Gather::new(memory);
-                let (setop, out) = SetOp::new(left.schema(), gathered, kind, all, index, memory);
-                let schema = setop.schema().clone();
                 let kept = self.watch(reference, gather_id, counting, "Gather", None);
+                self.close(right, counting, Arc::new(Watched::new(gather, kept)));
+                let mut left = self.node(left)?;
+                let (setop, out) = SetOp::new(&left.schema, gathered, kind, all, index, memory);
+                let schema = setop.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "SetOp", None);
-                let made = Arc::clone(&counters);
-                Box::new(Paired::new(
-                    right,
-                    Watched::new(gather, kept),
-                    self.report.driving(counting),
-                    left,
-                    Watched::new(setop, counters),
-                    self.report.driving(pipeline),
-                    out,
-                    made,
-                    schema,
-                ))
+                let reading = Arc::clone(&counters);
+                left.after.push(counting);
+                self.close(left, pipeline, Arc::new(Watched::new(setop, counters)));
+                Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
         };
-        Ok(Box::new(Guarded::new(inner, self.cancel.clone())))
+        Ok(segment)
     }
-}
-
-/// A leaf source with the adapter that pulls chunks out of it.
-///
-/// Every leaf is a [`Source`] and everything above it still pulls, so this is
-/// where the two meet. The schema is passed in rather than asked for through a trait, because a
-/// source says what it produces on its own type and adding a trait method to say it again would be
-/// a second answer to the same question.
-fn pulled<'a, S: Source + 'a>(source: S, schema: Schema) -> Box<dyn Operator + 'a> {
-    Box::new(Pulled::new(source, schema))
 }
