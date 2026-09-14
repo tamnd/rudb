@@ -139,12 +139,12 @@ fn a_limit_that_is_not_small_is_left_alone() {
 }
 
 #[test]
-fn an_ordering_key_that_is_not_a_column_is_left_alone() {
-    // The narrowed projection under the top N is built out of the projection's own expressions, so
-    // a key that is not a bare column of it has nowhere to be rebound to.
+fn a_computed_ordering_key_is_replayed_after_the_fetch() {
     let database = Database::new();
-    let plan = database.plan(&wide(WIDE, "b + 1 DESC", 5)).expect("binds");
-    assert!(!plan.contains("Fetch"), "{plan}");
+    let sql = wide(WIDE, "b + 1 DESC", 5);
+    let plan = database.plan(&sql).expect("binds");
+    assert!(plan.contains("Fetch"), "{plan}");
+    assert_eq!(rows(&database, &sql), rows(&without_the_pass(), &sql));
 }
 
 #[test]
