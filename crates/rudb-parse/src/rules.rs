@@ -230,9 +230,41 @@ pub fn rule(name: &str) -> Option<&'static Rule> {
         .map(|index| &crate::generated::rules::RULES[index])
 }
 
+/// The rules a rule chooses between, in the order the matcher tries them.
+///
+/// Written for `Statement`, whose thirty six alternatives are the denominator of the statement
+/// coverage number in `spec/sql/duckdb/01-what-compatible-means.md` section 1.1. Reading them off
+/// the table rather than writing them down is the whole point: the list moves when the vendored
+/// grammar moves, so a statement upstream adds is a statement the denominator grew by, and nobody
+/// has to remember to edit a constant.
+///
+/// Empty when there is no such rule, when its body is not a choice, and when any alternative of the
+/// choice is something other than a reference to a rule. The last one is not a fussy guard. A choice
+/// of a rule and a bare keyword has no name for that second alternative, so a count over what came
+/// back would be a count with a hole in it, and handing back nothing says that more clearly than
+/// handing back a list one short.
+pub fn alternatives(name: &str) -> Vec<&'static str> {
+    let Some(found) = rule(name) else {
+        return Vec::new();
+    };
+    let body = crate::generated::rules::NODES[found.root as usize];
+    if body.op != Op::Choice {
+        return Vec::new();
+    }
+    let mut names = Vec::with_capacity(body.b as usize);
+    for &child in body.children() {
+        let node = crate::generated::rules::NODES[child as usize];
+        if node.op != Op::Rule {
+            return Vec::new();
+        }
+        names.push(crate::generated::rules::RULES[node.a as usize].name);
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Node, Op, Suggestion, bucket, rule, token_key};
+    use super::{Node, Op, Suggestion, alternatives, bucket, rule, token_key};
     use crate::generated::rules::{CHILDREN, NODES, PROGRAM, RULES, SYMBOLS};
     use crate::token::{Flags, Kind, Token};
 
@@ -332,6 +364,39 @@ mod tests {
         }
         assert_eq!(token_key(token(Kind::Keyword, 3)).count_ones(), 1);
         assert_eq!(bucket(0).count_ones(), 1);
+    }
+
+    #[test]
+    fn the_statement_rule_chooses_between_thirty_six_named_rules() {
+        let names = alternatives("Statement");
+        assert_eq!(names.len(), 36);
+        assert_eq!(names[0], "ExternalResourceStatement");
+        assert_eq!(names[3], "SelectStatement");
+        assert_eq!(names[35], "ExpressionStatement");
+        for name in &names {
+            assert!(rule(name).is_some(), "{name} is not a rule");
+        }
+    }
+
+    #[test]
+    fn the_order_the_alternatives_come_back_in_is_the_order_the_matcher_tries_them() {
+        let names = alternatives("Statement");
+        let body = NODES[rule("Statement").expect("Statement").root as usize];
+        let tried: Vec<&str> =
+            body.children().iter().map(|&at| RULES[NODES[at as usize].a as usize].name).collect();
+        assert_eq!(names, tried);
+    }
+
+    #[test]
+    fn a_rule_that_is_not_a_choice_has_no_alternatives_rather_than_one() {
+        let body = NODES[rule("Program").expect("Program").root as usize];
+        assert_ne!(body.op, Op::Choice);
+        assert!(alternatives("Program").is_empty());
+    }
+
+    #[test]
+    fn asking_for_the_alternatives_of_a_rule_that_is_not_there_is_not_an_error() {
+        assert!(alternatives("NoSuchRule").is_empty());
     }
 
     #[test]
