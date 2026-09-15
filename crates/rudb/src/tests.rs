@@ -1229,8 +1229,70 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // This table lists itself, because it is a table function and the table lists those.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
-        vec![vec![Value::BigInt(3)]]
+        vec![vec![Value::BigInt(4)]]
     );
+}
+
+#[test]
+fn the_settings_table_reads_back_what_set_left_behind() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    // A value read through a database is a real one, unlike the same table built with no database
+    // behind it, which is what `rudb_exec` tests against. What the default is depends on how much
+    // memory the machine has, so what is checked is that something answered rather than what.
+    assert!(
+        rows(
+            &db,
+            "SELECT value FROM duckdb_settings() WHERE name = 'memory_limit' AND value IS NOT NULL"
+        )
+        .len()
+            == 1
+    );
+    db.execute("SET memory_limit = '1GiB'").expect("a size");
+    assert_eq!(
+        rows(&db, "SELECT value, typed_value FROM duckdb_settings() WHERE name = 'memory_limit'"),
+        vec![vec![text("1.0 GiB"), text("1.0 GiB")]]
+    );
+    // The alias is a row of its own and it reports the same value, because it is the same setting.
+    assert_eq!(
+        rows(&db, "SELECT value FROM duckdb_settings() WHERE name = 'max_memory'"),
+        vec![vec![text("1.0 GiB")]]
+    );
+    // And writing through the alias moves the setting the other name reads.
+    db.execute("SET max_memory = '2GiB'").expect("a size");
+    assert_eq!(
+        rows(&db, "SELECT value FROM duckdb_settings() WHERE name = 'memory_limit'"),
+        vec![vec![text("2.0 GiB")]]
+    );
+    db.execute("SET worker_threads = 3").expect("a thread count");
+    assert_eq!(
+        rows(&db, "SELECT value FROM duckdb_settings() WHERE name = 'threads'"),
+        vec![vec![text("3")]]
+    );
+}
+
+#[test]
+fn the_settings_table_answers_the_question_a_client_asks_it() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    // Five rows for three settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(5)]]);
+    // The description is the pin's sentence word for word, since a client comparing them would
+    // otherwise see a difference that is not one.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'threads'"
+        ),
+        vec![vec![
+            text("The number of total threads used by the system."),
+            text("BIGINT"),
+            text("GLOBAL"),
+        ]]
+    );
+    // The seams are not settings, which is decided in the settings module and checked here because
+    // this is the table a reader would find them in if the decision ever changed by accident.
+    assert!(rows(&db, "SELECT name FROM duckdb_settings() WHERE name LIKE 'seam%'").is_empty());
 }
 
 /// The four ways a subscript is refused, in DuckDB's words. Per #278.

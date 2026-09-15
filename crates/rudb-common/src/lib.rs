@@ -13,7 +13,8 @@
 //! so the only place both can see it from is the bottom. The [`slow`] counter is here for the same
 //! reason: the two things that increment it are at rank 1 and rank 3, the thing that reads it is at
 //! rank 4, and no two of those three can see each other. So is the [`stage`] clock, which is
-//! written at rank 5 by the Parquet reader and read at rank 4 by the same shim.
+//! written at rank 5 by the Parquet reader and read at rank 4 by the same shim. So is [`Session`],
+//! which is filled in at rank 13 by whatever ran `SET` and read at rank 12 by `duckdb_settings()`.
 
 #![forbid(unsafe_code)]
 
@@ -21,6 +22,7 @@ pub mod bounds;
 pub mod cancel;
 pub mod error;
 pub mod memory;
+pub mod session;
 pub mod slow;
 pub mod stage;
 pub mod types;
@@ -30,6 +32,7 @@ pub use bounds::{Bound, Op, excluded};
 pub use cancel::Cancel;
 pub use error::{Error, ErrorCode, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human};
+pub use session::Session;
 pub use slow::{Cause, Tally};
 pub use stage::{Spent, Stage};
 pub use types::{Field, LogicalType, MAX_DECIMAL_WIDTH, PhysicalType};

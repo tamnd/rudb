@@ -15,6 +15,7 @@
 
 pub mod file;
 pub mod functioncatalog;
+pub mod settingcatalog;
 pub mod signature;
 pub mod table;
 pub mod typecatalog;
@@ -26,6 +27,7 @@ pub use functioncatalog::{
     CONSISTENT, FUNCTION_CATALOG, FUNCTION_SCHEMA, FunctionEntry, function_entries, function_fields,
 };
 pub use rudb_csv::Given;
+pub use settingcatalog::{GLOBAL, SETTINGS, SettingEntry, setting_fields, setting_named};
 pub use signature::{
     FunctionKind, FunctionRow, Resolved, function_rows, kind_of, part_type, resolve,
 };
