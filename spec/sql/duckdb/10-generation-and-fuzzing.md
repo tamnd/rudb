@@ -166,6 +166,20 @@ A generator without reduction produces a pile. The loop is: generate, run both e
 
 Coverage closes it. `cargo-llvm-cov` over the run says which parts of the binder and the executor the generators are not reaching, and that is the feedback that stops a generator from producing a million variations of the same three code paths. Coverage is a diagnostic for the generators, not a published number, because line coverage of an engine says very little about compatibility.
 
+## 10.5.1 What coverage as feedback came out as, which is four operators the generators never reach
+
+It is `scripts/reach` in rudb-compat and `rudb-compat reach`. The script builds rudb with `-C instrument-coverage` on, runs the grammar generator, both partitioning oracles and upstream's sqlsmith over it, and the subcommand reads the lcov back and prints it per crate with the files nothing entered at all named underneath. It is a rebuild of the engine and twenty minutes, so it lives on the gaming machine and nothing gates on it.
+
+The first run reaches 32.4 percent of the 20171 lines of the engine's query path, and that number is worth almost nothing, which is the whole argument of section 10.5. What it is worth something for is the 22 files that were never entered at all. The largest are `rudb-exec/src/group.rs` at 1124 lines, `rudb-kernels/src/aggregate.rs`, `rudb-exec/src/join.rs`, `rudb-exec/src/sort.rs`, `rudb-exec/src/topn.rs` and `rudb-exec/src/setop.rs`. Read as a sentence about the generators rather than about the engine, that says the generated queries never aggregate, never join, never sort and never take a union.
+
+That is the feedback the section asked for and it is not a thing anybody was going to notice by reading generated queries. Every one of them looked reasonable. The partitioning oracles generate a predicate and wrap it in a filter, which is the shape those oracles are about, and the grammar generator walks the statement rule and produces something the binder rejects often enough that the executor is not where its output ends up. Three generators and none of them writes a `GROUP BY`, and the aggregate form of TLP in section 10.4.1.1 is about aggregates over a filter rather than about the group operator.
+
+So the work list is the generators and not the engine: a query generator that reaches the operators, which means joins with a real second table, grouping with an aggregate over it, an `ORDER BY` with a `LIMIT` to reach the top n path, and set operations. The oracles already know what to do with those, since NoREC and the aggregate form of TLP both hold over a grouped query.
+
+The per crate table is how it is read, because a crate is the unit somebody acts on. `rudb-exec` at 18.4 percent with 13 files cold is a sentence about which operators exist and are never asked for, and `rudb-parse` at 57.0 percent with nothing cold is the grammar generator doing exactly what it was written to do.
+
+One thing about the mechanics is worth writing down because it produced a wrong answer first. The engine is a dependency of the harness rather than a member of its workspace, and `cargo llvm-cov` instruments the workspace and nothing else unless the dependency is named. A run that does not name it produces a full report of the harness reaching itself, which reads exactly like a measurement of the engine. `rudb-compat reach` refuses to print a report with no engine files in it and says which half of the setup is wrong.
+
 ## 10.6 Where deterministic simulation fits, which is not here
 
 FoundationDB's simulator, TigerBeetle's VOPR and Antithesis are the state of the art for finding bugs in distributed and storage systems, by running the whole system deterministically against injected faults and replaying any failure exactly.
