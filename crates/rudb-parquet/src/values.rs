@@ -781,18 +781,19 @@ mod tests {
         std::thread::spawn(|| {
             let (schema, _) = column(2);
             let text = b"the quick brown fox jumps over the lazy dog, and then over it again";
+            const BODY: usize = 256 << 10;
             let (mut body, mut spans) = (Vec::new(), Vec::new());
-            while body.len() < 256 << 10 {
+            while body.len() < BODY {
                 spans.push((body.len(), text.len()));
                 body.extend_from_slice(text);
             }
             let total = spans.len();
             let data = super::place(&schema, &mut body, &spans, &[], total).expect("it places");
             assert!(body.is_empty(), "the page was copied out of rather than moved");
-            assert!(crate::arena::take().is_empty(), "a run still being read was handed out");
+            assert!(crate::arena::take(BODY).is_empty(), "a run still being read was handed out");
             drop(data);
             assert!(
-                !crate::arena::take().is_empty(),
+                !crate::arena::take(BODY).is_empty(),
                 "the arena went to the allocator rather than back to the ring"
             );
         })

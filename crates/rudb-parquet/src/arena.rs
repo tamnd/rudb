@@ -99,19 +99,30 @@ pub(crate) fn share(page: Vec<u8>) -> Arc<Vec<u8>> {
     page
 }
 
-/// The last page, if nothing is reading it any more.
+/// The last page, if nothing is reading it any more and it is the right size for `want` bytes.
 ///
-/// Empty when the slot is empty or its page is still being read, which is what the first page of a
-/// scan sees and what every page sees on a query that holds on to its chunks. The caller cannot
-/// tell the difference and does not need to: either way it is a `Vec<u8>` to grow into.
+/// Empty when the slot is empty, or its page is still being read, or its page is far larger than
+/// the caller asked for. The caller cannot tell the difference and does not need to: either way it
+/// is a `Vec<u8>` to grow into.
+///
+/// The size test is what stops a run from being captured by something that does not need it. Every
+/// column of a row group decompresses through here, so without it the first small page after a
+/// string page takes the ten megabyte arena, truncates it to forty kilobytes of integers, and holds
+/// that capacity until the row group is over, while the string column that wanted it allocates
+/// another one. Measured that way, query 37 of ClickBench held ten megabytes more than it needed
+/// to. A run is worth reusing when the caller will fill most of it, so the cut is half.
 ///
 /// It comes back at the length it was, not empty, which is the point. A run that comes back empty
 /// has to be grown before it can be written into, and growing one is an allocation and a walk over
 /// every byte.
 #[must_use]
-pub(crate) fn take() -> Vec<u8> {
+pub(crate) fn take(want: usize) -> Vec<u8> {
     PARKED
         .with_borrow_mut(|parked| {
+            let page = parked.as_ref()?;
+            if want < page.capacity() / 2 {
+                return None;
+            }
             let mut page = parked.take()?;
             match Arc::get_mut(&mut page) {
                 Some(run) => Some(std::mem::take(run)),
@@ -142,13 +153,13 @@ mod tests {
         alone(|| {
             let page = share(vec![7u8; FLOOR]);
             let address = page.as_ptr();
-            assert!(take().is_empty(), "a page still being read was handed out");
+            assert!(take(FLOOR).is_empty(), "a page still being read was handed out");
             drop(page);
-            let back = take();
+            let back = take(FLOOR);
             assert_eq!(back.as_ptr(), address, "the page was reallocated rather than reused");
             // The length is the point. A run that comes back empty has to be grown first.
             assert_eq!(back.len(), FLOOR);
-            assert!(take().is_empty(), "the same run was handed out twice");
+            assert!(take(FLOOR).is_empty(), "the same run was handed out twice");
         });
     }
 
@@ -156,10 +167,10 @@ mod tests {
     fn a_page_still_being_read_stays_in_the_slot_rather_than_being_thrown_away() {
         alone(|| {
             let page = share(vec![0u8; FLOOR]);
-            assert!(take().is_empty());
+            assert!(take(FLOOR).is_empty());
             assert!(PARKED.with_borrow(Option::is_some), "the handle was dropped on a failed take");
             drop(page);
-            assert!(!take().is_empty(), "the page did not come back after its reader went");
+            assert!(!take(FLOOR).is_empty(), "the page did not come back after its reader went");
         });
     }
 
@@ -167,7 +178,18 @@ mod tests {
     fn a_page_too_small_to_be_worth_keeping_is_not_kept() {
         alone(|| {
             drop(share(vec![0u8; FLOOR - 1]));
-            assert!(take().is_empty(), "a run under the floor was kept");
+            assert!(take(FLOOR - 1).is_empty(), "a run under the floor was kept");
+        });
+    }
+
+    /// A caller that would waste most of a run is left to the allocator, so that a page of
+    /// integers cannot end up sitting on a string column's arena for a row group.
+    #[test]
+    fn a_run_far_larger_than_the_caller_asked_for_is_not_handed_over() {
+        alone(|| {
+            drop(share(vec![0u8; FLOOR * 4]));
+            assert!(take(FLOOR).is_empty(), "a caller took four times the run it wanted");
+            assert!(!take(FLOOR * 2).is_empty(), "a caller that would fill half of it was refused");
         });
     }
 
@@ -180,7 +202,7 @@ mod tests {
             let second = share(vec![2u8; FLOOR * 2]);
             assert_eq!(Arc::strong_count(&first), 1, "the first page is still held somewhere");
             drop(second);
-            assert_eq!(take().len(), FLOOR * 2);
+            assert_eq!(take(FLOOR * 2).len(), FLOOR * 2);
         });
     }
 }
