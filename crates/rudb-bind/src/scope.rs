@@ -99,9 +99,12 @@ impl Scope {
             many => {
                 let candidates: Vec<String> =
                     many.iter().map(|held| format!("{}.{}", held.table, held.name)).collect();
+                // The column name is in double quotes and the candidates under it are in single
+                // ones, which reads like a mistake and is what the pin prints:
+                // `Ambiguous reference to column name "a" (use: 't.a' or 'u.a')`.
                 Err(Error::binder(format!(
-                    "Ambiguous reference to column name \"{column}\" (use: \"{}\")",
-                    candidates.join("\" or \"")
+                    "Ambiguous reference to column name \"{column}\" (use: '{}')",
+                    candidates.join("' or '")
                 )))
             }
         }
