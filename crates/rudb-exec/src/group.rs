@@ -1133,11 +1133,7 @@ impl<'a> Aggregate<'a> {
     /// [`Aggregate::room_for_local`] asks.
     ///
     /// Once per chunk rather than once per row, and the answer is almost always yes.
-    fn still_local(
-        &self,
-        spreading: &mut Spreading,
-        own: &mut [Option<Building>],
-    ) -> Result<bool> {
+    fn still_local(&self, spreading: &mut Spreading, own: &mut [Option<Building>]) -> Result<bool> {
         // flatten: a partition this instance has not folded into has no table and nothing to say.
         let spilled = own.iter().flatten().any(|table| table.over.is_some());
         if !spilled && !crowded(&self.memory) && self.room_for_local(own) {
@@ -1191,8 +1187,11 @@ impl<'a> Aggregate<'a> {
     fn room_for_local(&self, own: &[Option<Building>]) -> bool {
         let Some(limit) = self.memory.limit() else { return true };
         // flatten: a partition with no table is holding nothing.
-        let mine: u64 =
-            own.iter().flatten().map(|table| table.scratch.bytes() + table.containers.bytes()).sum();
+        let mine: u64 = own
+            .iter()
+            .flatten()
+            .map(|table| table.scratch.bytes() + table.containers.bytes())
+            .sum();
         let instances = self.started.load(Ordering::Relaxed) as u64;
         mine.saturating_mul(instances) < limit / 4
     }
@@ -1911,11 +1910,9 @@ impl Sink for Aggregate<'_> {
             self.hand(handing, spreading, own)?;
             return Ok(Progress::More);
         }
-        if self.locally.load(Ordering::Relaxed) {
-            if self.still_local(spreading, own)? {
-                self.spread_own(&rows, spreading, own)?;
-                return Ok(Progress::More);
-            }
+        if self.locally.load(Ordering::Relaxed) && self.still_local(spreading, own)? {
+            self.spread_own(&rows, spreading, own)?;
+            return Ok(Progress::More);
         }
         self.spread(&rows, spreading)?;
         Ok(Progress::More)
