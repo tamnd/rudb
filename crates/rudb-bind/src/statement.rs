@@ -17,7 +17,7 @@
 use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
 use rudb_parse::ast::{self, Ast};
-use rudb_parse::{NONE, parse_ast};
+use rudb_parse::{NONE, deparse, parse_ast};
 use rudb_plan::{Expr, ExprRef, Node, Plan};
 
 use crate::binder::Binder;
@@ -102,6 +102,11 @@ pub struct CreateView {
     pub name: QualifiedName,
     /// The body, as written.
     pub sql: String,
+    /// The whole statement written back out, which is what `duckdb_views()` reports as `sql`.
+    ///
+    /// Written here because this is the last place the tree is in reach. See
+    /// [`rudb_catalog::View::statement`] for what the column is and why it is not the text.
+    pub statement: String,
     /// The column names the statement gave, which rename a prefix of what the body produces.
     pub aliases: Vec<String>,
     /// Whether an existing entry of that name is left alone rather than being an error.
@@ -343,6 +348,7 @@ fn create_view(
     Ok(Bound::CreateView(CreateView {
         name,
         sql: ast.string(written.sql).to_string(),
+        statement: deparse::create_view(ast, index),
         aliases,
         if_not_exists: written.if_not_exists,
         or_replace: written.or_replace,

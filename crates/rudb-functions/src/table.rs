@@ -41,7 +41,9 @@
 
 use rudb_common::{Error, Field, LogicalType, Result};
 
-use crate::entrycatalog::{column_fields, database_fields, schema_fields, table_fields};
+use crate::entrycatalog::{
+    column_fields, database_fields, schema_fields, table_fields, view_fields,
+};
 use crate::functioncatalog::function_fields;
 use crate::settingcatalog::setting_fields;
 use crate::typecatalog::type_fields;
@@ -76,6 +78,8 @@ pub enum TableFunction {
     DuckdbSchemas,
     /// `duckdb_tables()`, every base table somebody created.
     DuckdbTables,
+    /// `duckdb_views()`, every view somebody created.
+    DuckdbViews,
     /// `duckdb_columns()`, every column of every one of those.
     DuckdbColumns,
 }
@@ -105,6 +109,7 @@ impl TableFunction {
             Self::DuckdbDatabases => "duckdb_databases",
             Self::DuckdbSchemas => "duckdb_schemas",
             Self::DuckdbTables => "duckdb_tables",
+            Self::DuckdbViews => "duckdb_views",
             Self::DuckdbColumns => "duckdb_columns",
         }
     }
@@ -195,6 +200,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("duckdb_tables") {
             return Some(Self::DuckdbTables);
+        }
+        if name.eq_ignore_ascii_case("duckdb_views") {
+            return Some(Self::DuckdbViews);
         }
         if name.eq_ignore_ascii_case("duckdb_columns") {
             return Some(Self::DuckdbColumns);
@@ -320,6 +328,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbDatabases
         | TableFunction::DuckdbSchemas
         | TableFunction::DuckdbTables
+        | TableFunction::DuckdbViews
         | TableFunction::DuckdbColumns => None,
     }
 }
@@ -336,6 +345,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::DuckdbDatabases => Some(database_fields()),
         TableFunction::DuckdbSchemas => Some(schema_fields()),
         TableFunction::DuckdbTables => Some(table_fields()),
+        TableFunction::DuckdbViews => Some(view_fields()),
         TableFunction::DuckdbColumns => Some(column_fields()),
         TableFunction::Range
         | TableFunction::GenerateSeries

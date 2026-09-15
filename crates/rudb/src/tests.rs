@@ -1229,7 +1229,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // This table lists itself, because it is a table function and the table lists those.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
-        vec![vec![Value::BigInt(8)]]
+        vec![vec![Value::BigInt(9)]]
     );
 }
 
@@ -1549,6 +1549,58 @@ fn a_view_lists_its_columns_the_way_a_table_does() {
         ),
         vec![vec![Value::BigInt(0)]]
     );
+}
+
+/// Every row of the fifth catalog table, against what the pin answers for the same two views.
+#[test]
+fn a_view_reports_itself_and_the_statement_it_was_written_as() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    db.execute("CREATE TABLE base(x INTEGER, s VARCHAR)").expect("a fresh table");
+    db.execute("CREATE VIEW v AS SELECT x, s FROM base WHERE x > 0").expect("a fresh view");
+    // Odd spacing, a comment, a lower case keyword and a name in the wrong case, none of which
+    // survives into the column. What the pin reports is the statement written back out, so the
+    // comment goes, the spacing is normalised, the keywords come back upper case and the names come
+    // back in the case they were written in.
+    db.execute("CREATE VIEW w(p) AS -- a comment\n   select   X  as Y from  base")
+        .expect("a view with an alias list");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT view_name, column_count, internal, temporary, is_bound, sql \
+             FROM duckdb_views() WHERE view_name IN ('v', 'w') ORDER BY view_name"
+        ),
+        vec![
+            vec![
+                text("v"),
+                Value::BigInt(2),
+                Value::Boolean(false),
+                Value::Boolean(false),
+                Value::Boolean(true),
+                text("CREATE VIEW v AS SELECT x, s FROM base WHERE (x > 0);"),
+            ],
+            vec![
+                text("w"),
+                Value::BigInt(1),
+                Value::Boolean(false),
+                Value::Boolean(false),
+                Value::Boolean(true),
+                text("CREATE VIEW w (p) AS SELECT X AS Y FROM base;"),
+            ],
+        ]
+    );
+    // The join a client writes, which is the whole point of the oid columns being filled in.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(*) FROM duckdb_views() v, duckdb_columns() c \
+             WHERE v.view_oid = c.table_oid"
+        ),
+        vec![vec![Value::BigInt(3)]]
+    );
+    // And a table is not a view, so neither table lists what the other one does.
+    assert!(rows(&db, "SELECT view_name FROM duckdb_views() WHERE view_name = 'base'").is_empty());
+    assert!(rows(&db, "SELECT table_name FROM duckdb_tables() WHERE table_name = 'v'").is_empty());
 }
 
 /// A view over a star follows the table under it, and the column list follows with it.

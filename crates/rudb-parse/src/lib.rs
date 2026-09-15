@@ -12,6 +12,7 @@
 pub mod ast;
 #[cfg(test)]
 mod corpus;
+pub mod deparse;
 pub mod generate;
 pub mod generated;
 pub mod matcher;
