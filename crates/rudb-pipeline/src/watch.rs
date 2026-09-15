@@ -60,8 +60,8 @@ impl<S: Source> Source for Watched<S> {
         self.inner.morsel()
     }
 
-    fn morsels(&self) -> Option<usize> {
-        self.inner.morsels()
+    fn morsels(&self, threads: usize) -> Option<usize> {
+        self.inner.morsels(threads)
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {

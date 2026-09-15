@@ -112,7 +112,7 @@ impl<'a> Pipeline<'a> {
         if ceiling <= 1 || !self.parallel() {
             return 1;
         }
-        match self.source.morsels() {
+        match self.source.morsels(ceiling) {
             Some(work) => work.clamp(1, ceiling),
             None => ceiling,
         }
