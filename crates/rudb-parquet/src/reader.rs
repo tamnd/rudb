@@ -175,6 +175,12 @@ pub struct Reader {
     /// One past the last row group this reader reads, which is the whole file until
     /// [`Reader::split`] says otherwise.
     end: usize,
+    /// Which rows of each row group this reader reads, which is all of them until
+    /// [`Reader::split_rows`] says otherwise.
+    ///
+    /// Only ever set on a reader that covers a single row group, because the only caller that wants
+    /// part of a group is the one cutting that group into morsels.
+    piece: Option<Range<usize>>,
     active: Option<Group>,
     bytes: u64,
 }
@@ -199,6 +205,7 @@ impl Reader {
             projection,
             group: 0,
             end,
+            piece: None,
             active: None,
             bytes: 0,
         })
@@ -240,9 +247,35 @@ impl Reader {
             projection: self.projection.clone(),
             group: groups.start,
             end: groups.end,
+            piece: None,
             active: None,
             bytes: 0,
         })
+    }
+
+    /// Another reader over part of one row group of the same file.
+    ///
+    /// [`Reader::split`] hands out whole row groups, and a whole row group is too large a unit of
+    /// work for a machine with cores to spare. DuckDB writes a hundred and twenty two thousand rows
+    /// into one, so the million row ClickBench file has nine of them, and a scan that can only cut
+    /// nine pieces leaves twenty three of a thirty two core machine's threads with nothing to do and
+    /// gets no faster above eight. Measured on that file: the same suite over a copy written with
+    /// thirty two thousand row groups runs in 749 ms at eight threads against 898, and in 676 ms at
+    /// thirty two threads against 930, where the nine group file gets slower the more threads it is
+    /// given.
+    ///
+    /// `rows` is a row ordinal range inside the group, not inside the file. What it costs to start
+    /// part way in is one page header read per page stepped over, which is a couple of hundred bytes
+    /// each and no decompression at all, because a header says how many values its page holds and
+    /// that is all the reader needs to know to skip it.
+    ///
+    /// # Errors
+    ///
+    /// If the group is not one the file has, which is a mistake in the caller.
+    pub fn split_rows(&self, group: usize, rows: Range<usize>) -> Result<Self> {
+        let mut split = self.split(group..group + 1)?;
+        split.piece = Some(rows);
+        Ok(split)
     }
 
     /// Reads only these columns, in this order.
@@ -525,15 +558,23 @@ impl Reader {
         let group = &self.metadata.row_groups[at];
         let rows = usize::try_from(group.rows)
             .map_err(|_| Error::io(format!("a row group of {} rows", group.rows)))?;
-        if rows == 0 {
+        let (from, upto) = match &self.piece {
+            Some(piece) => (piece.start.min(rows), piece.end.min(rows)),
+            None => (0, rows),
+        };
+        if from >= upto {
             return Ok(());
         }
         let plan = self.locate(at)?;
         let mut columns = Vec::with_capacity(plan.len());
         for chunk in plan {
-            columns.push(self.read_column(&chunk));
+            let mut cursor = self.read_column(&chunk);
+            // Every column is put on the same row of the group, so the pages the columns are cut
+            // into do not have to line up with each other and no writer's page size is assumed.
+            cursor.seek(self.file.as_ref(), from)?;
+            columns.push(cursor);
         }
-        self.active = Some(Group { columns, rows, done: 0 });
+        self.active = Some(Group { columns, rows: upto - from, done: 0 });
         Ok(())
     }
 
@@ -805,6 +846,70 @@ impl Cursor {
         Ok(piece)
     }
 
+    /// Steps over whole pages until `target`, a row ordinal inside this column chunk.
+    ///
+    /// What makes this affordable is that a page header carries the number of values in its page, so
+    /// deciding that nobody wants a page costs the couple of hundred bytes of its header and none of
+    /// its body. A page is never read, never decompressed and never decoded to be skipped. Only the
+    /// one page the target lands in is decoded, and the rows of it before the target are dropped by
+    /// starting the cursor part way into it.
+    ///
+    /// The dictionary page is the one page that cannot be stepped over, because every data page
+    /// after it is written in terms of it.
+    fn seek(&mut self, file: &dyn File, target: usize) -> Result<()> {
+        while self.row < target {
+            let (prefix, header, _, total) = self.peek(file)?;
+            if matches!(header.body, Body::Index) {
+                self.bytes_read = self.bytes_read.saturating_add(prefix.len() as u64);
+                self.at = self.at.saturating_add(total);
+                continue;
+            }
+            if matches!(header.body, Body::Dictionary(_)) {
+                self.take_dictionary(file, prefix, total)?;
+                continue;
+            }
+            let values = usize::try_from(header.values())
+                .map_err(|_| Error::io(format!("a page of {} values", header.values())))?;
+            if self.row.saturating_add(values) > target {
+                break;
+            }
+            self.bytes_read = self.bytes_read.saturating_add(prefix.len() as u64);
+            self.at = self.at.saturating_add(total);
+            self.row = self.row.saturating_add(values);
+            self.left -= i64::from(header.values());
+        }
+        let inside = target.saturating_sub(self.row);
+        if inside > 0 {
+            // The page the target is in, decoded by the streaming walk so that there is one piece of
+            // code that knows how to turn a page into a vector, and then started part way in.
+            self.left(Some(file))?;
+            self.offset = inside;
+        }
+        Ok(())
+    }
+
+    /// Reads and decodes the chunk's dictionary page, which every data page after it points into.
+    fn take_dictionary(&mut self, file: &dyn File, prefix: Vec<u8>, total: usize) -> Result<()> {
+        if self.dictionary.is_some() {
+            return Err(Error::io(format!(
+                "a second dictionary page in the chunk for column {}",
+                self.column.name
+            )));
+        }
+        let encoded = self.body(file, prefix, total)?;
+        let mut pages = Pages::new(&encoded, self.codec, self.left);
+        let mut page = pages.next().transpose()?.ok_or_else(|| {
+            Error::io(format!("the dictionary page of column {} is empty", self.column.name))
+        })?;
+        let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
+        let timing = Timing::start(Stage::Dictionary);
+        let built = page.decode_dictionary(&self.column);
+        timing.stop(bytes);
+        self.dictionary = Some(Arc::new(built?));
+        self.at = self.at.saturating_add(total);
+        Ok(())
+    }
+
     /// The values at `wanted`, which are row ordinals inside this column chunk, sorted.
     ///
     /// The point of the method is the pages it does not read. A page header says how many values
@@ -827,26 +932,7 @@ impl Cursor {
                 continue;
             }
             if matches!(header.body, Body::Dictionary(_)) {
-                if self.dictionary.is_some() {
-                    return Err(Error::io(format!(
-                        "a second dictionary page in the chunk for column {}",
-                        self.column.name
-                    )));
-                }
-                let encoded = self.body(file, prefix, total)?;
-                let mut pages = Pages::new(&encoded, self.codec, self.left);
-                let mut page = pages.next().transpose()?.ok_or_else(|| {
-                    Error::io(format!(
-                        "the dictionary page of column {} is empty",
-                        self.column.name
-                    ))
-                })?;
-                let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
-                let timing = Timing::start(Stage::Dictionary);
-                let built = page.decode_dictionary(&self.column);
-                timing.stop(bytes);
-                self.dictionary = Some(Arc::new(built?));
-                self.at = self.at.saturating_add(total);
+                self.take_dictionary(file, prefix, total)?;
                 continue;
             }
             let values = usize::try_from(header.values())
