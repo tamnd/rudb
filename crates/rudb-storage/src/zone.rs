@@ -2,15 +2,23 @@
 //!
 //! A filter that compares a column against a constant can be answered against two numbers instead of
 //! against a thousand rows, and the rows it rules out are rows nothing has to read, copy, compare or
-//! hand downstream. Parquet does this a row group at a time in [`rudb_parquet::skips`], which is a
+//! hand downstream. Parquet does this a row group at a time, in `rudb-parquet`'s `skips`, which is a
 //! hundred thousand rows on the files this engine is measured against. This does it a chunk at a
 //! time, which is a thousand, and the difference between those two granularities is most of what a
 //! selective query costs.
 //!
-//! On the ClickBench `hits` sample that is not a small difference. Query 37 filters on `CounterID`,
-//! which is written in sorted order, and 7381 rows of a million have the value it asks for. Row
-//! group bounds cut nine groups to two, which is 222 thousand rows to scan for 6722 answers. Chunk
-//! bounds cut the same query to the handful of chunks those rows actually sit in.
+//! On the ClickBench `hits` sample at a million rows, six of the forty three queries have a filter
+//! this can answer, and on those six it skips 75 percent of the chunks and they run between two and
+//! two and a half times faster. Query 37 is the clearest: 999,975 rows scanned becomes 247,265, and
+//! 11.05 milliseconds becomes 4.36.
+//!
+//! It is worth saying what that does not add up to, because the number that matters is the suite and
+//! not the query. Over the whole of ClickBench at a million rows the six queries save 37
+//! milliseconds and building the maps costs 60 to 90, so one pass over the suite is a wash. It pays
+//! from the second pass on, and the real ClickBench protocol runs each query three times. The reason
+//! it is not more is not the maps, it is that `hits` is not clustered on `CounterID`: the 7381 rows
+//! with the value query 37 asks for are spread across 121 chunks of the 489. A sort key would put
+//! them in four, and that is the F2 item this is the other half of.
 //!
 //! # Where the decision lives
 //!
@@ -30,14 +38,24 @@
 //!
 //! # What it costs to build
 //!
-//! One pass over each column as it is appended, which is the cost this trades against every query
-//! that follows. That cost is real and it belongs in the load time, not hidden behind it, because a
-//! table built once and queried forty three times and a table built once and queried once want
-//! different answers and the only way to have that conversation is with both numbers in front of
-//! you. [`MemoryTable::stats_ns`] is what a load reports it spent here.
+//! One pass over each column as it is appended. On `hits` at a million rows, one thread, that is
+//! about 60 milliseconds on a load of 0.93 seconds, so a table with a full set of zone maps costs
+//! 1.02 seconds to build against DuckDB's 1.18 for the same `CREATE TABLE AS SELECT`.
+//!
+//! Getting it to 60 milliseconds took two rounds. The first cost 260, which is where the comments on
+//! `extremes` and on `narrower` come from: one was a `Bound` allocated per value instead of a
+//! compare in the column's own type, and the other was a shared dictionary rescanned once per chunk.
+//!
+//! That cost is real and it belongs in the load time rather than hidden behind it, because a table
+//! built once and queried forty three times and a table built once and queried once want different
+//! answers, and the only way to have that conversation is with both numbers in front of you.
+//! [`MemoryTable::stats_ns`] is what a load reports it spent here.
 
 use rudb_common::bounds::{Bound, Op, excluded};
 use rudb_vector::{Chunk, Data, Form, Vector};
+
+#[cfg(doc)]
+use crate::MemoryTable;
 
 /// One comparison against one column of a table.
 #[derive(Debug, Clone)]
