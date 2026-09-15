@@ -4,9 +4,16 @@ use rudb_common::{Error, LogicalType, Result};
 
 /// An Arrow type.
 ///
-/// The subset our own types map onto, which is every type the engine can produce a value of today.
-/// The nested types are missing for the same reason `rudb-vector` has no nested vector: a list is
-/// offsets plus a child array, and there is no child array until the storage layer has one.
+/// The subset our own types map onto, which is every type the engine can produce a value of today
+/// except `LIST`, and `STRUCT`, `MAP`, `ARRAY` and `UNION`, which it cannot produce a value of at all.
+///
+/// `LIST` is the one of the five that is now only missing here. There has been a list vector since
+/// #302, so the blocker is no longer underneath this crate, and what is left is the conversion. It is
+/// not a copy of the buffers either way: Arrow says where a row ends by saying where the next one
+/// begins, and a list vector says where each row starts and how long it is, so a vector whose rows are
+/// in order and touching exports as offsets directly and one that has been gathered or filtered has to
+/// have its child gathered first. That is the piece to write, and it is a decision about when to pay
+/// for the gather rather than a missing layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     /// No values, all null, no buffers at all.

@@ -133,10 +133,25 @@ fn a_list_call_answers_to_the_function_name_when_nothing_aliased_it() {
 }
 
 #[test]
-fn a_list_where_an_expression_goes_is_a_gap_that_says_so() {
-    // There is no LIST vector yet, so a list that is not a file argument has nowhere to be
-    // computed. The message comes from the vector layer and names the thing that is missing rather
-    // than pretending the syntax is unknown.
-    let message = refusal("SELECT [1, 2, 3]");
-    assert!(message.contains("List"), "{message}");
+fn a_list_where_an_expression_goes_computes_since_there_is_a_vector_for_it() {
+    // This used to be the gap that said so, because there was no LIST vector and a list that was not
+    // a file argument had nowhere to be computed. #302 gave it one, so the same query that named the
+    // missing piece now answers.
+    let database = Database::new();
+    assert_eq!(
+        database.value("SELECT [1, 2, 3]").expect("runs"),
+        Value::List {
+            element: rudb_common::LogicalType::Integer,
+            values: vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        }
+    );
+}
+
+#[test]
+fn a_list_of_columns_is_the_half_of_the_gap_that_is_still_there() {
+    // The vector exists and the folding in the binder does not know it yet. A list of constants is
+    // folded into one value, which is why the test above passes, and a list with a column in it has
+    // nothing to fold into and no `list_value` function to become a call to. The message names what
+    // is missing rather than pretending the syntax is unknown.
+    assert_eq!(refusal("SELECT [a, 2] FROM (SELECT 1 AS a)"), "a list of anything but constants");
 }

@@ -60,6 +60,13 @@ fn text(value: &str) -> Value {
     Value::Varchar(value.to_string())
 }
 
+fn list(values: &[i32]) -> Value {
+    Value::List {
+        element: LogicalType::Integer,
+        values: values.iter().map(|&v| Value::Integer(v)).collect(),
+    }
+}
+
 #[test]
 fn a_star_reads_every_column_in_order() {
     let db = database();
@@ -1060,11 +1067,7 @@ fn a_bracket_on_a_string_indexes_it_by_character() {
     assert_eq!(rows(&db, "SELECT list_slice('abcdef', 2, 4)"), vec![vec![text("bcd")]]);
 }
 
-/// One index into a list, which is as far as the list side of this gets today. Per #278.
-///
-/// A slice of a list answers a list, and there is no LIST vector yet, so `[1, 2, 3][1:2]` stops
-/// with the same message `SELECT [1, 2, 3]` stops with. An index answers an element, and an element
-/// of a list of numbers is a number, so these run all the way through.
+/// One index into a list. Per #278.
 #[test]
 fn a_bracket_on_a_list_picks_one_element_out_of_it() {
     let db = database();
@@ -1074,9 +1077,60 @@ fn a_bracket_on_a_list_picks_one_element_out_of_it() {
     assert_eq!(rows(&db, "SELECT [1,2,3][0]"), vec![vec![Value::Null]]);
     assert_eq!(rows(&db, "SELECT [1,2,3][4]"), vec![vec![Value::Null]]);
     assert_eq!(rows(&db, "SELECT list_extract([1,2,3], 2)"), vec![vec![integer(2)]]);
-    let error = db.query("SELECT [1,2,3][1:2]").unwrap_err();
-    assert_eq!(error.code().duckdb_name(), "Not implemented Error");
-    assert_eq!(error.message(), db.query("SELECT [1,2,3]").unwrap_err().message());
+}
+
+/// The list half of #278, which could not be reached through SQL until #302.
+///
+/// Every rule here was measured in `rudb-kernels/src/subscript.rs` when the slice was written, and
+/// none of it could be checked end to end because the answer is a list and a list could not be put in
+/// a vector. So the rules were right and the path from the parser to the printed row was untested,
+/// which is the split this project tries not to have. These are the same thirteen cases read off the
+/// pinned binary.
+#[test]
+fn a_slice_of_a_list_answers_a_list() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT [1,2,3][1:2]"), vec![vec![list(&[1, 2])]]);
+    assert_eq!(rows(&db, "SELECT [1,2,3][2:]"), vec![vec![list(&[2, 3])]]);
+    assert_eq!(rows(&db, "SELECT [1,2,3][:2]"), vec![vec![list(&[1, 2])]]);
+    assert_eq!(rows(&db, "SELECT [1,2,3][:]"), vec![vec![list(&[1, 2, 3])]]);
+    // A list is one based, so zero is the same place one is rather than an error or an empty list.
+    assert_eq!(rows(&db, "SELECT [1,2,3][0:2]"), vec![vec![list(&[1, 2])]]);
+    assert_eq!(rows(&db, "SELECT [1,2,3][-2:-1]"), vec![vec![list(&[2, 3])]]);
+    // Both ends are clamped rather than refused, so a slice can name rows that are not there and a
+    // backwards slice is the empty list and not an error.
+    assert_eq!(rows(&db, "SELECT [1,2,3][2:99]"), vec![vec![list(&[2, 3])]]);
+    assert_eq!(rows(&db, "SELECT [1,2,3][-99:99]"), vec![vec![list(&[1, 2, 3])]]);
+    assert_eq!(rows(&db, "SELECT [1,2,3][3:1]"), vec![vec![list(&[])]]);
+    assert_eq!(rows(&db, "SELECT array_slice([1,2,3], 2, 3)"), vec![vec![list(&[2, 3])]]);
+    assert_eq!(rows(&db, "SELECT list_slice([1,2,3], 1, 1)"), vec![vec![list(&[1])]]);
+    // A null bound makes the whole slice null, and a null list slices to a null rather than to an
+    // empty list, which is the difference #302 made the vector able to carry.
+    assert_eq!(rows(&db, "SELECT [1,2,3][NULL:2]"), vec![vec![Value::Null]]);
+    assert_eq!(rows(&db, "SELECT (NULL::INT[])[1:2]"), vec![vec![Value::Null]]);
+}
+
+/// A list column, stored and read back. Per #302.
+#[test]
+fn a_list_column_keeps_an_empty_list_and_a_null_apart() {
+    let db = database();
+    db.execute("CREATE TABLE lists (a INTEGER[])").unwrap();
+    db.execute("INSERT INTO lists VALUES ([1,2,3]), (NULL), ([]), ([4])").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT a FROM lists"),
+        vec![vec![list(&[1, 2, 3])], vec![Value::Null], vec![list(&[])], vec![list(&[4])],]
+    );
+    // The mask is what tells the empty list from the null, so the count and the null test are the
+    // two questions that would give the same answer if it did not.
+    assert_eq!(rows(&db, "SELECT count(a) FROM lists"), vec![vec![Value::BigInt(3)]]);
+    assert_eq!(
+        rows(&db, "SELECT a IS NULL FROM lists"),
+        vec![
+            vec![Value::Boolean(false)],
+            vec![Value::Boolean(true)],
+            vec![Value::Boolean(false)],
+            vec![Value::Boolean(false)],
+        ]
+    );
 }
 
 /// The four ways a subscript is refused, in DuckDB's words. Per #278.

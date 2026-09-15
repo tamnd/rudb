@@ -120,9 +120,11 @@ impl Binder<'_> {
 
     /// `[a, b, c]`, which is a LIST value.
     ///
-    /// Constants only, because a list is folded into one `Value` here rather than evaluated. There
-    /// is no LIST vector yet, so a list of column references has nothing to compute into, and the
-    /// one thing a list is for today is the file argument of `read_parquet`, which is constants.
+    /// Constants only, because a list is folded into one `Value` here rather than evaluated. There is
+    /// a LIST vector to compute into as of #302, so what is missing now is the other half: a
+    /// `list_value` function for the folding to become a call to. Until that exists `[a, b]` over
+    /// columns has nowhere to be evaluated, and the one thing a list is for today is the file argument
+    /// of `read_parquet`, which is constants.
     ///
     /// The element type is what the items promote to, and an empty list is `INTEGER[]`, both of
     /// which are DuckDB's answers and were measured against the binary.

@@ -148,8 +148,8 @@ impl Gauge {
 ///
 /// # Errors
 ///
-/// If the selection points past the end of the chunk, or if the seam asked for a copy of a column
-/// with no flat layout, which today means the nested types and which
+/// If the selection points past the end of the chunk, or if the seam asked for a copy of a column of a
+/// type there is no vector for, which today means `STRUCT`, `MAP`, `ARRAY` and `UNION` and which
 /// [`Strategy::applicable`](rudb_seam::Strategy::applicable) already keeps the compacting
 /// implementations away from.
 pub fn narrow(
@@ -212,11 +212,16 @@ const THRESHOLD: usize = 5;
 
 /// Whether a type can be copied out of a chunk at all.
 ///
-/// The nested types have no flat layout to gather into yet, so a compaction of one is an error
-/// rather than a slow answer. Both compacting implementations decline a plan that has one in it,
-/// which leaves the reference, which handles everything.
+/// A `STRUCT`, a `MAP`, an `ARRAY` and a `UNION` have no vector to gather into yet, so a compaction
+/// of one is an error rather than a slow answer. Both compacting implementations decline a plan that
+/// has one in it, which leaves the reference, which handles everything.
+///
+/// A `LIST` was in that group until #302 and is not any more. A gather of a list column permutes the
+/// entries and shares the child, so it is eight bytes a row however long the lists are, which is the
+/// cheapest gather of any type here rather than the most expensive. Excluding it would have sent every
+/// plan with a list column in it to the reference for the sake of a restriction that had been lifted.
 fn gatherable(context: &Context<'_>) -> bool {
-    !context.types().iter().any(LogicalType::is_nested)
+    !context.types().iter().any(|ty| ty.is_nested() && !matches!(ty, LogicalType::List(_)))
 }
 
 /// Never copies. The rows a filter kept stay a selection over the chunk they came from.
@@ -353,7 +358,7 @@ impl Compaction for LearnedGain {
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::{LogicalType, Value};
+    use rudb_common::{Field, LogicalType, Value};
     use rudb_seam::{Context, Settings};
     use rudb_vector::{Chunk, Data, Selection, Vector};
 
@@ -403,7 +408,7 @@ mod tests {
     fn a_nested_column_leaves_only_the_one_that_copies_nothing() {
         let mut settings = Settings::new();
         settings.pin(SeamId::ChunkCompaction, "fixed-threshold");
-        let types = [LogicalType::List(Box::new(LogicalType::Integer))];
+        let types = [LogicalType::Struct(vec![Field::new("a", LogicalType::Integer)])];
         let context = Context::new(SeamId::ChunkCompaction, &settings).with_types(&types);
         let registry = compaction();
         assert!(
@@ -415,6 +420,24 @@ mod tests {
         let context = Context::new(SeamId::ChunkCompaction, &settings).with_types(&types);
         let chosen = registry.choose(&context).expect("the reference handles everything");
         assert_eq!(chosen.name(), "never");
+    }
+
+    /// A list was in the group above until #302 and this is the test that says it left.
+    ///
+    /// The distinction is worth a test of its own rather than a line in the one above, because the
+    /// reason a list can be copied now is not that somebody widened the guard. It is that a gather of a
+    /// list column moves the entries and shares the child, which makes it the cheapest gather here
+    /// rather than an impossible one, and a guard that still refused it would send every plan with a
+    /// list column in it to the reference for nothing.
+    #[test]
+    fn a_list_column_can_be_copied_out_since_a_gather_of_one_shares_its_child() {
+        let mut settings = Settings::new();
+        settings.pin(SeamId::ChunkCompaction, "fixed-threshold");
+        let types = [LogicalType::list(LogicalType::Integer)];
+        let context = Context::new(SeamId::ChunkCompaction, &settings).with_types(&types);
+        let registry = compaction();
+        let chosen = registry.choose(&context).expect("a list can be gathered");
+        assert_eq!(chosen.name(), "fixed-threshold");
     }
 
     /// Both narrowings answer with the same rows, which is the whole of what correctness means
