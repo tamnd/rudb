@@ -10,7 +10,7 @@ Baseline for every number here: rudb `e0f32d2`, rudb-compat `995f0e8`, DuckDB `v
 - [ ] Tree aware reducer behind `rudb-compat reduce`, using delta debugging over the arena AST
 - [ ] Skip counts by reason, split into harness gaps and real gaps
 - [ ] `disabled_optimizers` setting over the six entries in `PASSES`, and automatic per pass bisection on a failing record
-- [ ] `rudb-compat report` writing the eleven number page with full provenance
+- [x] `rudb-compat report` writing the eleven number page with full provenance
 - [ ] Real query corpus, first thousand queries, with a per function histogram
 - [ ] `loop`, `foreach` and `require` in the sqllogictest reader, which are the three largest harness gaps
 - [ ] `CALL sqlsmith()` pointed at both engines, which is a generated query source with no generator work on our side
