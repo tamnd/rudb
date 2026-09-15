@@ -26,6 +26,7 @@ pub mod session;
 pub mod slow;
 pub mod stage;
 pub mod types;
+pub mod utf8;
 pub mod value;
 
 pub use bounds::{Bound, Op, excluded};
