@@ -987,6 +987,38 @@ fn the_settings_table_is_five_rows_for_three_settings_and_says_nothing_about_a_v
 }
 
 #[test]
+fn the_databases_table_is_the_one_catalog_the_test_harness_built() {
+    let rows =
+        run("TableFunction duckdb_databases args=[] #0 [database_name::VARCHAR, path::VARCHAR, \
+         type::VARCHAR, readonly::BOOLEAN]");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], text("memory"));
+    // Null rather than a file name, because everything rudb attaches is in memory so far.
+    assert_eq!(rows[0][1], Value::Null);
+    assert_eq!(rows[0][2], text("duckdb"));
+    assert_eq!(rows[0][3], Value::Boolean(false));
+}
+
+#[test]
+fn the_schemas_table_carries_the_oid_the_databases_table_gave_its_database() {
+    // The reason these tables report oids at all. A client reads one of them, joins it to the other
+    // on the number, and gets the pair back. That join is what breaks if either side reports null.
+    let databases = run(
+        "TableFunction duckdb_databases args=[] #0 [database_name::VARCHAR, database_oid::BIGINT]",
+    );
+    let schemas =
+        run("TableFunction duckdb_schemas args=[] #0 [oid::BIGINT, database_name::VARCHAR, \
+         database_oid::BIGINT, schema_name::VARCHAR, internal::BOOLEAN]");
+    assert_eq!(schemas.len(), 1);
+    assert_eq!(schemas[0][1], text("memory"));
+    assert_eq!(schemas[0][2], databases[0][1]);
+    assert_eq!(schemas[0][3], text("main"));
+    assert_eq!(schemas[0][4], Value::Boolean(true));
+    // And the schema's own oid is its own, not the one its database is carrying.
+    assert_ne!(schemas[0][0], schemas[0][2]);
+}
+
+#[test]
 fn a_metadata_table_hands_back_the_columns_it_was_asked_for_in_the_order_asked() {
     // The same requirement as the strategies table and checked on a second one, because the
     // resolution by name now lives in one place and a regression there would be silent: every one of

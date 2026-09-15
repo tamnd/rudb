@@ -19,7 +19,7 @@ pub mod name;
 pub mod table;
 pub mod view;
 
-pub use catalog::{Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, Database, Entry, Schema};
+pub use catalog::{Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, DETACHED, Database, Entry, Schema};
 pub use name::{QualifiedName, same_name};
 pub use table::{Table, duplicate_check};
 pub use view::View;
