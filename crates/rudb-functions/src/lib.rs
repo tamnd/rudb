@@ -21,7 +21,9 @@ pub mod signature;
 pub mod table;
 pub mod typecatalog;
 
-pub use entrycatalog::{DUCKDB, database_fields, schema_fields};
+pub use entrycatalog::{
+    DUCKDB, canonical, column_fields, database_fields, numeric_facts, schema_fields, table_fields,
+};
 pub use file::{
     csv_fields, csv_given, files, is_file, is_pattern, open_csv, open_parquet, parquet_fields,
 };
@@ -39,5 +41,5 @@ pub use table::{
 };
 pub use typecatalog::{
     Signature, TYPE_NAMES, TypeEntry, representative, sort_key, type_category, type_fields,
-    type_size,
+    type_oid, type_size,
 };
