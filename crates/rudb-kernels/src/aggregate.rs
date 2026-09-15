@@ -178,6 +178,18 @@ enum State {
 }
 
 impl Accumulator {
+    /// Finish an exact integer SUM held in a compact grouped state.
+    #[must_use]
+    pub fn exact_sum(total: i128, seen: bool, returns: &LogicalType) -> Self {
+        Self { state: State::Whole { total, seen, returns: Return::new(returns) } }
+    }
+
+    /// Finish an exact integer AVG held in a compact grouped state.
+    #[must_use]
+    pub fn exact_avg(total: i128, seen: i64, returns: &LogicalType) -> Self {
+        Self { state: State::Mean { total, seen, exact: true, returns: Return::new(returns) } }
+    }
+
     fn kind(&self) -> Kind {
         match self.state {
             State::Counted { star, .. } => {
