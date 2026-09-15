@@ -5,15 +5,24 @@ use rudb_common::{Error, LogicalType, Result};
 /// An Arrow type.
 ///
 /// The subset our own types map onto, which is every type the engine can produce a value of today
-/// except `LIST`, and `STRUCT`, `MAP`, `ARRAY` and `UNION`, which it cannot produce a value of at all.
+/// except the five nested ones.
 ///
-/// `LIST` is the one of the five that is now only missing here. There has been a list vector since
-/// #302, so the blocker is no longer underneath this crate, and what is left is the conversion. It is
-/// not a copy of the buffers either way: Arrow says where a row ends by saying where the next one
-/// begins, and a list vector says where each row starts and how long it is, so a vector whose rows are
-/// in order and touching exports as offsets directly and one that has been gathered or filtered has to
-/// have its child gathered first. That is the piece to write, and it is a decision about when to pay
-/// for the gather rather than a missing layer.
+/// `LIST` and `STRUCT` are the two of the five that are now only missing here. There has been a list
+/// vector since #302 and a struct vector since #594, so for both of them the blocker is no longer
+/// underneath this crate.
+///
+/// A struct is nearly a transcription. Arrow holds one child array per field, each as long as the
+/// parent, with the parent's validity bitmap on top, which is exactly [`Form::Struct`]'s layout, so the
+/// export is the children exported and a schema saying what they are called. Nothing is rearranged and
+/// nothing is copied that would not have been copied anyway.
+///
+/// A list has a real decision in it. Arrow says where a row ends by saying where the next one begins,
+/// and a list vector says where each row starts and how long it is, so a vector whose rows are in order
+/// and touching exports as offsets directly and one that has been gathered or filtered has to have its
+/// child gathered first. That is the piece to write, and it is a decision about when to pay for the
+/// gather rather than a missing layer.
+///
+/// [`Form::Struct`]: rudb_vector::Form::Struct
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     /// No values, all null, no buffers at all.

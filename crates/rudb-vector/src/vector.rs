@@ -21,24 +21,26 @@
 //! page of strings moves sixteen bytes a row and copies none of the payload. Every other form here
 //! trades a little work per row for less memory, and that one trades nothing at all.
 //!
-//! A list is the odd one out in a different direction. The forms above are all ways of writing a
-//! column of scalars down more cheaply, and a list is not a scalar at all, so [`Form::List`] is the
-//! only form a list column has rather than one of several it could be in. What it is, is a child
-//! vector of every element and a start and a length per row, and the child is an ordinary vector that
-//! can be in any of the forms above. That is where a list column gets made smaller.
+//! The nested forms are the odd ones out in a different direction. The forms above are all ways of
+//! writing a column of scalars down more cheaply, and a nested value is not a scalar at all, so
+//! [`Form::List`] and [`Form::Struct`] are each the only form their column has rather than one of
+//! several it could be in. A list is a child vector of every element plus a start and a length per
+//! row. A struct is one child per field with no entries at all, because a struct row holds one value
+//! per field rather than a run of them. Either way the children are ordinary vectors and can be in any
+//! of the forms above, which is where a nested column gets made smaller.
 //!
 //! **What is not here yet.** Buffers are owned. Section 7.1 says a vector borrowed from a buffer
 //! managed page carries a pin, and there is no buffer manager until M2, so there is nothing to pin
-//! and pretending otherwise would be an interface built against an imaginary caller. `STRUCT`, `MAP`
-//! and `ARRAY` are not stored yet either. A list was the first of the four and set the pattern, and
-//! the other three are the same idea with a different count of children: a struct is one child per
-//! field and no entries, a map is a list of two children, and an array is a list whose length is the
-//! type's rather than the row's.
+//! and pretending otherwise would be an interface built against an imaginary caller. `MAP` and
+//! `ARRAY` are not stored yet either, and both are compositions of what is here rather than new
+//! shapes: a map is a list whose child is a two field struct of keys and values, and an array is a
+//! list whose length is the type's rather than the row's. `UNION` is the one that is genuinely
+//! different, since it is one child per member plus a tag saying which member each row is in.
 
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use rudb_common::{Cause, Error, LogicalType, Result, Value, slow};
+use rudb_common::{Cause, Error, Field, LogicalType, Result, Value, slow};
 
 use crate::buffer::Buffer;
 use crate::fsst::SymbolTable;
@@ -114,6 +116,15 @@ pub enum Form {
     /// list vector reports this whether or not anything has tried to make it smaller. Making it
     /// smaller happens in the child, which is an ordinary vector and can be any of the forms above.
     List,
+    /// One child vector per field, each as long as the vector itself.
+    ///
+    /// The form a `STRUCT` column is in, and the only form it has, for the reason [`Form::List`] is
+    /// the only form a list has. A struct holds exactly one value per field per row rather than a run
+    /// of them, so there are no entries here and the children line up with the rows one to one, which
+    /// makes a cut a cut of every child and a gather a gather of every child. Each child is an
+    /// ordinary vector and can be in any of the forms above, so that is where a struct column gets
+    /// made smaller.
+    Struct,
 }
 
 /// The values of a flat vector, one Rust vector per physical type.
@@ -362,6 +373,27 @@ enum Body {
         entries: Vec<(u32, u32)>,
         child: Arc<Vector>,
     },
+    /// One child vector per field, in the order the type names them, each as long as this vector.
+    ///
+    /// No entries, which is the whole difference from [`Body::Nested`]. A list row is a run of
+    /// elements so it needs to say where its run is, and a struct row is one value per field so row
+    /// `r` of field `f` is position `r` of child `f` and there is nothing to record. That makes a cut
+    /// a cut of every child and a gather a gather of every child, both at the same positions, rather
+    /// than a rewrite of an index.
+    ///
+    /// The children are behind an `Arc` for the reason a dictionary's values are, and it pays off less
+    /// often here. A cut of a list column shares its child untouched because the entries carry the
+    /// range, and a cut of a struct column has to cut each child, so the sharing only survives the
+    /// cases where nothing moves. It is still worth having, because a struct of a hundred fields
+    /// handed between operators is a hundred pointers rather than a hundred columns.
+    ///
+    /// A null struct is the validity mask at this level being false and says nothing about the
+    /// children, which still hold whatever was put in them at that row. That is DuckDB's behaviour and
+    /// it is the reason this form cannot decide a row is null by looking down: the mask is the answer,
+    /// the same as it is for a list.
+    Fields {
+        children: Vec<Arc<Vector>>,
+    },
 }
 
 impl Vector {
@@ -392,11 +424,16 @@ impl Vector {
     ///
     /// # Errors
     ///
-    /// If a value is not one the type can hold, or if the type is one that cannot be stored flat
-    /// yet, which today means the nested types.
+    /// If a value is not one the type can hold, or if the type is one there is no vector for yet,
+    /// which today means `MAP`, `ARRAY` and `UNION`. A `LIST` and a `STRUCT` are routed to their own
+    /// builders and come back built.
     pub fn from_values(ty: LogicalType, values: &[Value]) -> Result<Self> {
-        if let LogicalType::List(element) = &ty {
-            return Self::list_from_values(element.as_ref().clone(), values);
+        match &ty {
+            LogicalType::List(element) => {
+                return Self::list_from_values(element.as_ref().clone(), values);
+            }
+            LogicalType::Struct(fields) => return Self::struct_from_values(fields, values),
+            _ => {}
         }
         let mut data = empty_data_for(&ty)?;
         for value in values {
@@ -474,6 +511,108 @@ impl Vector {
             validity: Validity::AllValid,
             body: Body::Nested { entries, child: Arc::new(child) },
         })
+    }
+
+    /// A struct vector of `fields`, built from one [`Value::Struct`] per row.
+    ///
+    /// One pass per field rather than one pass per row, because each field becomes its own child
+    /// vector and a child is built from a run of values of one type. So a struct of three fields over
+    /// a thousand rows is three calls to [`Self::from_values`] and not a thousand.
+    ///
+    /// The fields are matched by name and not by position. A `Value::Struct` carries its names, and a
+    /// caller that built one in a different order from the type's would otherwise get the values
+    /// silently transposed into the wrong columns, which is the kind of wrong answer that reads as
+    /// right. A row missing a field the type names is an error rather than a null for the same reason.
+    ///
+    /// A null row is a null in every child as well as a false bit in the mask here. [`Body::Fields`]
+    /// says a null struct is allowed to have readable children and that is about a struct built out of
+    /// children that already exist, where whatever is underneath is the caller's. Built from values
+    /// there is nothing underneath to keep, so the children get the null.
+    fn struct_from_values(fields: &[Field], values: &[Value]) -> Result<Self> {
+        let mut children = Vec::with_capacity(fields.len());
+        for field in fields {
+            let mut column = Vec::with_capacity(values.len());
+            for value in values {
+                column.push(match value {
+                    Value::Null => Value::Null,
+                    Value::Struct(held) => held
+                        .iter()
+                        .find(|(name, _)| *name == field.name)
+                        .map(|(_, held)| held.clone())
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "a struct row with no {} field in it",
+                                field.name
+                            ))
+                        })?,
+                    other => {
+                        return Err(Error::internal(format!(
+                            "{other:?} does not belong in a struct vector"
+                        )));
+                    }
+                });
+            }
+            children.push(Arc::new(Self::from_values(field.ty.clone(), &column)?));
+        }
+        let validity = Validity::from_iter(values.len(), |index| !values[index].is_null());
+        Ok(Self {
+            ty: LogicalType::Struct(fields.to_vec()),
+            len: values.len(),
+            validity,
+            body: Body::Fields { children },
+        })
+    }
+
+    /// A struct vector over children that already exist, one per field.
+    ///
+    /// What a scan and a struct returning kernel build, both of which produce each field as a column
+    /// and then put them side by side. Every row is valid, since a caller with nulls to record adds
+    /// them with [`Self::with_validity`].
+    ///
+    /// # Errors
+    ///
+    /// If there are no fields, or if the children are not all the same length. The first is not a
+    /// fussy restriction: a struct vector with no children has no child to take its length from, so a
+    /// zero field struct column would be a length with nothing to check it against, and a caller that
+    /// wants a column of empty structs wants a constant vector of one.
+    pub fn structure(children: Vec<(String, Vector)>) -> Result<Self> {
+        let Some((_, first)) = children.first() else {
+            return Err(Error::internal("a struct vector of no fields, which has no length"));
+        };
+        let len = first.len();
+        for (name, child) in &children {
+            if child.len() != len {
+                return Err(Error::internal(format!(
+                    "a {} field of {} rows beside a struct of {len}",
+                    name,
+                    child.len()
+                )));
+            }
+        }
+        let fields = children
+            .iter()
+            .map(|(name, child)| Field::new(name.clone(), child.ty.clone()))
+            .collect();
+        let children = children.into_iter().map(|(_, child)| Arc::new(child)).collect();
+        Ok(Self {
+            ty: LogicalType::Struct(fields),
+            len,
+            validity: Validity::AllValid,
+            body: Body::Fields { children },
+        })
+    }
+
+    /// The children, for a struct vector, and `None` for any other form.
+    ///
+    /// The accessor a kernel over a struct column reads, and the reason field extraction is free:
+    /// picking one field out of a struct is picking one of these, so a projection of `s.a` hands back
+    /// a vector that already exists rather than reading a row at a time and rebuilding a column.
+    #[must_use]
+    pub fn struct_parts(&self) -> Option<&[Arc<Self>]> {
+        match &self.body {
+            Body::Fields { children } => Some(children),
+            _ => None,
+        }
     }
 
     /// The entries and the child, for a list vector, and `None` for any other form.
@@ -654,7 +793,8 @@ impl Vector {
     ///
     /// # Errors
     ///
-    /// If the type has no flat layout, which today means the nested types.
+    /// From the gather this does at the end, and nowhere else. A body that is not flat comes back
+    /// unchanged rather than as an error, so a nested vector never reaches the part that can fail.
     pub fn run_encoded(&self) -> Result<Self> {
         let Body::Flat(data) = &self.body else {
             return Ok(self.clone());
@@ -964,6 +1104,13 @@ impl Vector {
             Body::Nested { entries, child } => {
                 entries.capacity() * size_of::<(u32, u32)>() + child.footprint()
             }
+            // Every child in full, the way the list child counts. A struct is as wide as its fields
+            // are, so this is the one body whose cost is a sum over children rather than one number,
+            // and a struct of a hundred narrow fields costs what the hundred columns cost.
+            Body::Fields { children } => {
+                children.capacity() * size_of::<Arc<Self>>()
+                    + children.iter().map(|child| child.footprint()).sum::<usize>()
+            }
         };
         size_of::<Self>() + self.validity.footprint() + body
     }
@@ -1017,6 +1164,7 @@ impl Vector {
             Body::Coded { .. } => Form::Fsst,
             Body::Runs { .. } => Form::Rle,
             Body::Nested { .. } => Form::List,
+            Body::Fields { .. } => Form::Struct,
         }
     }
 
@@ -1238,6 +1386,17 @@ impl Vector {
                 },
                 None => Value::Null,
             },
+            // One value read out of each child at the same position, which is the slow path this whole
+            // function is and is why a kernel over a struct column reads `struct_parts` instead. The
+            // names come from this vector's type rather than from the children, because a child is a
+            // vector and a vector has no name, and the type is where the field order is written down.
+            Body::Fields { children } => Value::Struct(
+                fields_of(&self.ty)
+                    .iter()
+                    .zip(children)
+                    .map(|(field, child)| (field.name.clone(), child.value_at(index)))
+                    .collect(),
+            ),
             Body::Flat(data) => value_from(&self.ty, data, index),
         }
     }
@@ -1298,7 +1457,8 @@ impl Vector {
             Body::Coded { .. }
             | Body::Sequence { .. }
             | Body::Packed { .. }
-            | Body::Nested { .. } => None,
+            | Body::Nested { .. }
+            | Body::Fields { .. } => None,
         }
     }
 
@@ -1348,10 +1508,13 @@ impl Vector {
             // The same `None` [`Self::bytes_at`] gives, for the same reason. A packed or compressed
             // row is not an integer anywhere until it has been unpacked, and a caller that gets
             // `None` goes to `value_at` and gets the row unpacked into a value. A list row is not an
-            // integer in any form, however many integers are in it.
-            Body::Coded { .. } | Body::Packed { .. } | Body::Views { .. } | Body::Nested { .. } => {
-                None
-            }
+            // integer in any form, however many integers are in it, and a struct row is not one even
+            // when it has exactly one integer field, since the row is the struct and not the field.
+            Body::Coded { .. }
+            | Body::Packed { .. }
+            | Body::Views { .. }
+            | Body::Nested { .. }
+            | Body::Fields { .. } => None,
         }
     }
 
@@ -1448,6 +1611,17 @@ impl Vector {
             Body::Nested { entries, child } => {
                 Body::Nested { entries: entries[at..end].to_vec(), child: Arc::clone(child) }
             }
+            // Every child cut at the same place, because a struct row is one value per field at the
+            // same position in each and there is no entry standing between the row and the child to
+            // rewrite instead. So this is the one nested form whose cut is not free, and what it costs
+            // is whatever cutting each field costs, which for a field of string views is sixteen bytes
+            // a row and for a field of packed integers is one addition.
+            Body::Fields { children } => Body::Fields {
+                children: children
+                    .iter()
+                    .map(|child| child.slice(at, len).map(Arc::new))
+                    .collect::<Result<Vec<_>>>()?,
+            },
             // The one form with nowhere to point, so its range is copied out. A gather is the
             // right tool here and does no more than this would: a flat body has no dictionary
             // under it for the gather to flatten.
@@ -1474,7 +1648,9 @@ impl Vector {
     ///
     /// # Errors
     ///
-    /// If the type is one this crate cannot store flat yet, which today means the nested types.
+    /// If the type is one there is no vector for yet, which today means `MAP`, `ARRAY` and `UNION`. A
+    /// `LIST` flattens to a list and a `STRUCT` to a struct of flattened fields, since neither has a
+    /// data slice in any form and there is nothing flatter for either to become.
     pub fn flatten(&self) -> Result<Self> {
         if let Body::Flat(_) = self.body {
             return Ok(self.clone());
@@ -1497,7 +1673,8 @@ impl Vector {
     ///
     /// # Errors
     ///
-    /// If the type has no flat layout, which today means the nested types.
+    /// If the type is one there is no vector for yet, which today means `MAP`, `ARRAY` and `UNION`. A
+    /// `LIST` gathers by permuting its entries and a `STRUCT` by gathering every field.
     pub fn gather(&self, indices: &[u32]) -> Result<Self> {
         self.copied(indices.iter().map(|&index| index as usize).collect(), true)
     }
@@ -1516,10 +1693,13 @@ impl Vector {
         let validity = Validity::from_run(&live);
         let body = match &leaf.body {
             // The same gather the arm below is, for a type that has no flat layout to be written out
-            // into. It goes through the list builder rather than through a run of data, because the
-            // builder is the one place that knows a row of a list column is a range of a child, and a
-            // second copy of that here would be a second thing to keep in step with it.
-            Body::Constant(value) if matches!(self.ty, LogicalType::List(_)) => {
+            // into. It goes through the nested builders rather than through a run of data, because they
+            // are the one place that knows a row of a list column is a range of a child and a row of a
+            // struct column is one position in each of several, and a second copy of that here would
+            // be a second thing to keep in step with them.
+            Body::Constant(value)
+                if matches!(self.ty, LogicalType::List(_) | LogicalType::Struct(_)) =>
+            {
                 if forms_stay && matches!(validity, Validity::AllValid) {
                     return Ok(Self::constant(self.ty.clone(), value.as_ref().clone(), rows));
                 }
@@ -1641,6 +1821,21 @@ impl Vector {
                     .map(|&index| entries.get(index).copied().unwrap_or((0, 0)))
                     .collect(),
                 child: Arc::clone(child),
+            },
+            // Every child gathered at the same positions, for the reason the cut cuts every child:
+            // there are no entries to permute instead, so the permutation happens once per field. The
+            // positions handed down are the resolved ones, sentinel and all, so a row that resolved to
+            // nowhere comes back null in each field as well as null here.
+            //
+            // `forms_stay` is passed straight through rather than ignored, which is the opposite of
+            // what the list arm does, and the difference is real. There is nothing flatter for a list
+            // to become, and a struct is only as flat as its fields are, so a flatten of a struct
+            // column is a flatten of each field and a caller that asked for data slices gets them.
+            Body::Fields { children } => Body::Fields {
+                children: children
+                    .iter()
+                    .map(|child| child.copied(at.clone(), forms_stay).map(Arc::new))
+                    .collect::<Result<Vec<_>>>()?,
             },
             // Unreachable, because `resolve` walks past both of the forms that point at another
             // vector and stops at the first body that does not.
@@ -2209,6 +2404,19 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
     value.unwrap_or(Value::Null)
 }
 
+/// The fields a struct type names, and nothing for any other type.
+///
+/// Only a `STRUCT` vector has a [`Body::Fields`] body, and the two are built together, so in practice
+/// the empty slice is unreachable and is here so that reading a field name is not a panic if that ever
+/// stops being true. A struct vector whose type has fewer fields than it has children answers about
+/// the fields it can name, because the zip stops at the shorter of the two.
+fn fields_of(ty: &LogicalType) -> &[Field] {
+    match ty {
+        LogicalType::Struct(fields) => fields,
+        _ => &[],
+    }
+}
+
 /// One row of a string column as a value, given what its bytes are meant to be read as.
 ///
 /// Both forms that hold strings come through here, so a row that is a `BLOB` in a flat column is a
@@ -2344,7 +2552,7 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
 mod tests {
     use std::sync::Arc;
 
-    use rudb_common::{LogicalType, Value};
+    use rudb_common::{Field, LogicalType, Value};
 
     use super::{Body, Data, FSST_PAYS_AT, Form, VECTOR_SIZE, Vector};
     use crate::buffer::Buffer;
@@ -2454,6 +2662,193 @@ mod tests {
     #[test]
     fn the_scalar_readers_decline_a_list_instead_of_answering_about_its_elements() {
         let column = list_column(&[list(&[7])]);
+        assert_eq!(column.signed_at(0), None);
+        assert_eq!(column.bytes_at(0), None);
+        assert_eq!(column.data(), None);
+    }
+
+    fn pair(a: i32, b: &str) -> Value {
+        Value::Struct(vec![
+            ("a".to_string(), Value::Integer(a)),
+            ("b".to_string(), Value::Varchar(b.to_string())),
+        ])
+    }
+
+    fn pair_type() -> LogicalType {
+        LogicalType::Struct(vec![
+            Field::new("a", LogicalType::Integer),
+            Field::new("b", LogicalType::Varchar),
+        ])
+    }
+
+    fn pair_column(rows: &[Value]) -> Vector {
+        Vector::from_values(pair_type(), rows).unwrap()
+    }
+
+    #[test]
+    fn a_struct_column_is_one_child_per_field_as_long_as_the_column() {
+        let rows = vec![pair(1, "x"), pair(2, "y"), pair(3, "z")];
+        let column = pair_column(&rows);
+        assert_eq!(column.form(), Form::Struct);
+        assert_eq!(column.len(), 3);
+        assert_eq!(column.logical_type(), &pair_type());
+        // Two children rather than two entries and a child, and both of them as long as the column,
+        // which is the whole difference between this form and the list one.
+        let children = column.struct_parts().expect("a struct");
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].len(), 3);
+        assert_eq!(children[1].len(), 3);
+        assert_eq!(children[0].logical_type(), &LogicalType::Integer);
+        assert_eq!(children[1].logical_type(), &LogicalType::Varchar);
+        assert_eq!(column.iter().collect::<Vec<_>>(), rows);
+    }
+
+    /// Picking one field out of a struct is picking one child, which is the reason this accessor is
+    /// public. A projection of `s.a` hands back a vector that already exists, so it costs a pointer
+    /// rather than a pass over the rows, and that is only true while the children are full length.
+    #[test]
+    fn one_field_of_a_struct_column_is_a_column_that_is_already_there() {
+        let column = pair_column(&[pair(10, "x"), pair(20, "y")]);
+        let field = &column.struct_parts().expect("a struct")[0];
+        assert_eq!(field.iter().collect::<Vec<_>>(), [Value::Integer(10), Value::Integer(20)]);
+        assert_eq!(field.signed_at(1), Some(20), "the field is a scalar column and reads like one");
+    }
+
+    /// A null struct is a bit in the mask at the top and nothing deeper, which is how every other type
+    /// records a null and is what DuckDB does. The row reads as a single null rather than as a struct of
+    /// nulls, and the fields underneath are still their own columns.
+    #[test]
+    fn a_null_struct_is_the_mask_at_the_top_and_not_a_struct_full_of_nulls() {
+        let column = pair_column(&[pair(1, "x"), Value::Null]);
+        assert!(!column.is_null_at(0));
+        assert!(column.is_null_at(1));
+        assert_eq!(column.value_at(1), Value::Null);
+        // A struct row whose every field happens to be null is a different row, and it is not null.
+        let all_null = pair_column(&[Value::Struct(vec![
+            ("a".to_string(), Value::Null),
+            ("b".to_string(), Value::Null),
+        ])]);
+        assert!(!all_null.is_null_at(0), "a struct of nulls is a row that is there");
+        assert_ne!(all_null.value_at(0), Value::Null);
+    }
+
+    #[test]
+    fn slicing_a_struct_column_cuts_every_field_at_the_same_place() {
+        let rows: Vec<Value> = (0..64).map(|row| pair(row, "s")).collect();
+        let column = pair_column(&rows);
+        let cut = column.slice(8, 4).unwrap();
+        assert_eq!(cut.form(), Form::Struct);
+        assert_eq!(cut.iter().collect::<Vec<_>>(), rows[8..12]);
+        // The cut a list column does not have to do. A list shares its child untouched because the
+        // entries carry the range, and a struct has no entry standing between the row and the child,
+        // so every child is four rows long here rather than sixty four.
+        for child in cut.struct_parts().expect("a struct") {
+            assert_eq!(child.len(), 4);
+        }
+    }
+
+    #[test]
+    fn gathering_a_struct_column_gathers_every_field_at_the_same_positions() {
+        let column = pair_column(&[pair(1, "x"), pair(2, "y"), pair(3, "z")]);
+        let picked = column.gather(&[2, 0, 2]).unwrap();
+        assert_eq!(picked.iter().collect::<Vec<_>>(), [pair(3, "z"), pair(1, "x"), pair(3, "z")]);
+        for child in picked.struct_parts().expect("a struct") {
+            assert_eq!(child.len(), 3, "a field is as long as the gather, not as the source");
+        }
+    }
+
+    #[test]
+    fn a_gather_past_the_end_of_a_struct_column_is_null_in_every_field_and_at_the_top() {
+        let column = pair_column(&[pair(1, "x"), pair(2, "y")]);
+        let picked = column.gather(&[1, 9]).unwrap();
+        assert_eq!(picked.value_at(0), pair(2, "y"));
+        assert_eq!(picked.value_at(1), Value::Null);
+        for child in picked.struct_parts().expect("a struct") {
+            assert!(child.is_null_at(1), "a row that came from nowhere has no field value either");
+        }
+    }
+
+    /// The names are matched and not counted, because a caller holding a struct value built in a
+    /// different order from the type's would otherwise get its columns transposed, and that is a wrong
+    /// answer that reads as a right one.
+    #[test]
+    fn the_fields_of_a_struct_value_go_in_by_name_rather_than_by_position() {
+        let swapped = Value::Struct(vec![
+            ("b".to_string(), Value::Varchar("x".to_string())),
+            ("a".to_string(), Value::Integer(1)),
+        ]);
+        let column = pair_column(&[swapped]);
+        assert_eq!(column.value_at(0), pair(1, "x"));
+        let wrong = Value::Struct(vec![
+            ("a".to_string(), Value::Integer(1)),
+            ("c".to_string(), Value::Varchar("x".to_string())),
+        ]);
+        let failed = Vector::from_values(pair_type(), &[wrong]);
+        assert!(failed.is_err(), "a row with no b field is an error rather than a null b");
+    }
+
+    #[test]
+    fn a_struct_built_from_children_takes_its_field_names_from_the_caller() {
+        let column = Vector::structure(vec![
+            ("a".to_string(), integers(&[1, 2, 3])),
+            ("b".to_string(), integers(&[4, 5, 6])),
+        ])
+        .expect("two columns of three");
+        assert_eq!(column.len(), 3);
+        assert_eq!(
+            column.logical_type(),
+            &LogicalType::Struct(vec![
+                Field::new("a", LogicalType::Integer),
+                Field::new("b", LogicalType::Integer),
+            ])
+        );
+        assert_eq!(
+            column.value_at(1),
+            Value::Struct(vec![
+                ("a".to_string(), Value::Integer(2)),
+                ("b".to_string(), Value::Integer(5)),
+            ])
+        );
+    }
+
+    /// The two mistakes this constructor makes easy, both refused rather than stored. A short field is
+    /// the one that matters: it would be a struct that reads past the end of one of its own children,
+    /// which is the same mistake `Vector::list` checks for at the other end.
+    #[test]
+    fn a_struct_of_uneven_children_or_of_no_children_is_refused() {
+        let uneven = Vector::structure(vec![
+            ("a".to_string(), integers(&[1, 2, 3])),
+            ("b".to_string(), integers(&[4, 5])),
+        ]);
+        assert!(uneven.is_err(), "a field shorter than the struct");
+        assert!(Vector::structure(vec![]).is_err(), "no field to take a length from");
+    }
+
+    #[test]
+    fn a_struct_of_lists_and_a_list_of_structs_both_nest() {
+        let ty =
+            LogicalType::Struct(vec![Field::new("a", LogicalType::list(LogicalType::Integer))]);
+        let row = Value::Struct(vec![("a".to_string(), list(&[1, 2]))]);
+        let column = Vector::from_values(ty, std::slice::from_ref(&row)).unwrap();
+        assert_eq!(column.value_at(0), row);
+        assert_eq!(column.struct_parts().expect("a struct")[0].form(), Form::List);
+
+        let outer = Value::List { element: pair_type(), values: vec![pair(1, "x"), pair(2, "y")] };
+        let lists =
+            Vector::from_values(LogicalType::list(pair_type()), std::slice::from_ref(&outer))
+                .unwrap();
+        assert_eq!(lists.value_at(0), outer);
+        assert_eq!(lists.list_parts().expect("a list").1.form(), Form::Struct);
+    }
+
+    /// A struct row is not bytes and not an integer, and it stays that way when it has exactly one
+    /// integer field, which is the case where answering about the field would look reasonable and would
+    /// be a hash keyed on the wrong thing.
+    #[test]
+    fn the_scalar_readers_decline_a_struct_of_one_integer_field() {
+        let ty = LogicalType::Struct(vec![Field::new("a", LogicalType::Integer)]);
+        let row = Value::Struct(vec![("a".to_string(), Value::Integer(7))]);
+        let column = Vector::from_values(ty, &[row]).unwrap();
         assert_eq!(column.signed_at(0), None);
         assert_eq!(column.bytes_at(0), None);
         assert_eq!(column.data(), None);
