@@ -36,15 +36,15 @@ use rudb_vector::{Data, Vector};
 use crate::key::{canonical, mix, same, spread};
 use crate::rows;
 
-/// What a bucket holds when it holds nothing.
+/// What the slot half of a bucket holds when the bucket holds nothing.
 const EMPTY: u32 = u32::MAX;
 
 /// The most groups one of these can hold.
 ///
-/// A slot is a `u32` because the buckets are most of what a probe reads and half of them being
-/// padding would halve the number that fit in a cache line. The bound that leaves is four billion
-/// groups, which at the width of a key is a hundred gigabytes of them, so a query that reaches it
-/// has run out of memory in every sense that matters and the only question is which error says so.
+/// A slot is a `u32` because it shares its bucket with the salt beside it, and the two together are
+/// one aligned word that a probe reads in one load. The bound that leaves is four billion groups,
+/// which at the width of a key is a hundred gigabytes of them, so a query that reaches it has run
+/// out of memory in every sense that matters and the only question is which error says so.
 const LIMIT: usize = EMPTY as usize;
 
 /// How many buckets a table starts with.
@@ -63,7 +63,7 @@ pub(crate) const BATCH: usize = 64;
 /// Below this many buckets a table is small enough to probe a row at a time.
 ///
 /// The batch below buys one thing, which is cache misses that overlap instead of queueing. A table
-/// of eight thousand buckets is thirty two kilobytes and there are no misses to overlap, so what is
+/// of eight thousand buckets is sixty four kilobytes and there are no misses to overlap, so what is
 /// left is the cost of the batch, and a group by over a handful of groups is a query where that is
 /// the whole of the time.
 const HOT: usize = 8 * 1024;
@@ -75,6 +75,40 @@ const HOT: usize = 8 * 1024;
 /// comparison and no correctness, because the comparison is what decides.
 const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
 
+/// A bucket holding nothing, which is [`EMPTY`] in its slot half and a salt that is never read.
+const VACANT: u64 = EMPTY as u64;
+
+/// The part of a hash that is kept in the bucket beside the slot.
+///
+/// The top thirty two bits, because the bottom ones are the bucket number and would say nothing: two
+/// keys only ever meet in a bucket by having the same bottom bits already. The top ones are the bits
+/// a linear probe has not looked at yet, so they are the ones that can tell two keys apart.
+fn salt_of(hash: u64) -> u32 {
+    (hash >> 32) as u32
+}
+
+/// One bucket, which is a salt over a slot in a single word.
+///
+/// The two together rather than in two vectors is the whole point of the layout. A probe used to
+/// read the bucket and then read the stored hash of whatever slot was in it, and the second address
+/// is only known once the first load has landed, so every probe step on a table larger than the
+/// cache was two trips to memory one after the other. With the salt in the bucket the first load
+/// settles all but about one step in four billion, and the second trip is to the key itself, which
+/// is the comparison that has to happen anyway.
+fn bucket_of(salt: u32, slot: usize) -> u64 {
+    (u64::from(salt) << 32) | slot as u64
+}
+
+/// The slot half of a bucket, which is [`EMPTY`] if it holds nothing.
+fn slot_of(bucket: u64) -> u32 {
+    bucket as u32
+}
+
+/// The salt half of a bucket, which means nothing unless the slot half is not [`EMPTY`].
+fn bucket_salt(bucket: u64) -> u32 {
+    (bucket >> 32) as u32
+}
+
 /// A hash table from a row of key columns to the slot its group was given.
 ///
 /// The slot is the number of groups seen before this one, so the answer comes out in the order the
@@ -82,15 +116,16 @@ const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
 /// test a diff rather than an investigation.
 #[derive(Debug)]
 pub(crate) struct Table {
-    /// One slot per bucket, [`EMPTY`] where there is none. A power of two long, so the bucket a
-    /// hash belongs to is a mask rather than a division.
-    buckets: Vec<u32>,
+    /// One salt and slot per bucket, [`VACANT`] where there is no group. A power of two long, so
+    /// the bucket a hash belongs to is a mask rather than a division.
+    buckets: Vec<u64>,
     /// The stored keys, column at a time. `columns[column][slot]` is one group's value in one key
     /// column, which is the layout that lets a group be pushed without asking the allocator for a
     /// row to put it in.
     columns: Vec<Column>,
-    /// The hash of each group's key, so that a probe compares one word before it compares a key.
-    /// Worth its eight bytes on a string key, where the comparison it avoids is a memcmp.
+    /// The hash of each group's key. Not read by a probe, which has the salt in the bucket instead.
+    /// It is here for the two places that would otherwise hash a key that was hashed once already,
+    /// which are growing the buckets and merging one of these tables into another.
     hashes: Vec<u64>,
     /// What the stored keys own away from themselves, which is the strings and blobs among them.
     owned: u64,
@@ -113,7 +148,7 @@ impl Table {
     /// An empty table over a key of `columns` columns.
     pub(crate) fn new(types: &[rudb_common::LogicalType]) -> Self {
         Self {
-            buckets: vec![EMPTY; FIRST],
+            buckets: vec![VACANT; FIRST],
             columns: types.iter().map(Column::new).collect(),
             hashes: Vec::new(),
             owned: 0,
@@ -153,7 +188,7 @@ impl Table {
     /// and charging the used half of a structure that paid for all of it is how a query passes a
     /// limit it was told it was inside of.
     pub(crate) fn footprint(&self) -> u64 {
-        let buckets = self.buckets.capacity() * size_of::<u32>();
+        let buckets = self.buckets.capacity() * size_of::<u64>();
         let hashes = self.hashes.capacity() * size_of::<u64>();
         let keys: usize = self.columns.iter().map(Column::footprint).sum();
         u64::try_from(buckets + hashes + keys).unwrap_or(u64::MAX)
@@ -165,16 +200,23 @@ impl Table {
     /// computing it here is the point of the whole arrangement: the hash of a column of a thousand
     /// rows is one pass over a run of `i32` with the type dispatch done once, and doing it per row
     /// inside the probe would put the dispatch back.
+    ///
+    /// A step that gets past the salt goes straight to the key rather than to the stored hash. The
+    /// salt is already thirty two bits of the hash the bucket number did not cover, so the stored
+    /// hash would rule out about one step in four billion and cost a load from memory on every one
+    /// of the others. The key comparison is exact, so what the salt lets through it settles.
     pub(crate) fn probe(&self, hash: u64, keys: &[Vector], row: usize) -> Probe {
         let mask = self.buckets.len() - 1;
+        let salt = salt_of(hash);
         let mut at = (hash as usize) & mask;
         loop {
-            let slot = self.buckets[at];
+            let bucket = self.buckets[at];
+            let slot = slot_of(bucket);
             if slot == EMPTY {
                 return Probe::Vacant(at);
             }
             let slot = slot as usize;
-            if self.hashes[slot] == hash && self.holds(slot, keys, row) {
+            if bucket_salt(bucket) == salt && self.holds(slot, keys, row) {
                 return Probe::Found(slot);
             }
             at = (at + 1) & mask;
@@ -183,17 +225,17 @@ impl Table {
 
     /// Looks for a run of rows at once, which is where the time in a group by goes.
     ///
-    /// [`Self::probe`] is three loads deep on every row. It reads the bucket, then the stored hash of
-    /// whatever slot was in it, then the key beside that slot, and each address is only known once
-    /// the load before it has landed. On a table larger than the cache all three are misses, so a row
-    /// costs three trips to memory end to end and the core has nothing to get on with while it waits.
-    /// A probe of a single `INTEGER` key measured at seventy two nanoseconds a row that way, which is
-    /// not work, it is waiting.
+    /// [`Self::probe`] is two loads deep on every row. It reads the bucket, then the key beside the
+    /// slot the bucket held, and the second address is only known once the first load has landed. On
+    /// a table larger than the cache both are misses, so a row costs two trips to memory end to end
+    /// and the core has nothing to get on with while it waits. A probe of a single `INTEGER` key
+    /// measured at seventy two nanoseconds a row when it was three deep, which is not work, it is
+    /// waiting.
     ///
     /// Rows are independent of each other, so this walks [`BATCH`] of them together and does one kind
-    /// of load at a time across all of them: every bucket, then every stored hash, then every key.
-    /// Inside a pass every address is known before the pass starts, so the misses are all outstanding
-    /// at once and the batch waits about as long as one row used to.
+    /// of load at a time across all of them: every bucket, then every key. Inside a pass every
+    /// address is known before the pass starts, so the misses are all outstanding at once and the
+    /// batch waits about as long as one row used to.
     ///
     /// Rows whose walk reaches an empty bucket go on `pending` in row order instead of being
     /// inserted here. An insert moves the table under the rest of the batch, and two rows in one
@@ -226,14 +268,16 @@ impl Table {
         walk.here.clear();
         walk.here.extend((from..upto).map(|row| Step { row, at: (hashes[row] as usize) & mask }));
         while !walk.here.is_empty() {
-            // The bucket of every row still walking, and the only pass that is one load deep.
+            // The bucket of every row still walking, which is the only pass that goes to memory
+            // ahead of the keys.
             walk.seen.clear();
             walk.seen.extend(walk.here.iter().map(|step| self.buckets[step.at]));
-            // The stored hash of every bucket that holds a group. The slot each one reads came out of
-            // the pass above, so these are independent of each other even though they depend on it.
+            // Which of those buckets could hold the row's group, off the salt that came back with
+            // the slot. No load of its own: the buckets were just written and the hashes are read in
+            // row order, so this pass is arithmetic over what is already in the first level cache.
             walk.same.clear();
-            walk.same.extend(walk.here.iter().zip(&walk.seen).map(|(step, &slot)| {
-                slot != EMPTY && self.hashes[slot as usize] == hashes[step.row]
+            walk.same.extend(walk.here.iter().zip(&walk.seen).map(|(step, &bucket)| {
+                slot_of(bucket) != EMPTY && bucket_salt(bucket) == salt_of(hashes[step.row])
             }));
             // The keys, one column at a time, so the type of the stored column and the form of the
             // vector it is compared against are matched on once for the batch rather than once for
@@ -245,7 +289,8 @@ impl Table {
             // end a row's walk. A row that is neither a hit nor a vacancy moves along one bucket and
             // comes back around, so a run of collisions costs passes rather than a walk per row.
             walk.next.clear();
-            for ((step, &slot), &same) in walk.here.iter().zip(&walk.seen).zip(&walk.same) {
+            for ((step, &bucket), &same) in walk.here.iter().zip(&walk.seen).zip(&walk.same) {
+                let slot = slot_of(bucket);
                 if slot == EMPTY {
                     walk.pending.push(step.row);
                 } else if same {
@@ -283,10 +328,10 @@ impl Table {
             self.owned += self.columns[at].push_from(column, row)?;
         }
         self.hashes.push(hash);
-        self.buckets[bucket] = slot as u32;
+        self.buckets[bucket] = bucket_of(salt_of(hash), slot);
         // Half full rather than the seven eighths a `HashMap` allows, because this probes linearly
         // and a linear probe at seven eighths walks a run of about eight buckets to find a miss.
-        // The buckets are four bytes each, so the room the other half costs is small next to the
+        // The buckets are eight bytes each, so the room the other half costs is small next to the
         // keys beside it.
         if self.hashes.len() * 2 >= self.buckets.len() {
             self.regrow();
@@ -321,14 +366,14 @@ impl Table {
     /// The keys do not move and are not looked at. A rehash reads the hash of each group, which is
     /// stored, so growing a table of seventeen million string keys touches no strings.
     fn regrow(&mut self) {
-        let mut buckets = vec![EMPTY; self.buckets.len() * 2];
+        let mut buckets = vec![VACANT; self.buckets.len() * 2];
         let mask = buckets.len() - 1;
         for (slot, &hash) in self.hashes.iter().enumerate() {
             let mut at = (hash as usize) & mask;
-            while buckets[at] != EMPTY {
+            while slot_of(buckets[at]) != EMPTY {
                 at = (at + 1) & mask;
             }
-            buckets[at] = slot as u32;
+            buckets[at] = bucket_of(salt_of(hash), slot);
         }
         self.buckets = buckets;
     }
@@ -382,9 +427,9 @@ pub(crate) struct Walk {
     here: Vec<Step>,
     /// The ones that are still walking after this pass, swapped into `here` at the end of it.
     next: Vec<Step>,
-    /// What each row's bucket holds.
-    seen: Vec<u32>,
-    /// Whether each row's hash matches the hash stored for what its bucket holds.
+    /// What each row's bucket holds, salt and slot together.
+    seen: Vec<u64>,
+    /// Whether each row's key could still be the group its bucket holds.
     same: Vec<bool>,
     /// The rows of the last batch whose key was not in the table, in row order.
     pending: Vec<usize>,
@@ -552,7 +597,7 @@ impl Column {
     /// underneath compares two runs of the same width where they lie. It is the same move [`fold`]
     /// makes for the hash, applied to the comparison that follows it.
     ///
-    /// `same` comes in marked true for the rows whose stored hash matched, and each column narrows it
+    /// `same` comes in marked true for the rows whose salt matched, and each column narrows it
     /// rather than replacing it, so calling this for every key column in turn leaves exactly the rows
     /// whose whole key is the group they landed on. A row already ruled out by an earlier column is
     /// skipped, which is what makes a wide key cost less than its width on the rows that differ early.
@@ -560,18 +605,18 @@ impl Column {
     /// Every arm is [`Self::holds`] with the dispatch lifted out and nothing else. Anything the arms
     /// do not cover, which is every form that is not flat and every type without a run of its own,
     /// falls through to `holds` a row at a time, exactly as it did before.
-    fn holds_run(&self, here: &[Step], seen: &[u32], column: &Vector, same: &mut [bool]) {
+    fn holds_run(&self, here: &[Step], seen: &[u64], column: &Vector, same: &mut [bool]) {
         let validity = column.validity();
         /// One pass over a run of values of the same width as the run the table stored.
         macro_rules! run {
             ($stored:expr, $values:expr) => {{
                 let stored = $stored;
                 let values = $values.as_slice();
-                for ((step, &slot), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
                     if !*flag {
                         continue;
                     }
-                    let slot = slot as usize;
+                    let slot = slot_of(bucket) as usize;
                     *flag = match values.get(step.row) {
                         _ if !self.valid[slot] => !validity.is_valid(step.row),
                         Some(value) => validity.is_valid(step.row) && *value == stored[slot],
@@ -586,11 +631,11 @@ impl Column {
                 (StoredData::Integer(stored), Data::Int32(values)) => run!(stored, values),
                 (StoredData::BigInt(stored), Data::Int64(values)) => run!(stored, values),
                 (StoredData::Varchar(stored), Data::Varlen(strings)) => {
-                    for ((step, &slot), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                    for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
                         if !*flag {
                             continue;
                         }
-                        let slot = slot as usize;
+                        let slot = slot_of(bucket) as usize;
                         *flag = match strings.bytes(step.row) {
                             _ if !self.valid[slot] => !validity.is_valid(step.row),
                             Some(bytes) => validity.is_valid(step.row) && bytes == stored.get(slot),
@@ -602,9 +647,9 @@ impl Column {
                 _ => {}
             }
         }
-        for ((step, &slot), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+        for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
             if *flag {
-                *flag = self.holds(slot as usize, column, step.row);
+                *flag = self.holds(slot_of(bucket) as usize, column, step.row);
             }
         }
     }
@@ -1271,6 +1316,34 @@ mod tests {
         };
         table.insert(bucket, first[0], &keys, 0).expect("room for one group");
         assert!(matches!(table.probe(second[0], &[grace], 0), Probe::Vacant(_)));
+    }
+
+    /// The two halves of a bucket do not read each other. The case worth naming is a salt of all
+    /// ones, which is the bit pattern an empty slot has, and a slot that is every value a slot can
+    /// take next to it.
+    #[test]
+    fn a_salt_of_all_ones_does_not_read_as_an_empty_bucket() {
+        // row at a time: a handful of slots either side of the interesting bit patterns.
+        for slot in [0usize, 1, 63, 64, 65_535, LIMIT - 1] {
+            for salt in [0u32, 1, u32::MAX - 1, u32::MAX] {
+                let bucket = bucket_of(salt, slot);
+                assert_eq!(slot_of(bucket) as usize, slot, "slot {slot} under salt {salt}");
+                assert_eq!(bucket_salt(bucket), salt, "salt {salt} over slot {slot}");
+                assert_ne!(slot_of(bucket), EMPTY, "slot {slot} read as an empty bucket");
+            }
+        }
+        assert_eq!(slot_of(VACANT), EMPTY);
+    }
+
+    /// The salt is the half of the hash the bucket number did not already say, which is the only
+    /// reason keeping it is worth a load. Two hashes that land in one bucket of a table of any size
+    /// this reaches still differ in their salt.
+    #[test]
+    fn the_salt_is_bits_the_bucket_number_does_not_cover() {
+        let low = 0x0000_0000_dead_beef;
+        let high = 0xffff_ffff_dead_beef;
+        assert_eq!(low as u32, high as u32, "the test wants two hashes that share a bucket");
+        assert_ne!(salt_of(low), salt_of(high));
     }
 
     /// Growing is where a table stops working quietly. Every key put in before a rehash has to be
