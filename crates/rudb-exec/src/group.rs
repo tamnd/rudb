@@ -30,7 +30,7 @@ use rudb_common::{
 use rudb_kernels::{Accumulator, NOWHERE, is_true, update_scattered};
 use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
-use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
 use crate::key::{BigIntSet, Key, RowSet};
@@ -140,6 +140,8 @@ pub(crate) struct Aggregate<'a> {
     every: bool,
     /// A grouped `count(*)` needs one integer per group rather than a general aggregate state.
     count_only: bool,
+    /// COUNT(*), SUM(SMALLINT), AVG(SMALLINT) share one compact state per group.
+    compact_numeric: bool,
     /// The most groups an unordered limit above this operator can observe.
     max_groups: Option<usize>,
     memory: Memory,
@@ -305,6 +307,19 @@ impl<'a> Aggregate<'a> {
         }
         let inputs = Prepared::shared(plan, &inputs, &input_schema)?;
         let alone = groups.is_empty();
+        let compact_numeric = !alone
+            && calls.len() == 3
+            && calls[0].name == "count_star"
+            && calls[0].args.is_empty()
+            && calls[1].name == "sum"
+            && calls[1].args.len() == 1
+            && plan.expr_type(calls[1].args[0]) == &LogicalType::SmallInt
+            && calls[1].returns == LogicalType::HugeInt
+            && calls[2].name == "avg"
+            && calls[2].args.len() == 1
+            && plan.expr_type(calls[2].args[0]) == &LogicalType::SmallInt
+            && calls[2].returns == LogicalType::Double
+            && calls.iter().all(|call| !call.distinct && call.filter.is_none());
         let by_vector: Vec<bool> =
             calls.iter().map(|call| alone && !call.distinct && call.filter.is_none()).collect();
         let out = Buffered::new();
@@ -320,6 +335,7 @@ impl<'a> Aggregate<'a> {
                 && calls[0].name == "count_star"
                 && !calls[0].distinct
                 && calls[0].filter.is_none(),
+            compact_numeric,
             max_groups: None,
             by_vector,
             groups,
@@ -457,6 +473,7 @@ impl<'a> Aggregate<'a> {
             ),
             states: Vec::new(),
             counts: Vec::new(),
+            compact: Vec::new(),
             seen: Vec::new(),
             groups: 0,
             // One row of arguments per call, filled again for each input row and kept between rows
@@ -481,7 +498,8 @@ impl<'a> Aggregate<'a> {
         };
         if self.alone {
             local.groups = 1;
-            if let Err(error) = self.fresh(&mut local.states, &mut local.counts) {
+            if let Err(error) = self.fresh(&mut local.states, &mut local.counts, &mut local.compact)
+            {
                 local.failure = Some(error);
             }
             if self.sets {
@@ -508,6 +526,7 @@ impl<'a> Aggregate<'a> {
             table,
             states,
             counts,
+            compact,
             seen,
             groups,
             given,
@@ -594,9 +613,50 @@ impl<'a> Aggregate<'a> {
                 // table adds up as it goes and is charged the same way.
                 slots[row] = table.insert(bucket, hashes[row], keys, row)?;
                 *groups = table.len();
-                self.fresh(states, counts)?;
+                self.fresh(states, counts, compact)?;
                 if self.sets {
                     self.fresh_seen(seen);
+                }
+            }
+        }
+        if self.compact_numeric {
+            let sum = arguments[1].first().expect("SUM has one argument");
+            let mean = arguments[2].first().expect("AVG has one argument");
+            let sum_flat = flat_smallint(sum);
+            let mean_flat = flat_smallint(mean);
+            let read =
+                |column: &Vector, values: Option<&[i16]>, row: usize| -> Result<Option<i16>> {
+                    match values {
+                        Some(values) if column.validity().is_valid(row) => Ok(Some(values[row])),
+                        Some(_) => Ok(None),
+                        None => match column.value_at(row) {
+                            Value::SmallInt(value) => Ok(Some(value)),
+                            Value::Null => Ok(None),
+                            value => Err(Error::internal(format!(
+                                "a compact SMALLINT aggregate received {value:?}"
+                            ))),
+                        },
+                    }
+                };
+            // row at a time: each group needs its own two totals. Flat SMALLINT columns are read
+            // directly; the other vector forms use the general accessor in `read` above.
+            for (row, &slot) in slots.iter().enumerate() {
+                if slot == NOWHERE {
+                    continue;
+                }
+                let state = &mut compact[slot];
+                state.count += 1;
+                if let Some(value) = read(sum, sum_flat, row)? {
+                    state.sum = state.sum.checked_add(i128::from(value)).ok_or_else(|| {
+                        Error::out_of_range("a compact SUM overflowed its exact total")
+                    })?;
+                    state.sum_seen = true;
+                }
+                if let Some(value) = read(mean, mean_flat, row)? {
+                    state.mean = state.mean.checked_add(i128::from(value)).ok_or_else(|| {
+                        Error::out_of_range("a compact AVG overflowed its exact total")
+                    })?;
+                    state.mean_count += 1;
                 }
             }
         }
@@ -611,7 +671,7 @@ impl<'a> Aggregate<'a> {
         // pass, with the aggregate and the layout of its argument matched on once for the chunk
         // rather than once per row, and with no `Value` built at all on the paths the kernel covers.
         for (at, call) in self.calls.iter().enumerate() {
-            if self.count_only {
+            if self.count_only || self.compact_numeric {
                 break;
             }
             if self.by_vector[at] || call.affine.is_some() {
@@ -642,7 +702,7 @@ impl<'a> Aggregate<'a> {
         }
         rows::capacity(table.owned(), charged_keys, scratch)?;
         containers.grow(aside)?;
-        let now = tables(table, states, counts, seen);
+        let now = tables(table, states, counts, compact, seen);
         rows::capacity(now, charged, containers)?;
         // Asked after the chunk has been folded in and not before, so that a pass always takes at
         // least one chunk of groups whatever the budget says. That is what makes the loop in
@@ -695,6 +755,7 @@ impl<'a> Aggregate<'a> {
             table,
             states,
             counts,
+            compact,
             seen,
             groups,
             affine_rows,
@@ -708,7 +769,8 @@ impl<'a> Aggregate<'a> {
         drop(seen);
         let alive = table.footprint()
             + width_of(states.capacity() * size_of::<Accumulator>())
-            + width_of(counts.capacity() * size_of::<i64>());
+            + width_of(counts.capacity() * size_of::<i64>())
+            + width_of(compact.capacity() * size_of::<CompactNumeric>());
         containers.shrink(containers.bytes().saturating_sub(alive));
         // The answer is built straight out of the table, a chunk of groups at a time.
         //
@@ -750,6 +812,24 @@ impl<'a> Aggregate<'a> {
                 for slot in start..end {
                     let value = if self.count_only {
                         Ok(Value::BigInt(counts[slot]))
+                    } else if self.compact_numeric {
+                        let state = &compact[slot];
+                        match at {
+                            0 => Ok(Value::BigInt(state.count)),
+                            1 => Accumulator::exact_sum(
+                                state.sum,
+                                state.sum_seen,
+                                &self.calls[1].returns,
+                            )
+                            .finish(),
+                            2 => Accumulator::exact_avg(
+                                state.mean,
+                                state.mean_count,
+                                &self.calls[2].returns,
+                            )
+                            .finish(),
+                            _ => unreachable!("compact numeric has three calls"),
+                        }
                     } else {
                         match self.calls[at].affine {
                             Some((source, offset)) => states[slot * calls + source]
@@ -771,6 +851,7 @@ impl<'a> Aggregate<'a> {
         drop(results);
         drop(states);
         drop(counts);
+        drop(compact);
         drop(table);
         containers.release();
         match over {
@@ -854,6 +935,7 @@ impl<'a> Aggregate<'a> {
             table: source,
             states: taken,
             counts: tallies,
+            compact: packed,
             seen: mut watched,
             groups: found,
             affine_rows: counted,
@@ -870,6 +952,7 @@ impl<'a> Aggregate<'a> {
             distinct: &distinct,
             taken: &taken,
             tallies: &tallies,
+            compact: &packed,
             watched: &mut watched,
         };
         let mut aside = 0;
@@ -905,7 +988,7 @@ impl<'a> Aggregate<'a> {
         drop(scratch);
         drop(containers);
         rows::capacity(into.table.owned(), &mut into.charged_keys, &mut into.scratch)?;
-        let now = tables(&into.table, &into.states, &into.counts, &into.seen);
+        let now = tables(&into.table, &into.states, &into.counts, &into.compact, &into.seen);
         rows::capacity(now, &mut into.charged, &mut into.containers)
     }
 
@@ -943,7 +1026,7 @@ impl<'a> Aggregate<'a> {
                     }
                     let target = into.table.insert(bucket, hash, keys, row)?;
                     into.groups = into.table.len();
-                    self.fresh(&mut into.states, &mut into.counts)?;
+                    self.fresh(&mut into.states, &mut into.counts, &mut into.compact)?;
                     if self.sets {
                         self.fresh_seen(&mut into.seen);
                     }
@@ -985,6 +1068,7 @@ impl<'a> Aggregate<'a> {
             table: source,
             states: taken,
             counts: tallies,
+            compact: packed,
             seen: mut watched,
             groups: found,
             ..
@@ -997,6 +1081,7 @@ impl<'a> Aggregate<'a> {
             distinct: &distinct,
             taken: &taken,
             tallies: &tallies,
+            compact: &packed,
             watched: &mut watched,
         };
         let types: Vec<LogicalType> =
@@ -1393,6 +1478,7 @@ impl<'a> Aggregate<'a> {
             table: source,
             states: taken,
             counts: tallies,
+            compact: packed,
             seen: mut watched,
             groups: found,
             ..
@@ -1405,6 +1491,7 @@ impl<'a> Aggregate<'a> {
             distinct: &distinct,
             taken: &taken,
             tallies: &tallies,
+            compact: &packed,
             watched: &mut watched,
         };
         let types: Vec<LogicalType> =
@@ -1565,9 +1652,18 @@ impl<'a> Aggregate<'a> {
     /// One flat vector of accumulators rather than a vector per group, so that a new group costs a
     /// push and not a trip to the allocator. The accumulators of the group in `slot` are the run of
     /// `calls` entries starting at `slot * calls`.
-    fn fresh(&self, states: &mut Vec<Accumulator>, counts: &mut Vec<i64>) -> Result<()> {
+    fn fresh(
+        &self,
+        states: &mut Vec<Accumulator>,
+        counts: &mut Vec<i64>,
+        compact: &mut Vec<CompactNumeric>,
+    ) -> Result<()> {
         if self.count_only {
             counts.push(0);
+            return Ok(());
+        }
+        if self.compact_numeric {
+            compact.push(CompactNumeric::default());
             return Ok(());
         }
         for call in &self.calls {
@@ -1728,6 +1824,7 @@ pub(crate) struct Building {
     table: Table,
     states: Vec<Accumulator>,
     counts: Vec<i64>,
+    compact: Vec<CompactNumeric>,
     seen: Vec<DistinctSet>,
     groups: usize,
     given: Vec<Key>,
@@ -1741,6 +1838,26 @@ pub(crate) struct Building {
     away: Vec<Value>,
     /// What went wrong before any row arrived, which there is nowhere else to report from.
     failure: Option<Error>,
+}
+
+/// One group of COUNT(*), SUM(SMALLINT) and AVG(SMALLINT).
+///
+/// The general accumulator carries its variant and return type beside every call in every group.
+/// These three calls have fixed types for the whole operator, so the group holds only their totals.
+#[derive(Debug, Default, Clone)]
+struct CompactNumeric {
+    count: i64,
+    sum: i128,
+    sum_seen: bool,
+    mean: i128,
+    mean_count: i64,
+}
+
+fn flat_smallint(column: &Vector) -> Option<&[i16]> {
+    match column.data() {
+        Some(Data::Int16(values)) => Some(values.as_slice()),
+        _ => None,
+    }
 }
 
 /// A spill file being read back, and the buffers reading it fills.
@@ -2207,7 +2324,7 @@ impl Aggregate<'_> {
 fn charge(into: &mut Building, grown: u64) -> Result<()> {
     into.containers.grow(grown)?;
     rows::capacity(into.table.owned(), &mut into.charged_keys, &mut into.scratch)?;
-    let now = tables(&into.table, &into.states, &into.counts, &into.seen);
+    let now = tables(&into.table, &into.states, &into.counts, &into.compact, &into.seen);
     rows::capacity(now, &mut into.charged, &mut into.containers)
 }
 
@@ -2220,6 +2337,7 @@ struct Folding<'a> {
     distinct: &'a [bool],
     taken: &'a [Accumulator],
     tallies: &'a [i64],
+    compact: &'a [CompactNumeric],
     /// Taken by a mutable borrow because the sets are emptied as they are folded in, which is what
     /// keeps a value that moves from one set to the other from being copied.
     watched: &'a mut [DistinctSet],
@@ -2244,6 +2362,21 @@ fn merge_slot(
     target: usize,
     into: &mut Building,
 ) -> Result<u64> {
+    if let Some(arriving) = from.compact.get(slot) {
+        let kept = &mut into.compact[target];
+        kept.count += arriving.count;
+        kept.sum = kept
+            .sum
+            .checked_add(arriving.sum)
+            .ok_or_else(|| Error::out_of_range("a compact SUM overflowed its exact total"))?;
+        kept.sum_seen |= arriving.sum_seen;
+        kept.mean = kept
+            .mean
+            .checked_add(arriving.mean)
+            .ok_or_else(|| Error::out_of_range("a compact AVG overflowed its exact total"))?;
+        kept.mean_count += arriving.mean_count;
+        return Ok(0);
+    }
     if from.count_only {
         into.counts[target] += from.tallies[slot];
         return Ok(0);
@@ -2310,6 +2443,7 @@ fn tables(
     table: &Table,
     states: &Vec<Accumulator>,
     counts: &Vec<i64>,
+    compact: &Vec<CompactNumeric>,
     seen: &Vec<DistinctSet>,
 ) -> u64 {
     let width = |count: usize, size: usize| {
@@ -2318,6 +2452,7 @@ fn tables(
     table.footprint()
         + width(states.capacity(), size_of::<Accumulator>())
         + width(counts.capacity(), size_of::<i64>())
+        + width(compact.capacity(), size_of::<CompactNumeric>())
         + width(seen.capacity(), size_of::<DistinctSet>())
 }
 

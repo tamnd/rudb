@@ -147,6 +147,23 @@ fn a_group_by_produces_one_row_per_distinct_value() {
     );
 }
 
+/// The compact numeric group state has to keep SUM and AVG nulls independent of COUNT(*).
+#[test]
+fn grouped_smallint_sum_and_avg_keep_nulls() {
+    let db = scripted(&[
+        "CREATE TABLE numbers (k INTEGER, a SMALLINT, b SMALLINT)",
+        "INSERT INTO numbers VALUES (1, 1, 2), (1, NULL, 4), (1, 2, NULL), \
+         (2, NULL, NULL), (2, NULL, NULL)",
+    ]);
+    assert_eq!(
+        rows(&db, "SELECT k, COUNT(*), SUM(a), AVG(b) FROM numbers GROUP BY k ORDER BY k"),
+        vec![
+            vec![integer(1), Value::BigInt(3), Value::HugeInt(3), Value::Double(3.0)],
+            vec![integer(2), Value::BigInt(2), Value::Null, Value::Null],
+        ]
+    );
+}
+
 #[test]
 fn an_unordered_limit_keeps_only_the_groups_it_can_return() {
     let db = database();
