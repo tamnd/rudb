@@ -31,11 +31,11 @@
 //!
 //! **What is not here yet.** Buffers are owned. Section 7.1 says a vector borrowed from a buffer
 //! managed page carries a pin, and there is no buffer manager until M2, so there is nothing to pin
-//! and pretending otherwise would be an interface built against an imaginary caller. `MAP` and
-//! `ARRAY` are not stored yet either, and both are compositions of what is here rather than new
-//! shapes: a map is a list whose child is a two field struct of keys and values, and an array is a
-//! list whose length is the type's rather than the row's. `UNION` is the one that is genuinely
-//! different, since it is one child per member plus a tag saying which member each row is in.
+//! and pretending otherwise would be an interface built against an imaginary caller. `ARRAY` is not
+//! stored yet either, and it is a composition of what is here rather than a new shape: it is a list
+//! whose length is the type's rather than the row's, the way a `MAP` is a list whose child is a two
+//! field struct of keys and values. `UNION` is the one that is genuinely different, since it is one
+//! child per member plus a tag saying which member each row is in.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -54,6 +54,23 @@ use crate::validity::Validity;
 /// views at 16 KiB, which is the size at which several of these fit in L1 together rather than
 /// evicting each other.
 pub const VECTOR_SIZE: usize = 1024;
+
+/// What the key field of a map's child struct is called.
+///
+/// A map is stored as a list of two field structs, and these are the two names. They are DuckDB's, and
+/// they are also the names the Parquet specification gives a map's repeated group, so a reader that
+/// builds one of these from a file finds the names already agreed rather than translated.
+pub const MAP_KEY: &str = "key";
+
+/// What the value field of a map's child struct is called. See [`MAP_KEY`].
+pub const MAP_VALUE: &str = "value";
+
+/// What [`Vector::map_parts`] hands back: one entry per row, then the keys and then the values.
+///
+/// A name rather than the triple written out, because the triple written out is over the complexity
+/// clippy allows and because a kernel that takes these as an argument should be able to say so in one
+/// word.
+pub type MapParts<'a> = (&'a [(u32, u32)], &'a Vector, &'a Vector);
 
 /// Which physical form a vector is in.
 ///
@@ -115,6 +132,10 @@ pub enum Form {
     /// down a column of scalars more cheaply and this is the shape a nested value has at all, so a
     /// list vector reports this whether or not anything has tried to make it smaller. Making it
     /// smaller happens in the child, which is an ordinary vector and can be any of the forms above.
+    ///
+    /// A `MAP` column reports this too, because a map is a list whose child is a two field struct and
+    /// the bytes really are a list's. This enum is about the physical layout, and the logical type is
+    /// what remembers the difference, which is the same division `LogicalType::physical` already makes.
     List,
     /// One child vector per field, each as long as the vector itself.
     ///
@@ -369,6 +390,10 @@ enum Body {
     /// entry is `(start, 0)` and never read. An empty list is a valid row whose entry is `(start, 0)`
     /// as well. So the entry alone does not say which one a row is, the mask does, which is the same
     /// division of labour every other form here uses.
+    ///
+    /// A `MAP` is stored here too, with a [`Body::Fields`] child of `key` and `value`. Everything above
+    /// is true of it unchanged, which is the point of storing it this way: the cut, the gather and the
+    /// null rule are written once and a map inherits all three.
     Nested {
         entries: Vec<(u32, u32)>,
         child: Arc<Vector>,
@@ -425,7 +450,7 @@ impl Vector {
     /// # Errors
     ///
     /// If a value is not one the type can hold, or if the type is one there is no vector for yet,
-    /// which today means `MAP`, `ARRAY` and `UNION`. A `LIST` and a `STRUCT` are routed to their own
+    /// which today means `ARRAY` and `UNION`. A `LIST`, a `STRUCT` and a `MAP` are routed to their own
     /// builders and come back built.
     pub fn from_values(ty: LogicalType, values: &[Value]) -> Result<Self> {
         match &ty {
@@ -433,6 +458,9 @@ impl Vector {
                 return Self::list_from_values(element.as_ref().clone(), values);
             }
             LogicalType::Struct(fields) => return Self::struct_from_values(fields, values),
+            LogicalType::Map(key, value) => {
+                return Self::map_from_values(key.as_ref().clone(), value.as_ref().clone(), values);
+            }
             _ => {}
         }
         let mut data = empty_data_for(&ty)?;
@@ -615,12 +643,107 @@ impl Vector {
         }
     }
 
+    /// A map vector, built from one [`Value::Map`] per row.
+    ///
+    /// A map is a list whose child is a two field struct of keys and values, which is what DuckDB
+    /// stores and what Arrow and Parquet store, so this is the list builder and the struct builder
+    /// composed rather than a third layout. The keys of every row go into one column end to end, the
+    /// values into another beside it, and a row is a start and a length into the pair.
+    ///
+    /// The field names are [`MAP_KEY`] and [`MAP_VALUE`] because those are the names DuckDB gives them
+    /// and the names anything reading a Parquet map field will expect to find.
+    ///
+    /// A null row and an empty map are both an entry of length zero, told apart by the validity mask,
+    /// for the reason written on [`Body::Nested`].
+    fn map_from_values(key: LogicalType, value: LogicalType, values: &[Value]) -> Result<Self> {
+        let mut keys = Vec::new();
+        let mut held = Vec::new();
+        let mut entries = Vec::with_capacity(values.len());
+        for row in values {
+            let start = u32::try_from(keys.len())
+                .map_err(|_| Error::internal("a map column with more than u32 entries in it"))?;
+            match row {
+                Value::Null => entries.push((start, 0)),
+                Value::Map { entries: pairs, .. } => {
+                    let len = u32::try_from(pairs.len())
+                        .map_err(|_| Error::internal("a map with more than u32 entries"))?;
+                    for (one, other) in pairs {
+                        keys.push(one.clone());
+                        held.push(other.clone());
+                    }
+                    entries.push((start, len));
+                }
+                other => {
+                    return Err(Error::internal(format!(
+                        "{other:?} does not belong in a map vector"
+                    )));
+                }
+            }
+        }
+        // The two types are the column's rather than any one row's, for the reason the list builder
+        // takes the element type from the column: a row that is the empty map carries whatever it was
+        // built as being empty of, and the column is not entitled to take its type from that.
+        let child = Self::structure(vec![
+            (MAP_KEY.to_string(), Self::from_values(key, &keys)?),
+            (MAP_VALUE.to_string(), Self::from_values(value, &held)?),
+        ])?;
+        let ty = LogicalType::map(
+            fields_of(&child.ty)[0].ty.clone(),
+            fields_of(&child.ty)[1].ty.clone(),
+        );
+        let validity = Validity::from_iter(values.len(), |index| !values[index].is_null());
+        Ok(Self {
+            ty,
+            len: values.len(),
+            validity,
+            body: Body::Nested { entries, child: Arc::new(child) },
+        })
+    }
+
+    /// A map vector over a pair of columns that already exist, one entry per row.
+    ///
+    /// What a scan and a map returning kernel build. The keys and the values are two columns of the
+    /// same length, and each row of the map is the same range of both. Every row is valid, since a
+    /// caller with nulls to record adds them with [`Self::with_validity`].
+    ///
+    /// # Errors
+    ///
+    /// If the two columns are different lengths, or if an entry runs past the end of them.
+    pub fn map(entries: Vec<(u32, u32)>, keys: Vector, values: Vector) -> Result<Self> {
+        let key = keys.ty.clone();
+        let value = values.ty.clone();
+        let child =
+            Self::structure(vec![(MAP_KEY.to_string(), keys), (MAP_VALUE.to_string(), values)])?;
+        let mut vector = Self::list(entries, child)?;
+        vector.ty = LogicalType::map(key, value);
+        Ok(vector)
+    }
+
+    /// The entries and the two columns, for a map vector, and `None` for anything else.
+    ///
+    /// Reaches through the struct child that a map is stored as, so that a kernel over a map column
+    /// reads the keys and the values as the two columns they are rather than having to know that the
+    /// pair is spelled as a struct underneath.
+    #[must_use]
+    pub fn map_parts(&self) -> Option<MapParts<'_>> {
+        if !matches!(self.ty, LogicalType::Map(_, _)) {
+            return None;
+        }
+        let (entries, child) = self.list_parts()?;
+        let [keys, values] = child.struct_parts()? else { return None };
+        Some((entries, keys, values))
+    }
+
     /// The entries and the child, for a list vector, and `None` for any other form.
     ///
     /// The accessor a kernel over a list column reads, for the reason
     /// [`Self::dictionary_parts`] exists: `unnest` over 1024 rows wants the child once and the
     /// entries once, and reading it through [`Self::value_at`] would build a `Value::List` per row
     /// and then throw every one of them away.
+    ///
+    /// A map answers here as well, with the struct child it is stored as, because this is a question
+    /// about the layout and a map's layout is a list's. A caller that wants the keys and the values as
+    /// two columns wants [`Self::map_parts`], which reaches through that child.
     #[must_use]
     pub fn list_parts(&self) -> Option<(&[(u32, u32)], &Self)> {
         match &self.body {
@@ -1379,12 +1502,30 @@ impl Vector {
             // whole function is and is why a kernel over a list column reads `list_parts` instead.
             // The element type comes from the child rather than from this vector's type, so a list
             // whose child was built narrower than the column claims still hands back what is in it.
-            Body::Nested { entries, child } => match entries.get(index) {
-                Some(&(start, len)) => Value::List {
+            //
+            // A map is stored in this body too, so which value comes out is decided by the logical
+            // type rather than by the body. That is the one place the composition shows: the bytes of
+            // a map really are the bytes of a list of two field structs, and the only thing that
+            // remembers it is a map is the type.
+            Body::Nested { entries, child } => match (entries.get(index), &self.ty) {
+                (Some(&(start, len)), LogicalType::Map(key, value)) => {
+                    let pairs = child.struct_parts().unwrap_or_default();
+                    Value::map(
+                        key.as_ref().clone(),
+                        value.as_ref().clone(),
+                        (start..start + len)
+                            .filter_map(|at| {
+                                let [keys, values] = pairs else { return None };
+                                Some((keys.value_at(at as usize), values.value_at(at as usize)))
+                            })
+                            .collect(),
+                    )
+                }
+                (Some(&(start, len)), _) => Value::List {
                     element: child.ty.clone(),
                     values: (start..start + len).map(|at| child.value_at(at as usize)).collect(),
                 },
-                None => Value::Null,
+                (None, _) => Value::Null,
             },
             // One value read out of each child at the same position, which is the slow path this whole
             // function is and is why a kernel over a struct column reads `struct_parts` instead. The
@@ -1648,9 +1789,9 @@ impl Vector {
     ///
     /// # Errors
     ///
-    /// If the type is one there is no vector for yet, which today means `MAP`, `ARRAY` and `UNION`. A
-    /// `LIST` flattens to a list and a `STRUCT` to a struct of flattened fields, since neither has a
-    /// data slice in any form and there is nothing flatter for either to become.
+    /// If the type is one there is no vector for yet, which today means `ARRAY` and `UNION`. A `LIST`
+    /// and a `MAP` flatten to themselves and a `STRUCT` to a struct of flattened fields, since none of
+    /// the three has a data slice in any form and there is nothing flatter to become.
     pub fn flatten(&self) -> Result<Self> {
         if let Body::Flat(_) = self.body {
             return Ok(self.clone());
@@ -1673,8 +1814,8 @@ impl Vector {
     ///
     /// # Errors
     ///
-    /// If the type is one there is no vector for yet, which today means `MAP`, `ARRAY` and `UNION`. A
-    /// `LIST` gathers by permuting its entries and a `STRUCT` by gathering every field.
+    /// If the type is one there is no vector for yet, which today means `ARRAY` and `UNION`. A `LIST`
+    /// and a `MAP` gather by permuting their entries and a `STRUCT` by gathering every field.
     pub fn gather(&self, indices: &[u32]) -> Result<Self> {
         self.copied(indices.iter().map(|&index| index as usize).collect(), true)
     }
@@ -1698,7 +1839,10 @@ impl Vector {
             // struct column is one position in each of several, and a second copy of that here would
             // be a second thing to keep in step with them.
             Body::Constant(value)
-                if matches!(self.ty, LogicalType::List(_) | LogicalType::Struct(_)) =>
+                if matches!(
+                    self.ty,
+                    LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _)
+                ) =>
             {
                 if forms_stay && matches!(validity, Validity::AllValid) {
                     return Ok(Self::constant(self.ty.clone(), value.as_ref().clone(), rows));
@@ -2554,7 +2698,7 @@ mod tests {
 
     use rudb_common::{Field, LogicalType, Value};
 
-    use super::{Body, Data, FSST_PAYS_AT, Form, VECTOR_SIZE, Vector};
+    use super::{Body, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, VECTOR_SIZE, Vector};
     use crate::buffer::Buffer;
     use crate::fsst::SymbolTable;
     use crate::string::{StringColumn, StringView};
@@ -2839,6 +2983,163 @@ mod tests {
                 .unwrap();
         assert_eq!(lists.value_at(0), outer);
         assert_eq!(lists.list_parts().expect("a list").1.form(), Form::Struct);
+    }
+
+    fn tags(pairs: &[(&str, &str)]) -> Value {
+        Value::map(
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            pairs
+                .iter()
+                .map(|&(key, value)| {
+                    (Value::Varchar(key.to_string()), Value::Varchar(value.to_string()))
+                })
+                .collect(),
+        )
+    }
+
+    fn tag_column(rows: &[Value]) -> Vector {
+        Vector::from_values(LogicalType::map(LogicalType::Varchar, LogicalType::Varchar), rows)
+            .unwrap()
+    }
+
+    /// A map is a list of two field structs, which is the whole design, so the test that says so is
+    /// the one that reaches through both layers and finds the pieces where each of them puts them.
+    #[test]
+    fn a_map_column_is_a_list_whose_child_is_a_struct_of_keys_and_values() {
+        let rows =
+            vec![tags(&[("a", "b"), ("c", "d")]), tags(&[]), Value::Null, tags(&[("e", "f")])];
+        let column = tag_column(&rows);
+        assert_eq!(column.len(), 4);
+        assert_eq!(
+            column.logical_type(),
+            &LogicalType::map(LogicalType::Varchar, LogicalType::Varchar)
+        );
+        // The physical form is a list's, because the bytes are a list's. The logical type is what
+        // remembers it is a map, which is the same split `LogicalType::physical` already makes.
+        assert_eq!(column.form(), Form::List);
+        let (entries, child) = column.list_parts().expect("the layout of a list");
+        assert_eq!(entries, [(0, 2), (2, 0), (2, 0), (2, 1)]);
+        assert_eq!(child.form(), Form::Struct);
+        assert_eq!(
+            child.logical_type(),
+            &LogicalType::Struct(vec![
+                Field::new(MAP_KEY, LogicalType::Varchar),
+                Field::new(MAP_VALUE, LogicalType::Varchar),
+            ])
+        );
+        // And the accessor that reaches through it hands back the two columns rather than the struct.
+        let (entries, keys, values) = column.map_parts().expect("a map");
+        assert_eq!(entries.len(), 4);
+        assert_eq!(keys.text_at(0), Some("a"));
+        assert_eq!(values.text_at(0), Some("b"));
+        assert_eq!(column.iter().collect::<Vec<_>>(), rows);
+    }
+
+    /// The same distinction a list has, checked again here rather than assumed from the composition,
+    /// because the empty map is the one every catalog table in D2 is full of and a null map is what a
+    /// column with no tags at all would be.
+    #[test]
+    fn an_empty_map_and_a_null_map_are_different_rows() {
+        let column = tag_column(&[tags(&[]), Value::Null]);
+        assert!(!column.is_null_at(0), "an empty map is a row that is there");
+        assert!(column.is_null_at(1));
+        assert_eq!(column.value_at(0), tags(&[]));
+        assert_eq!(column.value_at(1), Value::Null);
+        assert_eq!(column.value_at(0).to_string(), "{}");
+        assert_eq!(column.value_at(1).to_string(), "NULL");
+    }
+
+    /// A map prints `{a=b}` and a struct prints `{'a': b}`, both measured off the pin. They share a
+    /// layout and they cannot share a printer, which is the one thing about this composition that does
+    /// not fall out of it.
+    #[test]
+    fn a_map_prints_with_equals_signs_and_a_struct_prints_with_quoted_names() {
+        assert_eq!(tags(&[("a", "b"), ("c", "d")]).to_string(), "{a=b, c=d}");
+        assert_eq!(pair(1, "x").to_string(), "{'a': 1, 'b': x}");
+        let numbers = Value::map(
+            LogicalType::Integer,
+            LogicalType::Integer,
+            vec![(Value::Integer(1), Value::Integer(3)), (Value::Integer(2), Value::Integer(4))],
+        );
+        assert_eq!(numbers.to_string(), "{1=3, 2=4}");
+        let null_value = Value::map(
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            vec![(Value::Varchar("x".to_string()), Value::Null)],
+        );
+        assert_eq!(null_value.to_string(), "{x=NULL}");
+    }
+
+    /// A map inherits the list's cut and the list's gather, which is the payoff for storing it as one.
+    /// Neither of these is code written for maps and both of them are worth a test that says the
+    /// inheritance works, since the type is rewritten on the way through and a form that came back as a
+    /// list would still read.
+    #[test]
+    fn cutting_and_gathering_a_map_keeps_it_a_map() {
+        let rows: Vec<Value> =
+            (0..16).map(|row| tags(&[("k", if row % 2 == 0 { "e" } else { "o" })])).collect();
+        let column = tag_column(&rows);
+
+        let cut = column.slice(4, 3).unwrap();
+        assert!(matches!(cut.logical_type(), LogicalType::Map(_, _)), "still a map after a cut");
+        assert_eq!(cut.iter().collect::<Vec<_>>(), rows[4..7]);
+        // The child was not cut, the same as for a list, which is what makes the cut eight bytes a row.
+        assert_eq!(cut.map_parts().expect("a map").1.len(), 16);
+
+        let picked = column.gather(&[3, 0, 3]).unwrap();
+        assert!(matches!(picked.logical_type(), LogicalType::Map(_, _)));
+        assert_eq!(
+            picked.iter().collect::<Vec<_>>(),
+            [rows[3].clone(), rows[0].clone(), rows[3].clone()]
+        );
+        let past = column.gather(&[0, 99]).unwrap();
+        assert_eq!(past.value_at(1), Value::Null);
+    }
+
+    #[test]
+    fn a_map_built_from_two_columns_pairs_them_by_position() {
+        let keys = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("a".to_string()), Value::Varchar("c".to_string())],
+        )
+        .unwrap();
+        let values = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("b".to_string()), Value::Varchar("d".to_string())],
+        )
+        .unwrap();
+        let column = Vector::map(vec![(0, 2), (2, 0)], keys, values).expect("two rows");
+        assert_eq!(column.len(), 2);
+        assert_eq!(
+            column.logical_type(),
+            &LogicalType::map(LogicalType::Varchar, LogicalType::Varchar)
+        );
+        assert_eq!(column.value_at(0), tags(&[("a", "b"), ("c", "d")]));
+        assert_eq!(column.value_at(1), tags(&[]));
+        // The entry check the list constructor does is the one a map gets, so an entry past the end of
+        // the pair of columns is refused here too rather than read as somebody else's keys.
+        let short =
+            Vector::from_values(LogicalType::Varchar, &[Value::Varchar("a".to_string())]).unwrap();
+        let other =
+            Vector::from_values(LogicalType::Varchar, &[Value::Varchar("b".to_string())]).unwrap();
+        assert!(Vector::map(vec![(0, 9)], short, other).is_err(), "an entry past the end");
+    }
+
+    /// `map_parts` is about the logical type and `list_parts` is about the layout, so a list has to
+    /// decline the first and a map has to answer the second. Getting that backwards would let a kernel
+    /// written for maps read a list of two field structs as if it were one.
+    #[test]
+    fn a_list_is_not_a_map_however_much_its_child_looks_like_one() {
+        let pairs = Value::List { element: pair_type(), values: vec![pair(1, "x")] };
+        let column =
+            Vector::from_values(LogicalType::list(pair_type()), std::slice::from_ref(&pairs))
+                .unwrap();
+        assert!(column.map_parts().is_none(), "a list of structs is a list");
+        assert!(column.list_parts().is_some());
+        let map = tag_column(&[tags(&[("a", "b")])]);
+        assert!(map.map_parts().is_some());
+        assert!(map.list_parts().is_some(), "a map has a list's layout and says so");
     }
 
     /// A struct row is not bytes and not an integer, and it stays that way when it has exactly one

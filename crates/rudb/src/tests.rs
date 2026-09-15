@@ -1155,6 +1155,26 @@ fn a_null_struct_is_a_value_now_rather_than_an_unwritten_vector() {
     assert!(rows(&db, "SELECT a FROM structs").is_empty());
 }
 
+/// The same one line for the map vector. Per #595.
+///
+/// A map needs a `map()` function or a `MAP {}` literal before a query can build one, and it has
+/// neither yet, so a cast of a null is again the whole visible surface. What it is really for is the
+/// eight catalog columns in D2 that are typed `MAP(VARCHAR, VARCHAR)` and are the empty map in every
+/// row, which could not be written at all while the form did not exist. Both answers here are the
+/// pin's.
+#[test]
+fn a_null_map_is_a_value_now_rather_than_an_unwritten_vector() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT NULL::MAP(VARCHAR, VARCHAR)"), vec![vec![Value::Null]]);
+    assert_eq!(
+        rows(&db, "SELECT typeof(NULL::MAP(INT, INT))"),
+        vec![vec![Value::Varchar("MAP(INTEGER, INTEGER)".to_string())]]
+    );
+    db.execute("CREATE TABLE maps (tags MAP(VARCHAR, VARCHAR))").unwrap();
+    assert_eq!(rows(&db, "SELECT count(*) FROM maps"), vec![vec![Value::BigInt(0)]]);
+    assert!(rows(&db, "SELECT tags FROM maps").is_empty());
+}
+
 /// The four ways a subscript is refused, in DuckDB's words. Per #278.
 #[test]
 fn the_subscripts_that_are_refused_say_what_duckdb_says() {

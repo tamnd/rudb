@@ -90,9 +90,44 @@ pub enum Value {
     },
     /// A struct, in field order.
     Struct(Vec<(String, Value)>),
+    /// A map, in insertion order, carrying both of its types so that an empty map still knows what it
+    /// is empty of.
+    ///
+    /// Pairs rather than a struct per entry, even though that is how a map is stored underneath and how
+    /// DuckDB stores one. A `Value` is what a result is read out as and what a test asserts on, and an
+    /// assertion about a map should read as an assertion about a map rather than about a list of two
+    /// field structs. The vector is where the other shape lives, and it is the shape that matters for
+    /// the bytes.
+    ///
+    /// Order is kept rather than sorted. DuckDB prints a map in the order it was built in and nothing
+    /// here is entitled to decide that the keys wanted sorting.
+    ///
+    /// The two types are boxed and the list's one is not, which looks inconsistent and is not. A
+    /// `LogicalType` is 32 bytes and this enum is 64, so a list fits its type and its values in an arm
+    /// with room to spare while two types and a vector would need 96 and every `BOOLEAN` in the system
+    /// would get 32 bytes wider to pay for it. [`LogicalType::Map`] boxes them for the same reason, so
+    /// the boxes here are the ones it already has rather than new ones.
+    Map {
+        /// The key type.
+        key: Box<LogicalType>,
+        /// The value type.
+        value: Box<LogicalType>,
+        /// The entries, in order.
+        entries: Vec<(Value, Value)>,
+    },
 }
 
 impl Value {
+    /// A map of these entries, keyed and valued by these types.
+    ///
+    /// Here because [`Value::Map`] holds its two types boxed and a caller should not have to say so.
+    /// Every other arm of this enum is built as a literal and this one would be too if it were not for
+    /// the boxes.
+    #[must_use]
+    pub fn map(key: LogicalType, value: LogicalType, entries: Vec<(Self, Self)>) -> Self {
+        Self::Map { key: Box::new(key), value: Box::new(value), entries }
+    }
+
     /// How many bytes this value takes, counting what it owns on the heap.
     ///
     /// What the memory limit charges for a value held in a buffer. It is the enum itself plus the
@@ -122,6 +157,14 @@ impl Value {
                         .iter()
                         .map(|(name, value)| name.capacity() + value.heap())
                         .sum::<usize>()
+            }
+            // The two boxed types are counted here and the list's inline element type is not, which is
+            // not a disagreement about what a type costs. A boxed type is an allocation and an inline
+            // one is already inside `size_of::<Self>()`.
+            Self::Map { entries, .. } => {
+                2 * size_of::<LogicalType>()
+                    + entries.capacity() * size_of::<(Self, Self)>()
+                    + entries.iter().map(|(key, value)| key.heap() + value.heap()).sum::<usize>()
             }
             _ => 0,
         }
@@ -167,6 +210,7 @@ impl Value {
                     .map(|(name, value)| crate::types::Field::new(name, value.logical_type()))
                     .collect(),
             ),
+            Self::Map { key, value, .. } => LogicalType::Map(key.clone(), value.clone()),
         }
     }
 
@@ -252,6 +296,19 @@ impl fmt::Display for Value {
                         f.write_str(", ")?;
                     }
                     write!(f, "'{name}': {value}")?;
+                }
+                f.write_str("}")
+            }
+            // Braces like a struct and nothing else like one. A struct quotes its field name and
+            // separates it with a colon, and a map writes `key=value` with neither, so the two cannot
+            // share a printer however alike their layouts are. Both of these are the pin's.
+            Self::Map { entries, .. } => {
+                f.write_str("{")?;
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{key}={value}")?;
                 }
                 f.write_str("}")
             }
@@ -676,5 +733,25 @@ mod tests {
         // The slot is counted once: an element does not carry its own enum on top of the slot it
         // sits in.
         assert_eq!(list.footprint(), bare + size_of::<Value>() + text.capacity());
+    }
+
+    /// The reason the two types in a map arm are boxed, written as a test so that unboxing them fails
+    /// here rather than showing up as a memory number nobody can account for. Sixty four bytes is what
+    /// the list arm needs and there is no arm that needs more.
+    #[test]
+    fn a_value_is_sixty_four_bytes_and_a_map_did_not_widen_it() {
+        assert_eq!(size_of::<Value>(), 64);
+        let entries = vec![(Value::Varchar("a".to_string()), Value::Varchar("b".to_string()))];
+        let map = Value::map(LogicalType::Varchar, LogicalType::Varchar, entries);
+        // The map itself, the two boxed types, the one pair slot which is two values wide, and the one
+        // byte each of the two strings owns.
+        assert_eq!(
+            map.footprint(),
+            size_of::<Value>() + 2 * size_of::<LogicalType>() + 2 * size_of::<Value>() + 2
+        );
+        assert_eq!(
+            map.logical_type(),
+            LogicalType::map(LogicalType::Varchar, LogicalType::Varchar)
+        );
     }
 }
