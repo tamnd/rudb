@@ -8,7 +8,7 @@
 //! numbers and not rows.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_catalog::Table;
@@ -22,6 +22,7 @@ use rudb_metrics::Counters;
 use rudb_parquet::{Bound, Op, Reader, Test, skips};
 use rudb_pipeline::{Morsel, Progress, Source};
 use rudb_plan::{ExprRef, Plan, Slice};
+use rudb_storage::Probe;
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
 use crate::expr::evaluate_all;
@@ -79,12 +80,20 @@ fn poisoned<T>(_: T) -> Error {
 /// half of one costs the same as reading all of it. When the storage format's blocks are what is
 /// scanned rather than an in memory table, a morsel becomes a run of rows inside a block and the
 /// only thing that changes is what the numbers in it mean.
+///
+/// `probes` is what the filter above this scan already knows, in the same shape [`FileScan`] takes
+/// it, and it is answered against the table's zone maps a chunk at a time. That is a finer unit than
+/// the Parquet path gets: a row group on the files this engine is measured against is a hundred
+/// thousand rows and a chunk is two thousand and forty eight, and on a selective filter over a
+/// clustered column that is most of the difference between the two paths.
 #[derive(Debug)]
 pub(crate) struct Scan<'a> {
     table: &'a Table,
     columns: Vec<usize>,
+    probes: Vec<Probe>,
     schema: Schema,
     chunks: Handout,
+    skipped: AtomicUsize,
 }
 
 impl<'a> Scan<'a> {
@@ -99,6 +108,7 @@ impl<'a> Scan<'a> {
         table: &'a Table,
         index: u32,
         projection: Slice,
+        tests: Vec<(usize, Op, Bound)>,
     ) -> Result<Self> {
         let fields = plan.field_list(projection).to_vec();
         let mut columns = Vec::with_capacity(fields.len());
@@ -112,9 +122,16 @@ impl<'a> Scan<'a> {
             })?;
             columns.push(position);
         }
+        // A test names a column of the projection and a zone names a column of the table, so the
+        // test is moved onto the table's numbering here rather than at every chunk. A test on a
+        // column that is somehow not projected is dropped, which costs a chunk that gets read.
+        let probes = tests
+            .into_iter()
+            .filter_map(|(at, op, value)| Some(Probe { column: *columns.get(at)?, op, value }))
+            .collect();
         let schema = Schema::numbered(fields, index);
         let chunks = Handout::new(table.rows().chunk_count());
-        Ok(Self { table, columns, schema, chunks })
+        Ok(Self { table, columns, probes, schema, chunks, skipped: AtomicUsize::new(0) })
     }
 
     /// What this scan produces.
@@ -138,8 +155,16 @@ impl Source for Scan<'_> {
             *out = Chunk::empty(&self.schema.types());
             return Ok(Progress::Done);
         }
-        *out = self.table.rows().read(at, &self.columns)?;
         morsel.advance(1);
+        // A chunk the zone maps have ruled out is never read, so its columns are never copied and
+        // its rows are never handed to the filter above. An empty chunk is what the rest of the
+        // pipeline already expects from a morsel with nothing in it.
+        if !self.probes.is_empty() && self.table.rows().skips(at, &self.probes) {
+            self.skipped.fetch_add(1, Ordering::Relaxed);
+            *out = Chunk::empty(&self.schema.types());
+            return Ok(Progress::Done);
+        }
+        *out = self.table.rows().read(at, &self.columns)?;
         Ok(Progress::Done)
     }
 }
@@ -1000,15 +1025,16 @@ impl Source for Values {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-    use rudb_common::{LogicalType, Value};
+    use rudb_catalog::{QualifiedName, Table};
+    use rudb_common::{Field, LogicalType, Value};
     use rudb_functions::TableFunction;
     use rudb_pipeline::{Progress, Source};
     use rudb_plan::{Node, Plan};
     use rudb_vector::Chunk;
 
-    use super::{Bound, FileScan, Handout, Op, RUN, Schema, Series, VECTOR_SIZE};
+    use super::{Bound, FileScan, Handout, Op, Probe, RUN, Scan, Schema, Series, VECTOR_SIZE};
 
     /// A series without going through a plan, which is what `Series::new` is for.
     fn series(start: i64, step: i64, rows: u64) -> Series {
@@ -1212,5 +1238,84 @@ mod tests {
             rows.push(read);
         }
         assert_eq!(rows, [2048, 2048]);
+    }
+
+    /// A table of one `INTEGER` column holding `0..rows`, which puts a different range in every
+    /// chunk and so makes the zone maps worth having.
+    fn counted(rows: usize) -> Table {
+        let mut table = Table::new(
+            QualifiedName::new("memory", "main", "t"),
+            vec![Field::new("n", LogicalType::Integer)],
+        )
+        .expect("one column");
+        let values: Vec<Vec<Value>> = (0..rows).map(|n| vec![Value::Integer(n as i32)]).collect();
+        table.append_rows(&values).expect("integers");
+        table
+    }
+
+    /// A scan of that table with `tests` on its only column, built without going through a plan.
+    fn scanning(table: &Table, tests: Vec<(usize, Op, Bound)>) -> Scan<'_> {
+        let fields = vec![Field::new("n", LogicalType::Integer)];
+        let probes =
+            tests.into_iter().map(|(column, op, value)| Probe { column, op, value }).collect();
+        Scan {
+            table,
+            columns: vec![0],
+            probes,
+            schema: Schema::numbered(fields, 0),
+            chunks: Handout::new(table.rows().chunk_count()),
+            skipped: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many rows the scan produced, over every morsel it hands out.
+    fn counted_rows(scan: &Scan<'_>) -> usize {
+        let mut rows = 0;
+        while let Some(mut morsel) = scan.morsel() {
+            let mut chunk = Chunk::empty(&[LogicalType::Integer]);
+            loop {
+                let progress = scan.read(&mut morsel, &mut chunk).expect("a table scan reads");
+                rows += chunk.len();
+                if progress == Progress::Done {
+                    break;
+                }
+            }
+        }
+        rows
+    }
+
+    /// The point of the zone maps. Five chunks hold 0 to 10239, and `n = 5000` is in exactly one of
+    /// them, so four are never read at all and the filter above never sees their rows.
+    #[test]
+    fn a_filter_on_a_table_reads_only_the_chunks_that_can_hold_a_match() {
+        let table = counted(VECTOR_SIZE * 5);
+        assert_eq!(table.rows().chunk_count(), 5);
+        let scan = scanning(&table, vec![(0, Op::Equal, Bound::Int(5_000))]);
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE, "one chunk's worth");
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
+    }
+
+    /// A scan with nothing to go on reads everything, which is the case that must not regress.
+    #[test]
+    fn a_scan_with_no_tests_reads_every_chunk() {
+        let table = counted(VECTOR_SIZE * 3);
+        let scan = scanning(&table, Vec::new());
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 3);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 0);
+    }
+
+    /// Two conjuncts that between them leave no chunk, which is the shape ClickBench 37 has.
+    #[test]
+    fn conjuncts_that_rule_out_every_chunk_read_nothing() {
+        let table = counted(VECTOR_SIZE * 4);
+        let scan = scanning(
+            &table,
+            vec![(0, Op::GreaterOrEqual, Bound::Int(2_048)), (0, Op::Less, Bound::Int(2_048))],
+        );
+
+        assert_eq!(counted_rows(&scan), 0);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
     }
 }
