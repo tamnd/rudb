@@ -998,16 +998,23 @@ fn the_settings_table_is_five_rows_for_three_settings_and_says_nothing_about_a_v
 }
 
 #[test]
-fn the_databases_table_is_the_one_catalog_the_test_harness_built() {
+fn the_databases_table_is_the_catalogs_the_test_harness_built() {
     let rows =
         run("TableFunction duckdb_databases args=[] #0 [database_name::VARCHAR, path::VARCHAR, \
-         type::VARCHAR, readonly::BOOLEAN]");
-    assert_eq!(rows.len(), 1);
+         type::VARCHAR, readonly::BOOLEAN, internal::BOOLEAN]");
+    // Three, which is what a session starts with: the one a person creates in and the two the
+    // engine owns.
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[0][0], text("memory"));
     // Null rather than a file name, because everything rudb attaches is in memory so far.
     assert_eq!(rows[0][1], Value::Null);
     assert_eq!(rows[0][2], text("duckdb"));
     assert_eq!(rows[0][3], Value::Boolean(false));
+    assert_eq!(rows[0][4], Value::Boolean(false));
+    assert_eq!(rows[1][0], text("system"));
+    assert_eq!(rows[1][4], Value::Boolean(true));
+    assert_eq!(rows[2][0], text("temp"));
+    assert_eq!(rows[2][4], Value::Boolean(true));
 }
 
 #[test]
@@ -1020,11 +1027,20 @@ fn the_schemas_table_carries_the_oid_the_databases_table_gave_its_database() {
     let schemas =
         run("TableFunction duckdb_schemas args=[] #0 [oid::BIGINT, database_name::VARCHAR, \
          database_oid::BIGINT, schema_name::VARCHAR, internal::BOOLEAN]");
-    assert_eq!(schemas.len(), 1);
+    assert_eq!(schemas.len(), 5);
     assert_eq!(schemas[0][1], text("memory"));
     assert_eq!(schemas[0][2], databases[0][1]);
     assert_eq!(schemas[0][3], text("main"));
     assert_eq!(schemas[0][4], Value::Boolean(true));
+    // The four the engine owns come after it, and every one of them joins back to its database the
+    // same way.
+    for schema in &schemas[1..] {
+        let database = databases
+            .iter()
+            .find(|row| row[1] == schema[2])
+            .expect("every schema is in a database the other table reports");
+        assert!(schema[1] == database[0], "{:?} against {:?}", schema[1], database[0]);
+    }
     // And the schema's own oid is its own, not the one its database is carrying.
     assert_ne!(schemas[0][0], schemas[0][2]);
 }

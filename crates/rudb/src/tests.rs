@@ -1535,40 +1535,140 @@ fn the_settings_table_answers_the_question_a_client_asks_it() {
 }
 
 #[test]
-fn the_databases_and_schemas_tables_describe_the_one_catalog_there_is() {
+fn the_databases_and_schemas_tables_describe_the_catalogs_there_are() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // One database and one schema, where the pin returns three and five. `system` and `temp` are
-    // upstream's and rudb has neither, which the entrycatalog module doc records.
+    let yes = Value::Boolean(true);
+    let no = Value::Boolean(false);
+    // Three databases and five schemas, which is what the pin returns from a session that has
+    // attached nothing. `memory` is the one a person creates in and the other two are the engine's.
     assert_eq!(
-        rows(&db, "SELECT database_name, type, readonly, encrypted FROM duckdb_databases()"),
-        vec![vec![text("memory"), text("duckdb"), Value::Boolean(false), Value::Boolean(false)]]
+        rows(
+            &db,
+            "SELECT database_name, internal, type, readonly FROM duckdb_databases() ORDER BY 1"
+        ),
+        vec![
+            vec![text("memory"), no.clone(), text("duckdb"), no.clone()],
+            vec![text("system"), yes.clone(), text("duckdb"), no.clone()],
+            vec![text("temp"), yes.clone(), text("duckdb"), no.clone()],
+        ]
     );
+    // Internal on every row including `memory.main`, which is the pin's answer and reads oddly
+    // until you notice that nobody made that schema either.
     assert_eq!(
-        rows(&db, "SELECT database_name, schema_name FROM duckdb_schemas()"),
-        vec![vec![text("memory"), text("main")]]
+        rows(
+            &db,
+            "SELECT database_name, schema_name, internal FROM duckdb_schemas() ORDER BY 1, 2"
+        ),
+        vec![
+            vec![text("memory"), text("main"), yes.clone()],
+            vec![text("system"), text("information_schema"), yes.clone()],
+            vec![text("system"), text("main"), yes.clone()],
+            vec![text("system"), text("pg_catalog"), yes.clone()],
+            vec![text("temp"), text("main"), yes],
+        ]
     );
     // The join a client writes, which is the whole reason these two carry numbers.
     assert_eq!(
         rows(
             &db,
-            "SELECT s.schema_name FROM duckdb_schemas() s, duckdb_databases() d \
+            "SELECT count(*) FROM duckdb_schemas() s, duckdb_databases() d \
              WHERE s.database_oid = d.database_oid"
         ),
-        vec![vec![text("main")]]
+        vec![vec![Value::BigInt(5)]]
     );
+}
+
+/// The views a session has without making any, which is where `information_schema` comes from.
+///
+/// Every value here was read off the pin on the same statements, and the one thing that does not
+/// match it is how many of these there are: upstream ships 47 and rudb ships the 12 whose bodies
+/// only read table functions it has. See `rudb_catalog::system` for what the other 35 are waiting on.
+#[test]
+fn the_engine_ships_with_the_views_upstream_ships_with() {
+    // A database of its own rather than the shared one, because what these views report is
+    // everything in the catalog and the point of the test is that it is exactly what was made here.
+    let db = Database::new();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    db.execute("CREATE TABLE t(a INTEGER NOT NULL, b VARCHAR)").expect("a table to describe");
+    db.execute("CREATE VIEW v AS SELECT a FROM t").expect("a view to describe");
+    // The standard view of tables, which is a union of the two wrappers and so lists the table and
+    // the view and nothing the engine owns.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT table_catalog, table_schema, table_name, table_type, is_insertable_into \
+             FROM information_schema.tables ORDER BY table_name"
+        ),
+        vec![
+            vec![text("memory"), text("main"), text("t"), text("BASE TABLE"), text("YES")],
+            vec![text("memory"), text("main"), text("v"), text("VIEW"), text("NO")],
+        ]
+    );
+    // A view's columns are listed next to a table's, and `is_nullable` is the word rather than the
+    // boolean, which is the standard's spelling and the reason this view exists at all.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT table_name, column_name, ordinal_position, is_nullable, data_type \
+             FROM information_schema.columns ORDER BY table_name, ordinal_position"
+        ),
+        vec![
+            vec![text("t"), text("a"), Value::Integer(1), text("NO"), text("INTEGER")],
+            vec![text("t"), text("b"), Value::Integer(2), text("YES"), text("VARCHAR")],
+            vec![text("v"), text("a"), Value::Integer(1), text("YES"), text("INTEGER")],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT character_set_name, default_collate_name FROM information_schema.character_sets"
+        ),
+        vec![vec![text("UTF8"), text("ucs_basic")]]
+    );
+    // The wrapper and the table function are different questions. The bare name is what somebody
+    // made and the parentheses are what is really there, and the gap is the engine's own views.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_views"), vec![vec![Value::BigInt(1)]]);
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_views()"), vec![vec![Value::BigInt(13)]]);
+    // Nothing goes into a database the engine owns and nothing comes out of one.
+    assert_eq!(
+        failure(&db, "CREATE TABLE information_schema.x(a INTEGER)"),
+        "Cannot create entry in system catalog"
+    );
+    // Through `execute` rather than `query`, because a drop answers nothing and the query path
+    // complains about that before it gets as far as the catalog.
+    assert_eq!(
+        db.execute("DROP VIEW duckdb_views").expect_err("an internal entry").message(),
+        "Cannot drop internal catalog entry \"duckdb_views\"!"
+    );
+}
+
+/// A view the engine ships with goes in unbound and is bound at the first read, which is a fact
+/// about two columns of `duckdb_views()` and was measured on the pin twice over.
+#[test]
+fn a_view_the_engine_ships_with_is_bound_when_it_is_first_read() {
+    let db = database();
+    let unbound = "SELECT column_count, is_bound FROM duckdb_views() WHERE view_name = 'schemata'";
+    assert_eq!(rows(&db, unbound), vec![vec![Value::Null, Value::Boolean(false)]]);
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM information_schema.schemata"),
+        vec![vec![Value::BigInt(5)]]
+    );
+    assert_eq!(rows(&db, unbound), vec![vec![Value::BigInt(7), Value::Boolean(true)]]);
 }
 
 #[test]
 fn a_schema_carries_an_oid_of_its_own_and_not_its_databases() {
     let db = database();
     let rows = rows(&db, "SELECT oid, database_oid FROM duckdb_schemas()");
-    assert_eq!(rows.len(), 1);
-    assert_ne!(rows[0][0], rows[0][1]);
-    // Neither of them is the number a detached entry carries, which is what a caller reading these
-    // through a join would silently collapse on.
-    assert_ne!(rows[0][0], Value::BigInt(0));
-    assert_ne!(rows[0][1], Value::BigInt(0));
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        assert_ne!(row[0], row[1]);
+        // Neither of them is the number a detached entry carries, which is what a caller reading
+        // these through a join would silently collapse on.
+        assert_ne!(row[0], Value::BigInt(0));
+        assert_ne!(row[1], Value::BigInt(0));
+    }
 }
 
 #[test]
