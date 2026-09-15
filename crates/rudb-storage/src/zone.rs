@@ -214,29 +214,44 @@ fn flat(vector: &Vector, data: &Data) -> (Option<Bound>, Option<Bound>) {
 /// and one that is not: the boxed form cost about 1.7 nanoseconds a row, which over a hundred and
 /// five columns of a million rows is most of a second, and this is a compare and a branch.
 ///
-/// The null check is hoisted out of the loop rather than asked per row, because most columns of most
-/// chunks have no nulls at all and a branch per row here is a branch per row of the whole load.
+/// There are two loops rather than one with a check in it. A column with no nulls is the common case
+/// by a long way, and its loop has nothing in it but the two compares, which is what lets the
+/// compiler put a whole register of values through at a time. Folding the null check into that loop
+/// costs more than the check: it costs the vectorisation.
 fn extremes<T: Copy + PartialOrd>(values: &[T], vector: &Vector) -> (Option<T>, Option<T>) {
     let mut low: Option<T> = None;
     let mut high: Option<T> = None;
-    let nullable = vector.validity().has_nulls(vector.len());
-    for (index, &value) in values.iter().enumerate() {
-        // A value that does not order against itself is a NaN. It is left out because a NaN at
-        // either end makes every comparison against the range undecidable, which is a range that
-        // rules nothing out, and a filter is false for a NaN row whichever way this goes. For every
-        // integer layout this folds away, since their `partial_cmp` never answers `None`.
-        let comparable = value.partial_cmp(&value).is_some();
-        if !comparable || (nullable && vector.is_null_at(index)) {
-            continue;
+    if vector.validity().has_nulls(vector.len()) {
+        for (index, &value) in values.iter().enumerate() {
+            if !vector.is_null_at(index) {
+                widen(value, &mut low, &mut high);
+            }
         }
-        if low.is_none_or(|held| value < held) {
-            low = Some(value);
-        }
-        if high.is_none_or(|held| value > held) {
-            high = Some(value);
+    } else {
+        for &value in values {
+            widen(value, &mut low, &mut high);
         }
     }
     (low, high)
+}
+
+/// Opens the range far enough to hold `value`.
+///
+/// A value that does not order against itself is a NaN, and it is left out: a NaN at either end
+/// makes every comparison against the range undecidable, which is a range that rules nothing out,
+/// and a filter is false for a NaN row whichever way this goes. For every integer layout the check
+/// folds away, since their `partial_cmp` never answers `None`.
+#[inline]
+fn widen<T: Copy + PartialOrd>(value: T, low: &mut Option<T>, high: &mut Option<T>) {
+    if value.partial_cmp(&value).is_none() {
+        return;
+    }
+    if low.is_none_or(|held| value < held) {
+        *low = Some(value);
+    }
+    if high.is_none_or(|held| value > held) {
+        *high = Some(value);
+    }
 }
 
 /// The range of a column of strings, walked as bytes.
