@@ -171,7 +171,29 @@ fn decompress_within(input: &[u8], expected: usize, header: usize, out: &mut [u8
     let out = &mut out[..expected];
     let mut src = header;
     let mut pos = 0usize;
+    unchecked(input, out, &mut src, &mut pos);
+    let pos = checked(input, out, src, pos)?;
+    if pos == expected {
+        Ok(())
+    } else {
+        Err(Error::io(format!(
+            "this block says it holds {expected} bytes and its elements produced {pos}"
+        )))
+    }
+}
 
+/// The walk that checks every element, which is the one that says what is wrong with a block.
+///
+/// Every element form is here and so is every error. [`unchecked`] above is this loop with the
+/// tests that cannot fail taken out, it runs first, and it stops as soon as an element might not
+/// fit, so this one finishes every block and is the only one that ever reports anything. The two
+/// have to agree everywhere they overlap, which is what `the two walks agree on every block` puts
+/// a test on.
+///
+/// The answer is how many bytes the block produced, which the caller compares against what its
+/// header claimed.
+fn checked(input: &[u8], out: &mut [u8], mut src: usize, mut pos: usize) -> Result<usize> {
+    let expected = out.len();
     while src < input.len() {
         let tag = input[src];
         src += 1;
@@ -262,14 +284,162 @@ fn decompress_within(input: &[u8], expected: usize, header: usize, out: &mut [u8
             pos += len;
         }
     }
+    Ok(pos)
+}
 
-    if pos == expected {
-        Ok(())
-    } else {
-        Err(Error::io(format!(
-            "this block says it holds {expected} bytes and its elements produced {pos}"
-        )))
+/// How much room both sides need before an element can be placed without checking its range.
+///
+/// A copy writes at most 64 bytes, because its length is six bits of the tag plus one. A literal
+/// whose length is inside its tag writes at most 60. So an element that starts with 64 bytes left
+/// in the input and 64 left in the output cannot run off either of them, and every range test on it
+/// is a test that was always going to pass.
+///
+/// That is worth removing rather than tidying. The careful walk below spends five of them on a
+/// copy and five on a literal, the branch predictor gets them all right, and they still cost the
+/// instructions to issue: a callgrind run over the nine `URL` pages of `hits-1m-snappy.parquet` put
+/// the decoder at 47 instructions an element with 12 branches, against nine bytes of output an
+/// element. Hoisting them into the one comparison that starts this loop is the difference between
+/// deciding per element whether an element fits and deciding it once for the next few thousand.
+///
+/// # The room on the output side is kept without a test that shows it is needed
+///
+/// Mutation testing found the input side guard load bearing and the output side one not: turning
+/// `out.len() - SLACK` into `out.len()` leaves every test passing. That is not a hole in the tests
+/// so much as a claim about the format, because a literal takes one more byte of input than it
+/// produces and a copy produces at least twice what it takes, so the input runs out first in
+/// anything a writer emits. Making it run out second needs a chain of long form literals holding
+/// one byte each, and those go through [`long_literal`], which checks its own range. The guard
+/// stays because that argument has to hold for every element form at once and a wrong one is an
+/// out of range write, and the cost of keeping it is one comparison per few thousand elements.
+const SLACK: usize = 64;
+
+/// The walk that does not check, for as long as both sides have [`SLACK`] bytes left.
+///
+/// Leaves `src` and `pos` on an element boundary whatever happens, so the careful walk picks up
+/// from there and reaches the same answer. Nothing here reports a problem and nothing here decides
+/// a block is corrupt: an element it will not place is an element it leaves, and the walk that
+/// knows how to describe the failure gets it. That is what keeps this loop free of error paths
+/// without giving up anything the reader used to say about a bad file.
+///
+/// The one shape it hands over for a reason other than running out of room is a copy that reaches
+/// back past what has been produced, which is corrupt rather than rare.
+fn unchecked(input: &[u8], out: &mut [u8], src: &mut usize, pos: &mut usize) {
+    let input_room = input.len().saturating_sub(SLACK);
+    let out_room = out.len().saturating_sub(SLACK);
+    while *src < input_room && *pos < out_room {
+        let at = *src;
+        let tag = input[at];
+        if tag & 0b11 == 0 {
+            let count = usize::from(tag >> 2);
+            if count >= 60 {
+                // A literal whose length is written after the tag, which is 0.2 percent of the
+                // literals on a real page. Its length is not bounded by anything, so this is the
+                // one element in here that checks, and it hands over rather than reporting.
+                if !long_literal(input, out, src, pos, count) {
+                    return;
+                }
+                continue;
+            }
+            let len = count + 1;
+            if len <= WIDE {
+                // Overruns on purpose. See [`WIDE`]. In range because the loop said so: the tag is
+                // more than `SLACK` bytes from the end of the input and `pos` is more than `SLACK`
+                // from the end of the output.
+                out[*pos..*pos + WIDE].copy_from_slice(&input[at + 1..at + 1 + WIDE]);
+            } else {
+                out[*pos..*pos + len].copy_from_slice(&input[at + 1..at + 1 + len]);
+            }
+            *src = at + 1 + len;
+            *pos += len;
+            continue;
+        }
+        let (len, offset, used) = copy_of(input, at, tag);
+        if offset == 0 || offset > *pos {
+            return;
+        }
+        copy_back(out, *pos, offset, len);
+        *src = at + used;
+        *pos += len;
     }
+}
+
+/// A copy element read out of a block that is known to have [`SLACK`] bytes left at `at`.
+///
+/// The answer is its length, how far back it reaches, and how many bytes it took including the tag.
+/// Nothing is checked because nothing can fail: the widest of the three forms is five bytes.
+fn copy_of(input: &[u8], at: usize, tag: u8) -> (usize, usize, usize) {
+    match tag & 0b11 {
+        // One byte of offset, and three bits of it ride along in the tag. Lengths four to eleven,
+        // which is 87 percent of the copies on a real page.
+        1 => {
+            let offset = (usize::from(tag >> 5) << 8) | usize::from(input[at + 1]);
+            (4 + usize::from((tag >> 2) & 0b111), offset, 2)
+        }
+        2 => {
+            let offset = usize::from(u16::from_le_bytes([input[at + 1], input[at + 2]]));
+            (1 + usize::from(tag >> 2), offset, 3)
+        }
+        _ => {
+            let bytes = [input[at + 1], input[at + 2], input[at + 3], input[at + 4]];
+            let offset = u32::from_le_bytes(bytes) as usize;
+            (1 + usize::from(tag >> 2), offset, 5)
+        }
+    }
+}
+
+/// Writes one copy element, whose room and whose reach the caller has already established.
+///
+/// The three cases are the ones the careful walk has and they are there for the same reasons, which
+/// are written out at [`WIDE`]. What is different is that none of them tests whether it fits.
+fn copy_back(out: &mut [u8], pos: usize, offset: usize, len: usize) {
+    let from = pos - offset;
+    if len <= WIDE && offset >= WIDE {
+        let mut wide = [0u8; WIDE];
+        wide.copy_from_slice(&out[from..from + WIDE]);
+        out[pos..pos + WIDE].copy_from_slice(&wide);
+    } else if offset >= len {
+        let (before, after) = out.split_at_mut(pos);
+        after[..len].copy_from_slice(&before[from..from + len]);
+    } else {
+        out.copy_within(from..pos, pos);
+        let mut done = offset;
+        while done < len {
+            let chunk = done.min(len - done);
+            out.copy_within(pos..pos + chunk, pos + done);
+            done += chunk;
+        }
+    }
+}
+
+/// Writes a literal whose length is written after its tag, and says whether it did.
+///
+/// `false` means it will not fit and the careful walk should have it, which is also how a block
+/// that lies about a length gets its error reported in the one place that knows how to word it.
+fn long_literal(
+    input: &[u8],
+    out: &mut [u8],
+    src: &mut usize,
+    pos: &mut usize,
+    count: usize,
+) -> bool {
+    let at = *src;
+    let extra = count - 59;
+    let mut value = 0u64;
+    for step in 0..extra {
+        value |= u64::from(input[at + 1 + step]) << (8 * step);
+    }
+    // A four byte length of all ones plus one is a corrupt block rather than a literal, and on a
+    // target where a `usize` is four bytes wide it is also not a number. Either way it is not this
+    // walk's to report.
+    let Ok(len) = usize::try_from(value + 1) else { return false };
+    let from = at + 1 + extra;
+    if input.len() - from < len || out.len() - *pos < len {
+        return false;
+    }
+    out[*pos..*pos + len].copy_from_slice(&input[from..from + len]);
+    *src = from + len;
+    *pos += len;
+    true
 }
 
 /// Reads a copy element's length and offset, advancing `src` past the bytes it used.
@@ -363,6 +533,162 @@ mod tests {
     fn copy2(len: usize, offset: usize) -> Vec<u8> {
         assert!((1..=64).contains(&len));
         vec![(((len - 1) as u8) << 2) | 0b10, offset as u8, (offset >> 8) as u8]
+    }
+
+    /// A one byte offset copy, which is the form a real page is mostly made of.
+    ///
+    /// Eleven bits of offset, three of length, and it only reaches lengths four to eleven. On the
+    /// `URL` pages of a ClickBench `hits.parquet` it is 87 percent of the copies, so a test that
+    /// builds only the two byte form is a test that misses the path the reader actually runs.
+    fn copy1(len: usize, offset: usize) -> Vec<u8> {
+        assert!((4..=11).contains(&len));
+        assert!(offset < (1 << 11));
+        let tag = (((offset >> 8) as u8) << 5) | (((len - 4) as u8) << 2) | 0b01;
+        vec![tag, offset as u8]
+    }
+
+    /// A four byte offset copy, which is the form a block reaches for past 64 kilobytes.
+    fn copy4(len: usize, offset: usize) -> Vec<u8> {
+        assert!((1..=64).contains(&len));
+        let mut out = vec![(((len - 1) as u8) << 2) | 0b11];
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out
+    }
+
+    /// Every element form, in blocks long enough that the fast walk gets most of them.
+    ///
+    /// The lengths and offsets are the ones that pick a different branch: a literal under sixteen
+    /// bytes and one over, a copy under sixteen and one over, an offset under sixteen and one over,
+    /// and an offset smaller than the length, which is the overlapping copy. The generator walks a
+    /// counter through all of them rather than listing the combinations, so a form nobody thought of
+    /// is still reached.
+    fn shapes() -> Vec<(usize, Vec<u8>)> {
+        let mut built = Vec::new();
+        for seed in 0..48usize {
+            let mut body = Vec::new();
+            let mut produced = 0usize;
+            // Literals first, because a copy needs something to reach back into, and enough of them
+            // that a one byte copy can reach further than 255 and put something in the three bits
+            // of offset its tag carries. Eight of them is about 400 bytes.
+            for round in 0..8usize {
+                let first = 1 + (seed + round * 5) % 60;
+                let bytes: Vec<u8> =
+                    (0..first).map(|at| b'a' + ((at + round) % 26) as u8).collect();
+                body.extend_from_slice(&literal(&bytes));
+                produced += first;
+            }
+            for step in 0..40usize {
+                let mix = seed * 7 + step * 13;
+                if mix % 3 == 0 {
+                    let len = 1 + mix % 60;
+                    let bytes: Vec<u8> =
+                        (0..len).map(|at| b'A' + ((at + step) % 26) as u8).collect();
+                    body.extend_from_slice(&literal(&bytes));
+                    produced += len;
+                } else if mix % 3 == 1 {
+                    // The form 87 percent of a real page's copies take, which only reaches eleven
+                    // bytes and 2048 back.
+                    let len = 4 + mix % 8;
+                    let reach = produced.min(1 << 11);
+                    // Every other one reaches as far back as it legally can, so the three bits of
+                    // offset the tag carries are set rather than left at zero.
+                    let offset = if mix % 2 == 0 { reach } else { 1 + mix % reach.max(1) };
+                    body.extend_from_slice(&copy1(len, offset.max(1)));
+                    produced += len;
+                } else {
+                    let len = 1 + mix % 64;
+                    let offset = 1 + mix % produced.max(1);
+                    let element =
+                        if mix % 6 == 2 { copy2(len, offset) } else { copy4(len, offset) };
+                    body.extend_from_slice(&element);
+                    produced += len;
+                }
+            }
+            built.push((produced, block(produced, &body)));
+        }
+        // A literal consumes one more byte than it produces and a copy produces far more than it
+        // consumes, so in a block of mixed elements the input runs out first and the fast walk stops
+        // on the input guard every time. Which leaves the guard on the output untested, and that is
+        // the one that keeps a wide write inside the buffer. These blocks end in a long run of long
+        // copies so that the position outruns the source and the other guard is the one that binds.
+        for seed in 0..8usize {
+            let mut body = Vec::new();
+            let mut produced = 0usize;
+            let bytes: Vec<u8> = (0..60).map(|at| b'a' + ((at + seed) % 26) as u8).collect();
+            body.extend_from_slice(&literal(&bytes));
+            produced += 60;
+            for step in 0..64usize {
+                let len = 49 + (seed + step) % 16;
+                let offset = 1 + (seed * 3 + step * 7) % produced;
+                body.extend_from_slice(&copy2(len, offset));
+                produced += len;
+            }
+            built.push((produced, block(produced, &body)));
+        }
+        built
+    }
+
+    /// The fast walk and the careful one have to produce the same bytes, everywhere they overlap.
+    ///
+    /// The fast walk exists only because the careful one spends most of its instructions on tests
+    /// that cannot fail, so the thing to check is that taking them out changed nothing. This runs
+    /// each block twice, once through the pair as the reader uses them and once through the careful
+    /// walk on its own, and the two answers have to be the same block.
+    #[test]
+    fn the_two_walks_agree_on_every_block() {
+        for (len, built) in shapes() {
+            let both = decompress(&built).expect("a block these tests built did not decode");
+            let mut alone = vec![0u8; len];
+            let (_, header) = super::read_varint(&built).unwrap();
+            let produced = super::checked(&built, &mut alone, header, 0)
+                .expect("the careful walk did not decode a block the pair did");
+            assert_eq!(produced, len, "the careful walk produced a different length");
+            assert_eq!(both, alone, "the two walks disagree on a block of {len} bytes");
+        }
+    }
+
+    /// The fast walk runs at all, which the test above would pass without.
+    ///
+    /// A block shorter than the slack never enters it, so if the generator only built small blocks
+    /// the agreement above would be the careful walk agreeing with itself.
+    #[test]
+    fn the_blocks_the_walks_are_compared_on_are_long_enough_to_reach_the_fast_one() {
+        let longest = shapes().iter().map(|(len, _)| *len).max().unwrap_or(0);
+        assert!(longest > super::SLACK * 4, "the longest block built is only {longest} bytes");
+    }
+
+    /// The fast walk hands a bad element back rather than acting on it.
+    ///
+    /// Every other corruption test here builds a block of a few bytes, which is shorter than the
+    /// slack and so never enters the fast walk at all. The fast walk has its own guard on the one
+    /// thing it cannot recover from, a copy that reaches back further than it has produced, and this
+    /// is the only test that reaches it. Both of these would read before the start of the buffer if
+    /// the guard were off by one, so the failure this catches is a panic rather than a wrong answer.
+    #[test]
+    fn a_bad_copy_in_the_middle_of_a_long_block_is_an_error_and_not_a_read_before_the_start() {
+        for offset in [0usize, 1] {
+            let mut body = Vec::new();
+            let mut produced = 0usize;
+            while produced < super::SLACK * 8 {
+                body.extend_from_slice(&literal(b"abcdefghijklmnopqrstuvwxyz"));
+                produced += 26;
+            }
+            // One past everything produced so far, or zero, both of which are unreachable in a block
+            // a writer produced and neither of which the fast walk may act on.
+            let reach = if offset == 0 { 0 } else { produced + 1 };
+            body.extend_from_slice(&copy2(4, reach));
+            // Enough after it that the bad element is well inside the fast walk's room.
+            for _ in 0..16 {
+                body.extend_from_slice(&literal(b"abcdefghijklmnopqrstuvwxyz"));
+            }
+            let claimed = produced + 4 + 16 * 26;
+            let error = decompress(&block(claimed, &body)).unwrap_err();
+            let message = error.message();
+            assert!(
+                message.contains("offset of zero") || message.contains("reaching back"),
+                "an offset of {reach} gave {message}"
+            );
+        }
     }
 
     /// A block with `body` in it and a header saying it produces `len` bytes.
