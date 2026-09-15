@@ -3029,3 +3029,35 @@ fn a_group_by_that_spills_before_it_partitions_lands_the_file_and_the_table() {
     one.sort_by_key(|row| first_key(row));
     assert_eq!(many, one, "every row landed once whether it came back from a file or not");
 }
+
+/// A table built from a query keeps whatever form the query produced, and a caller still gets flat
+/// columns because a result set is the thing that flattens rather than the thing that stores.
+///
+/// The one that matters is the first assertion. Draining a query happens on one thread, so a copy
+/// made there is a copy made while the rest of the pool has nothing to do, and on a wide load it is
+/// most of what the statement costs. A dictionary column is the case where the copy is largest,
+/// because flattening it writes one value per row out of a body that held one per distinct value.
+#[test]
+fn a_table_built_from_a_query_keeps_the_dictionary_the_query_produced() {
+    let db = Database::new();
+    db.execute("CREATE TABLE src AS SELECT range % 4 AS k FROM range(4096)").expect("src builds");
+    // A filter over a small distinct set is what leaves a dictionary behind, which is the same
+    // thing a parquet scan of a dictionary encoded column hands up.
+    db.execute("CREATE TABLE kept AS SELECT k FROM src WHERE k < 3").expect("kept builds");
+    let forms = db.with_catalog(|catalog| {
+        let name = rudb_catalog::QualifiedName::new("memory", "main", "kept");
+        let table = catalog.table(&name).expect("the table is there");
+        (0..table.rows().chunk_count())
+            .filter_map(|at| table.rows().chunk(at))
+            .map(|chunk| chunk.column(0).expect("one column").form())
+            .collect::<Vec<_>>()
+    });
+    assert!(!forms.is_empty(), "the table has chunks");
+    assert!(
+        forms.iter().any(|&form| form != rudb_vector::Form::Flat),
+        "every chunk was flattened on the way in, so the drain still pays for a copy nobody wants"
+    );
+    let answer = db.query("SELECT count(*), sum(k) FROM kept").expect("it reads back");
+    let rows: Vec<Vec<Value>> = answer.rows().collect();
+    assert_eq!(rows, vec![vec![Value::BigInt(3072), Value::HugeInt(3072)]]);
+}
