@@ -133,6 +133,18 @@ enum Shape {
     /// where it started. Comparing at the first argument's type instead would round the second one
     /// and answer `nullif(2, 2.5)` with null.
     PromotedToFirst,
+    /// One string naming a setting, and the result is whatever type that setting holds.
+    ///
+    /// `current_setting` and nothing else. It is a shape rather than a fixed pair because the pin
+    /// declares the return as `ANY` and then works it out from the name that was passed, which is
+    /// why `typeof(current_setting('threads'))` is BIGINT there and
+    /// `typeof(current_setting('memory_limit'))` is VARCHAR. Both come from one overload.
+    ///
+    /// Resolving this is an error and that is the point of it. The binder folds the call to the
+    /// setting's value before it asks this table anything, so the only way a call arrives here is
+    /// the way the fold cannot happen, which is an argument that is not a constant, and that is the
+    /// case the pin refuses in the same words.
+    Setting,
 }
 
 /// The return types a signature can name outright.
@@ -519,6 +531,18 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::Varchar),
         numeric_only: false,
     },
+    // The value of a setting, as a value rather than as a row of `duckdb_settings()`. This is the
+    // second function the binder folds and it folds for the same reason `typeof` does: the answer
+    // is settled once the name is known and nothing about it changes per row. Upstream folds it too
+    // and an `EXPLAIN` of a query that calls it shows the literal, which is what makes an `ANY`
+    // return type resolve to something a plan can carry.
+    Entry {
+        name: "current_setting",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Setting,
+        numeric_only: false,
+    },
     // Aggregates.
     aggregate("count_star", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt), false),
     aggregate("count", Arity::exactly(1), Shape::AnyTo(Fixed::BigInt), false),
@@ -767,6 +791,14 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let returns = if *first == LogicalType::Null { common.clone() } else { first.clone() };
             (vec![common; arguments.len()], returns)
         }
+        // Reaching here means the binder could not fold the call, and the only reason it cannot is
+        // an argument that is not a constant. The pin says exactly this and names the parameter.
+        Shape::Setting => {
+            return Err(Error::binder(format!(
+                "The \"setting_name\" argument in function \"{}\" must be a constant expression",
+                entry.name
+            )));
+        }
     };
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
 }
@@ -1007,6 +1039,7 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("typeof", &["typeof(col0 ANY) -> VARCHAR"]),
+    ("current_setting", &["current_setting(setting_name VARCHAR) -> ANY"]),
 ];
 
 /// What one element of a subscripted value is, or `None` for a value that cannot be subscripted.
@@ -1302,6 +1335,9 @@ impl Shape {
             Self::TextThenIndex(taken, to) => {
                 (leading(taken, Fixed::Varchar.name(), "BIGINT"), to.name())
             }
+            // One overload with an `ANY` return, which is the pin's row for it. The name decides
+            // the type and a name is not something a signature can hold.
+            Self::Setting => (all(Fixed::Varchar.name()), ANY),
         }
     }
 }
@@ -1752,6 +1788,12 @@ mod tests {
     #[test]
     fn every_entry_resolves_at_every_count_it_accepts() {
         for entry in TABLE {
+            // The one row that is meant not to resolve, because the binder answers the call before
+            // it gets here and the only way here is the case upstream refuses. It has a test of its
+            // own below rather than an exception with nothing behind it.
+            if entry.shape == Shape::Setting {
+                continue;
+            }
             for count in entry.arity.counts() {
                 // A shape that names the type it wants is asked for it, since `chr` wants an
                 // INTEGER and refuses a string the way upstream does.
@@ -1778,6 +1820,38 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// The three answers the pin gives a call to `current_setting`, read off `v2.0.0-dev84237`.
+    ///
+    /// The right number of arguments and a name the binder could not fold is the constant
+    /// expression sentence, and a wrong number is the ordinary arity error with the one overload
+    /// listed under it. The folded case is not here because it never reaches this table.
+    #[test]
+    fn a_setting_read_from_a_column_is_refused_in_the_pins_words() {
+        let error = resolve("current_setting", &[LogicalType::Varchar]).expect_err("is refused");
+        assert_eq!(
+            error.to_string(),
+            "Binder Error: The \"setting_name\" argument in function \"current_setting\" must be a constant expression"
+        );
+        let none = resolve("current_setting", &[]).expect_err("takes one argument");
+        assert_eq!(
+            none.to_string(),
+            "Binder Error: No function matches the given name and argument types 'current_setting()'. \
+             You might need to add explicit type casts.\n\tCandidate functions:\n\tcurrent_setting(setting_name VARCHAR) -> ANY\n"
+        );
+    }
+
+    /// One row with an `ANY` return, which is what the pin's `duckdb_functions()` says about it.
+    #[test]
+    fn a_setting_is_declared_over_a_string_and_returns_anything() {
+        let row = function_rows()
+            .into_iter()
+            .find(|row| row.name == "current_setting")
+            .expect("a row for it");
+        assert_eq!(row.types, ["VARCHAR"]);
+        assert_eq!(row.returns, "ANY");
+        assert_eq!(row.varargs, None);
     }
 
     /// A signature that promotes over its arguments and accepts none of them would reach the

@@ -1272,6 +1272,74 @@ fn the_settings_table_reads_back_what_set_left_behind() {
 }
 
 #[test]
+fn a_setting_read_as_a_value_has_the_type_the_setting_holds() {
+    let db = database();
+    db.execute("SET threads = 3").expect("a thread count");
+    db.execute("SET memory_limit = '1GiB'").expect("a size");
+    // A BIGINT and a VARCHAR out of one overload, which is the whole reason the declared return
+    // type is ANY. Both were read off the pin.
+    assert_eq!(rows(&db, "SELECT current_setting('threads')"), vec![vec![Value::BigInt(3)]]);
+    assert_eq!(rows(&db, "SELECT typeof(current_setting('threads'))"), vec![vec![text("BIGINT")]]);
+    assert_eq!(rows(&db, "SELECT current_setting('memory_limit')"), vec![vec![text("1.0 GiB")]]);
+    assert_eq!(
+        rows(&db, "SELECT typeof(current_setting('memory_limit'))"),
+        vec![vec![text("VARCHAR")]]
+    );
+    // An alias reads the setting it points at, both ways round.
+    assert_eq!(rows(&db, "SELECT current_setting('worker_threads')"), vec![vec![Value::BigInt(3)]]);
+    assert_eq!(rows(&db, "SELECT current_setting('max_memory')"), vec![vec![text("1.0 GiB")]]);
+    // The name is matched the way an identifier is, which the pin does as well.
+    assert_eq!(rows(&db, "SELECT current_setting('THREADS')"), vec![vec![Value::BigInt(3)]]);
+    // The column is named after what was written, since nothing renames a folded call.
+    assert_eq!(
+        db.query("SELECT current_setting('threads')").expect("a setting").names(),
+        ["current_setting('threads')".to_string()]
+    );
+    // And it reads the setting as it is now rather than as it was when the database opened.
+    db.execute("RESET threads").expect("a reset");
+    let before = db.opened_with().threads();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('threads')"),
+        vec![vec![Value::BigInt(i64::try_from(before).expect("a thread count fits"))]]
+    );
+}
+
+#[test]
+fn a_setting_read_as_a_value_is_folded_before_the_plan_exists() {
+    let db = database();
+    db.execute("SET threads = 7").expect("a thread count");
+    // The plan holds the number and not the call, which is what the pin does: an EXPLAIN there
+    // shows `Projections: 6` over a dummy scan rather than a function over one.
+    // The name survives as the column's alias, which is what the pin calls it too, so what is
+    // asserted is that the thing projected is the number.
+    let plan = db.plan("SELECT current_setting('threads')").expect("a plan");
+    assert!(plan.contains("[7::BIGINT AS \"current_setting('threads')\"]"), "{plan}");
+}
+
+#[test]
+fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
+    let db = database();
+    // A column of names cannot be folded, so the call falls through to the signature table and
+    // gets the sentence the pin prints for exactly this.
+    assert_eq!(
+        failure(&db, "SELECT current_setting(s) FROM t"),
+        "The \"setting_name\" argument in function \"current_setting\" must be a constant expression"
+    );
+    // A name nobody has is the same sentence `SET` gives for it, which is one sentence in one place.
+    let unknown = failure(&db, "SELECT current_setting('nope')");
+    assert!(unknown.starts_with("unrecognized configuration parameter \"nope\""), "{unknown}");
+    assert!(unknown.contains("Did you mean: \"disabled_optimizers\""), "{unknown}");
+    assert_eq!(unknown, db.execute("SET nope = 1").unwrap_err().message());
+    // The wrong number of arguments is the ordinary arity error with the one overload under it.
+    assert_eq!(
+        failure(&db, "SELECT current_setting()"),
+        "No function matches the given name and argument types 'current_setting()'. You might \
+         need to add explicit type casts.\n\tCandidate functions:\n\tcurrent_setting(setting_name \
+         VARCHAR) -> ANY\n"
+    );
+}
+
+#[test]
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());

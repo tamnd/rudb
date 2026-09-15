@@ -29,7 +29,9 @@
 //! `memory`, which is the opposite of `duckdb_types()`, where the types are repeated once per
 //! catalog. Reporting `memory` here would break every client query that filters on the schema and
 //! would say the functions belong to a database, which is not true of a builtin. So this says
-//! `system.main`, and the catalog itself gains a `system` entry when the catalog tables land.
+//! `system.main`. The catalog tables have landed since and the catalog still has no `system` entry,
+//! so `duckdb_schemas()` cannot return the name this column reports. That is #607 rather than a
+//! thing this file can fix, because the entry has to come from the catalog and not from here.
 //!
 //! `function_oid` is null for the same reason `database_oid` is null in `duckdb_types()`: upstream's
 //! is a counter its catalog handed out at startup and rudb has no oid space. `description`,
@@ -142,7 +144,7 @@ fn scalar(row: FunctionRow) -> FunctionEntry {
         },
         alias_of: row.alias_of,
         return_type: Some(row.returns),
-        parameters: positional(row.types.len()),
+        parameters: named(row.alias_of.unwrap_or(row.name), row.types.len()),
         parameter_types: row.types.iter().map(|name| (*name).to_string()).collect(),
         varargs: row.varargs,
         has_side_effects: Some(false),
@@ -247,6 +249,30 @@ const fn positional_type(function: TableFunction) -> &'static str {
 fn positional(count: usize) -> Vec<String> {
     (0..count).map(|at| format!("col{at}")).collect()
 }
+
+/// The names one function's arguments go by, which is [`positional`] unless the function is in
+/// [`PARAMETER_NAMES`].
+fn named(name: &str, count: usize) -> Vec<String> {
+    match PARAMETER_NAMES.iter().find(|(entry, _)| *entry == name) {
+        Some((_, names)) if names.len() == count => {
+            names.iter().map(|name| (*name).to_string()).collect()
+        }
+        _ => positional(count),
+    }
+}
+
+/// The scalar functions whose arguments upstream gives real names rather than `col0`.
+///
+/// Short on purpose. Upstream names the arguments of a few dozen functions and leaves the rest as
+/// `col0`, and the ones it names are the ones where the name carries information a type does not:
+/// `regexp_replace(string, regex, replacement)` is three VARCHARs and the order is not guessable
+/// from that. `current_setting` is here because its error message names the parameter, so a row
+/// saying `col0` next to a message saying `setting_name` would be this table disagreeing with the
+/// binder about the same argument.
+///
+/// A row only applies at the argument count it has names for, so a function with two arities keeps
+/// `col0` at the arity this list does not cover rather than being given the wrong names.
+const PARAMETER_NAMES: &[(&str, &[&str])] = &[("current_setting", &["setting_name"])];
 
 #[cfg(test)]
 mod tests {
@@ -360,6 +386,25 @@ mod tests {
             csv.parameters[1..],
             ["all_varchar", "delim", "escape", "header", "quote", "sep"]
         );
+    }
+
+    /// The one scalar whose argument has a name, and the reason it needs one.
+    #[test]
+    fn a_setting_is_read_by_an_argument_the_table_names() {
+        let entry = function_entries()
+            .into_iter()
+            .find(|entry| entry.name == "current_setting")
+            .expect("a row for it");
+        assert_eq!(entry.function_type, "scalar");
+        assert_eq!(entry.parameters, ["setting_name"]);
+        assert_eq!(entry.parameter_types, ["VARCHAR"]);
+        assert_eq!(entry.return_type, Some("ANY"));
+        // Every other scalar keeps `col0`, so the list is an exception and not a new convention.
+        let lower = function_entries()
+            .into_iter()
+            .find(|entry| entry.name == "lower")
+            .expect("a row for it");
+        assert_eq!(lower.parameters, ["col0"]);
     }
 
     #[test]

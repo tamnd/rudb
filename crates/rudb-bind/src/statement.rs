@@ -15,7 +15,7 @@
 //! loop over chunks.
 
 use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, parse_ast};
 use rudb_plan::{Expr, ExprRef, Node, Plan};
@@ -139,10 +139,10 @@ pub struct Insert {
 /// If the script does not hold exactly one statement, if a name does not resolve, if a type does
 /// not work out, or if the statement uses something that is not bound yet.
 pub fn bind_statement(ast: &Ast, catalog: &Catalog) -> Result<Bound> {
-    bind_statement_with(ast, catalog, &Parameters::new())
+    bind_statement_with(ast, catalog, &Parameters::new(), &Session::new())
 }
 
-/// Binds one parsed statement against a catalog, with values for its parameters.
+/// Binds one parsed statement against a catalog, with values for its parameters and its settings.
 ///
 /// This is the prepared statement path. The statement is parsed once and bound once per set of
 /// values, so a parameter is a constant by the time the plan exists and everything after the binder
@@ -151,7 +151,12 @@ pub fn bind_statement(ast: &Ast, catalog: &Catalog) -> Result<Bound> {
 /// # Errors
 ///
 /// Everything [`bind_statement`] reports, plus an error for a parameter that was given no value.
-pub fn bind_statement_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters) -> Result<Bound> {
+pub fn bind_statement_with(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+) -> Result<Bound> {
     let statement = match ast.statements.as_slice() {
         [statement] => *statement,
         [] => return Err(Error::binder("no statement to bind")),
@@ -159,19 +164,21 @@ pub fn bind_statement_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters
     };
     match statement {
         ast::Statement::Query(query) => {
-            let mut binder = Binder::with(catalog, parameters);
+            let mut binder = Binder::with(catalog, parameters, session);
             let (root, _) = binder.bind_query(ast, query)?;
             Ok(Bound::Query(finish(binder, root)?))
         }
-        ast::Statement::CreateTable(index) => create_table(ast, catalog, parameters, index),
-        ast::Statement::CreateView(index) => create_view(ast, catalog, parameters, index),
+        ast::Statement::CreateTable(index) => {
+            create_table(ast, catalog, parameters, session, index)
+        }
+        ast::Statement::CreateView(index) => create_view(ast, catalog, parameters, session, index),
         ast::Statement::DropTable(index) => drop_table(ast, catalog, index),
-        ast::Statement::Insert(index) => insert(ast, catalog, parameters, index),
+        ast::Statement::Insert(index) => insert(ast, catalog, parameters, session, index),
         ast::Statement::Set(index) | ast::Statement::Reset(index) => {
-            setting(ast, catalog, parameters, index)
+            setting(ast, catalog, parameters, session, index)
         }
         ast::Statement::Explain { query, analyze } => {
-            let mut binder = Binder::with(catalog, parameters);
+            let mut binder = Binder::with(catalog, parameters, session);
             let (root, _) = binder.bind_query(ast, query)?;
             Ok(Bound::Explain { plan: finish(binder, root)?, analyze })
         }
@@ -200,6 +207,7 @@ fn create_table(
     ast: &Ast,
     catalog: &Catalog,
     parameters: &Parameters,
+    session: &Session,
     index: ast::CreateTableRef,
 ) -> Result<Bound> {
     let written = ast.create_table(index);
@@ -232,7 +240,7 @@ fn create_table(
         }
         (columns, None)
     } else {
-        let mut binder = Binder::with(catalog, parameters);
+        let mut binder = Binder::with(catalog, parameters, session);
         let (root, scope) = binder.bind_query(ast, written.query)?;
         if defs.len() > scope.len() {
             // DuckDB's sentence, typo and all. A column list shorter than the query is fine and
@@ -302,6 +310,7 @@ fn create_view(
     ast: &Ast,
     catalog: &Catalog,
     parameters: &Parameters,
+    session: &Session,
     index: ast::CreateViewRef,
 ) -> Result<Bound> {
     let written = ast.create_view(index);
@@ -315,7 +324,7 @@ fn create_view(
     let name = catalog.resolve_for_create(&parts)?;
     let aliases: Vec<String> = ast.name(written.columns).map(str::to_string).collect();
 
-    let mut binder = Binder::with(catalog, parameters);
+    let mut binder = Binder::with(catalog, parameters, session);
     let (_, scope) = binder.bind_query(ast, written.query)?;
     if aliases.len() > scope.len() {
         return Err(Error::binder("More VIEW aliases than columns in query result"));
@@ -356,6 +365,7 @@ fn setting(
     ast: &Ast,
     catalog: &Catalog,
     parameters: &Parameters,
+    session: &Session,
     index: ast::SettingRef,
 ) -> Result<Bound> {
     let written = ast.setting(index);
@@ -363,7 +373,7 @@ fn setting(
     let value = if written.value == NONE {
         None
     } else {
-        let mut binder = Binder::with(catalog, parameters);
+        let mut binder = Binder::with(catalog, parameters, session);
         let bound = binder.bind_setting_value(ast, written.value)?;
         let Expr::Constant(value) = *binder.plan().expr(bound) else {
             return Err(Error::not_implemented(format!(
@@ -379,6 +389,7 @@ fn insert(
     ast: &Ast,
     catalog: &Catalog,
     parameters: &Parameters,
+    session: &Session,
     index: ast::InsertRef,
 ) -> Result<Bound> {
     let written = ast.insert(index);
@@ -417,7 +428,7 @@ fn insert(
         targets
     };
 
-    let mut binder = Binder::with(catalog, parameters);
+    let mut binder = Binder::with(catalog, parameters, session);
     let (root, scope) = binder.bind_query(ast, written.source)?;
     if scope.len() != targets.len() {
         return Err(Error::binder(format!(

@@ -21,11 +21,11 @@
 //! for a global setting, which is a different sentence and says which of the two the writer got
 //! wrong.
 //!
-//! `duckdb_settings()` reads these back from SQL, and it does it through [`Settings::session`] rather
-//! than by reaching in here, because the executor is four ranks below this file and cannot see it.
-//! What is not here yet is `current_setting()`, which is the other way SQL reads a setting rather
-//! than writing one. [`crate::Database::setting`] is the Rust side of that read and the SQL side is a
-//! scalar function over engine state, which is a shape no function in rudb has yet.
+//! `duckdb_settings()` and `current_setting()` read these back from SQL, and both do it through
+//! [`Settings::session`] rather than by reaching in here, because neither the binder nor the
+//! executor can see this file from where they are. The table is built at execution and the function
+//! is folded at binding, so the session is read once per statement and handed to both.
+//! [`crate::Database::setting`] is the Rust side of the same read.
 
 use std::sync::RwLock;
 
@@ -138,12 +138,7 @@ impl Settings {
                 .set(name, text.trim());
         }
         if !Self::NAMES.contains(&name) {
-            let known: Vec<String> =
-                Self::NAMES.iter().map(|known| format!("\"{known}\"")).collect();
-            return Err(Error::catalog(format!(
-                "unrecognized configuration parameter \"{name}\"\n\nDid you mean: {}",
-                known.join(", ")
-            )));
+            return Err(Error::catalog(rudb_functions::unknown_setting(name)));
         }
         match canonical(name) {
             "disabled_optimizers" => {
@@ -205,29 +200,37 @@ impl Settings {
             // largest number a limit could be would be describing a limit that is not there.
             "memory_limit" => Ok(config.memory_limit().map_or("unlimited".to_string(), human)),
             "threads" => Ok(config.threads().to_string()),
-            _ => {
-                let known: Vec<String> =
-                    Self::NAMES.iter().map(|known| format!("\"{known}\"")).collect();
-                Err(Error::catalog(format!(
-                    "unrecognized configuration parameter \"{name}\"\n\nDid you mean: {}",
-                    known.join(", ")
-                )))
-            }
+            _ => Err(Error::catalog(rudb_functions::unknown_setting(name))),
         }
     }
 
-    /// Every setting and its value, for the table that lists them.
+    /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per query rather than held, because there are five names and the alternative is a
-    /// second copy of the settings that has to be kept in step with this one. An alias reports the
-    /// same value as the name it resolves to, which is the same thing reading either spelling back
-    /// gives, and it is what the binary returns for both halves of each pair.
+    /// Built once per statement rather than held, because there are five names and the alternative
+    /// is a second copy of the settings that has to be kept in step with this one. An alias reports
+    /// the same value as the name it resolves to, which is the same thing reading either spelling
+    /// back gives, and it is what the binary returns for both halves of each pair.
+    ///
+    /// The two locks are taken once each here rather than once per name through [`Settings::value`],
+    /// because every statement pays for this now that `current_setting()` can appear in any of them.
+    /// Three settings and five names means the loop below would otherwise take six locks to read
+    /// three numbers.
     pub(crate) fn session(&self) -> Session {
+        let config = self.config();
+        let disabled = self.disabled_optimizers();
+        let memory = config.memory_limit().map_or_else(|| "unlimited".to_string(), human);
+        let threads = config.threads().to_string();
         let mut session = Session::new();
         for name in Self::NAMES {
-            if let Ok(value) = self.value(name) {
-                session.set(name, value);
-            }
+            session.set(
+                name,
+                match canonical(name) {
+                    "disabled_optimizers" => disabled.clone(),
+                    "memory_limit" => memory.clone(),
+                    "threads" => threads.clone(),
+                    other => unreachable!("{other} is not one of NAMES"),
+                },
+            );
         }
         session
     }

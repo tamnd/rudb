@@ -93,8 +93,8 @@ impl Database {
 
     /// One setting, by the name `SET` uses for it, in the spelling DuckDB prints.
     ///
-    /// The Rust side of reading a setting back. `current_setting()` is the SQL side and it is not
-    /// written yet, because a scalar function over engine state is a shape no function in rudb has.
+    /// The Rust side of reading a setting back. `SELECT current_setting('threads')` is the SQL side
+    /// and it answers with the same text, typed as whatever the setting holds.
     ///
     /// # Errors
     ///
@@ -373,15 +373,16 @@ impl Shared {
         Budget { memory: &self.inner.memory, pool: &self.inner.pool }
     }
 
-    /// The settings this plan is going to report, and an empty set for a plan that reports none.
+    /// What the settings are now, read once and handed to both the binder and the executor.
     ///
-    /// `duckdb_settings()` is the only thing in the engine that reads a session and almost no query
-    /// contains one, so the values are read out of the settings when the plan says they are going to
-    /// be looked at rather than once per statement. Reading them means taking three locks and
-    /// formatting two numbers, which is not much and is still more than every `SELECT` in a benchmark
-    /// should pay for a table it does not mention.
-    fn session_for(&self, plan: &rudb_plan::Plan) -> Session {
-        if reads_settings(plan) { self.inner.settings.session() } else { Session::new() }
+    /// It used to be read only for a plan that turned out to mention `duckdb_settings()`, on the
+    /// argument that no other query looks at a setting. `current_setting()` is the other one that
+    /// does and the binder folds it, so the values have to be in hand before there is a plan to
+    /// look at, and the check that would say whether a statement needs them is a walk of the parse
+    /// tree that costs about what reading them costs. So it is read once per statement and the
+    /// special case is gone. [`crate::settings::Settings::session`] takes two locks for it.
+    fn session(&self) -> Session {
+        self.inner.settings.session()
     }
 
     /// Runs one query and returns every row it produced.
@@ -395,18 +396,17 @@ impl Shared {
         let seams = self.seams(sql)?;
         let context = self.optimizer(&catalog)?;
         let ast = rudb_parse::parse_ast(sql)?;
-        match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new())? {
+        let session = self.session();
+        match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new(), &session)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
                 let budget = self.budget();
-                let session = self.session_for(&plan);
                 let under =
                     Under::new(budget, context.statistics(), &seams, &session, Rows::ForACaller);
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                let session = self.session_for(&plan);
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
                     &plan,
@@ -483,7 +483,7 @@ impl Shared {
     /// The plan a query runs.
     pub(crate) fn plan(&self, sql: &str) -> Result<String> {
         let catalog = self.read();
-        Ok(planned(sql, &catalog, &self.optimizer(&catalog)?)?.to_string())
+        Ok(planned(sql, &catalog, &self.optimizer(&catalog)?, &self.session())?.to_string())
     }
 
     /// Runs one statement, which may change the database.
@@ -511,18 +511,17 @@ impl Shared {
         let seams = self.seams(sql)?;
         let mut catalog = self.write();
         let context = self.optimizer(&catalog)?;
-        match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
+        let session = self.session();
+        match rudb_bind::bind_statement_with(ast, &catalog, parameters, &session)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
                 let budget = self.budget();
-                let session = self.session_for(&plan);
                 let under =
                     Under::new(budget, context.statistics(), &seams, &session, Rows::ForACaller);
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                let session = self.session_for(&plan);
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
                     &plan,
@@ -548,8 +547,6 @@ impl Shared {
                 Ok(QueryResult::empty())
             }
             Bound::CreateTable(create) => {
-                let session =
-                    create.source.as_ref().map_or_else(Session::new, |plan| self.session_for(plan));
                 create_table(
                     sql,
                     create,
@@ -582,7 +579,6 @@ impl Shared {
                 // output forever or depend on how the scan holds its chunks.
                 rudb_opt::optimize_with(&mut insert.source, &context)?;
                 let statistics = context.statistics();
-                let session = self.session_for(&insert.source);
                 let under =
                     Under::new(self.budget(), statistics, &seams, &session, Rows::ForATable);
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
@@ -606,8 +602,9 @@ fn planned(
     sql: &str,
     catalog: &Catalog,
     context: &rudb_opt::pass::Context,
+    session: &Session,
 ) -> Result<rudb_plan::Plan> {
-    let mut plan = rudb_bind::bind_sql(sql, catalog)?;
+    let mut plan = rudb_bind::bind_sql_with(sql, catalog, session)?;
     rudb_opt::optimize_with(&mut plan, context)?;
     Ok(plan)
 }
@@ -687,24 +684,6 @@ impl<'a> Under<'a> {
     ) -> Self {
         Self { budget, statistics, seams, session, going }
     }
-}
-
-/// Whether this plan reads `duckdb_settings()` anywhere in it.
-///
-/// Every node in the arena rather than the reachable ones, because the answer is the same either way
-/// and the arena is a slice. The name is spelled here and in `rudb_functions::TableFunction`, which
-/// is the one place this could drift: a rename that missed this line would leave the table full of
-/// nulls, so there is a test in [`crate::tests`] that reads a real value back out of it.
-fn reads_settings(plan: &rudb_plan::Plan) -> bool {
-    (0..plan.node_count()).any(|index| {
-        let index = u32::try_from(index).expect("a plan this large cannot be built");
-        match *plan.node(index) {
-            rudb_plan::Node::TableFunction { function, .. } => {
-                plan.string(function).eq_ignore_ascii_case("duckdb_settings")
-            }
-            _ => false,
-        }
-    })
 }
 
 fn run(

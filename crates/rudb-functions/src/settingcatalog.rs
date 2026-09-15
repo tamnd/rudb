@@ -108,14 +108,34 @@ pub fn setting_fields() -> Vec<Field> {
 }
 
 /// The entry for a setting with this name, and `None` for a name that is not a setting.
+///
+/// The comparison ignores case, which is the pin's rule rather than a convenience here.
+/// `SELECT current_setting('THREADS')` answers with the thread count there and `SET THREADS = 4`
+/// turns it, so a setting name is matched the way an identifier is and not the way a string is.
 #[must_use]
 pub fn setting_named(name: &str) -> Option<&'static SettingEntry> {
-    SETTINGS.iter().find(|entry| entry.name == name)
+    SETTINGS.iter().find(|entry| entry.name.eq_ignore_ascii_case(name))
+}
+
+/// What the engine says when it is handed a name that is not a setting.
+///
+/// Here rather than where each caller is, because there are three of them and they are in two
+/// crates. `SET nope = 1`, `RESET nope` and `current_setting('nope')` all say this, and on the pin
+/// they say the same sentence as each other, so one sentence is what they share.
+///
+/// The list after it is upstream's suggestion list, which on the pin is the five nearest names by
+/// edit distance out of its hundred and ninety two. rudb has five settings altogether, so the
+/// nearest five and the whole list are the same thing and this prints the whole list. It stops
+/// being the same thing when the sixth setting lands.
+#[must_use]
+pub fn unknown_setting(name: &str) -> String {
+    let known: Vec<String> = SETTINGS.iter().map(|entry| format!("\"{}\"", entry.name)).collect();
+    format!("unrecognized configuration parameter \"{name}\"\n\nDid you mean: {}", known.join(", "))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GLOBAL, SETTINGS, setting_fields, setting_named};
+    use super::{GLOBAL, SETTINGS, setting_fields, setting_named, unknown_setting};
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
@@ -158,5 +178,24 @@ mod tests {
             assert_eq!(entry.scope, GLOBAL, "{}", entry.name);
         }
         assert_eq!(setting_named("nothing_called_this"), None);
+    }
+
+    /// The pin answers `current_setting('THREADS')` and turns `SET THREADS`, so case is ignored.
+    #[test]
+    fn a_setting_is_found_whichever_way_the_name_is_cased() {
+        assert_eq!(setting_named("THREADS").expect("a setting").name, "threads");
+        assert_eq!(setting_named("Memory_Limit").expect("a setting").name, "memory_limit");
+    }
+
+    /// The sentence three callers in two crates share, with the pin's blank line in the middle.
+    #[test]
+    fn an_unknown_setting_is_named_and_then_the_known_ones_are_listed() {
+        let message = unknown_setting("nope");
+        assert!(
+            message.starts_with("unrecognized configuration parameter \"nope\"\n\nDid you mean: ")
+        );
+        for entry in SETTINGS {
+            assert!(message.contains(&format!("\"{}\"", entry.name)), "{message}");
+        }
     }
 }
