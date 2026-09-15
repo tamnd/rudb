@@ -22,9 +22,13 @@
 //!
 //! Most of the columns are a fact about a database rudb does not have yet. `path` is null because
 //! every database here is in memory, `readonly`, `encrypted` and `cipher` say so, and `options` is
-//! empty because `ATTACH` takes none. `internal` is false on the one database rudb attaches, which
-//! is the answer upstream gives for `memory` and not the one it gives for `system` and `temp`. The
-//! day there is a file behind a database these columns say something.
+//! empty because `ATTACH` takes none. The day there is a file behind a database these columns say
+//! something.
+//!
+//! `internal` is read off the database an entry is in rather than being a constant. A session has
+//! three of them, `memory` to create in and `system` and `temp` that the engine owns, so the column
+//! separates what somebody wrote from what rudb shipped with, which is the difference a client asks
+//! about when it lists what is in a database. See `rudb_catalog::system` for what is in `system`.
 //!
 //! `sql`, `parent_schema` and `parent_schema_oid` are null on every schema row. Upstream's are null
 //! too on everything it returns from a fresh session, because a schema created by `CREATE SCHEMA`
@@ -60,7 +64,7 @@ pub(crate) fn databasenames(
             Value::Null,
             Value::Null,
             empty(),
-            Value::Boolean(false),
+            Value::Boolean(database.internal()),
             text(DUCKDB),
             Value::Boolean(false),
             Value::Boolean(false),
@@ -128,7 +132,7 @@ pub(crate) fn tablenames(
             Value::BigInt(table.oid()),
             Value::Null,
             empty(),
-            Value::Boolean(false),
+            Value::Boolean(database.internal()),
             // Neither of these can be true yet. `CREATE TEMP TABLE` is not a statement rudb takes
             // and a primary key is not a constraint it stores, so both are a constant rather than a
             // fact read off the entry, and both stop being one the day the DDL grows the clause.
@@ -148,15 +152,17 @@ pub(crate) fn tablenames(
 ///
 /// `sql` is the statement written back out, which the binder wrote down at creation. `column_count`
 /// is the length of the column cache on the entry, so it is as stale as the cache is, which is what
-/// upstream reports too. `is_bound` says whether that cache holds anything, and it is true on every
-/// row here because rudb binds a view's body at `CREATE VIEW` and cannot get an entry into the
-/// catalog without one. Upstream reaches false by restoring a database file, which rudb has no way
-/// to do yet, so the column is answered rather than faked.
+/// upstream reports too.
 ///
-/// `temporary` is false on every row for the same reason: `CREATE TEMP VIEW` is refused by the
-/// binder, since there is no `temp` catalog for one to live in. `internal` is false because every
-/// view here is one somebody wrote, where upstream returns its own `information_schema` views with
-/// it set.
+/// `is_bound` says whether that cache holds anything, and `column_count` is null when it does not.
+/// A view somebody wrote is bound at `CREATE VIEW` and cannot get into the catalog without one, so
+/// the two of them only say no for a view the engine ships with, which goes in unbound and is bound
+/// at the first read. That is the pin's answer as well, measured on a fresh session and again after
+/// reading one of them.
+///
+/// `internal` and `temporary` are both read off the database the view is in. Upstream sets both on
+/// everything in `system`, which reads oddly for `temporary` on a view that is not in `temp`, and it
+/// is what the pin prints for all 47 of them.
 ///
 /// # Errors
 ///
@@ -171,7 +177,7 @@ pub(crate) fn viewnames(
     for database in catalog.databases() {
         for schema in database.schemas() {
             for view in schema.views() {
-                let count = i64::try_from(view.columns().len()).unwrap_or(i64::MAX);
+                let columns = view.columns();
                 rows.push(vec![
                     text(database.name()),
                     Value::BigInt(database.oid()),
@@ -181,11 +187,15 @@ pub(crate) fn viewnames(
                     Value::BigInt(view.oid()),
                     Value::Null,
                     empty(),
-                    Value::Boolean(false),
-                    Value::Boolean(false),
-                    Value::BigInt(count),
+                    Value::Boolean(database.internal()),
+                    Value::Boolean(database.internal()),
+                    if columns.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::BigInt(i64::try_from(columns.len()).unwrap_or(i64::MAX))
+                    },
                     text(view.statement()),
-                    Value::Boolean(true),
+                    Value::Boolean(!columns.is_empty()),
                 ]);
             }
         }
@@ -267,7 +277,7 @@ fn column_row(
         // One based, which is the pin's answer and not the position in the vector.
         Value::Integer(i32::try_from(at + 1).unwrap_or(i32::MAX)),
         Value::Null,
-        Value::Boolean(false),
+        Value::Boolean(database.internal()),
         Value::Null,
         Value::Boolean(nullable),
         text(&ty.to_string()),

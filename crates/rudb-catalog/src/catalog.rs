@@ -5,6 +5,9 @@ use std::fmt;
 use rudb_common::{Error, Field, Result};
 
 use crate::name::{QualifiedName, same_name};
+use crate::system::{
+    INFORMATION_SCHEMA, INTERNAL_VIEWS, PG_CATALOG, SYSTEM_CATALOG, TEMP_CATALOG, statement,
+};
 use crate::table::Table;
 use crate::view::View;
 
@@ -27,6 +30,7 @@ pub struct Database {
     name: String,
     schemas: Vec<Schema>,
     oid: i64,
+    internal: bool,
 }
 
 impl Database {
@@ -34,6 +38,17 @@ impl Database {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether the engine made this one rather than a person.
+    ///
+    /// True for `system` and `temp` and false for everything a person attaches, which is the pin's
+    /// answer in the `internal` column of `duckdb_databases()`. Everything in an internal database
+    /// is internal too, so this is where the `internal` column of the table, view and column tables
+    /// is read from as well: there is no entry in `system` that somebody wrote.
+    #[must_use]
+    pub fn internal(&self) -> bool {
+        self.internal
     }
 
     /// The number the catalog tables join on.
@@ -154,19 +169,37 @@ impl Default for Catalog {
 }
 
 impl Catalog {
-    /// A catalog with `memory.main` in it and nothing else, which is what an in-memory session
-    /// starts from.
+    /// What an in-memory session starts from: `memory.main` to create in, the `system` database
+    /// with the views the engine ships with, and an empty `temp`.
+    ///
+    /// Three databases and five schemas, which is what the pin reports from a session that has
+    /// attached nothing. See `crate::system` for what goes in `system` and why the bodies are
+    /// upstream's own text.
     #[must_use]
     pub fn new() -> Self {
+        // The three databases and the five schemas take 1 to 8 between them and the views the
+        // engine ships with take the numbers after that, so the first table a person makes carries
+        // whatever is left.
+        let (system, next) = system(9);
         Self {
-            databases: vec![Database {
-                name: DEFAULT_CATALOG.to_string(),
-                schemas: vec![Schema::empty(DEFAULT_SCHEMA, 2)],
-                oid: 1,
-            }],
+            databases: vec![
+                Database {
+                    name: DEFAULT_CATALOG.to_string(),
+                    schemas: vec![Schema::empty(DEFAULT_SCHEMA, 2)],
+                    oid: 1,
+                    internal: false,
+                },
+                system,
+                Database {
+                    name: TEMP_CATALOG.to_string(),
+                    schemas: vec![Schema::empty(DEFAULT_SCHEMA, 8)],
+                    oid: 7,
+                    internal: true,
+                },
+            ],
             default_catalog: DEFAULT_CATALOG.to_string(),
             default_schema: DEFAULT_SCHEMA.to_string(),
-            next: 3,
+            next,
         }
     }
 
@@ -213,6 +246,7 @@ impl Catalog {
             name: name.to_string(),
             schemas: vec![Schema::empty(DEFAULT_SCHEMA, schema)],
             oid,
+            internal: false,
         });
         Ok(())
     }
@@ -225,6 +259,9 @@ impl Catalog {
     pub fn create_schema(&mut self, catalog: &str, name: &str) -> Result<()> {
         let oid = self.stamp();
         let database = self.database_mut(catalog)?;
+        if database.internal {
+            return Err(in_the_system_catalog());
+        }
         if database.schemas.iter().any(|held| same_name(&held.name, name)) {
             return Err(Error::catalog(format!("Schema with name \"{name}\" already exists!")));
         }
@@ -293,6 +330,12 @@ impl Catalog {
 
     /// Removes whichever of the two the caller said it was dropping, refusing the other one.
     fn drop_entry(&mut self, name: &QualifiedName, wanted: Entry) -> Result<()> {
+        if self.database(&name.catalog)?.internal {
+            return Err(Error::catalog(format!(
+                "Cannot drop internal catalog entry \"{}\"!",
+                name.table
+            )));
+        }
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
         match schema.kind(&name.table) {
             // The type in this one is the type being dropped, so `DROP VIEW gone` is a missing view
@@ -430,6 +473,16 @@ impl Catalog {
         let mut first_error = None;
         for candidate in &candidates {
             match self.schema(&candidate.catalog, &candidate.schema) {
+                Ok(_) if same_name(&candidate.catalog, TEMP_CATALOG) => {
+                    // A create that names `temp` out loud is a create of a temporary table written
+                    // the long way, and upstream refuses it from the parser rather than making one.
+                    return Err(Error::parser(format!(
+                        "Only TEMPORARY table names can use the \"{TEMP_CATALOG}\" catalog"
+                    )));
+                }
+                Ok(_) if self.database(&candidate.catalog)?.internal => {
+                    return Err(in_the_system_catalog());
+                }
                 Ok(_) => return Ok(candidate.clone()),
                 Err(error) => first_error = first_error.or(Some(error)),
             }
@@ -448,14 +501,24 @@ impl Catalog {
     }
 
     /// The readings of a written name, best first.
+    ///
+    /// The tail of both lists is the search path, which is the reason `information_schema.tables`
+    /// and a bare `duckdb_views` find anything at all: neither is in the database a session creates
+    /// in, and a name that is not found where it was written is looked for in `system` before it is
+    /// reported missing. Upstream's path is `temp.main`, the current database's `main`, `system.main`
+    /// and `system.pg_catalog`, which `current_schemas(true)` prints, and the two that are added here
+    /// are the two that hold anything.
     fn candidates(&self, parts: &[&str]) -> Result<Vec<QualifiedName>> {
         match parts {
-            [table] => {
-                Ok(vec![QualifiedName::new(&self.default_catalog, &self.default_schema, *table)])
-            }
+            [table] => Ok(vec![
+                QualifiedName::new(&self.default_catalog, &self.default_schema, *table),
+                QualifiedName::new(SYSTEM_CATALOG, DEFAULT_SCHEMA, *table),
+                QualifiedName::new(SYSTEM_CATALOG, PG_CATALOG, *table),
+            ]),
             [first, table] => Ok(vec![
                 QualifiedName::new(&self.default_catalog, *first, *table),
                 QualifiedName::new(*first, &self.default_schema, *table),
+                QualifiedName::new(SYSTEM_CATALOG, *first, *table),
             ]),
             [catalog, schema, table] => Ok(vec![QualifiedName::new(*catalog, *schema, *table)]),
             _ => Err(Error::catalog(format!(
@@ -494,6 +557,47 @@ impl Catalog {
             .find(|held| same_name(&held.name, schema))
             .ok_or_else(|| Error::catalog(format!("Schema with name {schema} does not exist!")))
     }
+}
+
+/// The `system` database with the views the engine ships with in it, and the next free oid.
+///
+/// Built whole rather than through [`Catalog::create_view`], because a create can fail and this one
+/// cannot: the schemas it puts things in are the three made in its first three lines.
+fn system(mut oid: i64) -> (Database, i64) {
+    let mut main = Schema::empty(DEFAULT_SCHEMA, 4);
+    let mut standard = Schema::empty(INFORMATION_SCHEMA, 5);
+    let mut postgres = Schema::empty(PG_CATALOG, 6);
+    for view in INTERNAL_VIEWS {
+        let name = QualifiedName::new(SYSTEM_CATALOG, view.schema, view.name);
+        // Nothing is bound here, so the column list is empty and stays that way until somebody reads
+        // the view. That is the pin's answer too, where a fresh session reports `is_bound` false for
+        // every one of these and reading one fills it in.
+        let mut made =
+            View::new(name, view.sql.to_string(), statement(view), Vec::new(), Vec::new());
+        made.stamp(oid);
+        oid += 1;
+        match view.schema {
+            INFORMATION_SCHEMA => standard.views.push(made),
+            PG_CATALOG => postgres.views.push(made),
+            _ => main.views.push(made),
+        }
+    }
+    let database = Database {
+        name: SYSTEM_CATALOG.to_string(),
+        schemas: vec![main, standard, postgres],
+        oid: 3,
+        internal: true,
+    };
+    (database, oid)
+}
+
+/// The error for creating something in a database the engine owns.
+///
+/// Upstream reports this from the binder rather than from the catalog, and it names the catalog
+/// rather than the schema, so `CREATE TABLE pg_catalog.x` and `CREATE TABLE system.main.x` are the
+/// same sentence.
+fn in_the_system_catalog() -> Error {
+    Error::binder("Cannot create entry in system catalog")
 }
 
 fn missing_table(name: &str) -> Error {
@@ -549,8 +653,69 @@ mod tests {
         let catalog = Catalog::new();
         assert_eq!(catalog.default_catalog(), "memory");
         assert_eq!(catalog.default_schema(), "main");
-        assert_eq!(catalog.databases().len(), 1);
+        // Three databases and five schemas, which is the pin's count from a session that has
+        // attached nothing, and no tables, because everything the engine ships with is a view.
+        assert_eq!(catalog.databases().len(), 3);
+        assert_eq!(catalog.databases().iter().flat_map(Database::schemas).count(), 5);
         assert_eq!(catalog.tables().count(), 0);
+        assert!(!catalog.databases()[0].internal(), "memory is the one a person creates in");
+        assert!(catalog.databases()[1].internal(), "system is the engine's");
+    }
+
+    /// The views a session has without making any, and the two rules about where they live.
+    #[test]
+    fn the_system_catalog_holds_the_views_the_engine_ships_with() {
+        let catalog = Catalog::new();
+        let views: Vec<&View> = catalog
+            .databases()
+            .iter()
+            .flat_map(Database::schemas)
+            .flat_map(Schema::views)
+            .collect();
+        assert_eq!(views.len(), INTERNAL_VIEWS.len());
+        assert!(
+            views.iter().all(|view| same_name(&view.name().catalog, SYSTEM_CATALOG)),
+            "every one of them is in the system catalog"
+        );
+        // Unbound, which is what `is_bound` reports and what the pin reports from a fresh session.
+        assert!(views.iter().all(|view| view.columns().is_empty()));
+    }
+
+    /// The search path, which is the reason a name that is nowhere a person put anything resolves.
+    #[test]
+    fn a_name_the_engine_owns_is_found_without_being_written_out() {
+        let catalog = Catalog::new();
+        let found = catalog.resolve(&["duckdb_views"]).expect("a wrapper in system.main");
+        assert_eq!(found.catalog, "system");
+        assert_eq!(found.schema, "main");
+        let found = catalog.resolve(&["information_schema", "tables"]).expect("a standard view");
+        assert_eq!(found.catalog, "system");
+        assert_eq!(found.schema, "information_schema");
+    }
+
+    /// Nothing goes into a database the engine owns, whichever way the name is written.
+    #[test]
+    fn the_system_catalog_refuses_what_a_statement_would_create_in_it() {
+        let mut catalog = Catalog::new();
+        for parts in
+            [vec!["information_schema", "x"], vec!["pg_catalog", "x"], vec!["system", "main", "x"]]
+        {
+            let error = catalog.resolve_for_create(&parts).expect_err("the system catalog");
+            assert_eq!(error.message(), "Cannot create entry in system catalog", "{parts:?}");
+        }
+        let error = catalog.resolve_for_create(&["temp", "main", "x"]).expect_err("the temp one");
+        assert!(error.message().contains("Only TEMPORARY table names"), "{error}");
+        let error = catalog.create_schema("system", "s").expect_err("a schema in system");
+        assert_eq!(error.message(), "Cannot create entry in system catalog");
+    }
+
+    /// And nothing comes out of one either, which is a different sentence from a missing name.
+    #[test]
+    fn a_view_the_engine_owns_cannot_be_dropped() {
+        let mut catalog = Catalog::new();
+        let name = catalog.resolve(&["duckdb_views"]).expect("a wrapper in system.main");
+        let error = catalog.drop_view(&name).expect_err("an internal entry");
+        assert_eq!(error.message(), "Cannot drop internal catalog entry \"duckdb_views\"!");
     }
 
     /// The property `duckdb_schemas()` and `duckdb_tables()` are built on top of, checked here
