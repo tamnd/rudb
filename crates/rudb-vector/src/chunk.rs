@@ -226,8 +226,8 @@ impl Chunk {
     ///
     /// # Errors
     ///
-    /// If the selection points past the end of the chunk, or if a column has a type with no flat
-    /// layout, which today means the nested types.
+    /// If the selection points past the end of the chunk, or if a column has a type there is no
+    /// vector for, which today means `STRUCT`, `MAP`, `ARRAY` and `UNION`.
     pub fn compact(self, selection: &Selection) -> Result<Self> {
         if let Some(bad) = selection.iter().find(|&index| index >= self.rows) {
             return Err(Error::internal(format!(
@@ -285,7 +285,8 @@ impl Chunk {
     ///
     /// # Errors
     ///
-    /// If a column has a type that cannot be stored flat yet, which today means the nested types.
+    /// If a column has a type there is no vector for, which today means `STRUCT`, `MAP`, `ARRAY` and
+    /// `UNION`. A `LIST` flattens to a list, since there is nothing flatter for one to become.
     pub fn flatten(&self) -> Result<Self> {
         let mut columns = Vec::with_capacity(self.columns.len());
         for column in &self.columns {

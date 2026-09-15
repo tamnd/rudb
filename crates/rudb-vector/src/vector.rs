@@ -21,11 +21,19 @@
 //! page of strings moves sixteen bytes a row and copies none of the payload. Every other form here
 //! trades a little work per row for less memory, and that one trades nothing at all.
 //!
+//! A list is the odd one out in a different direction. The forms above are all ways of writing a
+//! column of scalars down more cheaply, and a list is not a scalar at all, so [`Form::List`] is the
+//! only form a list column has rather than one of several it could be in. What it is, is a child
+//! vector of every element and a start and a length per row, and the child is an ordinary vector that
+//! can be in any of the forms above. That is where a list column gets made smaller.
+//!
 //! **What is not here yet.** Buffers are owned. Section 7.1 says a vector borrowed from a buffer
 //! managed page carries a pin, and there is no buffer manager until M2, so there is nothing to pin
-//! and pretending otherwise would be an interface built against an imaginary caller. Nested types
-//! are not stored yet either, for the same reason: a `LIST(STRUCT(...))` is offsets plus child
-//! column chunks, and child column chunks are storage.
+//! and pretending otherwise would be an interface built against an imaginary caller. `STRUCT`, `MAP`
+//! and `ARRAY` are not stored yet either. A list was the first of the four and set the pattern, and
+//! the other three are the same idea with a different count of children: a struct is one child per
+//! field and no entries, a map is a list of two children, and an array is a list whose length is the
+//! type's rather than the row's.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -99,6 +107,13 @@ pub enum Form {
     /// rather than a hundred million additions. Dictionary says which distinct values there are and
     /// this says where they stop, and a column can want either one without wanting the other.
     Rle,
+    /// A child vector of every element, and a start and a length per row.
+    ///
+    /// The form a `LIST` column is in, and the only form it has. The others are all ways of writing
+    /// down a column of scalars more cheaply and this is the shape a nested value has at all, so a
+    /// list vector reports this whether or not anything has tried to make it smaller. Making it
+    /// smaller happens in the child, which is an ordinary vector and can be any of the forms above.
+    List,
 }
 
 /// The values of a flat vector, one Rust vector per physical type.
@@ -325,6 +340,28 @@ enum Body {
         ends: Vec<u32>,
         values: Arc<Vector>,
     },
+    /// One child vector holding every element of every row, and a start and a length per row.
+    ///
+    /// Start and length rather than the run of offsets Arrow carries, because offsets say where a
+    /// row ends by saying where the next one begins, and that is only true while the rows are in
+    /// order and none is skipped. A gather permutes the rows and a filter drops them, both of which
+    /// this form has to survive without copying the child, so each row says where its own elements
+    /// are and nothing is implied about its neighbour.
+    ///
+    /// The child is behind an `Arc` for the reason a dictionary's values are. A cut of a list column
+    /// is the entries and nothing else, so a page of lists taken in chunk sized pieces holds one
+    /// child however many pieces it is read in, and the elements outside the cut stay reachable but
+    /// unreferenced rather than being copied out.
+    ///
+    /// A null list and an empty list are different rows and this is where the difference lives. A
+    /// null is the validity mask at this level being false, the same as for any other type, and its
+    /// entry is `(start, 0)` and never read. An empty list is a valid row whose entry is `(start, 0)`
+    /// as well. So the entry alone does not say which one a row is, the mask does, which is the same
+    /// division of labour every other form here uses.
+    Nested {
+        entries: Vec<(u32, u32)>,
+        child: Arc<Vector>,
+    },
 }
 
 impl Vector {
@@ -358,12 +395,99 @@ impl Vector {
     /// If a value is not one the type can hold, or if the type is one that cannot be stored flat
     /// yet, which today means the nested types.
     pub fn from_values(ty: LogicalType, values: &[Value]) -> Result<Self> {
+        if let LogicalType::List(element) = &ty {
+            return Self::list_from_values(element.as_ref().clone(), values);
+        }
         let mut data = empty_data_for(&ty)?;
         for value in values {
             push_value(&mut data, value)?;
         }
         let validity = Validity::from_iter(values.len(), |index| !values[index].is_null());
         Ok(Self { ty, len: values.len(), validity, body: Body::Flat(data) })
+    }
+
+    /// A list vector of `element`, built from one [`Value::List`] per row.
+    ///
+    /// The elements of every row go into one child vector end to end, so a row's elements are a
+    /// contiguous range of it and a row is a start and a length into it. That is what makes a cut of
+    /// this form the entries and nothing else.
+    ///
+    /// A null row contributes no elements and gets an entry of length zero, which is the same entry
+    /// an empty list gets. The two are told apart by the validity mask rather than by the entry, for
+    /// the reason written on [`Body::Nested`].
+    fn list_from_values(element: LogicalType, values: &[Value]) -> Result<Self> {
+        let mut flat = Vec::new();
+        let mut entries = Vec::with_capacity(values.len());
+        for value in values {
+            let start = u32::try_from(flat.len())
+                .map_err(|_| Error::internal("a list column with more than u32 elements in it"))?;
+            match value {
+                Value::Null => entries.push((start, 0)),
+                Value::List { values: held, .. } => {
+                    let len = u32::try_from(held.len())
+                        .map_err(|_| Error::internal("a list longer than u32"))?;
+                    flat.extend_from_slice(held);
+                    entries.push((start, len));
+                }
+                other => {
+                    return Err(Error::internal(format!(
+                        "{other:?} does not belong in a list vector"
+                    )));
+                }
+            }
+        }
+        // The element type is the column's rather than any one value's. A `Value::List` carries what
+        // it thinks it is empty of, and a column built from a row of `INTEGER[]` and a row of
+        // `[]::NULL[]` would otherwise take its type from whichever row came first.
+        let child = Self::from_values(element, &flat)?;
+        let validity = Validity::from_iter(values.len(), |index| !values[index].is_null());
+        Ok(Self {
+            ty: LogicalType::list(child.ty.clone()),
+            len: values.len(),
+            validity,
+            body: Body::Nested { entries, child: Arc::new(child) },
+        })
+    }
+
+    /// A list vector over a child that already exists, one entry per row.
+    ///
+    /// What a scan and a list returning kernel build, both of which produce the elements in bulk and
+    /// then say which row each range belongs to. Every row is valid, since a caller with nulls to
+    /// record adds them with [`Self::with_validity`].
+    ///
+    /// # Errors
+    ///
+    /// If an entry runs past the end of the child, which would be a row that reads elements belonging
+    /// to nobody and is the one mistake this form makes easy.
+    pub fn list(entries: Vec<(u32, u32)>, child: Vector) -> Result<Self> {
+        let reach = child.len();
+        for &(start, len) in &entries {
+            if start as usize + len as usize > reach {
+                return Err(Error::internal(format!(
+                    "a list entry of {len} at {start} in a child of {reach}"
+                )));
+            }
+        }
+        Ok(Self {
+            ty: LogicalType::list(child.ty.clone()),
+            len: entries.len(),
+            validity: Validity::AllValid,
+            body: Body::Nested { entries, child: Arc::new(child) },
+        })
+    }
+
+    /// The entries and the child, for a list vector, and `None` for any other form.
+    ///
+    /// The accessor a kernel over a list column reads, for the reason
+    /// [`Self::dictionary_parts`] exists: `unnest` over 1024 rows wants the child once and the
+    /// entries once, and reading it through [`Self::value_at`] would build a `Value::List` per row
+    /// and then throw every one of them away.
+    #[must_use]
+    pub fn list_parts(&self) -> Option<(&[(u32, u32)], &Self)> {
+        match &self.body {
+            Body::Nested { entries, child } => Some((entries, child)),
+            _ => None,
+        }
     }
 
     /// A vector of `len` copies of one value.
@@ -835,6 +959,11 @@ impl Vector {
                 codes.capacity() + spans.capacity() * size_of::<(u32, u32)>() + table.footprint()
             }
             Body::Runs { ends, values } => ends.capacity() * size_of::<u32>() + values.footprint(),
+            // The child counts in full in every vector sharing it, the way a shared dictionary and a
+            // shared arena do, and for the same reason.
+            Body::Nested { entries, child } => {
+                entries.capacity() * size_of::<(u32, u32)>() + child.footprint()
+            }
         };
         size_of::<Self>() + self.validity.footprint() + body
     }
@@ -887,6 +1016,7 @@ impl Vector {
             Body::Views { .. } => Form::StringView,
             Body::Coded { .. } => Form::Fsst,
             Body::Runs { .. } => Form::Rle,
+            Body::Nested { .. } => Form::List,
         }
     }
 
@@ -1097,6 +1227,17 @@ impl Vector {
                     None => Value::Null,
                 }
             }
+            // A row's elements are read out of the child one at a time, which is the slow path this
+            // whole function is and is why a kernel over a list column reads `list_parts` instead.
+            // The element type comes from the child rather than from this vector's type, so a list
+            // whose child was built narrower than the column claims still hands back what is in it.
+            Body::Nested { entries, child } => match entries.get(index) {
+                Some(&(start, len)) => Value::List {
+                    element: child.ty.clone(),
+                    values: (start..start + len).map(|at| child.value_at(at as usize)).collect(),
+                },
+                None => Value::Null,
+            },
             Body::Flat(data) => value_from(&self.ty, data, index),
         }
     }
@@ -1152,7 +1293,12 @@ impl Vector {
             // The same `None` [`Self::text_at`] gives, for the same reason. A compressed row is not
             // anywhere in its plain bytes, so there is nothing here to hand back a borrow of, and a
             // caller that gets `None` goes to `value_at` and gets the row decompressed into a value.
-            Body::Coded { .. } | Body::Sequence { .. } | Body::Packed { .. } => None,
+            // A list row is `None` for a nearer reason: it is not bytes at all, and a caller wanting
+            // its elements wants [`Self::list_parts`] rather than a borrow of one row.
+            Body::Coded { .. }
+            | Body::Sequence { .. }
+            | Body::Packed { .. }
+            | Body::Nested { .. } => None,
         }
     }
 
@@ -1201,8 +1347,11 @@ impl Vector {
             Body::Runs { ends, values } => values.signed_at(run_holding(ends, index)?),
             // The same `None` [`Self::bytes_at`] gives, for the same reason. A packed or compressed
             // row is not an integer anywhere until it has been unpacked, and a caller that gets
-            // `None` goes to `value_at` and gets the row unpacked into a value.
-            Body::Coded { .. } | Body::Packed { .. } | Body::Views { .. } => None,
+            // `None` goes to `value_at` and gets the row unpacked into a value. A list row is not an
+            // integer in any form, however many integers are in it.
+            Body::Coded { .. } | Body::Packed { .. } | Body::Views { .. } | Body::Nested { .. } => {
+                None
+            }
         }
     }
 
@@ -1292,6 +1441,13 @@ impl Vector {
             // An empty cut has no run to point at and an empty run length body would be a vector of
             // no runs claiming a length, so it comes back as the empty flat vector instead.
             Body::Runs { .. } => return self.gather(&[]),
+            // The entries are absolute positions in the shared child, so a cut is a run of them and
+            // nothing has to be rebased, the same as a cut of FSST spans. The elements outside the
+            // range stay in the child unreferenced, which is the trade this form makes: a chunk cut
+            // out of a page of lists moves eight bytes a row and copies no elements at all.
+            Body::Nested { entries, child } => {
+                Body::Nested { entries: entries[at..end].to_vec(), child: Arc::clone(child) }
+            }
             // The one form with nowhere to point, so its range is copied out. A gather is the
             // right tool here and does no more than this would: a flat body has no dictionary
             // under it for the gather to flatten.
@@ -1359,6 +1515,24 @@ impl Vector {
         let live: Vec<bool> = at.iter().map(|&index| index != NOWHERE).collect();
         let validity = Validity::from_run(&live);
         let body = match &leaf.body {
+            // The same gather the arm below is, for a type that has no flat layout to be written out
+            // into. It goes through the list builder rather than through a run of data, because the
+            // builder is the one place that knows a row of a list column is a range of a child, and a
+            // second copy of that here would be a second thing to keep in step with it.
+            Body::Constant(value) if matches!(self.ty, LogicalType::List(_)) => {
+                if forms_stay && matches!(validity, Validity::AllValid) {
+                    return Ok(Self::constant(self.ty.clone(), value.as_ref().clone(), rows));
+                }
+                let rows: Vec<Value> = at
+                    .iter()
+                    .map(
+                        |&index| {
+                            if index == NOWHERE { Value::Null } else { value.as_ref().clone() }
+                        },
+                    )
+                    .collect();
+                return Self::from_values(self.ty.clone(), &rows);
+            }
             // Every position holds the same value, so the only thing the gather can change is the
             // length and which positions are null. A gather with no null in it is still a constant.
             Body::Constant(value) => {
@@ -1451,6 +1625,23 @@ impl Vector {
                 }
                 Body::Flat(Data::Varlen(out))
             }
+            // The entries move and the child does not, which is the same trade the string forms
+            // make and is why a gather of a list column costs eight bytes a row however long the
+            // lists are. A position that resolved to nowhere gets a zero length entry, and the mask
+            // already says it is null, so the entry is never read.
+            //
+            // This arm ignores `forms_stay`, unlike every arm above it, because there is nothing
+            // flatter for a list to become. The other forms are all cheaper ways of writing down a
+            // column of scalars and flattening gives up the saving to hand back a data slice, and a
+            // list has no data slice in any form, so a flatten of one is this and a caller reading it
+            // goes through `list_parts` either way.
+            Body::Nested { entries, child } => Body::Nested {
+                entries: at
+                    .iter()
+                    .map(|&index| entries.get(index).copied().unwrap_or((0, 0)))
+                    .collect(),
+                child: Arc::clone(child),
+            },
             // Unreachable, because `resolve` walks past both of the forms that point at another
             // vector and stops at the first body that does not.
             Body::Dictionary { .. } | Body::Runs { .. } => {
@@ -2163,6 +2354,109 @@ mod tests {
 
     fn integers(values: &[i32]) -> Vector {
         Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into())).unwrap()
+    }
+
+    /// A `Value::List` of integers, which is what a row of a list column arrives as.
+    fn list(values: &[i32]) -> Value {
+        Value::List {
+            element: LogicalType::Integer,
+            values: values.iter().map(|&v| Value::Integer(v)).collect(),
+        }
+    }
+
+    fn list_column(rows: &[Value]) -> Vector {
+        Vector::from_values(LogicalType::list(LogicalType::Integer), rows).unwrap()
+    }
+
+    #[test]
+    fn a_list_column_is_one_child_and_a_range_per_row() {
+        let rows = vec![list(&[1, 2, 3]), list(&[]), Value::Null, list(&[4])];
+        let column = list_column(&rows);
+        assert_eq!(column.form(), Form::List);
+        assert_eq!(column.len(), 4);
+        assert_eq!(column.logical_type(), &LogicalType::list(LogicalType::Integer));
+        // Four rows and four elements, because a null and an empty list both contribute none.
+        let (entries, child) = column.list_parts().expect("a list");
+        assert_eq!(entries, [(0, 3), (3, 0), (3, 0), (3, 1)]);
+        assert_eq!(child.len(), 4);
+        assert_eq!(column.iter().collect::<Vec<_>>(), rows);
+    }
+
+    /// The one thing the entries cannot say on their own, so it has to be checked that the mask says
+    /// it. An empty list is a row that is there and holds nothing, a null is a row that is not there,
+    /// and both of them have an entry of length zero.
+    #[test]
+    fn an_empty_list_and_a_null_list_have_the_same_entry_and_are_different_rows() {
+        let column = list_column(&[list(&[]), Value::Null]);
+        let (entries, _) = column.list_parts().expect("a list");
+        assert_eq!(entries[0].1, entries[1].1, "both entries are empty");
+        assert!(!column.is_null_at(0), "an empty list is not null");
+        assert!(column.is_null_at(1), "a null list is null");
+        assert_eq!(column.value_at(0), list(&[]));
+        assert_eq!(column.value_at(1), Value::Null);
+    }
+
+    #[test]
+    fn slicing_a_list_column_shares_the_child_rather_than_copying_it() {
+        let rows: Vec<Value> = (0..64).map(|row| list(&[row, row + 1, row + 2])).collect();
+        let column = list_column(&rows);
+        let cut = column.slice(8, 4).unwrap();
+        assert_eq!(cut.form(), Form::List);
+        assert_eq!(cut.iter().collect::<Vec<_>>(), rows[8..12]);
+        // The entries are absolute positions in a child that was not cut, which is what makes the
+        // cut eight bytes a row however long the lists are. The elements outside the range are still
+        // there and nothing points at them.
+        let (entries, child) = cut.list_parts().expect("a list");
+        assert_eq!(entries[0], (24, 3));
+        assert_eq!(child.len(), 192);
+    }
+
+    #[test]
+    fn gathering_a_list_column_permutes_the_entries_and_leaves_the_child_alone() {
+        let rows = vec![list(&[1]), list(&[2, 2]), list(&[3, 3, 3])];
+        let column = list_column(&rows);
+        let picked = column.gather(&[2, 0, 2]).unwrap();
+        assert_eq!(
+            picked.iter().collect::<Vec<_>>(),
+            [list(&[3, 3, 3]), list(&[1]), list(&[3, 3, 3])]
+        );
+        // Two of the three rows are the same row, which is the case a run of offsets cannot write
+        // down and a start and a length can. That is the whole reason this form carries both.
+        assert_eq!(picked.list_parts().expect("a list").1.len(), 6);
+    }
+
+    #[test]
+    fn a_gather_past_the_end_of_a_list_column_is_null_rather_than_somebody_elses_elements() {
+        let column = list_column(&[list(&[1, 2]), list(&[3])]);
+        let picked = column.gather(&[1, 9]).unwrap();
+        assert_eq!(picked.value_at(0), list(&[3]));
+        assert_eq!(picked.value_at(1), Value::Null);
+    }
+
+    #[test]
+    fn a_list_of_lists_nests_as_far_as_it_is_written() {
+        let outer = Value::List {
+            element: LogicalType::list(LogicalType::Integer),
+            values: vec![list(&[1, 2]), list(&[3])],
+        };
+        let column = Vector::from_values(
+            LogicalType::list(LogicalType::list(LogicalType::Integer)),
+            std::slice::from_ref(&outer),
+        )
+        .unwrap();
+        assert_eq!(column.value_at(0), outer);
+        assert_eq!(column.list_parts().expect("a list").1.form(), Form::List);
+    }
+
+    /// A list row is not bytes and not an integer, and a caller that asks for either gets nothing
+    /// rather than the first element or a length. Both of those would be a wrong answer that a
+    /// group by or a hash would read without complaining.
+    #[test]
+    fn the_scalar_readers_decline_a_list_instead_of_answering_about_its_elements() {
+        let column = list_column(&[list(&[7])]);
+        assert_eq!(column.signed_at(0), None);
+        assert_eq!(column.bytes_at(0), None);
+        assert_eq!(column.data(), None);
     }
 
     #[test]
