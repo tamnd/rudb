@@ -101,6 +101,50 @@ pub fn split(text: &str) -> Result<Vec<String>> {
     Ok(found.into_iter().map(|statement| statement.sql().to_string()).collect())
 }
 
+/// Every kind of statement the grammar has, in the order the matcher tries them.
+///
+/// The thirty six alternatives of the `Statement` rule, by their grammar names, which is the
+/// denominator of the statement coverage number in `spec/sql/duckdb/01-what-compatible-means.md`
+/// section 1.1. They come off the vendored rule table rather than out of a list written here, so the
+/// day upstream adds a statement the denominator grows by one on its own.
+///
+/// The names are the grammar's, `SelectStatement` rather than `SELECT`, because that is what a
+/// reader can go and look up. The last one, `ExpressionStatement`, is the alternative that makes a
+/// bare expression a statement, and it is one of the thirty six rather than a special case.
+#[must_use]
+pub fn statement_kinds() -> Vec<&'static str> {
+    rudb_parse::alternatives("Statement")
+}
+
+/// Which kind of statement a piece of text is, by the name of the alternative that matched.
+///
+/// This is the other half of [`statement_kinds`] and the reason that one exists. A harness counting
+/// how much of the statement surface works needs each record in its corpus sorted into one of the
+/// thirty six buckets, and the only thing that can do that correctly is the parser, because
+/// `WITH x AS (...) INSERT INTO t SELECT * FROM x` starts with the word `WITH` and is an
+/// `InsertStatement`.
+///
+/// The first statement in the text, so a caller holding a script should run [`split`] over it first
+/// and ask about each piece. That is what a harness does anyway, since it has to hand them to the
+/// engine one at a time.
+///
+/// `None` when the text does not parse, and `None` for text that parses into no statement at all,
+/// which is a file of comments. Neither is an error worth a message: the caller asking this question
+/// is sorting a corpus and has somewhere to put what it could not read.
+#[must_use]
+pub fn statement_kind(sql: &str) -> Option<&'static str> {
+    let tree = parse(sql).ok()?;
+    // A `TopLevelStatement` is `Statement? (';'+ / EndOfInput)`, so a leading semicolon and a
+    // trailing one each produce one that holds no statement. Walk past those rather than reading the
+    // first one and calling the answer nothing.
+    tree.children(tree.root())
+        .filter_map(|top| tree.children(top).find(|&at| tree.name(at) == STATEMENT))
+        .find_map(|statement| tree.children(statement).next().map(|at| tree.name(at)))
+}
+
+/// The rule whose alternatives are the statement kinds.
+const STATEMENT: &str = "Statement";
+
 /// Where in the text an error is about, as a line and a column, both counting from one.
 ///
 /// Byte offsets are what the parser carries, because that is what slicing wants, and a line and a
@@ -130,7 +174,83 @@ pub fn where_it_happened(sql: &str, error: &Error) -> Option<(usize, usize)> {
 mod tests {
     use rudb_common::Error;
 
-    use super::{RowOrder, accepts, line_and_column, parses, row_order, split, where_it_happened};
+    use super::{
+        RowOrder, accepts, line_and_column, parses, row_order, split, statement_kind,
+        statement_kinds, where_it_happened,
+    };
+
+    #[test]
+    fn the_statement_surface_is_thirty_six_kinds_wide() {
+        let kinds = statement_kinds();
+        assert_eq!(kinds.len(), 36);
+        assert!(kinds.contains(&"SelectStatement"));
+        assert!(kinds.contains(&"MergeIntoStatement"));
+        assert!(kinds.contains(&"ExpressionStatement"));
+    }
+
+    #[test]
+    fn a_statement_says_which_of_the_thirty_six_it_is() {
+        assert_eq!(statement_kind("SELECT 1"), Some("SelectStatement"));
+        assert_eq!(statement_kind("CREATE TABLE t (x INTEGER)"), Some("CreateStatement"));
+        assert_eq!(statement_kind("INSERT INTO t VALUES (1)"), Some("InsertStatement"));
+        assert_eq!(statement_kind("SET memory_limit = '1GB'"), Some("SetStatement"));
+        assert_eq!(statement_kind("EXPLAIN SELECT 1"), Some("ExplainStatement"));
+    }
+
+    #[test]
+    fn every_kind_a_statement_reports_is_one_of_the_kinds_there_are() {
+        let kinds = statement_kinds();
+        for sql in [
+            "SELECT 1",
+            "CREATE TABLE t (x INTEGER)",
+            "DROP TABLE t",
+            "UPDATE t SET x = 1",
+            "DELETE FROM t",
+            "COPY t TO 'out.csv'",
+            "ATTACH 'other.db'",
+            "PRAGMA version",
+            "BEGIN",
+            "MERGE INTO t USING s ON t.x = s.x WHEN MATCHED THEN DELETE",
+        ] {
+            let kind = statement_kind(sql).unwrap_or_else(|| panic!("{sql} parses"));
+            assert!(kinds.contains(&kind), "{kind} is not one of the thirty six");
+        }
+    }
+
+    #[test]
+    fn what_a_statement_starts_with_is_not_what_it_is() {
+        // The word is `WITH` and the statement is an insert, which is the whole reason this asks the
+        // parser instead of looking at the first token.
+        assert_eq!(
+            statement_kind("WITH x AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM x"),
+            Some("InsertStatement")
+        );
+        assert_eq!(statement_kind("WITH x AS (SELECT 1) SELECT * FROM x"), Some("SelectStatement"));
+    }
+
+    #[test]
+    fn text_with_no_statement_in_it_is_no_kind_rather_than_the_first_kind() {
+        assert_eq!(statement_kind("-- nothing but a comment\n"), None);
+        assert_eq!(statement_kind("   "), None);
+        assert_eq!(statement_kind("SELECT FROM WHERE"), None);
+    }
+
+    #[test]
+    fn a_semicolon_in_front_of_a_statement_does_not_hide_it() {
+        assert_eq!(statement_kind(";SELECT 1"), Some("SelectStatement"));
+        assert_eq!(statement_kind("SELECT 1;"), Some("SelectStatement"));
+    }
+
+    #[test]
+    fn a_script_reports_the_first_statement_and_a_caller_wanting_all_of_them_splits_first() {
+        assert_eq!(statement_kind("SELECT 1; DROP TABLE t"), Some("SelectStatement"));
+        let each: Vec<_> = split("SELECT 1; DROP TABLE t")
+            .unwrap()
+            .iter()
+            .map(|one| statement_kind(one))
+            .collect();
+        assert_eq!(each, vec![Some("SelectStatement"), Some("DropStatement")]);
+    }
 
     #[test]
     fn a_top_level_order_by_is_a_declared_order() {

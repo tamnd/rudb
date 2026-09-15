@@ -124,7 +124,10 @@ pub use database::Database;
 pub use prepared::Prepared;
 pub use result::QueryResult;
 pub use statements::{Statement, is_complete, statements};
-pub use syntax::{RowOrder, accepts, line_and_column, parses, row_order, split, where_it_happened};
+pub use syntax::{
+    RowOrder, accepts, line_and_column, parses, row_order, split, statement_kind, statement_kinds,
+    where_it_happened,
+};
 
 // The types the API deals in, so a program that embeds rudb depends on this crate and nothing else.
 // `rudb-compat` and `rudb-bench` driving the library through one crate is the point of #110, and a
