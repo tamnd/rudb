@@ -130,18 +130,12 @@ fn range(vector: &Vector) -> Range {
         },
         // The distinct values, which are a superset of the values the codes point at.
         Form::Dictionary => match vector.dictionary_parts() {
-            Some((_, values)) => {
-                let inner = range(values);
-                (inner.low, inner.high)
-            }
+            Some((_, values)) => narrower(vector, values),
             None => (None, None),
         },
         // Same, for the value of each run.
         Form::Rle => match vector.run_parts() {
-            Some((_, values)) => {
-                let inner = range(values);
-                (inner.low, inner.high)
-            }
+            Some((_, values)) => narrower(vector, values),
             None => (None, None),
         },
         Form::Flat => match vector.data() {
@@ -157,6 +151,29 @@ fn range(vector: &Vector) -> Range {
         _ => (None, None),
     };
     Range { low, high, nulls }
+}
+
+/// The range of a column that points somewhere else, from whichever end is cheaper to walk.
+///
+/// Scanning the values instead of the rows is what makes a dictionary and a run encoded column
+/// nearly free here, because the values are a superset of what the rows hold and a superset is a
+/// bound that is still correct.
+///
+/// It stops being cheap when the values outnumber the rows, which happens because one dictionary is
+/// shared by every chunk of a column. Scanning it per chunk then does the same work once per chunk.
+/// On `hits` at a million rows that was `SearchPhrase`, whose dictionary is far larger than a chunk:
+/// 90 milliseconds of the load went on that one column, against 10 for `URL`, which is plain and
+/// several times its size. Walking the rows through the codes gives the exact range for the cost of
+/// the rows, so that is what happens when there are fewer of them.
+fn narrower(vector: &Vector, values: &Vector) -> (Option<Bound>, Option<Bound>) {
+    // Only for strings, because `text` is the one row walk here that borrows rather than allocating.
+    // A numeric dictionary this size is not a shape any reader in this engine produces.
+    let strings = matches!(values.data(), Some(Data::Varlen(_))) || values.text_parts().is_some();
+    if strings && values.len() > vector.len() {
+        return text(vector);
+    }
+    let inner = range(values);
+    (inner.low, inner.high)
 }
 
 /// The two ends of a sequence of `len` values starting at `start`.
@@ -356,6 +373,25 @@ mod tests {
         let range = zone.column(0).expect("one column");
         assert_eq!(range.low, Some(Bound::Bytes(b"ada".to_vec())));
         assert_eq!(range.high, Some(Bound::Bytes(b"turing".to_vec())));
+    }
+
+    /// The `SearchPhrase` shape: more entries in the dictionary than rows in the chunk. The rows are
+    /// walked instead, which costs the rows and gives the exact range rather than the dictionary's.
+    #[test]
+    fn a_dictionary_wider_than_its_chunk_is_read_through_its_codes() {
+        let values: Vec<Value> = ["ada", "babbage", "grace", "hopper", "turing"]
+            .iter()
+            .map(|s| s.to_string())
+            .map(Value::Varchar)
+            .collect();
+        let inner = Vector::from_values(LogicalType::Varchar, &values).expect("a dictionary");
+        let vector = Vector::dictionary(vec![1, 2], inner).expect("two rows of five values");
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        let range = zone.column(0).expect("one column");
+        assert_eq!(range.low, Some(Bound::Bytes(b"babbage".to_vec())), "not ada");
+        assert_eq!(range.high, Some(Bound::Bytes(b"grace".to_vec())), "not turing");
+        let probes = vec![Probe { column: 0, op: Op::Equal, value: Bound::Bytes(b"ada".to_vec()) }];
+        assert!(zone.skips(&probes));
     }
 
     /// A dictionary is not walked, so its bounds cover values no row holds. That is allowed, and
