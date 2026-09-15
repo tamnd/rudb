@@ -289,7 +289,7 @@ impl<'a> Pages<'a> {
             return Ok(body);
         }
         if levels == 0 {
-            let mut body = std::mem::take(&mut self.spare);
+            let mut body = self.run(expected);
             self.codec.decompress_into(raw, expected, &mut body)?;
             body.truncate(expected);
             return Ok(body);
@@ -305,12 +305,23 @@ impl<'a> Pages<'a> {
         Ok(body)
     }
 
+    /// Somewhere to decompress into: the buffer this walker got back, or one off this thread's ring.
+    ///
+    /// The walker's own buffer comes back on a column whose pages are copied out of, which is every
+    /// column except a plain encoded string one. That is the case the ring exists for, and it is the
+    /// expensive one, because those pages are the largest in the file and there is one per row group
+    /// rather than one per file.
+    fn run(&mut self, want: usize) -> Vec<u8> {
+        let body = std::mem::take(&mut self.spare);
+        if body.capacity() == 0 { crate::arena::take(want) } else { body }
+    }
+
     /// The recycled buffer, grown to `len` and cut to it, ready to be written over.
     ///
     /// Grown rather than cleared and refilled, because zeroing what is about to be overwritten is
     /// most of what keeping the buffer saved.
     fn buffer(&mut self, len: usize) -> Vec<u8> {
-        let mut body = std::mem::take(&mut self.spare);
+        let mut body = self.run(len);
         if body.len() < len {
             body.resize(len, 0);
         }

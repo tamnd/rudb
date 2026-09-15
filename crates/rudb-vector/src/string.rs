@@ -438,8 +438,23 @@ impl StringColumn {
     /// A builder that knows the total byte count, which a scan reading a page and a gather copying a
     /// column both do, saves the doubling entirely. Nothing is wrong without it, which is why it is
     /// a hint and not a constructor argument.
+    ///
+    /// Not for a column built by [`Self::over`] on a page it shares, because reserving writes and a
+    /// write through a shared buffer copies the whole page out first. Such a column is not appended
+    /// to anyway: its strings are already in its arena and [`Self::push_in_place`] records where.
     pub fn reserve_bytes(&mut self, bytes: usize) {
         self.arena.reserve(bytes);
+    }
+
+    /// Room for `count` more strings, taken in one allocation rather than as they arrive.
+    ///
+    /// The views and not the payload, which is the half [`Self::reserve_bytes`] does not cover and
+    /// is the only half that matters to a column built by [`Self::over`], whose payload is already
+    /// there. A Parquet page of a hundred thousand strings is one and three quarter megabytes of
+    /// views, and growing that from nothing is twenty allocations and a copy of everything written
+    /// so far each time.
+    pub fn reserve_views(&mut self, count: usize) {
+        self.views.reserve(count);
     }
 }
 
