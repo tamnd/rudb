@@ -76,6 +76,16 @@ fn catalog() -> Catalog {
             vec![Value::Varchar("2".to_string())],
         ])
         .expect("three rows");
+    // One view, so that the tables which list one have something to list. Its columns are written
+    // down the way the binder writes them down, because nothing below the binder can work them out.
+    catalog
+        .create_view(rudb_catalog::View::new(
+            QualifiedName::new("memory", "main", "v"),
+            "SELECT x, s FROM t".to_string(),
+            Vec::new(),
+            vec![Field::new("x", LogicalType::Integer), Field::new("s", LogicalType::Varchar)],
+        ))
+        .expect("a fresh view");
     catalog
 }
 
@@ -1032,6 +1042,36 @@ fn the_tables_table_counts_the_columns_and_the_rows_of_what_was_created() {
     // The empty table is a row here with nothing in it, not an absent row.
     let empty = rows.iter().find(|row| row[0] == text("empty")).expect("the empty table");
     assert_eq!(empty[2], Value::BigInt(0));
+}
+
+#[test]
+fn a_view_lists_the_columns_the_binder_last_wrote_down_for_it() {
+    // The rows the pin returns for a view are a table's rows with the view's oid in `table_oid`,
+    // `column_default` null, and `is_nullable` true on every column, including one that reads a
+    // NOT NULL column straight through. All three were measured.
+    let rows =
+        run("TableFunction duckdb_columns args=[] #0 [table_name::VARCHAR, table_oid::BIGINT, \
+         column_name::VARCHAR, column_index::INTEGER, is_nullable::BOOLEAN, data_type::VARCHAR, \
+         column_default::VARCHAR]");
+    let own: Vec<&Vec<Value>> = rows.iter().filter(|row| row[0] == text("v")).collect();
+    assert_eq!(own.len(), 2, "the view has two columns");
+    assert_eq!(own[0][2], text("x"));
+    assert_eq!(own[0][3], Value::Integer(1));
+    assert_eq!(own[0][4], Value::Boolean(true));
+    assert_eq!(own[0][5], text("INTEGER"));
+    assert_eq!(own[0][6], Value::Null);
+    assert_eq!(own[1][2], text("s"));
+    assert_eq!(own[1][3], Value::Integer(2));
+    // The oid is the view's own, so a client that joins this to a table naming views gets the pair.
+    let oid = catalog()
+        .view(&QualifiedName::new("memory", "main", "v"))
+        .expect("the view the harness built")
+        .oid();
+    assert_eq!(own[0][1], Value::BigInt(oid));
+    assert_eq!(own[1][1], Value::BigInt(oid));
+    // And it is not the table's, which is the mistake this would be easy to make.
+    let table = rows.iter().find(|row| row[0] == text("t")).expect("the table");
+    assert_ne!(own[0][1], table[1]);
 }
 
 #[test]

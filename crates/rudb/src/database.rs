@@ -820,7 +820,7 @@ fn create_view(create: rudb_bind::CreateView, catalog: &mut Catalog) -> Result<(
     if create.or_replace && catalog.view(&create.name).is_ok() {
         catalog.drop_view(&create.name)?;
     }
-    catalog.create_view(View::new(create.name, create.sql, create.aliases))
+    catalog.create_view(View::new(create.name, create.sql, create.aliases, create.columns))
 }
 
 /// The `CREATE TABLE` half of a statement.

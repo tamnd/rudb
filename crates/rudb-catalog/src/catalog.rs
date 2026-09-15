@@ -672,6 +672,7 @@ mod tests {
                 QualifiedName::new("memory", "main", "recent"),
                 "SELECT * FROM hits".to_string(),
                 Vec::new(),
+                Vec::new(),
             ))
             .expect("a view in the default schema");
         catalog
@@ -701,6 +702,7 @@ mod tests {
             .create_view(View::new(
                 QualifiedName::new("memory", "main", "HITS"),
                 "SELECT 1".to_string(),
+                Vec::new(),
                 Vec::new(),
             ))
             .expect_err("hits is a table");
