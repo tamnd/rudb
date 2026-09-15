@@ -1764,7 +1764,8 @@ fn the_four_pragmas_about_the_build_answer_in_one_row_of_their_own_columns() {
                 .collect();
         assert_eq!(named, columns.iter().map(|column| text(column)).collect::<Vec<Value>>());
         let message = failure(&db, &format!("SELECT * FROM {name}('t')"));
-        assert!(message.contains(&format!("{name}() takes no arguments")), "{message}");
+        assert!(message.starts_with("No function matches the given name"), "{message}");
+        assert!(message.contains(&format!("\"{name}\"()")), "{message}");
     }
 }
 
@@ -3728,7 +3729,7 @@ fn the_compaction_seam_lists_its_three_implementations() {
 fn rudb_strategies_takes_no_arguments() {
     let db = database();
     assert!(
-        failure(&db, "SELECT * FROM rudb_strategies(1)").contains("takes no arguments"),
+        failure(&db, "SELECT * FROM rudb_strategies(1)").contains("\"rudb_strategies\"()"),
         "a call with an argument is a binder error rather than an ignored argument"
     );
 }
