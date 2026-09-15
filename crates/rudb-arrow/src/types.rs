@@ -7,9 +7,9 @@ use rudb_common::{Error, LogicalType, Result};
 /// The subset our own types map onto, which is every type the engine can produce a value of today
 /// except the five nested ones.
 ///
-/// `LIST` and `STRUCT` are the two of the five that are now only missing here. There has been a list
-/// vector since #302 and a struct vector since #594, so for both of them the blocker is no longer
-/// underneath this crate.
+/// `LIST`, `STRUCT` and `MAP` are the three of the five that are now only missing here. There has been
+/// a list vector since #302, a struct vector since #594 and a map vector since #595, so for all three of
+/// them the blocker is no longer underneath this crate.
 ///
 /// A struct is nearly a transcription. Arrow holds one child array per field, each as long as the
 /// parent, with the parent's validity bitmap on top, which is exactly [`Form::Struct`]'s layout, so the
@@ -21,6 +21,10 @@ use rudb_common::{Error, LogicalType, Result};
 /// and touching exports as offsets directly and one that has been gathered or filtered has to have its
 /// child gathered first. That is the piece to write, and it is a decision about when to pay for the
 /// gather rather than a missing layer.
+///
+/// A map costs whatever the list costs and nothing on top of it. Arrow's map is a list of a two field
+/// struct named `entries`, which is the layout a map vector already has, so once the list export exists
+/// the map export is the same code with the child's field names checked.
 ///
 /// [`Form::Struct`]: rudb_vector::Form::Struct
 #[derive(Debug, Clone, PartialEq, Eq)]
