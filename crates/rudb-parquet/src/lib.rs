@@ -33,6 +33,7 @@
 
 #![forbid(unsafe_code)]
 
+mod arena;
 mod chunk;
 mod delta;
 mod hybrid;

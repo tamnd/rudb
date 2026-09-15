@@ -310,9 +310,11 @@ fn place(
     levels: &[u32],
     total: usize,
 ) -> Result<Data> {
-    // The page becomes the column's arena, so this is where a body stops being recyclable. The
-    // walker gets an empty buffer back and the next page of this column allocates its own.
-    let mut out = StringColumn::over(Buffer::from_vec(std::mem::take(body)));
+    // The page becomes the column's arena, so the walker gets an empty buffer back and the next
+    // page of this column has to find a run somewhere else. `arena::share` is where it finds one:
+    // the page goes out behind a handle and a second handle stays on this thread, so the run comes
+    // back to be decompressed into once every vector built over it has been dropped.
+    let mut out = StringColumn::over(Buffer::from_arc(crate::arena::share(std::mem::take(body))));
     let mut next = 0;
     for index in 0..total {
         if !levels.is_empty() && levels.get(index) != Some(&1) {
@@ -763,6 +765,38 @@ mod tests {
             assert!(distinct.len() <= 8, "{} distinct values is not a dictionary", distinct.len());
             assert_eq!(codes.len(), page.len());
         }
+    }
+
+    /// The ring wired up to the string path, end to end through [`place`](super::place).
+    ///
+    /// Nothing can take the run while a vector is still reading it, and the run comes back the
+    /// moment that vector is dropped rather than going to the allocator. Worth asserting here and
+    /// not only in `arena.rs`, because the mistake it catches is `place` building an owned buffer
+    /// again, which is not a wrong answer and no other test in this file would see it.
+    ///
+    /// On its own thread because the ring is per thread and the harness shares them.
+    #[test]
+    fn a_page_that_became_a_string_arena_comes_back_when_the_column_is_dropped() {
+        std::thread::spawn(|| {
+            let (schema, _) = column(2);
+            let text = b"the quick brown fox jumps over the lazy dog, and then over it again";
+            let (mut body, mut spans) = (Vec::new(), Vec::new());
+            while body.len() < 256 << 10 {
+                spans.push((body.len(), text.len()));
+                body.extend_from_slice(text);
+            }
+            let total = spans.len();
+            let data = super::place(&schema, &mut body, &spans, &[], total).expect("it places");
+            assert!(body.is_empty(), "the page was copied out of rather than moved");
+            assert!(crate::arena::take().is_empty(), "a run still being read was handed out");
+            drop(data);
+            assert!(
+                !crate::arena::take().is_empty(),
+                "the arena went to the allocator rather than back to the ring"
+            );
+        })
+        .join()
+        .expect("the test thread");
     }
 
     #[test]
