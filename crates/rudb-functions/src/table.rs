@@ -5,7 +5,7 @@
 //! resolution problem from [`crate::signature`]: the answer is not a return type, it is a list of
 //! columns, because the caller can alias them and select from them and join against them.
 //!
-//! Five of them are here. `range` and `generate_series` between them account for two thousand
+//! Six of them are here. `range` and `generate_series` between them account for two thousand
 //! records in DuckDB's `sqllogictest` corpus, because a test that needs a thousand rows should not
 //! have to write a thousand rows, and the corpus uses them the way a person uses a for loop. The
 //! difference between those two is one row: `range` stops before the end and `generate_series`
@@ -19,10 +19,17 @@
 //! [`crate::file`] is where that happens. For CSV there is nothing in the file that states the
 //! columns either, so opening it means sniffing it.
 //!
-//! `rudb_strategies()` is the fifth and it is not a DuckDB function. It lists every seam in the
-//! engine and every implementation registered against it, which is how a reader finds out what this
-//! engine will let them swap and what it lets them swap today. It takes no arguments and its
-//! columns are fixed, so resolving it is the simplest case in this file.
+//! `rudb_strategies()` and `duckdb_keywords()` are the other two and they are the third kind, a
+//! table whose rows are a fact about the engine rather than data somebody stored. Both take no
+//! arguments and both know their own columns, so resolving one is the simplest case in this file and
+//! they share an arm. The first is not a DuckDB function at all: it lists every seam in the engine
+//! and every implementation registered against it, which is how a reader finds out what this engine
+//! will let them swap and what it lets them swap today. The second is DuckDB's and is every word the
+//! grammar knows about, which this crate can answer because the grammar is vendored.
+//!
+//! D2 adds about a dozen more of that third kind, the settings and the types and the functions and
+//! the catalog tables among them. Each one is a column list here and a list of rows in
+//! `rudb_exec::metadata`, and nothing else.
 
 use rudb_common::{Error, Field, LogicalType, Result};
 
@@ -42,6 +49,8 @@ pub enum TableFunction {
     ReadCsv,
     /// `rudb_strategies()`, every seam and every implementation registered against it.
     RudbStrategies,
+    /// `duckdb_keywords()`, every word the grammar knows and which class each one is in.
+    DuckdbKeywords,
 }
 
 /// The name of the column `file_row_number=True` adds.
@@ -62,6 +71,7 @@ impl TableFunction {
             Self::ReadParquet => "read_parquet",
             Self::ReadCsv => "read_csv",
             Self::RudbStrategies => "rudb_strategies",
+            Self::DuckdbKeywords => "duckdb_keywords",
         }
     }
 
@@ -130,6 +140,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("rudb_strategies") {
             return Some(Self::RudbStrategies);
+        }
+        if name.eq_ignore_ascii_case("duckdb_keywords") {
+            return Some(Self::DuckdbKeywords);
         }
         None
     }
@@ -207,16 +220,20 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
         return Ok(ResolvedTable { function, arguments: vec![wanted], columns });
     }
     let arity = arguments.len();
-    if function == TableFunction::RudbStrategies {
+    // The metadata tables take nothing and their columns are fixed, which makes them the simplest
+    // case here. They are one arm rather than one each because the only thing that differs is the
+    // column list, and a name that is added to this list and not to `lookup` cannot be reached.
+    if let Some(columns) = fixed_columns(function) {
         if arity != 0 {
             return Err(Error::binder(format!(
-                "Table function rudb_strategies() takes no arguments, {arity} were given"
+                "Table function {}() takes no arguments, {arity} were given",
+                function.name()
             )));
         }
         return Ok(ResolvedTable {
             function,
             arguments: Vec::new(),
-            columns: Columns::Fixed(strategy_fields()),
+            columns: Columns::Fixed(columns),
         });
     }
     if !(1..=3).contains(&arity) {
@@ -238,9 +255,23 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
     match function {
         TableFunction::ReadParquet => Some(Columns::Parquet),
         TableFunction::ReadCsv => Some(Columns::Csv),
-        TableFunction::Range | TableFunction::GenerateSeries | TableFunction::RudbStrategies => {
-            None
-        }
+        TableFunction::Range
+        | TableFunction::GenerateSeries
+        | TableFunction::RudbStrategies
+        | TableFunction::DuckdbKeywords => None,
+    }
+}
+
+/// The columns of a table function that takes no arguments and knows its own, and `None` for one
+/// that has to look at what it was called with.
+fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
+    match function {
+        TableFunction::RudbStrategies => Some(strategy_fields()),
+        TableFunction::DuckdbKeywords => Some(keyword_fields()),
+        TableFunction::Range
+        | TableFunction::GenerateSeries
+        | TableFunction::ReadParquet
+        | TableFunction::ReadCsv => None,
     }
 }
 
@@ -269,6 +300,50 @@ pub fn strategy_fields() -> Vec<Field> {
         Field::new("is_reference", LogicalType::Boolean),
         Field::new("is_default", LogicalType::Boolean),
     ]
+}
+
+/// The columns `duckdb_keywords()` produces, which is DuckDB's two.
+#[must_use]
+pub fn keyword_fields() -> Vec<Field> {
+    vec![
+        Field::new("keyword_name", LogicalType::Varchar),
+        Field::new("keyword_category", LogicalType::Varchar),
+    ]
+}
+
+/// The four categories DuckDB sorts a keyword into.
+///
+/// The vendored grammar does not carry these. It carries five keyword rules, `reserved_keyword`,
+/// `unreserved_keyword`, `column_name_keyword`, `func_name_keyword` and `type_name_keyword`, and
+/// `rudb_parse::KEYWORDS` is a mask over those five because they are not disjoint. DuckDB's table
+/// reports PostgreSQL's four categories instead, where `type_function` is the one category that the
+/// grammar spells as two rules, because a word usable as a type name is usable as a function name.
+///
+/// So a word can produce two rows, and six of them do: `columns`, `generated`, `map`, `struct`,
+/// `try_cast` and `tuple` are each in the column name class and in the type function class. That is
+/// why the pinned binary returns 505 rows over 499 distinct words, and a table that deduplicated
+/// them would be 499 rows and wrong.
+///
+/// A word whose mask is zero is in no class at all. The grammar spells fifteen words directly in
+/// some rule, `ascending` and `variant` among them, which makes them matchable as literals and
+/// keywords nowhere, and the pinned binary leaves all fifteen out of this table.
+#[must_use]
+pub fn keyword_categories(classes: u8) -> Vec<&'static str> {
+    use rudb_parse::{COLUMN_NAME, FUNC_NAME, RESERVED, TYPE_NAME, UNRESERVED};
+    let mut out = Vec::new();
+    if classes & RESERVED != 0 {
+        out.push("reserved");
+    }
+    if classes & UNRESERVED != 0 {
+        out.push("unreserved");
+    }
+    if classes & COLUMN_NAME != 0 {
+        out.push("column_name");
+    }
+    if classes & (FUNC_NAME | TYPE_NAME) != 0 {
+        out.push("type_function");
+    }
+    out
 }
 
 /// DuckDB's message for a call that matched a name and no overload of it.
@@ -450,6 +525,50 @@ mod tests {
         // where the two functions stop being different.
         assert_eq!(series(TableFunction::Range, 2, 7, 2).unwrap(), vec![2, 4, 6]);
         assert_eq!(series(TableFunction::GenerateSeries, 2, 7, 2).unwrap(), vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn the_four_categories_come_out_of_the_grammars_five_rules() {
+        use rudb_parse::{COLUMN_NAME, FUNC_NAME, RESERVED, TYPE_NAME, UNRESERVED};
+        assert_eq!(keyword_categories(RESERVED), ["reserved"]);
+        assert_eq!(keyword_categories(UNRESERVED), ["unreserved"]);
+        assert_eq!(keyword_categories(COLUMN_NAME), ["column_name"]);
+        // The two rules that are one category. A word usable as a type name is usable as a function
+        // name, which is why the grammar has two rules where PostgreSQL has one category, and either
+        // rule on its own is still that one category rather than half of it.
+        assert_eq!(keyword_categories(FUNC_NAME | TYPE_NAME), ["type_function"]);
+        assert_eq!(keyword_categories(TYPE_NAME), ["type_function"]);
+        assert_eq!(keyword_categories(FUNC_NAME), ["type_function"]);
+        // Both, which is the case that makes one word two rows.
+        assert_eq!(keyword_categories(COLUMN_NAME | FUNC_NAME), ["column_name", "type_function"]);
+        // A word the grammar spells directly in a rule is in no class, and the pinned binary leaves
+        // all fifteen of those out of the table rather than giving them a category of their own.
+        assert!(keyword_categories(0).is_empty());
+    }
+
+    #[test]
+    fn a_metadata_table_given_an_argument_says_it_takes_none() {
+        for name in ["rudb_strategies", "duckdb_keywords"] {
+            let function = TableFunction::lookup(name).expect("a known function");
+            let error = resolve_table(name, &[LogicalType::BigInt]).expect_err("takes none");
+            assert!(
+                error.to_string().contains(&format!("{}() takes no arguments", function.name())),
+                "{error}"
+            );
+            let resolved = resolve_table(name, &[]).expect("takes none, and none were given");
+            assert_eq!(resolved.function, function);
+            assert!(matches!(resolved.columns, Columns::Fixed(_)));
+        }
+    }
+
+    #[test]
+    fn duckdb_keywords_has_duckdbs_two_columns_under_that_name() {
+        let resolved = resolve_table("DuckDB_Keywords", &[]).expect("a case insensitive name");
+        assert_eq!(resolved.function, TableFunction::DuckdbKeywords);
+        let Columns::Fixed(fields) = resolved.columns else { panic!("fixed columns") };
+        let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, ["keyword_name", "keyword_category"]);
+        assert!(fields.iter().all(|field| field.ty == LogicalType::Varchar));
     }
 
     #[test]

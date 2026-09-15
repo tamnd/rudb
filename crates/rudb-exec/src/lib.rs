@@ -86,6 +86,8 @@ mod gather;
 mod group;
 mod join;
 mod key;
+mod keywords;
+mod metadata;
 mod ordering;
 mod prepared;
 mod query;

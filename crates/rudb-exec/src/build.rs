@@ -62,13 +62,14 @@ use crate::fetch::Fetch;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join};
+use crate::keywords::keywords;
 use crate::query::Query;
 use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
 use crate::sort::Sort;
 use crate::source::{Dummy, FileScan, Scan, Series, Values};
-use crate::strategies::Strategies;
+use crate::strategies::strategies;
 use crate::stream::{Filter, Limit, Project};
 use crate::topn::TopN;
 
@@ -446,10 +447,19 @@ impl<'a> Building<'a, '_> {
                         let schema = scan.schema().clone();
                         Segment::new(Arc::new(Watched::new(scan, counters)), schema)
                     }
-                    Some(TableFunction::RudbStrategies) => {
-                        let table = Strategies::new(plan, index, columns)?;
+                    Some(
+                        function @ (TableFunction::RudbStrategies | TableFunction::DuckdbKeywords),
+                    ) => {
+                        let table = match function {
+                            TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
+                            _ => strategies(plan, index, columns)?,
+                        };
                         let schema = table.schema().clone();
-                        let counters = self.watch(reference, id, pipeline, "Strategies", None);
+                        // `EXPLAIN` names the table rather than the operator, because every one of
+                        // these is the same operator and a plan that said `Metadata` four times
+                        // would not say which four tables it read.
+                        let counters =
+                            self.watch(reference, id, pipeline, "Metadata", Some(function.name()));
                         Segment::new(Arc::new(Watched::new(table, counters)), schema)
                     }
                     _ => {
