@@ -27,7 +27,7 @@
 //! and read back compressed, and it is the row to watch when a change to the decoder is meant to
 //! show up in a query.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rudb_compress::snappy;
 
@@ -131,11 +131,33 @@ fn payloads(size: usize) -> Vec<Payload> {
 ///
 /// So this row is a page a real writer produced, decompressed by the same decoder that reads the
 /// file, with its own compressor's choices intact. It is the row to watch.
-fn page(root: &Path) -> Result<Payload, String> {
-    let path = root.join("crates/rudb-compress/tests/data/hits-page.snappy");
+///
+/// # It is a small page, and the pages that set the pace of a scan are not
+///
+/// The committed one is fifteen kilobytes, which is a page from the middle of the size
+/// distribution. The pages that a ClickBench query actually waits on are the string columns, and
+/// there one column chunk of one row group is a single page: `URL` in `hits-1m-snappy.parquet` is
+/// 4.6 megabytes compressed and 10.5 uncompressed, one `DATA_PAGE` per row group, `PLAIN`. Those
+/// two sizes do not decompress at the same rate and it is not close, because at fifteen kilobytes
+/// every byte a copy reaches back to is in L1 and at ten megabytes almost none of them are. The
+/// committed row reads 2859 MiB/s on the bench host and the decompress stage of the query that
+/// reads those pages reads 786 MB/s, so the row rule ten says has to track the query is out by 3.6
+/// times.
+///
+/// `--page PATH` is how to point this row at one of them. A real page cannot be committed at that
+/// size, so the fixture stays small and the flag is what makes the honest measurement available to
+/// anyone who has a Parquet file.
+fn page(root: &Path, given: Option<&str>) -> Result<Payload, String> {
+    let (name, path) = match given {
+        Some(path) => ("the page given", PathBuf::from(path)),
+        None => {
+            ("a hits.parquet page", root.join("crates/rudb-compress/tests/data/hits-page.snappy"))
+        }
+    };
     let block = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let raw = snappy::decompress(&block, 1 << 20).map_err(|e| e.message().to_string())?;
-    Ok(Payload { name: "a hits.parquet page", raw, block: Some(block) })
+    let limit = snappy::decompressed_len(&block).map_err(|e| e.message().to_string())?;
+    let raw = snappy::decompress(&block, limit).map_err(|e| e.message().to_string())?;
+    Ok(Payload { name, raw, block: Some(block) })
 }
 
 /// One step of the mixer the payloads that want unpredictable bytes are built from.
@@ -165,8 +187,9 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         return crate::timing::rebuild(root, "compress", args);
     }
 
+    let given = args.iter().position(|arg| arg == "--page").and_then(|at| args.get(at + 1));
     // The real page once, at the size it is, and every built payload at each block size.
-    let mut work: Vec<(usize, Payload)> = vec![(0, page(root)?)];
+    let mut work: Vec<(usize, Payload)> = vec![(0, page(root, given.map(String::as_str))?)];
     for block_bytes in BLOCKS {
         work.extend(payloads(TOTAL).into_iter().map(|payload| (block_bytes, payload)));
     }
