@@ -13,7 +13,7 @@
 //! an `INTEGER` and a `BIGINT` does.
 
 use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Given, TableFunction, csv_fields, csv_given, files, is_file,
     is_pattern, parquet_fields, resolve, resolve_table,
@@ -33,15 +33,23 @@ use crate::scope::{Scope, Visible};
 /// If the script does not hold exactly one statement, if a name does not resolve, if a type does
 /// not work out, or if the query uses something M0 does not bind yet.
 pub fn bind(ast: &Ast, catalog: &Catalog) -> Result<Plan> {
-    bind_with(ast, catalog, &Parameters::new())
+    bind_with(ast, catalog, &Parameters::new(), &Session::new())
 }
 
-/// Binds a parsed query against a catalog, with values for its parameters.
+/// Binds a parsed query against a catalog, with values for its parameters and its settings.
+///
+/// The session is what `current_setting()` reads, and a caller with no database behind it passes an
+/// empty one, which makes every setting name unrecognized rather than making up an answer.
 ///
 /// # Errors
 ///
 /// Everything [`bind`] reports, plus an error for a parameter that was given no value.
-pub fn bind_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters) -> Result<Plan> {
+pub fn bind_with(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+) -> Result<Plan> {
     let query = match ast.statements.as_slice() {
         [ast::Statement::Query(query)] => *query,
         [] => return Err(Error::binder("no statement to bind")),
@@ -50,7 +58,7 @@ pub fn bind_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters) -> Resul
         [_] => return Err(Error::not_implemented("a statement that is not a query")),
         _ => return Err(Error::not_implemented("a script of more than one statement")),
     };
-    let mut binder = Binder::with(catalog, parameters);
+    let mut binder = Binder::with(catalog, parameters, session);
     let (root, _) = binder.bind_query(ast, query)?;
     let mut plan = binder.into_plan();
     plan.set_root(root);
@@ -64,8 +72,17 @@ pub fn bind_with(ast: &Ast, catalog: &Catalog, parameters: &Parameters) -> Resul
 ///
 /// Anything the parser or the binder reports.
 pub fn bind_sql(query: &str, catalog: &Catalog) -> Result<Plan> {
+    bind_sql_with(query, catalog, &Session::new())
+}
+
+/// Parses and binds one query, with the settings a call to `current_setting()` reads.
+///
+/// # Errors
+///
+/// Anything the parser or the binder reports.
+pub fn bind_sql_with(query: &str, catalog: &Catalog, session: &Session) -> Result<Plan> {
     let ast = parse_ast(query)?;
-    bind(&ast, catalog)
+    bind_with(&ast, catalog, &Parameters::new(), session)
 }
 
 /// What an aggregating select block has decided so far.
@@ -85,6 +102,8 @@ pub(crate) struct Binder<'a> {
     catalog: &'a Catalog,
     /// What the parameters were given, empty for a statement that is not prepared.
     pub(crate) parameters: &'a Parameters,
+    /// What the settings are now, which is what `current_setting()` folds to.
+    pub(crate) session: &'a Session,
     plan: Plan,
     next_index: u32,
     /// Set while a select block aggregates, which changes what a bare column means.
@@ -98,10 +117,15 @@ pub(crate) struct Binder<'a> {
 }
 
 impl<'a> Binder<'a> {
-    pub(crate) fn with(catalog: &'a Catalog, parameters: &'a Parameters) -> Self {
+    pub(crate) fn with(
+        catalog: &'a Catalog,
+        parameters: &'a Parameters,
+        session: &'a Session,
+    ) -> Self {
         Self {
             catalog,
             parameters,
+            session,
             plan: Plan::new(),
             next_index: 0,
             aggregation: None,

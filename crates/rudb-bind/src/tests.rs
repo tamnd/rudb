@@ -5,9 +5,9 @@
 //! reads fails in a way that says what went wrong.
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Field, LogicalType};
+use rudb_common::{Field, LogicalType, Session};
 
-use crate::bind_sql;
+use crate::{bind_sql, bind_sql_with};
 
 /// A catalog with two tables in it, which is enough for a join and for every name rule.
 fn catalog() -> Catalog {
@@ -612,4 +612,28 @@ fn a_name_that_is_not_a_table_function_does_not_fall_through_to_the_table_lookup
     assert!(failure("SELECT * FROM hits(1)").contains("hits"));
     assert!(failure("SELECT * FROM nowhere.range(3)").contains("nowhere"));
     assert!(failure("SELECT * FROM range()").contains("range"));
+}
+
+#[test]
+fn a_setting_is_folded_to_a_constant_of_the_type_the_setting_holds() {
+    let mut session = Session::new();
+    session.set("threads", "8");
+    session.set("memory_limit", "1.0 GiB");
+    let printed = bind_sql_with("SELECT current_setting('threads')", &catalog(), &session)
+        .expect("a setting reads")
+        .to_string();
+    // The call is gone by the time there is a plan, which is what upstream's EXPLAIN shows too.
+    assert!(printed.contains("8::BIGINT"), "{printed}");
+    let text = bind_sql_with("SELECT current_setting('memory_limit')", &catalog(), &session)
+        .expect("a setting reads")
+        .to_string();
+    assert!(text.contains("'1.0 GiB'::VARCHAR"), "{text}");
+}
+
+#[test]
+fn a_binder_with_no_database_behind_it_has_no_settings_to_read() {
+    // `bind_sql` passes an empty session, so every name is unrecognized rather than answered with
+    // a default this crate would have had to invent.
+    let message = failure("SELECT current_setting('threads')");
+    assert!(message.starts_with("unrecognized configuration parameter \"threads\""), "{message}");
 }

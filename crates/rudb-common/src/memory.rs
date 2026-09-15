@@ -288,22 +288,28 @@ impl Drop for Reservation {
 /// A size the way an error message says one.
 ///
 /// The shape DuckDB prints, which is one decimal place and the binary units, so that
-/// `9.3 MiB/9.5 MiB used` in a message from here reads as the same sentence as the one from there.
-/// It rounds, which is why it is not the formatter `--print-config` uses: a configuration dump has
-/// to print a number somebody can compare against what they set, and a message about running out of
-/// memory has to print one somebody can read.
+/// `9.2 MiB/9.2 MiB used` in a message from here reads as the same sentence as the one from there.
+///
+/// It truncates rather than rounding, which was measured rather than chosen. 9,751,000 bytes is
+/// 9.2993 mebibytes and the pin prints `9.2 MiB` for it, both in an out of memory message and in
+/// `SELECT current_setting('memory_limit')`, so the digit it drops is dropped and not carried. The
+/// arithmetic is in whole tenths for the same reason: a division by 1024 in floating point puts a
+/// number that is exactly 9.3 a hair under it often enough to matter at one decimal place.
+///
+/// This is not the formatter `--print-config` uses. A configuration dump prints a size with a unit
+/// only when the byte count divides by it exactly, because somebody reading a dump is comparing it
+/// against what they set.
 pub fn human(bytes: u64) -> String {
-    #[expect(clippy::cast_precision_loss, reason = "a rounded size is the point of this function")]
-    let mut size = bytes as f64;
+    let mut divisor = 1u128;
     for unit in ["bytes", "KiB", "MiB", "GiB", "TiB", "PiB"] {
-        if size < 1024.0 || unit == "PiB" {
-            return if unit == "bytes" {
-                format!("{bytes} bytes")
-            } else {
-                format!("{size:.1} {unit}")
-            };
+        if u128::from(bytes) < divisor * 1024 || unit == "PiB" {
+            if unit == "bytes" {
+                return format!("{bytes} bytes");
+            }
+            let tenths = u128::from(bytes) * 10 / divisor;
+            return format!("{}.{} {unit}", tenths / 10, tenths % 10);
         }
-        size /= 1024.0;
+        divisor *= 1024;
     }
     unreachable!("the loop returns on its last unit")
 }
@@ -441,11 +447,16 @@ mod tests {
         assert_eq!(human(512), "512 bytes");
         assert_eq!(human(256 * 1024), "256.0 KiB");
         assert_eq!(human(10 * 1024 * 1024), "10.0 MiB");
-        assert_eq!(human(9_751_000), "9.3 MiB");
+        // The two the pin prints, read off it with a memory limit set to each number and then with
+        // a query that runs out of it. 9,751,000 bytes is 9.2993 mebibytes and the answer is 9.2,
+        // so the tenth is truncated and not rounded.
+        assert_eq!(human(9_751_000), "9.2 MiB");
+        assert_eq!(human(10_000_000), "9.5 MiB");
+        assert_eq!(human(1_000_000_000), "953.6 MiB");
         assert_eq!(human(3 * 1024 * 1024 * 1024), "3.0 GiB");
         assert_eq!(human(5 * 1024u64.pow(5)), "5.0 PiB");
         // The last unit runs off the end rather than there being a unit past it, because a size
         // that big is a bug in whatever asked for it and not a number anybody reads.
-        assert_eq!(human(u64::MAX), "16384.0 PiB");
+        assert_eq!(human(u64::MAX), "16383.9 PiB");
     }
 }

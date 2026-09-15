@@ -35,7 +35,7 @@ Closes when `rudb-compat levels` stops saying that nothing has been measured, an
 - [ ] `duckdb_tables`, `duckdb_columns`, `duckdb_schemas`, `duckdb_views`, `duckdb_databases`
 - [ ] `duckdb_extensions`, `duckdb_optimizers`
 - [ ] `information_schema` and the `pragma_*` function family
-- [ ] `current_setting()`, and settings readable as values
+- [x] `current_setting()`, and settings readable as values
 - [ ] Session context: `now()`, `current_date`, `current_timestamp`, `current_schema`, `current_user`
 - [ ] Session time zone, and the one argument `age`
 - [ ] The semantics bundle, holding the nineteen meaning changing settings, consumed by the binder and read by nothing below it
