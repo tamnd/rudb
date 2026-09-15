@@ -944,32 +944,42 @@ fn expect(matched: bool, what: &str) -> Result<()> {
 ///
 /// The aliases are DuckDB's, and they are here rather than in the parser because `CREATE TABLE t
 /// (a INT4)` and `CAST(x AS INT4)` have to agree and there is only one table.
+///
+/// Every name in here was checked against the pinned binary with `typeof(NULL::name)` and every name
+/// that is not in here was checked the same way, because the numeric ones do not follow the rule they
+/// look like they follow. `int1` through `int8` count bytes, `int16` through `int128` count bits, and
+/// both series exist on the signed side, so `int8` and `int64` are the same type. On the unsigned side
+/// only the bit counting series exists, so `uint8` is one byte and `uint1` is not a type at all. An
+/// earlier version of this table assumed the two sides were symmetric and answered `UBIGINT` for
+/// `uint8`, which is the wrong type rather than an error, and nothing caught it because both engines
+/// answered. That is why `the_unsigned_names_count_bits_and_the_short_signed_ones_count_bytes` carries
+/// the measured grid below: a name added by following the pattern is now a failing test.
 fn alias(upper: &str) -> Option<LogicalType> {
     Some(match upper {
         "NULL" => LogicalType::Null,
         "BOOLEAN" | "BOOL" | "LOGICAL" => LogicalType::Boolean,
         "TINYINT" | "INT1" => LogicalType::TinyInt,
-        "SMALLINT" | "INT2" | "SHORT" => LogicalType::SmallInt,
-        "INTEGER" | "INT" | "INT4" | "SIGNED" => LogicalType::Integer,
-        "BIGINT" | "INT8" | "LONG" => LogicalType::BigInt,
+        "SMALLINT" | "INT2" | "INT16" | "SHORT" => LogicalType::SmallInt,
+        "INTEGER" | "INT" | "INT4" | "INT32" | "SIGNED" | "INTEGRAL" => LogicalType::Integer,
+        "BIGINT" | "INT8" | "INT64" | "LONG" | "OID" => LogicalType::BigInt,
         "HUGEINT" | "INT128" => LogicalType::HugeInt,
-        "UTINYINT" | "UINT1" => LogicalType::UTinyInt,
-        "USMALLINT" | "UINT2" => LogicalType::USmallInt,
-        "UINTEGER" | "UINT4" => LogicalType::UInteger,
-        "UBIGINT" | "UINT8" => LogicalType::UBigInt,
+        "UTINYINT" | "UINT8" => LogicalType::UTinyInt,
+        "USMALLINT" | "UINT16" => LogicalType::USmallInt,
+        "UINTEGER" | "UINT32" => LogicalType::UInteger,
+        "UBIGINT" | "UINT64" => LogicalType::UBigInt,
         "UHUGEINT" | "UINT128" => LogicalType::UHugeInt,
         "FLOAT" | "FLOAT4" | "REAL" => LogicalType::Float,
         "FLOAT8" => LogicalType::Double,
-        "VARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING" => LogicalType::Varchar,
+        "VARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING" | "NVARCHAR" => LogicalType::Varchar,
         "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => LogicalType::Blob,
         "BIT" | "BITSTRING" => LogicalType::Bit,
         "UUID" | "GUID" => LogicalType::Uuid,
         "DATE" => LogicalType::Date,
         "TIMETZ" => LogicalType::TimeTz,
-        "DATETIME" => LogicalType::Timestamp,
-        "TIMESTAMP_S" | "TIMESTAMP_SEC" | "TIMESTAMP_SECONDS" => LogicalType::TimestampS,
-        "TIMESTAMP_MS" | "TIMESTAMP_MILLISECONDS" => LogicalType::TimestampMs,
-        "TIMESTAMP_NS" | "TIMESTAMP_NANOSECONDS" => LogicalType::TimestampNs,
+        "DATETIME" | "TIMESTAMP_US" => LogicalType::Timestamp,
+        "TIMESTAMP_S" => LogicalType::TimestampS,
+        "TIMESTAMP_MS" => LogicalType::TimestampMs,
+        "TIMESTAMP_NS" => LogicalType::TimestampNs,
         "TIMESTAMPTZ" => LogicalType::TimestampTz,
         "INTERVAL" => LogicalType::Interval,
         _ => return None,
@@ -1214,6 +1224,70 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(LogicalType::parse(text).unwrap(), expected, "{text}");
         }
+    }
+
+    #[test]
+    fn the_unsigned_names_count_bits_and_the_short_signed_ones_count_bytes() {
+        // Read off `typeof(NULL::name)` in DuckDB v2.0.0-dev84237 cc7e7bac7f, one row per name, both
+        // the ones that resolve and the ones that do not. The pattern is deliberately written out
+        // rather than described, because the last time somebody described it they extended the signed
+        // side onto the unsigned side and `uint8` came out eight bytes wide instead of one.
+        let resolves = [
+            ("int1", LogicalType::TinyInt),
+            ("int2", LogicalType::SmallInt),
+            ("int4", LogicalType::Integer),
+            ("int8", LogicalType::BigInt),
+            ("int16", LogicalType::SmallInt),
+            ("int32", LogicalType::Integer),
+            ("int64", LogicalType::BigInt),
+            ("int128", LogicalType::HugeInt),
+            ("uint8", LogicalType::UTinyInt),
+            ("uint16", LogicalType::USmallInt),
+            ("uint32", LogicalType::UInteger),
+            ("uint64", LogicalType::UBigInt),
+            ("uint128", LogicalType::UHugeInt),
+        ];
+        for (text, expected) in resolves {
+            assert_eq!(LogicalType::parse(text).unwrap(), expected, "{text}");
+        }
+        // DuckDB answers `Catalog Error: Type with name uint1 does not exist!` for these, so a name
+        // this engine invents to fill the gap is a query that works here and fails there.
+        for text in ["uint1", "uint2", "uint4"] {
+            assert!(LogicalType::parse(text).is_err(), "{text} should not be a type name");
+        }
+    }
+
+    #[test]
+    fn the_four_timestamp_units_are_the_only_four_spellings() {
+        let resolves = [
+            ("timestamp_s", LogicalType::TimestampS),
+            ("timestamp_ms", LogicalType::TimestampMs),
+            ("timestamp_us", LogicalType::Timestamp),
+            ("timestamp_ns", LogicalType::TimestampNs),
+        ];
+        for (text, expected) in resolves {
+            assert_eq!(LogicalType::parse(text).unwrap(), expected, "{text}");
+        }
+        // The long forms read like they ought to exist and none of them does. `timestamp_us` is the
+        // one that does and the one this engine used to be missing, which is the same mistake in the
+        // other direction: a spelling somebody guessed at instead of measuring.
+        for text in [
+            "timestamp_sec",
+            "timestamp_seconds",
+            "timestamp_milliseconds",
+            "timestamp_nanoseconds",
+        ] {
+            assert!(LogicalType::parse(text).is_err(), "{text} should not be a type name");
+        }
+    }
+
+    #[test]
+    fn the_three_aliases_that_are_not_about_width_resolve() {
+        // `integral` and `oid` are Postgres inheritance and `nvarchar` is somebody else's dialect,
+        // and all three are in `duckdb_types()` so a query that casts to one has to work here.
+        assert_eq!(LogicalType::parse("integral").unwrap(), LogicalType::Integer);
+        assert_eq!(LogicalType::parse("oid").unwrap(), LogicalType::BigInt);
+        assert_eq!(LogicalType::parse("nvarchar").unwrap(), LogicalType::Varchar);
     }
 
     #[test]
