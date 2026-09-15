@@ -13,31 +13,33 @@
 //!
 //! # What giving a run back actually costs
 //!
-//! Two things, and the second is the larger one.
+//! Whatever glibc decides to do with a block that size, which is not a fixed thing. It serves one
+//! with `mmap` when its threshold is low and returns it to the kernel on free, so the next one
+//! faults in a four kilobyte page at a time before a byte is written. The threshold moves: freeing
+//! an mmapped block raises it, so a program that frees one large block teaches the allocator to
+//! keep the next one, and where a scan lands in that depends on the order of its allocations.
 //!
-//! A run that comes back empty has to be grown before it can be written into, and growing a `Vec`
-//! writes zeros over every byte. Ten and a half megabytes of zeros nine times is ninety four
-//! megabytes of memory bandwidth spent on bytes the decompressor is about to overwrite. A run that
-//! comes back at the size it was last time is grown by nothing and zeroed not at all.
-//!
-//! Then there is what the allocator does with a block that size. glibc serves it with `mmap` when
-//! its threshold is low and returns it to the kernel on free, so the next one faults in a four
-//! kilobyte page at a time before a byte is written. Its threshold is not fixed: freeing an mmapped
-//! block raises it, so a program that frees one large block teaches the allocator to keep the next
-//! one. That is an accident, it depends on the order of a program's allocations, and it is worth
-//! not depending on. Measured on a scan of `URL` in `hits-1m-snappy.parquet` on one thread, running
-//! with `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_` both raised so that nothing is ever
+//! Measured on a scan of `URL` in `hits-1m-snappy.parquet` on one thread, running with
+//! `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_` both raised so that nothing is ever
 //! returned took the query from 109.03 milliseconds to 100.56. Neither setting does anything on its
 //! own, because setting either one turns off glibc's adjustment of the other, and each alone
-//! measured slower than the default.
+//! measured slower than the default. Eight of those milliseconds are what a scan is paying for
+//! handing back runs it is about to ask for again, and a run that never goes back is a run none of
+//! that can happen to.
 //!
-//! # Why a ring and not a field
+//! A run that comes back also comes back at the length it was, so the decompressor writes into it
+//! rather than growing it first. That is worth less than it sounds on this path: `snappy` grows an
+//! empty buffer with `vec![0u8; expected]`, which is `alloc_zeroed` and therefore pages the kernel
+//! has not had to write to yet. It is the uncompressed and ZSTD paths, which `resize` instead, that
+//! pay for the zeros.
 //!
-//! The ends of this are [`share`], called from `values::place` when a page becomes an arena,
-//! [`park`], called when a cursor is dropped, and [`take`], called when the next page needs
-//! somewhere to go. There is no object all three can see. A cursor is built per column chunk and
-//! the string decoder is a free function several calls below the scan, so connecting them by a
-//! parameter means a pool argument on every decoder in `values.rs` for the benefit of one of them.
+//! # Why a thread local and not a field
+//!
+//! The two ends of this are [`share`], called from `values::place` when a page becomes an arena,
+//! and [`take`], called when the next page needs somewhere to go. There is no object both can see.
+//! A cursor is built per column chunk and the string decoder is a free function several calls below
+//! the scan, so connecting them by a parameter means a pool argument on every decoder in
+//! `values.rs` for the benefit of one of them.
 //!
 //! A thread local also happens to be the right place rather than only the convenient one. A run
 //! handed back to the thread that faulted it in is the one whose pages are already in that core's
@@ -45,185 +47,140 @@
 //!
 //! # What it costs when nobody collects
 //!
-//! A parked run is held until another page wants it, and if the scan ends first it is held until
-//! the thread does. That is bounded by [`BUDGET`] bytes on each thread that has read a page large
-//! enough to be worth parking, which is also what stops one enormous run from being kept on the off
-//! chance: a run that does not fit in the budget on its own is never parked at all.
+//! One run per thread, and only while that run is free. The slot holds the last page a string
+//! column was built over, and the next one replaces it whether or not it was ever reused, so a
+//! scan cannot accumulate them. A run still being read downstream costs nothing to have a handle
+//! to, because the vector reading it is holding it up anyway.
+//!
+//! One slot is what stops this from making a short scan worse, and that is not a guess. A version
+//! of this with a thirty two megabyte budget and every cursor parking its buffers on the way out
+//! measured query 37 of ClickBench at 43.98 milliseconds against 42.14, with peak resident memory
+//! up from 35.6 to 51.1 megabytes. Query 37 reads two row groups after pruning, so the arena of the
+//! first was still being read when the second was decompressed, and the ring ended up holding the
+//! first while the second was allocated beside it. Replacing the slot rather than growing a pool
+//! means the worst case is the behaviour without it.
+//!
+//! It also means two string columns in one scan take turns evicting each other and neither is
+//! reused. That is the behaviour this had before it existed, so it is a missed win rather than a
+//! cost, and a slot per column is a change to make when a query that wants it has been measured.
 
 use std::cell::RefCell;
 use std::sync::Arc;
 
 /// Runs smaller than this are left to the allocator, which is better at them than this is.
 ///
-/// glibc serves anything under its mmap threshold out of a free list it already keeps, so parking a
-/// small run buys nothing and costs budget that a page sized run wanted. The threshold moves at run
-/// time, so this is the floor of where it can be rather than where it is.
+/// glibc serves anything under its mmap threshold out of a free list it already keeps, so holding a
+/// small run buys nothing and costs the slot that a page sized run wanted. The threshold moves at
+/// run time, so this is the floor of where it can be rather than where it is.
 const FLOOR: usize = 128 << 10;
 
-/// How many bytes of parked runs one thread holds.
-///
-/// A scan of `hits` wants fifteen of these megabytes for one string column, so this is room for a
-/// couple of them, and a query reading more string columns than that gets the behaviour it had
-/// before this existed, which is an allocation per page. Bounded rather than generous on purpose: a
-/// run parked here is memory a query is not using and cannot be asked to give back, and thirty two
-/// megabytes a thread is already the same order as the chunks a scan has in flight.
-const BUDGET: usize = 32 << 20;
-
 thread_local! {
-    /// The runs this thread is holding a handle to.
+    /// The last page this thread built a string column over.
     ///
-    /// An entry whose strong count is one is free and can be taken back. An entry whose count is
-    /// higher is a page that a vector somewhere downstream is still reading, and it is here because
-    /// it will become free later, which is the whole mechanism: nothing has to be told when a chunk
-    /// dies. Oldest first, because that is the order to give up on.
-    static PARKED: RefCell<Vec<Arc<Vec<u8>>>> = const { RefCell::new(Vec::new()) };
+    /// Free and reusable when its strong count is one. A higher count is a page a vector somewhere
+    /// downstream is still reading, and the handle is here because it will become free later, which
+    /// is the whole mechanism: nothing has to be told when a chunk dies.
+    static PARKED: RefCell<Option<Arc<Vec<u8>>>> = const { RefCell::new(None) };
 }
 
 /// Hands `page` out as an arena and keeps a handle so the run can come back.
 ///
 /// The caller gets a handle to put in a [`Buffer`](rudb_vector::Buffer), and when every vector over
 /// that page has been dropped the handle kept here is the only one left and [`take`] can empty it.
+///
+/// Whatever was in the slot is let go of here, reused or not. A page that has not come free by the
+/// time the next one is built is a page this is not going to get, and holding it while the next one
+/// is allocated beside it is the one way this could cost more memory than it saves.
 pub(crate) fn share(page: Vec<u8>) -> Arc<Vec<u8>> {
     let page = Arc::new(page);
-    keep(&page);
+    if page.capacity() >= FLOOR {
+        PARKED.with_borrow_mut(|parked| *parked = Some(Arc::clone(&page)));
+    }
     page
 }
 
-/// Parks a run whose owner is done with it, for the next page that wants one.
+/// The last page, if nothing is reading it any more.
 ///
-/// What [`share`] does for a run that leaves with a vector, done for one that comes back by value.
-/// An empty run is not parked, so a caller that has nothing to give does not have to check.
-pub(crate) fn park(run: Vec<u8>) {
-    if !run.is_empty() {
-        keep(&Arc::new(run));
-    }
-}
-
-/// Puts a handle on the ring if the run behind it is worth keeping and there is room.
-fn keep(page: &Arc<Vec<u8>>) {
-    let size = page.capacity();
-    if !(FLOOR..=BUDGET).contains(&size) {
-        return;
-    }
-    PARKED.with_borrow_mut(|parked| {
-        let mut held: usize = parked.iter().map(|run| run.capacity()).sum();
-        while held + size > BUDGET && !parked.is_empty() {
-            // The oldest, which has had the longest to be wanted again and was not.
-            held -= parked.remove(0).capacity();
-        }
-        parked.push(Arc::clone(page));
-    });
-}
-
-/// A run of at least `want` bytes to write into, from this thread's ring if one is free.
+/// Empty when the slot is empty or its page is still being read, which is what the first page of a
+/// scan sees and what every page sees on a query that holds on to its chunks. The caller cannot
+/// tell the difference and does not need to: either way it is a `Vec<u8>` to grow into.
 ///
-/// Empty when nothing is free, which is what the first page of a scan sees and what every page sees
-/// on a query that holds on to its chunks. The caller cannot tell the difference and does not need
-/// to: either way it is a `Vec<u8>` to grow into.
+/// It comes back at the length it was, not empty, which is the point. A run that comes back empty
+/// has to be grown before it can be written into, and growing one is an allocation and a walk over
+/// every byte.
 #[must_use]
-pub(crate) fn take(want: usize) -> Vec<u8> {
+pub(crate) fn take() -> Vec<u8> {
     PARKED
         .with_borrow_mut(|parked| {
-            let mut best: Option<usize> = None;
-            for (at, run) in parked.iter().enumerate() {
-                if Arc::strong_count(run) != 1 {
-                    continue;
-                }
-                // The smallest run that is large enough, and the largest run when none is. A scan
-                // holding a ten megabyte arena and a four megabyte read buffer wants them to go back to
-                // the two callers they came from rather than the read buffer taking the arena's run and
-                // the arena then having to grow one.
-                let better = best.is_none_or(|old| {
-                    let (new, old) = (run.capacity(), parked[old].capacity());
-                    if (new >= want) == (old >= want) {
-                        if new >= want { new < old } else { new > old }
-                    } else {
-                        new >= want
-                    }
-                });
-                if better {
-                    best = Some(at);
+            let mut page = parked.take()?;
+            match Arc::get_mut(&mut page) {
+                Some(run) => Some(std::mem::take(run)),
+                None => {
+                    // Still being read, so put the handle back and wait for the next page.
+                    *parked = Some(page);
+                    None
                 }
             }
-            let mut run = parked.swap_remove(best?);
-            Some(std::mem::take(Arc::get_mut(&mut run)?))
         })
         .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BUDGET, FLOOR, PARKED, park, share, take};
+    use std::sync::Arc;
 
-    /// Each test gets a thread of its own, because the ring is per thread and the harness runs
+    use super::{FLOOR, PARKED, share, take};
+
+    /// Each test gets a thread of its own, because the slot is per thread and the harness runs
     /// tests on shared ones. Cheaper than a lock and it is also how the reader uses this.
     fn alone(test: fn()) {
         std::thread::spawn(test).join().expect("the test thread");
     }
 
     #[test]
-    fn a_shared_run_comes_back_once_the_last_reader_of_it_is_gone() {
+    fn a_page_comes_back_once_the_last_reader_of_it_is_gone() {
         alone(|| {
             let page = share(vec![7u8; FLOOR]);
             let address = page.as_ptr();
-            assert!(take(FLOOR).is_empty(), "a run still being read was handed out");
+            assert!(take().is_empty(), "a page still being read was handed out");
             drop(page);
-            let back = take(FLOOR);
-            assert_eq!(back.as_ptr(), address, "the run was reallocated rather than reused");
+            let back = take();
+            assert_eq!(back.as_ptr(), address, "the page was reallocated rather than reused");
+            // The length is the point. A run that comes back empty has to be grown first.
             assert_eq!(back.len(), FLOOR);
-            assert!(take(FLOOR).is_empty(), "the same run was handed out twice");
+            assert!(take().is_empty(), "the same run was handed out twice");
         });
     }
 
     #[test]
-    fn a_parked_run_comes_back_at_the_length_it_was_parked_at() {
+    fn a_page_still_being_read_stays_in_the_slot_rather_than_being_thrown_away() {
         alone(|| {
-            let mut run = vec![0u8; FLOOR];
-            let address = run.as_ptr();
-            park(std::mem::take(&mut run));
-            let back = take(FLOOR);
-            assert_eq!(back.as_ptr(), address);
-            // The length is the point. A run that comes back empty has to be grown before it can be
-            // written into, and growing a vector writes zeros over every byte of it.
-            assert_eq!(back.len(), FLOOR);
+            let page = share(vec![0u8; FLOOR]);
+            assert!(take().is_empty());
+            assert!(PARKED.with_borrow(Option::is_some), "the handle was dropped on a failed take");
+            drop(page);
+            assert!(!take().is_empty(), "the page did not come back after its reader went");
         });
     }
 
     #[test]
-    fn a_run_too_small_or_too_large_to_be_worth_keeping_is_not_kept() {
+    fn a_page_too_small_to_be_worth_keeping_is_not_kept() {
         alone(|| {
-            park(vec![0u8; FLOOR - 1]);
-            assert!(take(FLOOR - 1).is_empty(), "a run under the floor was parked");
-            park(vec![0u8; BUDGET + 1]);
-            assert!(take(BUDGET).is_empty(), "a run over the budget was parked");
-            park(Vec::new());
-            assert!(take(0).is_empty(), "an empty run was parked");
+            drop(share(vec![0u8; FLOOR - 1]));
+            assert!(take().is_empty(), "a run under the floor was kept");
         });
     }
 
+    /// The property that stops this from ever holding more than one spare run. Whatever is in the
+    /// slot is let go of when the next page arrives, reused or not.
     #[test]
-    fn the_ring_holds_the_bytes_it_says_it_holds_and_no_more() {
+    fn the_slot_holds_one_page_and_the_next_one_replaces_it() {
         alone(|| {
-            let held: Vec<_> = (0..8).map(|_| share(vec![0u8; BUDGET / 4])).collect();
-            PARKED.with_borrow(|parked| {
-                let bytes: usize = parked.iter().map(|run| run.capacity()).sum();
-                assert!(bytes <= BUDGET, "{bytes} bytes parked against a budget of {BUDGET}");
-            });
-            drop(held);
-        });
-    }
-
-    /// The reader has two callers of different sizes and they should each get their own run back.
-    #[test]
-    fn the_smallest_run_that_is_large_enough_is_the_one_handed_out() {
-        alone(|| {
-            park(vec![0u8; FLOOR * 4]);
-            park(vec![0u8; FLOOR]);
-            park(vec![0u8; FLOOR * 2]);
-            assert_eq!(take(FLOOR * 2).len(), FLOOR * 2);
-            assert_eq!(take(FLOOR).len(), FLOOR);
-            // Nothing left is large enough, so the largest is better than growing from nothing.
-            assert_eq!(take(FLOOR * 8).len(), FLOOR * 4);
+            let first = share(vec![1u8; FLOOR]);
+            let second = share(vec![2u8; FLOOR * 2]);
+            assert_eq!(Arc::strong_count(&first), 1, "the first page is still held somewhere");
+            drop(second);
+            assert_eq!(take().len(), FLOOR * 2);
         });
     }
 }

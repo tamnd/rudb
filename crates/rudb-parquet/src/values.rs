@@ -789,13 +789,10 @@ mod tests {
             let total = spans.len();
             let data = super::place(&schema, &mut body, &spans, &[], total).expect("it places");
             assert!(body.is_empty(), "the page was copied out of rather than moved");
-            assert!(
-                crate::arena::take(256 << 10).is_empty(),
-                "a run still being read was handed out"
-            );
+            assert!(crate::arena::take().is_empty(), "a run still being read was handed out");
             drop(data);
             assert!(
-                !crate::arena::take(256 << 10).is_empty(),
+                !crate::arena::take().is_empty(),
                 "the arena went to the allocator rather than back to the ring"
             );
         })

@@ -455,20 +455,6 @@ impl Reader {
     }
 }
 
-/// Hands a cursor's two large buffers to the next cursor on this thread.
-///
-/// A cursor is built per column per row group, so without this both of them go back to the
-/// allocator nine times over a scan of `hits` and the next row group starts from nothing. Neither
-/// is pointed at by anything downstream at this point: the compressed bytes never are, and the
-/// decompressed run is empty on the one column type that keeps it, which is a string column and is
-/// what `arena::share` is for.
-impl Drop for Cursor {
-    fn drop(&mut self) {
-        crate::arena::park(std::mem::take(&mut self.encoded));
-        crate::arena::park(std::mem::take(&mut self.spare));
-    }
-}
-
 #[derive(Debug)]
 struct Group {
     columns: Vec<Cursor>,
@@ -843,10 +829,12 @@ impl Cursor {
     /// bytes that the read is about to overwrite is most of what keeping the buffer saved.
     fn body(&mut self, file: &dyn File, prefix: &[u8], total: usize) -> Result<Vec<u8>> {
         let mut encoded = std::mem::take(&mut self.encoded);
-        if encoded.capacity() == 0 {
-            encoded = crate::arena::take(total);
-        }
-        if encoded.len() < total {
+        if encoded.is_empty() {
+            // Every one of these bytes is overwritten two statements down, so the zeros are waste
+            // either way. A fresh buffer gets them from the allocator, which hands back pages the
+            // kernel has not had to write to yet. Growing one by hand writes them a second time.
+            encoded = vec![0u8; total];
+        } else if encoded.len() < total {
             encoded.resize(total, 0);
         }
         encoded.truncate(total);
