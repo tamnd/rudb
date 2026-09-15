@@ -8,6 +8,7 @@
 //! numbers and not rows.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -145,7 +146,7 @@ impl Source for Scan<'_> {
         self.chunks.take()
     }
 
-    fn morsels(&self) -> Option<usize> {
+    fn morsels(&self, _threads: usize) -> Option<usize> {
         Some(self.chunks.total())
     }
 
@@ -195,7 +196,7 @@ impl Source for Dummy {
         self.one.take()
     }
 
-    fn morsels(&self) -> Option<usize> {
+    fn morsels(&self, _threads: usize) -> Option<usize> {
         Some(self.one.total())
     }
 
@@ -373,7 +374,7 @@ impl Source for Series {
             .then(|| Morsel::new(index, start, self.rows.min(start.saturating_add(RUN))))
     }
 
-    fn morsels(&self) -> Option<usize> {
+    fn morsels(&self, _threads: usize) -> Option<usize> {
         Some(usize::try_from(self.rows.div_ceil(RUN)).unwrap_or(usize::MAX))
     }
 
@@ -483,6 +484,133 @@ pub(crate) struct FileScan {
     counters: Option<Arc<Counters>>,
 }
 
+/// How many rows a scan aims to put in one morsel.
+///
+/// A morsel is the unit of work a thread takes, so it decides two things at once: how many threads
+/// can be busy at all, and how evenly the last round of work divides among them. A row group is the
+/// obvious unit and it is the wrong size for both. DuckDB writes a hundred and twenty two thousand
+/// rows into one, so the million row ClickBench file has nine, and nine pieces of work is nine busy
+/// threads on a machine with thirty two and one straggler deciding when everybody is finished.
+///
+/// Thirty two thousand is measured rather than picked. The same suite over copies of that file
+/// written with different row group sizes runs in 898 ms on nine groups, 749 on thirty one and 768
+/// on sixty one, all at eight threads, and at thirty two threads the nine group file is slower than
+/// it was at eight while the thirty one group file is faster again at 676.
+///
+/// Whether a row group is cut at all is [`morsel_rows`], which asks the file how long its pages are
+/// first, because a morsel cannot start inside a page for free.
+const MORSEL_ROWS: usize = 32_768;
+
+/// How many times what a morsel wastes it has to read before the cutting is worth doing.
+///
+/// A morsel that starts inside a page pays for that page decoded twice, once by the morsel that ends
+/// in it and once by the morsel that starts in it. The columns of a row group do not break their
+/// pages in the same places, so a boundary costs one page of every column read, and holding a
+/// morsel's first pages against the bytes it goes on to read is what says whether that is a rounding
+/// error or the whole read.
+///
+/// Four is the smallest number that still refuses the file DuckDB writes, where the first page of a
+/// chunk is the whole chunk and the waste is not a quarter but everything. A page a quarter of a
+/// morsel long is measured to be worth cutting anyway: the ClickBench suite over a copy of the file
+/// written with 64 KB pages runs in 770 ms at thirty two threads against 909 uncut.
+///
+/// Asking in bytes rather than in rows matters, and asking in rows is what this did first and got
+/// wrong. A column with four distinct values packs a whole row group into one page of two bit
+/// dictionary indices, so the longest page of a file measured in rows is always the cheapest column
+/// in it, and a file of small pages was refused because of the one column that cost nothing to read.
+const FINE: u64 = 4;
+
+/// How many rows one morsel of a row group covers, or zero to hand out whole row groups.
+///
+/// Two things have to be true before a row group is worth cutting, and on the files this engine is
+/// measured against neither of them is.
+///
+/// There have to be threads with nothing to do. A file of nine row groups already keeps eight
+/// threads busy, so cutting it costs the cutting and buys nothing, and the cut is made exactly fine
+/// enough to give every thread a piece rather than as fine as it will go.
+///
+/// The pages have to be small. A morsel steps over whole pages for free but decodes the page its
+/// first row sits in, so a page as long as a row group means a group cut four ways is a group
+/// decoded four times. DuckDB writes exactly that, one page per column chunk, and cutting its files
+/// anyway is a measured disaster: the suite at one thread went from 2.9 seconds to 5.9 with the scan
+/// reading, decompressing and decoding four times the bytes for the same answers.
+fn morsel_rows(reader: &FileReader, groups: usize, threads: usize) -> usize {
+    let FileReader::Parquet(parquet) = reader else { return 0 };
+    if groups == 0 || threads <= groups {
+        return 0;
+    }
+    let page = parquet.page_bytes().unwrap_or(u64::MAX);
+    cut_rows(page, parquet.chunk_bytes(), group_rows(parquet, 0), groups, threads)
+}
+
+/// The arithmetic of [`morsel_rows`], with the file already asked its questions.
+///
+/// `page` is what a morsel reads before it reads a row it wants, `whole` what reading the group it
+/// is part of costs, and `rows` how many rows that group holds, all over the projected columns.
+fn cut_rows(page: u64, whole: u64, rows: usize, groups: usize, threads: usize) -> usize {
+    if groups == 0 || threads <= groups || rows == 0 || page == 0 {
+        return 0;
+    }
+    let cut = rows.div_ceil(threads.div_ceil(groups)).max(MORSEL_ROWS);
+    let taking = u64::try_from(cut.min(rows)).unwrap_or(u64::MAX);
+    let each = whole / u64::try_from(rows).unwrap_or(u64::MAX) * taking;
+    if page.saturating_mul(FINE) > each { 0 } else { cut }
+}
+
+/// The rows of the next morsel of a row group of `rows` rows, `part` of which are handed out.
+///
+/// Even pieces rather than full ones and a remainder, because the remainder is the piece everybody
+/// else waits for. A group of a hundred and twenty three thousand rows is four morsels of thirty one
+/// thousand rather than three of thirty two thousand and one of twenty five.
+///
+/// An empty range means the group is done, and a group of no rows is done straight away, which is
+/// what stops a file with an empty row group in it from being cut forever.
+fn next_piece(rows: usize, part: usize, target: usize) -> Range<usize> {
+    let each = rows.div_ceil(parts(rows, target));
+    let upto = part.saturating_add(each).min(rows);
+    part.min(upto)..upto
+}
+
+/// How many morsels a row group of `rows` rows is cut into, which is one when `target` is zero.
+fn parts(rows: usize, target: usize) -> usize {
+    if target == 0 {
+        return 1;
+    }
+    rows.div_ceil(target).max(1)
+}
+
+/// How many rows the row group at `at` holds, or none if it is not a group this file has.
+fn group_rows(reader: &Reader, at: usize) -> usize {
+    reader
+        .metadata()
+        .row_groups
+        .get(at)
+        .map_or(0, |group| usize::try_from(group.rows).unwrap_or(usize::MAX))
+}
+
+/// Decides how finely the file being cut is worth cutting, and how many morsels that comes to.
+///
+/// Called when a file is opened and again when the scheduler says how many threads it has, which
+/// happens in that order on the first file and the other way round on the rest. Both are cheap: the
+/// page size is read once per file and the rest is arithmetic over the footer.
+fn aim(cutting: &mut Cutting) {
+    let Some(reader) = cutting.reader.as_ref() else { return };
+    cutting.cut = morsel_rows(reader, cutting.groups, cutting.threads);
+    cutting.pieces = pieces(reader, cutting.cut);
+}
+
+/// How many morsels a whole file comes to, which is what [`Source::morsels`] answers with.
+fn pieces(reader: &FileReader, target: usize) -> usize {
+    let FileReader::Parquet(reader) = reader else { return 1 };
+    reader
+        .metadata()
+        .row_groups
+        .iter()
+        .map(|group| parts(usize::try_from(group.rows).unwrap_or(usize::MAX), target))
+        .sum::<usize>()
+        .max(1)
+}
+
 /// Where the cutting has got to.
 ///
 /// One file's worth of morsels is cut at a time, and the reader the Parquet splits come off is kept
@@ -496,6 +624,29 @@ struct Cutting {
     /// The next row group of that file to hand out, and one past its last.
     group: usize,
     groups: usize,
+    /// How many rows of that row group have been handed out already.
+    ///
+    /// A row group is cut into several morsels when it is large enough to be worth cutting, so the
+    /// cutting sits inside a group as well as between them. Zero whenever the next morsel starts a
+    /// group, which is every morsel of a file whose groups are small.
+    part: usize,
+    /// How many rows one morsel of a row group of this file covers, or zero for whole row groups.
+    ///
+    /// Worked out when the file is opened and again when the scheduler says how many threads it has,
+    /// because whether cutting a group pays depends on the page size the writer chose and on there
+    /// being a thread with nothing else to do.
+    cut: usize,
+    /// How many threads the scheduler said it would lend, which is one until it says otherwise.
+    ///
+    /// [`Source::morsels`] is asked before any instance starts and is given the ceiling, so this is
+    /// set by the time the cutting matters. One until then, which means no cutting, because a scan
+    /// nobody told is a scan that should not be inventing work.
+    threads: usize,
+    /// How many morsels the whole of the file being cut comes to.
+    ///
+    /// Worked out once when the file is opened, because [`Source::morsels`] is asked before any of
+    /// them is handed out and it is asked to decide how many instances of a pipeline to build.
+    pieces: usize,
     /// [`FileScan::tests`] against the column numbers of the file being cut.
     skipping: Vec<Test>,
     /// How many row groups the bounds have ruled out so far, over every file of the scan.
@@ -573,6 +724,10 @@ impl FileScan {
                 reader: None,
                 group: 0,
                 groups: 0,
+                part: 0,
+                cut: 0,
+                threads: 1,
+                pieces: 1,
                 skipping: Vec::new(),
                 skipped: 0,
                 row: 0,
@@ -608,6 +763,9 @@ impl FileScan {
         cutting.row = 0;
         cutting.group = 0;
         cutting.groups = 0;
+        cutting.part = 0;
+        cutting.cut = 0;
+        cutting.pieces = 1;
         cutting.skipping = Vec::new();
         let Some(path) = self.paths.get(cutting.at) else { return Ok(()) };
         let mut reader = FileReader::open(self.function, path, self.given)?;
@@ -625,6 +783,7 @@ impl FileScan {
             .collect();
         cutting.reader = Some(reader);
         cutting.at += 1;
+        aim(cutting);
         Ok(())
     }
 
@@ -654,10 +813,19 @@ impl FileScan {
         let piece = match cutting.reader.as_ref() {
             Some(FileReader::Parquet(reader)) if cutting.group < cutting.groups => {
                 let at = cutting.group;
-                let split = reader.split(at..at + 1)?;
-                cutting.group += 1;
+                let rows = group_rows(reader, at);
+                let piece = next_piece(rows, cutting.part, cutting.cut);
+                let split = reader.split_rows(at, piece.clone())?;
+                if piece.end >= rows {
+                    cutting.group += 1;
+                    cutting.part = 0;
+                } else {
+                    cutting.part = piece.end;
+                }
                 let row = cutting.row;
-                cutting.row = cutting.row.saturating_add(reader.metadata().row_groups[at].rows);
+                cutting.row = cutting
+                    .row
+                    .saturating_add(i64::try_from(piece.end - piece.start).unwrap_or(i64::MAX));
                 Piece { file, reader: Some(FileReader::Parquet(split)), failure: None, row }
             }
             Some(FileReader::Csv(_)) => {
@@ -770,18 +938,19 @@ impl Source for FileScan {
         }
     }
 
-    /// The first file's row groups, taken as what every file in the list looks like.
+    /// The first file's morsels, taken as what every file in the list looks like.
     ///
     /// The first file is already open, because opening it is how a scan reports a file that has
-    /// gone missing since it was bound, so its row group count is there to be read without opening
-    /// anything. The rest are assumed to match, which is right for a directory written by one
-    /// writer and is the case worth being right about. A CSV file has one morsel however large it
-    /// is, since a CSV reader cannot be positioned, so a list of CSV files is as many morsels as
+    /// gone missing since it was bound, so what its row groups come to is there to be read without
+    /// opening anything. The rest are assumed to match, which is right for a directory written by
+    /// one writer and is the case worth being right about. A CSV file has one morsel however large
+    /// it is, since a CSV reader cannot be positioned, so a list of CSV files is as many morsels as
     /// there are files.
-    fn morsels(&self) -> Option<usize> {
-        let cutting = self.cutting.lock().ok()?;
-        let each = cutting.groups.max(1);
-        Some(each.saturating_mul(self.paths.len().max(1)))
+    fn morsels(&self, threads: usize) -> Option<usize> {
+        let mut cutting = self.cutting.lock().ok()?;
+        cutting.threads = threads;
+        aim(&mut cutting);
+        Some(cutting.pieces.max(1).saturating_mul(self.paths.len().max(1)))
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
@@ -1009,7 +1178,7 @@ impl Source for Values {
         self.handout.take()
     }
 
-    fn morsels(&self) -> Option<usize> {
+    fn morsels(&self, _threads: usize) -> Option<usize> {
         Some(self.handout.total())
     }
 
@@ -1034,7 +1203,25 @@ mod tests {
     use rudb_plan::{Node, Plan};
     use rudb_vector::Chunk;
 
-    use super::{Bound, FileScan, Handout, Op, Probe, RUN, Scan, Schema, Series, VECTOR_SIZE};
+    use super::{
+        Bound, FileScan, Handout, Op, Probe, RUN, Scan, Schema, Series, VECTOR_SIZE, cut_rows,
+        next_piece, parts,
+    };
+
+    /// Every morsel a row group of `rows` rows is cut into, by asking for them the way `cut` does.
+    fn cutting(rows: usize, target: usize) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let mut part = 0;
+        loop {
+            let piece = next_piece(rows, part, target);
+            if piece.is_empty() {
+                return out;
+            }
+            part = piece.end;
+            out.push(piece);
+            assert!(out.len() <= rows + 1, "cutting {rows} rows into {target} did not terminate");
+        }
+    }
 
     /// A series without going through a plan, which is what `Series::new` is for.
     fn series(start: i64, step: i64, rows: u64) -> Series {
@@ -1317,5 +1504,100 @@ mod tests {
 
         assert_eq!(counted_rows(&scan), 0);
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
+    }
+
+    /// The cutting of a row group, driven directly because every committed fixture is smaller than
+    /// one morsel and so cannot be cut into more than one.
+    #[test]
+    fn the_morsels_of_a_row_group_tile_it_once_each() {
+        for rows in [1, 2, 7, 9, 10, 100, 4_095, 4_096, 4_097, 122_880, 123_554] {
+            for target in [1, 2, 3, 300, 4_096, 32_768] {
+                let pieces = cutting(rows, target);
+                assert_eq!(pieces.len(), parts(rows, target), "{rows} rows in morsels of {target}");
+                let mut at = 0;
+                for piece in &pieces {
+                    assert_eq!(piece.start, at, "{rows} rows in morsels of {target}");
+                    assert!(piece.len() <= target, "{rows} rows in morsels of {target}");
+                    at = piece.end;
+                }
+                assert_eq!(at, rows, "{rows} rows in morsels of {target}");
+            }
+        }
+    }
+
+    /// Even morsels rather than full ones and a remainder, because the remainder is the morsel every
+    /// other thread waits for.
+    #[test]
+    fn a_row_group_is_cut_into_even_morsels() {
+        // A DuckDB row group in four, which is 30889 rows three times and 30887 once rather than
+        // 32768 three times and 25250 once.
+        let pieces = cutting(123_554, 32_768);
+        assert_eq!(pieces.len(), 4);
+        let longest = pieces.iter().map(std::ops::Range::len).max().expect("four morsels");
+        let shortest = pieces.iter().map(std::ops::Range::len).min().expect("four morsels");
+        assert_eq!(longest, 30_889);
+        assert_eq!(shortest, 30_887);
+        assert!(longest - shortest < pieces.len(), "morsels of {longest} and {shortest} rows");
+    }
+
+    /// The common case, which is every row group of every file small enough not to be worth cutting.
+    #[test]
+    fn a_row_group_no_larger_than_a_morsel_is_one_morsel() {
+        assert_eq!(cutting(2_048, 32_768), vec![0..2_048]);
+        assert_eq!(cutting(32_768, 32_768), vec![0..32_768]);
+        assert_eq!(parts(2_048, 32_768), 1);
+    }
+
+    /// What stops a file with an empty row group in it from being cut forever. The group is counted
+    /// as one morsel by `parts` and handed out as none, which is the safe way round because the
+    /// count is only ever used to decide how many copies of a pipeline to build.
+    #[test]
+    fn an_empty_row_group_is_no_morsels() {
+        assert!(next_piece(0, 0, 32_768).is_empty());
+        assert_eq!(cutting(0, 32_768), Vec::new());
+        assert_eq!(cutting(0, 0), Vec::new());
+    }
+
+    /// A file whose pages are as long as its row groups, which is every file DuckDB writes. The cut
+    /// is turned off rather than made small, because a morsel that starts inside a page decodes that
+    /// page whole and then throws most of it away.
+    #[test]
+    fn a_row_group_that_is_not_worth_cutting_is_one_morsel() {
+        assert_eq!(cutting(123_554, 0), vec![0..123_554]);
+        assert_eq!(parts(123_554, 0), 1);
+        assert_eq!(parts(0, 0), 1);
+    }
+
+    /// How finely a file is cut, as a function of the threads there are to keep busy. Driven through
+    /// the arithmetic rather than through a scan, because a committed fixture is one row group of
+    /// 2048 rows and the question is about a file of nine groups of a hundred and twenty thousand.
+    #[test]
+    fn a_file_is_cut_only_as_finely_as_there_are_threads_to_want_it() {
+        // A million rows in nine row groups, which is what DuckDB writes, with pages small enough
+        // that cutting is allowed at all.
+        // Sixty four threads want eight pieces of each group and get four, because `MORSEL_ROWS` is
+        // the floor on how small a piece is worth being whatever the machine has.
+        let rows = 123_554;
+        let whole = 12_355_400;
+        for (threads, wanted) in [(1, 1), (8, 1), (9, 1), (16, 2), (32, 4), (64, 4)] {
+            let cut = cut_rows(1024, whole, rows, 9, threads);
+            assert_eq!(parts(rows, cut), wanted, "{threads} threads over nine row groups");
+        }
+    }
+
+    /// The other half of the rule. However many threads are waiting, a file whose first page costs
+    /// a morsel more than a quarter of what the morsel reads is handed out a row group at a time.
+    #[test]
+    fn a_file_of_coarse_pages_is_not_cut_however_many_threads_there_are() {
+        // A hundred bytes a row, so the finest morsel this rule makes of a group of 123_554 rows is
+        // `MORSEL_ROWS` rows and 3_276_800 bytes, a quarter of which is 819_200.
+        let rows = 123_554;
+        let whole = 12_355_400;
+        assert_eq!(cut_rows(whole, whole, rows, 9, 64), 0, "one page per chunk, as DuckDB writes");
+        assert_eq!(cut_rows(819_201, whole, rows, 9, 64), 0);
+        assert_eq!(cut_rows(0, whole, rows, 9, 64), 0);
+        assert_eq!(cut_rows(1024, 0, rows, 9, 64), 0, "a group of no bytes is never worth cutting");
+        // The largest first page the rule lets through at the finest cut it makes.
+        assert!(cut_rows(819_200, whole, rows, 9, 64) > 0);
     }
 }

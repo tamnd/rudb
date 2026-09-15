@@ -81,7 +81,7 @@ impl Source for Buffered {
         Some(Morsel::new(index, index, index + 1))
     }
 
-    fn morsels(&self) -> Option<usize> {
+    fn morsels(&self, _threads: usize) -> Option<usize> {
         self.len().ok()
     }
 
