@@ -113,7 +113,13 @@ impl<'a> Hybrid<'a> {
                 }
                 Run::Packed { start, total, done } => {
                     let take = (total - done).min(left);
-                    self.unpack(out, start, done, take);
+                    // Grown and then written rather than pushed into, because a push is a capacity
+                    // test and a length update per value and the unpacker below is three
+                    // instructions per value. Zeroing the space first costs a `memset` over the
+                    // batch, which is a few bytes a cycle and disappears next to what it replaces.
+                    let base = out.len();
+                    out.resize(base + take, 0);
+                    self.unpack(&mut out[base..], start, done);
                     left -= take;
                     if done + take == total {
                         self.at = start + self.packed_bytes(total);
@@ -228,11 +234,9 @@ impl<'a> Hybrid<'a> {
         total * usize::from(self.width) / 8
     }
 
-    /// Unpacks `count` values from the run at `start`, skipping the `done` already handed out.
-    fn unpack(&mut self, out: &mut Vec<u32>, start: usize, done: usize, count: usize) {
-        // Narrowing back to 32 bits loses nothing: `Hybrid::new` refuses a width past 32, so
-        // every value the unpacker produces here already fits.
-        unpack(&self.bytes[start..], self.width, done, count, |value| out.push(value as u32));
+    /// Fills `out` from the run at `start`, skipping the `done` values already handed out.
+    fn unpack(&mut self, out: &mut [u32], start: usize, done: usize) {
+        unpack_into(&self.bytes[start..], self.width, done, out);
     }
 
     /// A little-endian base 128 varint, which is what a run header is.
@@ -349,6 +353,135 @@ pub(crate) fn unpack(
     }
 }
 
+/// Fills `out` with bit packed values of `width` bits each, starting `skip` values into `bytes`.
+///
+/// Same packing and same answers as [`unpack`], and the tests hold the two against each other for
+/// every width and every start. The difference is that this one knows where the values are going, so
+/// the bulk of a batch can skip the accumulator entirely.
+///
+/// # Why the accumulator is not enough
+///
+/// [`unpack`] carries a 128 bit accumulator across values because it has to: it hands values to a
+/// closure one at a time and cannot see where the batch ends. That costs a `bits < width` test, a
+/// variable width shift of a 128 bit value, which x86 does not have and the compiler builds out of
+/// several instructions, and a bounds checked `Vec::push` through a function pointer. Sixteen
+/// instructions a value, and a ten column integer scan of `hits` spent 22 percent of its
+/// instructions and 38 percent of its mispredicted branches in here, more than any other function in
+/// the program.
+///
+/// # What replaces it
+///
+/// A group of eight values is exactly `width` bytes, which is the one thing the format guarantees
+/// about where values sit. So groups start on byte boundaries, a group can be read without carrying
+/// anything from the group before, and once the width is a constant every shift and mask in a group
+/// is a constant too. That is [`packed_groups`], and it is two loads and eight shift and mask pairs
+/// for eight values with no test between them, which the compiler is then free to unroll and
+/// vectorize.
+///
+/// The width is a constant because [`packed`] dispatches on it once per batch rather than per value.
+///
+/// # The two ends
+///
+/// A caller does not always start on a group boundary: a page's worth of values can end part way
+/// through a run and the next read picks up mid group. Those leading values go through [`unpack`],
+/// and there are at most seven of them.
+///
+/// The trailing values go through [`unpack`] too, for a different reason. Reading a group takes a
+/// sixteen byte window from the group's start, whatever the width, and near the end of the buffer
+/// that window would run off it. The format says bits past the end read as zero, which [`unpack`]
+/// does and a plain load cannot, so the last groups of a run that sits at the end of a page take the
+/// slow path. In a real file that is the last group or two of the last column chunk.
+pub(crate) fn unpack_into(bytes: &[u8], width: u8, skip: usize, out: &mut [u32]) {
+    if width == 0 {
+        // Same case as in `unpack`: no bytes, and every value is zero.
+        out.fill(0);
+        return;
+    }
+    let stride = usize::from(width);
+    // The values between here and the next group boundary, which is where the unrolled path starts.
+    let head = ((8 - skip % 8) % 8).min(out.len());
+    let start = (skip + head) / 8 * stride;
+    // How far past a group's first byte the pair of loads reaches. The first four values are the low
+    // `4 * width` bits, which fit in sixteen bytes, and the last four start at byte `4 * width / 8`
+    // and fit in sixteen bytes from there.
+    let window = 4 * stride / 8 + 16;
+    let room = bytes.len().saturating_sub(start);
+    let groups = if room >= window { (room - window) / stride + 1 } else { 0 };
+    let fast = groups.min((out.len() - head) / 8) * 8;
+
+    let (front, rest) = out.split_at_mut(head);
+    let (middle, back) = rest.split_at_mut(fast);
+    one_at_a_time(bytes, width, skip, front);
+    packed(bytes, width, start, middle);
+    one_at_a_time(bytes, width, skip + head + fast, back);
+}
+
+/// Sends whole groups of eight to the routine written for their width.
+///
+/// One `match` per batch rather than a test per value. Thirty two arms because there are thirty two
+/// widths, and each one is the same loop with different constants in it.
+fn packed(bytes: &[u8], width: u8, start: usize, out: &mut [u32]) {
+    macro_rules! arms {
+        ($($w:literal)*) => {
+            match width {
+                $($w => packed_groups::<$w>(bytes, start, out),)*
+                // Not reachable: `Hybrid::new` refuses a width past 32 and zero was handled by the
+                // caller. Answering anyway rather than panicking, so that a caller who one day
+                // passes a wider width is slow rather than dead.
+                _ => one_at_a_time(bytes, width, start * 8 / usize::from(width), out),
+            }
+        };
+    }
+    arms!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32);
+}
+
+/// Fills `out` with whole groups of eight `W` bit values, starting at byte `start`.
+///
+/// `out` must be a multiple of eight long and the caller must have checked that the last group's
+/// sixteen byte windows are inside `bytes`.
+fn packed_groups<const W: usize>(bytes: &[u8], start: usize, out: &mut [u32]) {
+    let mask = if W == 32 { u32::MAX } else { (1u32 << W) - 1 };
+    // Where the fifth value's byte is, and how far into that byte it starts. Both constants.
+    let split = 4 * W / 8;
+    let skew = (4 * W) % 8;
+    for (group, slot) in out.chunks_exact_mut(8).enumerate() {
+        let at = start + group * W;
+        let low = window_at(bytes, at);
+        let high = window_at(bytes, at + split);
+        // row at a time: four is the whole loop and the compiler unrolls it, because `W` is a
+        // constant and so every shift below is one too.
+        for i in 0..4 {
+            slot[i] = ((low >> (i * W)) as u32) & mask;
+            slot[i + 4] = ((high >> (skew + i * W)) as u32) & mask;
+        }
+    }
+}
+
+/// The sixteen bytes at `at` as one number, which is as much of a group as a register holds.
+///
+/// Sixteen and not eight because four values of the widest width are exactly a hundred and twenty
+/// eight bits, so a `u128` is the smallest thing that holds half a group whatever the width.
+#[inline]
+fn window_at(bytes: &[u8], at: usize) -> u128 {
+    let window: [u8; 16] = bytes[at..at + 16].try_into().expect("sixteen bytes");
+    u128::from_le_bytes(window)
+}
+
+/// Fills `out` through [`unpack`], for the values at either end that the unrolled path cannot take.
+fn one_at_a_time(bytes: &[u8], width: u8, skip: usize, out: &mut [u32]) {
+    let count = out.len();
+    if count == 0 {
+        return;
+    }
+    let mut at = 0;
+    // Narrowing back to 32 bits loses nothing: every caller of this has a width of at most 32, so
+    // every value the unpacker produces already fits.
+    unpack(bytes, width, skip, count, |value| {
+        out[at] = value as u32;
+        at += 1;
+    });
+}
+
 /// How many bits a level of at most `max` needs.
 ///
 /// Zero for a required column, which is the case worth getting right: the width is not one, the
@@ -359,7 +492,7 @@ pub(crate) fn width_for(max: u32) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hybrid, unpack, width_for};
+    use super::{Hybrid, unpack, unpack_into, width_for};
 
     /// A run of `times` copies of `value`, at `width` bits.
     fn repeat(times: u64, value: u32, width: u8) -> Vec<u8> {
@@ -652,6 +785,69 @@ mod tests {
                 let mut got = Vec::new();
                 unpack(short, width, 0, 30, |value| got.push(value));
                 assert_eq!(got, wanted, "width {width} over {cut} bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn the_unrolled_unpacker_answers_what_the_one_at_a_time_one_answers() {
+        // Every width, every start inside a group, and enough values to cover the leading part, a
+        // few whole groups and the trailing part. The three pieces meeting in the right places is
+        // the whole of what this unpacker gets wrong when it is wrong.
+        let bytes: Vec<u8> = (0..255u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        for width in 0..=32u8 {
+            for skip in 0..17 {
+                for count in [0usize, 1, 7, 8, 9, 16, 31, 64] {
+                    let wanted: Vec<u32> =
+                        window(&bytes, width, skip, count).iter().map(|&v| v as u32).collect();
+                    let mut got = vec![0u32; count];
+                    unpack_into(&bytes, width, skip, &mut got);
+                    assert_eq!(got, wanted, "width {width}, skip {skip}, count {count}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_unrolled_unpacker_finds_zeroes_past_the_end_like_the_other_one() {
+        // The trailing groups of a run that sits at the end of the buffer cannot take the unrolled
+        // path, because its sixteen byte window would read off the end and the format says those
+        // bits are zero. Cutting the buffer at every length puts that boundary in every place it
+        // can be.
+        let bytes: Vec<u8> = (0..40u8).collect();
+        for width in [1u8, 3, 7, 8, 12, 16, 17, 31, 32] {
+            for cut in 0..=bytes.len() {
+                let short = &bytes[..cut];
+                for skip in [0usize, 3, 8] {
+                    let wanted: Vec<u32> =
+                        window(short, width, skip, 48).iter().map(|&v| v as u32).collect();
+                    let mut got = vec![0u32; 48];
+                    unpack_into(short, width, skip, &mut got);
+                    assert_eq!(got, wanted, "width {width} over {cut} bytes from {skip}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_packed_run_read_in_pieces_is_the_same_run() {
+        // A page's worth of values can end part way through a packed run, so the next read starts
+        // mid group. Reading one run in every split there is checks that the leading values and the
+        // run position survive the handover.
+        let values: Vec<u32> = (0..200u32).map(|i| i.wrapping_mul(2_654_435_761) >> 20).collect();
+        for width in [1u8, 5, 12, 16, 21, 32] {
+            let capped: Vec<u32> = values
+                .iter()
+                .map(|&v| if width == 32 { v } else { v & ((1 << width) - 1) })
+                .collect();
+            let bytes = packed(&capped, width);
+            for first in 0..=capped.len() {
+                let mut stream =
+                    Hybrid::new(&bytes, width).expect("a width this narrow is allowed");
+                let mut out = Vec::new();
+                stream.read(&mut out, first).expect("the run holds this many");
+                stream.read(&mut out, capped.len() - first).expect("and the rest");
+                assert_eq!(out, capped, "width {width} split at {first}");
             }
         }
     }
