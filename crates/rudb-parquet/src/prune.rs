@@ -26,9 +26,19 @@
 //! group that is all nulls could be skipped for any comparison at all, because `nulls` is optional in
 //! the format and the saving is a group that is cheap to read anyway.
 //!
-//! Page level bounds are the next step and are not here. The column index and offset index are a
-//! separate footer structure this reader does not parse yet, and a row group is the unit the scan
-//! already hands out as a morsel, so the group level decision is the one that costs nothing to act on.
+//! Page level bounds are not here, and the reason is that they are not in the files. The column
+//! index and the offset index are a separate structure that the footer only points at, and
+//! [`ColumnChunk::column_index`] reads the pointer. On the `hits.parquet` that ClickBench
+//! distributes, written by parquet-cpp 1.5.1, there is no pointer to read, and DuckDB v1.4.1 writes
+//! none either, so on every file this engine is measured against the bounds a page level skip would
+//! be decided on were never written. `tests/pageindex.rs` is that finding as a test.
+//!
+//! It would not have helped on the query that costs the most even if they were there. DuckDB writes
+//! `URL` as one plain page per row group, ten and a half megabytes of it, so the page and the row
+//! group are the same unit on the one column worth skipping. Finer bounds need a file with finer
+//! pages in it, which is a writer decision rather than a reader one.
+//!
+//! [`ColumnChunk::column_index`]: crate::ColumnChunk::column_index
 //!
 //! [`read_stats`]: crate::metadata::read_stats
 //! [`Stats`]: crate::metadata::Stats
@@ -282,6 +292,8 @@ mod tests {
                     min: low.map(|number| number.to_le_bytes().to_vec()),
                     max: high.map(|number| number.to_le_bytes().to_vec()),
                 }),
+                column_index: None,
+                offset_index: None,
             }],
             rows: 100,
             bytes: 400,
