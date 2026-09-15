@@ -194,6 +194,21 @@ pub mod fallback {
     pub use rudb_kernels::fallback::{report, reset};
 }
 
+/// Statements written out of the grammar, for a harness that needs queries nobody wrote.
+///
+/// A module rather than a flat re-export because `Catalog` here is a pool of names to write
+/// statements out of and a catalog everywhere else in the engine is where a real table lives, and
+/// the two should not be one word apart at a call site.
+///
+/// It is published from the facade rather than left in `rudb-parse` for the reason in
+/// `spec/13-client-api.md`: a program embedding rudb depends on this crate and on nothing else, and
+/// the compatibility harness is the closest thing this project has to one of those. A generator it
+/// could only reach by depending on an internal crate would be a generator that teaches us nothing
+/// about the boundary.
+pub mod generate {
+    pub use rudb_parse::generate::{Catalog, Generator, Table};
+}
+
 /// Arrow interchange, which is what [`QueryResult::to_arrow`] hands back.
 ///
 /// A module rather than a flat re-export because Arrow has a `Field` and a `Schema` of its own and

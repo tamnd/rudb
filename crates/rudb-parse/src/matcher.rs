@@ -745,7 +745,7 @@ fn is_bare_operator(text: &str) -> bool {
 ///
 /// A table rather than a `match`, because the discriminants are dense and written by the generator
 /// and the table is checked against them by `the_suggestions_are_dense_and_in_order`.
-const SUGGESTIONS: [Suggestion; 11] = [
+pub(crate) const SUGGESTIONS: [Suggestion; 11] = [
     Suggestion::Variable,
     Suggestion::CatalogName,
     Suggestion::SchemaName,
