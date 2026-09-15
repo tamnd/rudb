@@ -71,7 +71,7 @@
 //! still to come and belongs here rather than up there.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use rudb_common::stage::{Stage, Timing};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
@@ -83,7 +83,87 @@ use crate::chunk::Pages;
 use crate::metadata::{Metadata, SchemaColumn};
 use crate::page::Body;
 
-type PickedColumns = Vec<(usize, Vec<Value>)>;
+type PickedColumns = Vec<(usize, usize, Vec<Value>)>;
+
+/// One column chunk of one row group, and where its values belong when they come back.
+///
+/// The unit of work a fetch hands a thread. It used to be a column, with the row groups done one
+/// after another, and that left the threads waiting on whichever column of the row group in hand
+/// was the widest. A fetch of ten rows touches five row groups on `hits-1m-snappy.parquet`, so
+/// there were always five times as many of these available as were being run at once.
+#[derive(Debug)]
+struct Job {
+    /// Which of the touched row groups this came from, counting only the ones that hold a row.
+    order: usize,
+    /// Which projected column, which is where the values go.
+    column: usize,
+    cursor: Cursor,
+}
+
+/// How many bytes of column chunk one fetch keeps open at once.
+///
+/// The number that matters is what a worker holds while it works: the chunk it read and the page it
+/// decompressed out of it. Sixteen workers all on the widest columns of the file was worth a hundred
+/// megabytes of peak RSS on ClickBench against reading a row group at a time, which is a bad trade
+/// for the twenty seven milliseconds the wider spread bought. Thirty two megabytes is enough for the
+/// widest chunk of `hits.parquet` several times over, so the big columns still overlap, and it is
+/// small enough that the fetch is not what a query is remembered for.
+const FETCH_BUDGET: usize = 32 << 20;
+
+/// The jobs of one fetch, and how many bytes of them are open.
+#[derive(Debug)]
+struct Queue {
+    /// Widest first, each taken out as a worker claims it.
+    jobs: Vec<Option<Job>>,
+    /// How many are still there, so a worker knows to stop rather than scanning an empty list.
+    left: usize,
+    inflight: usize,
+}
+
+/// The next job a worker should run, or nothing when there are none left.
+///
+/// Widest first among the ones that fit in what is left of the budget. A worker that finds nothing
+/// small enough waits, and whoever finishes wakes it. Nothing fits and nothing is open cannot
+/// happen, because the first job is always allowed when the budget is untouched.
+fn claim(queue: &Mutex<Queue>, room: &Condvar) -> Result<Option<Job>> {
+    let mut held =
+        queue.lock().map_err(|_| Error::internal("a Parquet fetch queue was poisoned"))?;
+    loop {
+        if held.left == 0 {
+            return Ok(None);
+        }
+        let inflight = held.inflight;
+        let at = held.jobs.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|job| inflight == 0 || inflight + job.cursor.len <= FETCH_BUDGET)
+        });
+        match at {
+            Some(at) => {
+                let job = held.jobs[at].take().ok_or_else(|| {
+                    Error::internal("a Parquet fetch claimed a job that was already taken")
+                })?;
+                held.left -= 1;
+                held.inflight = held.inflight.saturating_add(job.cursor.len);
+                return Ok(Some(job));
+            }
+            None => {
+                held = room
+                    .wait(held)
+                    .map_err(|_| Error::internal("a Parquet fetch queue was poisoned"))?;
+            }
+        }
+    }
+}
+
+/// Gives the budget back and wakes whoever was waiting for it.
+fn release(queue: &Mutex<Queue>, room: &Condvar, bytes: usize) -> Result<()> {
+    let mut held =
+        queue.lock().map_err(|_| Error::internal("a Parquet fetch queue was poisoned"))?;
+    held.inflight = held.inflight.saturating_sub(bytes);
+    drop(held);
+    room.notify_all();
+    Ok(())
+}
 
 /// A Parquet file, read as chunks.
 #[derive(Debug)]
@@ -271,8 +351,8 @@ impl Reader {
                 )));
             }
         }
-        let mut picked: Vec<Vec<Value>> =
-            self.projection.iter().map(|_| Vec::with_capacity(rows.len())).collect();
+        let mut wanted: Vec<Vec<usize>> = Vec::new();
+        let mut touched: Vec<usize> = Vec::new();
         let mut base = 0_u64;
         let mut next = 0;
         for at in 0..self.metadata.row_groups.len() {
@@ -289,73 +369,36 @@ impl Reader {
                 next += 1;
             }
             base = end;
-            if local.is_empty() {
-                continue;
+            if !local.is_empty() {
+                wanted.push(local);
+                touched.push(at);
             }
-            let plan = self.locate(at)?;
-            let cursors: Vec<Cursor> = plan.iter().map(|column| self.read_column(column)).collect();
-            let workers = std::thread::available_parallelism()
-                .map_or(1, std::num::NonZero::get)
-                .min(16)
-                .min(cursors.len());
-            let read = if workers > 1 && cursors.len() >= 8 {
-                let mut assigned: Vec<Vec<(usize, Cursor)>> =
-                    (0..workers).map(|_| Vec::new()).collect();
-                let mut loads = vec![0_usize; workers];
-                let mut ordered: Vec<(usize, Cursor)> = cursors.into_iter().enumerate().collect();
-                ordered.sort_unstable_by_key(|(_, cursor)| std::cmp::Reverse(cursor.len));
-                for column in ordered {
-                    let worker = loads
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|&(_, bytes)| bytes)
-                        .map_or(0, |(worker, _)| worker);
-                    loads[worker] = loads[worker].saturating_add(column.1.len);
-                    assigned[worker].push(column);
-                }
-                std::thread::scope(|scope| -> Result<u64> {
-                    let mut jobs = Vec::with_capacity(workers);
-                    for mut columns in assigned {
-                        let file = self.file.as_ref();
-                        let rows = local.as_slice();
-                        jobs.push(scope.spawn(move || -> Result<(u64, PickedColumns)> {
-                            let mut read = 0_u64;
-                            let mut output = Vec::with_capacity(columns.len());
-                            for (at, cursor) in &mut columns {
-                                let values = cursor.pick(file, rows)?;
-                                read = read.saturating_add(cursor.bytes_read);
-                                output.push((*at, values));
-                            }
-                            Ok((read, output))
-                        }));
-                    }
-                    let mut read = 0_u64;
-                    for job in jobs {
-                        let (bytes, output) = job
-                            .join()
-                            .map_err(|_| Error::internal("a Parquet fetch worker panicked"))??;
-                        read = read.saturating_add(bytes);
-                        for (at, values) in output {
-                            picked[at].extend(values);
-                        }
-                    }
-                    Ok(read)
-                })?
-            } else {
-                let mut read = 0_u64;
-                for (mut cursor, values) in cursors.into_iter().zip(&mut picked) {
-                    values.extend(cursor.pick(self.file.as_ref(), &local)?);
-                    read = read.saturating_add(cursor.bytes_read);
-                }
-                read
-            };
-            self.bytes = self.bytes.saturating_add(read);
         }
         if next < rows.len() {
             return Err(Error::internal(format!(
                 "row ordinal {} is past the end of a file of {base} rows",
                 rows[next]
             )));
+        }
+        let mut jobs: Vec<Job> = Vec::new();
+        for (order, &at) in touched.iter().enumerate() {
+            for (column, chunk) in self.locate(at)?.iter().enumerate() {
+                jobs.push(Job { order, column, cursor: self.read_column(chunk) });
+            }
+        }
+        let mut gathered: Vec<Vec<Option<Vec<Value>>>> =
+            touched.iter().map(|_| self.projection.iter().map(|_| None).collect()).collect();
+        let read = self.fetch(jobs, &wanted, &mut gathered)?;
+        self.bytes = self.bytes.saturating_add(read);
+        let mut picked: Vec<Vec<Value>> =
+            self.projection.iter().map(|_| Vec::with_capacity(rows.len())).collect();
+        for group in gathered {
+            for (column, values) in group.into_iter().enumerate() {
+                let Some(values) = values else {
+                    return Err(Error::internal("a Parquet fetch lost one of its columns"));
+                };
+                picked[column].extend(values);
+            }
         }
         let vectors: Result<Vec<_>> = self
             .fields()
@@ -364,6 +407,92 @@ impl Reader {
             .map(|(field, values)| Vector::from_values(field.ty, values))
             .collect();
         Chunk::with_rows(vectors?, rows.len())
+    }
+
+    /// Runs every column chunk a fetch has to open, spread over a handful of threads.
+    ///
+    /// Every column of every touched row group goes in at once. Doing a row group at a time meant
+    /// the threads waited on whichever column of the row group in hand was widest, and a fetch of
+    /// ten rows touches five row groups on `hits-1m-snappy.parquet`, so there were five hundred and
+    /// twenty five chunks to open and only a hundred and five of them ever in flight.
+    ///
+    /// The widest chunk goes first, which is the rule that keeps the tail short, and the threads
+    /// pull from one list rather than being dealt a share up front, because a share dealt by size
+    /// is a guess at how long a chunk takes and the list is not a guess.
+    ///
+    /// What the list is bounded by is bytes rather than jobs. A worker holds the chunk it is
+    /// reading and the page it decompressed out of it, and the widest chunks of this file are
+    /// megabytes each, so sixteen threads all starting on the widest chunk in the file is the peak
+    /// of the whole query. [`FETCH_BUDGET`] is what a fetch is allowed to have open at once, and a
+    /// thread that would go over it waits for one to finish instead. A chunk wider than the budget
+    /// still runs, alone, because refusing it would mean never finishing.
+    ///
+    /// Sixteen threads at most, and the reader has no view of what the query was told to use. That
+    /// is a wart, and it is the same one the scan has.
+    ///
+    /// # Errors
+    ///
+    /// If a read or a decode fails, or if a worker panics.
+    fn fetch(
+        &self,
+        jobs: Vec<Job>,
+        wanted: &[Vec<usize>],
+        into: &mut [Vec<Option<Vec<Value>>>],
+    ) -> Result<u64> {
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(16)
+            .min(jobs.len().max(1));
+        if workers <= 1 || jobs.len() < 8 {
+            let mut read = 0_u64;
+            for mut job in jobs {
+                let values = job.cursor.pick(self.file.as_ref(), &wanted[job.order])?;
+                read = read.saturating_add(job.cursor.bytes_read);
+                into[job.order][job.column] = Some(values);
+            }
+            return Ok(read);
+        }
+        let mut ordered = jobs;
+        ordered.sort_unstable_by_key(|job| std::cmp::Reverse(job.cursor.len));
+        let left = ordered.len();
+        let queue =
+            Mutex::new(Queue { jobs: ordered.into_iter().map(Some).collect(), left, inflight: 0 });
+        let room = Condvar::new();
+        std::thread::scope(|scope| -> Result<u64> {
+            let mut running = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let file = self.file.as_ref();
+                let queue = &queue;
+                let room = &room;
+                running.push(scope.spawn(move || -> Result<(u64, PickedColumns)> {
+                    let mut read = 0_u64;
+                    let mut output = Vec::new();
+                    // The job is taken by value and dropped here, because a cursor keeps the last
+                    // page body it read to decompress the next one into, and holding those is what
+                    // the budget is counting.
+                    while let Some(mut job) = claim(queue, room)? {
+                        let taken = job.cursor.len;
+                        let values = job.cursor.pick(file, &wanted[job.order])?;
+                        read = read.saturating_add(job.cursor.bytes_read);
+                        output.push((job.order, job.column, values));
+                        drop(job);
+                        release(queue, room, taken)?;
+                    }
+                    Ok((read, output))
+                }));
+            }
+            let mut read = 0_u64;
+            for job in running {
+                let (bytes, output) = job
+                    .join()
+                    .map_err(|_| Error::internal("a Parquet fetch worker panicked"))??;
+                read = read.saturating_add(bytes);
+                for (order, column, values) in output {
+                    into[order][column] = Some(values);
+                }
+            }
+            Ok(read)
+        })
     }
 
     /// The next chunk, or nothing when the file is done.
@@ -743,9 +872,9 @@ impl Cursor {
             })?;
             let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
             let timing = Timing::start(Stage::Decode);
-            let decoded = page.decode(&self.column, self.dictionary.as_ref());
+            let decoded = page.decode_at(&self.column, self.dictionary.as_ref(), &indices);
             timing.stop(bytes);
-            out.extend(decoded?.gather(&indices)?.iter());
+            out.extend(decoded?.iter());
             self.at = self.at.saturating_add(total);
             self.row = end;
             self.left -= i64::from(header.values());
