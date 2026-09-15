@@ -192,23 +192,31 @@ fn ordered(plan: &Plan, node: NodeRef) -> bool {
     }
 }
 
-/// What a filter over a Parquet scan can tell that scan before it opens anything.
+/// What a filter over a scan can tell that scan before it reads anything.
 ///
-/// A row group carries the smallest and largest value of each of its columns in the footer, so a
-/// conjunct comparing one of those columns against a constant can rule a whole group out without
-/// reading a page of it. This pulls out the conjuncts of that shape and drops everything else,
-/// which is the conservative direction: a test that is not here costs time, a test that is here
-/// wrongly costs rows.
+/// Both kinds of scan keep the smallest and the largest value of each of their columns: a Parquet
+/// file keeps them per row group in its footer, and a table in memory keeps them per chunk in a zone
+/// map. A conjunct comparing one of those columns against a constant can rule a whole unit out
+/// without touching a row of it. This pulls out the conjuncts of that shape and drops everything
+/// else, which is the conservative direction: a test that is not here costs time, a test that is
+/// here wrongly costs rows.
 ///
 /// Only an `AND` is walked into. Under an `OR` a conjunct being false says nothing about the row,
-/// and a `NOT` is already gone by the time the plan is bound. Only `read_parquet` is worth doing
-/// this for, because a CSV has no footer to read, and only a comparison against this scan's own
-/// columns counts, since a binding into some other operator's output is not in this file at all.
+/// and a `NOT` is already gone by the time the plan is bound. Of the table functions only
+/// `read_parquet` is worth doing this for, because a CSV has no footer to read. Only a comparison
+/// against this scan's own columns counts, since a binding into some other operator's output is not
+/// in this table at all.
 fn bounds(plan: &Plan, input: NodeRef, predicate: ExprRef) -> Vec<(usize, Op, Bound)> {
-    let Node::TableFunction { index, function, .. } = *plan.node(input) else { return Vec::new() };
-    if TableFunction::lookup(plan.string(function)) != Some(TableFunction::ReadParquet) {
-        return Vec::new();
-    }
+    let index = match *plan.node(input) {
+        Node::TableFunction { index, function, .. } => {
+            if TableFunction::lookup(plan.string(function)) != Some(TableFunction::ReadParquet) {
+                return Vec::new();
+            }
+            index
+        }
+        Node::Get { index, .. } => index,
+        _ => return Vec::new(),
+    };
     let mut tests = Vec::new();
     conjuncts(plan, predicate, index, &mut tests);
     tests
@@ -416,7 +424,8 @@ impl<'a> Building<'a, '_> {
                     plan.string(schema),
                     plan.string(table),
                 );
-                let scan = Scan::new(plan, self.catalog.table(&name)?, index, columns)?;
+                let tests = std::mem::take(&mut self.pruning);
+                let scan = Scan::new(plan, self.catalog.table(&name)?, index, columns, tests)?;
                 let schema = scan.schema().clone();
                 let counters =
                     self.watch(reference, id, pipeline, "Scan", Some(plan.string(table)));

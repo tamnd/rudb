@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bounds;
 pub mod cancel;
 pub mod error;
 pub mod memory;
@@ -25,6 +26,7 @@ pub mod stage;
 pub mod types;
 pub mod value;
 
+pub use bounds::{Bound, Op, excluded};
 pub use cancel::Cancel;
 pub use error::{Error, ErrorCode, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human};

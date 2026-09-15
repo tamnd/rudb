@@ -43,118 +43,17 @@
 //! [`read_stats`]: crate::metadata::read_stats
 //! [`Stats`]: crate::metadata::Stats
 
-use std::cmp::Ordering;
-
-use rudb_common::{LogicalType, Value};
+use rudb_common::LogicalType;
 
 use crate::metadata::{ColumnChunk, Physical, RowGroup, SchemaColumn};
 
-/// The comparison a test applies, which is the half of `CompareOp` that bounds can answer.
+/// The bounds vocabulary, which is shared rather than restated.
 ///
-/// This is its own enum rather than `rudb_plan::CompareOp` because the plan is at rank nine and this
-/// is at rank five, so the translation happens where the plan is readable and what arrives here is
-/// only the part that has a meaning against a minimum and a maximum. `<>` is not here: a group can
-/// be skipped for it only when its bounds are equal to each other and to the constant, which is a
-/// column of one value and not worth a case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Op {
-    /// `=`.
-    Equal,
-    /// `<`.
-    Less,
-    /// `<=`.
-    LessOrEqual,
-    /// `>`.
-    Greater,
-    /// `>=`.
-    GreaterOrEqual,
-}
-
-impl Op {
-    /// The same comparison with its operands the other way round, for `5 < x` written as such.
-    #[must_use]
-    pub fn flipped(self) -> Self {
-        match self {
-            Self::Equal => Self::Equal,
-            Self::Less => Self::Greater,
-            Self::LessOrEqual => Self::GreaterOrEqual,
-            Self::Greater => Self::Less,
-            Self::GreaterOrEqual => Self::LessOrEqual,
-        }
-    }
-}
-
-/// A value in the domain its type is ordered by.
-///
-/// Three domains cover every type a bound can be read for. Every integer, date, time and timestamp
-/// orders as a signed integer once it is widened, which is what `i128` is for and why there is no
-/// unsigned case. Floats order as themselves. Strings and blobs order as bytes, which is what SQL
-/// says and what the format says the `min_value` of a byte array is.
-///
-/// Comparing two bounds of different domains answers `None`, and a test whose comparison answers
-/// `None` does not skip anything. That is the safe direction and it is the one every unhandled case
-/// takes: a bound this cannot read, a type it does not know, a writer that emitted the wrong width.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Bound {
-    /// Every integer and date, widened.
-    Int(i128),
-    /// `FLOAT` and `DOUBLE`.
-    Real(f64),
-    /// `VARCHAR` and `BLOB`, ordered as bytes.
-    Bytes(Vec<u8>),
-}
-
-impl Bound {
-    /// The bound a constant in a filter stands for, or `None` for a constant no bound compares with.
-    ///
-    /// A `NULL` answers `None` on purpose. A comparison against null is null, so a filter holding one
-    /// keeps no rows at all, and that is a fact about the whole scan rather than about one row group.
-    /// Deciding it here would be deciding it in the wrong place.
-    ///
-    /// A time and a timestamp answer `None` as well, and that one is a gap rather than a decision. A
-    /// [`Value::Timestamp`] is microseconds, a file is free to store the same column in milliseconds
-    /// or nanoseconds, and the statistics are at the file's unit. Comparing the two would rule out
-    /// row groups holding rows the query wants. A column stated as UTC loses its unit on the way into
-    /// [`LogicalType`] as well, so the unit cannot be recovered here at all, and closing this means
-    /// carrying it on the test rather than guessing at it.
-    ///
-    /// [`LogicalType`]: rudb_common::LogicalType
-    #[must_use]
-    pub fn of_value(value: &Value) -> Option<Self> {
-        Some(match value {
-            Value::Boolean(flag) => Self::Int(i128::from(*flag)),
-            Value::TinyInt(number) => Self::Int(i128::from(*number)),
-            Value::SmallInt(number) => Self::Int(i128::from(*number)),
-            Value::Integer(number) => Self::Int(i128::from(*number)),
-            Value::BigInt(number) => Self::Int(i128::from(*number)),
-            Value::HugeInt(number) => Self::Int(*number),
-            Value::UTinyInt(number) => Self::Int(i128::from(*number)),
-            Value::USmallInt(number) => Self::Int(i128::from(*number)),
-            Value::UInteger(number) => Self::Int(i128::from(*number)),
-            Value::UBigInt(number) => Self::Int(i128::from(*number)),
-            Value::UHugeInt(number) => Self::Int(i128::try_from(*number).ok()?),
-            Value::Date(days) => Self::Int(i128::from(*days)),
-            Value::Float(number) => Self::Real(f64::from(*number)),
-            Value::Double(number) => Self::Real(*number),
-            Value::Varchar(text) => Self::Bytes(text.as_bytes().to_vec()),
-            Value::Blob(bytes) => Self::Bytes(bytes.clone()),
-            _ => return None,
-        })
-    }
-
-    /// The order between two bounds of the same domain, and `None` across domains.
-    ///
-    /// A `NaN` compares with nothing, which falls out of `f64::partial_cmp` and is right: a column
-    /// whose minimum is `NaN` has no minimum, so no test against it can rule anything out.
-    fn order(&self, other: &Self) -> Option<Ordering> {
-        match (self, other) {
-            (Self::Int(left), Self::Int(right)) => Some(left.cmp(right)),
-            (Self::Real(left), Self::Real(right)) => left.partial_cmp(right),
-            (Self::Bytes(left), Self::Bytes(right)) => Some(left.as_slice().cmp(right)),
-            _ => None,
-        }
-    }
-}
+/// [`Op`] and [`Bound`] live in `rudb-common` because a Parquet row group is one of three places
+/// this engine keeps a minimum and a maximum, and the reasoning about what those two numbers rule
+/// out is the same wherever they came from. What is Parquet's own is everything below: decoding a
+/// writer's bytes into a bound, and knowing which chunk of which row group to look in.
+pub use rudb_common::bounds::{Bound, Op};
 
 /// One comparison against one column, with the bound it is testing for.
 #[derive(Debug, Clone)]
@@ -189,32 +88,7 @@ fn rules_out(test: &Test, chunk: &ColumnChunk, column: &SchemaColumn) -> bool {
     let Some(stats) = chunk.stats.as_ref() else { return false };
     let low = stats.min.as_deref().and_then(|bytes| read(bytes, column));
     let high = stats.max.as_deref().and_then(|bytes| read(bytes, column));
-    // Which end of the range each comparison needs. `x < c` can only be false everywhere when even
-    // the smallest value in the group is not below `c`, and the mirror holds for the other three.
-    // `x = c` needs both ends, because the constant has to fall outside the range on either side.
-    match test.op {
-        Op::Less => low.is_some_and(|low| !ordered(&low, &test.value, Ordering::Less, false)),
-        Op::LessOrEqual => low.is_some_and(|low| !ordered(&low, &test.value, Ordering::Less, true)),
-        Op::Greater => high.is_some_and(|high| !ordered(&test.value, &high, Ordering::Less, false)),
-        Op::GreaterOrEqual => {
-            high.is_some_and(|high| !ordered(&test.value, &high, Ordering::Less, true))
-        }
-        Op::Equal => {
-            low.is_some_and(|low| ordered(&test.value, &low, Ordering::Less, false))
-                || high.is_some_and(|high| ordered(&high, &test.value, Ordering::Less, false))
-        }
-    }
-}
-
-/// Whether `left` stands in `want` to `right`, counting equality when `or_equal` says to.
-///
-/// A comparison that cannot be made answers `false`, and every caller is written so that `false` is
-/// the answer that keeps the row group.
-fn ordered(left: &Bound, right: &Bound, want: Ordering, or_equal: bool) -> bool {
-    match left.order(right) {
-        Some(order) => order == want || (or_equal && order == Ordering::Equal),
-        None => false,
-    }
+    rudb_common::bounds::excluded(test.op, &test.value, low.as_ref(), high.as_ref())
 }
 
 /// Reads a bound out of the bytes a writer put in the footer, in the column's own domain.
@@ -258,7 +132,7 @@ fn read(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::{LogicalType, Value};
+    use rudb_common::LogicalType;
 
     use super::{Bound, Op, Test, skips};
     use crate::metadata::{ColumnChunk, Encoding, Physical, RowGroup, SchemaColumn, Stats};
@@ -386,22 +260,5 @@ mod tests {
         let group = group(Some(bytes(3_000_000_000)), Some(bytes(4_000_000_000)));
         let test = vec![Test { column: 0, op: Op::Greater, value: Bound::Int(2_000_000_000) }];
         assert!(!skips(&test, &group, &schema), "the group is entirely above two billion");
-    }
-
-    /// The gap [`Bound::of_value`] documents, pinned so that closing it is a test that changes rather
-    /// than a behaviour that quietly appears. A timestamp constant is microseconds and the file's
-    /// statistics are at whatever unit the file chose, so no test is made from one at all.
-    #[test]
-    fn a_timestamp_constant_makes_no_test() {
-        assert_eq!(Bound::of_value(&Value::Timestamp(1)), None);
-        assert_eq!(Bound::of_value(&Value::Time(1)), None);
-        assert_eq!(Bound::of_value(&Value::Date(1)), Some(Bound::Int(1)));
-    }
-
-    #[test]
-    fn a_flipped_op_is_the_one_with_its_operands_the_other_way_round() {
-        assert_eq!(Op::Less.flipped(), Op::Greater);
-        assert_eq!(Op::GreaterOrEqual.flipped(), Op::LessOrEqual);
-        assert_eq!(Op::Equal.flipped(), Op::Equal);
     }
 }
