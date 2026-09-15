@@ -216,6 +216,8 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::DuckdbColumns,
     TableFunction::DuckdbExtensions,
     TableFunction::DuckdbOptimizers,
+    TableFunction::PragmaTableInfo,
+    TableFunction::PragmaShow,
 ];
 
 /// The second name each of the two file readers answers to.
@@ -226,7 +228,10 @@ const TABLE_ALIASES: &[(&str, TableFunction)] =
 fn positional_counts(function: TableFunction) -> Vec<usize> {
     match function {
         TableFunction::Range | TableFunction::GenerateSeries => vec![1, 2, 3],
-        TableFunction::ReadParquet | TableFunction::ReadCsv => vec![1],
+        TableFunction::ReadParquet
+        | TableFunction::ReadCsv
+        | TableFunction::PragmaTableInfo
+        | TableFunction::PragmaShow => vec![1],
         TableFunction::RudbStrategies
         | TableFunction::DuckdbKeywords
         | TableFunction::DuckdbTypes
@@ -245,7 +250,10 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
 /// The type a table function's positional arguments take.
 const fn positional_type(function: TableFunction) -> &'static str {
     match function {
-        TableFunction::ReadParquet | TableFunction::ReadCsv => "VARCHAR",
+        TableFunction::ReadParquet
+        | TableFunction::ReadCsv
+        | TableFunction::PragmaTableInfo
+        | TableFunction::PragmaShow => "VARCHAR",
         _ => "BIGINT",
     }
 }
