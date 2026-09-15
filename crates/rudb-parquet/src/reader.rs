@@ -263,6 +263,7 @@ impl Reader {
     /// If the ordinals are not sorted and strictly increasing, if one of them is past the end of
     /// the file, or if a read or a decode fails.
     pub fn rows_at(&mut self, rows: &[u64]) -> Result<Chunk> {
+        for c in [&DBG_SKIP, &DBG_READ, &DBG_PREFIX, &DBG_DICT, &DBG_DATA] { c.store(0, std::sync::atomic::Ordering::Relaxed); }
         for pair in rows.windows(2) {
             if pair[0] >= pair[1] {
                 return Err(Error::internal(format!(
@@ -273,6 +274,20 @@ impl Reader {
         }
         let mut picked: Vec<Vec<Value>> =
             self.projection.iter().map(|_| Vec::with_capacity(rows.len())).collect();
+        struct Dbg;
+        impl Drop for Dbg {
+            fn drop(&mut self) {
+                use std::sync::atomic::Ordering::Relaxed;
+                eprintln!(
+                    "DBG pick skipped={} read={} prefix={:.1}MB dict={:.1}MB data={:.1}MB",
+                    DBG_SKIP.load(Relaxed), DBG_READ.load(Relaxed),
+                    DBG_PREFIX.load(Relaxed) as f64 / 1e6,
+                    DBG_DICT.load(Relaxed) as f64 / 1e6,
+                    DBG_DATA.load(Relaxed) as f64 / 1e6,
+                );
+            }
+        }
+        let _dbg = Dbg;
         let mut base = 0_u64;
         let mut next = 0;
         for at in 0..self.metadata.row_groups.len() {
@@ -454,6 +469,12 @@ impl Reader {
         )
     }
 }
+
+static DBG_SKIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DBG_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DBG_PREFIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DBG_DICT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DBG_DATA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug)]
 struct Group {
@@ -688,11 +709,13 @@ impl Cursor {
     /// the wrong shape for anything large. That is deliberate. This is for the handful of rows a
     /// `LIMIT` left standing, and a caller with a lot of rows to pick should be scanning.
     fn pick(&mut self, file: &dyn File, wanted: &[usize]) -> Result<Vec<Value>> {
+        let _dbg = ();
         let mut out = Vec::with_capacity(wanted.len());
         let mut next = 0;
         while next < wanted.len() {
             let (prefix, header, _, total) = self.peek(file)?;
             if matches!(header.body, Body::Index) {
+                DBG_PREFIX.fetch_add(prefix.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 self.bytes_read = self.bytes_read.saturating_add(prefix.len() as u64);
                 self.at = self.at.saturating_add(total);
                 continue;
@@ -704,6 +727,7 @@ impl Cursor {
                         self.column.name
                     )));
                 }
+                DBG_DICT.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
                 let encoded = self.body(file, prefix, total)?;
                 let mut pages = Pages::new(&encoded, self.codec, self.left);
                 let mut page = pages.next().transpose()?.ok_or_else(|| {
@@ -724,6 +748,8 @@ impl Cursor {
                 .map_err(|_| Error::io(format!("a page of {} values", header.values())))?;
             let end = self.row.saturating_add(values);
             if wanted[next] >= end {
+                DBG_SKIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                DBG_PREFIX.fetch_add(prefix.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 self.bytes_read = self.bytes_read.saturating_add(prefix.len() as u64);
                 self.at = self.at.saturating_add(total);
                 self.row = end;
@@ -736,6 +762,8 @@ impl Cursor {
                 indices.push(u32::try_from(wanted[next] - base).unwrap_or(u32::MAX));
                 next += 1;
             }
+            DBG_DATA.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+            DBG_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let encoded = self.body(file, prefix, total)?;
             let mut pages = Pages::new(&encoded, self.codec, self.left);
             let mut page = pages.next().transpose()?.ok_or_else(|| {
