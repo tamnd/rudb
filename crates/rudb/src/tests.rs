@@ -1201,6 +1201,38 @@ fn the_types_table_answers_a_query_a_client_would_actually_write() {
     );
 }
 
+/// `duckdb_functions()` through the binder and the executor, per #465.
+#[test]
+fn the_functions_table_answers_the_question_a_client_asks_it() {
+    let db = database();
+    // The query a client actually writes, which is whether a name is there at all.
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'sqrt'"),
+        vec![vec![Value::BigInt(0)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT function_type FROM duckdb_functions() WHERE function_name = 'avg'"),
+        vec![vec![Value::Varchar("aggregate".to_string())]]
+    );
+    // Builtins are reported in `system.main` and not in `memory`, which is where the pin puts them
+    // and where every client query looks. rudb has no catalog named `system` yet, so this is the one
+    // column in the table that names something the catalog does not have.
+    assert_eq!(
+        rows(&db, "SELECT DISTINCT database_name, schema_name FROM duckdb_functions()"),
+        vec![vec![Value::Varchar("system".to_string()), Value::Varchar("main".to_string())]]
+    );
+    // Every row is a builtin, which is what makes the corpus query for user defined functions come
+    // back empty rather than wrong.
+    assert!(
+        rows(&db, "SELECT function_name FROM duckdb_functions() WHERE NOT internal").is_empty()
+    );
+    // This table lists itself, because it is a table function and the table lists those.
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
+        vec![vec![Value::BigInt(3)]]
+    );
+}
+
 /// The four ways a subscript is refused, in DuckDB's words. Per #278.
 #[test]
 fn the_subscripts_that_are_refused_say_what_duckdb_says() {

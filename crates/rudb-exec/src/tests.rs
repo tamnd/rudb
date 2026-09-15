@@ -903,6 +903,64 @@ fn the_types_table_says_what_this_engine_stores_rather_than_what_the_pin_does() 
 }
 
 #[test]
+fn the_functions_table_is_one_row_per_name_and_argument_count() {
+    // Sorted by name and then by how many arguments the row takes, because a client reading this
+    // table is looking a name up. The pin's own order is its catalog's registration order and is not
+    // reproduced, which is why the two corpus records that read the table both say `order by`.
+    let rows = run("TableFunction duckdb_functions args=[] #0 [function_name::VARCHAR, \
+         function_type::VARCHAR, return_type::VARCHAR]");
+    assert!(rows.len() > 100, "{} rows", rows.len());
+    let name_of = |row: &Vec<Value>| match &row[0] {
+        Value::Varchar(name) => name.clone(),
+        other => panic!("a function name, not {other:?}"),
+    };
+    let names: Vec<String> = rows.iter().map(name_of).collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+    // A table function has no one return type, because it produces columns rather than a value, and
+    // the pin leaves the column null for the same reason.
+    for row in rows.iter().filter(|row| row[1] == text("table")) {
+        assert_eq!(row[2], Value::Null, "{:?}", row[0]);
+    }
+    // Everything else has one, and nothing here is a macro or a pragma or a window function because
+    // rudb has none of the three.
+    let mut kinds: Vec<String> = rows
+        .iter()
+        .map(|row| match &row[1] {
+            Value::Varchar(kind) => kind.clone(),
+            other => panic!("a function kind, not {other:?}"),
+        })
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    assert_eq!(kinds, ["aggregate", "scalar", "table"]);
+}
+
+#[test]
+fn the_functions_table_declares_a_promoted_argument_with_the_type_variable() {
+    // The one place rudb's table is shaped differently from the pin's rather than shorter. `+` is
+    // one entry that says both arguments promote, so it is two rows here, one per arity, where the
+    // pin carries an implementation per pair of numeric types and reports 44.
+    let rows = run("TableFunction duckdb_functions args=[] #0 [function_name::VARCHAR, \
+         parameter_types::VARCHAR[], return_type::VARCHAR, alias_of::VARCHAR]");
+    let plus: Vec<&Vec<Value>> = rows.iter().filter(|row| row[0] == text("+")).collect();
+    assert_eq!(plus.len(), 2);
+    let types = |values: &Value| match values {
+        Value::List { values, .. } => values.clone(),
+        other => panic!("a list of type names, not {other:?}"),
+    };
+    assert_eq!(types(&plus[1][1]), vec![text("T"), text("T")]);
+    // The result is the weaker spelling, because a decimal sum gains a carry digit and so is not the
+    // type the operands met at.
+    assert_eq!(plus[1][2], text("ANY"));
+    // An alias is a row of its own saying what it resolves to, which is what the pin does.
+    let len = rows.iter().find(|row| row[0] == text("len")).expect("the alias for length");
+    assert_eq!(len[3], text("length"));
+    assert_eq!(types(&len[1]), vec![text("VARCHAR")]);
+}
+
+#[test]
 fn a_metadata_table_hands_back_the_columns_it_was_asked_for_in_the_order_asked() {
     // The same requirement as the strategies table and checked on a second one, because the
     // resolution by name now lives in one place and a regression there would be silent: every one of
