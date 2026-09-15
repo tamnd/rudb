@@ -66,6 +66,7 @@ use rudb_common::{Error, Result};
 use crate::chooser::{Chooser, EXHAUSTIVE};
 use crate::fsst::SymbolTable;
 use crate::integer;
+use crate::lz;
 use crate::reader::Reader;
 
 /// How deep the recursion goes. A dictionary of a dictionary is not a thing, so this only has to
@@ -76,6 +77,13 @@ const MAX_DEPTH: u8 = 2;
 /// this. A twentieth of the column is around where the prefix lengths start paying for themselves,
 /// and below it the candidate is an encode of the whole column that loses.
 const SHARE_DIVISOR: usize = 20;
+
+/// How few bytes is too few to bother looking for repeats in.
+///
+/// The matcher costs a hash table and a pass over the bytes whether it wins or not, and the chooser
+/// is exhaustive, so an ungated candidate is a tax on every string column in the database. Four
+/// kilobytes is about where a 32 KiB window has enough behind it to find anything.
+const LZ_FLOOR: usize = 4096;
 
 /// How many bytes of a column the symbol table is trained on.
 ///
@@ -97,6 +105,9 @@ pub enum Kind {
     Dict = 3,
     /// Shared prefix lengths as an integer chunk, and what is left of each value as a string chunk.
     Front = 4,
+    /// Value lengths, copy lengths and copy offsets as integer chunks, and the bytes no copy
+    /// covered as a string chunk. See the `lz` module for what the matcher does and why it is here.
+    Lz = 5,
 }
 
 impl Kind {
@@ -111,6 +122,7 @@ impl Kind {
             2 => Ok(Self::Fsst),
             3 => Ok(Self::Dict),
             4 => Ok(Self::Front),
+            5 => Ok(Self::Lz),
             other => Err(Error::internal(format!("unknown string encoding tag {other}"))),
         }
     }
@@ -124,6 +136,7 @@ impl Kind {
             Self::Fsst => "FSST",
             Self::Dict => "DICT",
             Self::Front => "FRONT",
+            Self::Lz => "LZ",
         }
     }
 }
@@ -286,6 +299,9 @@ fn candidates(values: &[&[u8]], depth: u8) -> Vec<Kind> {
     if depth < MAX_DEPTH && sharing_of(values) >= total_len(values) / SHARE_DIVISOR {
         kinds.push(Kind::Front);
     }
+    if depth < MAX_DEPTH && total_len(values) >= LZ_FLOOR {
+        kinds.push(Kind::Lz);
+    }
     kinds
 }
 
@@ -416,6 +432,19 @@ fn encode_as(
             out.extend_from_slice(&integer::encode_with(&prefixes, chooser)?);
             out.extend_from_slice(&encode_at(&suffixes, depth + 1, chooser)?);
         }
+        Kind::Lz => {
+            let mut joined = Vec::with_capacity(total_len(values));
+            let mut sizes = Vec::with_capacity(values.len());
+            for value in values {
+                joined.extend_from_slice(value);
+                sizes.push(value.len() as i64);
+            }
+            let tokens = lz::tokens_of(&joined);
+            out.extend_from_slice(&integer::encode_with(&sizes, chooser)?);
+            out.extend_from_slice(&integer::encode_with(&tokens.lengths, chooser)?);
+            out.extend_from_slice(&integer::encode_with(&tokens.offsets, chooser)?);
+            out.extend_from_slice(&encode_at(&tokens.literals, depth + 1, chooser)?);
+        }
     }
     Ok(Some(out))
 }
@@ -481,6 +510,40 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<Vec<u8>>> {
             }
             front_decode(&prefixes, suffixes)
         }
+        Kind::Lz => {
+            let sizes = decode_integers(reader)?;
+            let lengths = decode_integers(reader)?;
+            let offsets = decode_integers(reader)?;
+            let literals = decode_chunk(reader)?;
+            if sizes.len() != count {
+                return Err(Error::internal(format!(
+                    "a matched chunk says it holds {count} values and has {} lengths",
+                    sizes.len()
+                )));
+            }
+            let mut total = 0usize;
+            let mut widths = Vec::with_capacity(count);
+            for size in sizes {
+                let width = usize::try_from(size)
+                    .map_err(|_| Error::internal("a negative string length"))?;
+                total += width;
+                widths.push(width);
+            }
+            let joined = lz::rebuild(&literals, &lengths, &offsets, total)?;
+            if joined.len() != total {
+                return Err(Error::internal(format!(
+                    "a matched chunk rebuilt {} bytes where its lengths add up to {total}",
+                    joined.len()
+                )));
+            }
+            let mut values = Vec::with_capacity(count);
+            let mut at = 0;
+            for width in widths {
+                values.push(joined[at..at + width].to_vec());
+                at += width;
+            }
+            Ok(values)
+        }
     }
 }
 
@@ -514,6 +577,13 @@ fn describe_chunk(reader: &mut Reader<'_>) -> Result<String> {
             let prefixes = describe_integers(reader)?;
             let suffixes = describe_chunk(reader)?;
             format!("FRONT({prefixes}, {suffixes})")
+        }
+        Kind::Lz => {
+            let sizes = describe_integers(reader)?;
+            let lengths = describe_integers(reader)?;
+            let offsets = describe_integers(reader)?;
+            let literals = describe_chunk(reader)?;
+            format!("LZ({sizes}, {lengths}, {offsets}, {literals})")
         }
     })
 }
@@ -832,15 +902,24 @@ mod tests {
     }
 
     #[test]
-    fn a_url_column_of_unique_values_uses_fsst() {
+    fn a_url_column_of_unique_values_is_matched_rather_than_only_compressed() {
         // Every value distinct, so a dictionary is the values plus an index and cannot win, and
         // every value starts with an identifier of its own, so neighbours share nothing and front
-        // coding cannot win either. What is left is a column with a lot of repeated vocabulary in
-        // it and no structure that anything but a symbol table can reach. Section 6.5 says the high
-        // cardinality end of `URL` falls back to FSST only and this is that case.
+        // coding cannot win either. This used to be the case that fell back to FSST, on the
+        // reasoning that a symbol table was the only thing that could reach repeated vocabulary
+        // with no structure around it. That reasoning was wrong and #575 is the measurement: the
+        // vocabulary repeats at a distance, and a match finder reaches distance where a 255 symbol
+        // table of at most eight bytes each does not.
         let values = keyed(urls(20_000));
         let bytes = round_trip(&values);
-        assert_eq!(kind_of(&bytes), Kind::Fsst);
+        assert_eq!(kind_of(&bytes), Kind::Lz);
+
+        // Against the encoding that used to win, on the same values, so the claim is a comparison
+        // and not just a label.
+        let borrowed: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        let fsst = encode_as(Kind::Fsst, &borrowed, 0, &EXHAUSTIVE).unwrap().unwrap();
+        assert!(bytes.len() < fsst.len(), "{} against FSST {}", bytes.len(), fsst.len());
+
         // Eleven bytes of every value are the identifier and a separator and nothing compresses
         // them, so the ratio here is lower than the one FSST gets on the URLs on their own.
         let ratio = raw_size(&values) as f64 / bytes.len() as f64;
@@ -889,17 +968,17 @@ mod tests {
     #[test]
     fn a_repeating_column_becomes_a_dictionary_of_compressed_entries() {
         // The DICT_FSST row of the section 6.2 table, which is not an encoding of its own here: it
-        // is a dictionary whose entries went back through the chooser. A dictionary sorts its
-        // entries, so what comes back on anything URL shaped is front coding with the leftovers
-        // FSST compressed, and nobody had to name that shape for the chooser to arrive at it.
+        // is a dictionary whose entries went back through the chooser. What the entries then get
+        // is whatever wins on them, and since #575 that is the match finder rather than front
+        // coding with the leftovers FSST compressed. The point of the test is unchanged: nobody
+        // named the shape and the chooser arrived at it.
         let distinct = urls(500);
         let values: Vec<Vec<u8>> =
             (0..50_000).map(|index| distinct[index * 7919 % distinct.len()].clone()).collect();
         let bytes = round_trip(&values);
         assert_eq!(kind_of(&bytes), Kind::Dict);
         let shape = describe(&bytes).unwrap();
-        assert!(shape.starts_with("DICT(FRONT("), "{shape}");
-        assert!(shape.contains("FSST"), "{shape}");
+        assert!(shape.starts_with("DICT(LZ("), "{shape}");
         let ratio = raw_size(&values) as f64 / bytes.len() as f64;
         assert!(ratio > 20.0, "{ratio:.2}x, {shape}");
     }
