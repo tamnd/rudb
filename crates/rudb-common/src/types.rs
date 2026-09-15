@@ -171,6 +171,32 @@ pub enum PhysicalType {
     Empty,
 }
 
+impl PhysicalType {
+    /// How many bytes one value of this layout takes in a vector.
+    ///
+    /// What the values buffer costs per row, and not what a row costs. A `VARCHAR` is 16 because that
+    /// is the view, and the bytes of a long string are somewhere else. A `LIST` is 8 because that is
+    /// the start and the length, and the elements are in the child. A `STRUCT` is 0 because the parent
+    /// holds nothing of its own beyond the validity mask, and every byte it costs is a child's.
+    ///
+    /// This is the number `duckdb_types().type_size` reports, so it is worth naming the three places
+    /// it disagrees with the pinned binary, all of which are this engine's layout rather than a
+    /// transcription error. A list entry is two `u32` here and two `u64` there, so a `LIST` and a
+    /// `MAP` are 8 against 16. The null type stores nothing here and is given an `INT32` body there,
+    /// so it is 0 against 4.
+    #[must_use]
+    pub const fn size(self) -> usize {
+        match self {
+            Self::Bool | Self::Int8 | Self::UInt8 => 1,
+            Self::Int16 | Self::UInt16 => 2,
+            Self::Int32 | Self::UInt32 | Self::Float32 => 4,
+            Self::Int64 | Self::UInt64 | Self::Float64 | Self::List => 8,
+            Self::Int128 | Self::UInt128 | Self::Interval | Self::Varlen => 16,
+            Self::Array | Self::Struct | Self::Empty => 0,
+        }
+    }
+}
+
 impl LogicalType {
     /// A `DECIMAL(width, scale)`, checked.
     ///

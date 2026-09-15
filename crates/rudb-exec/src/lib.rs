@@ -102,6 +102,7 @@ mod strategies;
 mod stream;
 mod table;
 mod topn;
+mod typenames;
 mod written;
 
 #[cfg(test)]
