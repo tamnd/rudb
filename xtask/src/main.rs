@@ -20,6 +20,7 @@ mod differential;
 mod encode;
 mod flatten;
 mod focus;
+mod generate;
 mod grammar;
 mod io;
 mod kernels;
@@ -86,6 +87,9 @@ fn main() -> ExitCode {
         // shape by shape. `differential` above asks whether the two engines agree and this one
         // asks how far apart they are, which needs many runs rather than one.
         Some("parquet") => parquet::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        // What the grammar generator writes, as a distribution: the share the matcher takes back,
+        // how long a statement is, and which statement kinds the walk actually reaches.
+        Some("generate") => generate::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         // The committed corpus from tamnd/rudb-compat, against the shell this tree builds. Not
         // `differential` above, which compares two engines over a file somebody downloaded. This
         // one has its answers written down in the repository that owns them.
@@ -158,6 +162,12 @@ fn usage() {
     println!("           same files and the same SQL, one row per shape from the footer alone up");
     println!("           to every column of every row. process start is measured and subtracted");
     println!("           from both sides. --threads <n> sets both engines to that many threads");
+    println!("  generate [rule]        what the grammar generator writes, as a distribution: the");
+    println!("           share the matcher takes back, the words per statement, and which");
+    println!("           statement kinds the walk reaches. defaults to the Statement rule");
+    println!("           --seeds <n> how many to write, --seed <n> where to start, --show <n>");
+    println!("           prints that many of them, --budget <n> and --repeats <n> are the two");
+    println!("           knobs on the walk itself");
     println!("  bench <suite>          the whole comparison, against every engine on this machine");
     println!("                         builds rudb and the harness, then runs the suite. needs a");
     println!("                         tamnd/rudb-bench checkout beside this one, or");

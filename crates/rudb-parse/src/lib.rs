@@ -12,6 +12,7 @@
 pub mod ast;
 #[cfg(test)]
 mod corpus;
+pub mod generate;
 pub mod generated;
 pub mod matcher;
 pub mod rules;
@@ -20,6 +21,7 @@ pub mod tokenize;
 pub mod transform;
 
 pub use ast::Ast;
+pub use generate::{Catalog, Generator, Table};
 pub use generated::keywords::{
     COLUMN_NAME, FUNC_NAME, KEYWORDS, LONGEST, RESERVED, TYPE_NAME, UNRESERVED,
 };
