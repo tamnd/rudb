@@ -51,6 +51,55 @@ pub fn physical_memory() -> Option<u64> {
 /// which is what the operators reserved and not the resident size of the process.
 pub const DEFAULT_FRACTION: f64 = 0.8;
 
+/// The number of cores a CPU-bound query should use by default.
+///
+/// Linux exposes physical core IDs for the CPUs this process may run on. Counting each core once
+/// avoids running two aggregate workers on one core when simultaneous multithreading adds no
+/// throughput. Other platforms, or Linux hosts without topology data, use the logical count.
+#[must_use]
+pub fn execution_cores() -> usize {
+    let logical = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    #[cfg(target_os = "linux")]
+    if let Some(physical) = linux_execution_cores() {
+        return physical.min(logical).max(1);
+    }
+    logical
+}
+
+#[cfg(target_os = "linux")]
+fn linux_execution_cores() -> Option<usize> {
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let allowed = status.lines().find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
+    let mut cores = BTreeSet::new();
+    for part in allowed.trim().split(',') {
+        let (first, last) = match part.split_once('-') {
+            Some((first, last)) => (first.parse::<usize>().ok()?, last.parse::<usize>().ok()?),
+            None => {
+                let cpu = part.parse::<usize>().ok()?;
+                (cpu, cpu)
+            }
+        };
+        if last < first || last - first > 65_536 {
+            return None;
+        }
+        for cpu in first..=last {
+            let root = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
+            let package = fs::read_to_string(format!("{root}/physical_package_id"))
+                .ok()?
+                .trim()
+                .parse::<i32>()
+                .ok()?;
+            let core =
+                fs::read_to_string(format!("{root}/core_id")).ok()?.trim().parse::<i32>().ok()?;
+            cores.insert((package, core));
+        }
+    }
+    (!cores.is_empty()).then_some(cores.len())
+}
+
 /// The budget a database opens with on this machine, or `None` when the machine will not say.
 ///
 /// Rounded down to a whole mebibyte, which is not about the memory and is about the printing.

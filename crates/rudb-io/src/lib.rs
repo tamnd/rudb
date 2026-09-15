@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 use rudb_common::Result;
 
 pub use glob::expand;
-pub use machine::{default_memory_limit, physical_memory};
+pub use machine::{default_memory_limit, execution_cores, physical_memory};
 pub use pool::{Config, Pool, Pooled, Stats};
 pub use real::RealFilesystem;
 pub use sim::{Completions, Crash, Op, SimFilesystem};

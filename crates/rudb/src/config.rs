@@ -21,11 +21,10 @@ use rudb_common::{Error, Result};
 /// used is not a result, and a run that says eight while the engine used one is worse than one that
 /// says nothing.
 ///
-/// The query timeout and the memory limit are enforced. The thread count is not yet, because that
-/// needs a parallel executor, which is E4, and the documentation on it says so rather than implying
-/// otherwise. Recording the intent first is what lets the harnesses be written against the final
-/// shape, and it is also what makes the gap visible: a setting that is stored and ignored is easier
-/// to find than a setting that was never accepted.
+/// The query timeout, memory limit and thread ceiling are enforced. A pipeline may use fewer
+/// workers when its source has fewer morsels or one of its operators has to run serially. Metrics
+/// record the instances that actually ran, so the configured ceiling and the measured work can be
+/// read together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     memory_limit: Option<u64>,
@@ -35,7 +34,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let threads = rudb_io::execution_cores();
         Self { memory_limit: rudb_io::default_memory_limit(), threads, query_timeout: None }
     }
 }
@@ -77,9 +76,9 @@ impl Config {
 
     /// How many threads a query may run on.
     ///
-    /// Defaults to the number of cores the program can see, which is what DuckDB does, and one if
-    /// the operating system will not say. The executor is single threaded today, so this is
-    /// recorded and not yet obeyed.
+    /// Defaults to the physical cores the process can use on Linux, and to the logical count
+    /// elsewhere. A memory-bound aggregate gains little from a second worker on the same core,
+    /// while that worker holds another decoded chunk and aggregate scratch space.
     #[must_use]
     pub fn threads(&self) -> usize {
         self.threads
