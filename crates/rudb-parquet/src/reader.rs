@@ -189,30 +189,112 @@ struct Dictionaries {
     held: Mutex<Held>,
 }
 
-/// The pages, and how many morsels of each row group are still reading.
+/// The slots, and how many morsels of each row group are still reading.
 #[derive(Debug, Default)]
 struct Held {
     reading: HashMap<usize, usize>,
-    pages: HashMap<(usize, usize), Arc<Vector>>,
+    pages: HashMap<(usize, usize), Arc<Slot>>,
+}
+
+/// One column chunk's dictionary page, and whoever is waiting for it.
+///
+/// A slot rather than a page because the morsels of a row group start together. Cutting a group four
+/// ways and letting each morsel look the page up when it gets there decodes it four times anyway,
+/// since all four look before any of them has finished, and that is exactly what the measurement
+/// showed: 35 MB of dictionary decoded on the ClickBench file where reading it uncut decodes 10. So
+/// the first morsel to ask takes the slot and the others wait on it.
+#[derive(Debug, Default)]
+struct Slot {
+    page: Mutex<State>,
+    ready: Condvar,
+}
+
+/// What is in a slot.
+#[derive(Debug, Default)]
+enum State {
+    /// Somebody is decoding it, and whoever wants it should wait.
+    #[default]
+    Decoding,
+    Decoded(Arc<Vector>),
+    /// Whoever took it gave up, so everybody else is on their own.
+    Failed,
+}
+
+/// What asking for a dictionary page gets you.
+enum Claim {
+    /// Another morsel decoded it, so read none of the page.
+    Held(Arc<Vector>),
+    /// Nobody has, so decode it and hand it over.
+    Mine(Filling),
+}
+
+/// The right to decode one dictionary page, and the duty to say so either way.
+///
+/// Dropping one without filling it marks the slot failed and wakes the waiters, so a morsel that
+/// fails on the page, or anywhere between taking the slot and decoding, does not leave the rest of
+/// its row group waiting for a page that is never coming.
+struct Filling {
+    slot: Arc<Slot>,
+    filled: bool,
+}
+
+impl Filling {
+    /// Hands the decoded page to everybody waiting for it.
+    fn fill(mut self, page: &Arc<Vector>) {
+        if let Ok(mut state) = self.slot.page.lock() {
+            *state = State::Decoded(Arc::clone(page));
+        }
+        self.filled = true;
+        self.slot.ready.notify_all();
+    }
+}
+
+impl Drop for Filling {
+    fn drop(&mut self) {
+        if self.filled {
+            return;
+        }
+        if let Ok(mut state) = self.slot.page.lock() {
+            *state = State::Failed;
+        }
+        self.slot.ready.notify_all();
+    }
+}
+
+/// The page in a slot, waiting for whoever took it if it is not decoded yet.
+///
+/// Nothing when the slot failed, which means the caller decodes the page itself.
+fn awaited(slot: &Arc<Slot>) -> Option<Arc<Vector>> {
+    let mut state = slot.page.lock().ok()?;
+    loop {
+        match &*state {
+            State::Decoded(page) => return Some(Arc::clone(page)),
+            State::Failed => return None,
+            State::Decoding => state = slot.ready.wait(state).ok()?,
+        }
+    }
 }
 
 impl Dictionaries {
-    /// The decoded dictionary page of one column chunk, if it is still held.
+    /// The decoded dictionary page of one column chunk, or the job of decoding it.
     ///
-    /// A poisoned lock is a miss rather than an error. Losing the cache costs time and nothing else,
-    /// and a read failing because another thread panicked somewhere unrelated would be worse.
-    fn get(&self, group: usize, column: usize) -> Option<Arc<Vector>> {
-        let held = self.held.lock().ok()?;
-        held.pages.get(&(group, column)).map(Arc::clone)
-    }
-
-    /// Holds a decoded dictionary page for the other morsels of its row group.
-    fn put(&self, group: usize, column: usize, page: &Arc<Vector>) {
-        let Ok(mut held) = self.held.lock() else { return };
+    /// Nothing at all when this row group is not being read in pieces, because a group read whole
+    /// reads each of its dictionaries once already and would only pay to keep them. A poisoned lock
+    /// is nothing too: losing the cache costs time and nothing else, and a read failing because
+    /// another thread panicked somewhere unrelated would be worse.
+    fn claim(&self, group: usize, column: usize) -> Option<Claim> {
+        let mut held = self.held.lock().ok()?;
         if !held.reading.contains_key(&group) {
-            return;
+            return None;
         }
-        held.pages.insert((group, column), Arc::clone(page));
+        if let Some(slot) = held.pages.get(&(group, column)) {
+            let slot = Arc::clone(slot);
+            drop(held);
+            return awaited(&slot).map(Claim::Held);
+        }
+        let slot = Arc::new(Slot::default());
+        held.pages.insert((group, column), Arc::clone(&slot));
+        Some(Claim::Mine(Filling { slot, filled: false }))
     }
 
     /// Says that one more morsel of this row group is about to be read.
@@ -987,14 +1069,14 @@ impl Cursor {
                 // Another morsel of the same row group may have decoded this page already. Reading
                 // it again could not be helped, because a page says what it is only once it is read,
                 // but decoding it again is the part that costs.
-                match self.held_dictionary() {
-                    Some(held) => self.dictionary = Some(held),
-                    None => {
+                match self.claim_dictionary() {
+                    Some(Claim::Held(held)) => self.dictionary = Some(held),
+                    claim => {
                         let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
                         let timing = Timing::start(Stage::Dictionary);
                         let built = page.decode_dictionary(&self.column);
                         timing.stop(bytes);
-                        self.hold_dictionary(Arc::new(built?));
+                        self.hold_dictionary(claim, Arc::new(built?));
                     }
                 }
                 self.spare = page.body;
@@ -1089,7 +1171,8 @@ impl Cursor {
                 self.column.name
             )));
         }
-        if let Some(held) = self.held_dictionary() {
+        let claim = self.claim_dictionary();
+        if let Some(Claim::Held(held)) = claim {
             self.bytes_read = self.bytes_read.saturating_add(prefix.len() as u64);
             self.at = self.at.saturating_add(total);
             self.dictionary = Some(held);
@@ -1104,7 +1187,7 @@ impl Cursor {
         let timing = Timing::start(Stage::Dictionary);
         let built = page.decode_dictionary(&self.column);
         timing.stop(bytes);
-        self.hold_dictionary(Arc::new(built?));
+        self.hold_dictionary(claim, Arc::new(built?));
         self.at = self.at.saturating_add(total);
         Ok(())
     }
@@ -1124,15 +1207,19 @@ impl Cursor {
         Ok(0)
     }
 
-    /// The chunk's dictionary page, if another morsel of the same row group has decoded it.
-    fn held_dictionary(&self) -> Option<Arc<Vector>> {
-        self.cached.as_ref().and_then(|at| at.pages.get(at.group, at.column))
+    /// The chunk's dictionary page, or the job of decoding it for the rest of the row group.
+    ///
+    /// Blocks while another morsel of the same group is decoding it, which is the point: the morsels
+    /// of a group start together, so a lookup that did not wait would find nothing and every one of
+    /// them would decode the page.
+    fn claim_dictionary(&self) -> Option<Claim> {
+        self.cached.as_ref().and_then(|at| at.pages.claim(at.group, at.column))
     }
 
-    /// Keeps a freshly decoded dictionary page, and offers it to the other morsels of its row group.
-    fn hold_dictionary(&mut self, built: Arc<Vector>) {
-        if let Some(at) = &self.cached {
-            at.pages.put(at.group, at.column, &built);
+    /// Keeps a freshly decoded dictionary page, and hands it to whoever is waiting for it.
+    fn hold_dictionary(&mut self, claim: Option<Claim>, built: Arc<Vector>) {
+        if let Some(Claim::Mine(filling)) = claim {
+            filling.fill(&built);
         }
         self.dictionary = Some(built);
     }

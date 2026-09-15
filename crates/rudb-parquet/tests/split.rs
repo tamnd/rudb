@@ -12,6 +12,7 @@
 //! lands inside a page rather than on one, which is the case worth being sure about.
 
 use std::path::{Path, PathBuf};
+use std::sync::Barrier;
 
 use rudb_common::Value;
 use rudb_common::stage::{self, Stage};
@@ -144,6 +145,40 @@ fn the_morsels_of_a_row_group_decode_its_dictionary_once() {
     let mut second = parent.split_rows(0, cut..all.len()).expect("splits off the second half");
     assert_eq!(rows(&mut second), all[cut..]);
     assert_eq!(decoded_dictionary(), once, "the second morsel decoded the dictionary again");
+}
+
+#[test]
+fn morsels_that_start_together_decode_the_dictionary_once_between_them() {
+    // The reason the cache makes whoever asks second wait rather than telling it to decode its own
+    // copy. A scan hands the morsels of a row group out at the same moment, so all of them reach the
+    // dictionary page before any of them has finished with it, and a cache that only answers about
+    // pages already decoded answers nothing at all. Measured on ClickBench, that was 35 MB of
+    // dictionary decoded where reading the file uncut decodes 10.
+    let all = whole("mixed.parquet", 0);
+    let cut = all.len() / 2;
+    let parent = reader("mixed.parquet");
+    stage::reset();
+    let mut alone = parent.split_rows(0, 0..cut).expect("splits off the first half");
+    assert_eq!(rows(&mut alone), all[..cut]);
+    let once = decoded_dictionary();
+    assert!(once > 0, "the fixture has a dictionary encoded column");
+    drop(alone);
+
+    let gate = Barrier::new(2);
+    let together: u64 = std::thread::scope(|scope| {
+        let halves = [0..cut, cut..all.len()].map(|wanted| {
+            let (parent, gate, all) = (&parent, &gate, &all);
+            scope.spawn(move || {
+                let mut morsel = parent.split_rows(0, wanted.clone()).expect("splits off a morsel");
+                stage::reset();
+                gate.wait();
+                assert_eq!(rows(&mut morsel), all[wanted]);
+                decoded_dictionary()
+            })
+        });
+        halves.into_iter().map(|half| half.join().expect("the morsel thread finished")).sum()
+    });
+    assert_eq!(together, once, "the two morsels decoded the dictionary twice between them");
 }
 
 #[test]
