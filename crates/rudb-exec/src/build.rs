@@ -59,6 +59,7 @@ use rudb_plan::{
 use rudb_seam::Settings;
 
 use crate::fetch::Fetch;
+use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join};
@@ -460,11 +461,13 @@ impl<'a> Building<'a, '_> {
                     Some(
                         function @ (TableFunction::RudbStrategies
                         | TableFunction::DuckdbKeywords
-                        | TableFunction::DuckdbTypes),
+                        | TableFunction::DuckdbTypes
+                        | TableFunction::DuckdbFunctions),
                     ) => {
                         let table = match function {
                             TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
                             TableFunction::DuckdbTypes => typenames(plan, index, columns)?,
+                            TableFunction::DuckdbFunctions => functionnames(plan, index, columns)?,
                             _ => strategies(plan, index, columns)?,
                         };
                         let schema = table.schema().clone();

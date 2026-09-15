@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod file;
+pub mod functioncatalog;
 pub mod signature;
 pub mod table;
 pub mod typecatalog;
@@ -21,8 +22,13 @@ pub mod typecatalog;
 pub use file::{
     csv_fields, csv_given, files, is_file, is_pattern, open_csv, open_parquet, parquet_fields,
 };
+pub use functioncatalog::{
+    CONSISTENT, FUNCTION_CATALOG, FUNCTION_SCHEMA, FunctionEntry, function_entries, function_fields,
+};
 pub use rudb_csv::Given;
-pub use signature::{FunctionKind, Resolved, kind_of, part_type, resolve};
+pub use signature::{
+    FunctionKind, FunctionRow, Resolved, function_rows, kind_of, part_type, resolve,
+};
 pub use table::{
     Columns, FILE_ROW_NUMBER, ResolvedTable, TableFunction, keyword_categories, keyword_fields,
     resolve_table, series, series_length, strategy_fields,
