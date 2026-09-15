@@ -40,6 +40,18 @@ Neither share is one, and the reason is ordered choice rather than a bug. The sh
 
 What is left is to point it at both engines in `tamnd/rudb-compat`, so that a statement we refuse and DuckDB accepts is recorded rather than printed. Until that lands the generator is a parser exerciser, which is worth having on its own: the property that the FIRST filter never changes an answer is now asserted over generated statements, which reach parts of the rule table no corpus does.
 
+## 10.2.2 What it said with both engines in it, which is not what this section expected
+
+That landed as `rudb-compat grammar`, in `tamnd/rudb-compat#78`. It asks both engines the parse question and nothing else, because a walk of the whole grammar writes `DROP`, `ATTACH`, `EXPORT DATABASE` and `COPY t TO 'out.csv'`, so a mode that ran what it wrote would write files into whatever directory it started in. Two thousand statements from each of the two rules, against the pinned binary on server2.
+
+From `Statement`: 83 statements neither engine parses, 1617 both parse, 0 in the gap, and 300 statements in 122 groups where rudb parses and DuckDB does not. From `SelectStatement`: 262 neither parses, 474 both parse, 0 in the gap, 1264 in 159 groups the other way.
+
+The gap is empty and it is going to stay empty, which is the finding and is not a compatibility result. This generator writes from the same table the matcher reads. A source that cannot write a statement rudb refuses cannot measure what rudb refuses, so pointing it at DuckDB does not turn it into a level two input the way the paragraph above assumed it would. What the gap column is worth is as a check on the construction: a number above zero means the generator and the matcher disagree about the grammar they share, which is a bug in one of them and not a gap against DuckDB. The level two statement number still comes from the corpus and from `sqlsmith`, which write statements this one cannot.
+
+The direction that does fill up was not in the plan and is worth more than expected. Three hundred statements from the whole grammar and 1264 from the query rule are accepted by rudb and refused by DuckDB, and the groups say one thing over and over: DuckDB checks things while it parses that its own grammar allows. `SELECT` with no select list is 507 of the query cases. A CTE body that is a `CHECKPOINT` is 255. An empty subscript is 105. Two aliases on one table reference, a window name defined twice, a positional reference of zero, `RESPECT NULLS` on something that is not a window function. Every one of those is in the vendored grammar, DuckDB's transformer refuses it, and rudb has no transformer, so rudb takes all of them.
+
+That is a real surface and it belongs to milestone 3 and milestone 6 rather than to the parser. A parser that accepts more than the thing it is compatible with will bind something it should have refused, and the record of it is now 281 groups with a shortest example each, which is a worklist rather than 281 issues. The honest reading of this mode is that it measures over acceptance, and that section 11's `Syntax` reason has one fewer source than this document claimed it would.
+
 ## 10.3 Fuzzing our own code, which is a different job
 
 The two generators above look for differences. A fuzzer looks for crashes, panics, assertion failures, hangs and memory growth, and it is a separate activity with separate tooling and a separate success criterion.
