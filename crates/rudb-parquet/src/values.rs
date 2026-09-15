@@ -315,6 +315,7 @@ fn place(
     // the page goes out behind a handle and a second handle stays on this thread, so the run comes
     // back to be decompressed into once every vector built over it has been dropped.
     let mut out = StringColumn::over(Buffer::from_arc(crate::arena::share(std::mem::take(body))));
+    out.reserve_views(total);
     let mut next = 0;
     for index in 0..total {
         if !levels.is_empty() && levels.get(index) != Some(&1) {
