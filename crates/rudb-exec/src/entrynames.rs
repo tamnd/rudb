@@ -5,11 +5,13 @@
 //! `rudb_functions::entrycatalog` has their columns, because the binder resolves the call and needs
 //! the columns before there is a catalog in reach, and the rows are here because this is where one is.
 //!
-//! `duckdb_views()` is the fifth and it is not here. A view in rudb's catalog is a name and the text
-//! of its body, and neither the number of columns it produces nor the deparsed statement the pin
-//! reports as `sql` can be worked out from that without binding it. That is a decision about what the
-//! catalog stores rather than a row builder, so it is filed and not guessed at. `duckdb_columns()`
-//! lists a view's columns upstream and lists only table columns here for the same reason.
+//! `duckdb_columns()` lists a view's columns as well as a table's. What it reads is the list the
+//! binder wrote down the last time the view was bound, which is a cache that goes stale, and that is
+//! upstream's design rather than a shortcut taken here. See `rudb_catalog::View` for the measurement.
+//!
+//! `duckdb_views()` is the fifth table and it is not here yet. Every column of it is answerable now
+//! except `sql`, which the pin reports as a deparse of the body rather than the text somebody typed,
+//! and rudb has nothing that writes a query back out as SQL. That is its own piece of work.
 //!
 //! Every table is walked in catalog order, which is the order things were attached and created in.
 //! That is not sorted and it is not reproduced from the pin either, whose order is its own catalog's.
@@ -152,39 +154,84 @@ pub(crate) fn columnnames(
     columns: Slice,
 ) -> Result<Metadata> {
     let mut rows = Vec::new();
-    for (database, schema, table) in entries(catalog) {
-        for (at, column) in table.columns().iter().enumerate() {
-            let (precision, radix, scale) = numeric_facts(&column.ty);
-            rows.push(vec![
-                text(database.name()),
-                Value::BigInt(database.oid()),
-                text(schema.name()),
-                Value::BigInt(schema.oid()),
-                text(&table.name().table),
-                Value::BigInt(table.oid()),
-                text(&column.name),
-                // One based, which is the pin's answer and not the position in the vector.
-                Value::Integer(i32::try_from(at + 1).unwrap_or(i32::MAX)),
-                Value::Null,
-                Value::Boolean(false),
-                Value::Null,
-                Value::Boolean(!column.not_null),
-                text(&column.ty.to_string()),
-                type_oid(&canonical(&column.ty)).map_or(Value::Null, Value::BigInt),
-                // Null even on a VARCHAR the DDL gave a length, because the pin reports null there
-                // too: DuckDB parses the length modifier and then drops it, so by the time a column
-                // is in a catalog there is no length left to report.
-                Value::Null,
-                precision.map_or(Value::Null, Value::Integer),
-                radix.map_or(Value::Null, Value::Integer),
-                scale.map_or(Value::Null, Value::Integer),
-                empty(),
-                Value::Boolean(false),
-                Value::Null,
-            ]);
+    for database in catalog.databases() {
+        for schema in database.schemas() {
+            for table in schema.tables() {
+                for (at, column) in table.columns().iter().enumerate() {
+                    rows.push(column_row(
+                        database,
+                        schema,
+                        &table.name().table,
+                        table.oid(),
+                        at,
+                        &column.name,
+                        &column.ty,
+                        !column.not_null,
+                    ));
+                }
+            }
+            for view in schema.views() {
+                for (at, field) in view.columns().iter().enumerate() {
+                    // Nullable on every column of every view the pin returns, including one that
+                    // reads a `NOT NULL` column straight through, so it is a constant here and not a
+                    // fact carried over from the table underneath.
+                    rows.push(column_row(
+                        database,
+                        schema,
+                        &view.name().table,
+                        view.oid(),
+                        at,
+                        &field.name,
+                        &field.ty,
+                        true,
+                    ));
+                }
+            }
         }
     }
     Metadata::new("duckdb_columns", &column_fields(), &rows, plan, index, columns)
+}
+
+/// One row of `duckdb_columns()`, which is the same twenty one columns for a table and for a view.
+#[expect(clippy::too_many_arguments, reason = "a row of a twenty one column table")]
+fn column_row(
+    database: &Database,
+    schema: &Schema,
+    table: &str,
+    oid: i64,
+    at: usize,
+    name: &str,
+    ty: &LogicalType,
+    nullable: bool,
+) -> Vec<Value> {
+    let (precision, radix, scale) = numeric_facts(ty);
+    vec![
+        text(database.name()),
+        Value::BigInt(database.oid()),
+        text(schema.name()),
+        Value::BigInt(schema.oid()),
+        text(table),
+        Value::BigInt(oid),
+        text(name),
+        // One based, which is the pin's answer and not the position in the vector.
+        Value::Integer(i32::try_from(at + 1).unwrap_or(i32::MAX)),
+        Value::Null,
+        Value::Boolean(false),
+        Value::Null,
+        Value::Boolean(nullable),
+        text(&ty.to_string()),
+        type_oid(&canonical(ty)).map_or(Value::Null, Value::BigInt),
+        // Null even on a VARCHAR the DDL gave a length, because the pin reports null there too:
+        // DuckDB parses the length modifier and then drops it, so by the time a column is in a
+        // catalog there is no length left to report.
+        Value::Null,
+        precision.map_or(Value::Null, Value::Integer),
+        radix.map_or(Value::Null, Value::Integer),
+        scale.map_or(Value::Null, Value::Integer),
+        empty(),
+        Value::Boolean(false),
+        Value::Null,
+    ]
 }
 
 /// Every base table in the catalog with the database and schema it is in.

@@ -1506,6 +1506,72 @@ fn a_not_null_column_says_so_in_both_tables() {
     );
 }
 
+#[test]
+fn a_view_lists_its_columns_the_way_a_table_does() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    db.execute("CREATE TABLE base(x INTEGER NOT NULL, s VARCHAR, d DECIMAL(9,2))")
+        .expect("a fresh table");
+    db.execute("CREATE VIEW v AS SELECT x, s, d, x + 1 AS e FROM base").expect("a fresh view");
+    db.execute("CREATE VIEW w(p, q) AS SELECT x, s FROM base").expect("a view with an alias list");
+    // Every one of these was read off the pin. A computed column is reported as the type it comes
+    // out as, the alias list is what the columns answer to, and `is_nullable` is true even on the
+    // column that reads a NOT NULL column straight through.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT table_name, column_name, column_index, is_nullable, data_type \
+             FROM duckdb_columns() WHERE table_name IN ('v', 'w') \
+             ORDER BY table_name, column_index"
+        ),
+        vec![
+            vec![text("v"), text("x"), Value::Integer(1), Value::Boolean(true), text("INTEGER")],
+            vec![text("v"), text("s"), Value::Integer(2), Value::Boolean(true), text("VARCHAR")],
+            vec![
+                text("v"),
+                text("d"),
+                Value::Integer(3),
+                Value::Boolean(true),
+                text("DECIMAL(9,2)")
+            ],
+            vec![text("v"), text("e"), Value::Integer(4), Value::Boolean(true), text("INTEGER")],
+            vec![text("w"), text("p"), Value::Integer(1), Value::Boolean(true), text("INTEGER")],
+            vec![text("w"), text("q"), Value::Integer(2), Value::Boolean(true), text("VARCHAR")],
+        ]
+    );
+    // A view's columns carry the view's oid rather than the oid of whatever is underneath it, which
+    // is the join a client writes and the one that would silently return the wrong rows.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(*) FROM duckdb_columns() c, duckdb_tables() t \
+             WHERE c.table_oid = t.table_oid AND c.table_name IN ('v', 'w')"
+        ),
+        vec![vec![Value::BigInt(0)]]
+    );
+}
+
+/// A view over a star follows the table under it, and the column list follows with it.
+#[test]
+fn a_star_in_a_view_is_expanded_again_every_time_the_view_is_read() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    db.execute("CREATE TABLE base(x INTEGER)").expect("a fresh table");
+    db.execute("CREATE VIEW star AS SELECT * FROM base").expect("a fresh view");
+    assert_eq!(
+        rows(&db, "SELECT column_name FROM duckdb_columns() WHERE table_name = 'star'"),
+        vec![vec![text("x")]]
+    );
+    // Reading the view rewrites the list. There is no ALTER TABLE yet, so this cannot yet be made
+    // to report a different answer than it did before, and the point of it here is that a read does
+    // not damage the list either.
+    db.query("SELECT * FROM star").expect("the view reads");
+    assert_eq!(
+        rows(&db, "SELECT column_name FROM duckdb_columns() WHERE table_name = 'star'"),
+        vec![vec![text("x")]]
+    );
+}
+
 /// The four ways a subscript is refused, in DuckDB's words. Per #278.
 #[test]
 fn the_subscripts_that_are_refused_say_what_duckdb_says() {

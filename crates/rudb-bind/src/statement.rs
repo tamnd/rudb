@@ -108,6 +108,12 @@ pub struct CreateView {
     pub if_not_exists: bool,
     /// Whether an existing entry of that name is dropped first.
     pub or_replace: bool,
+    /// The columns binding the body produced, after the alias list was applied.
+    ///
+    /// Worked out here because this is where the body is bound, and carried to the catalog because
+    /// that is where `duckdb_columns()` and `duckdb_views()` read it from. See the doc on
+    /// `rudb_catalog::View` for why the catalog keeps a list it will have to refresh later.
+    pub columns: Vec<Field>,
 }
 
 /// A bound `DROP TABLE` or `DROP VIEW`.
@@ -325,9 +331,13 @@ fn create_view(
     let aliases: Vec<String> = ast.name(written.columns).map(str::to_string).collect();
 
     let mut binder = Binder::with(catalog, parameters, session);
-    let (_, scope) = binder.bind_query(ast, written.query)?;
+    let (_, mut scope) = binder.bind_query(ast, written.query)?;
     if aliases.len() > scope.len() {
         return Err(Error::binder("More VIEW aliases than columns in query result"));
+    }
+    if !aliases.is_empty() {
+        let written: Vec<&str> = aliases.iter().map(String::as_str).collect();
+        scope.rename(&written, "unnamed_subquery")?;
     }
 
     Ok(Bound::CreateView(CreateView {
@@ -336,6 +346,7 @@ fn create_view(
         aliases,
         if_not_exists: written.if_not_exists,
         or_replace: written.or_replace,
+        columns: scope.fields(),
     }))
 }
 
