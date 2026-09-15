@@ -1327,8 +1327,8 @@ fn the_session_context_answers_for_the_clock_the_catalog_and_the_user() {
     // And a name two tables both carry is still the ambiguity error rather than the constant.
     assert_eq!(
         failure(&db, "SELECT current_date FROM context, context AS again"),
-        "Ambiguous reference to column name \"current_date\" (use: \"context.current_date\" or \
-         \"again.current_date\")"
+        "Ambiguous reference to column name \"current_date\" (use: 'context.current_date' or \
+         'again.current_date')"
     );
     // The five names that take one spelling and not the other. `current_database` is a function and
     // not a keyword on the pin, and `current_timestamp` is a keyword and not a function.
@@ -1387,11 +1387,15 @@ fn the_session_context_answers_for_the_clock_the_catalog_and_the_user() {
             text("2020-01-02 03:04:05+00"),
         ]]
     );
-    // All fourteen are in the function table, which is where a client looks to find out.
+    // All fourteen are in the function table, which is where a client looks to find out. The count
+    // is of the distinct names rather than of the rows, because the pin has two rows for
+    // `current_schema` and two for `current_database`, a scalar and a macro with the same name, and
+    // the thing worth holding still is that the name is there rather than how many ways it is there.
     assert_eq!(
         rows(
             &db,
-            "SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('now', 'today', \
+            "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE function_name IN \
+             ('now', 'today', \
              'get_current_timestamp', 'get_current_time', 'transaction_timestamp', \
              'current_localtime', 'current_localtimestamp', 'current_date', 'current_schema', \
              'current_database', 'current_catalog', 'current_user', 'session_user', 'user')"
