@@ -1175,6 +1175,32 @@ fn a_null_map_is_a_value_now_rather_than_an_unwritten_vector() {
     assert!(rows(&db, "SELECT tags FROM maps").is_empty());
 }
 
+/// `duckdb_types()` through the binder and the executor rather than through a hand written plan.
+#[test]
+fn the_types_table_answers_a_query_a_client_would_actually_write() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_types()"), vec![vec![Value::BigInt(93)]]);
+    // A client reading this table is asking whether the engine has a type, so the useful query is a
+    // name lookup, and it has to work through the where clause rather than only over the whole
+    // table.
+    assert_eq!(
+        rows(&db, "SELECT logical_type, type_size FROM duckdb_types() WHERE type_name = 'hugeint'"),
+        vec![vec![Value::Varchar("HUGEINT".to_string()), Value::BigInt(16)]]
+    );
+    // The name is case insensitive the way every function name is, and the table is in the default
+    // catalog and schema because that is where the pin puts the builtin types.
+    assert_eq!(
+        rows(&db, "SELECT DISTINCT database_name, schema_name FROM DuckDB_Types()"),
+        vec![vec![Value::Varchar("memory".to_string()), Value::Varchar("main".to_string())]]
+    );
+    // `tags` is why this table needed a map vector, so it is read back here as one rather than only
+    // counted.
+    assert_eq!(
+        rows(&db, "SELECT tags FROM duckdb_types() WHERE type_name = 'boolean'"),
+        vec![vec![Value::map(LogicalType::Varchar, LogicalType::Varchar, Vec::new())]]
+    );
+}
+
 /// The four ways a subscript is refused, in DuckDB's words. Per #278.
 #[test]
 fn the_subscripts_that_are_refused_say_what_duckdb_says() {

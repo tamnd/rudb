@@ -5,7 +5,7 @@
 //! resolution problem from [`crate::signature`]: the answer is not a return type, it is a list of
 //! columns, because the caller can alias them and select from them and join against them.
 //!
-//! Six of them are here. `range` and `generate_series` between them account for two thousand
+//! Seven of them are here. `range` and `generate_series` between them account for two thousand
 //! records in DuckDB's `sqllogictest` corpus, because a test that needs a thousand rows should not
 //! have to write a thousand rows, and the corpus uses them the way a person uses a for loop. The
 //! difference between those two is one row: `range` stops before the end and `generate_series`
@@ -19,19 +19,23 @@
 //! [`crate::file`] is where that happens. For CSV there is nothing in the file that states the
 //! columns either, so opening it means sniffing it.
 //!
-//! `rudb_strategies()` and `duckdb_keywords()` are the other two and they are the third kind, a
-//! table whose rows are a fact about the engine rather than data somebody stored. Both take no
-//! arguments and both know their own columns, so resolving one is the simplest case in this file and
-//! they share an arm. The first is not a DuckDB function at all: it lists every seam in the engine
-//! and every implementation registered against it, which is how a reader finds out what this engine
-//! will let them swap and what it lets them swap today. The second is DuckDB's and is every word the
-//! grammar knows about, which this crate can answer because the grammar is vendored.
+//! `rudb_strategies()`, `duckdb_keywords()` and `duckdb_types()` are the other three and they are
+//! the third kind, a table whose rows are a fact about the engine rather than data somebody stored.
+//! All three take no arguments and all three know their own columns, so resolving one is the
+//! simplest case in this file and they share an arm. The first is not a DuckDB function at all: it
+//! lists every seam in the engine and every implementation registered against it, which is how a
+//! reader finds out what this engine will let them swap and what it lets them swap today. The second
+//! is every word the grammar knows about, which this crate can answer because the grammar is
+//! vendored. The third is every type name the engine has, and its list is in
+//! [`crate::typecatalog`] because which names exist is a fact about the type system.
 //!
-//! D2 adds about a dozen more of that third kind, the settings and the types and the functions and
-//! the catalog tables among them. Each one is a column list here and a list of rows in
-//! `rudb_exec::metadata`, and nothing else.
+//! D2 adds about ten more of that third kind, the settings and the functions and the catalog tables
+//! among them. Each one is a column list here and a list of rows in `rudb_exec::metadata`, and
+//! nothing else.
 
 use rudb_common::{Error, Field, LogicalType, Result};
+
+use crate::typecatalog::type_fields;
 
 /// Which table function a call resolved to.
 ///
@@ -51,6 +55,8 @@ pub enum TableFunction {
     RudbStrategies,
     /// `duckdb_keywords()`, every word the grammar knows and which class each one is in.
     DuckdbKeywords,
+    /// `duckdb_types()`, every type name the engine knows and what each one stands for.
+    DuckdbTypes,
 }
 
 /// The name of the column `file_row_number=True` adds.
@@ -72,6 +78,7 @@ impl TableFunction {
             Self::ReadCsv => "read_csv",
             Self::RudbStrategies => "rudb_strategies",
             Self::DuckdbKeywords => "duckdb_keywords",
+            Self::DuckdbTypes => "duckdb_types",
         }
     }
 
@@ -143,6 +150,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("duckdb_keywords") {
             return Some(Self::DuckdbKeywords);
+        }
+        if name.eq_ignore_ascii_case("duckdb_types") {
+            return Some(Self::DuckdbTypes);
         }
         None
     }
@@ -258,7 +268,8 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::RudbStrategies
-        | TableFunction::DuckdbKeywords => None,
+        | TableFunction::DuckdbKeywords
+        | TableFunction::DuckdbTypes => None,
     }
 }
 
@@ -268,6 +279,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
     match function {
         TableFunction::RudbStrategies => Some(strategy_fields()),
         TableFunction::DuckdbKeywords => Some(keyword_fields()),
+        TableFunction::DuckdbTypes => Some(type_fields()),
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::ReadParquet
@@ -548,7 +560,7 @@ mod tests {
 
     #[test]
     fn a_metadata_table_given_an_argument_says_it_takes_none() {
-        for name in ["rudb_strategies", "duckdb_keywords"] {
+        for name in ["rudb_strategies", "duckdb_keywords", "duckdb_types"] {
             let function = TableFunction::lookup(name).expect("a known function");
             let error = resolve_table(name, &[LogicalType::BigInt]).expect_err("takes none");
             assert!(
@@ -569,6 +581,21 @@ mod tests {
         let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
         assert_eq!(names, ["keyword_name", "keyword_category"]);
         assert!(fields.iter().all(|field| field.ty == LogicalType::Varchar));
+    }
+
+    #[test]
+    fn duckdb_types_has_duckdbs_seventeen_columns_under_that_name() {
+        let resolved = resolve_table("DuckDB_Types", &[]).expect("a case insensitive name");
+        assert_eq!(resolved.function, TableFunction::DuckdbTypes);
+        let Columns::Fixed(fields) = resolved.columns else { panic!("fixed columns") };
+        let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names.len(), 17);
+        assert_eq!(names[0], "database_name");
+        assert_eq!(names[16], "varargs");
+        // The one column that is not a varchar, a bigint or a boolean, and the reason this table
+        // waited on the map vector.
+        let tags = fields.iter().find(|field| field.name == "tags").expect("a tags column");
+        assert_eq!(tags.ty, LogicalType::map(LogicalType::Varchar, LogicalType::Varchar));
     }
 
     #[test]
