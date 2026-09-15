@@ -43,7 +43,7 @@
 //!
 //! # The second variant arrived early, and from the other direction
 //!
-//! [`Store::Shared`] is here before the buffer manager is, because the Parquet reader needed the
+//! The shared variant is here before the buffer manager is, because the Parquet reader needed the
 //! same thing for a different reason. A string column is built over the page it was decoded from
 //! rather than copying out of it, so the page becomes the column's arena and goes downstream with
 //! it, and the reader never gets the allocation back. On `hits` that is ten and a half megabytes a
