@@ -40,10 +40,12 @@
 //! here rather than there because the format string is defined by Arrow's document, so it is the
 //! part a test can check against that document rather than against our own opinion.
 //!
-//! The nested types. A struct is a list of child arrays and there is no child vector to build one out
-//! of until `rudb-vector` has a struct vector, which is true of `MAP`, `ARRAY` and `UNION` too. A list
-//! is the one that is only missing here: there has been a list vector since #302, and what is left is
-//! turning a start and a length per row into the offsets Arrow wants, which [`DataType`] writes up.
+//! The nested types. There is a list vector as of #302 and a struct vector as of #594, so for those
+//! two the blocker is no longer underneath this crate and what is left is here. A struct is the easier
+//! of the two, because Arrow holds a struct the same way we do, one child array per field each as long
+//! as the parent, so the export is the children exported and a schema saying so. A list is the one with
+//! a real decision in it, and [`DataType`] writes that up. `MAP`, `ARRAY` and `UNION` are still missing
+//! a vector to export from.
 
 #![forbid(unsafe_code)]
 

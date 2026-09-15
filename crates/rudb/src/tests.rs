@@ -1133,6 +1133,28 @@ fn a_list_column_keeps_an_empty_list_and_a_null_apart() {
     );
 }
 
+/// What the struct vector changes that a query can see today. Per #594.
+///
+/// One line, and that is the honest size of it. A struct vector exists now, so a query that has to put
+/// a struct in one stops erroring, and the only such query a user can write is a cast of a null, because
+/// the parser does not build a struct literal yet and there is no `struct_pack` to call instead. That is
+/// the same split #302 left for lists and the same order: the vector first so the rest has somewhere to
+/// compute into. Both answers here are the pin's.
+#[test]
+fn a_null_struct_is_a_value_now_rather_than_an_unwritten_vector() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT NULL::STRUCT(a INT)"), vec![vec![Value::Null]]);
+    assert_eq!(
+        rows(&db, "SELECT typeof(NULL::STRUCT(a INT, b VARCHAR))"),
+        vec![vec![Value::Varchar("STRUCT(a INTEGER, b VARCHAR)".to_string())]]
+    );
+    // A struct column in a table is a column the catalog already held and the reader could not read.
+    // It has no rows in it, because putting one in needs a literal the parser does not build.
+    db.execute("CREATE TABLE structs (a STRUCT(x INTEGER, y VARCHAR))").unwrap();
+    assert_eq!(rows(&db, "SELECT count(*) FROM structs"), vec![vec![Value::BigInt(0)]]);
+    assert!(rows(&db, "SELECT a FROM structs").is_empty());
+}
+
 /// The four ways a subscript is refused, in DuckDB's words. Per #278.
 #[test]
 fn the_subscripts_that_are_refused_say_what_duckdb_says() {
