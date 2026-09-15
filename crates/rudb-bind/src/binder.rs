@@ -1053,6 +1053,13 @@ impl<'a> Binder<'a> {
         if !aliases.is_empty() {
             scope.rename(&aliases, "unnamed_subquery")?;
         }
+        // What the catalog tables report as this view's columns, written down here because this is
+        // the moment they are known. Upstream refreshes the same cache at the same point, which was
+        // measured: both `duckdb_columns()` and `duckdb_views().column_count` keep reporting the old
+        // list after an `ALTER TABLE` underneath until something reads the view, and then both move.
+        // It is written before the label and before the `AS t(a, b)` list below, because those two
+        // rename the view for one query and not for everyone.
+        view.remember(scope.fields());
         let label = if alias == NONE { name.table.clone() } else { ast.string(alias).to_string() };
         scope.relabel(&label);
         if !columns.is_empty() {

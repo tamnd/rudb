@@ -10,7 +10,7 @@
 //! no `hits` to refer to, which is SQL's rule and not ours.
 
 use rudb_catalog::same_name;
-use rudb_common::{Error, LogicalType, Result};
+use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_plan::ColumnBinding;
 
 /// One visible column.
@@ -155,6 +155,17 @@ impl Scope {
             column.name = (*name).to_string();
         }
         Ok(())
+    }
+
+    /// The visible columns as fields, which is what a view writes down for the catalog tables.
+    ///
+    /// The table name each one is reachable through is dropped, because a field is a name and a
+    /// type and the catalog already knows which view it is looking at.
+    pub(crate) fn fields(&self) -> Vec<Field> {
+        self.columns
+            .iter()
+            .map(|column| Field::new(column.name.clone(), column.ty.clone()))
+            .collect()
     }
 
     /// Drops the column at `position`, which is what `USING` does to the right side's copy.
