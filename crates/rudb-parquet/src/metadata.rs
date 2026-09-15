@@ -204,6 +204,31 @@ pub struct ColumnChunk {
     pub dictionary_page_offset: Option<u64>,
     /// What the writer said about the values.
     pub stats: Option<Stats>,
+    /// Where the column index for this chunk is, when the writer wrote one.
+    ///
+    /// The column index holds the same bounds [`ColumnChunk::stats`] holds, one set per page instead
+    /// of one per chunk. It is not in the footer: the footer says where it is, and a reader that
+    /// wants it reads it. That is the format doing the right thing, because a hundred and five
+    /// columns times nine row groups times a bound per page is larger than the rest of the footer
+    /// put together and a query wants it for the columns it filters on and no others.
+    pub column_index: Option<Region>,
+    /// Where the offset index for this chunk is, when the writer wrote one.
+    ///
+    /// Bounds without offsets are not actionable. The column index says page four cannot hold a
+    /// matching row, and this is what says where page four starts and which row it starts at.
+    pub offset_index: Option<Region>,
+}
+
+/// A stretch of the file to read, as the footer describes it.
+///
+/// Two numbers with a name, which is worth a type because the footer has four of them in pairs and
+/// crossing the pair is a bug a type can prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    /// Where it starts.
+    pub at: u64,
+    /// How long it is.
+    pub len: usize,
 }
 
 impl ColumnChunk {
@@ -385,6 +410,8 @@ struct RawChunk {
     data_page_offset: u64,
     dictionary_page_offset: Option<u64>,
     stats: Option<Stats>,
+    column_index: Option<Region>,
+    offset_index: Option<Region>,
 }
 
 /// Matches every chunk of a row group to the schema column it belongs to.
@@ -412,6 +439,8 @@ fn resolve(group: RawGroup, schema: &[SchemaColumn]) -> Result<RowGroup> {
             data_page_offset: chunk.data_page_offset,
             dictionary_page_offset: chunk.dictionary_page_offset,
             stats: chunk.stats,
+            column_index: chunk.column_index,
+            offset_index: chunk.offset_index,
         });
     }
     Ok(RowGroup { columns, rows: group.rows, bytes: group.bytes })
@@ -767,6 +796,8 @@ fn read_row_group(reader: &mut Reader<'_>) -> Result<RawGroup> {
 fn read_column_chunk(reader: &mut Reader<'_>) -> Result<RawChunk> {
     let saved = reader.struct_begin();
     let mut chunk = None;
+    let (mut pages_at, mut pages_len) = (None, None);
+    let (mut index_at, mut index_len) = (None, None);
     while let Some(field) = reader.field_begin()? {
         match field.id {
             1 => {
@@ -778,11 +809,27 @@ fn read_column_chunk(reader: &mut Reader<'_>) -> Result<RawChunk> {
                 }
             }
             3 => chunk = Some(read_column_metadata(reader)?),
+            4 => pages_at = Some(offset(reader.read_int()?, "an offset index")?),
+            5 => pages_len = Some(reader.read_int()?),
+            6 => index_at = Some(offset(reader.read_int()?, "a column index")?),
+            7 => index_len = Some(reader.read_int()?),
             _ => reader.skip(field.kind)?,
         }
     }
     reader.struct_end(saved);
-    chunk.ok_or_else(|| Error::io("a column chunk with no metadata in it"))
+    let mut chunk = chunk.ok_or_else(|| Error::io("a column chunk with no metadata in it"))?;
+    chunk.offset_index = region(pages_at, pages_len);
+    chunk.column_index = region(index_at, index_len);
+    Ok(chunk)
+}
+
+/// A region from the offset and the length the footer carries separately.
+///
+/// Both or neither. A writer that recorded one and not the other has said nothing a reader can act
+/// on, and treating half a pair as an error would fail a file that is otherwise readable.
+fn region(at: Option<u64>, len: Option<i64>) -> Option<Region> {
+    let (at, len) = (at?, usize::try_from(len?).ok()?);
+    (len > 0).then_some(Region { at, len })
 }
 
 /// Reads one `ColumnMetaData`, which is where a column chunk's offsets live.
@@ -837,6 +884,8 @@ fn read_column_metadata(reader: &mut Reader<'_>) -> Result<RawChunk> {
         data_page_offset,
         dictionary_page_offset,
         stats,
+        column_index: None,
+        offset_index: None,
     })
 }
 
