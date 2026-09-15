@@ -437,8 +437,10 @@ impl Column {
             (StoredData::Integer(values), Value::Null) => values.push(0),
             (StoredData::BigInt(values), Value::BigInt(value)) => values.push(value),
             (StoredData::BigInt(values), Value::Null) => values.push(0),
-            (StoredData::Varchar(values), Value::Varchar(value)) => values.push(value.as_bytes()),
-            (StoredData::Varchar(values), Value::Null) => values.push(&[]),
+            (StoredData::Varchar(values), Value::Varchar(value)) => {
+                values.push(value.as_bytes())?
+            }
+            (StoredData::Varchar(values), Value::Null) => values.push(&[])?,
             (StoredData::Other(values), value) => values.push(Stored::from(value)),
             (_, value) => {
                 return Err(Error::internal(format!(
@@ -485,7 +487,7 @@ impl Column {
             }
             StoredData::Varchar(values) => match column.bytes_at(row) {
                 Some(bytes) => {
-                    values.push(bytes);
+                    values.push(bytes)?;
                     true
                 }
                 None => false,
@@ -657,18 +659,25 @@ impl Column {
 #[derive(Debug, Default)]
 struct StringColumn {
     bytes: Vec<u8>,
-    ends: Vec<usize>,
+    ends: Vec<u32>,
 }
 
 impl StringColumn {
-    fn push(&mut self, value: &[u8]) {
+    fn push(&mut self, value: &[u8]) -> Result<()> {
+        let length = self.bytes.len().checked_add(value.len()).ok_or_else(|| {
+            Error::out_of_memory("an aggregate partition's string keys are too large")
+        })?;
+        let end = u32::try_from(length).map_err(|_| {
+            Error::out_of_memory("one aggregate partition holds more than 4 GiB of string keys")
+        })?;
         self.bytes.extend_from_slice(value);
-        self.ends.push(self.bytes.len());
+        self.ends.push(end);
+        Ok(())
     }
 
     fn get(&self, slot: usize) -> &[u8] {
-        let start = slot.checked_sub(1).map_or(0, |before| self.ends[before]);
-        &self.bytes[start..self.ends[slot]]
+        let start = slot.checked_sub(1).map_or(0, |before| self.ends[before]) as usize;
+        &self.bytes[start..self.ends[slot] as usize]
     }
 
     fn string(&self, slot: usize) -> String {
@@ -676,7 +685,7 @@ impl StringColumn {
     }
 
     fn footprint(&self) -> usize {
-        self.bytes.capacity() + self.ends.capacity() * size_of::<usize>()
+        self.bytes.capacity() + self.ends.capacity() * size_of::<u32>()
     }
 }
 
