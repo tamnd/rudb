@@ -105,6 +105,87 @@ impl Page {
         }
     }
 
+    /// The page's values at a handful of positions, without building the rest.
+    ///
+    /// This is what a late materialised fetch wants. `SELECT * FROM hits WHERE ... ORDER BY
+    /// EventTime LIMIT 10` picks ten rows and then needs a hundred and five columns of those ten,
+    /// and a page here holds a hundred and ten thousand values. Going through [`Page::decode`] and
+    /// gathering afterwards builds all hundred and ten thousand of them to keep one, which measured
+    /// on `hits-1m-snappy.parquet` was 195 ms of the 425 ms the fetch spent, more than the
+    /// decompression that had to happen either way.
+    ///
+    /// `wanted` is positions in the page, strictly increasing. Anything that is not strictly
+    /// increasing, and any encoding this has no shortcut for, falls back to decoding the page and
+    /// gathering, so this is never wrong, only sometimes no faster.
+    ///
+    /// The shortcut is for plain pages, which is where the time is: on that file a hundred and
+    /// seventy eight of its two hundred and twenty megabytes are plain and the rest is dictionary
+    /// encoded, and a dictionary page already decodes to codes and a shared dictionary rather than
+    /// to values, so gathering from it is cheap already.
+    ///
+    /// # Errors
+    ///
+    /// For everything [`Page::decode`] fails on, and if a position is past the end of the page.
+    pub fn decode_at(
+        &mut self,
+        column: &SchemaColumn,
+        dictionary: Option<&Arc<Vector>>,
+        wanted: &[u32],
+    ) -> Result<Vector> {
+        let encoding = match &self.header.body {
+            Body::DataV1(page) => page.encoding,
+            Body::DataV2(page) => page.encoding,
+            Body::Dictionary(_) | Body::Index => {
+                return Err(Error::io(
+                    "values were asked of a page that holds no rows".to_string(),
+                ));
+            }
+        };
+        let shortcut = encoding == Encoding::Plain
+            && !matches!(column.physical, Physical::Boolean)
+            && wanted.windows(2).all(|pair| pair[0] < pair[1]);
+        if !shortcut {
+            return self.decode(column, dictionary)?.gather(wanted);
+        }
+        let total = usize::try_from(self.header.values())
+            .map_err(|_| Error::io("a page with a negative value count".to_string()))?;
+        let (levels, at) = self.definitions(column.optional)?;
+        let (dense, picked) = wherever(&levels, total, wanted)?;
+        let (validity, _) = presence(&picked, wanted.len());
+        let data = match column.physical {
+            Physical::ByteArray => {
+                text(column)?;
+                let spans = walk(&self.body, at, &dense)?;
+                place(column, &mut self.body, &spans, &picked, wanted.len())?
+            }
+            _ => {
+                let width = match column.physical {
+                    Physical::Int32 | Physical::Float => 4,
+                    Physical::Int64 | Physical::Double => 8,
+                    Physical::Int96 => {
+                        return Err(Error::io(
+                            "an INT96 column, which is the timestamp the format deprecated and \
+                             this reader does not read yet"
+                                .to_string(),
+                        ));
+                    }
+                    Physical::FixedLenByteArray => {
+                        return Err(Error::io(
+                            "a FIXED_LEN_BYTE_ARRAY column, which this reader does not read yet"
+                                .to_string(),
+                        ));
+                    }
+                    Physical::Boolean | Physical::ByteArray => {
+                        unreachable!("booleans take the fallback and byte arrays their own arm")
+                    }
+                };
+                let mut narrow = gathered(&self.body, at, width, &dense)?;
+                plain(column, &mut narrow, 0, dense.len(), &picked, wanted.len())?
+            }
+        };
+        Ok(Vector::flat(column.ty.clone(), data)?.with_validity(validity))
+    }
+
     /// The values of a dictionary page, as a vector.
     ///
     /// Its values are always plain encoded and never null, which is why this is separate rather
@@ -296,6 +377,110 @@ fn delta(
         }
         other => Err(Error::io(format!("a page in {other:?}, which is not a delta encoding"))),
     }
+}
+
+/// Where the wanted positions sit among the values a page actually holds, and which of them are
+/// null.
+///
+/// A page stores only its non-null values, so position seventy in the page is not value seventy in
+/// the body. The definition levels say which positions hold a value, and counting them up to a
+/// position gives where that value is. The levels are walked once for the whole run of wanted
+/// positions rather than once each, which is why the positions have to arrive in order.
+///
+/// What comes back is the dense offsets of the positions that are not null, and a level per wanted
+/// position for the vector to spread over. A page with no nulls at all skips the walk and gets an
+/// empty level list, which is the same thing [`Page::decode`] hands the plain readers.
+fn wherever(levels: &[u32], total: usize, wanted: &[u32]) -> Result<(Vec<usize>, Vec<u32>)> {
+    let mut dense = Vec::with_capacity(wanted.len());
+    if levels.is_empty() {
+        for &position in wanted {
+            let position = position as usize;
+            if position >= total {
+                return Err(Error::io(format!("position {position} in a page of {total} values")));
+            }
+            dense.push(position);
+        }
+        return Ok((dense, Vec::new()));
+    }
+    let mut picked = Vec::with_capacity(wanted.len());
+    let mut before = 0;
+    let mut seen = 0;
+    for &position in wanted {
+        let position = position as usize;
+        if position >= total {
+            return Err(Error::io(format!("position {position} in a page of {total} values")));
+        }
+        while seen < position {
+            if levels.get(seen) == Some(&1) {
+                before += 1;
+            }
+            seen += 1;
+        }
+        let here = levels.get(position) == Some(&1);
+        picked.push(u32::from(here));
+        if here {
+            dense.push(before);
+        }
+    }
+    Ok((dense, picked))
+}
+
+/// The bytes of a few fixed width values, laid end to end as if they were a page of their own.
+///
+/// Copying them out is what lets the plain reader run over them unchanged. A handful of values is
+/// a handful of copies of four or eight bytes, and the alternative is a second implementation of
+/// every wire type this reader knows.
+fn gathered(body: &[u8], at: usize, width: usize, dense: &[usize]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(dense.len().saturating_mul(width));
+    for &value in dense {
+        let start = at
+            .checked_add(value.saturating_mul(width))
+            .ok_or_else(|| Error::io("a value past the end of memory".to_string()))?;
+        let bytes = body.get(start..start.saturating_add(width)).ok_or_else(|| {
+            Error::io(format!("a {width} byte value at {start} in a page of {} bytes", body.len()))
+        })?;
+        out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
+/// Where a few byte array values are, found by stepping over the ones in between.
+///
+/// A plain byte array page is a length and then that many bytes, over and over, so the only way to
+/// reach the tenth value is to add up the nine before it. That is the walk, and it is cheap: a four
+/// byte read and an addition per value, against building a view and checking its bytes are text,
+/// which is what decoding the whole page would do to every one of them.
+fn walk(body: &[u8], at: usize, dense: &[usize]) -> Result<Vec<(usize, usize)>> {
+    let mut spans = Vec::with_capacity(dense.len());
+    let mut cursor = at;
+    let mut value = 0;
+    for &target in dense {
+        while value <= target {
+            let head = body.get(cursor..cursor.saturating_add(4)).ok_or_else(|| {
+                Error::io(format!(
+                    "a byte array length at {cursor} in a page of {} bytes",
+                    body.len()
+                ))
+            })?;
+            let len = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
+            let start = cursor + 4;
+            let end = start.checked_add(len).ok_or_else(|| {
+                Error::io("a byte array running past the end of memory".to_string())
+            })?;
+            if end > body.len() {
+                return Err(Error::io(format!(
+                    "a byte array at {start} of {len} bytes in a page of {} bytes",
+                    body.len()
+                )));
+            }
+            if value == target {
+                spans.push((start, len));
+            }
+            cursor = end;
+            value += 1;
+        }
+    }
+    Ok(spans)
 }
 
 /// Builds a string column over a page from spans that are already inside it.
