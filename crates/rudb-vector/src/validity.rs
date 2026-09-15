@@ -144,6 +144,22 @@ impl Validity {
         Self::Mask(Bitmap { words }).normalize(len)
     }
 
+    /// The validity of `len` rows starting at `at`.
+    ///
+    /// The two flag arms are the point. A cut of a column with no nulls in it has no nulls in it,
+    /// and answering that with a flag rather than by building a mask and collapsing it again is the
+    /// difference between a cut costing nothing and costing a pass over the rows. Every column of
+    /// `hits` that is not nullable takes this, and a page is cut into chunk sized pieces, so it is
+    /// taken once per chunk per column of every scan.
+    #[must_use]
+    pub fn slice(&self, at: usize, len: usize) -> Self {
+        match self {
+            Self::AllValid => Self::AllValid,
+            Self::AllInvalid => Self::AllInvalid,
+            Self::Mask(mask) => Self::Mask(mask.slice(at, len)).normalize(len),
+        }
+    }
+
     /// The validity of a value that is valid in both inputs, which is what almost every binary
     /// operator wants and is worth having in one place.
     #[must_use]
@@ -247,6 +263,37 @@ impl Bitmap {
         self.words.get(at).copied().unwrap_or(0)
     }
 
+    /// The `len` bits starting at `at`, moved down to start at bit zero.
+    ///
+    /// A word at a time, because a cut is almost never on a word boundary and doing it a bit at a
+    /// time is a divide, a shift and a read modify write per row. Each output word is the high part
+    /// of one input word and the low part of the next, which is two loads and three shifts for
+    /// sixty four rows.
+    ///
+    /// The bits past `len` in the last word are set rather than clear, for the reason
+    /// [`Validity::from_run`] gives: this type has no length, so its equality is over whole words
+    /// and a constructor that left them clear would compare unequal to one that did not.
+    #[must_use]
+    pub fn slice(&self, at: usize, len: usize) -> Self {
+        let skip = at / 64;
+        let shift = (at % 64) as u32;
+        let mut words = Vec::with_capacity(len.div_ceil(64));
+        for index in 0..len.div_ceil(64) {
+            let low = self.word(skip + index) >> shift;
+            // Written around rather than as a shift by sixty four, which is not a shift this
+            // machine has, and when the cut is word aligned there is no next word to take from.
+            let high = if shift == 0 { 0 } else { self.word(skip + index + 1) << (64 - shift) };
+            words.push(low | high);
+        }
+        if let Some(last) = words.last_mut() {
+            let used = len % 64;
+            if used != 0 {
+                *last |= u64::MAX << used;
+            }
+        }
+        Self { words }
+    }
+
     /// Intersects this bitmap with another, in place.
     pub fn and_with(&mut self, other: &Self) {
         for (index, word) in self.words.iter_mut().enumerate() {
@@ -267,6 +314,37 @@ mod tests {
         assert!(Validity::Mask(mask.clone()).is_valid(3));
         mask.set(3, false);
         assert!(!Validity::Mask(mask).is_valid(3));
+    }
+
+    #[test]
+    fn a_cut_of_a_mask_says_what_reading_it_a_bit_at_a_time_says() {
+        // Every start and every length over a pattern with no period in common with sixty four, so
+        // that the word boundary lands in a different place in the pattern for every cut. The word
+        // at a time cut and the bit at a time one have to agree bit for bit, including the bits
+        // past the end of the last word, since this type compares by whole words.
+        let rows = 200;
+        let mut mask = Bitmap::all_valid(rows);
+        // row at a time: building the pattern the test reads, not a path anything runs.
+        for row in 0..rows {
+            mask.set(row, row % 7 != 0 && row % 11 != 3);
+        }
+        let whole = Validity::Mask(mask.clone());
+        for at in 0..70 {
+            for len in 0..70 {
+                let wanted = Validity::from_iter(len, |row| whole.is_valid(at + row));
+                assert_eq!(whole.slice(at, len), wanted, "rows {at} to {}", at + len);
+            }
+        }
+    }
+
+    #[test]
+    fn a_cut_of_a_column_with_no_nulls_has_no_nulls_and_no_mask() {
+        assert_eq!(Validity::AllValid.slice(17, 33), Validity::AllValid);
+        assert_eq!(Validity::AllInvalid.slice(17, 33), Validity::AllInvalid);
+        // And a cut of a mask that happens to be uniform over the range collapses the same way.
+        let mut mask = Bitmap::all_valid(128);
+        mask.set(100, false);
+        assert_eq!(Validity::Mask(mask).slice(0, 64), Validity::AllValid);
     }
 
     #[test]
