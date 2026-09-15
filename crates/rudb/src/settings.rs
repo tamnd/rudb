@@ -2,8 +2,12 @@
 //!
 //! A setting is not a catalog entry. It is not named by a query, it has no schema, and the set of
 //! them is fixed at compile time, so this is a match on a name rather than a map. [`Settings::NAMES`]
-//! is that set, and it is three because [`crate::Config`] holds three things a program can choose
-//! and a fourth that DuckDB has no setting for.
+//! is that set, and it is five names for three settings, because [`crate::Config`] holds three things
+//! a program can choose and a fourth that DuckDB has no setting for, and two of the three have a
+//! second spelling. `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways
+//! round, which is what the binary does and what a client that writes the other spelling expects.
+//! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
+//! `RESET` or through a read of the value all land on the same setting.
 //!
 //! The seam settings are the exception to the fixed set, and they are a separate set rather than
 //! three more names. `SET seam.hash.table = 'unchained'` picks which implementation runs at one of
@@ -17,14 +21,15 @@
 //! for a global setting, which is a different sentence and says which of the two the writer got
 //! wrong.
 //!
-//! What is not here yet is `current_setting()` and `duckdb_settings()`, which are the two ways SQL
-//! reads a setting back rather than writing one. [`crate::Database::setting`] is the Rust side of
-//! that read and the SQL side is a scalar function over engine state, which is a shape no function
-//! in rudb has yet.
+//! `duckdb_settings()` reads these back from SQL, and it does it through [`Settings::session`] rather
+//! than by reaching in here, because the executor is four ranks below this file and cannot see it.
+//! What is not here yet is `current_setting()`, which is the other way SQL reads a setting rather
+//! than writing one. [`crate::Database::setting`] is the Rust side of that read and the SQL side is a
+//! scalar function over engine state, which is a shape no function in rudb has yet.
 
 use std::sync::RwLock;
 
-use rudb_common::{Error, Memory, Result, Value, human};
+use rudb_common::{Error, Memory, Result, Session, Value, human};
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
@@ -53,8 +58,9 @@ pub(crate) struct Settings {
 }
 
 impl Settings {
-    /// Every setting name, in the order `duckdb_settings()` would list them.
-    pub(crate) const NAMES: [&'static str; 3] = ["disabled_optimizers", "memory_limit", "threads"];
+    /// Every setting name, in the order `duckdb_settings()` lists them.
+    pub(crate) const NAMES: [&'static str; 5] =
+        ["disabled_optimizers", "max_memory", "memory_limit", "threads", "worker_threads"];
 
     /// The settings a database opened with this configuration starts at.
     pub(crate) fn new(config: Config) -> Self {
@@ -139,7 +145,7 @@ impl Settings {
                 known.join(", ")
             )));
         }
-        match name {
+        match canonical(name) {
             "disabled_optimizers" => {
                 let text = match value {
                     None => String::new(),
@@ -192,7 +198,7 @@ impl Settings {
             });
         }
         let config = self.config();
-        match name {
+        match canonical(name) {
             "disabled_optimizers" => Ok(self.disabled_optimizers()),
             // An unlimited budget prints as the word rather than as a number, because rudb's
             // default is no limit where DuckDB's is a fraction of the machine, and printing the
@@ -210,8 +216,38 @@ impl Settings {
         }
     }
 
+    /// Every setting and its value, for the table that lists them.
+    ///
+    /// Built once per query rather than held, because there are five names and the alternative is a
+    /// second copy of the settings that has to be kept in step with this one. An alias reports the
+    /// same value as the name it resolves to, which is the same thing reading either spelling back
+    /// gives, and it is what the binary returns for both halves of each pair.
+    pub(crate) fn session(&self) -> Session {
+        let mut session = Session::new();
+        for name in Self::NAMES {
+            if let Ok(value) = self.value(name) {
+                session.set(name, value);
+            }
+        }
+        session
+    }
+
     fn replace(&self, config: Config) {
         *self.current.write().unwrap_or_else(|held| held.into_inner()) = config;
+    }
+}
+
+/// The setting a name means, which is itself for every name but the two aliases.
+///
+/// DuckDB puts the alias list on `max_memory` and `worker_threads` and leaves it empty on
+/// `memory_limit` and `threads`, so by its own table the second of each pair is the canonical one.
+/// That is the way round it is here too, because `memory_limit` and `threads` are the names the
+/// documentation uses and the names everything else in rudb already spells.
+fn canonical(name: &str) -> &str {
+    match name {
+        "max_memory" => "memory_limit",
+        "worker_threads" => "threads",
+        other => other,
     }
 }
 

@@ -1,0 +1,162 @@
+//! What `duckdb_settings()` says about each setting this engine has.
+//!
+//! Five rows for three settings, because two of them have an alias and the pin gives an alias a row
+//! of its own. The descriptions, the input types and the alias lists were read off the pinned binary
+//! rather than written here, since a client that reads this table to find out what it can turn is a
+//! client that will compare the sentence against the one it already knows.
+//!
+//! # The alias direction is the opposite way round from the obvious one
+//!
+//! `max_memory` carries `[memory_limit]` in its alias list and `memory_limit` carries an empty one,
+//! and the same for `threads` and `worker_threads`. So the name the documentation uses is the alias
+//! and the name nobody types is the entry that points at it. That reads backwards and it is what the
+//! binary returns, so it is what is here. Both spellings set the same thing either way, which is the
+//! part that matters to a client, and which of the two rows is the one with the list in it only
+//! matters to a test.
+//!
+//! # `typed_value` is a `VARCHAR` here and a `VARIANT` there
+//!
+//! The pin's last column is a `VARIANT`, which is a type rudb has no [`LogicalType`] for at all, and
+//! it holds the same text as `value` on 191 of the pin's 192 rows. So this reports it as a `VARCHAR`
+//! with the value in it. Adding a `VARIANT` to the type system for one column of one catalog table
+//! would be adding a type no expression can produce, no cast can reach and no file format can store,
+//! and the day rudb has a real one this column changes with the rest of them.
+//!
+//! # What is not here
+//!
+//! The pin returns 192 rows and this returns 5, because rudb has three settings. The other 187 are
+//! settings for things rudb does not do, and a row saying `SET enable_http_metadata_cache = true`
+//! worked when nothing read it would be worse than no row at all. The list grows when the engine
+//! does.
+//!
+//! The seam settings are not here either, and that is decided in `rudb`'s own settings module rather
+//! than in this one. There are twenty seven of them, none is a DuckDB setting, and this table is the
+//! answer to "what can I turn that DuckDB also has". `rudb_strategies()` is the table that answers
+//! the other question.
+
+use rudb_common::{Field, LogicalType};
+
+/// One setting, and everything `duckdb_settings()` says about it that is not its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingEntry {
+    /// The name, as `SET` spells it.
+    pub name: &'static str,
+    /// The sentence the pin prints, word for word.
+    pub description: &'static str,
+    /// The type a value for it is read as, which is the pin's spelling and not a [`LogicalType`].
+    pub input_type: &'static str,
+    /// `GLOBAL` or `LOCAL`, and every setting rudb has is global.
+    pub scope: &'static str,
+    /// The other spellings of this setting, which the pin fills in on one of the pair and not both.
+    pub aliases: &'static [&'static str],
+}
+
+/// The scope every setting rudb has, since none of them is per connection yet.
+pub const GLOBAL: &str = "GLOBAL";
+
+/// Every setting, in the order the pin lists them, which is by name.
+pub static SETTINGS: &[SettingEntry] = &[
+    SettingEntry {
+        name: "disabled_optimizers",
+        description: "DEBUG SETTING: disable a specific set of optimizers (comma separated)",
+        input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
+        name: "max_memory",
+        description: "The maximum memory of the system (e.g. 1GB)",
+        input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &["memory_limit"],
+    },
+    SettingEntry {
+        name: "memory_limit",
+        description: "The maximum memory of the system (e.g. 1GB)",
+        input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
+        name: "threads",
+        description: "The number of total threads used by the system.",
+        input_type: "BIGINT",
+        scope: GLOBAL,
+        aliases: &["worker_threads"],
+    },
+    SettingEntry {
+        name: "worker_threads",
+        description: "The number of total threads used by the system.",
+        input_type: "BIGINT",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+];
+
+/// The columns `duckdb_settings()` returns, in the pin's order.
+#[must_use]
+pub fn setting_fields() -> Vec<Field> {
+    vec![
+        Field::new("name", LogicalType::Varchar),
+        Field::new("value", LogicalType::Varchar),
+        Field::new("description", LogicalType::Varchar),
+        Field::new("input_type", LogicalType::Varchar),
+        Field::new("scope", LogicalType::Varchar),
+        Field::new("aliases", LogicalType::list(LogicalType::Varchar)),
+        Field::new("typed_value", LogicalType::Varchar),
+    ]
+}
+
+/// The entry for a setting with this name, and `None` for a name that is not a setting.
+#[must_use]
+pub fn setting_named(name: &str) -> Option<&'static SettingEntry> {
+    SETTINGS.iter().find(|entry| entry.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GLOBAL, SETTINGS, setting_fields, setting_named};
+
+    #[test]
+    fn the_table_is_the_shape_the_pin_returns() {
+        assert_eq!(SETTINGS.len(), 5, "three settings and two of them have a second spelling");
+        assert_eq!(setting_fields().len(), 7);
+    }
+
+    #[test]
+    fn the_names_are_sorted_because_the_pin_returns_them_that_way() {
+        let names: Vec<&str> = SETTINGS.iter().map(|entry| entry.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+    }
+
+    /// The alias reads backwards, so it gets a test rather than a comment nobody checks against the
+    /// binary again.
+    #[test]
+    fn an_alias_is_a_row_of_its_own_and_the_list_sits_on_the_other_one() {
+        let memory = setting_named("max_memory").expect("a setting");
+        assert_eq!(memory.aliases, ["memory_limit"]);
+        assert_eq!(setting_named("memory_limit").expect("a setting").aliases, [] as [&str; 0]);
+        let threads = setting_named("threads").expect("a setting");
+        assert_eq!(threads.aliases, ["worker_threads"]);
+        assert_eq!(setting_named("worker_threads").expect("a setting").aliases, [] as [&str; 0]);
+        // Both halves of a pair say the same thing, since they are one setting with two names.
+        assert_eq!(
+            memory.description,
+            setting_named("memory_limit").expect("a setting").description
+        );
+        assert_eq!(
+            threads.input_type,
+            setting_named("worker_threads").expect("a setting").input_type
+        );
+    }
+
+    #[test]
+    fn nothing_here_is_per_connection_yet_and_the_table_says_so() {
+        for entry in SETTINGS {
+            assert_eq!(entry.scope, GLOBAL, "{}", entry.name);
+        }
+        assert_eq!(setting_named("nothing_called_this"), None);
+    }
+}

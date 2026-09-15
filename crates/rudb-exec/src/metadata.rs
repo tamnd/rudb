@@ -1,10 +1,14 @@
 //! A table whose rows are a fact about the engine rather than data somebody stored.
 //!
-//! `rudb_strategies()` was the first of these and `duckdb_keywords()`, `duckdb_types()` and
-//! `duckdb_functions()` followed it, and D2 has about nine more in it: the settings, the schemas,
-//! the tables, the columns, the views, the databases, the extensions and the optimizer passes. Every
-//! one of them is the same operator with a different list of rows behind it, so the operator is here
-//! once and each table is the function that builds its rows.
+//! `rudb_strategies()` was the first of these and `duckdb_keywords()`, `duckdb_types()`,
+//! `duckdb_functions()` and `duckdb_settings()` followed it, and D2 has about eight more in it: the
+//! schemas, the tables, the columns, the views, the databases, the extensions and the optimizer
+//! passes. Every one of them is the same operator with a different list of rows behind it, so the
+//! operator is here once and each table is the function that builds its rows.
+//!
+//! Four of the five build their rows out of something that cannot change while the process runs.
+//! `duckdb_settings()` is the exception and it reads the session the query is being built with,
+//! which is why [`crate::build_measured`] takes one.
 //!
 //! What the operator does is the part that is easy to get subtly wrong twelve times. The plan's
 //! column list is resolved against the table's own by name, because the binder projects every
@@ -13,10 +17,11 @@
 //! [`VECTOR_SIZE`] and handed out one chunk per morsel, which is what lets a metadata table be
 //! scanned by the same parallel driver as a real one without being a special case in it.
 //!
-//! The rows are built when the operator is. Every one of these tables comes from a list that cannot
-//! change while the process runs, and the largest of them is in the low thousands, so there is
-//! nothing to stream and a row that arrived halfway through a scan would be a table that answers
-//! two different questions in one query.
+//! The rows are built when the operator is. The largest of these tables is in the low thousands, so
+//! there is nothing to stream, and a row that arrived halfway through a scan would be a table that
+//! answers two different questions in one query. That is the reason the settings are read once when
+//! the query is built rather than looked up per row, as well: a `SET` that landed between two chunks
+//! would otherwise show up as two values in one result set.
 
 use rudb_common::{Error, Field, Result, Value};
 use rudb_pipeline::{Morsel, Progress, Source};

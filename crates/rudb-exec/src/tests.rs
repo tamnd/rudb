@@ -961,6 +961,32 @@ fn the_functions_table_declares_a_promoted_argument_with_the_type_variable() {
 }
 
 #[test]
+fn the_settings_table_is_five_rows_for_three_settings_and_says_nothing_about_a_value() {
+    // Built through `run`, which goes through `build` and so has no database behind it. There is
+    // nothing to read a value out of there, so both value columns come back null, and that is the
+    // answer rather than a default: this crate does not know what memory limit the process was
+    // started with and inventing one would be a table that lies about a running system.
+    let rows = run("TableFunction duckdb_settings args=[] #0 [name::VARCHAR, value::VARCHAR, \
+         scope::VARCHAR, typed_value::VARCHAR]");
+    let names: Vec<String> = rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Varchar(name) => name.clone(),
+            other => panic!("a setting name, not {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        ["disabled_optimizers", "max_memory", "memory_limit", "threads", "worker_threads"]
+    );
+    for row in &rows {
+        assert_eq!(row[1], Value::Null, "{:?}", row[0]);
+        assert_eq!(row[2], text("GLOBAL"), "{:?}", row[0]);
+        assert_eq!(row[3], Value::Null, "{:?}", row[0]);
+    }
+}
+
+#[test]
 fn a_metadata_table_hands_back_the_columns_it_was_asked_for_in_the_order_asked() {
     // The same requirement as the strategies table and checked on a second one, because the
     // resolution by name now lives in one place and a regression there would be silent: every one of
@@ -993,6 +1019,7 @@ fn the_ids_the_builder_tags_its_counters_with_are_the_ones_the_plan_says() {
         &Cancel::new(),
         &Memory::unlimited(),
         &Settings::new(),
+        &rudb_common::Session::new(),
         &report,
     )
     .expect("the query builds");

@@ -31,7 +31,7 @@ Closes when `rudb-compat levels` stops saying that nothing has been measured, an
 
 ## Milestone 2, introspection, session and the dialect seam
 
-- [ ] `duckdb_functions`, `duckdb_settings`, `duckdb_types`, `duckdb_keywords`
+- [x] `duckdb_functions`, `duckdb_settings`, `duckdb_types`, `duckdb_keywords`
 - [ ] `duckdb_tables`, `duckdb_columns`, `duckdb_schemas`, `duckdb_views`, `duckdb_databases`
 - [ ] `duckdb_extensions`, `duckdb_optimizers`
 - [ ] `information_schema` and the `pragma_*` function family
