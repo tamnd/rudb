@@ -1729,6 +1729,88 @@ fn a_pragma_given_a_name_that_is_not_there_says_what_the_catalog_says() {
     }
 }
 
+/// The four pragmas that report on the build and the process answer in one row each, in the columns
+/// the pin names, and none of them takes anything.
+#[test]
+fn the_four_pragmas_about_the_build_answer_in_one_row_of_their_own_columns() {
+    let db = database();
+    let shapes = [
+        ("pragma_version", vec!["library_version", "source_id", "codename"]),
+        ("pragma_platform", vec!["platform"]),
+        ("pragma_user_agent", vec!["user_agent"]),
+        (
+            "pragma_database_size",
+            vec![
+                "database_name",
+                "database_size",
+                "block_size",
+                "total_blocks",
+                "used_blocks",
+                "free_blocks",
+                "wal_size",
+                "memory_usage",
+                "memory_limit",
+            ],
+        ),
+    ];
+    for (name, columns) in shapes {
+        let answer = rows(&db, &format!("SELECT * FROM {name}()"));
+        assert_eq!(answer.len(), 1, "{name} answers about one build and one process");
+        assert_eq!(answer[0].len(), columns.len(), "{name}");
+        let named: Vec<Value> =
+            rows(&db, &format!("SELECT column_name FROM (DESCRIBE SELECT * FROM {name}())"))
+                .into_iter()
+                .map(|row| row[0].clone())
+                .collect();
+        assert_eq!(named, columns.iter().map(|column| text(column)).collect::<Vec<Value>>());
+        let message = failure(&db, &format!("SELECT * FROM {name}('t')"));
+        assert!(message.contains(&format!("{name}() takes no arguments")), "{message}");
+    }
+}
+
+/// What the version pragma says is true of this engine rather than borrowed from the pin, and the
+/// other two strings are built out of the same two facts.
+#[test]
+fn the_version_pragma_says_what_this_engine_is_and_the_others_agree_with_it() {
+    let db = database();
+    let version = rows(&db, "SELECT * FROM pragma_version()").remove(0);
+    assert_eq!(version[0], text(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    // A build nobody handed a revision to reports an empty source id, which is the honest answer,
+    // and the codename is the one DuckDB itself uses before a release is named.
+    assert_eq!(version[1], text(""));
+    assert_eq!(version[2], text("Development Version"));
+    let platform = rows(&db, "SELECT * FROM pragma_platform()").remove(0);
+    let Value::Varchar(written) = &platform[0] else { panic!("the platform is text") };
+    assert!(written.contains('_'), "{written}");
+    assert!(!written.contains("macos") && !written.contains("x86_64"), "{written}");
+    let agent = rows(&db, "SELECT * FROM pragma_user_agent()").remove(0);
+    assert_eq!(agent[0], text(&format!("rudb/v{}({written})", env!("CARGO_PKG_VERSION"))));
+}
+
+/// The size pragma has a row for the one database that is attached and none for the two internal
+/// ones, and the numbers are zero because nothing here is on disk.
+#[test]
+fn the_size_pragma_reports_the_attached_database_and_the_live_memory_budget() {
+    let db = database();
+    let size = rows(&db, "SELECT * FROM pragma_database_size()");
+    assert_eq!(size.len(), 1);
+    let row = &size[0];
+    assert_eq!(row[0], text("memory"));
+    for column in [1, 6] {
+        assert_eq!(row[column], text("0 bytes"));
+    }
+    assert_eq!(
+        row[2..=5],
+        [Value::BigInt(0), Value::BigInt(0), Value::BigInt(0), Value::BigInt(0)]
+    );
+    // The last two are read off the budget rather than made up, so a limit somebody set shows up
+    // here the same way it shows up in `current_setting`.
+    db.execute("SET memory_limit = '1GiB'").expect("a size");
+    let after = rows(&db, "SELECT memory_limit FROM pragma_database_size()").remove(0);
+    assert_eq!(after[0], text("1.0 GiB"));
+    assert_eq!(after[0], rows(&db, "SELECT current_setting('memory_limit')").remove(0)[0]);
+}
+
 /// A view the engine ships with goes in unbound and is bound at the first read, which is a fact
 /// about two columns of `duckdb_views()` and was measured on the pin twice over.
 #[test]

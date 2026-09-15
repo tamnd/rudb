@@ -5,7 +5,7 @@
 //! resolution problem from [`crate::signature`]: the answer is not a return type, it is a list of
 //! columns, because the caller can alias them and select from them and join against them.
 //!
-//! Thirteen of them are here. `range` and `generate_series` between them account for two thousand
+//! Twenty two of them are here. `range` and `generate_series` between them account for two thousand
 //! records in DuckDB's `sqllogictest` corpus, because a test that needs a thousand rows should not
 //! have to write a thousand rows, and the corpus uses them the way a person uses a for loop. The
 //! difference between those two is one row: `range` stops before the end and `generate_series`
@@ -19,9 +19,9 @@
 //! [`crate::file`] is where that happens. For CSV there is nothing in the file that states the
 //! columns either, so opening it means sniffing it.
 //!
-//! The other nine are the third kind, a table whose rows are a fact about the engine rather than
-//! data somebody stored. All nine take no arguments and all nine know their own columns, so
-//! resolving one is the simplest case in this file and they share an arm. `rudb_strategies()` is not
+//! The next ten are the third kind, a table whose rows are a fact about the engine rather than data
+//! somebody stored. All ten take no arguments and all ten know their own columns, so resolving one
+//! is the simplest case in this file and they share an arm. `rudb_strategies()` is not
 //! a DuckDB function at all: it lists every seam in the engine and every implementation registered
 //! against it, which is how a reader finds out what this engine will let them swap and what it lets
 //! them swap today. `duckdb_keywords()` is every word the grammar knows about, which this crate can
@@ -31,8 +31,8 @@
 //! executor. `duckdb_settings()` is every setting `SET` will take, and it is the one of the five
 //! whose rows are not all known here: the names and the descriptions are, and the values come from
 //! the session the query is running in. `duckdb_databases()`, `duckdb_schemas()`, `duckdb_tables()`
-//! and `duckdb_columns()` are the last four and they are further from this crate again, because
-//! their rows are whatever somebody created, so only their columns are here and
+//! `duckdb_views()` and `duckdb_columns()` are the last five and they are further from this crate
+//! again, because their rows are whatever somebody created, so only their columns are here and
 //! [`crate::entrycatalog`] says why.
 //!
 //! `duckdb_extensions()` and `duckdb_optimizers()` are two more of that third kind and they are the
@@ -41,6 +41,13 @@
 //! forty four and turning off a pass that was never written is a request that has already been
 //! granted. `duckdb_extensions()` is the same names DuckDB's default build advertises with rudb's own
 //! answer in the two boolean columns, and `rudb_exec` says which two are true and why.
+//!
+//! `pragma_version()`, `pragma_platform()`, `pragma_user_agent()` and `pragma_database_size()` are
+//! four more of that third kind and they are the four where the fact is about this build and this
+//! process rather than about the language. The first three are a constant worked out from the crate
+//! version and the target, and the fourth reads the catalog and the memory budget, so like
+//! `duckdb_settings()` its rows are not all known here. `rudb_exec::enginenames` decides all four
+//! values and argues there for why they describe rudb rather than reporting DuckDB's answers.
 //!
 //! D2 adds a few more of that third kind. Each one is a column list here and a list of rows in
 //! `rudb_exec::metadata`, and nothing else.
@@ -103,6 +110,14 @@ pub enum TableFunction {
     PragmaTableInfo,
     /// `pragma_show(name)`, the same columns again in the six `DESCRIBE` answers with.
     PragmaShow,
+    /// `pragma_version()`, the version of the engine answering, in three columns.
+    PragmaVersion,
+    /// `pragma_platform()`, the operating system and processor this build was made for.
+    PragmaPlatform,
+    /// `pragma_user_agent()`, the one line a client sends when it says who it is.
+    PragmaUserAgent,
+    /// `pragma_database_size()`, what each attached database costs on disk and in memory.
+    PragmaDatabaseSize,
 }
 
 /// The name of the column `file_row_number=True` adds.
@@ -136,6 +151,10 @@ impl TableFunction {
             Self::DuckdbOptimizers => "duckdb_optimizers",
             Self::PragmaTableInfo => "pragma_table_info",
             Self::PragmaShow => "pragma_show",
+            Self::PragmaVersion => "pragma_version",
+            Self::PragmaPlatform => "pragma_platform",
+            Self::PragmaUserAgent => "pragma_user_agent",
+            Self::PragmaDatabaseSize => "pragma_database_size",
         }
     }
 
@@ -253,6 +272,18 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("pragma_show") {
             return Some(Self::PragmaShow);
+        }
+        if name.eq_ignore_ascii_case("pragma_version") {
+            return Some(Self::PragmaVersion);
+        }
+        if name.eq_ignore_ascii_case("pragma_platform") {
+            return Some(Self::PragmaPlatform);
+        }
+        if name.eq_ignore_ascii_case("pragma_user_agent") {
+            return Some(Self::PragmaUserAgent);
+        }
+        if name.eq_ignore_ascii_case("pragma_database_size") {
+            return Some(Self::PragmaDatabaseSize);
         }
         None
     }
@@ -396,7 +427,11 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbExtensions
         | TableFunction::DuckdbOptimizers
         | TableFunction::PragmaTableInfo
-        | TableFunction::PragmaShow => None,
+        | TableFunction::PragmaShow
+        | TableFunction::PragmaVersion
+        | TableFunction::PragmaPlatform
+        | TableFunction::PragmaUserAgent
+        | TableFunction::PragmaDatabaseSize => None,
     }
 }
 
@@ -416,6 +451,10 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::DuckdbColumns => Some(column_fields()),
         TableFunction::DuckdbExtensions => Some(extension_fields()),
         TableFunction::DuckdbOptimizers => Some(optimizer_fields()),
+        TableFunction::PragmaVersion => Some(version_fields()),
+        TableFunction::PragmaPlatform => Some(platform_fields()),
+        TableFunction::PragmaUserAgent => Some(user_agent_fields()),
+        TableFunction::PragmaDatabaseSize => Some(database_size_fields()),
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::ReadParquet
@@ -467,6 +506,54 @@ pub fn describe_fields() -> Vec<Field> {
         .iter()
         .map(|name| Field::new(*name, LogicalType::Varchar))
         .collect()
+}
+
+/// The columns `pragma_version()` produces.
+///
+/// Three columns rather than one, because a build has three things worth asking about: which release
+/// it is, which source it was made from and what that release is called. rudb answers all three
+/// about itself rather than reporting a DuckDB version, for the reason `crate` level compatibility
+/// does not extend to lying about which engine is running. `crates/rudb-exec/src/enginenames.rs` is
+/// where the three values are decided and it argues the case there.
+#[must_use]
+pub fn version_fields() -> Vec<Field> {
+    ["library_version", "source_id", "codename"]
+        .iter()
+        .map(|name| Field::new(*name, LogicalType::Varchar))
+        .collect()
+}
+
+/// The column `pragma_platform()` produces, which is the name a build is published under.
+#[must_use]
+pub fn platform_fields() -> Vec<Field> {
+    vec![Field::new("platform", LogicalType::Varchar)]
+}
+
+/// The column `pragma_user_agent()` produces, which is the line a client sends to say who it is.
+#[must_use]
+pub fn user_agent_fields() -> Vec<Field> {
+    vec![Field::new("user_agent", LogicalType::Varchar)]
+}
+
+/// The columns `pragma_database_size()` produces, one row per attached database.
+///
+/// Three of the nine are a size written for a person to read rather than a number, which is DuckDB's
+/// choice and not a helpful one for a client doing arithmetic, but the width and the types of a
+/// result are part of the result. The four block columns are the ones that mean something only once
+/// there is a file underneath, so they are the ones rudb answers zero to and says why.
+#[must_use]
+pub fn database_size_fields() -> Vec<Field> {
+    vec![
+        Field::new("database_name", LogicalType::Varchar),
+        Field::new("database_size", LogicalType::Varchar),
+        Field::new("block_size", LogicalType::BigInt),
+        Field::new("total_blocks", LogicalType::BigInt),
+        Field::new("used_blocks", LogicalType::BigInt),
+        Field::new("free_blocks", LogicalType::BigInt),
+        Field::new("wal_size", LogicalType::Varchar),
+        Field::new("memory_usage", LogicalType::Varchar),
+        Field::new("memory_limit", LogicalType::Varchar),
+    ]
 }
 
 /// The columns `rudb_strategies()` produces.
@@ -944,5 +1031,62 @@ mod tests {
         // an integer to a name any more than it casts one to a path.
         let error = resolve_table("pragma_show", &[LogicalType::Integer]).expect_err("a name");
         assert!(error.message().contains("'pragma_show(INTEGER)'"), "{error}");
+    }
+
+    #[test]
+    fn the_four_pragmas_about_the_build_take_nothing_and_name_their_own_columns() {
+        let wanted: [(&str, TableFunction, &[&str]); 4] = [
+            (
+                "PRAGMA_Version",
+                TableFunction::PragmaVersion,
+                &["library_version", "source_id", "codename"],
+            ),
+            ("pragma_platform", TableFunction::PragmaPlatform, &["platform"]),
+            ("pragma_user_agent", TableFunction::PragmaUserAgent, &["user_agent"]),
+            (
+                "pragma_database_size",
+                TableFunction::PragmaDatabaseSize,
+                &[
+                    "database_name",
+                    "database_size",
+                    "block_size",
+                    "total_blocks",
+                    "used_blocks",
+                    "free_blocks",
+                    "wal_size",
+                    "memory_usage",
+                    "memory_limit",
+                ],
+            ),
+        ];
+        for (name, function, columns) in wanted {
+            let resolved = resolve_table(name, &[]).expect("takes none, and none were given");
+            assert_eq!(resolved.function, function);
+            assert!(resolved.arguments.is_empty());
+            assert!(!function.takes_a_name(), "{name}");
+            let written: Vec<&str> =
+                fixed(&resolved).iter().map(|field| field.name.as_str()).collect();
+            assert_eq!(written, columns);
+            let error = resolve_table(name, &[LogicalType::Varchar]).expect_err("takes none");
+            assert!(
+                error.to_string().contains(&format!("{}() takes no arguments", function.name())),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_four_block_columns_are_the_only_numbers_pragma_database_size_reports() {
+        // The pin writes three of the nine as text a person reads rather than as a number, which is
+        // worth a test because a client doing arithmetic on `database_size` gets a cast error on
+        // both engines and that is the compatible answer rather than a bug in either.
+        let fields = database_size_fields();
+        let numbers: Vec<&str> = fields
+            .iter()
+            .filter(|field| field.ty == LogicalType::BigInt)
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(numbers, ["block_size", "total_blocks", "used_blocks", "free_blocks"]);
+        assert!(fields.iter().filter(|field| field.ty == LogicalType::Varchar).count() == 5);
     }
 }

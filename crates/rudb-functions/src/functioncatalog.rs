@@ -218,6 +218,10 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::DuckdbOptimizers,
     TableFunction::PragmaTableInfo,
     TableFunction::PragmaShow,
+    TableFunction::PragmaVersion,
+    TableFunction::PragmaPlatform,
+    TableFunction::PragmaUserAgent,
+    TableFunction::PragmaDatabaseSize,
 ];
 
 /// The second name each of the two file readers answers to.
@@ -243,7 +247,11 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::DuckdbViews
         | TableFunction::DuckdbColumns
         | TableFunction::DuckdbExtensions
-        | TableFunction::DuckdbOptimizers => vec![0],
+        | TableFunction::DuckdbOptimizers
+        | TableFunction::PragmaVersion
+        | TableFunction::PragmaPlatform
+        | TableFunction::PragmaUserAgent
+        | TableFunction::PragmaDatabaseSize => vec![0],
     }
 }
 
