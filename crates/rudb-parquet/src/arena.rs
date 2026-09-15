@@ -45,6 +45,15 @@
 //! handed back to the thread that faulted it in is the one whose pages are already in that core's
 //! translation buffers, and a scan reads a column chunk on one thread from start to end.
 //!
+//! # What it is worth
+//!
+//! Measured on `hits-1m-snappy.parquet` on one thread, nine runs interleaved against the same
+//! binary without this, medians. A scan of all nine row groups of `URL` went from 110.53
+//! milliseconds to 107.08 and its peak resident memory from 38.5 megabytes to 34.6. Query 37 of
+//! ClickBench, which reads two row groups after pruning, went from 41.47 to 39.85 and from 35.3
+//! megabytes to 34.8. The decompress stage is where it shows up on both, 57.12 to 54.23 and 19.77
+//! to 18.43, and no other stage moved.
+//!
 //! # What it costs when nobody collects
 //!
 //! One run per thread, and only while that run is free. The slot holds the last page a string
@@ -54,13 +63,11 @@
 //!
 //! One slot is what stops this from making a short scan worse, and that is not a guess. A version
 //! of this with a thirty two megabyte budget and every cursor parking its buffers on the way out
-//! measured query 37 of ClickBench at 43.98 milliseconds against 42.14, with peak resident memory
-//! up from 35.6 to 51.1 megabytes. Query 37 reads two row groups after pruning, so the arena of the
-//! first was still being read when the second was decompressed, and the ring ended up holding the
-//! first while the second was allocated beside it. Replacing the slot rather than growing a pool
-//! means the worst case is the behaviour without it.
+//! measured query 37 at 43.98 milliseconds against 42.14, with peak memory up from 35.6 to 51.1
+//! megabytes. Two row groups is not enough for a pool to pay for itself, and a pool that has not
+//! paid for itself is memory a query is not using and cannot be asked to give back.
 //!
-//! It also means two string columns in one scan take turns evicting each other and neither is
+//! It also means two string columns in one scan take turns replacing each other and neither is
 //! reused. That is the behaviour this had before it existed, so it is a missed win rather than a
 //! cost, and a slot per column is a change to make when a query that wants it has been measured.
 
