@@ -35,9 +35,15 @@
 //! their rows are whatever somebody created, so only their columns are here and
 //! [`crate::entrycatalog`] says why.
 //!
-//! D2 adds a few more of that third kind, `duckdb_views()` and the extension and optimizer tables
-//! among them. Each one is a column list here and a list of rows in `rudb_exec::metadata`, and
-//! nothing else.
+//! `duckdb_extensions()` and `duckdb_optimizers()` are two more of that third kind and they are the
+//! two where rudb has to answer about itself rather than reproduce a list. `duckdb_optimizers()` is
+//! every name `SET disabled_optimizers` takes, which is DuckDB's forty four, because rudb takes all
+//! forty four and turning off a pass that was never written is a request that has already been
+//! granted. `duckdb_extensions()` is the same names DuckDB's default build advertises with rudb's own
+//! answer in the two boolean columns, and `rudb_exec` says which two are true and why.
+//!
+//! D2 adds a few more of that third kind. Each one is a column list here and a list of rows in
+//! `rudb_exec::metadata`, and nothing else.
 
 use rudb_common::{Error, Field, LogicalType, Result};
 
@@ -82,6 +88,10 @@ pub enum TableFunction {
     DuckdbViews,
     /// `duckdb_columns()`, every column of every one of those.
     DuckdbColumns,
+    /// `duckdb_extensions()`, every extension DuckDB names and whether this engine has it.
+    DuckdbExtensions,
+    /// `duckdb_optimizers()`, every name `SET disabled_optimizers` takes.
+    DuckdbOptimizers,
 }
 
 /// The name of the column `file_row_number=True` adds.
@@ -111,6 +121,8 @@ impl TableFunction {
             Self::DuckdbTables => "duckdb_tables",
             Self::DuckdbViews => "duckdb_views",
             Self::DuckdbColumns => "duckdb_columns",
+            Self::DuckdbExtensions => "duckdb_extensions",
+            Self::DuckdbOptimizers => "duckdb_optimizers",
         }
     }
 
@@ -206,6 +218,12 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("duckdb_columns") {
             return Some(Self::DuckdbColumns);
+        }
+        if name.eq_ignore_ascii_case("duckdb_extensions") {
+            return Some(Self::DuckdbExtensions);
+        }
+        if name.eq_ignore_ascii_case("duckdb_optimizers") {
+            return Some(Self::DuckdbOptimizers);
         }
         None
     }
@@ -329,7 +347,9 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbSchemas
         | TableFunction::DuckdbTables
         | TableFunction::DuckdbViews
-        | TableFunction::DuckdbColumns => None,
+        | TableFunction::DuckdbColumns
+        | TableFunction::DuckdbExtensions
+        | TableFunction::DuckdbOptimizers => None,
     }
 }
 
@@ -347,6 +367,8 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::DuckdbTables => Some(table_fields()),
         TableFunction::DuckdbViews => Some(view_fields()),
         TableFunction::DuckdbColumns => Some(column_fields()),
+        TableFunction::DuckdbExtensions => Some(extension_fields()),
+        TableFunction::DuckdbOptimizers => Some(optimizer_fields()),
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::ReadParquet
@@ -388,6 +410,33 @@ pub fn keyword_fields() -> Vec<Field> {
         Field::new("keyword_name", LogicalType::Varchar),
         Field::new("keyword_category", LogicalType::Varchar),
     ]
+}
+
+/// The columns `duckdb_extensions()` produces, which is DuckDB's ten in its order.
+///
+/// `aliases` is the one list column in any of these tables. It is the other names an extension
+/// answers to, so `httpfs` carries `[http, https, s3]` and most of them carry an empty list, and an
+/// empty list is not a null: the pin returns `[]` on every row that has no alias.
+#[must_use]
+pub fn extension_fields() -> Vec<Field> {
+    vec![
+        Field::new("extension_name", LogicalType::Varchar),
+        Field::new("loaded", LogicalType::Boolean),
+        Field::new("installed", LogicalType::Boolean),
+        Field::new("install_path", LogicalType::Varchar),
+        Field::new("description", LogicalType::Varchar),
+        Field::new("aliases", LogicalType::list(LogicalType::Varchar)),
+        Field::new("extension_version", LogicalType::Varchar),
+        Field::new("install_mode", LogicalType::Varchar),
+        Field::new("installed_from", LogicalType::Varchar),
+        Field::new("signature_key_fingerprint", LogicalType::Varchar),
+    ]
+}
+
+/// The columns `duckdb_optimizers()` produces, which is DuckDB's one.
+#[must_use]
+pub fn optimizer_fields() -> Vec<Field> {
+    vec![Field::new("name", LogicalType::Varchar)]
 }
 
 /// The four categories DuckDB sorts a keyword into.

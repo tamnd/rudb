@@ -39,8 +39,8 @@ pub use signature::{
     FunctionKind, FunctionRow, Resolved, function_rows, kind_of, part_type, resolve,
 };
 pub use table::{
-    Columns, FILE_ROW_NUMBER, ResolvedTable, TableFunction, keyword_categories, keyword_fields,
-    resolve_table, series, series_length, strategy_fields,
+    Columns, FILE_ROW_NUMBER, ResolvedTable, TableFunction, extension_fields, keyword_categories,
+    keyword_fields, optimizer_fields, resolve_table, series, series_length, strategy_fields,
 };
 pub use typecatalog::{
     Signature, TYPE_NAMES, TypeEntry, representative, sort_key, type_category, type_fields,
