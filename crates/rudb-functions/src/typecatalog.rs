@@ -246,6 +246,21 @@ pub fn representative(logical_type: &str) -> Option<LogicalType> {
     })
 }
 
+/// The `LogicalTypeId` of a canonical type name, and `None` for one this catalog does not carry.
+///
+/// The same number [`TypeEntry::oid`] holds, read the other way round. That column puts the oid on
+/// the alphabetically first name of a type and leaves it null on the aliases, because that is what
+/// the pin does, so finding a type's oid means scanning for the one entry that has it rather than
+/// looking up a name. `duckdb_columns()` reports this as `data_type_id` and does not care which name
+/// somebody wrote the column with, so `INTEGER` and `int4` both come out as 13.
+#[must_use]
+pub fn type_oid(logical_type: &str) -> Option<i64> {
+    TYPE_NAMES
+        .iter()
+        .find(|entry| entry.logical_type == logical_type && entry.oid.is_some())
+        .and_then(|entry| entry.oid)
+}
+
 /// How many bytes one value of this name takes, and `None` for the one name where it depends.
 ///
 /// A decimal is stored in the narrowest integer that holds its width, so there is no answer until

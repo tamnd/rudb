@@ -1019,6 +1019,48 @@ fn the_schemas_table_carries_the_oid_the_databases_table_gave_its_database() {
 }
 
 #[test]
+fn the_tables_table_counts_the_columns_and_the_rows_of_what_was_created() {
+    let rows =
+        run("TableFunction duckdb_tables args=[] #0 [table_name::VARCHAR, column_count::BIGINT, \
+         estimated_size::BIGINT, index_count::BIGINT, sql::VARCHAR]");
+    let t = rows.iter().find(|row| row[0] == text("t")).expect("the table the harness built");
+    assert_eq!(t[1], Value::BigInt(2));
+    assert_eq!(t[2], Value::BigInt(4));
+    assert_eq!(t[3], Value::BigInt(0));
+    // Written back out from the entry rather than stored, which is what the pin does too.
+    assert_eq!(t[4], text("CREATE TABLE t(x INTEGER, s VARCHAR);"));
+    // The empty table is a row here with nothing in it, not an absent row.
+    let empty = rows.iter().find(|row| row[0] == text("empty")).expect("the empty table");
+    assert_eq!(empty[2], Value::BigInt(0));
+}
+
+#[test]
+fn the_columns_table_numbers_from_one_and_reports_bits_as_the_precision() {
+    let rows =
+        run("TableFunction duckdb_columns args=[] #0 [table_name::VARCHAR, column_name::VARCHAR, \
+         column_index::INTEGER, is_nullable::BOOLEAN, data_type::VARCHAR, data_type_id::BIGINT, \
+         numeric_precision::INTEGER, numeric_precision_radix::INTEGER]");
+    let mut own: Vec<&Vec<Value>> = rows.iter().filter(|row| row[0] == text("t")).collect();
+    own.sort_by_key(|row| match row[2] {
+        Value::Integer(at) => at,
+        _ => panic!("a column index"),
+    });
+    assert_eq!(own.len(), 2);
+    assert_eq!(own[0][1], text("x"));
+    assert_eq!(own[0][2], Value::Integer(1));
+    assert_eq!(own[0][3], Value::Boolean(true));
+    assert_eq!(own[0][4], text("INTEGER"));
+    // 13 is INTEGER's LogicalTypeId, which is a number in someone else's public header and so is
+    // worth reproducing where a catalog's allocation counter is not.
+    assert_eq!(own[0][5], Value::BigInt(13));
+    assert_eq!(own[0][6], Value::Integer(32));
+    assert_eq!(own[0][7], Value::Integer(2));
+    assert_eq!(own[1][1], text("s"));
+    assert_eq!(own[1][5], Value::BigInt(25));
+    assert_eq!(own[1][6], Value::Null);
+}
+
+#[test]
 fn a_metadata_table_hands_back_the_columns_it_was_asked_for_in_the_order_asked() {
     // The same requirement as the strategies table and checked on a second one, because the
     // resolution by name now lives in one place and a regression there would be silent: every one of

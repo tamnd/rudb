@@ -1,9 +1,10 @@
 //! The columns of the tables that describe what somebody created.
 //!
-//! `duckdb_databases()` and `duckdb_schemas()` here, and the three that describe a table are the
-//! next piece of D2. Only the columns are here, because unlike the other four metadata tables the
-//! rows are not a fact about the binary. They are whatever is in the catalog, so they are built in
-//! `rudb_exec` where the catalog is in reach and this crate is only the half both ends agree on.
+//! `duckdb_databases()`, `duckdb_schemas()`, `duckdb_tables()` and `duckdb_columns()` here, and
+//! `duckdb_views()` is the one still missing. Only the columns are here, because unlike the other
+//! four metadata tables the rows are not a fact about the binary. They are whatever is in the
+//! catalog, so they are built in `rudb_exec` where the catalog is in reach and this crate is only the
+//! half both ends agree on.
 //!
 //! # Every one of these tables has an oid column and rudb fills them in
 //!
@@ -69,6 +70,102 @@ pub fn schema_fields() -> Vec<Field> {
     ]
 }
 
+/// The columns `duckdb_tables()` returns, in the pin's order.
+#[must_use]
+pub fn table_fields() -> Vec<Field> {
+    vec![
+        Field::new("database_name", LogicalType::Varchar),
+        Field::new("database_oid", LogicalType::BigInt),
+        Field::new("schema_name", LogicalType::Varchar),
+        Field::new("schema_oid", LogicalType::BigInt),
+        Field::new("table_name", LogicalType::Varchar),
+        Field::new("table_oid", LogicalType::BigInt),
+        Field::new("comment", LogicalType::Varchar),
+        Field::new("tags", tags()),
+        Field::new("internal", LogicalType::Boolean),
+        Field::new("temporary", LogicalType::Boolean),
+        Field::new("has_primary_key", LogicalType::Boolean),
+        Field::new("estimated_size", LogicalType::BigInt),
+        Field::new("column_count", LogicalType::BigInt),
+        Field::new("index_count", LogicalType::BigInt),
+        Field::new("check_constraint_count", LogicalType::BigInt),
+        Field::new("sql", LogicalType::Varchar),
+    ]
+}
+
+/// The columns `duckdb_columns()` returns, in the pin's order.
+#[must_use]
+pub fn column_fields() -> Vec<Field> {
+    vec![
+        Field::new("database_name", LogicalType::Varchar),
+        Field::new("database_oid", LogicalType::BigInt),
+        Field::new("schema_name", LogicalType::Varchar),
+        Field::new("schema_oid", LogicalType::BigInt),
+        Field::new("table_name", LogicalType::Varchar),
+        Field::new("table_oid", LogicalType::BigInt),
+        Field::new("column_name", LogicalType::Varchar),
+        Field::new("column_index", LogicalType::Integer),
+        Field::new("comment", LogicalType::Varchar),
+        Field::new("internal", LogicalType::Boolean),
+        Field::new("column_default", LogicalType::Varchar),
+        Field::new("is_nullable", LogicalType::Boolean),
+        Field::new("data_type", LogicalType::Varchar),
+        Field::new("data_type_id", LogicalType::BigInt),
+        Field::new("character_maximum_length", LogicalType::Integer),
+        Field::new("numeric_precision", LogicalType::Integer),
+        Field::new("numeric_precision_radix", LogicalType::Integer),
+        Field::new("numeric_scale", LogicalType::Integer),
+        Field::new("tags", tags()),
+        Field::new("is_generated", LogicalType::Boolean),
+        Field::new("generation_expression", LogicalType::Varchar),
+    ]
+}
+
+/// The canonical name of a type, which is what [`crate::typecatalog::type_oid`] is keyed by.
+///
+/// The type written out, minus whatever modifiers it carries. `DECIMAL(9,2)` and `DECIMAL(38,10)`
+/// are both the same type as far as `data_type_id` is concerned, and so are a list of integers and a
+/// list of strings, because the oid is `LogicalTypeId` and that enumeration has one entry for the
+/// type constructor rather than one per instance of it.
+#[must_use]
+pub fn canonical(ty: &LogicalType) -> String {
+    match ty {
+        LogicalType::Decimal { .. } => "DECIMAL".to_string(),
+        LogicalType::List(_) | LogicalType::Array(_, _) => "LIST".to_string(),
+        LogicalType::Map(_, _) => "MAP".to_string(),
+        LogicalType::Struct(_) => "STRUCT".to_string(),
+        LogicalType::Union(_) => "UNION".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The three numeric columns of `duckdb_columns()`, which most types report nothing in.
+///
+/// Measured off the pin rather than reasoned about, because the answers are not what the column
+/// names suggest. `numeric_precision` on an integer is a count of bits and not of digits, so an
+/// `INTEGER` reports 32 with a radix of 2, and a `FLOAT` reports 24 and a `DOUBLE` 53 because those
+/// are the mantissa widths. A `DECIMAL` is the one type where the number means digits, so it reports
+/// its width with a radix of 10 and its scale. Every unsigned integer reports nothing at all, which
+/// looks like an oversight upstream and is reproduced here because a client reading these is reading
+/// them from DuckDB's side of the comparison.
+#[must_use]
+pub fn numeric_facts(ty: &LogicalType) -> (Option<i32>, Option<i32>, Option<i32>) {
+    let binary = |bits| (Some(bits), Some(2), Some(0));
+    match ty {
+        LogicalType::TinyInt => binary(8),
+        LogicalType::SmallInt => binary(16),
+        LogicalType::Integer => binary(32),
+        LogicalType::BigInt => binary(64),
+        LogicalType::HugeInt => binary(128),
+        LogicalType::Float => binary(24),
+        LogicalType::Double => binary(53),
+        LogicalType::Decimal { width, scale } => {
+            (Some(i32::from(*width)), Some(10), Some(i32::from(*scale)))
+        }
+        _ => (None, None, None),
+    }
+}
+
 /// The `MAP(VARCHAR, VARCHAR)` that every one of these tables carries at least one of.
 fn tags() -> LogicalType {
     LogicalType::map(LogicalType::Varchar, LogicalType::Varchar)
@@ -76,12 +173,40 @@ fn tags() -> LogicalType {
 
 #[cfg(test)]
 mod tests {
-    use super::{database_fields, schema_fields};
+    use rudb_common::LogicalType;
+
+    use super::{
+        canonical, column_fields, database_fields, numeric_facts, schema_fields, table_fields,
+    };
 
     #[test]
-    fn the_two_tables_are_the_shape_the_pin_returns() {
+    fn the_four_tables_are_the_shape_the_pin_returns() {
         assert_eq!(database_fields().len(), 11);
         assert_eq!(schema_fields().len(), 10);
+        assert_eq!(table_fields().len(), 16);
+        assert_eq!(column_fields().len(), 21);
+    }
+
+    /// The four values read off the pin, which are not the ones the column names suggest.
+    #[test]
+    fn a_numeric_precision_is_bits_everywhere_except_on_a_decimal() {
+        assert_eq!(numeric_facts(&LogicalType::Integer), (Some(32), Some(2), Some(0)));
+        assert_eq!(numeric_facts(&LogicalType::Double), (Some(53), Some(2), Some(0)));
+        assert_eq!(
+            numeric_facts(&LogicalType::Decimal { width: 9, scale: 2 }),
+            (Some(9), Some(10), Some(2))
+        );
+        // An unsigned integer reports nothing, which is upstream's answer and not an omission here.
+        assert_eq!(numeric_facts(&LogicalType::UBigInt), (None, None, None));
+        assert_eq!(numeric_facts(&LogicalType::Varchar), (None, None, None));
+    }
+
+    #[test]
+    fn a_types_modifiers_are_not_part_of_the_name_the_oid_is_keyed_by() {
+        assert_eq!(canonical(&LogicalType::Decimal { width: 9, scale: 2 }), "DECIMAL");
+        assert_eq!(canonical(&LogicalType::list(LogicalType::Integer)), "LIST");
+        assert_eq!(canonical(&LogicalType::Integer), "INTEGER");
+        assert_eq!(canonical(&LogicalType::TimestampTz), "TIMESTAMP WITH TIME ZONE");
     }
 
     /// The one column name that does not follow the rule the other four tables follow.
