@@ -382,10 +382,7 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
     // column list, and a name that is added to this list and not to `lookup` cannot be reached.
     if let Some(columns) = fixed_columns(function) {
         if arity != 0 {
-            return Err(Error::binder(format!(
-                "Table function {}() takes no arguments, {arity} were given",
-                function.name()
-            )));
+            return Err(nothing_at_all(function, arguments));
         }
         return Ok(ResolvedTable {
             function,
@@ -685,6 +682,23 @@ fn one_name(function: TableFunction, arguments: &[LogicalType]) -> Error {
     ))
 }
 
+/// The same message again for a table function whose one overload takes nothing at all.
+///
+/// Every metadata table is one of these and upstream quotes all of their names, not only the ones
+/// the parser also spells as a statement, so `"duckdb_extensions"()` reads the same way
+/// `"pragma_version"()` does. Saying how many arguments were given instead would be a shorter
+/// sentence and a worse one, because a client that reads the candidate line to find out what it may
+/// call learns nothing from a count.
+fn nothing_at_all(function: TableFunction, arguments: &[LogicalType]) -> Error {
+    let written: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+    let name = function.name();
+    Error::binder(format!(
+        "No function matches the given name and argument types '{name}({})'. You might need to \
+         add explicit type casts.\n\tCandidate functions:\n\t\"{name}\"()\n",
+        written.join(", ")
+    ))
+}
+
 /// The values `start`, `stop` and `step` produce, in order.
 ///
 /// Whole rather than an iterator because the caller wants them in a vector to build a vector out
@@ -885,10 +899,7 @@ mod tests {
         ] {
             let function = TableFunction::lookup(name).expect("a known function");
             let error = resolve_table(name, &[LogicalType::BigInt]).expect_err("takes none");
-            assert!(
-                error.to_string().contains(&format!("{}() takes no arguments", function.name())),
-                "{error}"
-            );
+            assert!(error.to_string().contains(&format!("\"{}\"()", function.name())), "{error}");
             let resolved = resolve_table(name, &[]).expect("takes none, and none were given");
             assert_eq!(resolved.function, function);
             assert!(matches!(resolved.columns, Columns::Fixed(_)));
@@ -976,7 +987,8 @@ mod tests {
     #[test]
     fn rudb_strategies_with_an_argument_says_it_takes_none() {
         let error = resolve_table("rudb_strategies", &[LogicalType::BigInt]).unwrap_err();
-        assert!(error.to_string().contains("takes no arguments"), "{error}");
+        assert!(error.to_string().contains("\"rudb_strategies\"()"), "{error}");
+        assert!(error.to_string().contains("'rudb_strategies(BIGINT)'"), "{error}");
     }
 
     #[test]
@@ -1068,10 +1080,7 @@ mod tests {
                 fixed(&resolved).iter().map(|field| field.name.as_str()).collect();
             assert_eq!(written, columns);
             let error = resolve_table(name, &[LogicalType::Varchar]).expect_err("takes none");
-            assert!(
-                error.to_string().contains(&format!("{}() takes no arguments", function.name())),
-                "{error}"
-            );
+            assert!(error.to_string().contains(&format!("\"{}\"()", function.name())), "{error}");
         }
     }
 
