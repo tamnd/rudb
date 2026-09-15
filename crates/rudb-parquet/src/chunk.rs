@@ -61,10 +61,11 @@ impl Page {
     /// The definition levels of a data page, and where its values start in [`Page::body`].
     ///
     /// A definition level of one means the value is there and a zero means it is null, for a flat
-    /// schema, which is the only shape this crate reads. A required column has no levels at all
-    /// and gets an empty vector back, which is not the same as a column of zeroes and is the
-    /// reason this returns the offset as well: the caller needs to know where the values start
-    /// whether or not there were any levels in front of them.
+    /// schema, which is the only shape this crate reads. An empty vector comes back when there is
+    /// nothing per row worth saying, which is either a required column, which has no level stream
+    /// at all, or an optional column whose page turned out to hold no nulls. Empty is not a column
+    /// of zeroes, and it is the reason this returns the offset as well: the caller needs to know
+    /// where the values start whether or not there were any levels in front of them.
     ///
     /// The two page versions put the levels in the same place and describe them differently. A
     /// version one page writes each level stream with a four byte little endian length in front of
@@ -116,10 +117,19 @@ impl Page {
                 self.body.len()
             ))
         })?;
-        let mut levels = Vec::with_capacity(values);
         // One bit, because a flat optional column's largest definition level is one. A required
         // column took the early return above and never reaches here.
-        Hybrid::new(bytes, width_for(1))?.read(&mut levels, values)?;
+        let mut stream = Hybrid::new(bytes, width_for(1))?;
+        if stream.whole_run_of(1, values)? {
+            // Nothing on this page is null, and the run header said so without a level being
+            // decoded. An empty vector is how a caller is already told that every position holds a
+            // value, so this page now costs the same as a required column's does, which for a file
+            // of a hundred columns that happen to be nullable and happen to be full is the
+            // difference between four bytes a row a column and none.
+            return Ok((Vec::new(), after));
+        }
+        let mut levels = Vec::with_capacity(values);
+        stream.read(&mut levels, values)?;
         Ok((levels, after))
     }
 
@@ -595,13 +605,17 @@ mod tests {
                     }
                     let (found, values_at) =
                         page.definitions(optional).expect("the levels of a flat column decode");
-                    assert_eq!(found.len(), page.header.values() as usize);
+                    let rows = page.header.values() as usize;
+                    // An empty vector is a page saying it has no nulls, so it stands for that many
+                    // levels of one. Counting it as zero levels would make every column but `s`
+                    // disagree with the footer below, which is the check that matters here.
+                    assert!(found.is_empty() || found.len() == rows);
                     assert!(values_at <= page.body.len(), "values past the end of the body");
                     assert!(
                         found.iter().all(|&level| level <= 1),
                         "a flat column's levels are 0 or 1"
                     );
-                    levels += found.len();
+                    levels += rows;
                     nulls += found.iter().filter(|&&level| level == 0).count() as i64;
                 }
                 assert_eq!(levels as i64, chunk.values, "column {}", chunk.column);
@@ -611,6 +625,43 @@ mod tests {
             }
         }
         assert!(groups >= 14, "the fixture has two row groups of seven columns, saw {groups}");
+    }
+
+    #[test]
+    fn an_optional_column_with_nothing_null_in_it_builds_no_levels_at_all() {
+        // The fixture declares every column optional and only `s` ever holds a null, which is what
+        // a file written by a tool that makes everything nullable by default looks like, and that
+        // is most files. So this is not a corner: it is the shape the reader spends its time in,
+        // and on a hundred column file the vector this does not build is four bytes a row a column.
+        let file = open();
+        let metadata = Metadata::read(file.as_ref()).expect("the footer reads");
+        let mut empty = 0;
+        let mut filled = 0;
+        for group in &metadata.row_groups {
+            for chunk in &group.columns {
+                if !metadata.schema[chunk.column].optional {
+                    continue;
+                }
+                let mut bytes = vec![0u8; chunk.compressed_size as usize];
+                file.read_at(chunk.start(), &mut bytes).expect("the chunk is in the file");
+                for page in Pages::new(&bytes, chunk.compression, chunk.values) {
+                    let page = page.expect("every page walks");
+                    if matches!(page.header.body, Body::Dictionary(_)) {
+                        continue;
+                    }
+                    let (found, _) = page.definitions(true).expect("the levels decode");
+                    let nulls = chunk.stats.as_ref().and_then(|stats| stats.nulls);
+                    if found.is_empty() {
+                        assert_eq!(nulls, Some(0), "column {} said no nulls", chunk.column);
+                        empty += 1;
+                    } else {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert!(empty > 0, "no page took the no nulls path and the fixture is full of them");
+        assert!(filled > 0, "column s has nulls and its pages still have to decode levels");
     }
 
     #[test]

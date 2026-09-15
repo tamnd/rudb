@@ -811,12 +811,15 @@ mod tests {
             }
             let (levels, _) = page.definitions(true).expect("the levels decode");
             let vector = page.decode(&schema, dictionary.as_ref()).expect("the values decode");
-            assert_eq!(levels.len(), vector.len());
-            for (at, &level) in levels.iter().enumerate() {
-                let value = vector.value_at(at);
+            assert!(levels.is_empty() || levels.len() == vector.len());
+            for at in 0..vector.len() {
+                // No level for a position means the page said outright that it holds no nulls, so
+                // the position is not null. That is a different thing to a level of zero and the
+                // two have to keep landing on different answers here.
+                let null = levels.get(at) == Some(&0);
                 assert_eq!(
-                    level == 0,
-                    matches!(value, Value::Null),
+                    null,
+                    matches!(vector.value_at(at), Value::Null),
                     "position {at} disagrees with its level"
                 );
                 checked += 1;
