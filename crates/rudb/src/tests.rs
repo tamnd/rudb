@@ -1229,7 +1229,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // This table lists itself, because it is a table function and the table lists those.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
-        vec![vec![Value::BigInt(6)]]
+        vec![vec![Value::BigInt(8)]]
     );
 }
 
@@ -1330,6 +1330,112 @@ fn a_schema_carries_an_oid_of_its_own_and_not_its_databases() {
     // through a join would silently collapse on.
     assert_ne!(rows[0][0], Value::BigInt(0));
     assert_ne!(rows[0][1], Value::BigInt(0));
+}
+
+#[test]
+fn the_tables_and_columns_tables_describe_what_was_created() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    db.execute("CREATE TABLE shapes(x INTEGER, s VARCHAR, d DECIMAL(9,2), b BOOLEAN)")
+        .expect("a fresh table");
+    db.execute("INSERT INTO shapes VALUES (1, 'a', 1.5, true)").expect("a row");
+    // Every value here is the pin's, read off it on the same statements. The `sql` column is the
+    // interesting one: it is written back out from the entry rather than stored, which is why the
+    // types come back upper case on a statement that did not write them that way.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT column_count, estimated_size, index_count, check_constraint_count, sql \
+             FROM duckdb_tables() WHERE table_name = 'shapes'"
+        ),
+        vec![vec![
+            Value::BigInt(4),
+            Value::BigInt(1),
+            Value::BigInt(0),
+            Value::BigInt(0),
+            text("CREATE TABLE shapes(x INTEGER, s VARCHAR, d DECIMAL(9,2), b BOOLEAN);"),
+        ]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT column_name, column_index, data_type, data_type_id, numeric_precision, \
+             numeric_precision_radix, numeric_scale FROM duckdb_columns() \
+             WHERE table_name = 'shapes' ORDER BY column_index"
+        ),
+        vec![
+            vec![
+                text("x"),
+                Value::Integer(1),
+                text("INTEGER"),
+                Value::BigInt(13),
+                Value::Integer(32),
+                Value::Integer(2),
+                Value::Integer(0),
+            ],
+            vec![
+                text("s"),
+                Value::Integer(2),
+                text("VARCHAR"),
+                Value::BigInt(25),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                text("d"),
+                Value::Integer(3),
+                text("DECIMAL(9,2)"),
+                Value::BigInt(21),
+                Value::Integer(9),
+                Value::Integer(10),
+                Value::Integer(2),
+            ],
+            vec![
+                text("b"),
+                Value::Integer(4),
+                text("BOOLEAN"),
+                Value::BigInt(10),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+}
+
+#[test]
+fn a_table_and_its_columns_agree_on_the_oid_they_join_on() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    db.execute("CREATE TABLE joined(x INTEGER, s VARCHAR)").expect("a fresh table");
+    // The join a client writes, and the reason every one of these tables carries an oid.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT c.column_name FROM duckdb_columns() c, duckdb_tables() t \
+             WHERE c.table_oid = t.table_oid AND t.table_name = 'joined' ORDER BY c.column_index"
+        ),
+        vec![vec![text("x")], vec![text("s")]]
+    );
+}
+
+#[test]
+fn a_not_null_column_says_so_in_both_tables() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    db.execute("CREATE TABLE n(a INTEGER NOT NULL, b INTEGER)").expect("a fresh table");
+    assert_eq!(
+        rows(&db, "SELECT sql FROM duckdb_tables() WHERE table_name = 'n'"),
+        vec![vec![text("CREATE TABLE n(a INTEGER NOT NULL, b INTEGER);")]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT is_nullable FROM duckdb_columns() WHERE table_name = 'n' ORDER BY column_index"
+        ),
+        vec![vec![Value::Boolean(false)], vec![Value::Boolean(true)]]
+    );
 }
 
 /// The four ways a subscript is refused, in DuckDB's words. Per #278.

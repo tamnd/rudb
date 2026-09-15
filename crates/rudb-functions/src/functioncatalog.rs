@@ -209,6 +209,8 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::DuckdbSettings,
     TableFunction::DuckdbDatabases,
     TableFunction::DuckdbSchemas,
+    TableFunction::DuckdbTables,
+    TableFunction::DuckdbColumns,
 ];
 
 /// The second name each of the two file readers answers to.
@@ -226,7 +228,9 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::DuckdbFunctions
         | TableFunction::DuckdbSettings
         | TableFunction::DuckdbDatabases
-        | TableFunction::DuckdbSchemas => vec![0],
+        | TableFunction::DuckdbSchemas
+        | TableFunction::DuckdbTables
+        | TableFunction::DuckdbColumns => vec![0],
     }
 }
 

@@ -544,24 +544,13 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
 
 /// An identifier as a generated name writes it, which is quoted when it has to be.
 ///
-/// DuckDB writes every identifier inside a generated name through its deparser, and the deparser
-/// quotes on two grounds. One is that the word is a keyword in a class, so
+/// DuckDB writes every identifier inside a generated name through its deparser, so
 /// `SELECT min(name)` comes back as `min("name")` and `SELECT trim(' a ')` as `"trim"(' a ')`,
-/// while `SELECT min(alias)` comes back bare because `alias` is spelled by a rule and is in no
-/// class at all. The other is that the text is not one word the tokenizer would read back, so
-/// `"my col"`, `"9x"` and `"é"` keep their quotes.
-///
-/// What it does not quote on is case. `min(UserID)` comes back exactly like that upstream even
-/// though reading it again folds it, which is the whole reason ClickBench's column names agree
-/// between the two engines, so this does not quote on case either. Per #251.
+/// while `SELECT min(alias)` comes back bare. The rule is in [`rudb_parse::quoted`], which is where
+/// the keyword table it asks is, and the `sql` column of `duckdb_tables()` asks the same one.
+/// Per #251.
 fn quoted(text: &str) -> String {
-    let mut bytes = text.bytes();
-    let plain = matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic() || byte == b'_')
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-    if plain && rudb_parse::classes(rudb_parse::lookup(text)) == 0 {
-        return text.to_string();
-    }
-    format!("\"{}\"", text.replace('"', "\"\""))
+    rudb_parse::quoted(text)
 }
 
 /// The name a target gets when the query did not give it one.

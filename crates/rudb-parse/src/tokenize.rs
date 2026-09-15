@@ -585,6 +585,30 @@ pub fn classes(keyword: u16) -> u8 {
     if keyword == NOT_A_KEYWORD { 0 } else { KEYWORDS[keyword as usize].1 }
 }
 
+/// An identifier as DuckDB's deparser writes it, quoted when it has to be.
+///
+/// Two grounds for quoting. One is that the word is a keyword in a class, so a column called `name`
+/// comes back as `"name"` while one called `alias` comes back bare, since `alias` is spelled by a
+/// grammar rule and is in no class. The other is that the text is not one word the tokenizer above
+/// would read back, so `my col`, `9x` and `é` keep their quotes.
+///
+/// Case is not a ground. `UserID` comes back exactly like that even though reading it again folds
+/// it, which is the whole reason ClickBench's column names agree between the two engines.
+///
+/// Here rather than in the binder because two callers want the same rule: a generated column name
+/// and the `sql` column of `duckdb_tables()`, which are both a deparser writing an identifier back
+/// out for somebody to read.
+#[must_use]
+pub fn quoted(text: &str) -> String {
+    let mut bytes = text.bytes();
+    let plain = matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if plain && classes(lookup(text)) == 0 {
+        return text.to_string();
+    }
+    format!("\"{}\"", text.replace('"', "\"\""))
+}
+
 const fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
@@ -673,9 +697,29 @@ fn special_operator(bytes: &[u8], at: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{classes, lookup, tokenize};
+    use super::{classes, lookup, quoted, tokenize};
     use crate::generated::keywords::{RESERVED, UNRESERVED};
     use crate::token::{Flags, Kind, NOT_A_KEYWORD, Token};
+
+    #[test]
+    fn a_deparsed_identifier_is_quoted_on_a_keyword_or_a_word_that_will_not_read_back() {
+        // A keyword in a class, which is what makes `min(name)` come back as `min("name")`.
+        assert_eq!(quoted("name"), "\"name\"");
+        // A soft word, in the table with no class, which does not block an identifier and so stays
+        // bare. This is the pair that makes the rule worth asking the table about rather than
+        // guessing from the keyword list.
+        assert_eq!(quoted("alias"), "alias");
+        assert_eq!(quoted("x"), "x");
+        assert_eq!(quoted("_x9"), "_x9");
+        assert_eq!(quoted("my col"), "\"my col\"");
+        assert_eq!(quoted("9x"), "\"9x\"");
+        assert_eq!(quoted("e\u{301}"), "\"e\u{301}\"");
+        // Case is not a ground, which is the whole reason ClickBench's column names agree with
+        // DuckDB's even though reading one back folds it.
+        assert_eq!(quoted("UserID"), "UserID");
+        // A quote inside doubles, so the result reads back as the name that went in.
+        assert_eq!(quoted("a\"b"), "\"a\"\"b\"");
+    }
 
     /// Every token but the sentinel, as the pair worth asserting on.
     fn scan(query: &str) -> Vec<(Kind, &str)> {
