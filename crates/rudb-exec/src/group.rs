@@ -330,14 +330,11 @@ impl<'a> Aggregate<'a> {
                 held: Vec::new(),
                 instances: 0,
                 partitioning: false,
-                // Worker-local radix tables duplicate high-cardinality groups and can lose
-                // counts when their states are merged. Use the shared partitions until the
-                // worker-local merge is correct and bounded by a memory budget.
-                local: false,
+                local: true,
             }),
             merged: (0..RADIX_PARTITIONS).map(|_| Mutex::new(Partition::default())).collect(),
             started: AtomicUsize::new(0),
-            locally: AtomicBool::new(false),
+            locally: AtomicBool::new(true),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -1168,8 +1165,6 @@ impl<'a> Aggregate<'a> {
     /// The number of partitions stands in as a floor instead, because an aggregate worth running on
     /// several threads is one the pipeline gives at least that many.
     ///
-    /// This check applies only when worker-local tables are enabled. They are currently disabled
-    /// because their merge loses counts and their copies inflate high-cardinality memory use.
     fn worth_local(&self) -> bool {
         let Some(limit) = self.memory.limit() else { return true };
         let instances = self.started.load(Ordering::Relaxed).max(self.merged.len()) as u64;
@@ -1944,7 +1939,17 @@ impl Sink for Aggregate<'_> {
         }
         if built.partitioning {
             drop(built);
-            return self.hand(arriving, &mut spreading, &mut own);
+            self.hand(arriving, &mut spreading, &mut own)?;
+            // A second deposit, because `hand` can put the arriving table into this instance's own
+            // tables rather than into the shared partitions, and the deposit above ran before it
+            // and so saw nothing. Without this, an instance that never partitioned on its own but
+            // finished while the aggregate was partitioning locally had its whole table scattered
+            // into tables that were then dropped on the floor, and every row it had folded went
+            // with them. That is the lost count #614 turned worker-local tables off for.
+            //
+            // Cheap when `hand` took the shared path, because a deposit of nothing is a check that
+            // this instance holds no table and a return.
+            return self.deposit(&mut own, &mut spreading);
         }
         let mut kept = self.merged[0].lock().map_err(poisoned)?;
         if kept.table.is_none() {
