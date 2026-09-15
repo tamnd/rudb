@@ -37,7 +37,7 @@ impl Counting {
 }
 
 impl Source for Counting {
-    fn morsels(&self) -> Option<usize> {
+    fn morsels(&self, _threads: usize) -> Option<usize> {
         Some(usize::try_from((self.values.len() as u64).div_ceil(self.per_morsel)).unwrap_or(1))
     }
 

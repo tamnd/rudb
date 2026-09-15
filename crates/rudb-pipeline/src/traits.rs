@@ -35,7 +35,13 @@ pub trait Source: Send + Sync + fmt::Debug {
     ///
     /// `None` means the source does not know, and the scheduler takes that as permission to use
     /// every thread it has, because a source that cannot count its work is not thereby small.
-    fn morsels(&self) -> Option<usize> {
+    ///
+    /// `threads` is what the scheduler would lend if the answer came back large enough to want it.
+    /// Most sources have a fixed amount of work and ignore it. A source that can choose how finely
+    /// to cut its work needs it, because cutting finer than there are threads to run the pieces
+    /// costs the cutting and buys nothing.
+    fn morsels(&self, threads: usize) -> Option<usize> {
+        let _ = threads;
         None
     }
 
