@@ -114,6 +114,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) clause: &'static str,
     /// The views whose bodies are open on the stack, which is what catches a cycle.
     expanding: Vec<String>,
+    /// When this statement started, read once and kept, which is what `now()` folds to.
+    started: Option<i64>,
 }
 
 impl<'a> Binder<'a> {
@@ -132,7 +134,22 @@ impl<'a> Binder<'a> {
             in_aggregate: false,
             clause: "SELECT clause",
             expanding: Vec::new(),
+            started: None,
         }
+    }
+
+    pub(crate) fn catalog(&self) -> &Catalog {
+        self.catalog
+    }
+
+    /// When this statement started, in microseconds since the epoch.
+    ///
+    /// Read from the clock the first time something asks and kept after that, so a query that
+    /// writes `now()` twice gets one answer for both. That is what the pin does and what it reports
+    /// in the `stability` column of `duckdb_functions()`, where every one of these is
+    /// `CONSISTENT_WITHIN_QUERY`. A query that never asks never reads the clock.
+    pub(crate) fn instant(&mut self) -> i64 {
+        *self.started.get_or_insert_with(crate::context::micros_now)
     }
 
     pub(crate) fn plan(&self) -> &Plan {

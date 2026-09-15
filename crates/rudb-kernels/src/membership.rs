@@ -128,7 +128,11 @@ fn number(value: &Value) -> Option<i128> {
         Value::TinyInt(held) => Some(i128::from(held)),
         Value::SmallInt(held) => Some(i128::from(held)),
         Value::Integer(held) | Value::Date(held) => Some(i128::from(held)),
-        Value::BigInt(held) | Value::Time(held) | Value::Timestamp(held) => Some(i128::from(held)),
+        Value::BigInt(held)
+        | Value::Time(held)
+        | Value::TimeTz(held)
+        | Value::Timestamp(held)
+        | Value::TimestampTz(held) => Some(i128::from(held)),
         Value::HugeInt(held) => Some(held),
         Value::UTinyInt(held) => Some(i128::from(held)),
         Value::USmallInt(held) => Some(i128::from(held)),

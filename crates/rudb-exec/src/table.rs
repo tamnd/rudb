@@ -783,7 +783,9 @@ enum Stored {
     Blob(Vec<u8>),
     Date(i32),
     Time(i64),
+    TimeTz(i64),
     Timestamp(i64),
+    TimestampTz(i64),
     Interval { months: i32, days: i32, micros: i64 },
     Other(Box<Value>),
 }
@@ -810,7 +812,9 @@ impl From<Value> for Stored {
             Value::Blob(v) => Self::Blob(v),
             Value::Date(v) => Self::Date(v),
             Value::Time(v) => Self::Time(v),
+            Value::TimeTz(v) => Self::TimeTz(v),
             Value::Timestamp(v) => Self::Timestamp(v),
+            Value::TimestampTz(v) => Self::TimestampTz(v),
             Value::Interval { months, days, micros } => Self::Interval { months, days, micros },
             other => Self::Other(Box::new(other)),
         }
@@ -841,7 +845,9 @@ impl Stored {
             Self::Blob(v) => Value::Blob(v.clone()),
             Self::Date(v) => Value::Date(*v),
             Self::Time(v) => Value::Time(*v),
+            Self::TimeTz(v) => Value::TimeTz(*v),
             Self::Timestamp(v) => Value::Timestamp(*v),
+            Self::TimestampTz(v) => Value::TimestampTz(*v),
             Self::Interval { months, days, micros } => {
                 Value::Interval { months: *months, days: *days, micros: *micros }
             }
@@ -950,7 +956,11 @@ fn fold_value(state: u64, value: &Value) -> u64 {
         Value::TinyInt(x) => mix(state, i64::from(*x) as u64),
         Value::SmallInt(x) => mix(state, i64::from(*x) as u64),
         Value::Integer(x) | Value::Date(x) => mix(state, i64::from(*x) as u64),
-        Value::BigInt(x) | Value::Time(x) | Value::Timestamp(x) => mix(state, *x as u64),
+        Value::BigInt(x)
+        | Value::Time(x)
+        | Value::TimeTz(x)
+        | Value::Timestamp(x)
+        | Value::TimestampTz(x) => mix(state, *x as u64),
         Value::UTinyInt(x) => mix(state, u64::from(*x)),
         Value::USmallInt(x) => mix(state, u64::from(*x)),
         Value::UInteger(x) => mix(state, u64::from(*x)),

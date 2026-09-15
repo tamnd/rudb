@@ -2527,15 +2527,16 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
             data.bytes_at(index).map(|bytes| bytes_as(ty, bytes))
         }
         LogicalType::Date => signed().and_then(|x| i32::try_from(x).ok()).map(Value::Date),
-        LogicalType::Time | LogicalType::TimeTz => {
-            signed().and_then(|x| i64::try_from(x).ok()).map(Value::Time)
-        }
+        LogicalType::Time => signed().and_then(|x| i64::try_from(x).ok()).map(Value::Time),
+        LogicalType::TimeTz => signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimeTz),
         LogicalType::Timestamp
         | LogicalType::TimestampS
         | LogicalType::TimestampMs
-        | LogicalType::TimestampNs
-        | LogicalType::TimestampTz => {
+        | LogicalType::TimestampNs => {
             signed().and_then(|x| i64::try_from(x).ok()).map(Value::Timestamp)
+        }
+        LogicalType::TimestampTz => {
+            signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimestampTz)
         }
         LogicalType::Interval => match data {
             Data::Interval(v) => {
@@ -2651,7 +2652,11 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
         },
         Data::Int64(v) => match value {
             Value::Null => v.push(0),
-            Value::BigInt(x) | Value::Time(x) | Value::Timestamp(x) => v.push(*x),
+            Value::BigInt(x)
+            | Value::Time(x)
+            | Value::TimeTz(x)
+            | Value::Timestamp(x)
+            | Value::TimestampTz(x) => v.push(*x),
             Value::Decimal { unscaled, .. } => decimal!(v, i64, unscaled),
             other => return Err(Error::internal(format!("{other:?} is not a 64 bit value"))),
         },

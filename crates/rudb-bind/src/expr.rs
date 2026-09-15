@@ -95,6 +95,18 @@ impl Binder<'_> {
 
     fn bind_column(&mut self, ast: &Ast, name: ast::Slice, scope: &Scope) -> Result<ExprRef> {
         let parts: Vec<&str> = ast.name(name).collect();
+        // A bare `current_date` is one of the ten session context keywords, and a column of that
+        // name beats it. The scope is asked whether anything answers to the word before the fold
+        // rather than the fold happening when resolution fails, so that two tables carrying the name
+        // is still the ambiguity error. Both halves were measured against the pin. See
+        // `crate::context`.
+        if let [word] = parts.as_slice() {
+            if !scope.names(word) {
+                if let Some(folded) = self.context_keyword(word) {
+                    return Ok(folded);
+                }
+            }
+        }
         let found = scope.resolve(&parts)?;
         let (binding, ty) = (found.binding, found.ty.clone());
         Ok(self.plan_mut().add_expr(Expr::Column(binding), ty))
@@ -280,6 +292,16 @@ impl Binder<'_> {
         // through to the table, which refuses it in upstream's words.
         if rudb_catalog::same_name(&written, "current_setting") && bound.len() == 1 {
             if let Some(folded) = self.setting(bound[0])? {
+                return Ok(folded);
+            }
+        }
+        // The session context functions are the third group the binder answers, and they fold for
+        // the reason the pin marks them `CONSISTENT_WITHIN_QUERY`: the answer is settled when the
+        // statement starts and no row changes it. A call with arguments is not one of these and
+        // falls through to the table, which has a row per name so that `now(1)` is the arity error
+        // rather than a missing function. See `crate::context`.
+        if bound.is_empty() {
+            if let Some(folded) = self.context_call(&written) {
                 return Ok(folded);
             }
         }
