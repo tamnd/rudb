@@ -1122,13 +1122,13 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
     }
 }
 
-/// How many entries a dictionary may hold for [`tally`] to take it, and a power of two.
+/// How many entries a dictionary may hold for [`tally`] to take it.
 ///
 /// The counters have to fit in the first level cache beside everything else the loop touches, and
-/// they have to be zeroed before each vector is read. Two hundred and fifty six entries across four
-/// lanes is four kilobytes, which is a hundred and twenty eight wide stores to clear against the
-/// fifteen hundred or so rows of a vector, so the clearing is a few percent of the loop it saves
-/// most of. Anything much wider stops being either of those things.
+/// they have to be cleared and then folded once per vector. Both of those are per dictionary entry
+/// rather than per row, so a wide dictionary pays them over and over for a vector of fifteen hundred
+/// rows and never gets them back. `UserID` has about half a million distinct values, which is where
+/// the idea stops working entirely.
 const TALLY_LIMIT: usize = 256;
 
 /// How many counters each dictionary entry gets.
@@ -1153,15 +1153,32 @@ const TALLY_LANES: usize = 4;
 /// dictionary entry, which is what a column store should do with a low cardinality column. The row
 /// loop stops touching the values at all: it is a load, a mask and one read modify write against
 /// memory that stays in the first level cache, and the multiplications move off the per row path
-/// into a fold over the dictionary, which is at most [`TALLY_LIMIT`] long however many rows there
-/// were. It is exact, because integers add in any order.
+/// into a fold over the dictionary. It is exact, because integers add in any order.
 ///
-/// `None` when the dictionary is too wide to count, which is the case this must not take: `UserID`
-/// has about half a million distinct values and counting those would be a pass over half a million
-/// counters for every vector of fifteen hundred rows. Also `None` for a layout with no fixed width,
-/// and for a code that points past the dictionary, which cannot happen because `Vector::dictionary`
-/// refuses one on the way in and which is checked here anyway rather than quietly dropping rows.
+/// The counters are sized to the dictionary and not to [`TALLY_LIMIT`], which is the difference
+/// between this paying and not. A fixed set of counters wide enough for the largest dictionary this
+/// takes is four kilobytes to clear and a thousand slots to fold for every vector, and measured that
+/// way the clearing alone gave back everything the row loop saved. So there is a ladder of sizes and
+/// a two entry dictionary clears a hundred and twenty eight bytes.
+///
+/// `None` when the dictionary is too wide to count, and for a layout with no fixed width, and for a
+/// code that points past the dictionary, which cannot happen because `Vector::dictionary` refuses
+/// one on the way in and which is checked here anyway rather than quietly dropping rows.
 fn tally(data: &Data, codes: &[u32]) -> Option<i128> {
+    // The rungs are the lane count times a power of two, so that the index below is inside the
+    // counters by construction. Each one covers dictionaries up to a quarter of its own size.
+    match data.len() {
+        0..=8 => tally_into::<{ TALLY_LANES * 8 }>(data, codes),
+        9..=32 => tally_into::<{ TALLY_LANES * 32 }>(data, codes),
+        33..=128 => tally_into::<{ TALLY_LANES * 128 }>(data, codes),
+        129..=TALLY_LIMIT => tally_into::<{ TALLY_LANES * TALLY_LIMIT }>(data, codes),
+        _ => None,
+    }
+}
+
+/// [`tally`] with the counters it decided on, `TOTAL` of them across [`TALLY_LANES`] lanes.
+fn tally_into<const TOTAL: usize>(data: &Data, codes: &[u32]) -> Option<i128> {
+    let slots = TOTAL / TALLY_LANES;
     macro_rules! counted {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match data {
@@ -1171,23 +1188,23 @@ fn tally(data: &Data, codes: &[u32]) -> Option<i128> {
         };
         (@run $values:expr) => {{
             let values = $values.as_slice();
-            if values.len() > TALLY_LIMIT {
+            if values.len() > slots {
                 return None;
             }
-            let mut counts = [0u32; TALLY_LANES * TALLY_LIMIT];
+            let mut counts = [0u32; TOTAL];
             // row at a time: this is the loop the whole function is, and what it does per row is the
-            // point. Masked rather than bounds checked: `TALLY_LIMIT` is a power of two and `counts`
-            // is exactly `TALLY_LANES` of it, so the index is inside the array by construction and
-            // the compiler can see it, which is the check gone without any unsafe code.
+            // point. Masked rather than bounds checked: `slots` is a power of two and `TOTAL` is
+            // exactly `TALLY_LANES` of it, so the index is inside the array by construction and the
+            // compiler can see it, which is the check gone without any unsafe code.
             for (row, &code) in codes.iter().enumerate() {
-                let lane = (row & (TALLY_LANES - 1)) * TALLY_LIMIT;
-                counts[lane + (code as usize & (TALLY_LIMIT - 1))] += 1;
+                let lane = (row & (TALLY_LANES - 1)) * slots;
+                counts[lane + (code as usize & (slots - 1))] += 1;
             }
             let mut total: i128 = 0;
-            for slot in 0..TALLY_LIMIT {
+            for slot in 0..slots {
                 let mut seen: u64 = 0;
                 for lane in 0..TALLY_LANES {
-                    seen += u64::from(counts[lane * TALLY_LIMIT + slot]);
+                    seen += u64::from(counts[lane * slots + slot]);
                 }
                 match values.get(slot) {
                     Some(&value) => total += i128::from(value) * i128::from(seen),
