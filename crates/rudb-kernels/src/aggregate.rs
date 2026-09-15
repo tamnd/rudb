@@ -1107,13 +1107,101 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
             // code lands on is a number out of the data and nothing knows it is in range until it
             // has been looked at.
             let codes = codes.get(..rows)?;
-            collect::<false, _>(values.data()?, |index| codes[index] as usize, rows, nulls, want)
+            let data = values.data()?;
+            if let (Want::Whole, Validity::AllValid) = (want, nulls) {
+                if let Some(total) = tally(data, codes) {
+                    return Some(Contribution::Whole(total));
+                }
+            }
+            collect::<false, _>(data, |index| codes[index] as usize, rows, nulls, want)
         }
         // A constant folds in as one value repeated and a sequence as an arithmetic series, and
         // both have a closed form that is better than any loop. Neither is what a scan of a column
         // produces, so both wait for the counter to ask for them.
         _ => None,
     }
+}
+
+/// How many entries a dictionary may hold for [`tally`] to take it, and a power of two.
+///
+/// The counters have to fit in the first level cache beside everything else the loop touches, and
+/// they have to be zeroed before each vector is read. Two hundred and fifty six entries across four
+/// lanes is four kilobytes, which is a hundred and twenty eight wide stores to clear against the
+/// fifteen hundred or so rows of a vector, so the clearing is a few percent of the loop it saves
+/// most of. Anything much wider stops being either of those things.
+const TALLY_LIMIT: usize = 256;
+
+/// How many counters each dictionary entry gets.
+///
+/// One would do for the answer and is the wrong number for the machine. A column like `JavaEnable`
+/// holds two distinct values, so a single set of counters has every row incrementing one of two
+/// addresses, and each increment has to wait for the previous one to leave the store buffer. That is
+/// about five cycles a row, which is slower than the gather this replaces. Four sets means four rows
+/// in a row land on four different addresses whatever the data does, so the wait is five cycles per
+/// four rows instead, and the lanes are added together at the end where there are only as many
+/// additions as there are dictionary entries.
+const TALLY_LANES: usize = 4;
+
+/// The total of a dictionary encoded column, counted rather than gathered.
+///
+/// A gather reads `values[codes[row]]` for every row: two loads, one of them dependent on the other,
+/// plus a bounds check that nothing can remove because a code is data and its range is not known
+/// until it has been read. That is about thirteen instructions a value, and on a ten column integer
+/// scan of ClickBench's `hits` it was the largest single thing in the program.
+///
+/// The same answer comes out of counting how often each code appears and then taking one product per
+/// dictionary entry, which is what a column store should do with a low cardinality column. The row
+/// loop stops touching the values at all: it is a load, a mask and one read modify write against
+/// memory that stays in the first level cache, and the multiplications move off the per row path
+/// into a fold over the dictionary, which is at most [`TALLY_LIMIT`] long however many rows there
+/// were. It is exact, because integers add in any order.
+///
+/// `None` when the dictionary is too wide to count, which is the case this must not take: `UserID`
+/// has about half a million distinct values and counting those would be a pass over half a million
+/// counters for every vector of fifteen hundred rows. Also `None` for a layout with no fixed width,
+/// and for a code that points past the dictionary, which cannot happen because `Vector::dictionary`
+/// refuses one on the way in and which is checked here anyway rather than quietly dropping rows.
+fn tally(data: &Data, codes: &[u32]) -> Option<i128> {
+    macro_rules! counted {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => counted!(@run values),)+
+                _ => return None,
+            }
+        };
+        (@run $values:expr) => {{
+            let values = $values.as_slice();
+            if values.len() > TALLY_LIMIT {
+                return None;
+            }
+            let mut counts = [0u32; TALLY_LANES * TALLY_LIMIT];
+            // row at a time: this is the loop the whole function is, and what it does per row is the
+            // point. Masked rather than bounds checked: `TALLY_LIMIT` is a power of two and `counts`
+            // is exactly `TALLY_LANES` of it, so the index is inside the array by construction and
+            // the compiler can see it, which is the check gone without any unsafe code.
+            for (row, &code) in codes.iter().enumerate() {
+                let lane = (row & (TALLY_LANES - 1)) * TALLY_LIMIT;
+                counts[lane + (code as usize & (TALLY_LIMIT - 1))] += 1;
+            }
+            let mut total: i128 = 0;
+            for slot in 0..TALLY_LIMIT {
+                let mut seen: u64 = 0;
+                for lane in 0..TALLY_LANES {
+                    seen += u64::from(counts[lane * TALLY_LIMIT + slot]);
+                }
+                match values.get(slot) {
+                    Some(&value) => total += i128::from(value) * i128::from(seen),
+                    // A code the dictionary has no entry for. Unreachable on a vector built the
+                    // usual way, and the answer here would be short by those rows, so hand the work
+                    // back rather than be quietly wrong.
+                    None if seen != 0 => return None,
+                    None => {}
+                }
+            }
+            total
+        }};
+    }
+    Some(rudb_vector::for_each_layout!(narrow, counted))
 }
 
 /// The first `rows` values as one slice, when the mapping into them is the identity.
@@ -1984,6 +2072,55 @@ mod tests {
                 assert_eq!(got, Value::HugeInt(wanted), "the first {count} rows");
             }
         }
+    }
+
+    /// The counted total and the gathered one are two ways to the same number, and which one runs
+    /// depends on how wide the dictionary is. So the answer is held against the flat sum of the same
+    /// rows at every width that matters: under the limit, exactly on it, and past it where the
+    /// counting is refused and the gather has to give the answer instead.
+    #[test]
+    fn a_counted_dictionary_totals_what_the_same_rows_total_laid_out_flat() {
+        // row at a time: each width is its own vector and its own expected answer.
+        for distinct in [1usize, 2, 7, 255, TALLY_LIMIT, TALLY_LIMIT + 1, TALLY_LIMIT * 3] {
+            let entries: Vec<Value> =
+                (0..distinct).map(|slot| Value::Integer(slot as i32 * 7 - 11)).collect();
+            let values = Vector::from_values(LogicalType::Integer, &entries).expect("a dictionary");
+            // A pattern with no period in common with the four lanes, so the rows that share a
+            // counter are not the rows that share a lane.
+            let codes: Vec<u32> = (0..1500u32).map(|row| row * 13 % distinct as u32).collect();
+            let flat: Vec<Value> =
+                codes.iter().map(|&code| entries[code as usize].clone()).collect();
+
+            let coded = Vector::dictionary(codes, values).expect("codes are in range");
+            let mut counted = Accumulator::new("sum", &LogicalType::HugeInt).expect("a known one");
+            counted.update_run(std::slice::from_ref(&coded), 1500).expect("totals");
+
+            let laid_out = Vector::from_values(LogicalType::Integer, &flat).expect("a vector");
+            let mut gathered = Accumulator::new("sum", &LogicalType::HugeInt).expect("a known one");
+            gathered.update_run(std::slice::from_ref(&laid_out), 1500).expect("totals");
+
+            assert_eq!(
+                counted.finish().expect("a total"),
+                gathered.finish().expect("a total"),
+                "a dictionary of {distinct} entries"
+            );
+        }
+    }
+
+    /// The counting reads the rows it was asked for and not the ones past them, which the masking
+    /// of the counter index would hide if the loop went over the whole code run.
+    #[test]
+    fn a_counted_dictionary_stops_at_the_rows_it_was_asked_for() {
+        let entries = [Value::Integer(1), Value::Integer(100)];
+        let values = Vector::from_values(LogicalType::Integer, &entries).expect("a dictionary");
+        let coded = Vector::dictionary(vec![0, 0, 0, 1, 1], values).expect("codes are in range");
+        let mut accumulator = Accumulator::new("sum", &LogicalType::HugeInt).expect("a known one");
+        accumulator.update_run(std::slice::from_ref(&coded), 3).expect("totals");
+        assert_eq!(
+            accumulator.finish().expect("a total"),
+            Value::HugeInt(3),
+            "only the three ones"
+        );
     }
 
     /// Why the whole sum stops at sixty four bits: at a hundred and twenty eight the total of one
