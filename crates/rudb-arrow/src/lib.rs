@@ -40,12 +40,13 @@
 //! here rather than there because the format string is defined by Arrow's document, so it is the
 //! part a test can check against that document rather than against our own opinion.
 //!
-//! The nested types. There is a list vector as of #302 and a struct vector as of #594, so for those
-//! two the blocker is no longer underneath this crate and what is left is here. A struct is the easier
-//! of the two, because Arrow holds a struct the same way we do, one child array per field each as long
-//! as the parent, so the export is the children exported and a schema saying so. A list is the one with
-//! a real decision in it, and [`DataType`] writes that up. `MAP`, `ARRAY` and `UNION` are still missing
-//! a vector to export from.
+//! The nested types. There is a list vector as of #302, a struct vector as of #594 and a map vector as
+//! of #595, so for those three the blocker is no longer underneath this crate and what is left is here.
+//! A struct is the easiest, because Arrow holds a struct the same way we do, one child array per field
+//! each as long as the parent, so the export is the children exported and a schema saying so. A list is
+//! the one with a real decision in it, and [`DataType`] writes that up. A map is a list of two field
+//! structs in Arrow exactly as it is here, so it costs whatever the list costs and nothing more.
+//! `ARRAY` and `UNION` are still missing a vector to export from.
 
 #![forbid(unsafe_code)]
 

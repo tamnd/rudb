@@ -149,7 +149,7 @@ impl Gauge {
 /// # Errors
 ///
 /// If the selection points past the end of the chunk, or if the seam asked for a copy of a column of a
-/// type there is no vector for, which today means `MAP`, `ARRAY` and `UNION` and which
+/// type there is no vector for, which today means `ARRAY` and `UNION` and which
 /// [`Strategy::applicable`](rudb_seam::Strategy::applicable) already keeps the compacting
 /// implementations away from.
 pub fn narrow(
@@ -212,22 +212,23 @@ const THRESHOLD: usize = 5;
 
 /// Whether a type can be copied out of a chunk at all.
 ///
-/// A `MAP`, an `ARRAY` and a `UNION` have no vector to gather into yet, so a compaction of one is an
-/// error rather than a slow answer. Both compacting implementations decline a plan that has one in it,
-/// which leaves the reference, which handles everything.
+/// An `ARRAY` and a `UNION` have no vector to gather into yet, so a compaction of one is an error
+/// rather than a slow answer. Both compacting implementations decline a plan that has one in it, which
+/// leaves the reference, which handles everything.
 ///
-/// A `LIST` was in that group until #302 and a `STRUCT` until #594, and neither is any more, but they
-/// left for different reasons and the difference is worth keeping in mind before this list is trimmed
-/// again. A gather of a list column permutes the entries and shares the child, so it is eight bytes a
-/// row however long the lists are, which is the cheapest gather of any type here. A gather of a struct
+/// A `LIST` was in that group until #302, a `STRUCT` until #594 and a `MAP` until #595, and none of the
+/// three is any more. They did not leave for the same reason and the difference is worth keeping in
+/// mind before this list is trimmed again. A gather of a list column permutes the entries and shares
+/// the child, so it is eight bytes a row however long the lists are, which is the cheapest gather of
+/// any type here, and a map gathers exactly the same way because a map is a list. A gather of a struct
 /// column is a gather of every field, so it costs what those fields cost and a struct of twenty of them
 /// costs twenty gathers. That is still a gather rather than a refusal, and `PER_COLUMN_NS` is the knob
 /// that is meant to notice a wide row, so the decision belongs in the cost model rather than here.
 fn gatherable(context: &Context<'_>) -> bool {
-    !context
-        .types()
-        .iter()
-        .any(|ty| ty.is_nested() && !matches!(ty, LogicalType::List(_) | LogicalType::Struct(_)))
+    !context.types().iter().any(|ty| {
+        ty.is_nested()
+            && !matches!(ty, LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _))
+    })
 }
 
 /// Never copies. The rows a filter kept stay a selection over the chunk they came from.
@@ -414,7 +415,7 @@ mod tests {
     fn a_nested_column_leaves_only_the_one_that_copies_nothing() {
         let mut settings = Settings::new();
         settings.pin(SeamId::ChunkCompaction, "fixed-threshold");
-        let types = [LogicalType::map(LogicalType::Varchar, LogicalType::Varchar)];
+        let types = [LogicalType::array(LogicalType::Integer, 3)];
         let context = Context::new(SeamId::ChunkCompaction, &settings).with_types(&types);
         let registry = compaction();
         assert!(
