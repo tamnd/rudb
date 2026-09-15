@@ -11,23 +11,29 @@
 //! row. A row-at-a-time interface here would be an interface every operator above would grow
 //! against, and unwinding that later is the rewrite this project exists to avoid.
 
+use std::time::Instant;
+
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::vector::VECTOR_SIZE;
 use rudb_vector::{Chunk, Vector};
+
+use crate::zone::{Probe, Zone};
 
 /// A table held in memory as a sequence of chunks.
 #[derive(Debug, Clone)]
 pub struct MemoryTable {
     types: Vec<LogicalType>,
     chunks: Vec<Chunk>,
+    zones: Vec<Zone>,
     rows: usize,
+    stats_ns: u64,
 }
 
 impl MemoryTable {
     /// An empty table of the given column types.
     #[must_use]
     pub fn new(types: Vec<LogicalType>) -> Self {
-        Self { types, chunks: Vec::new(), rows: 0 }
+        Self { types, chunks: Vec::new(), zones: Vec::new(), rows: 0, stats_ns: 0 }
     }
 
     /// The column types.
@@ -86,9 +92,37 @@ impl MemoryTable {
         if chunk.is_empty() {
             return Ok(());
         }
+        let started = Instant::now();
+        let zone = Zone::of(&chunk);
+        self.stats_ns += started.elapsed().as_nanos() as u64;
         self.rows += chunk.len();
+        self.zones.push(zone);
         self.chunks.push(chunk);
         Ok(())
+    }
+
+    /// How long this table has spent building statistics, in nanoseconds.
+    ///
+    /// A load reports this next to its own wall time so that the price of the zone maps is a number
+    /// somebody can argue with rather than something buried inside the load. See `zone.rs`.
+    #[must_use]
+    pub fn stats_ns(&self) -> u64 {
+        self.stats_ns
+    }
+
+    /// The zone of one chunk, or `None` past the end.
+    #[must_use]
+    pub fn zone(&self, index: usize) -> Option<&Zone> {
+        self.zones.get(index)
+    }
+
+    /// Whether the probes rule out every row of chunk `index`.
+    ///
+    /// A chunk with no zone is a chunk that is read, because saying nothing about a chunk has to
+    /// mean keeping it. That is what makes this safe to ask about any index at all.
+    #[must_use]
+    pub fn skips(&self, index: usize, probes: &[Probe]) -> bool {
+        self.zones.get(index).is_some_and(|zone| zone.skips(probes))
     }
 
     /// Appends rows given one at a time, splitting them into chunks.
