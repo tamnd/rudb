@@ -609,6 +609,56 @@ pub fn quoted(text: &str) -> String {
     format!("\"{}\"", text.replace('"', "\"\""))
 }
 
+/// A dotted name split into its parts, with the quoting taken off each one.
+///
+/// The inverse of [`quoted`] over a whole name rather than over one identifier, and the reason it
+/// is here is that the two rules have to be the same rule. `pragma_table_info('main.t')` is a table
+/// name that arrived as a string rather than as a name the parser read, so somebody has to decide
+/// where the parts of it end, and the only right answer is wherever the tokenizer would have said
+/// they end. A table created as `"a.b"` is one part and a table written `a.b` is two.
+///
+/// Quoting is per part. `"a.b".c` is `a.b` and `c`, a doubled quote inside a quoted part is one
+/// quote, and a part with no quotes keeps whatever case it was written in, because nothing in this
+/// crate folds a name. An unterminated quote takes the rest of the text, which is the same thing
+/// the tokenizer does with one.
+///
+/// The empty string is one empty part rather than no parts at all. That is what makes an empty name
+/// a name the catalog can say it does not have, and upstream is worth being plain about here: the
+/// pinned binary answers `Invalid Error: cannot create std::vector larger than max_size()` for
+/// `pragma_table_info('')`, which is tamnd/duckdb#5, while `pragma_table_info('.')` on the same
+/// build is an ordinary catalog error about a table with no name. The two are the same name, so
+/// this returns the same parts for both and the catalog gives the same answer to each.
+#[must_use]
+pub fn identifier_parts(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut rest = text.chars().peekable();
+    while let Some(c) = rest.next() {
+        match c {
+            '.' => parts.push(std::mem::take(&mut part)),
+            '"' => {
+                while let Some(inside) = rest.next() {
+                    if inside != '"' {
+                        part.push(inside);
+                        continue;
+                    }
+                    // A doubled quote is one quote and the part carries on, and a single one ends
+                    // the part, which is the tokenizer's rule for a quoted identifier.
+                    if rest.peek() == Some(&'"') {
+                        rest.next();
+                        part.push('"');
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => part.push(c),
+        }
+    }
+    parts.push(part);
+    parts
+}
+
 const fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
@@ -697,7 +747,7 @@ fn special_operator(bytes: &[u8], at: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{classes, lookup, quoted, tokenize};
+    use super::{classes, identifier_parts, lookup, quoted, tokenize};
     use crate::generated::keywords::{RESERVED, UNRESERVED};
     use crate::token::{Flags, Kind, NOT_A_KEYWORD, Token};
 
@@ -1057,5 +1107,36 @@ mod tests {
                 (Kind::Terminator, ";"),
             ]
         );
+    }
+
+    /// The parts of a name in a string, which is how a pragma is handed a table to describe.
+    #[test]
+    fn a_dotted_name_splits_where_the_tokenizer_would_split_it() {
+        assert_eq!(identifier_parts("t"), ["t"]);
+        assert_eq!(identifier_parts("main.t"), ["main", "t"]);
+        assert_eq!(identifier_parts("memory.main.t"), ["memory", "main", "t"]);
+        // Case survives, because nothing in this crate folds a name.
+        assert_eq!(identifier_parts("Memory.Main.MyTable"), ["Memory", "Main", "MyTable"]);
+    }
+
+    /// A quoted part keeps whatever is inside it, dots included, which is the whole reason this
+    /// cannot be a split on the character.
+    #[test]
+    fn a_quoted_part_holds_the_dots_that_are_inside_it() {
+        assert_eq!(identifier_parts("\"a.b\""), ["a.b"]);
+        assert_eq!(identifier_parts("\"a.b\".c"), ["a.b", "c"]);
+        assert_eq!(identifier_parts("\"a\"\"b\""), ["a\"b"]);
+        assert_eq!(identifier_parts("main.\"My Table\""), ["main", "My Table"]);
+        // An unterminated quote takes the rest, the way the tokenizer reads one.
+        assert_eq!(identifier_parts("\"a.b"), ["a.b"]);
+    }
+
+    /// An empty name is a name, and a name with an empty part in it is as well.
+    #[test]
+    fn an_empty_name_is_one_empty_part_rather_than_nothing() {
+        assert_eq!(identifier_parts(""), [""]);
+        assert_eq!(identifier_parts("."), ["", ""]);
+        assert_eq!(identifier_parts("a."), ["a", ""]);
+        assert_eq!(identifier_parts("memory..t"), ["memory", "", "t"]);
     }
 }

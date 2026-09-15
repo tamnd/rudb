@@ -1643,6 +1643,92 @@ fn the_engine_ships_with_the_views_upstream_ships_with() {
     );
 }
 
+/// The two pragmas that take a name, both of them answered while the query is bound.
+///
+/// Every row below was read off the pin on the same statements before it was written here.
+#[test]
+fn the_two_pragmas_describe_a_table_and_a_view_the_way_upstream_does() {
+    // A database of its own, because these report the columns of whatever was made here and the
+    // shared one has a second table in it that would only be noise.
+    let db = Database::new();
+    db.execute("CREATE TABLE t(a INTEGER NOT NULL, b VARCHAR)").expect("a table to describe");
+    db.execute("CREATE VIEW v AS SELECT a FROM t").expect("a view to describe");
+    let no = Value::Boolean(false);
+    // `dflt_value` is null and `pk` is false on every row, because `CREATE TABLE` in rudb takes
+    // neither a default nor a key yet. `cid` counts from zero, which is SQLite's numbering.
+    let table = vec![
+        vec![integer(0), text("a"), text("INTEGER"), Value::Boolean(true), Value::Null, no.clone()],
+        vec![integer(1), text("b"), text("VARCHAR"), no.clone(), Value::Null, no.clone()],
+    ];
+    assert_eq!(rows(&db, "SELECT * FROM pragma_table_info('t')"), table);
+    // The name is split under the identifier rule rather than taken whole, so a qualified name and
+    // a fully qualified one in the wrong case are the same table.
+    assert_eq!(rows(&db, "SELECT * FROM pragma_table_info('main.t')"), table);
+    assert_eq!(rows(&db, "SELECT * FROM pragma_table_info('MEMORY.MAIN.T')"), table);
+    // Every column of a view is nullable whatever the column underneath was declared as, so the
+    // `NOT NULL` on `a` is gone by the time it is read through `v`.
+    assert_eq!(
+        rows(&db, "SELECT * FROM pragma_table_info('v')"),
+        vec![vec![integer(0), text("a"), text("INTEGER"), no.clone(), Value::Null, no]]
+    );
+    // The same two columns again in the six `DESCRIBE` answers with, where nullability is the word
+    // rather than the boolean and the sense of it is the other way round.
+    assert_eq!(
+        rows(&db, "SELECT * FROM pragma_show('t')"),
+        vec![
+            vec![text("a"), text("INTEGER"), text("NO"), Value::Null, Value::Null, Value::Null],
+            vec![text("b"), text("VARCHAR"), text("YES"), Value::Null, Value::Null, Value::Null],
+        ]
+    );
+    // An ordinary relation, which is the point of having these as functions and not only as
+    // statements: an alias, a column list of its own, a qualified reference and a filter.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT info.name, info.type FROM pragma_table_info('t') AS info WHERE info.cid = 1"
+        ),
+        vec![vec![text("b"), text("VARCHAR")]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT n FROM pragma_table_info('t') AS info(c, n, ty, nn, d, k) WHERE c = 0"),
+        vec![vec![text("a")]]
+    );
+}
+
+/// Describing a view is reading it, including one the engine ships with.
+#[test]
+fn a_pragma_pointed_at_an_internal_view_binds_it_and_reports_its_columns() {
+    let db = Database::new();
+    let bound = "SELECT column_count FROM duckdb_views() WHERE view_name = 'duckdb_views'";
+    assert_eq!(rows(&db, bound), vec![vec![Value::Null]]);
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM pragma_table_info('duckdb_views')"),
+        vec![vec![Value::BigInt(13)]]
+    );
+    assert_eq!(rows(&db, bound), vec![vec![Value::BigInt(13)]]);
+}
+
+/// The four ways of getting one of these wrong, all four measured on the pin.
+#[test]
+fn a_pragma_given_a_name_that_is_not_there_says_what_the_catalog_says() {
+    let db = database();
+    assert_eq!(
+        failure(&db, "SELECT * FROM pragma_table_info('nope')"),
+        "Table with name nope does not exist!"
+    );
+    // A null is a name spelled `NULL` rather than a complaint about nulls, because the pin turns
+    // whatever it was handed into text and then goes looking for a table called that.
+    assert_eq!(
+        failure(&db, "SELECT * FROM pragma_show(NULL)"),
+        "Table with name NULL does not exist!"
+    );
+    for wrong in ["pragma_table_info()", "pragma_table_info('a', 'b')", "pragma_show(3)"] {
+        let message = failure(&db, &format!("SELECT * FROM {wrong}"));
+        assert!(message.starts_with("No function matches the given name"), "{message}");
+        assert!(message.contains("(VARCHAR)"), "{message}");
+    }
+}
+
 /// A view the engine ships with goes in unbound and is bound at the first read, which is a fact
 /// about two columns of `duckdb_views()` and was measured on the pin twice over.
 #[test]

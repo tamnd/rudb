@@ -29,5 +29,5 @@ pub use generated::keywords::{
 pub use matcher::{NONE, ParseNode, Tree, parse, parse_from, parse_tokens};
 pub use rules::{Node, Op, Rule, Suggestion, alternatives, rule, token_key};
 pub use token::{Flags, Kind, NOT_A_KEYWORD, Token};
-pub use tokenize::{classes, hints, lookup, quoted, tokenize};
+pub use tokenize::{classes, hints, identifier_parts, lookup, quoted, tokenize};
 pub use transform::{parse_ast, transform};

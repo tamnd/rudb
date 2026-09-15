@@ -19,7 +19,7 @@ use rudb_functions::{
     is_pattern, parquet_fields, resolve, resolve_table,
 };
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
-use rudb_parse::{NONE, parse_ast};
+use rudb_parse::{NONE, identifier_parts, parse_ast};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey};
 
 use crate::expr::{describe, has_aggregate};
@@ -1151,6 +1151,15 @@ impl<'a> Binder<'a> {
             .map(|(&expr, ty)| self.cast_to(expr, ty))
             .collect();
 
+        if resolved.function.takes_a_name() {
+            let Columns::Fixed(fields) = resolved.columns else {
+                return Err(Error::internal("a pragma that resolved to a file"));
+            };
+            let [argument] = cast[..] else {
+                return Err(Error::internal("a pragma that resolved to more than one name"));
+            };
+            return self.bind_pragma(ast, resolved.function, &fields, argument, alias, columns);
+        }
         let fields = match resolved.columns {
             Columns::Fixed(fields) => fields,
             columns => {
@@ -1218,6 +1227,139 @@ impl<'a> Binder<'a> {
             &label,
             &names,
         )
+    }
+
+    /// `pragma_table_info('t')` or `pragma_show('t')`, answered while it is bound.
+    ///
+    /// The same trick `DESCRIBE` uses and for the same reason: the columns of a table are settled by
+    /// the time the name has resolved, so the rows are a constant from there on and this comes out
+    /// as a `VALUES` rather than as an operator that reads a catalog while the query runs. It also
+    /// means `SELECT name FROM pragma_table_info('t') WHERE notnull` is an ordinary query over an
+    /// ordinary relation, which is the whole reason these exist as functions rather than only as
+    /// statements.
+    ///
+    /// The name arrives as a string rather than as something the parser read, so it is split here
+    /// under the identifier rule and then resolved like any other name. A name that is not there
+    /// comes back as the catalog's own complaint, which is what the pin answers with too.
+    fn bind_pragma(
+        &mut self,
+        ast: &Ast,
+        function: TableFunction,
+        fields: &[Field],
+        argument: ExprRef,
+        alias: ast::StrRef,
+        columns: ast::Slice,
+    ) -> Result<(NodeRef, Scope)> {
+        let written = self.pragma_name(argument, function)?;
+        let parts = identifier_parts(&written);
+        let spelled: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let name = self.catalog.resolve(&spelled)?;
+        let described = self.described(ast, &name)?;
+        let mut rows = Vec::with_capacity(described.len());
+        for (at, field) in described.iter().enumerate() {
+            let items = if matches!(function, TableFunction::PragmaShow) {
+                self.describing(field)
+            } else {
+                self.table_info(at, field)
+            };
+            rows.push(self.plan.add_expr_list(&items));
+        }
+        let rows = self.plan.add_rows(&rows);
+        let held = self.plan.add_fields(fields);
+        let index = self.fresh_index();
+        let node = self.plan.add_node(Node::Values { index, columns: held, rows });
+        let label =
+            if alias == NONE { function.name().to_string() } else { ast.string(alias).to_string() };
+        let mut scope = Scope::empty();
+        for (at, field) in fields.iter().enumerate() {
+            scope.push(Visible {
+                table: label.clone(),
+                name: field.name.clone(),
+                binding: ColumnBinding::new(index, at as u32),
+                ty: field.ty.clone(),
+                not_null: false,
+            });
+        }
+        if !columns.is_empty() {
+            let names: Vec<&str> = ast.name(columns).collect();
+            scope.rename(&names, &label)?;
+        }
+        Ok((node, scope))
+    }
+
+    /// The name a pragma was called with, which has to be a constant.
+    ///
+    /// A null is a name spelled `NULL` rather than an error about nulls, because the pin turns
+    /// whatever it was handed into text before it goes looking and then says a table of that name
+    /// does not exist. Writing `pragma_table_info(NULL)` is a mistake either way and this is the
+    /// sentence the mistake already has.
+    ///
+    /// `pragma_table_info('t' || 'x')` is the pin's `tx` and is turned away here, which is the same
+    /// missing constant folding [`Binder::named_argument`] writes about and closes the same day.
+    fn pragma_name(&self, argument: ExprRef, function: TableFunction) -> Result<String> {
+        let Expr::Constant(reference) = *self.plan.expr(argument) else {
+            return Err(Error::not_implemented(format!(
+                "{}() given a name that is not a constant",
+                function.name()
+            )));
+        };
+        match self.plan.value(reference) {
+            Value::Varchar(name) => Ok(name.clone()),
+            Value::Null => Ok("NULL".to_string()),
+            other => {
+                Err(Error::internal(format!("a pragma name bound as VARCHAR arrived as {other}")))
+            }
+        }
+    }
+
+    /// The columns of whatever a pragma was pointed at.
+    ///
+    /// A view is bound here, which is how it comes to have columns at all. Reading a view is what
+    /// binds it and describing one counts as reading it, so a view the engine ships with reports a
+    /// column count from this point on, the same as it would after a select. The node that binding
+    /// produces is thrown away, because the answer is the scope and not the query.
+    ///
+    /// Every column of a view is nullable whatever the column underneath was declared as, which is
+    /// the pin's answer through `pragma_table_info()`, `pragma_show()` and `duckdb_columns()` alike.
+    /// [`Scope::fields`] drops the flag on its own, so there is nothing to clear here.
+    fn described(&mut self, ast: &Ast, name: &QualifiedName) -> Result<Vec<Field>> {
+        if self.catalog.entry(name)? == Entry::Table {
+            return Ok(self.catalog.table(name)?.columns().to_vec());
+        }
+        let (_, scope) = self.bind_view(ast, name, NONE, ast::Slice::default())?;
+        Ok(scope.fields())
+    }
+
+    /// One row of `pragma_show()`, which is one row of `DESCRIBE` written by the other caller.
+    fn describing(&mut self, field: &Field) -> Vec<ExprRef> {
+        let written = [
+            field.name.clone(),
+            field.ty.to_string(),
+            if field.not_null { "NO" } else { "YES" }.to_owned(),
+        ];
+        let mut items: Vec<ExprRef> =
+            written.into_iter().map(|text| self.plan.add_constant(Value::Varchar(text))).collect();
+        for _ in 0..3 {
+            let empty = self.plan.add_constant(Value::Null);
+            items.push(self.cast_to(empty, &LogicalType::Varchar));
+        }
+        items
+    }
+
+    /// One row of `pragma_table_info()`, which is SQLite's six columns about the same column.
+    ///
+    /// `cid` counts from zero, which is SQLite's numbering and not the one based `ordinal_position`
+    /// the standard views report. `dflt_value` and `pk` are the two nothings rudb has to report
+    /// until `CREATE TABLE` takes a `DEFAULT` or a key.
+    fn table_info(&mut self, at: usize, field: &Field) -> Vec<ExprRef> {
+        let cid = self.plan.add_constant(Value::Integer(i32::try_from(at).unwrap_or(i32::MAX)));
+        let name = self.plan.add_constant(Value::Varchar(field.name.clone()));
+        let ty = self.plan.add_constant(Value::Varchar(field.ty.to_string()));
+        let not_null = self.plan.add_constant(Value::Boolean(field.not_null));
+        let default = self.plan.add_constant(Value::Null);
+        let default = self.cast_to(default, &LogicalType::Varchar);
+        let key = self.plan.add_constant(Value::Boolean(false));
+        vec![cid, name, ty, not_null, default, key]
     }
 
     /// One named parameter of a table function call, folded into what the call was given.

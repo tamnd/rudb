@@ -44,6 +44,13 @@
 //!
 //! D2 adds a few more of that third kind. Each one is a column list here and a list of rows in
 //! `rudb_exec::metadata`, and nothing else.
+//!
+//! `pragma_table_info()` and `pragma_show()` are a fourth kind and the first two of the pragma
+//! family. They take one table name and describe whatever it names, so their columns are fixed and
+//! their rows are not a fact about the engine at all, they are a fact about one entry in a catalog.
+//! That makes them the first table functions here whose answer the binder settles on its own: it
+//! binds the name the way `DESCRIBE` binds one and hands back the rows, which is why nothing in
+//! `rudb_exec` knows either name.
 
 use rudb_common::{Error, Field, LogicalType, Result};
 
@@ -92,6 +99,10 @@ pub enum TableFunction {
     DuckdbExtensions,
     /// `duckdb_optimizers()`, every name `SET disabled_optimizers` takes.
     DuckdbOptimizers,
+    /// `pragma_table_info(name)`, the columns of one table or view, in SQLite's six columns.
+    PragmaTableInfo,
+    /// `pragma_show(name)`, the same columns again in the six `DESCRIBE` answers with.
+    PragmaShow,
 }
 
 /// The name of the column `file_row_number=True` adds.
@@ -123,7 +134,19 @@ impl TableFunction {
             Self::DuckdbColumns => "duckdb_columns",
             Self::DuckdbExtensions => "duckdb_extensions",
             Self::DuckdbOptimizers => "duckdb_optimizers",
+            Self::PragmaTableInfo => "pragma_table_info",
+            Self::PragmaShow => "pragma_show",
         }
+    }
+
+    /// Whether the call takes one table name and answers about whatever that names.
+    ///
+    /// The two pragmas are the only ones, and they are a family rather than a pair because the rest
+    /// of the `pragma_*` functions that take a name are the storage ones, which land here the day
+    /// rudb has storage to describe.
+    #[must_use]
+    pub const fn takes_a_name(self) -> bool {
+        matches!(self, Self::PragmaTableInfo | Self::PragmaShow)
     }
 
     /// Whether the last value is produced.
@@ -225,6 +248,12 @@ impl TableFunction {
         if name.eq_ignore_ascii_case("duckdb_optimizers") {
             return Some(Self::DuckdbOptimizers);
         }
+        if name.eq_ignore_ascii_case("pragma_table_info") {
+            return Some(Self::PragmaTableInfo);
+        }
+        if name.eq_ignore_ascii_case("pragma_show") {
+            return Some(Self::PragmaShow);
+        }
         None
     }
 }
@@ -300,6 +329,22 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
         };
         return Ok(ResolvedTable { function, arguments: vec![wanted], columns });
     }
+    if function.takes_a_name() {
+        // One name, and a null is one of them. `pragma_table_info(NULL)` is a catalog error about a
+        // table called NULL on the pin rather than a complaint about the argument, because the
+        // pragma turns whatever it was given into text before it goes looking, so the null is left
+        // as a null here and the binder does the same thing with it.
+        let single = arguments.len() == 1
+            && matches!(arguments[0], LogicalType::Varchar | LogicalType::Null);
+        if !single {
+            return Err(one_name(function, arguments));
+        }
+        return Ok(ResolvedTable {
+            function,
+            arguments: vec![arguments[0].clone()],
+            columns: Columns::Fixed(name_columns(function)),
+        });
+    }
     let arity = arguments.len();
     // The metadata tables take nothing and their columns are fixed, which makes them the simplest
     // case here. They are one arm rather than one each because the only thing that differs is the
@@ -349,7 +394,9 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbViews
         | TableFunction::DuckdbColumns
         | TableFunction::DuckdbExtensions
-        | TableFunction::DuckdbOptimizers => None,
+        | TableFunction::DuckdbOptimizers
+        | TableFunction::PragmaTableInfo
+        | TableFunction::PragmaShow => None,
     }
 }
 
@@ -372,8 +419,54 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::ReadParquet
-        | TableFunction::ReadCsv => None,
+        | TableFunction::ReadCsv
+        | TableFunction::PragmaTableInfo
+        | TableFunction::PragmaShow => None,
     }
+}
+
+/// The columns one of the two name taking pragmas produces.
+fn name_columns(function: TableFunction) -> Vec<Field> {
+    match function {
+        TableFunction::PragmaShow => describe_fields(),
+        _ => table_info_fields(),
+    }
+}
+
+/// The columns `pragma_table_info()` produces, which is SQLite's six.
+///
+/// DuckDB answers to this because SQLite did, and the six are SQLite's names, its order and its
+/// types right down to `cid` being a 32 bit integer where everything else in these tables is a
+/// bigint. The one departure from SQLite is that `notnull` and `pk` are booleans rather than the
+/// zero or one SQLite prints, which was measured rather than assumed.
+///
+/// `dflt_value` and `pk` are null and false on everything rudb can declare, because `DEFAULT`,
+/// `PRIMARY KEY` and `UNIQUE` are all refused by `CREATE TABLE` today. They are here rather than
+/// left out because the width of a result is part of the result. `DESCRIBE` says the same three
+/// nothings in its own three columns and for the same reason.
+#[must_use]
+pub fn table_info_fields() -> Vec<Field> {
+    vec![
+        Field::new("cid", LogicalType::Integer),
+        Field::new("name", LogicalType::Varchar),
+        Field::new("type", LogicalType::Varchar),
+        Field::new("notnull", LogicalType::Boolean),
+        Field::new("dflt_value", LogicalType::Varchar),
+        Field::new("pk", LogicalType::Boolean),
+    ]
+}
+
+/// The columns `DESCRIBE` answers with, which is what `pragma_show()` produces too.
+///
+/// One list rather than two because the two really are the same six columns: `pragma_show('t')` and
+/// `DESCRIBE t` return the same rows on the pin, which is what you would expect of a pragma that
+/// exists so a client can write the describe as a function call and select from it.
+#[must_use]
+pub fn describe_fields() -> Vec<Field> {
+    ["column_name", "column_type", "null", "key", "default", "extra"]
+        .iter()
+        .map(|name| Field::new(*name, LogicalType::Varchar))
+        .collect()
 }
 
 /// The columns `rudb_strategies()` produces.
@@ -485,6 +578,22 @@ fn no_overload(function: TableFunction, arguments: &[LogicalType]) -> Error {
     Error::binder(format!(
         "No function matches the given name and argument types '{name}({})'. You might need to \
          add explicit type casts.\n\tCandidate functions:\n\t{name}(VARCHAR)\n\t{name}(VARCHAR[])\n",
+        written.join(", ")
+    ))
+}
+
+/// The same message for a pragma, which has one overload and prints its own name quoted.
+///
+/// The quoting is upstream's and is not a mistake being copied for its own sake. A pragma is
+/// registered under a name the parser also spells as a statement, so the binary writes the
+/// candidate through its identifier rule and gets `"pragma_table_info"(VARCHAR)` where
+/// `read_parquet` gets no quotes. A client that matches on the line has to see the quotes.
+fn one_name(function: TableFunction, arguments: &[LogicalType]) -> Error {
+    let written: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+    let name = function.name();
+    Error::binder(format!(
+        "No function matches the given name and argument types '{name}({})'. You might need to \
+         add explicit type casts.\n\tCandidate functions:\n\t\"{name}\"(VARCHAR)\n",
         written.join(", ")
     ))
 }
@@ -781,5 +890,59 @@ mod tests {
     fn rudb_strategies_with_an_argument_says_it_takes_none() {
         let error = resolve_table("rudb_strategies", &[LogicalType::BigInt]).unwrap_err();
         assert!(error.to_string().contains("takes no arguments"), "{error}");
+    }
+
+    #[test]
+    fn the_two_pragmas_take_a_name_and_nothing_else_does() {
+        assert!(TableFunction::PragmaTableInfo.takes_a_name());
+        assert!(TableFunction::PragmaShow.takes_a_name());
+        for other in [TableFunction::Range, TableFunction::DuckdbTables, TableFunction::ReadParquet]
+        {
+            assert!(!other.takes_a_name(), "{}", other.name());
+        }
+    }
+
+    #[test]
+    fn pragma_table_info_answers_in_sqlites_six_columns() {
+        let resolved = resolve_table("PRAGMA_Table_Info", &[LogicalType::Varchar])
+            .expect("a case insensitive name");
+        assert_eq!(resolved.function, TableFunction::PragmaTableInfo);
+        assert_eq!(resolved.arguments, vec![LogicalType::Varchar]);
+        let names: Vec<&str> = fixed(&resolved).iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, ["cid", "name", "type", "notnull", "dflt_value", "pk"]);
+    }
+
+    #[test]
+    fn pragma_show_answers_in_the_six_columns_describe_answers_in() {
+        let resolved =
+            resolve_table("pragma_show", &[LogicalType::Varchar]).expect("one name, one overload");
+        assert_eq!(resolved.function, TableFunction::PragmaShow);
+        let names: Vec<&str> = fixed(&resolved).iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, ["column_name", "column_type", "null", "key", "default", "extra"]);
+        assert!(fixed(&resolved).iter().all(|field| field.ty == LogicalType::Varchar));
+    }
+
+    #[test]
+    fn a_null_name_resolves_because_the_catalog_is_what_turns_it_down() {
+        let resolved = resolve_table("pragma_table_info", &[LogicalType::Null]).expect("a null");
+        assert_eq!(resolved.arguments, vec![LogicalType::Null]);
+    }
+
+    #[test]
+    fn a_pragma_given_the_wrong_arguments_lists_its_one_overload() {
+        for count in [0, 2] {
+            let error = resolve_table("pragma_table_info", &integers(count)).expect_err("one name");
+            assert!(
+                error.message().starts_with(
+                    "No function matches the given name and argument types 'pragma_table_info("
+                ),
+                "{error}"
+            );
+            assert!(error.message().contains("\"pragma_table_info\"(VARCHAR)"), "{error}");
+        }
+        // A single argument of the wrong type is the same message, because the pin does not cast
+        // an integer to a name any more than it casts one to a path.
+        let error = resolve_table("pragma_show", &[LogicalType::Integer]).expect_err("a name");
+        assert!(error.message().contains("'pragma_show(INTEGER)'"), "{error}");
     }
 }
