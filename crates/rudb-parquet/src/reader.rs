@@ -264,15 +264,16 @@ impl Reader {
     /// the file, or if a read or a decode fails.
     pub fn rows_at(&mut self, rows: &[u64]) -> Result<Chunk> {
         use std::sync::atomic::Ordering::Relaxed;
-        for c in [&DBG_BODY, &DBG_DEC, &DBG_DICTT, &DBG_GATHER, &DBG_PAGES] { c.store(0, Relaxed); }
+        for c in [&DBG_BODY, &DBG_DEC, &DBG_DICTT, &DBG_GATHER, &DBG_PAGES, &DBG_UNZIP] { c.store(0, Relaxed); }
         struct Dbg;
         impl Drop for Dbg {
             fn drop(&mut self) {
                 use std::sync::atomic::Ordering::Relaxed;
                 eprintln!(
-                    "DBG fetch pages={} body={:.1}ms decode={:.1}ms dict={:.1}ms gather={:.1}ms",
+                    "DBG fetch pages={} body={:.1}ms unzip={:.1}ms decode={:.1}ms dict={:.1}ms gather={:.1}ms",
                     DBG_PAGES.load(Relaxed),
                     DBG_BODY.load(Relaxed) as f64 / 1e6,
+                    DBG_UNZIP.load(Relaxed) as f64 / 1e6,
                     DBG_DEC.load(Relaxed) as f64 / 1e6,
                     DBG_DICTT.load(Relaxed) as f64 / 1e6,
                     DBG_GATHER.load(Relaxed) as f64 / 1e6,
@@ -472,6 +473,7 @@ impl Reader {
     }
 }
 
+static DBG_UNZIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DBG_BODY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DBG_DEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DBG_DICTT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -772,6 +774,8 @@ impl Cursor {
             let mut page = pages.next().transpose()?.ok_or_else(|| {
                 Error::io(format!("a data page of column {} is empty", self.column.name))
             })?;
+            DBG_UNZIP.fetch_add(dbg1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            let dbg1 = std::time::Instant::now();
             let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
             let timing = Timing::start(Stage::Decode);
             let decoded = page.decode(&self.column, self.dictionary.as_ref());
