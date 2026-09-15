@@ -1122,103 +1122,87 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
     }
 }
 
-/// How many entries a dictionary may hold for [`tally`] to take it.
+/// The widest dictionary [`tally`] copies, and a power of two.
 ///
-/// The counters have to fit in the first level cache beside everything else the loop touches, and
-/// they have to be cleared and then folded once per vector. Both of those are per dictionary entry
-/// rather than per row, so a wide dictionary pays them over and over for a vector of fifteen hundred
-/// rows and never gets them back. `UserID` has about half a million distinct values, which is where
-/// the idea stops working entirely.
+/// The copy is per vector and the gather it speeds up is per row, so a dictionary wide enough that
+/// copying it costs more than the fifteen hundred or so rows of a vector is one to leave alone.
+/// `UserID` has about half a million distinct values, which is where the idea stops working
+/// entirely, and the cut is well below that because the copy also has to stay in the first level
+/// cache to be worth anything.
 const TALLY_LIMIT: usize = 256;
 
-/// How many counters each dictionary entry gets.
+/// The total of a dictionary encoded column, read through a padded copy of the dictionary.
 ///
-/// One would do for the answer and is the wrong number for the machine. A column like `JavaEnable`
-/// holds two distinct values, so a single set of counters has every row incrementing one of two
-/// addresses, and each increment has to wait for the previous one to leave the store buffer. That is
-/// about five cycles a row, which is slower than the gather this replaces. Four sets means four rows
-/// in a row land on four different addresses whatever the data does, so the wait is five cycles per
-/// four rows instead, and the lanes are added together at the end where there are only as many
-/// additions as there are dictionary entries.
-const TALLY_LANES: usize = 4;
-
-/// The total of a dictionary encoded column, counted rather than gathered.
+/// The loop this replaces is `values[codes[row]]` for every row, and its cost is not the two loads.
+/// It is that a code is data, so nothing knows it is inside the dictionary until it has been read,
+/// so there is a bounds check and a branch in the middle of the loop on every row. That is about
+/// thirteen instructions a value with no unrolling, and on a ten column integer scan of ClickBench's
+/// `hits` it was the largest single thing in the program at twenty three percent.
 ///
-/// A gather reads `values[codes[row]]` for every row: two loads, one of them dependent on the other,
-/// plus a bounds check that nothing can remove because a code is data and its range is not known
-/// until it has been read. That is about thirteen instructions a value, and on a ten column integer
-/// scan of ClickBench's `hits` it was the largest single thing in the program.
+/// So the dictionary is copied into an array whose length is a power of two known at compile time,
+/// and the code is masked with that length instead of checked against it. Now the index is inside
+/// the array by construction, the compiler can see it, the check and the branch are gone and the
+/// loop unrolls. About seven instructions a value, and no branch in it that can be mispredicted.
 ///
-/// The same answer comes out of counting how often each code appears and then taking one product per
-/// dictionary entry, which is what a column store should do with a low cardinality column. The row
-/// loop stops touching the values at all: it is a load, a mask and one read modify write against
-/// memory that stays in the first level cache, and the multiplications move off the per row path
-/// into a fold over the dictionary. It is exact, because integers add in any order.
+/// The array is sized to the dictionary by a ladder rather than fixed at [`TALLY_LIMIT`], because it
+/// has to be zeroed before the copy and a two entry dictionary should not pay for a two hundred and
+/// fifty six entry one.
 ///
-/// The counters are sized to the dictionary and not to [`TALLY_LIMIT`], which is the difference
-/// between this paying and not. A fixed set of counters wide enough for the largest dictionary this
-/// takes is four kilobytes to clear and a thousand slots to fold for every vector, and measured that
-/// way the clearing alone gave back everything the row loop saved. So there is a ladder of sizes and
-/// a two entry dictionary clears a hundred and twenty eight bytes.
+/// # Why not count the codes instead
 ///
-/// `None` when the dictionary is too wide to count, and for a layout with no fixed width, and for a
-/// code that points past the dictionary, which cannot happen because `Vector::dictionary` refuses
-/// one on the way in and which is checked here anyway rather than quietly dropping rows.
+/// Because it is slower, which is not what the instruction count says. Counting how often each code
+/// appears and then taking one product per dictionary entry moves the multiplications off the per
+/// row path entirely and measured six percent fewer instructions than the version here. It also
+/// measured nine percent slower on one thread and twenty eight percent slower on thirty two, because
+/// the row loop becomes a read modify write against memory at an address that comes out of the data.
+/// Four counters per entry were not enough to keep consecutive rows off the same address, and every
+/// repeat waits for the previous store to forward. A load has no such problem, and the loop here is
+/// loads.
+///
+/// `None` when the dictionary is too wide to copy, and for a layout with no fixed width. A code past
+/// the end of the dictionary reads one of the zeros the copy was padded with rather than raising,
+/// and cannot happen: `Vector::dictionary` refuses one on the way in, which is the same invariant
+/// the gather this replaces was already relying on to index without a bound of its own.
 fn tally(data: &Data, codes: &[u32]) -> Option<i128> {
-    // The rungs are the lane count times a power of two, so that the index below is inside the
-    // counters by construction. Each one covers dictionaries up to a quarter of its own size.
+    // Each rung covers dictionaries up to its own size, and every rung is a power of two so that the
+    // mask below is the bounds check.
     match data.len() {
-        0..=8 => tally_into::<{ TALLY_LANES * 8 }>(data, codes),
-        9..=32 => tally_into::<{ TALLY_LANES * 32 }>(data, codes),
-        33..=128 => tally_into::<{ TALLY_LANES * 128 }>(data, codes),
-        129..=TALLY_LIMIT => tally_into::<{ TALLY_LANES * TALLY_LIMIT }>(data, codes),
+        0..=8 => tally_into::<8>(data, codes),
+        9..=32 => tally_into::<32>(data, codes),
+        33..=128 => tally_into::<128>(data, codes),
+        129..=TALLY_LIMIT => tally_into::<TALLY_LIMIT>(data, codes),
         _ => None,
     }
 }
 
-/// [`tally`] with the counters it decided on, `TOTAL` of them across [`TALLY_LANES`] lanes.
-fn tally_into<const TOTAL: usize>(data: &Data, codes: &[u32]) -> Option<i128> {
-    let slots = TOTAL / TALLY_LANES;
-    macro_rules! counted {
+/// [`tally`] with the rung it decided on, `SLOTS` entries wide.
+fn tally_into<const SLOTS: usize>(data: &Data, codes: &[u32]) -> Option<i128> {
+    macro_rules! padded {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match data {
-                $(Data::$variant(values) => counted!(@run values),)+
+                $(Data::$variant(values) => padded!(@run values, $zero),)+
                 _ => return None,
             }
         };
-        (@run $values:expr) => {{
+        (@run $values:expr, $zero:expr) => {{
             let values = $values.as_slice();
-            if values.len() > slots {
+            if values.len() > SLOTS {
                 return None;
             }
-            let mut counts = [0u32; TOTAL];
-            // row at a time: this is the loop the whole function is, and what it does per row is the
-            // point. Masked rather than bounds checked: `slots` is a power of two and `TOTAL` is
-            // exactly `TALLY_LANES` of it, so the index is inside the array by construction and the
-            // compiler can see it, which is the check gone without any unsafe code.
-            for (row, &code) in codes.iter().enumerate() {
-                let lane = (row & (TALLY_LANES - 1)) * slots;
-                counts[lane + (code as usize & (slots - 1))] += 1;
-            }
+            let mut table = [$zero; SLOTS];
+            table[..values.len()].copy_from_slice(values);
             let mut total: i128 = 0;
-            for slot in 0..slots {
-                let mut seen: u64 = 0;
-                for lane in 0..TALLY_LANES {
-                    seen += u64::from(counts[lane * slots + slot]);
-                }
-                match values.get(slot) {
-                    Some(&value) => total += i128::from(value) * i128::from(seen),
-                    // A code the dictionary has no entry for. Unreachable on a vector built the
-                    // usual way, and the answer here would be short by those rows, so hand the work
-                    // back rather than be quietly wrong.
-                    None if seen != 0 => return None,
-                    None => {}
-                }
+            // row at a time: this is the loop the whole function is. Masked rather than bounds
+            // checked, which is the point: `SLOTS` is a power of two and is the length of `table`,
+            // so the index is inside it by construction and the compiler can see that without any
+            // unsafe code.
+            for &code in codes {
+                total += i128::from(table[code as usize & (SLOTS - 1)]);
             }
             total
         }};
     }
-    Some(rudb_vector::for_each_layout!(narrow, counted))
+    Some(rudb_vector::for_each_layout!(narrow, padded))
 }
 
 /// The first `rows` values as one slice, when the mapping into them is the identity.
@@ -2091,19 +2075,19 @@ mod tests {
         }
     }
 
-    /// The counted total and the gathered one are two ways to the same number, and which one runs
+    /// The padded copy and the plain gather are two ways to the same number, and which one runs
     /// depends on how wide the dictionary is. So the answer is held against the flat sum of the same
-    /// rows at every width that matters: under the limit, exactly on it, and past it where the
-    /// counting is refused and the gather has to give the answer instead.
+    /// rows at every width that matters: on each rung of the ladder, on the boundary between two of
+    /// them, and past the last one where the copy is refused and the gather answers instead.
     #[test]
-    fn a_counted_dictionary_totals_what_the_same_rows_total_laid_out_flat() {
+    fn a_dictionary_read_through_a_padded_copy_totals_what_the_same_rows_total_laid_out_flat() {
         // row at a time: each width is its own vector and its own expected answer.
         for distinct in [1usize, 2, 7, 255, TALLY_LIMIT, TALLY_LIMIT + 1, TALLY_LIMIT * 3] {
             let entries: Vec<Value> =
                 (0..distinct).map(|slot| Value::Integer(slot as i32 * 7 - 11)).collect();
             let values = Vector::from_values(LogicalType::Integer, &entries).expect("a dictionary");
-            // A pattern with no period in common with the four lanes, so the rows that share a
-            // counter are not the rows that share a lane.
+            // A stride that shares no factor with the rungs, so the codes walk the whole dictionary
+            // rather than the first few entries of it.
             let codes: Vec<u32> = (0..1500u32).map(|row| row * 13 % distinct as u32).collect();
             let flat: Vec<Value> =
                 codes.iter().map(|&code| entries[code as usize].clone()).collect();
@@ -2124,10 +2108,10 @@ mod tests {
         }
     }
 
-    /// The counting reads the rows it was asked for and not the ones past them, which the masking
-    /// of the counter index would hide if the loop went over the whole code run.
+    /// The copy is read for the rows it was asked for and not the ones past them, which the masking
+    /// of the index would hide if the loop went over the whole code run.
     #[test]
-    fn a_counted_dictionary_stops_at_the_rows_it_was_asked_for() {
+    fn a_padded_dictionary_stops_at_the_rows_it_was_asked_for() {
         let entries = [Value::Integer(1), Value::Integer(100)];
         let values = Vector::from_values(LogicalType::Integer, &entries).expect("a dictionary");
         let coded = Vector::dictionary(vec![0, 0, 0, 1, 1], values).expect("codes are in range");
