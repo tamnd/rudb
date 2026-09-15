@@ -103,16 +103,19 @@ fn a_piece_that_starts_inside_a_page_reads_no_more_of_the_file_than_it_has_to() 
 fn the_page_size_says_how_finely_a_file_can_be_cut() {
     // The question a scan asks before deciding to cut a row group at all, because a piece that
     // starts inside a page decodes that page whole. The fixtures hold 2048 rows a group and the
-    // writers put every one of them in one page, so cutting these would cost more than it saves and
-    // the number saying so is the point of the call.
+    // writers put every one of them in one page, so the first page of a chunk is very nearly the
+    // whole chunk, cutting these would cost more than it saves, and the pair of numbers saying so
+    // is the point of the two calls.
     for name in ["mixed.parquet", "zstd.parquet", "delta.parquet", "lengths.parquet"] {
         let reader = reader(name);
-        let page = reader.page_rows().expect("reads the first page header of every column");
-        let group = reader.metadata().row_groups[0].rows;
+        let page = reader.page_bytes().expect("reads the first page header of every column");
+        let whole = reader.chunk_bytes();
         assert!(page > 0, "{name} has a column with no data page in its first row group");
+        assert!(page <= whole, "{name} has first pages of {page} bytes in chunks of {whole}");
         assert!(
-            i64::try_from(page).expect("a page of a sane number of rows") <= group,
-            "{name} has a page of {page} rows in a row group of {group}"
+            page * 2 > whole,
+            "{name} was expected to hold a row group in about one page a column, and its first \
+             pages are {page} bytes of {whole}"
         );
     }
 }
@@ -141,6 +144,32 @@ fn the_morsels_of_a_row_group_decode_its_dictionary_once() {
     let mut second = parent.split_rows(0, cut..all.len()).expect("splits off the second half");
     assert_eq!(rows(&mut second), all[cut..]);
     assert_eq!(decoded_dictionary(), once, "the second morsel decoded the dictionary again");
+}
+
+#[test]
+fn a_morsel_keeps_its_dictionary_while_another_row_group_is_being_read() {
+    // Holding the newest row group or two is what the cache did first and it was wrong. Thirty two
+    // threads on a nine group file have a morsel of every group in flight at once, so a rule that
+    // drops everything older than the last morsel handed out drops pages that are still wanted, and
+    // on ClickBench that was 25 MB of dictionary decoded again.
+    let parent = reader("mixed.parquet");
+    let groups = parent.metadata().row_groups.len();
+    assert!(groups > 1, "the fixture needs more than one row group for this to mean anything");
+    let all = whole("mixed.parquet", 0);
+    let cut = all.len() / 2;
+    stage::reset();
+    let mut first = parent.split_rows(0, 0..cut).expect("splits off the first half");
+    assert_eq!(rows(&mut first), all[..cut]);
+    let once = decoded_dictionary();
+    assert!(once > 0, "the fixture has a dictionary encoded column");
+    // A later group read to the end and dropped, which is what used to evict group zero.
+    let mut later = parent.split_rows(1, 0..1).expect("splits off a morsel of the next group");
+    let _ = rows(&mut later);
+    drop(later);
+    let between = decoded_dictionary();
+    let mut second = parent.split_rows(0, cut..all.len()).expect("splits off the second half");
+    assert_eq!(rows(&mut second), all[cut..]);
+    assert_eq!(decoded_dictionary(), between, "the second morsel decoded the dictionary again");
 }
 
 #[test]

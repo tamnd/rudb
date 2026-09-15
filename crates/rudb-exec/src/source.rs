@@ -501,13 +501,24 @@ pub(crate) struct FileScan {
 /// first, because a morsel cannot start inside a page for free.
 const MORSEL_ROWS: usize = 32_768;
 
-/// How much smaller than a morsel a page has to be before a row group is worth cutting.
+/// How many times what a morsel wastes it has to read before the cutting is worth doing.
 ///
 /// A morsel that starts inside a page pays for that page decoded twice, once by the morsel that ends
 /// in it and once by the morsel that starts in it. The columns of a row group do not break their
-/// pages in the same places, so a boundary costs at worst one page per column, and a page an eighth
-/// of a morsel long puts a ceiling of an eighth on what the cutting throws away.
-const FINE: usize = 8;
+/// pages in the same places, so a boundary costs one page of every column read, and holding a
+/// morsel's first pages against the bytes it goes on to read is what says whether that is a rounding
+/// error or the whole read.
+///
+/// Four is the smallest number that still refuses the file DuckDB writes, where the first page of a
+/// chunk is the whole chunk and the waste is not a quarter but everything. A page a quarter of a
+/// morsel long is measured to be worth cutting anyway: the ClickBench suite over a copy of the file
+/// written with 64 KB pages runs in 770 ms at thirty two threads against 909 uncut.
+///
+/// Asking in bytes rather than in rows matters, and asking in rows is what this did first and got
+/// wrong. A column with four distinct values packs a whole row group into one page of two bit
+/// dictionary indices, so the longest page of a file measured in rows is always the cheapest column
+/// in it, and a file of small pages was refused because of the one column that cost nothing to read.
+const FINE: u64 = 4;
 
 /// How many rows one morsel of a row group covers, or zero to hand out whole row groups.
 ///
@@ -528,19 +539,22 @@ fn morsel_rows(reader: &FileReader, groups: usize, threads: usize) -> usize {
     if groups == 0 || threads <= groups {
         return 0;
     }
-    let page = parquet.page_rows().unwrap_or(usize::MAX);
-    cut_rows(page, group_rows(parquet, 0), groups, threads)
+    let page = parquet.page_bytes().unwrap_or(u64::MAX);
+    cut_rows(page, parquet.chunk_bytes(), group_rows(parquet, 0), groups, threads)
 }
 
-/// The arithmetic of [`morsel_rows`], with the file already asked its two questions.
+/// The arithmetic of [`morsel_rows`], with the file already asked its questions.
 ///
-/// `page` is the rows in the longest page of the file and `rows` the rows in a row group of it.
-fn cut_rows(page: usize, rows: usize, groups: usize, threads: usize) -> usize {
-    if groups == 0 || threads <= groups || page == 0 {
+/// `page` is what a morsel reads before it reads a row it wants, `whole` what reading the group it
+/// is part of costs, and `rows` how many rows that group holds, all over the projected columns.
+fn cut_rows(page: u64, whole: u64, rows: usize, groups: usize, threads: usize) -> usize {
+    if groups == 0 || threads <= groups || rows == 0 || page == 0 {
         return 0;
     }
     let cut = rows.div_ceil(threads.div_ceil(groups)).max(MORSEL_ROWS);
-    if page.saturating_mul(FINE) > cut { 0 } else { cut }
+    let taking = u64::try_from(cut.min(rows)).unwrap_or(u64::MAX);
+    let each = whole / u64::try_from(rows).unwrap_or(u64::MAX) * taking;
+    if page.saturating_mul(FINE) > each { 0 } else { cut }
 }
 
 /// The rows of the next morsel of a row group of `rows` rows, `part` of which are handed out.
@@ -1190,8 +1204,8 @@ mod tests {
     use rudb_vector::Chunk;
 
     use super::{
-        Bound, FINE, FileScan, Handout, MORSEL_ROWS, Op, Probe, RUN, Scan, Schema, Series,
-        VECTOR_SIZE, cut_rows, next_piece, parts,
+        Bound, FileScan, Handout, Op, Probe, RUN, Scan, Schema, Series, VECTOR_SIZE, cut_rows,
+        next_piece, parts,
     };
 
     /// Every morsel a row group of `rows` rows is cut into, by asking for them the way `cut` does.
@@ -1564,20 +1578,26 @@ mod tests {
         // Sixty four threads want eight pieces of each group and get four, because `MORSEL_ROWS` is
         // the floor on how small a piece is worth being whatever the machine has.
         let rows = 123_554;
+        let whole = 12_355_400;
         for (threads, wanted) in [(1, 1), (8, 1), (9, 1), (16, 2), (32, 4), (64, 4)] {
-            let cut = cut_rows(512, rows, 9, threads);
+            let cut = cut_rows(1024, whole, rows, 9, threads);
             assert_eq!(parts(rows, cut), wanted, "{threads} threads over nine row groups");
         }
     }
 
-    /// The other half of the rule. However many threads are waiting, a file whose pages are as long
-    /// as its row groups is handed out a row group at a time.
+    /// The other half of the rule. However many threads are waiting, a file whose first page costs
+    /// a morsel more than a quarter of what the morsel reads is handed out a row group at a time.
     #[test]
     fn a_file_of_coarse_pages_is_not_cut_however_many_threads_there_are() {
-        assert_eq!(cut_rows(123_554, 123_554, 9, 64), 0);
-        assert_eq!(cut_rows(MORSEL_ROWS / FINE + 1, 123_554, 9, 64), 0);
-        assert_eq!(cut_rows(0, 123_554, 9, 64), 0);
-        // The largest page the rule lets through at the finest cut it makes.
-        assert!(cut_rows(MORSEL_ROWS / FINE, 123_554, 9, 64) > 0);
+        // A hundred bytes a row, so the finest morsel this rule makes of a group of 123_554 rows is
+        // `MORSEL_ROWS` rows and 3_276_800 bytes, a quarter of which is 819_200.
+        let rows = 123_554;
+        let whole = 12_355_400;
+        assert_eq!(cut_rows(whole, whole, rows, 9, 64), 0, "one page per chunk, as DuckDB writes");
+        assert_eq!(cut_rows(819_201, whole, rows, 9, 64), 0);
+        assert_eq!(cut_rows(0, whole, rows, 9, 64), 0);
+        assert_eq!(cut_rows(1024, 0, rows, 9, 64), 0, "a group of no bytes is never worth cutting");
+        // The largest first page the rule lets through at the finest cut it makes.
+        assert!(cut_rows(819_200, whole, rows, 9, 64) > 0);
     }
 }
