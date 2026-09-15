@@ -70,6 +70,7 @@
 //! question. Page level skipping, which is the same idea a level down using the page index, is
 //! still to come and belongs here rather than up there.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -165,11 +166,73 @@ fn release(queue: &Mutex<Queue>, room: &Condvar, bytes: usize) -> Result<()> {
     Ok(())
 }
 
+/// How many row groups' dictionary pages are kept once a later group has asked for one.
+///
+/// A scan hands its morsels out in row group order, so by the time a morsel of group `n` wants a
+/// dictionary every morsel of group `n - 1` has already been handed one and is holding it. One
+/// group of slack covers the case where two of them ask at the same time and the later one wins the
+/// lock.
+const KEPT: usize = 2;
+
+/// The decoded dictionary pages of the row groups being read, shared by every reader of one file.
+///
+/// A row group cut into four morsels used to decode each of its dictionary pages four times, which
+/// on a file of wide string columns costs more than the cutting saves: the ClickBench suite at one
+/// thread went from 2.9 seconds to 6.6 when the cutting landed without this. So the readers split
+/// off one file share the pages they decode, and a morsel that starts inside a group reads the
+/// dictionary page's header, finds the page already decoded and reads none of its body.
+///
+/// Entries are dropped by row group rather than counted, because nothing here knows how many morsels
+/// a group is cut into and [`KEPT`] groups of pages is a small enough thing to hold.
+#[derive(Debug, Default)]
+struct Dictionaries {
+    held: Mutex<Held>,
+}
+
+/// The pages, and the newest row group any of them belongs to.
+#[derive(Debug, Default)]
+struct Held {
+    newest: usize,
+    pages: HashMap<(usize, usize), Arc<Vector>>,
+}
+
+impl Dictionaries {
+    /// The decoded dictionary page of one column chunk, if it is still held.
+    ///
+    /// A poisoned lock is a miss rather than an error. Losing the cache costs time and nothing else,
+    /// and a read failing because another thread panicked somewhere unrelated would be worse.
+    fn get(&self, group: usize, column: usize) -> Option<Arc<Vector>> {
+        let held = self.held.lock().ok()?;
+        held.pages.get(&(group, column)).map(Arc::clone)
+    }
+
+    /// Holds a decoded dictionary page for the other morsels of its row group.
+    fn put(&self, group: usize, column: usize, page: &Arc<Vector>) {
+        let Ok(mut held) = self.held.lock() else { return };
+        if group > held.newest {
+            held.newest = group;
+            let oldest = group.saturating_sub(KEPT - 1);
+            held.pages.retain(|&(at, _), _| at >= oldest);
+        }
+        held.pages.insert((group, column), Arc::clone(page));
+    }
+}
+
+/// Where a chunk's dictionary page belongs in the cache the readers of one file share.
+#[derive(Debug, Clone)]
+struct Cached {
+    pages: Arc<Dictionaries>,
+    group: usize,
+    column: usize,
+}
+
 /// A Parquet file, read as chunks.
 #[derive(Debug)]
 pub struct Reader {
     file: Arc<dyn File>,
     metadata: Arc<Metadata>,
+    /// The dictionary pages decoded so far, shared with every reader split off this one.
+    dictionaries: Arc<Dictionaries>,
     projection: Vec<usize>,
     group: usize,
     /// One past the last row group this reader reads, which is the whole file until
@@ -202,6 +265,7 @@ impl Reader {
         Ok(Self {
             file,
             metadata: Arc::new(metadata),
+            dictionaries: Arc::new(Dictionaries::default()),
             projection,
             group: 0,
             end,
@@ -244,6 +308,7 @@ impl Reader {
         Ok(Self {
             file: Arc::clone(&self.file),
             metadata: Arc::clone(&self.metadata),
+            dictionaries: Arc::clone(&self.dictionaries),
             projection: self.projection.clone(),
             group: groups.start,
             end: groups.end,
@@ -599,6 +664,7 @@ impl Reader {
                 Error::io(format!("a column chunk of {} bytes", chunk.compressed_size))
             })?;
             plan.push(Where {
+                group: at,
                 column: wanted,
                 start: chunk.start(),
                 len,
@@ -613,14 +679,22 @@ impl Reader {
     ///
     /// The dictionary page is read first and kept for the whole walk, because one dictionary serves
     /// every data page of the chunk and the format puts it first for exactly that reason. It is not
-    /// a row of the column and does not become a vector of its own.
+    /// a row of the column and does not become a vector of its own. The cursor is pointed at the
+    /// cache this file's readers share, so a chunk another morsel of the same row group has already
+    /// decoded costs a page header and no more.
     fn read_column(&self, chunk: &Where) -> Cursor {
+        let cached = Cached {
+            pages: Arc::clone(&self.dictionaries),
+            group: chunk.group,
+            column: chunk.column,
+        };
         Cursor::new(
             chunk.start,
             chunk.len,
             chunk.codec,
             chunk.values,
             self.metadata.schema[chunk.column].clone(),
+            Some(cached),
         )
     }
 }
@@ -666,6 +740,7 @@ impl Group {
 /// copy than the alternatives are to explain.
 #[derive(Debug)]
 struct Where {
+    group: usize,
     column: usize,
     start: u64,
     len: usize,
@@ -692,6 +767,11 @@ struct Cursor {
     /// cursor holding the dictionary by value meant copying the whole thing per page on the way
     /// into a handle nothing else was holding.
     dictionary: Option<Arc<Vector>>,
+    /// Where this chunk's dictionary page belongs in the cache the readers of one file share.
+    ///
+    /// `None` on a cursor built by a test, which reads one chunk once and has nothing to share it
+    /// with.
+    cached: Option<Cached>,
     page: Option<Vector>,
     queued: Vec<Vector>,
     offset: usize,
@@ -718,7 +798,14 @@ struct Cursor {
 
 impl Cursor {
     /// A cursor over a column's pages, in order.
-    fn new(start: u64, len: usize, codec: Codec, left: i64, column: SchemaColumn) -> Self {
+    fn new(
+        start: u64,
+        len: usize,
+        codec: Codec,
+        left: i64,
+        column: SchemaColumn,
+        cached: Option<Cached>,
+    ) -> Self {
         Self {
             start,
             len,
@@ -727,6 +814,7 @@ impl Cursor {
             left,
             column,
             dictionary: None,
+            cached,
             page: None,
             queued: Vec::new(),
             offset: 0,
@@ -753,6 +841,7 @@ impl Cursor {
                 width: 0,
             },
             dictionary: None,
+            cached: None,
             page: None,
             queued: pages,
             offset: 0,
@@ -804,12 +893,20 @@ impl Cursor {
                         self.column.name
                     )));
                 }
-                let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
-                let timing = Timing::start(Stage::Dictionary);
-                let built = page.decode_dictionary(&self.column);
-                timing.stop(bytes);
+                // Another morsel of the same row group may have decoded this page already. Reading
+                // it again could not be helped, because a page says what it is only once it is read,
+                // but decoding it again is the part that costs.
+                match self.held_dictionary() {
+                    Some(held) => self.dictionary = Some(held),
+                    None => {
+                        let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
+                        let timing = Timing::start(Stage::Dictionary);
+                        let built = page.decode_dictionary(&self.column);
+                        timing.stop(bytes);
+                        self.hold_dictionary(Arc::new(built?));
+                    }
+                }
                 self.spare = page.body;
-                self.dictionary = Some(Arc::new(built?));
                 continue;
             }
             self.left -= i64::from(page.header.values());
@@ -889,12 +986,23 @@ impl Cursor {
     }
 
     /// Reads and decodes the chunk's dictionary page, which every data page after it points into.
+    ///
+    /// Another morsel of the same row group may have decoded it already, in which case the page
+    /// comes out of the cache and its body is never read. That is the whole reason a row group can
+    /// be cut into morsels without paying for the cut: the page header says how long the page is,
+    /// which is all that is needed to step over it.
     fn take_dictionary(&mut self, file: &dyn File, prefix: Vec<u8>, total: usize) -> Result<()> {
         if self.dictionary.is_some() {
             return Err(Error::io(format!(
                 "a second dictionary page in the chunk for column {}",
                 self.column.name
             )));
+        }
+        if let Some(held) = self.held_dictionary() {
+            self.bytes_read = self.bytes_read.saturating_add(prefix.len() as u64);
+            self.at = self.at.saturating_add(total);
+            self.dictionary = Some(held);
+            return Ok(());
         }
         let encoded = self.body(file, prefix, total)?;
         let mut pages = Pages::new(&encoded, self.codec, self.left);
@@ -905,9 +1013,22 @@ impl Cursor {
         let timing = Timing::start(Stage::Dictionary);
         let built = page.decode_dictionary(&self.column);
         timing.stop(bytes);
-        self.dictionary = Some(Arc::new(built?));
+        self.hold_dictionary(Arc::new(built?));
         self.at = self.at.saturating_add(total);
         Ok(())
+    }
+
+    /// The chunk's dictionary page, if another morsel of the same row group has decoded it.
+    fn held_dictionary(&self) -> Option<Arc<Vector>> {
+        self.cached.as_ref().and_then(|at| at.pages.get(at.group, at.column))
+    }
+
+    /// Keeps a freshly decoded dictionary page, and offers it to the other morsels of its row group.
+    fn hold_dictionary(&mut self, built: Arc<Vector>) {
+        if let Some(at) = &self.cached {
+            at.pages.put(at.group, at.column, &built);
+        }
+        self.dictionary = Some(built);
     }
 
     /// The values at `wanted`, which are row ordinals inside this column chunk, sorted.

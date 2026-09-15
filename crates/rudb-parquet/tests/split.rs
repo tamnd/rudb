@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use rudb_common::Value;
+use rudb_common::stage::{self, Stage};
 use rudb_io::{Filesystem, OpenMode, RealFilesystem};
 use rudb_parquet::Reader;
 
@@ -96,6 +97,32 @@ fn a_piece_that_starts_inside_a_page_reads_no_more_of_the_file_than_it_has_to() 
         "reading half a row group read {} bytes of the {read} the whole of it reads",
         second.bytes_read()
     );
+}
+
+/// How many bytes of dictionary page this thread has decoded since the clock was last reset.
+fn decoded_dictionary() -> u64 {
+    stage::here()
+        .taken()
+        .find(|(stage, _, _)| *stage == Stage::Dictionary)
+        .map_or(0, |(_, _, bytes)| bytes)
+}
+
+#[test]
+fn the_morsels_of_a_row_group_decode_its_dictionary_once() {
+    // Without this the cutting costs more than it saves. Every morsel of a row group points into the
+    // same dictionary page, so a group cut four ways used to decode it four times, and on a file of
+    // wide string columns that is the whole of the read.
+    let all = whole("mixed.parquet", 0);
+    let cut = all.len() / 2;
+    let parent = reader("mixed.parquet");
+    stage::reset();
+    let mut first = parent.split_rows(0, 0..cut).expect("splits off the first half");
+    assert_eq!(rows(&mut first), all[..cut]);
+    let once = decoded_dictionary();
+    assert!(once > 0, "the fixture has a dictionary encoded column");
+    let mut second = parent.split_rows(0, cut..all.len()).expect("splits off the second half");
+    assert_eq!(rows(&mut second), all[cut..]);
+    assert_eq!(decoded_dictionary(), once, "the second morsel decoded the dictionary again");
 }
 
 #[test]
