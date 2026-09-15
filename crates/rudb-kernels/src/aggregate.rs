@@ -1101,11 +1101,12 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
         }
         Form::Dictionary | Form::Rle => {
             let (codes, values) = input.positions()?;
-            if codes.len() < rows {
-                return None;
-            }
-            // Every code is inside the dictionary because `Vector::dictionary` checks that on the
-            // way in, so the gather below indexes without a bound of its own.
+            // Cut to the rows wanted rather than checked against them, so that the loops below can
+            // see that a row number is inside the codes and drop the check they would otherwise do
+            // on every row. The codes are the half of the read that can say this: which value a
+            // code lands on is a number out of the data and nothing knows it is in range until it
+            // has been looked at.
+            let codes = codes.get(..rows)?;
             collect::<false, _>(values.data()?, |index| codes[index] as usize, rows, nulls, want)
         }
         // A constant folds in as one value repeated and a sequence as an arithmetic series, and
