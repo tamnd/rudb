@@ -541,8 +541,23 @@ struct Cursor {
     ///
     /// Empty whenever the last decode kept the body, which is what a string column does: its values
     /// are the page, pointed at rather than copied. So this fills up on a column of integers and
-    /// stays empty on a column of strings that is not dictionary encoded.
+    /// stays empty on a column of strings that is not dictionary encoded, and `arena.rs` is what
+    /// gets a run back to that column.
     spare: Vec<u8>,
+    /// The compressed bytes of the last page, to read the next page into.
+    ///
+    /// The same argument as [`Self::spare`] one level up, and it always comes back, because nothing
+    /// downstream ever points into the compressed form of a page. On `hits` a `URL` page is four and
+    /// a half megabytes of Snappy, so without this the read stage takes a block that size from the
+    /// allocator and gives it back once a row group, which on glibc means `mmap` and a fault on
+    /// every four kilobyte page of it before the first byte is read into it.
+    ///
+    /// It was measured by leaving it out. Recycling the arena alone moved the decompress stage of a
+    /// scan of `URL` from 57.39 milliseconds to 51.49 and the read stage the wrong way, from 6.57 to
+    /// 9.25, which is glibc rather than anything this reader does: freeing the arena used to push the
+    /// dynamic mmap threshold up far enough that this buffer came off the heap, and keeping the arena
+    /// took that accident away. A buffer this reader holds on purpose does not depend on the accident.
+    encoded: Vec<u8>,
 }
 
 impl Cursor {
@@ -562,6 +577,7 @@ impl Cursor {
             row: 0,
             bytes_read: 0,
             spare: Vec::new(),
+            encoded: Vec::new(),
         }
     }
 
@@ -588,6 +604,7 @@ impl Cursor {
             row: 0,
             bytes_read: 0,
             spare: Vec::new(),
+            encoded: Vec::new(),
         }
     }
 
@@ -613,15 +630,21 @@ impl Cursor {
                 encoded.as_ref().map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
             );
             let encoded = encoded?;
-            let mut pages = Pages::new(&encoded, self.codec, self.left);
-            pages.recycle(std::mem::take(&mut self.spare));
-            let mut page = pages.next().transpose()?.ok_or_else(|| {
-                Error::io(format!(
-                    "the column {} ran out with {} values left",
-                    self.column.name, self.left
-                ))
-            })?;
-            let consumed = pages.position();
+            // The walk borrows the compressed bytes, so it lives in a block and the buffer goes
+            // back to the cursor the moment it is over. Nothing downstream points into it: a page
+            // body is decompressed into a buffer of its own, and an uncompressed one is copied.
+            let (mut page, consumed) = {
+                let mut pages = Pages::new(&encoded, self.codec, self.left);
+                pages.recycle(std::mem::take(&mut self.spare));
+                let page = pages.next().transpose()?.ok_or_else(|| {
+                    Error::io(format!(
+                        "the column {} ran out with {} values left",
+                        self.column.name, self.left
+                    ))
+                })?;
+                (page, pages.position())
+            };
+            self.encoded = encoded;
             self.at = self.at.saturating_add(consumed);
             if matches!(page.header.body, Body::Index) {
                 continue;
@@ -703,7 +726,7 @@ impl Cursor {
                         self.column.name
                     )));
                 }
-                let encoded = self.body(file, prefix, total)?;
+                let encoded = self.body(file, &prefix, total)?;
                 let mut pages = Pages::new(&encoded, self.codec, self.left);
                 let mut page = pages.next().transpose()?.ok_or_else(|| {
                     Error::io(format!(
@@ -715,6 +738,7 @@ impl Cursor {
                 let timing = Timing::start(Stage::Dictionary);
                 let built = page.decode_dictionary(&self.column);
                 timing.stop(bytes);
+                self.encoded = encoded;
                 self.dictionary = Some(Arc::new(built?));
                 self.at = self.at.saturating_add(total);
                 continue;
@@ -735,7 +759,7 @@ impl Cursor {
                 indices.push(u32::try_from(wanted[next] - base).unwrap_or(u32::MAX));
                 next += 1;
             }
-            let encoded = self.body(file, prefix, total)?;
+            let encoded = self.body(file, &prefix, total)?;
             let mut pages = Pages::new(&encoded, self.codec, self.left);
             let mut page = pages.next().transpose()?.ok_or_else(|| {
                 Error::io(format!("a data page of column {} is empty", self.column.name))
@@ -744,6 +768,7 @@ impl Cursor {
             let timing = Timing::start(Stage::Decode);
             let decoded = page.decode(&self.column, self.dictionary.as_ref());
             timing.stop(bytes);
+            self.encoded = encoded;
             out.extend(decoded?.gather(&indices)?.iter());
             self.at = self.at.saturating_add(total);
             self.row = end;
@@ -755,7 +780,7 @@ impl Cursor {
     /// Reads exactly one encoded page, discovering its variable-width header with bounded probes.
     fn read_page(&mut self, file: &dyn File) -> Result<Vec<u8>> {
         let (prefix, _, _, total) = self.peek(file)?;
-        self.body(file, prefix, total)
+        self.body(file, &prefix, total)
     }
 
     /// The header of the page the cursor is sitting on, without reading its body.
@@ -799,15 +824,19 @@ impl Cursor {
     }
 
     /// The whole page, given the prefix a [`Self::peek`] already read.
-    fn body(&mut self, file: &dyn File, prefix: Vec<u8>, total: usize) -> Result<Vec<u8>> {
-        let mut encoded = Vec::with_capacity(total);
-        encoded.extend_from_slice(&prefix[..prefix.len().min(total)]);
+    ///
+    /// Read into [`Self::encoded`], grown to size rather than cleared and refilled, because zeroing
+    /// bytes that the read is about to overwrite is most of what keeping the buffer saved.
+    fn body(&mut self, file: &dyn File, prefix: &[u8], total: usize) -> Result<Vec<u8>> {
+        let mut encoded = std::mem::take(&mut self.encoded);
         if encoded.len() < total {
-            let old = encoded.len();
             encoded.resize(total, 0);
-            file.read_exact_at(self.start + self.at as u64 + old as u64, &mut encoded[old..])?;
-        } else {
-            encoded.truncate(total);
+        }
+        encoded.truncate(total);
+        let head = prefix.len().min(total);
+        encoded[..head].copy_from_slice(&prefix[..head]);
+        if head < total {
+            file.read_exact_at(self.start + self.at as u64 + head as u64, &mut encoded[head..])?;
         }
         self.bytes_read = self.bytes_read.saturating_add(total as u64);
         Ok(encoded)
