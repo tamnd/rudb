@@ -2044,11 +2044,14 @@ impl<'a> Transform<'a> {
         let argument = self.first(self.first(arguments));
         let part = match self.name(argument) {
             "ExtractStringArgument" => self.string_value(argument)?,
-            // A keyword or an identifier, both taken as written. Which specifier names are legal is
-            // not a question about syntax, so the answer to it lives with the function.
-            "ExtractDatePartArgument" | "ExtractIdentifierArgument" => {
-                self.text(argument).to_string()
-            }
+            // A keyword, which is one of the thirteen the grammar names and is written back as the
+            // one spelling that keyword has. `EXTRACT(seconds FROM t)` and `EXTRACT(SECOND FROM t)`
+            // are both `date_part('SECOND', t)`, which was measured, and it shows up in the column
+            // name as well as in the deparse, since an unaliased column is named after the call.
+            "ExtractDatePartArgument" => date_part(self.text(argument)),
+            // An identifier, taken as written. Which specifier names are legal is not a question
+            // about syntax, so the answer to it lives with the function.
+            "ExtractIdentifierArgument" => self.text(argument).to_string(),
             _ => return self.unsupported(argument),
         };
         let text = self.intern(&part);
@@ -2354,6 +2357,51 @@ const UNITS: &[(&str, &str, Option<&str>)] = &[
     ("SecondKeyword", "to_seconds", None),
     ("MillisecondKeyword", "to_milliseconds", None),
 ];
+
+/// The one spelling a date part keyword is written back as, which is not always the singular.
+///
+/// Both spellings of each of the thirteen keywords land on one name, and the name is upper case and
+/// is plural for the two smallest parts and singular for the rest. That is not a rule, it is a list,
+/// and it was read off the pinned binary a keyword at a time: `EXTRACT(milliseconds FROM t)` and
+/// `EXTRACT(millisecond FROM t)` are both `date_part('MILLISECONDS', t)` while `EXTRACT(seconds FROM
+/// t)` is `date_part('SECOND', t)`.
+///
+/// A word that is not a keyword never reaches here, because the grammar tells the two apart, and it
+/// keeps whatever case it was written in. `EXTRACT(epoch FROM t)` stays lower case, measured.
+fn date_part(written: &str) -> String {
+    const PARTS: &[(&str, &str)] = &[
+        ("YEAR", "YEAR"),
+        ("YEARS", "YEAR"),
+        ("MONTH", "MONTH"),
+        ("MONTHS", "MONTH"),
+        ("DAY", "DAY"),
+        ("DAYS", "DAY"),
+        ("HOUR", "HOUR"),
+        ("HOURS", "HOUR"),
+        ("MINUTE", "MINUTE"),
+        ("MINUTES", "MINUTE"),
+        ("SECOND", "SECOND"),
+        ("SECONDS", "SECOND"),
+        ("MILLISECOND", "MILLISECONDS"),
+        ("MILLISECONDS", "MILLISECONDS"),
+        ("MICROSECOND", "MICROSECONDS"),
+        ("MICROSECONDS", "MICROSECONDS"),
+        ("WEEK", "WEEK"),
+        ("WEEKS", "WEEK"),
+        ("QUARTER", "QUARTER"),
+        ("QUARTERS", "QUARTER"),
+        ("DECADE", "DECADE"),
+        ("DECADES", "DECADE"),
+        ("CENTURY", "CENTURY"),
+        ("CENTURIES", "CENTURY"),
+        ("MILLENNIUM", "MILLENNIUM"),
+        ("MILLENNIA", "MILLENNIUM"),
+    ];
+    PARTS
+        .iter()
+        .find(|(spelling, _)| spelling.eq_ignore_ascii_case(written))
+        .map_or_else(|| written.to_string(), |(_, name)| (*name).to_string())
+}
 
 /// A grammar rule name like `DayToHour` as the words upstream puts in the message for it.
 fn worded(rule: &str) -> String {

@@ -1,7 +1,8 @@
-//! The four catalog tables: what is attached, what is in it, and what somebody created there.
+//! The five catalog tables: what is attached, what is in it, and what somebody created there.
 //!
-//! `duckdb_databases()`, `duckdb_schemas()`, `duckdb_tables()` and `duckdb_columns()`, the metadata
-//! tables whose rows come out of the catalog rather than out of a list this binary was compiled with.
+//! `duckdb_databases()`, `duckdb_schemas()`, `duckdb_tables()`, `duckdb_views()` and
+//! `duckdb_columns()`, the metadata tables whose rows come out of the catalog rather than out of a
+//! list this binary was compiled with.
 //! `rudb_functions::entrycatalog` has their columns, because the binder resolves the call and needs
 //! the columns before there is a catalog in reach, and the rows are here because this is where one is.
 //!
@@ -9,9 +10,10 @@
 //! binder wrote down the last time the view was bound, which is a cache that goes stale, and that is
 //! upstream's design rather than a shortcut taken here. See `rudb_catalog::View` for the measurement.
 //!
-//! `duckdb_views()` is the fifth table and it is not here yet. Every column of it is answerable now
-//! except `sql`, which the pin reports as a deparse of the body rather than the text somebody typed,
-//! and rudb has nothing that writes a query back out as SQL. That is its own piece of work.
+//! `duckdb_views()` is the fifth and it reports the statement written back out, which the binder
+//! wrote down at `CREATE VIEW` using `rudb_parse::deparse`. The pin reports a deparse there too
+//! rather than the text somebody typed, which is measured, so the column is a comparison like any
+//! other and not a place where the two are allowed to differ.
 //!
 //! Every table is walked in catalog order, which is the order things were attached and created in.
 //! That is not sorted and it is not reproduced from the pin either, whose order is its own catalog's.
@@ -32,7 +34,7 @@ use rudb_catalog::{Catalog, Database, Schema, Table};
 use rudb_common::{LogicalType, Result, Value};
 use rudb_functions::{
     DUCKDB, canonical, column_fields, database_fields, numeric_facts, schema_fields, table_fields,
-    type_oid,
+    type_oid, view_fields,
 };
 use rudb_parse::quoted;
 use rudb_plan::{Plan, Slice};
@@ -140,6 +142,55 @@ pub(crate) fn tablenames(
         ]);
     }
     Metadata::new("duckdb_tables", &table_fields(), &rows, plan, index, columns)
+}
+
+/// Every view in the catalog, in the columns the plan asked for.
+///
+/// `sql` is the statement written back out, which the binder wrote down at creation. `column_count`
+/// is the length of the column cache on the entry, so it is as stale as the cache is, which is what
+/// upstream reports too. `is_bound` says whether that cache holds anything, and it is true on every
+/// row here because rudb binds a view's body at `CREATE VIEW` and cannot get an entry into the
+/// catalog without one. Upstream reaches false by restoring a database file, which rudb has no way
+/// to do yet, so the column is answered rather than faked.
+///
+/// `temporary` is false on every row for the same reason: `CREATE TEMP VIEW` is refused by the
+/// binder, since there is no `temp` catalog for one to live in. `internal` is false because every
+/// view here is one somebody wrote, where upstream returns its own `information_schema` views with
+/// it set.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn viewnames(
+    catalog: &Catalog,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let mut rows = Vec::new();
+    for database in catalog.databases() {
+        for schema in database.schemas() {
+            for view in schema.views() {
+                let count = i64::try_from(view.columns().len()).unwrap_or(i64::MAX);
+                rows.push(vec![
+                    text(database.name()),
+                    Value::BigInt(database.oid()),
+                    text(schema.name()),
+                    Value::BigInt(schema.oid()),
+                    text(&view.name().table),
+                    Value::BigInt(view.oid()),
+                    Value::Null,
+                    empty(),
+                    Value::Boolean(false),
+                    Value::Boolean(false),
+                    Value::BigInt(count),
+                    text(view.statement()),
+                    Value::Boolean(true),
+                ]);
+            }
+        }
+    }
+    Metadata::new("duckdb_views", &view_fields(), &rows, plan, index, columns)
 }
 
 /// Every column of every base table, in the columns the plan asked for.
