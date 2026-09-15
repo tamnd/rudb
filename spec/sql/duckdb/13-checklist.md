@@ -17,7 +17,7 @@ Baseline for every number here: rudb `e0f32d2`, rudb-compat `995f0e8`, DuckDB `v
 - [x] Fuzz target over tokenize and match on raw bytes
 - [x] Structure aware fuzz target over the AST using `arbitrary`
 - [x] Plan print and plan parse round trip as a property test over generated plans
-- [ ] Grammar driven statement generation, walking the same 1088 rule table in the other direction, with weighted alternatives, a recursion bound and a real catalog
+- [x] Grammar driven statement generation, walking the same 1088 rule table in the other direction, with weighted alternatives, a recursion bound and a real catalog
 - [x] TLP as an oracle that runs on rudb alone with no DuckDB binary present, in the WHERE form
 - [x] The other two TLP forms, over an aggregate and over GROUP BY with HAVING
 - [x] NoREC as an oracle that runs on rudb alone with no DuckDB binary present
