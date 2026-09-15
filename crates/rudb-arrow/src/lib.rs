@@ -40,8 +40,10 @@
 //! here rather than there because the format string is defined by Arrow's document, so it is the
 //! part a test can check against that document rather than against our own opinion.
 //!
-//! The nested types. A list is offsets and a child array, a struct is a list of child arrays, and
-//! there is no child array to build one out of until `rudb-vector` has a nested vector.
+//! The nested types. A struct is a list of child arrays and there is no child vector to build one out
+//! of until `rudb-vector` has a struct vector, which is true of `MAP`, `ARRAY` and `UNION` too. A list
+//! is the one that is only missing here: there has been a list vector since #302, and what is left is
+//! turning a start and a length per row into the offsets Arrow wants, which [`DataType`] writes up.
 
 #![forbid(unsafe_code)]
 
