@@ -127,6 +127,38 @@ impl<'a> Hybrid<'a> {
         Ok(())
     }
 
+    /// Whether the next `count` values are one repeat of `value`, consuming them if they are.
+    ///
+    /// This is the question a page of definition levels is asked before anything else, because a
+    /// page of an optional column where nothing is null is written as a single repeated run and the
+    /// run header says so in two bytes. Answering from the header rather than from the values means
+    /// there is no vector of levels to allocate, none to count and none to walk again when the
+    /// values are placed, which for a wide file with few nulls is most of what reading a level
+    /// stream costs.
+    ///
+    /// A false answer leaves the reader on the run it just looked at rather than rewinding, so the
+    /// caller can go straight on to [`Hybrid::read`] and the header is not parsed twice.
+    ///
+    /// # Errors
+    ///
+    /// If the run header or the value behind it runs off the end of the stream.
+    pub(crate) fn whole_run_of(&mut self, value: u32, count: usize) -> Result<bool> {
+        if self.run == Run::Done {
+            self.next_run()?;
+        }
+        match self.run {
+            Run::Repeat { value: found, left } if found == value && left >= count => {
+                self.run = if left == count {
+                    Run::Done
+                } else {
+                    Run::Repeat { value, left: left - count }
+                };
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Reads the next run header and sets up the run it introduces.
     fn next_run(&mut self) -> Result<()> {
         if self.at >= self.bytes.len() {
@@ -386,6 +418,50 @@ mod tests {
         let bytes = repeat(20_000, 1, 1);
         assert_eq!(bytes.len(), 4, "a header of three bytes and one byte of value");
         assert_eq!(read(&bytes, 1, 20_000), vec![1u32; 20_000]);
+    }
+
+    #[test]
+    fn a_whole_page_of_ones_is_answered_from_the_run_header() {
+        let bytes = repeat(20_000, 1, 1);
+        let mut stream = Hybrid::new(&bytes, 1).expect("a width this narrow is allowed");
+        assert!(stream.whole_run_of(1, 20_000).expect("the header reads"));
+    }
+
+    #[test]
+    fn a_run_that_is_short_of_the_page_is_not_the_whole_page() {
+        // The run says ten thousand and the page holds twenty, so something else follows and the
+        // levels have to be decoded after all. Saying yes here would put ten thousand nulls in the
+        // wrong place and never report a thing.
+        let mut bytes = repeat(10_000, 1, 1);
+        bytes.extend(repeat(10_000, 0, 1));
+        let mut stream = Hybrid::new(&bytes, 1).expect("a width this narrow is allowed");
+        assert!(!stream.whole_run_of(1, 20_000).expect("the header reads"));
+    }
+
+    #[test]
+    fn a_no_that_looked_at_a_header_does_not_lose_the_run_it_looked_at() {
+        // The reader is left standing on the run rather than rewound, so a caller that asked and
+        // was told no goes straight on to reading and gets every value, including the ones in the
+        // run whose header was already eaten.
+        let mut bytes = repeat(16, 1, 1);
+        bytes.extend(repeat(8, 0, 1));
+        let mut stream = Hybrid::new(&bytes, 1).expect("a width this narrow is allowed");
+        assert!(!stream.whole_run_of(1, 24).expect("the header reads"));
+        let mut out = Vec::new();
+        stream.read(&mut out, 24).expect("the stream holds this many values");
+        assert_eq!(out, [vec![1u32; 16], vec![0u32; 8]].concat());
+    }
+
+    #[test]
+    fn a_run_longer_than_the_page_leaves_the_rest_where_it_was() {
+        // One run can cover more than the page asks for, and what is left of it belongs to
+        // whatever is read next rather than being thrown away with the run.
+        let bytes = repeat(20, 1, 1);
+        let mut stream = Hybrid::new(&bytes, 1).expect("a width this narrow is allowed");
+        assert!(stream.whole_run_of(1, 12).expect("the header reads"));
+        let mut out = Vec::new();
+        stream.read(&mut out, 8).expect("the stream holds this many values");
+        assert_eq!(out, vec![1u32; 8]);
     }
 
     #[test]
