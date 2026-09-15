@@ -541,7 +541,8 @@ struct Cursor {
     ///
     /// Empty whenever the last decode kept the body, which is what a string column does: its values
     /// are the page, pointed at rather than copied. So this fills up on a column of integers and
-    /// stays empty on a column of strings that is not dictionary encoded.
+    /// stays empty on a column of strings that is not dictionary encoded, and `arena.rs` is what
+    /// gets a run back to that column.
     spare: Vec<u8>,
 }
 
