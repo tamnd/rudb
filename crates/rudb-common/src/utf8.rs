@@ -244,4 +244,58 @@ mod tests {
             }
         }
     }
+
+    /// One byte out of each range a continuation byte is ever tested against, plus the two either
+    /// side of the range as a whole.
+    const EDGES: [u8; 10] = [0x00, 0x7f, 0x80, 0x8f, 0x90, 0x9f, 0xa0, 0xbf, 0xc0, 0xff];
+
+    #[test]
+    fn a_three_byte_sequence_answers_what_the_standard_library_answers() {
+        // Every byte that starts a sequence against every second byte, which is the pair the range
+        // rules are about, and then a third byte from each side of each boundary.
+        // row at a time: the point is the cross product, so there is nothing to batch.
+        for first in 0xC0..=0xFF {
+            for second in 0..=u8::MAX {
+                for third in EDGES {
+                    agree(&[first, second, third]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_four_byte_sequence_answers_what_the_standard_library_answers() {
+        // The same for the only four bytes that start a four byte sequence, and for the one either
+        // side of them that looks as though it should.
+        // row at a time: the point is the cross product, so there is nothing to batch.
+        for first in 0xEF..=0xF5 {
+            for second in 0..=u8::MAX {
+                for third in EDGES {
+                    for fourth in EDGES {
+                        agree(&[first, second, third, fourth]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_sequence_after_a_word_of_ascii_answers_what_the_standard_library_answers() {
+        // The same cases again at every offset the word loop can hand the automaton, because the
+        // two loops meeting in the middle of a character is the shape that breaks first.
+        // row at a time: the point is the cross product, so there is nothing to batch.
+        for pad in 0..9 {
+            let ascii = vec![b'a'; pad];
+            for first in 0xC0..=0xFF {
+                for second in EDGES {
+                    for third in EDGES {
+                        let mut bytes = ascii.clone();
+                        bytes.extend_from_slice(&[first, second, third]);
+                        bytes.extend_from_slice(b"tail");
+                        agree(&bytes);
+                    }
+                }
+            }
+        }
+    }
 }
