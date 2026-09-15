@@ -387,7 +387,9 @@ impl Shared {
         match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new())? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                run(sql, &plan, &catalog, cancel, self.budget(), context.statistics(), &seams)
+                let budget = self.budget();
+                let under = Under::new(budget, context.statistics(), &seams, Rows::ForACaller);
+                run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
@@ -488,7 +490,9 @@ impl Shared {
         match rudb_bind::bind_statement_with(ast, &catalog, parameters)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
-                run(sql, &plan, &catalog, cancel, self.budget(), context.statistics(), &seams)
+                let budget = self.budget();
+                let under = Under::new(budget, context.statistics(), &seams, Rows::ForACaller);
+                run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
@@ -529,15 +533,9 @@ impl Shared {
                 // and a version of this that appended chunk by chunk would either read its own
                 // output forever or depend on how the scan holds its chunks.
                 rudb_opt::optimize_with(&mut insert.source, &context)?;
-                let result = run(
-                    sql,
-                    &insert.source,
-                    &catalog,
-                    cancel,
-                    self.budget(),
-                    context.statistics(),
-                    &seams,
-                )?;
+                let statistics = context.statistics();
+                let under = Under::new(self.budget(), statistics, &seams, Rows::ForATable);
+                let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let table = catalog.table_mut(&insert.name)?;
                 for chunk in result.into_chunks() {
                     table.append(chunk)?;
@@ -593,16 +591,60 @@ struct Budget<'a> {
     pool: &'a Pool,
 }
 
+/// Who the rows a query produced are for, which is what decides whether they are flattened.
+///
+/// A caller outside the engine reads a value at a time and has never heard of a dictionary vector,
+/// so a result going to one has every column copied into flat form first. A table has heard of it,
+/// because storage holds the same vector forms execution does, so a result going into one keeps
+/// whatever form the scan handed up.
+///
+/// The difference is not small. `CREATE TABLE t AS SELECT * FROM 'hits.parquet'` over a hundred and
+/// five columns does its reading on every thread in the pool and then flattens the whole answer on
+/// the one thread draining it. The string columns of that file are dictionary encoded, so flattening
+/// them is a copy per row per column, single threaded, at the end of a query that was parallel up to
+/// that point. Measured against duckdb on a nine row group file, that tail is the difference between
+/// getting 1.8 times out of thirty two threads and getting 5.4.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rows {
+    /// Going out of the engine, so every column is flattened on the way.
+    ForACaller,
+    /// Going into a table, so nothing is copied.
+    ForATable,
+}
+
+/// Everything a query runs under that is not the plan, the catalog or the cancel flag.
+///
+/// The same reasoning as [`Budget`], one level out. These four travel together because every caller
+/// of `run` has to say all four and none of them is a property of the plan, and passing them as one
+/// keeps the argument list from growing a slot every time something new turns out to be true of a
+/// running query rather than of the query itself.
+#[derive(Clone, Copy)]
+struct Under<'a> {
+    budget: Budget<'a>,
+    statistics: &'a rudb_opt::estimate::Statistics,
+    seams: &'a rudb_seam::Settings,
+    going: Rows,
+}
+
+impl<'a> Under<'a> {
+    fn new(
+        budget: Budget<'a>,
+        statistics: &'a rudb_opt::estimate::Statistics,
+        seams: &'a rudb_seam::Settings,
+        going: Rows,
+    ) -> Self {
+        Self { budget, statistics, seams, going }
+    }
+}
+
 fn run(
     sql: &str,
     plan: &rudb_plan::Plan,
     catalog: &Catalog,
     cancel: &Cancel,
-    budget: Budget<'_>,
-    statistics: &rudb_opt::estimate::Statistics,
-    seams: &rudb_seam::Settings,
+    under: Under<'_>,
 ) -> Result<QueryResult> {
-    let Budget { memory, pool } = budget;
+    let Under { budget: Budget { memory, pool }, statistics, seams, going } = under;
     // The budget is shared by the database and its high-water mark survives a query. Reset it to
     // what is live now before measuring this execution, otherwise a metrics document either says
     // zero forever (when nobody copies the mark) or inherits the largest earlier query. A caller
@@ -627,11 +669,18 @@ fn run(
         if chunk.is_empty() {
             continue;
         }
-        // flatten: this is the top of the query and the chunk is about to become a result set that
-        // somebody outside the engine reads. A caller holding a `Result` gets a value at a time, so
-        // a dictionary or a constant here would be a form every one of them has to understand to
-        // read a row. The decode stops at this line and nothing below it sees a flat column.
-        let chunk = chunk.flatten()?;
+        let chunk = match going {
+            // flatten: this is the top of the query and the chunk is about to become a result set
+            // that somebody outside the engine reads. A caller holding a `Result` gets a value at a
+            // time, so a dictionary or a constant here would be a form every one of them has to
+            // understand to read a row. The decode stops at this line and nothing below it sees a
+            // flat column. The other arm is a chunk going into a table, where there is nobody
+            // outside the engine to protect: storage holds the same forms execution does, and this
+            // loop is the one part of a parallel query that runs on a single thread, so a copy made
+            // here is a copy the rest of the pool sits idle through.
+            Rows::ForACaller => chunk.flatten()?,
+            Rows::ForATable => chunk,
+        };
         held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
         chunks.push(chunk);
     }
@@ -682,7 +731,8 @@ fn explaining(
             &rudb_opt::explain::explain_with(plan, statistics, seams),
         );
     }
-    let result = run(sql, plan, catalog, cancel, budget, statistics, seams.settings())?;
+    let under = Under::new(budget, statistics, seams.settings(), Rows::ForACaller);
+    let result = run(sql, plan, catalog, cancel, under)?;
     let measured = result.metrics().expect("a query that ran reports what it did");
     let text = rudb_opt::explain::analyzed(plan, statistics, seams, measured);
     explained("analyzed_plan", &text)
@@ -741,7 +791,8 @@ fn create_table(
     let rows = match &mut create.source {
         Some(plan) => {
             rudb_opt::optimize_with(plan, context)?;
-            Some(run(sql, plan, catalog, cancel, budget, context.statistics(), seams)?)
+            let under = Under::new(budget, context.statistics(), seams, Rows::ForATable);
+            Some(run(sql, plan, catalog, cancel, under)?)
         }
         None => None,
     };
