@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod entrycatalog;
 pub mod file;
 pub mod functioncatalog;
 pub mod settingcatalog;
@@ -20,6 +21,7 @@ pub mod signature;
 pub mod table;
 pub mod typecatalog;
 
+pub use entrycatalog::{DUCKDB, database_fields, schema_fields};
 pub use file::{
     csv_fields, csv_given, files, is_file, is_pattern, open_csv, open_parquet, parquet_fields,
 };

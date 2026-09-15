@@ -13,11 +13,20 @@ pub const DEFAULT_CATALOG: &str = "memory";
 /// The default schema inside it.
 pub const DEFAULT_SCHEMA: &str = "main";
 
+/// The oid of an entry that is not in a catalog.
+///
+/// Every database, schema, table and view reachable from a [`Catalog`] has a real one, because the
+/// four calls that put an entry in are the four that stamp it. A [`Table`] or a [`View`] built with
+/// its own constructor and never handed over has this until it is, which is a thing the tests do and
+/// nothing else does.
+pub const DETACHED: i64 = 0;
+
 /// One attached database.
 #[derive(Debug, Clone)]
 pub struct Database {
     name: String,
     schemas: Vec<Schema>,
+    oid: i64,
 }
 
 impl Database {
@@ -25,6 +34,12 @@ impl Database {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The number the catalog tables join on.
+    #[must_use]
+    pub fn oid(&self) -> i64 {
+        self.oid
     }
 
     /// The schemas in it.
@@ -63,18 +78,25 @@ pub struct Schema {
     name: String,
     tables: Vec<Table>,
     views: Vec<View>,
+    oid: i64,
 }
 
 impl Schema {
     /// A schema of that name with nothing in it.
-    fn empty(name: &str) -> Self {
-        Self { name: name.to_string(), tables: Vec::new(), views: Vec::new() }
+    fn empty(name: &str, oid: i64) -> Self {
+        Self { name: name.to_string(), tables: Vec::new(), views: Vec::new(), oid }
     }
 
     /// The schema name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The number the catalog tables join on.
+    #[must_use]
+    pub fn oid(&self) -> i64 {
+        self.oid
     }
 
     /// The tables in it.
@@ -115,6 +137,14 @@ pub struct Catalog {
     databases: Vec<Database>,
     default_catalog: String,
     default_schema: String,
+    /// The next oid to hand out.
+    ///
+    /// A counter rather than a position, because a position changes when the thing before it is
+    /// dropped and a client that cached the oid of one table would then be joining against another.
+    /// Upstream's are a counter too, and its values are not reproduced here for the same reason
+    /// `duckdb_types()` does not reproduce `database_oid`: an allocation counter says what order a
+    /// process happened to create things in, so matching it would mean matching an accident.
+    next: i64,
 }
 
 impl Default for Catalog {
@@ -131,11 +161,23 @@ impl Catalog {
         Self {
             databases: vec![Database {
                 name: DEFAULT_CATALOG.to_string(),
-                schemas: vec![Schema::empty(DEFAULT_SCHEMA)],
+                schemas: vec![Schema::empty(DEFAULT_SCHEMA, 2)],
+                oid: 1,
             }],
             default_catalog: DEFAULT_CATALOG.to_string(),
             default_schema: DEFAULT_SCHEMA.to_string(),
+            next: 3,
         }
+    }
+
+    /// The next oid, and moves the counter on.
+    ///
+    /// Never handed out twice in the life of one catalog, including across a drop and a create of
+    /// the same name, because that is the whole point of an oid.
+    fn stamp(&mut self) -> i64 {
+        let oid = self.next;
+        self.next += 1;
+        oid
     }
 
     /// The catalog an unqualified name resolves in.
@@ -165,9 +207,12 @@ impl Catalog {
         if self.databases.iter().any(|held| same_name(&held.name, name)) {
             return Err(Error::catalog(format!("Database with name \"{name}\" already exists!")));
         }
+        let oid = self.stamp();
+        let schema = self.stamp();
         self.databases.push(Database {
             name: name.to_string(),
-            schemas: vec![Schema::empty(DEFAULT_SCHEMA)],
+            schemas: vec![Schema::empty(DEFAULT_SCHEMA, schema)],
+            oid,
         });
         Ok(())
     }
@@ -178,11 +223,12 @@ impl Catalog {
     ///
     /// If the database is not attached, or a schema of that name is already in it.
     pub fn create_schema(&mut self, catalog: &str, name: &str) -> Result<()> {
+        let oid = self.stamp();
         let database = self.database_mut(catalog)?;
         if database.schemas.iter().any(|held| same_name(&held.name, name)) {
             return Err(Error::catalog(format!("Schema with name \"{name}\" already exists!")));
         }
-        database.schemas.push(Schema::empty(name));
+        database.schemas.push(Schema::empty(name, oid));
         Ok(())
     }
 
@@ -193,7 +239,11 @@ impl Catalog {
     /// If the database or the schema is missing, if a table or a view of that name is already
     /// there, or if two columns have the same name.
     pub fn create_table(&mut self, name: QualifiedName, columns: Vec<Field>) -> Result<()> {
-        let table = Table::new(name.clone(), columns)?;
+        let mut table = Table::new(name.clone(), columns)?;
+        // Stamped before the name is checked, so a refused create burns an oid rather than handing
+        // the next table the number the refused one would have had. A gap in the sequence costs
+        // nothing and a number handed out twice costs a wrong join.
+        table.stamp(self.stamp());
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
         if let Some(found) = schema.kind(&name.table) {
             return Err(taken(found, &name.table));
@@ -211,8 +261,9 @@ impl Catalog {
     ///
     /// If the database or the schema is missing, or if a table or a view of that name is already
     /// there.
-    pub fn create_view(&mut self, view: View) -> Result<()> {
+    pub fn create_view(&mut self, mut view: View) -> Result<()> {
         let name = view.name().clone();
+        view.stamp(self.stamp());
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
         if let Some(found) = schema.kind(&name.table) {
             return Err(taken(found, &name.table));
@@ -500,6 +551,29 @@ mod tests {
         assert_eq!(catalog.default_schema(), "main");
         assert_eq!(catalog.databases().len(), 1);
         assert_eq!(catalog.tables().count(), 0);
+    }
+
+    /// The property `duckdb_schemas()` and `duckdb_tables()` are built on top of, checked here
+    /// because this is the only place that hands a number out.
+    #[test]
+    fn no_two_entries_carry_the_same_oid() {
+        let mut catalog = with_hits();
+        catalog
+            .create_table(
+                QualifiedName::new("memory", "main", "visits"),
+                vec![Field::new("id", LogicalType::BigInt)],
+            )
+            .expect("a second table");
+        catalog.create_schema("memory", "s").expect("a fresh schema");
+        let database = &catalog.databases()[0];
+        let mut oids = vec![database.oid()];
+        oids.extend(database.schemas().iter().map(Schema::oid));
+        oids.extend(catalog.tables().map(Table::oid));
+        let mut sorted = oids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), oids.len(), "{oids:?}");
+        assert!(oids.iter().all(|oid| *oid != DETACHED), "{oids:?}");
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! what the catalog keeps is a plan, because a plan has the columns of the day it was built baked
 //! into it. So the catalog keeps the query and the binder binds it again at every reference.
 
+use crate::catalog::DETACHED;
 use crate::name::QualifiedName;
 
 /// One view.
@@ -15,13 +16,26 @@ pub struct View {
     name: QualifiedName,
     sql: String,
     aliases: Vec<String>,
+    /// What `duckdb_views()` reports as `view_oid`, stamped by the catalog when this goes in.
+    oid: i64,
 }
 
 impl View {
     /// A view over `sql`, whose columns answer to `aliases` as far as that list goes.
     #[must_use]
     pub fn new(name: QualifiedName, sql: String, aliases: Vec<String>) -> Self {
-        Self { name, sql, aliases }
+        Self { name, sql, aliases, oid: DETACHED }
+    }
+
+    /// The number the catalog tables join on, and [`DETACHED`] for a view not in a catalog.
+    #[must_use]
+    pub fn oid(&self) -> i64 {
+        self.oid
+    }
+
+    /// Stamps the oid, which only [`crate::Catalog::create_view`] does.
+    pub(crate) fn stamp(&mut self, oid: i64) {
+        self.oid = oid;
     }
 
     /// The three part name.

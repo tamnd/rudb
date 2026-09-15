@@ -5,7 +5,7 @@
 //! resolution problem from [`crate::signature`]: the answer is not a return type, it is a list of
 //! columns, because the caller can alias them and select from them and join against them.
 //!
-//! Nine of them are here. `range` and `generate_series` between them account for two thousand
+//! Eleven of them are here. `range` and `generate_series` between them account for two thousand
 //! records in DuckDB's `sqllogictest` corpus, because a test that needs a thousand rows should not
 //! have to write a thousand rows, and the corpus uses them the way a person uses a for loop. The
 //! difference between those two is one row: `range` stops before the end and `generate_series`
@@ -19,8 +19,8 @@
 //! [`crate::file`] is where that happens. For CSV there is nothing in the file that states the
 //! columns either, so opening it means sniffing it.
 //!
-//! The other five are the third kind, a table whose rows are a fact about the engine rather than
-//! data somebody stored. All five take no arguments and all five know their own columns, so
+//! The other seven are the third kind, a table whose rows are a fact about the engine rather than
+//! data somebody stored. All seven take no arguments and all seven know their own columns, so
 //! resolving one is the simplest case in this file and they share an arm. `rudb_strategies()` is not
 //! a DuckDB function at all: it lists every seam in the engine and every implementation registered
 //! against it, which is how a reader finds out what this engine will let them swap and what it lets
@@ -30,13 +30,16 @@
 //! names exist is a fact about the type system and the function library rather than about the
 //! executor. `duckdb_settings()` is every setting `SET` will take, and it is the one of the five
 //! whose rows are not all known here: the names and the descriptions are, and the values come from
-//! the session the query is running in.
+//! the session the query is running in. `duckdb_databases()` and `duckdb_schemas()` are the last
+//! two and they are further from this crate again, because their rows are whatever somebody
+//! created, so only their columns are here and [`crate::entrycatalog`] says why.
 //!
-//! D2 adds about eight more of that third kind, the catalog tables among them. Each one is a column
-//! list here and a list of rows in `rudb_exec::metadata`, and nothing else.
+//! D2 adds about six more of that third kind, the rest of the catalog tables among them. Each one is
+//! a column list here and a list of rows in `rudb_exec::metadata`, and nothing else.
 
 use rudb_common::{Error, Field, LogicalType, Result};
 
+use crate::entrycatalog::{database_fields, schema_fields};
 use crate::functioncatalog::function_fields;
 use crate::settingcatalog::setting_fields;
 use crate::typecatalog::type_fields;
@@ -65,6 +68,10 @@ pub enum TableFunction {
     DuckdbFunctions,
     /// `duckdb_settings()`, every setting `SET` will take and what each one is now.
     DuckdbSettings,
+    /// `duckdb_databases()`, every database attached to this session.
+    DuckdbDatabases,
+    /// `duckdb_schemas()`, every schema in every one of them.
+    DuckdbSchemas,
 }
 
 /// The name of the column `file_row_number=True` adds.
@@ -89,6 +96,8 @@ impl TableFunction {
             Self::DuckdbTypes => "duckdb_types",
             Self::DuckdbFunctions => "duckdb_functions",
             Self::DuckdbSettings => "duckdb_settings",
+            Self::DuckdbDatabases => "duckdb_databases",
+            Self::DuckdbSchemas => "duckdb_schemas",
         }
     }
 
@@ -169,6 +178,12 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("duckdb_settings") {
             return Some(Self::DuckdbSettings);
+        }
+        if name.eq_ignore_ascii_case("duckdb_databases") {
+            return Some(Self::DuckdbDatabases);
+        }
+        if name.eq_ignore_ascii_case("duckdb_schemas") {
+            return Some(Self::DuckdbSchemas);
         }
         None
     }
@@ -287,7 +302,9 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbKeywords
         | TableFunction::DuckdbTypes
         | TableFunction::DuckdbFunctions
-        | TableFunction::DuckdbSettings => None,
+        | TableFunction::DuckdbSettings
+        | TableFunction::DuckdbDatabases
+        | TableFunction::DuckdbSchemas => None,
     }
 }
 
@@ -300,6 +317,8 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::DuckdbTypes => Some(type_fields()),
         TableFunction::DuckdbFunctions => Some(function_fields()),
         TableFunction::DuckdbSettings => Some(setting_fields()),
+        TableFunction::DuckdbDatabases => Some(database_fields()),
+        TableFunction::DuckdbSchemas => Some(schema_fields()),
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::ReadParquet
@@ -586,6 +605,8 @@ mod tests {
             "duckdb_types",
             "duckdb_functions",
             "duckdb_settings",
+            "duckdb_databases",
+            "duckdb_schemas",
         ] {
             let function = TableFunction::lookup(name).expect("a known function");
             let error = resolve_table(name, &[LogicalType::BigInt]).expect_err("takes none");

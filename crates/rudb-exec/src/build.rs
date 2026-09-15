@@ -58,6 +58,7 @@ use rudb_plan::{
 };
 use rudb_seam::Settings;
 
+use crate::entrynames::{databasenames, schemanames};
 use crate::fetch::Fetch;
 use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
@@ -474,7 +475,9 @@ impl<'a> Building<'a, '_> {
                         | TableFunction::DuckdbKeywords
                         | TableFunction::DuckdbTypes
                         | TableFunction::DuckdbFunctions
-                        | TableFunction::DuckdbSettings),
+                        | TableFunction::DuckdbSettings
+                        | TableFunction::DuckdbDatabases
+                        | TableFunction::DuckdbSchemas),
                     ) => {
                         let table = match function {
                             TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
@@ -482,6 +485,12 @@ impl<'a> Building<'a, '_> {
                             TableFunction::DuckdbFunctions => functionnames(plan, index, columns)?,
                             TableFunction::DuckdbSettings => {
                                 settingnames(self.session, plan, index, columns)?
+                            }
+                            TableFunction::DuckdbDatabases => {
+                                databasenames(self.catalog, plan, index, columns)?
+                            }
+                            TableFunction::DuckdbSchemas => {
+                                schemanames(self.catalog, plan, index, columns)?
                             }
                             _ => strategies(plan, index, columns)?,
                         };

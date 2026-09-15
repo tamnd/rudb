@@ -80,6 +80,7 @@
 
 mod buffer;
 mod build;
+mod entrynames;
 mod expr;
 mod fetch;
 mod functionnames;
