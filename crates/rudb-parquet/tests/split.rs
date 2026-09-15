@@ -99,6 +99,24 @@ fn a_piece_that_starts_inside_a_page_reads_no_more_of_the_file_than_it_has_to() 
     );
 }
 
+#[test]
+fn the_page_size_says_how_finely_a_file_can_be_cut() {
+    // The question a scan asks before deciding to cut a row group at all, because a piece that
+    // starts inside a page decodes that page whole. The fixtures hold 2048 rows a group and the
+    // writers put every one of them in one page, so cutting these would cost more than it saves and
+    // the number saying so is the point of the call.
+    for name in ["mixed.parquet", "zstd.parquet", "delta.parquet", "lengths.parquet"] {
+        let reader = reader(name);
+        let page = reader.page_rows().expect("reads the first page header of every column");
+        let group = reader.metadata().row_groups[0].rows;
+        assert!(page > 0, "{name} has a column with no data page in its first row group");
+        assert!(
+            i64::try_from(page).expect("a page of a sane number of rows") <= group,
+            "{name} has a page of {page} rows in a row group of {group}"
+        );
+    }
+}
+
 /// How many bytes of dictionary page this thread has decoded since the clock was last reset.
 fn decoded_dictionary() -> u64 {
     stage::here()

@@ -334,6 +334,13 @@ impl Reader {
     /// each and no decompression at all, because a header says how many values its page holds and
     /// that is all the reader needs to know to skip it.
     ///
+    /// What it does not step over is the page the first row is in, which is decoded whole and then
+    /// cut. So the page is the floor on how finely a file can be read, and a caller works out where
+    /// that floor is with [`Reader::page_rows`] before cutting anything. Cutting below it is not a
+    /// little wasteful, it is a disaster: the ClickBench suite at one thread went from 2.9 seconds
+    /// to 5.9 when a file DuckDB wrote was cut four ways, because DuckDB writes one page per column
+    /// chunk and each of the four morsels decoded the whole of it.
+    ///
     /// # Errors
     ///
     /// If the group is not one the file has, which is a mistake in the caller.
@@ -341,6 +348,37 @@ impl Reader {
         let mut split = self.split(group..group + 1)?;
         split.piece = Some(rows);
         Ok(split)
+    }
+
+    /// How many rows the widest page of this file holds, as far as its first row group shows.
+    ///
+    /// A page is the floor on how finely a file can be read in pieces. Stepping over a page is free,
+    /// because its header says how long it is, but a piece that starts inside one decodes the whole
+    /// of that page and then throws away the part before it starts. So a caller deciding how small
+    /// to cut a row group asks this first, and a file whose pages hold as many rows as its row groups
+    /// cannot usefully be cut at all. DuckDB writes exactly that file: `URL` in the ClickBench data
+    /// is one plain page of ten and a half megabytes per row group.
+    ///
+    /// Only the first row group is read, because page size is a setting the writer holds for the
+    /// whole file rather than something that moves through one, and only the projected columns,
+    /// because a column nobody reads does not have to be cut. What it costs is one page header per
+    /// column, which is a couple of hundred bytes each and no page bodies at all.
+    ///
+    /// Zero when this reader has no row groups left to read.
+    ///
+    /// # Errors
+    ///
+    /// If a column chunk is missing from the footer or its first page header does not parse.
+    pub fn page_rows(&self) -> Result<usize> {
+        if self.group >= self.end {
+            return Ok(0);
+        }
+        let mut widest = 0;
+        for chunk in self.locate(self.group)? {
+            let mut cursor = self.read_column(&chunk);
+            widest = widest.max(cursor.first_page(self.file.as_ref())?);
+        }
+        Ok(widest)
     }
 
     /// Reads only these columns, in this order.
@@ -1016,6 +1054,21 @@ impl Cursor {
         self.hold_dictionary(Arc::new(built?));
         self.at = self.at.saturating_add(total);
         Ok(())
+    }
+
+    /// How many values the chunk's first data page holds, reading page headers and no bodies.
+    ///
+    /// Zero on a chunk with no data page in it, which is a chunk of no rows.
+    fn first_page(&mut self, file: &dyn File) -> Result<usize> {
+        while self.at < self.len {
+            let (_, header, _, total) = self.peek(file)?;
+            if !matches!(header.body, Body::Index | Body::Dictionary(_)) {
+                return usize::try_from(header.values())
+                    .map_err(|_| Error::io(format!("a page of {} values", header.values())));
+            }
+            self.at = self.at.saturating_add(total);
+        }
+        Ok(0)
     }
 
     /// The chunk's dictionary page, if another morsel of the same row group has decoded it.

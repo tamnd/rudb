@@ -496,7 +496,32 @@ pub(crate) struct FileScan {
 /// written with different row group sizes runs in 898 ms on nine groups, 749 on thirty one and 768
 /// on sixty one, all at eight threads, and at thirty two threads the nine group file is slower than
 /// it was at eight while the thirty one group file is faster again at 676.
+///
+/// Whether a row group is cut at all is [`morsel_rows`], which asks the file how long its pages are
+/// first, because a morsel cannot start inside a page for free.
 const MORSEL_ROWS: usize = 32_768;
+
+/// How much smaller than a morsel a page has to be before a row group is worth cutting.
+///
+/// A morsel that starts inside a page pays for that page decoded twice, once by the morsel that ends
+/// in it and once by the morsel that starts in it. The columns of a row group do not break their
+/// pages in the same places, so a boundary costs at worst one page per column, and a page an eighth
+/// of a morsel long puts a ceiling of an eighth on what the cutting throws away.
+const FINE: usize = 8;
+
+/// How many rows one morsel of a row group covers, or zero to hand out whole row groups.
+///
+/// Zero is not a fallback, it is the answer for every file this engine is measured against. DuckDB
+/// writes one page per column chunk, so a page and a row group are the same thing and a row group
+/// cannot be cut into anything cheaper than itself. Cutting one anyway is a measured disaster: the
+/// suite at one thread went from 2.9 seconds to 5.9, and the scan read, decompressed and decoded
+/// four times the bytes, because each of the four morsels of a group decoded the group's one page
+/// whole and then used a quarter of it.
+fn morsel_rows(reader: &FileReader) -> usize {
+    let FileReader::Parquet(reader) = reader else { return 0 };
+    let page = reader.page_rows().unwrap_or(usize::MAX);
+    if page == 0 || page.saturating_mul(FINE) > MORSEL_ROWS { 0 } else { MORSEL_ROWS }
+}
 
 /// The rows of the next morsel of a row group of `rows` rows, `part` of which are handed out.
 ///
@@ -507,14 +532,17 @@ const MORSEL_ROWS: usize = 32_768;
 /// An empty range means the group is done, and a group of no rows is done straight away, which is
 /// what stops a file with an empty row group in it from being cut forever.
 fn next_piece(rows: usize, part: usize, target: usize) -> Range<usize> {
-    let each = rows.div_ceil(rows.div_ceil(target.max(1)).max(1));
+    let each = rows.div_ceil(parts(rows, target));
     let upto = part.saturating_add(each).min(rows);
     part.min(upto)..upto
 }
 
-/// How many morsels a row group of `rows` rows is cut into.
+/// How many morsels a row group of `rows` rows is cut into, which is one when `target` is zero.
 fn parts(rows: usize, target: usize) -> usize {
-    rows.div_ceil(target.max(1)).max(1)
+    if target == 0 {
+        return 1;
+    }
+    rows.div_ceil(target).max(1)
 }
 
 /// How many rows the row group at `at` holds, or none if it is not a group this file has.
@@ -527,13 +555,13 @@ fn group_rows(reader: &Reader, at: usize) -> usize {
 }
 
 /// How many morsels a whole file comes to, which is what [`Source::morsels`] answers with.
-fn pieces(reader: &FileReader) -> usize {
+fn pieces(reader: &FileReader, target: usize) -> usize {
     let FileReader::Parquet(reader) = reader else { return 1 };
     reader
         .metadata()
         .row_groups
         .iter()
-        .map(|group| parts(usize::try_from(group.rows).unwrap_or(usize::MAX), MORSEL_ROWS))
+        .map(|group| parts(usize::try_from(group.rows).unwrap_or(usize::MAX), target))
         .sum::<usize>()
         .max(1)
 }
@@ -557,6 +585,11 @@ struct Cutting {
     /// cutting sits inside a group as well as between them. Zero whenever the next morsel starts a
     /// group, which is every morsel of a file whose groups are small.
     part: usize,
+    /// How many rows one morsel of a row group of this file covers, or zero for whole row groups.
+    ///
+    /// Worked out once when the file is opened, from the page size the writer chose, because a
+    /// morsel cannot start inside a page without paying for that page twice.
+    cut: usize,
     /// How many morsels the whole of the file being cut comes to.
     ///
     /// Worked out once when the file is opened, because [`Source::morsels`] is asked before any of
@@ -640,6 +673,7 @@ impl FileScan {
                 group: 0,
                 groups: 0,
                 part: 0,
+                cut: 0,
                 pieces: 1,
                 skipping: Vec::new(),
                 skipped: 0,
@@ -677,6 +711,7 @@ impl FileScan {
         cutting.group = 0;
         cutting.groups = 0;
         cutting.part = 0;
+        cutting.cut = 0;
         cutting.pieces = 1;
         cutting.skipping = Vec::new();
         let Some(path) = self.paths.get(cutting.at) else { return Ok(()) };
@@ -686,7 +721,8 @@ impl FileScan {
         reader.project(&held)?;
         reader.settle(&self.wanted)?;
         cutting.groups = reader.row_groups();
-        cutting.pieces = pieces(&reader);
+        cutting.cut = morsel_rows(&reader);
+        cutting.pieces = pieces(&reader, cutting.cut);
         cutting.skipping = self
             .tests
             .iter()
@@ -726,7 +762,7 @@ impl FileScan {
             Some(FileReader::Parquet(reader)) if cutting.group < cutting.groups => {
                 let at = cutting.group;
                 let rows = group_rows(reader, at);
-                let piece = next_piece(rows, cutting.part, MORSEL_ROWS);
+                let piece = next_piece(rows, cutting.part, cutting.cut);
                 let split = reader.split_rows(at, piece.clone())?;
                 if piece.end >= rows {
                     cutting.group += 1;
@@ -1465,5 +1501,16 @@ mod tests {
     fn an_empty_row_group_is_no_morsels() {
         assert!(next_piece(0, 0, 32_768).is_empty());
         assert_eq!(cutting(0, 32_768), Vec::new());
+        assert_eq!(cutting(0, 0), Vec::new());
+    }
+
+    /// A file whose pages are as long as its row groups, which is every file DuckDB writes. The cut
+    /// is turned off rather than made small, because a morsel that starts inside a page decodes that
+    /// page whole and then throws most of it away.
+    #[test]
+    fn a_row_group_that_is_not_worth_cutting_is_one_morsel() {
+        assert_eq!(cutting(123_554, 0), vec![0..123_554]);
+        assert_eq!(parts(123_554, 0), 1);
+        assert_eq!(parts(0, 0), 1);
     }
 }
