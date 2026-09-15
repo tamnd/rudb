@@ -967,6 +967,21 @@ struct Cursor {
     /// stays empty on a column of strings that is not dictionary encoded, and `arena.rs` is what
     /// gets a run back to that column.
     spare: Vec<u8>,
+
+    /// The buffer the compressed bytes of a page are read into, kept from page to page.
+    ///
+    /// The counterpart to `spare`, for the other end of the same page. A read needs somewhere
+    /// initialised to read into, because the only way to hand a file a place to put bytes without
+    /// unsafe code is to hand it a slice that already exists, and a freshly allocated one has to be
+    /// written before it can be a slice. So every page was zeroing a few hundred kilobytes and then
+    /// reading over every byte of what it had just zeroed. On a ten column scan of `hits` that was
+    /// twenty three million instructions and a fifth of every conditional branch in the program.
+    ///
+    /// Kept at the high water mark of every page that has been through it and never cut back, so a
+    /// page that fits inside it is read with nothing zeroed at all and one that does not only zeroes
+    /// what it added. That is why the length is not the length of the page, and why the callers take
+    /// the page's own byte count of it rather than the whole thing.
+    encoded: Vec<u8>,
 }
 
 impl Cursor {
@@ -994,6 +1009,7 @@ impl Cursor {
             row: 0,
             bytes_read: 0,
             spare: Vec::new(),
+            encoded: Vec::new(),
         }
     }
 
@@ -1021,6 +1037,7 @@ impl Cursor {
             row: 0,
             bytes_read: 0,
             spare: Vec::new(),
+            encoded: Vec::new(),
         }
     }
 
@@ -1043,10 +1060,10 @@ impl Cursor {
             let read = Timing::start(Stage::Read);
             let encoded = self.read_page(file);
             read.stop(
-                encoded.as_ref().map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+                encoded.as_ref().map_or(0, |(_, total)| u64::try_from(*total).unwrap_or(u64::MAX)),
             );
-            let encoded = encoded?;
-            let mut pages = Pages::new(&encoded, self.codec, self.left);
+            let (encoded, total) = encoded?;
+            let mut pages = Pages::new(&encoded[..total], self.codec, self.left);
             pages.recycle(std::mem::take(&mut self.spare));
             let mut page = pages.next().transpose()?.ok_or_else(|| {
                 Error::io(format!(
@@ -1055,6 +1072,8 @@ impl Cursor {
                 ))
             })?;
             let consumed = pages.position();
+            drop(pages);
+            self.recycle(encoded);
             self.at = self.at.saturating_add(consumed);
             if matches!(page.header.body, Body::Index) {
                 continue;
@@ -1179,7 +1198,7 @@ impl Cursor {
             return Ok(());
         }
         let encoded = self.body(file, prefix, total)?;
-        let mut pages = Pages::new(&encoded, self.codec, self.left);
+        let mut pages = Pages::new(&encoded[..total], self.codec, self.left);
         let mut page = pages.next().transpose()?.ok_or_else(|| {
             Error::io(format!("the dictionary page of column {} is empty", self.column.name))
         })?;
@@ -1187,6 +1206,8 @@ impl Cursor {
         let timing = Timing::start(Stage::Dictionary);
         let built = page.decode_dictionary(&self.column);
         timing.stop(bytes);
+        drop(pages);
+        self.recycle(encoded);
         self.hold_dictionary(claim, Arc::new(built?));
         self.at = self.at.saturating_add(total);
         Ok(())
@@ -1266,7 +1287,7 @@ impl Cursor {
                 next += 1;
             }
             let encoded = self.body(file, prefix, total)?;
-            let mut pages = Pages::new(&encoded, self.codec, self.left);
+            let mut pages = Pages::new(&encoded[..total], self.codec, self.left);
             let mut page = pages.next().transpose()?.ok_or_else(|| {
                 Error::io(format!("a data page of column {} is empty", self.column.name))
             })?;
@@ -1274,6 +1295,8 @@ impl Cursor {
             let timing = Timing::start(Stage::Decode);
             let decoded = page.decode_at(&self.column, self.dictionary.as_ref(), &indices);
             timing.stop(bytes);
+            drop(pages);
+            self.recycle(encoded);
             out.extend(decoded?.iter());
             self.at = self.at.saturating_add(total);
             self.row = end;
@@ -1283,9 +1306,12 @@ impl Cursor {
     }
 
     /// Reads exactly one encoded page, discovering its variable-width header with bounded probes.
-    fn read_page(&mut self, file: &dyn File) -> Result<Vec<u8>> {
+    ///
+    /// The page is the first `total` bytes of the buffer that comes back rather than all of it, and
+    /// `total` is the second half of the answer for that reason.
+    fn read_page(&mut self, file: &dyn File) -> Result<(Vec<u8>, usize)> {
         let (prefix, _, _, total) = self.peek(file)?;
-        self.body(file, prefix, total)
+        Ok((self.body(file, prefix, total)?, total))
     }
 
     /// The header of the page the cursor is sitting on, without reading its body.
@@ -1330,17 +1356,29 @@ impl Cursor {
 
     /// The whole page, given the prefix a [`Self::peek`] already read.
     fn body(&mut self, file: &dyn File, prefix: Vec<u8>, total: usize) -> Result<Vec<u8>> {
-        let mut encoded = Vec::with_capacity(total);
-        encoded.extend_from_slice(&prefix[..prefix.len().min(total)]);
+        let mut encoded = std::mem::take(&mut self.encoded);
+        // Grown to the page and never cut back to it, so the zeroing is over what this page added to
+        // the high water mark and not over the page. The bytes above `total` are whatever the last
+        // page left there and no caller looks at them, because every caller of this takes `total` of
+        // what comes back.
         if encoded.len() < total {
-            let old = encoded.len();
             encoded.resize(total, 0);
-            file.read_exact_at(self.start + self.at as u64 + old as u64, &mut encoded[old..])?;
-        } else {
-            encoded.truncate(total);
+        }
+        let head = prefix.len().min(total);
+        encoded[..head].copy_from_slice(&prefix[..head]);
+        if head < total {
+            let at = self.start + self.at as u64 + head as u64;
+            file.read_exact_at(at, &mut encoded[head..total])?;
         }
         self.bytes_read = self.bytes_read.saturating_add(total as u64);
         Ok(encoded)
+    }
+
+    /// Takes the page buffer back so that the next page is read into it rather than into a new one.
+    fn recycle(&mut self, encoded: Vec<u8>) {
+        if encoded.len() > self.encoded.len() {
+            self.encoded = encoded;
+        }
     }
 }
 
@@ -1368,6 +1406,64 @@ mod tests {
     use rudb_vector::Vector;
 
     use super::Cursor;
+
+    /// A file that is the bytes it was built from, so that a read can be checked without a disk.
+    #[derive(Debug)]
+    struct Bytes(Vec<u8>);
+
+    impl rudb_io::File for Bytes {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> rudb_common::Result<usize> {
+            let at = usize::try_from(offset).expect("an offset inside a test file");
+            let take = buf.len().min(self.0.len().saturating_sub(at));
+            buf[..take].copy_from_slice(&self.0[at..at + take]);
+            Ok(take)
+        }
+
+        fn write_at(&self, _offset: u64, _data: &[u8]) -> rudb_common::Result<()> {
+            unimplemented!("the test file is read only")
+        }
+
+        fn sync(&self) -> rudb_common::Result<()> {
+            Ok(())
+        }
+
+        fn truncate(&self, _len: u64) -> rudb_common::Result<()> {
+            unimplemented!("the test file is read only")
+        }
+
+        fn len(&self) -> rudb_common::Result<u64> {
+            Ok(self.0.len() as u64)
+        }
+    }
+
+    /// The buffer a page is read into is kept from page to page and is only ever grown, so a short
+    /// page after a long one sits in front of the long one's bytes. Nothing may see those bytes.
+    #[test]
+    fn a_short_page_after_a_long_one_does_not_read_the_long_one_s_tail() {
+        let file = Bytes((0..200u8).collect());
+        let mut cursor = Cursor::decoded(Vec::new());
+        cursor.start = 0;
+
+        cursor.at = 0;
+        let long = cursor.body(&file, Vec::new(), 100).expect("reads the long page");
+        assert_eq!(&long[..100], &(0..100u8).collect::<Vec<_>>(), "the long page is its own bytes");
+        cursor.recycle(long);
+
+        cursor.at = 100;
+        let short = cursor.body(&file, Vec::new(), 10).expect("reads the short page");
+        assert_eq!(
+            &short[..10],
+            &(100..110u8).collect::<Vec<_>>(),
+            "the short page is its own bytes and not the ones left behind"
+        );
+        assert!(short.len() >= 100, "and the buffer kept its high water mark");
+        cursor.recycle(short);
+
+        // The prefix a header probe already read counts against the page and is not read again.
+        cursor.at = 100;
+        let mixed = cursor.body(&file, vec![9, 9, 9], 6).expect("reads the page with a prefix");
+        assert_eq!(&mixed[..6], &[9, 9, 9, 103, 104, 105], "the prefix sits in front of the read");
+    }
 
     fn ints(values: &[i32]) -> Vector {
         let values: Vec<Value> = values.iter().map(|&v| Value::Integer(v)).collect();
