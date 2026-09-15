@@ -810,6 +810,61 @@ fn the_strategies_table_hands_back_the_columns_it_was_asked_for() {
 }
 
 #[test]
+fn the_keywords_table_is_the_generated_grammar_table_and_not_a_transcription() {
+    // 505 rows over 499 words, which is the number the pinned binary returns and the number the
+    // categories add up to: 75 reserved, 339 unreserved, 55 column name and 36 type function. It is
+    // not 514, which is how many entries the generated table has, because fifteen of them are words
+    // the grammar spells directly in some rule and so are in no keyword class at all.
+    let rows = run("TableFunction duckdb_keywords args=[] #0 [keyword_name::VARCHAR, \
+         keyword_category::VARCHAR]");
+    assert_eq!(rows.len(), 505);
+    let mut words: Vec<&Value> = rows.iter().map(|row| &row[0]).collect();
+    words.dedup();
+    assert_eq!(words.len(), 499);
+    let mut counted = std::collections::BTreeMap::new();
+    for row in &rows {
+        let Value::Varchar(category) = &row[1] else { panic!("a category") };
+        *counted.entry(category.clone()).or_insert(0) += 1;
+    }
+    let counted: Vec<(&str, usize)> =
+        counted.iter().map(|(name, count)| (name.as_str(), *count)).collect();
+    assert_eq!(
+        counted,
+        [("column_name", 55), ("reserved", 75), ("type_function", 36), ("unreserved", 339)]
+    );
+}
+
+#[test]
+fn the_six_words_in_two_classes_at_once_get_a_row_each() {
+    // The grammar has five keyword rules and they are not disjoint, and DuckDB reports PostgreSQL's
+    // four categories where `type_function` is the one it spells as two rules. Six words are in the
+    // column name class and in the type function class, so each of them is two rows, and a table
+    // that collapsed them would be six rows short of the binary it is meant to match.
+    let rows = run("TableFunction duckdb_keywords args=[] #0 [keyword_name::VARCHAR, \
+         keyword_category::VARCHAR]");
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for row in &rows {
+        let Value::Varchar(word) = &row[0] else { panic!("a keyword name") };
+        *seen.entry(word.clone()).or_insert(0) += 1;
+    }
+    let twice: Vec<&str> =
+        seen.iter().filter(|(_, count)| **count > 1).map(|(word, _)| word.as_str()).collect();
+    assert_eq!(twice, ["columns", "generated", "map", "struct", "try_cast", "tuple"]);
+}
+
+#[test]
+fn a_metadata_table_hands_back_the_columns_it_was_asked_for_in_the_order_asked() {
+    // The same requirement as the strategies table and checked on a second one, because the
+    // resolution by name now lives in one place and a regression there would be silent: every one of
+    // these tables would answer with the right column names over the wrong column values.
+    let rows = run("TableFunction duckdb_keywords args=[] #0 [keyword_category::VARCHAR, \
+         keyword_name::VARCHAR]");
+    let first = rows.first().expect("at least one keyword");
+    assert_eq!(first[0], text("unreserved"), "the category column, not the first of the table");
+    assert_eq!(first[1], text("abort"));
+}
+
+#[test]
 fn the_ids_the_builder_tags_its_counters_with_are_the_ones_the_plan_says() {
     // The point of the numbering living in `rudb-plan` is that `EXPLAIN` can print an operator's id
     // without building the operator. That only holds if what gets built agrees, so this checks the
