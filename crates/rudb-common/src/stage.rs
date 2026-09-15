@@ -1,10 +1,17 @@
-//! Where a scan's time went, split by the stage of the read that spent it.
+//! Where an operator's time went, split by the phase inside it that spent it.
 //!
 //! A ClickBench run says the file scan is more than half of everything the engine charges, and one
 //! number for a scan is not a number anybody can act on. A scan reads bytes off a file, hands them
 //! to a codec, decodes a page into values, builds a dictionary and copies pieces of pages into the
 //! chunk an operator sees. Those are five different pieces of code with five different fixes, and
 //! working on any of them without knowing which one holds the time is guessing.
+//!
+//! A grouped aggregate is the same story. It folds rows into a hash table, splits that table across
+//! radix partitions, merges one instance's table into another and turns the finished tables into
+//! rows, and on ClickBench at a million rows the last two are a third of the query and neither of
+//! them showed up anywhere. The threads that do them are started by the aggregate rather than taken
+//! from the pool, so their CPU reaches neither the pipeline counters nor the worker total, and the
+//! only trace they left was wall time nobody could account for.
 //!
 //! This is [`crate::slow`] with a clock instead of a count, and it is here for the same reason that
 //! one is here. The stages happen in `rudb-parquet` at rank 5, the thing that has to say which
@@ -23,10 +30,16 @@
 use std::cell::Cell;
 use std::time::Instant;
 
-/// A stage of reading a column, in the order the bytes go through them.
+/// A named phase inside one operator, small enough that knowing it holds the time says what to fix.
 ///
-/// Not exhaustive because a format this does not read yet has stages this list does not name, and a
-/// reader added later should be able to say where its time went without every match on this
+/// The first five are the stages of reading a column, in the order the bytes go through them. The
+/// rest are the phases of a grouped aggregate, which needs the same split for the same reason: one
+/// number for an aggregate says it is slow and nothing about which of folding rows, splitting a
+/// table by radix bits, merging one instance's table into another or turning a finished table into
+/// rows is the part that is slow.
+///
+/// Not exhaustive because an operator this does not measure yet has phases this list does not name,
+/// and one added later should be able to say where its time went without every match on this
 /// breaking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -41,15 +54,32 @@ pub enum Stage {
     Dictionary,
     /// Cutting pages to the chunk boundary and putting the columns side by side.
     Assemble,
+    /// Folding a chunk of rows into a hash table, which is the probe and the accumulator update.
+    Fold,
+    /// Splitting a table across the radix partitions, or folding rows straight into them.
+    Scatter,
+    /// Folding one instance's table into another, one probe per group rather than per row.
+    Merge,
+    /// Turning a finished table into the chunks it answers for.
+    Emit,
 }
 
 /// How many stages there are, which is how wide a [`Spent`] is.
-const STAGES: usize = 5;
+const STAGES: usize = 9;
 
 impl Stage {
-    /// Every stage, in the order the bytes go through them.
-    pub const ALL: [Self; STAGES] =
-        [Self::Read, Self::Decompress, Self::Decode, Self::Dictionary, Self::Assemble];
+    /// Every stage, in the order the work goes through them.
+    pub const ALL: [Self; STAGES] = [
+        Self::Read,
+        Self::Decompress,
+        Self::Decode,
+        Self::Dictionary,
+        Self::Assemble,
+        Self::Fold,
+        Self::Scatter,
+        Self::Merge,
+        Self::Emit,
+    ];
 
     /// The name in the document and in the report.
     #[must_use]
@@ -60,6 +90,10 @@ impl Stage {
             Self::Decode => "decode",
             Self::Dictionary => "dictionary",
             Self::Assemble => "assemble",
+            Self::Fold => "fold",
+            Self::Scatter => "scatter",
+            Self::Merge => "merge",
+            Self::Emit => "emit",
         }
     }
 
@@ -72,6 +106,10 @@ impl Stage {
             Self::Decode => 2,
             Self::Dictionary => 3,
             Self::Assemble => 4,
+            Self::Fold => 5,
+            Self::Scatter => 6,
+            Self::Merge => 7,
+            Self::Emit => 8,
         }
     }
 }
@@ -183,6 +221,25 @@ pub fn took(stage: Stage, nanos: u64, bytes: u64) {
         let mut now = spent.get();
         now.add(Spent::of(stage, nanos, bytes));
         spent.set(now);
+    });
+}
+
+/// Adds what another thread spent to this thread's total.
+///
+/// For work an operator hands to threads of its own rather than to the pool. The instrumentation
+/// shim takes its reading on the thread that called the operator, so a thread the operator started
+/// is invisible to it, and the aggregate's finalize is exactly that: it closes sixteen partitions
+/// on threads it scopes itself and then joins them. Each of those threads reads its own total when
+/// it finishes and the one that started them adds the readings here, so the phases come out against
+/// the operator that did them and nothing is lost.
+///
+/// The time is a sum over threads and not an elapsed time, the same as every other stage number,
+/// because that is the one that compares against the CPU an operator charged.
+pub fn gained(spent: Spent) {
+    SPENT.with(|slot| {
+        let mut now = slot.get();
+        now.add(spent);
+        slot.set(now);
     });
 }
 

@@ -24,7 +24,9 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
-use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
+use rudb_common::{
+    Error, Field, LogicalType, Memory, Reservation, Result, Spent, Stage, Value, stage,
+};
 use rudb_kernels::{Accumulator, NOWHERE, is_true, update_scattered};
 use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
@@ -419,7 +421,10 @@ impl<'a> Aggregate<'a> {
             self.merge(carried, &mut local)?;
         }
         while let Some(rows) = spilled.next(self)? {
-            self.fold(&rows, &mut local, None)?;
+            let timing = stage::Timing::start(Stage::Fold);
+            let folded = self.fold(&rows, &mut local, None);
+            timing.stop(0);
+            folded?;
         }
         self.finish(local, chunks, held)
     }
@@ -671,6 +676,19 @@ impl<'a> Aggregate<'a> {
         chunks: &mut Vec<Chunk>,
         held: &mut Reservation,
     ) -> Result<Option<Spill>> {
+        let timing = stage::Timing::start(Stage::Emit);
+        let finished = self.finishing(local, chunks, held);
+        timing.stop(0);
+        finished
+    }
+
+    /// [`Aggregate::finish`] with the clock taken off it, so that the clock wraps all of it.
+    fn finishing(
+        &self,
+        local: Building,
+        chunks: &mut Vec<Chunk>,
+        held: &mut Reservation,
+    ) -> Result<Option<Spill>> {
         let Building {
             mut scratch,
             mut containers,
@@ -815,6 +833,14 @@ impl<'a> Aggregate<'a> {
     /// [`rudb_common::ErrorCode::NotImplemented`] for that one. Whatever the probe, the insert or
     /// an accumulator merge reports otherwise.
     fn merge(&self, from: Building, into: &mut Building) -> Result<()> {
+        let timing = stage::Timing::start(Stage::Merge);
+        let merged = self.merging(from, into);
+        timing.stop(0);
+        merged
+    }
+
+    /// [`Aggregate::merge`] with the clock taken off it, so that the clock wraps all of it.
+    fn merging(&self, from: Building, into: &mut Building) -> Result<()> {
         if from.over.is_some() || into.over.is_some() {
             return Err(Error::internal(
                 "two tables of an aggregate were merged with a spill file between them, where a \
@@ -944,6 +970,14 @@ impl<'a> Aggregate<'a> {
     /// every key it does not hold, and a group put in the table here would then be finished once out
     /// of the table and once out of the file.
     fn scatter(&self, from: Building, spin: usize) -> Result<()> {
+        let timing = stage::Timing::start(Stage::Scatter);
+        let scattered = self.scattering(from, spin);
+        timing.stop(0);
+        scattered
+    }
+
+    /// [`Aggregate::scatter`] with the clock taken off it, so that the clock wraps all of it.
+    fn scattering(&self, from: Building, spin: usize) -> Result<()> {
         debug_assert!(from.over.is_none(), "a spill file is drained by hand_over, not scattered");
         let Building {
             scratch,
@@ -1309,6 +1343,22 @@ impl<'a> Aggregate<'a> {
         spreading: &mut Spreading,
         own: &mut [Option<Building>],
     ) -> Result<()> {
+        // Timed here rather than around each `fold` below, because there are sixteen of those to a
+        // chunk and a pair of clock readings on each of them would be a measurable share of what
+        // they measure. One reading a chunk is the granularity rule the stage clock is written to.
+        let timing = stage::Timing::start(Stage::Fold);
+        let spread = self.spreading_own(rows, spreading, own);
+        timing.stop(0);
+        spread
+    }
+
+    /// [`Aggregate::spread_own`] with the clock taken off it, so that the clock wraps all of it.
+    fn spreading_own(
+        &self,
+        rows: &Rows,
+        spreading: &mut Spreading,
+        own: &mut [Option<Building>],
+    ) -> Result<()> {
         let ready = self.split(rows, spreading)?;
         for (partition, selected) in ready.iter().enumerate() {
             let Some(selected) = selected else { continue };
@@ -1328,6 +1378,14 @@ impl<'a> Aggregate<'a> {
     /// set groups aside from. And nobody else can be folding into the destination, so there is no
     /// rotating start and no second sweep.
     fn scatter_own(&self, from: Building, own: &mut [Option<Building>]) -> Result<()> {
+        let timing = stage::Timing::start(Stage::Scatter);
+        let scattered = self.scattering_own(from, own);
+        timing.stop(0);
+        scattered
+    }
+
+    /// [`Aggregate::scatter_own`] with the clock taken off it, so that the clock wraps all of it.
+    fn scattering_own(&self, from: Building, own: &mut [Option<Building>]) -> Result<()> {
         debug_assert!(from.over.is_none(), "a spilled table is never scattered locally");
         let Building {
             scratch,
@@ -1393,6 +1451,17 @@ impl<'a> Aggregate<'a> {
     /// every instance asked for partition zero first and thirty two threads queued behind one lock
     /// before doing any work at all.
     fn spread(&self, rows: &Rows, spreading: &mut Spreading) -> Result<()> {
+        // Timed as a whole for the reason [`Aggregate::spread_own`] gives, and the lock waits in
+        // here are part of what it is worth timing: this is the shared path, so a chunk that spent
+        // its time waiting for a partition spent it inside this clock.
+        let timing = stage::Timing::start(Stage::Fold);
+        let spread = self.spreading(rows, spreading);
+        timing.stop(0);
+        spread
+    }
+
+    /// [`Aggregate::spread`] with the clock taken off it, so that the clock wraps all of it.
+    fn spreading(&self, rows: &Rows, spreading: &mut Spreading) -> Result<()> {
         let ready = self.split(rows, spreading)?;
         let Spreading { keyed, spin, waiting, .. } = spreading;
         let spin = &*spin;
@@ -1899,7 +1968,10 @@ impl Sink for Aggregate<'_> {
             if let Some(error) = table.failure.take() {
                 return Err(error);
             }
-            self.fold(&rows, table, None)?;
+            let timing = stage::Timing::start(Stage::Fold);
+            let folded = self.fold(&rows, table, None);
+            timing.stop(0);
+            folded?;
             if !self.ought_to_partition(table) {
                 return Ok(Progress::More);
             }
@@ -2033,22 +2105,41 @@ impl Aggregate<'_> {
     /// this safe to do at all: the rows come out in the order the one thread put them in. A thread
     /// that panics leaves its slot empty, and an empty slot is reported rather than silently
     /// dropping a partition.
+    ///
+    /// Each of these threads hands its stage clock back on the way out and the thread that started
+    /// them adds the readings to its own, so that merging and emitting are charged to the aggregate
+    /// that did them. Without it they are charged to nobody: the instrumentation shim reads the
+    /// clock on the thread that called `finalize`, these are not that thread, and they are not pool
+    /// workers either, so their CPU misses the worker total as well. On ClickBench at a million rows
+    /// that was a third of a `GROUP BY URL` sitting in wall time with no counter anywhere to say
+    /// what it was.
     fn close_together(&self, degree: usize) -> Result<Vec<Result<Part>>> {
         let next = AtomicUsize::new(0);
         let slots: Vec<Mutex<Option<Result<Part>>>> =
             (0..self.merged.len()).map(|_| Mutex::new(None)).collect();
+        let mut theirs = Spent::none();
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(degree - 1);
             for _ in 1..degree {
-                handles.push(scope.spawn(|| self.closing(&next, &slots)));
+                handles.push(scope.spawn(|| {
+                    self.closing(&next, &slots);
+                    // The whole of this thread's reading rather than a difference, because the
+                    // thread was made a line ago and has spent nothing else.
+                    stage::here()
+                }));
             }
             // The thread that asked finishes partitions too rather than waiting on the ones it
             // started, for the reason the parallel driver gives for doing the same.
             self.closing(&next, &slots);
             for handle in handles {
-                drop(handle.join());
+                // A thread that panicked closed no partition, which the empty slot reports below.
+                // It also has no reading to add, and losing it matters less than the panic does.
+                if let Ok(spent) = handle.join() {
+                    theirs.add(spent);
+                }
             }
         });
+        stage::gained(theirs);
         let mut closed = Vec::with_capacity(slots.len());
         for (at, slot) in slots.into_iter().enumerate() {
             closed.push(slot.into_inner().map_err(poisoned)?.unwrap_or_else(|| {

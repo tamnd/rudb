@@ -86,13 +86,24 @@ fn a_file_scan_says_which_stage_of_the_read_its_time_went_to() {
         scan.stages.total(),
         scan.wall_ns
     );
-    // Only the scan reads, so nothing else in the query is allowed to be carrying a split.
+    // Only the scan reads. Other operators do report stages, because an aggregate says which of its
+    // phases took its time on the same clock, but none of them is allowed to be carrying a stage of
+    // a read it did not do.
+    let reading =
+        [Stage::Read, Stage::Decompress, Stage::Decode, Stage::Dictionary, Stage::Assemble];
     for operator in &metrics.operators {
-        assert!(
-            operator.kind == "FileScan" || operator.stages.is_empty(),
-            "{} reported stages of a read it did not do",
-            operator.kind
-        );
+        if operator.kind == "FileScan" {
+            continue;
+        }
+        for stage in reading {
+            assert_eq!(
+                operator.stages.nanos(stage),
+                0,
+                "{} reported the {} stage of a read it did not do",
+                operator.kind,
+                stage.name()
+            );
+        }
     }
 }
 
