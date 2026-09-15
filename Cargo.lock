@@ -139,6 +139,7 @@ dependencies = [
  "rudb-kernels",
  "rudb-metrics",
  "rudb-parquet",
+ "rudb-parse",
  "rudb-pipeline",
  "rudb-plan",
  "rudb-seam",
@@ -165,6 +166,7 @@ dependencies = [
  "rudb-ir",
  "rudb-kernels",
  "rudb-parquet",
+ "rudb-parse",
  "rudb-vector",
 ]
 
