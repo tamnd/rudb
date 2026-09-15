@@ -16,6 +16,7 @@
 pub mod bitpack;
 pub mod chooser;
 pub mod integer;
+mod lz;
 pub mod multi;
 mod reader;
 pub mod sketch;
