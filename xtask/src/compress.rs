@@ -26,6 +26,24 @@
 //! of a ClickBench `hits.parquet`, committed as `crates/rudb-compress/tests/data/hits-page.snappy`
 //! and read back compressed, and it is the row to watch when a change to the decoder is meant to
 //! show up in a query.
+//!
+//! # And it has to be a page of the size the query waits on
+//!
+//! The committed page is fifteen kilobytes, and for a while this table said it decompressed at 2859
+//! MiB/s while the decompress stage of the query that reads those pages said 786 MB/s. Rule ten
+//! says the micro number and the end to end number it explains have to agree, and 3.6 times apart
+//! is not agreeing.
+//!
+//! The reason is the page size and not the element mix. A ClickBench string column is one
+//! `DATA_PAGE` per row group per column chunk: `URL` in `hits-1m-snappy.parquet` is `PLAIN`, 4.6
+//! megabytes compressed and 10.5 uncompressed, and nine of those are the whole column. At fifteen
+//! kilobytes every byte a copy reaches back to is in L1. At ten megabytes 78 percent of the copies
+//! reach back between one and sixty four kilobytes, which is L2 at best, and the rate is what it
+//! really is. Pointed at a real `URL` page with `--page`, this table reads 1739 MiB/s and the query
+//! that reads nine of them reads 1769, which is the agreement rule ten was asking for.
+//!
+//! A 4.6 megabyte fixture is not going in the repository, so `--page PATH` is how that row is
+//! taken. Anyone with a Parquet file can cut one out of it and get the honest number.
 
 use std::path::{Path, PathBuf};
 
@@ -278,6 +296,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     println!("    decompress stage of a FileScan, which `rudb --metrics` prints per operator.");
     println!("    The hits.parquet row is the one that tracks it. The generated rows are two to");
     println!("    ten times faster than any real page and are here to say which loop moved.");
+    println!("  the committed page is fifteen kilobytes and the pages a ClickBench query waits on");
+    println!("    are ten megabytes, one per row group per string column. Those do not decompress");
+    println!("    at the same rate. Pass --page PATH with a real one to get the row that agrees");
+    println!("    with the query.");
     Ok(())
 }
 
