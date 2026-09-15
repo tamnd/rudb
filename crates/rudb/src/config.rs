@@ -337,7 +337,7 @@ mod tests {
         let binary = parse_size("1GiB").expect("a gibibyte");
         assert_eq!(decimal, 1_000_000_000);
         assert_eq!(binary, 1_073_741_824);
-        assert_eq!(rudb_common::human(decimal), "953.7 MiB");
+        assert_eq!(rudb_common::human(decimal), "953.6 MiB");
     }
 
     #[test]

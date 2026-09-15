@@ -273,6 +273,16 @@ impl Binder<'_> {
             let named = self.plan().expr_type(bound[0]).to_string();
             return Ok(self.plan_mut().add_constant(Value::Varchar(named)));
         }
+        // `current_setting` is the other one the binder answers, and it has to be answered here
+        // rather than by a kernel for a reason `typeof` does not have: its declared return type is
+        // ANY, so there is no type for a plan to carry until the name is read. Upstream folds it
+        // too, which an `EXPLAIN` of a query that calls it shows. A call this cannot fold falls
+        // through to the table, which refuses it in upstream's words.
+        if rudb_catalog::same_name(&written, "current_setting") && bound.len() == 1 {
+            if let Some(folded) = self.setting(bound[0])? {
+                return Ok(folded);
+            }
+        }
         self.call(&written, bound)
     }
 
@@ -381,6 +391,36 @@ impl Binder<'_> {
         let args = self.plan_mut().add_expr_list(&cast);
         let name = self.plan_mut().intern(resolved.name);
         Ok(self.plan_mut().add_expr(Expr::Function { name, args }, returns))
+    }
+
+    /// The value of the setting a constant names, folded into the plan.
+    ///
+    /// `None` for an argument that is not a constant string, which is the one case the fold cannot
+    /// cover and the one case upstream refuses. The caller falls through to the signature table for
+    /// it, so the sentence about it is written once and next to the declared overload it is about.
+    ///
+    /// The type is the setting's `input_type` and not the shape of the text that came back, which
+    /// is what makes `typeof(current_setting('threads'))` BIGINT on both engines while
+    /// `typeof(current_setting('memory_limit'))` is VARCHAR. A session with no answer for a name the
+    /// catalog knows is a caller that bound without a database behind it, and that is the same
+    /// answer as a name nobody has, since neither one can be read.
+    fn setting(&mut self, argument: ExprRef) -> Result<Option<ExprRef>> {
+        let Expr::Constant(held) = *self.plan().expr(argument) else { return Ok(None) };
+        let Value::Varchar(name) = self.plan().value(held) else { return Ok(None) };
+        let name = name.clone();
+        let known = rudb_functions::setting_named(&name)
+            .ok_or_else(|| Error::catalog(rudb_functions::unknown_setting(&name)))?;
+        let text = self
+            .session
+            .get(known.name)
+            .ok_or_else(|| Error::catalog(rudb_functions::unknown_setting(&name)))?;
+        let value = match known.input_type {
+            "BIGINT" => Value::BigInt(text.parse().map_err(|_| {
+                Error::internal(format!("{} is set to {text}, which is not a number", known.name))
+            })?),
+            _ => Value::Varchar(text.to_string()),
+        };
+        Ok(Some(self.plan_mut().add_constant(value)))
     }
 
     /// The answer type of a `date_part`, which is the one call whose type comes from the value of
