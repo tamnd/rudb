@@ -1,10 +1,10 @@
 //! A table whose rows are a fact about the engine rather than data somebody stored.
 //!
-//! `rudb_strategies()` was the first of these and `duckdb_keywords()` is the second, and D2 has
-//! about a dozen more in it: the settings, the types, the functions, the schemas, the tables, the
-//! columns, the views, the databases, the extensions and the optimizer passes. Every one of them is
-//! the same operator with a different list of rows behind it, so the operator is here once and each
-//! table is the function that builds its rows.
+//! `rudb_strategies()` was the first of these, `duckdb_keywords()` the second and `duckdb_types()`
+//! the third, and D2 has about ten more in it: the settings, the functions, the schemas, the tables,
+//! the columns, the views, the databases, the extensions and the optimizer passes. Every one of them
+//! is the same operator with a different list of rows behind it, so the operator is here once and
+//! each table is the function that builds its rows.
 //!
 //! What the operator does is the part that is easy to get subtly wrong twelve times. The plan's
 //! column list is resolved against the table's own by name, because the binder projects every

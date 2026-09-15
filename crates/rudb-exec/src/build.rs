@@ -72,6 +72,7 @@ use crate::source::{Dummy, FileScan, Scan, Series, Values};
 use crate::strategies::strategies;
 use crate::stream::{Filter, Limit, Project};
 use crate::topn::TopN;
+use crate::typenames::typenames;
 
 /// Builds the pipelines for a plan's root, for a query nothing will stop.
 ///
@@ -457,10 +458,13 @@ impl<'a> Building<'a, '_> {
                         Segment::new(Arc::new(Watched::new(scan, counters)), schema)
                     }
                     Some(
-                        function @ (TableFunction::RudbStrategies | TableFunction::DuckdbKeywords),
+                        function @ (TableFunction::RudbStrategies
+                        | TableFunction::DuckdbKeywords
+                        | TableFunction::DuckdbTypes),
                     ) => {
                         let table = match function {
                             TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
+                            TableFunction::DuckdbTypes => typenames(plan, index, columns)?,
                             _ => strategies(plan, index, columns)?,
                         };
                         let schema = table.schema().clone();
