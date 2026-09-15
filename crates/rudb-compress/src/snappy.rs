@@ -363,28 +363,60 @@ fn unchecked(input: &[u8], out: &mut [u8], src: &mut usize, pos: &mut usize) {
     }
 }
 
+/// What a copy element's tag byte means, with nothing left to branch on.
+///
+/// The three copy forms differ in how many offset bytes follow the tag and in where the length
+/// comes from, and asking which form a tag is costs a branch that the data cannot make predictable.
+/// A real page is 87 percent one byte offsets and 13 percent the other two, so the branch is right
+/// most of the time and wrong often enough to matter: the whole of `decompress_into` was 54 percent
+/// of the mispredicted branches in a ClickBench scan, six million of them on a file of a million
+/// rows, and a mispredict is worth about as much as the rest of an element put together.
+///
+/// So every tag byte gets an entry here and the decoder reads the four bytes after the tag whether
+/// it needs them or not, which it may because [`SLACK`] says there are sixty four bytes left. The
+/// entry says which of those four bytes are the offset, what to add to them, how long the copy is
+/// and how many bytes the element took. Two kilobytes of table, which sits in L1 next to everything
+/// else the loop touches.
+///
+/// A literal's entry is zero and is never read, because the caller has already branched on the one
+/// bit of the tag it cannot avoid branching on.
+const COPY: [u64; 256] = copy_table();
+
+/// Packs one entry of [`COPY`]: length, bytes used, what the tag contributes to the offset, and
+/// which of the four bytes after the tag the offset is.
+const fn packed(len: usize, used: usize, high: usize, mask: u64) -> u64 {
+    (len as u64) | ((used as u64) << 8) | ((high as u64) << 16) | (mask << 32)
+}
+
+/// Builds [`COPY`], which is the format's three copy forms written out once each per tag byte.
+const fn copy_table() -> [u64; 256] {
+    let mut table = [0u64; 256];
+    let mut tag = 0usize;
+    while tag < 256 {
+        table[tag] = match tag & 0b11 {
+            // One byte of offset, and three bits of it ride along in the tag. Lengths four to
+            // eleven, which is 87 percent of the copies on a real page.
+            1 => packed(4 + ((tag >> 2) & 0b111), 2, (tag >> 5) << 8, 0xff),
+            2 => packed(1 + (tag >> 2), 3, 0, 0xffff),
+            3 => packed(1 + (tag >> 2), 5, 0, 0xffff_ffff),
+            _ => 0,
+        };
+        tag += 1;
+    }
+    table
+}
+
 /// A copy element read out of a block that is known to have [`SLACK`] bytes left at `at`.
 ///
 /// The answer is its length, how far back it reaches, and how many bytes it took including the tag.
 /// Nothing is checked because nothing can fail: the widest of the three forms is five bytes.
 fn copy_of(input: &[u8], at: usize, tag: u8) -> (usize, usize, usize) {
-    match tag & 0b11 {
-        // One byte of offset, and three bits of it ride along in the tag. Lengths four to eleven,
-        // which is 87 percent of the copies on a real page.
-        1 => {
-            let offset = (usize::from(tag >> 5) << 8) | usize::from(input[at + 1]);
-            (4 + usize::from((tag >> 2) & 0b111), offset, 2)
-        }
-        2 => {
-            let offset = usize::from(u16::from_le_bytes([input[at + 1], input[at + 2]]));
-            (1 + usize::from(tag >> 2), offset, 3)
-        }
-        _ => {
-            let bytes = [input[at + 1], input[at + 2], input[at + 3], input[at + 4]];
-            let offset = u32::from_le_bytes(bytes) as usize;
-            (1 + usize::from(tag >> 2), offset, 5)
-        }
-    }
+    let entry = COPY[tag as usize];
+    let after = u32::from_le_bytes([input[at + 1], input[at + 2], input[at + 3], input[at + 4]]);
+    let len = (entry & 0xff) as usize;
+    let used = ((entry >> 8) & 0xff) as usize;
+    let offset = ((entry >> 16) & 0xffff) | (u64::from(after) & (entry >> 32));
+    (len, offset as usize, used)
 }
 
 /// Writes one copy element, whose room and whose reach the caller has already established.
