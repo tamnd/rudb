@@ -263,6 +263,23 @@ impl Reader {
     /// If the ordinals are not sorted and strictly increasing, if one of them is past the end of
     /// the file, or if a read or a decode fails.
     pub fn rows_at(&mut self, rows: &[u64]) -> Result<Chunk> {
+        use std::sync::atomic::Ordering::Relaxed;
+        for c in [&DBG_BODY, &DBG_DEC, &DBG_DICTT, &DBG_GATHER, &DBG_PAGES] { c.store(0, Relaxed); }
+        struct Dbg;
+        impl Drop for Dbg {
+            fn drop(&mut self) {
+                use std::sync::atomic::Ordering::Relaxed;
+                eprintln!(
+                    "DBG fetch pages={} body={:.1}ms decode={:.1}ms dict={:.1}ms gather={:.1}ms",
+                    DBG_PAGES.load(Relaxed),
+                    DBG_BODY.load(Relaxed) as f64 / 1e6,
+                    DBG_DEC.load(Relaxed) as f64 / 1e6,
+                    DBG_DICTT.load(Relaxed) as f64 / 1e6,
+                    DBG_GATHER.load(Relaxed) as f64 / 1e6,
+                );
+            }
+        }
+        let _dbg = Dbg;
         for pair in rows.windows(2) {
             if pair[0] >= pair[1] {
                 return Err(Error::internal(format!(
@@ -454,6 +471,12 @@ impl Reader {
         )
     }
 }
+
+static DBG_BODY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DBG_DEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DBG_DICTT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DBG_GATHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DBG_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug)]
 struct Group {
@@ -704,7 +727,10 @@ impl Cursor {
                         self.column.name
                     )));
                 }
+                let dbg0 = std::time::Instant::now();
                 let encoded = self.body(file, prefix, total)?;
+                DBG_BODY.fetch_add(dbg0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                let dbg1 = std::time::Instant::now();
                 let mut pages = Pages::new(&encoded, self.codec, self.left);
                 let mut page = pages.next().transpose()?.ok_or_else(|| {
                     Error::io(format!(
@@ -717,6 +743,7 @@ impl Cursor {
                 let built = page.decode_dictionary(&self.column);
                 timing.stop(bytes);
                 self.dictionary = Some(Arc::new(built?));
+                DBG_DICTT.fetch_add(dbg1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 self.at = self.at.saturating_add(total);
                 continue;
             }
@@ -736,7 +763,11 @@ impl Cursor {
                 indices.push(u32::try_from(wanted[next] - base).unwrap_or(u32::MAX));
                 next += 1;
             }
+            let dbg0 = std::time::Instant::now();
             let encoded = self.body(file, prefix, total)?;
+            DBG_BODY.fetch_add(dbg0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            DBG_PAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dbg1 = std::time::Instant::now();
             let mut pages = Pages::new(&encoded, self.codec, self.left);
             let mut page = pages.next().transpose()?.ok_or_else(|| {
                 Error::io(format!("a data page of column {} is empty", self.column.name))
@@ -745,7 +776,10 @@ impl Cursor {
             let timing = Timing::start(Stage::Decode);
             let decoded = page.decode(&self.column, self.dictionary.as_ref());
             timing.stop(bytes);
+            DBG_DEC.fetch_add(dbg1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            let dbg2 = std::time::Instant::now();
             out.extend(decoded?.gather(&indices)?.iter());
+            DBG_GATHER.fetch_add(dbg2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             self.at = self.at.saturating_add(total);
             self.row = end;
             self.left -= i64::from(header.values());
