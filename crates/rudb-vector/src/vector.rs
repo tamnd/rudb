@@ -1693,7 +1693,7 @@ impl Vector {
         if at == 0 && len == self.len {
             return Ok(self.clone());
         }
-        let validity = Validity::from_iter(len, |row| self.validity.is_valid(at + row));
+        let validity = self.validity.slice(at, len);
         let body = match &self.body {
             Body::Constant(value) => Body::Constant(value.clone()),
             Body::Sequence { start, step } => {
@@ -1763,14 +1763,14 @@ impl Vector {
                     .map(|child| child.slice(at, len).map(Arc::new))
                     .collect::<Result<Vec<_>>>()?,
             },
-            // The one form with nowhere to point, so its range is copied out. A gather is the
-            // right tool here and does no more than this would: a flat body has no dictionary
-            // under it for the gather to flatten.
-            Body::Flat(_) => {
-                let indices: Vec<u32> =
-                    (at..end).map(|row| u32::try_from(row).unwrap_or(u32::MAX)).collect();
-                return self.gather(&indices);
-            }
+            // The one form with nowhere to point, so its range is copied out. A run and not a
+            // gather: this used to build a vector of the positions `at..end` and hand it to
+            // `gather`, which then built a vector of `usize` from it, a vector of `bool` beside
+            // that, and read the values back one bounds checked index at a time. That is five
+            // passes and three allocations to say `memcpy`, and on a scan it was the largest thing
+            // in the program after the aggregation itself, because every chunk of every column of
+            // every page comes through here.
+            Body::Flat(data) => Body::Flat(run_of(data, at, end)),
         };
         Ok(Self { ty: self.ty.clone(), len, validity, body })
     }
@@ -2427,6 +2427,62 @@ const NOWHERE: usize = usize::MAX;
 /// A zero and not a skip, because every layout here is a parallel array to a validity mask and a
 /// short one would put every value after the first null at the wrong index. It is the same rule
 /// [`push_value`] follows for a null.
+/// A contiguous run of a flat body, copied out.
+///
+/// The counterpart to [`copy_of`] for the one case that is a range rather than a set of positions,
+/// which is what [`Vector::slice`] asks for. Every fixed width layout is one `memcpy` and the
+/// string layout is a run of views and their bytes, where `copy_of` is a bounds checked index and a
+/// null test per row.
+///
+/// The caller has already checked that `end` is inside the vector, and a body whose data is shorter
+/// than its vector claims is a bug elsewhere, so a short run is clamped rather than reported.
+fn run_of(data: &Data, at: usize, end: usize) -> Data {
+    macro_rules! run {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                Data::Empty => Data::Empty,
+                $(Data::$variant(values) => {
+                    let values = values.as_slice();
+                    let from = at.min(values.len());
+                    let to = end.max(from).min(values.len());
+                    let mut out = Buffer::with_capacity(end - at);
+                    out.extend_from_slice(&values[from..to]);
+                    // A body shorter than the rows asked for pads with the zero every layout uses
+                    // for a null, which is the answer `copy_of` gives for a position past the end.
+                    // row at a time: never runs on a vector whose data matches its length.
+                    for _ in to..end {
+                        out.push($zero);
+                    }
+                    Data::$variant(out)
+                })+
+                // A view says where its bytes are, so a run of rows is not a run of bytes and this
+                // is the one layout whose cut is still a loop. The total is known before any of it
+                // is copied, so the arena is one allocation.
+                Data::Varlen(values) => {
+                    let views = values.views();
+                    let mut out = StringColumn::with_capacity(end - at);
+                    out.reserve_bytes(
+                        views
+                            .get(at.min(views.len())..end.min(views.len()))
+                            .unwrap_or(&[])
+                            .iter()
+                            .filter(|view| !view.is_inline())
+                            .map(StringView::len)
+                            .sum(),
+                    );
+                    // row at a time: see above, the bytes of consecutive rows need not be next to
+                    // each other.
+                    for index in at..end {
+                        out.push_from(values, index);
+                    }
+                    Data::Varlen(out)
+                }
+            }
+        };
+    }
+    crate::for_each_layout!(fixed, run)
+}
+
 fn copy_of(data: &Data, at: &[usize]) -> Data {
     macro_rules! copied {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
@@ -3394,6 +3450,56 @@ mod tests {
             vector.slice(0, 3).unwrap().iter().collect::<Vec<_>>(),
             [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
         );
+    }
+
+    #[test]
+    fn cutting_a_flat_body_answers_what_gathering_the_same_rows_answers() {
+        // The cut of a flat body used to be written as a gather over the positions in the range,
+        // and it is now a run copied out, so the two have to keep saying the same thing. Every
+        // start and every length, with nulls in the range and out of it, since the validity is the
+        // half of this that changed shape.
+        let rows: Vec<i32> = (0..70).collect();
+        let valid: Vec<bool> = (0..70).map(|row| row % 7 != 0 && row % 11 != 3).collect();
+        let vector = integers(&rows).with_validity(Validity::from_run(&valid));
+        for at in 0..70usize {
+            for len in 0..=(70 - at) {
+                let cut = vector.slice(at, len).unwrap();
+                let positions: Vec<u32> = (at..at + len).map(|row| row as u32).collect();
+                let gathered = vector.gather(&positions).unwrap();
+                assert_eq!(cut.len(), len, "rows {at} to {}", at + len);
+                assert_eq!(
+                    cut.iter().collect::<Vec<_>>(),
+                    gathered.iter().collect::<Vec<_>>(),
+                    "rows {at} to {}",
+                    at + len
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cutting_a_flat_string_column_answers_what_gathering_it_answers() {
+        // The string layout is the one whose cut is still a loop, and it is also the one where a
+        // row is a view into an arena rather than a slot, so it gets the same treatment separately.
+        // Both inline and out of line strings, since they are copied by different paths.
+        let rows: Vec<String> =
+            (0..40).map(|row| "x".repeat(row % 30) + &row.to_string()).collect();
+        let values: Vec<Value> = rows.iter().map(|row| Value::Varchar(row.clone())).collect();
+        let vector = Vector::from_values(LogicalType::Varchar, &values).unwrap().flatten().unwrap();
+        assert_eq!(vector.form(), Form::Flat, "the cut under test is the flat one");
+        for at in 0..40usize {
+            for len in 0..=(40 - at) {
+                let cut = vector.slice(at, len).unwrap();
+                let positions: Vec<u32> = (at..at + len).map(|row| row as u32).collect();
+                let gathered = vector.gather(&positions).unwrap();
+                assert_eq!(
+                    cut.iter().collect::<Vec<_>>(),
+                    gathered.iter().collect::<Vec<_>>(),
+                    "rows {at} to {}",
+                    at + len
+                );
+            }
+        }
     }
 
     #[test]
