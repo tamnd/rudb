@@ -21,7 +21,7 @@
 //! is built to be asked about. It is asked about once per row, so it matters, and it is not this
 //! change because a set per group is a different shape from a table over the whole input.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Value};
@@ -154,6 +154,12 @@ pub(crate) struct Aggregate<'a> {
     /// That costs speed and never an answer, because what makes partitioning safe is the flag in
     /// [`Built`] and not this.
     started: AtomicUsize,
+    /// A cheap read of [`Built::local`], so the fold does not take a lock to ask.
+    ///
+    /// It can be read stale, and reading it stale costs a chunk folded into a table that is about
+    /// to be handed over rather than an answer. What decides the question is the field under the
+    /// lock, which is checked again at the one moment it matters.
+    locally: AtomicBool,
     out: Buffered,
 }
 
@@ -177,6 +183,14 @@ struct Built {
     /// large enough to switch on its own, because a group that is in `merged[0]` whole and in
     /// `merged[5]` as part of a partition comes out of `finalize` twice.
     partitioning: bool,
+    /// Whether a partitioned instance still keeps its own table per partition.
+    ///
+    /// True until something makes it impossible, which is one of the two spilling cases. Once it is
+    /// false it never becomes true again, every instance folds into the shared tables instead, and
+    /// the tables already handed in are folded in too before this lock is let go. That ordering is
+    /// the whole of why it is safe: an instance takes this lock before it hands a table in, so it
+    /// cannot be doing that while the switch is happening.
+    local: bool,
 }
 
 /// One radix partition: the groups that hash to it, and the ones that arrived too late to join them.
@@ -195,6 +209,12 @@ struct Built {
 struct Partition {
     table: Option<Building>,
     carried: Option<Building>,
+    /// The tables instances kept to themselves, waiting to be merged into one.
+    ///
+    /// One per instance that folded anything into this partition. They are merged by whichever
+    /// thread closes this partition, which is one thread per partition and so sixteen merges
+    /// running at once rather than one.
+    pending: Vec<Building>,
 }
 
 const RADIX_PARTITIONS: usize = 16;
@@ -310,9 +330,11 @@ impl<'a> Aggregate<'a> {
                 held: Vec::new(),
                 instances: 0,
                 partitioning: false,
+                local: true,
             }),
             merged: (0..RADIX_PARTITIONS).map(|_| Mutex::new(Partition::default())).collect(),
             started: AtomicUsize::new(0),
+            locally: AtomicBool::new(true),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -972,7 +994,7 @@ impl<'a> Aggregate<'a> {
                     continue;
                 }
                 let mut held = self.merged[at].lock().map_err(poisoned)?;
-                let Partition { table, carried } = &mut *held;
+                let Partition { table, carried, .. } = &mut *held;
                 let into = table.get_or_insert_with(|| self.start());
                 if into.over.is_none() {
                     let grown =
@@ -1039,7 +1061,15 @@ impl<'a> Aggregate<'a> {
     /// Doing nothing when the flag is already set is not just an optimisation. Two instances can
     /// cross the threshold at the same moment, and the second one must not scatter what the first
     /// one has started folding into.
-    fn begin_partitioning(&self, spreading: &mut Spreading) -> Result<()> {
+    ///
+    /// This is also where the aggregate decides, once, whether to keep tables locally at all. The
+    /// decision belongs here because it is the last moment at which nothing has been kept locally
+    /// yet, and an aggregate that says no here never has to unpick anything later.
+    fn begin_partitioning(
+        &self,
+        spreading: &mut Spreading,
+        own: &mut [Option<Building>],
+    ) -> Result<()> {
         let mut built = self.built.lock().map_err(poisoned)?;
         if built.partitioning {
             return Ok(());
@@ -1047,10 +1077,170 @@ impl<'a> Aggregate<'a> {
         built.partitioning = true;
         let seeded = self.merged[0].lock().map_err(poisoned)?.table.take();
         drop(built);
+        if !self.worth_local() {
+            self.give_up_local(spreading)?;
+        }
         match seeded {
-            Some(seeded) => self.hand_over(seeded, spreading),
+            Some(seeded) => self.hand(seeded, spreading, own),
             None => Ok(()),
         }
+    }
+
+    /// One whole table given up, into this instance's own partitions or into the shared ones.
+    ///
+    /// Which of the two is the question [`Built::local`] answers, and two things answer it by
+    /// themselves. A table that has spilled cannot be merged with another table at the end. And an
+    /// instance that reaches here because the budget is already crowded is an instance that has no
+    /// room for one set of tables per thread, which is what keeping them locally costs. Either way
+    /// the aggregate stops being local here and everything already kept locally goes with it.
+    fn hand(
+        &self,
+        from: Building,
+        spreading: &mut Spreading,
+        own: &mut [Option<Building>],
+    ) -> Result<()> {
+        if from.over.is_some() || crowded(&self.memory) {
+            self.give_up_local(spreading)?;
+            self.hand_all(spreading, own)?;
+        }
+        if self.locally.load(Ordering::Relaxed) {
+            return self.scatter_own(from, own);
+        }
+        self.hand_over(from, spreading)
+    }
+
+    /// Everything this instance was keeping to itself, folded into the shared partitions.
+    fn hand_all(&self, spreading: &mut Spreading, own: &mut [Option<Building>]) -> Result<()> {
+        for held in own.iter_mut() {
+            let Some(table) = held.take() else { continue };
+            self.hand_over(table, spreading)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this instance can go on keeping a table of its own per partition.
+    ///
+    /// Asked before the chunk is folded and not after, which matters: a table that runs out of room
+    /// during a fold opens a spill file, and a file opened by a table holding a hundred groups is a
+    /// file that no number of later passes will get through. The check has to happen while there is
+    /// still room to be wrong about.
+    ///
+    /// Three things end it and all three are about room. A table that has opened a spill file can
+    /// never be merged with another table, because a key can be in one table and in the other's
+    /// file at once and the merge would finish a group the file is still holding rows for. A budget
+    /// already half spent is the same crowding the single table path watches for. And the aggregate
+    /// itself has to be small enough that one set of tables per instance still fits, which is what
+    /// [`Aggregate::room_for_local`] asks.
+    ///
+    /// Once per chunk rather than once per row, and the answer is almost always yes.
+    fn still_local(
+        &self,
+        spreading: &mut Spreading,
+        own: &mut [Option<Building>],
+    ) -> Result<bool> {
+        // flatten: a partition this instance has not folded into has no table and nothing to say.
+        let spilled = own.iter().flatten().any(|table| table.over.is_some());
+        if !spilled && !crowded(&self.memory) && self.room_for_local(own) {
+            return Ok(true);
+        }
+        self.give_up_local(spreading)?;
+        self.hand_all(spreading, own)?;
+        Ok(false)
+    }
+
+    /// Whether this aggregate should keep tables locally at all, asked once and never again.
+    ///
+    /// Keeping a table per instance per partition costs the number of instances times what one set
+    /// of tables holds, and that is a bet made at the moment the first table is split, before
+    /// anything is known about how many groups are coming. The bet is only worth making when losing
+    /// it is cheap, and losing it is cheap only when the budget is nowhere near spent.
+    ///
+    /// So the question asked here is whether what the query is holding right now, multiplied by the
+    /// instances that would each hold their own copy of it, still fits in half the budget. That is a
+    /// deliberately pessimistic reading: most of what the query holds at this point belongs to the
+    /// scan and not to the aggregate, and no instance is going to duplicate the scan. The pessimism
+    /// is the point. An aggregate that backs out of local mode later has to fold every local table
+    /// into the shared ones while both are alive, which is the most memory the query will ever want,
+    /// and it wants it at exactly the moment it is already short. Better to never start.
+    ///
+    /// The instance count is the one thing here that is not known yet. The first table splits long
+    /// before the last instance has started, so a count read now would say one when the answer turns
+    /// out to be thirty two, and the bet would be sized against a thread count that never existed.
+    /// The number of partitions stands in as a floor instead, because an aggregate worth running on
+    /// several threads is one the pipeline gives at least that many.
+    ///
+    /// With no limit set there is nothing to lose, so local mode is always on, and that is the case
+    /// every benchmark runs in.
+    fn worth_local(&self) -> bool {
+        let Some(limit) = self.memory.limit() else { return true };
+        let instances = self.started.load(Ordering::Relaxed).max(self.merged.len()) as u64;
+        self.memory.used().saturating_mul(instances) < limit / 2
+    }
+
+    /// Whether the budget still has room for one set of tables per instance.
+    ///
+    /// What this instance is holding locally is what every other instance is holding too, near
+    /// enough, because the keys are divided by a hash and a hash spreads them. So the room the
+    /// aggregate needs is what this one is using times the number of instances, and the question is
+    /// whether that much still fits inside half the budget. Half and not all of it, because the
+    /// tables have to be folded into the shared ones while both sets are alive.
+    ///
+    /// This asks about the tables rather than about the process, which is the difference that makes
+    /// it usable. `crowded` reads what the whole query is holding, and on a scan of a large table
+    /// most of that is the table and none of it is the aggregate's to give back.
+    fn room_for_local(&self, own: &[Option<Building>]) -> bool {
+        let Some(limit) = self.memory.limit() else { return true };
+        // flatten: a partition with no table is holding nothing.
+        let mine: u64 =
+            own.iter().flatten().map(|table| table.scratch.bytes() + table.containers.bytes()).sum();
+        let instances = self.started.load(Ordering::Relaxed) as u64;
+        mine.saturating_mul(instances) < limit / 4
+    }
+
+    /// The aggregate stops keeping a table per instance per partition, for good.
+    ///
+    /// The `built` lock is held across the drain, and an instance takes that same lock before it
+    /// hands its tables in. That ordering is the whole of the safety here: a table cannot be
+    /// deposited into a partition after this has finished looking at it, so no table is left
+    /// waiting to be merged into a partition that has since started spilling.
+    fn give_up_local(&self, spreading: &mut Spreading) -> Result<()> {
+        let mut built = self.built.lock().map_err(poisoned)?;
+        if !built.local {
+            return Ok(());
+        }
+        built.local = false;
+        self.locally.store(false, Ordering::Relaxed);
+        let mut handed = Vec::new();
+        for partition in &self.merged {
+            handed.append(&mut partition.lock().map_err(poisoned)?.pending);
+        }
+        drop(built);
+        for table in handed {
+            self.hand_over(table, spreading)?;
+        }
+        Ok(())
+    }
+
+    /// This instance's own tables handed in at the end of it.
+    ///
+    /// They are left to be merged when the aggregate is still local and folded in now when it is
+    /// not, and the `built` lock is what tells the two apart. See [`Aggregate::give_up_local`] for
+    /// why that lock and not this instance's own view of the flag.
+    fn deposit(&self, own: &mut [Option<Building>], spreading: &mut Spreading) -> Result<()> {
+        // flatten: an instance that never partitioned has no tables here and nothing to hand in.
+        if own.iter().flatten().next().is_none() {
+            return Ok(());
+        }
+        let built = self.built.lock().map_err(poisoned)?;
+        if built.local {
+            for (at, held) in own.iter_mut().enumerate() {
+                let Some(table) = held.take() else { continue };
+                self.merged[at].lock().map_err(poisoned)?.pending.push(table);
+            }
+            return Ok(());
+        }
+        drop(built);
+        self.hand_all(spreading, own)
     }
 
     /// One instance's own table given up to the partitions, spill file and all.
@@ -1076,17 +1266,13 @@ impl<'a> Aggregate<'a> {
         Ok(())
     }
 
-    /// One batch of rows split by the high bits of its group hash and folded into the partitions.
+    /// One batch of rows divided by the high bits of its group hash, ready to be folded.
     ///
-    /// The two sweeps are what makes this scale. Gathering a partition's rows out of the batch is a
-    /// copy of every column and it happens before any lock is taken, so an instance never holds a
-    /// partition while it copies. Then the partitions are tried in turn from a rotating start, and
-    /// one that is already being folded into is put aside rather than waited for. The second sweep
-    /// waits for what is left, by which time whoever held it has usually moved on. Without this,
-    /// every instance asked for partition zero first and thirty two threads queued behind one lock
-    /// before doing any work at all.
-    fn spread(&self, rows: &Rows, spreading: &mut Spreading) -> Result<()> {
-        let Spreading { hashes, picks, keyed, spin, waiting } = spreading;
+    /// Both halves of the fold want the same three things and neither wants to hash twice, so the
+    /// division is here and what is done with the pieces is not. The gather is a copy of every
+    /// column of the batch and it happens before any lock is taken by either caller.
+    fn split(&self, rows: &Rows, spreading: &mut Spreading) -> Result<Vec<Option<Rows>>> {
+        let Spreading { hashes, picks, keyed, spin, .. } = spreading;
         crate::table::hash(&rows.keys, rows.rows, hashes);
         for pick in picks.iter_mut() {
             pick.clear();
@@ -1105,6 +1291,114 @@ impl<'a> Aggregate<'a> {
             ready.push(if pick.is_empty() { None } else { Some(rows.gather(pick)?) });
         }
         *spin = (*spin + 1) % RADIX_PARTITIONS;
+        Ok(ready)
+    }
+
+    /// One batch of rows folded into the tables this instance keeps to itself.
+    ///
+    /// No lock and no sweep, because no other thread can reach any of these tables. That is the
+    /// whole of the difference between this and [`Aggregate::spread`], and on ClickBench it is
+    /// about half of what a grouped aggregate over a high cardinality key used to spend: the
+    /// operator's wall time was twice its CPU time, and the difference was threads waiting for a
+    /// partition somebody else was folding into.
+    ///
+    /// What it costs is a group seen by four instances held in four tables until
+    /// [`Aggregate::close`] merges them. That merge is one probe per group rather than per row, it
+    /// runs on sixteen threads at once, and the tables it merges are only ever the ones belonging
+    /// to a single partition.
+    fn spread_own(
+        &self,
+        rows: &Rows,
+        spreading: &mut Spreading,
+        own: &mut [Option<Building>],
+    ) -> Result<()> {
+        let ready = self.split(rows, spreading)?;
+        for (partition, selected) in ready.iter().enumerate() {
+            let Some(selected) = selected else { continue };
+            let table = own[partition].get_or_insert_with(|| self.start());
+            if let Some(error) = table.failure.take() {
+                return Err(error);
+            }
+            self.fold(selected, table, Some(&spreading.keyed[partition]))?;
+        }
+        Ok(())
+    }
+
+    /// One whole table's groups divided among the tables this instance keeps to itself.
+    ///
+    /// The unlocked twin of [`Aggregate::scatter`], and simpler for two reasons. Nothing here has
+    /// spilled, because a table that spills is what ends local mode, so there is no partition to
+    /// set groups aside from. And nobody else can be folding into the destination, so there is no
+    /// rotating start and no second sweep.
+    fn scatter_own(&self, from: Building, own: &mut [Option<Building>]) -> Result<()> {
+        debug_assert!(from.over.is_none(), "a spilled table is never scattered locally");
+        let Building {
+            scratch,
+            containers,
+            table: source,
+            states: taken,
+            counts: tallies,
+            seen: mut watched,
+            groups: found,
+            ..
+        } = from;
+        let calls = self.calls.len();
+        let distinct: Vec<bool> = self.calls.iter().map(|call| call.distinct).collect();
+        let mut coming = Folding {
+            count_only: self.count_only,
+            calls,
+            distinct: &distinct,
+            taken: &taken,
+            tallies: &tallies,
+            watched: &mut watched,
+        };
+        let types: Vec<LogicalType> =
+            self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
+        let shift = u64::BITS - RADIX_PARTITIONS.ilog2();
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); RADIX_PARTITIONS];
+        for start in (0..found).step_by(VECTOR_SIZE) {
+            let end = (start + VECTOR_SIZE).min(found);
+            let mut keys = Vec::with_capacity(types.len());
+            for (at, ty) in types.iter().enumerate() {
+                keys.push(source.column(at, ty, start..end)?);
+            }
+            for bucket in &mut buckets {
+                bucket.clear();
+            }
+            for slot in start..end {
+                buckets[(source.hash_of(slot) >> shift) as usize].push(slot);
+            }
+            for (at, bucket) in buckets.iter().enumerate() {
+                if bucket.is_empty() {
+                    continue;
+                }
+                let into = own[at].get_or_insert_with(|| self.start());
+                let grown = self.fold_slots(&mut coming, &source, &keys, start, bucket, into)?;
+                charge(into, grown)?;
+            }
+        }
+        drop(watched);
+        drop(taken);
+        drop(tallies);
+        drop(source);
+        drop(scratch);
+        drop(containers);
+        Ok(())
+    }
+
+    /// One batch of rows split by the high bits of its group hash and folded into the partitions.
+    ///
+    /// The two sweeps are what makes this scale. Gathering a partition's rows out of the batch is a
+    /// copy of every column and it happens before any lock is taken, so an instance never holds a
+    /// partition while it copies. Then the partitions are tried in turn from a rotating start, and
+    /// one that is already being folded into is put aside rather than waited for. The second sweep
+    /// waits for what is left, by which time whoever held it has usually moved on. Without this,
+    /// every instance asked for partition zero first and thirty two threads queued behind one lock
+    /// before doing any work at all.
+    fn spread(&self, rows: &Rows, spreading: &mut Spreading) -> Result<()> {
+        let ready = self.split(rows, spreading)?;
+        let Spreading { keyed, spin, waiting, .. } = spreading;
+        let spin = &*spin;
         waiting.clear();
         for step in 0..RADIX_PARTITIONS {
             let partition = (step + *spin) % RADIX_PARTITIONS;
@@ -1311,6 +1605,14 @@ pub(crate) struct Partitioned {
     single: Option<Building>,
     expressions: Scratch,
     spreading: Spreading,
+    /// One table per partition, belonging to this instance and to nobody else.
+    ///
+    /// This is what a partitioned instance folds into while the aggregate is running locally, which
+    /// is every aggregate that does not run out of room. No lock is taken to reach one, because no
+    /// other thread can. What it costs is that a group seen by four threads is held four times
+    /// until [`Aggregate::close`] merges the four, and what it buys is that the fold itself never
+    /// waits for anybody.
+    own: Vec<Option<Building>>,
 }
 
 /// The scratch that splitting a chunk across the partitions needs, kept between chunks.
@@ -1559,6 +1861,7 @@ impl Sink for Aggregate<'_> {
             single: Some(self.start()),
             expressions: self.inputs.scratch(),
             spreading: Spreading::new(),
+            own: (0..RADIX_PARTITIONS).map(|_| None).collect(),
         }
     }
 
@@ -1593,7 +1896,7 @@ impl Sink for Aggregate<'_> {
     /// on. Without this, every instance asked for partition zero first and thirty two threads queued
     /// behind one lock before doing any work at all.
     fn sink(&self, chunk: &Chunk, local: &mut Partitioned) -> Result<Progress> {
-        let Partitioned { single, expressions, spreading } = local;
+        let Partitioned { single, expressions, spreading, own } = local;
         let rows = self.read(chunk, expressions)?;
         if let Some(table) = single {
             if let Some(error) = table.failure.take() {
@@ -1604,9 +1907,15 @@ impl Sink for Aggregate<'_> {
                 return Ok(Progress::More);
             }
             let handing = single.take().expect("the table was there a moment ago");
-            self.begin_partitioning(spreading)?;
-            self.hand_over(handing, spreading)?;
+            self.begin_partitioning(spreading, own)?;
+            self.hand(handing, spreading, own)?;
             return Ok(Progress::More);
+        }
+        if self.locally.load(Ordering::Relaxed) {
+            if self.still_local(spreading, own)? {
+                self.spread_own(&rows, spreading, own)?;
+                return Ok(Progress::More);
+            }
         }
         self.spread(&rows, spreading)?;
         Ok(Progress::More)
@@ -1625,7 +1934,8 @@ impl Sink for Aggregate<'_> {
     /// the flag and an instance setting it cannot both be between the read and the deposit at once,
     /// so a table is never left whole in partition zero after the switch.
     fn combine(&self, local: Partitioned) -> Result<()> {
-        let Partitioned { single, mut spreading, .. } = local;
+        let Partitioned { single, mut spreading, mut own, .. } = local;
+        self.deposit(&mut own, &mut spreading)?;
         let mut built = self.built.lock().map_err(poisoned)?;
         built.instances += 1;
         let Some(arriving) = single else { return Ok(()) };
@@ -1634,7 +1944,7 @@ impl Sink for Aggregate<'_> {
         }
         if built.partitioning {
             drop(built);
-            return self.hand_over(arriving, &mut spreading);
+            return self.hand(arriving, &mut spreading, &mut own);
         }
         let mut kept = self.merged[0].lock().map_err(poisoned)?;
         if kept.table.is_none() {
@@ -1763,8 +2073,18 @@ impl Aggregate<'_> {
     fn close(&self, at: usize) -> Result<Part> {
         let mut part = Part { chunks: Vec::new(), held: self.memory.reservation() };
         let mut partition = self.merged[at].lock().map_err(poisoned)?;
-        let Partition { table, carried } = &mut *partition;
-        let Some(kept) = table.take() else {
+        let Partition { table, carried, pending } = &mut *partition;
+        // The tables the instances kept to themselves, folded into one. Each of them holds only
+        // keys belonging to this partition, so this is the one place they can meet, and it is one
+        // probe per group rather than per row. Sixteen of these run at once, one per partition.
+        let mut kept = table.take();
+        for arriving in std::mem::take(pending) {
+            match &mut kept {
+                Some(into) => self.merge(arriving, into)?,
+                None => kept = Some(arriving),
+            }
+        }
+        let Some(kept) = kept else {
             debug_assert!(carried.is_none(), "nothing is set aside from a partition with no table");
             return Ok(part);
         };
