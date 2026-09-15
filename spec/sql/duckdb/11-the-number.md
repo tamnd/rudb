@@ -28,6 +28,14 @@ The three resource ratios from section 9.7, rudb over DuckDB on time, CPU second
 
 Provenance on every one: the rudb commit, the rudb-compat commit, the DuckDB commit and binary hash, the corpus commit, the machine and the seed. Section 9.8 called a percentage without those a rumour and this is where that bites. The resource numbers need it more than the correctness numbers do, because a ratio from a shared machine is not a ratio, which is why server3 is excluded from producing them.
 
+## 11.2.1 The provenance is in, and the seed row is what it took to say properly
+
+The six fields are gathered and written, in `rudb-compat/src/report.rs`, and the corpus page and the function sweep have carried them for a while. The seed row is the one that took work, because five of the six are facts about the machine and the seed is a fact about the run, and for most of that time nothing in the harness generated anything so the row said so.
+
+There are four generated modes now, and as of tamnd/rudb-compat#79 each of them prints the six fields and appends a row to `target/report/generated.tsv`. What goes in the seed row is the command that reproduces the run rather than the bare number, and that is not decoration. A grammar run is a seed and a count and a rule, a TLP run is a seed and a count and a form, and a sqlsmith run is a seed and a count and which build of the extension wrote the queries. A reader given only the seed has to work the rest out, and a reader given the command line can paste it. It is built out of the values the run used rather than written down beside them, so it cannot drift from them, and it gives `--count` and `--seed` even when both were defaults, because a default is a thing that changes and a recorded command should keep working after it does.
+
+One series for all four modes with a mode column, rather than one file each. The three columns that mean the same thing in all four are how many cases were generated, how many said anything at all, and how many of those came out wrong, and the question a series exists to answer is whether generated testing found more this month than last. Four files would make somebody open four of them to answer it. What the modes disagree about is what a case is and what wrong means, and that is what the mode column is for.
+
 ## 11.3 The weighted function number, exactly
 
 For each of the 1159 distinct names in `duckdb_functions()` on the pin, the weight is the number of records in the real query corpus that call it, counted from a real parse and not a text search. Coverage is the sum of weights over implemented names divided by the sum over all names.
