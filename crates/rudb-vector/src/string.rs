@@ -366,15 +366,13 @@ impl StringColumn {
                 self.arena.len()
             ))
         })?;
-        // The ASCII check first and the general validator only for what it does not settle. They
-        // answer the same question for a string of ASCII, which is what a column of this kind holds
-        // nearly all of the time, and they cost very different amounts: `is_ascii` is a compare per
-        // word with nothing in front of it, and `str::from_utf8` is an out of line call that a scan
-        // profile puts at two hundred instructions a URL, most of it prologue rather than bytes.
-        if !bytes.is_ascii() {
-            std::str::from_utf8(bytes).map_err(|_| {
-                Error::internal(format!("the bytes at {offset} are not valid UTF-8"))
-            })?;
+        // One pass, which is what `rudb_common::utf8::valid` is for. This used to run `is_ascii`
+        // and then `str::from_utf8` over whatever the first one did not settle, and on a column of
+        // URLs that is nearly every string twice: the ASCII walk stops at the Cyrillic in the query
+        // string and the real validator then starts again from the front with its own prologue in
+        // front of it. A scan profile put the second of those at two hundred instructions a URL.
+        if !rudb_common::utf8::valid(bytes) {
+            return Err(Error::internal(format!("the bytes at {offset} are not valid UTF-8")));
         }
         self.views.push(StringView::over(bytes, offset as u64));
         Ok(self.views.len() - 1)
