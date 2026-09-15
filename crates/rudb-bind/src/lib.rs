@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 mod binder;
+mod context;
 mod expr;
 mod parameters;
 mod scope;

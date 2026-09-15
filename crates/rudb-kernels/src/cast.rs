@@ -499,7 +499,9 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
         LogicalType::Blob => to_blob(value),
         LogicalType::Date => to_date(value),
         LogicalType::Time => to_time(value),
+        LogicalType::TimeTz => to_time_tz(value),
         LogicalType::Timestamp => to_timestamp(value),
+        LogicalType::TimestampTz => to_timestamp_tz(value),
         LogicalType::Interval => to_interval(value),
         other => {
             Err(Error::not_implemented(format!("a cast from {} to {other}", value.logical_type())))
@@ -930,9 +932,11 @@ fn hex(byte: u8) -> Option<u8> {
 
 fn to_date(value: &Value) -> Result<Value> {
     match value {
-        Value::Timestamp(micros) => i32::try_from(micros.div_euclid(MICROS_PER_DAY))
-            .map(Value::Date)
-            .map_err(|_| out_of_range(value, &LogicalType::Date)),
+        Value::Timestamp(micros) | Value::TimestampTz(micros) => {
+            i32::try_from(micros.div_euclid(MICROS_PER_DAY))
+                .map(Value::Date)
+                .map_err(|_| out_of_range(value, &LogicalType::Date))
+        }
         Value::Varchar(text) => match parse_date(text) {
             Ok(days) => Ok(Value::Date(days)),
             // A zone that is written like an offset and is not one has a sentence of its own for a
@@ -951,9 +955,42 @@ fn to_date(value: &Value) -> Result<Value> {
 /// ignored, so `'12:34:56 UTC'` and `'12:34:56abc'` are both twelve thirty four.
 fn to_time(value: &Value) -> Result<Value> {
     match value {
-        Value::Timestamp(micros) => Ok(Value::Time(micros.rem_euclid(MICROS_PER_DAY))),
+        Value::Timestamp(micros) | Value::TimestampTz(micros) | Value::TimeTz(micros) => {
+            Ok(Value::Time(micros.rem_euclid(MICROS_PER_DAY)))
+        }
         Value::Varchar(text) => parse_clock(text).map(Value::Time).ok_or_else(|| bad_time(text)),
         _ => Err(no_cast(value, &LogicalType::Time)),
+    }
+}
+
+/// A cast to `TIME WITH TIME ZONE`, which is the same reading with the offset kept.
+///
+/// Dropping a zone and putting one on are both the identity while the only session time zone rudb
+/// has is UTC, and both of them move the reading by the offset once there is a zone to move it by.
+/// That is the time zone box and not this one, and this is the answer that box gives for UTC.
+fn to_time_tz(value: &Value) -> Result<Value> {
+    match value {
+        Value::Time(micros) | Value::Timestamp(micros) | Value::TimestampTz(micros) => {
+            Ok(Value::TimeTz(micros.rem_euclid(MICROS_PER_DAY)))
+        }
+        Value::Varchar(text) => parse_clock(text).map(Value::TimeTz).ok_or_else(|| bad_time(text)),
+        _ => Err(no_cast(value, &LogicalType::TimeTz)),
+    }
+}
+
+/// A cast to `TIMESTAMP WITH TIME ZONE`, which is the same instant read as a point in time.
+///
+/// See [`to_time_tz`] for why this is the identity today. A date becomes midnight the way it does
+/// for `TIMESTAMP`, which is midnight UTC here and midnight in the session zone upstream.
+fn to_timestamp_tz(value: &Value) -> Result<Value> {
+    match value {
+        Value::Date(days) => Ok(Value::TimestampTz(i64::from(*days) * MICROS_PER_DAY)),
+        Value::Timestamp(micros) => Ok(Value::TimestampTz(*micros)),
+        Value::Varchar(text) => match parse_timestamp(text) {
+            Ok(micros) => Ok(Value::TimestampTz(micros)),
+            Err(fault) => Err(fault.said("timestamp with time zone", text, TIMESTAMP_FORMAT)),
+        },
+        _ => Err(no_cast(value, &LogicalType::TimestampTz)),
     }
 }
 
@@ -967,6 +1004,7 @@ fn bad_time(text: &str) -> Error {
 fn to_timestamp(value: &Value) -> Result<Value> {
     match value {
         Value::Date(days) => Ok(Value::Timestamp(i64::from(*days) * MICROS_PER_DAY)),
+        Value::TimestampTz(micros) => Ok(Value::Timestamp(*micros)),
         Value::Varchar(text) => match parse_timestamp(text) {
             Ok(micros) => Ok(Value::Timestamp(micros)),
             Err(fault) => Err(fault.said("timestamp", text, TIMESTAMP_FORMAT)),

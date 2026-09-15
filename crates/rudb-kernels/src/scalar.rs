@@ -1593,7 +1593,7 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
     let doubled = *returns == LogicalType::Double;
     match (name == "date_trunc", when) {
         (false, Value::Date(days)) if doubled => part.double_of_days(*days).map(Value::Double),
-        (false, Value::Timestamp(micros)) if doubled => {
+        (false, Value::Timestamp(micros) | Value::TimestampTz(micros)) if doubled => {
             part.double_of_micros(*micros).map(Value::Double)
         }
         (false, Value::Interval { months, days, micros }) if doubled => part
@@ -1601,12 +1601,18 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
             .double_of_interval(*months, *days, *micros)
             .map(Value::Double),
         (false, Value::Date(days)) => part.of_days(*days).map(Value::BigInt),
-        (false, Value::Timestamp(micros)) => part.of_micros(*micros).map(Value::BigInt),
+        (false, Value::Timestamp(micros) | Value::TimestampTz(micros)) => {
+            part.of_micros(*micros).map(Value::BigInt)
+        }
         (false, Value::Interval { months, days, micros }) => {
             part.of_an_interval(spelling)?.of_interval(*months, *days, *micros).map(Value::BigInt)
         }
         (true, Value::Date(days)) => part.truncate_days(*days).map(Value::Date),
         (true, Value::Timestamp(micros)) => part.truncate_micros(*micros).map(Value::Timestamp),
+        // The truncation comes back zoned, because `date_trunc` answers the type it was handed and
+        // the plan holds that type next to the value. Which moment it lands on is the calendar's
+        // question and so is the session time zone's, the same as the shift in `datetime`.
+        (true, Value::TimestampTz(micros)) => part.truncate_micros(*micros).map(Value::TimestampTz),
         (true, Value::Interval { months, days, micros }) => {
             let (months, days, micros) = part.truncate_interval(*months, *days, *micros)?;
             Ok(Value::Interval { months, days, micros })
@@ -1764,7 +1770,8 @@ pub fn call_values(
             datetime::counted(left, right, name == "-")
         }
         ("-", [left @ Value::Date(_), right @ Value::Date(_)])
-        | ("-", [left @ Value::Timestamp(_), right @ Value::Timestamp(_)]) => {
+        | ("-", [left @ Value::Timestamp(_), right @ Value::Timestamp(_)])
+        | ("-", [left @ Value::TimestampTz(_), right @ Value::TimestampTz(_)]) => {
             datetime::apart(left, right)
         }
         ("+", [left, right]) if datetime::is_joined(left, right) => datetime::joined(left, right),

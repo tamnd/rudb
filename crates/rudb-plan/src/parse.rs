@@ -733,8 +733,14 @@ fn read_value(text: &str, ty: &LogicalType) -> Result<Value> {
         LogicalType::Time => {
             text.parse().map(Value::Time).map_err(|_| whole("a microsecond count"))
         }
+        LogicalType::TimeTz => {
+            text.parse().map(Value::TimeTz).map_err(|_| whole("a microsecond count"))
+        }
         LogicalType::Timestamp => {
             text.parse().map(Value::Timestamp).map_err(|_| whole("a microsecond count"))
+        }
+        LogicalType::TimestampTz => {
+            text.parse().map(Value::TimestampTz).map_err(|_| whole("a microsecond count"))
         }
         LogicalType::Interval => {
             let parts = read_braced(text)?;

@@ -97,6 +97,16 @@ enum Shape {
     /// whether the type is already right, and not whether a cast exists, since a cast exists for
     /// every one of the three.
     Widened(Fixed, Fixed),
+    /// Every argument widens to the one type they all reach, no narrower than a floor, and the
+    /// result is fixed. `age(x, y)`.
+    ///
+    /// The difference from [`Shape::Widened`] is which way the arguments are allowed to pull. There
+    /// the floor is the answer and an argument wider than it is refused, which is right for a name
+    /// whose one overload reads a fixed type. Here the arguments meet each other first, so
+    /// `age(DATE, DATE)` reads two timestamps because the floor says so and `age(now(), now())`
+    /// reads two zoned ones because the arguments say so. Upstream has a row per combination and
+    /// this is the one rule they follow.
+    WidenedTogether(Fixed, Fixed),
     /// The arguments are whatever they are and the result is fixed. `count(x)` over anything.
     AnyTo(Fixed),
     /// The first `n` arguments are cast to one fixed type, the rest are left alone, and the result
@@ -145,6 +155,15 @@ enum Shape {
     /// the way the fold cannot happen, which is an argument that is not a constant, and that is the
     /// case the pin refuses in the same words.
     Setting,
+    /// No arguments at all and a fixed result. `now()` and `current_schema()`.
+    ///
+    /// The session context functions, which are the ones whose answer comes from the connection
+    /// rather than from anything written in the query. The binder folds every one of them into a
+    /// constant before this table is asked, the same way it folds `typeof`, so what these rows are
+    /// for is the two questions the fold does not answer: which names exist, which is what
+    /// `duckdb_functions()` reports, and what `now(1)` says, which is the arity error rather than a
+    /// missing function.
+    Constant(Fixed),
 }
 
 /// The return types a signature can name outright.
@@ -159,7 +178,10 @@ enum Fixed {
     Double,
     Varchar,
     Date,
+    Time,
+    TimeTz,
     Timestamp,
+    TimestampTz,
     Interval,
 }
 
@@ -172,7 +194,10 @@ impl Fixed {
             Self::Double => LogicalType::Double,
             Self::Varchar => LogicalType::Varchar,
             Self::Date => LogicalType::Date,
+            Self::Time => LogicalType::Time,
+            Self::TimeTz => LogicalType::TimeTz,
             Self::Timestamp => LogicalType::Timestamp,
+            Self::TimestampTz => LogicalType::TimestampTz,
             Self::Interval => LogicalType::Interval,
         }
     }
@@ -425,7 +450,7 @@ const TABLE: &[Entry] = &[
         name: "age",
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(2),
-        shape: Shape::Widened(Fixed::Timestamp, Fixed::Interval),
+        shape: Shape::WidenedTogether(Fixed::Timestamp, Fixed::Interval),
         numeric_only: false,
     },
     // The two that turn a number into a date and a timestamp, which is how every ClickBench entry
@@ -543,6 +568,29 @@ const TABLE: &[Entry] = &[
         shape: Shape::Setting,
         numeric_only: false,
     },
+    // Session context. Fourteen names for eight answers, which is the SQL standard's spellings and
+    // Postgres's spellings and DuckDB's own sitting on top of each other. The binder folds every one
+    // of them, so these rows exist to be listed by `duckdb_settings()`'s neighbour
+    // `duckdb_functions()` and to give `now(1)` the arity error the pin gives it.
+    //
+    // Four of these are macro rows upstream rather than scalar rows, which is `current_user`,
+    // `session_user`, `user` and `current_catalog`, and this table has no macros so they are scalars
+    // here. The difference shows up in the `function_type` column of `duckdb_functions()` and
+    // nowhere else, since the parenthesized call binds on both engines and answers the same.
+    session("now", Fixed::TimestampTz),
+    session("get_current_timestamp", Fixed::TimestampTz),
+    session("transaction_timestamp", Fixed::TimestampTz),
+    session("current_localtimestamp", Fixed::Timestamp),
+    session("get_current_time", Fixed::TimeTz),
+    session("current_localtime", Fixed::Time),
+    session("current_date", Fixed::Date),
+    session("today", Fixed::Date),
+    session("current_schema", Fixed::Varchar),
+    session("current_database", Fixed::Varchar),
+    session("current_catalog", Fixed::Varchar),
+    session("current_user", Fixed::Varchar),
+    session("session_user", Fixed::Varchar),
+    session("user", Fixed::Varchar),
     // Aggregates.
     aggregate("count_star", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt), false),
     aggregate("count", Arity::exactly(1), Shape::AnyTo(Fixed::BigInt), false),
@@ -575,6 +623,17 @@ const fn built(name: &'static str, count: Fixed) -> Entry {
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(1),
         shape: Shape::Widened(count, Fixed::Interval),
+        numeric_only: false,
+    }
+}
+
+/// A session context function, which takes nothing and answers about the connection.
+const fn session(name: &'static str, returns: Fixed) -> Entry {
+    Entry {
+        name,
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(0),
+        shape: Shape::Constant(returns),
         numeric_only: false,
     }
 }
@@ -714,6 +773,21 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             }
             (vec![wanted; arguments.len()], result.ty())
         }
+        Shape::WidenedTogether(floor, result) => {
+            // A null has nothing to pull with, so it is left out of the meeting and then cast to
+            // whatever the rest of them settled on, which is the floor when they were all nulls.
+            let mut wanted = floor.ty();
+            for ty in arguments {
+                if *ty == LogicalType::Null {
+                    continue;
+                }
+                match ty.promote(&wanted) {
+                    Some(met) => wanted = met,
+                    None => return Err(no_match(entry.name, arguments)),
+                }
+            }
+            (vec![wanted.clone(); arguments.len()], result.ty())
+        }
         Shape::AnyTo(result) => (arguments.to_vec(), result.ty()),
         Shape::LeadingFixedTo(count, first, result) => {
             (leading(count, first, arguments), result.ty())
@@ -799,6 +873,9 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
                 entry.name
             )));
         }
+        // The arity check above already refused every call but the one with no arguments, so there
+        // is nothing to cast and nothing left to decide.
+        Shape::Constant(fixed) => (Vec::new(), fixed.ty()),
     };
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
 }
@@ -843,8 +920,8 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
 /// because the sentence for an ambiguous call is #395.
 fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
     use LogicalType::{
-        BigInt, Date, Double, HugeInt, Integer, Interval, Null, SmallInt, Time, Timestamp, TinyInt,
-        UBigInt, UHugeInt, USmallInt, UTinyInt,
+        BigInt, Date, Double, HugeInt, Integer, Interval, Null, SmallInt, Time, TimeTz, Timestamp,
+        TimestampTz, TinyInt, UBigInt, UHugeInt, USmallInt, UTinyInt,
     };
     let kept = |returns| Some((arguments.to_vec(), returns));
     // A null literal has no type yet, so it counts as the number and the cast to a double is what
@@ -867,6 +944,18 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
             Some((vec![Timestamp, Timestamp], Interval))
         }
         ("+", [Date, Time] | [Time, Date]) => kept(Timestamp),
+        // A zoned value keeps its zone through all of this, which is upstream's answer for every one
+        // of these rather than something read off the unzoned rows above. The mixed subtraction is
+        // the one that has a cast in it: a plain timestamp or a date next to a zoned one becomes
+        // zoned first, and then the two of them are two of the same kind.
+        ("+" | "-", [TimestampTz, Interval]) | ("+", [Interval, TimestampTz]) => kept(TimestampTz),
+        ("+" | "-", [TimeTz, Interval]) | ("+", [Interval, TimeTz]) => kept(TimeTz),
+        ("-", [TimestampTz, TimestampTz]) => kept(Interval),
+        ("-", [TimestampTz, Timestamp | Date] | [Timestamp | Date, TimestampTz]) => {
+            Some((vec![TimestampTz, TimestampTz], Interval))
+        }
+        ("+", [Date, TimeTz] | [TimeTz, Date]) => kept(TimestampTz),
+        ("+" | "-", [TimestampTz, Null]) | ("+", [Null, TimestampTz]) => kept(TimestampTz),
         ("+" | "-", [Date, count]) if days(count) => Some((vec![Date, Integer], Date)),
         ("+", [count, Date]) if days(count) => Some((vec![Integer, Date], Date)),
         ("+" | "-", [Timestamp, Null]) | ("+", [Null, Timestamp]) => kept(Timestamp),
@@ -915,6 +1004,21 @@ fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
 /// A name missing from here gets the sentence with no block under it, which is what every function
 /// outside the string family does today.
 const CANDIDATES: &[(&str, &[&str])] = &[
+    // The session context functions, which all print the same way because they all take nothing.
+    // The four spelled as macros upstream are not here on purpose: the pin answers those with
+    // "Macro current_user() does not support the supplied arguments" and a `Candidate macros:` block
+    // under it, and rudb has no macros to say that about, so a block naming candidate functions
+    // would be a second thing wrong rather than the sentence with nothing under it.
+    ("now", &["now() -> TIMESTAMP WITH TIME ZONE"]),
+    ("get_current_timestamp", &["get_current_timestamp() -> TIMESTAMP WITH TIME ZONE"]),
+    ("transaction_timestamp", &["transaction_timestamp() -> TIMESTAMP WITH TIME ZONE"]),
+    ("current_localtimestamp", &["current_localtimestamp() -> TIMESTAMP"]),
+    ("get_current_time", &["get_current_time() -> TIME WITH TIME ZONE"]),
+    ("current_localtime", &["current_localtime() -> TIME"]),
+    ("current_date", &["current_date() -> DATE"]),
+    ("today", &["today() -> DATE"]),
+    ("current_schema", &["current_schema() -> VARCHAR"]),
+    ("current_database", &["current_database() -> VARCHAR"]),
     ("lower", &["lower(col0 VARCHAR) -> VARCHAR"]),
     ("upper", &["upper(col0 VARCHAR) -> VARCHAR"]),
     (
@@ -1285,7 +1389,10 @@ impl Fixed {
             Self::Double => "DOUBLE",
             Self::Varchar => "VARCHAR",
             Self::Date => "DATE",
+            Self::Time => "TIME",
+            Self::TimeTz => "TIME WITH TIME ZONE",
             Self::Timestamp => "TIMESTAMP",
+            Self::TimestampTz => "TIMESTAMP WITH TIME ZONE",
             Self::Interval => "INTERVAL",
         }
     }
@@ -1320,9 +1427,12 @@ impl Shape {
                 (all(SAME), ANY)
             }
             Self::PromotedTo(fixed) => (all(SAME), fixed.name()),
-            Self::FixedTo(from, to) | Self::Exact(from, to) | Self::Widened(from, to) => {
-                (all(from.name()), to.name())
-            }
+            // The floor is what a shape that widens is declared as, which is the overload upstream
+            // lists first and the one a call with nothing to say about its arguments lands on.
+            Self::FixedTo(from, to)
+            | Self::Exact(from, to)
+            | Self::Widened(from, to)
+            | Self::WidenedTogether(from, to) => (all(from.name()), to.name()),
             Self::AnyTo(fixed) => (all(ANY), fixed.name()),
             Self::LeadingFixedTo(taken, first, to) => {
                 (leading(taken, first.name(), ANY), to.name())
@@ -1338,6 +1448,8 @@ impl Shape {
             // One overload with an `ANY` return, which is the pin's row for it. The name decides
             // the type and a name is not something a signature can hold.
             Self::Setting => (all(Fixed::Varchar.name()), ANY),
+            // No arguments, so `all` is empty whatever it is handed and only the result is named.
+            Self::Constant(fixed) => (Vec::new(), fixed.name()),
         }
     }
 }
@@ -1798,7 +1910,12 @@ mod tests {
                 // A shape that names the type it wants is asked for it, since `chr` wants an
                 // INTEGER and refuses a string the way upstream does.
                 let ty = match (entry.numeric_only, entry.shape) {
-                    (_, Shape::Exact(argument, _) | Shape::Widened(argument, _)) => argument.ty(),
+                    (
+                        _,
+                        Shape::Exact(argument, _)
+                        | Shape::Widened(argument, _)
+                        | Shape::WidenedTogether(argument, _),
+                    ) => argument.ty(),
                     (true, _) => LogicalType::Integer,
                     (false, _) => LogicalType::Varchar,
                 };

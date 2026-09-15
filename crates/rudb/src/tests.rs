@@ -1233,6 +1233,173 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     );
 }
 
+/// The fourteen names that answer about the connection rather than about the query.
+#[test]
+fn the_session_context_answers_for_the_clock_the_catalog_and_the_user() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    // The types first, because the type is the half a client reads through a driver and the half
+    // that is easy to get wrong. Every one of these was measured against the pin.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT typeof(now()), typeof(current_timestamp), typeof(get_current_timestamp()), \
+             typeof(transaction_timestamp()), typeof(current_localtimestamp()), \
+             typeof(localtimestamp)"
+        ),
+        vec![vec![
+            text("TIMESTAMP WITH TIME ZONE"),
+            text("TIMESTAMP WITH TIME ZONE"),
+            text("TIMESTAMP WITH TIME ZONE"),
+            text("TIMESTAMP WITH TIME ZONE"),
+            text("TIMESTAMP"),
+            text("TIMESTAMP"),
+        ]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT typeof(current_date), typeof(today()), typeof(current_time), \
+             typeof(get_current_time()), typeof(localtime), typeof(current_localtime())"
+        ),
+        vec![vec![
+            text("DATE"),
+            text("DATE"),
+            text("TIME WITH TIME ZONE"),
+            text("TIME WITH TIME ZONE"),
+            text("TIME"),
+            text("TIME"),
+        ]]
+    );
+    // The four that name something the catalog knows, plus the user, which rudb answers the pin's
+    // way because neither engine has users and a client asking wants a name.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT current_schema, current_schema(), current_catalog, current_database(), \
+             current_user, session_user, user"
+        ),
+        vec![vec![
+            text("main"),
+            text("main"),
+            text("memory"),
+            text("memory"),
+            text("duckdb"),
+            text("duckdb"),
+            text("duckdb"),
+        ]]
+    );
+    // One instant per statement, whatever spells it and however many rows read it. That is what the
+    // pin reports as CONSISTENT_WITHIN_QUERY and what it answers for the same query.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT now() = current_timestamp, now() = transaction_timestamp(), \
+             now() = get_current_timestamp(), today() = current_date"
+        ),
+        vec![vec![
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+        ]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(DISTINCT n) FROM (SELECT now() AS n FROM range(3))"),
+        vec![vec![Value::BigInt(1)]]
+    );
+    // The clock reads forward, which is the only thing about its value a test can hold it to.
+    assert_eq!(
+        rows(&db, "SELECT now() > TIMESTAMP '2024-01-01', current_date > DATE '2024-01-01'"),
+        vec![vec![Value::Boolean(true), Value::Boolean(true)]]
+    );
+    // A column of the same name wins over the keyword, which was measured on the pin for all ten of
+    // the bare spellings and is why the scope is asked before the fold.
+    db.execute(
+        "CREATE TABLE context(current_date VARCHAR, current_user VARCHAR, \"user\" VARCHAR)",
+    )
+    .expect("three columns named after keywords");
+    db.execute("INSERT INTO context VALUES ('a', 'b', 'c')").expect("one row");
+    assert_eq!(
+        rows(&db, "SELECT current_date, current_user, user FROM context"),
+        vec![vec![text("a"), text("b"), text("c")]]
+    );
+    // And a name two tables both carry is still the ambiguity error rather than the constant.
+    assert_eq!(
+        failure(&db, "SELECT current_date FROM context, context AS again"),
+        "Ambiguous reference to column name \"current_date\" (use: \"context.current_date\" or \
+         \"again.current_date\")"
+    );
+    // The five names that take one spelling and not the other. `current_database` is a function and
+    // not a keyword on the pin, and `current_timestamp` is a keyword and not a function.
+    assert_eq!(
+        failure(&db, "SELECT current_database"),
+        "Referenced column \"current_database\" not found in FROM clause!"
+    );
+    assert_eq!(
+        failure(&db, "SELECT current_timestamp()"),
+        "Scalar Function with name current_timestamp does not exist!"
+    );
+    // A call with arguments is not one of these and reaches the signature table, which has a row per
+    // name so that the message is the arity error the pin gives rather than a missing function.
+    assert!(
+        failure(&db, "SELECT now(1)")
+            .starts_with("No function matches the given name and argument types 'now(INTEGER)'"),
+        "an arity error rather than a missing function"
+    );
+    // A zoned value keeps its zone through arithmetic, which is the half of this that is not about
+    // the clock at all: `now()` is the first way a query gets one of these, so every operator that
+    // takes a timestamp had to learn the zoned kind. All of these were measured against the pin.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT typeof(now() + INTERVAL 1 DAY), typeof(INTERVAL 1 DAY + now()), \
+             typeof(now() - now()), typeof(now() - TIMESTAMP '2020-01-01'), \
+             typeof(now() - DATE '2020-01-01'), typeof(now() + NULL), \
+             typeof(current_time + INTERVAL 1 HOUR), typeof(current_date + current_time)"
+        ),
+        vec![vec![
+            text("TIMESTAMP WITH TIME ZONE"),
+            text("TIMESTAMP WITH TIME ZONE"),
+            text("INTERVAL"),
+            text("INTERVAL"),
+            text("INTERVAL"),
+            text("TIMESTAMP WITH TIME ZONE"),
+            text("TIME WITH TIME ZONE"),
+            text("TIMESTAMP WITH TIME ZONE"),
+        ]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT typeof(date_part('year', now())), typeof(date_trunc('day', now())), \
+             typeof(age(now(), now())), \
+             CAST(date_trunc('day', TIMESTAMPTZ '2020-01-02 03:04:05') AS VARCHAR), \
+             CAST(TIMESTAMPTZ '2020-01-31 10:00:00' + INTERVAL 1 MONTH AS VARCHAR), \
+             CAST(DATE '2020-01-02' + TIMETZ '03:04:05' AS VARCHAR)"
+        ),
+        vec![vec![
+            text("BIGINT"),
+            text("TIMESTAMP WITH TIME ZONE"),
+            text("INTERVAL"),
+            text("2020-01-02 00:00:00+00"),
+            text("2020-02-29 10:00:00+00"),
+            text("2020-01-02 03:04:05+00"),
+        ]]
+    );
+    // All fourteen are in the function table, which is where a client looks to find out.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('now', 'today', \
+             'get_current_timestamp', 'get_current_time', 'transaction_timestamp', \
+             'current_localtime', 'current_localtimestamp', 'current_date', 'current_schema', \
+             'current_database', 'current_catalog', 'current_user', 'session_user', 'user')"
+        ),
+        vec![vec![Value::BigInt(14)]]
+    );
+}
+
 #[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
