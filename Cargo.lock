@@ -139,6 +139,7 @@ dependencies = [
  "rudb-jit",
  "rudb-kernels",
  "rudb-metrics",
+ "rudb-opt",
  "rudb-parquet",
  "rudb-parse",
  "rudb-pipeline",
