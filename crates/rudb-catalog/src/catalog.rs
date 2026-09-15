@@ -671,6 +671,7 @@ mod tests {
             .create_view(View::new(
                 QualifiedName::new("memory", "main", "recent"),
                 "SELECT * FROM hits".to_string(),
+                "CREATE VIEW recent AS SELECT * FROM hits;".to_string(),
                 Vec::new(),
                 Vec::new(),
             ))
@@ -702,6 +703,7 @@ mod tests {
             .create_view(View::new(
                 QualifiedName::new("memory", "main", "HITS"),
                 "SELECT 1".to_string(),
+                "CREATE VIEW HITS AS SELECT 1;".to_string(),
                 Vec::new(),
                 Vec::new(),
             ))

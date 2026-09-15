@@ -1,10 +1,9 @@
 //! The columns of the tables that describe what somebody created.
 //!
-//! `duckdb_databases()`, `duckdb_schemas()`, `duckdb_tables()` and `duckdb_columns()` here, and
-//! `duckdb_views()` is the one still missing. Only the columns are here, because unlike the other
-//! four metadata tables the rows are not a fact about the binary. They are whatever is in the
-//! catalog, so they are built in `rudb_exec` where the catalog is in reach and this crate is only the
-//! half both ends agree on.
+//! `duckdb_databases()`, `duckdb_schemas()`, `duckdb_tables()`, `duckdb_views()` and
+//! `duckdb_columns()`. Only the columns are here, because unlike the other metadata tables the rows
+//! are not a fact about the binary. They are whatever is in the catalog, so they are built in
+//! `rudb_exec` where the catalog is in reach and this crate is only the half both ends agree on.
 //!
 //! # Every one of these tables has an oid column and rudb fills them in
 //!
@@ -93,6 +92,30 @@ pub fn table_fields() -> Vec<Field> {
     ]
 }
 
+/// The columns `duckdb_views()` returns, in the pin's order.
+///
+/// Thirteen, which is three fewer than `duckdb_tables()` and not the same thirteen. There is no
+/// `estimated_size` and no `index_count` because a view holds nothing, and there is an `is_bound`
+/// which says whether the column cache on the entry holds anything yet.
+#[must_use]
+pub fn view_fields() -> Vec<Field> {
+    vec![
+        Field::new("database_name", LogicalType::Varchar),
+        Field::new("database_oid", LogicalType::BigInt),
+        Field::new("schema_name", LogicalType::Varchar),
+        Field::new("schema_oid", LogicalType::BigInt),
+        Field::new("view_name", LogicalType::Varchar),
+        Field::new("view_oid", LogicalType::BigInt),
+        Field::new("comment", LogicalType::Varchar),
+        Field::new("tags", tags()),
+        Field::new("internal", LogicalType::Boolean),
+        Field::new("temporary", LogicalType::Boolean),
+        Field::new("column_count", LogicalType::BigInt),
+        Field::new("sql", LogicalType::Varchar),
+        Field::new("is_bound", LogicalType::Boolean),
+    ]
+}
+
 /// The columns `duckdb_columns()` returns, in the pin's order.
 #[must_use]
 pub fn column_fields() -> Vec<Field> {
@@ -177,13 +200,15 @@ mod tests {
 
     use super::{
         canonical, column_fields, database_fields, numeric_facts, schema_fields, table_fields,
+        view_fields,
     };
 
     #[test]
-    fn the_four_tables_are_the_shape_the_pin_returns() {
+    fn the_five_tables_are_the_shape_the_pin_returns() {
         assert_eq!(database_fields().len(), 11);
         assert_eq!(schema_fields().len(), 10);
         assert_eq!(table_fields().len(), 16);
+        assert_eq!(view_fields().len(), 13);
         assert_eq!(column_fields().len(), 21);
     }
 

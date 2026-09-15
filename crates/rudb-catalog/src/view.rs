@@ -35,6 +35,7 @@ use crate::name::QualifiedName;
 pub struct View {
     name: QualifiedName,
     sql: String,
+    statement: String,
     aliases: Vec<String>,
     /// What `duckdb_views()` reports as `view_oid`, stamped by the catalog when this goes in.
     oid: i64,
@@ -45,15 +46,25 @@ pub struct View {
 impl View {
     /// A view over `sql`, whose columns answer to `aliases` as far as that list goes.
     ///
-    /// `columns` is what binding the body at creation produced, after the alias list was applied.
+    /// `statement` is the whole `CREATE VIEW` written back out, which `duckdb_views()` reports and
+    /// nothing else reads. `columns` is what binding the body at creation produced, after the alias
+    /// list was applied.
     #[must_use]
     pub fn new(
         name: QualifiedName,
         sql: String,
+        statement: String,
         aliases: Vec<String>,
         columns: Vec<Field>,
     ) -> Self {
-        Self { name, sql, aliases, oid: DETACHED, columns: Arc::new(RwLock::new(columns)) }
+        Self {
+            name,
+            sql,
+            statement,
+            aliases,
+            oid: DETACHED,
+            columns: Arc::new(RwLock::new(columns)),
+        }
     }
 
     /// The number the catalog tables join on, and [`DETACHED`] for a view not in a catalog.
@@ -77,6 +88,18 @@ impl View {
     #[must_use]
     pub fn sql(&self) -> &str {
         &self.sql
+    }
+
+    /// The whole statement written back out, which is what `duckdb_views()` reports as `sql`.
+    ///
+    /// Not the text somebody typed and not the body either. Upstream reports a deparse of the
+    /// statement, so a view created with odd spacing and a comment in the middle comes back
+    /// normalised and without the comment, and that was measured. The writing happens in
+    /// `rudb_parse::deparse` at bind time, since that is where the tree is, and the answer is
+    /// carried here because this is where the table reads it from.
+    #[must_use]
+    pub fn statement(&self) -> &str {
+        &self.statement
     }
 
     /// The column names the statement gave, which rename a prefix of what the body produces.
@@ -117,6 +140,7 @@ mod tests {
         View::new(
             QualifiedName::new("memory", "main", "v"),
             "SELECT x FROM t".to_string(),
+            "CREATE VIEW v AS SELECT x FROM t;".to_string(),
             Vec::new(),
             columns,
         )

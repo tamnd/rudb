@@ -82,6 +82,7 @@ fn catalog() -> Catalog {
         .create_view(rudb_catalog::View::new(
             QualifiedName::new("memory", "main", "v"),
             "SELECT x, s FROM t".to_string(),
+            "CREATE VIEW v AS SELECT x, s FROM t;".to_string(),
             Vec::new(),
             vec![Field::new("x", LogicalType::Integer), Field::new("s", LogicalType::Varchar)],
         ))
