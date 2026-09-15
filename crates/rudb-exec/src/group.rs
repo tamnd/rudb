@@ -330,11 +330,14 @@ impl<'a> Aggregate<'a> {
                 held: Vec::new(),
                 instances: 0,
                 partitioning: false,
-                local: true,
+                // Worker-local radix tables duplicate high-cardinality groups and can lose
+                // counts when their states are merged. Use the shared partitions until the
+                // worker-local merge is correct and bounded by a memory budget.
+                local: false,
             }),
             merged: (0..RADIX_PARTITIONS).map(|_| Mutex::new(Partition::default())).collect(),
             started: AtomicUsize::new(0),
-            locally: AtomicBool::new(true),
+            locally: AtomicBool::new(false),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -1165,8 +1168,8 @@ impl<'a> Aggregate<'a> {
     /// The number of partitions stands in as a floor instead, because an aggregate worth running on
     /// several threads is one the pipeline gives at least that many.
     ///
-    /// With no limit set there is nothing to lose, so local mode is always on, and that is the case
-    /// every benchmark runs in.
+    /// This check applies only when worker-local tables are enabled. They are currently disabled
+    /// because their merge loses counts and their copies inflate high-cardinality memory use.
     fn worth_local(&self) -> bool {
         let Some(limit) = self.memory.limit() else { return true };
         let instances = self.started.load(Ordering::Relaxed).max(self.merged.len()) as u64;
