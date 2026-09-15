@@ -40,6 +40,22 @@ So the first harness change is to count and publish skips by reason, separating 
 
 The hash modes deserve a decision rather than an implementation. `hash-threshold` exists so a test file can store a hash instead of a large expected result, and section 1.3 says comparing a hash is the most common way a differential harness reports success it has not earned. We run those files against the live binary and compare the full result, and we use the stored hash only as a second opinion.
 
+## 9.3.1 The hash modes, decided, and the corpus barely uses them
+
+The paragraph above was written before anybody counted, so here is the count at the pin. Of 34329 `query` records in `test/sql`, 231 store a digest instead of their values, in 32 files. 212 of those are in `.test_slow` files, which `slt` leaves out by default, so an ordinary corpus run sees 19 hashed records in 15 files. And there is no `hash-threshold` line anywhere in the corpus at the pin, not one, so the threshold mechanism the paragraph is named after is unreachable from these files and the 231 digests are written into them directly.
+
+That changes what the decision has to protect against. It is not that our pass rate leans on digests, because 19 records out of 34329 cannot move a percentage that is printed to one decimal place. It is that a harness with a hash comparison in it acquires a hash mode of its own the first time a result is inconvenient to store. So the rule is about us rather than about the corpus: nothing in the harness hashes a result it could have compared, no corpus we write stores a digest, and the harness never grows a `hash-threshold` setting. A digest is read because 32 of DuckDB's files contain one, and for no other reason.
+
+For those records, the digest match stands as the outcome and the record is counted like any other, which is a deliberate weakening of the paragraph above. Running 19 records against a live binary on every corpus run would make a run that needs no DuckDB into a run that needs one, and section 9.8 keeps that property because it is what makes the corpus run something CI does on every commit. Nineteen records is not worth that, and the day the count changes, either because the pin brings more or because `--slow` becomes the default, this is the sentence to come back to.
+
+What a digest genuinely cannot do is produce a difference. `expected 100000 values hashing to 8e3f... and got 4c21...` is one bit of information, so it cannot tell a wrong value from a wrong order from the wrong number of columns, and there is nothing in it for the reducer in section 9.5 to work on. The count of values is checked before the digest, which is the one thing the format gives us besides the digest itself, and it is what catches most of the interesting failures anyway. Beyond that, a failing hashed record goes to the live binary to get its values back before anybody reads it, and that belongs to the reduce path where a person is already waiting, rather than to the scoring path that runs on every commit.
+
+A digest also depends on our sort being DuckDB's sort, since it is taken over the values in the order the record's sort mode asked for, and it depends on our formatting of every value matching. That is the hidden cost of the format and it is the argument against ever writing one ourselves: a value comparison that fails tells you which value, and a digest that fails tells you that something about a hundred thousand values is different.
+
+One record in the corpus hashes 24004860 values. That record cannot exist in a file any other way, which is the honest case for the format existing, and it is also the reason the second opinion is per record on demand rather than on by default, because comparing it means twenty four million values held on both sides at once.
+
+Last, a digest in a file is a frozen answer rather than a live one. If it was written against an older DuckDB and the pin has since moved, then a rudb that matches the digest disagrees with the pinned binary. That is the first case in section 9.4, the file being stale rather than the engine being wrong, and it comes out as a note about the corpus and not as a failure.
+
 ## 9.4 Two oracles, and what it means when they disagree
 
 Every record in the upstream corpus has an expected result written in the file, and section 14.2 says a claim is always checked against a real binary of a named version. So there are two oracles and they are both available.
