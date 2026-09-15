@@ -196,6 +196,39 @@ fn fetching_a_few_rows_by_ordinal_gets_what_a_scan_of_the_whole_file_would() {
 }
 
 #[test]
+fn fetching_every_row_of_the_file_gets_every_row_of_the_file() {
+    // The fetch reads only the positions it was asked for rather than decoding the page and
+    // gathering, which means the walk over the values in between is its own piece of code and its
+    // own chance to be off by one. Asking for all of them, in one go and in scattered runs, is what
+    // catches that: a wrong step shows up as the wrong row rather than as a slow read.
+    // A fetch comes back as one chunk, so the whole file takes four of them, which also covers the
+    // case of a window that lies inside one row group and one that straddles both.
+    for window in 0..4 {
+        let mut whole = reader();
+        let first = window * 1024;
+        let wanted: Vec<u64> = (first..first + 1024).collect();
+        let chunk = whole.rows_at(&wanted).expect("fetches");
+        assert_eq!(chunk.len(), 1024);
+        // row at a time: the point is that every one of the 4096 rows came back right, not a sample.
+        for at in 0..chunk.len() {
+            let got: Vec<Value> =
+                (0..chunk.width()).map(|column| chunk.value_at(at, column)).collect();
+            assert_eq!(got, row((first + at as u64) as i64), "row {}", first + at as u64);
+        }
+    }
+
+    let mut scattered = reader();
+    let wanted: Vec<u64> = (0..4096).filter(|row| row % 7 == 3 || row % 101 == 0).collect();
+    let chunk = scattered.rows_at(&wanted).expect("fetches");
+    assert_eq!(chunk.len(), wanted.len());
+    // row at a time: same again, against the ordinal each row was asked for.
+    for (at, &row_number) in wanted.iter().enumerate() {
+        let got: Vec<Value> = (0..chunk.width()).map(|column| chunk.value_at(at, column)).collect();
+        assert_eq!(got, row(row_number as i64), "row {row_number}");
+    }
+}
+
+#[test]
 fn fetching_rows_never_opens_a_row_group_that_holds_none_of_them() {
     // The fixture is two row groups of 2048 and one page per column chunk, so a page here always
     // holds a wanted row and page skipping has nothing to do. What it can show is the level above:
