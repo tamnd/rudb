@@ -4,6 +4,7 @@ use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_storage::MemoryTable;
 use rudb_vector::{Chunk, Form};
 
+use crate::catalog::DETACHED;
 use crate::name::{QualifiedName, same_name};
 
 /// Refuses a column list that names the same column twice.
@@ -40,6 +41,8 @@ pub struct Table {
     name: QualifiedName,
     columns: Vec<Field>,
     rows: MemoryTable,
+    /// What `duckdb_tables()` reports as `table_oid`, stamped by the catalog when this goes in.
+    oid: i64,
 }
 
 impl Table {
@@ -55,7 +58,18 @@ impl Table {
     pub fn new(name: QualifiedName, columns: Vec<Field>) -> Result<Self> {
         duplicate_check(&columns)?;
         let types = columns.iter().map(|column| column.ty.clone()).collect();
-        Ok(Self { name, columns, rows: MemoryTable::new(types) })
+        Ok(Self { name, columns, rows: MemoryTable::new(types), oid: DETACHED })
+    }
+
+    /// The number the catalog tables join on, and [`DETACHED`] for a table not in a catalog.
+    #[must_use]
+    pub fn oid(&self) -> i64 {
+        self.oid
+    }
+
+    /// Stamps the oid, which only [`crate::Catalog::create_table`] does.
+    pub(crate) fn stamp(&mut self, oid: i64) {
+        self.oid = oid;
     }
 
     /// The three part name.

@@ -1229,7 +1229,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // This table lists itself, because it is a table function and the table lists those.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
-        vec![vec![Value::BigInt(4)]]
+        vec![vec![Value::BigInt(6)]]
     );
 }
 
@@ -1293,6 +1293,43 @@ fn the_settings_table_answers_the_question_a_client_asks_it() {
     // The seams are not settings, which is decided in the settings module and checked here because
     // this is the table a reader would find them in if the decision ever changed by accident.
     assert!(rows(&db, "SELECT name FROM duckdb_settings() WHERE name LIKE 'seam%'").is_empty());
+}
+
+#[test]
+fn the_databases_and_schemas_tables_describe_the_one_catalog_there_is() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    // One database and one schema, where the pin returns three and five. `system` and `temp` are
+    // upstream's and rudb has neither, which the entrycatalog module doc records.
+    assert_eq!(
+        rows(&db, "SELECT database_name, type, readonly, encrypted FROM duckdb_databases()"),
+        vec![vec![text("memory"), text("duckdb"), Value::Boolean(false), Value::Boolean(false)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT database_name, schema_name FROM duckdb_schemas()"),
+        vec![vec![text("memory"), text("main")]]
+    );
+    // The join a client writes, which is the whole reason these two carry numbers.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT s.schema_name FROM duckdb_schemas() s, duckdb_databases() d \
+             WHERE s.database_oid = d.database_oid"
+        ),
+        vec![vec![text("main")]]
+    );
+}
+
+#[test]
+fn a_schema_carries_an_oid_of_its_own_and_not_its_databases() {
+    let db = database();
+    let rows = rows(&db, "SELECT oid, database_oid FROM duckdb_schemas()");
+    assert_eq!(rows.len(), 1);
+    assert_ne!(rows[0][0], rows[0][1]);
+    // Neither of them is the number a detached entry carries, which is what a caller reading these
+    // through a join would silently collapse on.
+    assert_ne!(rows[0][0], Value::BigInt(0));
+    assert_ne!(rows[0][1], Value::BigInt(0));
 }
 
 /// The four ways a subscript is refused, in DuckDB's words. Per #278.
