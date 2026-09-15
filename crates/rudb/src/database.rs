@@ -4,7 +4,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rudb_bind::{Bound, Parameters};
 use rudb_catalog::{Catalog, Entry, View};
-use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Value};
+use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Value};
 use rudb_metrics::{Document, Report, Span};
 
 use rudb_parse::ast::Ast;
@@ -373,6 +373,17 @@ impl Shared {
         Budget { memory: &self.inner.memory, pool: &self.inner.pool }
     }
 
+    /// The settings this plan is going to report, and an empty set for a plan that reports none.
+    ///
+    /// `duckdb_settings()` is the only thing in the engine that reads a session and almost no query
+    /// contains one, so the values are read out of the settings when the plan says they are going to
+    /// be looked at rather than once per statement. Reading them means taking three locks and
+    /// formatting two numbers, which is not much and is still more than every `SELECT` in a benchmark
+    /// should pay for a table it does not mention.
+    fn session_for(&self, plan: &rudb_plan::Plan) -> Session {
+        if reads_settings(plan) { self.inner.settings.session() } else { Session::new() }
+    }
+
     /// Runs one query and returns every row it produced.
     ///
     /// `EXPLAIN` comes through here as well as through [`Shared::execute`], because it answers with
@@ -388,13 +399,26 @@ impl Shared {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
                 let budget = self.budget();
-                let under = Under::new(budget, context.statistics(), &seams, Rows::ForACaller);
+                let session = self.session_for(&plan);
+                let under =
+                    Under::new(budget, context.statistics(), &seams, &session, Rows::ForACaller);
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
+                let session = self.session_for(&plan);
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
-                explaining(&plan, &catalog, cancel, self.budget(), &context, seams, analyze, sql)
+                explaining(
+                    &plan,
+                    &catalog,
+                    cancel,
+                    self.budget(),
+                    &context,
+                    seams,
+                    &session,
+                    analyze,
+                    sql,
+                )
             }
             _ => Err(Error::not_implemented("a statement that is not a query, on the query path")),
         }
@@ -491,13 +515,26 @@ impl Shared {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
                 let budget = self.budget();
-                let under = Under::new(budget, context.statistics(), &seams, Rows::ForACaller);
+                let session = self.session_for(&plan);
+                let under =
+                    Under::new(budget, context.statistics(), &seams, &session, Rows::ForACaller);
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
+                let session = self.session_for(&plan);
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
-                explaining(&plan, &catalog, cancel, self.budget(), &context, seams, analyze, sql)
+                explaining(
+                    &plan,
+                    &catalog,
+                    cancel,
+                    self.budget(),
+                    &context,
+                    seams,
+                    &session,
+                    analyze,
+                    sql,
+                )
             }
             Bound::Setting(setting) => {
                 let value = setting.value.as_ref();
@@ -511,7 +548,18 @@ impl Shared {
                 Ok(QueryResult::empty())
             }
             Bound::CreateTable(create) => {
-                create_table(sql, create, &mut catalog, cancel, self.budget(), &context, &seams)?;
+                let session =
+                    create.source.as_ref().map_or_else(Session::new, |plan| self.session_for(plan));
+                create_table(
+                    sql,
+                    create,
+                    &mut catalog,
+                    cancel,
+                    self.budget(),
+                    &context,
+                    &seams,
+                    &session,
+                )?;
                 Ok(QueryResult::empty())
             }
             Bound::CreateView(create) => {
@@ -534,7 +582,9 @@ impl Shared {
                 // output forever or depend on how the scan holds its chunks.
                 rudb_opt::optimize_with(&mut insert.source, &context)?;
                 let statistics = context.statistics();
-                let under = Under::new(self.budget(), statistics, &seams, Rows::ForATable);
+                let session = self.session_for(&insert.source);
+                let under =
+                    Under::new(self.budget(), statistics, &seams, &session, Rows::ForATable);
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let table = catalog.table_mut(&insert.name)?;
                 for chunk in result.into_chunks() {
@@ -614,8 +664,8 @@ enum Rows {
 
 /// Everything a query runs under that is not the plan, the catalog or the cancel flag.
 ///
-/// The same reasoning as [`Budget`], one level out. These four travel together because every caller
-/// of `run` has to say all four and none of them is a property of the plan, and passing them as one
+/// The same reasoning as [`Budget`], one level out. These five travel together because every caller
+/// of `run` has to say all five and none of them is a property of the plan, and passing them as one
 /// keeps the argument list from growing a slot every time something new turns out to be true of a
 /// running query rather than of the query itself.
 #[derive(Clone, Copy)]
@@ -623,6 +673,7 @@ struct Under<'a> {
     budget: Budget<'a>,
     statistics: &'a rudb_opt::estimate::Statistics,
     seams: &'a rudb_seam::Settings,
+    session: &'a Session,
     going: Rows,
 }
 
@@ -631,10 +682,29 @@ impl<'a> Under<'a> {
         budget: Budget<'a>,
         statistics: &'a rudb_opt::estimate::Statistics,
         seams: &'a rudb_seam::Settings,
+        session: &'a Session,
         going: Rows,
     ) -> Self {
-        Self { budget, statistics, seams, going }
+        Self { budget, statistics, seams, session, going }
     }
+}
+
+/// Whether this plan reads `duckdb_settings()` anywhere in it.
+///
+/// Every node in the arena rather than the reachable ones, because the answer is the same either way
+/// and the arena is a slice. The name is spelled here and in `rudb_functions::TableFunction`, which
+/// is the one place this could drift: a rename that missed this line would leave the table full of
+/// nulls, so there is a test in [`crate::tests`] that reads a real value back out of it.
+fn reads_settings(plan: &rudb_plan::Plan) -> bool {
+    (0..plan.node_count()).any(|index| {
+        let index = u32::try_from(index).expect("a plan this large cannot be built");
+        match *plan.node(index) {
+            rudb_plan::Node::TableFunction { function, .. } => {
+                plan.string(function).eq_ignore_ascii_case("duckdb_settings")
+            }
+            _ => false,
+        }
+    })
 }
 
 fn run(
@@ -644,7 +714,7 @@ fn run(
     cancel: &Cancel,
     under: Under<'_>,
 ) -> Result<QueryResult> {
-    let Under { budget: Budget { memory, pool }, statistics, seams, going } = under;
+    let Under { budget: Budget { memory, pool }, statistics, seams, session, going } = under;
     // The budget is shared by the database and its high-water mark survives a query. Reset it to
     // what is live now before measuring this execution, otherwise a metrics document either says
     // zero forever (when nobody copies the mark) or inherits the largest earlier query. A caller
@@ -653,7 +723,7 @@ fn run(
     memory.forget_peak();
     let report = Report::new();
     let building = Span::start();
-    let query = rudb_exec::build_measured(plan, catalog, cancel, memory, seams, &report)?;
+    let query = rudb_exec::build_measured(plan, catalog, cancel, memory, seams, session, &report)?;
     let (built_wall, built_cpu) = building.stop();
     let names = query.schema().names();
     let types = query.schema().types();
@@ -721,6 +791,7 @@ fn explaining(
     budget: Budget<'_>,
     context: &rudb_opt::pass::Context,
     seams: rudb_opt::explain::Seams<'_>,
+    session: &Session,
     analyze: bool,
     sql: &str,
 ) -> Result<QueryResult> {
@@ -731,7 +802,7 @@ fn explaining(
             &rudb_opt::explain::explain_with(plan, statistics, seams),
         );
     }
-    let under = Under::new(budget, statistics, seams.settings(), Rows::ForACaller);
+    let under = Under::new(budget, statistics, seams.settings(), session, Rows::ForACaller);
     let result = run(sql, plan, catalog, cancel, under)?;
     let measured = result.metrics().expect("a query that ran reports what it did");
     let text = rudb_opt::explain::analyzed(plan, statistics, seams, measured);
@@ -774,6 +845,7 @@ fn create_view(create: rudb_bind::CreateView, catalog: &mut Catalog) -> Result<(
 }
 
 /// The `CREATE TABLE` half of a statement.
+#[allow(clippy::too_many_arguments)]
 fn create_table(
     sql: &str,
     mut create: rudb_bind::CreateTable,
@@ -782,6 +854,7 @@ fn create_table(
     budget: Budget<'_>,
     context: &rudb_opt::pass::Context,
     seams: &rudb_seam::Settings,
+    session: &Session,
 ) -> Result<()> {
     if create.if_not_exists && catalog.table(&create.name).is_ok() {
         return Ok(());
@@ -791,7 +864,7 @@ fn create_table(
     let rows = match &mut create.source {
         Some(plan) => {
             rudb_opt::optimize_with(plan, context)?;
-            let under = Under::new(budget, context.statistics(), seams, Rows::ForATable);
+            let under = Under::new(budget, context.statistics(), seams, session, Rows::ForATable);
             Some(run(sql, plan, catalog, cancel, under)?)
         }
         None => None,

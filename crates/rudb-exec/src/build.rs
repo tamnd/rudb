@@ -45,7 +45,7 @@
 use std::sync::Arc;
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Cancel, Memory, Result};
+use rudb_common::{Cancel, Memory, Result, Session};
 use rudb_functions::TableFunction;
 use rudb_metrics::{Counters, Driver, Report};
 use rudb_parquet::{Bound, Op};
@@ -68,6 +68,7 @@ use crate::query::Query;
 use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
+use crate::settingnames::settingnames;
 use crate::sort::Sort;
 use crate::source::{Dummy, FileScan, Scan, Series, Values};
 use crate::strategies::strategies;
@@ -122,7 +123,7 @@ pub fn build_with<'a>(
     memory: &Memory,
     seams: &Settings,
 ) -> Result<Query<'a>> {
-    build_measured(plan, catalog, cancel, memory, seams, &Report::new())
+    build_measured(plan, catalog, cancel, memory, seams, &Session::new(), &Report::new())
 }
 
 /// Builds the pipelines, reporting what every operator in them did into `report`.
@@ -130,6 +131,12 @@ pub fn build_with<'a>(
 /// The report is what the caller keeps. Once the query has been run, [`Report::fill`] turns it into
 /// the operator and pipeline rows of a metrics document, and that document is the same one
 /// `EXPLAIN ANALYZE` prints and `--metrics` writes.
+///
+/// The session is what `SET` has left the settings at, and the only thing that reads it is
+/// `duckdb_settings()`. It is a separate argument from the seam settings because the seams are a
+/// choice an operator makes while it is built and the settings are rows in a table. [`build`] and
+/// [`build_with`] pass an empty one, which reports every value as null, since a caller with no
+/// database behind it has no settings to report.
 ///
 /// # Errors
 ///
@@ -140,6 +147,7 @@ pub fn build_measured<'a>(
     cancel: &Cancel,
     memory: &Memory,
     seams: &Settings,
+    session: &Session,
     report: &Report,
 ) -> Result<Query<'a>> {
     let shape = Shape::of(plan);
@@ -155,6 +163,7 @@ pub fn build_measured<'a>(
         cancel,
         memory,
         seams,
+        session,
         report,
         shape,
         done: Vec::new(),
@@ -315,6 +324,8 @@ struct Building<'a, 'b> {
     cancel: &'b Cancel,
     memory: &'b Memory,
     seams: &'b Settings,
+    /// What `SET` has left the settings at, which only `duckdb_settings()` reads.
+    session: &'b Session,
     report: &'b Report,
     shape: Shape,
     /// The pipelines closed so far, in the order they have to run.
@@ -462,12 +473,16 @@ impl<'a> Building<'a, '_> {
                         function @ (TableFunction::RudbStrategies
                         | TableFunction::DuckdbKeywords
                         | TableFunction::DuckdbTypes
-                        | TableFunction::DuckdbFunctions),
+                        | TableFunction::DuckdbFunctions
+                        | TableFunction::DuckdbSettings),
                     ) => {
                         let table = match function {
                             TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
                             TableFunction::DuckdbTypes => typenames(plan, index, columns)?,
                             TableFunction::DuckdbFunctions => functionnames(plan, index, columns)?,
+                            TableFunction::DuckdbSettings => {
+                                settingnames(self.session, plan, index, columns)?
+                            }
                             _ => strategies(plan, index, columns)?,
                         };
                         let schema = table.schema().clone();

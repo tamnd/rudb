@@ -96,6 +96,7 @@ mod register;
 mod rows;
 mod schema;
 mod setop;
+mod settingnames;
 mod sort;
 mod source;
 mod spill;
