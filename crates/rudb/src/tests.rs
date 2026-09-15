@@ -1229,7 +1229,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // This table lists itself, because it is a table function and the table lists those.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
-        vec![vec![Value::BigInt(9)]]
+        vec![vec![Value::BigInt(11)]]
     );
 }
 
@@ -1601,6 +1601,96 @@ fn a_view_reports_itself_and_the_statement_it_was_written_as() {
     // And a table is not a view, so neither table lists what the other one does.
     assert!(rows(&db, "SELECT view_name FROM duckdb_views() WHERE view_name = 'base'").is_empty());
     assert!(rows(&db, "SELECT table_name FROM duckdb_tables() WHERE table_name = 'v'").is_empty());
+}
+
+/// The two tables a client reads on connect to find out what engine it got.
+#[test]
+fn the_engine_answers_for_its_optimizer_passes_and_its_extensions() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    // Forty four on the pin and forty four here, because the table is the set of names
+    // `SET disabled_optimizers` takes and rudb takes every one of them.
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM duckdb_optimizers()"),
+        vec![vec![Value::BigInt(44)]]
+    );
+    // The eight rudb has actually written are all in that list rather than names of its own, which
+    // is what makes a corpus file written against DuckDB turn off the pass it meant.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(*) FROM duckdb_optimizers() WHERE name IN ('expression_rewriter', \
+             'distinct_aggregate_rewrite', 'filter_pushdown', 'empty_result_pullup', \
+             'unused_columns', 'limit_pushdown', 'top_n', 'late_materialization')"
+        ),
+        vec![vec![Value::BigInt(8)]]
+    );
+    // And the name the table gives is a name the setting takes.
+    db.execute("SET disabled_optimizers = 'join_order,filter_pushdown'").expect("both names take");
+    // Thirty one extensions on the pin and thirty one here. Two of them are true here where six are
+    // true there, and the two are the two rudb has.
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM duckdb_extensions()"),
+        vec![vec![Value::BigInt(31)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT extension_name FROM duckdb_extensions() WHERE loaded ORDER BY 1"),
+        vec![vec![text("core_functions")], vec![text("parquet")]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT loaded, installed, install_path, install_mode, signature_key_fingerprint \
+             FROM duckdb_extensions() WHERE extension_name = 'parquet'"
+        ),
+        vec![vec![
+            Value::Boolean(true),
+            Value::Boolean(true),
+            text("(BUILT-IN)"),
+            text("STATICALLY_LINKED"),
+            Value::Null,
+        ]]
+    );
+    // The three empty strings on a row for something that is not here are empty strings and not
+    // nulls, which was measured, and the fingerprint is null on every row either way.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT loaded, installed, install_path, extension_version, install_mode, \
+             installed_from FROM duckdb_extensions() WHERE extension_name = 'spatial'"
+        ),
+        vec![vec![
+            Value::Boolean(false),
+            Value::Boolean(false),
+            text(""),
+            text(""),
+            text("NOT_INSTALLED"),
+            text(""),
+        ]]
+    );
+    // The aliases are the pin's, because they are a fact about the extension rather than about this
+    // engine, and an extension with none carries an empty list rather than a null.
+    let aliases = |values: Vec<&str>| Value::List {
+        element: LogicalType::Varchar,
+        values: values.into_iter().map(text).collect(),
+    };
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT aliases FROM duckdb_extensions() \
+             WHERE extension_name IN ('httpfs', 'parquet') ORDER BY extension_name"
+        ),
+        vec![vec![aliases(vec!["http", "https", "s3"])], vec![aliases(Vec::new())]]
+    );
+    // Both tables are table functions, so both list themselves in the function table.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(*) FROM duckdb_functions() \
+             WHERE function_name IN ('duckdb_extensions', 'duckdb_optimizers')"
+        ),
+        vec![vec![Value::BigInt(2)]]
+    );
 }
 
 /// A view over a star follows the table under it, and the column list follows with it.
