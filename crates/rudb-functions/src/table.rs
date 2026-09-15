@@ -5,7 +5,7 @@
 //! resolution problem from [`crate::signature`]: the answer is not a return type, it is a list of
 //! columns, because the caller can alias them and select from them and join against them.
 //!
-//! Seven of them are here. `range` and `generate_series` between them account for two thousand
+//! Eight of them are here. `range` and `generate_series` between them account for two thousand
 //! records in DuckDB's `sqllogictest` corpus, because a test that needs a thousand rows should not
 //! have to write a thousand rows, and the corpus uses them the way a person uses a for loop. The
 //! difference between those two is one row: `range` stops before the end and `generate_series`
@@ -19,22 +19,23 @@
 //! [`crate::file`] is where that happens. For CSV there is nothing in the file that states the
 //! columns either, so opening it means sniffing it.
 //!
-//! `rudb_strategies()`, `duckdb_keywords()` and `duckdb_types()` are the other three and they are
-//! the third kind, a table whose rows are a fact about the engine rather than data somebody stored.
-//! All three take no arguments and all three know their own columns, so resolving one is the
-//! simplest case in this file and they share an arm. The first is not a DuckDB function at all: it
-//! lists every seam in the engine and every implementation registered against it, which is how a
-//! reader finds out what this engine will let them swap and what it lets them swap today. The second
-//! is every word the grammar knows about, which this crate can answer because the grammar is
-//! vendored. The third is every type name the engine has, and its list is in
-//! [`crate::typecatalog`] because which names exist is a fact about the type system.
+//! The other four are the third kind, a table whose rows are a fact about the engine rather than
+//! data somebody stored. All four take no arguments and all four know their own columns, so
+//! resolving one is the simplest case in this file and they share an arm. `rudb_strategies()` is not
+//! a DuckDB function at all: it lists every seam in the engine and every implementation registered
+//! against it, which is how a reader finds out what this engine will let them swap and what it lets
+//! them swap today. `duckdb_keywords()` is every word the grammar knows about, which this crate can
+//! answer because the grammar is vendored. `duckdb_types()` is every type name the engine has and
+//! `duckdb_functions()` is every function, and both of their lists are in this crate because which
+//! names exist is a fact about the type system and the function library rather than about the
+//! executor.
 //!
-//! D2 adds about ten more of that third kind, the settings and the functions and the catalog tables
-//! among them. Each one is a column list here and a list of rows in `rudb_exec::metadata`, and
-//! nothing else.
+//! D2 adds about nine more of that third kind, the settings and the catalog tables among them. Each
+//! one is a column list here and a list of rows in `rudb_exec::metadata`, and nothing else.
 
 use rudb_common::{Error, Field, LogicalType, Result};
 
+use crate::functioncatalog::function_fields;
 use crate::typecatalog::type_fields;
 
 /// Which table function a call resolved to.
@@ -57,6 +58,8 @@ pub enum TableFunction {
     DuckdbKeywords,
     /// `duckdb_types()`, every type name the engine knows and what each one stands for.
     DuckdbTypes,
+    /// `duckdb_functions()`, every function the engine knows and what each one takes.
+    DuckdbFunctions,
 }
 
 /// The name of the column `file_row_number=True` adds.
@@ -79,6 +82,7 @@ impl TableFunction {
             Self::RudbStrategies => "rudb_strategies",
             Self::DuckdbKeywords => "duckdb_keywords",
             Self::DuckdbTypes => "duckdb_types",
+            Self::DuckdbFunctions => "duckdb_functions",
         }
     }
 
@@ -153,6 +157,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("duckdb_types") {
             return Some(Self::DuckdbTypes);
+        }
+        if name.eq_ignore_ascii_case("duckdb_functions") {
+            return Some(Self::DuckdbFunctions);
         }
         None
     }
@@ -269,7 +276,8 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::GenerateSeries
         | TableFunction::RudbStrategies
         | TableFunction::DuckdbKeywords
-        | TableFunction::DuckdbTypes => None,
+        | TableFunction::DuckdbTypes
+        | TableFunction::DuckdbFunctions => None,
     }
 }
 
@@ -280,6 +288,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::RudbStrategies => Some(strategy_fields()),
         TableFunction::DuckdbKeywords => Some(keyword_fields()),
         TableFunction::DuckdbTypes => Some(type_fields()),
+        TableFunction::DuckdbFunctions => Some(function_fields()),
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::ReadParquet
@@ -560,7 +569,7 @@ mod tests {
 
     #[test]
     fn a_metadata_table_given_an_argument_says_it_takes_none() {
-        for name in ["rudb_strategies", "duckdb_keywords", "duckdb_types"] {
+        for name in ["rudb_strategies", "duckdb_keywords", "duckdb_types", "duckdb_functions"] {
             let function = TableFunction::lookup(name).expect("a known function");
             let error = resolve_table(name, &[LogicalType::BigInt]).expect_err("takes none");
             assert!(

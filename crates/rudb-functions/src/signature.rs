@@ -1153,6 +1153,159 @@ fn find(name: &str) -> Option<&'static Entry> {
     TABLE.iter().find(|entry| entry.name.eq_ignore_ascii_case(name))
 }
 
+/// One overload of one function, as `duckdb_functions()` reports it.
+///
+/// An overload here is a name and an argument count, because that is what an entry in this crate's
+/// table has one of each. Upstream has an overload per pair of argument types instead and so reports
+/// 44 rows for `+`, and `types` is where the difference shows up. See [`function_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionRow {
+    /// The name as it was written, which is the alias for an alias.
+    pub name: &'static str,
+    /// Scalar or aggregate.
+    pub kind: FunctionKind,
+    /// The name this one resolves to, and `None` for a name that is its own.
+    pub alias_of: Option<&'static str>,
+    /// One per argument, in order.
+    pub types: Vec<&'static str>,
+    /// What the call produces.
+    pub returns: &'static str,
+    /// The type of the trailing variadic argument, for the names that take one.
+    pub varargs: Option<&'static str>,
+}
+
+/// Every name in the table and every argument count it takes, for `duckdb_functions()`.
+///
+/// The types here are declared types and not resolved ones, which is the whole difference between
+/// this table and upstream's. The table in this module resolves by shape: `+` is one entry saying
+/// both arguments promote and the result is what they promote to, where upstream carries an entry
+/// per pair of numeric types because it carries an implementation per pair. So upstream reports 44
+/// rows for `+` naming concrete types and this reports two, one per arity, with the type variable.
+///
+/// `T` is upstream's own spelling for an argument whose type the call decides, which it uses for
+/// `list_extract` and `lag` and the rest of the generic functions, and it means the same thing here:
+/// every argument spelled `T` in one row is the same type as every other. `ANY` is the weaker one
+/// and means the argument is not constrained and not tied to the others, which is what `count(x)`
+/// takes. A return of `ANY` means the type is decided by the arguments in a way a name cannot say,
+/// which is where `sum` is, since it promotes and then widens an integer to the accumulator.
+///
+/// Rows come out in the order the table is written in, which is by family. The caller sorts.
+///
+/// [`resolve`]: crate::signature::resolve
+#[must_use]
+pub fn function_rows() -> Vec<FunctionRow> {
+    let mut rows = Vec::new();
+    for entry in TABLE {
+        for count in entry.arity.every_count() {
+            let (types, returns) = entry.shape.declared(count);
+            rows.push(FunctionRow {
+                name: entry.name,
+                kind: entry.kind,
+                alias_of: None,
+                types,
+                returns,
+                varargs: entry.arity.open().then(|| entry.shape.declared(1).0[0]),
+            });
+        }
+    }
+    // An alias is a row of its own with the same shape, because a client reading this table to find
+    // out whether `len` works wants a row for `len`. Upstream does the same and fills `alias_of`
+    // with the name it resolves to, which is how this crate's list was read off in the first place.
+    for (alias, real) in ALIASES {
+        let mut aliased: Vec<FunctionRow> = rows
+            .iter()
+            .filter(|row| row.name == *real)
+            .map(|row| FunctionRow { name: alias, alias_of: Some(real), ..row.clone() })
+            .collect();
+        rows.append(&mut aliased);
+    }
+    rows
+}
+
+impl Arity {
+    /// Every argument count this accepts, with an open end reported as its shortest form.
+    ///
+    /// An open end is `concat` and friends, which take any number, and the row for one says so in
+    /// `varargs` rather than by having a row per count up to some number nobody picked.
+    fn every_count(self) -> Vec<usize> {
+        match self {
+            Self::Exactly(count) => vec![count],
+            Self::Between(least, Some(most)) => (least..=most).collect(),
+            Self::Between(least, None) => vec![least],
+            Self::OneOf(counts) => counts.to_vec(),
+        }
+    }
+
+    /// Whether the count has no upper end.
+    const fn open(self) -> bool {
+        matches!(self, Self::Between(_, None))
+    }
+}
+
+impl Fixed {
+    /// The name this type goes by in a catalog table, which is the name a cast spells.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Boolean => "BOOLEAN",
+            Self::Integer => "INTEGER",
+            Self::BigInt => "BIGINT",
+            Self::Double => "DOUBLE",
+            Self::Varchar => "VARCHAR",
+            Self::Date => "DATE",
+            Self::Timestamp => "TIMESTAMP",
+            Self::Interval => "INTERVAL",
+        }
+    }
+}
+
+/// The type variable, for an argument whose type the call decides and that every other argument
+/// spelled the same way has to agree with.
+const SAME: &str = "T";
+
+/// An argument that is not constrained and is not tied to the others, or a result that the
+/// arguments decide in a way no name can say.
+const ANY: &str = "ANY";
+
+impl Shape {
+    /// What the arguments and the result are declared to be, at this argument count.
+    ///
+    /// Not what a call resolves to. A shape that promotes says `T` here and works out the real type
+    /// in [`resolve`] from what was passed, and a shape that widens a decimal says `ANY` for the
+    /// result because the width is not in the name.
+    fn declared(self, count: usize) -> (Vec<&'static str>, &'static str) {
+        let all = |name: &'static str| vec![name; count];
+        let leading = |taken: usize, first: &'static str, rest: &'static str| {
+            (0..count).map(|at| if at < taken { first } else { rest }).collect::<Vec<_>>()
+        };
+        match self {
+            // Promoting says `T` and the result is that same `T`, exactly.
+            Self::Promoted | Self::PromotedToFirst => (all(SAME), SAME),
+            // Promoting and then moving: a decimal product is as wide as both operands, a decimal
+            // quotient is a double, a decimal sum gains a carry digit and an integer sum widens to
+            // the accumulator. The arguments still meet at one type and the result is no longer it.
+            Self::Multiplied | Self::Divided | Self::PromotedWithCarry | Self::Accumulated => {
+                (all(SAME), ANY)
+            }
+            Self::PromotedTo(fixed) => (all(SAME), fixed.name()),
+            Self::FixedTo(from, to) | Self::Exact(from, to) | Self::Widened(from, to) => {
+                (all(from.name()), to.name())
+            }
+            Self::AnyTo(fixed) => (all(ANY), fixed.name()),
+            Self::LeadingFixedTo(taken, first, to) => {
+                (leading(taken, first.name(), ANY), to.name())
+            }
+            Self::LeadingFixedToLast(first) => (leading(1, first.name(), SAME), SAME),
+            // A subscript takes a string or a list and a whole number, and the whole number is not
+            // cast to one, which is why it is spelled out rather than left as `ANY`.
+            Self::Extracted => (leading(1, SAME, "BIGINT"), ANY),
+            Self::Sliced => (leading(1, SAME, "BIGINT"), SAME),
+            Self::TextThenIndex(taken, to) => {
+                (leading(taken, Fixed::Varchar.name(), "BIGINT"), to.name())
+            }
+        }
+    }
+}
+
 /// The name a function is in [`TABLE`] under, which is its own name unless it is an alias.
 ///
 /// Aliases are resolved here rather than by a second row in the table, so that [`Resolved::name`]

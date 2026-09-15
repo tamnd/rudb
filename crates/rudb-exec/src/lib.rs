@@ -82,6 +82,7 @@ mod buffer;
 mod build;
 mod expr;
 mod fetch;
+mod functionnames;
 mod gather;
 mod group;
 mod join;
