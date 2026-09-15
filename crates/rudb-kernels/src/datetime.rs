@@ -658,8 +658,16 @@ const YEARS: std::ops::RangeInclusive<i64> = -5_877_641..=5_881_580;
 /// already refused everything else that shares the spelling, so this only has to tell the two
 /// apart and not police them.
 pub(crate) fn is_shift(left: &Value, right: &Value) -> bool {
-    let when =
-        |value: &Value| matches!(value, Value::Date(_) | Value::Timestamp(_) | Value::Time(_));
+    let when = |value: &Value| {
+        matches!(
+            value,
+            Value::Date(_)
+                | Value::Timestamp(_)
+                | Value::TimestampTz(_)
+                | Value::Time(_)
+                | Value::TimeTz(_)
+        )
+    };
     let interval = |value: &Value| matches!(value, Value::Interval { .. });
     (interval(left) && when(right)) || (when(left) && interval(right))
 }
@@ -694,18 +702,29 @@ pub(crate) fn shift(left: &Value, right: &Value, subtract: bool) -> Result<Value
             moved(*day, 0, 0)?;
             Ok(Value::Timestamp(moved(shifted_days(*day, months, days)?, 0, micros)?))
         }
-        Value::Timestamp(stamp) => {
+        // A zoned moment moves the same way and comes back zoned. The months and the days are
+        // calendar fields and a calendar is a local thing, so this is the one place where a session
+        // time zone will change the answer rather than only the printing, and that is that box.
+        Value::Timestamp(stamp) | Value::TimestampTz(stamp) => {
             let day =
                 i32::try_from(stamp.div_euclid(MICROS_PER_DAY)).map_err(|_| not_in_range())?;
             let within = stamp.rem_euclid(MICROS_PER_DAY);
-            Ok(Value::Timestamp(moved(shifted_days(day, months, days)?, within, micros)?))
+            let moved = moved(shifted_days(day, months, days)?, within, micros)?;
+            Ok(match when {
+                Value::TimestampTz(_) => Value::TimestampTz(moved),
+                _ => Value::Timestamp(moved),
+            })
         }
         // A time is a clock and not a point in history, so the whole days go nowhere and what is
         // left wraps. `TIME '10:00:00' + INTERVAL '-1 day 1 hour'` is eleven in the morning.
-        Value::Time(clock) => {
+        Value::Time(clock) | Value::TimeTz(clock) => {
             let day = i128::from(MICROS_PER_DAY);
             let wrapped = (i128::from(*clock) + micros).rem_euclid(day);
-            Ok(Value::Time(i64::try_from(wrapped).map_err(|_| not_in_range())?))
+            let wrapped = i64::try_from(wrapped).map_err(|_| not_in_range())?;
+            Ok(match when {
+                Value::TimeTz(_) => Value::TimeTz(wrapped),
+                _ => Value::Time(wrapped),
+            })
         }
         other => Err(Error::internal(format!("{other} takes no interval"))),
     }
@@ -979,7 +998,8 @@ pub(crate) fn apart(left: &Value, right: &Value) -> Result<Value> {
         (Value::Date(late), Value::Date(early)) => {
             Ok(Value::BigInt(i64::from(*late) - i64::from(*early)))
         }
-        (Value::Timestamp(late), Value::Timestamp(early)) => {
+        (Value::Timestamp(late), Value::Timestamp(early))
+        | (Value::TimestampTz(late), Value::TimestampTz(early)) => {
             let apart = late.checked_sub(*early).ok_or_else(too_far)?;
             // The day count of a difference that fits an `i64` of microseconds is about a hundred
             // million, so the narrowing cannot fail, and it reports the same sentence rather than
@@ -1018,7 +1038,9 @@ fn too_far() -> Error {
 /// measuring it backwards: the borrow has to come from the earlier moment either way, so the swap
 /// happens first and the sign goes back on at the end.
 pub(crate) fn age(left: &Value, right: &Value) -> Result<Value> {
-    let (Value::Timestamp(first), Value::Timestamp(second)) = (left, right) else {
+    let ((Value::Timestamp(first), Value::Timestamp(second))
+    | (Value::TimestampTz(first), Value::TimestampTz(second))) = (left, right)
+    else {
         return Err(Error::internal(format!("{left} and {right} are not two moments")));
     };
     let backwards = first < second;
@@ -1062,7 +1084,9 @@ fn fields_of(stamp: i64) -> Result<Fields> {
 
 /// Whether a pair of values is a date and a time of day.
 pub(crate) fn is_joined(left: &Value, right: &Value) -> bool {
-    matches!((left, right), (Value::Date(_), Value::Time(_)) | (Value::Time(_), Value::Date(_)))
+    let clock = |value: &Value| matches!(value, Value::Time(_) | Value::TimeTz(_));
+    let date = |value: &Value| matches!(value, Value::Date(_));
+    (date(left) && clock(right)) || (clock(left) && date(right))
 }
 
 /// A date and a time of day as the one moment they name together.
@@ -1074,16 +1098,21 @@ pub(crate) fn is_joined(left: &Value, right: &Value) -> bool {
 /// `Date and time not in timestamp range` for a date with an interval on it. The two are different
 /// paths upstream and they were measured rather than shared.
 pub(crate) fn joined(left: &Value, right: &Value) -> Result<Value> {
-    let (day, clock) = match (left, right) {
+    // A zoned time makes a zoned moment, since the zone is what the time knows that the date does
+    // not and joining the two of them does not throw it away.
+    let (day, clock, zoned) = match (left, right) {
         (Value::Date(day), Value::Time(clock)) | (Value::Time(clock), Value::Date(day)) => {
-            (*day, *clock)
+            (*day, *clock, false)
+        }
+        (Value::Date(day), Value::TimeTz(clock)) | (Value::TimeTz(clock), Value::Date(day)) => {
+            (*day, *clock, true)
         }
         _ => return Err(Error::internal(format!("{left} and {right} are not a date and a time"))),
     };
     let stamp = i128::from(day) * i128::from(MICROS_PER_DAY) + i128::from(clock);
     match i64::try_from(stamp) {
         Ok(stamp) if (OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(&stamp) => {
-            Ok(Value::Timestamp(stamp))
+            Ok(if zoned { Value::TimestampTz(stamp) } else { Value::Timestamp(stamp) })
         }
         _ => Err(Error::out_of_range("Timestamp out of range")),
     }

@@ -66,8 +66,21 @@ pub enum Value {
     Date(i32),
     /// `TIME`, microseconds since midnight.
     Time(i64),
+    /// `TIME WITH TIME ZONE`, microseconds since midnight UTC.
+    ///
+    /// An arm of its own rather than a [`Value::Time`] under a type that says the zone, because the
+    /// plan holds a constant's type and its value in two places and checks that the two agree, and
+    /// because printing one is not printing the other: a zoned time carries the offset after it.
+    TimeTz(i64),
     /// `TIMESTAMP`, microseconds since 1970-01-01 00:00:00.
     Timestamp(i64),
+    /// `TIMESTAMP WITH TIME ZONE`, microseconds since 1970-01-01 00:00:00 UTC.
+    ///
+    /// The same instant a [`Value::Timestamp`] holds, and what makes it a different value is what a
+    /// reader is entitled to conclude from it. A `TIMESTAMP` is a wall clock reading with no zone
+    /// behind it and this is a point in time, so the one thing this arm knows that the other does
+    /// not is which moment it is.
+    TimestampTz(i64),
     /// `INTERVAL`, the months, days and microseconds triple.
     ///
     /// Three fields rather than one duration because interval arithmetic with months is not
@@ -201,7 +214,9 @@ impl Value {
             Self::Blob(_) => LogicalType::Blob,
             Self::Date(_) => LogicalType::Date,
             Self::Time(_) => LogicalType::Time,
+            Self::TimeTz(_) => LogicalType::TimeTz,
             Self::Timestamp(_) => LogicalType::Timestamp,
+            Self::TimestampTz(_) => LogicalType::TimestampTz,
             Self::Interval { .. } => LogicalType::Interval,
             Self::List { element, .. } => LogicalType::list(element.clone()),
             Self::Struct(fields) => LogicalType::Struct(
@@ -277,7 +292,18 @@ impl fmt::Display for Value {
             Self::Blob(v) => write_blob(f, v),
             Self::Date(v) => write_date(f, *v),
             Self::Time(v) => write_time(f, *v),
+            // The unzoned rendering and then the offset, which is what the pin prints and is
+            // `+00` until there is a session time zone to print something else. The offset is not
+            // optional there: a zoned value always ends in one.
+            Self::TimeTz(v) => {
+                write_time(f, *v)?;
+                f.write_str(UTC)
+            }
             Self::Timestamp(v) => write_timestamp(f, *v),
+            Self::TimestampTz(v) => {
+                write_timestamp(f, *v)?;
+                f.write_str(UTC)
+            }
             Self::Interval { months, days, micros } => write_interval(f, *months, *days, *micros),
             Self::List { values, .. } => {
                 f.write_str("[")?;
@@ -499,6 +525,13 @@ fn write_date(f: &mut fmt::Formatter<'_>, days: i32) -> fmt::Result {
         write!(f, "{year:04}-{month:02}-{day:02}")
     }
 }
+
+/// The offset a zoned value prints with while the only session time zone rudb has is UTC.
+///
+/// A constant here rather than a formatting rule, because the rule is the time zone box's and this
+/// is the answer that rule gives for the one zone there is. The pin prints the same two characters
+/// after `SET TimeZone='UTC'`, which was measured.
+const UTC: &str = "+00";
 
 fn write_time(f: &mut fmt::Formatter<'_>, micros: i64) -> fmt::Result {
     let seconds = micros.div_euclid(1_000_000);

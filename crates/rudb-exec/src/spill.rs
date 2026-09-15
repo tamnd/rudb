@@ -248,6 +248,8 @@ mod tag {
     pub(super) const INTERVAL: u8 = 20;
     pub(super) const LIST: u8 = 21;
     pub(super) const STRUCT: u8 = 22;
+    pub(super) const TIME_TZ: u8 = 23;
+    pub(super) const TIMESTAMP_TZ: u8 = 24;
 }
 
 /// Writes one value.
@@ -278,7 +280,9 @@ fn put(out: &mut Sink<'_>, value: &Value, ty: &LogicalType) -> Result<()> {
         Value::Blob(held) => bytes(out, tag::BLOB, held),
         Value::Date(held) => fixed(out, tag::DATE, &held.to_le_bytes()),
         Value::Time(held) => fixed(out, tag::TIME, &held.to_le_bytes()),
+        Value::TimeTz(held) => fixed(out, tag::TIME_TZ, &held.to_le_bytes()),
         Value::Timestamp(held) => fixed(out, tag::TIMESTAMP, &held.to_le_bytes()),
+        Value::TimestampTz(held) => fixed(out, tag::TIMESTAMP_TZ, &held.to_le_bytes()),
         Value::Interval { months, days, micros } => {
             out.put(&[tag::INTERVAL])?;
             out.put(&months.to_le_bytes())?;
@@ -385,7 +389,9 @@ fn get(reader: &mut BufReader<File>, ty: &LogicalType, reuse: Option<Value>) -> 
         }
         tag::DATE => Value::Date(i32::from_le_bytes(take(reader)?)),
         tag::TIME => Value::Time(i64::from_le_bytes(take(reader)?)),
+        tag::TIME_TZ => Value::TimeTz(i64::from_le_bytes(take(reader)?)),
         tag::TIMESTAMP => Value::Timestamp(i64::from_le_bytes(take(reader)?)),
+        tag::TIMESTAMP_TZ => Value::TimestampTz(i64::from_le_bytes(take(reader)?)),
         tag::INTERVAL => Value::Interval {
             months: i32::from_le_bytes(take(reader)?),
             days: i32::from_le_bytes(take(reader)?),
@@ -498,7 +504,9 @@ mod tests {
             (LogicalType::Blob, vec![Value::Blob(Vec::new()), Value::Blob(vec![0, 255, 128])]),
             (LogicalType::Date, vec![Value::Date(i32::MIN), Value::Date(19_000)]),
             (LogicalType::Time, vec![Value::Time(86_399_999_999)]),
+            (LogicalType::TimeTz, vec![Value::TimeTz(86_399_999_999)]),
             (LogicalType::Timestamp, vec![Value::Timestamp(i64::MIN)]),
+            (LogicalType::TimestampTz, vec![Value::TimestampTz(i64::MIN)]),
             (
                 LogicalType::Interval,
                 vec![Value::Interval { months: -1, days: 2, micros: i64::MIN }],

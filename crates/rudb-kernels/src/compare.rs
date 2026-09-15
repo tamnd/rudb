@@ -875,9 +875,12 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Varchar(a), Value::Varchar(b)) => Ok(a.as_bytes().cmp(b.as_bytes())),
         (Value::Blob(a), Value::Blob(b)) => Ok(a.cmp(b)),
         (Value::Date(a), Value::Date(b)) => Ok(a.cmp(b)),
-        (Value::Time(a), Value::Time(b)) | (Value::Timestamp(a), Value::Timestamp(b)) => {
-            Ok(a.cmp(b))
-        }
+        // A zoned value orders with its own kind and by the same rule, since both of them are the
+        // count of microseconds from a fixed point and the zone is about printing.
+        (Value::Time(a), Value::Time(b))
+        | (Value::TimeTz(a), Value::TimeTz(b))
+        | (Value::Timestamp(a), Value::Timestamp(b))
+        | (Value::TimestampTz(a), Value::TimestampTz(b)) => Ok(a.cmp(b)),
         (
             Value::Interval { months: am, days: ad, micros: au },
             Value::Interval { months: bm, days: bd, micros: bu },

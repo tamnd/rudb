@@ -189,6 +189,17 @@ impl Scope {
         found
     }
 
+    /// Whether anything in scope answers to this name, in any table.
+    ///
+    /// Not the same question as [`Scope::position_of`], which says no when two columns match. This
+    /// one says yes, because the caller is `current_date` asking whether it is a column here at all
+    /// and two columns called `current_date` is the ambiguity error rather than the session constant.
+    /// That was measured: `SELECT current_date FROM t, u` with the name in both is
+    /// `Ambiguous reference to column name "current_date"` on the pin.
+    pub(crate) fn names(&self, column: &str) -> bool {
+        self.columns.iter().any(|held| same_name(&held.name, column))
+    }
+
     fn not_found(&self, table: Option<&str>, column: &str) -> Error {
         match table {
             Some(table) if self.columns.iter().all(|held| !same_name(&held.table, table)) => {
