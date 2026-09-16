@@ -1937,6 +1937,51 @@ fn warnings_as_errors_matches_the_pin_without_a_logger() {
 }
 
 #[test]
+fn errors_as_json_structures_errors_at_every_sql_api_boundary() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('errors_as_json')"),
+        vec![vec![Value::Boolean(false)]]
+    );
+    db.execute("SET errors_as_json = true").expect("JSON errors");
+
+    let missing = db.query("SELECT * FROM nonexistent_table").expect_err("missing table");
+    assert_eq!(missing.code().duckdb_name(), "Catalog Error");
+    assert!(missing.message().contains("\"exception_type\":\"Catalog\""));
+    assert!(missing.message().contains("\"error_subtype\":\"MISSING_ENTRY\""));
+    assert!(!missing.to_string().starts_with("Catalog Error:"));
+
+    let column = db.query("SELECT cbl FROM (VALUES (42)) t(col)").expect_err("missing column");
+    assert!(column.message().contains("\"exception_type\":\"Binder\""));
+    assert!(column.message().contains("\"error_subtype\":\"COLUMN_NOT_FOUND\""));
+
+    let syntax = db.prepare("SECT 1").expect_err("syntax error");
+    assert!(syntax.message().contains("\"exception_type\":\"Parser\""));
+    assert!(syntax.message().contains("\"error_subtype\":\"SYNTAX_ERROR\""));
+    assert!(syntax.message().contains("\"position\":"));
+
+    assert!(db.plan("SELECT missing").expect_err("plan error").message().starts_with('{'));
+    db.execute("RESET errors_as_json").expect("plain errors");
+    assert!(
+        db.query("SELECT * FROM nonexistent_table")
+            .expect_err("plain error")
+            .to_string()
+            .starts_with("Catalog Error:")
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'errors_as_json'"
+        ),
+        vec![vec![
+            text("Output error messages as structured JSON instead of as a raw string"),
+            text("BOOLEAN"),
+            text("GLOBAL"),
+        ]]
+    );
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -2046,8 +2091,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Nineteen rows for seventeen settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(19)]]);
+    // Twenty rows for eighteen settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(20)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
