@@ -1748,6 +1748,9 @@ fn regex_operator_semantics_are_resolved_while_the_expression_is_bound() {
 fn show_behavior_resolves_a_name_before_execution() {
     let db = database();
     assert_eq!(rows(&db, "SHOW show_behavior"), vec![vec![text("AUTO")]]);
+    let mixed = db.query("SHOW ShOw_BeHaViOr").expect("setting names ignore case");
+    assert_eq!(mixed.names(), ["ShOw_BeHaViOr"]);
+    assert_eq!(mixed.rows().collect::<Vec<_>>(), vec![vec![text("AUTO")]]);
     assert_eq!(
         rows(&db, "SHOW t"),
         vec![
