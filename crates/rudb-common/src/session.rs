@@ -37,6 +37,7 @@ pub struct Semantics {
     disable_timestamptz_casts: bool,
     integer_division: bool,
     ieee_floating_point_ops: bool,
+    identifier_case: IdentifierCase,
     null_on_division_by_zero: bool,
     order_by_non_integer_literal: bool,
     regex_match_full: bool,
@@ -51,6 +52,7 @@ impl Default for Semantics {
             disable_timestamptz_casts: false,
             integer_division: false,
             ieee_floating_point_ops: true,
+            identifier_case: IdentifierCase::Preserve,
             null_on_division_by_zero: false,
             order_by_non_integer_literal: false,
             regex_match_full: false,
@@ -60,6 +62,11 @@ impl Default for Semantics {
 }
 
 impl Semantics {
+    /// How unquoted identifiers are folded while a statement is parsed.
+    #[must_use]
+    pub fn identifier_case(self) -> IdentifierCase {
+        self.identifier_case
+    }
     /// Whether casts from local timestamps to zoned timestamps are refused.
     #[must_use]
     pub fn disable_timestamptz_casts(self) -> bool {
@@ -118,6 +125,18 @@ impl Semantics {
     pub fn show_behavior(self) -> ShowBehavior {
         self.show_behavior
     }
+}
+
+/// How a session folds identifiers that were not quoted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IdentifierCase {
+    /// Keep the spelling in the statement.
+    #[default]
+    Preserve,
+    /// Fold ASCII letters to lowercase.
+    Lower,
+    /// Fold ASCII letters to uppercase.
+    Upper,
 }
 
 /// How `SHOW name` chooses between a setting and a table.
@@ -220,6 +239,11 @@ impl Session {
     /// Sets whether floating division and remainder use IEEE answers for zero divisors.
     pub fn set_ieee_floating_point_ops(&mut self, enabled: bool) {
         self.semantics.ieee_floating_point_ops = enabled;
+    }
+
+    /// Sets how unquoted identifiers are folded while a statement is parsed.
+    pub fn set_identifier_case(&mut self, case: IdentifierCase) {
+        self.semantics.identifier_case = case;
     }
 
     /// Sets whether division errors caused by a zero divisor become nulls.
