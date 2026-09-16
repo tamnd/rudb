@@ -336,6 +336,10 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         // keyword.
         Expr::Row { items } => format!("\"row\"({})", exprs(ast, items)),
         Expr::Subquery { query: inner } => format!("({})", query(ast, inner)),
+        Expr::Exists { query: inner, negated } => {
+            let exists = format!("EXISTS({})", query(ast, inner));
+            if negated { format!("(NOT {exists})") } else { exists }
+        }
     }
 }
 
