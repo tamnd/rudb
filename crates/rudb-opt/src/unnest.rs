@@ -146,20 +146,7 @@ fn scalar_projection_domain(
         return None;
     };
     let outer = produced(plan, left);
-    let independent = match *plan.node(input) {
-        Node::Dummy | Node::Get { .. } => true,
-        Node::Values { rows, .. } => plan
-            .row_list(rows)
-            .iter()
-            .all(|row| plan.expr_list(*row).iter().all(|&expr| !reads(plan, expr, &outer))),
-        Node::TableFunction { args, settings, .. } => plan
-            .expr_list(args)
-            .iter()
-            .chain(plan.expr_list(settings))
-            .all(|&expr| !reads(plan, expr, &outer)),
-        _ => false,
-    };
-    if !independent {
+    if !independent_leaf(plan, input, &outer) {
         return None;
     }
     let projected = plan.expr_list(exprs).to_vec();
@@ -376,23 +363,33 @@ fn scalar_aggregate_domain(
     else {
         return None;
     };
-    let Node::Filter { input, predicate } = *plan.node(filtered) else {
-        return None;
-    };
 
     let outer = produced(plan, left);
+    let (input, predicate) = match *plan.node(filtered) {
+        Node::Filter { input, predicate } => (input, Some(predicate)),
+        _ if independent_leaf(plan, filtered, &outer) => (filtered, None),
+        _ => return None,
+    };
     let inner = produced(plan, input);
     let mut correlated = Vec::new();
     let mut local = Vec::new();
-    split(plan, predicate, &mut |part| {
-        if reads(plan, part, &outer) {
-            correlated.push(part);
-        } else {
-            local.push(part);
-        }
-    });
-    if correlated.is_empty()
-        || correlated.iter().all(|&part| equality_pair(plan, part, &outer, &inner).is_some())
+    if let Some(predicate) = predicate {
+        split(plan, predicate, &mut |part| {
+            if reads(plan, part, &outer) {
+                correlated.push(part);
+            } else {
+                local.push(part);
+            }
+        });
+    }
+    let expression_correlated = plan
+        .expr_list(groups)
+        .iter()
+        .chain(plan.expr_list(aggregates))
+        .any(|&expr| reads(plan, expr, &outer));
+    if !expression_correlated
+        && (correlated.is_empty()
+            || correlated.iter().all(|&part| equality_pair(plan, part, &outer, &inner).is_some()))
     {
         return None;
     }
@@ -454,7 +451,7 @@ fn scalar_aggregate_domain(
     let presence = plan.add_expr_at(
         Expr::Column(ColumnBinding::new(inner_index, u32::try_from(marker_position).ok()?)),
         LogicalType::Boolean,
-        plan.expr_span(predicate),
+        predicate.map_or_else(|| plan.expr_span(outer_exprs[0]), |expr| plan.expr_span(expr)),
     );
 
     let domain_conditions: Vec<ExprRef> = correlated
@@ -475,7 +472,10 @@ fn scalar_aggregate_domain(
     let original_groups = plan.expr_list(groups).to_vec();
     let mut grouped_exprs: Vec<ExprRef> = original_groups
         .iter()
-        .map(|&group| replace_inner(plan, group, inner_index, &inner_outputs))
+        .map(|&group| {
+            let group = replace_inner(plan, group, inner_index, &inner_outputs);
+            replace_inner(plan, group, domain_index, &domain_outputs)
+        })
         .collect();
     for (position, &source) in outer_exprs.iter().enumerate() {
         grouped_exprs.push(plan.add_expr_at(
@@ -490,6 +490,7 @@ fn scalar_aggregate_domain(
         .into_iter()
         .map(|call| {
             let call = replace_inner(plan, call, inner_index, &inner_outputs);
+            let call = replace_inner(plan, call, domain_index, &domain_outputs);
             count_with_presence(plan, call, presence)
         })
         .collect();
@@ -1126,6 +1127,22 @@ fn reads(plan: &Plan, expr: ExprRef, tables: &crate::tables::TableSet) -> bool {
     let mut yes = false;
     walk::columns(plan, expr, &mut |binding| yes |= tables.contains(binding.table));
     yes
+}
+
+fn independent_leaf(plan: &Plan, input: NodeRef, outer: &crate::tables::TableSet) -> bool {
+    match *plan.node(input) {
+        Node::Dummy | Node::Get { .. } => true,
+        Node::Values { rows, .. } => plan
+            .row_list(rows)
+            .iter()
+            .all(|row| plan.expr_list(*row).iter().all(|&expr| !reads(plan, expr, outer))),
+        Node::TableFunction { args, settings, .. } => plan
+            .expr_list(args)
+            .iter()
+            .chain(plan.expr_list(settings))
+            .all(|&expr| !reads(plan, expr, outer)),
+        _ => false,
+    }
 }
 
 fn split(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ExprRef)) {
