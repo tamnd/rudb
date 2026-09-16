@@ -658,7 +658,7 @@ impl<'a> Binder<'a> {
                 return found.name.clone();
             }
         }
-        describe(ast, target, self.semantics.integer_division())
+        describe(ast, target, self.semantics)
     }
 
     /// The expressions a `GROUP BY` clause names, with positions and output aliases followed.
@@ -755,7 +755,7 @@ impl<'a> Binder<'a> {
                         Some(position) => position,
                         None => {
                             exprs.push(bound);
-                            names.push(describe(ast, item.expr, self.semantics.integer_division()));
+                            names.push(describe(ast, item.expr, self.semantics));
                             extra.push(exprs.len() - 1);
                             exprs.len() - 1
                         }

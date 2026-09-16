@@ -1712,8 +1712,10 @@ impl<'a> Transform<'a> {
                     // `LikeVariations`, so a `NOT` in front of either stays an explicit negation.
                     ("GlobToken", _) => BinaryOp::Glob,
                     ("RegexMatchToken", _) => BinaryOp::Regex,
-                    ("SimilarToToken", false) | ("NotSimilarToOp", true) => BinaryOp::SimilarTo,
-                    ("SimilarToToken", true) | ("NotSimilarToOp", false) => BinaryOp::NotSimilarTo,
+                    ("SimilarToToken", false) => BinaryOp::SimilarTo,
+                    ("SimilarToToken", true) => BinaryOp::NotSimilarTo,
+                    ("NotSimilarToOp", false) => BinaryOp::NotRegex,
+                    ("NotSimilarToOp", true) => BinaryOp::Regex,
                     ("RegexInsensitiveMatchToken", false)
                     | ("NotRegexInsensitiveMatchOp", true) => BinaryOp::RegexInsensitive,
                     ("RegexInsensitiveMatchToken", true)
