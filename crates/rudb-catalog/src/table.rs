@@ -1,7 +1,7 @@
 //! A table: a name, some columns, and the rows.
 
 use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_native::Reader as NativeReader;
+use rudb_native::{FrequencyOccurrences, Reader as NativeReader};
 use rudb_storage::{MemoryTable, Probe};
 use rudb_vector::{Chunk, Form, Vector};
 
@@ -49,6 +49,14 @@ impl Rows {
         match self {
             Self::Memory(_) => Ok(None),
             Self::Native(reader) => reader.top_frequencies(column, top),
+        }
+    }
+
+    /// Sparse numeric frequency candidate rows from a committed native snapshot.
+    pub fn frequency_occurrences(&self, column: usize) -> Result<Option<FrequencyOccurrences>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Native(reader) => reader.frequency_occurrences(column),
         }
     }
 
