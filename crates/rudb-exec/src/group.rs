@@ -148,6 +148,12 @@ pub(crate) struct Aggregate<'a> {
     /// Emit at most this many groups from each radix partition when the parent orders by count
     /// descending. The ordinary TopN still makes the final global choice.
     top_counts: Option<usize>,
+    /// Emit only groups whose COUNT(*) call at this index reaches the inclusive bound.
+    ///
+    /// The Filter remains above the aggregate and checks the predicate again. This only avoids
+    /// materializing groups that cannot pass it, so a missed shape is slow and never changes an
+    /// answer.
+    having_count: Option<(usize, i64)>,
     /// The most groups an unordered limit above this operator can observe.
     max_groups: Option<usize>,
     memory: Memory,
@@ -441,6 +447,7 @@ impl<'a> Aggregate<'a> {
             compact_numeric,
             distinct_count,
             top_counts: None,
+            having_count: None,
             max_groups: None,
             by_vector,
             groups,
@@ -476,6 +483,20 @@ impl<'a> Aggregate<'a> {
     pub(crate) fn top_counts(mut self, bound: usize) -> Self {
         if self.count_only || self.compact_numeric || self.distinct_count {
             self.top_counts = Some(bound);
+        }
+        self
+    }
+
+    /// Drops groups below an inclusive COUNT(*) bound before result vectors are materialized.
+    #[must_use]
+    pub(crate) fn having_count(mut self, call: usize, minimum: i64) -> Self {
+        if self.calls.get(call).is_some_and(|call| {
+            call.name == "count_star"
+                && call.args.is_empty()
+                && !call.distinct
+                && call.filter.is_none()
+        }) {
+            self.having_count = Some((call, minimum));
         }
         self
     }
@@ -1020,31 +1041,41 @@ impl<'a> Aggregate<'a> {
         // chunk. The ungrouped case falls out of the same loop with no key columns and one group.
         let types = self.schema.types();
         let width = self.groups.len();
-        let selected = self.top_counts.map(|bound| {
-            let count = |slot: usize| {
-                if self.count_only {
-                    counts[slot]
-                } else if self.compact_numeric {
-                    compact[slot].count()
-                } else {
-                    states[slot * calls]
-                        .counted()
-                        .expect("a distinct count prefix has a COUNT state")
-                }
-            };
-            let mut best = Vec::with_capacity(bound.min(groups));
-            for slot in 0..groups {
-                let at = best.partition_point(|&kept| count(kept) >= count(slot));
-                if at < bound {
-                    best.insert(at, slot);
-                    best.truncate(bound);
-                }
+        let count = |slot: usize, call: usize| {
+            if self.count_only {
+                return counts[slot];
             }
-            // The downstream TopN settles equal keys by arrival. Preserve the order this
-            // partition would have emitted without the reduction.
-            best.sort_unstable();
-            best
-        });
+            if self.compact_numeric {
+                return compact[slot].count();
+            }
+            states[slot * calls + call].counted().expect("a selected COUNT call has a COUNT state")
+        };
+        let selected = match (self.top_counts, self.having_count) {
+            (Some(bound), _) => {
+                let mut best = Vec::with_capacity(bound.min(groups));
+                for slot in 0..groups {
+                    let at = best.partition_point(|&kept| count(kept, 0) >= count(slot, 0));
+                    if at < bound {
+                        best.insert(at, slot);
+                        best.truncate(bound);
+                    }
+                }
+                // The downstream TopN settles equal keys by arrival. Preserve the order this
+                // partition would have emitted without the reduction.
+                best.sort_unstable();
+                Some(best)
+            }
+            (_, Some((call, minimum))) => {
+                let mut kept = Vec::new();
+                for slot in 0..groups {
+                    if count(slot, call) >= minimum {
+                        kept.push(slot);
+                    }
+                }
+                Some(kept)
+            }
+            _ => None,
+        };
         let output_groups = selected.as_ref().map_or(groups, Vec::len);
         // The one buffer the results of a call go through on their way into a vector, kept between
         // chunks and charged once.
