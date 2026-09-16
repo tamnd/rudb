@@ -990,6 +990,7 @@ fn the_settings_table_is_twenty_rows_for_eighteen_settings_and_says_nothing_abou
         names,
         [
             "TimeZone",
+            "allow_parser_override_extension",
             "current_dialect",
             "default_null_order",
             "default_order",
