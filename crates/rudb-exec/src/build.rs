@@ -691,24 +691,30 @@ impl<'a> Building<'a, '_> {
         let schema = aggregate.schema().clone();
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
-        if bound.max_groups.is_none()
-            && bound.having_count.is_none()
-            && let Some(top) = bound.top_counts
-            && let Some(frequencies) =
-                native_frequencies(self.plan, self.catalog, input, groups, aggregates, top)?
-        {
-            let source = Frequencies::new(
-                self.plan,
-                &below.schema,
-                schema.clone(),
-                groups,
-                frequencies.column,
-                frequencies.entries,
-                self.session,
-            )?;
-            let counters =
-                self.watch(reference, id, pipeline, "Aggregate", Some("native frequencies"));
-            return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+        if bound.max_groups.is_none() && bound.having_count.is_none() {
+            if let Some(top) = bound.top_counts {
+                if let Some(frequencies) =
+                    native_frequencies(self.plan, self.catalog, input, groups, aggregates, top)?
+                {
+                    let source = Frequencies::new(
+                        self.plan,
+                        &below.schema,
+                        schema.clone(),
+                        groups,
+                        frequencies.column,
+                        frequencies.entries,
+                        self.session,
+                    )?;
+                    let counters = self.watch(
+                        reference,
+                        id,
+                        pipeline,
+                        "Aggregate",
+                        Some("native frequencies"),
+                    );
+                    return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+                }
+            }
         }
         let counters = self.watch(reference, id, pipeline, "Aggregate", None);
         let reading = Arc::clone(&counters);
