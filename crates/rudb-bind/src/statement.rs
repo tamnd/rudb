@@ -470,7 +470,7 @@ fn insert(
                 let column = &scope.columns[from];
                 let expr =
                     binder.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
-                binder.cast_to(expr, &field.ty)
+                binder.checked_cast_to(expr, &field.ty, false)?
             }
             None => {
                 // A typed null rather than `add_constant`, which would give it the null type and
