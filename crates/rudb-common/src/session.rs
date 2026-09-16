@@ -35,6 +35,7 @@ pub struct Semantics {
     default_descending: bool,
     default_null_order: DefaultNullOrder,
     integer_division: bool,
+    order_by_non_integer_literal: bool,
 }
 
 impl Semantics {
@@ -59,6 +60,12 @@ impl Semantics {
     #[must_use]
     pub fn integer_division(self) -> bool {
         self.integer_division
+    }
+
+    /// Whether a constant non-integer expression is accepted as a sort key.
+    #[must_use]
+    pub fn order_by_non_integer_literal(self) -> bool {
+        self.order_by_non_integer_literal
     }
 }
 
@@ -145,6 +152,11 @@ impl Session {
     /// Sets whether `/` is bound as the integer division operator.
     pub fn set_integer_division(&mut self, enabled: bool) {
         self.semantics.integer_division = enabled;
+    }
+
+    /// Sets whether a constant non-integer expression is accepted as a sort key.
+    pub fn set_order_by_non_integer_literal(&mut self, enabled: bool) {
+        self.semantics.order_by_non_integer_literal = enabled;
     }
 
     /// The meaning-changing choices the binder resolves into the plan.

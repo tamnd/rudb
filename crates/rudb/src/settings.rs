@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry. It is not named by a query, it has no schema, and the set of
 //! them is fixed at compile time, so this is a match on a name rather than a map. [`Settings::NAMES`]
-//! is that set, and it is nine names for seven settings because two have a second spelling.
+//! is that set, and it is ten names for eight settings because two have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
@@ -56,6 +56,8 @@ pub(crate) struct Settings {
     default_null_order: RwLock<String>,
     /// Whether `/` binds to integer division instead of floating point division.
     integer_division: RwLock<bool>,
+    /// Whether an `ORDER BY` may name a non-integer literal that cannot affect the order.
+    order_by_non_integer_literal: RwLock<bool>,
     /// Which implementation runs at each seam, as `SET seam.<name>` has left it.
     ///
     /// Held here rather than in [`Config`], because there are twenty seven of them and a `Config`
@@ -67,7 +69,7 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 9] = [
+    pub(crate) const NAMES: [&'static str; 10] = [
         "TimeZone",
         "default_null_order",
         "default_order",
@@ -75,6 +77,7 @@ impl Settings {
         "integer_division",
         "max_memory",
         "memory_limit",
+        "order_by_non_integer_literal",
         "threads",
         "worker_threads",
     ];
@@ -94,6 +97,7 @@ impl Settings {
             default_order: RwLock::new("ASCENDING".to_string()),
             default_null_order: RwLock::new("NULLS_LAST".to_string()),
             integer_division: RwLock::new(false),
+            order_by_non_integer_literal: RwLock::new(false),
             seams: RwLock::new(rudb_seam::Settings::new()),
         }
     }
@@ -241,6 +245,13 @@ impl Settings {
                 });
                 memory.set_limit(limit);
             }
+            "order_by_non_integer_literal" => {
+                let enabled = value.map_or(Ok(false), boolean_of)?;
+                *self
+                    .order_by_non_integer_literal
+                    .write()
+                    .unwrap_or_else(|held| held.into_inner()) = enabled;
+            }
             "threads" => {
                 let threads = match value {
                     None => self.defaults.threads(),
@@ -289,6 +300,11 @@ impl Settings {
             // default is no limit where DuckDB's is a fraction of the machine, and printing the
             // largest number a limit could be would be describing a limit that is not there.
             "memory_limit" => Ok(config.memory_limit().map_or("unlimited".to_string(), human)),
+            "order_by_non_integer_literal" => Ok(self
+                .order_by_non_integer_literal
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .to_string()),
             "threads" => Ok(config.threads().to_string()),
             _ => Err(Error::catalog(rudb_functions::unknown_setting(name))),
         }
@@ -296,14 +312,14 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are nine names and the alternative
+    /// Built once per statement rather than held, because there are ten names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Seven settings and nine names means the loop below would otherwise take several locks.
+    /// Eight settings and ten names means the loop below would otherwise take several locks.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
@@ -316,6 +332,8 @@ impl Settings {
             self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone();
         let integer_division =
             *self.integer_division.read().unwrap_or_else(|held| held.into_inner());
+        let order_by_non_integer_literal =
+            *self.order_by_non_integer_literal.read().unwrap_or_else(|held| held.into_inner());
         let mut session = Session::new();
         session.set_time_zone(&time_zone);
         session.set_default_descending(default_order == "DESC");
@@ -326,6 +344,7 @@ impl Settings {
             _ => DefaultNullOrder::Last,
         });
         session.set_integer_division(integer_division);
+        session.set_order_by_non_integer_literal(order_by_non_integer_literal);
         for name in Self::NAMES {
             session.set(
                 name,
@@ -336,6 +355,7 @@ impl Settings {
                     "disabled_optimizers" => disabled.clone(),
                     "integer_division" => integer_division.to_string(),
                     "memory_limit" => memory.clone(),
+                    "order_by_non_integer_literal" => order_by_non_integer_literal.to_string(),
                     "threads" => threads.clone(),
                     other => unreachable!("{other} is not one of NAMES"),
                 },

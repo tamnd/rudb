@@ -1544,6 +1544,20 @@ fn integer_division_is_resolved_while_the_expression_is_bound() {
 }
 
 #[test]
+fn a_non_integer_order_literal_needs_the_session_opt_in() {
+    let db = database();
+    let expected = "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to allow this behavior.";
+    assert_eq!(failure(&db, "SELECT 2 AS x ORDER BY 'a'"), expected);
+    assert_eq!(failure(&db, "SELECT 2 AS x ORDER BY 1.5"), expected);
+    assert_eq!(failure(&db, "SELECT 2 AS x ORDER BY NULL"), expected);
+    db.execute("SET order_by_non_integer_literal = true").expect("constant sort keys");
+    assert_eq!(db.setting("order_by_non_integer_literal").expect("the setting"), "true");
+    assert_eq!(rows(&db, "SELECT 2 AS x ORDER BY 'a'"), vec![vec![Value::Integer(2)]]);
+    db.execute("RESET order_by_non_integer_literal").expect("the default guard");
+    assert_eq!(db.setting("order_by_non_integer_literal").expect("the setting"), "false");
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -1653,8 +1667,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Nine rows for seven settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(9)]]);
+    // Ten rows for eight settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(10)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
