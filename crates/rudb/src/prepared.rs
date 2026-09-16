@@ -105,8 +105,10 @@ impl Prepared {
 
     /// Checks the values against the statement and runs it.
     fn run(&self, parameters: Parameters) -> Result<QueryResult> {
-        self.check(&parameters)?;
-        self.shared.execute_ast(&self.ast, &self.sql, &parameters, &self.shared.token())
+        let result = self.check(&parameters).and_then(|()| {
+            self.shared.execute_ast(&self.ast, &self.sql, &parameters, &self.shared.token())
+        });
+        result.map_err(|error| self.shared.process_error(error))
     }
 
     /// Both halves of the mismatch, in DuckDB's words.

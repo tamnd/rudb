@@ -35,6 +35,7 @@ pub struct Semantics {
     default_descending: bool,
     default_null_order: DefaultNullOrder,
     disable_timestamptz_casts: bool,
+    errors_as_json: bool,
     integer_division: bool,
     ieee_floating_point_ops: bool,
     identifier_case: IdentifierCase,
@@ -51,6 +52,7 @@ impl Default for Semantics {
             default_descending: false,
             default_null_order: DefaultNullOrder::default(),
             disable_timestamptz_casts: false,
+            errors_as_json: false,
             integer_division: false,
             ieee_floating_point_ops: true,
             identifier_case: IdentifierCase::Preserve,
@@ -64,6 +66,11 @@ impl Default for Semantics {
 }
 
 impl Semantics {
+    /// Whether errors are returned as structured JSON.
+    #[must_use]
+    pub fn errors_as_json(self) -> bool {
+        self.errors_as_json
+    }
     /// How unquoted identifiers are folded while a statement is parsed.
     #[must_use]
     pub fn identifier_case(self) -> IdentifierCase {
@@ -267,6 +274,11 @@ impl Session {
     /// Sets whether casts from local timestamps to zoned timestamps are refused.
     pub fn set_disable_timestamptz_casts(&mut self, enabled: bool) {
         self.semantics.disable_timestamptz_casts = enabled;
+    }
+
+    /// Sets whether errors are returned as structured JSON.
+    pub fn set_errors_as_json(&mut self, enabled: bool) {
+        self.semantics.errors_as_json = enabled;
     }
 
     /// Sets whether regex match operators require the entire string to match.

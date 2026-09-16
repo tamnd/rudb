@@ -160,12 +160,13 @@ struct Payload {
     code: ErrorCode,
     message: String,
     span: Option<Span>,
+    message_only: bool,
 }
 
 impl Error {
     /// An error with a code and a message and no span.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self(Box::new(Payload { code, message: message.into(), span: None }))
+        Self(Box::new(Payload { code, message: message.into(), span: None, message_only: false }))
     }
 
     /// The same error, with the part of the query it is about.
@@ -191,6 +192,27 @@ impl Error {
     #[must_use]
     pub fn span(&self) -> Option<Span> {
         self.0.span
+    }
+
+    /// Renders this error as the structured JSON form DuckDB returns for `errors_as_json`.
+    #[must_use]
+    pub fn into_json(mut self) -> Self {
+        let exception_type = self.0.code.json_name();
+        let subtype = self.0.code.json_subtype(&self.0.message);
+        let mut fields = vec![
+            ("exception_type", exception_type.to_string()),
+            ("exception_message", self.0.message.clone()),
+        ];
+        if let Some(span) = self.0.span {
+            fields.push(("location", format!("[{},{}]", span.start, span.len())));
+            fields.push(("position", span.start.to_string()));
+        }
+        if let Some(subtype) = subtype {
+            fields.push(("error_subtype", subtype.to_string()));
+        }
+        self.0.message = json_object(&fields);
+        self.0.message_only = true;
+        self
     }
 
     /// The text is not SQL.
@@ -274,8 +296,72 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.message_only {
+            return f.write_str(&self.0.message);
+        }
         write!(f, "{}: {}", self.0.code, self.0.message)
     }
+}
+
+impl ErrorCode {
+    const fn json_name(self) -> &'static str {
+        match self {
+            Self::Parser => "Parser",
+            Self::Syntax => "Syntax",
+            Self::Binder => "Binder",
+            Self::Catalog => "Catalog",
+            Self::Conversion => "Conversion",
+            Self::OutOfRange => "Out of Range",
+            Self::InvalidInput => "Invalid Input",
+            Self::OutOfMemory => "Out of Memory",
+            Self::Io => "IO",
+            Self::NotImplemented => "Not implemented",
+            Self::Constraint => "Constraint",
+            Self::Transaction => "TransactionContext",
+            Self::Settings => "Settings",
+            Self::Interrupt => "Interrupt",
+            Self::Internal => "INTERNAL",
+        }
+    }
+
+    fn json_subtype(self, message: &str) -> Option<&'static str> {
+        match self {
+            Self::Parser => Some("SYNTAX_ERROR"),
+            Self::Binder if message.starts_with("Referenced column") => Some("COLUMN_NOT_FOUND"),
+            Self::Binder if message.contains("No function matches") => Some("NO_MATCHING_FUNCTION"),
+            Self::Catalog if message.contains("does not exist") => Some("MISSING_ENTRY"),
+            _ => None,
+        }
+    }
+}
+
+fn json_object(fields: &[(&str, String)]) -> String {
+    let mut out = String::from("{");
+    for (index, (name, value)) in fields.iter().enumerate() {
+        if index != 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(name);
+        out.push_str("\":\"");
+        for character in value.chars() {
+            match character {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                character if character <= '\u{1f}' => {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "\\u{:04x}", character as u32);
+                }
+                character => out.push(character),
+            }
+        }
+        out.push('"');
+    }
+    out.push('}');
+    out
 }
 
 impl std::error::Error for Error {}
@@ -297,6 +383,18 @@ mod tests {
             error.to_string(),
             "Binder Error: Referenced column \"nope\" not found in FROM clause!"
         );
+    }
+
+    #[test]
+    fn a_json_error_is_structured_and_has_no_text_prefix() {
+        let error = Error::binder("Referenced column \"nope\" not found\nnext")
+            .with_span(Span::new(7, 11))
+            .into_json();
+        assert_eq!(
+            error.to_string(),
+            "{\"exception_type\":\"Binder\",\"exception_message\":\"Referenced column \\\"nope\\\" not found\\nnext\",\"location\":\"[7,4]\",\"position\":\"7\",\"error_subtype\":\"COLUMN_NOT_FOUND\"}"
+        );
+        assert_eq!(error.code(), ErrorCode::Binder);
     }
 
     #[test]
