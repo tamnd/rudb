@@ -128,9 +128,10 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
 
 /// Replays a scalar projection over the distinct outer values it reads.
 ///
-/// A scalar query such as `SELECT (SELECT outer.k + 1)` has no inner filter from which to extract
-/// a join key. Its one-row input is replaced by the outer-key domain, the projection is rewritten
-/// against that domain, and a null-safe lookup attaches the result to every original outer row.
+/// A scalar query such as `SELECT (SELECT outer.k + inner.x)` has no inner filter from which to
+/// extract a join key. Its independent input is crossed with the outer-key domain, the projection
+/// is rewritten against that domain, and a null-safe lookup attaches the result to every original
+/// outer row. The final `SINGLE` join still enforces the scalar row-count rule.
 fn scalar_projection_domain(
     plan: &mut Plan,
     left: NodeRef,
@@ -144,10 +145,23 @@ fn scalar_projection_domain(
     let Node::Project { input, index, exprs, names } = *plan.node(right) else {
         return None;
     };
-    if !matches!(plan.node(input), Node::Dummy) {
+    let outer = produced(plan, left);
+    let independent = match *plan.node(input) {
+        Node::Dummy | Node::Get { .. } => true,
+        Node::Values { rows, .. } => plan
+            .row_list(rows)
+            .iter()
+            .all(|row| plan.expr_list(*row).iter().all(|&expr| !reads(plan, expr, &outer))),
+        Node::TableFunction { args, settings, .. } => plan
+            .expr_list(args)
+            .iter()
+            .chain(plan.expr_list(settings))
+            .all(|&expr| !reads(plan, expr, &outer)),
+        _ => false,
+    };
+    if !independent {
         return None;
     }
-    let outer = produced(plan, left);
     let projected = plan.expr_list(exprs).to_vec();
     let mut outer_keys = Vec::new();
     for &expr in &projected {
@@ -169,6 +183,11 @@ fn scalar_projection_domain(
     let aggregates = plan.add_expr_list(&[]);
     let domain =
         plan.add_node(Node::Aggregate { input: left, index: domain_index, groups, aggregates });
+    let replay_input = if matches!(plan.node(input), Node::Dummy) {
+        domain
+    } else {
+        plan.add_node(Node::CrossProduct { left: domain, right: input })
+    };
     let outputs: HashMap<ColumnBinding, usize> =
         outer_keys.iter().copied().enumerate().map(|(position, key)| (key, position)).collect();
     let mut rewritten: Vec<ExprRef> = projected
@@ -188,7 +207,7 @@ fn scalar_projection_domain(
     let visible = rewritten.len() - outer_exprs.len();
     let exprs = plan.add_expr_list(&rewritten);
     let names = plan.add_name_list(&projected_names);
-    let right = plan.add_node(Node::Project { input: domain, index, exprs, names });
+    let right = plan.add_node(Node::Project { input: replay_input, index, exprs, names });
 
     let mut all = plan.expr_list(conditions).to_vec();
     for (position, &outer_expr) in outer_exprs.iter().enumerate() {
