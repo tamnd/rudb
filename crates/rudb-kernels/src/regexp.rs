@@ -17,10 +17,12 @@
 //! distinct values that the dictionary form may never appear on it.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_regex::{Options, Regex, Rewrite};
-use rudb_vector::{Data, StringColumn, Vector};
+use rudb_vector::{Data, StringColumn, Validity, Vector};
 
 use crate::number::integral;
 use crate::scalar::{finish, over_valid};
@@ -86,6 +88,11 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
     let base = nulls_of(text);
     match (name, returns) {
         ("regexp_replace", LogicalType::Varchar) => {
+            if let Some((codes, dictionary)) = text.stable_dictionary_parts() {
+                if let Some(replaced) = call.stable_replace(dictionary, codes, base.clone())? {
+                    return Ok(Some(replaced));
+                }
+            }
             // One buffer for the whole vector rather than a fresh `String` per row. It grows to the
             // longest value in the column once and then stays there.
             let mut buffer = String::new();
@@ -165,6 +172,15 @@ pub(crate) struct Call {
     group: usize,
     /// The fixed host extraction used by ClickBench q29.
     host: bool,
+    /// One transformed code space shared by every page of a stable native dictionary.
+    stable: OnceLock<Result<StableReplace>>,
+}
+
+#[derive(Debug)]
+struct StableReplace {
+    source: Arc<Vector>,
+    values: Arc<Vector>,
+    remap: Vec<u32>,
 }
 
 impl Call {
@@ -212,7 +228,106 @@ impl Call {
             && spelling.is_empty();
         let regex = Regex::with_options(pattern, options)?;
         let rewrite = Rewrite::new(replacement, regex.groups());
-        Ok(Some(Self { regex, rewrite, global: options.global, group, host }))
+        Ok(Some(Self {
+            regex,
+            rewrite,
+            global: options.global,
+            group,
+            host,
+            stable: OnceLock::new(),
+        }))
+    }
+
+    /// Rewrites a stable dictionary once and reuses its deduplicated result codes on every page.
+    fn stable_replace(
+        &self,
+        dictionary: &Arc<Vector>,
+        codes: &[u32],
+        validity: Validity,
+    ) -> Result<Option<Vector>> {
+        let cached = self
+            .stable
+            .get_or_init(|| self.build_stable_replace(Arc::clone(dictionary)))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        // A selection keeps stable codes but can clone the dictionary handle. The stable flag is
+        // the storage promise that those codes retain their meaning across pages of this input;
+        // equal dictionary width is enough to distinguish that case from another code space.
+        if cached.source.len() != dictionary.len() {
+            return Ok(None);
+        }
+        let mut remapped = Vec::with_capacity(codes.len());
+        for &code in codes {
+            remapped.push(
+                *cached
+                    .remap
+                    .get(code as usize)
+                    .ok_or_else(|| Error::internal("a stable regexp code is out of range"))?,
+            );
+        }
+        Vector::stable_dictionary(remapped, Arc::clone(&cached.values))
+            .map(|vector| Some(vector.with_validity(validity)))
+    }
+
+    fn build_stable_replace(&self, dictionary: Arc<Vector>) -> Result<StableReplace> {
+        let mut unique = HashMap::<Vec<u8>, u32>::new();
+        let mut remap = Vec::with_capacity(dictionary.len());
+        let mut null = None;
+        let mut next = 0_u32;
+        let mut buffer = String::new();
+        for at in 0..dictionary.len() {
+            let Some(text) = dictionary.try_text_at(at)? else {
+                let code = *null.get_or_insert_with(|| {
+                    let code = next;
+                    next = next.saturating_add(1);
+                    code
+                });
+                remap.push(code);
+                continue;
+            };
+            let bytes = if self.host {
+                host_bytes(text.as_bytes())
+            } else {
+                buffer.clear();
+                self.regex.replace_into(&mut buffer, text, &self.rewrite, self.global);
+                buffer.as_bytes()
+            };
+            let code = match unique.get(bytes) {
+                Some(&code) => code,
+                None => {
+                    let code = next;
+                    next = next
+                        .checked_add(1)
+                        .ok_or_else(|| Error::internal("too many stable regexp values"))?;
+                    unique.insert(bytes.to_vec(), code);
+                    code
+                }
+            };
+            remap.push(code);
+        }
+        let values_len = usize::try_from(next)
+            .map_err(|_| Error::internal("stable regexp values do not fit this platform"))?;
+        let mut ordered = vec![None; values_len];
+        for (value, &code) in &unique {
+            ordered[code as usize] = Some(value.as_slice());
+        }
+        let mut values = StringColumn::with_capacity(values_len);
+        let mut valid = Vec::with_capacity(values_len);
+        for value in ordered {
+            match value {
+                Some(value) => {
+                    values.push_bytes(value);
+                    valid.push(true);
+                }
+                None => {
+                    values.push("");
+                    valid.push(false);
+                }
+            }
+        }
+        let values = Vector::flat(LogicalType::Varchar, Data::Varlen(values))?
+            .with_validity(Validity::from_run(&valid));
+        Ok(StableReplace { source: dictionary, values: Arc::new(values), remap })
     }
 }
 
@@ -303,9 +418,12 @@ impl<'a> Source<'a> {
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::Value;
+    use std::sync::Arc;
 
-    use super::{Call, host};
+    use rudb_common::{LogicalType, Value};
+    use rudb_vector::{Validity, Vector};
+
+    use super::{Call, host, vectorized};
 
     #[test]
     fn clickbench_host_extraction_keeps_the_regex_boundaries() {
@@ -341,5 +459,35 @@ mod tests {
             call.regex.replace_into(&mut general, text, &call.rewrite, call.global);
             assert_eq!(host(text), general, "{text:?}");
         }
+    }
+
+    #[test]
+    fn stable_replacements_deduplicate_outputs_and_keep_outer_nulls() {
+        let pattern = Value::Varchar("^https?://(?:www\\.)?([^/]+)/.*$".into());
+        let replacement = Value::Varchar("\\1".into());
+        let call = Call::read("regexp_replace", &[&pattern, &replacement])
+            .expect("valid pattern")
+            .expect("a prepared call");
+        let dictionary = Arc::new(
+            Vector::from_values(
+                LogicalType::Varchar,
+                &[
+                    Value::Varchar("http://www.example.com/a".into()),
+                    Value::Varchar("https://example.com/b".into()),
+                ],
+            )
+            .expect("dictionary values"),
+        );
+        let input = Vector::stable_dictionary(vec![0, 1, 0], dictionary)
+            .expect("stable dictionary")
+            .with_validity(Validity::from_run(&[true, true, false]));
+        let output = vectorized("regexp_replace", Some(&call), &[input], &LogicalType::Varchar, 3)
+            .expect("replacement succeeds")
+            .expect("vectorized replacement");
+        let (codes, _) = output.stable_dictionary_parts().expect("stable output");
+        assert_eq!(codes[0], codes[1]);
+        assert_eq!(output.value_at(0), Value::Varchar("example.com".into()));
+        assert_eq!(output.value_at(1), Value::Varchar("example.com".into()));
+        assert_eq!(output.value_at(2), Value::Null);
     }
 }
