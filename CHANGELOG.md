@@ -6,6 +6,15 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.23
+
+A patch release about session-controlled integer division, constant sort keys, and regex operator matching. The storage format version is unchanged.
+
+- `integer_division` changes slash between integer operands from floating division to truncating integer division, including the generated column name. Decimal and floating operands keep floating division. The binder resolves the setting once, so execution does not read session state.
+- `order_by_non_integer_literal` keeps DuckDB's default error for constant non-integer sort keys and accepts them after the session opt-in. The binder removes accepted constant keys, so sorting adds no setting read or runtime work.
+- `regex_match_operator_semantics` selects partial or full matching for `~`, `!~`, `~*`, and `!~*`. `SIMILAR TO` remains a full match in both modes, and the parser now keeps `!~` distinct from `NOT SIMILAR TO`. DuckDB emits a deprecation warning when this setting changes, while rudb does not have a warning channel yet.
+- The pinned DuckDB oracle agrees on every integer division, order literal, and regex semantics record added with this release. No DuckDB bug was found in this work.
+
 ## 0.3.22
 
 A patch release about session time zones, zoned timestamp rendering, sort defaults, and smaller hot paths in the optimizer and grouped string aggregates. The storage format version is unchanged.
