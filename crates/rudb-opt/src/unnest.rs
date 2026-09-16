@@ -2,8 +2,8 @@
 //!
 //! Binding keeps correlation explicit as a dependent join.
 //! Execution never implements that node because each rule here has to remove the dependency before the plan can run.
-//! The first rule covers a scalar projection over a correlated filter.
-//! Inner columns used by the filter are added to the projection as hidden outputs, the predicate is rewritten against those outputs, and the dependent join becomes an ordinary `SINGLE` join.
+//! Scalar projections over correlated filters carry inner filter columns as hidden outputs before the dependent join becomes an ordinary `SINGLE` join.
+//! Scalar aggregates add equality correlation keys to their grouping, so the inner input is still scanned and aggregated once rather than once per outer row.
 
 use std::collections::HashMap;
 
@@ -35,6 +35,9 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
         return Some(join);
     }
     if let Some(join) = mark(plan, left, right, kind, conditions) {
+        return Some(join);
+    }
+    if let Some(join) = scalar_aggregate(plan, left, right, kind, conditions) {
         return Some(join);
     }
     let Node::Project { input: filtered, index, exprs, names } = *plan.node(right) else {
@@ -109,6 +112,134 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     let all: Vec<ExprRef> = plan.expr_list(conditions).iter().copied().chain(rewritten).collect();
     let conditions = plan.add_expr_list(&all);
     Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+}
+
+/// Adds equality correlation keys to a scalar aggregate's grouping and joins the grouped result
+/// back to the outer input. Aggregates other than counts already have the right missing-group
+/// result because a missing joined row is NULL. Counts need a domain join and are left for the
+/// next rule rather than being lowered with the wrong empty-input value.
+fn scalar_aggregate(
+    plan: &mut Plan,
+    left: NodeRef,
+    right: NodeRef,
+    kind: JoinKind,
+    conditions: rudb_plan::Slice,
+) -> Option<NodeRef> {
+    if kind != JoinKind::Single {
+        return None;
+    }
+    let Node::Project { input: grouped, index, exprs, names } = *plan.node(right) else {
+        return None;
+    };
+    let Node::Aggregate { input: filtered, index: aggregate_index, groups, aggregates } =
+        *plan.node(grouped)
+    else {
+        return None;
+    };
+    if plan.expr_list(aggregates).iter().any(|&call| {
+        matches!(*plan.expr(call), Expr::Aggregate { name, .. } if matches!(plan.string(name), "count" | "count_star"))
+    }) {
+        return None;
+    }
+    let Node::Filter { input, predicate } = *plan.node(filtered) else {
+        return None;
+    };
+
+    let outer = produced(plan, left);
+    let inner = produced(plan, input);
+    let mut correlated = Vec::new();
+    let mut local = Vec::new();
+    split(plan, predicate, &mut |part| {
+        if equality_key(plan, part, &outer, &inner).is_some() {
+            correlated.push(part);
+        } else {
+            local.push(part);
+        }
+    });
+    if correlated.is_empty() || local.iter().any(|&part| reads(plan, part, &outer)) {
+        return None;
+    }
+
+    let original_groups = plan.expr_list(groups).to_vec();
+    let mut grouped_exprs = original_groups.clone();
+    let mut inner_keys = Vec::new();
+    for &condition in &correlated {
+        let (binding, expr) = equality_key(plan, condition, &outer, &inner)?;
+        if inner_keys.iter().any(|(held, _, _)| *held == binding) {
+            continue;
+        }
+        let output = grouped_exprs.len();
+        grouped_exprs.push(expr);
+        inner_keys.push((binding, expr, output));
+    }
+
+    let added = inner_keys.len();
+    let projected: Vec<ExprRef> = plan
+        .expr_list(exprs)
+        .to_vec()
+        .into_iter()
+        .map(|expr| {
+            shift_aggregate_outputs(plan, expr, aggregate_index, original_groups.len(), added)
+        })
+        .collect();
+    let mut projected_names = plan.name_list(names).to_vec();
+    let mut outputs = HashMap::new();
+    let mut projected = projected;
+    for (binding, source, aggregate_output) in inner_keys {
+        let output = projected.len();
+        projected.push(plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(
+                aggregate_index,
+                u32::try_from(aggregate_output).ok()?,
+            )),
+            plan.expr_type(source).clone(),
+            plan.expr_span(source),
+        ));
+        projected_names.push(plan.intern(&format!("__correlated_{output}")));
+        outputs.insert(binding, output);
+    }
+
+    let input = make_filter(plan, input, local);
+    let groups = plan.add_expr_list(&grouped_exprs);
+    let grouped =
+        plan.add_node(Node::Aggregate { input, index: aggregate_index, groups, aggregates });
+    let exprs = plan.add_expr_list(&projected);
+    let names = plan.add_name_list(&projected_names);
+    let right = plan.add_node(Node::Project { input: grouped, index, exprs, names });
+    let rewritten: Vec<ExprRef> = correlated
+        .into_iter()
+        .map(|condition| replace_inner(plan, condition, index, &outputs))
+        .collect();
+    let all: Vec<ExprRef> = plan.expr_list(conditions).iter().copied().chain(rewritten).collect();
+    let conditions = plan.add_expr_list(&all);
+    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+}
+
+fn shift_aggregate_outputs(
+    plan: &mut Plan,
+    expr: ExprRef,
+    aggregate_index: u32,
+    groups: usize,
+    added: usize,
+) -> ExprRef {
+    if let Expr::Column(binding) = *plan.expr(expr) {
+        if binding.table == aggregate_index && binding.column as usize >= groups {
+            let ty = plan.expr_type(expr).clone();
+            let span = plan.expr_span(expr);
+            return plan.add_expr_at(
+                Expr::Column(ColumnBinding::new(
+                    binding.table,
+                    binding.column + u32::try_from(added).expect("aggregate width"),
+                )),
+                ty,
+                span,
+            );
+        }
+        return expr;
+    }
+    walk::rebuild(plan, expr, &mut |plan, child| {
+        shift_aggregate_outputs(plan, child, aggregate_index, groups, added)
+    })
 }
 
 fn mark(
