@@ -3,9 +3,15 @@
 use std::sync::Arc;
 
 use rudb_arrow::{DataType, Field, RecordBatch, Schema};
-use rudb_common::{LogicalType, Memory, Reservation, Result, Value};
+use rudb_common::{LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_metrics::Document;
 use rudb_vector::Chunk;
+
+fn unix_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
+}
 
 /// The rows a query produced, with the names and types of its columns.
 ///
@@ -40,6 +46,10 @@ pub struct QueryResult {
     /// What the execution that produced these rows measured about itself, when it was an execution
     /// at all.
     metrics: Option<Document>,
+    /// The session whose zone decides how zoned values are rendered.
+    session: Session,
+    /// The instant used to choose the offset for a zoned time with no date of its own.
+    rendered_at: i64,
 }
 
 impl QueryResult {
@@ -58,7 +68,17 @@ impl QueryResult {
             rows += chunk.len();
         }
         starts.push(rows);
-        Self { names, types, chunks, starts, rows, held: Arc::new(held), metrics: None }
+        Self {
+            names,
+            types,
+            chunks,
+            starts,
+            rows,
+            held: Arc::new(held),
+            metrics: None,
+            session: Session::new(),
+            rendered_at: unix_micros(),
+        }
     }
 
     /// The same result, carrying the document the execution that produced it filled in.
@@ -66,6 +86,29 @@ impl QueryResult {
     pub(crate) fn measured(mut self, metrics: Document) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Carries the session that produced the result so zoned values keep its rendering.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: Session) -> Self {
+        self.session = session;
+        self
+    }
+
+    /// A value rendered under the session that produced this result.
+    #[must_use]
+    pub fn value_text(&self, value: &Value) -> String {
+        let instant = match value {
+            Value::TimestampTz(micros) => *micros,
+            _ => self.rendered_at,
+        };
+        value.to_string_at_offset(self.session.offset_seconds_at(instant))
+    }
+
+    /// One cell rendered under the session that produced this result.
+    #[must_use]
+    pub fn text_at(&self, row: usize, column: usize) -> String {
+        self.value_text(&self.value_at(row, column))
     }
 
     /// A result of no columns and no rows, which is what a statement that writes hands back.

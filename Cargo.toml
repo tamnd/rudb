@@ -23,6 +23,9 @@ readme = "README.md"
 # section 18.3. Internal crates are pinned exactly so that a partial publish cannot produce a
 # mixed-version build.
 [workspace.dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["std"] }
+chrono-tz = "0.10.4"
+iana-time-zone = "0.1.65"
 memchr = "2.7.6"
 rudb = { version = "=0.3.21", path = "crates/rudb" }
 rudb-arrow = { version = "=0.3.21", path = "crates/rudb-arrow" }

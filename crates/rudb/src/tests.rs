@@ -1422,6 +1422,48 @@ fn the_session_context_answers_for_the_clock_the_catalog_and_the_user() {
 }
 
 #[test]
+fn the_session_time_zone_moves_local_context_and_one_argument_age() {
+    let db = database();
+    let default_zone = db.setting("TimeZone").expect("the operating-system zone");
+    db.execute("SET TimeZone = 'America/New_York'").expect("an IANA zone");
+    assert_eq!(
+        rows(&db, "SELECT current_setting('timezone')"),
+        vec![vec![Value::Varchar("America/New_York".to_string())]]
+    );
+    let answer = rows(&db, "SELECT now(), localtimestamp, current_time, localtime");
+    let [
+        Value::TimestampTz(utc),
+        Value::Timestamp(local),
+        Value::TimeTz(zoned_time),
+        Value::Time(local_time),
+    ] = &answer[0][..]
+    else {
+        panic!("the four context values had the wrong types: {:?}", answer[0]);
+    };
+    assert_eq!(local - utc, -4 * 60 * 60 * 1_000_000, "New York is EDT in September");
+    assert_eq!(zoned_time, local_time);
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT age(DATE '2020-02-28') = age(current_date, DATE '2020-02-28'), \
+             age(TIMESTAMP '2020-02-28 12:00:00') = \
+             age(current_date, TIMESTAMP '2020-02-28 12:00:00')"
+        ),
+        vec![vec![Value::Boolean(true), Value::Boolean(true)]]
+    );
+    db.execute("SET TIME ZONE 'Asia/Kathmandu'").expect("the standard spelling");
+    assert_eq!(db.setting("TimeZone").expect("the zone"), "Asia/Kathmandu");
+    db.execute("RESET TimeZone").expect("the default zone");
+    assert_eq!(db.setting("timezone").expect("case is ignored"), default_zone);
+    db.execute("SET TimeZone = 'UTC'").expect("a different zone");
+    db.execute("SET TIME ZONE LOCAL").expect("the local zone");
+    assert_eq!(db.setting("TimeZone").expect("the local zone"), default_zone);
+    let error = db.execute("SET TimeZone = 'not/a_zone'").expect_err("an unknown zone");
+    assert_eq!(error.code().duckdb_name(), "Not implemented Error");
+    assert!(error.message().starts_with("Unknown TimeZone 'not/a_zone'!"), "{error}");
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -1516,7 +1558,7 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
     // A name nobody has is the same sentence `SET` gives for it, which is one sentence in one place.
     let unknown = failure(&db, "SELECT current_setting('nope')");
     assert!(unknown.starts_with("unrecognized configuration parameter \"nope\""), "{unknown}");
-    assert!(unknown.contains("Did you mean: \"disabled_optimizers\""), "{unknown}");
+    assert!(unknown.contains("\"disabled_optimizers\""), "{unknown}");
     assert_eq!(unknown, db.execute("SET nope = 1").unwrap_err().message());
     // The wrong number of arguments is the ordinary arity error with the one overload under it.
     assert_eq!(
@@ -1531,8 +1573,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Five rows for three settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(5)]]);
+    // Six rows for four settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(6)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(

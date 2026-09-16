@@ -910,7 +910,7 @@ fn run(
     metrics.resource.peak_bytes = memory.peak();
     report.fill(&mut metrics);
     rudb_opt::explain::record_estimates(plan, statistics, &mut metrics);
-    Ok(QueryResult::new(names, types, chunks, held).measured(metrics))
+    Ok(QueryResult::new(names, types, chunks, held).in_session(session.clone()).measured(metrics))
 }
 
 /// The plan `EXPLAIN` prints, run first if `ANALYZE` was asked for.
