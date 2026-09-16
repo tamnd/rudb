@@ -21,6 +21,7 @@
 //! is built to be asked about. It is asked about once per row, so it matters, and it is not this
 //! change because a set per group is a different shape from a table over the whole input.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
@@ -474,6 +475,7 @@ impl<'a> Aggregate<'a> {
             states: Vec::new(),
             counts: Vec::new(),
             compact: Vec::new(),
+            overflow: HashMap::new(),
             seen: Vec::new(),
             groups: 0,
             // One row of arguments per call, filled again for each input row and kept between rows
@@ -527,6 +529,7 @@ impl<'a> Aggregate<'a> {
             states,
             counts,
             compact,
+            overflow,
             seen,
             groups,
             given,
@@ -645,19 +648,12 @@ impl<'a> Aggregate<'a> {
                     continue;
                 }
                 let state = &mut compact[slot];
-                state.count += 1;
-                if let Some(value) = read(sum, sum_flat, row)? {
-                    state.sum = state.sum.checked_add(i128::from(value)).ok_or_else(|| {
-                        Error::out_of_range("a compact SUM overflowed its exact total")
-                    })?;
-                    state.sum_seen = true;
-                }
-                if let Some(value) = read(mean, mean_flat, row)? {
-                    state.mean = state.mean.checked_add(i128::from(value)).ok_or_else(|| {
-                        Error::out_of_range("a compact AVG overflowed its exact total")
-                    })?;
-                    state.mean_count += 1;
-                }
+                state.add(
+                    slot,
+                    read(sum, sum_flat, row)?,
+                    read(mean, mean_flat, row)?,
+                    overflow,
+                )?;
             }
         }
         if self.count_only {
@@ -702,7 +698,7 @@ impl<'a> Aggregate<'a> {
         }
         rows::capacity(table.owned(), charged_keys, scratch)?;
         containers.grow(aside)?;
-        let now = tables(table, states, counts, compact, seen);
+        let now = tables(table, states, counts, compact, overflow, seen);
         rows::capacity(now, charged, containers)?;
         // Asked after the chunk has been folded in and not before, so that a pass always takes at
         // least one chunk of groups whatever the budget says. That is what makes the loop in
@@ -756,6 +752,7 @@ impl<'a> Aggregate<'a> {
             states,
             counts,
             compact,
+            overflow,
             seen,
             groups,
             affine_rows,
@@ -770,7 +767,8 @@ impl<'a> Aggregate<'a> {
         let alive = table.footprint()
             + width_of(states.capacity() * size_of::<Accumulator>())
             + width_of(counts.capacity() * size_of::<i64>())
-            + width_of(compact.capacity() * size_of::<CompactNumeric>());
+            + width_of(compact.capacity() * size_of::<CompactNumeric>())
+            + overflow_footprint(&overflow);
         containers.shrink(containers.bytes().saturating_sub(alive));
         // The answer is built straight out of the table, a chunk of groups at a time.
         //
@@ -814,16 +812,15 @@ impl<'a> Aggregate<'a> {
                         Ok(Value::BigInt(counts[slot]))
                     } else if self.compact_numeric {
                         let state = &compact[slot];
+                        let (sum, mean) = state.totals(slot, &overflow);
                         match at {
                             0 => Ok(Value::BigInt(state.count)),
-                            1 => Accumulator::exact_sum(
-                                state.sum,
-                                state.sum_seen,
-                                &self.calls[1].returns,
-                            )
-                            .finish(),
+                            1 => {
+                                Accumulator::exact_sum(sum, state.sum_seen, &self.calls[1].returns)
+                                    .finish()
+                            }
                             2 => Accumulator::exact_avg(
-                                state.mean,
+                                mean,
                                 state.mean_count,
                                 &self.calls[2].returns,
                             )
@@ -936,6 +933,7 @@ impl<'a> Aggregate<'a> {
             states: taken,
             counts: tallies,
             compact: packed,
+            overflow: wide,
             seen: mut watched,
             groups: found,
             affine_rows: counted,
@@ -953,6 +951,7 @@ impl<'a> Aggregate<'a> {
             taken: &taken,
             tallies: &tallies,
             compact: &packed,
+            overflow: &wide,
             watched: &mut watched,
         };
         let mut aside = 0;
@@ -988,7 +987,14 @@ impl<'a> Aggregate<'a> {
         drop(scratch);
         drop(containers);
         rows::capacity(into.table.owned(), &mut into.charged_keys, &mut into.scratch)?;
-        let now = tables(&into.table, &into.states, &into.counts, &into.compact, &into.seen);
+        let now = tables(
+            &into.table,
+            &into.states,
+            &into.counts,
+            &into.compact,
+            &into.overflow,
+            &into.seen,
+        );
         rows::capacity(now, &mut into.charged, &mut into.containers)
     }
 
@@ -1069,6 +1075,7 @@ impl<'a> Aggregate<'a> {
             states: taken,
             counts: tallies,
             compact: packed,
+            overflow: wide,
             seen: mut watched,
             groups: found,
             ..
@@ -1082,6 +1089,7 @@ impl<'a> Aggregate<'a> {
             taken: &taken,
             tallies: &tallies,
             compact: &packed,
+            overflow: &wide,
             watched: &mut watched,
         };
         let types: Vec<LogicalType> =
@@ -1484,6 +1492,7 @@ impl<'a> Aggregate<'a> {
             states: taken,
             counts: tallies,
             compact: packed,
+            overflow: wide,
             seen: mut watched,
             groups: found,
             ..
@@ -1497,6 +1506,7 @@ impl<'a> Aggregate<'a> {
             taken: &taken,
             tallies: &tallies,
             compact: &packed,
+            overflow: &wide,
             watched: &mut watched,
         };
         let types: Vec<LogicalType> =
@@ -1830,6 +1840,8 @@ pub(crate) struct Building {
     states: Vec<Accumulator>,
     counts: Vec<i64>,
     compact: Vec<CompactNumeric>,
+    /// Exact totals only for groups whose SMALLINT sum does not fit in 64 bits.
+    overflow: HashMap<usize, (i128, i128)>,
     seen: Vec<DistinctSet>,
     groups: usize,
     given: Vec<Key>,
@@ -1852,10 +1864,99 @@ pub(crate) struct Building {
 #[derive(Debug, Default, Clone)]
 struct CompactNumeric {
     count: i64,
-    sum: i128,
+    sum: i64,
     sum_seen: bool,
-    mean: i128,
+    mean: i64,
     mean_count: i64,
+    large: bool,
+}
+
+impl CompactNumeric {
+    fn totals(&self, slot: usize, overflow: &HashMap<usize, (i128, i128)>) -> (i128, i128) {
+        if self.large {
+            *overflow.get(&slot).expect("a wide compact total has an overflow entry")
+        } else {
+            (i128::from(self.sum), i128::from(self.mean))
+        }
+    }
+
+    fn add(
+        &mut self,
+        slot: usize,
+        sum: Option<i16>,
+        mean: Option<i16>,
+        overflow: &mut HashMap<usize, (i128, i128)>,
+    ) -> Result<()> {
+        self.count += 1;
+        self.sum_seen |= sum.is_some();
+        self.mean_count += i64::from(mean.is_some());
+        let added_sum = i64::from(sum.unwrap_or(0));
+        let added_mean = i64::from(mean.unwrap_or(0));
+        if !self.large {
+            if let (Some(total_sum), Some(total_mean)) =
+                (self.sum.checked_add(added_sum), self.mean.checked_add(added_mean))
+            {
+                self.sum = total_sum;
+                self.mean = total_mean;
+                return Ok(());
+            }
+            overflow.insert(
+                slot,
+                (
+                    i128::from(self.sum) + i128::from(added_sum),
+                    i128::from(self.mean) + i128::from(added_mean),
+                ),
+            );
+            self.large = true;
+            return Ok(());
+        }
+        let totals = overflow.get_mut(&slot).expect("a wide compact total has an overflow entry");
+        totals.0 = totals
+            .0
+            .checked_add(i128::from(added_sum))
+            .ok_or_else(|| Error::out_of_range("a compact SUM overflowed its exact total"))?;
+        totals.1 = totals
+            .1
+            .checked_add(i128::from(added_mean))
+            .ok_or_else(|| Error::out_of_range("a compact AVG overflowed its exact total"))?;
+        Ok(())
+    }
+
+    fn combine(
+        &mut self,
+        target: usize,
+        coming: &Self,
+        slot: usize,
+        from: &HashMap<usize, (i128, i128)>,
+        into: &mut HashMap<usize, (i128, i128)>,
+    ) -> Result<()> {
+        let (sum, mean) = self.totals(target, into);
+        let (coming_sum, coming_mean) = coming.totals(slot, from);
+        let sum = sum
+            .checked_add(coming_sum)
+            .ok_or_else(|| Error::out_of_range("a compact SUM overflowed its exact total"))?;
+        let mean = mean
+            .checked_add(coming_mean)
+            .ok_or_else(|| Error::out_of_range("a compact AVG overflowed its exact total"))?;
+        self.count += coming.count;
+        self.sum_seen |= coming.sum_seen;
+        self.mean_count += coming.mean_count;
+        match (i64::try_from(sum), i64::try_from(mean)) {
+            (Ok(sum), Ok(mean)) => {
+                self.sum = sum;
+                self.mean = mean;
+                if self.large {
+                    into.remove(&target);
+                    self.large = false;
+                }
+            }
+            _ => {
+                into.insert(target, (sum, mean));
+                self.large = true;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn flat_smallint(column: &Vector) -> Option<&[i16]> {
@@ -2329,7 +2430,8 @@ impl Aggregate<'_> {
 fn charge(into: &mut Building, grown: u64) -> Result<()> {
     into.containers.grow(grown)?;
     rows::capacity(into.table.owned(), &mut into.charged_keys, &mut into.scratch)?;
-    let now = tables(&into.table, &into.states, &into.counts, &into.compact, &into.seen);
+    let now =
+        tables(&into.table, &into.states, &into.counts, &into.compact, &into.overflow, &into.seen);
     rows::capacity(now, &mut into.charged, &mut into.containers)
 }
 
@@ -2343,6 +2445,7 @@ struct Folding<'a> {
     taken: &'a [Accumulator],
     tallies: &'a [i64],
     compact: &'a [CompactNumeric],
+    overflow: &'a HashMap<usize, (i128, i128)>,
     /// Taken by a mutable borrow because the sets are emptied as they are folded in, which is what
     /// keeps a value that moves from one set to the other from being copied.
     watched: &'a mut [DistinctSet],
@@ -2369,17 +2472,7 @@ fn merge_slot(
 ) -> Result<u64> {
     if let Some(arriving) = from.compact.get(slot) {
         let kept = &mut into.compact[target];
-        kept.count += arriving.count;
-        kept.sum = kept
-            .sum
-            .checked_add(arriving.sum)
-            .ok_or_else(|| Error::out_of_range("a compact SUM overflowed its exact total"))?;
-        kept.sum_seen |= arriving.sum_seen;
-        kept.mean = kept
-            .mean
-            .checked_add(arriving.mean)
-            .ok_or_else(|| Error::out_of_range("a compact AVG overflowed its exact total"))?;
-        kept.mean_count += arriving.mean_count;
+        kept.combine(target, arriving, slot, from.overflow, &mut into.overflow)?;
         return Ok(0);
     }
     if from.count_only {
@@ -2449,6 +2542,7 @@ fn tables(
     states: &Vec<Accumulator>,
     counts: &Vec<i64>,
     compact: &Vec<CompactNumeric>,
+    overflow: &HashMap<usize, (i128, i128)>,
     seen: &Vec<DistinctSet>,
 ) -> u64 {
     let width = |count: usize, size: usize| {
@@ -2458,7 +2552,12 @@ fn tables(
         + width(states.capacity(), size_of::<Accumulator>())
         + width(counts.capacity(), size_of::<i64>())
         + width(compact.capacity(), size_of::<CompactNumeric>())
+        + overflow_footprint(overflow)
         + width(seen.capacity(), size_of::<DistinctSet>())
+}
+
+fn overflow_footprint(overflow: &HashMap<usize, (i128, i128)>) -> u64 {
+    width_of(overflow.capacity() * size_of::<(usize, (i128, i128))>() * 2)
 }
 
 /// A `size_of` in the width the budget is counted in.
@@ -2698,12 +2797,14 @@ fn poisoned<T>(_: T) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use rudb_common::{Field, LogicalType, Memory, Value};
     use rudb_pipeline::Sink;
     use rudb_plan::{Plan, Slice};
     use rudb_vector::{Chunk, Data, Vector};
 
-    use super::{Aggregate, Distinct};
+    use super::{Aggregate, CompactNumeric, Distinct};
     use crate::buffer::Buffered;
     use crate::schema::Schema;
 
@@ -2934,5 +3035,27 @@ mod tests {
         distinct.finalize().expect("the answer");
 
         assert_eq!(out.len().expect("readable"), 0);
+    }
+
+    #[test]
+    fn compact_smallint_totals_remain_exact_past_i64() {
+        let mut wide = CompactNumeric { sum: i64::MAX, mean: i64::MIN, ..Default::default() };
+        let mut wide_overflow = HashMap::new();
+        wide.add(0, Some(1), Some(-1), &mut wide_overflow).expect("wide totals");
+        assert_eq!(
+            wide.totals(0, &wide_overflow),
+            (i128::from(i64::MAX) + 1, i128::from(i64::MIN) - 1)
+        );
+
+        let mut coming = CompactNumeric::default();
+        let mut coming_overflow = HashMap::new();
+        coming.add(0, Some(2), Some(3), &mut coming_overflow).expect("small totals");
+        wide.combine(0, &coming, 0, &coming_overflow, &mut wide_overflow).expect("combined totals");
+        assert_eq!(
+            wide.totals(0, &wide_overflow),
+            (i128::from(i64::MAX) + 3, i128::from(i64::MIN) + 2)
+        );
+        assert_eq!(wide.count, 2);
+        assert_eq!(wide.mean_count, 2);
     }
 }
