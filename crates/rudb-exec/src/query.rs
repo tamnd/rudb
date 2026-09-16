@@ -162,10 +162,15 @@ impl<'a> Query<'a> {
     /// [`ErrorCode::Internal`](rudb_common::ErrorCode::Internal) if a thread panicked while holding
     /// the queue.
     pub fn next_chunk(&self) -> Result<Option<Chunk>> {
-        self.reader
+        let chunk = self
+            .reader
             .as_ref()
             .ok_or_else(|| Error::internal("a query built into a sink has no result reader"))?
-            .next_chunk()
+            .next_chunk()?;
+        if let Some(chunk) = &chunk {
+            chunk.validate_external()?;
+        }
+        Ok(chunk)
     }
 
     /// Runs the query and collects everything it produced.

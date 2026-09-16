@@ -161,7 +161,7 @@ pub fn compare_prepared(
     }
     let len = left.len();
     if left.form() == Form::Constant && right.form() == Form::Constant && len > 0 {
-        let single = compare_values(op, &left.value_at(0), &right.value_at(0))?;
+        let single = compare_values(op, &left.try_value_at(0)?, &right.try_value_at(0)?)?;
         return Ok(Vector::constant(LogicalType::Boolean, single, len));
     }
 
@@ -176,6 +176,10 @@ pub fn compare_prepared(
         return boolean(vec![false; len], Validity::AllInvalid, len);
     }
 
+    if let Some(answers) = external_text_literal(op, left, right, len, identity)? {
+        let validity = left_valid.and(&right_valid, len);
+        return boolean(blank_the_nulls(answers, &validity), validity, len);
+    }
     if let Some(answers) =
         specialized(op, left, right, &left_valid, &right_valid, len, identity, held)
     {
@@ -189,7 +193,7 @@ pub fn compare_prepared(
     // row at a time: the path recorded on the line above, which exists to be correct for a pair of
     // forms no specialization covers and counts itself so that pair shows up in the report.
     for index in 0..len {
-        values.push(compare_values(op, &left.value_at(index), &right.value_at(index))?);
+        values.push(compare_values(op, &left.try_value_at(index)?, &right.try_value_at(index)?)?);
     }
     Vector::from_values(LogicalType::Boolean, &values)
 }
@@ -254,7 +258,7 @@ pub fn refine_prepared(
         return Ok(Selection::empty());
     }
     if left.form() == Form::Constant && right.form() == Form::Constant {
-        let single = compare_values(op, &left.value_at(0), &right.value_at(0))?;
+        let single = compare_values(op, &left.try_value_at(0)?, &right.try_value_at(0)?)?;
         return Ok(if is_true(&single) { kept.clone() } else { Selection::empty() });
     }
 
@@ -266,6 +270,12 @@ pub fn refine_prepared(
 
     let rows = kept.indices();
     let map = |slot: usize| rows[slot] as usize;
+    if let Some(answers) = external_text_literal(op, left, right, kept.len(), map)? {
+        return Ok(narrowed(&answers, rows, |slot| {
+            let row = rows[slot] as usize;
+            left_valid.is_valid(row) && right_valid.is_valid(row)
+        }));
+    }
     if let Some(answers) =
         specialized(op, left, right, &left_valid, &right_valid, kept.len(), map, held)
     {
@@ -290,11 +300,51 @@ pub fn refine_prepared(
     // covers, reading only the rows the conjuncts before this one kept.
     for &row in rows {
         let index = row as usize;
-        if is_true(&compare_values(op, &left.value_at(index), &right.value_at(index))?) {
+        if is_true(&compare_values(op, &left.try_value_at(index)?, &right.try_value_at(index)?)?) {
             out.push(row);
         }
     }
     Ok(Selection::from_indices(out))
+}
+
+/// Equality between storage-backed text and a literal, without constructing row values.
+fn external_text_literal<M>(
+    op: Comparison,
+    left: &Vector,
+    right: &Vector,
+    len: usize,
+    map: M,
+) -> Result<Option<Vec<bool>>>
+where
+    M: Fn(usize) -> usize + Copy,
+{
+    if !matches!(op, Comparison::Equal | Comparison::NotEqual)
+        || left.logical_type() != &LogicalType::Varchar
+        || right.logical_type() != &LogicalType::Varchar
+    {
+        return Ok(None);
+    }
+    let (column, literal, swapped) = match (left.constant_value(), right.constant_value()) {
+        (None, Some(Value::Varchar(literal))) if left.positions().is_some() => {
+            (left, literal.as_bytes(), false)
+        }
+        (Some(Value::Varchar(literal)), None) if right.positions().is_some() => {
+            (right, literal.as_bytes(), true)
+        }
+        _ => return Ok(None),
+    };
+    let same = if swapped { op.swapped() } else { op } == Comparison::Equal;
+    let mut answers = Vec::with_capacity(len);
+    for slot in 0..len {
+        let row = map(slot);
+        let equal = if literal.is_empty() {
+            column.try_bytes_len_at(row)?.is_some_and(|length| length == 0)
+        } else {
+            column.try_bytes_at(row)?.is_some_and(|bytes| bytes == literal)
+        };
+        answers.push(equal == same);
+    }
+    Ok(Some(answers))
 }
 
 /// The positions of `rows` whose answer is true and whose row is live, without a branch per row.

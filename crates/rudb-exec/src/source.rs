@@ -160,8 +160,17 @@ impl Source for Scan<'_> {
         self.chunks.take()
     }
 
-    fn morsels(&self, _threads: usize) -> Option<usize> {
-        Some(self.chunks.total())
+    fn morsels(&self, threads: usize) -> Option<usize> {
+        let chunks = self.chunks.total();
+        if !self.table.rows().is_native() {
+            return Some(chunks);
+        }
+        // A native stripe is cheap enough that launching every available worker costs more than
+        // it saves on small snapshots. Keep enough rows behind each worker to amortize its thread,
+        // local operator state, and final combine. The upper bound also avoids the sharp cache and
+        // scheduler regression measured above sixteen workers on dense code aggregation.
+        let useful = self.table.rows().len().div_ceil(50_000).clamp(1, 4);
+        Some(chunks.min(threads).min(useful))
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
