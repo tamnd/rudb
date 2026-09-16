@@ -58,7 +58,7 @@
 use std::cmp::Ordering;
 use std::sync::Mutex;
 
-use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Value};
+use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_kernels::{Comparison, refine};
 use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
@@ -112,6 +112,13 @@ pub(crate) struct Running {
 }
 
 impl TopN {
+    /// Applies the session semantics to the prepared sort keys.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.exprs = self.exprs.in_session(session);
+        self
+    }
+
     /// # Errors
     ///
     /// If a sort key does not resolve against the input's schema.

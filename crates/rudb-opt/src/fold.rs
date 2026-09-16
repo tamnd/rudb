@@ -298,6 +298,14 @@ fn simplify(plan: &mut Plan, expr: ExprRef) -> ExprRef {
 fn fold(plan: &Plan, expr: ExprRef) -> Option<Value> {
     match *plan.expr(expr) {
         Expr::Cast { input, try_cast } => {
+            // Text for a zoned timestamp depends on the session zone at the timestamp's instant.
+            // The optimizer has no session by design, so leaving this cast in the plan is what
+            // lets the prepared executor use the parsed zone without making optimization stateful.
+            if plan.expr_type(input) == &LogicalType::TimestampTz
+                && plan.expr_type(expr) == &LogicalType::Varchar
+            {
+                return None;
+            }
             let inner = constant(plan, input)?;
             cast_value(&inner, plan.expr_type(expr), try_cast).ok()
         }

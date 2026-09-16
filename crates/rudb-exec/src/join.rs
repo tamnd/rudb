@@ -30,14 +30,16 @@
 
 use std::sync::Mutex;
 
-use rudb_common::{Cancel, Error, LogicalType, Memory, Reservation, Result, Value};
+use rudb_common::{
+    Cancel, Error, LogicalType, Memory, Reservation, Result, Session, SessionTimeZone, Value,
+};
 use rudb_kernels::{Connective, combine, is_true};
 use rudb_pipeline::{Progress, Sink, Stream};
 use rudb_plan::{ExprRef, JoinKind, Plan, Slice};
 use rudb_vector::{Chunk, Vector};
 
 use crate::buffer::Buffered;
-use crate::expr::evaluate_all;
+use crate::expr::evaluate_all_in_time_zone;
 use crate::gather::{self, Gathering, Rows};
 use crate::rows;
 use crate::schema::Schema;
@@ -68,6 +70,8 @@ pub(crate) struct Join<'a> {
     /// What the joined chunks are charged, held for as long as they are readable.
     held: Mutex<Reservation>,
     out: Buffered,
+    /// The parsed zone used by casts in join conditions.
+    time_zone: SessionTimeZone,
 }
 
 /// The side of a join that is finished before the other one starts.
@@ -117,8 +121,16 @@ impl<'a> Join<'a> {
             charged: Mutex::new(Vec::new()),
             held: Mutex::new(memory.reservation()),
             out: out.clone(),
+            time_zone: SessionTimeZone::default(),
         };
         (join, out)
+    }
+
+    /// Applies the session semantics to join conditions.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.time_zone = session.session_time_zone();
+        self
     }
 
     /// What this operator produces, which is both sides' columns unless the kind throws one away.
@@ -223,7 +235,13 @@ impl<'a> Join<'a> {
                 hits.extend(base..base + rows);
             } else {
                 let combined = widen(left_row, left_types, chunk)?;
-                let flags = evaluate_all(self.plan, &self.conditions, &self.combined, &combined)?;
+                let flags = evaluate_all_in_time_zone(
+                    self.plan,
+                    &self.conditions,
+                    &self.combined,
+                    &combined,
+                    self.time_zone,
+                )?;
                 let merged = combine(Connective::And, &flags)?;
                 // row at a time: this is the nested loop join, which is the join that exists until
                 // 2h (#62) builds the hash join on top of 2f's table. The flags are already a

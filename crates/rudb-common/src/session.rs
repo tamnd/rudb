@@ -28,6 +28,27 @@ pub struct Session {
     time_zone: Tz,
 }
 
+/// A parsed session time zone, cheap enough to carry beside a prepared expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTimeZone(Tz);
+
+impl Default for SessionTimeZone {
+    fn default() -> Self {
+        Self(chrono_tz::UTC)
+    }
+}
+
+impl SessionTimeZone {
+    /// The UTC offset in seconds at an instant expressed as Unix microseconds.
+    #[must_use]
+    pub fn offset_seconds_at(self, micros: i64) -> i32 {
+        let seconds = micros.div_euclid(1_000_000);
+        let nanos = u32::try_from(micros.rem_euclid(1_000_000) * 1_000).unwrap_or_default();
+        let Some(utc) = Utc.timestamp_opt(seconds, nanos).single() else { return 0 };
+        self.0.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc()
+    }
+}
+
 impl Default for Session {
     fn default() -> Self {
         Self { values: BTreeMap::new(), time_zone: chrono_tz::UTC }
@@ -57,6 +78,12 @@ impl Session {
         self.time_zone.name()
     }
 
+    /// The parsed zone used by prepared expressions.
+    #[must_use]
+    pub fn session_time_zone(&self) -> SessionTimeZone {
+        SessionTimeZone(self.time_zone)
+    }
+
     /// Whether the bundled time-zone database knows this name.
     #[must_use]
     pub fn knows_time_zone(name: &str) -> bool {
@@ -66,10 +93,7 @@ impl Session {
     /// The UTC offset in seconds at an instant expressed as Unix microseconds.
     #[must_use]
     pub fn offset_seconds_at(&self, micros: i64) -> i32 {
-        let seconds = micros.div_euclid(1_000_000);
-        let nanos = u32::try_from(micros.rem_euclid(1_000_000) * 1_000).unwrap_or_default();
-        let Some(utc) = Utc.timestamp_opt(seconds, nanos).single() else { return 0 };
-        self.time_zone.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc()
+        self.session_time_zone().offset_seconds_at(micros)
     }
 
     /// A UTC instant shifted to the wall clock of this session.

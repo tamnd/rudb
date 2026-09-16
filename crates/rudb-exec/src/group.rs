@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use rudb_common::{
-    Error, Field, LogicalType, Memory, Reservation, Result, Spent, Stage, Value, stage,
+    Error, Field, LogicalType, Memory, Reservation, Result, Session, Spent, Stage, Value, stage,
 };
 use rudb_kernels::{Accumulator, NOWHERE, is_true, update_scattered};
 use rudb_pipeline::{Progress, Sink};
@@ -241,6 +241,13 @@ const RADIX_PARTITIONS: usize = 16;
 const PARTITION_FROM: usize = 4_096;
 
 impl<'a> Aggregate<'a> {
+    /// Applies the session semantics to group keys and aggregate inputs.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.inputs = self.inputs.in_session(session);
+        self
+    }
+
     /// An aggregation over the plan's groups and aggregate calls, and the source it finishes into.
     ///
     /// # Errors
@@ -2644,6 +2651,13 @@ pub(crate) struct Keeping {
 }
 
 impl Distinct {
+    /// Applies the session semantics to the distinct expressions.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.on = self.on.in_session(session);
+        self
+    }
+
     /// The sink, and the source its rows come out of.
     ///
     /// # Errors
