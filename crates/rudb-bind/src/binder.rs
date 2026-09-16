@@ -96,6 +96,13 @@ pub(crate) struct Aggregation {
     pub(crate) aggregates: Vec<ExprRef>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PendingSubquery {
+    pub(crate) node: NodeRef,
+    pub(crate) kind: JoinKind,
+    pub(crate) conditions: Vec<ExprRef>,
+}
+
 /// The state one binding run carries.
 #[derive(Debug)]
 pub(crate) struct Binder<'a> {
@@ -113,7 +120,7 @@ pub(crate) struct Binder<'a> {
     /// Set while an aggregate's own arguments are being bound, so nesting is caught.
     pub(crate) in_aggregate: bool,
     /// Uncorrelated scalar queries waiting to be joined into the select block that uses them.
-    pub(crate) scalar_subqueries: Vec<NodeRef>,
+    pub(crate) scalar_subqueries: Vec<PendingSubquery>,
     /// Where we are, for an error message that says which clause the writer should look at.
     pub(crate) clause: &'static str,
     /// The views whose bodies are open on the stack, which is what catches a cycle.
@@ -186,16 +193,14 @@ impl<'a> Binder<'a> {
     /// Joins scalar query results into the row stream that contains their expressions.
     fn attach_scalar_subqueries(&mut self, mut input: NodeRef) -> NodeRef {
         let subqueries = std::mem::take(&mut self.scalar_subqueries);
-        for mut right in subqueries {
-            if !self.semantics.scalar_subquery_error_on_multiple_rows() {
+        for pending in subqueries {
+            let PendingSubquery { node: mut right, kind, conditions } = pending;
+            if kind == JoinKind::Single && !self.semantics.scalar_subquery_error_on_multiple_rows()
+            {
                 right = self.plan.add_node(Node::Limit { input: right, count: Some(1), offset: 0 });
             }
-            input = self.plan.add_node(Node::Join {
-                left: input,
-                right,
-                kind: JoinKind::Single,
-                conditions: rudb_plan::Slice::EMPTY,
-            });
+            let conditions = self.plan.add_expr_list(&conditions);
+            input = self.plan.add_node(Node::Join { left: input, right, kind, conditions });
         }
         input
     }

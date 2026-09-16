@@ -329,6 +329,10 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
             let written = format!("({} IN ({}))", expr(ast, operand), exprs(ast, list));
             if negated { format!("(NOT {written})") } else { written }
         }
+        Expr::InSubquery { operand, query: inner, negated } => {
+            let any = format!("({} = ANY({}))", expr(ast, operand), query(ast, inner));
+            if negated { format!("(NOT {any})") } else { any }
+        }
         Expr::Parameter { name } => format!("${}", ast.string(name)),
         // A bracketed list is a call to `list_value`, including when it is empty.
         Expr::List { items } => format!("list_value({})", exprs(ast, items)),
@@ -916,6 +920,11 @@ mod tests {
         );
         assert_eq!(body("SELECT x IN (1, 2, 3) FROM t"), "SELECT (x IN (1, 2, 3)) FROM t");
         assert_eq!(body("SELECT x NOT IN (1, 2) FROM t"), "SELECT (NOT (x IN (1, 2))) FROM t");
+        assert_eq!(body("SELECT x IN (SELECT y FROM t)"), "SELECT (x = ANY(SELECT y FROM t))");
+        assert_eq!(
+            body("SELECT x NOT IN (SELECT y FROM t)"),
+            "SELECT (NOT (x = ANY(SELECT y FROM t)))"
+        );
     }
 
     /// The four pattern operators have a word spelling and a symbol spelling, and the symbol is

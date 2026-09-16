@@ -161,7 +161,9 @@ pub(crate) fn across(
 fn droppable(kind: JoinKind) -> (bool, bool) {
     match kind {
         JoinKind::Inner => (true, true),
-        JoinKind::Left | JoinKind::Semi | JoinKind::Anti | JoinKind::Single => (false, true),
+        JoinKind::Left | JoinKind::Semi | JoinKind::Anti | JoinKind::Single | JoinKind::Mark => {
+            (false, true)
+        }
         JoinKind::Right => (true, false),
         JoinKind::Full | JoinKind::Positional => (false, false),
     }

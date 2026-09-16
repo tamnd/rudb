@@ -206,7 +206,7 @@ fn join(left: Option<u64>, right: Option<u64>, kind: JoinKind, conditions: usize
         JoinKind::Semi => left.map(|n| scale(n, KEPT_BY_A_CONDITION).max(1)),
         JoinKind::Anti => left.map(|n| scale(n, 1.0 - KEPT_BY_A_CONDITION).max(1)),
         // At most one right row each, by definition.
-        JoinKind::Single => left,
+        JoinKind::Single | JoinKind::Mark => left,
         // The nth with the nth, so the shorter side decides.
         JoinKind::Positional => match (left, right) {
             (Some(left), Some(right)) => Some(left.min(right)),
