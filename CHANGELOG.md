@@ -6,6 +6,19 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.25
+
+A patch release about SHOW resolution, the SQL dialect registry, and lower aggregation and native scan costs. The storage format version is unchanged.
+
+- `show_behavior` selects how `SHOW name` resolves a bare name. AUTO prefers an existing table and otherwise reads a setting, SETTING reads only settings, and TABLE describes only tables. Resolution happens while binding and becomes an ordinary constant plan, so execution adds no setting read or runtime branch.
+- SHOW setting lookup ignores case while preserving the spelling the query wrote as the result column name. Table and setting collisions, qualified names, missing names, reset, readback and catalog metadata match the pinned DuckDB.
+- A parser dialect registry owns the installed DuckDB grammar. `current_dialect` resolves through that registry, preserves the accepted spelling, resets to `duckdb`, and rejects an uninstalled dialect with DuckDB's error.
+- `duckdb_dialects()` reads the registry and returns the installed `duckdb` row. `duckdb_grammar_extensions()` reports the empty registry with DuckDB's two-column schema, which is the default pinned answer. Both functions appear in `duckdb_functions()`.
+- Native ClickBench scans keep scaling beyond one million rows instead of letting fixed scheduling and materialisation costs take over as the input grows.
+- Singleton BIGINT distinct values stay inline instead of paying for a general set, reducing state and allocation for the common one-value group.
+- A count predicate in HAVING is applied before aggregate rows are materialised, so rejected groups do not allocate and fill result values that are immediately discarded.
+- The pinned DuckDB oracle agrees on every new compatibility record in this release. No DuckDB bug was found in this work.
+
 ## 0.3.24
 
 A patch release about zero-division policy, IEEE floating point policy, guarded timestamp casts, and faster grouped aggregation. The storage format version is unchanged.
