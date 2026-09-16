@@ -1481,6 +1481,48 @@ fn the_session_time_zone_moves_local_context_and_one_argument_age() {
 }
 
 #[test]
+fn the_session_sort_defaults_are_resolved_into_each_sort_key() {
+    let db = database();
+    db.execute("CREATE TABLE sort_defaults(x INTEGER)").expect("a nullable column");
+    db.execute("INSERT INTO sort_defaults VALUES (1), (NULL), (2)").expect("three rows");
+    let one = |value| vec![Value::Integer(value)];
+    let null = vec![Value::Null];
+    assert_eq!(
+        rows(&db, "SELECT x FROM sort_defaults ORDER BY x DESC"),
+        vec![one(2), one(1), null.clone()]
+    );
+    db.execute("SET default_order = 'descending'").expect("the descending default");
+    assert_eq!(db.setting("default_order").expect("the direction"), "DESC");
+    assert_eq!(
+        rows(&db, "SELECT x FROM sort_defaults ORDER BY x"),
+        vec![one(2), one(1), null.clone()]
+    );
+    db.execute("SET default_null_order = 'first'").expect("nulls first");
+    assert_eq!(
+        rows(&db, "SELECT x FROM sort_defaults ORDER BY x"),
+        vec![null.clone(), one(2), one(1)]
+    );
+    db.execute("SET default_null_order = 'sqlite'").expect("the SQLite convention");
+    assert_eq!(
+        rows(&db, "SELECT x FROM sort_defaults ORDER BY x ASC"),
+        vec![null.clone(), one(1), one(2)]
+    );
+    assert_eq!(
+        rows(&db, "SELECT x FROM sort_defaults ORDER BY x DESC"),
+        vec![one(2), one(1), null.clone()]
+    );
+    db.execute("SET default_null_order = 'postgres'").expect("the PostgreSQL convention");
+    assert_eq!(
+        rows(&db, "SELECT x FROM sort_defaults ORDER BY x DESC"),
+        vec![null, one(2), one(1)]
+    );
+    db.execute("RESET default_order").expect("the direction default");
+    db.execute("RESET default_null_order").expect("the null default");
+    assert_eq!(db.setting("default_order").expect("the direction"), "ASCENDING");
+    assert_eq!(db.setting("default_null_order").expect("the null order"), "NULLS_LAST");
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -1590,8 +1632,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Six rows for four settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(6)]]);
+    // Eight rows for six settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(8)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
