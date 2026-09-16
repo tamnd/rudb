@@ -130,14 +130,27 @@ impl Stream for TableFetch<'_> {
             Some(Data::Int64(values)) if !ordinals.validity().has_nulls(count) => values.as_slice(),
             _ => return Err(Error::internal("a table fetch was handed invalid row ordinals")),
         };
-        let rows = held
-            .iter()
-            .map(|&row| {
-                u64::try_from(row)
-                    .map_err(|_| Error::internal("a table fetch was handed a negative row ordinal"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        *chunk = self.table.rows().rows_at(&self.types, &self.columns, &rows)?;
+        // Read forward through the table and only once per ordinal, then restore the TopN order.
+        // Native random access keeps one decoded stripe. Reading winners in result order can bounce
+        // between stripes and decode the same hundred-column stripe more than once.
+        let mut order: Vec<usize> = (0..count).collect();
+        order.sort_by_key(|&at| held[at]);
+        let mut rows = Vec::with_capacity(count);
+        let mut taken = vec![0_u32; count];
+        for at in order {
+            let row = u64::try_from(held[at])
+                .map_err(|_| Error::internal("a table fetch was handed a negative row ordinal"))?;
+            if rows.last() != Some(&row) {
+                rows.push(row);
+            }
+            taken[at] = u32::try_from(rows.len() - 1).unwrap_or(u32::MAX);
+        }
+        let fetched = self.table.rows().rows_at(&self.types, &self.columns, &rows)?;
+        let mut columns = Vec::with_capacity(fetched.width());
+        for at in 0..fetched.width() {
+            columns.push(fetched.column(at)?.gather(&taken)?);
+        }
+        *chunk = Chunk::with_rows(columns, count)?;
         Ok(Progress::More)
     }
 }
