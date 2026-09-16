@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry.
 //! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so this is a match on a name rather than a map.
-//! [`Settings::NAMES`] is that set, and it is fourteen names for twelve settings because two have a second spelling.
+//! [`Settings::NAMES`] is that set, and it is fifteen names for thirteen settings because two have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
@@ -27,7 +27,7 @@
 
 use std::sync::RwLock;
 
-use rudb_common::{DefaultNullOrder, Error, Memory, Result, Session, Value, human};
+use rudb_common::{DefaultNullOrder, Error, Memory, Result, Session, ShowBehavior, Value, human};
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
@@ -66,6 +66,8 @@ pub(crate) struct Settings {
     order_by_non_integer_literal: RwLock<bool>,
     /// Whether regex match operators require the entire string to match.
     regex_match_operator_semantics: RwLock<String>,
+    /// How a bare name following `SHOW` is resolved.
+    show_behavior: RwLock<String>,
     /// Which implementation runs at each seam, as `SET seam.<name>` has left it.
     ///
     /// Held here rather than in [`Config`], because there are twenty seven of them and a `Config`
@@ -77,7 +79,7 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 14] = [
+    pub(crate) const NAMES: [&'static str; 15] = [
         "TimeZone",
         "default_null_order",
         "default_order",
@@ -90,6 +92,7 @@ impl Settings {
         "null_on_division_by_zero",
         "order_by_non_integer_literal",
         "regex_match_operator_semantics",
+        "show_behavior",
         "threads",
         "worker_threads",
     ];
@@ -114,6 +117,7 @@ impl Settings {
             null_on_division_by_zero: RwLock::new(false),
             order_by_non_integer_literal: RwLock::new(false),
             regex_match_operator_semantics: RwLock::new("partial".to_string()),
+            show_behavior: RwLock::new("AUTO".to_string()),
             seams: RwLock::new(rudb_seam::Settings::new()),
         }
     }
@@ -306,6 +310,18 @@ impl Settings {
                     .write()
                     .unwrap_or_else(|held| held.into_inner()) = written;
             }
+            "show_behavior" => {
+                let written = value.map_or("AUTO".to_string(), text_of);
+                match written.to_ascii_uppercase().as_str() {
+                    "AUTO" | "SETTING" | "TABLE" => {}
+                    _ => {
+                        return Err(Error::not_implemented(format!(
+                            "Enum value: unrecognized value \"{written}\" for enum \"ShowBehaviorType\"\n\nCandidates: \"AUTO\""
+                        )));
+                    }
+                }
+                *self.show_behavior.write().unwrap_or_else(|held| held.into_inner()) = written;
+            }
             "threads" => {
                 let threads = match value {
                     None => self.defaults.threads(),
@@ -379,6 +395,9 @@ impl Settings {
                 .read()
                 .unwrap_or_else(|held| held.into_inner())
                 .clone()),
+            "show_behavior" => {
+                Ok(self.show_behavior.read().unwrap_or_else(|held| held.into_inner()).clone())
+            }
             "threads" => Ok(config.threads().to_string()),
             _ => Err(Error::catalog(rudb_functions::unknown_setting(name))),
         }
@@ -419,6 +438,8 @@ impl Settings {
             .read()
             .unwrap_or_else(|held| held.into_inner())
             .clone();
+        let show_behavior =
+            self.show_behavior.read().unwrap_or_else(|held| held.into_inner()).clone();
         let mut session = Session::new();
         session.set_time_zone(&time_zone);
         session.set_default_descending(default_order == "DESC");
@@ -434,6 +455,11 @@ impl Settings {
         session.set_null_on_division_by_zero(null_on_division_by_zero);
         session.set_order_by_non_integer_literal(order_by_non_integer_literal);
         session.set_regex_match_full(regex_match_operator_semantics.eq_ignore_ascii_case("full"));
+        session.set_show_behavior(match show_behavior.to_ascii_uppercase().as_str() {
+            "SETTING" => ShowBehavior::Setting,
+            "TABLE" => ShowBehavior::Table,
+            _ => ShowBehavior::Auto,
+        });
         for name in Self::NAMES {
             session.set(
                 name,
@@ -449,6 +475,7 @@ impl Settings {
                     "memory_limit" => memory.clone(),
                     "order_by_non_integer_literal" => order_by_non_integer_literal.to_string(),
                     "regex_match_operator_semantics" => regex_match_operator_semantics.clone(),
+                    "show_behavior" => show_behavior.clone(),
                     "threads" => threads.clone(),
                     other => unreachable!("{other} is not one of NAMES"),
                 },

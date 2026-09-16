@@ -138,6 +138,13 @@ pub static SETTINGS: &[SettingEntry] = &[
         aliases: &[],
     },
     SettingEntry {
+        name: "show_behavior",
+        description: "How SHOW resolves a bare identifier: 'auto' (describe a table if one exists, else a setting; deprecated), 'table' (always a table), or 'setting' (always a setting)",
+        input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
         name: "threads",
         description: "The number of total threads used by the system.",
         input_type: "BIGINT",
@@ -197,7 +204,7 @@ mod tests {
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
-        assert_eq!(SETTINGS.len(), 14, "twelve settings and two of them have a second spelling");
+        assert_eq!(SETTINGS.len(), 15, "thirteen settings and two of them have a second spelling");
         assert_eq!(setting_fields().len(), 7);
     }
 

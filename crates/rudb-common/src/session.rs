@@ -40,6 +40,7 @@ pub struct Semantics {
     null_on_division_by_zero: bool,
     order_by_non_integer_literal: bool,
     regex_match_full: bool,
+    show_behavior: ShowBehavior,
 }
 
 impl Default for Semantics {
@@ -53,6 +54,7 @@ impl Default for Semantics {
             null_on_division_by_zero: false,
             order_by_non_integer_literal: false,
             regex_match_full: false,
+            show_behavior: ShowBehavior::Auto,
         }
     }
 }
@@ -110,6 +112,24 @@ impl Semantics {
     pub fn regex_match_full(self) -> bool {
         self.regex_match_full
     }
+
+    /// How a bare name following `SHOW` is resolved.
+    #[must_use]
+    pub fn show_behavior(self) -> ShowBehavior {
+        self.show_behavior
+    }
+}
+
+/// How `SHOW name` chooses between a setting and a table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShowBehavior {
+    /// Prefer a table when one exists, then fall back to a setting.
+    #[default]
+    Auto,
+    /// Always read a setting.
+    Setting,
+    /// Always describe a table.
+    Table,
 }
 
 /// How an unstated `NULLS FIRST` or `NULLS LAST` is resolved.
@@ -220,6 +240,11 @@ impl Session {
     /// Sets whether regex match operators require the entire string to match.
     pub fn set_regex_match_full(&mut self, enabled: bool) {
         self.semantics.regex_match_full = enabled;
+    }
+
+    /// Sets how `SHOW name` resolves its name.
+    pub fn set_show_behavior(&mut self, behavior: ShowBehavior) {
+        self.semantics.show_behavior = behavior;
     }
 
     /// The meaning-changing choices the binder resolves into the plan.

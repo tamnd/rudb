@@ -33,7 +33,7 @@ pub use bounds::{Bound, Op, excluded};
 pub use cancel::Cancel;
 pub use error::{Error, ErrorCode, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human};
-pub use session::{DefaultNullOrder, Semantics, Session, SessionTimeZone};
+pub use session::{DefaultNullOrder, Semantics, Session, SessionTimeZone, ShowBehavior};
 pub use slow::{Cause, Tally};
 pub use stage::{Spent, Stage};
 pub use types::{Field, LogicalType, MAX_DECIMAL_WIDTH, PhysicalType};
