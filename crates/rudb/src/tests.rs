@@ -1802,6 +1802,42 @@ fn current_dialect_resolves_through_the_installed_parser_registry() {
 }
 
 #[test]
+fn dialect_compatibility_mode_accepts_exactly_the_modes_the_pin_has() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('dialect_compatibility_mode')"),
+        vec![vec![text("NONE")]]
+    );
+    db.execute("SET dialect_compatibility_mode = 'spark'").expect("Spark mode");
+    assert_eq!(db.setting("dialect_compatibility_mode").expect("the mode"), "spark");
+    db.execute("SET GLOBAL dialect_compatibility_mode = 'SPARK'").expect("global Spark mode");
+    assert_eq!(db.setting("dialect_compatibility_mode").expect("the mode"), "SPARK");
+    db.execute("SET dialect_compatibility_mode = 'none'").expect("no compatibility mode");
+    assert_eq!(db.setting("dialect_compatibility_mode").expect("the mode"), "none");
+    db.execute("RESET GLOBAL dialect_compatibility_mode").expect("the default mode");
+    assert_eq!(db.setting("dialect_compatibility_mode").expect("the mode"), "NONE");
+    let error = db.execute("SET dialect_compatibility_mode = 'nope'").expect_err("an unknown mode");
+    assert_eq!(error.code().duckdb_name(), "Not implemented Error");
+    assert_eq!(
+        error.message(),
+        "Enum value: unrecognized value \"nope\" for enum \"DialectCompatibilityMode\"\n\nCandidates: \"NONE\""
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'dialect_compatibility_mode'"
+        ),
+        vec![vec![
+            text(
+                "Enable SQL dialect compatibility for a certain engine (e.g. `SET dialect_compatibility_mode='spark'`)"
+            ),
+            text("VARCHAR"),
+            text("GLOBAL"),
+        ]]
+    );
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -1911,8 +1947,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Sixteen rows for fourteen settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(16)]]);
+    // Seventeen rows for fifteen settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(17)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
