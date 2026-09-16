@@ -1523,6 +1523,27 @@ fn the_session_sort_defaults_are_resolved_into_each_sort_key() {
 }
 
 #[test]
+fn integer_division_is_resolved_while_the_expression_is_bound() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT 7 / 2, typeof(7 / 2)"),
+        vec![vec![Value::Double(3.5), text("DOUBLE")]]
+    );
+    db.execute("SET integer_division = true").expect("integer division");
+    assert_eq!(db.setting("integer_division").expect("the setting"), "true");
+    assert_eq!(
+        rows(&db, "SELECT 7 / 2, typeof(7 / 2), 7.5 / 2.0, typeof(7.5 / 2.0)"),
+        vec![vec![Value::Integer(3), text("INTEGER"), Value::Double(3.75), text("DOUBLE")]]
+    );
+    assert_eq!(db.query("SELECT 7 / 2").expect("a division").names(), ["(7 // 2)".to_string()]);
+    db.execute("RESET integer_division").expect("floating point division");
+    assert_eq!(db.setting("integer_division").expect("the setting"), "false");
+    assert_eq!(rows(&db, "SELECT 7 / 2"), vec![vec![Value::Double(3.5)]]);
+    let error = db.execute("SET integer_division = 'off'").expect_err("not a boolean");
+    assert_eq!(error.message(), "Failed to cast value: Could not convert string 'off' to BOOL");
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -1632,8 +1653,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Eight rows for six settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(8)]]);
+    // Nine rows for seven settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(9)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
