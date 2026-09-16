@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use rudb_common::{Error, IdentifierCase, Result, Value};
+use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 
 use crate::ast::{
     Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, CreateView, Distinct, DropTable, Expr, ExprRef,
@@ -68,6 +68,7 @@ pub fn transform_with_case(
         interned: HashMap::new(),
         anonymous: 0,
         identifier_case,
+        current_span: Span::new(0, 0),
     };
     transform.program(tree.root())?;
     Ok(transform.ast)
@@ -82,6 +83,7 @@ struct Transform<'a> {
     /// How many bare `?` parameters have been seen, which is what numbers the next one.
     anonymous: u32,
     identifier_case: IdentifierCase,
+    current_span: Span,
 }
 
 impl<'a> Transform<'a> {
@@ -90,6 +92,21 @@ impl<'a> Transform<'a> {
     /// The text a node covers.
     fn text(&self, node: u32) -> &'a str {
         self.tree.text(node, self.query, self.tokens)
+    }
+
+    /// The byte range covered by a parse node.
+    fn span(&self, node: u32) -> Span {
+        let parsed = self.tree.node(node);
+        if parsed.start >= parsed.end {
+            let at = self
+                .tokens
+                .get(parsed.start as usize)
+                .map_or(self.query.len() as u32, |token| token.start);
+            return Span::new(at, at);
+        }
+        let first = self.tokens[parsed.start as usize];
+        let last = self.tokens[parsed.end as usize - 1];
+        Span::new(first.start, last.end)
     }
 
     /// The name of the rule a node is.
@@ -184,6 +201,7 @@ impl<'a> Transform<'a> {
     fn push(&mut self, expr: Expr) -> ExprRef {
         let index = self.ast.exprs.len() as u32;
         self.ast.exprs.push(expr);
+        self.ast.expr_spans.push(self.current_span);
         index
     }
 
@@ -198,6 +216,7 @@ impl<'a> Transform<'a> {
     fn push_query(&mut self, query: Query) -> QueryRef {
         let index = self.ast.queries.len() as u32;
         self.ast.queries.push(query);
+        self.ast.query_spans.push(self.current_span);
         index
     }
 
@@ -819,6 +838,14 @@ impl<'a> Transform<'a> {
 
     /// `SelectStatementInternal <- WithClause? SelectSetOpChain ResultModifiers?`.
     fn query(&mut self, node: u32) -> Result<QueryRef> {
+        let span = self.span(node);
+        let outer = std::mem::replace(&mut self.current_span, span);
+        let result = self.query_inner(node);
+        self.current_span = outer;
+        result
+    }
+
+    fn query_inner(&mut self, node: u32) -> Result<QueryRef> {
         if self.find(node, "WithClause") != NONE {
             return self.unsupported(self.find(node, "WithClause"));
         }
@@ -1505,6 +1532,14 @@ impl<'a> Transform<'a> {
     /// grammar has eleven hundred rules and the ones with a keyword and one child are not enumerable
     /// by reading the ones that are wrong today.
     fn expr(&mut self, node: u32) -> Result<ExprRef> {
+        let span = self.span(node);
+        let outer = std::mem::replace(&mut self.current_span, span);
+        let result = self.expr_inner(node);
+        self.current_span = outer;
+        result
+    }
+
+    fn expr_inner(&mut self, node: u32) -> Result<ExprRef> {
         let mut node = node;
         loop {
             let count = self.count(node);
@@ -3187,6 +3222,26 @@ mod tests {
                 format!("EXPLAIN {analyze}{}", show_query(&ast, query))
             }
         }
+    }
+
+    #[test]
+    fn expressions_and_queries_keep_their_source_ranges() {
+        let sql = "SELECT 1 + 22";
+        let ast = parse_ast(sql).expect("the query parses");
+        let Statement::Query(query) = ast.statements[0] else { panic!("a query") };
+        assert_eq!(ast.query_span(query), Span::new(0, sql.len() as u32));
+        let twenty_two = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(at, expr)| match *expr {
+                Expr::Literal { kind: LiteralKind::Number, text } if ast.string(text) == "22" => {
+                    Some(at as u32)
+                }
+                _ => None,
+            })
+            .expect("the literal is in the arena");
+        assert_eq!(ast.expr_span(twenty_two), Span::new(11, 13));
     }
 
     #[test]

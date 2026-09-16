@@ -5,7 +5,7 @@
 //! reads fails in a way that says what went wrong.
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Field, LogicalType, Session};
+use rudb_common::{Field, LogicalType, Session, Span};
 
 use crate::{bind_sql, bind_sql_with};
 
@@ -635,4 +635,15 @@ fn a_binder_with_no_database_behind_it_has_no_settings_to_read() {
     // a default this crate would have had to invent.
     let message = failure("SELECT current_setting('threads')");
     assert!(message.starts_with("unrecognized configuration parameter \"threads\""), "{message}");
+}
+
+#[test]
+fn bound_expressions_keep_the_ast_source_ranges() {
+    let sql = "SELECT 1 + 22";
+    let plan = bind_sql(sql, &catalog()).expect("the expression binds");
+    let spans: Vec<Span> = (0..plan.expr_count() as u32).map(|expr| plan.expr_span(expr)).collect();
+    assert!(spans.contains(&Span::new(7, 8)), "the first literal is missing from {spans:?}");
+    assert!(spans.contains(&Span::new(11, 13)), "the second literal is missing from {spans:?}");
+    assert!(spans.contains(&Span::new(7, 13)), "the addition is missing from {spans:?}");
+    assert_eq!(plan.node_span(plan.root()), Span::new(0, sql.len() as u32));
 }
