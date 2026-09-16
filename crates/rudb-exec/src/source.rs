@@ -72,6 +72,40 @@ pub(crate) struct Frequencies {
 }
 
 impl Frequencies {
+    /// Builds already evaluated multi-column grouped counts.
+    pub(crate) fn grouped(schema: Schema, entries: Vec<(Vec<Value>, u64)>) -> Result<Self> {
+        let output_types = schema.types();
+        let Some((&LogicalType::BigInt, group_types)) = output_types.split_last() else {
+            return Err(Error::internal("a grouped frequency source count is not BIGINT"));
+        };
+        let mut chunks = Vec::with_capacity(entries.len().div_ceil(VECTOR_SIZE));
+        for entries in entries.chunks(VECTOR_SIZE) {
+            let mut columns = vec![Vec::with_capacity(entries.len()); group_types.len()];
+            let mut counts = Vec::with_capacity(entries.len());
+            for (keys, count) in entries {
+                if keys.len() != group_types.len() {
+                    return Err(Error::internal("a grouped frequency key has the wrong width"));
+                }
+                for (column, key) in columns.iter_mut().zip(keys) {
+                    column.push(key.clone());
+                }
+                counts.push(
+                    i64::try_from(*count)
+                        .map_err(|_| Error::internal("a stored frequency exceeds BIGINT"))?,
+                );
+            }
+            let mut output = columns
+                .into_iter()
+                .zip(group_types)
+                .map(|(values, ty)| Vector::from_values(ty.clone(), &values))
+                .collect::<Result<Vec<_>>>()?;
+            output.push(Vector::flat(LogicalType::BigInt, Data::Int64(counts.into()))?);
+            chunks.push(Chunk::with_rows(output, entries.len())?);
+        }
+        let handout = Handout::new(chunks.len());
+        Ok(Self { chunks, handout })
+    }
+
     /// Builds the aggregate rows which the ordinary TopN above this source will order and limit.
     pub(crate) fn new(
         plan: &Plan,

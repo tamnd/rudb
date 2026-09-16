@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
@@ -35,7 +35,7 @@ const FREQUENCIES: &[u8; 8] = b"RUDBFQ2\0";
 const FREQUENCY_CANDIDATES: usize = 32_768;
 const FREQUENCY_ENTRIES: usize = 512;
 const FREQUENCY_BUILD_RANK: usize = 10;
-const FREQUENCY_ORDINALS: usize = 65_536;
+const FREQUENCY_ORDINALS: usize = 131_072;
 const MAX_FREQUENCY_WORKERS: usize = 16;
 
 fn io(error: std::io::Error) -> Error {
@@ -503,14 +503,11 @@ impl Writer {
                 decrements = decrements.saturating_add(1);
             }
         })?;
-        let (exact, ordinals) = if decrements == 0 {
-            (
-                candidates
-                    .into_iter()
-                    .map(|(value, count)| (value, u64::from(count)))
-                    .collect::<HashMap<_, _>>(),
-                Vec::new(),
-            )
+        let exact = if decrements == 0 {
+            candidates
+                .into_iter()
+                .map(|(value, count)| (value, u64::from(count)))
+                .collect::<HashMap<_, _>>()
         } else {
             let mut lower = candidates.values().copied().collect::<Vec<_>>();
             lower.sort_unstable_by(|left, right| right.cmp(left));
@@ -521,22 +518,12 @@ impl Writer {
             }
             let mut exact =
                 candidates.into_keys().map(|value| (value, 0_u64)).collect::<HashMap<_, _>>();
-            let mut ordinals = Vec::new();
-            let mut exceeded = false;
-            self.visit_numeric(column, |ordinal, value| {
+            self.visit_numeric(column, |_, value| {
                 if let Some(count) = exact.get_mut(&value) {
                     *count = count.saturating_add(1);
-                    if !exceeded {
-                        if ordinals.len() < FREQUENCY_ORDINALS {
-                            ordinals.push(ordinal);
-                        } else {
-                            ordinals.clear();
-                            exceeded = true;
-                        }
-                    }
                 }
             })?;
-            (exact, ordinals)
+            exact
         };
         let mut entries = exact
             .into_iter()
@@ -548,6 +535,19 @@ impl Writer {
         let omitted_max =
             entries.get(FREQUENCY_ENTRIES).map_or(decrements, |entry| decrements.max(entry.count));
         entries.truncate(FREQUENCY_ENTRIES);
+        let kept_rows = entries.iter().try_fold(0_u64, |total, entry| {
+            total.checked_add(entry.count).filter(|&total| total <= FREQUENCY_ORDINALS as u64)
+        });
+        let mut ordinals = Vec::new();
+        if let Some(kept_rows) = kept_rows {
+            let kept = entries.iter().map(|entry| entry.value).collect::<HashSet<_>>();
+            ordinals.reserve(usize::try_from(kept_rows).unwrap_or(FREQUENCY_ORDINALS));
+            self.visit_numeric(column, |ordinal, value| {
+                if kept.contains(&value) {
+                    ordinals.push(ordinal);
+                }
+            })?;
+        }
         Ok(Some(FrequencySummary { entries, omitted_max, ordinals }))
     }
 

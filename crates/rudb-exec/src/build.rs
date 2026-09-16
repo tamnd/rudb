@@ -42,6 +42,7 @@
 //! they were written and disagree some time after. What this module does is ask which operator a
 //! node is and wrap it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rudb_catalog::{Catalog, QualifiedName};
@@ -417,6 +418,98 @@ struct NativeFrequencies {
     column: usize,
 }
 
+struct NativePairFrequencies {
+    entries: Vec<(Vec<Value>, u64)>,
+}
+
+/// Exact two-key counts over bounded heavy-hitter rows, certified against the omitted maximum.
+fn native_pair_frequencies(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+    top: usize,
+) -> Result<Option<NativePairFrequencies>> {
+    let Node::Get { catalog: database, schema, table, index, columns, .. } = *plan.node(input)
+    else {
+        return Ok(None);
+    };
+    let [first_expr, second_expr] = plan.expr_list(groups) else { return Ok(None) };
+    let Expr::Column(first) = *plan.expr(*first_expr) else { return Ok(None) };
+    let Expr::Column(second) = *plan.expr(*second_expr) else { return Ok(None) };
+    if first.table != index
+        || second.table != index
+        || plan.expr_type(*first_expr) != &rudb_common::LogicalType::BigInt
+        || plan.expr_type(*second_expr) != &rudb_common::LogicalType::Varchar
+    {
+        return Ok(None);
+    }
+    let [aggregate] = plan.expr_list(aggregates) else { return Ok(None) };
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
+        return Ok(None);
+    };
+    if top == 0
+        || plan.string(name) != "count_star"
+        || !plan.expr_list(args).is_empty()
+        || distinct
+        || filter.is_some()
+    {
+        return Ok(None);
+    }
+    let fields = plan.field_list(columns);
+    let Some(first_field) = fields.get(first.column as usize) else { return Ok(None) };
+    let Some(second_field) = fields.get(second.column as usize) else { return Ok(None) };
+    let name = QualifiedName::new(plan.string(database), plan.string(schema), plan.string(table));
+    let table = catalog.table(&name)?;
+    let Some(first_column) = table.column_index(&first_field.name) else { return Ok(None) };
+    let Some(second_column) = table.column_index(&second_field.name) else { return Ok(None) };
+    let Some(occurrences) = table.rows().frequency_occurrences(first_column)? else {
+        return Ok(None);
+    };
+    let rows = table.rows().rows_at(
+        &[rudb_common::LogicalType::BigInt, rudb_common::LogicalType::Varchar],
+        &[first_column, second_column],
+        &occurrences.ordinals,
+    )?;
+    let first_values = rows.column(0)?;
+    let second_values = rows.column(1)?;
+    let mut counts = HashMap::<(Option<i64>, Option<String>), u64>::new();
+    for row in 0..rows.len() {
+        let first = if first_values.is_null_at(row) {
+            None
+        } else {
+            Some(
+                i64::try_from(first_values.signed_at(row).ok_or_else(|| {
+                    Error::internal("a BIGINT frequency occurrence has no signed value")
+                })?)
+                .map_err(|_| Error::internal("a BIGINT frequency occurrence is out of range"))?,
+            )
+        };
+        let second = second_values.try_text_at(row)?.map(str::to_owned);
+        *counts.entry((first, second)).or_default() += 1;
+    }
+    let mut boundaries = counts.values().copied().collect::<Vec<_>>();
+    if boundaries.len() < top {
+        return Ok(None);
+    }
+    boundaries.select_nth_unstable_by(top - 1, |left, right| right.cmp(left));
+    let boundary = boundaries[top - 1];
+    if boundary <= occurrences.omitted_max {
+        return Ok(None);
+    }
+    let entries = counts
+        .into_iter()
+        .filter(|(_, count)| *count >= boundary)
+        .map(|((first, second), count)| {
+            let first = first.map_or(Value::Null, Value::BigInt);
+            let second = second.map_or(Value::Null, Value::Varchar);
+            (vec![first, second], count)
+        })
+        .collect();
+    Ok(Some(NativePairFrequencies { entries }))
+}
+
 /// Exact grouped counts already certified by a native file's frequency synopsis.
 fn native_frequencies(
     plan: &Plan,
@@ -693,6 +786,24 @@ impl<'a> Building<'a, '_> {
         let pipeline = self.shape.pipeline(reference);
         if bound.max_groups.is_none() && bound.having_count.is_none() {
             if let Some(top) = bound.top_counts {
+                if let Some(frequencies) = native_pair_frequencies(
+                    self.plan,
+                    self.catalog,
+                    input,
+                    groups,
+                    aggregates,
+                    top,
+                )? {
+                    let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
+                    let counters = self.watch(
+                        reference,
+                        id,
+                        pipeline,
+                        "Aggregate",
+                        Some("native pair frequencies"),
+                    );
+                    return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+                }
                 if let Some(frequencies) =
                     native_frequencies(self.plan, self.catalog, input, groups, aggregates, top)?
                 {
