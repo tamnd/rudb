@@ -14,7 +14,7 @@
 //! [`Bound`], which is a plan for a query and a resolved catalog operation for `CREATE TABLE`,
 //! `DROP TABLE` and `INSERT`. DDL is not a plan node, for the reason `statement.rs` gives.
 //!
-//! What it does not do yet is subqueries, window functions, `WITH`, and every statement outside
+//! What it does not do yet is correlated subquery unnesting, window functions, `WITH`, and every statement outside
 //! those four. Each of those is an error naming what was written rather than a silently wrong
 //! plan, which is the rule the whole front end follows.
 
