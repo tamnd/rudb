@@ -5219,3 +5219,46 @@ fn a_file_backed_insert_streams_into_a_snapshot_that_a_new_process_can_read() {
     );
     std::fs::remove_file(path).expect("the temporary native database is removed");
 }
+
+#[test]
+fn a_native_frequency_synopsis_answers_count_topn() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-native-frequency-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let database = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the new native database opens");
+    database.execute("CREATE TABLE hits (id BIGINT)").expect("the table is made");
+    database
+        .execute(
+            "INSERT INTO hits SELECT CASE WHEN range < 1000 THEN 0 WHEN range < 1500 THEN 1 \
+             WHEN range < 1750 THEN 2 ELSE range END FROM range(5000)",
+        )
+        .expect("the rows are inserted");
+    assert_eq!(
+        rows(&database, "SELECT id, count(*) AS c FROM hits GROUP BY id ORDER BY c DESC LIMIT 3",),
+        vec![
+            vec![Value::BigInt(0), Value::BigInt(1000)],
+            vec![Value::BigInt(1), Value::BigInt(500)],
+            vec![Value::BigInt(2), Value::BigInt(250)],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT id, id - 1, id - 2, count(*) AS c FROM hits \
+             GROUP BY id, id - 1, id - 2 ORDER BY c DESC LIMIT 3",
+        ),
+        vec![
+            vec![Value::BigInt(0), Value::BigInt(-1), Value::BigInt(-2), Value::BigInt(1000)],
+            vec![Value::BigInt(1), Value::BigInt(0), Value::BigInt(-1), Value::BigInt(500)],
+            vec![Value::BigInt(2), Value::BigInt(1), Value::BigInt(0), Value::BigInt(250)],
+        ]
+    );
+    drop(database);
+    std::fs::remove_file(path).expect("the temporary native database is removed");
+}

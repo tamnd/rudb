@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -15,7 +16,7 @@ use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 
 use rudb_common::bounds::Bound;
-use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
@@ -27,6 +28,10 @@ const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
 const MAX_DIRECTORY: usize = 128 * 1024 * 1024;
+const FREQUENCIES: &[u8; 8] = b"RUDBFQ1\0";
+const FREQUENCY_CANDIDATES: usize = 32_768;
+const FREQUENCY_ENTRIES: usize = 512;
+const FREQUENCY_BUILD_RANK: usize = 10;
 
 fn io(error: std::io::Error) -> Error {
     Error::io(error.to_string())
@@ -130,6 +135,29 @@ struct Page {
     hash: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FrequencyValue {
+    Null,
+    Integer(i128),
+    Code(u32),
+}
+
+#[derive(Debug, Clone)]
+struct FrequencyEntry {
+    value: FrequencyValue,
+    count: u64,
+}
+
+/// Exact leading frequencies for one column.
+///
+/// Values outside `entries` occur at most `omitted_max` times. This lets a count-descending TopN
+/// use the synopsis only when its last winner is strictly above every omitted value.
+#[derive(Debug, Clone)]
+struct FrequencySummary {
+    entries: Vec<FrequencyEntry>,
+    omitted_max: u64,
+}
+
 /// One independently readable stripe of a table.
 #[derive(Debug, Clone)]
 pub struct Stripe {
@@ -154,6 +182,7 @@ pub struct Table {
     stripes: Vec<Stripe>,
     rows: usize,
     dictionaries: Vec<Option<Page>>,
+    frequencies: Vec<Option<FrequencySummary>>,
 }
 
 impl Table {
@@ -189,6 +218,8 @@ struct GlobalDictionary {
     collisions: HashMap<u64, Vec<u32>>,
     offsets: Vec<u32>,
     payload: Vec<u8>,
+    counts: Vec<u64>,
+    nulls: u64,
 }
 
 impl GlobalDictionary {
@@ -198,6 +229,8 @@ impl GlobalDictionary {
             collisions: HashMap::new(),
             offsets: vec![0],
             payload: Vec::new(),
+            counts: Vec::new(),
+            nulls: 0,
         }
     }
 
@@ -237,7 +270,21 @@ impl GlobalDictionary {
             u32::try_from(self.payload.len())
                 .map_err(|_| invalid("global dictionary payload exceeds 4 GiB"))?,
         );
+        self.counts.push(0);
         Ok(code)
+    }
+
+    fn observe(&mut self, code: u32, null: bool) -> Result<()> {
+        if null {
+            self.nulls = self.nulls.saturating_add(1);
+            return Ok(());
+        }
+        let count = self
+            .counts
+            .get_mut(code as usize)
+            .ok_or_else(|| invalid("global dictionary count code is out of range"))?;
+        *count = count.saturating_add(1);
+        Ok(())
     }
 }
 
@@ -295,6 +342,7 @@ impl Writer {
                 fields,
                 stripes: Vec::new(),
                 rows: 0,
+                frequencies: Vec::new(),
             },
             generation: 1,
             order: Vec::new(),
@@ -381,6 +429,95 @@ impl Writer {
         Ok(())
     }
 
+    /// Finds exact heavy hitters without keeping a hash table for every numeric column while the
+    /// load is live. The pages are already in the target file, so one column at a time uses a
+    /// bounded Misra-Gries candidate table and then recounts only those candidates.
+    fn numeric_frequency(&self, column: usize) -> Result<Option<FrequencySummary>> {
+        let ty = &self.table.fields[column].ty;
+        if !matches!(
+            ty,
+            LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+                | LogicalType::Date
+                | LogicalType::Timestamp
+        ) {
+            return Ok(None);
+        }
+        let mut candidates: HashMap<FrequencyValue, u32> = HashMap::new();
+        let mut decrements = 0_u64;
+        self.visit_numeric(column, |value| {
+            if let Some(count) = candidates.get_mut(&value) {
+                *count = count.saturating_add(1);
+            } else if candidates.len() < FREQUENCY_CANDIDATES {
+                candidates.insert(value, 1);
+            } else {
+                candidates.retain(|_, count| {
+                    *count -= 1;
+                    *count != 0
+                });
+                decrements = decrements.saturating_add(1);
+            }
+        })?;
+        let exact = if decrements == 0 {
+            candidates
+                .into_iter()
+                .map(|(value, count)| (value, u64::from(count)))
+                .collect::<HashMap<_, _>>()
+        } else {
+            let mut lower = candidates.values().copied().collect::<Vec<_>>();
+            lower.sort_unstable_by(|left, right| right.cmp(left));
+            if lower.len() < FREQUENCY_BUILD_RANK
+                || u64::from(lower[FREQUENCY_BUILD_RANK - 1]) <= decrements
+            {
+                return Ok(None);
+            }
+            let mut exact =
+                candidates.into_keys().map(|value| (value, 0_u64)).collect::<HashMap<_, _>>();
+            self.visit_numeric(column, |value| {
+                if let Some(count) = exact.get_mut(&value) {
+                    *count = count.saturating_add(1);
+                }
+            })?;
+            exact
+        };
+        let mut entries = exact
+            .into_iter()
+            .map(|(value, count)| FrequencyEntry { value, count })
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| {
+            right.count.cmp(&left.count).then_with(|| frequency_order(left.value, right.value))
+        });
+        let omitted_max =
+            entries.get(FREQUENCY_ENTRIES).map_or(decrements, |entry| decrements.max(entry.count));
+        entries.truncate(FREQUENCY_ENTRIES);
+        Ok(Some(FrequencySummary { entries, omitted_max }))
+    }
+
+    fn visit_numeric(&self, column: usize, mut visit: impl FnMut(FrequencyValue)) -> Result<()> {
+        let ty = &self.table.fields[column].ty;
+        for stripe in &self.table.stripes {
+            let page = stripe.pages[column];
+            let mut bytes = vec![0; page.length as usize];
+            read_at(&self.file, page.offset, &mut bytes)?;
+            if checksum(&bytes) != page.hash {
+                return Err(invalid("column page checksum differs while building frequencies"));
+            }
+            let vector = decode(ty, stripe.rows, &bytes, None)?;
+            for row in 0..stripe.rows {
+                let value = if vector.is_null_at(row) {
+                    FrequencyValue::Null
+                } else {
+                    FrequencyValue::Integer(vector.signed_at(row).ok_or_else(|| {
+                        invalid("numeric frequency page did not contain a signed value")
+                    })?)
+                };
+                visit(value);
+            }
+        }
+        Ok(())
+    }
+
     /// Commits the directory and syncs the file before publishing its header slot.
     ///
     /// # Errors
@@ -388,11 +525,18 @@ impl Writer {
     /// If directory encoding, writing, or syncing fails.
     pub fn finish(mut self) -> Result<Table> {
         self.flush_pending()?;
-        let mut stripes = self.order.into_iter().zip(self.table.stripes).collect::<Vec<_>>();
+        let mut stripes = std::mem::take(&mut self.order)
+            .into_iter()
+            .zip(std::mem::take(&mut self.table.stripes))
+            .collect::<Vec<_>>();
         stripes.sort_by_key(|(order, _)| *order);
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
+        self.table.frequencies = (0..self.table.fields.len())
+            .map(|column| self.numeric_frequency(column))
+            .collect::<Result<Vec<_>>>()?;
         for (index, dictionary) in self.dictionaries.into_iter().enumerate() {
             let Some(dictionary) = dictionary else { continue };
+            self.table.frequencies[index] = Some(code_frequency(&dictionary));
             let encoded = encode_global_dictionary(dictionary)?;
             let offset = self.file.stream_position().map_err(io)?;
             self.file.write_all(&encoded.index).map_err(io)?;
@@ -688,6 +832,83 @@ impl Reader {
         &self.table
     }
 
+    /// Exact leading frequencies when the stored synopsis proves a count-descending prefix.
+    ///
+    /// The returned list can be longer than `top`. Keeping the stored tail lets a later TopN apply
+    /// additional ordering keys without losing a value tied with the requested boundary.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema or a stored value does not fit its declared type.
+    pub fn top_frequencies(&self, column: usize, top: usize) -> Result<Option<Vec<(Value, u64)>>> {
+        let field = self
+            .table
+            .fields
+            .get(column)
+            .ok_or_else(|| invalid("frequency column index out of range"))?;
+        let Some(summary) = self.table.frequencies.get(column).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        if top == 0 || summary.entries.len() < top {
+            return Ok(None);
+        }
+        let boundary = summary.entries[top - 1].count;
+        if boundary <= summary.omitted_max {
+            return Ok(None);
+        }
+        let dictionary =
+            if field.ty == LogicalType::Varchar { self.dictionary(column)? } else { None };
+        let mut out = Vec::with_capacity(summary.entries.len());
+        for entry in &summary.entries {
+            let value = match entry.value {
+                FrequencyValue::Null => Value::Null,
+                FrequencyValue::Integer(value) => match field.ty {
+                    LogicalType::SmallInt => Value::SmallInt(
+                        i16::try_from(value)
+                            .map_err(|_| invalid("frequency SMALLINT is out of range"))?,
+                    ),
+                    LogicalType::Integer => Value::Integer(
+                        i32::try_from(value)
+                            .map_err(|_| invalid("frequency INTEGER is out of range"))?,
+                    ),
+                    LogicalType::BigInt => Value::BigInt(
+                        i64::try_from(value)
+                            .map_err(|_| invalid("frequency BIGINT is out of range"))?,
+                    ),
+                    LogicalType::Date => Value::Date(
+                        i32::try_from(value)
+                            .map_err(|_| invalid("frequency DATE is out of range"))?,
+                    ),
+                    LogicalType::Timestamp => Value::Timestamp(
+                        i64::try_from(value)
+                            .map_err(|_| invalid("frequency TIMESTAMP is out of range"))?,
+                    ),
+                    _ => return Err(invalid("integer frequency belongs to another type")),
+                },
+                FrequencyValue::Code(code) => dictionary
+                    .as_ref()
+                    .ok_or_else(|| invalid("frequency code has no dictionary"))?
+                    .try_value_at(code as usize)?,
+            };
+            out.push((value, entry.count));
+        }
+        Ok(Some(out))
+    }
+
+    fn dictionary(&self, column: usize) -> Result<Option<Arc<Vector>>> {
+        let Some(page) = self.table.dictionaries[column] else { return Ok(None) };
+        if let Some(dictionary) = self.dictionaries[column].get() {
+            return Ok(Some(Arc::clone(dictionary)));
+        }
+        let dictionary = Arc::new(open_global_dictionary(
+            Arc::clone(&self.file),
+            page,
+            &self.table.fields[column].ty,
+        )?);
+        let _ = self.dictionaries[column].set(Arc::clone(&dictionary));
+        Ok(Some(self.dictionaries[column].get().map_or(dictionary, Arc::clone)))
+    }
+
     /// Reads only the named columns from one stripe.
     ///
     /// # Errors
@@ -767,21 +988,7 @@ impl Reader {
             if checksum(page_bytes) != page.hash {
                 return Err(invalid("column page checksum differs"));
             }
-            let dictionary = match self.table.dictionaries[column] {
-                None => None,
-                Some(dictionary_page) => match self.dictionaries[column].get() {
-                    Some(dictionary) => Some(Arc::clone(dictionary)),
-                    None => {
-                        let dictionary = Arc::new(open_global_dictionary(
-                            Arc::clone(&self.file),
-                            dictionary_page,
-                            &field.ty,
-                        )?);
-                        let _ = self.dictionaries[column].set(Arc::clone(&dictionary));
-                        Some(self.dictionaries[column].get().map_or(dictionary, Arc::clone))
-                    }
-                },
-            };
+            let dictionary = self.dictionary(column)?;
             picked.push(decode(&field.ty, stripe.rows, page_bytes, dictionary)?);
         }
         Chunk::with_rows(picked, stripe.rows)
@@ -851,6 +1058,37 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+fn frequency_order(left: FrequencyValue, right: FrequencyValue) -> Ordering {
+    match (left, right) {
+        (FrequencyValue::Null, FrequencyValue::Null) => Ordering::Equal,
+        (FrequencyValue::Null, _) => Ordering::Less,
+        (_, FrequencyValue::Null) => Ordering::Greater,
+        (FrequencyValue::Integer(left), FrequencyValue::Integer(right)) => left.cmp(&right),
+        (FrequencyValue::Code(left), FrequencyValue::Code(right)) => left.cmp(&right),
+        (FrequencyValue::Integer(_), FrequencyValue::Code(_)) => Ordering::Less,
+        (FrequencyValue::Code(_), FrequencyValue::Integer(_)) => Ordering::Greater,
+    }
+}
+
+fn code_frequency(dictionary: &GlobalDictionary) -> FrequencySummary {
+    let mut entries = dictionary
+        .counts
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count != 0)
+        .map(|(code, &count)| FrequencyEntry { value: FrequencyValue::Code(code as u32), count })
+        .collect::<Vec<_>>();
+    if dictionary.nulls != 0 {
+        entries.push(FrequencyEntry { value: FrequencyValue::Null, count: dictionary.nulls });
+    }
+    entries.sort_unstable_by(|left, right| {
+        right.count.cmp(&left.count).then_with(|| frequency_order(left.value, right.value))
+    });
+    let omitted_max = entries.get(FREQUENCY_ENTRIES).map_or(0, |entry| entry.count);
+    entries.truncate(FREQUENCY_ENTRIES);
+    FrequencySummary { entries, omitted_max }
+}
+
 fn encode_directory(table: &Table) -> Result<Vec<u8>> {
     let mut out = DIRECTORY.to_vec();
     let name = table.name.as_bytes();
@@ -894,6 +1132,39 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
                 &mut out,
                 u32::try_from(range.nulls).map_err(|_| invalid("null count overflow"))?,
             );
+        }
+    }
+    out.extend_from_slice(FREQUENCIES);
+    put_u16(
+        &mut out,
+        u16::try_from(table.frequencies.len())
+            .map_err(|_| invalid("too many frequency columns"))?,
+    );
+    for summary in &table.frequencies {
+        let Some(summary) = summary else {
+            out.push(0);
+            continue;
+        };
+        out.push(1);
+        put_u64(&mut out, summary.omitted_max);
+        put_u32(
+            &mut out,
+            u32::try_from(summary.entries.len())
+                .map_err(|_| invalid("too many frequency entries"))?,
+        );
+        for entry in &summary.entries {
+            match entry.value {
+                FrequencyValue::Null => out.push(0),
+                FrequencyValue::Integer(value) => {
+                    out.push(1);
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+                FrequencyValue::Code(value) => {
+                    out.push(2);
+                    put_u32(&mut out, value);
+                }
+            }
+            put_u64(&mut out, entry.count);
         }
     }
     Ok(out)
@@ -1024,10 +1295,72 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     if total != rows {
         return Err(invalid("table row count differs from stripes"));
     }
+    let frequencies = if cur.at == bytes.len() {
+        vec![None; width]
+    } else {
+        if cur.take(8)? != FREQUENCIES {
+            return Err(invalid("directory extension magic differs"));
+        }
+        if cur.u16()? as usize != width {
+            return Err(invalid("frequency column count differs"));
+        }
+        let mut frequencies = Vec::with_capacity(width);
+        for field in &fields {
+            let summary = match cur.u8()? {
+                0 => None,
+                1 => {
+                    let omitted_max = cur.u64()?;
+                    let count = cur.u32()? as usize;
+                    if count > FREQUENCY_ENTRIES {
+                        return Err(invalid("frequency entry count exceeds its bound"));
+                    }
+                    let mut entries = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let value = match cur.u8()? {
+                            0 => FrequencyValue::Null,
+                            1 => FrequencyValue::Integer(i128::from_le_bytes(
+                                cur.take(16)?.try_into().expect("sixteen bytes"),
+                            )),
+                            2 => FrequencyValue::Code(cur.u32()?),
+                            _ => return Err(invalid("frequency value tag differs")),
+                        };
+                        let valid = matches!(
+                            (&field.ty, value),
+                            (_, FrequencyValue::Null)
+                                | (LogicalType::Varchar, FrequencyValue::Code(_))
+                                | (
+                                    LogicalType::SmallInt
+                                        | LogicalType::Integer
+                                        | LogicalType::BigInt
+                                        | LogicalType::Date
+                                        | LogicalType::Timestamp,
+                                    FrequencyValue::Integer(_),
+                                )
+                        );
+                        if !valid {
+                            return Err(invalid("frequency value does not match its column"));
+                        }
+                        let count = cur.u64()?;
+                        if count == 0 || count > rows as u64 {
+                            return Err(invalid("frequency count is outside the table"));
+                        }
+                        entries.push(FrequencyEntry { value, count });
+                    }
+                    if entries.windows(2).any(|pair| pair[0].count < pair[1].count) {
+                        return Err(invalid("frequency entries are not descending"));
+                    }
+                    Some(FrequencySummary { entries, omitted_max })
+                }
+                _ => return Err(invalid("frequency summary tag differs")),
+            };
+            frequencies.push(summary);
+        }
+        frequencies
+    };
     if cur.at != bytes.len() {
         return Err(invalid("directory has trailing bytes"));
     }
-    Ok(Table { name, fields, stripes, rows, dictionaries })
+    Ok(Table { name, fields, stripes, rows, dictionaries, frequencies })
 }
 
 fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
@@ -1060,7 +1393,9 @@ fn encode(vector: &Vector, global: Option<&mut GlobalDictionary>) -> Result<Vec<
         let mut codes = Vec::with_capacity(flat.len());
         for row in 0..flat.len() {
             let text = flat.text_at(row).unwrap_or("");
-            codes.push(global.code(text)?);
+            let code = global.code(text)?;
+            global.observe(code, flat.is_null_at(row))?;
+            codes.push(code);
         }
         global_codes = Some(codes);
     }
@@ -1549,6 +1884,16 @@ mod tests {
         assert_eq!(count.len(), 3);
         assert!(reader.skips(0, &[Probe { column: 0, op: Op::Greater, value: Bound::Int(100) }]));
         assert!(!reader.skips(0, &[Probe { column: 0, op: Op::Greater, value: Bound::Int(0) }]));
+        let integers = reader.top_frequencies(0, 1).expect("valid integer synopsis").expect("kept");
+        assert_eq!(
+            integers,
+            vec![(Value::Integer(-2), 2), (Value::Integer(4), 2), (Value::Integer(9), 2),]
+        );
+        let strings = reader.top_frequencies(1, 1).expect("valid string synopsis").expect("kept");
+        assert_eq!(strings.len(), 3);
+        assert!(strings.contains(&(Value::Null, 2)));
+        assert!(strings.contains(&(Value::Varchar("alpha".into()), 2)));
+        assert!(strings.contains(&(Value::Varchar("long text after a slash".into()), 2)));
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -1626,6 +1971,7 @@ mod tests {
             stripes: Vec::new(),
             rows: 0,
             dictionaries: vec![Some(dictionary)],
+            frequencies: vec![None],
         };
         let directory = encode_directory(&table).expect("directory");
         let file_size = dictionary.offset + u64::from(dictionary.length) + 1;
