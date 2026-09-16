@@ -185,6 +185,8 @@ pub(crate) struct Aggregate<'a> {
     fixed: OnceLock<FixedExchange>,
     /// Integer rows exchanged to one owner per radix partition for an ungrouped distinct count.
     bigint_distinct: OnceLock<BigIntDistinctExchange>,
+    /// Native integer and dictionary-code rows exchanged for a three-key count and TopN.
+    encoded_count: OnceLock<Option<EncodedCountExchange>>,
     out: Buffered,
 }
 
@@ -235,6 +237,71 @@ impl BigIntDistinctPartition {
 
     fn footprint(&self) -> usize {
         self.rows.capacity() * size_of::<BigIntDistinctRecord>()
+    }
+}
+
+#[derive(Debug)]
+struct EncodedCountExchange {
+    dictionary: Arc<Vector>,
+    partitions: Vec<Mutex<EncodedCountPartition>>,
+    held: Mutex<Vec<Reservation>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EncodedCountRecord {
+    first: i64,
+    second: i64,
+    hash: u32,
+    third: u32,
+}
+
+#[derive(Debug, Default)]
+struct EncodedCountPartition {
+    rows: Vec<EncodedCountRecord>,
+    /// Empty while all three keys are valid. It is allocated when this partition sees a null.
+    validity: Vec<u8>,
+}
+
+impl EncodedCountRecord {
+    const FIRST: u8 = 1;
+    const SECOND: u8 = 2;
+    const THIRD: u8 = 4;
+    const ALL: u8 = Self::FIRST | Self::SECOND | Self::THIRD;
+}
+
+impl EncodedCountPartition {
+    fn push(&mut self, row: EncodedCountRecord, valid: u8) {
+        if valid != EncodedCountRecord::ALL && self.validity.is_empty() {
+            self.validity.resize(self.rows.len(), EncodedCountRecord::ALL);
+        }
+        self.rows.push(row);
+        if !self.validity.is_empty() {
+            self.validity.push(valid);
+        }
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        if self.rows.is_empty() {
+            std::mem::swap(self, other);
+            return;
+        }
+        if self.validity.is_empty() && !other.validity.is_empty() {
+            self.validity.resize(self.rows.len(), EncodedCountRecord::ALL);
+        }
+        let incoming = other.rows.len();
+        self.rows.append(&mut other.rows);
+        if self.validity.is_empty() {
+            debug_assert!(other.validity.is_empty());
+        } else if other.validity.is_empty() {
+            self.validity.resize(self.validity.len() + incoming, EncodedCountRecord::ALL);
+        } else {
+            self.validity.append(&mut other.validity);
+        }
+    }
+
+    fn footprint(&self) -> usize {
+        self.rows.capacity() * size_of::<EncodedCountRecord>()
+            + self.validity.capacity() * size_of::<u8>()
     }
 }
 
@@ -512,6 +579,7 @@ impl<'a> Aggregate<'a> {
             dense: OnceLock::new(),
             fixed: OnceLock::new(),
             bigint_distinct: OnceLock::new(),
+            encoded_count: OnceLock::new(),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -582,6 +650,16 @@ impl<'a> Aggregate<'a> {
             && self.keys.len() == 2
             && self.plan.expr_type(self.keys[0]) == &LogicalType::BigInt
             && self.plan.expr_type(self.keys[1]) == &LogicalType::Integer
+    }
+
+    fn encoded_top_count(&self) -> bool {
+        self.count_only
+            && self.top_counts.is_some()
+            && self.constants.iter().all(Option::is_none)
+            && self.keys.len() == 3
+            && self.plan.expr_type(self.keys[0]) == &LogicalType::BigInt
+            && self.plan.expr_type(self.keys[1]) == &LogicalType::BigInt
+            && self.plan.expr_type(self.keys[2]) == &LogicalType::Varchar
     }
 
     fn buffer_fixed(
@@ -663,6 +741,94 @@ impl<'a> Aggregate<'a> {
         }
         let after = partitions.iter().map(FixedPartition::footprint).sum::<usize>();
         memory.grow(width_of(after.saturating_sub(before)))
+    }
+
+    fn buffer_encoded_count(
+        &self,
+        rows: &Rows,
+        partitions: &mut [EncodedCountPartition],
+        memory: &mut Reservation,
+    ) -> Result<bool> {
+        let [first, second, third] = rows.keys.as_slice() else {
+            return Err(Error::internal("an encoded count exchange received the wrong key width"));
+        };
+        let dictionary = third.stable_dictionary_parts();
+        let state = self.encoded_count.get_or_init(|| {
+            dictionary.as_ref().map(|(_, dictionary)| EncodedCountExchange {
+                dictionary: Arc::clone(dictionary),
+                partitions: (0..RADIX_PARTITIONS)
+                    .map(|_| Mutex::new(EncodedCountPartition::default()))
+                    .collect(),
+                held: Mutex::new(Vec::new()),
+            })
+        });
+        let Some(state) = state else { return Ok(false) };
+        let Some((codes, dictionary)) = dictionary else {
+            return Err(Error::internal(
+                "an encoded count exchange changed from dictionary to flat strings",
+            ));
+        };
+        if !Arc::ptr_eq(&state.dictionary, dictionary) {
+            return Err(Error::internal(
+                "an encoded count exchange received two string code spaces",
+            ));
+        }
+        let before = partitions.iter().map(EncodedCountPartition::footprint).sum::<usize>();
+        let shift = u32::BITS - RADIX_PARTITIONS.ilog2();
+        const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
+        for (row, &third_code) in codes.iter().enumerate().take(rows.rows) {
+            let mut valid = 0;
+            let first_value = if first.is_null_at(row) {
+                0
+            } else {
+                valid |= EncodedCountRecord::FIRST;
+                i64::try_from(first.signed_at(row).ok_or_else(|| {
+                    Error::internal("an encoded BIGINT key has no signed representation")
+                })?)
+                .map_err(|_| Error::internal("an encoded BIGINT key is out of range"))?
+            };
+            let second_value = if second.is_null_at(row) {
+                0
+            } else {
+                valid |= EncodedCountRecord::SECOND;
+                i64::try_from(second.signed_at(row).ok_or_else(|| {
+                    Error::internal("an encoded BIGINT key has no signed representation")
+                })?)
+                .map_err(|_| Error::internal("an encoded BIGINT key is out of range"))?
+            };
+            let third_value = if third.is_null_at(row) {
+                0
+            } else {
+                valid |= EncodedCountRecord::THIRD;
+                if third_code as usize >= dictionary.len() {
+                    return Err(Error::internal("an encoded string code is out of range"));
+                }
+                third_code
+            };
+            let first_word =
+                if valid & EncodedCountRecord::FIRST != 0 { first_value as u64 } else { NOTHING };
+            let second_word =
+                if valid & EncodedCountRecord::SECOND != 0 { second_value as u64 } else { NOTHING };
+            let third_word = if valid & EncodedCountRecord::THIRD != 0 {
+                u64::from(third_value)
+            } else {
+                NOTHING
+            };
+            let wide = spread(mix(mix(mix(0, first_word), second_word), third_word));
+            let hash = (wide ^ (wide >> 32)) as u32;
+            partitions[(hash >> shift) as usize].push(
+                EncodedCountRecord {
+                    first: first_value,
+                    second: second_value,
+                    hash,
+                    third: third_value,
+                },
+                valid,
+            );
+        }
+        let after = partitions.iter().map(EncodedCountPartition::footprint).sum::<usize>();
+        memory.grow(width_of(after.saturating_sub(before)))?;
+        Ok(true)
     }
 
     fn buffer_bigint_distinct(
@@ -2124,6 +2290,9 @@ impl Rows {
 /// The scratch one pipeline instance keeps between chunks, and its table when it has one of its own.
 #[derive(Debug)]
 pub(crate) struct Partitioned {
+    encoded: bool,
+    encoded_records: Vec<EncodedCountPartition>,
+    encoded_memory: Reservation,
     radix_distinct: bool,
     radix_distinct_records: Vec<BigIntDistinctPartition>,
     radix_distinct_memory: Reservation,
@@ -2569,6 +2738,11 @@ impl Sink for Aggregate<'_> {
     fn local(&self) -> Partitioned {
         self.started.fetch_add(1, Ordering::Relaxed);
         Partitioned {
+            encoded: false,
+            encoded_records: (0..RADIX_PARTITIONS)
+                .map(|_| EncodedCountPartition::default())
+                .collect(),
+            encoded_memory: self.memory.reservation(),
             radix_distinct: false,
             radix_distinct_records: (0..RADIX_PARTITIONS)
                 .map(|_| BigIntDistinctPartition::default())
@@ -2620,6 +2794,9 @@ impl Sink for Aggregate<'_> {
     /// behind one lock before doing any work at all.
     fn sink(&self, chunk: &Chunk, local: &mut Partitioned) -> Result<Progress> {
         let Partitioned {
+            encoded,
+            encoded_records,
+            encoded_memory,
             radix_distinct,
             radix_distinct_records,
             radix_distinct_memory,
@@ -2636,6 +2813,15 @@ impl Sink for Aggregate<'_> {
             own,
         } = local;
         let rows = self.read(chunk, expressions)?;
+        if self.encoded_top_count() {
+            let timing = stage::Timing::start(Stage::Scatter);
+            let buffered = self.buffer_encoded_count(&rows, encoded_records, encoded_memory);
+            timing.stop(0);
+            if buffered? {
+                *encoded = true;
+                return Ok(Progress::More);
+            }
+        }
         if self.radix_distinct_count {
             let timing = stage::Timing::start(Stage::Scatter);
             let buffered =
@@ -2741,6 +2927,9 @@ impl Sink for Aggregate<'_> {
     /// so a table is never left whole in partition zero after the switch.
     fn combine(&self, local: Partitioned) -> Result<()> {
         let Partitioned {
+            encoded,
+            mut encoded_records,
+            encoded_memory,
             radix_distinct,
             mut radix_distinct_records,
             radix_distinct_memory,
@@ -2756,6 +2945,22 @@ impl Sink for Aggregate<'_> {
             mut own,
             ..
         } = local;
+        if encoded {
+            let state = self
+                .encoded_count
+                .get()
+                .and_then(Option::as_ref)
+                .expect("an encoded exchange exists after an encoded sink");
+            for (partition, rows) in encoded_records.iter_mut().enumerate() {
+                if rows.rows.is_empty() {
+                    continue;
+                }
+                state.partitions[partition].lock().map_err(poisoned)?.append(rows);
+            }
+            state.held.lock().map_err(poisoned)?.push(encoded_memory);
+            self.built.lock().map_err(poisoned)?.instances += 1;
+            return Ok(());
+        }
         if radix_distinct {
             let state = self
                 .bigint_distinct
@@ -2866,6 +3071,65 @@ impl Sink for Aggregate<'_> {
     /// its one group is made when the instance is, and an instance is made whether or not a row
     /// arrives.
     fn finalize(&self) -> Result<()> {
+        if let Some(Some(encoded)) = self.encoded_count.get() {
+            let next = AtomicUsize::new(0);
+            let slots: Vec<Mutex<Option<Result<Part>>>> =
+                (0..RADIX_PARTITIONS).map(|_| Mutex::new(None)).collect();
+            let input = encoded
+                .partitions
+                .iter()
+                .map(|partition| partition.lock().map(|rows| rows.rows.len()).map_err(poisoned))
+                .sum::<Result<usize>>()?;
+            let degree = input.div_ceil(65_536).clamp(1, RADIX_PARTITIONS);
+            let parts = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(degree - 1);
+                for _ in 1..degree {
+                    handles.push(scope.spawn(|| {
+                        finish_encoded_count(
+                            &next,
+                            &slots,
+                            encoded,
+                            self.top_counts.expect("an encoded exchange has a TopN bound"),
+                            &self.memory,
+                        );
+                        stage::here()
+                    }));
+                }
+                finish_encoded_count(
+                    &next,
+                    &slots,
+                    encoded,
+                    self.top_counts.expect("an encoded exchange has a TopN bound"),
+                    &self.memory,
+                );
+                let mut theirs = Spent::none();
+                for handle in handles {
+                    let spent = handle
+                        .join()
+                        .map_err(|_| Error::internal("an encoded radix worker panicked"))?;
+                    theirs.add(spent);
+                }
+                stage::gained(theirs);
+                let mut parts = Vec::with_capacity(slots.len());
+                for (at, slot) in slots.iter().enumerate() {
+                    parts.push(slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
+                        Err(Error::internal(format!(
+                            "nothing finished encoded radix partition {at}"
+                        )))
+                    })?);
+                }
+                Ok::<_, Error>(parts)
+            })?;
+            let mut chunks = Vec::new();
+            let mut held = encoded.held.lock().map_err(poisoned)?;
+            held.clear();
+            for Part { chunks: mut part, held: charge } in parts {
+                chunks.append(&mut part);
+                held.push(charge);
+            }
+            drop(held);
+            return self.out.fill(chunks);
+        }
         if let Some(distinct) = self.bigint_distinct.get() {
             let next = AtomicUsize::new(0);
             let slots: Vec<Mutex<Option<Result<i64>>>> =
@@ -3016,6 +3280,124 @@ impl Sink for Aggregate<'_> {
         drop(built);
         self.out.fill(chunks)
     }
+}
+
+fn finish_encoded_count(
+    next: &AtomicUsize,
+    slots: &[Mutex<Option<Result<Part>>>],
+    encoded: &EncodedCountExchange,
+    bound: usize,
+    memory: &Memory,
+) {
+    loop {
+        let at = next.fetch_add(1, Ordering::Relaxed);
+        let Some(partition) = encoded.partitions.get(at) else {
+            return;
+        };
+        let done = partition.lock().map_err(poisoned).and_then(|mut rows| {
+            encoded_count_partition(&mut rows, &encoded.dictionary, bound, memory)
+        });
+        if let Ok(mut slot) = slots[at].lock() {
+            *slot = Some(done);
+        }
+    }
+}
+
+fn encoded_count_partition(
+    partition: &mut EncodedCountPartition,
+    dictionary: &Vector,
+    bound: usize,
+    memory: &Memory,
+) -> Result<Part> {
+    const EMPTY: u32 = u32::MAX;
+    let capacity = partition.rows.len().saturating_mul(2).max(64).next_power_of_two();
+    let mut working = memory.reservation();
+    working
+        .grow(width_of(capacity * size_of::<u32>() + partition.rows.len() * size_of::<i64>()))?;
+    let mut buckets = vec![EMPTY; capacity];
+    let mut counts: Vec<i64> = Vec::with_capacity(partition.rows.len());
+    let mask = capacity - 1;
+    let all_valid = partition.validity.is_empty();
+    let timing = stage::Timing::start(Stage::Fold);
+    for source in 0..partition.rows.len() {
+        let row = partition.rows[source];
+        let valid = if all_valid { EncodedCountRecord::ALL } else { partition.validity[source] };
+        let mut at = row.hash as usize & mask;
+        let slot = loop {
+            let slot = buckets[at];
+            if slot == EMPTY {
+                let slot = counts.len();
+                buckets[at] = u32::try_from(slot)
+                    .map_err(|_| Error::out_of_memory("an encoded radix partition is too large"))?;
+                partition.rows[slot] = row;
+                if !all_valid {
+                    partition.validity[slot] = valid;
+                }
+                counts.push(0);
+                break slot;
+            }
+            let slot = slot as usize;
+            let held = partition.rows[slot];
+            let held_valid =
+                if all_valid { EncodedCountRecord::ALL } else { partition.validity[slot] };
+            if held.hash == row.hash
+                && held.first == row.first
+                && held.second == row.second
+                && held.third == row.third
+                && held_valid == valid
+            {
+                break slot;
+            }
+            at = (at + 1) & mask;
+        };
+        counts[slot] = counts[slot]
+            .checked_add(1)
+            .ok_or_else(|| Error::out_of_range("a grouped COUNT overflowed BIGINT"))?;
+    }
+    partition.rows.truncate(counts.len());
+    if !all_valid {
+        partition.validity.truncate(counts.len());
+    }
+    timing.stop(0);
+    let timing = stage::Timing::start(Stage::Emit);
+    let mut best = Vec::with_capacity(bound.min(counts.len()));
+    for slot in 0..counts.len() {
+        let at = best.partition_point(|&kept| counts[kept] >= counts[slot]);
+        if at < bound {
+            best.insert(at, slot);
+            best.truncate(bound);
+        }
+    }
+    best.sort_unstable();
+    let mut output = Vec::with_capacity(best.len());
+    for slot in best {
+        let key = partition.rows[slot];
+        let valid = if all_valid { EncodedCountRecord::ALL } else { partition.validity[slot] };
+        output.push(vec![
+            if valid & EncodedCountRecord::FIRST != 0 {
+                Value::BigInt(key.first)
+            } else {
+                Value::Null
+            },
+            if valid & EncodedCountRecord::SECOND != 0 {
+                Value::BigInt(key.second)
+            } else {
+                Value::Null
+            },
+            if valid & EncodedCountRecord::THIRD != 0 {
+                dictionary.try_value_at(key.third as usize)?
+            } else {
+                Value::Null
+            },
+            Value::BigInt(counts[slot]),
+        ]);
+    }
+    let mut held = memory.reservation();
+    let types =
+        [LogicalType::BigInt, LogicalType::BigInt, LogicalType::Varchar, LogicalType::BigInt];
+    let chunks = rows::chunks(&types, &output, &mut held)?;
+    timing.stop(0);
+    Ok(Part { chunks, held })
 }
 
 fn finish_bigint_distinct(
@@ -3781,8 +4163,8 @@ mod tests {
 
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctPartition, BigIntDistinctRecord, Call,
-        CompactNumeric, Distinct, FixedPartition, FixedRecord, bigint_distinct_partition,
-        fixed_partition,
+        CompactNumeric, Distinct, EncodedCountPartition, EncodedCountRecord, FixedPartition,
+        FixedRecord, bigint_distinct_partition, encoded_count_partition, fixed_partition,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -4120,6 +4502,48 @@ mod tests {
             "equal hashes still compare their integer values"
         );
         assert_eq!(size_of::<BigIntDistinctRecord>(), 16);
+    }
+
+    #[test]
+    fn an_encoded_count_partition_aggregates_collisions_and_nulls_exactly() {
+        let dictionary = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("one".into()), Value::Varchar("two".into())],
+        )
+        .expect("a string dictionary");
+        let row = |first, second, third| EncodedCountRecord { first, second, hash: 7, third };
+        let mut partition = EncodedCountPartition::default();
+        partition.push(row(1, 2, 0), EncodedCountRecord::ALL);
+        partition.push(row(1, 2, 0), EncodedCountRecord::ALL);
+        partition.push(row(1, 2, 1), EncodedCountRecord::ALL);
+        partition.push(row(0, 2, 0), EncodedCountRecord::SECOND | EncodedCountRecord::THIRD);
+        let part = encoded_count_partition(&mut partition, &dictionary, 10, &Memory::unlimited())
+            .expect("the encoded partition");
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for chunk in part.chunks {
+            for row in 0..chunk.len() {
+                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+            }
+        }
+        rows.sort_by_key(|row| format!("{row:?}"));
+        let mut expected = vec![
+            vec![
+                Value::BigInt(1),
+                Value::BigInt(2),
+                Value::Varchar("one".into()),
+                Value::BigInt(2),
+            ],
+            vec![
+                Value::BigInt(1),
+                Value::BigInt(2),
+                Value::Varchar("two".into()),
+                Value::BigInt(1),
+            ],
+            vec![Value::Null, Value::BigInt(2), Value::Varchar("one".into()), Value::BigInt(1)],
+        ];
+        expected.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(rows, expected);
+        assert_eq!(size_of::<EncodedCountRecord>(), 24);
     }
 
     #[test]
