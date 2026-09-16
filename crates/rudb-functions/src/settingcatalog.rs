@@ -1,6 +1,6 @@
 //! What `duckdb_settings()` says about each setting this engine has.
 //!
-//! Eight rows for six settings, because two of them have an alias and the pin gives an alias a row
+//! Nine rows for seven settings, because two of them have an alias and the pin gives an alias a row
 //! of its own. The descriptions, the input types and the alias lists were read off the pinned binary
 //! rather than written here, since a client that reads this table to find out what it can turn is a
 //! client that will compare the sentence against the one it already knows.
@@ -24,7 +24,7 @@
 //!
 //! # What is not here
 //!
-//! The pin returns 192 rows and this returns 8, because rudb has six settings. The other 184 are
+//! The pin returns 192 rows and this returns 9, because rudb has seven settings. The other 183 are
 //! settings for things rudb does not do, and a row saying `SET enable_http_metadata_cache = true`
 //! worked when nothing read it would be worse than no row at all. The list grows when the engine
 //! does.
@@ -81,6 +81,13 @@ pub static SETTINGS: &[SettingEntry] = &[
         name: "disabled_optimizers",
         description: "DEBUG SETTING: disable a specific set of optimizers (comma separated)",
         input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
+        name: "integer_division",
+        description: "Whether or not the / operator defaults to integer division, or to floating point division",
+        input_type: "BOOLEAN",
         scope: GLOBAL,
         aliases: &[],
     },
@@ -144,10 +151,8 @@ pub fn setting_named(name: &str) -> Option<&'static SettingEntry> {
 /// crates. `SET nope = 1`, `RESET nope` and `current_setting('nope')` all say this, and on the pin
 /// they say the same sentence as each other, so one sentence is what they share.
 ///
-/// The list after it is upstream's suggestion list, which on the pin is the five nearest names by
-/// edit distance out of its hundred and ninety two. rudb has five settings altogether, so the
-/// nearest five and the whole list are the same thing and this prints the whole list. It stops
-/// being the same thing when the sixth setting lands.
+/// The list after it is upstream's suggestion list, which on the pin is the five nearest names by edit distance out of its hundred and ninety two.
+/// This prints every setting rudb has, since a complete list is more useful while that set is still small.
 #[must_use]
 pub fn unknown_setting(name: &str) -> String {
     let known: Vec<String> = SETTINGS.iter().map(|entry| format!("\"{}\"", entry.name)).collect();
@@ -160,7 +165,7 @@ mod tests {
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
-        assert_eq!(SETTINGS.len(), 8, "six settings and two of them have a second spelling");
+        assert_eq!(SETTINGS.len(), 9, "seven settings and two of them have a second spelling");
         assert_eq!(setting_fields().len(), 7);
     }
 

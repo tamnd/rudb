@@ -2,10 +2,8 @@
 //!
 //! A setting is not a catalog entry. It is not named by a query, it has no schema, and the set of
 //! them is fixed at compile time, so this is a match on a name rather than a map. [`Settings::NAMES`]
-//! is that set, and it is eight names for six settings, because [`crate::Config`] holds three things
-//! a program can choose and a fourth that DuckDB has no setting for, and two of the three have a
-//! second spelling. `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways
-//! round, which is what the binary does and what a client that writes the other spelling expects.
+//! is that set, and it is nine names for seven settings because two have a second spelling.
+//! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
 //!
@@ -16,7 +14,7 @@
 //! list twenty eight names the binary has never heard of. They go through the same [`Settings::apply`]
 //! anyway, because a second door into the settings is a second place for a scope rule to be wrong.
 //!
-//! Every setting here is global, which is the scope DuckDB gives all three of them. `SET LOCAL` is
+//! Every setting here is global, which is the scope DuckDB gives them. `SET LOCAL` is
 //! refused with the sentence the binary prints, and `SET SESSION` is refused with the one it prints
 //! for a global setting, which is a different sentence and says which of the two the writer got
 //! wrong.
@@ -56,6 +54,8 @@ pub(crate) struct Settings {
     default_order: RwLock<String>,
     /// The null placement mode used when an order item does not state one.
     default_null_order: RwLock<String>,
+    /// Whether `/` binds to integer division instead of floating point division.
+    integer_division: RwLock<bool>,
     /// Which implementation runs at each seam, as `SET seam.<name>` has left it.
     ///
     /// Held here rather than in [`Config`], because there are twenty seven of them and a `Config`
@@ -67,11 +67,12 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 8] = [
+    pub(crate) const NAMES: [&'static str; 9] = [
         "TimeZone",
         "default_null_order",
         "default_order",
         "disabled_optimizers",
+        "integer_division",
         "max_memory",
         "memory_limit",
         "threads",
@@ -92,6 +93,7 @@ impl Settings {
             default_time_zone,
             default_order: RwLock::new("ASCENDING".to_string()),
             default_null_order: RwLock::new("NULLS_LAST".to_string()),
+            integer_division: RwLock::new(false),
             seams: RwLock::new(rudb_seam::Settings::new()),
         }
     }
@@ -223,6 +225,10 @@ impl Settings {
                 let tidy = rudb_opt::pass::Context::tidy(&text)?;
                 *self.disabled.write().unwrap_or_else(|held| held.into_inner()) = tidy;
             }
+            "integer_division" => {
+                let enabled = value.map_or(Ok(false), boolean_of)?;
+                *self.integer_division.write().unwrap_or_else(|held| held.into_inner()) = enabled;
+            }
             "memory_limit" => {
                 let limit = match value {
                     None => self.defaults.memory_limit(),
@@ -274,6 +280,11 @@ impl Settings {
                 Ok(self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
             "disabled_optimizers" => Ok(self.disabled_optimizers()),
+            "integer_division" => Ok(self
+                .integer_division
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .to_string()),
             // An unlimited budget prints as the word rather than as a number, because rudb's
             // default is no limit where DuckDB's is a fraction of the machine, and printing the
             // largest number a limit could be would be describing a limit that is not there.
@@ -285,15 +296,14 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are eight names and the alternative
+    /// Built once per statement rather than held, because there are nine names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Six settings and eight names means the loop below would otherwise take several locks to read
-    /// three numbers.
+    /// Seven settings and nine names means the loop below would otherwise take several locks.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
@@ -304,6 +314,8 @@ impl Settings {
             self.default_order.read().unwrap_or_else(|held| held.into_inner()).clone();
         let default_null_order =
             self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone();
+        let integer_division =
+            *self.integer_division.read().unwrap_or_else(|held| held.into_inner());
         let mut session = Session::new();
         session.set_time_zone(&time_zone);
         session.set_default_descending(default_order == "DESC");
@@ -313,6 +325,7 @@ impl Settings {
             "POSTGRES" => DefaultNullOrder::Postgres,
             _ => DefaultNullOrder::Last,
         });
+        session.set_integer_division(integer_division);
         for name in Self::NAMES {
             session.set(
                 name,
@@ -321,6 +334,7 @@ impl Settings {
                     "default_order" => default_order.clone(),
                     "default_null_order" => default_null_order.clone(),
                     "disabled_optimizers" => disabled.clone(),
+                    "integer_division" => integer_division.to_string(),
                     "memory_limit" => memory.clone(),
                     "threads" => threads.clone(),
                     other => unreachable!("{other} is not one of NAMES"),
@@ -361,7 +375,7 @@ fn canonical(name: &str) -> &str {
 /// Whether this name is a seam rather than one of the settings DuckDB has.
 ///
 /// A name with the `seam.` prefix is one whatever follows the prefix is, so that a mistyped seam
-/// gets the error naming the seams rather than the one naming the three DuckDB settings. Without
+/// gets the error naming the seams rather than the one naming the DuckDB settings. Without
 /// the prefix it has to be a name `rudb_seam` knows, which is where the three spellings of a seam
 /// name are decided.
 ///
@@ -386,6 +400,34 @@ fn text_of(value: &Value) -> String {
         Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// A value cast to a boolean by the same spellings DuckDB's boolean cast accepts.
+fn boolean_of(value: &Value) -> Result<bool> {
+    let converted = match value {
+        Value::Boolean(value) => Some(*value),
+        Value::TinyInt(value) => Some(*value != 0),
+        Value::SmallInt(value) => Some(*value != 0),
+        Value::Integer(value) => Some(*value != 0),
+        Value::BigInt(value) => Some(*value != 0),
+        Value::HugeInt(value) => Some(*value != 0),
+        Value::UTinyInt(value) => Some(*value != 0),
+        Value::USmallInt(value) => Some(*value != 0),
+        Value::UInteger(value) => Some(*value != 0),
+        Value::UBigInt(value) => Some(*value != 0),
+        Value::Varchar(text) => match text.to_ascii_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" | "1" => Some(true),
+            "false" | "f" | "no" | "n" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    };
+    converted.ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Failed to cast value: Could not convert string '{}' to BOOL",
+            text_of(value)
+        ))
+    })
 }
 
 /// The thread count a value names.

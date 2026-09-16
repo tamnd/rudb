@@ -105,7 +105,7 @@ pub(crate) struct Binder<'a> {
     /// What the settings are now, which is what `current_setting()` folds to.
     pub(crate) session: &'a Session,
     /// Meaning-changing choices copied once and resolved into the plan above execution.
-    semantics: Semantics,
+    pub(crate) semantics: Semantics,
     plan: Plan,
     next_index: u32,
     /// Set while a select block aggregates, which changes what a bare column means.
@@ -658,7 +658,7 @@ impl<'a> Binder<'a> {
                 return found.name.clone();
             }
         }
-        describe(ast, target)
+        describe(ast, target, self.semantics.integer_division())
     }
 
     /// The expressions a `GROUP BY` clause names, with positions and output aliases followed.
@@ -754,7 +754,7 @@ impl<'a> Binder<'a> {
                         Some(position) => position,
                         None => {
                             exprs.push(bound);
-                            names.push(describe(ast, item.expr));
+                            names.push(describe(ast, item.expr, self.semantics.integer_division()));
                             extra.push(exprs.len() - 1);
                             exprs.len() - 1
                         }
