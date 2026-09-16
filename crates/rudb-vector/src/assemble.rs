@@ -209,17 +209,12 @@ impl Assembly {
 ///
 /// # What it will not lay
 ///
-/// Anything that is not already a flat run of values, which is answered with `None` rather than with
-/// an error, because a caller that gets one has somewhere to put the pieces and this is a choice
-/// about layout rather than a failure. The reason is that laying an encoded piece end to end means
-/// flattening it, and a dictionary encoded string column flattened is larger than it was and has
-/// thrown away the thing that made it small. A column whose chunks arrive encoded is better left as
-/// the chunks it arrived as, and that is what `None` tells the caller to do.
-///
-/// It is worth saying that this is not a permanent answer. Two encoded chunks that share a
-/// dictionary can be laid end to end by appending their codes, and two that do not can be laid by
-/// merging the two dictionaries, and both are worth doing once there is a measurement asking for
-/// them. Neither is this, and the fallback has to exist either way for the run that mixes forms.
+/// Anything that is neither a flat run nor a stable dictionary over the same shared values is
+/// answered with `None` rather than with an error, because a caller that gets one has somewhere to
+/// put the pieces and this is a choice about layout rather than a failure. Stable dictionary pieces
+/// sharing one value vector are the encoded exception: laying them is just appending their codes.
+/// An ordinary dictionary has no cross-piece code-space promise, and flattening it would make it
+/// larger and throw away the thing that made it useful, so it is still left to the caller.
 ///
 /// # Strings
 ///
@@ -236,6 +231,27 @@ pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
     if pieces.is_empty() {
         return Ok(None);
     }
+    let rows = pieces.iter().map(Vector::len).sum();
+    if let Some((_, values)) = pieces[0].stable_dictionary_parts()
+        && pieces.iter().all(|piece| {
+            piece.logical_type() == ty
+                && !piece.is_empty()
+                && piece
+                    .stable_dictionary_parts()
+                    .is_some_and(|(_, held)| Arc::ptr_eq(held, values))
+        })
+    {
+        let mut codes = Vec::with_capacity(rows);
+        for piece in pieces {
+            if let Some((held, _)) = piece.stable_dictionary_parts() {
+                codes.extend_from_slice(held);
+            }
+        }
+        let validity = run_of(pieces, rows);
+        return Ok(Some(
+            Vector::stable_dictionary(codes, Arc::clone(values))?.with_validity(validity),
+        ));
+    }
     // Checked before anything is copied, because the fallback is for the caller to keep the pieces
     // it already has and a half built page would be work thrown away.
     let laid = pieces
@@ -244,7 +260,6 @@ pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
     if !laid {
         return Ok(None);
     }
-    let rows = pieces.iter().map(Vector::len).sum();
     // Sized before the first value moves, so the page is one allocation and holds no more than the
     // rows that went into it. Growing from empty instead ends at the next power of two, which on a
     // full row group is eight thousand values of slack carried for the life of the table.
@@ -910,6 +925,24 @@ mod tests {
         );
         let window = built.slice(0, 1).expect("a window into the page");
         assert_eq!(values(&window), all_of(&pieces[..1]), "the long string, cut back out");
+    }
+
+    #[test]
+    fn stable_dictionary_pieces_sharing_values_lay_as_codes() {
+        let ty = LogicalType::Varchar;
+        let values = Arc::new(
+            Vector::from_values(
+                ty.clone(),
+                &[Value::Varchar("a".to_string()), Value::Varchar("b".to_string())],
+            )
+            .expect("dictionary values"),
+        );
+        let first = Vector::stable_dictionary(vec![1, 0], Arc::clone(&values)).expect("codes");
+        let second = Vector::stable_dictionary(vec![1], Arc::clone(&values)).expect("codes");
+        let built = concat(&ty, &[first, second]).expect("no error").expect("shared codes lay");
+        let (codes, held) = built.stable_dictionary_parts().expect("the stable form survives");
+        assert_eq!(codes, &[1, 0, 1]);
+        assert!(Arc::ptr_eq(held, &values));
     }
 
     /// What will not lay, which is a layout answer and not an error.

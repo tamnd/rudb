@@ -96,7 +96,14 @@ const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
 const MAX_DIRECTORY: usize = 128 * 1024 * 1024;
-const FREQUENCIES: &[u8; 8] = b"RUDBFQ2\0";
+const FREQUENCIES_V2: &[u8; 8] = b"RUDBFQ2\0";
+const FREQUENCIES: &[u8; 8] = b"RUDBFQ3\0";
+/// Exact leading counts for a bounded pair of dictionary-backed grouping keys.
+///
+/// This is a separate optional directory block rather than another frequency format. Readers that
+/// predate it still understand every earlier directory, and a table without a pair worth keeping
+/// writes no block at all.
+const PAIR_FREQUENCIES: &[u8; 8] = b"RUDBPF1\0";
 /// The clustering declaration, written after the frequencies and only when there is one.
 ///
 /// No format bump for this, which is the convention the frequency section set in #728: a new
@@ -139,7 +146,8 @@ const MAX_SECTIONS: usize = 4096;
 const FREQUENCY_CANDIDATES: usize = 32_768;
 const FREQUENCY_ENTRIES: usize = 512;
 const FREQUENCY_BUILD_RANK: usize = 10;
-const FREQUENCY_ORDINALS: usize = 65_536;
+const FREQUENCY_ORDINALS: usize = 131_072;
+const MAX_PAIR_FREQUENCIES: usize = 1024;
 /// The most threads the two per column passes at the end of a commit are spread over.
 ///
 /// A table like `hits` has ninety numeric columns, so on a machine with more cores than this the
@@ -350,6 +358,27 @@ struct FrequencySummary {
     entries: Vec<FrequencyEntry>,
     omitted_max: u64,
     ordinals: Vec<u64>,
+    ordinal_entries: Vec<u16>,
+}
+
+#[derive(Debug, Clone)]
+struct PairFrequencyEntry {
+    first_entry: u16,
+    second: Option<u32>,
+    count: u64,
+}
+
+/// Exact leading counts for one numeric frequency anchor and one stable string code space.
+///
+/// `omitted_max` covers both first-key values outside the numeric synopsis and pairs below the
+/// retained prefix. A TopN may therefore use the entries only when its boundary strictly exceeds
+/// this number.
+#[derive(Debug, Clone)]
+struct PairFrequencySummary {
+    first: u16,
+    second: u16,
+    entries: Vec<PairFrequencyEntry>,
+    omitted_max: u64,
 }
 
 /// The values one column's frequency synopsis lists, with a bound on everything it left out.
@@ -365,13 +394,20 @@ pub struct FrequencyPrefix {
 }
 
 /// Sparse row ordinals covered by a numeric frequency candidate set.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FrequencyOccurrences {
     /// Upper bound for the frequency of every value absent from the fetched rows.
     pub omitted_max: u64,
     /// Table-wide row ordinals in ascending order.
     pub ordinals: Vec<u64>,
+    /// The retained heavy-hitter values named by `anchor_indices`.
+    pub anchors: Vec<Value>,
+    /// The index in `anchors` at each ordinal, or empty for a legacy FQ2 directory.
+    pub anchor_indices: Vec<u16>,
 }
+
+/// Exact grouped counts for a pair of values, in descending count order.
+pub type PairFrequencyCounts = Vec<(Vec<Value>, u64)>;
 
 /// Where one column's page for one stripe sits in the file.
 ///
@@ -454,6 +490,7 @@ pub struct Table {
     /// reason, so that a table built by hand in a test does not have to know about it.
     dictionary_payloads: Vec<u64>,
     frequencies: Vec<Option<FrequencySummary>>,
+    pair_frequencies: Vec<PairFrequencySummary>,
     /// How many distinct values each column holds, for the columns that know.
     ///
     /// A dictionary entry is made the first time a value is seen and nothing ever removes one, so
@@ -1245,6 +1282,7 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
+                pair_frequencies: Vec::new(),
                 clustering: None,
                 generation,
                 sections: Vec::new(),
@@ -1294,6 +1332,7 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
+                pair_frequencies: Vec::new(),
                 clustering: None,
                 generation: 1,
                 sections: Vec::new(),
@@ -1393,6 +1432,7 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
+                pair_frequencies: Vec::new(),
                 clustering: None,
                 generation,
                 sections: Vec::new(),
@@ -1954,14 +1994,11 @@ impl Writer {
                 decrements = decrements.saturating_add(1);
             }
         })?;
-        let (exact, ordinals) = if decrements == 0 {
-            (
-                candidates
-                    .into_iter()
-                    .map(|(value, count)| (value, u64::from(count)))
-                    .collect::<HashMap<_, _>>(),
-                Vec::new(),
-            )
+        let exact = if decrements == 0 {
+            candidates
+                .into_iter()
+                .map(|(value, count)| (value, u64::from(count)))
+                .collect::<HashMap<_, _>>()
         } else {
             let mut lower = candidates.values().copied().collect::<Vec<_>>();
             lower.sort_unstable_by(|left, right| right.cmp(left));
@@ -1972,29 +2009,48 @@ impl Writer {
             }
             let mut exact =
                 candidates.into_keys().map(|value| (value, 0_u64)).collect::<HashMap<_, _>>();
-            let mut ordinals = Vec::new();
-            let mut exceeded = false;
-            self.visit_numeric(column, |ordinal, value| {
+            self.visit_numeric(column, |_, value| {
                 if let Some(count) = exact.get_mut(&value) {
                     *count = count.saturating_add(1);
-                    if !exceeded {
-                        if ordinals.len() < FREQUENCY_ORDINALS {
-                            ordinals.push(ordinal);
-                        } else {
-                            ordinals.clear();
-                            exceeded = true;
-                        }
-                    }
                 }
             })?;
-            (exact, ordinals)
+            exact
         };
         let mut entries = exact
             .into_iter()
             .map(|(value, count)| FrequencyEntry { value, count })
             .collect::<Vec<_>>();
         let omitted_max = keep_most_frequent(&mut entries).max(decrements);
-        Ok((Some(FrequencySummary { entries, omitted_max, ordinals }), distinct.count()))
+        let kept_rows = entries.iter().try_fold(0_u64, |total, entry| {
+            total.checked_add(entry.count).filter(|&total| total <= FREQUENCY_ORDINALS as u64)
+        });
+        let mut ordinals = Vec::new();
+        let mut ordinal_entries = Vec::new();
+        if let Some(kept_rows) = kept_rows {
+            let kept = entries
+                .iter()
+                .enumerate()
+                .map(|(at, entry)| {
+                    Ok((
+                        entry.value,
+                        u16::try_from(at)
+                            .map_err(|_| invalid("too many retained frequency entries"))?,
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+            ordinals.reserve(usize::try_from(kept_rows).unwrap_or(FREQUENCY_ORDINALS));
+            ordinal_entries.reserve(usize::try_from(kept_rows).unwrap_or(FREQUENCY_ORDINALS));
+            self.visit_numeric(column, |ordinal, value| {
+                if let Some(&entry) = kept.get(&value) {
+                    ordinals.push(ordinal);
+                    ordinal_entries.push(entry);
+                }
+            })?;
+        }
+        Ok((
+            Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries }),
+            distinct.count(),
+        ))
     }
 
     fn visit_numeric(
@@ -2125,6 +2181,129 @@ impl Writer {
         Ok(frequencies)
     }
 
+    /// Reads one stable dictionary code column only at sorted table-wide row ordinals.
+    fn stable_codes_at(&self, column: usize, ordinals: &[u64]) -> Result<Option<Vec<Option<u32>>>> {
+        if self.dictionaries.get(column).and_then(Option::as_ref).is_none() {
+            return Ok(None);
+        }
+        if ordinals.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(invalid("frequency ordinals are not sorted and unique"));
+        }
+        let mut out = Vec::with_capacity(ordinals.len());
+        let mut wanted = 0;
+        let mut stripe_start = 0_u64;
+        for stripe in &self.table.stripes {
+            let stripe_end = stripe_start.saturating_add(stripe.rows as u64);
+            if wanted == ordinals.len() || ordinals[wanted] >= stripe_end {
+                stripe_start = stripe_end;
+                continue;
+            }
+            let spans = read_index(&self.file, stripe, column)?;
+            let page = stripe.pages[column];
+            let mut bytes = vec![0; page.length as usize];
+            read_at(&self.file, page.offset, &mut bytes)?;
+            let mut part_start = stripe_start;
+            for (span, &rows) in spans.iter().zip(&stripe.parts) {
+                let part_end = part_start.saturating_add(u64::from(rows));
+                if wanted < ordinals.len() && ordinals[wanted] < part_end {
+                    let part = part_bytes(&bytes, *span)?;
+                    if checksum(part) != span.hash {
+                        return Err(invalid(
+                            "column page checksum differs while building pair frequencies",
+                        ));
+                    }
+                    let Some(codes) = decode_stable_codes(rows as usize, part)? else {
+                        return Ok(None);
+                    };
+                    while wanted < ordinals.len() && ordinals[wanted] < part_end {
+                        let row = usize::try_from(ordinals[wanted].saturating_sub(part_start))
+                            .map_err(|_| invalid("frequency row offset does not fit in memory"))?;
+                        out.push(*codes.get(row).ok_or_else(|| {
+                            invalid("frequency row offset is outside its string page")
+                        })?);
+                        wanted += 1;
+                    }
+                }
+                part_start = part_end;
+            }
+            stripe_start = stripe_end;
+        }
+        if wanted != ordinals.len() {
+            return Err(invalid("frequency ordinal is outside the table"));
+        }
+        Ok(Some(out))
+    }
+
+    /// Derives bounded two-key leaders from numeric anchor ordinals and stable string codes.
+    fn pair_frequencies(&self) -> Result<Vec<PairFrequencySummary>> {
+        let anchors = self
+            .table
+            .frequencies
+            .iter()
+            .enumerate()
+            .filter_map(|(column, summary)| {
+                summary
+                    .as_ref()
+                    .filter(|summary| {
+                        !summary.ordinals.is_empty()
+                            && summary.ordinal_entries.len() == summary.ordinals.len()
+                    })
+                    .cloned()
+                    .map(|summary| (column, summary))
+            })
+            .collect::<Vec<_>>();
+        let strings = self
+            .dictionaries
+            .iter()
+            .enumerate()
+            .filter_map(|(column, dictionary)| dictionary.as_ref().map(|_| column))
+            .collect::<Vec<_>>();
+        let mut summaries = Vec::new();
+        for (first, anchors) in anchors {
+            for &second in &strings {
+                if summaries.len() == MAX_PAIR_FREQUENCIES {
+                    return Ok(summaries);
+                }
+                let Some(codes) = self.stable_codes_at(second, &anchors.ordinals)? else {
+                    continue;
+                };
+                if codes.len() != anchors.ordinal_entries.len() {
+                    return Err(invalid("pair frequency columns have different lengths"));
+                }
+                let mut counts = HashMap::<(u16, Option<u32>), u64>::new();
+                for (&anchor, code) in anchors.ordinal_entries.iter().zip(codes) {
+                    *counts.entry((anchor, code)).or_default() += 1;
+                }
+                let mut entries = counts
+                    .into_iter()
+                    .map(|((first_entry, second), count)| PairFrequencyEntry {
+                        first_entry,
+                        second,
+                        count,
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_unstable_by(|left, right| {
+                    right
+                        .count
+                        .cmp(&left.count)
+                        .then_with(|| left.first_entry.cmp(&right.first_entry))
+                        .then_with(|| left.second.cmp(&right.second))
+                });
+                let pair_omitted = entries.get(FREQUENCY_ENTRIES).map_or(0, |entry| entry.count);
+                entries.truncate(FREQUENCY_ENTRIES);
+                summaries.push(PairFrequencySummary {
+                    first: u16::try_from(first)
+                        .map_err(|_| invalid("pair frequency column index overflows"))?,
+                    second: u16::try_from(second)
+                        .map_err(|_| invalid("pair frequency column index overflows"))?,
+                    entries,
+                    omitted_max: anchors.omitted_max.max(pair_omitted),
+                });
+            }
+        }
+        Ok(summaries)
+    }
+
     /// Writes the directory of the table this writer is on and says where it went.
     ///
     /// Everything [`Writer::finish`] used to do except the two writes that publish. Pulling it out
@@ -2157,6 +2336,7 @@ impl Writer {
             dictionary.finish_blocks()?;
         }
         self.place_blocks()?;
+        self.table.pair_frequencies = self.pair_frequencies()?;
         let dictionaries = std::mem::take(&mut self.dictionaries);
         self.table.dictionary_payloads = vec![0; self.table.fields.len()];
         // One column at a time, and every column's values dropped before the next column's are read
@@ -3989,6 +4169,81 @@ impl Reader {
         self.decode_frequencies(column, &field.ty, &summary.entries).map(Some)
     }
 
+    /// Exact leading counts for a numeric key paired with a stable-dictionary string key.
+    ///
+    /// The stored prefix is returned only when its requested boundary strictly beats the bound on
+    /// every pair omitted at load time. The returned tail may be longer than `top`, as with
+    /// [`Self::top_frequencies`], so downstream ordering can settle ties without reading rows.
+    ///
+    /// # Errors
+    ///
+    /// If either column is outside the schema or persisted pair metadata is inconsistent with the
+    /// frequency synopsis or dictionary it names.
+    pub fn top_pair_frequencies(
+        &self,
+        first: usize,
+        second: usize,
+        top: usize,
+    ) -> Result<Option<PairFrequencyCounts>> {
+        if first >= self.table.fields.len() || second >= self.table.fields.len() {
+            return Err(invalid("pair frequency column index out of range"));
+        }
+        let Some(summary) =
+            self.table.pair_frequencies.iter().find(|summary| {
+                summary.first as usize == first && summary.second as usize == second
+            })
+        else {
+            return Ok(None);
+        };
+        if top == 0 || summary.entries.len() < top {
+            return Ok(None);
+        }
+        let boundary = summary.entries[top - 1].count;
+        if boundary <= summary.omitted_max {
+            return Ok(None);
+        }
+        let first_summary = self
+            .table
+            .frequencies
+            .get(first)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid("pair frequency first column has no synopsis"))?;
+        let anchors = self
+            .decode_frequencies(first, &self.table.fields[first].ty, &first_summary.entries)?
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect::<Vec<_>>();
+        let dictionary = self
+            .dictionary(second)?
+            .ok_or_else(|| invalid("pair frequency second column has no dictionary"))?;
+        let mut codes = summary.entries.iter().filter_map(|entry| entry.second).collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        let texts = dictionary
+            .try_values_visited(&codes.iter().map(|&code| code as usize).collect::<Vec<_>>())?;
+        let mut out = Vec::with_capacity(summary.entries.len());
+        for entry in &summary.entries {
+            if entry.count < boundary {
+                break;
+            }
+            let first = anchors
+                .get(entry.first_entry as usize)
+                .cloned()
+                .ok_or_else(|| invalid("pair frequency anchor is outside its values"))?;
+            let second = match entry.second {
+                None => Value::Null,
+                Some(code) => {
+                    let at = codes
+                        .binary_search(&code)
+                        .map_err(|_| invalid("pair frequency code was not among the codes read"))?;
+                    texts[at].clone()
+                }
+            };
+            out.push((vec![first, second], entry.count));
+        }
+        Ok(Some(out))
+    }
+
     /// Every value of one column with the number of rows holding it, when the synopsis is complete.
     ///
     /// The heavy hitter pass keeps a bounded set of candidates and decrements them all when it runs
@@ -4165,7 +4420,8 @@ impl Reader {
     ///
     /// If the column is outside the schema.
     pub fn frequency_occurrences(&self, column: usize) -> Result<Option<FrequencyOccurrences>> {
-        self.table
+        let field = self
+            .table
             .fields
             .get(column)
             .ok_or_else(|| invalid("frequency column index out of range"))?;
@@ -4175,9 +4431,17 @@ impl Reader {
         if summary.ordinals.is_empty() {
             return Ok(None);
         }
+        let (anchors, anchor_indices) = if summary.ordinal_entries.len() == summary.ordinals.len() {
+            let entries = self.decode_frequencies(column, &field.ty, &summary.entries)?;
+            (entries.into_iter().map(|(value, _)| value).collect(), summary.ordinal_entries.clone())
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Ok(Some(FrequencyOccurrences {
             omitted_max: summary.omitted_max,
             ordinals: summary.ordinals.clone(),
+            anchors,
+            anchor_indices,
         }))
     }
 
@@ -5093,7 +5357,7 @@ fn code_frequency(dictionary: &GlobalDictionary) -> FrequencySummary {
         entries.push(FrequencyEntry { value: FrequencyValue::Null, count: dictionary.nulls });
     }
     let omitted_max = keep_most_frequent(&mut entries);
-    FrequencySummary { entries, omitted_max, ordinals: Vec::new() }
+    FrequencySummary { entries, omitted_max, ordinals: Vec::new(), ordinal_entries: Vec::new() }
 }
 
 fn encode_directory(table: &Table) -> Result<Vec<u8>> {
@@ -5251,6 +5515,44 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             }
             put_var_u64(&mut out, delta);
             previous = ordinal;
+        }
+        if summary.ordinal_entries.len() != summary.ordinals.len() {
+            return Err(invalid("frequency ordinal values have a different length"));
+        }
+        for &entry in &summary.ordinal_entries {
+            if entry as usize >= summary.entries.len() {
+                return Err(invalid("frequency ordinal value is outside its entries"));
+            }
+            put_u16(&mut out, entry);
+        }
+    }
+    if !table.pair_frequencies.is_empty() {
+        out.extend_from_slice(PAIR_FREQUENCIES);
+        put_u16(
+            &mut out,
+            u16::try_from(table.pair_frequencies.len())
+                .map_err(|_| invalid("too many pair frequency summaries"))?,
+        );
+        for summary in &table.pair_frequencies {
+            put_u16(&mut out, summary.first);
+            put_u16(&mut out, summary.second);
+            put_u64(&mut out, summary.omitted_max);
+            put_u16(
+                &mut out,
+                u16::try_from(summary.entries.len())
+                    .map_err(|_| invalid("too many pair frequency entries"))?,
+            );
+            for entry in &summary.entries {
+                put_u16(&mut out, entry.first_entry);
+                match entry.second {
+                    None => out.push(0),
+                    Some(code) => {
+                        out.push(1);
+                        put_u32(&mut out, code);
+                    }
+                }
+                put_u64(&mut out, entry.count);
+            }
         }
     }
     // Written only when there is a declaration, so that the common file is the same bytes it was
@@ -5714,7 +6016,9 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     let frequencies = if cur.at == bytes.len() {
         vec![None; width]
     } else {
-        if cur.take(8)? != FREQUENCIES {
+        let frequency_magic = cur.take(8)?;
+        let frequency_values = frequency_magic == FREQUENCIES;
+        if !frequency_values && frequency_magic != FREQUENCIES_V2 {
             return Err(invalid("directory extension magic differs"));
         }
         if cur.u16()? as usize != width {
@@ -5798,7 +6102,22 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
                         }
                         ordinals
                     };
-                    Some(FrequencySummary { entries, omitted_max, ordinals })
+                    let ordinal_entries = if frequency_values {
+                        let mut ordinal_entries = Vec::with_capacity(ordinals.len());
+                        for _ in 0..ordinals.len() {
+                            let entry = cur.u16()?;
+                            if entry as usize >= entries.len() {
+                                return Err(invalid(
+                                    "frequency ordinal value is outside its entries",
+                                ));
+                            }
+                            ordinal_entries.push(entry);
+                        }
+                        ordinal_entries
+                    } else {
+                        Vec::new()
+                    };
+                    Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries })
                 }
                 _ => return Err(invalid("frequency summary tag differs")),
             };
@@ -5817,6 +6136,8 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     // in one directory is a torn directory and the only question is which of them is the lie.
     let mut clustering = None;
     let mut sections = Vec::new();
+    let mut pair_frequencies = Vec::new();
+    let mut seen_pair_frequencies = false;
     let mut seen_sections = false;
     let mut dictionary_payloads = Vec::new();
     let mut seen_payloads = false;
@@ -5826,7 +6147,66 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     while cur.at != bytes.len() {
         let mut tag = [0u8; 8];
         tag.copy_from_slice(cur.take(8)?);
-        if &tag == CLUSTERING {
+        if &tag == PAIR_FREQUENCIES {
+            if seen_pair_frequencies {
+                return Err(invalid("directory names two pair frequency blocks"));
+            }
+            seen_pair_frequencies = true;
+            let count = cur.u16()? as usize;
+            if count > MAX_PAIR_FREQUENCIES {
+                return Err(invalid("pair frequency count exceeds its bound"));
+            }
+            pair_frequencies = Vec::with_capacity(count);
+            for _ in 0..count {
+                let first = cur.u16()?;
+                let second = cur.u16()?;
+                let first_at = first as usize;
+                let second_at = second as usize;
+                let Some(first_summary) = frequencies.get(first_at).and_then(Option::as_ref) else {
+                    return Err(invalid("pair frequency first column has no synopsis"));
+                };
+                if !matches!(fields.get(second_at), Some(field) if field.ty == LogicalType::Varchar)
+                    || dictionaries.get(second_at).copied().flatten().is_none()
+                {
+                    return Err(invalid("pair frequency second column has no stable dictionary"));
+                }
+                if pair_frequencies
+                    .iter()
+                    .any(|held: &PairFrequencySummary| held.first == first && held.second == second)
+                {
+                    return Err(invalid("directory repeats a pair frequency summary"));
+                }
+                let omitted_max = cur.u64()?;
+                if omitted_max > rows as u64 {
+                    return Err(invalid("pair frequency omitted count exceeds the table"));
+                }
+                let entries_count = cur.u16()? as usize;
+                if entries_count > FREQUENCY_ENTRIES {
+                    return Err(invalid("pair frequency entry count exceeds its bound"));
+                }
+                let mut entries = Vec::with_capacity(entries_count);
+                for _ in 0..entries_count {
+                    let first_entry = cur.u16()?;
+                    if first_entry as usize >= first_summary.entries.len() {
+                        return Err(invalid("pair frequency anchor is outside its synopsis"));
+                    }
+                    let second = match cur.u8()? {
+                        0 => None,
+                        1 => Some(cur.u32()?),
+                        _ => return Err(invalid("pair frequency string tag differs")),
+                    };
+                    let count = cur.u64()?;
+                    if count == 0 || count > rows as u64 {
+                        return Err(invalid("pair frequency count is outside the table"));
+                    }
+                    entries.push(PairFrequencyEntry { first_entry, second, count });
+                }
+                if entries.windows(2).any(|pair| pair[0].count < pair[1].count) {
+                    return Err(invalid("pair frequency entries are not descending"));
+                }
+                pair_frequencies.push(PairFrequencySummary { first, second, entries, omitted_max });
+            }
+        } else if &tag == CLUSTERING {
             if clustering.is_some() {
                 return Err(invalid("directory names two clustering declarations"));
             }
@@ -5905,6 +6285,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
         dictionary_payloads,
         distincts,
         frequencies,
+        pair_frequencies,
         clustering,
         generation,
         sections,
@@ -7432,6 +7813,61 @@ fn page_encoding(ty: &LogicalType, rows: usize, bytes: &[u8]) -> String {
     }
 }
 
+/// Stable dictionary codes from one page, without opening the dictionary they name.
+///
+/// The writer uses this while closing a table to derive bounded composite counts. At that point
+/// the code pages are final but the dictionary index is not in the directory yet, and the values
+/// are irrelevant: equality and nullness are all a grouped count needs.
+fn decode_stable_codes(rows: usize, bytes: &[u8]) -> Result<Option<Vec<Option<u32>>>> {
+    let mut cur = Cursor { bytes, at: 0 };
+    let codec = cur.u8()?;
+    let flag = cur.u8()?;
+    let validity = match flag {
+        0 => Validity::AllValid,
+        1 => Validity::AllInvalid,
+        2 => {
+            let mask = cur.take(rows.div_ceil(8))?;
+            Validity::from_iter(rows, |row| mask[row / 8] >> (row % 8) & 1 == 1)
+        }
+        _ => return Err(invalid("page validity tag differs")),
+    };
+    if codec != 3 && codec != 4 {
+        return Ok(None);
+    }
+    let codes = if codec == 4 {
+        let wide = integer::decode(&bytes[cur.at..])?;
+        if wide.len() != rows {
+            return Err(invalid("encoded code page holds the wrong number of rows"));
+        }
+        let mut codes = Vec::with_capacity(wide.len());
+        let mut seen = 0_i64;
+        for &code in &wide {
+            seen |= code;
+            codes.push(code as u32);
+        }
+        if seen < 0 || seen > i64::from(u32::MAX) {
+            return Err(invalid("code is not a code"));
+        }
+        codes
+    } else {
+        let mut codes = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            codes.push(cur.u32()?);
+        }
+        if cur.at != bytes.len() {
+            return Err(invalid("global code page has trailing bytes"));
+        }
+        codes
+    };
+    Ok(Some(
+        codes
+            .into_iter()
+            .enumerate()
+            .map(|(row, code)| validity.is_valid(row).then_some(code))
+            .collect(),
+    ))
+}
+
 fn decode(
     ty: &LogicalType,
     rows: usize,
@@ -8092,6 +8528,7 @@ mod tests {
             dictionary_payloads: Vec::new(),
             distincts: vec![None],
             frequencies: vec![None],
+            pair_frequencies: Vec::new(),
             clustering: None,
             generation: 1,
             sections,
@@ -9830,8 +10267,65 @@ mod tests {
             reader.frequency_occurrences(0).expect("valid metadata").expect("bounded ordinals");
         assert!(occurrences.omitted_max < 100);
         assert!(occurrences.ordinals.len() <= FREQUENCY_ORDINALS);
+        assert_eq!(occurrences.anchor_indices.len(), occurrences.ordinals.len());
         assert!(occurrences.ordinals.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&occurrences.ordinals[..1_000], &(0_u64..1_000).collect::<Vec<_>>());
+        assert_eq!(
+            &occurrences.anchor_indices[..1_000]
+                .iter()
+                .map(|&entry| occurrences.anchors[entry as usize].clone())
+                .collect::<Vec<_>>(),
+            &(0_i64..10)
+                .flat_map(|leader| std::iter::repeat_n(Value::BigInt(leader), 100))
+                .collect::<Vec<_>>()
+        );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn numeric_string_pair_leaders_are_certified_in_the_directory() {
+        let path = path("pair-frequencies");
+        let mut pairs = Vec::new();
+        pairs.extend(std::iter::repeat_n((1_i64, "alpha".to_string()), 100));
+        pairs.extend(std::iter::repeat_n((1_i64, "beta".to_string()), 50));
+        pairs.extend(std::iter::repeat_n((2_i64, "gamma".to_string()), 40));
+        pairs.extend((1_000_i64..1_600).map(|id| (id, format!("tail {id}"))));
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("id", LogicalType::BigInt),
+                Field::required("phrase", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        for part in pairs.chunks(1_024) {
+            let ids = part.iter().map(|(id, _)| Value::BigInt(*id)).collect::<Vec<_>>();
+            let phrases =
+                part.iter().map(|(_, phrase)| Value::Varchar(phrase.clone())).collect::<Vec<_>>();
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::BigInt, &ids).expect("ids"),
+                        Vector::from_values(LogicalType::Varchar, &phrases).expect("phrases"),
+                    ])
+                    .expect("matching columns"),
+                )
+                .expect("rows");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let leaders = reader
+            .top_pair_frequencies(0, 1, 2)
+            .expect("valid pair metadata")
+            .expect("the top two beat the omitted tail");
+        assert!(
+            leaders.contains(&(vec![Value::BigInt(1), Value::Varchar("alpha".to_string())], 100,))
+        );
+        assert!(
+            leaders.contains(&(vec![Value::BigInt(1), Value::Varchar("beta".to_string())], 50,))
+        );
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -10844,6 +11338,7 @@ mod tests {
             dictionary_payloads: Vec::new(),
             distincts: vec![None],
             frequencies: vec![None],
+            pair_frequencies: Vec::new(),
             clustering: None,
             generation: 1,
             sections: Vec::new(),
