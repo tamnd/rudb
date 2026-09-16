@@ -469,6 +469,7 @@ impl<'a> Building<'a, '_> {
         let below = self.node(input)?;
         let (aggregate, out) =
             Aggregate::new(self.plan, &below.schema, index, groups, aggregates, self.memory)?;
+        let aggregate = aggregate.in_session(self.session);
         let aggregate = match max_groups {
             Some(limit) => aggregate.limit_groups(limit),
             None => aggregate,
@@ -509,7 +510,7 @@ impl<'a> Building<'a, '_> {
                 Segment::new(Arc::new(Watched::new(dummy, counters)), schema)
             }
             Node::Values { index, columns, rows } => {
-                let values = Values::new(plan, index, columns, rows)?;
+                let values = Values::new(plan, index, columns, rows, self.session)?;
                 let schema = values.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Values", None);
                 Segment::new(Arc::new(Watched::new(values, counters)), schema)
@@ -597,6 +598,7 @@ impl<'a> Building<'a, '_> {
                 let below = self.node(input)?;
                 let counters = self.watch(reference, id, pipeline, "Fetch", None);
                 let fetch = Fetch::new(plan, &below.schema, index, args, columns, row)?
+                    .in_session(self.session)
                     .watched(counters.clone());
                 let schema = fetch.schema().clone();
                 below.then(Arc::new(Watched::new(fetch, counters)), schema)
@@ -616,7 +618,8 @@ impl<'a> Building<'a, '_> {
                     self.catalog.table(&name)?,
                     columns,
                     row,
-                )?;
+                )?
+                .in_session(self.session);
                 let schema = fetch.schema().clone();
                 below.then(Arc::new(Watched::new(fetch, counters)), schema)
             }
@@ -627,13 +630,15 @@ impl<'a> Building<'a, '_> {
                 // else leaves them sitting there for whatever scan the walk reaches next.
                 self.pruning = Vec::new();
                 let schema = below.schema.clone();
-                let filter = Filter::new(plan, reference, predicate, &schema, self.seams)?;
+                let filter = Filter::new(plan, reference, predicate, &schema, self.seams)?
+                    .in_session(self.session);
                 let counters = self.watch(reference, id, pipeline, "Filter", None);
                 below.then(Arc::new(Watched::new(filter, counters)), schema)
             }
             Node::Project { input, index, exprs, names } => {
                 let below = self.node(input)?;
-                let project = Project::new(plan, &below.schema, index, exprs, names)?;
+                let project = Project::new(plan, &below.schema, index, exprs, names)?
+                    .in_session(self.session);
                 let schema = project.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Project", None);
                 below.then(Arc::new(Watched::new(project, counters)), schema)
@@ -645,6 +650,7 @@ impl<'a> Building<'a, '_> {
                 let below = self.node(input)?;
                 let schema = below.schema.clone();
                 let (sort, out) = Sort::new(plan, &schema, keys, memory)?;
+                let sort = sort.in_session(self.session);
                 let counters = self.watch(reference, id, pipeline, "Sort", None);
                 let reading = Arc::clone(&counters);
                 self.close(below, pipeline, Arc::new(Watched::new(sort, counters)));
@@ -672,6 +678,7 @@ impl<'a> Building<'a, '_> {
                 let below = self.node(input)?;
                 let schema = below.schema.clone();
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
+                let top = top.in_session(self.session);
                 let counters = self.watch(reference, id, pipeline, "TopN", None);
                 let reading = Arc::clone(&counters);
                 self.close(below, pipeline, Arc::new(Watched::new(top, counters)));
@@ -681,6 +688,7 @@ impl<'a> Building<'a, '_> {
                 let below = self.node(input)?;
                 let schema = below.schema.clone();
                 let (distinct, out) = Distinct::new(plan, &schema, on, memory)?;
+                let distinct = distinct.in_session(self.session);
                 let counters = self.watch(reference, id, pipeline, "Distinct", None);
                 let reading = Arc::clone(&counters);
                 self.close(below, pipeline, Arc::new(Watched::new(distinct, counters)));
@@ -703,6 +711,7 @@ impl<'a> Building<'a, '_> {
                 let side = Gathered { schema: &right_schema, rows: gathered };
                 let (join, out) =
                     Join::new(plan, &left.schema, side, kind, conditions, self.cancel, memory);
+                let join = join.in_session(self.session);
                 let schema = join.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Join", None);
                 let reading = Arc::clone(&counters);

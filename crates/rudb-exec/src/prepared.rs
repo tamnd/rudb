@@ -33,10 +33,10 @@
 //! `spec/engine/04-expressions.md` gives: once the tree walk is gone what is left to save is pass
 //! count, and at 1024 rows the intermediate vectors are eight kilobytes and stay in L1.
 
-use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
+use rudb_common::{Error, LogicalType, PhysicalType, Result, Session, SessionTimeZone, Value};
 use rudb_kernels::{
-    Comparison, Connective, Held, Members, Recipe, cast, combine, compare_prepared, in_set,
-    is_true, refine_flags, refine_prepared, selection,
+    Comparison, Connective, Held, Members, Recipe, cast_in_time_zone, combine, compare_prepared,
+    in_set, is_true, refine_flags, refine_prepared, selection,
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Chunk, Selection, Vector};
@@ -88,6 +88,8 @@ pub struct Prepared {
     /// The step already compiled for each shared plan expression.
     shared: HashMap<ExprRef, usize>,
     share: bool,
+    /// The parsed zone used only by casts whose answer depends on the session.
+    time_zone: SessionTimeZone,
 }
 
 /// One node of a flattened expression.
@@ -252,6 +254,7 @@ impl Prepared {
             roots: Vec::new(),
             shared: HashMap::new(),
             share,
+            time_zone: SessionTimeZone::default(),
         };
         for &expr in exprs {
             let root = prepared.push(plan, expr, schema)?;
@@ -259,6 +262,13 @@ impl Prepared {
         }
         prepared.last_use = prepared.last_uses();
         Ok(prepared)
+    }
+
+    /// Uses the zone of the session that owns this prepared expression.
+    #[must_use]
+    pub fn in_session(mut self, session: &Session) -> Self {
+        self.time_zone = session.session_time_zone();
+        self
     }
 
     /// Which step is the last to read each step, computed once when the expression is prepared.
@@ -684,9 +694,12 @@ impl Prepared {
         let produced = match &self.steps[index] {
             Step::Column(_) => None,
             Step::Constant(value) => Some(Vector::constant(ty.clone(), value.clone(), chunk.len())),
-            Step::Cast { input, try_cast } => {
-                Some(cast(self.operand(*input, chunk, slots)?, ty, *try_cast)?)
-            }
+            Step::Cast { input, try_cast } => Some(cast_in_time_zone(
+                self.operand(*input, chunk, slots)?,
+                ty,
+                *try_cast,
+                Some(self.time_zone),
+            )?),
             Step::Compare { op, left, right, held } => Some(compare_prepared(
                 *op,
                 self.operand(*left, chunk, slots)?,

@@ -1254,6 +1254,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
 #[test]
 fn the_session_context_answers_for_the_clock_the_catalog_and_the_user() {
     let db = database();
+    db.execute("SET TimeZone = 'UTC'").expect("a stable zone for written timestamp answers");
     let text = |value: &str| Value::Varchar(value.to_string());
     // The types first, because the type is the half a client reads through a driver and the half
     // that is easy to get wrong. Every one of these was measured against the pin.
@@ -1442,6 +1443,22 @@ fn the_session_time_zone_moves_local_context_and_one_argument_age() {
     };
     assert_eq!(local - utc, -4 * 60 * 60 * 1_000_000, "New York is EDT in September");
     assert_eq!(zoned_time, local_time);
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT CAST(stamp AS VARCHAR) FROM (VALUES \
+             (TIMESTAMPTZ '2020-01-01 12:00:00+00'), \
+             (TIMESTAMPTZ '2020-07-01 12:00:00+00')) AS t(stamp)"
+        ),
+        vec![
+            vec![Value::Varchar("2020-01-01 07:00:00-05".to_string())],
+            vec![Value::Varchar("2020-07-01 08:00:00-04".to_string())],
+        ]
+    );
+    assert_eq!(
+        rows(&db, "VALUES (CAST(TIMESTAMPTZ '2020-07-01 12:00:00+00' AS VARCHAR))"),
+        vec![vec![Value::Varchar("2020-07-01 08:00:00-04".to_string())]]
+    );
     assert_eq!(
         rows(
             &db,

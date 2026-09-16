@@ -12,7 +12,7 @@
 //! drives them is the serial driver in `rudb-pipeline`, which pushes one chunk through every stream
 //! of a pipeline in the order `build.rs` stacked them.
 
-use rudb_common::{Field, Result};
+use rudb_common::{Field, Result, Session};
 use rudb_pipeline::{Compaction, Gauge, Progress, Stream, narrow};
 use rudb_plan::{ExprRef, Node, NodeRef, Plan, Slice};
 use rudb_seam::{Context, SeamId, Settings};
@@ -55,6 +55,13 @@ pub(crate) struct Filtering {
 }
 
 impl Filter {
+    /// Applies the session semantics to the predicate's prepared casts.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.predicate = self.predicate.in_session(session);
+        self
+    }
+
     /// # Errors
     ///
     /// If the predicate does not resolve against the input's schema, which is a failure of the plan
@@ -155,6 +162,13 @@ pub(crate) struct Project {
 }
 
 impl Project {
+    /// Applies the session semantics to the projection's prepared casts.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.exprs = self.exprs.in_session(session);
+        self
+    }
+
     /// A projection producing the plan's expressions under the plan's names.
     ///
     /// # Errors
