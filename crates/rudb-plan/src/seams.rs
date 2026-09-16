@@ -47,7 +47,8 @@ pub fn seams_of(node: &Node) -> &'static [SeamId] {
         | Node::Fetch { .. }
         | Node::TableFetch { .. }
         | Node::Limit { .. }
-        | Node::CrossProduct { .. } => &[],
+        | Node::CrossProduct { .. }
+        | Node::DependentJoin { .. } => &[],
     }
 }
 

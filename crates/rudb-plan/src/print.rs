@@ -175,7 +175,7 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             out.write_str(" on=")?;
             write_expr_list(plan, out, on)
         }
-        Node::Join { kind, conditions, .. } => {
+        Node::Join { kind, conditions, .. } | Node::DependentJoin { kind, conditions, .. } => {
             write!(out, " {} on=", kind.keyword())?;
             write_expr_list(plan, out, conditions)
         }

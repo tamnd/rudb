@@ -158,6 +158,9 @@ pub fn rows(plan: &Plan, node: NodeRef, stats: &Statistics) -> Option<u64> {
         Node::Join { left, right, kind, conditions } => {
             join(of(left), of(right), kind, plan.expr_list(conditions).len())
         }
+        // The right cardinality is a function of each left row until decorrelation, so treating it
+        // as one independently measured input would be a made-up estimate.
+        Node::DependentJoin { .. } => None,
         Node::CrossProduct { left, right } => match (of(left), of(right)) {
             (Some(left), Some(right)) => Some(left.saturating_mul(right)),
             _ => None,

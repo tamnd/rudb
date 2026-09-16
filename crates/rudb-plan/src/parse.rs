@@ -276,18 +276,20 @@ impl Reader<'_> {
                 let on = read_expr_list(plan, c)?;
                 Ok(Built::unary(move |input| Node::Distinct { input, on }))
             }
-            "Join" => {
+            "Join" | "DependentJoin" => {
                 let kind = read_keyword(c, &JoinKind::ALL, JoinKind::keyword, "a join kind")?;
                 c.expect_word("on")?;
                 c.expect("=")?;
                 let conditions = read_expr_list(plan, c)?;
+                let dependent = keyword == "DependentJoin";
                 Ok(Built {
                     arity: 2,
-                    assemble: Box::new(move |left, right| Node::Join {
-                        left,
-                        right,
-                        kind,
-                        conditions,
+                    assemble: Box::new(move |left, right| {
+                        if dependent {
+                            Node::DependentJoin { left, right, kind, conditions }
+                        } else {
+                            Node::Join { left, right, kind, conditions }
+                        }
                     }),
                 })
             }
@@ -1321,6 +1323,19 @@ mod tests {
     fn the_reader_runs_the_plan_invariant() {
         let message = Plan::parse("Filter 1::INTEGER\n  Dummy\n").unwrap_err().to_string();
         assert!(message.contains("BOOLEAN"), "unhelpful message: {message}");
+    }
+
+    #[test]
+    fn a_dependent_join_round_trips_with_its_correlation_visible() {
+        let text = concat!(
+            "DependentJoin SINGLE on=[]\n",
+            "  Values #0 [x::INTEGER] rows=[[1::INTEGER]]\n",
+            "  Project #1 [#0.0::INTEGER AS x]\n",
+            "    Dummy\n",
+        );
+        let plan = Plan::parse(text).expect("the dependent join reads");
+        assert!(matches!(plan.node(plan.root()), Node::DependentJoin { .. }));
+        assert_eq!(plan.to_string(), text);
     }
 
     /// The printer quotes a function whose name is a reserved word. If that quoting did not buy a

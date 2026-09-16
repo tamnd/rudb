@@ -234,6 +234,20 @@ pub enum Node {
         /// is not.
         conditions: Slice,
     },
+    /// A join whose right input can refer to columns produced by its left input.
+    ///
+    /// Binding emits this for a correlated subquery. The unnesting pass has to replace every one
+    /// before execution, so the executor never evaluates the right input once per left row.
+    DependentJoin {
+        /// The outer input whose columns the right side may reference.
+        left: NodeRef,
+        /// The correlated input.
+        right: NodeRef,
+        /// Which result shape the subquery needs.
+        kind: JoinKind,
+        /// Conditions introduced while binding the subquery.
+        conditions: Slice,
+    },
     /// An unconditional cross product.
     ///
     /// Separate from a [`Node::Join`] with no conditions because join ordering treats them
@@ -280,6 +294,7 @@ impl Node {
             Self::TableFetch { .. } => "TableFetch",
             Self::Distinct { .. } => "Distinct",
             Self::Join { .. } => "Join",
+            Self::DependentJoin { .. } => "DependentJoin",
             Self::CrossProduct { .. } => "CrossProduct",
             Self::SetOp { .. } => "SetOp",
         }
@@ -306,6 +321,7 @@ impl Node {
             | Self::TableFetch { input, .. }
             | Self::Distinct { input, .. } => [Some(input), None],
             Self::Join { left, right, .. }
+            | Self::DependentJoin { left, right, .. }
             | Self::CrossProduct { left, right }
             | Self::SetOp { left, right, .. } => [Some(left), Some(right)],
         }
@@ -455,6 +471,12 @@ mod tests {
             Node::Limit { input: 0, count: None, offset: 0 },
             Node::Distinct { input: 0, on: Slice::EMPTY },
             Node::Join { left: 0, right: 1, kind: JoinKind::Inner, conditions: Slice::EMPTY },
+            Node::DependentJoin {
+                left: 0,
+                right: 1,
+                kind: JoinKind::Single,
+                conditions: Slice::EMPTY,
+            },
             Node::CrossProduct { left: 0, right: 1 },
             Node::SetOp { left: 0, right: 1, kind: SetOpKind::Union, all: true, index: 0 },
         ]

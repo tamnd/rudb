@@ -149,7 +149,7 @@ fn reads(node: &Node) -> u32 {
         | Node::TableFetch { .. } => 1,
         Node::Aggregate { .. } | Node::Distinct { .. } | Node::SetOp { .. } => 2,
         Node::TopN { .. } | Node::CrossProduct { .. } => 2,
-        Node::Join { .. } => 3,
+        Node::Join { .. } | Node::DependentJoin { .. } => 3,
         Node::Sort { .. } => 3,
     }
 }

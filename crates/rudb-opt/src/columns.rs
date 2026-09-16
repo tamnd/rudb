@@ -258,7 +258,9 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
         }
         Node::Limit { .. } => {}
         Node::Distinct { on, .. } => list(plan, on, found),
-        Node::Join { conditions, .. } => list(plan, conditions, found),
+        Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
+            list(plan, conditions, found);
+        }
     }
 }
 

@@ -201,7 +201,9 @@ impl Shape {
                 self.of[node as usize] = Some(Placed { operator, gathered: None, pipeline: below });
                 self.walk(plan, input, below);
             }
-            Node::Join { left, right, .. } | Node::SetOp { left, right, .. } => {
+            Node::Join { left, right, .. }
+            | Node::DependentJoin { left, right, .. }
+            | Node::SetOp { left, right, .. } => {
                 let gathered = self.number();
                 let first = self.fresh();
                 let second = self.fresh();
