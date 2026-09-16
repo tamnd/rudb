@@ -45,7 +45,7 @@ rudb-pipeline = 4
 # Storage and the format readers. None of these depends on the execution engine, which is what
 # keeps each of them usable and testable on its own.
 rudb-storage = 5
-rudb-native = 5
+rudb-native = 6
 rudb-arrow = 5
 rudb-csv = 5
 rudb-json = 5

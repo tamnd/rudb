@@ -94,6 +94,18 @@ pub struct Zone {
 }
 
 impl Zone {
+    /// Builds a zone from persisted ranges.
+    #[must_use]
+    pub fn from_ranges(columns: Vec<Range>) -> Self {
+        Self { columns }
+    }
+
+    /// Persisted ranges in column order.
+    #[must_use]
+    pub fn columns(&self) -> &[Range] {
+        &self.columns
+    }
+
     /// The zone of a chunk, one pass per column.
     #[must_use]
     pub fn of(chunk: &Chunk) -> Self {

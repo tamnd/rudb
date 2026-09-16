@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod columns;
+pub mod dependent;
 pub mod distinct;
 pub mod empty;
 pub mod estimate;
@@ -81,9 +82,10 @@ pub const RANK: u8 = 11;
 /// Top N is last, because it is the one pass that fuses two operators into one rather than moving
 /// something around. Everything before it is written against a sort and a limit, and a pass that had
 /// to know about both spellings of the same plan is a pass with two of every rule in it.
-pub static PASSES: [&(dyn Pass + Sync); 8] = [
+pub static PASSES: [&(dyn Pass + Sync); 9] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
+    &dependent::DependentGroupKeys,
     &filter::FilterPushdown,
     &empty::EmptyResultPullup,
     &columns::UnusedColumns,
