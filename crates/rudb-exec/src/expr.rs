@@ -122,7 +122,7 @@ pub(crate) fn evaluate_in_time_zone(
                         evaluate_in_time_zone(plan, arm.then, schema, &matched, time_zone)?;
                     // row at a time: the scatter this wants is 2c (#57), same as the loop above.
                     for (slot, &(_, row)) in taken.iter().enumerate() {
-                        answers[row] = results.value_at(slot);
+                        answers[row] = results.try_value_at(slot)?;
                     }
                 }
                 pending = still;
@@ -134,7 +134,7 @@ pub(crate) fn evaluate_in_time_zone(
                         evaluate_in_time_zone(plan, otherwise, schema, &narrowed, time_zone)?;
                     // row at a time: the scatter this wants is 2c (#57), same as the two above.
                     for (slot, &row) in pending.iter().enumerate() {
-                        answers[row] = results.value_at(slot);
+                        answers[row] = results.try_value_at(slot)?;
                     }
                 }
             }

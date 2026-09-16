@@ -832,7 +832,7 @@ impl Prepared {
                 let results = arm.then.evaluate_one(&matched, &mut scratch)?;
                 // row at a time: the scatter this wants is #57, same as the loop above.
                 for (slot, &(_, row)) in taken.iter().enumerate() {
-                    answers[row] = results.value_at(slot);
+                    answers[row] = results.try_value_at(slot)?;
                 }
             }
             pending = still;
@@ -844,7 +844,7 @@ impl Prepared {
                 let results = otherwise.evaluate_one(&narrowed, &mut scratch)?;
                 // row at a time: the scatter this wants is #57, same as the two above.
                 for (slot, &row) in pending.iter().enumerate() {
-                    answers[row] = results.value_at(slot);
+                    answers[row] = results.try_value_at(slot)?;
                 }
             }
         }

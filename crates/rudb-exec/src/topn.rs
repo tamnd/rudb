@@ -220,8 +220,11 @@ impl Sink for TopN {
         // row at a time: the key still has the same Value layout the sort holds, and 2i (#63)
         // replaces it with one normalized comparable byte string per row.
         for row in 0..chunk.len() {
-            let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
-            let values: Vec<Value> = chunk.row(row).collect();
+            let key: Vec<Value> =
+                keys.iter().map(|column| column.try_value_at(row)).collect::<Result<_>>()?;
+            let values: Vec<Value> = (0..chunk.width())
+                .map(|column| chunk.try_value_at(row, column))
+                .collect::<Result<_>>()?;
             taken += rows::footprint(&key) + rows::footprint(&values);
             local.kept.push((key, values, local.place.of(row)));
         }
@@ -296,14 +299,28 @@ fn keep(
     {
         return;
     }
-    let key: Vec<Value> = columns.iter().map(|column| column.value_at(row)).collect();
+    let key: Vec<Value> = match columns.iter().map(|column| column.try_value_at(row)).collect() {
+        Ok(key) => key,
+        Err(error) => {
+            failure.get_or_insert(error);
+            return;
+        }
+    };
+    let values: Vec<Value> =
+        match (0..chunk.width()).map(|column| chunk.try_value_at(row, column)).collect() {
+            Ok(values) => values,
+            Err(error) => {
+                failure.get_or_insert(error);
+                return;
+            }
+        };
     // After every candidate whose key it ties, which is where its arrival puts it too: an instance
     // reads the morsels it is given in order and each of them from the start, so a row reaching
     // here arrived after everything already held.
     let at = kept.partition_point(|candidate| {
         compare(keys, &candidate.0, &key, failure) != Ordering::Greater
     });
-    kept.insert(at, (key, chunk.row(row).collect(), arrival));
+    kept.insert(at, (key, values, arrival));
     kept.truncate(bound);
 }
 
@@ -328,7 +345,14 @@ fn against(
     failure: &mut Option<Error>,
 ) -> Ordering {
     for (at, key) in keys.iter().enumerate() {
-        let ordering = match rank(&columns[at].value_at(row), &held[at], *key) {
+        let value = match columns[at].try_value_at(row) {
+            Ok(value) => value,
+            Err(error) => {
+                failure.get_or_insert(error);
+                return Ordering::Equal;
+            }
+        };
+        let ordering = match rank(&value, &held[at], *key) {
             Ok(ordering) => ordering,
             Err(error) => {
                 failure.get_or_insert(error);

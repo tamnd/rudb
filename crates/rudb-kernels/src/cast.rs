@@ -89,7 +89,7 @@ pub fn cast_in_time_zone(
         return Ok(Vector::constant(target.clone(), Value::Null, 0));
     }
     if input.form() == Form::Constant {
-        let single = cast_value_in_time_zone(&input.value_at(0), target, try_cast, time_zone)?;
+        let single = cast_value_in_time_zone(&input.try_value_at(0)?, target, try_cast, time_zone)?;
         return Ok(Vector::constant(target.clone(), single, input.len()));
     }
     if let Some(vector) = swept(input, target) {
@@ -102,7 +102,12 @@ pub fn cast_in_time_zone(
     // row at a time: the path recorded on the line above, which exists to be correct for a
     // conversion `swept` does not cover and counts itself so that conversion shows up.
     for index in 0..input.len() {
-        values.push(cast_value_in_time_zone(&input.value_at(index), target, try_cast, time_zone)?);
+        values.push(cast_value_in_time_zone(
+            &input.try_value_at(index)?,
+            target,
+            try_cast,
+            time_zone,
+        )?);
     }
     Vector::from_values(target.clone(), &values)
 }

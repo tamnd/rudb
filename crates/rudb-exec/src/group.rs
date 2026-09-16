@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, TryLockError};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use rudb_common::{
     Error, Field, LogicalType, Memory, Reservation, Result, Session, Spent, Stage, Value, stage,
@@ -31,7 +31,7 @@ use rudb_common::{
 use rudb_kernels::{Accumulator, NOWHERE, is_true, update_scattered};
 use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
-use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
 use crate::buffer::Buffered;
 use crate::key::{BigIntSet, Key, RowSet};
@@ -143,6 +143,9 @@ pub(crate) struct Aggregate<'a> {
     count_only: bool,
     /// COUNT(*), SUM(SMALLINT), AVG(SMALLINT) share one compact state per group.
     compact_numeric: bool,
+    /// Emit at most this many groups from each radix partition when the parent orders by count
+    /// descending. The ordinary TopN still makes the final global choice.
+    top_counts: Option<usize>,
     /// The most groups an unordered limit above this operator can observe.
     max_groups: Option<usize>,
     memory: Memory,
@@ -165,7 +168,22 @@ pub(crate) struct Aggregate<'a> {
     /// to be handed over rather than an answer. What decides the question is the field under the
     /// lock, which is checked again at the one moment it matters.
     locally: AtomicBool,
+    /// A grouped count over one stable dictionary is a dense array indexed by its storage code.
+    dense: OnceLock<DenseCount>,
     out: Buffered,
+}
+
+#[derive(Debug)]
+struct DenseCount {
+    dictionary: Arc<Vector>,
+    partitions: Vec<Mutex<DensePartition>>,
+    held: Mutex<Vec<Reservation>>,
+}
+
+#[derive(Debug, Default)]
+struct DensePartition {
+    runs: Vec<Vec<u32>>,
+    nulls: i64,
 }
 
 /// What the passes have finished, which is the answer as it is assembled.
@@ -223,6 +241,7 @@ struct Partition {
 }
 
 const RADIX_PARTITIONS: usize = 16;
+const DENSE_PARTITIONS: usize = 4;
 
 /// How many groups an instance holds before it stops keeping them to itself.
 ///
@@ -344,6 +363,7 @@ impl<'a> Aggregate<'a> {
                 && !calls[0].distinct
                 && calls[0].filter.is_none(),
             compact_numeric,
+            top_counts: None,
             max_groups: None,
             by_vector,
             groups,
@@ -361,6 +381,7 @@ impl<'a> Aggregate<'a> {
             merged: (0..RADIX_PARTITIONS).map(|_| Mutex::new(Partition::default())).collect(),
             started: AtomicUsize::new(0),
             locally: AtomicBool::new(true),
+            dense: OnceLock::new(),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -369,6 +390,15 @@ impl<'a> Aggregate<'a> {
     /// Stops opening groups once an unordered limit above this aggregate cannot observe another.
     pub(crate) fn limit_groups(mut self, max_groups: usize) -> Self {
         self.max_groups = Some(max_groups);
+        self
+    }
+
+    /// Keeps only the groups that can still reach a count-descending TopN above this aggregate.
+    #[must_use]
+    pub(crate) fn top_counts(mut self, bound: usize) -> Self {
+        if self.count_only || self.compact_numeric {
+            self.top_counts = Some(bound);
+        }
         self
     }
 
@@ -790,22 +820,46 @@ impl<'a> Aggregate<'a> {
         // chunk. The ungrouped case falls out of the same loop with no key columns and one group.
         let types = self.schema.types();
         let width = self.groups.len();
+        let selected = self.top_counts.and_then(|bound| {
+            (self.count_only || self.compact_numeric).then(|| {
+                let count = |slot: usize| {
+                    if self.count_only { counts[slot] } else { compact[slot].count() }
+                };
+                let mut best = Vec::with_capacity(bound.min(groups));
+                for slot in 0..groups {
+                    let at = best.partition_point(|&kept| count(kept) >= count(slot));
+                    if at < bound {
+                        best.insert(at, slot);
+                        best.truncate(bound);
+                    }
+                }
+                // The downstream TopN settles equal keys by arrival. Preserve the order this
+                // partition would have emitted without the reduction.
+                best.sort_unstable();
+                best
+            })
+        });
+        let output_groups = selected.as_ref().map_or(groups, Vec::len);
         // The one buffer the results of a call go through on their way into a vector, kept between
         // chunks and charged once.
-        scratch.grow(width_of(VECTOR_SIZE.min(groups) * size_of::<Value>()))?;
+        scratch.grow(width_of(VECTOR_SIZE.min(output_groups) * size_of::<Value>()))?;
         let mut results: Vec<Value> = Vec::new();
         // row at a time: the outer loop steps a chunk at a time and the key columns are copied a
         // column at a time out of the table, so the only thing left here that is per group is asking
         // each accumulator for its result, which is 2g (#61).
-        for start in (0..groups).step_by(VECTOR_SIZE) {
-            let end = (start + VECTOR_SIZE).min(groups);
+        for start in (0..output_groups).step_by(VECTOR_SIZE) {
+            let end = (start + VECTOR_SIZE).min(output_groups);
+            let slots = selected.as_ref().map(|slots| &slots[start..end]);
             let mut columns = Vec::with_capacity(width + calls);
             let mut key = 0;
             for (at, ty) in types.iter().take(width).enumerate() {
                 if let Some(value) = &self.constants[at] {
                     columns.push(Vector::constant(ty.clone(), value.clone(), end - start));
                 } else {
-                    columns.push(table.column(key, ty, start..end)?);
+                    columns.push(match slots {
+                        Some(slots) => table.column_slots(key, ty, slots)?,
+                        None => table.column(key, ty, start..end)?,
+                    });
                     key += 1;
                 }
             }
@@ -814,18 +868,21 @@ impl<'a> Aggregate<'a> {
                 // so that part is charged as it arrives and given back once it is in the vector.
                 let mut taken = 0;
                 results.clear();
-                for slot in start..end {
+                for index in start..end {
+                    let slot = slots.map_or(index, |slots| slots[index - start]);
                     let value = if self.count_only {
                         Ok(Value::BigInt(counts[slot]))
                     } else if self.compact_numeric {
                         let state = &compact[slot];
                         let (sum, mean) = state.totals(slot, &overflow);
                         match at {
-                            0 => Ok(Value::BigInt(state.count)),
-                            1 => {
-                                Accumulator::exact_sum(sum, state.sum_seen, &self.calls[1].returns)
-                                    .finish()
-                            }
+                            0 => Ok(Value::BigInt(state.count())),
+                            1 => Accumulator::exact_sum(
+                                sum,
+                                state.sum_seen(),
+                                &self.calls[1].returns,
+                            )
+                            .finish(),
                             2 => Accumulator::exact_avg(
                                 mean,
                                 state.mean_count,
@@ -1631,7 +1688,7 @@ impl<'a> Aggregate<'a> {
             if let (DistinctSet::BigInt(set), [column]) =
                 (&mut seen[slot * calls + at], rows.arguments[at].as_slice())
             {
-                match column.value_at(row) {
+                match column.try_value_at(row)? {
                     Value::Null => continue,
                     Value::BigInt(value) => {
                         if set.insert(value) {
@@ -1648,7 +1705,7 @@ impl<'a> Aggregate<'a> {
                 }
             }
             let args = &mut given[at];
-            fill(args, &rows.arguments[at], row);
+            fill(args, &rows.arguments[at], row)?;
             // Asked before it is added, because the answer is usually that it is there already and
             // a set that is asked never takes a copy of what it was asked about. A
             // `count(DISTINCT x)` over a million rows and a thousand values copies a thousand times
@@ -1780,6 +1837,10 @@ impl Rows {
 /// The scratch one pipeline instance keeps between chunks, and its table when it has one of its own.
 #[derive(Debug)]
 pub(crate) struct Partitioned {
+    dense: bool,
+    dense_codes: Vec<Vec<u32>>,
+    dense_nulls: i64,
+    dense_memory: Reservation,
     /// The table this instance folds into while it still keeps its groups to itself.
     ///
     /// Every instance starts with one, because splitting a chunk sixteen ways is not free and a
@@ -1870,21 +1931,27 @@ pub(crate) struct Building {
 /// These three calls have fixed types for the whole operator, so the group holds only their totals.
 #[derive(Debug, Default, Clone)]
 struct CompactNumeric {
-    count: i64,
+    /// The low 63 bits are COUNT(*). The high bit records whether SUM saw a value.
+    count_and_sum_seen: u64,
     sum: i64,
-    sum_seen: bool,
     mean: i64,
     mean_count: i64,
-    large: bool,
 }
 
 impl CompactNumeric {
+    const SUM_SEEN: u64 = 1 << 63;
+    const COUNT: u64 = Self::SUM_SEEN - 1;
+
+    fn count(&self) -> i64 {
+        (self.count_and_sum_seen & Self::COUNT) as i64
+    }
+
+    fn sum_seen(&self) -> bool {
+        self.count_and_sum_seen & Self::SUM_SEEN != 0
+    }
+
     fn totals(&self, slot: usize, overflow: &HashMap<usize, (i128, i128)>) -> (i128, i128) {
-        if self.large {
-            *overflow.get(&slot).expect("a wide compact total has an overflow entry")
-        } else {
-            (i128::from(self.sum), i128::from(self.mean))
-        }
+        overflow.get(&slot).copied().unwrap_or((i128::from(self.sum), i128::from(self.mean)))
     }
 
     fn add(
@@ -1894,12 +1961,19 @@ impl CompactNumeric {
         mean: Option<i16>,
         overflow: &mut HashMap<usize, (i128, i128)>,
     ) -> Result<()> {
-        self.count += 1;
-        self.sum_seen |= sum.is_some();
-        self.mean_count += i64::from(mean.is_some());
+        let count = self
+            .count()
+            .checked_add(1)
+            .ok_or_else(|| Error::out_of_range("a compact COUNT overflowed BIGINT"))?;
+        self.count_and_sum_seen =
+            count as u64 | if self.sum_seen() || sum.is_some() { Self::SUM_SEEN } else { 0 };
+        self.mean_count = self
+            .mean_count
+            .checked_add(i64::from(mean.is_some()))
+            .ok_or_else(|| Error::out_of_range("a compact AVG count overflowed BIGINT"))?;
         let added_sum = i64::from(sum.unwrap_or(0));
         let added_mean = i64::from(mean.unwrap_or(0));
-        if !self.large {
+        if !overflow.contains_key(&slot) {
             if let (Some(total_sum), Some(total_mean)) =
                 (self.sum.checked_add(added_sum), self.mean.checked_add(added_mean))
             {
@@ -1914,7 +1988,6 @@ impl CompactNumeric {
                     i128::from(self.mean) + i128::from(added_mean),
                 ),
             );
-            self.large = true;
             return Ok(());
         }
         let totals = overflow.get_mut(&slot).expect("a wide compact total has an overflow entry");
@@ -1945,21 +2018,24 @@ impl CompactNumeric {
         let mean = mean
             .checked_add(coming_mean)
             .ok_or_else(|| Error::out_of_range("a compact AVG overflowed its exact total"))?;
-        self.count += coming.count;
-        self.sum_seen |= coming.sum_seen;
-        self.mean_count += coming.mean_count;
+        let count = self
+            .count()
+            .checked_add(coming.count())
+            .ok_or_else(|| Error::out_of_range("a compact COUNT overflowed BIGINT"))?;
+        self.count_and_sum_seen =
+            count as u64 | if self.sum_seen() || coming.sum_seen() { Self::SUM_SEEN } else { 0 };
+        self.mean_count = self
+            .mean_count
+            .checked_add(coming.mean_count)
+            .ok_or_else(|| Error::out_of_range("a compact AVG count overflowed BIGINT"))?;
         match (i64::try_from(sum), i64::try_from(mean)) {
             (Ok(sum), Ok(mean)) => {
                 self.sum = sum;
                 self.mean = mean;
-                if self.large {
-                    into.remove(&target);
-                    self.large = false;
-                }
+                into.remove(&target);
             }
             _ => {
                 into.insert(target, (sum, mean));
-                self.large = true;
             }
         }
         Ok(())
@@ -2054,8 +2130,8 @@ fn put_away(file: &mut Spill, seen: &Rows, row: usize, away: &mut Vec<Value>) ->
     away.truncate(seen.width());
     for (at, column) in columns.enumerate() {
         match away.get_mut(at) {
-            Some(slot) => set(slot, column, row),
-            None => away.push(column.value_at(row)),
+            Some(slot) => set(slot, column, row)?,
+            None => away.push(column.try_value_at(row)?),
         }
     }
     file.write(away)
@@ -2128,24 +2204,26 @@ fn crowded(memory: &Memory) -> bool {
 /// it back on the next one, and a group by over `URL` does that a hundred million times to look at
 /// each buffer once. Writing into the buffer that is already there asks for nothing. Every other
 /// value owns nothing, so overwriting one is a move of a few bytes.
-fn fill(key: &mut Key, columns: &[Vector], row: usize) {
+fn fill(key: &mut Key, columns: &[Vector], row: usize) -> Result<()> {
     key.0.truncate(columns.len());
     for (at, column) in columns.iter().enumerate() {
         match key.0.get_mut(at) {
-            Some(slot) => set(slot, column, row),
-            None => key.0.push(column.value_at(row)),
+            Some(slot) => set(slot, column, row)?,
+            None => key.0.push(column.try_value_at(row)?),
         }
     }
+    Ok(())
 }
 
 /// Puts one column's value at `row` into `slot`, keeping the buffer that is already there if it can.
-fn set(slot: &mut Value, column: &Vector, row: usize) {
-    if let (Value::Varchar(buffer), Some(text)) = (&mut *slot, column.text_at(row)) {
+fn set(slot: &mut Value, column: &Vector, row: usize) -> Result<()> {
+    if let (Value::Varchar(buffer), Some(text)) = (&mut *slot, column.try_text_at(row)?) {
         buffer.clear();
         buffer.push_str(text);
-        return;
+        return Ok(());
     }
-    *slot = column.value_at(row);
+    *slot = column.try_value_at(row)?;
+    Ok(())
 }
 
 impl Sink for Aggregate<'_> {
@@ -2154,6 +2232,10 @@ impl Sink for Aggregate<'_> {
     fn local(&self) -> Partitioned {
         self.started.fetch_add(1, Ordering::Relaxed);
         Partitioned {
+            dense: false,
+            dense_codes: vec![Vec::new(); DENSE_PARTITIONS],
+            dense_nulls: 0,
+            dense_memory: self.memory.reservation(),
             single: Some(self.start()),
             expressions: self.inputs.scratch(),
             spreading: Spreading::new(),
@@ -2192,8 +2274,67 @@ impl Sink for Aggregate<'_> {
     /// on. Without this, every instance asked for partition zero first and thirty two threads queued
     /// behind one lock before doing any work at all.
     fn sink(&self, chunk: &Chunk, local: &mut Partitioned) -> Result<Progress> {
-        let Partitioned { single, expressions, spreading, own } = local;
+        let Partitioned {
+            dense,
+            dense_codes,
+            dense_nulls,
+            dense_memory,
+            single,
+            expressions,
+            spreading,
+            own,
+        } = local;
         let rows = self.read(chunk, expressions)?;
+        if self.count_only && self.keys.len() == 1 {
+            if let [key] = rows.keys.as_slice() {
+                if let Some((codes, dictionary)) = key.stable_dictionary_parts() {
+                    let state = self.dense.get_or_init(|| DenseCount {
+                        dictionary: Arc::clone(dictionary),
+                        partitions: (0..DENSE_PARTITIONS)
+                            .map(|_| Mutex::new(DensePartition::default()))
+                            .collect(),
+                        held: Mutex::new(Vec::new()),
+                    });
+                    if !Arc::ptr_eq(&state.dictionary, dictionary) {
+                        return Err(Error::internal(
+                            "one stable dictionary aggregate received two code spaces",
+                        ));
+                    }
+                    let validity = key.validity();
+                    let before = dense_codes.iter().map(Vec::capacity).sum::<usize>();
+                    if !validity.has_nulls(rows.rows)
+                        && !dictionary.validity().has_nulls(dictionary.len())
+                    {
+                        for &code in &codes[..rows.rows] {
+                            if code as usize >= dictionary.len() {
+                                return Err(Error::internal(
+                                    "a stable dictionary code is out of range",
+                                ));
+                            }
+                            dense_codes[code as usize % DENSE_PARTITIONS].push(code);
+                        }
+                    } else {
+                        for row in 0..rows.rows {
+                            if key.is_null_at(row) {
+                                *dense_nulls += 1;
+                            } else {
+                                let code = codes[row] as usize;
+                                if code >= dictionary.len() {
+                                    return Err(Error::internal(
+                                        "a stable dictionary code is out of range",
+                                    ));
+                                }
+                                dense_codes[code % DENSE_PARTITIONS].push(code as u32);
+                            }
+                        }
+                    }
+                    let after = dense_codes.iter().map(Vec::capacity).sum::<usize>();
+                    dense_memory.grow(width_of(after.saturating_sub(before) * size_of::<u32>()))?;
+                    *dense = true;
+                    return Ok(Progress::More);
+                }
+            }
+        }
         if let Some(table) = single {
             if let Some(error) = table.failure.take() {
                 return Err(error);
@@ -2231,7 +2372,34 @@ impl Sink for Aggregate<'_> {
     /// the flag and an instance setting it cannot both be between the read and the deposit at once,
     /// so a table is never left whole in partition zero after the switch.
     fn combine(&self, local: Partitioned) -> Result<()> {
-        let Partitioned { single, mut spreading, mut own, .. } = local;
+        let Partitioned {
+            dense,
+            mut dense_codes,
+            dense_nulls,
+            dense_memory,
+            single,
+            mut spreading,
+            mut own,
+            ..
+        } = local;
+        if dense {
+            let state = self.dense.get().expect("dense state exists after a dense sink");
+            for (partition, run) in dense_codes.iter_mut().enumerate() {
+                if run.is_empty() && (partition != 0 || dense_nulls == 0) {
+                    continue;
+                }
+                let mut shared = state.partitions[partition].lock().map_err(poisoned)?;
+                if partition == 0 {
+                    shared.nulls += dense_nulls;
+                }
+                if !run.is_empty() {
+                    shared.runs.push(std::mem::take(run));
+                }
+            }
+            state.held.lock().map_err(poisoned)?.push(dense_memory);
+            self.built.lock().map_err(poisoned)?.instances += 1;
+            return Ok(());
+        }
         self.deposit(&mut own, &mut spreading)?;
         let mut built = self.built.lock().map_err(poisoned)?;
         built.instances += 1;
@@ -2297,6 +2465,51 @@ impl Sink for Aggregate<'_> {
     /// its one group is made when the instance is, and an instance is made whether or not a row
     /// arrives.
     fn finalize(&self) -> Result<()> {
+        if let Some(dense) = self.dense.get() {
+            let mut working = self.memory.reservation();
+            working.grow(width_of(dense.dictionary.len() * size_of::<i64>()))?;
+            let types = self.schema.types();
+            let group_types = &types[..self.groups.len()];
+            let chunks = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(DENSE_PARTITIONS);
+                for (number, partition) in dense.partitions.iter().enumerate() {
+                    let dictionary = Arc::clone(&dense.dictionary);
+                    handles.push(scope.spawn(move || {
+                        let mut partition = partition.lock().map_err(poisoned)?;
+                        dense_partition(
+                            &dictionary,
+                            number,
+                            &mut partition,
+                            &self.constants,
+                            group_types,
+                        )
+                    }));
+                }
+                let mut chunks = Vec::new();
+                for handle in handles {
+                    chunks.extend(
+                        handle
+                            .join()
+                            .map_err(|_| Error::internal("a dense count worker panicked"))??,
+                    );
+                }
+                Ok::<_, Error>(chunks)
+            })?;
+            let mut output = self.memory.reservation();
+            let shared = dense.dictionary.footprint();
+            let output_bytes = chunks
+                .iter()
+                .map(Chunk::footprint)
+                .sum::<usize>()
+                .saturating_sub(shared.saturating_mul(chunks.len().saturating_sub(1)));
+            output.grow(width_of(output_bytes))?;
+            let mut held = dense.held.lock().map_err(poisoned)?;
+            held.clear();
+            working.release();
+            held.push(output);
+            drop(held);
+            return self.out.fill(chunks);
+        }
         let mut built = self.built.lock().map_err(poisoned)?;
         let degree = built.instances.clamp(1, self.merged.len());
         let closed = if degree > 1 { self.close_together(degree)? } else { self.close_in_turn()? };
@@ -2309,6 +2522,75 @@ impl Sink for Aggregate<'_> {
         drop(built);
         self.out.fill(chunks)
     }
+}
+
+fn dense_partition(
+    dictionary: &Arc<Vector>,
+    number: usize,
+    partition: &mut DensePartition,
+    constants: &[Option<Value>],
+    group_types: &[LogicalType],
+) -> Result<Vec<Chunk>> {
+    let width = dictionary.len().saturating_add(DENSE_PARTITIONS - 1 - number) / DENSE_PARTITIONS;
+    let mut dense = vec![0_i64; width];
+    for run in &partition.runs {
+        for &code in run {
+            dense[code as usize / DENSE_PARTITIONS] += 1;
+        }
+    }
+    let mut chunks = Vec::new();
+    let mut codes = Vec::with_capacity(VECTOR_SIZE);
+    let mut counts = Vec::with_capacity(VECTOR_SIZE);
+    let mut valid = Vec::with_capacity(VECTOR_SIZE);
+    for (slot, &count) in dense.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        codes.push((slot * DENSE_PARTITIONS + number) as u32);
+        counts.push(count);
+        valid.push(true);
+        if codes.len() == VECTOR_SIZE {
+            chunks.push(dense_chunk(dictionary, &codes, &counts, &valid, constants, group_types)?);
+            codes.clear();
+            counts.clear();
+            valid.clear();
+        }
+    }
+    if number == 0 && partition.nulls != 0 {
+        codes.push(0);
+        counts.push(partition.nulls);
+        valid.push(false);
+    }
+    if !codes.is_empty() {
+        chunks.push(dense_chunk(dictionary, &codes, &counts, &valid, constants, group_types)?);
+    }
+    Ok(chunks)
+}
+
+fn dense_chunk(
+    dictionary: &Arc<Vector>,
+    codes: &[u32],
+    counts: &[i64],
+    valid: &[bool],
+    constants: &[Option<Value>],
+    group_types: &[LogicalType],
+) -> Result<Chunk> {
+    let validity = Validity::from_iter(valid.len(), |row| valid[row]);
+    let key =
+        Vector::stable_dictionary(codes.to_vec(), Arc::clone(dictionary))?.with_validity(validity);
+    let mut key = Some(key);
+    let mut columns = Vec::with_capacity(constants.len() + 1);
+    for (constant, ty) in constants.iter().zip(group_types) {
+        columns.push(match constant {
+            Some(value) => Vector::constant(ty.clone(), value.clone(), codes.len()),
+            None => key
+                .take()
+                .ok_or_else(|| Error::internal("a dense count has more than one varying key"))?,
+        });
+    }
+    let counts = Vector::flat(LogicalType::BigInt, Data::Int64(counts.to_vec().into()))?;
+    columns.push(counts);
+    Chunk::with_rows(columns, codes.len())
 }
 
 /// One partition's share of the answer, and what holding it is charged.
@@ -2732,17 +3014,24 @@ impl Sink for Distinct {
         for row in 0..chunk.len() {
             if self.whole {
                 local.key.0.clear();
-                local.key.0.extend(chunk.row(row));
+                local.key.0 = (0..chunk.width())
+                    .map(|column| chunk.try_value_at(row, column))
+                    .collect::<Result<_>>()?;
             } else {
-                fill(&mut local.key, &keys, row);
+                fill(&mut local.key, &keys, row)?;
             }
             // Asked before anything is copied, because a row that has been seen is a row this has
             // no further use for, and most rows of a `DISTINCT` worth running have been.
             if local.seen.contains(&local.key) {
                 continue;
             }
-            let values: Vec<Value> =
-                if self.whole { local.key.0.clone() } else { chunk.row(row).collect() };
+            let values: Vec<Value> = if self.whole {
+                local.key.0.clone()
+            } else {
+                (0..chunk.width())
+                    .map(|column| chunk.try_value_at(row, column))
+                    .collect::<Result<_>>()?
+            };
             // The row is kept twice, once as the key in the table and once in the output, and each
             // copy is its own block. What the table and the output took to have room for them is
             // charged below, once per chunk. The copy is charged and not the buffer it came from,
@@ -3069,7 +3358,8 @@ mod tests {
             wide.totals(0, &wide_overflow),
             (i128::from(i64::MAX) + 3, i128::from(i64::MIN) + 2)
         );
-        assert_eq!(wide.count, 2);
+        assert_eq!(wide.count(), 2);
         assert_eq!(wide.mean_count, 2);
+        assert_eq!(size_of::<CompactNumeric>(), 32);
     }
 }

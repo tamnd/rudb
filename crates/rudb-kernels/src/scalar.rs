@@ -51,6 +51,8 @@
 use memchr::memmem;
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::cast;
 use crate::compare::{self, Comparison};
@@ -135,7 +137,8 @@ fn run<V: AsRef<Vector>>(
     // constant folding, and it is also every correlated scalar the optimizer has already evaluated.
     if rows > 0 && !args.is_empty() && args.iter().all(|arg| arg.as_ref().form() == Form::Constant)
     {
-        let row: Vec<Value> = args.iter().map(|arg| arg.as_ref().value_at(0)).collect();
+        let row: Vec<Value> =
+            args.iter().map(|arg| arg.as_ref().try_value_at(0)).collect::<Result<_>>()?;
         return Ok(Vector::constant(
             returns.clone(),
             call_values(name, &row, returns, written)?,
@@ -158,7 +161,9 @@ fn run<V: AsRef<Vector>>(
     // yet, and counts itself so which functions those are shows up in the report.
     for index in 0..rows {
         row.clear();
-        row.extend(args.iter().map(|arg| arg.as_ref().value_at(index)));
+        for arg in args {
+            row.push(arg.as_ref().try_value_at(index)?);
+        }
         values.push(call_values(name, &row, returns, written)?);
     }
     Vector::from_values(returns.clone(), &values)
@@ -251,6 +256,24 @@ pub(crate) fn finish(
 /// `length`, `strlen` and the `lower` in front of a `LIKE`.
 fn unary(name: &str, arg: &Vector, returns: &LogicalType, rows: usize) -> Result<Option<Vector>> {
     let base = nulls_of(arg);
+    if matches!(name, "length" | "strlen")
+        && arg.logical_type() == &LogicalType::Varchar
+        && returns == &LogicalType::BigInt
+        && arg.data().is_none()
+    {
+        let mut out = vec![0_i64; rows];
+        let validity = over_valid(rows, base, |index| {
+            let bytes = arg.try_bytes_at(index)?.unwrap_or_default();
+            let size = if name == "strlen" {
+                bytes.len()
+            } else {
+                bytes.iter().filter(|byte| (**byte as i8) >= -0x40).count()
+            };
+            out[index] = i64::try_from(size).unwrap_or(i64::MAX);
+            Ok(())
+        })?;
+        return finish(returns, Data::Int64(out.into()), validity);
+    }
     match arg.form() {
         Form::Flat => {
             let Some(data) = arg.data() else {
@@ -1197,6 +1220,9 @@ fn like_of(
         }
     };
     let base = nulls_of(text).and(&nulls_of(pattern), rows);
+    if let Some((codes, dictionary)) = text.stable_dictionary_parts() {
+        return like_stable(dictionary, codes, like, base, rows, returns);
+    }
     match text.form() {
         Form::Flat => {
             let Some(Data::Varlen(column)) = text.data() else {
@@ -1212,7 +1238,7 @@ fn like_of(
                 return Ok(None);
             }
             let Some(Data::Varlen(column)) = values.data() else {
-                return Ok(None);
+                return like_vector_run(values, &codes, like, base, rows, returns);
             };
             // Every code is inside the dictionary because `Vector::dictionary` checks that on the
             // way in, so the gather indexes without a bound of its own.
@@ -1243,6 +1269,13 @@ pub(crate) struct Like {
     fold_case: bool,
     /// Whether the answer is inverted, which is the `!` in the spelling.
     negated: bool,
+    stable: OnceLock<StableLike>,
+}
+
+#[derive(Debug)]
+struct StableLike {
+    dictionary: Arc<Vector>,
+    answers: Vec<AtomicU8>,
 }
 
 impl Like {
@@ -1264,7 +1297,12 @@ impl Like {
         } else {
             spelling
         };
-        Some(Self { compiled: Pattern::compile(spelling), fold_case, negated })
+        Some(Self {
+            compiled: Pattern::compile(spelling),
+            fold_case,
+            negated,
+            stable: OnceLock::new(),
+        })
     }
 
     /// Whether the string at `position` matches, negation included.
@@ -1285,6 +1323,22 @@ impl Like {
         let text = folded.as_deref().unwrap_or(text);
         self.compiled.holds(text, characters) != self.negated
     }
+
+    fn holds_vector(
+        &self,
+        vector: &Vector,
+        position: usize,
+        characters: &mut Vec<char>,
+    ) -> Result<bool> {
+        if !self.fold_case && !matches!(self.compiled, Pattern::General(_)) {
+            let text = vector.try_bytes_at(position)?.unwrap_or_default();
+            return Ok(self.compiled.holds_bytes(text) != self.negated);
+        }
+        let text = vector.try_text_at(position)?.unwrap_or_default();
+        let folded = if self.fold_case { Some(text.to_lowercase()) } else { None };
+        let text = folded.as_deref().unwrap_or(text);
+        Ok(self.compiled.holds(text, characters) != self.negated)
+    }
 }
 
 /// The `LIKE` loop itself, once per form the text can arrive in.
@@ -1304,6 +1358,57 @@ fn like_run<A: Fn(usize) -> usize>(
     let mut characters: Vec<char> = Vec::new();
     let validity = over_valid(rows, base, |index| {
         out[index] = like.holds_at(column, at(index), &mut characters);
+        Ok(())
+    })?;
+    finish(returns, Data::Bool(out.into()), validity)
+}
+
+fn like_vector_run(
+    values: &Vector,
+    codes: &[u32],
+    like: &Like,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let mut out = vec![false; rows];
+    let mut characters = Vec::new();
+    let validity = over_valid(rows, base, |index| {
+        out[index] = like.holds_vector(values, codes[index] as usize, &mut characters)?;
+        Ok(())
+    })?;
+    finish(returns, Data::Bool(out.into()), validity)
+}
+
+fn like_stable(
+    dictionary: &Arc<Vector>,
+    codes: &[u32],
+    like: &Like,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let cache = like.stable.get_or_init(|| StableLike {
+        dictionary: Arc::clone(dictionary),
+        answers: (0..dictionary.len()).map(|_| AtomicU8::new(0)).collect(),
+    });
+    if !Arc::ptr_eq(&cache.dictionary, dictionary) {
+        return like_vector_run(dictionary, codes, like, base, rows, returns);
+    }
+    let mut out = vec![false; rows];
+    let mut characters = Vec::new();
+    let validity = over_valid(rows, base, |index| {
+        let code = codes[index] as usize;
+        let answer = cache
+            .answers
+            .get(code)
+            .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?;
+        let mut state = answer.load(Ordering::Relaxed);
+        if state == 0 {
+            state = u8::from(like.holds_vector(dictionary, code, &mut characters)?) + 1;
+            answer.store(state, Ordering::Relaxed);
+        }
+        out[index] = state == 2;
         Ok(())
     })?;
     finish(returns, Data::Bool(out.into()), validity)

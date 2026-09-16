@@ -221,6 +221,7 @@ fn build_measured_with_sink<'a>(
         done: Vec::new(),
         drivers: Vec::new(),
         pruning: Vec::new(),
+        top_counts: Vec::new(),
     };
     let segment = building.node(plan.root())?;
     let schema = segment.schema.clone();
@@ -259,6 +260,47 @@ fn ordered(plan: &Plan, node: NodeRef) -> bool {
         | Node::Fetch { input, .. } => ordered(plan, input),
         _ => false,
     }
+}
+
+/// The aggregate under a TopN whose only key is its first COUNT(*) result descending.
+///
+/// Keeping the local prefix from every radix partition is sufficient for the global prefix: a
+/// group excluded behind `k` groups in its own partition cannot enter the first `k` overall. The
+/// regular TopN remains in the plan and settles the small union, so this only reduces aggregate
+/// output and does not replace ordering semantics.
+fn count_top_aggregate(plan: &Plan, input: NodeRef, keys: Slice) -> Option<NodeRef> {
+    let [key] = plan.sort_key_list(keys) else { return None };
+    if !key.descending {
+        return None;
+    }
+    let Expr::Column(ordered) = *plan.expr(key.expr) else { return None };
+    let (aggregate, output) = match *plan.node(input) {
+        Node::Project { input, index, exprs, .. } => {
+            if ordered.table != index {
+                return None;
+            }
+            let projected = *plan.expr_list(exprs).get(ordered.column as usize)?;
+            let Expr::Column(output) = *plan.expr(projected) else { return None };
+            (input, output)
+        }
+        Node::Aggregate { index, .. } if ordered.table == index => (input, ordered),
+        _ => return None,
+    };
+    let Node::Aggregate { index, groups, aggregates, .. } = *plan.node(aggregate) else {
+        return None;
+    };
+    if output.table != index || output.column as usize != plan.expr_list(groups).len() {
+        return None;
+    }
+    let first = *plan.expr_list(aggregates).first()?;
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(first) else {
+        return None;
+    };
+    (plan.string(name) == "count_star"
+        && plan.expr_list(args).is_empty()
+        && !distinct
+        && filter.is_none())
+    .then_some(aggregate)
 }
 
 /// What a filter over a scan can tell that scan before it reads anything.
@@ -398,6 +440,8 @@ struct Building<'a, 'b> {
     /// own input, and the scan arm takes them. It is empty every other time it is read, and empty
     /// means hand out every row group, which is what every scan did before pruning existed.
     pruning: Vec<(usize, Op, Bound)>,
+    /// Aggregates whose parent TopN orders by COUNT(*) descending, and its count plus offset.
+    top_counts: Vec<(NodeRef, usize)>,
 }
 
 impl<'a> Building<'a, '_> {
@@ -465,6 +509,7 @@ impl<'a> Building<'a, '_> {
         groups: Slice,
         aggregates: Slice,
         max_groups: Option<usize>,
+        top_counts: Option<usize>,
     ) -> Result<Segment<'a>> {
         let below = self.node(input)?;
         let (aggregate, out) =
@@ -472,6 +517,10 @@ impl<'a> Building<'a, '_> {
         let aggregate = aggregate.in_session(self.session);
         let aggregate = match max_groups {
             Some(limit) => aggregate.limit_groups(limit),
+            None => aggregate,
+        };
+        let aggregate = match top_counts {
+            Some(bound) => aggregate.top_counts(bound),
             None => aggregate,
         };
         let schema = aggregate.schema().clone();
@@ -644,7 +693,11 @@ impl<'a> Building<'a, '_> {
                 below.then(Arc::new(Watched::new(project, counters)), schema)
             }
             Node::Aggregate { input, index, groups, aggregates } => {
-                self.aggregate(reference, input, index, groups, aggregates, None)?
+                let top_counts = self
+                    .top_counts
+                    .iter()
+                    .find_map(|&(aggregate, bound)| (aggregate == reference).then_some(bound));
+                self.aggregate(reference, input, index, groups, aggregates, None, top_counts)?
             }
             Node::Sort { input, keys } => {
                 let below = self.node(input)?;
@@ -664,9 +717,15 @@ impl<'a> Building<'a, '_> {
                     (
                         Node::Aggregate { input: under, index, groups, aggregates },
                         Some(max_groups),
-                    ) => {
-                        self.aggregate(input, under, index, groups, aggregates, Some(max_groups))?
-                    }
+                    ) => self.aggregate(
+                        input,
+                        under,
+                        index,
+                        groups,
+                        aggregates,
+                        Some(max_groups),
+                        None,
+                    )?,
                     _ => self.node(input)?,
                 };
                 let schema = below.schema.clone();
@@ -675,6 +734,12 @@ impl<'a> Building<'a, '_> {
                 below.then(Arc::new(Watched::new(limit, counters)), schema)
             }
             Node::TopN { input, keys, count, offset } => {
+                if let Some(aggregate) = count_top_aggregate(plan, input, keys) {
+                    let bound = count.saturating_add(offset);
+                    if let Ok(bound) = usize::try_from(bound) {
+                        self.top_counts.push((aggregate, bound));
+                    }
+                }
                 let below = self.node(input)?;
                 let schema = below.schema.clone();
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
@@ -758,5 +823,42 @@ impl<'a> Building<'a, '_> {
             }
         };
         Ok(segment)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rudb_plan::{Node, Plan};
+
+    use super::count_top_aggregate;
+
+    fn plan(direction: &str) -> Plan {
+        Plan::parse(&format!(
+            "TopN 10 offset 0 [#2.2::BIGINT {direction} NULLS LAST]\n  \
+             Project #2 [#1.0::BIGINT AS WatchID, #1.1::INTEGER AS ClientIP, #1.2::BIGINT AS c]\n    \
+             Aggregate #1 groups=[#0.0::BIGINT, #0.1::INTEGER] \
+             aggregates=[count_star()::BIGINT]\n      \
+             Values #0 [WatchID::BIGINT, ClientIP::INTEGER] rows=[]"
+        ))
+        .expect("a grouped count plan")
+    }
+
+    #[test]
+    fn count_descending_topn_marks_its_aggregate() {
+        let plan = plan("DESC");
+        let Node::TopN { input, keys, .. } = *plan.node(plan.root()) else {
+            panic!("the root is a TopN")
+        };
+        let aggregate = count_top_aggregate(&plan, input, keys).expect("the grouped count");
+        assert!(matches!(plan.node(aggregate), Node::Aggregate { .. }));
+    }
+
+    #[test]
+    fn count_ascending_cannot_discard_large_counts() {
+        let plan = plan("ASC");
+        let Node::TopN { input, keys, .. } = *plan.node(plan.root()) else {
+            panic!("the root is a TopN")
+        };
+        assert!(count_top_aggregate(&plan, input, keys).is_none());
     }
 }
