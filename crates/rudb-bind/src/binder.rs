@@ -13,7 +13,9 @@
 //! an `INTEGER` and a `BIGINT` does.
 
 use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
-use rudb_common::{Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Value};
+use rudb_common::{
+    Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Value,
+};
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Given, TableFunction, csv_fields, csv_given, files, is_file,
     is_pattern, parquet_fields, resolve, resolve_pragma, resolve_table,
@@ -115,6 +117,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) semantics: Semantics,
     plan: Plan,
     next_index: u32,
+    /// Source range inherited by plan objects built for the current AST expression or query.
+    pub(crate) current_span: Span,
     /// Set while a select block aggregates, which changes what a bare column means.
     pub(crate) aggregation: Option<Aggregation>,
     /// Set while an aggregate's own arguments are being bound, so nesting is caught.
@@ -142,6 +146,7 @@ impl<'a> Binder<'a> {
             semantics: session.semantics(),
             plan: Plan::new(),
             next_index: 0,
+            current_span: Span::new(0, 0),
             aggregation: None,
             in_aggregate: false,
             scalar_subqueries: Vec::new(),
@@ -173,6 +178,20 @@ impl<'a> Binder<'a> {
         &mut self.plan
     }
 
+    pub(crate) fn add_expr(&mut self, expr: Expr, ty: LogicalType) -> ExprRef {
+        self.plan.add_expr_at(expr, ty, self.current_span)
+    }
+
+    pub(crate) fn add_constant(&mut self, value: Value) -> ExprRef {
+        let ty = value.logical_type();
+        let reference = self.plan.add_value(value);
+        self.plan.add_expr_at(Expr::Constant(reference), ty, self.current_span)
+    }
+
+    pub(crate) fn add_node(&mut self, node: Node) -> NodeRef {
+        self.plan.add_node_at(node, self.current_span)
+    }
+
     pub(crate) fn into_plan(self) -> Plan {
         self.plan
     }
@@ -197,10 +216,10 @@ impl<'a> Binder<'a> {
             let PendingSubquery { node: mut right, kind, conditions } = pending;
             if kind == JoinKind::Single && !self.semantics.scalar_subquery_error_on_multiple_rows()
             {
-                right = self.plan.add_node(Node::Limit { input: right, count: Some(1), offset: 0 });
+                right = self.add_node(Node::Limit { input: right, count: Some(1), offset: 0 });
             }
             let conditions = self.plan.add_expr_list(&conditions);
-            input = self.plan.add_node(Node::Join { left: input, right, kind, conditions });
+            input = self.add_node(Node::Join { left: input, right, kind, conditions });
         }
         input
     }
@@ -212,6 +231,13 @@ impl<'a> Binder<'a> {
         ast: &Ast,
         query: ast::QueryRef,
     ) -> Result<(NodeRef, Scope)> {
+        let outer = std::mem::replace(&mut self.current_span, ast.query_span(query));
+        let result = self.bind_query_inner(ast, query);
+        self.current_span = outer;
+        result
+    }
+
+    fn bind_query_inner(&mut self, ast: &Ast, query: ast::QueryRef) -> Result<(NodeRef, Scope)> {
         let written = ast.query(query);
         match written.body {
             ast::QueryBody::Select(select) => self.bind_select(ast, select, &written),
@@ -259,7 +285,7 @@ impl<'a> Binder<'a> {
         let rows = self.plan.add_rows(&[row]);
         let columns = self.plan.add_fields(std::slice::from_ref(&field));
         let index = self.fresh_index();
-        let node = self.plan.add_node(Node::Values { index, columns, rows });
+        let node = self.add_node(Node::Values { index, columns, rows });
         let mut scope = Scope::empty();
         scope.push(Visible {
             table: String::new(),
@@ -319,7 +345,7 @@ impl<'a> Binder<'a> {
         let rows = self.plan.add_rows(&slices);
         let columns = self.plan.add_fields(&fields);
         let index = self.fresh_index();
-        let mut node = self.plan.add_node(Node::Values { index, columns, rows });
+        let mut node = self.add_node(Node::Values { index, columns, rows });
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {
             scope.push(Visible {
@@ -333,7 +359,7 @@ impl<'a> Binder<'a> {
         let keys = self.sort_keys(ast, query, &scope, &[])?;
         if !keys.is_empty() {
             let keys = self.plan.add_sort_keys(&keys);
-            node = self.plan.add_node(Node::Sort { input: node, keys });
+            node = self.add_node(Node::Sort { input: node, keys });
         }
         node = self.apply_limit(ast, query, node)?;
         Ok((node, scope))
@@ -418,7 +444,7 @@ impl<'a> Binder<'a> {
             .collect();
         let columns = self.plan.add_fields(&fields);
         let index = self.fresh_index();
-        let mut node = self.plan.add_node(Node::Values { index, columns, rows });
+        let mut node = self.add_node(Node::Values { index, columns, rows });
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {
             scope.push(Visible {
@@ -432,7 +458,7 @@ impl<'a> Binder<'a> {
         let keys = self.sort_keys(ast, query, &scope, &[])?;
         if !keys.is_empty() {
             let keys = self.plan.add_sort_keys(&keys);
-            node = self.plan.add_node(Node::Sort { input: node, keys });
+            node = self.add_node(Node::Sort { input: node, keys });
         }
         node = self.apply_limit(ast, query, node)?;
         Ok((node, scope))
@@ -478,13 +504,8 @@ impl<'a> Binder<'a> {
         // UNION alone removes duplicates and UNION ALL keeps them, which is the one place the
         // unwritten quantifier and ALL disagree.
         let all = quantifier == Quantifier::All;
-        let mut node = self.plan.add_node(Node::SetOp {
-            left: left_node,
-            right: right_node,
-            kind,
-            all,
-            index,
-        });
+        let mut node =
+            self.add_node(Node::SetOp { left: left_node, right: right_node, kind, all, index });
         let mut scope = Scope::empty();
         for (at, (column, ty)) in left_scope.columns.iter().zip(&types).enumerate() {
             scope.push(Visible {
@@ -503,7 +524,7 @@ impl<'a> Binder<'a> {
         let keys = self.sort_keys(ast, query, &scope, &[])?;
         if !keys.is_empty() {
             let keys = self.plan.add_sort_keys(&keys);
-            node = self.plan.add_node(Node::Sort { input: node, keys });
+            node = self.add_node(Node::Sort { input: node, keys });
         }
         node = self.apply_limit(ast, query, node)?;
         Ok((node, scope))
@@ -524,7 +545,7 @@ impl<'a> Binder<'a> {
         }
         let exprs = self.plan.add_expr_list(&exprs);
         let names = self.plan.add_name_list(&names);
-        Ok(self.plan.add_node(Node::Project { input: node, index, exprs, names }))
+        Ok(self.add_node(Node::Project { input: node, index, exprs, names }))
     }
 
     // ----------------------------------------------------------------- select
@@ -544,7 +565,7 @@ impl<'a> Binder<'a> {
             let predicate = self.bind_expr(ast, written.filter, &input)?;
             let predicate = self.as_boolean(predicate, "WHERE")?;
             node = self.attach_scalar_subqueries(node);
-            node = self.plan.add_node(Node::Filter { input: node, predicate });
+            node = self.add_node(Node::Filter { input: node, predicate });
         }
 
         let targets = ast.target_list(written.targets).to_vec();
@@ -610,16 +631,16 @@ impl<'a> Binder<'a> {
             let index = aggregation.index;
             let groups = self.plan.add_expr_list(&aggregation.groups);
             let aggregates = self.plan.add_expr_list(&aggregation.aggregates);
-            node = self.plan.add_node(Node::Aggregate { input: node, index, groups, aggregates });
+            node = self.add_node(Node::Aggregate { input: node, index, groups, aggregates });
         }
         if let Some(predicate) = having {
-            node = self.plan.add_node(Node::Filter { input: node, predicate });
+            node = self.add_node(Node::Filter { input: node, predicate });
         }
 
         let interned: Vec<u32> = names.iter().map(|name| self.plan.intern(name)).collect();
         let exprs_slice = self.plan.add_expr_list(&exprs);
         let names_slice = self.plan.add_name_list(&interned);
-        node = self.plan.add_node(Node::Project {
+        node = self.add_node(Node::Project {
             input: node,
             index: project,
             exprs: exprs_slice,
@@ -628,11 +649,11 @@ impl<'a> Binder<'a> {
 
         if written.distinct != Distinct::No {
             let on = self.plan.add_expr_list(&on);
-            node = self.plan.add_node(Node::Distinct { input: node, on });
+            node = self.add_node(Node::Distinct { input: node, on });
         }
         if !keys.is_empty() {
             let keys = self.plan.add_sort_keys(&keys);
-            node = self.plan.add_node(Node::Sort { input: node, keys });
+            node = self.add_node(Node::Sort { input: node, keys });
         }
         node = self.apply_limit(ast, query, node)?;
 
@@ -660,7 +681,7 @@ impl<'a> Binder<'a> {
         }
         let exprs = self.plan.add_expr_list(&kept);
         let names = self.plan.add_name_list(&kept_names);
-        node = self.plan.add_node(Node::Project { input: node, index, exprs, names });
+        node = self.add_node(Node::Project { input: node, index, exprs, names });
         Ok((node, scope))
     }
 
@@ -989,7 +1010,7 @@ impl<'a> Binder<'a> {
         if count.is_none() && offset == 0 {
             return Ok(input);
         }
-        Ok(self.plan.add_node(Node::Limit { input, count, offset }))
+        Ok(self.add_node(Node::Limit { input, count, offset }))
     }
 
     /// The row count a `LIMIT` or an `OFFSET` names, which has to be a constant.
@@ -1034,12 +1055,12 @@ impl<'a> Binder<'a> {
         let Some((first, rest)) = sources.split_first() else {
             // No FROM clause is one row of no columns, which is what SELECT 1 sits on. Not an
             // empty table: an empty table would make SELECT 1 return nothing.
-            return Ok((self.plan.add_node(Node::Dummy), Scope::empty()));
+            return Ok((self.add_node(Node::Dummy), Scope::empty()));
         };
         let (mut node, mut scope) = self.bind_source(ast, *first)?;
         for source in rest {
             let (right, right_scope) = self.bind_source(ast, *source)?;
-            node = self.plan.add_node(Node::CrossProduct { left: node, right });
+            node = self.add_node(Node::CrossProduct { left: node, right });
             scope = scope.concat(right_scope);
         }
         Ok((node, scope))
@@ -1129,7 +1150,7 @@ impl<'a> Binder<'a> {
         let table_name = self.plan.intern(&resolved.table);
         let alias = self.plan.intern(&label);
         let columns = self.plan.add_fields(&fields);
-        let node = self.plan.add_node(Node::Get {
+        let node = self.add_node(Node::Get {
             catalog: catalog_name,
             schema,
             table: table_name,
@@ -1401,7 +1422,7 @@ impl<'a> Binder<'a> {
         let rows = self.plan.add_rows(&rows);
         let held = self.plan.add_fields(fields);
         let index = self.fresh_index();
-        let node = self.plan.add_node(Node::Values { index, columns: held, rows });
+        let node = self.add_node(Node::Values { index, columns: held, rows });
         let label =
             if alias == NONE { function.name().to_string() } else { ast.string(alias).to_string() };
         let mut scope = Scope::empty();
@@ -1673,7 +1694,7 @@ impl<'a> Binder<'a> {
         let options = self.plan.add_name_list(&named);
         let settings = self.plan.add_expr_list(&settings);
         let columns = self.plan.add_fields(&fields);
-        let node = self.plan.add_node(Node::TableFunction {
+        let node = self.add_node(Node::TableFunction {
             index,
             function,
             args,
@@ -1827,13 +1848,11 @@ impl<'a> Binder<'a> {
             if !conditions.is_empty() {
                 return Err(Error::binder("a CROSS JOIN cannot have a condition"));
             }
-            let node =
-                self.plan.add_node(Node::CrossProduct { left: left_node, right: right_node });
+            let node = self.add_node(Node::CrossProduct { left: left_node, right: right_node });
             return Ok((node, scope));
         }
         if conditions.is_empty() && kind == ast::JoinKind::Inner {
-            let node =
-                self.plan.add_node(Node::CrossProduct { left: left_node, right: right_node });
+            let node = self.add_node(Node::CrossProduct { left: left_node, right: right_node });
             return Ok((node, scope));
         }
         let kind = match kind {
@@ -1847,7 +1866,7 @@ impl<'a> Binder<'a> {
         };
         let conditions = self.plan.add_expr_list(&conditions);
         let node =
-            self.plan.add_node(Node::Join { left: left_node, right: right_node, kind, conditions });
+            self.add_node(Node::Join { left: left_node, right: right_node, kind, conditions });
         Ok((node, scope))
     }
 

@@ -1,6 +1,6 @@
 //! The arena a plan lives in, and the invariant that keeps its indices honest.
 
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Span, Value};
 
 use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
 use crate::node::Node;
@@ -26,7 +26,11 @@ use crate::{ExprRef, NodeRef, Slice, StrRef, ValueRef};
 #[derive(Debug, Clone)]
 pub struct Plan {
     nodes: Vec<Node>,
+    /// Source ranges parallel to `nodes`.
+    node_spans: Vec<Span>,
     exprs: Vec<Expr>,
+    /// Source ranges parallel to `exprs`.
+    expr_spans: Vec<Span>,
     /// The type of `exprs[i]`, parallel and always the same length.
     types: Vec<LogicalType>,
     values: Vec<Value>,
@@ -63,7 +67,9 @@ impl Plan {
     pub(crate) fn without_nodes() -> Self {
         Self {
             nodes: Vec::new(),
+            node_spans: Vec::new(),
             exprs: Vec::new(),
+            expr_spans: Vec::new(),
             types: Vec::new(),
             values: Vec::new(),
             strings: Vec::new(),
@@ -105,13 +111,75 @@ impl Plan {
 
     /// Appends a node.
     pub fn add_node(&mut self, node: Node) -> NodeRef {
+        let span = node
+            .children()
+            .into_iter()
+            .flatten()
+            .map(|child| self.node_span(child))
+            .fold(Span::new(0, 0), merge_span);
+        self.add_node_at(node, span)
+    }
+
+    /// Appends a node with the source range that produced it.
+    pub fn add_node_at(&mut self, node: Node, span: Span) -> NodeRef {
+        self.node_spans.push(span);
         push(&mut self.nodes, node)
     }
 
     /// Appends an expression and the type it evaluates to.
     pub fn add_expr(&mut self, expr: Expr, ty: LogicalType) -> ExprRef {
+        let span = self.inferred_expr_span(&expr);
+        self.add_expr_at(expr, ty, span)
+    }
+
+    /// Appends an expression and its type with the source range that produced it.
+    pub fn add_expr_at(&mut self, expr: Expr, ty: LogicalType, span: Span) -> ExprRef {
         self.types.push(ty);
+        self.expr_spans.push(span);
         push(&mut self.exprs, expr)
+    }
+
+    fn inferred_expr_span(&self, expr: &Expr) -> Span {
+        let mut span = Span::new(0, 0);
+        let mut include = |reference: ExprRef| {
+            span = merge_span(span, self.expr_span(reference));
+        };
+        match *expr {
+            Expr::Column(_) | Expr::Constant(_) => {}
+            Expr::Cast { input, .. } => include(input),
+            Expr::Compare { left, right, .. } => {
+                include(left);
+                include(right);
+            }
+            Expr::Conjunction { children, .. } => {
+                for &child in self.expr_list(children) {
+                    include(child);
+                }
+            }
+            Expr::Function { args, .. } => {
+                for &arg in self.expr_list(args) {
+                    include(arg);
+                }
+            }
+            Expr::Aggregate { args, filter, .. } => {
+                for &arg in self.expr_list(args) {
+                    include(arg);
+                }
+                if let Some(filter) = filter {
+                    include(filter);
+                }
+            }
+            Expr::Case { arms, otherwise } => {
+                for arm in self.arm_list(arms) {
+                    include(arm.when);
+                    include(arm.then);
+                }
+                if let Some(otherwise) = otherwise {
+                    include(otherwise);
+                }
+            }
+        }
+        span
     }
 
     /// Appends a constant.
@@ -210,6 +278,18 @@ impl Plan {
     #[must_use]
     pub fn expr_type(&self, reference: ExprRef) -> &LogicalType {
         &self.types[reference as usize]
+    }
+
+    /// The source range carried by a node.
+    #[must_use]
+    pub fn node_span(&self, reference: NodeRef) -> Span {
+        self.node_spans[reference as usize]
+    }
+
+    /// The source range carried by an expression.
+    #[must_use]
+    pub fn expr_span(&self, reference: ExprRef) -> Span {
+        self.expr_spans[reference as usize]
     }
 
     /// The constant at `reference`.
@@ -345,6 +425,20 @@ impl Plan {
     /// If a pool has more than `u32::MAX` entries, which is the same bound every reference in the
     /// arena already carries.
     pub fn validate(&self) -> Result<()> {
+        if self.nodes.len() != self.node_spans.len() {
+            return Err(Error::internal(format!(
+                "the plan has {} nodes and {} node spans",
+                self.nodes.len(),
+                self.node_spans.len()
+            )));
+        }
+        if self.exprs.len() != self.expr_spans.len() {
+            return Err(Error::internal(format!(
+                "the plan has {} expressions and {} expression spans",
+                self.exprs.len(),
+                self.expr_spans.len()
+            )));
+        }
         if self.exprs.len() != self.types.len() {
             return Err(Error::internal(format!(
                 "the plan has {} expressions and {} types",
@@ -716,6 +810,14 @@ impl Plan {
 ///
 /// If the pool has more than `u32::MAX` entries, which is a plan of four billion nodes and is a
 /// bug somewhere upstream rather than a query anybody wrote.
+fn merge_span(left: Span, right: Span) -> Span {
+    match (left.is_empty(), right.is_empty()) {
+        (true, _) => right,
+        (_, true) => left,
+        (false, false) => Span::new(left.start.min(right.start), left.end.max(right.end)),
+    }
+}
+
 fn push<T>(pool: &mut Vec<T>, item: T) -> u32 {
     let index = u32::try_from(pool.len()).expect("a plan arena cannot hold four billion entries");
     pool.push(item);
@@ -745,6 +847,25 @@ mod tests {
         let plan = Plan::new();
         assert_eq!(*plan.node(plan.root()), Node::Dummy);
         plan.validate().expect("an empty plan is one row and no columns, which is legal");
+    }
+
+    #[test]
+    fn every_node_and_expression_carries_a_span_through_an_in_place_rewrite() {
+        let mut plan = Plan::new();
+        let expr = plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(7, 0)),
+            LogicalType::Integer,
+            Span::new(7, 12),
+        );
+        let node = plan
+            .add_node_at(Node::Filter { input: plan.root(), predicate: expr }, Span::new(0, 18));
+        let root = plan.root();
+        let exprs = plan.add_expr_list(&[expr]);
+        *plan.node_mut(node) = Node::Project { input: root, index: 9, exprs, names: Slice::EMPTY };
+        assert_eq!(plan.expr_span(expr), Span::new(7, 12));
+        assert_eq!(plan.node_span(node), Span::new(0, 18));
+        assert_eq!(plan.node_spans.len(), plan.nodes.len());
+        assert_eq!(plan.expr_spans.len(), plan.exprs.len());
     }
 
     #[test]

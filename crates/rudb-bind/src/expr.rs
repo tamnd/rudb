@@ -37,6 +37,13 @@ impl Binder<'_> {
         expr: ast::ExprRef,
         scope: &Scope,
     ) -> Result<ExprRef> {
+        let outer = std::mem::replace(&mut self.current_span, ast.expr_span(expr));
+        let result = self.bind_expr_inner(ast, expr, scope);
+        self.current_span = outer;
+        result
+    }
+
+    fn bind_expr_inner(&mut self, ast: &Ast, expr: ast::ExprRef, scope: &Scope) -> Result<ExprRef> {
         match ast.expr(expr) {
             ast::Expr::Star { .. } => {
                 Err(Error::binder(format!("* is not allowed in the {}", self.clause)))
@@ -87,7 +94,7 @@ impl Binder<'_> {
                 scope.len()
             )));
         };
-        let expr = self.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
+        let expr = self.add_expr(Expr::Column(column.binding), column.ty.clone());
         self.scalar_subqueries.push(PendingSubquery {
             node,
             kind: rudb_plan::JoinKind::Single,
@@ -104,18 +111,13 @@ impl Binder<'_> {
         negated: bool,
     ) -> Result<ExprRef> {
         let (node, _) = self.bind_isolated_subquery(ast, query)?;
-        let node = self.plan_mut().add_node(rudb_plan::Node::Limit {
-            input: node,
-            count: Some(1),
-            offset: 0,
-        });
+        let node = self.add_node(rudb_plan::Node::Limit { input: node, count: Some(1), offset: 0 });
         let index = self.fresh_index();
-        let marker = self.plan_mut().add_constant(Value::Boolean(true));
+        let marker = self.add_constant(Value::Boolean(true));
         let exprs = self.plan_mut().add_expr_list(&[marker]);
         let name = self.plan_mut().intern("exists");
         let names = self.plan_mut().add_name_list(&[name]);
-        let node =
-            self.plan_mut().add_node(rudb_plan::Node::Project { input: node, index, exprs, names });
+        let node = self.add_node(rudb_plan::Node::Project { input: node, index, exprs, names });
         let marker = self
             .plan_mut()
             .add_expr(Expr::Column(rudb_plan::ColumnBinding::new(index, 0)), LogicalType::Boolean);
@@ -173,7 +175,7 @@ impl Binder<'_> {
                  parameters, prepare the statement first, which is Connection::prepare",
             ));
         };
-        Ok(self.plan_mut().add_constant(value.clone()))
+        Ok(self.add_constant(value.clone()))
     }
 
     fn bind_column(&mut self, ast: &Ast, name: ast::Slice, scope: &Scope) -> Result<ExprRef> {
@@ -192,7 +194,7 @@ impl Binder<'_> {
         }
         let found = scope.resolve(&parts)?;
         let (binding, ty) = (found.binding, found.ty.clone());
-        Ok(self.plan_mut().add_expr(Expr::Column(binding), ty))
+        Ok(self.add_expr(Expr::Column(binding), ty))
     }
 
     fn bind_literal(&mut self, ast: &Ast, kind: LiteralKind, text: ast::StrRef) -> Result<ExprRef> {
@@ -203,7 +205,7 @@ impl Binder<'_> {
             LiteralKind::String | LiteralKind::Blob => Value::Varchar(ast.string(text).to_string()),
             LiteralKind::Number => number(ast.string(text), false)?,
         };
-        let constant = self.plan_mut().add_constant(value);
+        let constant = self.add_constant(value);
         // A blob literal is the text a blob prints as, so the cast that reads that text back is the
         // whole of the conversion, and the one that refuses `x'zz'` is the one that already refuses
         // `'\xzz'::BLOB`, in the same words. Per #329.
@@ -246,7 +248,7 @@ impl Binder<'_> {
                 return Err(Error::not_implemented("a list whose items are not all one type"));
             }
         }
-        Ok(self.plan_mut().add_constant(Value::List { element, values }))
+        Ok(self.add_constant(Value::List { element, values }))
     }
 
     fn bind_unary(
@@ -261,7 +263,7 @@ impl Binder<'_> {
         if op == UnaryOp::Negate {
             if let ast::Expr::Literal { kind: LiteralKind::Number, text } = ast.expr(operand) {
                 let value = number(ast.string(text), true)?;
-                return Ok(self.plan_mut().add_constant(value));
+                return Ok(self.add_constant(value));
             }
         }
         let bound = self.bind_expr(ast, operand, scope)?;
@@ -369,7 +371,7 @@ impl Binder<'_> {
         let returns = self.plan().expr_type(divisor).clone();
         let args = self.plan_mut().add_expr_list(&[divisor]);
         let name = self.plan_mut().intern("__rudb_zero_to_null");
-        self.plan_mut().add_expr(Expr::Function { name, args }, returns)
+        self.add_expr(Expr::Function { name, args }, returns)
     }
 
     /// Binds one of the regex operators to the ordinary regex function it means.
@@ -385,7 +387,7 @@ impl Binder<'_> {
         let name = if full { "regexp_full_match" } else { "regexp_matches" };
         let mut args = vec![left, right];
         if insensitive {
-            args.push(self.plan_mut().add_constant(Value::Varchar("i".to_string())));
+            args.push(self.add_constant(Value::Varchar("i".to_string())));
         }
         let matched = self.call(name, args)?;
         if negated { self.call("not", vec![matched]) } else { Ok(matched) }
@@ -437,7 +439,7 @@ impl Binder<'_> {
         if rudb_catalog::same_name(&written, "typeof") && bound.len() == 1 {
             self.over_aggregate(bound[0], scope)?;
             let named = self.plan().expr_type(bound[0]).to_string();
-            return Ok(self.plan_mut().add_constant(Value::Varchar(named)));
+            return Ok(self.add_constant(Value::Varchar(named)));
         }
         // `current_setting` is the other one the binder answers, and it has to be answered here
         // rather than by a kernel for a reason `typeof` does not have: its declared return type is
@@ -510,7 +512,7 @@ impl Binder<'_> {
         let fallback =
             fallback.map(|expr| self.checked_cast_to(expr, &result, false)).transpose()?;
         let arms = self.plan_mut().add_arms(&bound);
-        Ok(self.plan_mut().add_expr(Expr::Case { arms, otherwise: fallback }, result))
+        Ok(self.add_expr(Expr::Case { arms, otherwise: fallback }, result))
     }
 
     fn bind_between(
@@ -610,24 +612,20 @@ impl Binder<'_> {
         };
         let candidate_type = column.ty.clone();
         let candidate_name = column.name.clone();
-        let source = self.plan_mut().add_expr(Expr::Column(column.binding), candidate_type.clone());
-        let marker_value = self.plan_mut().add_constant(Value::Boolean(true));
+        let source = self.add_expr(Expr::Column(column.binding), candidate_type.clone());
+        let marker_value = self.add_constant(Value::Boolean(true));
         let projected = self.fresh_index();
         let exprs = self.plan_mut().add_expr_list(&[source, marker_value]);
         let candidate_name = self.plan_mut().intern(&candidate_name);
         let marker_name = self.plan_mut().intern("mark");
         let names = self.plan_mut().add_name_list(&[candidate_name, marker_name]);
-        let node = self.plan_mut().add_node(rudb_plan::Node::Project {
-            input: node,
-            index: projected,
-            exprs,
-            names,
-        });
+        let node =
+            self.add_node(rudb_plan::Node::Project { input: node, index: projected, exprs, names });
         let candidate = self
             .plan_mut()
             .add_expr(Expr::Column(rudb_plan::ColumnBinding::new(projected, 0)), candidate_type);
         let condition = self.compare(comparison, subject, candidate)?;
-        let marker = self.plan_mut().add_expr(
+        let marker = self.add_expr(
             Expr::Column(rudb_plan::ColumnBinding::new(projected, 1)),
             LogicalType::Boolean,
         );
@@ -671,7 +669,7 @@ impl Binder<'_> {
         let returns = self.narrowed_part(resolved.name, &cast, resolved.returns);
         let args = self.plan_mut().add_expr_list(&cast);
         let name = self.plan_mut().intern(stored_name.unwrap_or(resolved.name));
-        Ok(self.plan_mut().add_expr(Expr::Function { name, args }, returns))
+        Ok(self.add_expr(Expr::Function { name, args }, returns))
     }
 
     /// The value of the setting a constant names, folded into the plan.
@@ -704,7 +702,7 @@ impl Binder<'_> {
             })?),
             _ => Value::Varchar(text.to_string()),
         };
-        Ok(Some(self.plan_mut().add_constant(value)))
+        Ok(Some(self.add_constant(value)))
     }
 
     /// The answer type of a `date_part`, which is the one call whose type comes from the value of
@@ -733,7 +731,7 @@ impl Binder<'_> {
         if self.plan().expr_type(expr) == ty {
             return expr;
         }
-        self.plan_mut().add_expr(Expr::Cast { input: expr, try_cast: false }, ty.clone())
+        self.add_expr(Expr::Cast { input: expr, try_cast: false }, ty.clone())
     }
 
     /// A cast checked against the session choices that can forbid a conversion.
@@ -755,7 +753,7 @@ impl Binder<'_> {
         if from == ty {
             return Ok(expr);
         }
-        Ok(self.plan_mut().add_expr(Expr::Cast { input: expr, try_cast }, ty.clone()))
+        Ok(self.add_expr(Expr::Cast { input: expr, try_cast }, ty.clone()))
     }
 
     /// A comparison, with both sides brought to the type they meet at.
@@ -774,7 +772,7 @@ impl Binder<'_> {
         })?;
         let left = self.checked_cast_to(left, &common, false)?;
         let right = self.checked_cast_to(right, &common, false)?;
-        Ok(self.plan_mut().add_expr(Expr::Compare { op, left, right }, LogicalType::Boolean))
+        Ok(self.add_expr(Expr::Compare { op, left, right }, LogicalType::Boolean))
     }
 
     /// An `AND` or an `OR`, flattened into any child that uses the same connective.
@@ -789,11 +787,11 @@ impl Binder<'_> {
             }
         }
         match flat.as_slice() {
-            [] => self.plan_mut().add_constant(Value::Boolean(op == ConjunctionOp::And)),
+            [] => self.add_constant(Value::Boolean(op == ConjunctionOp::And)),
             [only] => *only,
             _ => {
                 let children = self.plan_mut().add_expr_list(&flat);
-                self.plan_mut().add_expr(Expr::Conjunction { op, children }, LogicalType::Boolean)
+                self.add_expr(Expr::Conjunction { op, children }, LogicalType::Boolean)
             }
         }
     }
@@ -814,13 +812,13 @@ impl Binder<'_> {
     }
 
     fn against_null(&mut self, op: CompareOp, expr: ExprRef) -> Result<ExprRef> {
-        let null = self.plan_mut().add_constant(Value::Null);
+        let null = self.add_constant(Value::Null);
         self.compare(op, expr, null)
     }
 
     fn against_boolean(&mut self, op: CompareOp, expr: ExprRef, wanted: bool) -> Result<ExprRef> {
         let condition = self.as_boolean(expr, "IS")?;
-        let constant = self.plan_mut().add_constant(Value::Boolean(wanted));
+        let constant = self.add_constant(Value::Boolean(wanted));
         self.compare(op, condition, constant)
     }
 }

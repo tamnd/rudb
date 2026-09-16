@@ -17,6 +17,8 @@
 //! so the code reads a node out by value first. Nodes are small and `Copy`, so that is a register
 //! move.
 
+use rudb_common::Span;
+
 use crate::matcher::NONE;
 
 /// A run of items in one of the side vectors.
@@ -830,10 +832,14 @@ pub struct Ast {
     pub statements: Vec<Statement>,
     /// The query arena.
     pub queries: Vec<Query>,
+    /// Source ranges parallel to `queries`.
+    pub query_spans: Vec<Span>,
     /// The select arena.
     pub selects: Vec<Select>,
     /// The expression arena.
     pub exprs: Vec<Expr>,
+    /// Source ranges parallel to `exprs`.
+    pub expr_spans: Vec<Span>,
     /// The from-item arena.
     pub sources: Vec<Source>,
     /// Interned text. Identifiers keep the case they were written in, because DuckDB does not fold
@@ -870,6 +876,16 @@ pub struct Ast {
 }
 
 impl Ast {
+    /// The source range of an expression.
+    pub fn expr_span(&self, expr: ExprRef) -> Span {
+        self.expr_spans[expr as usize]
+    }
+
+    /// The source range of a query.
+    pub fn query_span(&self, query: QueryRef) -> Span {
+        self.query_spans[query as usize]
+    }
+
     /// The text behind a [`StrRef`], or the empty string for `NONE`.
     pub fn string(&self, index: StrRef) -> &str {
         if index == NONE { "" } else { &self.strings[index as usize] }
