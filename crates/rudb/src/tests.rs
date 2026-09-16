@@ -2230,6 +2230,33 @@ fn correlated_scalar_aggregates_use_an_outer_domain_for_arbitrary_predicates() {
 }
 
 #[test]
+fn correlated_aggregate_arguments_replay_over_the_outer_domain() {
+    let db = database();
+    let sql = "SELECT k, (SELECT count(o.k) FROM (VALUES (10), (20)) i(x)) FROM (VALUES (1), (NULL)) o(k) ORDER BY k NULLS LAST";
+    assert_eq!(
+        rows(&db, sql),
+        vec![vec![Value::Integer(1), Value::BigInt(2)], vec![Value::Null, Value::BigInt(0)],]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k, (SELECT sum(o.k) FROM (VALUES (10), (20)) i(x)) FROM (VALUES (1), (NULL)) o(k) ORDER BY k NULLS LAST"
+        ),
+        vec![vec![Value::Integer(1), Value::HugeInt(2)], vec![Value::Null, Value::Null],]
+    );
+    db.execute("CREATE TABLE empty_aggregate_source(x INTEGER)")
+        .expect("the empty aggregate source is created");
+    assert_eq!(
+        rows(&db, "SELECT (SELECT count(o.k) FROM empty_aggregate_source) FROM (VALUES (1)) o(k)"),
+        vec![vec![Value::BigInt(0)]]
+    );
+    let plan = db.plan(sql).expect("the correlated aggregate argument plans");
+    assert!(plan.contains("Join LEFT"), "{plan}");
+    assert!(plan.contains("IS NOT DISTINCT FROM"), "{plan}");
+    assert!(!plan.contains("DependentJoin"), "{plan}");
+}
+
+#[test]
 fn uncorrelated_exists_is_a_single_joined_marker() {
     let db = database();
     let answer = db.query("SELECT EXISTS (SELECT 1)").expect("EXISTS answers");
