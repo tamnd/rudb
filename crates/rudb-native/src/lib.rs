@@ -504,6 +504,7 @@ impl Writer {
                 return Err(invalid("column page checksum differs while building frequencies"));
             }
             let vector = decode(ty, stripe.rows, &bytes, None)?;
+            // row at a time: frequency construction visits decoded values to update bounded candidates.
             for row in 0..stripe.rows {
                 let value = if vector.is_null_at(row) {
                     FrequencyValue::Null
@@ -1315,6 +1316,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
                         return Err(invalid("frequency entry count exceeds its bound"));
                     }
                     let mut entries = Vec::with_capacity(count);
+                    // row at a time: directory decoding validates each persisted bounded frequency entry.
                     for _ in 0..count {
                         let value = match cur.u8()? {
                             0 => FrequencyValue::Null,
