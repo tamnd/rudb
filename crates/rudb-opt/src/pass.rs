@@ -103,19 +103,23 @@ impl Context {
     /// For a name that is not an optimizer anywhere.
     pub fn disable(&mut self, name: &str) -> Result<()> {
         let name = name.to_ascii_lowercase();
-        if !crate::UPSTREAM.contains(&name.as_str()) {
+        let local = crate::PASSES.iter().find(|pass| pass.name() == name);
+        if !crate::UPSTREAM.contains(&name.as_str()) && local.is_none() {
             // Every accepted name rather than the closest one by edit distance, which is what the
             // binary prints. Listing a set that is not the set the caller may choose from would be
             // worse than listing a long one, and the accepted set is now the same forty four either
             // engine takes.
-            let known: Vec<String> =
-                crate::UPSTREAM.iter().map(|known| format!("\"{known}\"")).collect();
+            let mut names = crate::UPSTREAM.to_vec();
+            names.extend(crate::PASSES.iter().map(|pass| pass.name()));
+            names.sort_unstable();
+            names.dedup();
+            let known: Vec<String> = names.iter().map(|known| format!("\"{known}\"")).collect();
             return Err(Error::parser(format!(
                 "Optimizer type \"{name}\" not recognized\n\nCandidate optimizers: {}",
                 known.join(", ")
             )));
         }
-        let Some(found) = crate::PASSES.iter().find(|pass| pass.name() == name) else {
+        let Some(found) = local else {
             return Ok(());
         };
         if !self.is_disabled(&name) {
