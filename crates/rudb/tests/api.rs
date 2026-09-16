@@ -16,14 +16,18 @@ fn a_database_opens_by_name_and_two_spellings_mean_memory() {
 }
 
 #[test]
-fn a_file_name_says_what_is_missing_rather_than_quietly_being_a_memory_database() {
-    // A program that opened a file and wrote to it would be told nothing until it came back looking
-    // for its data, which is the worst moment to find out.
-    let error = Database::open("/tmp/whatever.rudb").expect_err("there is no storage format yet");
-    let message = error.message().to_string();
-    assert!(message.contains("/tmp/whatever.rudb"), "{message}");
-    assert!(message.contains("storage format"), "{message}");
-    assert!(message.contains("issues/103"), "{message}");
+fn a_file_name_opens_a_native_database() {
+    let path = std::env::temp_dir().join(format!("rudb-api-open-{}.rudb", std::process::id()));
+    let database = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("a file name starts a native database");
+    database.execute("CREATE TABLE t (a INTEGER)").expect("creates");
+    database.execute("INSERT INTO t VALUES (1), (2), (3)").expect("inserts");
+    database.execute("CHECKPOINT").expect("commits");
+    drop(database);
+    let reopened = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the native database reopens");
+    assert_eq!(reopened.value("SELECT sum(a) FROM t").expect("reads"), Value::HugeInt(6));
+    std::fs::remove_file(path).expect("removes the temporary database");
 }
 
 #[test]

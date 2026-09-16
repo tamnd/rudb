@@ -290,6 +290,7 @@ impl<'a> Transform<'a> {
             "SetStatement" => self.set_statement(inner),
             "ResetStatement" => self.reset_statement(inner),
             "ExplainStatement" => self.explain_statement(inner),
+            "CheckpointStatement" => Ok(Statement::Checkpoint),
             _ => self.unsupported(inner),
         }
     }
@@ -2951,6 +2952,7 @@ mod tests {
                 };
                 format!("RESET{scope} {}", ast.string(setting.name))
             }
+            Statement::Checkpoint => "CHECKPOINT".to_string(),
             Statement::Explain { query, analyze } => {
                 let analyze = if analyze { "ANALYZE " } else { "" };
                 format!("EXPLAIN {analyze}{}", show_query(&ast, query))

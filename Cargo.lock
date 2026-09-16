@@ -21,6 +21,7 @@ dependencies = [
  "rudb-io",
  "rudb-kernels",
  "rudb-metrics",
+ "rudb-native",
  "rudb-opt",
  "rudb-parse",
  "rudb-pipeline",
@@ -65,6 +66,7 @@ version = "0.3.20"
 dependencies = [
  "rudb-common",
  "rudb-functions",
+ "rudb-native",
  "rudb-storage",
  "rudb-txn",
  "rudb-vector",
@@ -232,6 +234,14 @@ name = "rudb-metrics"
 version = "0.3.20"
 dependencies = [
  "rudb-common",
+]
+
+[[package]]
+name = "rudb-native"
+version = "0.3.20"
+dependencies = [
+ "rudb-common",
+ "rudb-vector",
 ]
 
 [[package]]
