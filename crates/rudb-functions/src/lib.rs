@@ -40,8 +40,8 @@ pub use signature::{
 };
 pub use table::{
     Columns, FILE_ROW_NUMBER, ResolvedTable, TableFunction, database_size_fields, extension_fields,
-    keyword_categories, keyword_fields, optimizer_fields, platform_fields, resolve_table, series,
-    series_length, strategy_fields, user_agent_fields, version_fields,
+    keyword_categories, keyword_fields, optimizer_fields, platform_fields, resolve_pragma,
+    resolve_table, series, series_length, strategy_fields, user_agent_fields, version_fields,
 };
 pub use typecatalog::{
     Signature, TYPE_NAMES, TypeEntry, representative, sort_key, type_category, type_fields,

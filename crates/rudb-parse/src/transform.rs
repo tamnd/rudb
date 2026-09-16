@@ -289,6 +289,7 @@ impl<'a> Transform<'a> {
             "InsertStatement" => self.insert_statement(inner),
             "SetStatement" => self.set_statement(inner),
             "ResetStatement" => self.reset_statement(inner),
+            "PragmaStatement" => self.pragma_statement(inner),
             "ExplainStatement" => self.explain_statement(inner),
             "CheckpointStatement" => Ok(Statement::Checkpoint),
             _ => self.unsupported(inner),
@@ -354,6 +355,97 @@ impl<'a> Transform<'a> {
         let index = self.ast.settings.len() as u32;
         self.ast.settings.push(Setting { name, scope, value: NONE });
         Ok(Statement::Reset(index))
+    }
+
+    /// `PragmaStatement <- 'PRAGMA' PragmaAssignOrFunction`, which is two statements in one word.
+    ///
+    /// `PRAGMA memory_limit = '1GB'` is a `SET` with a different spelling and nothing else, so it
+    /// lands on the same [`Statement::Set`] and the same setting arena entry. The scope is
+    /// unwritten because the grammar has no room for one here, which is the same thing as a plain
+    /// `SET` with no scope word.
+    ///
+    /// `PRAGMA version` is a query. Upstream rewrites it to `SELECT * FROM pragma_version()` and
+    /// gives that away in its own error messages, which print the rewritten call back, so the
+    /// rewrite happens here rather than being a statement kind the planner has to know about. The
+    /// whole family comes out of it for free: an unknown pragma is the catalog's complaint, a bad
+    /// argument is the function's, and the answer is a relation like any other.
+    fn pragma_statement(&mut self, node: u32) -> Result<Statement> {
+        let inner = self.first(self.find(node, "PragmaAssignOrFunction"));
+        match self.name(inner) {
+            "PragmaAssign" => self.pragma_assign(inner),
+            "PragmaFunction" => self.pragma_function(inner),
+            _ => self.unsupported(inner),
+        }
+    }
+
+    /// `PragmaAssign <- SettingName '=' VariableList`, which is a `SET` and is treated as one.
+    fn pragma_assign(&mut self, node: u32) -> Result<Statement> {
+        let name = self.identifier(self.find(node, "SettingName"));
+        let list = self.find(node, "VariableList");
+        let mut values = Vec::new();
+        for kid in self.kids(list) {
+            values.push(self.expr(kid)?);
+        }
+        // The same refusal `set_statement` makes about a list, for the same reason. Nothing here
+        // reads one and taking the first of several would be worse than saying so.
+        let [value] = values[..] else {
+            return self.unsupported(list);
+        };
+        let index = self.ast.settings.len() as u32;
+        self.ast.settings.push(Setting { name, scope: Scope::Unwritten, value });
+        Ok(Statement::Set(index))
+    }
+
+    /// `PragmaFunction <- PragmaName PragmaParameters?`, rewritten into the call it stands for.
+    ///
+    /// The name is written without the prefix and the function carries it, so `PRAGMA table_info`
+    /// is `pragma_table_info`. The case the user wrote is kept rather than folded, because the name
+    /// goes back out in the message about a pragma that does not exist and upstream prints that
+    /// name back as it was typed.
+    ///
+    /// `PRAGMA version()` with empty parentheses is a parser error rather than a call, on both
+    /// engines, and that falls out of the grammar here without anything being done about it:
+    /// `PragmaParameters` is `Parens(List(Expression))` and a list of no expressions does not match.
+    fn pragma_function(&mut self, node: u32) -> Result<Statement> {
+        let interned = self.identifier(self.find(node, "PragmaName"));
+        let written = self.ast.string(interned).to_string();
+        let part = self.intern(&format!("pragma_{written}"));
+        let name = self.part_slice(vec![part]);
+        // The parameters are optional in the rule, so `PRAGMA version` has no node here at all
+        // rather than a node covering nothing.
+        let parameters = self.find(node, "PragmaParameters");
+        let mut args = Vec::new();
+        if parameters != NONE {
+            for kid in self.kids(parameters) {
+                let expr = self.expr(kid)?;
+                args.push(Target { expr: self.quoted(expr), alias: NONE });
+            }
+        }
+        let args = self.target_slice(args);
+        let source = self.push_source(Source::Function {
+            name,
+            args,
+            alias: NONE,
+            columns: Slice::default(),
+            pragma: true,
+        });
+        Ok(Statement::Query(self.star_over(source)))
+    }
+
+    /// A bare name in a pragma's parentheses is the name of a thing and not a column reference.
+    ///
+    /// `PRAGMA table_info(t)` and `PRAGMA table_info('t')` are the same statement on the pin, and
+    /// so are `PRAGMA table_info(s.u)` and `PRAGMA table_info('s.u')`, because there is no `FROM`
+    /// clause here for a column to come out of. Only a name is turned: `PRAGMA table_info(1)` stays
+    /// an integer and is told there is no overload that takes one, which is what the pin says too.
+    fn quoted(&mut self, expr: ExprRef) -> ExprRef {
+        let Expr::Column { name } = self.ast.exprs[expr as usize] else {
+            return expr;
+        };
+        let written: Vec<&str> = self.ast.name(name).collect();
+        let joined = written.join(".");
+        let text = self.intern(&joined);
+        self.push(Expr::Literal { kind: LiteralKind::String, text })
     }
 
     /// `SetVariableOrSetting <- SetVariable / SetSetting`, where the setting carries a scope word.
@@ -1191,7 +1283,7 @@ impl<'a> Transform<'a> {
                 }
                 let args = self.target_slice(args);
                 let (alias, columns) = self.table_alias(self.find(form, "TableAlias"));
-                Ok(self.push_source(Source::Function { name, args, alias, columns }))
+                Ok(self.push_source(Source::Function { name, args, alias, columns, pragma: false }))
             }
             "ValuesRef" => {
                 if self.find(inner, "TableAliasColon") != NONE {
@@ -3872,6 +3964,42 @@ mod tests {
             let error = parse_ast(query).unwrap_err().to_string();
             assert!(error.contains("grammar rule"), "{query} failed with {error}");
         }
+    }
+
+    #[test]
+    fn a_pragma_is_the_call_it_stands_for_by_the_time_it_leaves_here() {
+        assert_eq!(round("PRAGMA version"), "SELECT * FROM pragma_version()");
+        assert_eq!(round("PRAGMA database_size"), "SELECT * FROM pragma_database_size()");
+        // The case the user wrote survives, because the name goes back out in the message about a
+        // pragma that does not exist and the pin prints it back as it was typed.
+        assert_eq!(round("PRAGMA VERSION"), "SELECT * FROM pragma_VERSION()");
+        assert_eq!(round("PRAGMA table_info('t')"), "SELECT * FROM pragma_table_info('t')");
+    }
+
+    #[test]
+    fn a_bare_name_in_a_pragmas_parentheses_is_a_name_and_not_a_column() {
+        // There is no FROM clause here for a column to come out of, so both spellings have to
+        // arrive as the same string, and a qualified one has to arrive as one string and not two.
+        assert_eq!(round("PRAGMA table_info(t)"), "SELECT * FROM pragma_table_info('t')");
+        assert_eq!(round("PRAGMA table_info(main.t)"), "SELECT * FROM pragma_table_info('main.t')");
+        assert_eq!(round("PRAGMA table_info(\"T\")"), "SELECT * FROM pragma_table_info('T')");
+        // Anything that is not a name is left alone, so the binder is the one that says there is
+        // no overload taking an integer rather than a table called 1 being looked for.
+        assert_eq!(round("PRAGMA table_info(1)"), "SELECT * FROM pragma_table_info(1)");
+    }
+
+    #[test]
+    fn a_pragma_with_an_equals_sign_is_a_set_and_nothing_else() {
+        assert_eq!(round_statement("PRAGMA memory_limit = '1GB'"), "SET memory_limit = '1GB'");
+        assert_eq!(round_statement("PRAGMA threads = 4"), "SET threads = 4");
+    }
+
+    #[test]
+    fn a_pragma_with_empty_parentheses_does_not_parse_on_either_engine() {
+        // The rule is `PragmaParameters <- Parens(List(Expression))` and a list of no expressions
+        // does not match, which is where the pin's parser error comes from as well.
+        let error = parse_ast("PRAGMA version()").unwrap_err().to_string();
+        assert!(error.contains("syntax error at or near \")\""), "{error}");
     }
 
     #[test]

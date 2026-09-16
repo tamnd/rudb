@@ -16,7 +16,7 @@ use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
 use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Given, TableFunction, csv_fields, csv_given, files, is_file,
-    is_pattern, parquet_fields, resolve, resolve_table,
+    is_pattern, parquet_fields, resolve, resolve_pragma, resolve_table,
 };
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, identifier_parts, parse_ast};
@@ -935,8 +935,8 @@ impl<'a> Binder<'a> {
             ast::Source::Table { name, alias, columns } => {
                 self.bind_table(ast, name, alias, columns)
             }
-            ast::Source::Function { name, args, alias, columns } => {
-                self.bind_table_function(ast, name, args, alias, columns)
+            ast::Source::Function { name, args, alias, columns, pragma } => {
+                self.bind_table_function(ast, name, args, alias, columns, pragma)
             }
             ast::Source::Subquery { query, alias, columns } => {
                 let (node, mut scope) = self.bind_query(ast, query)?;
@@ -1100,6 +1100,7 @@ impl<'a> Binder<'a> {
         args: ast::Slice,
         alias: ast::StrRef,
         columns: ast::Slice,
+        pragma: bool,
     ) -> Result<(NodeRef, Scope)> {
         let parts: Vec<&str> = ast.name(name).collect();
         // A qualified call names a schema, and the two schemas that exist are the ones every
@@ -1118,6 +1119,20 @@ impl<'a> Binder<'a> {
         // not a table function says that, rather than reporting whatever is wrong with the
         // arguments of a function that was never going to exist.
         let Some(called) = TableFunction::lookup(function_name) else {
+            if pragma {
+                // `PRAGMA database_list` is a view upstream and not a function, and the pragma
+                // namespace holds both, so a name that is not a function gets one more look in the
+                // catalog before it is turned down. It has to be the no argument form: a view
+                // takes none, and `pragma_database_list()` with parentheses is a missing function
+                // on the pin too.
+                if args.is_empty() && self.catalog.resolve(&parts).is_ok() {
+                    return self.bind_table(ast, name, alias, columns);
+                }
+                let spelled = function_name.strip_prefix("pragma_").unwrap_or(function_name);
+                return Err(Error::catalog(format!(
+                    "Pragma Function with name {spelled} does not exist!"
+                )));
+            }
             return Err(Error::catalog(format!(
                 "Table Function with name {function_name} does not exist!"
             )));
@@ -1144,7 +1159,11 @@ impl<'a> Binder<'a> {
         // different answer from `read_parquet('3')` and only the types tell them apart.
         let given: Vec<LogicalType> =
             bound.iter().map(|&expr| self.plan.expr_type(expr).clone()).collect();
-        let resolved = resolve_table(function_name, &given)?;
+        let resolved = if pragma {
+            resolve_pragma(function_name, &given)?
+        } else {
+            resolve_table(function_name, &given)?
+        };
         let mut cast: Vec<ExprRef> = bound
             .iter()
             .zip(&resolved.arguments)
