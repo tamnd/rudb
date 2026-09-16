@@ -131,7 +131,7 @@ impl Tables {
                     set.extend(&self.of(plan, child));
                 }
             }
-            Expr::Aggregate { args, filter, .. } => {
+            Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
                 for arg in plan.expr_list(args).to_vec() {
                     set.extend(&self.of(plan, arg));
                 }
@@ -177,6 +177,10 @@ fn collect(plan: &Plan, at: NodeRef, set: &mut TableSet) {
         | Node::TableFetch { index, .. }
         | Node::Aggregate { index, .. }
         | Node::SetOp { index, .. } => set.insert(index),
+        Node::Window { input, index, .. } => {
+            collect(plan, input, set);
+            set.insert(index);
+        }
         Node::Dummy => {}
         Node::Filter { input, .. }
         | Node::Sort { input, .. }

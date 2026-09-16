@@ -1207,7 +1207,7 @@ fn find_column_expr(plan: &Plan, expr: ExprRef, wanted: ColumnBinding) -> Option
         Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
             plan.expr_list(children).iter().find_map(|&child| find_column_expr(plan, child, wanted))
         }
-        Expr::Aggregate { args, filter, .. } => plan
+        Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => plan
             .expr_list(args)
             .iter()
             .chain(filter.iter())

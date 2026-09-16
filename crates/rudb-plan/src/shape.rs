@@ -32,8 +32,8 @@
 //! The root of the plan produces into pipeline 0. Walking down from there, a node inherits the
 //! pipeline of its parent, except that
 //!
-//! - an aggregate, a sort, a top n and a distinct are sinks, so the node and everything under it
-//!   are a new pipeline that the parent's waits for,
+//! - an aggregate, a window, a sort, a top n and a distinct are sinks, so the node and everything
+//!   under it are a new pipeline that the parent's waits for,
 //! - a join and a set operation are two, the side that is gathered first and the side that reads
 //!   it, with the second waiting for the first and the parent's waiting for the second,
 //! - a cross product keeps its left side and itself in the parent's pipeline, because the product
@@ -193,6 +193,7 @@ impl Shape {
         let operator = self.number();
         match *plan.node(node) {
             Node::Aggregate { input, .. }
+            | Node::Window { input, .. }
             | Node::Sort { input, .. }
             | Node::TopN { input, .. }
             | Node::Distinct { input, .. } => {

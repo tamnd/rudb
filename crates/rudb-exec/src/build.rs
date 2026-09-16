@@ -1054,6 +1054,9 @@ impl<'a> Building<'a, '_> {
                     "a dependent join reached execution before subquery unnesting",
                 ));
             }
+            Node::Window { .. } => {
+                return Err(Error::not_implemented("window execution"));
+            }
         };
         Ok(segment)
     }

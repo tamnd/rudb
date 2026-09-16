@@ -71,9 +71,9 @@ fn form<W: Write>(plan: &Plan, out: &mut W, expr: ExprRef, schema: &Schema) -> f
             }
             out.write_char(')')
         }
-        Expr::Function { name, args } | Expr::Aggregate { name, args, .. } => {
-            call(plan, out, plan.string(name), args, schema)
-        }
+        Expr::Function { name, args }
+        | Expr::Aggregate { name, args, .. }
+        | Expr::Window { name, args, .. } => call(plan, out, plan.string(name), args, schema),
         Expr::Case { arms, otherwise } => {
             out.write_str("CASE")?;
             for arm in plan.arm_list(arms) {

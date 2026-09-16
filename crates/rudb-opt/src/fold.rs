@@ -201,6 +201,44 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
                 _ => unreachable!("the node was an aggregate a moment ago"),
             }
         }
+        Node::Window { partition, order, frame, expressions, .. } => {
+            let rewritten_partition = expr_list(plan, partition, done);
+            let rewritten_expressions = expr_list(plan, expressions, done);
+            let held_order = plan.sort_key_list(order).to_vec();
+            let rewritten_order: Vec<SortKey> = held_order
+                .iter()
+                .map(|key| SortKey { expr: expression(plan, key.expr, done), ..*key })
+                .collect();
+            let order =
+                (rewritten_order != held_order).then(|| plan.add_sort_keys(&rewritten_order));
+            let rewrite_bound = |plan: &mut Plan, bound, done: &mut Done| match bound {
+                rudb_plan::WindowBound::Preceding(offset) => {
+                    rudb_plan::WindowBound::Preceding(expression(plan, offset, done))
+                }
+                rudb_plan::WindowBound::Following(offset) => {
+                    rudb_plan::WindowBound::Following(expression(plan, offset, done))
+                }
+                other => other,
+            };
+            let start = rewrite_bound(plan, frame.start, done);
+            let end = rewrite_bound(plan, frame.end, done);
+            match plan.node_mut(node) {
+                Node::Window { partition, order: held_order, frame, expressions, .. } => {
+                    if let Some(rewritten) = rewritten_partition {
+                        *partition = rewritten;
+                    }
+                    if let Some(rewritten) = order {
+                        *held_order = rewritten;
+                    }
+                    frame.start = start;
+                    frame.end = end;
+                    if let Some(rewritten) = rewritten_expressions {
+                        *expressions = rewritten;
+                    }
+                }
+                _ => unreachable!("the node was a window a moment ago"),
+            }
+        }
         Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
             let held = plan.sort_key_list(keys).to_vec();
             let rewritten: Vec<SortKey> = held

@@ -178,6 +178,25 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             filter(plan, above, stay)
         }
 
+        // A window sees the rows before a filter above it. Moving that filter below changes the
+        // partition, the peer groups, and every frame, so the boundary is absolute.
+        Node::Window { input, index, partition, order, frame, expressions } => {
+            let rebuilt = node(plan, input, Vec::new(), tables);
+            let above = if rebuilt == input {
+                at
+            } else {
+                plan.add_node(Node::Window {
+                    input: rebuilt,
+                    index,
+                    partition,
+                    order,
+                    frame,
+                    expressions,
+                })
+            };
+            filter(plan, above, pending)
+        }
+
         // Neither of these introduces a table index, so a predicate written against what comes out
         // is already written against what goes in.
         Node::Sort { input, keys } => {

@@ -105,6 +105,19 @@ pub enum Expr {
         /// The `FILTER (WHERE ...)` predicate, if there is one.
         filter: Option<ExprRef>,
     },
+    /// A window function, evaluated by the [`Node::Window`](crate::Node::Window) that lists it.
+    Window {
+        /// The resolved scalar, aggregate, or dedicated window function name.
+        name: StrRef,
+        /// Function arguments over the window input.
+        args: Slice,
+        /// Whether duplicate argument tuples are collapsed first.
+        distinct: bool,
+        /// An aggregate filter, when the window call has one.
+        filter: Option<ExprRef>,
+        /// Whether null arguments are skipped by functions that support the modifier.
+        ignore_nulls: bool,
+    },
     /// A searched `CASE`.
     ///
     /// There is no simple `CASE` here. `CASE x WHEN 1 THEN ...` is rewritten to the searched form

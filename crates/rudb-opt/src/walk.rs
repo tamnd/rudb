@@ -68,6 +68,7 @@ pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
         Node::Filter { input, .. }
         | Node::Project { input, .. }
         | Node::Aggregate { input, .. }
+        | Node::Window { input, .. }
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
         | Node::TopN { input, .. }
@@ -158,6 +159,20 @@ pub(crate) fn rebuild(
                 )
             }
         }
+        Expr::Window { name, args, distinct, filter, ignore_nulls } => {
+            let rewritten_args = list(plan, args, child);
+            let rewritten_filter = filter.map(|inner| child(plan, inner));
+            if rewritten_args.is_none() && rewritten_filter == filter {
+                expr
+            } else {
+                let args = rewritten_args.unwrap_or(args);
+                plan.add_expr_at(
+                    Expr::Window { name, args, distinct, filter: rewritten_filter, ignore_nulls },
+                    ty,
+                    span,
+                )
+            }
+        }
         Expr::Case { arms, otherwise } => {
             let held = plan.arm_list(arms).to_vec();
             let rewritten: Vec<Arm> = held
@@ -204,7 +219,7 @@ pub(crate) fn columns(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ColumnB
                 columns(plan, child, found);
             }
         }
-        Expr::Aggregate { args, filter, .. } => {
+        Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
             for &arg in plan.expr_list(args) {
                 columns(plan, arg, found);
             }
@@ -242,7 +257,7 @@ pub(crate) fn volatile(plan: &Plan, expr: ExprRef) -> bool {
         Expr::Function { name, args } => {
             VOLATILE.contains(&plan.string(name)) || any_volatile(plan, args)
         }
-        Expr::Aggregate { args, filter, .. } => {
+        Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
             any_volatile(plan, args) || filter.is_some_and(|inner| volatile(plan, inner))
         }
         Expr::Case { arms, otherwise } => {
@@ -271,18 +286,16 @@ fn any_volatile(plan: &Plan, slice: Slice) -> bool {
 /// aggregate is safe to copy and is not elementwise, so a pass that moves a copy of an expression
 /// has to ask both. [`volatile`] is the other one.
 ///
-/// It is false for an aggregate today and that is the whole of the list, because an aggregate is
-/// the only expression rudb has whose value reads more than one row. A window function is the next
-/// one and there is none yet. The binder puts every aggregate in a [`Node::Aggregate`] rather than
-/// leaving one in a projection, so nothing a query produces today can make this false, and it is
-/// asked anyway: the first pass to believe the invariant without checking it is the pass that
-/// pushes a filter through a window function and answers the wrong query.
+/// It is false for aggregates and window functions, because both read more than one row. The binder
+/// puts either one in its dedicated operator rather than leaving it in a projection, and the check
+/// remains here because a pass that treats a window expression as elementwise can push a filter
+/// through it and answer the wrong query.
 ///
 /// [`Node::Aggregate`]: rudb_plan::Node::Aggregate
 pub(crate) fn elementwise(plan: &Plan, expr: ExprRef) -> bool {
     match *plan.expr(expr) {
         Expr::Column(_) | Expr::Constant(_) => true,
-        Expr::Aggregate { .. } => false,
+        Expr::Aggregate { .. } | Expr::Window { .. } => false,
         Expr::Cast { input, .. } => elementwise(plan, input),
         Expr::Compare { left, right, .. } => elementwise(plan, left) && elementwise(plan, right),
         Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
@@ -315,7 +328,7 @@ fn all_elementwise(plan: &Plan, slice: Slice) -> bool {
 pub(crate) fn constant(plan: &Plan, expr: ExprRef) -> bool {
     match *plan.expr(expr) {
         Expr::Constant(_) => true,
-        Expr::Column(_) | Expr::Aggregate { .. } => false,
+        Expr::Column(_) | Expr::Aggregate { .. } | Expr::Window { .. } => false,
         Expr::Cast { input, .. } => constant(plan, input),
         Expr::Compare { left, right, .. } => constant(plan, left) && constant(plan, right),
         Expr::Conjunction { children, .. } => all_constant(plan, children),

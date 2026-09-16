@@ -14,6 +14,42 @@
 
 use crate::{ExprRef, NodeRef, Slice, StrRef};
 
+/// How a window frame measures its bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowUnit {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// One end of a window frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowBound {
+    UnboundedPreceding,
+    Preceding(ExprRef),
+    CurrentRow,
+    Following(ExprRef),
+    UnboundedFollowing,
+}
+
+/// Which peers a window frame removes after its bounds are applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowExclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+/// The complete frame shared by a compatible run of window expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowFrame {
+    pub unit: WindowUnit,
+    pub start: WindowBound,
+    pub end: WindowBound,
+    pub exclude: WindowExclude,
+}
+
 /// One logical operator.
 ///
 /// Children are the inputs, in the order [`Node::children`] returns them, which is the order they
@@ -130,6 +166,21 @@ pub enum Node {
         /// The aggregate expressions, into the expression list pool. Every element is an
         /// [`Expr::Aggregate`](crate::Expr::Aggregate) and this is the only place one may appear.
         aggregates: Slice,
+    },
+    /// Window expressions that share one partition, ordering, and frame.
+    Window {
+        /// Rows over which the windows are evaluated.
+        input: NodeRef,
+        /// The table index of the appended window result columns.
+        index: u32,
+        /// Expressions that divide the input into independent partitions.
+        partition: Slice,
+        /// The ordering within each partition.
+        order: Slice,
+        /// The complete frame shared by this compatible expression run.
+        frame: WindowFrame,
+        /// Direct [`Expr::Window`](crate::Expr::Window) expressions appended to the input columns.
+        expressions: Slice,
     },
     /// An ordering.
     Sort {
@@ -287,6 +338,7 @@ impl Node {
             Self::Filter { .. } => "Filter",
             Self::Project { .. } => "Project",
             Self::Aggregate { .. } => "Aggregate",
+            Self::Window { .. } => "Window",
             Self::Sort { .. } => "Sort",
             Self::Limit { .. } => "Limit",
             Self::TopN { .. } => "TopN",
@@ -314,6 +366,7 @@ impl Node {
             Self::Filter { input, .. }
             | Self::Project { input, .. }
             | Self::Aggregate { input, .. }
+            | Self::Window { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. }
             | Self::TopN { input, .. }
@@ -344,6 +397,7 @@ impl Node {
             | Self::Fetch { index, .. }
             | Self::TableFetch { index, .. }
             | Self::Aggregate { index, .. }
+            | Self::Window { index, .. }
             | Self::SetOp { index, .. } => Some(index),
             _ => None,
         }
