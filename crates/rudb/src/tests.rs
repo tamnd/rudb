@@ -1544,6 +1544,49 @@ fn integer_division_is_resolved_while_the_expression_is_bound() {
 }
 
 #[test]
+fn zero_division_nulls_are_resolved_while_the_expression_is_bound() {
+    let db = database();
+    assert_eq!(db.setting("null_on_division_by_zero").expect("the setting"), "false");
+    assert!(db.query("SELECT 1 // 0").is_err());
+    db.execute("SET null_on_division_by_zero = true").expect("nulling division errors");
+    assert_eq!(db.setting("null_on_division_by_zero").expect("the setting"), "true");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT current_setting('null_on_division_by_zero'), typeof(current_setting('null_on_division_by_zero'))"
+        ),
+        vec![vec![Value::Boolean(true), text("BOOLEAN")]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT 1 / 0, 1 // 0, 1 % 0, 1.0 // 0.0, 1.0 % 0.0, CAST(1 AS FLOAT) / CAST(0 AS FLOAT)"
+        ),
+        vec![vec![
+            Value::Double(f64::INFINITY),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Float(f32::INFINITY),
+        ]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT a, 10 // a, 10 % a FROM range(-1, 2) t(a)"),
+        vec![
+            vec![Value::BigInt(-1), Value::BigInt(-10), Value::BigInt(0)],
+            vec![Value::BigInt(0), Value::Null, Value::Null],
+            vec![Value::BigInt(1), Value::BigInt(10), Value::BigInt(0)],
+        ]
+    );
+    db.execute("RESET null_on_division_by_zero").expect("division errors");
+    assert_eq!(db.setting("null_on_division_by_zero").expect("the setting"), "false");
+    assert!(db.query("SELECT 1 // 0").is_err());
+    let error = db.execute("SET null_on_division_by_zero = 'off'").expect_err("not a boolean");
+    assert_eq!(error.message(), "Failed to cast value: Could not convert string 'off' to BOOL");
+}
+
+#[test]
 fn a_non_integer_order_literal_needs_the_session_opt_in() {
     let db = database();
     let expected = "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to allow this behavior.";
@@ -1705,8 +1748,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Eleven rows for nine settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(11)]]);
+    // Twelve rows for ten settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(12)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(

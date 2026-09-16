@@ -56,6 +56,8 @@ pub(crate) struct Settings {
     default_null_order: RwLock<String>,
     /// Whether `/` binds to integer division instead of floating point division.
     integer_division: RwLock<bool>,
+    /// Whether a zero divisor that normally raises returns null.
+    null_on_division_by_zero: RwLock<bool>,
     /// Whether an `ORDER BY` may name a non-integer literal that cannot affect the order.
     order_by_non_integer_literal: RwLock<bool>,
     /// Whether regex match operators require the entire string to match.
@@ -71,7 +73,7 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 11] = [
+    pub(crate) const NAMES: [&'static str; 12] = [
         "TimeZone",
         "default_null_order",
         "default_order",
@@ -79,6 +81,7 @@ impl Settings {
         "integer_division",
         "max_memory",
         "memory_limit",
+        "null_on_division_by_zero",
         "order_by_non_integer_literal",
         "regex_match_operator_semantics",
         "threads",
@@ -100,6 +103,7 @@ impl Settings {
             default_order: RwLock::new("ASCENDING".to_string()),
             default_null_order: RwLock::new("NULLS_LAST".to_string()),
             integer_division: RwLock::new(false),
+            null_on_division_by_zero: RwLock::new(false),
             order_by_non_integer_literal: RwLock::new(false),
             regex_match_operator_semantics: RwLock::new("partial".to_string()),
             seams: RwLock::new(rudb_seam::Settings::new()),
@@ -249,6 +253,11 @@ impl Settings {
                 });
                 memory.set_limit(limit);
             }
+            "null_on_division_by_zero" => {
+                let enabled = value.map_or(Ok(false), boolean_of)?;
+                *self.null_on_division_by_zero.write().unwrap_or_else(|held| held.into_inner()) =
+                    enabled;
+            }
             "order_by_non_integer_literal" => {
                 let enabled = value.map_or(Ok(false), boolean_of)?;
                 *self
@@ -327,6 +336,11 @@ impl Settings {
             // default is no limit where DuckDB's is a fraction of the machine, and printing the
             // largest number a limit could be would be describing a limit that is not there.
             "memory_limit" => Ok(config.memory_limit().map_or("unlimited".to_string(), human)),
+            "null_on_division_by_zero" => Ok(self
+                .null_on_division_by_zero
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .to_string()),
             "order_by_non_integer_literal" => Ok(self
                 .order_by_non_integer_literal
                 .read()
@@ -364,6 +378,8 @@ impl Settings {
             self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone();
         let integer_division =
             *self.integer_division.read().unwrap_or_else(|held| held.into_inner());
+        let null_on_division_by_zero =
+            *self.null_on_division_by_zero.read().unwrap_or_else(|held| held.into_inner());
         let order_by_non_integer_literal =
             *self.order_by_non_integer_literal.read().unwrap_or_else(|held| held.into_inner());
         let regex_match_operator_semantics = self
@@ -381,6 +397,7 @@ impl Settings {
             _ => DefaultNullOrder::Last,
         });
         session.set_integer_division(integer_division);
+        session.set_null_on_division_by_zero(null_on_division_by_zero);
         session.set_order_by_non_integer_literal(order_by_non_integer_literal);
         session.set_regex_match_full(regex_match_operator_semantics.eq_ignore_ascii_case("full"));
         for name in Self::NAMES {
@@ -392,6 +409,7 @@ impl Settings {
                     "default_null_order" => default_null_order.clone(),
                     "disabled_optimizers" => disabled.clone(),
                     "integer_division" => integer_division.to_string(),
+                    "null_on_division_by_zero" => null_on_division_by_zero.to_string(),
                     "memory_limit" => memory.clone(),
                     "order_by_non_integer_literal" => order_by_non_integer_literal.to_string(),
                     "regex_match_operator_semantics" => regex_match_operator_semantics.clone(),

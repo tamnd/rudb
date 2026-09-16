@@ -62,6 +62,8 @@ enum Shape {
     /// `7 // 2` is 3 and an INTEGER on both engines, so it cannot share `/`'s shape. A FLOAT stays
     /// a FLOAT, which was measured, so this is a rule about decimals rather than about width.
     Divided,
+    /// Slash promotes integers and decimals to double but preserves two floats as float.
+    Slashed,
     /// Every argument promotes and a decimal result gains a digit for the carry. `+` and `-`.
     ///
     /// Adding two `DECIMAL(18,0)` produces nineteen digits, so a rule that gives the sum eighteen
@@ -288,7 +290,7 @@ const TABLE: &[Entry] = &[
     number("%", Arity::exactly(2), Shape::Promoted),
     // `/` is the exception and it is DuckDB's exception too: `7 / 2` is 3.5 and not 3, so the
     // result is a double whatever went in, and `//` is the operator that keeps the integer.
-    number("/", Arity::exactly(2), Shape::PromotedTo(Fixed::Double)),
+    number("/", Arity::exactly(2), Shape::Slashed),
     number("//", Arity::exactly(2), Shape::Divided),
     number("abs", Arity::exactly(1), Shape::Promoted),
     // Strings.
@@ -733,6 +735,12 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
                 LogicalType::Decimal { .. } => LogicalType::Double,
                 other => other,
             };
+            (vec![returns.clone(); arguments.len()], returns)
+        }
+        Shape::Slashed => {
+            let common = promote_all(name, arguments)?;
+            let returns =
+                if common == LogicalType::Float { LogicalType::Float } else { LogicalType::Double };
             (vec![returns.clone(); arguments.len()], returns)
         }
         Shape::PromotedWithCarry => {
@@ -1423,9 +1431,11 @@ impl Shape {
             // Promoting and then moving: a decimal product is as wide as both operands, a decimal
             // quotient is a double, a decimal sum gains a carry digit and an integer sum widens to
             // the accumulator. The arguments still meet at one type and the result is no longer it.
-            Self::Multiplied | Self::Divided | Self::PromotedWithCarry | Self::Accumulated => {
-                (all(SAME), ANY)
-            }
+            Self::Multiplied
+            | Self::Divided
+            | Self::Slashed
+            | Self::PromotedWithCarry
+            | Self::Accumulated => (all(SAME), ANY),
             Self::PromotedTo(fixed) => (all(SAME), fixed.name()),
             // The floor is what a shape that widens is declared as, which is the overload upstream
             // lists first and the one a call with nothing to say about its arguments lands on.

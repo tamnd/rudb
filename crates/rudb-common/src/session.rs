@@ -35,6 +35,7 @@ pub struct Semantics {
     default_descending: bool,
     default_null_order: DefaultNullOrder,
     integer_division: bool,
+    null_on_division_by_zero: bool,
     order_by_non_integer_literal: bool,
     regex_match_full: bool,
 }
@@ -61,6 +62,12 @@ impl Semantics {
     #[must_use]
     pub fn integer_division(self) -> bool {
         self.integer_division
+    }
+
+    /// Whether a division that would raise on a zero divisor yields null instead.
+    #[must_use]
+    pub fn null_on_division_by_zero(self) -> bool {
+        self.null_on_division_by_zero
     }
 
     /// Whether a constant non-integer expression is accepted as a sort key.
@@ -159,6 +166,11 @@ impl Session {
     /// Sets whether `/` is bound as the integer division operator.
     pub fn set_integer_division(&mut self, enabled: bool) {
         self.semantics.integer_division = enabled;
+    }
+
+    /// Sets whether division errors caused by a zero divisor become nulls.
+    pub fn set_null_on_division_by_zero(&mut self, enabled: bool) {
+        self.semantics.null_on_division_by_zero = enabled;
     }
 
     /// Sets whether a constant non-integer expression is accepted as a sort key.
