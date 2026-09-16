@@ -19,7 +19,7 @@ use rudb_common::LogicalType;
 use rudb_common::Value;
 
 use crate::expr::Expr;
-use crate::node::Node;
+use crate::node::{Node, WindowBound, WindowExclude, WindowFrame, WindowUnit};
 use crate::plan::Plan;
 use crate::{ExprRef, NodeRef, Slice};
 
@@ -159,6 +159,16 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             out.write_str(" aggregates=")?;
             write_expr_list(plan, out, aggregates)
         }
+        Node::Window { index, partition, order, frame, expressions, .. } => {
+            write!(out, " #{index} partition=")?;
+            write_expr_list(plan, out, partition)?;
+            out.write_str(" order=")?;
+            write_sort_keys(plan, out, order)?;
+            out.write_str(" frame=")?;
+            write_window_frame(plan, out, frame)?;
+            out.write_str(" expressions=")?;
+            write_expr_list(plan, out, expressions)
+        }
         Node::Sort { keys, .. } => write_sort_keys(plan, out, keys),
         Node::Limit { count, offset, .. } => {
             match count {
@@ -279,6 +289,28 @@ fn write_form<W: Write>(plan: &Plan, out: &mut W, expr: ExprRef) -> fmt::Result 
             }
             out.write_char(')')
         }
+        Expr::Window { name, args, distinct, filter, ignore_nulls } => {
+            write_function_name(out, plan.string(name))?;
+            out.write_char('(')?;
+            if distinct {
+                out.write_str("DISTINCT ")?;
+            }
+            write_arguments_of(plan, out, args)?;
+            if let Some(filter) = filter {
+                if !plan.expr_list(args).is_empty() {
+                    out.write_char(' ')?;
+                }
+                out.write_str("FILTER ")?;
+                write_expr(plan, out, filter)?;
+            }
+            if ignore_nulls {
+                if !plan.expr_list(args).is_empty() || filter.is_some() {
+                    out.write_char(' ')?;
+                }
+                out.write_str("IGNORE NULLS")?;
+            }
+            out.write_char(')')
+        }
         Expr::Case { arms, otherwise } => {
             out.write_str("CASE")?;
             for arm in plan.arm_list(arms) {
@@ -293,6 +325,40 @@ fn write_form<W: Write>(plan: &Plan, out: &mut W, expr: ExprRef) -> fmt::Result 
             }
             out.write_str(" END")
         }
+    }
+}
+
+fn write_window_frame<W: Write>(plan: &Plan, out: &mut W, frame: WindowFrame) -> fmt::Result {
+    out.write_str(match frame.unit {
+        WindowUnit::Rows => "ROWS ",
+        WindowUnit::Range => "RANGE ",
+        WindowUnit::Groups => "GROUPS ",
+    })?;
+    write_window_bound(plan, out, frame.start)?;
+    out.write_str(" TO ")?;
+    write_window_bound(plan, out, frame.end)?;
+    out.write_str(" EXCLUDE ")?;
+    out.write_str(match frame.exclude {
+        WindowExclude::NoOthers => "NO OTHERS",
+        WindowExclude::CurrentRow => "CURRENT ROW",
+        WindowExclude::Group => "GROUP",
+        WindowExclude::Ties => "TIES",
+    })
+}
+
+fn write_window_bound<W: Write>(plan: &Plan, out: &mut W, bound: WindowBound) -> fmt::Result {
+    match bound {
+        WindowBound::UnboundedPreceding => out.write_str("UNBOUNDED PRECEDING"),
+        WindowBound::Preceding(offset) => {
+            write_expr(plan, out, offset)?;
+            out.write_str(" PRECEDING")
+        }
+        WindowBound::CurrentRow => out.write_str("CURRENT ROW"),
+        WindowBound::Following(offset) => {
+            write_expr(plan, out, offset)?;
+            out.write_str(" FOLLOWING")
+        }
+        WindowBound::UnboundedFollowing => out.write_str("UNBOUNDED FOLLOWING"),
     }
 }
 

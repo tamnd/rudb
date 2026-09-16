@@ -10,7 +10,7 @@
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
     Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
-    SetOpKind, SortKey, StrRef,
+    SetOpKind, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
 /// Print, read, print, and insist the two dumps agree. Returns the dump so a test can also assert
@@ -106,6 +106,57 @@ Project #2 [#1.0::VARCHAR AS SearchPhrase, #1.1::BIGINT AS c]
           Get memory.main.hits AS hits #0 [SearchPhrase::VARCHAR]
 ";
     assert_eq!(round_trips(&plan), expected);
+}
+
+#[test]
+fn a_complete_window_contract_survives_the_round_trip() {
+    let mut plan = Plan::new();
+    let scan = get(
+        &mut plan,
+        "events",
+        0,
+        &[("group_id", LogicalType::Integer), ("value", LogicalType::BigInt)],
+    );
+    let group = column(&mut plan, 0, 0, LogicalType::Integer);
+    let partition = plan.add_expr_list(&[group]);
+    let value = column(&mut plan, 0, 1, LogicalType::BigInt);
+    let order =
+        plan.add_sort_keys(&[SortKey { expr: value, descending: true, nulls_first: false }]);
+    let one = plan.add_constant(Value::Integer(1));
+    let two = plan.add_constant(Value::Integer(2));
+    let frame = WindowFrame {
+        unit: WindowUnit::Groups,
+        start: WindowBound::Preceding(one),
+        end: WindowBound::Following(two),
+        exclude: WindowExclude::Ties,
+    };
+    let positive = plan.add_constant(Value::BigInt(0));
+    let filter = plan.add_expr(
+        Expr::Compare { op: CompareOp::Greater, left: value, right: positive },
+        LogicalType::Boolean,
+    );
+    let args = plan.add_expr_list(&[value]);
+    let sum = plan.intern("sum");
+    let expression = plan.add_expr(
+        Expr::Window { name: sum, args, distinct: true, filter: Some(filter), ignore_nulls: true },
+        LogicalType::HugeInt,
+    );
+    let expressions = plan.add_expr_list(&[expression]);
+    let window =
+        plan.add_node(Node::Window { input: scan, index: 1, partition, order, frame, expressions });
+    plan.set_root(window);
+
+    let expected = "\
+Window #1 partition=[#0.0::INTEGER] order= [#0.1::BIGINT DESC NULLS LAST] frame=GROUPS 1::INTEGER PRECEDING TO 2::INTEGER FOLLOWING EXCLUDE TIES expressions=[sum(DISTINCT #0.1::BIGINT FILTER (#0.1::BIGINT > 0::BIGINT)::BOOLEAN IGNORE NULLS)::HUGEINT]\n  Get memory.main.events AS events #0 [group_id::INTEGER, value::BIGINT]\n";
+    assert_eq!(round_trips(&plan), expected);
+    reads_back(concat!(
+        "Window #1 partition=[] order= [] frame=RANGE UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING EXCLUDE NO OTHERS expressions=[row_number()::BIGINT]\n",
+        "  Dummy\n",
+    ));
+    reads_back(concat!(
+        "Window #1 partition=[] order= [] frame=ROWS CURRENT ROW TO CURRENT ROW EXCLUDE CURRENT ROW expressions=[rank()::BIGINT]\n",
+        "  Dummy\n",
+    ));
 }
 
 /// Two joins, so the reader has to keep a stack rather than a single pending child, and an `OR`

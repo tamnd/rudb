@@ -16,7 +16,7 @@ use std::ops::Range;
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 
 use crate::expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
-use crate::node::{JoinKind, Node, SetOpKind};
+use crate::node::{JoinKind, Node, SetOpKind, WindowBound, WindowExclude, WindowFrame, WindowUnit};
 use crate::plan::Plan;
 use crate::{ExprRef, NodeRef, Slice};
 
@@ -252,6 +252,29 @@ impl Reader<'_> {
                 c.expect("=")?;
                 let aggregates = read_aggregate_list(plan, c)?;
                 Ok(Built::unary(move |input| Node::Aggregate { input, index, groups, aggregates }))
+            }
+            "Window" => {
+                let index = read_table_index(c)?;
+                c.expect_word("partition")?;
+                c.expect("=")?;
+                let partition = read_expr_list(plan, c)?;
+                c.expect_word("order")?;
+                c.expect("=")?;
+                let order = read_sort_keys(plan, c)?;
+                c.expect_word("frame")?;
+                c.expect("=")?;
+                let frame = read_window_frame(plan, c)?;
+                c.expect_word("expressions")?;
+                c.expect("=")?;
+                let expressions = read_window_list(plan, c)?;
+                Ok(Built::unary(move |input| Node::Window {
+                    input,
+                    index,
+                    partition,
+                    order,
+                    frame,
+                    expressions,
+                }))
             }
             "Sort" => {
                 let keys = read_sort_keys(plan, c)?;
@@ -497,6 +520,119 @@ fn read_aggregate(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<ExprRef> {
     let args = plan.add_expr_list(&args);
     let ty = read_annotation(c)?;
     Ok(plan.add_expr(Expr::Aggregate { name, args, distinct, filter }, ty))
+}
+
+fn read_window_list(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<Slice> {
+    let mut exprs = Vec::new();
+    c.expect("[")?;
+    if !c.eat_space_then("]") {
+        loop {
+            exprs.push(read_window(plan, c)?);
+            if !c.eat_space_then(",") {
+                break;
+            }
+        }
+        c.expect("]")?;
+    }
+    Ok(plan.add_expr_list(&exprs))
+}
+
+fn read_window(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<ExprRef> {
+    c.skip_space();
+    let Some(name) = try_call_name(c) else {
+        return Err(c.error("expected a window function call"));
+    };
+    let name = plan.intern(&name);
+    let distinct = c.eat_keyword_before_argument("DISTINCT");
+    let mut args = Vec::new();
+    let mut filter = None;
+    let mut ignore_nulls = false;
+    if !c.eat_space_then(")") {
+        let mut filtered = c.eat_keyword_before_argument("FILTER");
+        let mut ignoring = c.eat_keyword_before_argument("IGNORE");
+        if ignoring {
+            c.expect_word("NULLS")?;
+        }
+        if !filtered && !ignoring {
+            loop {
+                args.push(read_expr(plan, c)?);
+                if !c.eat_space_then(",") {
+                    break;
+                }
+            }
+            filtered = c.eat_keyword_before_argument("FILTER");
+            if filtered {
+                filter = Some(read_expr(plan, c)?);
+            }
+            ignoring = c.eat_keyword_before_argument("IGNORE");
+            if ignoring {
+                c.expect_word("NULLS")?;
+            }
+        } else if filtered {
+            filter = Some(read_expr(plan, c)?);
+            ignoring = c.eat_keyword_before_argument("IGNORE");
+            if ignoring {
+                c.expect_word("NULLS")?;
+            }
+        }
+        ignore_nulls = ignoring;
+        c.expect(")")?;
+    }
+    let args = plan.add_expr_list(&args);
+    let ty = read_annotation(c)?;
+    Ok(plan.add_expr(Expr::Window { name, args, distinct, filter, ignore_nulls }, ty))
+}
+
+fn read_window_frame(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<WindowFrame> {
+    let unit = if c.eat_word("ROWS") {
+        WindowUnit::Rows
+    } else if c.eat_word("RANGE") {
+        WindowUnit::Range
+    } else if c.eat_word("GROUPS") {
+        WindowUnit::Groups
+    } else {
+        return Err(c.error("expected ROWS, RANGE or GROUPS"));
+    };
+    let start = read_window_bound(plan, c)?;
+    c.expect_word("TO")?;
+    let end = read_window_bound(plan, c)?;
+    c.expect_word("EXCLUDE")?;
+    let exclude = if c.eat_word("NO") {
+        c.expect_word("OTHERS")?;
+        WindowExclude::NoOthers
+    } else if c.eat_word("CURRENT") {
+        c.expect_word("ROW")?;
+        WindowExclude::CurrentRow
+    } else if c.eat_word("GROUP") {
+        WindowExclude::Group
+    } else if c.eat_word("TIES") {
+        WindowExclude::Ties
+    } else {
+        return Err(c.error("expected a window exclusion"));
+    };
+    Ok(WindowFrame { unit, start, end, exclude })
+}
+
+fn read_window_bound(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<WindowBound> {
+    if c.eat_word("UNBOUNDED") {
+        if c.eat_word("PRECEDING") {
+            return Ok(WindowBound::UnboundedPreceding);
+        }
+        c.expect_word("FOLLOWING")?;
+        return Ok(WindowBound::UnboundedFollowing);
+    }
+    if c.eat_word("CURRENT") {
+        c.expect_word("ROW")?;
+        return Ok(WindowBound::CurrentRow);
+    }
+    let offset = read_expr(plan, c)?;
+    if c.eat_word("PRECEDING") {
+        Ok(WindowBound::Preceding(offset))
+    } else if c.eat_word("FOLLOWING") {
+        Ok(WindowBound::Following(offset))
+    } else {
+        Err(c.error("expected PRECEDING or FOLLOWING"))
+    }
 }
 
 /// A bracketed list of sort keys, which is what a sort and a top N both carry.

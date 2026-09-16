@@ -1980,7 +1980,7 @@ impl<'a> Binder<'a> {
                     "column {name} must appear in the GROUP BY clause or must be part of an aggregate function"
                 )))
             }
-            Expr::Constant(_) | Expr::Aggregate { .. } => Ok(expr),
+            Expr::Constant(_) | Expr::Aggregate { .. } | Expr::Window { .. } => Ok(expr),
             Expr::Cast { input, try_cast } => {
                 let input = self.over_aggregate(input, scope)?;
                 Ok(self.plan.add_expr(Expr::Cast { input, try_cast }, ty))

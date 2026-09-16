@@ -251,6 +251,20 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
             list(plan, groups, found);
             list(plan, aggregates, found);
         }
+        Node::Window { partition, order, frame, expressions, .. } => {
+            list(plan, partition, found);
+            for key in plan.sort_key_list(order) {
+                walk(plan, key.expr, found);
+            }
+            for bound in [frame.start, frame.end] {
+                if let rudb_plan::WindowBound::Preceding(offset)
+                | rudb_plan::WindowBound::Following(offset) = bound
+                {
+                    walk(plan, offset, found);
+                }
+            }
+            list(plan, expressions, found);
+        }
         Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
             for key in plan.sort_key_list(keys) {
                 walk(plan, key.expr, found);
@@ -296,7 +310,7 @@ fn walk(plan: &Plan, expr: ExprRef, found: &mut Found) {
         }
         Expr::Conjunction { children, .. } => list(plan, children, found),
         Expr::Function { args, .. } => list(plan, args, found),
-        Expr::Aggregate { args, filter, .. } => {
+        Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
             list(plan, args, found);
             if let Some(filter) = filter {
                 walk(plan, filter, found);
