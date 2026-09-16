@@ -2102,6 +2102,35 @@ fn uncorrelated_exists_is_a_single_joined_marker() {
 }
 
 #[test]
+fn uncorrelated_in_subqueries_are_mark_joins() {
+    let db = database();
+    let query = |subject: &str, values: &str| {
+        format!("SELECT {subject} IN (SELECT x FROM (VALUES {values}) t(x))")
+    };
+    assert_eq!(rows(&db, &query("1", "(1), (2)")), vec![vec![Value::Boolean(true)]]);
+    assert_eq!(rows(&db, &query("3", "(1), (2)")), vec![vec![Value::Boolean(false)]]);
+    assert_eq!(rows(&db, &query("3", "(1), (NULL)")), vec![vec![Value::Null]]);
+    assert_eq!(rows(&db, &query("NULL", "(1), (2)")), vec![vec![Value::Null]]);
+    assert_eq!(
+        rows(&db, "SELECT NULL IN (SELECT x FROM (VALUES (1)) t(x) WHERE false)"),
+        vec![vec![Value::Boolean(false)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT 3 NOT IN (SELECT x FROM (VALUES (1), (NULL)) t(x))"),
+        vec![vec![Value::Null]]
+    );
+    let answer = db
+        .query("SELECT 1 IN (SELECT x FROM (VALUES (1), (2)) t(x))")
+        .expect("the membership query answers");
+    assert_eq!(
+        answer.column_name(0),
+        "(1 = ANY(SELECT x FROM (SELECT * FROM (VALUES (1), (2)) AS valueslist) AS t(x)))"
+    );
+    let plan = db.plan(&query("1", "(1), (2)")).expect("the membership query plans");
+    assert!(plan.contains("Join MARK"), "{plan}");
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());

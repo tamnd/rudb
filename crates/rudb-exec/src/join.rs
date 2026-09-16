@@ -163,11 +163,23 @@ impl<'a> Join<'a> {
             // right side, which is the smallest unit this loop has that is not the inner one.
             self.cancel.check()?;
             let before = out.len();
+            if self.kind == JoinKind::Mark {
+                let marker = self.marker(left_row, &left_types, &right_chunks)?;
+                let mut row = pad_right(left_row, right_types.len());
+                let Some(last) = row.last_mut() else {
+                    return Err(Error::internal("a mark join has no marker column"));
+                };
+                *last = marker;
+                out.push(row);
+                scratch.grow(out[before..].iter().map(|row| rows::footprint(row)).sum())?;
+                continue;
+            }
             let hits = self.matching(left_row, &left_types, &right_chunks)?;
             for &hit in &hits {
                 matched[hit] = true;
             }
             match self.kind {
+                JoinKind::Mark => unreachable!("mark joins leave before collecting hits"),
                 JoinKind::Semi => {
                     if !hits.is_empty() {
                         out.push(left_row.clone());
@@ -255,6 +267,39 @@ impl<'a> Join<'a> {
             base += rows;
         }
         Ok(hits)
+    }
+
+    /// SQL's `ANY` result: true for a hit, null for no hit with an unknown comparison, false
+    /// otherwise. The right side is scanned without building the cross product a rewrite through
+    /// an ordinary inner join would materialise.
+    fn marker(
+        &self,
+        left_row: &[Value],
+        left_types: &[LogicalType],
+        right_chunks: &[Chunk],
+    ) -> Result<Value> {
+        let mut unknown = false;
+        for chunk in right_chunks {
+            let combined = widen(left_row, left_types, chunk)?;
+            let flags = evaluate_all_in_time_zone(
+                self.plan,
+                &self.conditions,
+                &self.combined,
+                &combined,
+                self.time_zone,
+            )?;
+            let merged = combine(Connective::And, &flags)?;
+            // row at a time: a mark join stops at the first true value and otherwise remembers
+            // whether any lane was null, which cannot be reduced by the ordinary boolean kernel.
+            for row in 0..chunk.len() {
+                match merged.value_at(row) {
+                    Value::Boolean(true) => return Ok(Value::Boolean(true)),
+                    Value::Null => unknown = true,
+                    _ => {}
+                }
+            }
+        }
+        Ok(if unknown { Value::Null } else { Value::Boolean(false) })
     }
 }
 

@@ -16,7 +16,7 @@ use rudb_parse::Ast;
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
 use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef};
 
-use crate::binder::Binder;
+use crate::binder::{Binder, PendingSubquery};
 use crate::scope::Scope;
 
 impl Binder<'_> {
@@ -62,6 +62,9 @@ impl Binder<'_> {
             ast::Expr::In { operand, list, negated } => {
                 self.bind_in(ast, operand, list, negated, scope)
             }
+            ast::Expr::InSubquery { operand, query, negated } => {
+                self.bind_in_subquery(ast, operand, query, negated, scope)
+            }
             ast::Expr::Row { .. } => {
                 Err(Error::not_implemented("a row value outside of a VALUES clause".to_string()))
             }
@@ -82,7 +85,11 @@ impl Binder<'_> {
             )));
         };
         let expr = self.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
-        self.scalar_subqueries.push(node);
+        self.scalar_subqueries.push(PendingSubquery {
+            node,
+            kind: rudb_plan::JoinKind::Single,
+            conditions: Vec::new(),
+        });
         Ok(expr)
     }
 
@@ -109,7 +116,11 @@ impl Binder<'_> {
         let marker = self
             .plan_mut()
             .add_expr(Expr::Column(rudb_plan::ColumnBinding::new(index, 0)), LogicalType::Boolean);
-        self.scalar_subqueries.push(node);
+        self.scalar_subqueries.push(PendingSubquery {
+            node,
+            kind: rudb_plan::JoinKind::Single,
+            conditions: Vec::new(),
+        });
         self.against_null(
             if negated { CompareOp::NotDistinctFrom } else { CompareOp::DistinctFrom },
             marker,
@@ -547,6 +558,56 @@ impl Binder<'_> {
         Ok(self.conjunction(connective, tests))
     }
 
+    /// Binds an uncorrelated `IN` as a mark join. The mark join answers the three-valued `ANY`
+    /// question directly, so it neither materialises a cross product nor loses the distinction
+    /// between false and an unknown comparison.
+    fn bind_in_subquery(
+        &mut self,
+        ast: &Ast,
+        operand: ast::ExprRef,
+        query: ast::QueryRef,
+        negated: bool,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let subject = self.bind_expr(ast, operand, scope)?;
+        let (node, inner) = self.bind_isolated_subquery(ast, query)?;
+        let [column] = inner.columns.as_slice() else {
+            return Err(Error::binder(format!(
+                "Subquery returns {} columns - expected 1",
+                inner.len()
+            )));
+        };
+        let candidate_type = column.ty.clone();
+        let candidate_name = column.name.clone();
+        let source = self.plan_mut().add_expr(Expr::Column(column.binding), candidate_type.clone());
+        let marker_value = self.plan_mut().add_constant(Value::Boolean(true));
+        let projected = self.fresh_index();
+        let exprs = self.plan_mut().add_expr_list(&[source, marker_value]);
+        let candidate_name = self.plan_mut().intern(&candidate_name);
+        let marker_name = self.plan_mut().intern("mark");
+        let names = self.plan_mut().add_name_list(&[candidate_name, marker_name]);
+        let node = self.plan_mut().add_node(rudb_plan::Node::Project {
+            input: node,
+            index: projected,
+            exprs,
+            names,
+        });
+        let candidate = self
+            .plan_mut()
+            .add_expr(Expr::Column(rudb_plan::ColumnBinding::new(projected, 0)), candidate_type);
+        let condition = self.compare(CompareOp::Equal, subject, candidate)?;
+        let marker = self.plan_mut().add_expr(
+            Expr::Column(rudb_plan::ColumnBinding::new(projected, 1)),
+            LogicalType::Boolean,
+        );
+        self.scalar_subqueries.push(PendingSubquery {
+            node,
+            kind: rudb_plan::JoinKind::Mark,
+            conditions: vec![condition],
+        });
+        if negated { self.call("not", vec![marker]) } else { Ok(marker) }
+    }
+
     /// Resolves a scalar call, casts the arguments to what the overload wants, and records it.
     pub(crate) fn call(&mut self, name: &str, args: Vec<ExprRef>) -> Result<ExprRef> {
         self.call_recorded_as(name, None, args)
@@ -785,6 +846,7 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
             has_aggregate(ast, operand)
                 || ast.expr_list(list).iter().any(|&item| has_aggregate(ast, item))
         }
+        ast::Expr::InSubquery { operand, .. } => has_aggregate(ast, operand),
         ast::Expr::Row { items } => {
             ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
         }
@@ -972,6 +1034,14 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                 ast.expr_list(list).iter().map(|&item| describe(ast, item, semantics)).collect();
             let text = format!("({} IN ({}))", describe(ast, operand, semantics), items.join(", "));
             if negated { format!("(NOT {text})") } else { text }
+        }
+        ast::Expr::InSubquery { operand, query, negated } => {
+            let any = format!(
+                "({} = ANY({}))",
+                describe(ast, operand, semantics),
+                rudb_parse::deparse::query(ast, query)
+            );
+            if negated { format!("(NOT {any})") } else { any }
         }
         // `row` is a keyword and a function of that name, so DuckDB quotes it in the name to say
         // which of the two it means.

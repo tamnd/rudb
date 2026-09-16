@@ -346,7 +346,9 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
 pub(crate) fn kept(kind: JoinKind) -> (bool, bool) {
     match kind {
         JoinKind::Inner => (true, true),
-        JoinKind::Left | JoinKind::Semi | JoinKind::Anti | JoinKind::Single => (true, false),
+        JoinKind::Left | JoinKind::Semi | JoinKind::Anti | JoinKind::Single | JoinKind::Mark => {
+            (true, false)
+        }
         JoinKind::Right => (false, true),
         JoinKind::Full | JoinKind::Positional => (false, false),
     }
