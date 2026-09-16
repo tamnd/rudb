@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_catalog::Table;
-use rudb_common::{Error, Field, LogicalType, Result, Session};
+use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
 use rudb_csv::Reader as CsvReader;
 use rudb_functions::{
     FILE_ROW_NUMBER, Given, TableFunction, csv_given, open_csv, open_parquet, series_length,
@@ -62,6 +62,88 @@ impl Handout {
 /// Where a morsel has got to, as an index into whatever the source counts.
 pub(crate) fn position(morsel: &Morsel) -> usize {
     usize::try_from(morsel.cursor()).unwrap_or(usize::MAX)
+}
+
+/// A grouped count answered from a native file's certified frequency synopsis.
+#[derive(Debug)]
+pub(crate) struct Frequencies {
+    chunks: Vec<Chunk>,
+    handout: Handout,
+}
+
+impl Frequencies {
+    /// Builds the aggregate rows which the ordinary TopN above this source will order and limit.
+    pub(crate) fn new(
+        plan: &Plan,
+        input: &Schema,
+        schema: Schema,
+        groups: Slice,
+        column: usize,
+        entries: Vec<(Value, u64)>,
+        session: &Session,
+    ) -> Result<Self> {
+        let output_types = schema.types();
+        let group_exprs = plan.expr_list(groups);
+        if output_types.len() != group_exprs.len() + 1
+            || output_types.last() != Some(&LogicalType::BigInt)
+        {
+            return Err(Error::internal("a frequency source count is not BIGINT"));
+        }
+        let input_types = input.types();
+        let key_type = input_types
+            .get(column)
+            .ok_or_else(|| Error::internal("a frequency column is outside its scan"))?;
+        let mut chunks = Vec::with_capacity(entries.len().div_ceil(VECTOR_SIZE));
+        for entries in entries.chunks(VECTOR_SIZE) {
+            let mut keys = Vec::with_capacity(entries.len());
+            let mut counts = Vec::with_capacity(entries.len());
+            for (key, count) in entries {
+                keys.push(key.clone());
+                counts.push(
+                    i64::try_from(*count)
+                        .map_err(|_| Error::internal("a stored frequency exceeds BIGINT"))?,
+                );
+            }
+            let mut columns = input_types
+                .iter()
+                .map(|ty| Vector::constant(ty.clone(), Value::Null, keys.len()))
+                .collect::<Vec<_>>();
+            columns[column] = Vector::from_values(key_type.clone(), &keys)?;
+            let input_chunk = Chunk::with_rows(columns, keys.len())?;
+            let mut output = evaluate_all_in_time_zone(
+                plan,
+                group_exprs,
+                input,
+                &input_chunk,
+                session.session_time_zone(),
+            )?;
+            output.push(Vector::flat(LogicalType::BigInt, Data::Int64(counts.into()))?);
+            chunks.push(Chunk::with_rows(output, keys.len())?);
+        }
+        let handout = Handout::new(chunks.len());
+        Ok(Self { chunks, handout })
+    }
+}
+
+impl Source for Frequencies {
+    fn morsel(&self) -> Option<Morsel> {
+        self.handout.take()
+    }
+
+    fn morsels(&self, _threads: usize) -> Option<usize> {
+        Some(self.handout.total())
+    }
+
+    fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
+        let at = position(morsel);
+        *out = self
+            .chunks
+            .get(at)
+            .ok_or_else(|| Error::internal("a frequency morsel is out of range"))?
+            .clone();
+        morsel.advance(1);
+        Ok(Progress::Done)
+    }
 }
 
 fn poisoned<T>(_: T) -> Error {
@@ -290,7 +372,7 @@ impl Values {
         let types = schema.types();
         let source = Schema::empty();
         let one = Chunk::with_rows(Vec::new(), 1)?;
-        let mut down: Vec<Vec<rudb_common::Value>> = vec![Vec::new(); types.len()];
+        let mut down: Vec<Vec<Value>> = vec![Vec::new(); types.len()];
         for row in plan.row_list(rows) {
             let exprs: Vec<ExprRef> = plan.expr_list(*row).to_vec();
             if exprs.len() != types.len() {
@@ -379,8 +461,8 @@ impl Series {
         let mut given = Vec::with_capacity(evaluated.len());
         for vector in &evaluated {
             match vector.value_at(0) {
-                rudb_common::Value::Null => return Ok(Self::empty(schema)),
-                rudb_common::Value::BigInt(n) => given.push(n),
+                Value::Null => return Ok(Self::empty(schema)),
+                Value::BigInt(n) => given.push(n),
                 other => {
                     return Err(Error::internal(format!(
                         "a table function argument bound as BIGINT arrived as {other}"
@@ -1152,7 +1234,7 @@ fn csv_options(plan: &Plan, options: Slice, settings: Slice) -> Result<Given> {
     let one = Chunk::with_rows(Vec::new(), 1)?;
     let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
     let names: Vec<&str> = plan.name_list(options).iter().map(|name| plan.string(*name)).collect();
-    let written: Vec<(&str, rudb_common::Value)> =
+    let written: Vec<(&str, Value)> =
         names.into_iter().zip(evaluated.iter().map(|vector| vector.value_at(0))).collect();
     csv_given(&written)
 }
@@ -1174,7 +1256,7 @@ pub(crate) fn file_arguments(
     let mut paths = Vec::with_capacity(evaluated.len());
     for vector in &evaluated {
         match vector.value_at(0) {
-            rudb_common::Value::Varchar(path) => paths.push(path),
+            Value::Varchar(path) => paths.push(path),
             other => {
                 return Err(Error::internal(format!(
                     "{}() bound with {other:?} rather than constant file names",
