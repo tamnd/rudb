@@ -7,8 +7,10 @@
 
 use std::collections::HashMap;
 
-use rudb_common::{LogicalType, Result};
-use rudb_plan::{ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan};
+use rudb_common::{LogicalType, Result, Value};
+use rudb_plan::{
+    ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+};
 
 use crate::tables::produced;
 use crate::walk;
@@ -30,6 +32,9 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
         return None;
     };
     if let Some(join) = exists(plan, left, right, kind, conditions) {
+        return Some(join);
+    }
+    if let Some(join) = mark(plan, left, right, kind, conditions) {
         return Some(join);
     }
     let Node::Project { input: filtered, index, exprs, names } = *plan.node(right) else {
@@ -106,11 +111,108 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     Some(plan.add_node(Node::Join { left, right, kind, conditions }))
 }
 
+fn mark(
+    plan: &mut Plan,
+    left: NodeRef,
+    right: NodeRef,
+    kind: JoinKind,
+    conditions: rudb_plan::Slice,
+) -> Option<NodeRef> {
+    if kind != JoinKind::Mark {
+        return None;
+    }
+    let Node::Project { input: selected, index, exprs, names } = *plan.node(right) else {
+        return None;
+    };
+    let projected = plan.expr_list(exprs).to_vec();
+    if projected.len() < 2 {
+        return None;
+    }
+    let Node::Project {
+        input: filtered,
+        index: selected_index,
+        exprs: selected_exprs,
+        names: selected_names,
+    } = *plan.node(selected)
+    else {
+        return None;
+    };
+    let Node::Filter { input, predicate } = *plan.node(filtered) else {
+        return None;
+    };
+
+    let outer = produced(plan, left);
+    let inner = produced(plan, input);
+    let mut correlated = Vec::new();
+    let mut local = Vec::new();
+    split(plan, predicate, &mut |part| {
+        if reads(plan, part, &outer) {
+            correlated.push(part);
+        } else {
+            local.push(part);
+        }
+    });
+    if correlated.is_empty() {
+        return None;
+    }
+
+    let selected_outputs = plan.expr_list(selected_exprs);
+    let mut outputs = HashMap::new();
+    for (position, &expr) in projected[..projected.len() - 1].iter().enumerate() {
+        let Expr::Column(binding) = *plan.expr(expr) else {
+            continue;
+        };
+        if binding.table != selected_index {
+            continue;
+        }
+        let source = *selected_outputs.get(binding.column as usize)?;
+        if let Expr::Column(source_binding) = *plan.expr(source) {
+            outputs.insert(source_binding, position);
+        }
+    }
+    for &condition in &correlated {
+        let mut available = true;
+        walk::columns(plan, condition, &mut |binding| {
+            if inner.contains(binding.table) {
+                available &= outputs.contains_key(&binding);
+            } else if !outer.contains(binding.table) {
+                available = false;
+            }
+        });
+        if !available {
+            return None;
+        }
+    }
+
+    let input = make_filter(plan, input, local);
+    let selected = plan.add_node(Node::Project {
+        input,
+        index: selected_index,
+        exprs: selected_exprs,
+        names: selected_names,
+    });
+    let right = plan.add_node(Node::Project { input: selected, index, exprs, names });
+    let mut all = plan.expr_list(conditions).to_vec();
+    for condition in correlated {
+        let condition = replace_inner(plan, condition, index, &outputs);
+        let span = plan.expr_span(condition);
+        let value = plan.add_value(Value::Boolean(true));
+        let truth = plan.add_expr_at(Expr::Constant(value), LogicalType::Boolean, span);
+        all.push(plan.add_expr_at(
+            Expr::Compare { op: CompareOp::NotDistinctFrom, left: condition, right: truth },
+            LogicalType::Boolean,
+            span,
+        ));
+    }
+    let conditions = plan.add_expr_list(&all);
+    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+}
+
 fn exists(
     plan: &mut Plan,
     left: NodeRef,
     right: NodeRef,
-    kind: rudb_plan::JoinKind,
+    kind: JoinKind,
     conditions: rudb_plan::Slice,
 ) -> Option<NodeRef> {
     let Node::Project { input: limited, index, exprs: marker_exprs, names: marker_names } =
