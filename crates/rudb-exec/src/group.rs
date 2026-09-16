@@ -145,6 +145,9 @@ pub(crate) struct Aggregate<'a> {
     compact_numeric: bool,
     /// The only call is COUNT(DISTINCT BIGINT), whose completed state is ordered like COUNT(*).
     distinct_count: bool,
+    /// An ungrouped COUNT(DISTINCT BIGINT) can exchange integer rows directly and count one set per
+    /// radix owner instead of building and merging one general aggregate state per worker.
+    radix_distinct_count: bool,
     /// Emit at most this many groups from each radix partition when the parent orders by count
     /// descending. The ordinary TopN still makes the final global choice.
     top_counts: Option<usize>,
@@ -180,6 +183,8 @@ pub(crate) struct Aggregate<'a> {
     dense: OnceLock<DenseCount>,
     /// Fixed width rows exchanged to one owner per radix partition for compact count aggregates.
     fixed: OnceLock<FixedExchange>,
+    /// Integer rows exchanged to one owner per radix partition for an ungrouped distinct count.
+    bigint_distinct: OnceLock<BigIntDistinctExchange>,
     out: Buffered,
 }
 
@@ -200,6 +205,37 @@ struct DensePartition {
 struct FixedExchange {
     partitions: Vec<Mutex<FixedPartition>>,
     held: Mutex<Vec<Reservation>>,
+}
+
+#[derive(Debug)]
+struct BigIntDistinctExchange {
+    partitions: Vec<Mutex<BigIntDistinctPartition>>,
+    held: Mutex<Vec<Reservation>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BigIntDistinctRecord {
+    hash: u64,
+    value: i64,
+}
+
+#[derive(Debug, Default)]
+struct BigIntDistinctPartition {
+    rows: Vec<BigIntDistinctRecord>,
+}
+
+impl BigIntDistinctPartition {
+    fn append(&mut self, other: &mut Self) {
+        if self.rows.is_empty() {
+            std::mem::swap(self, other);
+        } else {
+            self.rows.append(&mut other.rows);
+        }
+    }
+
+    fn footprint(&self) -> usize {
+        self.rows.capacity() * size_of::<BigIntDistinctRecord>()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -429,6 +465,13 @@ impl<'a> Aggregate<'a> {
             && calls[0].args.len() == 1
             && plan.expr_type(calls[0].args[0]) == &LogicalType::BigInt
             && calls[0].filter.is_none();
+        let radix_distinct_count = alone
+            && calls.len() == 1
+            && calls[0].name == "count"
+            && calls[0].distinct
+            && calls[0].args.len() == 1
+            && plan.expr_type(calls[0].args[0]) == &LogicalType::BigInt
+            && calls[0].filter.is_none();
         let by_vector: Vec<bool> =
             calls.iter().map(|call| alone && !call.distinct && call.filter.is_none()).collect();
         let out = Buffered::new();
@@ -446,6 +489,7 @@ impl<'a> Aggregate<'a> {
                 && calls[0].filter.is_none(),
             compact_numeric,
             distinct_count,
+            radix_distinct_count,
             top_counts: None,
             having_count: None,
             max_groups: None,
@@ -467,6 +511,7 @@ impl<'a> Aggregate<'a> {
             locally: AtomicBool::new(true),
             dense: OnceLock::new(),
             fixed: OnceLock::new(),
+            bigint_distinct: OnceLock::new(),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -649,6 +694,46 @@ impl<'a> Aggregate<'a> {
             );
         }
         let after = partitions.iter().map(FixedPartition::footprint).sum::<usize>();
+        memory.grow(width_of(after.saturating_sub(before)))
+    }
+
+    fn buffer_bigint_distinct(
+        &self,
+        rows: &Rows,
+        partitions: &mut [BigIntDistinctPartition],
+        memory: &mut Reservation,
+    ) -> Result<()> {
+        self.bigint_distinct.get_or_init(|| BigIntDistinctExchange {
+            partitions: (0..RADIX_PARTITIONS)
+                .map(|_| Mutex::new(BigIntDistinctPartition::default()))
+                .collect(),
+            held: Mutex::new(Vec::new()),
+        });
+        let Some(column) = rows.arguments.first().and_then(|arguments| arguments.first()) else {
+            return Err(Error::internal("a BIGINT distinct exchange received no argument"));
+        };
+        let before = partitions.iter().map(BigIntDistinctPartition::footprint).sum::<usize>();
+        let shift = u64::BITS - RADIX_PARTITIONS.ilog2();
+        for row in 0..rows.rows {
+            if column.is_null_at(row) {
+                continue;
+            }
+            let value = match column.signed_at(row) {
+                Some(value) => i64::try_from(value)
+                    .map_err(|_| Error::internal("a distinct BIGINT value is out of range"))?,
+                None => match column.try_value_at(row)? {
+                    Value::BigInt(value) => value,
+                    value => {
+                        return Err(Error::internal(format!(
+                            "a BIGINT distinct exchange received {value:?}"
+                        )));
+                    }
+                },
+            };
+            let hash = spread(mix(0, value as u64));
+            partitions[(hash >> shift) as usize].rows.push(BigIntDistinctRecord { hash, value });
+        }
+        let after = partitions.iter().map(BigIntDistinctPartition::footprint).sum::<usize>();
         memory.grow(width_of(after.saturating_sub(before)))
     }
 
@@ -2079,6 +2164,9 @@ impl Rows {
 /// The scratch one pipeline instance keeps between chunks, and its table when it has one of its own.
 #[derive(Debug)]
 pub(crate) struct Partitioned {
+    radix_distinct: bool,
+    radix_distinct_records: Vec<BigIntDistinctPartition>,
+    radix_distinct_memory: Reservation,
     fixed: bool,
     fixed_records: Vec<FixedPartition>,
     fixed_memory: Reservation,
@@ -2521,6 +2609,11 @@ impl Sink for Aggregate<'_> {
     fn local(&self) -> Partitioned {
         self.started.fetch_add(1, Ordering::Relaxed);
         Partitioned {
+            radix_distinct: false,
+            radix_distinct_records: (0..RADIX_PARTITIONS)
+                .map(|_| BigIntDistinctPartition::default())
+                .collect(),
+            radix_distinct_memory: self.memory.reservation(),
             fixed: false,
             fixed_records: (0..RADIX_PARTITIONS).map(|_| FixedPartition::default()).collect(),
             fixed_memory: self.memory.reservation(),
@@ -2567,6 +2660,9 @@ impl Sink for Aggregate<'_> {
     /// behind one lock before doing any work at all.
     fn sink(&self, chunk: &Chunk, local: &mut Partitioned) -> Result<Progress> {
         let Partitioned {
+            radix_distinct,
+            radix_distinct_records,
+            radix_distinct_memory,
             fixed,
             fixed_records,
             fixed_memory,
@@ -2580,6 +2676,15 @@ impl Sink for Aggregate<'_> {
             own,
         } = local;
         let rows = self.read(chunk, expressions)?;
+        if self.radix_distinct_count {
+            let timing = stage::Timing::start(Stage::Scatter);
+            let buffered =
+                self.buffer_bigint_distinct(&rows, radix_distinct_records, radix_distinct_memory);
+            timing.stop(0);
+            buffered?;
+            *radix_distinct = true;
+            return Ok(Progress::More);
+        }
         if self.fixed_top_count() {
             let timing = stage::Timing::start(Stage::Scatter);
             let buffered = self.buffer_fixed(&rows, fixed_records, fixed_memory);
@@ -2676,6 +2781,9 @@ impl Sink for Aggregate<'_> {
     /// so a table is never left whole in partition zero after the switch.
     fn combine(&self, local: Partitioned) -> Result<()> {
         let Partitioned {
+            radix_distinct,
+            mut radix_distinct_records,
+            radix_distinct_memory,
             fixed,
             mut fixed_records,
             fixed_memory,
@@ -2688,6 +2796,21 @@ impl Sink for Aggregate<'_> {
             mut own,
             ..
         } = local;
+        if radix_distinct {
+            let state = self
+                .bigint_distinct
+                .get()
+                .expect("a distinct exchange exists after a distinct sink");
+            for (partition, rows) in radix_distinct_records.iter_mut().enumerate() {
+                if rows.rows.is_empty() {
+                    continue;
+                }
+                state.partitions[partition].lock().map_err(poisoned)?.append(rows);
+            }
+            state.held.lock().map_err(poisoned)?.push(radix_distinct_memory);
+            self.built.lock().map_err(poisoned)?.instances += 1;
+            return Ok(());
+        }
         if fixed {
             let state = self.fixed.get().expect("fixed exchange exists after a fixed sink");
             for (partition, rows) in fixed_records.iter_mut().enumerate() {
@@ -2783,6 +2906,55 @@ impl Sink for Aggregate<'_> {
     /// its one group is made when the instance is, and an instance is made whether or not a row
     /// arrives.
     fn finalize(&self) -> Result<()> {
+        if let Some(distinct) = self.bigint_distinct.get() {
+            let next = AtomicUsize::new(0);
+            let slots: Vec<Mutex<Option<Result<i64>>>> =
+                (0..RADIX_PARTITIONS).map(|_| Mutex::new(None)).collect();
+            let input = distinct
+                .partitions
+                .iter()
+                .map(|partition| partition.lock().map(|rows| rows.rows.len()).map_err(poisoned))
+                .sum::<Result<usize>>()?;
+            let degree = input.div_ceil(65_536).clamp(1, RADIX_PARTITIONS);
+            let total = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(degree - 1);
+                for _ in 1..degree {
+                    handles.push(scope.spawn(|| {
+                        finish_bigint_distinct(&next, &slots, distinct, &self.memory);
+                        stage::here()
+                    }));
+                }
+                finish_bigint_distinct(&next, &slots, distinct, &self.memory);
+                let mut theirs = Spent::none();
+                for handle in handles {
+                    let spent = handle
+                        .join()
+                        .map_err(|_| Error::internal("a distinct radix worker panicked"))?;
+                    theirs.add(spent);
+                }
+                stage::gained(theirs);
+                let mut total = 0_i64;
+                for (at, slot) in slots.iter().enumerate() {
+                    let count = slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
+                        Err(Error::internal(format!(
+                            "nothing finished distinct radix partition {at}"
+                        )))
+                    })?;
+                    total = total
+                        .checked_add(count)
+                        .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
+                }
+                Ok::<_, Error>(total)
+            })?;
+            let mut held = distinct.held.lock().map_err(poisoned)?;
+            held.clear();
+            let values = [vec![Value::BigInt(total)]];
+            let mut output = self.memory.reservation();
+            let chunks = rows::chunks(&[LogicalType::BigInt], &values, &mut output)?;
+            held.push(output);
+            drop(held);
+            return self.out.fill(chunks);
+        }
         if let Some(fixed) = self.fixed.get() {
             let bound = self.top_counts.expect("a fixed exchange has a TopN bound");
             let next = AtomicUsize::new(0);
@@ -2884,6 +3056,62 @@ impl Sink for Aggregate<'_> {
         drop(built);
         self.out.fill(chunks)
     }
+}
+
+fn finish_bigint_distinct(
+    next: &AtomicUsize,
+    slots: &[Mutex<Option<Result<i64>>>],
+    distinct: &BigIntDistinctExchange,
+    memory: &Memory,
+) {
+    loop {
+        let at = next.fetch_add(1, Ordering::Relaxed);
+        let Some(partition) = distinct.partitions.get(at) else {
+            return;
+        };
+        let done = partition
+            .lock()
+            .map_err(poisoned)
+            .and_then(|mut rows| bigint_distinct_partition(&mut rows, memory));
+        if let Ok(mut slot) = slots[at].lock() {
+            *slot = Some(done);
+        }
+    }
+}
+
+fn bigint_distinct_partition(
+    partition: &mut BigIntDistinctPartition,
+    memory: &Memory,
+) -> Result<i64> {
+    const EMPTY: u32 = u32::MAX;
+    let capacity = partition.rows.len().saturating_mul(2).max(64).next_power_of_two();
+    let mut working = memory.reservation();
+    working.grow(width_of(capacity * size_of::<u32>()))?;
+    let mut buckets = vec![EMPTY; capacity];
+    let mask = capacity - 1;
+    let mut unique = 0_usize;
+    let timing = stage::Timing::start(Stage::Fold);
+    for source in 0..partition.rows.len() {
+        let row = partition.rows[source];
+        let mut at = row.hash as usize & mask;
+        loop {
+            let slot = buckets[at];
+            if slot == EMPTY {
+                buckets[at] = u32::try_from(unique)
+                    .map_err(|_| Error::out_of_memory("a distinct radix partition is too large"))?;
+                partition.rows[unique] = row;
+                unique += 1;
+                break;
+            }
+            let held = partition.rows[slot as usize];
+            if held.hash == row.hash && held.value == row.value {
+                break;
+            }
+            at = (at + 1) & mask;
+        }
+    }
+    timing.stop(0);
+    i64::try_from(unique).map_err(|_| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))
 }
 
 fn finish_fixed(
@@ -3592,7 +3820,8 @@ mod tests {
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Aggregate, BigIntDistinct, Call, CompactNumeric, Distinct, FixedPartition, FixedRecord,
+        Aggregate, BigIntDistinct, BigIntDistinctPartition, BigIntDistinctRecord, Call,
+        CompactNumeric, Distinct, FixedPartition, FixedRecord, bigint_distinct_partition,
         fixed_partition,
     };
     use crate::buffer::Buffered;
@@ -3690,6 +3919,58 @@ mod tests {
             }
         }
         rows
+    }
+
+    fn bigint_chunk(values: &[Value]) -> Chunk {
+        let column = Vector::from_values(LogicalType::BigInt, values).expect("BIGINT values");
+        Chunk::new(vec![column]).expect("one column is one length")
+    }
+
+    #[test]
+    fn radix_bigint_distinct_counts_across_instances_and_skips_nulls() {
+        let plan = Plan::parse(concat!(
+            "Aggregate #1 groups=[] aggregates=[count(DISTINCT #0.0::BIGINT)::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [x::BIGINT]",
+        ))
+        .expect("a distinct count plan");
+        let schema = Schema::numbered(vec![Field::new("x", LogicalType::BigInt)], 0);
+        let rudb_plan::Node::Aggregate { groups, aggregates, .. } = *plan.node(plan.root()) else {
+            panic!("the root is an aggregate")
+        };
+        let (aggregate, out) =
+            Aggregate::new(&plan, &schema, 1, groups, aggregates, &Memory::unlimited())
+                .expect("a distinct count aggregate");
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        aggregate
+            .sink(&bigint_chunk(&[Value::BigInt(7), Value::Null, Value::BigInt(8)]), &mut left)
+            .expect("the left values");
+        aggregate
+            .sink(&bigint_chunk(&[Value::BigInt(8), Value::BigInt(9), Value::Null]), &mut right)
+            .expect("the right values");
+        aggregate.combine(left).expect("the left instance");
+        aggregate.combine(right).expect("the right instance");
+        aggregate.finalize().expect("the distinct count");
+        assert_eq!(answer(&out), [vec![Value::BigInt(3)]]);
+    }
+
+    #[test]
+    fn radix_bigint_distinct_answers_zero_without_input() {
+        let plan = Plan::parse(concat!(
+            "Aggregate #1 groups=[] aggregates=[count(DISTINCT #0.0::BIGINT)::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [x::BIGINT]",
+        ))
+        .expect("a distinct count plan");
+        let schema = Schema::numbered(vec![Field::new("x", LogicalType::BigInt)], 0);
+        let rudb_plan::Node::Aggregate { groups, aggregates, .. } = *plan.node(plan.root()) else {
+            panic!("the root is an aggregate")
+        };
+        let (aggregate, out) =
+            Aggregate::new(&plan, &schema, 1, groups, aggregates, &Memory::unlimited())
+                .expect("a distinct count aggregate");
+        aggregate.combine(aggregate.local()).expect("an empty instance");
+        aggregate.finalize().expect("the zero count");
+        assert_eq!(answer(&out), [vec![Value::BigInt(0)]]);
     }
 
     /// The point of the whole thing. Two instances see different rows of the same group, and what
@@ -3860,6 +4141,25 @@ mod tests {
         assert!(!values.insert(7));
         assert!(!values.insert(9));
         assert!(matches!(values, BigIntDistinct::Many(_)));
+    }
+
+    #[test]
+    fn a_bigint_radix_partition_counts_unique_values_across_hash_collisions() {
+        let mut partition = BigIntDistinctPartition {
+            rows: vec![
+                BigIntDistinctRecord { hash: 7, value: 11 },
+                BigIntDistinctRecord { hash: 7, value: 12 },
+                BigIntDistinctRecord { hash: 7, value: 11 },
+                BigIntDistinctRecord { hash: 23, value: 13 },
+            ],
+        };
+        assert_eq!(
+            bigint_distinct_partition(&mut partition, &Memory::unlimited())
+                .expect("the distinct partition"),
+            3,
+            "equal hashes still compare their integer values"
+        );
+        assert_eq!(size_of::<BigIntDistinctRecord>(), 16);
     }
 
     #[test]
