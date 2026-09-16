@@ -10,6 +10,11 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::source::{collect, names, without_comment, without_strings};
+
+const POLICY_FREE_CRATES: [&str; 3] = ["rudb-plan", "rudb-opt", "rudb-exec"];
+const POLICY_TYPES: [&str; 2] = ["Dialect", "Semantics"];
+
 pub(crate) fn check(root: &Path) -> Result<(), String> {
     let ranks = read_ranks(root)?;
     let crates_dir = root.join("crates");
@@ -53,8 +58,12 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
         }
     }
 
+    check_language_policy(&crates_dir, &mut problems)?;
+
     if problems.is_empty() {
-        println!("the layer rule holds across {checked} crates");
+        println!(
+            "the layer rule holds across {checked} crates, and language policy stops at the binder"
+        );
         Ok(())
     } else {
         for problem in &problems {
@@ -62,6 +71,39 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
         }
         Err(format!("{} layer violations", problems.len()))
     }
+}
+
+/// The plan and both passes below the binder receive decisions, not the policy that made them.
+fn check_language_policy(crates_dir: &Path, problems: &mut Vec<String>) -> Result<(), String> {
+    for name in POLICY_FREE_CRATES {
+        let src = crates_dir.join(name).join("src");
+        let mut files = Vec::new();
+        collect(&src, &mut files)?;
+        files.sort();
+        for path in files {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+            for (line, text) in policy_type_lines(&text) {
+                let relative = path.strip_prefix(crates_dir).unwrap_or(&path);
+                problems.push(format!(
+                    "{}:{} names {text}, but language policy stops at the binder",
+                    relative.display(),
+                    line + 1
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn policy_type_lines(text: &str) -> Vec<(usize, &'static str)> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(line, text)| {
+            let code = without_strings(&without_comment(text));
+            POLICY_TYPES.iter().find(|word| names(&code, word)).map(|word| (line, *word))
+        })
+        .collect()
 }
 
 pub(crate) fn read_ranks(root: &Path) -> Result<BTreeMap<String, u32>, String> {
@@ -110,4 +152,15 @@ pub(crate) fn dependencies(manifest: &str) -> Vec<String> {
         }
     }
     deps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::policy_type_lines;
+
+    #[test]
+    fn language_policy_types_are_code_and_not_prose_or_longer_names() {
+        let text = "use rudb_common::Semantics;\nuse rudb_parse::Dialect;\n// Dialect in prose is fine\nlet s = \"Semantics\";\nstruct QuerySemantics;\n";
+        assert_eq!(policy_type_lines(text), vec![(0, "Semantics"), (1, "Dialect")]);
+    }
 }
