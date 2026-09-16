@@ -39,6 +39,22 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     db.query(sql).unwrap().rows().collect()
 }
 
+#[test]
+fn non_recursive_ctes_run_as_inlined_queries() {
+    let db = Database::new();
+    assert_eq!(
+        rows(
+            &db,
+            "WITH a AS (SELECT 2 AS x), b(y) AS NOT MATERIALIZED (SELECT x + 1 FROM a) SELECT y FROM b",
+        ),
+        vec![vec![Value::Integer(3)]]
+    );
+    assert_eq!(
+        rows(&db, "WITH t AS (SELECT 1 AS x) SELECT left_t.x + right_t.x FROM t left_t, t right_t",),
+        vec![vec![Value::Integer(2)]]
+    );
+}
+
 /// The first column of a row, for a test that sorts a grouped answer by a `BIGINT` key.
 fn first_key(row: &[Value]) -> i64 {
     match row[0] {
