@@ -2117,6 +2117,29 @@ fn a_correlated_scalar_projection_replays_over_distinct_outer_values() {
     assert!(plan.contains("IS NOT DISTINCT FROM"), "{plan}");
     assert!(plan.contains("__correlated_1"), "{plan}");
     assert!(!plan.contains("DependentJoin"), "{plan}");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k, (SELECT o.k + x FROM (VALUES (10)) i(x)) FROM (VALUES (1), (2)) o(k) ORDER BY k"
+        ),
+        vec![
+            vec![Value::Integer(1), Value::Integer(11)],
+            vec![Value::Integer(2), Value::Integer(12)],
+        ]
+    );
+    db.execute("CREATE TABLE empty_scalar_source(x INTEGER)")
+        .expect("the empty scalar source is created");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k, (SELECT o.k + x FROM empty_scalar_source) FROM (VALUES (1), (2)) o(k) ORDER BY k"
+        ),
+        vec![vec![Value::Integer(1), Value::Null], vec![Value::Integer(2), Value::Null],]
+    );
+    assert!(
+        db.query("SELECT (SELECT o.k + x FROM (VALUES (10), (20)) i(x)) FROM (VALUES (1)) o(k)")
+            .is_err()
+    );
 }
 
 #[test]
