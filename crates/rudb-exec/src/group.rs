@@ -1973,7 +1973,7 @@ impl CompactNumeric {
             .ok_or_else(|| Error::out_of_range("a compact AVG count overflowed BIGINT"))?;
         let added_sum = i64::from(sum.unwrap_or(0));
         let added_mean = i64::from(mean.unwrap_or(0));
-        if !overflow.contains_key(&slot) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = overflow.entry(slot) {
             if let (Some(total_sum), Some(total_mean)) =
                 (self.sum.checked_add(added_sum), self.mean.checked_add(added_mean))
             {
@@ -1981,13 +1981,10 @@ impl CompactNumeric {
                 self.mean = total_mean;
                 return Ok(());
             }
-            overflow.insert(
-                slot,
-                (
-                    i128::from(self.sum) + i128::from(added_sum),
-                    i128::from(self.mean) + i128::from(added_mean),
-                ),
-            );
+            entry.insert((
+                i128::from(self.sum) + i128::from(added_sum),
+                i128::from(self.mean) + i128::from(added_mean),
+            ));
             return Ok(());
         }
         let totals = overflow.get_mut(&slot).expect("a wide compact total has an overflow entry");
@@ -2314,11 +2311,11 @@ impl Sink for Aggregate<'_> {
                             dense_codes[code as usize % DENSE_PARTITIONS].push(code);
                         }
                     } else {
-                        for row in 0..rows.rows {
+                        for (row, &code) in codes.iter().enumerate().take(rows.rows) {
                             if key.is_null_at(row) {
                                 *dense_nulls += 1;
                             } else {
-                                let code = codes[row] as usize;
+                                let code = code as usize;
                                 if code >= dictionary.len() {
                                     return Err(Error::internal(
                                         "a stable dictionary code is out of range",

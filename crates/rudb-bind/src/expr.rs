@@ -251,14 +251,31 @@ impl Binder<'_> {
             }
             _ => {}
         }
+        let checked_slash = op == BinaryOp::Divide
+            && !self.semantics.ieee_floating_point_ops()
+            && self.plan().expr_type(left).is_numeric();
+        let checked_remainder = op == BinaryOp::Modulo
+            && !self.semantics.ieee_floating_point_ops()
+            && (matches!(self.plan().expr_type(left), LogicalType::Float | LogicalType::Double)
+                || matches!(
+                    self.plan().expr_type(right),
+                    LogicalType::Float | LogicalType::Double
+                ));
         if self.semantics.null_on_division_by_zero()
             && (matches!(op, BinaryOp::IntegerDivide | BinaryOp::Modulo)
+                || checked_slash
                 || (op == BinaryOp::Divide
                     && self.plan().expr_type(left) == &LogicalType::Interval))
         {
             right = self.zero_to_null(right);
         }
         match function_of(op) {
+            Some(name) if checked_slash && !self.semantics.null_on_division_by_zero() => {
+                self.call_as(name, "__rudb_checked_slash", vec![left, right])
+            }
+            Some(name) if checked_remainder && !self.semantics.null_on_division_by_zero() => {
+                self.call_as(name, "__rudb_checked_remainder", vec![left, right])
+            }
             Some(name) => self.call(name, vec![left, right]),
             None => Err(Error::not_implemented(format!("the {} operator", spelling(ast, op)))),
         }
@@ -462,16 +479,36 @@ impl Binder<'_> {
 
     /// Resolves a scalar call, casts the arguments to what the overload wants, and records it.
     pub(crate) fn call(&mut self, name: &str, args: Vec<ExprRef>) -> Result<ExprRef> {
+        self.call_recorded_as(name, None, args)
+    }
+
+    /// Resolves one name while recording another internal implementation name.
+    fn call_as(
+        &mut self,
+        resolved_name: &str,
+        stored_name: &str,
+        args: Vec<ExprRef>,
+    ) -> Result<ExprRef> {
+        self.call_recorded_as(resolved_name, Some(stored_name), args)
+    }
+
+    /// Resolves a scalar call and optionally records a private implementation name.
+    fn call_recorded_as(
+        &mut self,
+        resolved_name: &str,
+        stored_name: Option<&str>,
+        args: Vec<ExprRef>,
+    ) -> Result<ExprRef> {
         let types: Vec<LogicalType> =
             args.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
-        let resolved = resolve(name, &types)?;
+        let resolved = resolve(resolved_name, &types)?;
         let mut cast = Vec::with_capacity(args.len());
         for (arg, wanted) in args.iter().zip(&resolved.arguments) {
             cast.push(self.cast_to(*arg, wanted));
         }
         let returns = self.narrowed_part(resolved.name, &cast, resolved.returns);
         let args = self.plan_mut().add_expr_list(&cast);
-        let name = self.plan_mut().intern(resolved.name);
+        let name = self.plan_mut().intern(stored_name.unwrap_or(resolved.name));
         Ok(self.plan_mut().add_expr(Expr::Function { name, args }, returns))
     }
 

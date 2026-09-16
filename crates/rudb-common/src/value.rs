@@ -343,7 +343,7 @@ impl fmt::Display for Value {
 }
 
 impl Value {
-    /// Formats a value in a session offset rather than the UTC fallback used by [`Display`].
+    /// Formats a value in a session offset rather than the UTC fallback used by [`std::fmt::Display`].
     #[must_use]
     pub fn to_string_at_offset(&self, offset_seconds: i32) -> String {
         let offset = offset_text(offset_seconds);

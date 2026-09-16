@@ -105,6 +105,11 @@ fn call<W: Write>(
     args: rudb_plan::Slice,
     schema: &Schema,
 ) -> fmt::Result {
+    let name = match name {
+        "__rudb_checked_slash" => "/",
+        "__rudb_checked_remainder" => "%",
+        other => other,
+    };
     let operator = !name.starts_with(|first: char| first.is_alphabetic() || first == '_');
     let args = plan.expr_list(args);
     match (operator, args) {

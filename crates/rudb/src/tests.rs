@@ -1587,6 +1587,60 @@ fn zero_division_nulls_are_resolved_while_the_expression_is_bound() {
 }
 
 #[test]
+fn ieee_floating_point_ops_are_resolved_while_the_expression_is_bound() {
+    let db = database();
+    assert_eq!(db.setting("ieee_floating_point_ops").expect("the setting"), "true");
+    assert!(
+        matches!(rows(&db, "SELECT 0.0::DOUBLE / 0.0::DOUBLE")[0][0], Value::Double(answer) if answer.is_nan())
+    );
+    assert!(
+        matches!(rows(&db, "SELECT 1.0::DOUBLE % 0.0::DOUBLE")[0][0], Value::Double(answer) if answer.is_nan())
+    );
+    db.execute("SET ieee_floating_point_ops = false").expect("checked floating operations");
+    assert_eq!(db.setting("ieee_floating_point_ops").expect("the setting"), "false");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT current_setting('ieee_floating_point_ops'), typeof(current_setting('ieee_floating_point_ops'))"
+        ),
+        vec![vec![Value::Boolean(false), text("BOOLEAN")]]
+    );
+    let advice = "Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.";
+    assert_eq!(
+        failure(&db, "SELECT 1.0::DOUBLE / 0.0::DOUBLE"),
+        format!("Division by zero in expression (1.0 / 0.0). {advice}")
+    );
+    assert_eq!(
+        failure(&db, "SELECT 1.0::DOUBLE % 0.0::DOUBLE"),
+        format!("Division by zero in expression (1.0 % 0.0). {advice}")
+    );
+    db.create_table("ieee_values", vec![Field::new("a", LogicalType::Double)]).unwrap();
+    db.append(
+        "ieee_values",
+        &[vec![Value::Double(-1.0)], vec![Value::Double(0.0)], vec![Value::Double(1.0)]],
+    )
+    .unwrap();
+    assert_eq!(
+        failure(&db, "SELECT 1.0 / a FROM ieee_values"),
+        format!("Division by zero in expression (1.0 / a). {advice}")
+    );
+    assert_eq!(
+        failure(&db, "SELECT 1.0 % a FROM ieee_values"),
+        format!("Division by zero in expression (1.0 % a). {advice}")
+    );
+    db.execute("SET null_on_division_by_zero = true").expect("nulling division errors");
+    assert_eq!(
+        rows(&db, "SELECT 1.0::DOUBLE / 0.0::DOUBLE, 1.0::DOUBLE % 0.0::DOUBLE"),
+        vec![vec![Value::Null, Value::Null]]
+    );
+    db.execute("RESET null_on_division_by_zero").expect("division errors");
+    db.execute("RESET ieee_floating_point_ops").expect("IEEE floating operations");
+    assert_eq!(db.setting("ieee_floating_point_ops").expect("the setting"), "true");
+    let error = db.execute("SET ieee_floating_point_ops = 'off'").expect_err("not a boolean");
+    assert_eq!(error.message(), "Failed to cast value: Could not convert string 'off' to BOOL");
+}
+
+#[test]
 fn a_non_integer_order_literal_needs_the_session_opt_in() {
     let db = database();
     let expected = "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to allow this behavior.";
@@ -1748,8 +1802,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Twelve rows for ten settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(12)]]);
+    // Thirteen rows for eleven settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(13)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
@@ -4342,7 +4396,9 @@ fn a_query_on_several_threads_says_so_in_its_metrics() {
     assert_eq!(metrics.settings.threads, 8, "the document says what the query was allowed");
     let widest = metrics.pipelines.iter().map(|pipeline| pipeline.instances).max().unwrap();
     assert_eq!(widest, 8, "and the scan says it used all of them");
-    assert!(metrics.resource.cpu_ns > 0);
+    if rudb_metrics::thread_cpu_ns().is_some() {
+        assert!(metrics.resource.cpu_ns > 0);
+    }
 }
 
 #[test]

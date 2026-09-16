@@ -30,17 +30,38 @@ pub struct Session {
 }
 
 /// The meaning-changing session choices consumed while a query is bound.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Semantics {
     default_descending: bool,
     default_null_order: DefaultNullOrder,
     integer_division: bool,
+    ieee_floating_point_ops: bool,
     null_on_division_by_zero: bool,
     order_by_non_integer_literal: bool,
     regex_match_full: bool,
 }
 
+impl Default for Semantics {
+    fn default() -> Self {
+        Self {
+            default_descending: false,
+            default_null_order: DefaultNullOrder::default(),
+            integer_division: false,
+            ieee_floating_point_ops: true,
+            null_on_division_by_zero: false,
+            order_by_non_integer_literal: false,
+            regex_match_full: false,
+        }
+    }
+}
+
 impl Semantics {
+    /// Whether floating division and remainder use IEEE answers for zero divisors.
+    #[must_use]
+    pub fn ieee_floating_point_ops(self) -> bool {
+        self.ieee_floating_point_ops
+    }
+
     /// Whether an order item with no direction is descending.
     #[must_use]
     pub fn default_descending(self) -> bool {
@@ -166,6 +187,11 @@ impl Session {
     /// Sets whether `/` is bound as the integer division operator.
     pub fn set_integer_division(&mut self, enabled: bool) {
         self.semantics.integer_division = enabled;
+    }
+
+    /// Sets whether floating division and remainder use IEEE answers for zero divisors.
+    pub fn set_ieee_floating_point_ops(&mut self, enabled: bool) {
+        self.semantics.ieee_floating_point_ops = enabled;
     }
 
     /// Sets whether division errors caused by a zero divisor become nulls.
