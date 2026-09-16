@@ -168,8 +168,13 @@ impl Source for Scan<'_> {
         // A native stripe is cheap enough that launching every available worker costs more than
         // it saves on small snapshots. Keep enough rows behind each worker to amortize its thread,
         // local operator state, and final combine. The upper bound also avoids the sharp cache and
-        // scheduler regression measured above sixteen workers on dense code aggregation.
-        let useful = self.table.rows().len().div_ceil(50_000).clamp(1, 4);
+        // scheduler regression measured above sixteen workers on dense code aggregation. Four
+        // remains the ceiling for small snapshots: sixteen made the 1M ClickBench suite 16.6%
+        // slower. Large snapshots have enough work to amortize more instances, and sixteen made
+        // the 10M suite 23.2% faster. The two slopes preserve the old choices through 1M and grow
+        // smoothly to sixteen at ten million rows instead of putting an abrupt threshold between
+        // the two.
+        let useful = native_instances(self.table.rows().len());
         Some(chunks.min(threads).min(useful))
     }
 
@@ -207,6 +212,12 @@ impl Source for Scan<'_> {
         *out = Chunk::with_rows(held, read.len())?;
         Ok(Progress::Done)
     }
+}
+
+fn native_instances(rows: usize) -> usize {
+    let small = rows.div_ceil(50_000).min(4);
+    let large = rows.div_ceil(625_000).min(16);
+    small.max(large).max(1)
 }
 
 /// One row and no columns.
@@ -1252,7 +1263,7 @@ mod tests {
 
     use super::{
         Bound, FileScan, Handout, Op, Probe, RUN, Scan, Schema, Series, VECTOR_SIZE, cut_rows,
-        next_piece, parts,
+        native_instances, next_piece, parts,
     };
 
     /// Every morsel a row group of `rows` rows is cut into, by asking for them the way `cut` does.
@@ -1631,6 +1642,22 @@ mod tests {
         for (threads, wanted) in [(1, 1), (8, 1), (9, 1), (16, 2), (32, 4), (64, 4)] {
             let cut = cut_rows(1024, whole, rows, 9, threads);
             assert_eq!(parts(rows, cut), wanted, "{threads} threads over nine row groups");
+        }
+    }
+
+    #[test]
+    fn native_workers_grow_only_after_a_snapshot_can_amortize_them() {
+        for (rows, workers) in [
+            (0, 1),
+            (50_000, 1),
+            (100_000, 2),
+            (1_000_000, 4),
+            (2_500_000, 4),
+            (5_000_000, 8),
+            (9_999_750, 16),
+            (100_000_000, 16),
+        ] {
+            assert_eq!(native_instances(rows), workers, "{rows} rows");
         }
     }
 
