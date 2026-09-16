@@ -972,7 +972,7 @@ fn the_functions_table_declares_a_promoted_argument_with_the_type_variable() {
 }
 
 #[test]
-fn the_settings_table_is_fifteen_rows_for_thirteen_settings_and_says_nothing_about_a_value() {
+fn the_settings_table_is_sixteen_rows_for_fourteen_settings_and_says_nothing_about_a_value() {
     // Built through `run`, which goes through `build` and so has no database behind it. There is
     // nothing to read a value out of there, so both value columns come back null, and that is the
     // answer rather than a default: this crate does not know what memory limit the process was
@@ -990,6 +990,7 @@ fn the_settings_table_is_fifteen_rows_for_thirteen_settings_and_says_nothing_abo
         names,
         [
             "TimeZone",
+            "current_dialect",
             "default_null_order",
             "default_order",
             "disable_timestamptz_casts",

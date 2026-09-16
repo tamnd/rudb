@@ -61,6 +61,13 @@ pub static SETTINGS: &[SettingEntry] = &[
         aliases: &[],
     },
     SettingEntry {
+        name: "current_dialect",
+        description: "The SQL dialect used by the parser",
+        input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
         name: "default_null_order",
         description: "NULL ordering used when none is specified (NULLS_FIRST or NULLS_LAST)",
         input_type: "VARCHAR",
@@ -204,7 +211,7 @@ mod tests {
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
-        assert_eq!(SETTINGS.len(), 15, "thirteen settings and two of them have a second spelling");
+        assert_eq!(SETTINGS.len(), 16, "fourteen settings and two of them have a second spelling");
         assert_eq!(setting_fields().len(), 7);
     }
 
