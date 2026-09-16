@@ -47,8 +47,8 @@
 use rudb_catalog::Catalog;
 use rudb_common::{LogicalType, Memory, Result, Value, human};
 use rudb_functions::{
-    database_size_fields, extension_fields, optimizer_fields, platform_fields, user_agent_fields,
-    version_fields,
+    database_size_fields, dialect_fields, extension_fields, grammar_extension_fields,
+    optimizer_fields, platform_fields, user_agent_fields, version_fields,
 };
 use rudb_opt::UPSTREAM;
 use rudb_plan::{Plan, Slice};
@@ -158,6 +158,25 @@ pub(crate) fn extensions(plan: &Plan, index: u32, columns: Slice) -> Result<Meta
 pub(crate) fn optimizers(plan: &Plan, index: u32, columns: Slice) -> Result<Metadata> {
     let rows: Vec<Vec<Value>> = UPSTREAM.iter().map(|name| vec![text(name)]).collect();
     Metadata::new("duckdb_optimizers", &optimizer_fields(), &rows, plan, index, columns)
+}
+
+/// Every installed SQL parser dialect, from the registry that validates `current_dialect`.
+pub(crate) fn dialects(plan: &Plan, index: u32, columns: Slice) -> Result<Metadata> {
+    let rows: Vec<Vec<Value>> =
+        rudb_parse::dialect::DIALECTS.iter().map(|dialect| vec![text(dialect.name())]).collect();
+    Metadata::new("duckdb_dialects", &dialect_fields(), &rows, plan, index, columns)
+}
+
+/// Every installed grammar extension. This build has none, which is also the pin's default answer.
+pub(crate) fn grammar_extensions(plan: &Plan, index: u32, columns: Slice) -> Result<Metadata> {
+    Metadata::new(
+        "duckdb_grammar_extensions",
+        &grammar_extension_fields(),
+        &[],
+        plan,
+        index,
+        columns,
+    )
 }
 
 /// What this build calls itself, which is the crate version with the `v` the pin writes.
