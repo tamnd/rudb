@@ -957,7 +957,11 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
                     .offset
                     .checked_add(u64::from(page.length))
                     .ok_or_else(|| invalid("dictionary page offset overflow"))?;
-                if page.offset < HEADER || end > size || page.length as usize > MAX_PAGE {
+                // A global dictionary covers a whole column, not one bounded stripe. Its lazy
+                // payload is intentionally allowed to grow past `MAX_PAGE`; only ordinary column
+                // pages are capped there. `Writer::finish` has already bounded this length by the
+                // on-disk `u32`, and the range check below keeps it inside the file.
+                if page.offset < HEADER || end > size {
                     return Err(invalid("dictionary page range is outside the file"));
                 }
                 Some(page)
@@ -1587,5 +1591,26 @@ mod tests {
             chunk.validate_external().expect_err("payload corruption must reach the caller");
         assert!(error.message().contains("payload checksum differs"), "{error}");
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn a_global_dictionary_may_be_larger_than_one_column_page() {
+        let dictionary = Page {
+            offset: HEADER,
+            length: u32::try_from(MAX_PAGE + 1).expect("the page bound fits on disk"),
+            hash: 0,
+        };
+        let table = Table {
+            name: "items".to_owned(),
+            fields: vec![Field::new("text", LogicalType::Varchar)],
+            stripes: Vec::new(),
+            rows: 0,
+            dictionaries: vec![Some(dictionary)],
+        };
+        let directory = encode_directory(&table).expect("directory");
+        let file_size = dictionary.offset + u64::from(dictionary.length) + 1;
+
+        let decoded = decode_directory(&directory, file_size).expect("large lazy dictionary");
+        assert_eq!(decoded.dictionaries[0].expect("dictionary").length, dictionary.length);
     }
 }
