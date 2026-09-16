@@ -65,6 +65,9 @@ impl Binder<'_> {
             ast::Expr::InSubquery { operand, query, negated } => {
                 self.bind_in_subquery(ast, operand, query, negated, scope)
             }
+            ast::Expr::QuantifiedSubquery { operand, op, query, all } => {
+                self.bind_quantified_subquery(ast, operand, op, query, all, scope)
+            }
             ast::Expr::Row { .. } => {
                 Err(Error::not_implemented("a row value outside of a VALUES clause".to_string()))
             }
@@ -570,6 +573,34 @@ impl Binder<'_> {
         scope: &Scope,
     ) -> Result<ExprRef> {
         let subject = self.bind_expr(ast, operand, scope)?;
+        self.bind_mark_subquery(ast, subject, query, CompareOp::Equal, negated)
+    }
+
+    fn bind_quantified_subquery(
+        &mut self,
+        ast: &Ast,
+        operand: ast::ExprRef,
+        op: BinaryOp,
+        query: ast::QueryRef,
+        all: bool,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let subject = self.bind_expr(ast, operand, scope)?;
+        let op = comparison_of(op).ok_or_else(|| {
+            Error::binder("Only comparisons can be used before ANY or ALL".to_string())
+        })?;
+        let op = if all { negate_comparison(op) } else { op };
+        self.bind_mark_subquery(ast, subject, query, op, all)
+    }
+
+    fn bind_mark_subquery(
+        &mut self,
+        ast: &Ast,
+        subject: ExprRef,
+        query: ast::QueryRef,
+        comparison: CompareOp,
+        negate: bool,
+    ) -> Result<ExprRef> {
         let (node, inner) = self.bind_isolated_subquery(ast, query)?;
         let [column] = inner.columns.as_slice() else {
             return Err(Error::binder(format!(
@@ -595,7 +626,7 @@ impl Binder<'_> {
         let candidate = self
             .plan_mut()
             .add_expr(Expr::Column(rudb_plan::ColumnBinding::new(projected, 0)), candidate_type);
-        let condition = self.compare(CompareOp::Equal, subject, candidate)?;
+        let condition = self.compare(comparison, subject, candidate)?;
         let marker = self.plan_mut().add_expr(
             Expr::Column(rudb_plan::ColumnBinding::new(projected, 1)),
             LogicalType::Boolean,
@@ -605,7 +636,7 @@ impl Binder<'_> {
             kind: rudb_plan::JoinKind::Mark,
             conditions: vec![condition],
         });
-        if negated { self.call("not", vec![marker]) } else { Ok(marker) }
+        if negate { self.call("not", vec![marker]) } else { Ok(marker) }
     }
 
     /// Resolves a scalar call, casts the arguments to what the overload wants, and records it.
@@ -847,6 +878,7 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
                 || ast.expr_list(list).iter().any(|&item| has_aggregate(ast, item))
         }
         ast::Expr::InSubquery { operand, .. } => has_aggregate(ast, operand),
+        ast::Expr::QuantifiedSubquery { operand, .. } => has_aggregate(ast, operand),
         ast::Expr::Row { items } => {
             ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
         }
@@ -1043,6 +1075,16 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             );
             if negated { format!("(NOT {any})") } else { any }
         }
+        ast::Expr::QuantifiedSubquery { operand, op, query, all } => {
+            let op = if all { negate_binary_comparison(op) } else { op };
+            let any = format!(
+                "({} {} ANY({}))",
+                describe(ast, operand, semantics),
+                name_spelling(ast, op),
+                rudb_parse::deparse::query(ast, query)
+            );
+            if all { format!("(NOT {any})") } else { any }
+        }
         // `row` is a keyword and a function of that name, so DuckDB quotes it in the name to say
         // which of the two it means.
         ast::Expr::Row { items } => {
@@ -1121,6 +1163,31 @@ fn comparison_of(op: BinaryOp) -> Option<CompareOp> {
         BinaryOp::IsNotDistinctFrom => CompareOp::NotDistinctFrom,
         _ => return None,
     })
+}
+
+fn negate_binary_comparison(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Eq => BinaryOp::NotEq,
+        BinaryOp::NotEq => BinaryOp::Eq,
+        BinaryOp::Lt => BinaryOp::GtEq,
+        BinaryOp::LtEq => BinaryOp::Gt,
+        BinaryOp::Gt => BinaryOp::LtEq,
+        BinaryOp::GtEq => BinaryOp::Lt,
+        _ => op,
+    }
+}
+
+fn negate_comparison(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Equal => CompareOp::NotEqual,
+        CompareOp::NotEqual => CompareOp::Equal,
+        CompareOp::Less => CompareOp::GreaterOrEqual,
+        CompareOp::LessOrEqual => CompareOp::Greater,
+        CompareOp::Greater => CompareOp::LessOrEqual,
+        CompareOp::GreaterOrEqual => CompareOp::Less,
+        CompareOp::DistinctFrom => CompareOp::NotDistinctFrom,
+        CompareOp::NotDistinctFrom => CompareOp::DistinctFrom,
+    }
 }
 
 /// The function an operator resolves to, if there is one behind it.
