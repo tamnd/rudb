@@ -2099,6 +2099,27 @@ fn a_correlated_scalar_filter_unnests_to_one_single_join() {
 }
 
 #[test]
+fn a_correlated_scalar_projection_replays_over_distinct_outer_values() {
+    let db = database();
+    let sql =
+        "SELECT k, (SELECT o.k + 1) FROM (VALUES (1), (1), (2), (NULL)) o(k) ORDER BY k NULLS LAST";
+    assert_eq!(
+        rows(&db, sql),
+        vec![
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Integer(3)],
+            vec![Value::Null, Value::Null],
+        ]
+    );
+    let plan = db.plan(sql).expect("the correlated scalar projection plans");
+    assert!(plan.contains("Join SINGLE"), "{plan}");
+    assert!(plan.contains("IS NOT DISTINCT FROM"), "{plan}");
+    assert!(plan.contains("__correlated_1"), "{plan}");
+    assert!(!plan.contains("DependentJoin"), "{plan}");
+}
+
+#[test]
 fn correlated_scalar_aggregates_group_by_hidden_correlation_keys() {
     let db = database();
     let sql = "SELECT k, (SELECT sum(value) FROM (VALUES (1, 10), (1, 20), (2, 5), (NULL, 40)) i(k, value) WHERE i.k = o.k AND value > 5) FROM (VALUES (1), (2), (3), (NULL)) o(k) ORDER BY k NULLS LAST";

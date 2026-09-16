@@ -49,6 +49,9 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     if let Some(join) = scalar_aggregate(plan, left, right, kind, conditions) {
         return Some(join);
     }
+    if let Some(join) = scalar_projection_domain(plan, left, right, kind, conditions) {
+        return Some(join);
+    }
     let Node::Project { input: filtered, index, exprs, names } = *plan.node(right) else {
         return None;
     };
@@ -119,6 +122,87 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     let names = plan.add_name_list(&projected_names);
     let right = plan.add_node(Node::Project { input, index, exprs, names });
     let all: Vec<ExprRef> = plan.expr_list(conditions).iter().copied().chain(rewritten).collect();
+    let conditions = plan.add_expr_list(&all);
+    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+}
+
+/// Replays a scalar projection over the distinct outer values it reads.
+///
+/// A scalar query such as `SELECT (SELECT outer.k + 1)` has no inner filter from which to extract
+/// a join key. Its one-row input is replaced by the outer-key domain, the projection is rewritten
+/// against that domain, and a null-safe lookup attaches the result to every original outer row.
+fn scalar_projection_domain(
+    plan: &mut Plan,
+    left: NodeRef,
+    right: NodeRef,
+    kind: JoinKind,
+    conditions: rudb_plan::Slice,
+) -> Option<NodeRef> {
+    if kind != JoinKind::Single {
+        return None;
+    }
+    let Node::Project { input, index, exprs, names } = *plan.node(right) else {
+        return None;
+    };
+    if !matches!(plan.node(input), Node::Dummy) {
+        return None;
+    }
+    let outer = produced(plan, left);
+    let projected = plan.expr_list(exprs).to_vec();
+    let mut outer_keys = Vec::new();
+    for &expr in &projected {
+        walk::columns(plan, expr, &mut |binding| {
+            if outer.contains(binding.table) && !outer_keys.contains(&binding) {
+                outer_keys.push(binding);
+            }
+        });
+    }
+    if outer_keys.is_empty() {
+        return None;
+    }
+    let outer_exprs: Vec<ExprRef> = outer_keys
+        .iter()
+        .map(|&binding| projected.iter().find_map(|&expr| find_column_expr(plan, expr, binding)))
+        .collect::<Option<_>>()?;
+    let domain_index = walk::fresh_index(plan);
+    let groups = plan.add_expr_list(&outer_exprs);
+    let aggregates = plan.add_expr_list(&[]);
+    let domain =
+        plan.add_node(Node::Aggregate { input: left, index: domain_index, groups, aggregates });
+    let outputs: HashMap<ColumnBinding, usize> =
+        outer_keys.iter().copied().enumerate().map(|(position, key)| (key, position)).collect();
+    let mut rewritten: Vec<ExprRef> = projected
+        .into_iter()
+        .map(|expr| replace_inner(plan, expr, domain_index, &outputs))
+        .collect();
+    let mut projected_names = plan.name_list(names).to_vec();
+    for (position, &source) in outer_exprs.iter().enumerate() {
+        let output = rewritten.len();
+        rewritten.push(plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(domain_index, u32::try_from(position).ok()?)),
+            plan.expr_type(source).clone(),
+            plan.expr_span(source),
+        ));
+        projected_names.push(plan.intern(&format!("__correlated_{output}")));
+    }
+    let visible = rewritten.len() - outer_exprs.len();
+    let exprs = plan.add_expr_list(&rewritten);
+    let names = plan.add_name_list(&projected_names);
+    let right = plan.add_node(Node::Project { input: domain, index, exprs, names });
+
+    let mut all = plan.expr_list(conditions).to_vec();
+    for (position, &outer_expr) in outer_exprs.iter().enumerate() {
+        let right_expr = plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(index, u32::try_from(visible + position).ok()?)),
+            plan.expr_type(outer_expr).clone(),
+            plan.expr_span(outer_expr),
+        );
+        all.push(plan.add_expr_at(
+            Expr::Compare { op: CompareOp::NotDistinctFrom, left: outer_expr, right: right_expr },
+            LogicalType::Boolean,
+            plan.expr_span(outer_expr),
+        ));
+    }
     let conditions = plan.add_expr_list(&all);
     Some(plan.add_node(Node::Join { left, right, kind, conditions }))
 }
