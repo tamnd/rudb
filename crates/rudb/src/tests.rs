@@ -1781,6 +1781,27 @@ fn show_behavior_resolves_a_name_before_execution() {
 }
 
 #[test]
+fn current_dialect_resolves_through_the_installed_parser_registry() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT current_setting('current_dialect')"), vec![vec![text("duckdb")]]);
+    db.execute("SET current_dialect = 'DUCKDB'").expect("the installed dialect");
+    assert_eq!(db.setting("current_dialect").expect("the dialect"), "DUCKDB");
+    assert_eq!(rows(&db, "SELECT 1"), vec![vec![Value::Integer(1)]]);
+    let error = db.execute("SET current_dialect = 'cypher'").expect_err("not installed");
+    assert_eq!(error.code().duckdb_name(), "Invalid Input Error");
+    assert_eq!(error.message(), "Dialect \"cypher\" is not installed");
+    db.execute("RESET current_dialect").expect("the default dialect");
+    assert_eq!(db.setting("current_dialect").expect("the dialect"), "duckdb");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'current_dialect'"
+        ),
+        vec![vec![text("The SQL dialect used by the parser"), text("VARCHAR"), text("GLOBAL")]]
+    );
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -1890,8 +1911,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Fifteen rows for thirteen settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(15)]]);
+    // Sixteen rows for fourteen settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(16)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
