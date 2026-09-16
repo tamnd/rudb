@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry. It is not named by a query, it has no schema, and the set of
 //! them is fixed at compile time, so this is a match on a name rather than a map. [`Settings::NAMES`]
-//! is that set, and it is five names for three settings, because [`crate::Config`] holds three things
+//! is that set, and it is six names for four settings, because [`crate::Config`] holds three things
 //! a program can choose and a fourth that DuckDB has no setting for, and two of the three have a
 //! second spelling. `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways
 //! round, which is what the binary does and what a client that writes the other spelling expects.
@@ -48,6 +48,10 @@ pub(crate) struct Settings {
     /// compares against and what a read of the setting has to hand back. It is validated when it is
     /// set, so the context it builds later cannot fail.
     disabled: RwLock<String>,
+    /// The IANA time-zone name used to turn instants into session-local calendar fields.
+    time_zone: RwLock<String>,
+    /// The operating-system time zone restored by `RESET TimeZone` and `SET TIME ZONE LOCAL`.
+    default_time_zone: String,
     /// Which implementation runs at each seam, as `SET seam.<name>` has left it.
     ///
     /// Held here rather than in [`Config`], because there are twenty seven of them and a `Config`
@@ -59,15 +63,27 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 5] =
-        ["disabled_optimizers", "max_memory", "memory_limit", "threads", "worker_threads"];
+    pub(crate) const NAMES: [&'static str; 6] = [
+        "TimeZone",
+        "disabled_optimizers",
+        "max_memory",
+        "memory_limit",
+        "threads",
+        "worker_threads",
+    ];
 
     /// The settings a database opened with this configuration starts at.
     pub(crate) fn new(config: Config) -> Self {
+        let default_time_zone = iana_time_zone::get_timezone()
+            .ok()
+            .filter(|zone| Session::knows_time_zone(zone))
+            .unwrap_or_else(|| "UTC".to_string());
         Self {
             defaults: config,
             current: RwLock::new(config),
             disabled: RwLock::new(String::new()),
+            time_zone: RwLock::new(default_time_zone.clone()),
+            default_time_zone,
             seams: RwLock::new(rudb_seam::Settings::new()),
         }
     }
@@ -137,10 +153,20 @@ impl Settings {
                 .unwrap_or_else(|held| held.into_inner())
                 .set(name, text.trim());
         }
-        if !Self::NAMES.contains(&name) {
+        if !Self::NAMES.iter().any(|known| known.eq_ignore_ascii_case(name)) {
             return Err(Error::catalog(rudb_functions::unknown_setting(name)));
         }
         match canonical(name) {
+            "TimeZone" => {
+                let zone = match value {
+                    None => self.default_time_zone.clone(),
+                    Some(value) => text_of(value),
+                };
+                if !Session::knows_time_zone(&zone) {
+                    return Err(Error::not_implemented(format!("Unknown TimeZone '{zone}'!")));
+                }
+                *self.time_zone.write().unwrap_or_else(|held| held.into_inner()) = zone;
+            }
             "disabled_optimizers" => {
                 let text = match value {
                     None => String::new(),
@@ -194,6 +220,9 @@ impl Settings {
         }
         let config = self.config();
         match canonical(name) {
+            "TimeZone" => {
+                Ok(self.time_zone.read().unwrap_or_else(|held| held.into_inner()).clone())
+            }
             "disabled_optimizers" => Ok(self.disabled_optimizers()),
             // An unlimited budget prints as the word rather than as a number, because rudb's
             // default is no limit where DuckDB's is a fraction of the machine, and printing the
@@ -206,25 +235,28 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are five names and the alternative
+    /// Built once per statement rather than held, because there are six names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Three settings and five names means the loop below would otherwise take six locks to read
+    /// Four settings and six names means the loop below would otherwise take several locks to read
     /// three numbers.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
         let memory = config.memory_limit().map_or_else(|| "unlimited".to_string(), human);
         let threads = config.threads().to_string();
+        let time_zone = self.time_zone.read().unwrap_or_else(|held| held.into_inner()).clone();
         let mut session = Session::new();
+        session.set_time_zone(&time_zone);
         for name in Self::NAMES {
             session.set(
                 name,
                 match canonical(name) {
+                    "TimeZone" => time_zone.clone(),
                     "disabled_optimizers" => disabled.clone(),
                     "memory_limit" => memory.clone(),
                     "threads" => threads.clone(),
@@ -247,6 +279,9 @@ impl Settings {
 /// That is the way round it is here too, because `memory_limit` and `threads` are the names the
 /// documentation uses and the names everything else in rudb already spells.
 fn canonical(name: &str) -> &str {
+    if name.eq_ignore_ascii_case("timezone") {
+        return "TimeZone";
+    }
     match name {
         "max_memory" => "memory_limit",
         "worker_threads" => "threads",

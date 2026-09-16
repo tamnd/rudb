@@ -342,6 +342,37 @@ impl fmt::Display for Value {
     }
 }
 
+impl Value {
+    /// Formats a value in a session offset rather than the UTC fallback used by [`Display`].
+    #[must_use]
+    pub fn to_string_at_offset(&self, offset_seconds: i32) -> String {
+        let offset = offset_text(offset_seconds);
+        match self {
+            Self::TimestampTz(micros) => {
+                let local = micros.saturating_add(i64::from(offset_seconds) * 1_000_000);
+                format!("{}{offset}", Self::Timestamp(local))
+            }
+            Self::TimeTz(micros) => format!("{}{offset}", Self::Time(*micros)),
+            other => other.to_string(),
+        }
+    }
+}
+
+fn offset_text(seconds: i32) -> String {
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let absolute = seconds.unsigned_abs();
+    let hours = absolute / 3600;
+    let minutes = (absolute / 60) % 60;
+    let remainder = absolute % 60;
+    if remainder != 0 {
+        format!("{sign}{hours:02}:{minutes:02}:{remainder:02}")
+    } else if minutes != 0 {
+        format!("{sign}{hours:02}:{minutes:02}")
+    } else {
+        format!("{sign}{hours:02}")
+    }
+}
+
 /// The two float types, so that one printer can serve both without going through `f64`.
 ///
 /// Widening an `f32` to print it is wrong and quietly so: `0.1f32` as an `f64` is

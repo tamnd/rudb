@@ -305,6 +305,12 @@ impl Binder<'_> {
                 return Ok(folded);
             }
         }
+        // The one argument form measures from the session-local date at the start of the
+        // statement. Insert that date here so the ordinary two-moment kernel remains free of a
+        // session dependency and both spellings use exactly the same calendar arithmetic.
+        if rudb_catalog::same_name(&written, "age") && bound.len() == 1 {
+            bound.insert(0, self.current_date());
+        }
         self.call(&written, bound)
     }
 

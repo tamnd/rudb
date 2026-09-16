@@ -14,14 +14,24 @@
 
 use std::collections::BTreeMap;
 
+use chrono::{Offset, TimeZone as _, Utc};
+use chrono_tz::Tz;
+
 /// The settings a session has, by name.
 ///
 /// Every setting the engine has, not only the ones somebody changed. A reader of this is answering
 /// "what is it now", so a name that is missing means the engine does not have that setting rather
 /// than that it is at its default.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     values: BTreeMap<String, String>,
+    time_zone: Tz,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self { values: BTreeMap::new(), time_zone: chrono_tz::UTC }
+    }
 }
 
 impl Session {
@@ -34,6 +44,38 @@ impl Session {
     /// Records what one setting is now.
     pub fn set(&mut self, name: &str, value: impl Into<String>) {
         self.values.insert(name.to_string(), value.into());
+    }
+
+    /// Sets the time zone after it has been validated by the setting layer.
+    pub fn set_time_zone(&mut self, name: &str) {
+        self.time_zone = name.parse().unwrap_or(chrono_tz::UTC);
+    }
+
+    /// The canonical IANA name of the session time zone.
+    #[must_use]
+    pub fn time_zone(&self) -> &str {
+        self.time_zone.name()
+    }
+
+    /// Whether the bundled time-zone database knows this name.
+    #[must_use]
+    pub fn knows_time_zone(name: &str) -> bool {
+        name.parse::<Tz>().is_ok()
+    }
+
+    /// The UTC offset in seconds at an instant expressed as Unix microseconds.
+    #[must_use]
+    pub fn offset_seconds_at(&self, micros: i64) -> i32 {
+        let seconds = micros.div_euclid(1_000_000);
+        let nanos = u32::try_from(micros.rem_euclid(1_000_000) * 1_000).unwrap_or_default();
+        let Some(utc) = Utc.timestamp_opt(seconds, nanos).single() else { return 0 };
+        self.time_zone.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc()
+    }
+
+    /// A UTC instant shifted to the wall clock of this session.
+    #[must_use]
+    pub fn local_micros(&self, micros: i64) -> i64 {
+        micros.saturating_add(i64::from(self.offset_seconds_at(micros)) * 1_000_000)
     }
 
     /// What that setting is now, and `None` for a name this session has no answer for.

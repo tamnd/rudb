@@ -31,6 +31,7 @@ rudb-metrics.workspace = true
 rudb-native.workspace = true
 rudb-arrow.workspace = true
 rudb-io.workspace = true
+iana-time-zone.workspace = true
 
 [lints]
 workspace = true

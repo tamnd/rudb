@@ -128,12 +128,13 @@ impl Binder<'_> {
     /// One session context answer, as a constant in the plan.
     fn context(&mut self, what: Context) -> ExprRef {
         let instant = self.instant();
-        let midnight = || instant.rem_euclid(MICROS_PER_DAY);
+        let local = self.session.local_micros(instant);
+        let midnight = || local.rem_euclid(MICROS_PER_DAY);
         let value = match what {
             Context::Instant => Value::TimestampTz(instant),
-            Context::LocalInstant => Value::Timestamp(instant),
+            Context::LocalInstant => Value::Timestamp(local),
             Context::Date => {
-                let days = instant.div_euclid(MICROS_PER_DAY);
+                let days = local.div_euclid(MICROS_PER_DAY);
                 Value::Date(i32::try_from(days).unwrap_or(i32::MAX))
             }
             Context::ZonedTime => Value::TimeTz(midnight()),
@@ -143,6 +144,11 @@ impl Binder<'_> {
             Context::User => Value::Varchar(USER.to_string()),
         };
         self.plan_mut().add_constant(value)
+    }
+
+    /// The session-local date used as the first argument of one-argument `age`.
+    pub(crate) fn current_date(&mut self) -> ExprRef {
+        self.context(Context::Date)
     }
 }
 

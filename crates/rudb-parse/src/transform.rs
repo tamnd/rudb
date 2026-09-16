@@ -328,6 +328,9 @@ impl<'a> Transform<'a> {
     /// table and is ignored is a statement that changes an answer.
     fn set_statement(&mut self, node: u32) -> Result<Statement> {
         let inner = self.first(self.find(node, "SetAssignmentOrTimeZone"));
+        if self.name(inner) == "SetTimeZone" {
+            return self.set_time_zone(inner);
+        }
         if self.name(inner) != "StandardAssignment" {
             return self.unsupported(inner);
         }
@@ -346,6 +349,31 @@ impl<'a> Transform<'a> {
         };
         let index = self.ast.settings.len() as u32;
         self.ast.settings.push(Setting { name, scope, value });
+        Ok(Statement::Set(index))
+    }
+
+    /// `SET TIME ZONE value`, normalized to the `TimeZone` setting DuckDB exposes beside it.
+    fn set_time_zone(&mut self, node: u32) -> Result<Statement> {
+        let zone = self.first(self.find(node, "ZoneValue"));
+        let name = self.intern("TimeZone");
+        if matches!(self.name(zone), "ZoneDefault" | "ZoneLocal") {
+            let index = self.ast.settings.len() as u32;
+            self.ast.settings.push(Setting { name, scope: Scope::Unwritten, value: NONE });
+            return Ok(Statement::Reset(index));
+        }
+        let text = match self.name(zone) {
+            "ZoneStringLiteral" => self.string_value(self.find(zone, "StringLiteral"))?,
+            "ZoneIdentifier" => {
+                let identifier = self.find(zone, "Identifier");
+                let identifier = self.identifier(identifier);
+                self.ast.string(identifier).to_string()
+            }
+            _ => return self.unsupported(zone),
+        };
+        let text = self.intern(&text);
+        let value = self.push(Expr::Literal { kind: LiteralKind::String, text });
+        let index = self.ast.settings.len() as u32;
+        self.ast.settings.push(Setting { name, scope: Scope::Unwritten, value });
         Ok(Statement::Set(index))
     }
 
@@ -3085,6 +3113,13 @@ mod tests {
         assert_eq!(round_statement("SET LOCAL threads = 4"), "SET LOCAL threads = 4");
         assert_eq!(round_statement("RESET memory_limit"), "RESET memory_limit");
         assert_eq!(round_statement("RESET GLOBAL memory_limit"), "RESET GLOBAL memory_limit");
+        assert_eq!(
+            round_statement("SET TIME ZONE 'Asia/Kathmandu'"),
+            "SET TimeZone = 'Asia/Kathmandu'"
+        );
+        assert_eq!(round_statement("SET TIME ZONE UTC"), "SET TimeZone = 'UTC'");
+        assert_eq!(round_statement("SET TIME ZONE DEFAULT"), "RESET TimeZone");
+        assert_eq!(round_statement("SET TIME ZONE LOCAL"), "RESET TimeZone");
     }
 
     #[test]
@@ -3092,7 +3127,7 @@ mod tests {
         // `SET VARIABLE x = 1` declares a session variable and `SET SCHEMA` picks where an
         // unqualified name is looked up. Neither is a knob on the engine and reading either as one
         // would change an answer quietly.
-        for statement in ["SET VARIABLE x = 1", "SET SCHEMA 'main'", "SET TIME ZONE 'UTC'"] {
+        for statement in ["SET VARIABLE x = 1", "SET SCHEMA 'main'"] {
             let error = parse_ast(statement).expect_err(statement);
             assert_eq!(error.code().duckdb_name(), "Not implemented Error", "{statement}");
         }
