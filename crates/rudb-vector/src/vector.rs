@@ -2055,6 +2055,18 @@ pub struct Packed<'a> {
 }
 
 impl Packed<'_> {
+    /// Packed words. A persisted vector also records [`Self::offset`].
+    #[must_use]
+    pub fn words(&self) -> &[u64] {
+        self.words
+    }
+
+    /// Bit offset, in rows, of the first value.
+    #[must_use]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
     /// How many bits one code takes, between one and [`PACKED_WIDTH_MAX`].
     #[must_use]
     pub fn width(&self) -> u32 {

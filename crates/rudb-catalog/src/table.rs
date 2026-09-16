@@ -1,7 +1,8 @@
 //! A table: a name, some columns, and the rows.
 
 use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_storage::MemoryTable;
+use rudb_native::Reader as NativeReader;
+use rudb_storage::{MemoryTable, Probe};
 use rudb_vector::{Chunk, Form};
 
 use crate::catalog::DETACHED;
@@ -31,6 +32,78 @@ pub fn duplicate_check(columns: &[Field]) -> Result<()> {
     Ok(())
 }
 
+/// Rows held while a table is being built or read from a committed native snapshot.
+#[derive(Debug, Clone)]
+pub enum Rows {
+    /// Mutable chunks owned by this process.
+    Memory(MemoryTable),
+    /// Immutable stripes read by projected column from one file.
+    Native(NativeReader),
+}
+
+impl Rows {
+    /// Column types.
+    #[must_use]
+    pub fn types(&self) -> Vec<LogicalType> {
+        match self {
+            Self::Memory(rows) => rows.types().to_vec(),
+            Self::Native(reader) => {
+                reader.table().fields().iter().map(|field| field.ty.clone()).collect()
+            }
+        }
+    }
+
+    /// Total row count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Memory(rows) => rows.len(),
+            Self::Native(reader) => reader.table().rows(),
+        }
+    }
+
+    /// Whether there are no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of independently readable chunks or stripes.
+    #[must_use]
+    pub fn chunk_count(&self) -> usize {
+        match self {
+            Self::Memory(rows) => rows.chunk_count(),
+            Self::Native(reader) => reader.table().stripes().len(),
+        }
+    }
+
+    /// Reads only projected columns.
+    pub fn read(&self, at: usize, columns: &[usize]) -> Result<Chunk> {
+        match self {
+            Self::Memory(rows) => rows.read(at, columns),
+            Self::Native(reader) => reader.read(at, columns),
+        }
+    }
+
+    /// Whether statistics prove this chunk cannot match.
+    #[must_use]
+    pub fn skips(&self, at: usize, probes: &[Probe]) -> bool {
+        match self {
+            Self::Memory(rows) => rows.skips(at, probes),
+            Self::Native(_) => false,
+        }
+    }
+
+    /// One whole in-memory chunk, used by checkpointing and tests.
+    #[must_use]
+    pub fn chunk(&self, at: usize) -> Option<&Chunk> {
+        match self {
+            Self::Memory(rows) => rows.chunk(at),
+            Self::Native(_) => None,
+        }
+    }
+}
+
 /// One table.
 ///
 /// The rows are a [`MemoryTable`] because that is what M0 has. When the storage format arrives the
@@ -40,7 +113,7 @@ pub fn duplicate_check(columns: &[Field]) -> Result<()> {
 pub struct Table {
     name: QualifiedName,
     columns: Vec<Field>,
-    rows: MemoryTable,
+    rows: Rows,
     /// What `duckdb_tables()` reports as `table_oid`, stamped by the catalog when this goes in.
     oid: i64,
 }
@@ -58,7 +131,18 @@ impl Table {
     pub fn new(name: QualifiedName, columns: Vec<Field>) -> Result<Self> {
         duplicate_check(&columns)?;
         let types = columns.iter().map(|column| column.ty.clone()).collect();
-        Ok(Self { name, columns, rows: MemoryTable::new(types), oid: DETACHED })
+        Ok(Self { name, columns, rows: Rows::Memory(MemoryTable::new(types)), oid: DETACHED })
+    }
+
+    /// A table whose stripes are read from one committed native file.
+    ///
+    /// # Errors
+    ///
+    /// If the reader's stored schema has duplicate column names.
+    pub fn native(name: QualifiedName, reader: NativeReader) -> Result<Self> {
+        let columns = reader.table().fields().to_vec();
+        duplicate_check(&columns)?;
+        Ok(Self { name, columns, rows: Rows::Native(reader), oid: DETACHED })
     }
 
     /// The number the catalog tables join on, and [`DETACHED`] for a table not in a catalog.
@@ -98,7 +182,7 @@ impl Table {
 
     /// The rows.
     #[must_use]
-    pub fn rows(&self) -> &MemoryTable {
+    pub fn rows(&self) -> &Rows {
         &self.rows
     }
 
@@ -107,8 +191,15 @@ impl Table {
     /// This is the way past the constraint check, and the two `append` methods here are the way
     /// through it. A caller that already knows what it is holding, such as the loader that built
     /// the chunk out of a file the table was declared from, can take this one.
+    ///
+    /// # Panics
+    ///
+    /// If called for an immutable table opened from a committed native file.
     pub fn rows_mut(&mut self) -> &mut MemoryTable {
-        &mut self.rows
+        match &mut self.rows {
+            Rows::Memory(rows) => rows,
+            Rows::Native(_) => panic!("a committed native table is immutable"),
+        }
     }
 
     /// Adds a chunk, refusing a null in a column that said it would not have one.
@@ -120,7 +211,10 @@ impl Table {
     /// program that catches one by its text is a program rudb has to not surprise.
     pub fn append(&mut self, chunk: Chunk) -> Result<()> {
         self.refuse_nulls(&chunk)?;
-        self.rows.append(chunk)
+        match &mut self.rows {
+            Rows::Memory(rows) => rows.append(chunk),
+            Rows::Native(_) => Err(Error::not_implemented("appending to a committed native table")),
+        }
     }
 
     /// Adds rows of single values, refusing a null in a column that said it would not have one.
@@ -137,7 +231,10 @@ impl Table {
                 }
             }
         }
-        self.rows.append_rows(rows)
+        match &mut self.rows {
+            Rows::Memory(held) => held.append_rows(rows),
+            Rows::Native(_) => Err(Error::not_implemented("appending to a committed native table")),
+        }
     }
 
     /// Checks a chunk against the `NOT NULL` columns before any of it is kept.

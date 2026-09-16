@@ -10,6 +10,7 @@ use crate::system::{
 };
 use crate::table::Table;
 use crate::view::View;
+use rudb_native::Reader as NativeReader;
 
 /// The default attached database, which is the one an in-memory session gets.
 pub const DEFAULT_CATALOG: &str = "memory";
@@ -280,6 +281,27 @@ impl Catalog {
         // Stamped before the name is checked, so a refused create burns an oid rather than handing
         // the next table the number the refused one would have had. A gap in the sequence costs
         // nothing and a number handed out twice costs a wrong join.
+        table.stamp(self.stamp());
+        let schema = self.schema_mut(&name.catalog, &name.schema)?;
+        if let Some(found) = schema.kind(&name.table) {
+            return Err(taken(found, &name.table));
+        }
+        schema.tables.push(table);
+        Ok(())
+    }
+
+    /// Registers the table committed in one native file in the default catalog and schema.
+    ///
+    /// # Errors
+    ///
+    /// If its name is already used or its stored schema is invalid.
+    pub fn create_native_table(&mut self, reader: NativeReader) -> Result<()> {
+        let name = QualifiedName::new(
+            self.default_catalog.clone(),
+            self.default_schema.clone(),
+            reader.table().name(),
+        );
+        let mut table = Table::native(name.clone(), reader)?;
         table.stamp(self.stamp());
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
         if let Some(found) = schema.kind(&name.table) {

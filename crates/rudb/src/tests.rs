@@ -4153,3 +4153,31 @@ fn a_table_built_from_a_query_keeps_the_dictionary_the_query_produced() {
     let rows: Vec<Vec<Value>> = answer.rows().collect();
     assert_eq!(rows, vec![vec![Value::BigInt(3072), Value::HugeInt(3072)]]);
 }
+
+#[test]
+fn checkpoint_publishes_a_native_file_that_a_new_process_can_read() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-native-checkpoint-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let database = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the new native database opens");
+    database.execute("CREATE TABLE hits (id INTEGER, name VARCHAR)").expect("the table is made");
+    database
+        .execute("INSERT INTO hits VALUES (1, 'one'), (2, NULL), (3, 'three')")
+        .expect("the rows are inserted");
+    database.execute("CHECKPOINT").expect("the snapshot is committed");
+    drop(database);
+
+    let reopened = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the committed native database reopens");
+    assert_eq!(
+        rows(&reopened, "SELECT count(*), sum(id), min(name) FROM hits"),
+        vec![vec![Value::BigInt(3), Value::HugeInt(6), Value::Varchar("one".into())]]
+    );
+    std::fs::remove_file(path).expect("the temporary native database is removed");
+}

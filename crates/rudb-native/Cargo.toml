@@ -1,6 +1,6 @@
 [package]
-name = "rudb-catalog"
-description = "Schemas, tables, views, constraints, dependency tracking, dictionaries and symbol tables."
+name = "rudb-native"
+description = "Rudb single-file columnar storage reader and writer."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,10 +15,6 @@ readme.workspace = true
 [dependencies]
 rudb-common.workspace = true
 rudb-vector.workspace = true
-rudb-storage.workspace = true
-rudb-txn.workspace = true
-rudb-functions.workspace = true
-rudb-native.workspace = true
 
 [lints]
 workspace = true
