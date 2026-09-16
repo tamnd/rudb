@@ -333,8 +333,11 @@ impl<'a> Binder<'a> {
         }
         let mut slices = Vec::with_capacity(bound.len());
         for row in &bound {
-            let items: Vec<ExprRef> =
-                row.iter().zip(&types).map(|(&expr, ty)| self.cast_to(expr, ty)).collect();
+            let items: Vec<ExprRef> = row
+                .iter()
+                .zip(&types)
+                .map(|(&expr, ty)| self.checked_cast_to(expr, ty, false))
+                .collect::<Result<_>>()?;
             slices.push(self.plan.add_expr_list(&items));
         }
         let rows = self.plan.add_rows(&slices);
@@ -394,8 +397,8 @@ impl<'a> Binder<'a> {
             })?;
             types.push(common);
         }
-        let left_node = self.conform(left_node, &left_scope, &types);
-        let right_node = self.conform(right_node, &right_scope, &types);
+        let left_node = self.conform(left_node, &left_scope, &types)?;
+        let right_node = self.conform(right_node, &right_scope, &types)?;
         let index = self.fresh_index();
         let kind = match op {
             SetOp::Union => SetOpKind::Union,
@@ -437,21 +440,21 @@ impl<'a> Binder<'a> {
     }
 
     /// Projects one side of a set operation so that its columns have the agreed types.
-    fn conform(&mut self, node: NodeRef, scope: &Scope, types: &[LogicalType]) -> NodeRef {
+    fn conform(&mut self, node: NodeRef, scope: &Scope, types: &[LogicalType]) -> Result<NodeRef> {
         if scope.columns.iter().zip(types).all(|(column, ty)| &column.ty == ty) {
-            return node;
+            return Ok(node);
         }
         let index = self.fresh_index();
         let mut exprs = Vec::with_capacity(types.len());
         let mut names = Vec::with_capacity(types.len());
         for (column, ty) in scope.columns.iter().zip(types) {
             let expr = self.plan.add_expr(Expr::Column(column.binding), column.ty.clone());
-            exprs.push(self.cast_to(expr, ty));
+            exprs.push(self.checked_cast_to(expr, ty, false)?);
             names.push(self.plan.intern(&column.name));
         }
         let exprs = self.plan.add_expr_list(&exprs);
         let names = self.plan.add_name_list(&names);
-        self.plan.add_node(Node::Project { input: node, index, exprs, names })
+        Ok(self.plan.add_node(Node::Project { input: node, index, exprs, names }))
     }
 
     // ----------------------------------------------------------------- select
@@ -1205,8 +1208,8 @@ impl<'a> Binder<'a> {
         let mut cast: Vec<ExprRef> = bound
             .iter()
             .zip(&resolved.arguments)
-            .map(|(&expr, ty)| self.cast_to(expr, ty))
-            .collect();
+            .map(|(&expr, ty)| self.checked_cast_to(expr, ty, false))
+            .collect::<Result<_>>()?;
 
         if resolved.function.takes_a_name() {
             let Columns::Fixed(fields) = resolved.columns else {
@@ -1818,7 +1821,7 @@ impl<'a> Binder<'a> {
         let resolved = resolve(name, &types)?;
         let mut cast = Vec::with_capacity(bound.len());
         for (arg, wanted) in bound.iter().zip(&resolved.arguments) {
-            cast.push(self.cast_to(*arg, wanted));
+            cast.push(self.checked_cast_to(*arg, wanted, false)?);
         }
         let args = self.plan.add_expr_list(&cast);
         let name = self.plan.intern(resolved.name);

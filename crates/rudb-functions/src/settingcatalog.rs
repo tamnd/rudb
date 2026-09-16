@@ -1,6 +1,6 @@
 //! What `duckdb_settings()` says about each setting this engine has.
 //!
-//! Eleven rows represent nine settings because two aliases have rows of their own.
+//! Fourteen rows represent twelve settings because two aliases have rows of their own.
 //! The descriptions, input types, and alias lists were read from the pinned binary because clients may compare them with the values they already know.
 //!
 //! # The alias direction is the opposite way round from the obvious one
@@ -22,10 +22,9 @@
 //!
 //! # What is not here
 //!
-//! The pin returns 192 rows and this returns 11, because rudb has nine settings. The other 181 are
-//! settings for things rudb does not do, and a row saying `SET enable_http_metadata_cache = true`
-//! worked when nothing read it would be worse than no row at all. The list grows when the engine
-//! does.
+//! The pin returns 192 rows and this returns 14, because rudb has twelve settings.
+//! The other settings are for things rudb does not do, and a row saying `SET enable_http_metadata_cache = true` worked when nothing read it would be worse than no row at all.
+//! The list grows when the engine does.
 //!
 //! The seam settings are not here either, and that is decided in `rudb`'s own settings module rather
 //! than in this one. There are twenty seven of them, none is a DuckDB setting, and this table is the
@@ -72,6 +71,13 @@ pub static SETTINGS: &[SettingEntry] = &[
         name: "default_order",
         description: "The order type used when none is specified (ASC or DESC)",
         input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
+        name: "disable_timestamptz_casts",
+        description: "Disable casting from timestamp to timestamptz ",
+        input_type: "BOOLEAN",
         scope: GLOBAL,
         aliases: &[],
     },
@@ -191,7 +197,7 @@ mod tests {
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
-        assert_eq!(SETTINGS.len(), 13, "eleven settings and two of them have a second spelling");
+        assert_eq!(SETTINGS.len(), 14, "twelve settings and two of them have a second spelling");
         assert_eq!(setting_fields().len(), 7);
     }
 
