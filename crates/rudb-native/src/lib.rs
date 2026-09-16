@@ -455,6 +455,8 @@ struct CachedExtent {
 
 const CACHED_EXTENTS_PER_COLUMN: usize = 8;
 
+type CrossingCache = OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>;
+
 #[derive(Debug)]
 struct NativeText {
     file: Arc<File>,
@@ -463,7 +465,7 @@ struct NativeText {
     payload_len: usize,
     hashes: Vec<u64>,
     payload_blocks: Vec<OnceLock<Result<Vec<u8>>>>,
-    crossing: Vec<OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>>,
+    crossing: Vec<CrossingCache>,
 }
 
 const TEXT_PAYLOAD_BLOCK: usize = 64 * 1024;
@@ -568,7 +570,7 @@ impl TextSource for NativeText {
                 .filter_map(|result| result.as_ref().ok())
                 .map(Vec::capacity)
                 .sum::<usize>()
-            + self.crossing.capacity() * size_of::<OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>>()
+            + self.crossing.capacity() * size_of::<CrossingCache>()
             + self
                 .crossing
                 .iter()

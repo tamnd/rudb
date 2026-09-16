@@ -972,7 +972,7 @@ fn the_functions_table_declares_a_promoted_argument_with_the_type_variable() {
 }
 
 #[test]
-fn the_settings_table_is_twelve_rows_for_ten_settings_and_says_nothing_about_a_value() {
+fn the_settings_table_is_thirteen_rows_for_eleven_settings_and_says_nothing_about_a_value() {
     // Built through `run`, which goes through `build` and so has no database behind it. There is
     // nothing to read a value out of there, so both value columns come back null, and that is the
     // answer rather than a default: this crate does not know what memory limit the process was
@@ -993,6 +993,7 @@ fn the_settings_table_is_twelve_rows_for_ten_settings_and_says_nothing_about_a_v
             "default_null_order",
             "default_order",
             "disabled_optimizers",
+            "ieee_floating_point_ops",
             "integer_division",
             "max_memory",
             "memory_limit",

@@ -430,6 +430,10 @@ enum Body {
 pub trait TextSource: std::fmt::Debug + Send + Sync {
     /// Number of values available.
     fn len(&self) -> usize;
+    /// Whether this source has no values.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     /// Bytes at one position, or no value when the position is outside the source.
     fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>>;
     /// Byte length at one position without requiring the payload when the source has an index.

@@ -85,7 +85,9 @@ impl Rows {
             if cached.as_ref().is_none_or(|(held, _)| *held != chunk) {
                 cached = Some((chunk, self.read(chunk, columns)?));
             }
-            let held = &cached.as_ref().expect("cached above").1;
+            let Some((_, held)) = &cached else {
+                return Err(Error::internal("row chunk was not cached"));
+            };
             for (at, values) in values.iter_mut().enumerate() {
                 values.push(held.value_at(row, at));
             }
