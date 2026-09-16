@@ -132,6 +132,11 @@ impl<'a> Transform<'a> {
         self.kids(node).find(|&kid| self.name(kid) == name).unwrap_or(NONE)
     }
 
+    /// Whether a subtree contains a node with this rule name.
+    fn contains(&self, node: u32, name: &str) -> bool {
+        self.name(node) == name || self.kids(node).any(|kid| self.contains(kid, name))
+    }
+
     /// Every leaf of a subtree, in order.
     ///
     /// A leaf is a rule that matched only terminals, which for a name is the identifier itself. It
@@ -365,8 +370,14 @@ impl<'a> Transform<'a> {
         let (name, scope) = self.setting_name(self.find(inner, "SetVariableOrSetting"))?;
         let assignment = self.find(inner, "SetAssignment");
         let list = self.find(assignment, "VariableList");
+        let kids: Vec<u32> = self.kids(list).collect();
+        if kids.len() == 1 && self.contains(list, "DefaultExpression") {
+            let index = self.ast.settings.len() as u32;
+            self.ast.settings.push(Setting { name, scope, value: NONE });
+            return Ok(Statement::Reset(index));
+        }
         let mut values = Vec::new();
-        for kid in self.kids(list) {
+        for kid in kids {
             values.push(self.expr(kid)?);
         }
         // The grammar takes a list because `SET search_path = a, b` is a list in postgres. Nothing

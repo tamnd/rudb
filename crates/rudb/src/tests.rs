@@ -1911,6 +1911,38 @@ fn preserve_identifier_case_keeps_legacy_boolean_aliases_and_metadata() {
 }
 
 #[test]
+fn allow_parser_override_extension_matches_the_only_installed_mode() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('allow_parser_override_extension')"),
+        vec![vec![text("DEFAULT")]]
+    );
+    db.execute("SET allow_parser_override_extension = DEFAULT").expect("the default mode");
+    db.execute("SET allow_parser_override_extension = 'default'").expect("case insensitive mode");
+    let invalid = db
+        .execute("SET allow_parser_override_extension = true")
+        .expect_err("the pin has no enabled mode");
+    assert_eq!(invalid.code().duckdb_name(), "Not implemented Error");
+    assert_eq!(
+        invalid.message(),
+        "Enum value: unrecognized value \"true\" for enum \"AllowParserOverride\"\n\nCandidates: \"DEFAULT\""
+    );
+    db.execute("RESET allow_parser_override_extension").expect("reset the mode");
+    assert_eq!(db.setting("allow_parser_override_extension").expect("the mode"), "DEFAULT");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'allow_parser_override_extension'"
+        ),
+        vec![vec![
+            text("Allow extensions to override the current parser"),
+            text("VARCHAR"),
+            text("GLOBAL"),
+        ]]
+    );
+}
+
+#[test]
 fn warnings_as_errors_matches_the_pin_without_a_logger() {
     let db = database();
     assert_eq!(
@@ -2091,8 +2123,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Twenty rows for eighteen settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(20)]]);
+    // Twenty one rows for nineteen settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(21)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
