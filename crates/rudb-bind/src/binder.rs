@@ -13,7 +13,7 @@
 //! an `INTEGER` and a `BIGINT` does.
 
 use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
-use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Semantics, Session, Value};
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Given, TableFunction, csv_fields, csv_given, files, is_file,
     is_pattern, parquet_fields, resolve, resolve_pragma, resolve_table,
@@ -104,6 +104,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) parameters: &'a Parameters,
     /// What the settings are now, which is what `current_setting()` folds to.
     pub(crate) session: &'a Session,
+    /// Meaning-changing choices copied once and resolved into the plan above execution.
+    semantics: Semantics,
     plan: Plan,
     next_index: u32,
     /// Set while a select block aggregates, which changes what a bare column means.
@@ -128,6 +130,7 @@ impl<'a> Binder<'a> {
             catalog,
             parameters,
             session,
+            semantics: session.semantics(),
             plan: Plan::new(),
             next_index: 0,
             aggregation: None,
@@ -760,7 +763,7 @@ impl<'a> Binder<'a> {
             };
             let ty = self.plan.expr_type(exprs[position]).clone();
             let expr = self.column(project, position, ty);
-            keys.push(sort_key(expr, item));
+            keys.push(self.sort_key(expr, item));
         }
         Ok(keys)
     }
@@ -790,7 +793,7 @@ impl<'a> Binder<'a> {
                     self.bind_expr(ast, item.expr, output)?
                 }
             };
-            keys.push(sort_key(expr, item));
+            keys.push(self.sort_key(expr, item));
         }
         Ok(keys)
     }
@@ -802,9 +805,25 @@ impl<'a> Binder<'a> {
             .into_iter()
             .map(|(binding, ty)| {
                 let expr = self.plan.add_expr(Expr::Column(binding), ty);
-                SortKey { expr, descending: false, nulls_first: false }
+                let descending = self.semantics.default_descending();
+                SortKey { expr, descending, nulls_first: self.semantics.nulls_first(descending) }
             })
             .collect()
+    }
+
+    /// A sort key with the session defaults filled in.
+    fn sort_key(&self, expr: ExprRef, item: ast::OrderItem) -> SortKey {
+        let descending = match item.order {
+            Order::Unstated => self.semantics.default_descending(),
+            Order::Ascending => false,
+            Order::Descending => true,
+        };
+        let nulls_first = match item.nulls {
+            Nulls::First => true,
+            Nulls::Last => false,
+            Nulls::Unstated => self.semantics.nulls_first(descending),
+        };
+        SortKey { expr, descending, nulls_first }
     }
 
     /// Which output column a term names, by position or by name.
@@ -1961,21 +1980,6 @@ fn missing_replacement(name: &str, input: &Scope) -> Error {
         "Column \"{name}\" in REPLACE list not found in FROM clause{}",
         input.candidates()
     ))
-}
-
-/// A sort key with SQL's defaults filled in.
-///
-/// Unstated is ascending, and unstated nulls go where the direction puts them, which is last for
-/// ascending and first for descending. That is DuckDB's rule and it is the one that makes
-/// `ORDER BY x DESC` the exact reverse of `ORDER BY x`.
-fn sort_key(expr: ExprRef, item: ast::OrderItem) -> SortKey {
-    let descending = item.order == Order::Descending;
-    let nulls_first = match item.nulls {
-        Nulls::First => true,
-        Nulls::Last => false,
-        Nulls::Unstated => descending,
-    };
-    SortKey { expr, descending, nulls_first }
 }
 
 /// Structural equality over two expressions of one plan.
