@@ -10,7 +10,7 @@
 //! comparisons, `IN` becomes a disjunction of equalities, a simple `CASE` becomes a searched one,
 //! and `IS NULL` becomes a null safe comparison against a null.
 
-use rudb_common::{Error, LogicalType, MAX_DECIMAL_WIDTH, Result, Value};
+use rudb_common::{Error, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Value};
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::Ast;
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
@@ -236,10 +236,44 @@ impl Binder<'_> {
         if let Some(comparison) = comparison_of(op) {
             return self.compare(comparison, left, right);
         }
+        match op {
+            BinaryOp::Regex => return self.regex_operator(left, right, false, false, false),
+            BinaryOp::NotRegex => return self.regex_operator(left, right, false, true, false),
+            BinaryOp::RegexInsensitive => {
+                return self.regex_operator(left, right, true, false, false);
+            }
+            BinaryOp::NotRegexInsensitive => {
+                return self.regex_operator(left, right, true, true, false);
+            }
+            BinaryOp::SimilarTo => return self.regex_operator(left, right, false, false, true),
+            BinaryOp::NotSimilarTo => {
+                return self.regex_operator(left, right, false, true, true);
+            }
+            _ => {}
+        }
         match function_of(op) {
             Some(name) => self.call(name, vec![left, right]),
             None => Err(Error::not_implemented(format!("the {} operator", spelling(ast, op)))),
         }
+    }
+
+    /// Binds one of the regex operators to the ordinary regex function it means.
+    fn regex_operator(
+        &mut self,
+        left: ExprRef,
+        right: ExprRef,
+        insensitive: bool,
+        negated: bool,
+        always_full: bool,
+    ) -> Result<ExprRef> {
+        let full = always_full || self.semantics.regex_match_full();
+        let name = if full { "regexp_full_match" } else { "regexp_matches" };
+        let mut args = vec![left, right];
+        if insensitive {
+            args.push(self.plan_mut().add_constant(Value::Varchar("i".to_string())));
+        }
+        let matched = self.call(name, args)?;
+        if negated { self.call("not", vec![matched]) } else { Ok(matched) }
     }
 
     fn bind_call(
@@ -637,7 +671,7 @@ fn quoted(text: &str) -> String {
 /// write `AS`, which is most of ClickBench. The shapes that are known to be exactly DuckDB's are
 /// under test in `crates/rudb/tests/clickbench.rs`, which compares the whole result of all forty
 /// three against the answers duckdb gives for the same file.
-pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, integer_division: bool) -> String {
+pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> String {
     match ast.expr(expr) {
         ast::Expr::Star { qualifier, .. } => {
             if qualifier.is_empty() {
@@ -666,7 +700,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, integer_division: bool) ->
         // value. `IS UNKNOWN` is `IS NULL` with a word that only makes sense for a boolean, and
         // the name is the one it shares.
         ast::Expr::Unary { op, operand } => {
-            let inner = describe(ast, operand, integer_division);
+            let inner = describe(ast, operand, semantics);
             match op {
                 UnaryOp::Not => format!("(NOT {inner})"),
                 UnaryOp::Negate => match whole_number(ast, operand) {
@@ -693,19 +727,19 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, integer_division: bool) ->
         // the operator where DuckDB says the function is a name a client keys a row by and does
         // not find.
         ast::Expr::Binary { op, left, right } => {
-            let (left, right) =
-                (describe(ast, left, integer_division), describe(ast, right, integer_division));
+            let (left, right) = (describe(ast, left, semantics), describe(ast, right, semantics));
             match op {
-                BinaryOp::Regex => format!("regexp_matches({left}, {right})"),
-                BinaryOp::RegexInsensitive => format!("regexp_matches({left}, {right}, 'i')"),
-                BinaryOp::NotRegexInsensitive => {
-                    format!("(NOT regexp_matches({left}, {right}, 'i'))")
-                }
+                BinaryOp::Regex => regex_name(&left, &right, false, false, semantics),
+                BinaryOp::NotRegex => regex_name(&left, &right, false, true, semantics),
+                BinaryOp::RegexInsensitive => regex_name(&left, &right, true, false, semantics),
+                BinaryOp::NotRegexInsensitive => regex_name(&left, &right, true, true, semantics),
                 BinaryOp::SimilarTo => format!("regexp_full_match({left}, {right})"),
                 BinaryOp::NotSimilarTo => format!("(NOT regexp_full_match({left}, {right}))"),
                 // The one operator DuckDB names with no brackets around it at all.
                 BinaryOp::Collate => format!("{left} COLLATE {right}"),
-                BinaryOp::Divide if integer_division => format!("({left} // {right})"),
+                BinaryOp::Divide if semantics.integer_division() => {
+                    format!("({left} // {right})")
+                }
                 _ => format!("({left} {} {right})", name_spelling(ast, op)),
             }
         }
@@ -737,16 +771,13 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, integer_division: bool) ->
             // `count(UserID)` and `count(DISTINCT UserID)` are two different answers and a result
             // that called them both the first one would be reporting the wrong one.
             let word = if distinct { "DISTINCT " } else { "" };
-            let arguments: Vec<String> = ast
-                .expr_list(args)
-                .iter()
-                .map(|&arg| describe(ast, arg, integer_division))
-                .collect();
+            let arguments: Vec<String> =
+                ast.expr_list(args).iter().map(|&arg| describe(ast, arg, semantics)).collect();
             format!("{name}({word}{})", arguments.join(", "))
         }
         ast::Expr::Cast { operand, ty, try_cast } => {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
-            format!("{word}({} AS {})", describe(ast, operand, integer_division), ast.string(ty))
+            format!("{word}({} AS {})", describe(ast, operand, semantics), ast.string(ty))
         }
         // A CASE is named as the searched form it becomes, whichever form was written, with every
         // condition and every result in brackets of their own and the `ELSE` without them. A
@@ -758,23 +789,23 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, integer_division: bool) ->
             let mut text = "CASE ".to_string();
             for arm in ast.arm_list(arms) {
                 let when = if operand == rudb_parse::NONE {
-                    describe(ast, arm.when, integer_division)
+                    describe(ast, arm.when, semantics)
                 } else {
                     format!(
                         "({} = {})",
-                        describe(ast, operand, integer_division),
-                        describe(ast, arm.when, integer_division)
+                        describe(ast, operand, semantics),
+                        describe(ast, arm.when, semantics)
                     )
                 };
                 text.push_str(&format!(
                     " WHEN ({when}) THEN ({})",
-                    describe(ast, arm.then, integer_division)
+                    describe(ast, arm.then, semantics)
                 ));
             }
             let fallback = if otherwise == rudb_parse::NONE {
                 "NULL".to_string()
             } else {
-                describe(ast, otherwise, integer_division)
+                describe(ast, otherwise, semantics)
             };
             format!("{text} ELSE {fallback} END")
         }
@@ -783,30 +814,23 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, integer_division: bool) ->
         ast::Expr::Between { operand, low, high, negated } => {
             let text = format!(
                 "({} BETWEEN {} AND {})",
-                describe(ast, operand, integer_division),
-                describe(ast, low, integer_division),
-                describe(ast, high, integer_division)
+                describe(ast, operand, semantics),
+                describe(ast, low, semantics),
+                describe(ast, high, semantics)
             );
             if negated { format!("(NOT {text})") } else { text }
         }
         ast::Expr::In { operand, list, negated } => {
-            let items: Vec<String> = ast
-                .expr_list(list)
-                .iter()
-                .map(|&item| describe(ast, item, integer_division))
-                .collect();
-            let text =
-                format!("({} IN ({}))", describe(ast, operand, integer_division), items.join(", "));
+            let items: Vec<String> =
+                ast.expr_list(list).iter().map(|&item| describe(ast, item, semantics)).collect();
+            let text = format!("({} IN ({}))", describe(ast, operand, semantics), items.join(", "));
             if negated { format!("(NOT {text})") } else { text }
         }
         // `row` is a keyword and a function of that name, so DuckDB quotes it in the name to say
         // which of the two it means.
         ast::Expr::Row { items } => {
-            let items: Vec<String> = ast
-                .expr_list(items)
-                .iter()
-                .map(|&item| describe(ast, item, integer_division))
-                .collect();
+            let items: Vec<String> =
+                ast.expr_list(items).iter().map(|&item| describe(ast, item, semantics)).collect();
             format!("\"row\"({})", items.join(", "))
         }
         // DuckDB names a bracketed list after the function it is sugar for, so `SELECT [1, 2]`
@@ -814,11 +838,8 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, integer_division: bool) ->
         // schema and print `main.list_value(1, 2)`, which is what the reference binary said until
         // this project pinned one at the commit the grammar is vendored from.
         ast::Expr::List { items } => {
-            let items: Vec<String> = ast
-                .expr_list(items)
-                .iter()
-                .map(|&item| describe(ast, item, integer_division))
-                .collect();
+            let items: Vec<String> =
+                ast.expr_list(items).iter().map(|&item| describe(ast, item, semantics)).collect();
             format!("list_value({})", items.join(", "))
         }
         // DuckDB names the column after the parameter, so `SELECT ?` comes back as `$1` whatever
@@ -944,6 +965,21 @@ fn name_spelling(ast: &Ast, op: BinaryOp) -> String {
     }
 }
 
+/// The generated name of a regex operator under the session's matching mode.
+fn regex_name(
+    left: &str,
+    right: &str,
+    insensitive: bool,
+    negated: bool,
+    semantics: Semantics,
+) -> String {
+    let function =
+        if semantics.regex_match_full() { "regexp_full_match" } else { "regexp_matches" };
+    let options = if insensitive { ", 'i'" } else { "" };
+    let call = format!("{function}({left}, {right}{options})");
+    if negated { format!("(NOT {call})") } else { call }
+}
+
 /// How an operator is written, for a name and for an error message.
 fn spelling(ast: &Ast, op: BinaryOp) -> String {
     let fixed = match op {
@@ -977,6 +1013,7 @@ fn spelling(ast: &Ast, op: BinaryOp) -> String {
         BinaryOp::SimilarTo => "SIMILAR TO",
         BinaryOp::NotSimilarTo => "NOT SIMILAR TO",
         BinaryOp::Regex => "~",
+        BinaryOp::NotRegex => "!~",
         BinaryOp::RegexInsensitive => "~*",
         BinaryOp::NotRegexInsensitive => "!~*",
         BinaryOp::Collate => "COLLATE",

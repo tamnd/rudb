@@ -530,6 +530,7 @@ fn binary(ast: &Ast, op: BinaryOp, left: ExprRef, right: ExprRef) -> String {
         BinaryOp::NotILike => "!~~*",
         BinaryOp::Glob => "~~~",
         BinaryOp::Regex => "~",
+        BinaryOp::NotRegex => "!~",
         BinaryOp::RegexInsensitive => "~*",
         BinaryOp::NotRegexInsensitive => "!~*",
         BinaryOp::Arrow => "->",
@@ -921,6 +922,11 @@ mod tests {
         assert_eq!(body("SELECT s ILIKE 'a' FROM t"), "SELECT (s ~~* 'a') FROM t");
         assert_eq!(body("SELECT s NOT ILIKE 'a' FROM t"), "SELECT (s !~~* 'a') FROM t");
         assert_eq!(body("SELECT s GLOB 'a' FROM t"), "SELECT (s ~~~ 'a') FROM t");
+        assert_eq!(body("SELECT s !~ 'a' FROM t"), "SELECT (s !~ 'a') FROM t");
+        assert_eq!(
+            body("SELECT s NOT SIMILAR TO 'a' FROM t"),
+            "SELECT (NOT regexp_full_match(s, 'a')) FROM t"
+        );
     }
 
     #[test]

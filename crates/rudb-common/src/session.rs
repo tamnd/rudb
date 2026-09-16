@@ -36,6 +36,7 @@ pub struct Semantics {
     default_null_order: DefaultNullOrder,
     integer_division: bool,
     order_by_non_integer_literal: bool,
+    regex_match_full: bool,
 }
 
 impl Semantics {
@@ -66,6 +67,12 @@ impl Semantics {
     #[must_use]
     pub fn order_by_non_integer_literal(self) -> bool {
         self.order_by_non_integer_literal
+    }
+
+    /// Whether regex match operators require the entire string to match.
+    #[must_use]
+    pub fn regex_match_full(self) -> bool {
+        self.regex_match_full
     }
 }
 
@@ -157,6 +164,11 @@ impl Session {
     /// Sets whether a constant non-integer expression is accepted as a sort key.
     pub fn set_order_by_non_integer_literal(&mut self, enabled: bool) {
         self.semantics.order_by_non_integer_literal = enabled;
+    }
+
+    /// Sets whether regex match operators require the entire string to match.
+    pub fn set_regex_match_full(&mut self, enabled: bool) {
+        self.semantics.regex_match_full = enabled;
     }
 
     /// The meaning-changing choices the binder resolves into the plan.

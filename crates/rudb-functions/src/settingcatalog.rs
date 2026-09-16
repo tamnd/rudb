@@ -1,9 +1,7 @@
 //! What `duckdb_settings()` says about each setting this engine has.
 //!
-//! Ten rows for eight settings, because two of them have an alias and the pin gives an alias a row
-//! of its own. The descriptions, the input types and the alias lists were read off the pinned binary
-//! rather than written here, since a client that reads this table to find out what it can turn is a
-//! client that will compare the sentence against the one it already knows.
+//! Eleven rows represent nine settings because two aliases have rows of their own.
+//! The descriptions, input types, and alias lists were read from the pinned binary because clients may compare them with the values they already know.
 //!
 //! # The alias direction is the opposite way round from the obvious one
 //!
@@ -24,7 +22,7 @@
 //!
 //! # What is not here
 //!
-//! The pin returns 192 rows and this returns 10, because rudb has eight settings. The other 182 are
+//! The pin returns 192 rows and this returns 11, because rudb has nine settings. The other 181 are
 //! settings for things rudb does not do, and a row saying `SET enable_http_metadata_cache = true`
 //! worked when nothing read it would be worse than no row at all. The list grows when the engine
 //! does.
@@ -113,6 +111,13 @@ pub static SETTINGS: &[SettingEntry] = &[
         aliases: &[],
     },
     SettingEntry {
+        name: "regex_match_operator_semantics",
+        description: "Configures whether regex match operators use partial or full string matching",
+        input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
         name: "threads",
         description: "The number of total threads used by the system.",
         input_type: "BIGINT",
@@ -172,7 +177,7 @@ mod tests {
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
-        assert_eq!(SETTINGS.len(), 10, "eight settings and two of them have a second spelling");
+        assert_eq!(SETTINGS.len(), 11, "nine settings and two of them have a second spelling");
         assert_eq!(setting_fields().len(), 7);
     }
 
