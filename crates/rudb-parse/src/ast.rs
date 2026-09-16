@@ -301,6 +301,8 @@ pub enum QueryBody {
     /// shortcut: on the reference binary `DESCRIBE t` and `DESCRIBE SELECT * FROM t` produce the
     /// same six columns and the same rows, down to the primary key and the default.
     Describe(QueryRef),
+    /// `SHOW name`, resolved as a setting or a deprecated table description while binding.
+    Show { name: Slice, relation: QueryRef },
 }
 
 /// Which set operator.

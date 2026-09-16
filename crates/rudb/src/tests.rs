@@ -1745,6 +1745,39 @@ fn regex_operator_semantics_are_resolved_while_the_expression_is_bound() {
 }
 
 #[test]
+fn show_behavior_resolves_a_name_before_execution() {
+    let db = database();
+    assert_eq!(rows(&db, "SHOW show_behavior"), vec![vec![text("AUTO")]]);
+    assert_eq!(
+        rows(&db, "SHOW t"),
+        vec![
+            vec![text("x"), text("INTEGER"), text("YES"), Value::Null, Value::Null, Value::Null],
+            vec![text("s"), text("VARCHAR"), text("YES"), Value::Null, Value::Null, Value::Null],
+        ]
+    );
+    db.execute("SET show_behavior = 'setting'").expect("settings only");
+    assert_eq!(rows(&db, "SHOW show_behavior"), vec![vec![text("setting")]]);
+    assert_eq!(failure(&db, "SHOW t"), "Setting with name \"t\" does not exist");
+    db.execute("SET show_behavior = 'table'").expect("tables only");
+    assert_eq!(failure(&db, "SHOW show_behavior"), "Table with name show_behavior does not exist!");
+    db.execute("RESET show_behavior").expect("automatic resolution");
+    assert_eq!(db.setting("show_behavior").expect("the setting"), "AUTO");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'show_behavior'"
+        ),
+        vec![vec![
+            text(
+                "How SHOW resolves a bare identifier: 'auto' (describe a table if one exists, else a setting; deprecated), 'table' (always a table), or 'setting' (always a setting)"
+            ),
+            text("VARCHAR"),
+            text("GLOBAL"),
+        ]]
+    );
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -1854,8 +1887,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Fourteen rows for twelve settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(14)]]);
+    // Fifteen rows for thirteen settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(15)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(

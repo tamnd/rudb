@@ -13,7 +13,7 @@
 //! an `INTEGER` and a `BIGINT` does.
 
 use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
-use rudb_common::{Error, Field, LogicalType, Result, Semantics, Session, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Value};
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Given, TableFunction, csv_fields, csv_given, files, is_file,
     is_pattern, parquet_fields, resolve, resolve_pragma, resolve_table,
@@ -198,7 +198,50 @@ impl<'a> Binder<'a> {
             }
             ast::QueryBody::Values(rows) => self.bind_values(ast, &written, rows),
             ast::QueryBody::Describe(inner) => self.bind_describe(ast, &written, inner),
+            ast::QueryBody::Show { name, relation } => {
+                self.bind_show(ast, &written, name, relation)
+            }
         }
+    }
+
+    /// `SHOW name`, resolved while binding so execution receives an ordinary constant plan.
+    fn bind_show(
+        &mut self,
+        ast: &Ast,
+        query: &ast::Query,
+        name: ast::Slice,
+        relation: ast::QueryRef,
+    ) -> Result<(NodeRef, Scope)> {
+        let text = ast.name_text(name);
+        let parts: Vec<&str> = ast.name(name).collect();
+        let table_exists = self.catalog.resolve(&parts).is_ok();
+        let as_table = match self.semantics.show_behavior() {
+            ShowBehavior::Auto => table_exists,
+            ShowBehavior::Setting => false,
+            ShowBehavior::Table => true,
+        };
+        if as_table {
+            return self.bind_describe(ast, query, relation);
+        }
+        let Some(value) = self.session.get(&text) else {
+            return Err(Error::catalog(format!("Setting with name \"{text}\" does not exist")));
+        };
+        let field = Field::new(text, LogicalType::Varchar);
+        let expr = self.plan.add_constant(Value::Varchar(value.to_string()));
+        let row = self.plan.add_expr_list(&[expr]);
+        let rows = self.plan.add_rows(&[row]);
+        let columns = self.plan.add_fields(std::slice::from_ref(&field));
+        let index = self.fresh_index();
+        let node = self.plan.add_node(Node::Values { index, columns, rows });
+        let mut scope = Scope::empty();
+        scope.push(Visible {
+            table: String::new(),
+            name: field.name,
+            binding: ColumnBinding::new(index, 0),
+            ty: LogicalType::Varchar,
+            not_null: false,
+        });
+        Ok((node, scope))
     }
 
     /// `DESCRIBE <query>`, which is six VARCHAR columns saying what the query returns.
