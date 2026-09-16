@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry. It is not named by a query, it has no schema, and the set of
 //! them is fixed at compile time, so this is a match on a name rather than a map. [`Settings::NAMES`]
-//! is that set, and it is six names for four settings, because [`crate::Config`] holds three things
+//! is that set, and it is eight names for six settings, because [`crate::Config`] holds three things
 //! a program can choose and a fourth that DuckDB has no setting for, and two of the three have a
 //! second spelling. `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways
 //! round, which is what the binary does and what a client that writes the other spelling expects.
@@ -29,7 +29,7 @@
 
 use std::sync::RwLock;
 
-use rudb_common::{Error, Memory, Result, Session, Value, human};
+use rudb_common::{DefaultNullOrder, Error, Memory, Result, Session, Value, human};
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
@@ -52,6 +52,10 @@ pub(crate) struct Settings {
     time_zone: RwLock<String>,
     /// The operating-system time zone restored by `RESET TimeZone` and `SET TIME ZONE LOCAL`.
     default_time_zone: String,
+    /// The direction used when an order item says neither ascending nor descending.
+    default_order: RwLock<String>,
+    /// The null placement mode used when an order item does not state one.
+    default_null_order: RwLock<String>,
     /// Which implementation runs at each seam, as `SET seam.<name>` has left it.
     ///
     /// Held here rather than in [`Config`], because there are twenty seven of them and a `Config`
@@ -63,8 +67,10 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 6] = [
+    pub(crate) const NAMES: [&'static str; 8] = [
         "TimeZone",
+        "default_null_order",
+        "default_order",
         "disabled_optimizers",
         "max_memory",
         "memory_limit",
@@ -84,6 +90,8 @@ impl Settings {
             disabled: RwLock::new(String::new()),
             time_zone: RwLock::new(default_time_zone.clone()),
             default_time_zone,
+            default_order: RwLock::new("ASCENDING".to_string()),
+            default_null_order: RwLock::new("NULLS_LAST".to_string()),
             seams: RwLock::new(rudb_seam::Settings::new()),
         }
     }
@@ -167,6 +175,42 @@ impl Settings {
                 }
                 *self.time_zone.write().unwrap_or_else(|held| held.into_inner()) = zone;
             }
+            "default_order" => {
+                let Some(value) = value else {
+                    *self.default_order.write().unwrap_or_else(|held| held.into_inner()) =
+                        "ASCENDING".to_string();
+                    return Ok(());
+                };
+                let written = text_of(value);
+                let normalized = match written.to_ascii_uppercase().as_str() {
+                    "ASC" | "ASCENDING" => "ASC",
+                    "DESC" | "DESCENDING" => "DESC",
+                    _ => {
+                        return Err(Error::invalid_input(format!(
+                            "Unrecognized parameter for option DEFAULT_ORDER \"{written}\". Expected ASC or DESC."
+                        )));
+                    }
+                };
+                *self.default_order.write().unwrap_or_else(|held| held.into_inner()) =
+                    normalized.to_string();
+            }
+            "default_null_order" => {
+                let written = value.map_or("NULLS_LAST".to_string(), text_of);
+                let normalized = match written.to_ascii_uppercase().replace(' ', "_").as_str() {
+                    "FIRST" | "NULLS_FIRST" => "NULLS_FIRST",
+                    "LAST" | "NULLS_LAST" => "NULLS_LAST",
+                    "SQLITE" => "SQLITE",
+                    "MYSQL" => "MYSQL",
+                    "POSTGRES" | "POSTGRESQL" => "POSTGRES",
+                    _ => {
+                        return Err(Error::parser(format!(
+                            "Unrecognized parameter for option NULL_ORDER \"{written}\", expected either NULLS FIRST, NULLS LAST, SQLite, MySQL or Postgres"
+                        )));
+                    }
+                };
+                *self.default_null_order.write().unwrap_or_else(|held| held.into_inner()) =
+                    normalized.to_string();
+            }
             "disabled_optimizers" => {
                 let text = match value {
                     None => String::new(),
@@ -223,6 +267,12 @@ impl Settings {
             "TimeZone" => {
                 Ok(self.time_zone.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
+            "default_order" => {
+                Ok(self.default_order.read().unwrap_or_else(|held| held.into_inner()).clone())
+            }
+            "default_null_order" => {
+                Ok(self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone())
+            }
             "disabled_optimizers" => Ok(self.disabled_optimizers()),
             // An unlimited budget prints as the word rather than as a number, because rudb's
             // default is no limit where DuckDB's is a fraction of the machine, and printing the
@@ -235,14 +285,14 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are six names and the alternative
+    /// Built once per statement rather than held, because there are eight names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Four settings and six names means the loop below would otherwise take several locks to read
+    /// Six settings and eight names means the loop below would otherwise take several locks to read
     /// three numbers.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
@@ -250,13 +300,26 @@ impl Settings {
         let memory = config.memory_limit().map_or_else(|| "unlimited".to_string(), human);
         let threads = config.threads().to_string();
         let time_zone = self.time_zone.read().unwrap_or_else(|held| held.into_inner()).clone();
+        let default_order =
+            self.default_order.read().unwrap_or_else(|held| held.into_inner()).clone();
+        let default_null_order =
+            self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone();
         let mut session = Session::new();
         session.set_time_zone(&time_zone);
+        session.set_default_descending(default_order == "DESC");
+        session.set_default_null_order(match default_null_order.as_str() {
+            "NULLS_FIRST" => DefaultNullOrder::First,
+            "SQLITE" | "MYSQL" => DefaultNullOrder::Sqlite,
+            "POSTGRES" => DefaultNullOrder::Postgres,
+            _ => DefaultNullOrder::Last,
+        });
         for name in Self::NAMES {
             session.set(
                 name,
                 match canonical(name) {
                     "TimeZone" => time_zone.clone(),
+                    "default_order" => default_order.clone(),
+                    "default_null_order" => default_null_order.clone(),
                     "disabled_optimizers" => disabled.clone(),
                     "memory_limit" => memory.clone(),
                     "threads" => threads.clone(),
@@ -281,6 +344,12 @@ impl Settings {
 fn canonical(name: &str) -> &str {
     if name.eq_ignore_ascii_case("timezone") {
         return "TimeZone";
+    }
+    if name.eq_ignore_ascii_case("default_order") {
+        return "default_order";
+    }
+    if name.eq_ignore_ascii_case("default_null_order") {
+        return "default_null_order";
     }
     match name {
         "max_memory" => "memory_limit",

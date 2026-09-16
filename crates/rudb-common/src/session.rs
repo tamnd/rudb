@@ -26,6 +26,47 @@ use chrono_tz::Tz;
 pub struct Session {
     values: BTreeMap<String, String>,
     time_zone: Tz,
+    semantics: Semantics,
+}
+
+/// The meaning-changing session choices consumed while a query is bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Semantics {
+    default_descending: bool,
+    default_null_order: DefaultNullOrder,
+}
+
+impl Semantics {
+    /// Whether an order item with no direction is descending.
+    #[must_use]
+    pub fn default_descending(self) -> bool {
+        self.default_descending
+    }
+
+    /// Whether nulls precede values for an unstated placement in this direction.
+    #[must_use]
+    pub fn nulls_first(self, descending: bool) -> bool {
+        match self.default_null_order {
+            DefaultNullOrder::First => true,
+            DefaultNullOrder::Last => false,
+            DefaultNullOrder::Sqlite => !descending,
+            DefaultNullOrder::Postgres => descending,
+        }
+    }
+}
+
+/// How an unstated `NULLS FIRST` or `NULLS LAST` is resolved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DefaultNullOrder {
+    /// Nulls precede values in both directions.
+    First,
+    /// Nulls follow values in both directions, which is DuckDB's default.
+    #[default]
+    Last,
+    /// Nulls are low, as in SQLite and MySQL.
+    Sqlite,
+    /// Nulls are high, as in PostgreSQL.
+    Postgres,
 }
 
 /// A parsed session time zone, cheap enough to carry beside a prepared expression.
@@ -51,7 +92,7 @@ impl SessionTimeZone {
 
 impl Default for Session {
     fn default() -> Self {
-        Self { values: BTreeMap::new(), time_zone: chrono_tz::UTC }
+        Self { values: BTreeMap::new(), time_zone: chrono_tz::UTC, semantics: Semantics::default() }
     }
 }
 
@@ -82,6 +123,22 @@ impl Session {
     #[must_use]
     pub fn session_time_zone(&self) -> SessionTimeZone {
         SessionTimeZone(self.time_zone)
+    }
+
+    /// Sets the direction used by an order item that names none.
+    pub fn set_default_descending(&mut self, descending: bool) {
+        self.semantics.default_descending = descending;
+    }
+
+    /// Sets how an order item with no null placement is resolved.
+    pub fn set_default_null_order(&mut self, order: DefaultNullOrder) {
+        self.semantics.default_null_order = order;
+    }
+
+    /// The meaning-changing choices the binder resolves into the plan.
+    #[must_use]
+    pub fn semantics(&self) -> Semantics {
+        self.semantics
     }
 
     /// Whether the bundled time-zone database knows this name.

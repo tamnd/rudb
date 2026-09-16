@@ -227,7 +227,7 @@ fn an_order_by_sorts_the_projection_and_takes_the_defaults_sql_gives_it() {
     let text = plan("SELECT url FROM hits ORDER BY url");
     assert!(text.contains("Sort [#1.0::VARCHAR ASC NULLS LAST]"), "{text}");
     let descending = plan("SELECT url FROM hits ORDER BY url DESC");
-    assert!(descending.contains("DESC NULLS FIRST"), "{descending}");
+    assert!(descending.contains("DESC NULLS LAST"), "{descending}");
 }
 
 #[test]
