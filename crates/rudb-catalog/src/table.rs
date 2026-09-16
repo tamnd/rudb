@@ -65,6 +65,12 @@ impl Rows {
         columns: &[usize],
         ordinals: &[u64],
     ) -> Result<Chunk> {
+        if columns.len() != types.len() {
+            return Err(Error::internal("a row fetch has a different number of columns and types"));
+        }
+        if let Self::Native(reader) = self {
+            return Self::native_rows_at(reader, types, columns, ordinals);
+        }
         let mut values = vec![Vec::with_capacity(ordinals.len()); columns.len()];
         let mut cached: Option<(usize, Chunk)> = None;
         for &ordinal in ordinals {
@@ -83,7 +89,7 @@ impl Rows {
             let (chunk, row) =
                 found.ok_or_else(|| Error::internal("row ordinal is past the table"))?;
             if cached.as_ref().is_none_or(|(held, _)| *held != chunk) {
-                cached = Some((chunk, self.read_for_fetch(chunk, columns)?));
+                cached = Some((chunk, self.read(chunk, columns)?));
             }
             let Some((_, held)) = &cached else {
                 return Err(Error::internal("row chunk was not cached"));
@@ -100,25 +106,53 @@ impl Rows {
         Chunk::with_rows(vectors, ordinals.len())
     }
 
-    /// Reads a wide row fetch across independent native columns in parallel.
+    /// Reads a native row fetch across all requested stripes and columns in one worker fan-out.
     ///
     /// Ordinary scans already parallelize by stripe in the pipeline above the reader. A late fetch
-    /// is deliberately one pipeline instance, has only a handful of winning rows, and commonly
-    /// asks for all hundred ClickBench columns from one stripe. Its useful parallel dimension is
-    /// therefore columns rather than stripes.
-    fn read_for_fetch(&self, stripe: usize, columns: &[usize]) -> Result<Chunk> {
-        let Self::Native(reader) = self else { return self.read(stripe, columns) };
+    /// is deliberately one pipeline instance and commonly asks for all hundred ClickBench columns
+    /// from rows in several stripes. Keeping the workers alive across those stripes avoids a
+    /// scoped thread launch and join for every winning stripe.
+    fn native_rows_at(
+        reader: &NativeReader,
+        types: &[LogicalType],
+        columns: &[usize],
+        ordinals: &[u64],
+    ) -> Result<Chunk> {
+        if columns.is_empty() {
+            return Chunk::with_rows(Vec::new(), ordinals.len());
+        }
+        let mut ends = Vec::with_capacity(reader.table().stripes().len());
+        let mut end = 0_usize;
+        for stripe in reader.table().stripes() {
+            end = end.saturating_add(stripe.rows());
+            ends.push(end);
+        }
+        let mut locations = Vec::with_capacity(ordinals.len());
+        for &ordinal in ordinals {
+            let ordinal = usize::try_from(ordinal)
+                .map_err(|_| Error::internal("row ordinal does not fit this platform"))?;
+            let stripe = ends.partition_point(|&end| end <= ordinal);
+            if stripe == ends.len() {
+                return Err(Error::internal("row ordinal is past the table"));
+            }
+            let start = stripe.checked_sub(1).map_or(0, |before| ends[before]);
+            locations.push((stripe, ordinal - start));
+        }
         const MIN_COLUMNS_PER_WORKER: usize = 16;
         const MAX_WORKERS: usize = 8;
         let workers = columns.len().div_ceil(MIN_COLUMNS_PER_WORKER).min(MAX_WORKERS);
         if workers <= 1 {
-            return reader.read_sparse(stripe, columns);
+            let vectors = Self::read_native_columns(reader, columns, types, &locations)?;
+            return Chunk::with_rows(vectors, ordinals.len());
         }
         let width = columns.len().div_ceil(workers);
         let pieces = std::thread::scope(|scope| {
             let handles = columns
                 .chunks(width)
-                .map(|columns| scope.spawn(|| reader.read_sparse(stripe, columns)))
+                .zip(types.chunks(width))
+                .map(|(columns, types)| {
+                    scope.spawn(|| Self::read_native_columns(reader, columns, types, &locations))
+                })
                 .collect::<Vec<_>>();
             handles
                 .into_iter()
@@ -129,12 +163,40 @@ impl Rows {
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
-        let rows = pieces.first().map_or(0, Chunk::len);
         let mut vectors = Vec::with_capacity(columns.len());
         for piece in pieces {
-            vectors.extend(piece.into_columns());
+            vectors.extend(piece);
         }
-        Chunk::with_rows(vectors, rows)
+        Chunk::with_rows(vectors, ordinals.len())
+    }
+
+    fn read_native_columns(
+        reader: &NativeReader,
+        columns: &[usize],
+        types: &[LogicalType],
+        locations: &[(usize, usize)],
+    ) -> Result<Vec<Vector>> {
+        let mut values = vec![Vec::with_capacity(locations.len()); columns.len()];
+        let mut from = 0;
+        while from < locations.len() {
+            let stripe = locations[from].0;
+            let mut upto = from + 1;
+            while upto < locations.len() && locations[upto].0 == stripe {
+                upto += 1;
+            }
+            let held = reader.read_sparse(stripe, columns)?;
+            for &(_, row) in &locations[from..upto] {
+                for (at, values) in values.iter_mut().enumerate() {
+                    values.push(held.value_at(row, at));
+                }
+            }
+            from = upto;
+        }
+        values
+            .into_iter()
+            .zip(types)
+            .map(|(values, ty)| Vector::from_values(ty.clone(), &values))
+            .collect()
     }
 
     /// Column types.
