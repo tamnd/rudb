@@ -42,6 +42,7 @@ pub struct Semantics {
     order_by_non_integer_literal: bool,
     regex_match_full: bool,
     show_behavior: ShowBehavior,
+    warnings_as_errors: bool,
 }
 
 impl Default for Semantics {
@@ -57,6 +58,7 @@ impl Default for Semantics {
             order_by_non_integer_literal: false,
             regex_match_full: false,
             show_behavior: ShowBehavior::Auto,
+            warnings_as_errors: false,
         }
     }
 }
@@ -124,6 +126,12 @@ impl Semantics {
     #[must_use]
     pub fn show_behavior(self) -> ShowBehavior {
         self.show_behavior
+    }
+
+    /// Whether warnings are promoted to errors.
+    #[must_use]
+    pub fn warnings_as_errors(self) -> bool {
+        self.warnings_as_errors
     }
 }
 
@@ -269,6 +277,11 @@ impl Session {
     /// Sets how `SHOW name` resolves its name.
     pub fn set_show_behavior(&mut self, behavior: ShowBehavior) {
         self.semantics.show_behavior = behavior;
+    }
+
+    /// Sets whether warnings are promoted to errors.
+    pub fn set_warnings_as_errors(&mut self, enabled: bool) {
+        self.semantics.warnings_as_errors = enabled;
     }
 
     /// The meaning-changing choices the binder resolves into the plan.

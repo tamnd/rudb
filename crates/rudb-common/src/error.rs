@@ -82,6 +82,8 @@ pub enum ErrorCode {
     Constraint,
     /// A conflict, an abort, or a statement issued outside a transaction that needs one.
     Transaction,
+    /// A setting cannot be applied in the current engine configuration.
+    Settings,
     /// The query was cancelled. Cooperative, checked at morsel boundaries.
     Interrupt,
     /// An invariant this code is responsible for does not hold. Always a bug here, never in the
@@ -111,6 +113,7 @@ impl ErrorCode {
             Self::NotImplemented => "Not implemented Error",
             Self::Constraint => "Constraint Error",
             Self::Transaction => "TransactionContext Error",
+            Self::Settings => "Settings Error",
             Self::Interrupt => "Interrupt Error",
             Self::Internal => "INTERNAL Error",
         }
@@ -133,6 +136,7 @@ impl ErrorCode {
                 | Self::InvalidInput
                 | Self::Constraint
                 | Self::Transaction
+                | Self::Settings
         )
     }
 }
@@ -247,6 +251,11 @@ impl Error {
     /// A conflict, an abort, or a statement issued outside a transaction that needs one.
     pub fn transaction(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Transaction, message)
+    }
+
+    /// A setting cannot be applied in the current engine configuration.
+    pub fn settings(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Settings, message)
     }
 
     /// The query was cancelled.
