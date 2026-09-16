@@ -122,6 +122,8 @@ impl Stream for TableFetch<'_> {
             *chunk = Chunk::empty(&self.schema.types());
             return Ok(Progress::More);
         }
+        // flatten: a computed row ordinal can have any vector form, while rows_at needs one flat
+        // run to validate once and hand to the random-access reader.
         let ordinals = self.row.evaluate_one(chunk, scratch)?.flatten()?;
         let count = ordinals.len();
         let held: &[i64] = match ordinals.data() {
