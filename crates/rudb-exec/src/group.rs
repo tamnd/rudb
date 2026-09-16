@@ -143,6 +143,8 @@ pub(crate) struct Aggregate<'a> {
     count_only: bool,
     /// COUNT(*), SUM(SMALLINT), AVG(SMALLINT) share one compact state per group.
     compact_numeric: bool,
+    /// The only call is COUNT(DISTINCT BIGINT), whose completed state is ordered like COUNT(*).
+    distinct_count: bool,
     /// Emit at most this many groups from each radix partition when the parent orders by count
     /// descending. The ordinary TopN still makes the final global choice.
     top_counts: Option<usize>,
@@ -414,6 +416,13 @@ impl<'a> Aggregate<'a> {
             && plan.expr_type(calls[2].args[0]) == &LogicalType::SmallInt
             && calls[2].returns == LogicalType::Double
             && calls.iter().all(|call| !call.distinct && call.filter.is_none());
+        let distinct_count = !alone
+            && calls.len() == 1
+            && calls[0].name == "count"
+            && calls[0].distinct
+            && calls[0].args.len() == 1
+            && plan.expr_type(calls[0].args[0]) == &LogicalType::BigInt
+            && calls[0].filter.is_none();
         let by_vector: Vec<bool> =
             calls.iter().map(|call| alone && !call.distinct && call.filter.is_none()).collect();
         let out = Buffered::new();
@@ -430,6 +439,7 @@ impl<'a> Aggregate<'a> {
                 && !calls[0].distinct
                 && calls[0].filter.is_none(),
             compact_numeric,
+            distinct_count,
             top_counts: None,
             max_groups: None,
             by_vector,
@@ -464,7 +474,7 @@ impl<'a> Aggregate<'a> {
     /// Keeps only the groups that can still reach a count-descending TopN above this aggregate.
     #[must_use]
     pub(crate) fn top_counts(mut self, bound: usize) -> Self {
-        if self.count_only || self.compact_numeric {
+        if self.count_only || self.compact_numeric || self.distinct_count {
             self.top_counts = Some(bound);
         }
         self
@@ -1010,24 +1020,30 @@ impl<'a> Aggregate<'a> {
         // chunk. The ungrouped case falls out of the same loop with no key columns and one group.
         let types = self.schema.types();
         let width = self.groups.len();
-        let selected = self.top_counts.and_then(|bound| {
-            (self.count_only || self.compact_numeric).then(|| {
-                let count = |slot: usize| {
-                    if self.count_only { counts[slot] } else { compact[slot].count() }
-                };
-                let mut best = Vec::with_capacity(bound.min(groups));
-                for slot in 0..groups {
-                    let at = best.partition_point(|&kept| count(kept) >= count(slot));
-                    if at < bound {
-                        best.insert(at, slot);
-                        best.truncate(bound);
-                    }
+        let selected = self.top_counts.map(|bound| {
+            let count = |slot: usize| {
+                if self.count_only {
+                    counts[slot]
+                } else if self.compact_numeric {
+                    compact[slot].count()
+                } else {
+                    states[slot * calls]
+                        .counted()
+                        .expect("a distinct count prefix has a COUNT state")
                 }
-                // The downstream TopN settles equal keys by arrival. Preserve the order this
-                // partition would have emitted without the reduction.
-                best.sort_unstable();
-                best
-            })
+            };
+            let mut best = Vec::with_capacity(bound.min(groups));
+            for slot in 0..groups {
+                let at = best.partition_point(|&kept| count(kept) >= count(slot));
+                if at < bound {
+                    best.insert(at, slot);
+                    best.truncate(bound);
+                }
+            }
+            // The downstream TopN settles equal keys by arrival. Preserve the order this
+            // partition would have emitted without the reduction.
+            best.sort_unstable();
+            best
         });
         let output_groups = selected.as_ref().map_or(groups, Vec::len);
         // The one buffer the results of a call go through on their way into a vector, kept between
@@ -1878,21 +1894,26 @@ impl<'a> Aggregate<'a> {
             if let (DistinctSet::BigInt(set), [column]) =
                 (&mut seen[slot * calls + at], rows.arguments[at].as_slice())
             {
-                match column.try_value_at(row)? {
-                    Value::Null => continue,
-                    Value::BigInt(value) => {
-                        if set.insert(value) {
-                            aside += width_of(size_of::<i64>() * 2);
-                            states[slot * calls + at].update(&[Value::BigInt(value)])?;
-                        }
-                        continue;
-                    }
-                    value => {
-                        return Err(Error::internal(format!(
-                            "a BIGINT distinct set was given {value:?}"
-                        )));
-                    }
+                if column.is_null_at(row) {
+                    continue;
                 }
+                let value = match column.signed_at(row) {
+                    Some(value) => i64::try_from(value)
+                        .map_err(|_| Error::internal("a BIGINT distinct value is out of range"))?,
+                    None => match column.try_value_at(row)? {
+                        Value::BigInt(value) => value,
+                        value => {
+                            return Err(Error::internal(format!(
+                                "a BIGINT distinct set was given {value:?}"
+                            )));
+                        }
+                    },
+                };
+                if set.insert(value) {
+                    aside += width_of(size_of::<i64>() * 2);
+                    states[slot * calls + at].update(&[Value::BigInt(value)])?;
+                }
+                continue;
             }
             let args = &mut given[at];
             fill(args, &rows.arguments[at], row)?;
@@ -1947,7 +1968,7 @@ impl<'a> Aggregate<'a> {
                 && call.args.len() == 1
                 && self.plan.expr_type(call.args[0]) == &LogicalType::BigInt;
             if big_int {
-                seen.push(DistinctSet::BigInt(BigIntSet::default()));
+                seen.push(DistinctSet::BigInt(BigIntDistinct::default()));
             } else {
                 seen.push(DistinctSet::Row(RowSet::default()));
             }
@@ -2254,8 +2275,55 @@ struct Spilled<'s> {
 /// Values already accepted by one `DISTINCT` aggregate in one group.
 #[derive(Debug)]
 enum DistinctSet {
-    BigInt(BigIntSet),
+    BigInt(BigIntDistinct),
     Row(RowSet),
+}
+
+/// Signed 64-bit distinct values with the first value held inline.
+///
+/// High-cardinality string grouping commonly creates one group per row. A `COUNT(DISTINCT BIGINT)`
+/// beside it used to allocate a hash table for every one of those singleton groups. The first value
+/// needs no table, and the table is created only when a second distinct value reaches the group.
+#[derive(Debug, Default)]
+enum BigIntDistinct {
+    #[default]
+    Empty,
+    One(i64),
+    Many(BigIntSet),
+}
+
+impl BigIntDistinct {
+    fn insert(&mut self, value: i64) -> bool {
+        match self {
+            Self::Empty => {
+                *self = Self::One(value);
+                true
+            }
+            Self::One(held) if *held == value => false,
+            Self::One(held) => {
+                let first = *held;
+                let mut values = BigIntSet::default();
+                values.insert(first);
+                values.insert(value);
+                *self = Self::Many(values);
+                true
+            }
+            Self::Many(values) => values.insert(value),
+        }
+    }
+
+    fn into_each(self, mut accept: impl FnMut(i64) -> Result<()>) -> Result<()> {
+        match self {
+            Self::Empty => Ok(()),
+            Self::One(value) => accept(value),
+            Self::Many(values) => {
+                for value in values {
+                    accept(value)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl<'s> Spilled<'s> {
@@ -3169,12 +3237,13 @@ fn merge_slot(
         let state = &mut into.states[target * calls + at];
         match (&mut into.seen[target * calls + at], arriving) {
             (DistinctSet::BigInt(kept), DistinctSet::BigInt(arriving)) => {
-                for value in arriving {
+                arriving.into_each(|value| {
                     if kept.insert(value) {
                         aside += width_of(size_of::<i64>() * 2);
                         state.update(&[Value::BigInt(value)])?;
                     }
-                }
+                    Ok(())
+                })?;
             }
             (DistinctSet::Row(kept), DistinctSet::Row(arriving)) => {
                 for key in arriving {
@@ -3492,7 +3561,8 @@ mod tests {
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Aggregate, Call, CompactNumeric, Distinct, FixedPartition, FixedRecord, fixed_partition,
+        Aggregate, BigIntDistinct, Call, CompactNumeric, Distinct, FixedPartition, FixedRecord,
+        fixed_partition,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -3747,6 +3817,18 @@ mod tests {
         assert_eq!(wide.count(), 2);
         assert_eq!(wide.mean_count, 2);
         assert_eq!(size_of::<CompactNumeric>(), 32);
+    }
+
+    #[test]
+    fn a_bigint_distinct_set_allocates_only_after_its_first_value() {
+        let mut values = BigIntDistinct::default();
+        assert!(values.insert(7));
+        assert!(!values.insert(7));
+        assert!(matches!(values, BigIntDistinct::One(7)));
+        assert!(values.insert(9));
+        assert!(!values.insert(7));
+        assert!(!values.insert(9));
+        assert!(matches!(values, BigIntDistinct::Many(_)));
     }
 
     #[test]

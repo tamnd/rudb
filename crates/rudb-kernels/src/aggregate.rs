@@ -178,6 +178,15 @@ enum State {
 }
 
 impl Accumulator {
+    /// The value of a COUNT state, and `None` for every other aggregate.
+    #[must_use]
+    pub fn counted(&self) -> Option<i64> {
+        match self.state {
+            State::Counted { count, .. } => Some(count),
+            _ => None,
+        }
+    }
+
     /// Finish an exact integer SUM held in a compact grouped state.
     #[must_use]
     pub fn exact_sum(total: i128, seen: bool, returns: &LogicalType) -> Self {
