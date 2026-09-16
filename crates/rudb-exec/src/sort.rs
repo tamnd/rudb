@@ -172,8 +172,11 @@ impl Sink for Sort {
         let mut taken = 0;
         // row at a time: see `Sortable`.
         for row in 0..chunk.len() {
-            let key: Vec<Value> = keys.iter().map(|column| column.value_at(row)).collect();
-            let values: Vec<Value> = chunk.row(row).collect();
+            let key: Vec<Value> =
+                keys.iter().map(|column| column.try_value_at(row)).collect::<Result<_>>()?;
+            let values: Vec<Value> = (0..chunk.width())
+                .map(|column| chunk.try_value_at(row, column))
+                .collect::<Result<_>>()?;
             taken += rows::footprint(&key) + rows::footprint(&values);
             local.rows.push((key, values, local.place.of(row)));
         }

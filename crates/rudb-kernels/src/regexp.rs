@@ -23,7 +23,7 @@ use rudb_regex::{Options, Regex, Rewrite};
 use rudb_vector::{Data, StringColumn, Vector};
 
 use crate::number::integral;
-use crate::scalar::{each_string, finish, over_valid};
+use crate::scalar::{finish, over_valid};
 use crate::shape::nulls_of;
 
 /// Whether a name is one of the functions here.
@@ -89,28 +89,33 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
             // One buffer for the whole vector rather than a fresh `String` per row. It grows to the
             // longest value in the column once and then stays there.
             let mut buffer = String::new();
-            let out = each_string(rows, &base, |index, into| {
+            let mut out = StringColumn::with_capacity(rows);
+            let validity = over_valid(rows, base, |index| {
                 if call.host {
-                    into.push(host(source.get(index)));
-                    return;
+                    out.push_bytes(host_bytes(source.get_bytes(index)?));
+                    return Ok(());
                 }
+                let text = source.get(index)?;
                 buffer.clear();
-                call.regex.replace_into(&mut buffer, source.get(index), &call.rewrite, call.global);
-                into.push(&buffer);
-            });
-            finish(returns, Data::Varlen(out), base.normalize(rows))
+                call.regex.replace_into(&mut buffer, text, &call.rewrite, call.global);
+                out.push(&buffer);
+                Ok(())
+            })?;
+            finish(returns, Data::Varlen(out), validity)
         }
         ("regexp_extract", LogicalType::Varchar) => {
-            let out = each_string(rows, &base, |index, into| {
-                into.push(call.regex.extract(source.get(index), call.group).unwrap_or_default());
-            });
-            finish(returns, Data::Varlen(out), base.normalize(rows))
+            let mut out = StringColumn::with_capacity(rows);
+            let validity = over_valid(rows, base, |index| {
+                out.push(call.regex.extract(source.get(index)?, call.group).unwrap_or_default());
+                Ok(())
+            })?;
+            finish(returns, Data::Varlen(out), validity)
         }
         ("regexp_matches" | "regexp_full_match", LogicalType::Boolean) => {
             let whole = name == "regexp_full_match";
             let mut out = vec![false; rows];
             let validity = over_valid(rows, base, |index| {
-                let text = source.get(index);
+                let text = source.get(index)?;
                 out[index] =
                     if whole { call.regex.is_full_match(text) } else { call.regex.is_match(text) };
                 Ok(())
@@ -224,11 +229,27 @@ fn host(text: &str) -> &str {
     host.strip_prefix("www.").filter(|without| !without.is_empty()).unwrap_or(host)
 }
 
+/// The q29 host extraction over already validated string bytes.
+fn host_bytes(text: &[u8]) -> &[u8] {
+    let rest = text.strip_prefix(b"http://").or_else(|| text.strip_prefix(b"https://"));
+    let Some(rest) = rest else { return text };
+    let Some(end) = memchr::memchr(b'/', rest) else { return text };
+    if end == 0 || memchr::memchr(b'\n', &rest[end + 1..]).is_some() {
+        return text;
+    }
+    let host = &rest[..end];
+    host.strip_prefix(b"www.").filter(|without| !without.is_empty()).unwrap_or(host)
+}
+
 /// The text side of a call, which is a flat column or one read through positions.
 enum Source<'a> {
     Flat(&'a StringColumn),
     /// A dictionary or a run length column, which are the same thing to a loop that reads text.
     Indirect(Cow<'a, [u32]>, &'a StringColumn),
+    /// A dictionary whose values stay in the native reader's block cache.
+    External(Cow<'a, [u32]>, &'a Vector),
+    /// A storage-backed or view vector without another level of indirection.
+    Direct(&'a Vector),
 }
 
 impl<'a> Source<'a> {
@@ -239,21 +260,43 @@ impl<'a> Source<'a> {
         if let Some(Data::Varlen(column)) = vector.data() {
             return Some(Self::Flat(column));
         }
-        let (codes, values) = vector.positions()?;
-        match values.data() {
-            Some(Data::Varlen(column)) => Some(Self::Indirect(codes, column)),
-            _ => None,
+        if let Some((codes, values)) = vector.positions() {
+            return match values.data() {
+                Some(Data::Varlen(column)) => Some(Self::Indirect(codes, column)),
+                _ => Some(Self::External(codes, values)),
+            };
         }
+        Some(Self::Direct(vector))
     }
 
     /// Row `index`, or the empty string where the row is null and the value under it is whatever
     /// the column happens to hold. A null row is never read, since the loops above skip them.
-    fn get(&self, index: usize) -> &'a str {
+    fn get(&self, index: usize) -> Result<&'a str> {
         match self {
-            Self::Flat(column) => column.get(index).unwrap_or_default(),
+            Self::Flat(column) => Ok(column.get(index).unwrap_or_default()),
             Self::Indirect(codes, values) => {
-                codes.get(index).and_then(|&code| values.get(code as usize)).unwrap_or_default()
+                Ok(codes.get(index).and_then(|&code| values.get(code as usize)).unwrap_or_default())
             }
+            Self::External(codes, values) => match codes.get(index) {
+                Some(&code) => Ok(values.try_text_at(code as usize)?.unwrap_or_default()),
+                None => Ok(""),
+            },
+            Self::Direct(vector) => Ok(vector.try_text_at(index)?.unwrap_or_default()),
+        }
+    }
+
+    fn get_bytes(&self, index: usize) -> Result<&'a [u8]> {
+        match self {
+            Self::Flat(column) => Ok(column.bytes(index).unwrap_or_default()),
+            Self::Indirect(codes, values) => Ok(codes
+                .get(index)
+                .and_then(|&code| values.bytes(code as usize))
+                .unwrap_or_default()),
+            Self::External(codes, values) => match codes.get(index) {
+                Some(&code) => Ok(values.try_bytes_at(code as usize)?.unwrap_or_default()),
+                None => Ok(&[]),
+            },
+            Self::Direct(vector) => Ok(vector.try_bytes_at(index)?.unwrap_or_default()),
         }
     }
 }

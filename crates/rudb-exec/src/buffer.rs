@@ -81,8 +81,11 @@ impl Source for Buffered {
         Some(Morsel::new(index, index, index + 1))
     }
 
-    fn morsels(&self, _threads: usize) -> Option<usize> {
-        self.len().ok()
+    fn morsels(&self, threads: usize) -> Option<usize> {
+        let chunks = self.shared.chunks.lock().ok()?;
+        let rows = chunks.iter().map(Chunk::len).sum::<usize>();
+        let useful = rows.div_ceil(50_000).clamp(1, 4);
+        Some(chunks.len().min(threads).min(useful))
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {

@@ -278,7 +278,8 @@ fn row_at_a_time(
     rows: usize,
     returns: &LogicalType,
 ) -> Result<Vector> {
-    let held: Vec<Value> = (0..rows).map(|index| input.value_at(index)).collect();
+    let held: Vec<Value> =
+        (0..rows).map(|index| input.try_value_at(index)).collect::<Result<_>>()?;
     answer(rows, base, members, returns, |index| match (&members.held, &held[index]) {
         (Held::Text(set), Value::Varchar(text)) => set.contains(text.as_str()),
         (Held::Whole(set), value) => number(value).is_some_and(|held| set.contains(&held)),

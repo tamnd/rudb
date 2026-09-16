@@ -32,6 +32,7 @@
 
 use rudb_common::{Error, Result, Value, interval_micros};
 use rudb_vector::{Data, Vector};
+use std::sync::Arc;
 
 use crate::key::{canonical, mix, same, spread};
 use crate::rows;
@@ -405,6 +406,17 @@ impl Table {
     ) -> Result<Vector> {
         self.columns[at].vector(ty, range)
     }
+
+    /// Selected groups of one key column, used when an aggregate can discard groups before emit.
+    pub(crate) fn column_slots(
+        &self,
+        at: usize,
+        ty: &rudb_common::LogicalType,
+        slots: &[usize],
+    ) -> Result<Vector> {
+        let values = self.columns[at].values_at(slots);
+        Vector::from_values(ty.clone(), &values)
+    }
 }
 
 /// One row part way through a batched probe.
@@ -461,6 +473,7 @@ enum StoredData {
     Integer(Vec<i32>),
     BigInt(Vec<i64>),
     Varchar(StringColumn),
+    StableText { dictionary: Arc<Vector>, codes: Vec<u32> },
     Other(Vec<Stored>),
 }
 
@@ -508,6 +521,19 @@ impl Column {
     /// `BIGINT` key costs a range check and a push and a `VARCHAR` key costs a copy of its bytes.
     /// Everything else builds a value, which is what all of this used to do.
     fn push_from(&mut self, column: &Vector, row: usize) -> Result<u64> {
+        if matches!(&self.data, StoredData::Varchar(values) if values.ends.is_empty()) {
+            if let Some((codes, dictionary)) = column.stable_dictionary_parts() {
+                let code = *codes
+                    .get(row)
+                    .ok_or_else(|| Error::internal("a stable dictionary row is missing"))?;
+                self.data = StoredData::StableText {
+                    dictionary: Arc::clone(dictionary),
+                    codes: vec![code],
+                };
+                self.valid.push(!column.is_null_at(row));
+                return Ok(0);
+            }
+        }
         if column.is_null_at(row) {
             return self.push(Value::Null).map(|()| 0);
         }
@@ -537,6 +563,15 @@ impl Column {
                 }
                 None => false,
             },
+            StoredData::StableText { dictionary, codes } => {
+                match column.stable_dictionary_parts() {
+                    Some((incoming, values)) if Arc::ptr_eq(dictionary, values) => {
+                        codes.push(incoming[row]);
+                        true
+                    }
+                    _ => false,
+                }
+            }
             StoredData::Other(_) => false,
         };
         if taken {
@@ -557,6 +592,7 @@ impl Column {
             StoredData::Integer(values) => values.capacity() * size_of::<i32>(),
             StoredData::BigInt(values) => values.capacity() * size_of::<i64>(),
             StoredData::Varchar(values) => values.footprint(),
+            StoredData::StableText { codes, .. } => codes.capacity() * size_of::<u32>(),
             StoredData::Other(values) => values.capacity() * size_of::<Stored>(),
         };
         values + self.valid.capacity().div_ceil(8)
@@ -584,6 +620,14 @@ impl Column {
                 || same(&Value::Varchar(values.string(slot)), &column.value_at(row)),
                 |value| value == values.get(slot),
             ),
+            StoredData::StableText { dictionary, codes } => {
+                match column.stable_dictionary_parts() {
+                    Some((incoming, values)) if Arc::ptr_eq(dictionary, values) => {
+                        incoming.get(row) == codes.get(slot)
+                    }
+                    _ => dictionary.bytes_at(codes[slot] as usize) == column.bytes_at(row),
+                }
+            }
             StoredData::Other(values) => same(&values[slot].value(), &column.value_at(row)),
         }
     }
@@ -625,6 +669,26 @@ impl Column {
                 }
                 return;
             }};
+        }
+        if let StoredData::StableText { dictionary, codes: stored } = &self.data {
+            if let Some((values, incoming)) = column.stable_dictionary_parts() {
+                if Arc::ptr_eq(dictionary, incoming) {
+                    for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                        if !*flag {
+                            continue;
+                        }
+                        let slot = slot_of(bucket) as usize;
+                        *flag = match values.get(step.row) {
+                            _ if !self.valid[slot] => !validity.is_valid(step.row),
+                            Some(code) => {
+                                validity.is_valid(step.row) && Some(code) == stored.get(slot)
+                            }
+                            None => false,
+                        };
+                    }
+                    return;
+                }
+            }
         }
         if let Some(data) = column.data() {
             match (&self.data, data) {
@@ -694,6 +758,15 @@ impl Column {
                 }
                 Data::Varlen(out)
             }
+            StoredData::StableText { dictionary, codes } => {
+                let vector = Vector::stable_dictionary(
+                    codes[range.clone()].to_vec(),
+                    Arc::clone(dictionary),
+                )?;
+                let valid = &self.valid;
+                let validity = rudb_vector::Validity::from_iter(len, |index| valid[start + index]);
+                return Ok(vector.with_validity(validity));
+            }
             StoredData::Other(_) => {
                 return Vector::from_values(ty.clone(), &self.values(range));
             }
@@ -714,6 +787,29 @@ impl Column {
                     StoredData::Integer(values) => Value::Integer(values[slot]),
                     StoredData::BigInt(values) => Value::BigInt(values[slot]),
                     StoredData::Varchar(values) => Value::Varchar(values.string(slot)),
+                    StoredData::StableText { dictionary, codes } => {
+                        dictionary.value_at(codes[slot] as usize)
+                    }
+                    StoredData::Other(values) => values[slot].value(),
+                }
+            })
+            .collect()
+    }
+
+    fn values_at(&self, slots: &[usize]) -> Vec<Value> {
+        slots
+            .iter()
+            .map(|&slot| {
+                if !self.valid[slot] {
+                    return Value::Null;
+                }
+                match &self.data {
+                    StoredData::Integer(values) => Value::Integer(values[slot]),
+                    StoredData::BigInt(values) => Value::BigInt(values[slot]),
+                    StoredData::Varchar(values) => Value::Varchar(values.string(slot)),
+                    StoredData::StableText { dictionary, codes } => {
+                        dictionary.value_at(codes[slot] as usize)
+                    }
                     StoredData::Other(values) => values[slot].value(),
                 }
             })
@@ -868,6 +964,16 @@ impl Stored {
 pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>) {
     hashes.clear();
     hashes.resize(rows, 0);
+    if let [column] = keys {
+        if let Some((codes, _)) = column.stable_dictionary_parts() {
+            let validity = column.validity();
+            for (row, state) in hashes.iter_mut().enumerate() {
+                let word = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
+                *state = spread(mix(0, word));
+            }
+            return;
+        }
+    }
     for column in keys {
         fold(column, rows, hashes);
     }
@@ -886,6 +992,13 @@ pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>) {
 /// up to, which is what makes a day and twenty four hours one group.
 fn fold(column: &Vector, rows: usize, hashes: &mut [u64]) {
     let validity = column.validity();
+    if let Some((codes, _)) = column.stable_dictionary_parts() {
+        for (row, state) in hashes.iter_mut().enumerate().take(rows) {
+            let one = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
+            *state = mix(*state, one);
+        }
+        return;
+    }
     /// One pass over a run of values, turning each into a word the same way the general path does.
     macro_rules! run {
         ($values:expr, $word:expr) => {{

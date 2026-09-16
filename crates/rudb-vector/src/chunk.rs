@@ -149,6 +149,11 @@ impl Chunk {
         self.columns.iter().map(|column| column.logical_type().clone()).collect()
     }
 
+    /// Validate every storage-backed value reachable from this chunk.
+    pub fn validate_external(&self) -> Result<()> {
+        self.columns.iter().try_for_each(Vector::validate_external)
+    }
+
     /// The value at a row and a column, or null if either is past the end.
     ///
     /// The slow path, same as [`Vector::value_at`]. It is what a result set is read out with and
@@ -158,6 +163,14 @@ impl Chunk {
         match self.columns.get(column) {
             Some(held) => held.value_at(row),
             None => Value::Null,
+        }
+    }
+
+    /// The value at a row and column, preserving storage read and validation failures.
+    pub fn try_value_at(&self, row: usize, column: usize) -> Result<Value> {
+        match self.columns.get(column) {
+            Some(held) => held.try_value_at(row),
+            None => Ok(Value::Null),
         }
     }
 

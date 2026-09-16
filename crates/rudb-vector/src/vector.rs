@@ -316,6 +316,7 @@ enum Body {
     Dictionary {
         codes: Vec<u32>,
         values: Arc<Vector>,
+        stable: bool,
     },
     /// Integer codes of `width` bits each, packed end to end, each one an offset from `base`.
     ///
@@ -345,6 +346,10 @@ enum Body {
     Views {
         views: Vec<StringView>,
         arena: Arc<Buffer<u8>>,
+    },
+    /// Text owned by a storage source and fetched by position.
+    ExternalText {
+        source: Arc<dyn TextSource>,
     },
     /// The FSST codes of every row, end to end, with one symbol table over all of them.
     ///
@@ -419,6 +424,36 @@ enum Body {
     Fields {
         children: Vec<Arc<Vector>>,
     },
+}
+
+/// Random access to immutable text kept by a storage reader.
+pub trait TextSource: std::fmt::Debug + Send + Sync {
+    /// Number of values available.
+    fn len(&self) -> usize;
+    /// Bytes at one position, or no value when the position is outside the source.
+    fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>>;
+    /// Byte length at one position without requiring the payload when the source has an index.
+    fn bytes_len_at(&self, index: usize) -> Result<Option<usize>> {
+        Ok(self.bytes_at(index)?.map(<[u8]>::len))
+    }
+    /// Resident bytes retained by this source.
+    fn footprint(&self) -> usize;
+    /// Whether another source presents the same values.
+    fn equal(&self, other: &dyn TextSource) -> bool {
+        self.len() == other.len()
+            && (0..self.len()).all(|index| {
+                matches!(
+                    (self.bytes_at(index), other.bytes_at(index)),
+                    (Ok(left), Ok(right)) if left == right
+                )
+            })
+    }
+}
+
+impl PartialEq for dyn TextSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.equal(other)
+    }
 }
 
 impl Vector {
@@ -851,7 +886,33 @@ impl Vector {
             ty: values.ty.clone(),
             len: codes.len(),
             validity: Validity::AllValid,
-            body: Body::Dictionary { codes, values },
+            body: Body::Dictionary { codes, values, stable: false },
+        })
+    }
+
+    /// A dictionary whose codes keep the same meaning across every page of its source.
+    pub fn stable_dictionary(codes: Vec<u32>, values: Arc<Vector>) -> Result<Self> {
+        let mut vector = Self::dictionary_over(codes, values)?;
+        if let Body::Dictionary { stable, .. } = &mut vector.body {
+            *stable = true;
+        }
+        Ok(vector)
+    }
+
+    /// A stable dictionary whose caller already found the largest code while decoding it.
+    pub fn stable_dictionary_validated(
+        codes: Vec<u32>,
+        values: Arc<Vector>,
+        highest: Option<u32>,
+    ) -> Result<Self> {
+        if highest.is_some_and(|code| code as usize >= values.len()) {
+            return Err(Error::internal("a stable dictionary code is past its value dictionary"));
+        }
+        Ok(Self {
+            ty: values.ty.clone(),
+            len: codes.len(),
+            validity: Validity::AllValid,
+            body: Body::Dictionary { codes, values, stable: true },
         })
     }
 
@@ -1065,6 +1126,17 @@ impl Vector {
         Ok(Self { ty, len, validity: Validity::AllValid, body: Body::Views { views, arena } })
     }
 
+    /// A text vector whose values remain in a storage source until they are read.
+    pub fn external_text(ty: LogicalType, source: Arc<dyn TextSource>) -> Result<Self> {
+        if ty.physical() != rudb_common::PhysicalType::Varlen {
+            return Err(Error::internal(format!(
+                "a {ty} vector cannot use an external text source"
+            )));
+        }
+        let len = source.len();
+        Ok(Self { ty, len, validity: Validity::AllValid, body: Body::ExternalText { source } })
+    }
+
     /// The same strings, in a form where a cut of them does not copy the bytes.
     ///
     /// The counterpart of [`Self::run_encoded`] and [`Self::bit_packed`] for a string column, and
@@ -1204,7 +1276,7 @@ impl Vector {
             Body::Flat(data) => data.footprint(),
             Body::Constant(value) => value.footprint(),
             Body::Sequence { .. } => 0,
-            Body::Dictionary { codes, values } => {
+            Body::Dictionary { codes, values, .. } => {
                 codes.capacity() * size_of::<u32>() + values.footprint()
             }
             Body::Packed { words, .. } => words.capacity() * size_of::<u64>(),
@@ -1214,6 +1286,7 @@ impl Vector {
             Body::Views { views, arena } => {
                 views.capacity() * size_of::<StringView>() + arena.footprint()
             }
+            Body::ExternalText { source } => source.footprint(),
             // The table counts in full in every vector sharing it, the way a shared arena and a
             // shared dictionary do. It is the largest of the three and the most shared of them, so
             // this is the one place the over counting is worth saying out loud: a page of a hundred
@@ -1262,7 +1335,7 @@ impl Vector {
             return true;
         }
         match &self.body {
-            Body::Dictionary { codes, values } => match codes.get(index) {
+            Body::Dictionary { codes, values, .. } => match codes.get(index) {
                 Some(&code) => values.is_null_at(code as usize),
                 None => true,
             },
@@ -1284,6 +1357,7 @@ impl Vector {
             Body::Dictionary { .. } => Form::Dictionary,
             Body::Packed { .. } => Form::BitPacked,
             Body::Views { .. } => Form::StringView,
+            Body::ExternalText { .. } => Form::StringView,
             Body::Coded { .. } => Form::Fsst,
             Body::Runs { .. } => Form::Rle,
             Body::Nested { .. } => Form::List,
@@ -1333,7 +1407,29 @@ impl Vector {
     #[must_use]
     pub fn dictionary_parts(&self) -> Option<(&[u32], &Self)> {
         match &self.body {
-            Body::Dictionary { codes, values } => Some((codes, values.as_ref())),
+            Body::Dictionary { codes, values, .. } => Some((codes, values.as_ref())),
+            _ => None,
+        }
+    }
+
+    /// The codes and the shared dictionary handle for a dictionary vector.
+    ///
+    /// Storage readers use the identity of this handle to prove that codes from separate pages
+    /// belong to one table-wide dictionary. Kernels that only read values should continue to use
+    /// [`Self::dictionary_parts`].
+    #[must_use]
+    pub fn shared_dictionary_parts(&self) -> Option<(&[u32], &Arc<Self>)> {
+        match &self.body {
+            Body::Dictionary { codes, values, .. } => Some((codes, values)),
+            _ => None,
+        }
+    }
+
+    /// Stable codes and their shared values, when storage guarantees one code space across pages.
+    #[must_use]
+    pub fn stable_dictionary_parts(&self) -> Option<(&[u32], &Arc<Self>)> {
+        match &self.body {
+            Body::Dictionary { codes, values, stable: true } => Some((codes, values)),
             _ => None,
         }
     }
@@ -1373,7 +1469,7 @@ impl Vector {
     #[must_use]
     pub fn positions(&self) -> Option<(Cow<'_, [u32]>, &Self)> {
         match &self.body {
-            Body::Dictionary { codes, values } => Some((Cow::Borrowed(codes), values.as_ref())),
+            Body::Dictionary { codes, values, .. } => Some((Cow::Borrowed(codes), values.as_ref())),
             Body::Runs { ends, values } => {
                 let mut at = Vec::with_capacity(self.len);
                 for (run, &stop) in ends.iter().enumerate() {
@@ -1459,7 +1555,7 @@ impl Vector {
         match &self.body {
             Body::Constant(value) => value.as_ref().clone(),
             Body::Sequence { start, step } => Value::BigInt(start + step * index as i64),
-            Body::Dictionary { codes, values } => match codes.get(index) {
+            Body::Dictionary { codes, values, .. } => match codes.get(index) {
                 Some(&code) => values.value_at(code as usize),
                 None => Value::Null,
             },
@@ -1485,6 +1581,11 @@ impl Vector {
                     None => Value::Null,
                 }
             }
+            Body::ExternalText { source } => source
+                .bytes_at(index)
+                .ok()
+                .flatten()
+                .map_or(Value::Null, |bytes| bytes_as(&self.ty, bytes)),
             // One row decompressed on its own, which is the property the form is chosen for. It
             // allocates, which this path is allowed to do, and it is the reason anything about to
             // read a compressed column a row at a time should flatten it once instead.
@@ -1542,6 +1643,56 @@ impl Vector {
         }
     }
 
+    /// The value at `index`, preserving storage read and validation failures.
+    pub fn try_value_at(&self, index: usize) -> Result<Value> {
+        if index >= self.len || !self.validity.is_valid(index) {
+            return Ok(Value::Null);
+        }
+        match &self.body {
+            Body::ExternalText { source } => {
+                Ok(source.bytes_at(index)?.map_or(Value::Null, |bytes| bytes_as(&self.ty, bytes)))
+            }
+            Body::Dictionary { codes, values, .. } => match codes.get(index) {
+                Some(&code) => values.try_value_at(code as usize),
+                None => Ok(Value::Null),
+            },
+            Body::Runs { ends, values } => match run_holding(ends, index) {
+                Some(run) => values.try_value_at(run),
+                None => Ok(Value::Null),
+            },
+            Body::Nested { entries, child } => match (entries.get(index), &self.ty) {
+                (Some(&(start, len)), LogicalType::Map(key, value)) => {
+                    let pairs = child.struct_parts().unwrap_or_default();
+                    let [keys, values] = pairs else { return Ok(Value::Null) };
+                    let mut entries = Vec::with_capacity(len as usize);
+                    for at in start..start + len {
+                        entries.push((
+                            keys.try_value_at(at as usize)?,
+                            values.try_value_at(at as usize)?,
+                        ));
+                    }
+                    Ok(Value::map(key.as_ref().clone(), value.as_ref().clone(), entries))
+                }
+                (Some(&(start, len)), _) => {
+                    let mut values = Vec::with_capacity(len as usize);
+                    for at in start..start + len {
+                        values.push(child.try_value_at(at as usize)?);
+                    }
+                    Ok(Value::List { element: child.ty.clone(), values })
+                }
+                (None, _) => Ok(Value::Null),
+            },
+            Body::Fields { children } => {
+                let mut values = Vec::with_capacity(children.len());
+                for (field, child) in fields_of(&self.ty).iter().zip(children) {
+                    values.push((field.name.clone(), child.try_value_at(index)?));
+                }
+                Ok(Value::Struct(values))
+            }
+            _ => Ok(self.value_at(index)),
+        }
+    }
+
     /// The text at `index`, borrowed rather than copied.
     ///
     /// [`Self::value_at`] on a `VARCHAR` column allocates a `String` per call, and a group by that
@@ -1558,12 +1709,15 @@ impl Vector {
         }
         match &self.body {
             Body::Flat(data) => data.str_at(index),
-            Body::Dictionary { codes, values } => {
+            Body::Dictionary { codes, values, .. } => {
                 values.text_at(usize::try_from(*codes.get(index)?).ok()?)
             }
             Body::Runs { ends, values } => values.text_at(run_holding(ends, index)?),
             Body::Views { views, arena } => {
                 std::str::from_utf8(views.get(index)?.bytes_in(arena)?).ok()
+            }
+            Body::ExternalText { source } => {
+                std::str::from_utf8(source.bytes_at(index).ok().flatten()?).ok()
             }
             _ => None,
         }
@@ -1584,11 +1738,12 @@ impl Vector {
                 Value::Blob(bytes) => Some(bytes),
                 _ => None,
             },
-            Body::Dictionary { codes, values } => {
+            Body::Dictionary { codes, values, .. } => {
                 values.bytes_at(usize::try_from(*codes.get(index)?).ok()?)
             }
             Body::Runs { ends, values } => values.bytes_at(run_holding(ends, index)?),
             Body::Views { views, arena } => views.get(index)?.bytes_in(arena),
+            Body::ExternalText { source } => source.bytes_at(index).ok().flatten(),
             Body::Flat(data) => data.bytes_at(index),
             // The same `None` [`Self::text_at`] gives, for the same reason. A compressed row is not
             // anywhere in its plain bytes, so there is nothing here to hand back a borrow of, and a
@@ -1601,6 +1756,96 @@ impl Vector {
             | Body::Nested { .. }
             | Body::Fields { .. } => None,
         }
+    }
+
+    /// Variable length bytes at `index`, preserving storage read and validation failures.
+    pub fn try_bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
+        if index >= self.len || !self.validity.is_valid(index) {
+            return Ok(None);
+        }
+        match &self.body {
+            Body::Constant(value) => Ok(match value.as_ref() {
+                Value::Varchar(text) => Some(text.as_bytes()),
+                Value::Blob(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            }),
+            Body::Dictionary { codes, values, .. } => match codes.get(index) {
+                Some(&code) => values.try_bytes_at(code as usize),
+                None => Ok(None),
+            },
+            Body::Runs { ends, values } => match run_holding(ends, index) {
+                Some(run) => values.try_bytes_at(run),
+                None => Ok(None),
+            },
+            Body::Views { views, arena } => {
+                Ok(views.get(index).and_then(|view| view.bytes_in(arena)))
+            }
+            Body::ExternalText { source } => source.bytes_at(index),
+            Body::Flat(data) => Ok(data.bytes_at(index)),
+            Body::Coded { .. }
+            | Body::Sequence { .. }
+            | Body::Packed { .. }
+            | Body::Nested { .. }
+            | Body::Fields { .. } => Ok(None),
+        }
+    }
+
+    /// Variable length byte count at `index`, preserving storage failures.
+    pub fn try_bytes_len_at(&self, index: usize) -> Result<Option<usize>> {
+        if index >= self.len || !self.validity.is_valid(index) {
+            return Ok(None);
+        }
+        match &self.body {
+            Body::Dictionary { codes, values, .. } => match codes.get(index) {
+                Some(&code) => values.try_bytes_len_at(code as usize),
+                None => Ok(None),
+            },
+            Body::Runs { ends, values } => match run_holding(ends, index) {
+                Some(run) => values.try_bytes_len_at(run),
+                None => Ok(None),
+            },
+            Body::ExternalText { source } => source.bytes_len_at(index),
+            _ => Ok(self.bytes_at(index).map(<[u8]>::len)),
+        }
+    }
+
+    /// Text at `index`, preserving storage read, validation and UTF-8 failures.
+    pub fn try_text_at(&self, index: usize) -> Result<Option<&str>> {
+        if self.ty != LogicalType::Varchar {
+            return Ok(None);
+        }
+        self.try_bytes_at(index)?
+            .map(|bytes| {
+                std::str::from_utf8(bytes).map_err(|error| {
+                    Error::conversion(format!("invalid UTF-8 in VARCHAR: {error}"))
+                })
+            })
+            .transpose()
+    }
+
+    /// Read every storage-backed value reachable through this vector.
+    pub fn validate_external(&self) -> Result<()> {
+        match &self.body {
+            Body::ExternalText { source } => {
+                for index in 0..source.len() {
+                    source.bytes_at(index)?;
+                }
+            }
+            Body::Dictionary { codes, values, .. } => {
+                for &code in codes {
+                    values.try_bytes_at(code as usize)?;
+                }
+            }
+            Body::Runs { values, .. } => values.validate_external()?,
+            Body::Nested { child, .. } => child.validate_external()?,
+            Body::Fields { children } => {
+                for child in children {
+                    child.validate_external()?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// The signed integer at `index`, widened, read without building a [`Value`].
@@ -1642,7 +1887,7 @@ impl Vector {
             Body::Sequence { start, step } => {
                 Some(i128::from(start.wrapping_add(step.wrapping_mul(index as i64))))
             }
-            Body::Dictionary { codes, values } => {
+            Body::Dictionary { codes, values, .. } => {
                 values.signed_at(usize::try_from(*codes.get(index)?).ok()?)
             }
             Body::Runs { ends, values } => values.signed_at(run_holding(ends, index)?),
@@ -1654,6 +1899,7 @@ impl Vector {
             Body::Coded { .. }
             | Body::Packed { .. }
             | Body::Views { .. }
+            | Body::ExternalText { .. }
             | Body::Nested { .. }
             | Body::Fields { .. } => None,
         }
@@ -1699,9 +1945,11 @@ impl Vector {
             Body::Sequence { start, step } => {
                 Body::Sequence { start: start + step * at as i64, step: *step }
             }
-            Body::Dictionary { codes, values } => {
-                Body::Dictionary { codes: codes[at..end].to_vec(), values: Arc::clone(values) }
-            }
+            Body::Dictionary { codes, values, stable } => Body::Dictionary {
+                codes: codes[at..end].to_vec(),
+                values: Arc::clone(values),
+                stable: *stable,
+            },
             // The bits are not byte aligned, so a cut either repacks them or moves the row the
             // reading starts at. Moving it is one addition and repacking is a pass, and a page is
             // cut into chunk sized pieces often enough that the difference is the form.
@@ -1763,6 +2011,13 @@ impl Vector {
                     .map(|child| child.slice(at, len).map(Arc::new))
                     .collect::<Result<Vec<_>>>()?,
             },
+            Body::ExternalText { source } => {
+                let mut out = StringColumn::with_capacity(len);
+                for index in at..end {
+                    out.push_bytes(source.bytes_at(index)?.unwrap_or_default());
+                }
+                Body::Flat(Data::Varlen(out))
+            }
             // The one form with nowhere to point, so its range is copied out. A run and not a
             // gather: this used to build a vector of the positions `at..end` and hand it to
             // `gather`, which then built a vector of `usize` from it, a vector of `bool` beside
@@ -1829,6 +2084,18 @@ impl Vector {
     /// for that one both of them have to be written out.
     fn copied(&self, at: Vec<usize>, forms_stay: bool) -> Result<Self> {
         let rows = at.len();
+        if forms_stay {
+            if let Body::Dictionary { codes, values, stable: true } = &self.body {
+                let validity = Validity::from_iter(rows, |row| {
+                    at.get(row).is_some_and(|&index| index < self.len && !self.is_null_at(index))
+                });
+                let gathered =
+                    at.iter().map(|&index| codes.get(index).copied().unwrap_or(0)).collect();
+                return Ok(
+                    Self::stable_dictionary(gathered, Arc::clone(values))?.with_validity(validity)
+                );
+            }
+        }
         let (at, leaf) = self.resolve(at);
         let live: Vec<bool> = at.iter().map(|&index| index != NOWHERE).collect();
         let validity = Validity::from_run(&live);
@@ -1920,6 +2187,13 @@ impl Vector {
                 }
                 Body::Flat(Data::Varlen(out))
             }
+            Body::ExternalText { source } => {
+                let mut out = StringColumn::with_capacity(at.len());
+                for &index in &at {
+                    out.push_bytes(source.bytes_at(index)?.unwrap_or_default());
+                }
+                Body::Flat(Data::Varlen(out))
+            }
             // A gather keeps the form, because the codes do not move and a span survives being put
             // in an order the codes are not in. A position that resolved to nowhere gets the empty
             // span, which decompresses to no bytes, which is the zero every other layout writes.
@@ -2006,7 +2280,7 @@ impl Vector {
                 }
             }
             source = match &source.body {
-                Body::Dictionary { codes, values } => {
+                Body::Dictionary { codes, values, .. } => {
                     for slot in &mut at {
                         *slot = match codes.get(*slot) {
                             Some(&code) => code as usize,
@@ -2342,7 +2616,7 @@ fn compose(codes: Vec<u32>, values: Vector) -> (Vec<u32>, Vector) {
     }
     let Vector { ty, len, validity, body } = values;
     match body {
-        Body::Dictionary { codes: inner, values: leaf } => {
+        Body::Dictionary { codes: inner, values: leaf, .. } => {
             debug_assert!(
                 !matches!(leaf.body, Body::Dictionary { .. })
                     || !matches!(leaf.validity, Validity::AllValid),
@@ -3407,7 +3681,7 @@ mod tests {
         };
 
         let piece = vector.slice(1, 3).unwrap();
-        let Body::Dictionary { codes, values: cut } = &piece.body else {
+        let Body::Dictionary { codes, values: cut, .. } = &piece.body else {
             panic!("a slice of a dictionary is a dictionary");
         };
         assert!(Arc::ptr_eq(whole, cut), "the cut copied the dictionary");

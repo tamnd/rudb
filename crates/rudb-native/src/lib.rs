@@ -9,18 +9,20 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::mem::size_of;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 
 use rudb_common::bounds::Bound;
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
-use rudb_vector::{Buffer, Chunk, Data, Vector};
+use rudb_vector::{Buffer, Chunk, Data, TextSource, Vector};
 
-const MAGIC: &[u8; 8] = b"RUDBNV5\0";
-const DIRECTORY: &[u8; 8] = b"RUDBDIR5";
+const MAGIC: &[u8; 8] = b"RUDBNV7\0";
+const DIRECTORY: &[u8; 8] = b"RUDBDIR7";
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -151,6 +153,7 @@ pub struct Table {
     fields: Vec<Field>,
     stripes: Vec<Stripe>,
     rows: usize,
+    dictionaries: Vec<Option<Page>>,
 }
 
 impl Table {
@@ -181,20 +184,91 @@ impl Table {
 
 /// Appends pages and commits a new directory for one table.
 #[derive(Debug)]
+struct GlobalDictionary {
+    primary: HashMap<u64, u32>,
+    collisions: HashMap<u64, Vec<u32>>,
+    offsets: Vec<u32>,
+    payload: Vec<u8>,
+}
+
+impl GlobalDictionary {
+    fn new() -> Self {
+        Self {
+            primary: HashMap::new(),
+            collisions: HashMap::new(),
+            offsets: vec![0],
+            payload: Vec::new(),
+        }
+    }
+
+    fn bytes(&self, code: u32) -> Option<&[u8]> {
+        let start = *self.offsets.get(code as usize)? as usize;
+        let end = *self.offsets.get(code as usize + 1)? as usize;
+        self.payload.get(start..end)
+    }
+
+    fn code(&mut self, text: &str) -> Result<u32> {
+        let hash = checksum(text.as_bytes());
+        if let Some(&code) = self.primary.get(&hash) {
+            if self.bytes(code) == Some(text.as_bytes()) {
+                return Ok(code);
+            }
+            if let Some(codes) = self.collisions.get(&hash) {
+                if let Some(code) =
+                    codes.iter().copied().find(|&code| self.bytes(code) == Some(text.as_bytes()))
+                {
+                    return Ok(code);
+                }
+            }
+            let code = self.insert(text)?;
+            self.collisions.entry(hash).or_default().push(code);
+            return Ok(code);
+        }
+        let code = self.insert(text)?;
+        self.primary.insert(hash, code);
+        Ok(code)
+    }
+
+    fn insert(&mut self, text: &str) -> Result<u32> {
+        let code = u32::try_from(self.offsets.len() - 1)
+            .map_err(|_| invalid("global dictionary has too many values"))?;
+        self.payload.extend_from_slice(text.as_bytes());
+        self.offsets.push(
+            u32::try_from(self.payload.len())
+                .map_err(|_| invalid("global dictionary payload exceeds 4 GiB"))?,
+        );
+        Ok(code)
+    }
+}
+
+/// Appends pages and commits a new directory for one table.
+#[derive(Debug)]
 pub struct Writer {
     file: File,
     table: Table,
     generation: u64,
     order: Vec<(u64, u64)>,
     next_order: u64,
+    dictionaries: Vec<Option<GlobalDictionary>>,
+    pending: Vec<PendingStripe>,
 }
 
+#[derive(Debug)]
+struct PendingStripe {
+    order: (u64, u64),
+    rows: usize,
+    pages: Vec<Vec<u8>>,
+    zone: Zone,
+}
+
+const EXTENT_STRIPES: usize = 32;
+
 impl Writer {
-    /// Creates a new v5 file and its first table.
+    /// Creates a new v7 file and its first table.
     ///
     /// # Errors
     ///
-    /// If the file exists, a field has no v5 scalar encoding, or the path cannot be written.
+    /// If the file exists, a field has no v7 scalar encoding, or the path cannot be written.
     pub fn create(
         path: impl AsRef<Path>,
         name: impl Into<String>,
@@ -207,14 +281,25 @@ impl Writer {
             OpenOptions::new().write(true).read(true).create_new(true).open(path).map_err(io)?;
         let mut header = [0; HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
-        header[8..12].copy_from_slice(&5_u32.to_le_bytes());
+        header[8..12].copy_from_slice(&7_u32.to_le_bytes());
         file.write_all(&header).map_err(io)?;
         Ok(Self {
             file,
-            table: Table { name: name.into(), fields, stripes: Vec::new(), rows: 0 },
+            dictionaries: fields
+                .iter()
+                .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
+                .collect(),
+            table: Table {
+                name: name.into(),
+                dictionaries: vec![None; fields.len()],
+                fields,
+                stripes: Vec::new(),
+                rows: 0,
+            },
             generation: 1,
             order: Vec::new(),
             next_order: 0,
+            pending: Vec::with_capacity(EXTENT_STRIPES),
         })
     }
 
@@ -251,25 +336,48 @@ impl Writer {
             if column.logical_type() != &field.ty {
                 return Err(invalid("chunk type differs from table schema"));
             }
-            let bytes = encode(column)?;
+            let bytes = encode(column, self.dictionaries[index].as_mut())?;
             if bytes.len() > MAX_PAGE {
                 return Err(invalid("column page exceeds the configured bound"));
             }
-            let offset = self.file.stream_position().map_err(io)?;
-            self.file.write_all(&bytes).map_err(io)?;
-            pages.push(Page {
-                offset,
-                length: u32::try_from(bytes.len()).map_err(|_| invalid("page length overflow"))?,
-                hash: checksum(&bytes),
-            });
+            pages.push(bytes);
         }
         self.table.rows = self
             .table
             .rows
             .checked_add(chunk.len())
             .ok_or_else(|| invalid("row count overflow"))?;
-        self.table.stripes.push(Stripe { rows: chunk.len(), pages, zone: Zone::of(chunk) });
-        self.order.push(order);
+        self.pending.push(PendingStripe { order, rows: chunk.len(), pages, zone: Zone::of(chunk) });
+        if self.pending.len() == EXTENT_STRIPES {
+            self.flush_pending()?;
+        }
+        Ok(())
+    }
+
+    /// Writes one bounded group of stripes with each column contiguous on disk.
+    fn flush_pending(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let width = self.table.fields.len();
+        let mut pages = vec![Vec::with_capacity(width); self.pending.len()];
+        for column in 0..width {
+            for (stripe, pending) in self.pending.iter().enumerate() {
+                let bytes = &pending.pages[column];
+                let offset = self.file.stream_position().map_err(io)?;
+                self.file.write_all(bytes).map_err(io)?;
+                pages[stripe].push(Page {
+                    offset,
+                    length: u32::try_from(bytes.len())
+                        .map_err(|_| invalid("page length overflow"))?,
+                    hash: checksum(bytes),
+                });
+            }
+        }
+        for (pending, pages) in self.pending.drain(..).zip(pages) {
+            self.table.stripes.push(Stripe { rows: pending.rows, pages, zone: pending.zone });
+            self.order.push(pending.order);
+        }
         Ok(())
     }
 
@@ -279,9 +387,28 @@ impl Writer {
     ///
     /// If directory encoding, writing, or syncing fails.
     pub fn finish(mut self) -> Result<Table> {
+        self.flush_pending()?;
         let mut stripes = self.order.into_iter().zip(self.table.stripes).collect::<Vec<_>>();
         stripes.sort_by_key(|(order, _)| *order);
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
+        for (index, dictionary) in self.dictionaries.into_iter().enumerate() {
+            let Some(dictionary) = dictionary else { continue };
+            let encoded = encode_global_dictionary(dictionary)?;
+            let offset = self.file.stream_position().map_err(io)?;
+            self.file.write_all(&encoded.index).map_err(io)?;
+            self.file.write_all(&encoded.payload).map_err(io)?;
+            let length = encoded
+                .index
+                .len()
+                .checked_add(encoded.payload.len())
+                .ok_or_else(|| invalid("dictionary page length overflow"))?;
+            self.table.dictionaries[index] = Some(Page {
+                offset,
+                length: u32::try_from(length)
+                    .map_err(|_| invalid("dictionary page length overflow"))?,
+                hash: checksum(&encoded.index),
+            });
+        }
         let directory = encode_directory(&self.table)?;
         if directory.len() > MAX_DIRECTORY {
             return Err(invalid("directory exceeds the configured bound"));
@@ -308,6 +435,195 @@ impl Writer {
 pub struct Reader {
     file: Arc<File>,
     table: Arc<Table>,
+    dictionaries: Arc<Vec<OnceLock<Arc<Vector>>>>,
+    extents: Arc<Vec<Vec<ExtentPart>>>,
+    extent_cache: Arc<Vec<Mutex<Vec<CachedExtent>>>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ExtentPart {
+    offset: u64,
+    length: usize,
+    page_start: usize,
+}
+
+#[derive(Debug)]
+struct CachedExtent {
+    offset: u64,
+    bytes: Arc<Vec<u8>>,
+}
+
+const CACHED_EXTENTS_PER_COLUMN: usize = 8;
+
+#[derive(Debug)]
+struct NativeText {
+    file: Arc<File>,
+    offsets: Vec<u32>,
+    payload: u64,
+    payload_len: usize,
+    hashes: Vec<u64>,
+    payload_blocks: Vec<OnceLock<Result<Vec<u8>>>>,
+    crossing: Vec<OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>>,
+}
+
+const TEXT_PAYLOAD_BLOCK: usize = 64 * 1024;
+const TEXT_CROSSING_BLOCK: usize = 1024;
+
+impl NativeText {
+    fn payload_block(&self, block: usize) -> Result<Option<&[u8]>> {
+        let Some(slot) = self.payload_blocks.get(block) else { return Ok(None) };
+        slot.get_or_init(|| {
+            let start = block
+                .checked_mul(TEXT_PAYLOAD_BLOCK)
+                .ok_or_else(|| invalid("global dictionary block offset overflow"))?;
+            let len = TEXT_PAYLOAD_BLOCK.min(
+                self.payload_len
+                    .checked_sub(start)
+                    .ok_or_else(|| invalid("global dictionary block starts past payload"))?,
+            );
+            let mut bytes = vec![0; len];
+            read_at(&self.file, self.payload + start as u64, &mut bytes)?;
+            if checksum(&bytes)
+                != *self
+                    .hashes
+                    .get(block)
+                    .ok_or_else(|| invalid("global dictionary block has no checksum"))?
+            {
+                return Err(invalid("global dictionary payload checksum differs"));
+            }
+            Ok(bytes)
+        })
+        .as_ref()
+        .map(|bytes| Some(bytes.as_slice()))
+        .map_err(Clone::clone)
+    }
+}
+
+impl TextSource for NativeText {
+    fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
+        let (Some(&start), Some(&end)) = (self.offsets.get(index), self.offsets.get(index + 1))
+        else {
+            return Ok(None);
+        };
+        if start == end {
+            return Ok(Some(&[]));
+        }
+        let first = start as usize / TEXT_PAYLOAD_BLOCK;
+        let last = (end as usize - 1) / TEXT_PAYLOAD_BLOCK;
+        if first == last {
+            let Some(block) = self.payload_block(first)? else { return Ok(None) };
+            let within = start as usize % TEXT_PAYLOAD_BLOCK;
+            return Ok(block.get(within..within + (end - start) as usize));
+        }
+        let Some(crossing) = self.crossing.get(index / TEXT_CROSSING_BLOCK) else {
+            return Ok(None);
+        };
+        let block = crossing.get_or_init(|| {
+            (0..TEXT_CROSSING_BLOCK).map(|_| OnceLock::new()).collect::<Vec<_>>().into_boxed_slice()
+        });
+        block[index % TEXT_CROSSING_BLOCK]
+            .get_or_init(|| {
+                let mut bytes = Vec::with_capacity((end - start) as usize);
+                for part in first..=last {
+                    let source = self
+                        .payload_block(part)?
+                        .ok_or_else(|| invalid("global dictionary block is missing"))?;
+                    let from = if part == first { start as usize % TEXT_PAYLOAD_BLOCK } else { 0 };
+                    let to = if part == last {
+                        (end as usize - 1) % TEXT_PAYLOAD_BLOCK + 1
+                    } else {
+                        source.len()
+                    };
+                    bytes.extend_from_slice(source.get(from..to).ok_or_else(|| {
+                        invalid("global dictionary value exceeds its payload block")
+                    })?);
+                }
+                Ok(bytes)
+            })
+            .as_ref()
+            .map(|bytes| Some(bytes.as_slice()))
+            .map_err(Clone::clone)
+    }
+
+    fn bytes_len_at(&self, index: usize) -> Result<Option<usize>> {
+        let (Some(&start), Some(&end)) = (self.offsets.get(index), self.offsets.get(index + 1))
+        else {
+            return Ok(None);
+        };
+        Ok(Some((end - start) as usize))
+    }
+
+    fn footprint(&self) -> usize {
+        self.offsets.capacity() * size_of::<u32>()
+            + self.payload_blocks.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
+            + self.hashes.capacity() * size_of::<u64>()
+            + self
+                .payload_blocks
+                .iter()
+                .filter_map(OnceLock::get)
+                .filter_map(|result| result.as_ref().ok())
+                .map(Vec::capacity)
+                .sum::<usize>()
+            + self.crossing.capacity() * size_of::<OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>>()
+            + self
+                .crossing
+                .iter()
+                .filter_map(OnceLock::get)
+                .map(|block| {
+                    block.len() * size_of::<OnceLock<Result<Vec<u8>>>>()
+                        + block
+                            .iter()
+                            .filter_map(OnceLock::get)
+                            .filter_map(|result| result.as_ref().ok())
+                            .map(Vec::capacity)
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
+/// Maps each logical page to the bounded contiguous read that contains it.
+fn extent_parts(table: &Table) -> Result<Vec<Vec<ExtentPart>>> {
+    let mut refs = Vec::with_capacity(table.stripes.len().saturating_mul(table.fields.len()));
+    for (stripe, entry) in table.stripes.iter().enumerate() {
+        for (column, page) in entry.pages.iter().enumerate() {
+            refs.push((page.offset, column, stripe, page.length as usize));
+        }
+    }
+    refs.sort_unstable_by_key(|entry| entry.0);
+    let mut parts = vec![vec![ExtentPart::default(); table.fields.len()]; table.stripes.len()];
+    let mut first = 0;
+    while first < refs.len() {
+        let (offset, column, _, first_len) = refs[first];
+        let mut end = offset
+            .checked_add(first_len as u64)
+            .ok_or_else(|| invalid("column extent range overflow"))?;
+        let mut last = first + 1;
+        while last < refs.len()
+            && last - first < EXTENT_STRIPES
+            && refs[last].1 == column
+            && refs[last].0 == end
+        {
+            end = end
+                .checked_add(refs[last].3 as u64)
+                .ok_or_else(|| invalid("column extent range overflow"))?;
+            last += 1;
+        }
+        let length = usize::try_from(end - offset)
+            .map_err(|_| invalid("column extent length exceeds this platform"))?;
+        for &(_, _, stripe, _) in &refs[first..last] {
+            let page = table.stripes[stripe].pages[column];
+            let page_start = usize::try_from(page.offset - offset)
+                .map_err(|_| invalid("column page offset exceeds this platform"))?;
+            parts[stripe][column] = ExtentPart { offset, length, page_start };
+        }
+        first = last;
+    }
+    Ok(parts)
 }
 
 impl Reader {
@@ -324,7 +640,7 @@ impl Reader {
         }
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header).map_err(io)?;
-        if &header[..8] != MAGIC || header[8..12] != 5_u32.to_le_bytes() {
+        if &header[..8] != MAGIC || header[8..12] != 7_u32.to_le_bytes() {
             return Err(invalid("magic or major version is unsupported"));
         }
         let mut selected = None;
@@ -350,7 +666,18 @@ impl Reader {
         }
         let (_, bytes) = selected.ok_or_else(|| invalid("no committed directory slot is valid"))?;
         let table = decode_directory(&bytes, size)?;
-        Ok(Self { file: Arc::new(file), table: Arc::new(table) })
+        let extents = extent_parts(&table)?;
+        let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
+        let extent_cache = (0..table.fields.len())
+            .map(|_| Mutex::new(Vec::with_capacity(CACHED_EXTENTS_PER_COLUMN)))
+            .collect::<Vec<_>>();
+        Ok(Self {
+            file: Arc::new(file),
+            table: Arc::new(table),
+            dictionaries: Arc::new(dictionaries),
+            extents: Arc::new(extents),
+            extent_cache: Arc::new(extent_cache),
+        })
     }
 
     /// The committed table directory.
@@ -365,6 +692,7 @@ impl Reader {
     ///
     /// If a stripe, column, page, or checksum is invalid.
     pub fn read(&self, stripe: usize, columns: &[usize]) -> Result<Chunk> {
+        let stripe_index = stripe;
         let stripe =
             self.table.stripes.get(stripe).ok_or_else(|| invalid("stripe index out of range"))?;
         let mut picked = Vec::with_capacity(columns.len());
@@ -375,12 +703,68 @@ impl Reader {
                 .get(column)
                 .ok_or_else(|| invalid("column index out of range"))?;
             let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
-            let mut bytes = vec![0; page.length as usize];
-            read_at(&self.file, page.offset, &mut bytes)?;
-            if checksum(&bytes) != page.hash {
+            let part = self
+                .extents
+                .get(stripe_index)
+                .and_then(|parts| parts.get(column))
+                .ok_or_else(|| invalid("column extent is missing"))?;
+            let bytes = if part.length == page.length as usize {
+                let mut bytes = vec![0; page.length as usize];
+                read_at(&self.file, page.offset, &mut bytes)?;
+                Arc::new(bytes)
+            } else {
+                let cached = self.extent_cache[column]
+                    .lock()
+                    .map_err(|_| invalid("column extent cache is poisoned"))?
+                    .iter()
+                    .find(|cached| cached.offset == part.offset)
+                    .map(|cached| Arc::clone(&cached.bytes));
+                if let Some(bytes) = cached {
+                    bytes
+                } else {
+                    let mut bytes = vec![0; part.length];
+                    read_at(&self.file, part.offset, &mut bytes)?;
+                    let bytes = Arc::new(bytes);
+                    let mut cache = self.extent_cache[column]
+                        .lock()
+                        .map_err(|_| invalid("column extent cache is poisoned"))?;
+                    if let Some(cached) = cache.iter().find(|cached| cached.offset == part.offset) {
+                        Arc::clone(&cached.bytes)
+                    } else {
+                        if cache.len() == CACHED_EXTENTS_PER_COLUMN {
+                            cache.remove(0);
+                        }
+                        cache.push(CachedExtent { offset: part.offset, bytes: Arc::clone(&bytes) });
+                        bytes
+                    }
+                }
+            };
+            let end = part
+                .page_start
+                .checked_add(page.length as usize)
+                .ok_or_else(|| invalid("column page range overflow"))?;
+            let page_bytes = bytes
+                .get(part.page_start..end)
+                .ok_or_else(|| invalid("column page exceeds its extent"))?;
+            if checksum(page_bytes) != page.hash {
                 return Err(invalid("column page checksum differs"));
             }
-            picked.push(decode(&field.ty, stripe.rows, &bytes)?);
+            let dictionary = match self.table.dictionaries[column] {
+                None => None,
+                Some(dictionary_page) => match self.dictionaries[column].get() {
+                    Some(dictionary) => Some(Arc::clone(dictionary)),
+                    None => {
+                        let dictionary = Arc::new(open_global_dictionary(
+                            Arc::clone(&self.file),
+                            dictionary_page,
+                            &field.ty,
+                        )?);
+                        let _ = self.dictionaries[column].set(Arc::clone(&dictionary));
+                        Some(self.dictionaries[column].get().map_or(dictionary, Arc::clone))
+                    }
+                },
+            };
+            picked.push(decode(&field.ty, stripe.rows, page_bytes, dictionary)?);
         }
         Chunk::with_rows(picked, stripe.rows)
     }
@@ -461,6 +845,17 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
         out.extend_from_slice(name);
         out.push(type_tag(&field.ty)?);
         out.push(u8::from(field.not_null));
+    }
+    for dictionary in &table.dictionaries {
+        match dictionary {
+            None => out.push(0),
+            Some(page) => {
+                out.push(1);
+                put_u64(&mut out, page.offset);
+                put_u32(&mut out, page.length);
+                put_u64(&mut out, page.hash);
+            }
+        }
     }
     put_u64(&mut out, u64::try_from(table.rows).map_err(|_| invalid("row count overflow"))?);
     put_u32(&mut out, u32::try_from(table.stripes.len()).map_err(|_| invalid("too many stripes"))?);
@@ -550,6 +945,24 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
         };
         fields.push(Field { name, ty, not_null });
     }
+    let mut dictionaries = Vec::with_capacity(width);
+    for _ in 0..width {
+        dictionaries.push(match cur.u8()? {
+            0 => None,
+            1 => {
+                let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+                let end = page
+                    .offset
+                    .checked_add(u64::from(page.length))
+                    .ok_or_else(|| invalid("dictionary page offset overflow"))?;
+                if page.offset < HEADER || end > size || page.length as usize > MAX_PAGE {
+                    return Err(invalid("dictionary page range is outside the file"));
+                }
+                Some(page)
+            }
+            _ => return Err(invalid("dictionary page tag differs")),
+        });
+    }
     let rows = usize::try_from(cur.u64()?).map_err(|_| invalid("row count does not fit"))?;
     let count = cur.u32()? as usize;
     let mut stripes = Vec::with_capacity(count);
@@ -592,7 +1005,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     if cur.at != bytes.len() {
         return Err(invalid("directory has trailing bytes"));
     }
-    Ok(Table { name, fields, stripes, rows })
+    Ok(Table { name, fields, stripes, rows, dictionaries })
 }
 
 fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
@@ -615,15 +1028,34 @@ fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
     Ok(())
 }
 
-fn encode(vector: &Vector) -> Result<Vec<u8>> {
+fn encode(vector: &Vector, global: Option<&mut GlobalDictionary>) -> Result<Vec<u8>> {
     let ty = vector.logical_type();
     // flatten: the file writer needs a uniform scalar page and does it once per loaded chunk.
     let flat = vector.flatten()?;
     let mut out = Vec::new();
-    let dictionary = if ty == &LogicalType::Varchar { string_dictionary(&flat)? } else { None };
-    let packed_vector = if dictionary.is_none() { Some(flat.bit_packed()?) } else { None };
+    let mut global_codes = None;
+    if let Some(global) = global {
+        let mut codes = Vec::with_capacity(flat.len());
+        for row in 0..flat.len() {
+            let text = flat.text_at(row).unwrap_or("");
+            codes.push(global.code(text)?);
+        }
+        global_codes = Some(codes);
+    }
+    let dictionary = if global_codes.is_none() && ty == &LogicalType::Varchar {
+        string_dictionary(&flat)?
+    } else {
+        None
+    };
+    let packed_vector = if dictionary.is_none() && global_codes.is_none() {
+        Some(flat.bit_packed()?)
+    } else {
+        None
+    };
     let packed = packed_vector.as_ref().and_then(Vector::packed_parts);
-    out.push(if dictionary.is_some() {
+    out.push(if global_codes.is_some() {
+        3
+    } else if dictionary.is_some() {
         1
     } else if packed.is_some() {
         2
@@ -647,6 +1079,12 @@ fn encode(vector: &Vector) -> Result<Vec<u8>> {
             }
             out.push(bits);
         }
+    }
+    if let Some(codes) = global_codes {
+        for code in codes {
+            put_u32(&mut out, code);
+        }
+        return Ok(out);
     }
     if let Some(dictionary) = dictionary {
         out.extend_from_slice(&dictionary);
@@ -765,7 +1203,105 @@ fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
     Ok(Some(out))
 }
 
-fn decode(ty: &LogicalType, rows: usize, bytes: &[u8]) -> Result<Vector> {
+struct EncodedDictionary {
+    index: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+fn encode_global_dictionary(dictionary: GlobalDictionary) -> Result<EncodedDictionary> {
+    let values = dictionary.offsets.len() - 1;
+    let payload_len = dictionary.payload.len();
+    let blocks = payload_len.div_ceil(TEXT_PAYLOAD_BLOCK);
+    let mut index = Vec::with_capacity(12 + (values + 1) * 4 + blocks * 8);
+    put_u32(
+        &mut index,
+        u32::try_from(values).map_err(|_| invalid("global dictionary has too many values"))?,
+    );
+    put_u32(&mut index, TEXT_PAYLOAD_BLOCK as u32);
+    put_u32(
+        &mut index,
+        u32::try_from(blocks).map_err(|_| invalid("global dictionary has too many blocks"))?,
+    );
+    for offset in dictionary.offsets {
+        put_u32(&mut index, offset);
+    }
+    for block in dictionary.payload.chunks(TEXT_PAYLOAD_BLOCK) {
+        put_u64(&mut index, checksum(block));
+    }
+    Ok(EncodedDictionary { index, payload: dictionary.payload })
+}
+
+fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Result<Vector> {
+    if ty != &LogicalType::Varchar {
+        return Err(invalid("global dictionary belongs to a non-string column"));
+    }
+    let mut header = [0; 12];
+    read_at(&file, page.offset, &mut header)?;
+    let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
+    let block_size = u32::from_le_bytes(header[4..8].try_into().expect("four bytes")) as usize;
+    let blocks = u32::from_le_bytes(header[8..12].try_into().expect("four bytes")) as usize;
+    if block_size != TEXT_PAYLOAD_BLOCK {
+        return Err(invalid("global dictionary block width differs"));
+    }
+    let offset_len = (count + 1)
+        .checked_mul(4)
+        .ok_or_else(|| invalid("global dictionary offset count overflow"))?;
+    let hash_len =
+        blocks.checked_mul(8).ok_or_else(|| invalid("global dictionary block count overflow"))?;
+    let index_len = 12usize
+        .checked_add(offset_len)
+        .and_then(|len| len.checked_add(hash_len))
+        .ok_or_else(|| invalid("global dictionary header overflow"))?;
+    if index_len > page.length as usize {
+        return Err(invalid("global dictionary offset index exceeds its page"));
+    }
+    let mut index = vec![0; index_len];
+    index[..12].copy_from_slice(&header);
+    read_at(&file, page.offset + 12, &mut index[12..])?;
+    if checksum(&index) != page.hash {
+        return Err(invalid("global dictionary index checksum differs"));
+    }
+    let offsets = index[12..12 + offset_len]
+        .chunks_exact(4)
+        .map(|part| u32::from_le_bytes(part.try_into().expect("four bytes")))
+        .collect::<Vec<_>>();
+    let hashes = index[12 + offset_len..]
+        .chunks_exact(8)
+        .map(|part| u64::from_le_bytes(part.try_into().expect("eight bytes")))
+        .collect::<Vec<_>>();
+    let payload_len = page.length as usize - index_len;
+    if blocks != payload_len.div_ceil(TEXT_PAYLOAD_BLOCK) {
+        return Err(invalid("global dictionary block count differs from its payload"));
+    }
+    if offsets.first() != Some(&0)
+        || offsets.last().copied().map(|last| last as usize) != Some(payload_len)
+        || offsets.windows(2).any(|pair| pair[0] > pair[1])
+    {
+        return Err(invalid("global dictionary offsets do not bound the payload"));
+    }
+    let payload_blocks =
+        (0..payload_len.div_ceil(TEXT_PAYLOAD_BLOCK)).map(|_| OnceLock::new()).collect();
+    let crossing = (0..count.div_ceil(TEXT_CROSSING_BLOCK)).map(|_| OnceLock::new()).collect();
+    Vector::external_text(
+        LogicalType::Varchar,
+        Arc::new(NativeText {
+            file,
+            offsets,
+            payload: page.offset + index_len as u64,
+            payload_len,
+            hashes,
+            payload_blocks,
+            crossing,
+        }),
+    )
+}
+
+fn decode(
+    ty: &LogicalType,
+    rows: usize,
+    bytes: &[u8],
+    global: Option<Arc<Vector>>,
+) -> Result<Vector> {
     let mut cur = Cursor { bytes, at: 0 };
     let codec = cur.u8()?;
     let flag = cur.u8()?;
@@ -816,6 +1352,21 @@ fn decode(ty: &LogicalType, rows: usize, bytes: &[u8]) -> Result<Vector> {
         }
         let dictionary = Vector::flat(LogicalType::Varchar, Data::Varlen(strings))?;
         return Ok(Vector::dictionary(codes, dictionary)?.with_validity(validity));
+    }
+    if codec == 3 {
+        let dictionary = global.ok_or_else(|| invalid("global code page has no dictionary"))?;
+        let mut codes = Vec::with_capacity(rows);
+        let mut highest = None;
+        for _ in 0..rows {
+            let code = cur.u32()?;
+            highest = Some(highest.map_or(code, |old: u32| old.max(code)));
+            codes.push(code);
+        }
+        if cur.at != bytes.len() {
+            return Err(invalid("global code page has trailing bytes"));
+        }
+        return Ok(Vector::stable_dictionary_validated(codes, dictionary, highest)?
+            .with_validity(validity));
     }
     if codec == 2 {
         let width = u32::from(cur.u8()?);
@@ -1004,5 +1555,35 @@ mod tests {
         file.write_all(&[255]).expect("damage one byte");
         assert!(reader.read(0, &[0]).is_err(), "page checksum rejects corruption");
         fs::remove_file(damaged).expect("remove scratch file");
+    }
+
+    #[test]
+    fn damaged_lazy_dictionary_payload_is_an_error() {
+        let path = path("damaged-dictionary");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("id", LogicalType::Integer),
+                Field::new("text", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        writer.append(&sample()).expect("stripe written");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let dictionary = reader.table.dictionaries[1].expect("string dictionary page");
+        let index_len = 12_u64 + 4 * 4 + 8;
+        let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
+        file.seek(SeekFrom::Start(dictionary.offset + index_len))
+            .expect("inside dictionary payload");
+        file.write_all(&[255]).expect("damage dictionary payload");
+
+        let chunk = reader.read(0, &[1]).expect("code page and dictionary index remain valid");
+        let error =
+            chunk.validate_external().expect_err("payload corruption must reach the caller");
+        assert!(error.message().contains("payload checksum differs"), "{error}");
+        fs::remove_file(path).expect("remove scratch file");
     }
 }

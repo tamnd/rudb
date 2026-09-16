@@ -376,7 +376,7 @@ impl Accumulator {
         // row at a time: the path recorded on the line above, which exists to be correct for an
         // aggregate `folded` does not cover and counts itself so that aggregate shows up.
         for row in 0..rows {
-            let value = input.value_at(row);
+            let value = input.try_value_at(row)?;
             self.update(std::slice::from_ref(&value))?;
         }
         Ok(())
@@ -462,7 +462,7 @@ impl Accumulator {
             (State::Extreme { held, .. }, Contribution::Extreme(Some(index))) => {
                 // One `Value` for the whole vector and one call into the comparison kernel, rather
                 // than one of each per row. The row that won is found on the numbers.
-                let candidate = input.value_at(index);
+                let candidate = input.try_value_at(index)?;
                 let replace = match held {
                     None => true,
                     Some(current) => {
@@ -730,7 +730,7 @@ pub fn update_scattered(
                 continue;
             }
             let Some(index) = into.index(row) else { continue };
-            let text = input.text_at(row).ok_or_else(|| {
+            let text = input.try_text_at(row)?.ok_or_else(|| {
                 Error::internal("a valid varchar row had no borrowed text".to_string())
             })?;
             let State::Extreme { held, least } = &mut states[index].state else {
@@ -769,7 +769,7 @@ pub fn update_scattered(
     // `spread` does not cover and counts itself so that column shows up.
     for row in 0..rows {
         let Some(index) = into.index(row) else { continue };
-        let value = input.value_at(row);
+        let value = input.try_value_at(row)?;
         states[index].update(std::slice::from_ref(&value))?;
     }
     Ok(())
@@ -1055,7 +1055,7 @@ fn extreme_into<M: Fn(usize) -> usize>(
                         // arrives sorted is once and for a column that arrives shuffled is about
                         // the harmonic number of the rows in the group.
                         if replace {
-                            *held = Some(Box::new(run.input.value_at(row)));
+                            *held = Some(Box::new(run.input.try_value_at(row)?));
                         }
                     }
                 })+
@@ -1153,6 +1153,48 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
             // Every code is inside the dictionary because `Vector::dictionary` checks that on the
             // way in, so the gather below indexes without a bound of its own.
             collect(values.data()?, |index| codes[index] as usize, rows, nulls, want)
+        }
+        Form::BitPacked => {
+            let packed = input.packed_parts()?;
+            match want {
+                Want::Whole => {
+                    let mut total = 0_i128;
+                    for row in 0..rows {
+                        if nulls.is_valid(row) {
+                            total += packed.base() + i128::from(packed.code(row));
+                        }
+                    }
+                    Some(Contribution::Whole(total))
+                }
+                Want::Real { from, .. } => {
+                    let mut total = from;
+                    let mut seen = 0_i64;
+                    for row in 0..rows {
+                        if nulls.is_valid(row) {
+                            total += (packed.base() + i128::from(packed.code(row))) as f64;
+                            seen += 1;
+                        }
+                    }
+                    Some(Contribution::Real { total, seen })
+                }
+                Want::Extreme(least) => {
+                    let mut found: Option<(usize, u64)> = None;
+                    for row in 0..rows {
+                        if !nulls.is_valid(row) {
+                            continue;
+                        }
+                        let code = packed.code(row);
+                        if found.is_none_or(
+                            |(_, held)| {
+                                if least { code < held } else { code > held }
+                            },
+                        ) {
+                            found = Some((row, code));
+                        }
+                    }
+                    Some(Contribution::Extreme(found.map(|(row, _)| row)))
+                }
+            }
         }
         // A constant folds in as one value repeated and a sequence as an arithmetic series, and
         // both have a closed form that is better than any loop. Neither is what a scan of a column
