@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.30
+
+A patch release that broadens D3 correlated subqueries, adds non-recursive CTE inlining, establishes the window plan contract, and improves native grouped TopN metadata. The storage format version is unchanged.
+
+- Correlated scalar aggregates and existence tests use distinct outer domains for arbitrary predicates, preserving zero counts, null results, null-safe comparisons, empty inputs, and strict scalar cardinality without evaluating the inner query once per outer row.
+- Projection-only scalar correlations work over dummy, values, table, and table-function inputs, and aggregate arguments or grouping expressions can read outer values through the same set-based domain rule.
+- Plain and `NOT MATERIALIZED` non-recursive CTEs inline through the existing subquery path, including chained definitions, declared column names, repeated references, nested `WITH` clauses, and CTE name precedence over catalog tables.
+- The logical plan now represents windows with partition expressions, ordered keys, `ROWS`, `RANGE`, and `GROUPS` frames, all five bound forms, all four exclusions, filters, distinctness, and null treatment. Parsing, binding, and execution remain explicit follow-up work.
+- Native frequency metadata can answer grouped TopN from exact page membership, builds numeric synopses in parallel, uses encoded radix counts for two-key groups, and stores bounded candidate ordinals without widening the hot grouped records.
+- The committed compatibility corpus has 35 files and passes through the library, shell, isolated runner, four shards, and optimizer-disabled path.
+- The full gate passes on Rust 1.85. No DuckDB bug was found in this work.
+
 ## 0.3.29
 
 A patch release that advances D3 correlated subqueries and improves native scans and grouped aggregation. The storage format version is unchanged.
