@@ -223,10 +223,12 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
                 }
             }
         }
-        Node::Join { conditions, .. } => {
+        Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
             if let Some(rewritten) = expr_list(plan, conditions, done) {
                 match plan.node_mut(node) {
-                    Node::Join { conditions, .. } => *conditions = rewritten,
+                    Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
+                        *conditions = rewritten;
+                    }
                     _ => unreachable!("the node was a join a moment ago"),
                 }
             }

@@ -45,7 +45,7 @@
 use std::sync::Arc;
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Cancel, Memory, Result, Session, Value};
+use rudb_common::{Cancel, Error, Memory, Result, Session, Value};
 use rudb_functions::TableFunction;
 use rudb_metrics::{Counters, Driver, Report};
 use rudb_parquet::{Bound, Op};
@@ -911,6 +911,11 @@ impl<'a> Building<'a, '_> {
                 left.after.push(counting);
                 self.close(left, pipeline, Arc::new(Watched::new(setop, counters)));
                 Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
+            }
+            Node::DependentJoin { .. } => {
+                return Err(Error::not_implemented(
+                    "a dependent join reached execution before subquery unnesting",
+                ));
             }
         };
         Ok(segment)

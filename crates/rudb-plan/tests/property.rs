@@ -121,6 +121,7 @@ fn the_generator_reaches_every_operator_and_every_expression_form() {
         [
             "Aggregate",
             "CrossProduct",
+            "DependentJoin",
             "Distinct",
             "Dummy",
             "Fetch",
@@ -612,7 +613,7 @@ impl Generator {
             let leaf = self.leaf();
             return self.plan.add_node(leaf);
         }
-        let node = match self.random.below(13) {
+        let node = match self.random.below(14) {
             0 => {
                 let input = self.node(depth - 1);
                 let predicate = self.of_type(&LogicalType::Boolean, EXPR_DEPTH);
@@ -705,6 +706,21 @@ impl Generator {
                 Node::Join { left, right, kind, conditions }
             }
             11 => {
+                let left = self.node(depth - 1);
+                let right = self.node(depth - 1);
+                let kind = self.random.pick(&[
+                    JoinKind::Inner,
+                    JoinKind::Left,
+                    JoinKind::Semi,
+                    JoinKind::Anti,
+                    JoinKind::Single,
+                    JoinKind::Mark,
+                ]);
+                let count = self.random.below(3);
+                let conditions = self.booleans(count, EXPR_DEPTH);
+                Node::DependentJoin { left, right, kind, conditions }
+            }
+            12 => {
                 let left = self.node(depth - 1);
                 let right = self.node(depth - 1);
                 Node::CrossProduct { left, right }

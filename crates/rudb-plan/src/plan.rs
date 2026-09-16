@@ -3,7 +3,7 @@
 use rudb_common::{Error, Field, LogicalType, Result, Span, Value};
 
 use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
-use crate::node::Node;
+use crate::node::{JoinKind, Node};
 use crate::{ExprRef, NodeRef, Slice, StrRef, ValueRef};
 
 /// A bound logical plan.
@@ -675,6 +675,16 @@ impl Plan {
                     }
                 }
             }
+            Node::DependentJoin { kind, conditions, .. } => {
+                if matches!(kind, JoinKind::Right | JoinKind::Full | JoinKind::Positional) {
+                    return fail("has a join kind that cannot preserve an outer row dependency");
+                }
+                for &condition in self.checked_expr_list(conditions, reference)? {
+                    if *self.expr_type(condition) != LogicalType::Boolean {
+                        return fail("joins on a condition that is not BOOLEAN");
+                    }
+                }
+            }
             Node::SetOp { .. } => {}
         }
 
@@ -739,7 +749,9 @@ impl Plan {
                 self.sort_key_list(keys).iter().map(|key| (key.expr, false)).collect()
             }
             Node::Distinct { on, .. } => plain(self.expr_list(on)),
-            Node::Join { conditions, .. } => plain(self.expr_list(conditions)),
+            Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
+                plain(self.expr_list(conditions))
+            }
         }
     }
 
