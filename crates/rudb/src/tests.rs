@@ -2212,6 +2212,24 @@ fn correlated_membership_filters_unnest_to_mark_joins() {
 }
 
 #[test]
+fn correlated_mark_joins_carry_hidden_filter_columns_after_the_marker() {
+    let db = database();
+    let sql = "SELECT g, 15 IN (SELECT value FROM (VALUES (1, 10), (1, NULL), (2, 20)) i(g, value) WHERE i.g = o.g) FROM (VALUES (1), (2), (3)) o(g) ORDER BY g";
+    assert_eq!(
+        rows(&db, sql),
+        vec![
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::Boolean(false)],
+            vec![Value::Integer(3), Value::Boolean(false)],
+        ]
+    );
+    let plan = db.plan(sql).expect("the hidden correlation key plans");
+    assert!(plan.contains("Join MARK"), "{plan}");
+    assert!(plan.contains("__correlated_2"), "{plan}");
+    assert!(!plan.contains("DependentJoin"), "{plan}");
+}
+
+#[test]
 fn uncorrelated_any_and_all_subqueries_are_mark_joins() {
     let db = database();
     assert_eq!(
