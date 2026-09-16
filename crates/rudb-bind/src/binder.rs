@@ -223,7 +223,9 @@ impl<'a> Binder<'a> {
         if as_table {
             return self.bind_describe(ast, query, relation);
         }
-        let Some(value) = self.session.get(&text) else {
+        let Some((_, value)) =
+            self.session.iter().find(|(name, _)| name.eq_ignore_ascii_case(&text))
+        else {
             return Err(Error::catalog(format!("Setting with name \"{text}\" does not exist")));
         };
         let field = Field::new(text, LogicalType::Varchar);
