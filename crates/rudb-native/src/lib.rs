@@ -12,13 +12,15 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+use rudb_common::bounds::Bound;
 use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, Vector};
 
-const MAGIC: &[u8; 8] = b"RUDBNV3\0";
-const DIRECTORY: &[u8; 8] = b"RUDBDIR3";
+const MAGIC: &[u8; 8] = b"RUDBNV4\0";
+const DIRECTORY: &[u8; 8] = b"RUDBDIR4";
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -78,6 +80,7 @@ struct Page {
 pub struct Stripe {
     rows: usize,
     pages: Vec<Page>,
+    zone: Zone,
 }
 
 impl Stripe {
@@ -151,7 +154,7 @@ impl Writer {
             OpenOptions::new().write(true).read(true).create_new(true).open(path).map_err(io)?;
         let mut header = [0; HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
-        header[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        header[8..12].copy_from_slice(&4_u32.to_le_bytes());
         file.write_all(&header).map_err(io)?;
         Ok(Self {
             file,
@@ -212,7 +215,7 @@ impl Writer {
             .rows
             .checked_add(chunk.len())
             .ok_or_else(|| invalid("row count overflow"))?;
-        self.table.stripes.push(Stripe { rows: chunk.len(), pages });
+        self.table.stripes.push(Stripe { rows: chunk.len(), pages, zone: Zone::of(chunk) });
         self.order.push(order);
         Ok(())
     }
@@ -268,7 +271,7 @@ impl Reader {
         }
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header).map_err(io)?;
-        if &header[..8] != MAGIC || header[8..12] != 3_u32.to_le_bytes() {
+        if &header[..8] != MAGIC || header[8..12] != 4_u32.to_le_bytes() {
             return Err(invalid("magic or major version is unsupported"));
         }
         let mut selected = None;
@@ -327,6 +330,12 @@ impl Reader {
             picked.push(decode(&field.ty, stripe.rows, &bytes)?);
         }
         Chunk::with_rows(picked, stripe.rows)
+    }
+
+    /// Whether persisted bounds prove that a stripe cannot match the predicates.
+    #[must_use]
+    pub fn skips(&self, stripe: usize, probes: &[Probe]) -> bool {
+        self.table.stripes.get(stripe).is_some_and(|stripe| stripe.zone.skips(probes))
     }
 }
 
@@ -412,6 +421,14 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             put_u32(&mut out, page.length);
             put_u64(&mut out, page.hash);
         }
+        for range in stripe.zone.columns() {
+            put_bound(&mut out, range.low.as_ref())?;
+            put_bound(&mut out, range.high.as_ref())?;
+            put_u32(
+                &mut out,
+                u32::try_from(range.nulls).map_err(|_| invalid("null count overflow"))?,
+            );
+        }
     }
     Ok(out)
 }
@@ -440,6 +457,22 @@ impl<'a> Cursor<'a> {
     fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
     }
+    fn bound(&mut self) -> Result<Option<Bound>> {
+        Ok(match self.u8()? {
+            0 => None,
+            1 => Some(Bound::Int(i128::from_le_bytes(
+                self.take(16)?.try_into().expect("sixteen bytes"),
+            ))),
+            2 => Some(Bound::Real(f64::from_le_bytes(
+                self.take(8)?.try_into().expect("eight bytes"),
+            ))),
+            3 => {
+                let length = self.u32()? as usize;
+                Some(Bound::Bytes(self.take(length)?.to_vec()))
+            }
+            _ => return Err(invalid("bound tag differs")),
+        })
+    }
     fn text(&mut self) -> Result<String> {
         let len = self.u16()? as usize;
         String::from_utf8(self.take(len)?.to_vec()).map_err(|_| invalid("name is not UTF-8"))
@@ -466,18 +499,6 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     }
     let rows = usize::try_from(cur.u64()?).map_err(|_| invalid("row count does not fit"))?;
     let count = cur.u32()? as usize;
-    let required = count
-        .checked_mul(
-            4_usize
-                .checked_add(
-                    width.checked_mul(20).ok_or_else(|| invalid("directory size overflow"))?,
-                )
-                .ok_or_else(|| invalid("directory size overflow"))?,
-        )
-        .ok_or_else(|| invalid("directory size overflow"))?;
-    if bytes.len().saturating_sub(cur.at) != required {
-        return Err(invalid("directory stripe count differs"));
-    }
     let mut stripes = Vec::with_capacity(count);
     let mut total = 0_usize;
     for _ in 0..count {
@@ -500,12 +521,45 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             }
             pages.push(Page { offset, length, hash });
         }
-        stripes.push(Stripe { rows: stripe_rows, pages });
+        let mut ranges = Vec::with_capacity(width);
+        for _ in 0..width {
+            let low = cur.bound()?;
+            let high = cur.bound()?;
+            let nulls = cur.u32()? as usize;
+            if nulls > stripe_rows {
+                return Err(invalid("null count exceeds stripe rows"));
+            }
+            ranges.push(Range { low, high, nulls });
+        }
+        stripes.push(Stripe { rows: stripe_rows, pages, zone: Zone::from_ranges(ranges) });
     }
     if total != rows {
         return Err(invalid("table row count differs from stripes"));
     }
+    if cur.at != bytes.len() {
+        return Err(invalid("directory has trailing bytes"));
+    }
     Ok(Table { name, fields, stripes, rows })
+}
+
+fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
+    match bound {
+        None => out.push(0),
+        Some(Bound::Int(value)) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Some(Bound::Real(value)) => {
+            out.push(2);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Some(Bound::Bytes(value)) => {
+            out.push(3);
+            put_u32(out, u32::try_from(value.len()).map_err(|_| invalid("bound length overflow"))?);
+            out.extend_from_slice(value);
+        }
+    }
+    Ok(())
 }
 
 fn encode(vector: &Vector) -> Result<Vec<u8>> {
@@ -803,6 +857,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rudb_common::Value;
+    use rudb_common::bounds::Op;
 
     use super::*;
 
@@ -855,6 +910,8 @@ mod tests {
         assert_eq!(text.value_at(2, 0), Value::Varchar("long text after a slash".into()));
         let count = reader.read(0, &[]).expect("no page is needed for count");
         assert_eq!(count.len(), 3);
+        assert!(reader.skips(0, &[Probe { column: 0, op: Op::Greater, value: Bound::Int(100) }]));
+        assert!(!reader.skips(0, &[Probe { column: 0, op: Op::Greater, value: Bound::Int(0) }]));
         fs::remove_file(path).expect("remove scratch file");
     }
 
