@@ -1,7 +1,7 @@
 //! The handle everything else hangs off.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rudb_bind::{Bound, Parameters};
 use rudb_catalog::{Catalog, Entry, View};
@@ -9,8 +9,8 @@ use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Va
 use rudb_metrics::{Document, Report, Span};
 
 use rudb_parse::ast::Ast;
-use rudb_pipeline::Pool;
-use rudb_vector::{Chunk, Vector};
+use rudb_pipeline::{Morsel, Pool, Progress, Sink};
+use rudb_vector::{Chunk, Form, Vector};
 
 use crate::config::Config;
 use crate::connection::{Connection, single};
@@ -370,6 +370,9 @@ fn persist(path: &Path, catalog: &Catalog) -> Result<()> {
     if tables.next().is_some() {
         return Err(Error::not_implemented("more than one table in a native database file"));
     }
+    if table.rows().is_native() {
+        return Ok(());
+    }
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     if temporary.exists() {
         std::fs::remove_file(&temporary).map_err(|error| Error::io(error.to_string()))?;
@@ -388,6 +391,96 @@ fn persist(path: &Path, catalog: &Catalog) -> Result<()> {
     writer.finish()?;
     std::fs::rename(&temporary, path).map_err(|error| Error::io(error.to_string()))?;
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct NativePlace {
+    morsel: u64,
+    chunk: u64,
+}
+
+/// The root of a file-backed initial insert.
+#[derive(Debug)]
+struct NativeSink {
+    writer: Mutex<Option<rudb_native::Writer>>,
+    temporary: PathBuf,
+    target: PathBuf,
+    table: String,
+    fields: Vec<Field>,
+}
+
+impl NativeSink {
+    fn create(target: &Path, name: String, fields: Vec<Field>) -> Result<Self> {
+        let temporary = target.with_extension(format!("{}.tmp", std::process::id()));
+        if temporary.exists() {
+            std::fs::remove_file(&temporary).map_err(|error| Error::io(error.to_string()))?;
+        }
+        let writer = rudb_native::Writer::create(&temporary, name.clone(), fields.clone())?;
+        Ok(Self {
+            writer: Mutex::new(Some(writer)),
+            temporary,
+            target: target.to_path_buf(),
+            table: name,
+            fields,
+        })
+    }
+}
+
+impl Sink for NativeSink {
+    type Local = NativePlace;
+
+    fn parallel(&self) -> bool {
+        false
+    }
+
+    fn local(&self) -> Self::Local {
+        NativePlace::default()
+    }
+
+    fn at(&self, morsel: &Morsel, place: &mut Self::Local) -> Result<()> {
+        place.morsel = morsel.index();
+        place.chunk = 0;
+        Ok(())
+    }
+
+    fn sink(&self, chunk: &Chunk, place: &mut Self::Local) -> Result<Progress> {
+        for (at, field) in self.fields.iter().enumerate().filter(|(_, field)| field.not_null) {
+            let vector = chunk.column(at)?;
+            let null = match vector.form() {
+                Form::Dictionary | Form::Rle => (0..vector.len()).any(|row| vector.is_null_at(row)),
+                _ => vector.validity().has_nulls(vector.len()),
+            };
+            if null {
+                return Err(Error::constraint(format!(
+                    "NOT NULL constraint failed: {}.{}",
+                    self.table, field.name
+                )));
+            }
+        }
+        let mut writer =
+            self.writer.lock().map_err(|_| Error::internal("native writer panicked"))?;
+        writer
+            .as_mut()
+            .ok_or_else(|| Error::internal("native writer was already committed"))?
+            .append_at((place.morsel, place.chunk), chunk)?;
+        place.chunk = place.chunk.saturating_add(1);
+        Ok(Progress::More)
+    }
+
+    fn combine(&self, _local: Self::Local) -> Result<()> {
+        Ok(())
+    }
+
+    fn finalize(&self) -> Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| Error::internal("native writer panicked"))?
+            .take()
+            .ok_or_else(|| Error::internal("native writer was already committed"))?;
+        writer.finish()?;
+        std::fs::rename(&self.temporary, &self.target).map_err(|error| Error::io(error.to_string()))
+    }
 }
 
 impl Shared {
@@ -622,6 +715,30 @@ impl Shared {
                 // and a version of this that appended chunk by chunk would either read its own
                 // output forever or depend on how the scan holds its chunks.
                 rudb_opt::optimize_with(&mut insert.source, &context)?;
+                if let Some(path) = &self.inner.path {
+                    let target = catalog.table(&insert.name)?;
+                    if target.rows().is_empty() {
+                        let sink = Arc::new(NativeSink::create(
+                            path,
+                            target.name().table.clone(),
+                            target.columns().to_vec(),
+                        )?);
+                        let query = rudb_exec::build_measured_into(
+                            &insert.source,
+                            &catalog,
+                            cancel,
+                            &self.inner.memory,
+                            &seams,
+                            &session,
+                            sink,
+                        )?;
+                        query.run(cancel, &self.inner.pool)?;
+                        drop(query);
+                        let reader = rudb_native::Reader::open(path)?;
+                        catalog.table_mut(&insert.name)?.commit_native(reader)?;
+                        return Ok(QueryResult::empty());
+                    }
+                }
                 let statistics = context.statistics();
                 let under =
                     Under::new(self.budget(), statistics, &seams, &session, Rows::ForATable);

@@ -68,6 +68,12 @@ impl Rows {
         self.len() == 0
     }
 
+    /// Whether these rows already come from a committed native snapshot.
+    #[must_use]
+    pub fn is_native(&self) -> bool {
+        matches!(self, Self::Native(_))
+    }
+
     /// Number of independently readable chunks or stripes.
     #[must_use]
     pub fn chunk_count(&self) -> usize {
@@ -184,6 +190,24 @@ impl Table {
     #[must_use]
     pub fn rows(&self) -> &Rows {
         &self.rows
+    }
+
+    /// Replaces an empty mutable table with its committed native snapshot.
+    ///
+    /// # Errors
+    ///
+    /// If rows are already present or the stored schema differs from this table.
+    pub fn commit_native(&mut self, reader: NativeReader) -> Result<()> {
+        if !self.rows.is_empty() {
+            return Err(Error::not_implemented(
+                "streaming a native insert into a table that already has rows",
+            ));
+        }
+        if reader.table().fields() != self.columns {
+            return Err(Error::internal("a committed native snapshot changed its table schema"));
+        }
+        self.rows = Rows::Native(reader);
+        Ok(())
     }
 
     /// The rows, to add to.

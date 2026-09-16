@@ -4155,7 +4155,7 @@ fn a_table_built_from_a_query_keeps_the_dictionary_the_query_produced() {
 }
 
 #[test]
-fn checkpoint_publishes_a_native_file_that_a_new_process_can_read() {
+fn a_file_backed_insert_streams_into_a_snapshot_that_a_new_process_can_read() {
     let path = std::env::temp_dir().join(format!(
         "rudb-native-checkpoint-{}-{}.rdb",
         std::process::id(),
@@ -4170,7 +4170,12 @@ fn checkpoint_publishes_a_native_file_that_a_new_process_can_read() {
     database
         .execute("INSERT INTO hits VALUES (1, 'one'), (2, NULL), (3, 'three')")
         .expect("the rows are inserted");
-    database.execute("CHECKPOINT").expect("the snapshot is committed");
+    assert!(path.exists(), "the insert publishes its snapshot");
+    assert!(database.with_catalog(|catalog| {
+        let name = rudb_catalog::QualifiedName::new("memory", "main", "hits");
+        catalog.table(&name).expect("the table is there").rows().is_native()
+    }));
+    database.execute("CHECKPOINT").expect("checkpoint sees an already committed snapshot");
     drop(database);
 
     let reopened = Database::open(path.to_str().expect("a UTF-8 temporary path"))
