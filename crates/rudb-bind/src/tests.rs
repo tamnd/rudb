@@ -654,3 +654,27 @@ fn a_binder_error_keeps_the_smallest_expression_range() {
     let error = bind_sql(sql, &catalog()).expect_err("the column is not in scope");
     assert_eq!(error.span(), Some(Span::new(7, 14)));
 }
+
+#[test]
+fn a_correlated_scalar_subquery_records_a_dependent_join() {
+    let printed = plan(
+        "SELECT h.url, (SELECT v.duration FROM visits v WHERE v.UserID = h.UserID) FROM hits h",
+    );
+    assert!(printed.contains("DependentJoin SINGLE"), "{printed}");
+    assert!(printed.contains("#1.0::BIGINT = #0.0::BIGINT"), "{printed}");
+}
+
+#[test]
+fn an_inner_column_shadows_an_outer_column() {
+    let printed = plan("SELECT (SELECT UserID FROM visits) FROM hits");
+    assert!(!printed.contains("DependentJoin"), "{printed}");
+    assert!(printed.contains("Join SINGLE"), "{printed}");
+}
+
+#[test]
+fn a_correlated_exists_subquery_records_a_dependent_join() {
+    let printed = plan(
+        "SELECT h.url FROM hits h WHERE EXISTS (SELECT 1 FROM visits v WHERE v.UserID = h.UserID)",
+    );
+    assert!(printed.contains("DependentJoin SINGLE"), "{printed}");
+}

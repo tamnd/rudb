@@ -82,14 +82,21 @@ impl Binder<'_> {
             }
             ast::Expr::List { items } => self.bind_list(ast, items, scope),
             ast::Expr::Parameter { name } => self.bind_parameter(ast, name),
-            ast::Expr::Subquery { query } => self.bind_scalar_subquery(ast, query),
-            ast::Expr::Exists { query, negated } => self.bind_exists_subquery(ast, query, negated),
+            ast::Expr::Subquery { query } => self.bind_scalar_subquery(ast, query, scope),
+            ast::Expr::Exists { query, negated } => {
+                self.bind_exists_subquery(ast, query, negated, scope)
+            }
         }
     }
 
     /// Binds an uncorrelated scalar query and returns its one output as a column expression.
-    fn bind_scalar_subquery(&mut self, ast: &Ast, query: ast::QueryRef) -> Result<ExprRef> {
-        let (node, scope) = self.bind_isolated_subquery(ast, query)?;
+    fn bind_scalar_subquery(
+        &mut self,
+        ast: &Ast,
+        query: ast::QueryRef,
+        outer: &Scope,
+    ) -> Result<ExprRef> {
+        let (node, scope, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
         let [column] = scope.columns.as_slice() else {
             return Err(Error::binder(format!(
                 "Subquery returns {} columns - expected 1",
@@ -101,6 +108,7 @@ impl Binder<'_> {
             node,
             kind: rudb_plan::JoinKind::Single,
             conditions: Vec::new(),
+            dependent: !correlations.is_empty(),
         });
         Ok(expr)
     }
@@ -111,8 +119,9 @@ impl Binder<'_> {
         ast: &Ast,
         query: ast::QueryRef,
         negated: bool,
+        outer: &Scope,
     ) -> Result<ExprRef> {
-        let (node, _) = self.bind_isolated_subquery(ast, query)?;
+        let (node, _, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
         let node = self.add_node(rudb_plan::Node::Limit { input: node, count: Some(1), offset: 0 });
         let index = self.fresh_index();
         let marker = self.add_constant(Value::Boolean(true));
@@ -127,6 +136,7 @@ impl Binder<'_> {
             node,
             kind: rudb_plan::JoinKind::Single,
             conditions: Vec::new(),
+            dependent: !correlations.is_empty(),
         });
         self.against_null(
             if negated { CompareOp::NotDistinctFrom } else { CompareOp::DistinctFrom },
@@ -139,13 +149,18 @@ impl Binder<'_> {
         &mut self,
         ast: &Ast,
         query: ast::QueryRef,
-    ) -> Result<(rudb_plan::NodeRef, Scope)> {
+        outer_scope: &Scope,
+    ) -> Result<(rudb_plan::NodeRef, Scope, Vec<rudb_plan::ColumnBinding>)> {
         let outer_aggregation = self.aggregation.take();
         let outer_in_aggregate = std::mem::replace(&mut self.in_aggregate, false);
         let outer_subqueries = std::mem::take(&mut self.scalar_subqueries);
         let outer_clause = std::mem::replace(&mut self.clause, "SELECT clause");
 
+        self.outer_scopes.push(outer_scope.clone());
+        self.correlations.push(Vec::new());
         let bound = self.bind_query(ast, query);
+        let correlations = self.correlations.pop().expect("correlation frame");
+        self.outer_scopes.pop();
         let nested_subqueries = std::mem::take(&mut self.scalar_subqueries);
         self.aggregation = outer_aggregation;
         self.in_aggregate = outer_in_aggregate;
@@ -157,7 +172,7 @@ impl Binder<'_> {
             nested_subqueries.is_empty(),
             "a nested select left scalar queries unattached"
         );
-        Ok((node, scope))
+        Ok((node, scope, correlations))
     }
 
     /// `?`, `?1`, `$1` or `$name`, which is the value the statement was prepared with.
@@ -188,14 +203,30 @@ impl Binder<'_> {
         // is still the ambiguity error. Both halves were measured against the pin. See
         // `crate::context`.
         if let [word] = parts.as_slice() {
-            if !scope.names(word) {
+            if !scope.names(word) && !self.outer_scopes.iter().any(|outer| outer.names(word)) {
                 if let Some(folded) = self.context_keyword(word) {
                     return Ok(folded);
                 }
             }
         }
-        let found = scope.resolve(&parts)?;
-        let (binding, ty) = (found.binding, found.ty.clone());
+        if let Some(found) = scope.resolve_optional(&parts)? {
+            return Ok(self.add_expr(Expr::Column(found.binding), found.ty.clone()));
+        }
+        let mut found = None;
+        for outer in self.outer_scopes.iter().rev() {
+            if let Some(visible) = outer.resolve_optional(&parts)? {
+                found = Some((visible.binding, visible.ty.clone()));
+                break;
+            }
+        }
+        let Some((binding, ty)) = found else {
+            return scope.resolve(&parts).map(|_| unreachable!());
+        };
+        if let Some(correlations) = self.correlations.last_mut() {
+            if !correlations.contains(&binding) {
+                correlations.push(binding);
+            }
+        }
         Ok(self.add_expr(Expr::Column(binding), ty))
     }
 
@@ -577,7 +608,7 @@ impl Binder<'_> {
         scope: &Scope,
     ) -> Result<ExprRef> {
         let subject = self.bind_expr(ast, operand, scope)?;
-        self.bind_mark_subquery(ast, subject, query, CompareOp::Equal, negated)
+        self.bind_mark_subquery(ast, subject, query, CompareOp::Equal, negated, scope)
     }
 
     fn bind_quantified_subquery(
@@ -594,7 +625,7 @@ impl Binder<'_> {
             Error::binder("Only comparisons can be used before ANY or ALL".to_string())
         })?;
         let op = if all { negate_comparison(op) } else { op };
-        self.bind_mark_subquery(ast, subject, query, op, all)
+        self.bind_mark_subquery(ast, subject, query, op, all, scope)
     }
 
     fn bind_mark_subquery(
@@ -604,8 +635,9 @@ impl Binder<'_> {
         query: ast::QueryRef,
         comparison: CompareOp,
         negate: bool,
+        outer: &Scope,
     ) -> Result<ExprRef> {
-        let (node, inner) = self.bind_isolated_subquery(ast, query)?;
+        let (node, inner, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
         let [column] = inner.columns.as_slice() else {
             return Err(Error::binder(format!(
                 "Subquery returns {} columns - expected 1",
@@ -635,6 +667,7 @@ impl Binder<'_> {
             node,
             kind: rudb_plan::JoinKind::Mark,
             conditions: vec![condition],
+            dependent: !correlations.is_empty(),
         });
         if negate { self.call("not", vec![marker]) } else { Ok(marker) }
     }
