@@ -34,6 +34,7 @@ pub struct Session {
 pub struct Semantics {
     default_descending: bool,
     default_null_order: DefaultNullOrder,
+    integer_division: bool,
 }
 
 impl Semantics {
@@ -52,6 +53,12 @@ impl Semantics {
             DefaultNullOrder::Sqlite => !descending,
             DefaultNullOrder::Postgres => descending,
         }
+    }
+
+    /// Whether `/` is bound as the integer division operator.
+    #[must_use]
+    pub fn integer_division(self) -> bool {
+        self.integer_division
     }
 }
 
@@ -133,6 +140,11 @@ impl Session {
     /// Sets how an order item with no null placement is resolved.
     pub fn set_default_null_order(&mut self, order: DefaultNullOrder) {
         self.semantics.default_null_order = order;
+    }
+
+    /// Sets whether `/` is bound as the integer division operator.
+    pub fn set_integer_division(&mut self, enabled: bool) {
+        self.semantics.integer_division = enabled;
     }
 
     /// The meaning-changing choices the binder resolves into the plan.
