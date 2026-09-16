@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use rudb_common::{LogicalType, Result};
-use rudb_plan::{ColumnBinding, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan};
+use rudb_plan::{ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan};
 
 use crate::tables::produced;
 use crate::walk;
@@ -29,6 +29,9 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     let Node::DependentJoin { left, right, kind, conditions } = *plan.node(at) else {
         return None;
     };
+    if let Some(join) = exists(plan, left, right, kind, conditions) {
+        return Some(join);
+    }
     let Node::Project { input: filtered, index, exprs, names } = *plan.node(right) else {
         return None;
     };
@@ -101,6 +104,115 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     let all: Vec<ExprRef> = plan.expr_list(conditions).iter().copied().chain(rewritten).collect();
     let conditions = plan.add_expr_list(&all);
     Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+}
+
+fn exists(
+    plan: &mut Plan,
+    left: NodeRef,
+    right: NodeRef,
+    kind: rudb_plan::JoinKind,
+    conditions: rudb_plan::Slice,
+) -> Option<NodeRef> {
+    let Node::Project { input: limited, index, exprs: marker_exprs, names: marker_names } =
+        *plan.node(right)
+    else {
+        return None;
+    };
+    let [marker] = plan.expr_list(marker_exprs) else {
+        return None;
+    };
+    let marker = *marker;
+    let Node::Limit { input: selected, count: Some(1), offset: 0 } = *plan.node(limited) else {
+        return None;
+    };
+    let Node::Project { input: filtered, .. } = *plan.node(selected) else {
+        return None;
+    };
+    let Node::Filter { input, predicate } = *plan.node(filtered) else {
+        return None;
+    };
+
+    let outer = produced(plan, left);
+    let inner = produced(plan, input);
+    let mut correlated = Vec::new();
+    let mut local = Vec::new();
+    split(plan, predicate, &mut |part| {
+        if equality_key(plan, part, &outer, &inner).is_some() {
+            correlated.push(part);
+        } else {
+            local.push(part);
+        }
+    });
+    if correlated.is_empty() || local.iter().any(|&part| reads(plan, part, &outer)) {
+        return None;
+    }
+
+    let mut keys = Vec::new();
+    let mut outputs = HashMap::new();
+    for &condition in &correlated {
+        let (binding, expr) = equality_key(plan, condition, &outer, &inner)?;
+        if outputs.contains_key(&binding) {
+            continue;
+        }
+        outputs.insert(binding, keys.len() + 1);
+        keys.push(expr);
+    }
+    let input = make_filter(plan, input, local);
+    let grouped = walk::fresh_index(plan);
+    let groups = plan.add_expr_list(&keys);
+    let aggregates = plan.add_expr_list(&[]);
+    let input = plan.add_node(Node::Aggregate { input, index: grouped, groups, aggregates });
+
+    let mut projected = vec![marker];
+    let mut names = plan.name_list(marker_names).to_vec();
+    for (position, &key) in keys.iter().enumerate() {
+        let source = plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(grouped, u32::try_from(position).ok()?)),
+            plan.expr_type(key).clone(),
+            plan.expr_span(key),
+        );
+        projected.push(source);
+        names.push(plan.intern(&format!("__correlated_{}", position + 1)));
+    }
+    let exprs = plan.add_expr_list(&projected);
+    let names = plan.add_name_list(&names);
+    let right = plan.add_node(Node::Project { input, index, exprs, names });
+    let mut all = plan.expr_list(conditions).to_vec();
+    for condition in correlated {
+        all.push(replace_inner(plan, condition, index, &outputs));
+    }
+    let conditions = plan.add_expr_list(&all);
+    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+}
+
+fn equality_key(
+    plan: &Plan,
+    expr: ExprRef,
+    outer: &crate::tables::TableSet,
+    inner: &crate::tables::TableSet,
+) -> Option<(ColumnBinding, ExprRef)> {
+    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(expr) else {
+        return None;
+    };
+    match (plan.expr(left), plan.expr(right)) {
+        (Expr::Column(inner_column), Expr::Column(outer_column))
+            if inner.contains(inner_column.table) && outer.contains(outer_column.table) =>
+        {
+            Some((*inner_column, left))
+        }
+        (Expr::Column(outer_column), Expr::Column(inner_column))
+            if outer.contains(outer_column.table) && inner.contains(inner_column.table) =>
+        {
+            Some((*inner_column, right))
+        }
+        _ => None,
+    }
+}
+
+fn reads(plan: &Plan, expr: ExprRef, tables: &crate::tables::TableSet) -> bool {
+    let mut yes = false;
+    walk::columns(plan, expr, &mut |binding| yes |= tables.contains(binding.table));
+    yes
 }
 
 fn split(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ExprRef)) {
