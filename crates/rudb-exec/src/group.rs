@@ -686,18 +686,10 @@ impl<'a> Aggregate<'a> {
             if column.is_null_at(row) {
                 continue;
             }
-            let value = match column.signed_at(row) {
-                Some(value) => i64::try_from(value)
-                    .map_err(|_| Error::internal("a distinct BIGINT value is out of range"))?,
-                None => match column.try_value_at(row)? {
-                    Value::BigInt(value) => value,
-                    value => {
-                        return Err(Error::internal(format!(
-                            "a BIGINT distinct exchange received {value:?}"
-                        )));
-                    }
-                },
-            };
+            let value = i64::try_from(column.signed_at(row).ok_or_else(|| {
+                Error::internal("a distinct BIGINT value has no signed representation")
+            })?)
+            .map_err(|_| Error::internal("a distinct BIGINT value is out of range"))?;
             let hash = spread(mix(0, value as u64));
             partitions[(hash >> shift) as usize].rows.push(BigIntDistinctRecord { hash, value });
         }
