@@ -25,6 +25,7 @@ pub mod pass;
 pub mod tables;
 pub mod topn;
 mod transitive;
+pub mod unnest;
 mod walk;
 
 use rudb_common::{Error, Result};
@@ -191,6 +192,7 @@ pub fn optimize(plan: &mut Plan) -> Result<()> {
 /// Whatever a pass reported, and then, in a debug build, if a pass left the plan malformed, narrowed
 /// what it returns or did not settle, all three of which are a bug in the pass and not in the query.
 pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
+    unnest::lower(plan)?;
     run(plan, context, &PASSES)
 }
 

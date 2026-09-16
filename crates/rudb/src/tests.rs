@@ -2072,6 +2072,33 @@ fn scalar_subquery_multiple_row_behavior_is_a_bound_semantic() {
 }
 
 #[test]
+fn a_correlated_scalar_filter_unnests_to_one_single_join() {
+    let db = database();
+    let sql = "SELECT k, (SELECT value FROM (VALUES (1, 10), (2, 20)) i(k, value) WHERE i.k = o.k) FROM (VALUES (1), (2), (3)) o(k) ORDER BY k";
+    assert_eq!(
+        rows(&db, sql),
+        vec![
+            vec![Value::Integer(1), Value::Integer(10)],
+            vec![Value::Integer(2), Value::Integer(20)],
+            vec![Value::Integer(3), Value::Null],
+        ]
+    );
+    let plan = db.plan(sql).expect("the correlated scalar query plans");
+    assert!(plan.contains("Join SINGLE"), "{plan}");
+    assert!(!plan.contains("DependentJoin"), "{plan}");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT (SELECT value FROM (VALUES (1, 10), (1, 20)) i(k, value) WHERE i.k = o.k AND value > 10) FROM (VALUES (1), (2)) o(k) ORDER BY k"
+        ),
+        vec![vec![Value::Integer(20)], vec![Value::Null]]
+    );
+    db.execute("SET disabled_optimizers = 'unnest_rewriter'")
+        .expect("the upstream optimizer name is accepted");
+    assert_eq!(rows(&db, sql)[2], vec![Value::Integer(3), Value::Null]);
+}
+
+#[test]
 fn uncorrelated_exists_is_a_single_joined_marker() {
     let db = database();
     let answer = db.query("SELECT EXISTS (SELECT 1)").expect("EXISTS answers");
