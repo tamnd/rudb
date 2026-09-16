@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry.
 //! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so this is a match on a name rather than a map.
-//! [`Settings::NAMES`] is that set, and it is eleven names for nine settings because two have a second spelling.
+//! [`Settings::NAMES`] is that set, and it is fourteen names for twelve settings because two have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
@@ -54,6 +54,8 @@ pub(crate) struct Settings {
     default_order: RwLock<String>,
     /// The null placement mode used when an order item does not state one.
     default_null_order: RwLock<String>,
+    /// Whether casts from local timestamps to zoned timestamps are refused.
+    disable_timestamptz_casts: RwLock<bool>,
     /// Whether floating division and remainder use IEEE answers for zero divisors.
     ieee_floating_point_ops: RwLock<bool>,
     /// Whether `/` binds to integer division instead of floating point division.
@@ -75,10 +77,11 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 13] = [
+    pub(crate) const NAMES: [&'static str; 14] = [
         "TimeZone",
         "default_null_order",
         "default_order",
+        "disable_timestamptz_casts",
         "disabled_optimizers",
         "ieee_floating_point_ops",
         "integer_division",
@@ -105,6 +108,7 @@ impl Settings {
             default_time_zone,
             default_order: RwLock::new("ASCENDING".to_string()),
             default_null_order: RwLock::new("NULLS_LAST".to_string()),
+            disable_timestamptz_casts: RwLock::new(false),
             ieee_floating_point_ops: RwLock::new(true),
             integer_division: RwLock::new(false),
             null_on_division_by_zero: RwLock::new(false),
@@ -241,6 +245,11 @@ impl Settings {
                 let tidy = rudb_opt::pass::Context::tidy(&text)?;
                 *self.disabled.write().unwrap_or_else(|held| held.into_inner()) = tidy;
             }
+            "disable_timestamptz_casts" => {
+                let enabled = value.map_or(Ok(false), boolean_of)?;
+                *self.disable_timestamptz_casts.write().unwrap_or_else(|held| held.into_inner()) =
+                    enabled;
+            }
             "ieee_floating_point_ops" => {
                 let enabled = value.map_or(Ok(true), boolean_of)?;
                 *self.ieee_floating_point_ops.write().unwrap_or_else(|held| held.into_inner()) =
@@ -336,6 +345,11 @@ impl Settings {
                 Ok(self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
             "disabled_optimizers" => Ok(self.disabled_optimizers()),
+            "disable_timestamptz_casts" => Ok(self
+                .disable_timestamptz_casts
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .to_string()),
             "ieee_floating_point_ops" => Ok(self
                 .ieee_floating_point_ops
                 .read()
@@ -390,6 +404,8 @@ impl Settings {
             self.default_order.read().unwrap_or_else(|held| held.into_inner()).clone();
         let default_null_order =
             self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone();
+        let disable_timestamptz_casts =
+            *self.disable_timestamptz_casts.read().unwrap_or_else(|held| held.into_inner());
         let ieee_floating_point_ops =
             *self.ieee_floating_point_ops.read().unwrap_or_else(|held| held.into_inner());
         let integer_division =
@@ -412,6 +428,7 @@ impl Settings {
             "POSTGRES" => DefaultNullOrder::Postgres,
             _ => DefaultNullOrder::Last,
         });
+        session.set_disable_timestamptz_casts(disable_timestamptz_casts);
         session.set_ieee_floating_point_ops(ieee_floating_point_ops);
         session.set_integer_division(integer_division);
         session.set_null_on_division_by_zero(null_on_division_by_zero);
@@ -425,6 +442,7 @@ impl Settings {
                     "default_order" => default_order.clone(),
                     "default_null_order" => default_null_order.clone(),
                     "disabled_optimizers" => disabled.clone(),
+                    "disable_timestamptz_casts" => disable_timestamptz_casts.to_string(),
                     "ieee_floating_point_ops" => ieee_floating_point_ops.to_string(),
                     "integer_division" => integer_division.to_string(),
                     "null_on_division_by_zero" => null_on_division_by_zero.to_string(),

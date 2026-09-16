@@ -51,7 +51,7 @@ impl Binder<'_> {
             ast::Expr::Cast { operand, ty, try_cast } => {
                 let input = self.bind_expr(ast, operand, scope)?;
                 let target = LogicalType::parse(ast.string(ty))?;
-                Ok(self.plan_mut().add_expr(Expr::Cast { input, try_cast }, target))
+                self.checked_cast_to(input, &target, try_cast)
             }
             ast::Expr::Case { operand, arms, otherwise } => {
                 self.bind_case(ast, operand, arms, otherwise, scope)
@@ -422,9 +422,10 @@ impl Binder<'_> {
         };
         // Every arm and the else have to hand back the same type, since a CASE produces one column.
         for arm in &mut bound {
-            arm.then = self.cast_to(arm.then, &result);
+            arm.then = self.checked_cast_to(arm.then, &result, false)?;
         }
-        let fallback = fallback.map(|expr| self.cast_to(expr, &result));
+        let fallback =
+            fallback.map(|expr| self.checked_cast_to(expr, &result, false)).transpose()?;
         let arms = self.plan_mut().add_arms(&bound);
         Ok(self.plan_mut().add_expr(Expr::Case { arms, otherwise: fallback }, result))
     }
@@ -504,7 +505,7 @@ impl Binder<'_> {
         let resolved = resolve(resolved_name, &types)?;
         let mut cast = Vec::with_capacity(args.len());
         for (arg, wanted) in args.iter().zip(&resolved.arguments) {
-            cast.push(self.cast_to(*arg, wanted));
+            cast.push(self.checked_cast_to(*arg, wanted, false)?);
         }
         let returns = self.narrowed_part(resolved.name, &cast, resolved.returns);
         let args = self.plan_mut().add_expr_list(&cast);
@@ -574,6 +575,28 @@ impl Binder<'_> {
         self.plan_mut().add_expr(Expr::Cast { input: expr, try_cast: false }, ty.clone())
     }
 
+    /// A cast checked against the session choices that can forbid a conversion.
+    pub(crate) fn checked_cast_to(
+        &mut self,
+        expr: ExprRef,
+        ty: &LogicalType,
+        try_cast: bool,
+    ) -> Result<ExprRef> {
+        let from = self.plan().expr_type(expr);
+        if self.semantics.disable_timestamptz_casts()
+            && matches!(from, LogicalType::Date | LogicalType::Timestamp)
+            && *ty == LogicalType::TimestampTz
+        {
+            return Err(Error::binder(
+                "Casting from TIMESTAMP to TIMESTAMP WITH TIME ZONE without an explicit time zone has been disabled  - use \"AT TIME ZONE ...\"",
+            ));
+        }
+        if from == ty {
+            return Ok(expr);
+        }
+        Ok(self.plan_mut().add_expr(Expr::Cast { input: expr, try_cast }, ty.clone()))
+    }
+
     /// A comparison, with both sides brought to the type they meet at.
     pub(crate) fn compare(
         &mut self,
@@ -588,8 +611,8 @@ impl Binder<'_> {
                 "Cannot compare values of type {left_type} and type {right_type}"
             ))
         })?;
-        let left = self.cast_to(left, &common);
-        let right = self.cast_to(right, &common);
+        let left = self.checked_cast_to(left, &common, false)?;
+        let right = self.checked_cast_to(right, &common, false)?;
         Ok(self.plan_mut().add_expr(Expr::Compare { op, left, right }, LogicalType::Boolean))
     }
 

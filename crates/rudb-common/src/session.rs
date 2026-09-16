@@ -34,6 +34,7 @@ pub struct Session {
 pub struct Semantics {
     default_descending: bool,
     default_null_order: DefaultNullOrder,
+    disable_timestamptz_casts: bool,
     integer_division: bool,
     ieee_floating_point_ops: bool,
     null_on_division_by_zero: bool,
@@ -46,6 +47,7 @@ impl Default for Semantics {
         Self {
             default_descending: false,
             default_null_order: DefaultNullOrder::default(),
+            disable_timestamptz_casts: false,
             integer_division: false,
             ieee_floating_point_ops: true,
             null_on_division_by_zero: false,
@@ -56,6 +58,12 @@ impl Default for Semantics {
 }
 
 impl Semantics {
+    /// Whether casts from local timestamps to zoned timestamps are refused.
+    #[must_use]
+    pub fn disable_timestamptz_casts(self) -> bool {
+        self.disable_timestamptz_casts
+    }
+
     /// Whether floating division and remainder use IEEE answers for zero divisors.
     #[must_use]
     pub fn ieee_floating_point_ops(self) -> bool {
@@ -202,6 +210,11 @@ impl Session {
     /// Sets whether a constant non-integer expression is accepted as a sort key.
     pub fn set_order_by_non_integer_literal(&mut self, enabled: bool) {
         self.semantics.order_by_non_integer_literal = enabled;
+    }
+
+    /// Sets whether casts from local timestamps to zoned timestamps are refused.
+    pub fn set_disable_timestamptz_casts(&mut self, enabled: bool) {
+        self.semantics.disable_timestamptz_casts = enabled;
     }
 
     /// Sets whether regex match operators require the entire string to match.

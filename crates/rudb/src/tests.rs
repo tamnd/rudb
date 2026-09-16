@@ -1641,6 +1641,58 @@ fn ieee_floating_point_ops_are_resolved_while_the_expression_is_bound() {
 }
 
 #[test]
+fn timestamp_to_timestamptz_casts_can_be_disabled_while_binding() {
+    let db = database();
+    db.execute("SET TimeZone = 'UTC'").expect("a deterministic zone");
+    assert_eq!(db.setting("disable_timestamptz_casts").expect("the setting"), "false");
+    assert_eq!(
+        rows(&db, "SELECT TIMESTAMP '2024-01-02 03:04:05'::TIMESTAMPTZ"),
+        vec![vec![Value::TimestampTz(1_704_164_645_000_000)]]
+    );
+    db.execute("SET disable_timestamptz_casts = true").expect("disabled timestamp casts");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT current_setting('disable_timestamptz_casts'), typeof(current_setting('disable_timestamptz_casts'))"
+        ),
+        vec![vec![Value::Boolean(true), text("BOOLEAN")]]
+    );
+    let expected = "Casting from TIMESTAMP to TIMESTAMP WITH TIME ZONE without an explicit time zone has been disabled  - use \"AT TIME ZONE ...\"";
+    for query in [
+        "SELECT TIMESTAMP '2024-01-02 03:04:05'::TIMESTAMPTZ",
+        "SELECT TRY_CAST(TIMESTAMP '2024-01-02 03:04:05' AS TIMESTAMPTZ)",
+        "SELECT TIMESTAMP '2024-01-02 03:04:05' = TIMESTAMPTZ '2024-01-02 03:04:05+00'",
+        "SELECT CASE WHEN true THEN TIMESTAMP '2024-01-02 03:04:05' ELSE TIMESTAMPTZ '2024-01-02 03:04:05+00' END",
+        "SELECT DATE '2024-01-02'::TIMESTAMPTZ",
+        "VALUES (TIMESTAMP '2024-01-02 03:04:05'), (TIMESTAMPTZ '2024-01-02 03:04:05+00')",
+        "SELECT TIMESTAMP '2024-01-02 03:04:05' UNION ALL SELECT TIMESTAMPTZ '2024-01-02 03:04:05+00'",
+    ] {
+        assert_eq!(failure(&db, query), expected, "{query}");
+    }
+    db.create_table("zoned", vec![Field::new("z", LogicalType::TimestampTz)]).unwrap();
+    assert_eq!(failure(&db, "INSERT INTO zoned SELECT TIMESTAMP '2024-01-02 03:04:05'"), expected);
+    assert_eq!(
+        rows(&db, "SELECT '2024-01-02 03:04:05'::TIMESTAMPTZ"),
+        vec![vec![Value::TimestampTz(1_704_164_645_000_000)]]
+    );
+    db.execute("RESET disable_timestamptz_casts").expect("timestamp casts restored");
+    assert_eq!(db.setting("disable_timestamptz_casts").expect("the setting"), "false");
+    let error = db.execute("SET disable_timestamptz_casts = 'off'").expect_err("not a boolean");
+    assert_eq!(error.message(), "Failed to cast value: Could not convert string 'off' to BOOL");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'disable_timestamptz_casts'"
+        ),
+        vec![vec![
+            text("Disable casting from timestamp to timestamptz "),
+            text("BOOLEAN"),
+            text("GLOBAL"),
+        ]]
+    );
+}
+
+#[test]
 fn a_non_integer_order_literal_needs_the_session_opt_in() {
     let db = database();
     let expected = "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to allow this behavior.";
@@ -1802,8 +1854,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Thirteen rows for eleven settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(13)]]);
+    // Fourteen rows for twelve settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(14)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
