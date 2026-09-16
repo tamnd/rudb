@@ -216,11 +216,12 @@ fn host(text: &str) -> &str {
     let Some(rest) = text.strip_prefix("http://").or_else(|| text.strip_prefix("https://")) else {
         return text;
     };
-    let rest = rest.strip_prefix("www.").unwrap_or(rest);
-    match rest.find('/') {
-        Some(end) if end > 0 => &rest[..end],
-        _ => text,
+    let Some(end) = rest.find('/') else { return text };
+    if end == 0 || memchr::memchr(b'\n', &rest.as_bytes()[end + 1..]).is_some() {
+        return text;
     }
+    let host = &rest[..end];
+    host.strip_prefix("www.").filter(|without| !without.is_empty()).unwrap_or(host)
 }
 
 /// The text side of a call, which is a flat column or one read through positions.
@@ -259,7 +260,9 @@ impl<'a> Source<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::host;
+    use rudb_common::Value;
+
+    use super::{Call, host};
 
     #[test]
     fn clickbench_host_extraction_keeps_the_regex_boundaries() {
@@ -268,5 +271,32 @@ mod tests {
         assert_eq!(host("http://example.com"), "http://example.com");
         assert_eq!(host("ftp://example.com/a"), "ftp://example.com/a");
         assert_eq!(host("https:///a"), "https:///a");
+        assert_eq!(host("https://example.com/a\nb"), "https://example.com/a\nb");
+        assert_eq!(host("https://example.com/a\n"), "https://example.com/a\n");
+        assert_eq!(host("https://exa\nmple.com/a"), "exa\nmple.com");
+        assert_eq!(host("http://www./a"), "www.");
+    }
+
+    #[test]
+    fn clickbench_host_shortcut_agrees_with_the_regex_machine() {
+        let pattern = Value::Varchar("^https?://(?:www\\.)?([^/]+)/.*$".into());
+        let replacement = Value::Varchar("\\1".into());
+        let call = Call::read("regexp_replace", &[&pattern, &replacement])
+            .expect("valid pattern")
+            .expect("a prepared call");
+        assert!(call.host);
+        for text in [
+            "https://example.com/a",
+            "https://example.com/a\nb",
+            "https://example.com/a\n",
+            "https://exa\nmple.com/a",
+            "http://www./a",
+            "http://www.example.com/a",
+            "https:///a",
+        ] {
+            let mut general = String::new();
+            call.regex.replace_into(&mut general, text, &call.rewrite, call.global);
+            assert_eq!(host(text), general, "{text:?}");
+        }
     }
 }
