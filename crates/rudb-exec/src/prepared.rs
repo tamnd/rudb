@@ -33,7 +33,9 @@
 //! `spec/engine/04-expressions.md` gives: once the tree walk is gone what is left to save is pass
 //! count, and at 1024 rows the intermediate vectors are eight kilobytes and stay in L1.
 
-use rudb_common::{Error, LogicalType, PhysicalType, Result, Session, SessionTimeZone, Value};
+use rudb_common::{
+    Error, LogicalType, PhysicalType, Result, Session, SessionTimeZone, Span, Value,
+};
 use rudb_kernels::{
     Comparison, Connective, Held, Members, Recipe, cast_in_time_zone, combine, compare_prepared,
     in_set, is_true, refine_flags, refine_prepared, selection,
@@ -72,6 +74,8 @@ pub struct Prepared {
     /// [`LogicalType`] owns a `Vec` for its nested cases and putting one in every variant would make
     /// the common variants several times larger for the benefit of the rare ones.
     types: Vec<LogicalType>,
+    /// The source range each step came from, indexed the same way as `steps`.
+    spans: Vec<Span>,
     /// The operand lists of the steps that have one, as runs of step indices.
     operands: Vec<usize>,
     /// The last step that reads each step's slot, or `usize::MAX` for one nothing reads.
@@ -249,6 +253,7 @@ impl Prepared {
         let mut prepared = Self {
             steps: Vec::new(),
             types: Vec::new(),
+            spans: Vec::new(),
             operands: Vec::new(),
             last_use: Vec::new(),
             roots: Vec::new(),
@@ -672,7 +677,9 @@ impl Prepared {
 
     /// Runs one step and empties the slot of every operand this was the last step to read.
     fn run_step(&self, index: usize, chunk: &Chunk, scratch: &mut Scratch) -> Result<()> {
-        let produced = self.step(index, chunk, &scratch.slots)?;
+        let produced = self
+            .step(index, chunk, &scratch.slots)
+            .map_err(|error| error.with_fallback_span(self.spans[index]))?;
         scratch.slots[index] = produced;
         let slots = &mut scratch.slots;
         self.for_each_operand(index, |operand| {
@@ -920,6 +927,7 @@ impl Prepared {
         };
         self.steps.push(step);
         self.types.push(ty);
+        self.spans.push(plan.expr_span(expr));
         let step = self.steps.len() - 1;
         if self.share {
             self.shared.insert(expr, step);

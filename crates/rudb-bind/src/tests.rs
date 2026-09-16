@@ -647,3 +647,10 @@ fn bound_expressions_keep_the_ast_source_ranges() {
     assert!(spans.contains(&Span::new(7, 13)), "the addition is missing from {spans:?}");
     assert_eq!(plan.node_span(plan.root()), Span::new(0, sql.len() as u32));
 }
+
+#[test]
+fn a_binder_error_keeps_the_smallest_expression_range() {
+    let sql = "SELECT missing + 1 FROM hits";
+    let error = bind_sql(sql, &catalog()).expect_err("the column is not in scope");
+    assert_eq!(error.span(), Some(Span::new(7, 14)));
+}
