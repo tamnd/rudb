@@ -49,8 +49,9 @@ pub(crate) fn restack(
     let mut here = at;
     if children.into_iter().flatten().zip(&rebuilt).any(|(was, &now)| was != now) {
         let mut node = plan.node(at).clone();
+        let span = plan.node_span(at);
         replace_children(&mut node, &rebuilt);
-        here = plan.add_node(node);
+        here = plan.add_node_at(node, span);
     }
     match step(plan, here) {
         Some(above) => {
@@ -110,6 +111,7 @@ pub(crate) fn rebuild(
     child: &mut impl FnMut(&mut Plan, ExprRef) -> ExprRef,
 ) -> ExprRef {
     let ty = plan.expr_type(expr).clone();
+    let span = plan.expr_span(expr);
     match *plan.expr(expr) {
         Expr::Column(_) | Expr::Constant(_) => expr,
         Expr::Cast { input, try_cast } => {
@@ -117,7 +119,7 @@ pub(crate) fn rebuild(
             if rewritten == input {
                 expr
             } else {
-                plan.add_expr(Expr::Cast { input: rewritten, try_cast }, ty)
+                plan.add_expr_at(Expr::Cast { input: rewritten, try_cast }, ty, span)
             }
         }
         Expr::Compare { op, left, right } => {
@@ -126,19 +128,20 @@ pub(crate) fn rebuild(
             if rewritten_left == left && rewritten_right == right {
                 expr
             } else {
-                plan.add_expr(
+                plan.add_expr_at(
                     Expr::Compare { op, left: rewritten_left, right: rewritten_right },
                     ty,
+                    span,
                 )
             }
         }
         Expr::Conjunction { op, children } => match list(plan, children, child) {
             None => expr,
-            Some(children) => plan.add_expr(Expr::Conjunction { op, children }, ty),
+            Some(children) => plan.add_expr_at(Expr::Conjunction { op, children }, ty, span),
         },
         Expr::Function { name, args } => match list(plan, args, child) {
             None => expr,
-            Some(args) => plan.add_expr(Expr::Function { name, args }, ty),
+            Some(args) => plan.add_expr_at(Expr::Function { name, args }, ty, span),
         },
         Expr::Aggregate { name, args, distinct, filter } => {
             let rewritten_args = list(plan, args, child);
@@ -147,9 +150,10 @@ pub(crate) fn rebuild(
                 expr
             } else {
                 let args = rewritten_args.unwrap_or(args);
-                plan.add_expr(
+                plan.add_expr_at(
                     Expr::Aggregate { name, args, distinct, filter: rewritten_filter },
                     ty,
+                    span,
                 )
             }
         }
@@ -164,7 +168,7 @@ pub(crate) fn rebuild(
                 expr
             } else {
                 let arms = plan.add_arms(&rewritten);
-                plan.add_expr(Expr::Case { arms, otherwise: rewritten_otherwise }, ty)
+                plan.add_expr_at(Expr::Case { arms, otherwise: rewritten_otherwise }, ty, span)
             }
         }
     }

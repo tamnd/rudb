@@ -166,8 +166,9 @@ fn stage(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     // the expression the column is produced by, since that is what the inner aggregate's field says.
     let column = &mut |plan: &mut Plan, at: usize, source: ExprRef| {
         let ty = plan.expr_type(source).clone();
+        let span = plan.expr_span(source);
         let at = u32::try_from(at).expect("an aggregate with this many expressions cannot bind");
-        plan.add_expr(Expr::Column(ColumnBinding::new(staged, at)), ty)
+        plan.add_expr_at(Expr::Column(ColumnBinding::new(staged, at)), ty, span)
     };
     let outer_keys: Vec<ExprRef> =
         keys.iter().enumerate().map(|(at, &key)| column(plan, at, key)).collect();
@@ -181,8 +182,9 @@ fn stage(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
             return None;
         };
         let ty = plan.expr_type(call).clone();
+        let span = plan.expr_span(call);
         let plain = Expr::Aggregate { name, args: outer_args, distinct: false, filter: None };
-        outer_calls.push(plan.add_expr(plain, ty));
+        outer_calls.push(plan.add_expr_at(plain, ty, span));
     }
     let outer_keys = plan.add_expr_list(&outer_keys);
     let outer_calls = plan.add_expr_list(&outer_calls);

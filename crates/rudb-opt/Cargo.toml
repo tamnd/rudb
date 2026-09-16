@@ -23,5 +23,8 @@ rudb-catalog.workspace = true
 rudb-functions.workspace = true
 rudb-storage.workspace = true
 
+[dev-dependencies]
+rudb-bind.workspace = true
+
 [lints]
 workspace = true

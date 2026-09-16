@@ -265,6 +265,8 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
 mod tests {
     use super::*;
 
+    use rudb_catalog::Catalog;
+
     /// How wide the plan a text prints is, before anything has run over it.
     fn width(text: &str) -> usize {
         let plan =
@@ -278,6 +280,30 @@ mod tests {
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         optimize(&mut plan).unwrap_or_else(|error| panic!("{text} did not optimize: {error}"));
         plan.to_string()
+    }
+
+    #[test]
+    fn every_optimizer_allocation_keeps_a_source_span() {
+        let sql =
+            "SELECT count(DISTINCT x) FROM (VALUES ('a'), ('b'), ('b')) t(x) WHERE true LIMIT 1";
+        let mut plan = rudb_bind::bind_sql(sql, &Catalog::new()).expect("the query binds");
+        let nodes = plan.node_count();
+        let exprs = plan.expr_count();
+
+        optimize(&mut plan).expect("the complete optimizer sequence succeeds");
+
+        assert!(!plan.node_span(plan.root()).is_empty(), "the optimized root keeps a source range");
+        for at in nodes..plan.node_count() {
+            let at = u32::try_from(at).expect("the plan arena fits in a reference");
+            assert!(!plan.node_span(at).is_empty(), "optimizer node {at} has no source range");
+        }
+        for at in exprs..plan.expr_count() {
+            let at = u32::try_from(at).expect("the expression arena fits in a reference");
+            assert!(
+                !plan.expr_span(at).is_empty(),
+                "optimizer expression {at} has no source range"
+            );
+        }
     }
 
     #[test]

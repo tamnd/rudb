@@ -109,7 +109,9 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
 
 fn column(plan: &mut Plan, table: u32, position: usize, source: ExprRef) -> ExprRef {
     let position = u32::try_from(position).expect("an aggregate cannot have this many columns");
-    plan.add_expr(Expr::Column(ColumnBinding::new(table, position)), plan.expr_type(source).clone())
+    let ty = plan.expr_type(source).clone();
+    let span = plan.expr_span(source);
+    plan.add_expr_at(Expr::Column(ColumnBinding::new(table, position)), ty, span)
 }
 
 fn replay(

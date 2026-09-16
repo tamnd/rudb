@@ -362,7 +362,7 @@ fn constant_of(plan: &mut Plan, expr: ExprRef, value: Value) -> Option<ExprRef> 
         return None;
     }
     let held = plan.add_value(value);
-    Some(plan.add_expr(Expr::Constant(held), ty))
+    Some(plan.add_expr_at(Expr::Constant(held), ty, plan.expr_span(expr)))
 }
 
 /// Negating the smallest value of a signed integer type, which widens instead of raising.
@@ -396,7 +396,7 @@ fn widened_negation(plan: &mut Plan, expr: ExprRef) -> Option<ExprRef> {
     };
     let ty = widened.logical_type();
     let held = plan.add_value(widened);
-    Some(plan.add_expr(Expr::Constant(held), ty))
+    Some(plan.add_expr_at(Expr::Constant(held), ty, plan.expr_span(expr)))
 }
 
 /// `x AND true` is `x`, `x AND false` is `false`, and the same the other way up for `OR`.
@@ -428,7 +428,11 @@ fn conjunction(plan: &mut Plan, expr: ExprRef, op: ConjunctionOp, children: Slic
         [only] => *only,
         rest => {
             let children = plan.add_expr_list(rest);
-            plan.add_expr(Expr::Conjunction { op, children }, LogicalType::Boolean)
+            plan.add_expr_at(
+                Expr::Conjunction { op, children },
+                LogicalType::Boolean,
+                plan.expr_span(expr),
+            )
         }
     }
 }
@@ -486,7 +490,7 @@ fn case(plan: &mut Plan, expr: ExprRef, arms: Slice, otherwise: Option<ExprRef>)
     }
     let ty = plan.expr_type(expr).clone();
     let arms = plan.add_arms(&kept);
-    plan.add_expr(Expr::Case { arms, otherwise: result }, ty)
+    plan.add_expr_at(Expr::Case { arms, otherwise: result }, ty, plan.expr_span(expr))
 }
 
 /// A comparison against a null constant is null, whatever the other side is.
