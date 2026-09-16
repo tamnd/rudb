@@ -108,6 +108,7 @@ pub fn query(ast: &Ast, index: QueryRef) -> String {
         // is not a choice here: `CREATE VIEW v AS VALUES (1)` comes back with `AS valueslist` on it.
         QueryBody::Values(rows) => format!("SELECT * FROM ({}) AS valueslist", values(ast, rows)),
         QueryBody::Describe(inner) => format!("DESCRIBE ({})", query(ast, inner)),
+        QueryBody::Show { name, .. } => format!("SHOW {}", ast.name_text(name)),
     };
     if held.order_by_all {
         // `ORDER BY ALL` is a star over the columns by the time it is printed.

@@ -906,6 +906,20 @@ impl<'a> Transform<'a> {
                 let query = self.star_over(source);
                 Ok(self.push_query(Query::bare(QueryBody::Describe(query))))
             }
+            "ShowByName" => {
+                let target = self.find(inner, "ShowTarget");
+                if target == NONE {
+                    return self.unsupported(inner);
+                }
+                let name = self.name_parts(target);
+                let source = self.push_source(Source::Table {
+                    name,
+                    alias: NONE,
+                    columns: Slice::default(),
+                });
+                let relation = self.star_over(source);
+                Ok(self.push_query(Query::bare(QueryBody::Show { name, relation })))
+            }
             _ => self.unsupported(inner),
         }
     }
@@ -2942,6 +2956,7 @@ mod tests {
             }
             QueryBody::Values(rows) => show_rows(ast, rows),
             QueryBody::Describe(inner) => format!("DESCRIBE {}", show_query(ast, inner)),
+            QueryBody::Show { name, .. } => format!("SHOW {}", ast.name_text(name)),
         };
         if query.order_by_all {
             out += " ORDER BY ALL";
