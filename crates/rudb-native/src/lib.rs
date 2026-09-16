@@ -30,10 +30,12 @@ const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
 const MAX_DIRECTORY: usize = 128 * 1024 * 1024;
-const FREQUENCIES: &[u8; 8] = b"RUDBFQ1\0";
+const FREQUENCIES_V1: &[u8; 8] = b"RUDBFQ1\0";
+const FREQUENCIES: &[u8; 8] = b"RUDBFQ2\0";
 const FREQUENCY_CANDIDATES: usize = 32_768;
 const FREQUENCY_ENTRIES: usize = 512;
 const FREQUENCY_BUILD_RANK: usize = 10;
+const FREQUENCY_ORDINALS: usize = 65_536;
 const MAX_FREQUENCY_WORKERS: usize = 16;
 
 fn io(error: std::io::Error) -> Error {
@@ -159,6 +161,16 @@ struct FrequencyEntry {
 struct FrequencySummary {
     entries: Vec<FrequencyEntry>,
     omitted_max: u64,
+    ordinals: Vec<u64>,
+}
+
+/// Sparse row ordinals covered by a numeric frequency candidate set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrequencyOccurrences {
+    /// Upper bound for the frequency of every value absent from the fetched rows.
+    pub omitted_max: u64,
+    /// Table-wide row ordinals in ascending order.
+    pub ordinals: Vec<u64>,
 }
 
 /// One independently readable stripe of a table.
@@ -478,7 +490,7 @@ impl Writer {
         }
         let mut candidates: HashMap<FrequencyValue, u32> = HashMap::new();
         let mut decrements = 0_u64;
-        self.visit_numeric(column, |value| {
+        self.visit_numeric(column, |_, value| {
             if let Some(count) = candidates.get_mut(&value) {
                 *count = count.saturating_add(1);
             } else if candidates.len() < FREQUENCY_CANDIDATES {
@@ -491,11 +503,14 @@ impl Writer {
                 decrements = decrements.saturating_add(1);
             }
         })?;
-        let exact = if decrements == 0 {
-            candidates
-                .into_iter()
-                .map(|(value, count)| (value, u64::from(count)))
-                .collect::<HashMap<_, _>>()
+        let (exact, ordinals) = if decrements == 0 {
+            (
+                candidates
+                    .into_iter()
+                    .map(|(value, count)| (value, u64::from(count)))
+                    .collect::<HashMap<_, _>>(),
+                Vec::new(),
+            )
         } else {
             let mut lower = candidates.values().copied().collect::<Vec<_>>();
             lower.sort_unstable_by(|left, right| right.cmp(left));
@@ -506,12 +521,22 @@ impl Writer {
             }
             let mut exact =
                 candidates.into_keys().map(|value| (value, 0_u64)).collect::<HashMap<_, _>>();
-            self.visit_numeric(column, |value| {
+            let mut ordinals = Vec::new();
+            let mut exceeded = false;
+            self.visit_numeric(column, |ordinal, value| {
                 if let Some(count) = exact.get_mut(&value) {
                     *count = count.saturating_add(1);
+                    if !exceeded {
+                        if ordinals.len() < FREQUENCY_ORDINALS {
+                            ordinals.push(ordinal);
+                        } else {
+                            ordinals.clear();
+                            exceeded = true;
+                        }
+                    }
                 }
             })?;
-            exact
+            (exact, ordinals)
         };
         let mut entries = exact
             .into_iter()
@@ -523,11 +548,16 @@ impl Writer {
         let omitted_max =
             entries.get(FREQUENCY_ENTRIES).map_or(decrements, |entry| decrements.max(entry.count));
         entries.truncate(FREQUENCY_ENTRIES);
-        Ok(Some(FrequencySummary { entries, omitted_max }))
+        Ok(Some(FrequencySummary { entries, omitted_max, ordinals }))
     }
 
-    fn visit_numeric(&self, column: usize, mut visit: impl FnMut(FrequencyValue)) -> Result<()> {
+    fn visit_numeric(
+        &self,
+        column: usize,
+        mut visit: impl FnMut(u64, FrequencyValue),
+    ) -> Result<()> {
         let ty = &self.table.fields[column].ty;
+        let mut start = 0_u64;
         for stripe in &self.table.stripes {
             let page = stripe.pages[column];
             let mut bytes = vec![0; page.length as usize];
@@ -545,8 +575,9 @@ impl Writer {
                         invalid("numeric frequency page did not contain a signed value")
                     })?)
                 };
-                visit(value);
+                visit(start.saturating_add(row as u64), value);
             }
+            start = start.saturating_add(stripe.rows as u64);
         }
         Ok(())
     }
@@ -988,6 +1019,32 @@ impl Reader {
         Ok(Some(out))
     }
 
+    /// Sparse rows belonging to the bounded numeric frequency candidate set.
+    ///
+    /// The list is omitted when collecting it would exceed the fixed storage budget. A composite
+    /// aggregate may accept a result over these rows only when its requested boundary is strictly
+    /// greater than `omitted_max`.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema.
+    pub fn frequency_occurrences(&self, column: usize) -> Result<Option<FrequencyOccurrences>> {
+        self.table
+            .fields
+            .get(column)
+            .ok_or_else(|| invalid("frequency column index out of range"))?;
+        let Some(summary) = self.table.frequencies.get(column).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        if summary.ordinals.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(FrequencyOccurrences {
+            omitted_max: summary.omitted_max,
+            ordinals: summary.ordinals.clone(),
+        }))
+    }
+
     fn dictionary(&self, column: usize) -> Result<Option<Arc<Vector>>> {
         let Some(page) = self.table.dictionaries[column] else { return Ok(None) };
         if let Some(dictionary) = self.dictionaries[column].get() {
@@ -1188,6 +1245,13 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
+fn put_var_u64(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
 
 fn frequency_order(left: FrequencyValue, right: FrequencyValue) -> Ordering {
     match (left, right) {
@@ -1217,7 +1281,7 @@ fn code_frequency(dictionary: &GlobalDictionary) -> FrequencySummary {
     });
     let omitted_max = entries.get(FREQUENCY_ENTRIES).map_or(0, |entry| entry.count);
     entries.truncate(FREQUENCY_ENTRIES);
-    FrequencySummary { entries, omitted_max }
+    FrequencySummary { entries, omitted_max, ordinals: Vec::new() }
 }
 
 fn encode_directory(table: &Table) -> Result<Vec<u8>> {
@@ -1313,6 +1377,26 @@ fn encode_directory_version(table: &Table, version: u32) -> Result<Vec<u8>> {
             }
             put_u64(&mut out, entry.count);
         }
+        put_u32(
+            &mut out,
+            u32::try_from(summary.ordinals.len())
+                .map_err(|_| invalid("too many frequency ordinals"))?,
+        );
+        let mut previous = 0_u64;
+        for (at, &ordinal) in summary.ordinals.iter().enumerate() {
+            let delta = if at == 0 {
+                ordinal
+            } else {
+                ordinal
+                    .checked_sub(previous)
+                    .ok_or_else(|| invalid("frequency ordinals are not ordered"))?
+            };
+            if at != 0 && delta == 0 {
+                return Err(invalid("frequency ordinals are not unique"));
+            }
+            put_var_u64(&mut out, delta);
+            previous = ordinal;
+        }
     }
     Ok(out)
 }
@@ -1340,6 +1424,21 @@ impl<'a> Cursor<'a> {
     }
     fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
+    }
+    fn var_u64(&mut self) -> Result<u64> {
+        let mut value = 0_u64;
+        for shift in (0..=63).step_by(7) {
+            let byte = self.u8()?;
+            let part = u64::from(byte & 0x7f);
+            if shift == 63 && part > 1 {
+                return Err(invalid("frequency ordinal varint overflows"));
+            }
+            value |= part << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(invalid("frequency ordinal varint is too long"))
     }
     fn bound(&mut self) -> Result<Option<Bound>> {
         Ok(match self.u8()? {
@@ -1468,9 +1567,11 @@ fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
     let frequencies = if cur.at == bytes.len() {
         vec![None; width]
     } else {
-        if cur.take(8)? != FREQUENCIES {
-            return Err(invalid("directory extension magic differs"));
-        }
+        let frequency_version = match cur.take(8)? {
+            magic if magic == FREQUENCIES_V1 => 1,
+            magic if magic == FREQUENCIES => 2,
+            _ => return Err(invalid("directory extension magic differs")),
+        };
         if cur.u16()? as usize != width {
             return Err(invalid("frequency column count differs"));
         }
@@ -1520,7 +1621,36 @@ fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
                     if entries.windows(2).any(|pair| pair[0].count < pair[1].count) {
                         return Err(invalid("frequency entries are not descending"));
                     }
-                    Some(FrequencySummary { entries, omitted_max })
+                    let ordinals = if frequency_version == 1 {
+                        Vec::new()
+                    } else {
+                        let ordinal_count = cur.u32()? as usize;
+                        if ordinal_count > FREQUENCY_ORDINALS || ordinal_count > rows {
+                            return Err(invalid("frequency ordinal count exceeds its bound"));
+                        }
+                        let mut ordinals = Vec::with_capacity(ordinal_count);
+                        let mut previous = 0_u64;
+                        for at in 0..ordinal_count {
+                            let delta = cur.var_u64()?;
+                            if at != 0 && delta == 0 {
+                                return Err(invalid("frequency ordinals are not increasing"));
+                            }
+                            let ordinal = if at == 0 {
+                                delta
+                            } else {
+                                previous
+                                    .checked_add(delta)
+                                    .ok_or_else(|| invalid("frequency ordinal overflows"))?
+                            };
+                            if ordinal >= rows as u64 {
+                                return Err(invalid("frequency ordinal is outside the table"));
+                            }
+                            ordinals.push(ordinal);
+                            previous = ordinal;
+                        }
+                        ordinals
+                    };
+                    Some(FrequencySummary { entries, omitted_max, ordinals })
                 }
                 _ => return Err(invalid("frequency summary tag differs")),
             };
@@ -2139,6 +2269,34 @@ mod tests {
         assert!(strings.contains(&(Value::Null, 2)));
         assert!(strings.contains(&(Value::Varchar("alpha".into()), 2)));
         assert!(strings.contains(&(Value::Varchar("long text after a slash".into()), 2)));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn numeric_frequency_candidates_keep_bounded_row_ordinals() {
+        let path = path("frequency-ordinals");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::BigInt)])
+                .expect("new file");
+        let mut values = Vec::new();
+        for leader in 0..10_i64 {
+            values.extend(std::iter::repeat_n(leader, 100));
+        }
+        values.extend(1_000_i64..41_000);
+        for part in values.chunks(1_024) {
+            let vector = Vector::flat(LogicalType::BigInt, Data::Int64(part.to_vec().into()))
+                .expect("big integers");
+            writer.append(&Chunk::new(vec![vector]).expect("one column")).expect("one stripe");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let occurrences =
+            reader.frequency_occurrences(0).expect("valid metadata").expect("bounded ordinals");
+        assert!(occurrences.omitted_max < 100);
+        assert!(occurrences.ordinals.len() <= FREQUENCY_ORDINALS);
+        assert!(occurrences.ordinals.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(&occurrences.ordinals[..1_000], &(0_u64..1_000).collect::<Vec<_>>());
         fs::remove_file(path).expect("remove scratch file");
     }
 
