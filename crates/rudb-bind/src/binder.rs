@@ -103,6 +103,7 @@ pub(crate) struct PendingSubquery {
     pub(crate) node: NodeRef,
     pub(crate) kind: JoinKind,
     pub(crate) conditions: Vec<ExprRef>,
+    pub(crate) dependent: bool,
 }
 
 /// The state one binding run carries.
@@ -125,6 +126,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) in_aggregate: bool,
     /// Uncorrelated scalar queries waiting to be joined into the select block that uses them.
     pub(crate) scalar_subqueries: Vec<PendingSubquery>,
+    pub(crate) outer_scopes: Vec<Scope>,
+    pub(crate) correlations: Vec<Vec<ColumnBinding>>,
     /// Where we are, for an error message that says which clause the writer should look at.
     pub(crate) clause: &'static str,
     /// The views whose bodies are open on the stack, which is what catches a cycle.
@@ -150,6 +153,8 @@ impl<'a> Binder<'a> {
             aggregation: None,
             in_aggregate: false,
             scalar_subqueries: Vec::new(),
+            outer_scopes: Vec::new(),
+            correlations: Vec::new(),
             clause: "SELECT clause",
             expanding: Vec::new(),
             started: None,
@@ -213,13 +218,17 @@ impl<'a> Binder<'a> {
     fn attach_scalar_subqueries(&mut self, mut input: NodeRef) -> NodeRef {
         let subqueries = std::mem::take(&mut self.scalar_subqueries);
         for pending in subqueries {
-            let PendingSubquery { node: mut right, kind, conditions } = pending;
+            let PendingSubquery { node: mut right, kind, conditions, dependent } = pending;
             if kind == JoinKind::Single && !self.semantics.scalar_subquery_error_on_multiple_rows()
             {
                 right = self.add_node(Node::Limit { input: right, count: Some(1), offset: 0 });
             }
             let conditions = self.plan.add_expr_list(&conditions);
-            input = self.add_node(Node::Join { left: input, right, kind, conditions });
+            input = if dependent {
+                self.add_node(Node::DependentJoin { left: input, right, kind, conditions })
+            } else {
+                self.add_node(Node::Join { left: input, right, kind, conditions })
+            };
         }
         input
     }

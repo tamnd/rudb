@@ -74,6 +74,25 @@ impl Scope {
     ///
     /// If nothing matches, or if one part matches more than one column. The messages are DuckDB's.
     pub(crate) fn resolve(&self, parts: &[&str]) -> Result<&Visible> {
+        if let Some(visible) = self.resolve_optional(parts)? {
+            return Ok(visible);
+        }
+        let (table, column) = match parts {
+            [column] => (None, *column),
+            [table, column] => (Some(*table), *column),
+            [_, table, column] | [_, _, table, column] => (Some(*table), *column),
+            _ => {
+                return Err(Error::binder(format!(
+                    "Referenced column \"{}\" has too many parts to be a column name",
+                    parts.join(".")
+                )));
+            }
+        };
+        Err(self.not_found(table, column))
+    }
+
+    /// Resolves a name when it is present, while still reporting ambiguity.
+    pub(crate) fn resolve_optional(&self, parts: &[&str]) -> Result<Option<&Visible>> {
         let (table, column) = match parts {
             [column] => (None, *column),
             [table, column] => (Some(*table), *column),
@@ -94,8 +113,8 @@ impl Scope {
             })
             .collect();
         match matched.as_slice() {
-            [one] => Ok(one),
-            [] => Err(self.not_found(table, column)),
+            [one] => Ok(Some(one)),
+            [] => Ok(None),
             many => {
                 let candidates: Vec<String> =
                     many.iter().map(|held| format!("{}.{}", held.table, held.name)).collect();
