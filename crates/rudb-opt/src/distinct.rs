@@ -13,9 +13,10 @@
 //! one and none of it went to the second, so the cheapest way to make `DISTINCT` fast is to stop
 //! having a second implementation of it.
 //!
-//! Eight of the forty three ClickBench queries count distinct values. This rewrite fires on two of
-//! them, which are the two it is worth anything on, and the table below is why the other six are
-//! left alone. One of the two was the single worst query in the suite against the pinned DuckDB
+//! Eight of the forty three ClickBench queries count distinct values. This rewrite fires on the
+//! general value shapes where a grouped table is cheaper than a set of encoded rows. A single
+//! `BIGINT` goes to the fixed integer exchange instead. The string case was once the single worst
+//! query in the suite against the pinned DuckDB
 //! binary: on ten million rows `SELECT COUNT(DISTINCT SearchPhrase) FROM hits` took 0.39 seconds
 //! against DuckDB's 0.09, and it now takes 0.14.
 //!
@@ -63,8 +64,8 @@
 //! that accepts `DISTINCT` is in [`SET_DETERMINED`]; the list is written out rather than assumed so
 //! that adding an order dependent aggregate later is a decision somebody makes here.
 //!
-//! A grouped `COUNT(DISTINCT x)` where `x` is a single `BIGINT`, which is the one shape the row loop
-//! is already good at, for the reason the table below gives.
+//! A `COUNT(DISTINCT x)` where `x` is a single `BIGINT`. The execution operator exchanges those
+//! integers directly to radix owners, so a staged grouping would add an intermediate result.
 //!
 //! # Where the win is, measured
 //!
@@ -145,7 +146,7 @@ fn stage(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     let calls = plan.expr_list(aggregates).to_vec();
     let args = shared_arguments(plan, &calls)?;
     let keys = plan.expr_list(groups).to_vec();
-    if !keys.is_empty() && already_cheap(plan, &args) {
+    if already_cheap(plan, &args) && (!keys.is_empty() || one_count_distinct(plan, &calls)) {
         return None;
     }
 
@@ -228,20 +229,31 @@ fn shared_arguments(plan: &Plan, calls: &[ExprRef]) -> Option<Vec<ExprRef>> {
     shared
 }
 
-/// Whether the row loop already has a set for these arguments that is as cheap as a grouping.
+/// Whether execution already has a fixed integer path for these arguments.
 ///
-/// One `BIGINT`, which is the case `fresh_seen` in `rudb-exec`'s `group.rs` gives a set of `i64`
-/// rather than a set of encoded rows. An `i64` set insert is a hash and a compare of one word, so
-/// there is nothing for the rewrite to win back and the wider grouping key it leaves behind costs
-/// more than it saves. Every other argument shape goes to the general set, which keys on an encoded
-/// row and is what the rewrite beats by between two and five times.
+/// A grouped aggregate over one `BIGINT` uses the inline integer distinct state in `rudb-exec`'s
+/// `group.rs`. An ungrouped count exchanges fixed integer records to radix owners. Both avoid the
+/// encoded row set this rewrite is meant to replace, and the ungrouped exchange also avoids the
+/// intermediate grouped result the rewrite would create. Every other argument shape goes to the
+/// general set, which keys on an encoded row and is what the rewrite beats by between two and five
+/// times.
 ///
 /// This mirrors a decision made in the operator rather than one made here, which is the honest place
 /// for it: the pass is choosing between two implementations and has to know which one it is up
-/// against. A release that gives grouping a cheaper multi column key, or that drops the specialised
-/// set, should come back and delete this.
+/// against. A release that gives grouping a cheaper multi column key should come back and revisit
+/// this choice.
 fn already_cheap(plan: &Plan, args: &[ExprRef]) -> bool {
     matches!(args, [only] if plan.expr_type(*only) == &LogicalType::BigInt)
+}
+
+/// Whether the original node is one COUNT(DISTINCT ...) call.
+fn one_count_distinct(plan: &Plan, calls: &[ExprRef]) -> bool {
+    let [call] = calls else { return false };
+    matches!(
+        *plan.expr(*call),
+        Expr::Aggregate { name, distinct: true, filter: None, .. }
+            if plan.string(name) == "count"
+    )
 }
 
 #[cfg(test)]
@@ -350,19 +362,12 @@ mod tests {
     }
 
     #[test]
-    fn an_ungrouped_count_distinct_over_one_bigint_is_rewritten_anyway() {
-        assert_eq!(
-            staged(concat!(
-                "Aggregate #1 groups=[] aggregates=[count(DISTINCT #0.1::BIGINT)::BIGINT]\n",
-                "  Get memory.main.t AS t #0 [a::INTEGER, b::BIGINT]\n",
-            )),
-            concat!(
-                "Aggregate #1 groups=[] aggregates=[count(#2.0::BIGINT)::BIGINT]\n",
-                "  Aggregate #2 groups=[#0.1::BIGINT] aggregates=[]\n",
-                "    Get memory.main.t AS t #0 [a::INTEGER, b::BIGINT]\n",
-            ),
-            "one set for the whole query is one set that never partitions"
+    fn an_ungrouped_count_distinct_over_one_bigint_uses_the_radix_operator() {
+        let text = concat!(
+            "Aggregate #1 groups=[] aggregates=[count(DISTINCT #0.1::BIGINT)::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER, b::BIGINT]\n",
         );
+        assert_eq!(staged(text), text, "the execution operator has a fixed integer exchange");
     }
 
     #[test]
