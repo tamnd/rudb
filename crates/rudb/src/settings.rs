@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry.
 //! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so this is a match on a name rather than a map.
-//! [`Settings::NAMES`] is that set, and it is seventeen names for fifteen settings because two have a second spelling.
+//! [`Settings::NAMES`] is that set, and it is eighteen names for sixteen settings because two have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
@@ -27,7 +27,9 @@
 
 use std::sync::RwLock;
 
-use rudb_common::{DefaultNullOrder, Error, Memory, Result, Session, ShowBehavior, Value, human};
+use rudb_common::{
+    DefaultNullOrder, Error, IdentifierCase, Memory, Result, Session, ShowBehavior, Value, human,
+};
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
@@ -64,6 +66,8 @@ pub(crate) struct Settings {
     ieee_floating_point_ops: RwLock<bool>,
     /// Whether `/` binds to integer division instead of floating point division.
     integer_division: RwLock<bool>,
+    /// How unquoted identifiers are folded before binding.
+    preserve_identifier_case: RwLock<String>,
     /// Whether a zero divisor that normally raises returns null.
     null_on_division_by_zero: RwLock<bool>,
     /// Whether an `ORDER BY` may name a non-integer literal that cannot affect the order.
@@ -83,7 +87,7 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 17] = [
+    pub(crate) const NAMES: [&'static str; 18] = [
         "TimeZone",
         "current_dialect",
         "default_null_order",
@@ -97,6 +101,7 @@ impl Settings {
         "memory_limit",
         "null_on_division_by_zero",
         "order_by_non_integer_literal",
+        "preserve_identifier_case",
         "regex_match_operator_semantics",
         "show_behavior",
         "threads",
@@ -122,6 +127,7 @@ impl Settings {
             disable_timestamptz_casts: RwLock::new(false),
             ieee_floating_point_ops: RwLock::new(true),
             integer_division: RwLock::new(false),
+            preserve_identifier_case: RwLock::new("preserve_case".to_string()),
             null_on_division_by_zero: RwLock::new(false),
             order_by_non_integer_literal: RwLock::new(false),
             regex_match_operator_semantics: RwLock::new("partial".to_string()),
@@ -314,6 +320,33 @@ impl Settings {
                     .write()
                     .unwrap_or_else(|held| held.into_inner()) = enabled;
             }
+            "preserve_identifier_case" => {
+                if matches!(value, Some(Value::Null)) {
+                    return Err(Error::invalid_input(
+                        "preserve_identifier_case setting cannot be NULL",
+                    ));
+                }
+                let written = match value {
+                    None => "preserve_case".to_string(),
+                    Some(value) => match boolean_of(value) {
+                        Ok(true) => "preserve_case".to_string(),
+                        Ok(false) => "lowercase".to_string(),
+                        Err(_) => text_of(value),
+                    },
+                };
+                let normalized = match written.to_ascii_lowercase().as_str() {
+                    "preserve_case" => "preserve_case",
+                    "lowercase" => "lowercase",
+                    "uppercase" => "uppercase",
+                    _ => {
+                        return Err(Error::invalid_input(format!(
+                            "Unrecognized parameter for option preserve_identifier_case \"{written}\", expected one of: preserve_case, lowercase, uppercase"
+                        )));
+                    }
+                };
+                *self.preserve_identifier_case.write().unwrap_or_else(|held| held.into_inner()) =
+                    normalized.to_string();
+            }
             "regex_match_operator_semantics" => {
                 let written = value.map_or("partial".to_string(), text_of);
                 if !written.eq_ignore_ascii_case("partial") && !written.eq_ignore_ascii_case("full")
@@ -425,6 +458,11 @@ impl Settings {
                 .read()
                 .unwrap_or_else(|held| held.into_inner())
                 .to_string()),
+            "preserve_identifier_case" => Ok(self
+                .preserve_identifier_case
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .clone()),
             "regex_match_operator_semantics" => Ok(self
                 .regex_match_operator_semantics
                 .read()
@@ -440,14 +478,14 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are seventeen names and the alternative
+    /// Built once per statement rather than held, because there are eighteen names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Fifteen settings and seventeen names means the loop below would otherwise take several locks.
+    /// Sixteen settings and eighteen names means the loop below would otherwise take several locks.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
@@ -472,6 +510,8 @@ impl Settings {
             *self.null_on_division_by_zero.read().unwrap_or_else(|held| held.into_inner());
         let order_by_non_integer_literal =
             *self.order_by_non_integer_literal.read().unwrap_or_else(|held| held.into_inner());
+        let preserve_identifier_case =
+            self.preserve_identifier_case.read().unwrap_or_else(|held| held.into_inner()).clone();
         let regex_match_operator_semantics = self
             .regex_match_operator_semantics
             .read()
@@ -493,6 +533,11 @@ impl Settings {
         session.set_integer_division(integer_division);
         session.set_null_on_division_by_zero(null_on_division_by_zero);
         session.set_order_by_non_integer_literal(order_by_non_integer_literal);
+        session.set_identifier_case(match preserve_identifier_case.as_str() {
+            "lowercase" => IdentifierCase::Lower,
+            "uppercase" => IdentifierCase::Upper,
+            _ => IdentifierCase::Preserve,
+        });
         session.set_regex_match_full(regex_match_operator_semantics.eq_ignore_ascii_case("full"));
         session.set_show_behavior(match show_behavior.to_ascii_uppercase().as_str() {
             "SETTING" => ShowBehavior::Setting,
@@ -515,6 +560,7 @@ impl Settings {
                     "null_on_division_by_zero" => null_on_division_by_zero.to_string(),
                     "memory_limit" => memory.clone(),
                     "order_by_non_integer_literal" => order_by_non_integer_literal.to_string(),
+                    "preserve_identifier_case" => preserve_identifier_case.clone(),
                     "regex_match_operator_semantics" => regex_match_operator_semantics.clone(),
                     "show_behavior" => show_behavior.clone(),
                     "threads" => threads.clone(),
@@ -546,11 +592,13 @@ fn canonical(name: &str) -> &str {
     if name.eq_ignore_ascii_case("default_null_order") {
         return "default_null_order";
     }
-    match name {
-        "max_memory" => "memory_limit",
-        "worker_threads" => "threads",
-        other => other,
+    if name.eq_ignore_ascii_case("max_memory") {
+        return "memory_limit";
     }
+    if name.eq_ignore_ascii_case("worker_threads") {
+        return "threads";
+    }
+    Settings::NAMES.iter().copied().find(|known| known.eq_ignore_ascii_case(name)).unwrap_or(name)
 }
 
 /// Whether this name is a seam rather than one of the settings DuckDB has.

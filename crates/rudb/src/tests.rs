@@ -1838,6 +1838,79 @@ fn dialect_compatibility_mode_accepts_exactly_the_modes_the_pin_has() {
 }
 
 #[test]
+fn preserve_identifier_case_folds_only_unquoted_identifiers() {
+    let db = database();
+    assert_eq!(db.setting("preserve_identifier_case").expect("the mode"), "preserve_case");
+    db.execute("CREATE TABLE MixedTable (MixedColumn INTEGER)").expect("preserved names");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT table_name, column_name FROM duckdb_columns() WHERE table_name = 'MixedTable'"
+        ),
+        vec![vec![text("MixedTable"), text("MixedColumn")]]
+    );
+    db.execute("SET preserve_identifier_case = 'lowercase'").expect("lowercase names");
+    db.execute("CREATE TABLE LowerTable (LowerColumn INTEGER)").expect("lowercase table");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT table_name, column_name FROM duckdb_columns() WHERE table_name = 'lowertable'"
+        ),
+        vec![vec![text("lowertable"), text("lowercolumn")]]
+    );
+    db.execute("SET preserve_identifier_case = 'uppercase'").expect("uppercase names");
+    db.execute("CREATE TABLE UpperTable (UpperColumn INTEGER)").expect("uppercase table");
+    db.execute("CREATE TABLE \"QuotedTable\" (\"QuotedColumn\" INTEGER)").expect("quoted names");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT table_name, column_name FROM duckdb_columns() WHERE table_name IN ('UPPERTABLE', 'QuotedTable') ORDER BY table_name"
+        ),
+        vec![
+            vec![text("QuotedTable"), text("QuotedColumn")],
+            vec![text("UPPERTABLE"), text("UPPERCOLUMN")],
+        ]
+    );
+    assert_eq!(rows(&db, "SELECT 'MixedString'"), vec![vec![text("MixedString")]]);
+    db.execute("RESET preserve_identifier_case").expect("the default mode");
+    assert_eq!(db.setting("preserve_identifier_case").expect("the mode"), "preserve_case");
+}
+
+#[test]
+fn preserve_identifier_case_keeps_legacy_boolean_aliases_and_metadata() {
+    let db = database();
+    for truthy in ["true", "1", "'t'", "'y'", "'yes'"] {
+        db.execute(&format!("SET preserve_identifier_case = {truthy}")).expect("truthy alias");
+        assert_eq!(db.setting("preserve_identifier_case").expect("the mode"), "preserve_case");
+    }
+    for falsy in ["false", "0", "'f'", "'n'", "'no'"] {
+        db.execute(&format!("SET preserve_identifier_case = {falsy}")).expect("falsy alias");
+        assert_eq!(db.setting("preserve_identifier_case").expect("the mode"), "lowercase");
+    }
+    let invalid = db.execute("SET preserve_identifier_case = 'bogus'").expect_err("invalid mode");
+    assert_eq!(invalid.code().duckdb_name(), "Invalid Input Error");
+    assert_eq!(
+        invalid.message(),
+        "Unrecognized parameter for option preserve_identifier_case \"bogus\", expected one of: preserve_case, lowercase, uppercase"
+    );
+    let null = db.execute("SET preserve_identifier_case = NULL").expect_err("null mode");
+    assert_eq!(null.message(), "preserve_identifier_case setting cannot be NULL");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'preserve_identifier_case'"
+        ),
+        vec![vec![
+            text(
+                "How to fold non-quoted identifiers: 'preserve_case' keeps the case as written, 'lowercase' lowercases them, 'uppercase' uppercases them"
+            ),
+            text("VARCHAR"),
+            text("GLOBAL"),
+        ]]
+    );
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -1947,8 +2020,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Seventeen rows for fifteen settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(17)]]);
+    // Eighteen rows for sixteen settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(18)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(

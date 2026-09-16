@@ -19,7 +19,7 @@ use rudb_functions::{
     is_pattern, parquet_fields, resolve, resolve_pragma, resolve_table,
 };
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
-use rudb_parse::{NONE, identifier_parts, parse_ast};
+use rudb_parse::{NONE, identifier_parts, parse_ast_with_case};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey};
 
 use crate::expr::{describe, has_aggregate};
@@ -81,7 +81,7 @@ pub fn bind_sql(query: &str, catalog: &Catalog) -> Result<Plan> {
 ///
 /// Anything the parser or the binder reports.
 pub fn bind_sql_with(query: &str, catalog: &Catalog, session: &Session) -> Result<Plan> {
-    let ast = parse_ast(query)?;
+    let ast = parse_ast_with_case(query, session.semantics().identifier_case())?;
     bind_with(&ast, catalog, &Parameters::new(), session)
 }
 
@@ -1140,7 +1140,7 @@ impl<'a> Binder<'a> {
                 name.table
             )));
         }
-        let body = parse_ast(view.sql())?;
+        let body = parse_ast_with_case(view.sql(), self.semantics.identifier_case())?;
         let query = match body.statements.as_slice() {
             [ast::Statement::Query(query)] => *query,
             // Only a query can have got past the binder at creation, so this is a view the catalog

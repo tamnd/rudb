@@ -31,4 +31,4 @@ pub use matcher::{NONE, ParseNode, Tree, parse, parse_from, parse_tokens};
 pub use rules::{Node, Op, Rule, Suggestion, alternatives, rule, token_key};
 pub use token::{Flags, Kind, NOT_A_KEYWORD, Token};
 pub use tokenize::{classes, hints, identifier_parts, lookup, quoted, tokenize};
-pub use transform::{parse_ast, transform};
+pub use transform::{parse_ast, parse_ast_with_case, transform, transform_with_case};

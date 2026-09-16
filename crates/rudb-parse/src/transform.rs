@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use rudb_common::{Error, Result, Value};
+use rudb_common::{Error, IdentifierCase, Result, Value};
 
 use crate::ast::{
     Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, CreateView, Distinct, DropTable, Expr, ExprRef,
@@ -38,13 +38,28 @@ use crate::tokenize::tokenize;
 /// would be shorter and would tokenize the query a second time, which `cargo xtask bench` prices
 /// at about a tenth of the whole front end.
 pub fn parse_ast(query: &str) -> Result<Ast> {
+    parse_ast_with_case(query, IdentifierCase::Preserve)
+}
+
+/// Parse a script while folding its unquoted identifiers for this session.
+pub fn parse_ast_with_case(query: &str, identifier_case: IdentifierCase) -> Result<Ast> {
     let tokens = tokenize(query)?;
     let tree = parse_tokens(query, &tokens, PROGRAM, true)?;
-    transform(query, &tokens, &tree)
+    transform_with_case(query, &tokens, &tree, identifier_case)
 }
 
 /// Transform a parse tree that has already been produced.
 pub fn transform(query: &str, tokens: &[Token], tree: &Tree) -> Result<Ast> {
+    transform_with_case(query, tokens, tree, IdentifierCase::Preserve)
+}
+
+/// Transform a parse tree while folding its unquoted identifiers for this session.
+pub fn transform_with_case(
+    query: &str,
+    tokens: &[Token],
+    tree: &Tree,
+    identifier_case: IdentifierCase,
+) -> Result<Ast> {
     let mut transform = Transform {
         query,
         tokens,
@@ -52,6 +67,7 @@ pub fn transform(query: &str, tokens: &[Token], tree: &Tree) -> Result<Ast> {
         ast: Ast::default(),
         interned: HashMap::new(),
         anonymous: 0,
+        identifier_case,
     };
     transform.program(tree.root())?;
     Ok(transform.ast)
@@ -65,6 +81,7 @@ struct Transform<'a> {
     interned: HashMap<String, StrRef>,
     /// How many bare `?` parameters have been seen, which is what numbers the next one.
     anonymous: u32,
+    identifier_case: IdentifierCase,
 }
 
 impl<'a> Transform<'a> {
@@ -235,7 +252,7 @@ impl<'a> Transform<'a> {
         let mut leaves = Vec::new();
         self.leaves(node, &mut leaves);
         let text = leaves.last().map_or("", |&leaf| self.text(leaf));
-        let text = unquote(text.strip_suffix('.').unwrap_or(text));
+        let text = self.fold_identifier(text.strip_suffix('.').unwrap_or(text));
         self.intern(&text)
     }
 
@@ -251,11 +268,22 @@ impl<'a> Transform<'a> {
             if text.is_empty() || text == "*" {
                 continue;
             }
-            let text = unquote(text.strip_suffix('.').unwrap_or(text));
+            let text = self.fold_identifier(text.strip_suffix('.').unwrap_or(text));
             let interned = self.intern(&text);
             parts.push(interned);
         }
         self.part_slice(parts)
+    }
+
+    fn fold_identifier(&self, text: &str) -> String {
+        if text.starts_with(['"', '\'']) {
+            return unquote(text);
+        }
+        match self.identifier_case {
+            IdentifierCase::Preserve => text.to_string(),
+            IdentifierCase::Lower => text.to_ascii_lowercase(),
+            IdentifierCase::Upper => text.to_ascii_uppercase(),
+        }
     }
 
     // Statements.
@@ -2989,6 +3017,15 @@ mod tests {
         show_query(&ast, index)
     }
 
+    fn round_with_case(query: &str, case: IdentifierCase) -> String {
+        let ast =
+            parse_ast_with_case(query, case).unwrap_or_else(|error| panic!("{query}: {error}"));
+        let Statement::Query(index) = ast.statements[0] else {
+            panic!("{query} is not a query");
+        };
+        show_query(&ast, index)
+    }
+
     /// One statement, transformed and written back out as the DDL and DML shape it is.
     fn round_statement(query: &str) -> String {
         let ast = parse_ast(query).unwrap_or_else(|error| panic!("{query}: {error}"));
@@ -3993,6 +4030,14 @@ mod tests {
         assert_eq!(round("SELECT * FROM 'hits.parquet'"), "SELECT * FROM hits.parquet");
         assert_eq!(round("SELECT * FROM \"hits.parquet\""), "SELECT * FROM hits.parquet");
         assert_eq!(round("SELECT * FROM 'hits.parquet' AS h"), "SELECT * FROM hits.parquet AS h");
+        assert_eq!(
+            round_with_case("SELECT Mixed FROM 'NoSuch/Mixed/File.csv'", IdentifierCase::Lower),
+            "SELECT mixed FROM NoSuch/Mixed/File.csv"
+        );
+        assert_eq!(
+            round_with_case("SELECT Mixed FROM \"QuotedTable\"", IdentifierCase::Upper),
+            "SELECT MIXED FROM QuotedTable"
+        );
     }
 
     #[test]
