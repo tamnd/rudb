@@ -2014,6 +2014,64 @@ fn errors_as_json_structures_errors_at_every_sql_api_boundary() {
 }
 
 #[test]
+fn uncorrelated_scalar_subqueries_are_single_joins() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT (SELECT 42)"), vec![vec![Value::Integer(42)]]);
+    assert_eq!(rows(&db, "SELECT 1 + (SELECT 2)"), vec![vec![Value::Integer(3)]]);
+    assert_eq!(
+        rows(&db, "SELECT x, (SELECT 7) FROM (VALUES (1), (2)) t(x) ORDER BY x"),
+        vec![
+            vec![Value::Integer(1), Value::Integer(7)],
+            vec![Value::Integer(2), Value::Integer(7)]
+        ]
+    );
+    assert_eq!(rows(&db, "SELECT (SELECT 1 WHERE false)"), vec![vec![Value::Null]]);
+    let several = db
+        .query("SELECT (SELECT x FROM (VALUES (1), (2)) t(x))")
+        .expect_err("a scalar query has one row at most");
+    assert_eq!(several.code().duckdb_name(), "Invalid Input Error");
+    assert_eq!(
+        several.message(),
+        "More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to revert to previous behavior of returning a random row."
+    );
+    let plan = db.plan("SELECT (SELECT 42)").expect("the scalar query plans");
+    assert!(plan.contains("Join SINGLE"), "{plan}");
+}
+
+#[test]
+fn scalar_subquery_multiple_row_behavior_is_a_bound_semantic() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('scalar_subquery_error_on_multiple_rows')"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    db.execute("SET scalar_subquery_error_on_multiple_rows = false").expect("choose one row");
+    assert_eq!(
+        rows(&db, "SELECT (SELECT x FROM (VALUES (1), (2)) t(x))"),
+        vec![vec![Value::Integer(1)]]
+    );
+    let plan = db
+        .plan("SELECT (SELECT x FROM (VALUES (1), (2)) t(x))")
+        .expect("the relaxed scalar query plans");
+    assert!(plan.contains("Limit 1 offset 0"), "{plan}");
+    db.execute("RESET scalar_subquery_error_on_multiple_rows").expect("restore strict mode");
+    assert!(db.query("SELECT (SELECT x FROM (VALUES (1), (2)) t(x))").is_err());
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'scalar_subquery_error_on_multiple_rows'"
+        ),
+        vec![vec![
+            text(
+                "Throw an error when a scalar subquery returns more than one row. When disabled, an arbitrary row is returned instead."
+            ),
+            text("BOOLEAN"),
+            text("GLOBAL"),
+        ]]
+    );
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -2123,8 +2181,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Twenty one rows for nineteen settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(21)]]);
+    // Twenty two rows for twenty settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(22)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(

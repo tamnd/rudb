@@ -112,6 +112,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) aggregation: Option<Aggregation>,
     /// Set while an aggregate's own arguments are being bound, so nesting is caught.
     pub(crate) in_aggregate: bool,
+    /// Uncorrelated scalar queries waiting to be joined into the select block that uses them.
+    pub(crate) scalar_subqueries: Vec<NodeRef>,
     /// Where we are, for an error message that says which clause the writer should look at.
     pub(crate) clause: &'static str,
     /// The views whose bodies are open on the stack, which is what catches a cycle.
@@ -135,6 +137,7 @@ impl<'a> Binder<'a> {
             next_index: 0,
             aggregation: None,
             in_aggregate: false,
+            scalar_subqueries: Vec::new(),
             clause: "SELECT clause",
             expanding: Vec::new(),
             started: None,
@@ -178,6 +181,23 @@ impl<'a> Binder<'a> {
     fn column(&mut self, index: u32, position: usize, ty: LogicalType) -> ExprRef {
         let binding = ColumnBinding::new(index, position as u32);
         self.plan.add_expr(Expr::Column(binding), ty)
+    }
+
+    /// Joins scalar query results into the row stream that contains their expressions.
+    fn attach_scalar_subqueries(&mut self, mut input: NodeRef) -> NodeRef {
+        let subqueries = std::mem::take(&mut self.scalar_subqueries);
+        for mut right in subqueries {
+            if !self.semantics.scalar_subquery_error_on_multiple_rows() {
+                right = self.plan.add_node(Node::Limit { input: right, count: Some(1), offset: 0 });
+            }
+            input = self.plan.add_node(Node::Join {
+                left: input,
+                right,
+                kind: JoinKind::Single,
+                conditions: rudb_plan::Slice::EMPTY,
+            });
+        }
+        input
     }
 
     // ---------------------------------------------------------------- queries
@@ -512,11 +532,13 @@ impl<'a> Binder<'a> {
     ) -> Result<(NodeRef, Scope)> {
         let written = ast.select(select);
         let (mut node, input) = self.bind_from(ast, written.from)?;
+        node = self.attach_scalar_subqueries(node);
 
         if written.filter != NONE {
             self.clause = "WHERE clause";
             let predicate = self.bind_expr(ast, written.filter, &input)?;
             let predicate = self.as_boolean(predicate, "WHERE")?;
+            node = self.attach_scalar_subqueries(node);
             node = self.plan.add_node(Node::Filter { input: node, predicate });
         }
 
@@ -576,6 +598,8 @@ impl<'a> Binder<'a> {
             ));
         }
         let on = self.distinct_on(ast, written.distinct, &output)?;
+
+        node = self.attach_scalar_subqueries(node);
 
         if let Some(aggregation) = self.aggregation.take() {
             let index = aggregation.index;
