@@ -622,6 +622,17 @@ pub enum Expr {
         /// Whether it was written `NOT IN`.
         negated: bool,
     },
+    /// `x op ANY (SELECT ...)` or `x op ALL (SELECT ...)`.
+    QuantifiedSubquery {
+        /// The value on the left of the comparison.
+        operand: ExprRef,
+        /// The comparison applied to each candidate.
+        op: BinaryOp,
+        /// The query producing the candidates.
+        query: QueryRef,
+        /// Whether the quantifier was `ALL` rather than `ANY`.
+        all: bool,
+    },
     /// A prepared statement parameter, written `?`, `?1`, `$1` or `$name`.
     Parameter {
         /// The identifier, which is the number for a positional one and the word for a named one.

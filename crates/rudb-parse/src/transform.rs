@@ -132,6 +132,17 @@ impl<'a> Transform<'a> {
         self.kids(node).find(|&kid| self.name(kid) == name).unwrap_or(NONE)
     }
 
+    /// The first node named `name` anywhere under `node`, or `NONE`.
+    fn descendant(&self, node: u32, name: &str) -> u32 {
+        if self.name(node) == name {
+            return node;
+        }
+        self.kids(node)
+            .map(|kid| self.descendant(kid, name))
+            .find(|&found| found != NONE)
+            .unwrap_or(NONE)
+    }
+
     /// Whether a subtree contains a node with this rule name.
     fn contains(&self, node: u32, name: &str) -> bool {
         self.name(node) == name || self.kids(node).any(|kid| self.contains(kid, name))
@@ -1579,7 +1590,6 @@ impl<'a> Transform<'a> {
         let mut left = self.expr(head)?;
         for tail in kids {
             let operator = self.first(tail);
-            let op = self.binary_op(operator)?;
             // `ComparisonExpressionTail <- ComparisonOperator NotExpression? BetweenInLikeExpression`
             // is the one tail with an optional middle, so the operand is the last child and not the
             // second one. Taking the last is right for every tail and wrong for none.
@@ -1587,6 +1597,19 @@ impl<'a> Transform<'a> {
             if self.count(tail) > 2 {
                 return self.unsupported(tail);
             }
+            if self.contains(operator, "AnyAllParsedOperator") {
+                let any_op = self.descendant(operator, "AnyOp");
+                let op = self.binary_op(any_op)?;
+                let reference = self.descendant(operand, "SubqueryReference");
+                if reference == NONE {
+                    return self.unsupported(operand);
+                }
+                let query = self.query(self.first(reference))?;
+                let all = self.contains(operator, "SubqueryAll");
+                left = self.push(Expr::QuantifiedSubquery { operand: left, op, query, all });
+                continue;
+            }
+            let op = self.binary_op(operator)?;
             let right = self.expr(operand)?;
             left = self.push(Expr::Binary { op, left, right });
         }
@@ -2888,6 +2911,10 @@ mod tests {
             Expr::InSubquery { operand, query, negated } => {
                 let written = format!("{} IN ({})", show(ast, operand), show_query(ast, query));
                 if negated { format!("NOT {written}") } else { written }
+            }
+            Expr::QuantifiedSubquery { operand, op, query, all } => {
+                let quantifier = if all { "ALL" } else { "ANY" };
+                format!("{} {op:?} {quantifier} ({})", show(ast, operand), show_query(ast, query))
             }
         }
     }
