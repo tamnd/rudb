@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry.
 //! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so this is a match on a name rather than a map.
-//! [`Settings::NAMES`] is that set, and it is twenty one names for nineteen settings because two have a second spelling.
+//! [`Settings::NAMES`] is that set, and it is twenty two names for twenty settings because two have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
@@ -78,6 +78,8 @@ pub(crate) struct Settings {
     order_by_non_integer_literal: RwLock<bool>,
     /// Whether regex match operators require the entire string to match.
     regex_match_operator_semantics: RwLock<String>,
+    /// Whether a scalar query producing several rows raises an error.
+    scalar_subquery_error_on_multiple_rows: RwLock<bool>,
     /// How a bare name following `SHOW` is resolved.
     show_behavior: RwLock<String>,
     /// Whether warnings are promoted to errors.
@@ -93,7 +95,7 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 21] = [
+    pub(crate) const NAMES: [&'static str; 22] = [
         "TimeZone",
         "allow_parser_override_extension",
         "current_dialect",
@@ -111,6 +113,7 @@ impl Settings {
         "order_by_non_integer_literal",
         "preserve_identifier_case",
         "regex_match_operator_semantics",
+        "scalar_subquery_error_on_multiple_rows",
         "show_behavior",
         "threads",
         "warnings_as_errors",
@@ -142,6 +145,7 @@ impl Settings {
             null_on_division_by_zero: RwLock::new(false),
             order_by_non_integer_literal: RwLock::new(false),
             regex_match_operator_semantics: RwLock::new("partial".to_string()),
+            scalar_subquery_error_on_multiple_rows: RwLock::new(true),
             show_behavior: RwLock::new("AUTO".to_string()),
             warnings_as_errors: RwLock::new(false),
             seams: RwLock::new(rudb_seam::Settings::new()),
@@ -398,6 +402,13 @@ impl Settings {
                     .write()
                     .unwrap_or_else(|held| held.into_inner()) = written;
             }
+            "scalar_subquery_error_on_multiple_rows" => {
+                let enabled = value.map_or(Ok(true), boolean_of)?;
+                *self
+                    .scalar_subquery_error_on_multiple_rows
+                    .write()
+                    .unwrap_or_else(|held| held.into_inner()) = enabled;
+            }
             "show_behavior" => {
                 let written = value.map_or("AUTO".to_string(), text_of);
                 match written.to_ascii_uppercase().as_str() {
@@ -513,6 +524,11 @@ impl Settings {
                 .read()
                 .unwrap_or_else(|held| held.into_inner())
                 .clone()),
+            "scalar_subquery_error_on_multiple_rows" => Ok(self
+                .scalar_subquery_error_on_multiple_rows
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .to_string()),
             "show_behavior" => {
                 Ok(self.show_behavior.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
@@ -528,14 +544,14 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are twenty one names and the alternative
+    /// Built once per statement rather than held, because there are twenty two names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Nineteen settings and twenty one names means the loop below would otherwise take several locks.
+    /// Twenty settings and twenty two names means the loop below would otherwise take several locks.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
@@ -573,6 +589,10 @@ impl Settings {
             .read()
             .unwrap_or_else(|held| held.into_inner())
             .clone();
+        let scalar_subquery_error_on_multiple_rows = *self
+            .scalar_subquery_error_on_multiple_rows
+            .read()
+            .unwrap_or_else(|held| held.into_inner());
         let show_behavior =
             self.show_behavior.read().unwrap_or_else(|held| held.into_inner()).clone();
         let warnings_as_errors =
@@ -598,6 +618,7 @@ impl Settings {
             _ => IdentifierCase::Preserve,
         });
         session.set_regex_match_full(regex_match_operator_semantics.eq_ignore_ascii_case("full"));
+        session.set_scalar_subquery_error_on_multiple_rows(scalar_subquery_error_on_multiple_rows);
         session.set_show_behavior(match show_behavior.to_ascii_uppercase().as_str() {
             "SETTING" => ShowBehavior::Setting,
             "TABLE" => ShowBehavior::Table,
@@ -624,6 +645,9 @@ impl Settings {
                     "order_by_non_integer_literal" => order_by_non_integer_literal.to_string(),
                     "preserve_identifier_case" => preserve_identifier_case.clone(),
                     "regex_match_operator_semantics" => regex_match_operator_semantics.clone(),
+                    "scalar_subquery_error_on_multiple_rows" => {
+                        scalar_subquery_error_on_multiple_rows.to_string()
+                    }
                     "show_behavior" => show_behavior.clone(),
                     "threads" => threads.clone(),
                     "warnings_as_errors" => warnings_as_errors.to_string(),

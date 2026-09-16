@@ -42,6 +42,7 @@ pub struct Semantics {
     null_on_division_by_zero: bool,
     order_by_non_integer_literal: bool,
     regex_match_full: bool,
+    scalar_subquery_error_on_multiple_rows: bool,
     show_behavior: ShowBehavior,
     warnings_as_errors: bool,
 }
@@ -59,6 +60,7 @@ impl Default for Semantics {
             null_on_division_by_zero: false,
             order_by_non_integer_literal: false,
             regex_match_full: false,
+            scalar_subquery_error_on_multiple_rows: true,
             show_behavior: ShowBehavior::Auto,
             warnings_as_errors: false,
         }
@@ -127,6 +129,12 @@ impl Semantics {
     #[must_use]
     pub fn regex_match_full(self) -> bool {
         self.regex_match_full
+    }
+
+    /// Whether a scalar query producing several rows raises an error.
+    #[must_use]
+    pub fn scalar_subquery_error_on_multiple_rows(self) -> bool {
+        self.scalar_subquery_error_on_multiple_rows
     }
 
     /// How a bare name following `SHOW` is resolved.
@@ -284,6 +292,11 @@ impl Session {
     /// Sets whether regex match operators require the entire string to match.
     pub fn set_regex_match_full(&mut self, enabled: bool) {
         self.semantics.regex_match_full = enabled;
+    }
+
+    /// Sets whether scalar queries may choose one row from several.
+    pub fn set_scalar_subquery_error_on_multiple_rows(&mut self, enabled: bool) {
+        self.semantics.scalar_subquery_error_on_multiple_rows = enabled;
     }
 
     /// Sets how `SHOW name` resolves its name.

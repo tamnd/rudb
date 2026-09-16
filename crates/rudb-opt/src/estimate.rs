@@ -198,7 +198,7 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> i32 {
     i32::try_from(counted.min(8)).unwrap_or(8)
 }
 
-/// The eight join kinds, each of which is a different question.
+/// The join kinds, each of which is a different question.
 fn join(left: Option<u64>, right: Option<u64>, kind: JoinKind, conditions: usize) -> Option<u64> {
     match kind {
         // Left rows, filtered by whether a match exists. Never more than the left side, and the

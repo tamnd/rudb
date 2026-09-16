@@ -371,7 +371,6 @@ fn identifiers_match_without_regard_to_case_and_keep_the_case_they_were_created_
 #[test]
 fn what_is_not_bound_yet_says_what_was_written_rather_than_producing_a_wrong_plan() {
     for query in [
-        "SELECT url FROM hits WHERE counter = (SELECT max(counter) FROM hits)",
         "SELECT counter ** 2 FROM hits",
         "SELECT url FROM hits UNION BY NAME SELECT url FROM hits",
         "SELECT url FROM hits LIMIT 10 PERCENT",
