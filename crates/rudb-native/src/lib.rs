@@ -34,6 +34,7 @@ const FREQUENCIES: &[u8; 8] = b"RUDBFQ1\0";
 const FREQUENCY_CANDIDATES: usize = 32_768;
 const FREQUENCY_ENTRIES: usize = 512;
 const FREQUENCY_BUILD_RANK: usize = 10;
+const MAX_FREQUENCY_WORKERS: usize = 16;
 
 fn io(error: std::io::Error) -> Error {
     Error::io(error.to_string())
@@ -550,6 +551,66 @@ impl Writer {
         Ok(())
     }
 
+    /// Builds independent numeric synopses concurrently after all column pages are committed.
+    fn numeric_frequencies(&self) -> Result<Vec<Option<FrequencySummary>>> {
+        let columns = self
+            .table
+            .fields
+            .iter()
+            .enumerate()
+            .filter_map(|(column, field)| {
+                matches!(
+                    field.ty,
+                    LogicalType::SmallInt
+                        | LogicalType::Integer
+                        | LogicalType::BigInt
+                        | LogicalType::Date
+                        | LogicalType::Timestamp
+                )
+                .then_some(column)
+            })
+            .collect::<Vec<_>>();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_FREQUENCY_WORKERS)
+            .min(columns.len());
+        if workers <= 1 {
+            let mut frequencies = vec![None; self.table.fields.len()];
+            for column in columns {
+                frequencies[column] = self.numeric_frequency(column)?;
+            }
+            return Ok(frequencies);
+        }
+        let width = columns.len().div_ceil(workers);
+        let pieces = std::thread::scope(|scope| {
+            columns
+                .chunks(width)
+                .map(|columns| {
+                    scope.spawn(|| {
+                        columns
+                            .iter()
+                            .map(|&column| Ok((column, self.numeric_frequency(column)?)))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| Error::internal("a native frequency worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let mut frequencies = vec![None; self.table.fields.len()];
+        for piece in pieces {
+            for (column, summary) in piece {
+                frequencies[column] = summary;
+            }
+        }
+        Ok(frequencies)
+    }
+
     /// Commits the directory and syncs the file before publishing its header slot.
     ///
     /// # Errors
@@ -563,9 +624,7 @@ impl Writer {
             .collect::<Vec<_>>();
         stripes.sort_by_key(|(order, _)| *order);
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
-        self.table.frequencies = (0..self.table.fields.len())
-            .map(|column| self.numeric_frequency(column))
-            .collect::<Result<Vec<_>>>()?;
+        self.table.frequencies = self.numeric_frequencies()?;
         for (index, dictionary) in self.dictionaries.into_iter().enumerate() {
             let Some(dictionary) = dictionary else { continue };
             self.table.frequencies[index] = Some(code_frequency(&dictionary));
