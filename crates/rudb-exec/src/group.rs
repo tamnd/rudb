@@ -564,69 +564,37 @@ impl<'a> Aggregate<'a> {
                 0
             } else {
                 valid |= FixedRecord::FIRST;
-                match first.signed_at(row) {
-                    Some(value) => i64::try_from(value)
-                        .map_err(|_| Error::internal("a fixed BIGINT key is out of range"))?,
-                    None => match first.try_value_at(row)? {
-                        Value::BigInt(value) => value,
-                        value => {
-                            return Err(Error::internal(format!(
-                                "a fixed BIGINT key received {value:?}"
-                            )));
-                        }
-                    },
-                }
+                i64::try_from(first.signed_at(row).ok_or_else(|| {
+                    Error::internal("a fixed BIGINT key has no signed representation")
+                })?)
+                .map_err(|_| Error::internal("a fixed BIGINT key is out of range"))?
             };
             let second_value = if second.is_null_at(row) {
                 0
             } else {
                 valid |= FixedRecord::SECOND;
-                match second.signed_at(row) {
-                    Some(value) => i32::try_from(value)
-                        .map_err(|_| Error::internal("a fixed INTEGER key is out of range"))?,
-                    None => match second.try_value_at(row)? {
-                        Value::Integer(value) => value,
-                        value => {
-                            return Err(Error::internal(format!(
-                                "a fixed INTEGER key received {value:?}"
-                            )));
-                        }
-                    },
-                }
+                i32::try_from(second.signed_at(row).ok_or_else(|| {
+                    Error::internal("a fixed INTEGER key has no signed representation")
+                })?)
+                .map_err(|_| Error::internal("a fixed INTEGER key is out of range"))?
             };
             let sum_value = if sum.is_null_at(row) {
                 0
             } else {
                 valid |= FixedRecord::SUM;
-                match sum.signed_at(row) {
-                    Some(value) => i16::try_from(value)
-                        .map_err(|_| Error::internal("a fixed SMALLINT sum is out of range"))?,
-                    None => match sum.try_value_at(row)? {
-                        Value::SmallInt(value) => value,
-                        value => {
-                            return Err(Error::internal(format!(
-                                "a fixed SMALLINT sum received {value:?}"
-                            )));
-                        }
-                    },
-                }
+                i16::try_from(sum.signed_at(row).ok_or_else(|| {
+                    Error::internal("a fixed SMALLINT sum has no signed representation")
+                })?)
+                .map_err(|_| Error::internal("a fixed SMALLINT sum is out of range"))?
             };
             let mean_value = if mean.is_null_at(row) {
                 0
             } else {
                 valid |= FixedRecord::MEAN;
-                match mean.signed_at(row) {
-                    Some(value) => i16::try_from(value)
-                        .map_err(|_| Error::internal("a fixed SMALLINT mean is out of range"))?,
-                    None => match mean.try_value_at(row)? {
-                        Value::SmallInt(value) => value,
-                        value => {
-                            return Err(Error::internal(format!(
-                                "a fixed SMALLINT mean received {value:?}"
-                            )));
-                        }
-                    },
-                }
+                i16::try_from(mean.signed_at(row).ok_or_else(|| {
+                    Error::internal("a fixed SMALLINT mean has no signed representation")
+                })?)
+                .map_err(|_| Error::internal("a fixed SMALLINT mean is out of range"))?
             };
             const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
             let first_word =
