@@ -317,6 +317,22 @@ fn a_subquery_in_the_from_clause_is_bound_and_then_named() {
 }
 
 #[test]
+fn a_non_recursive_cte_is_an_inlined_subquery() {
+    let printed = plan("WITH chosen AS (SELECT UserID, url FROM hits) SELECT url FROM chosen");
+    assert!(printed.contains("Get memory.main.hits"), "{printed}");
+    assert_eq!(printed.matches("Project").count(), 2, "{printed}");
+}
+
+#[test]
+fn later_ctes_can_read_earlier_ones_and_rename_their_columns() {
+    let printed = plan(
+        "WITH first AS (SELECT counter FROM hits), second(n) AS NOT MATERIALIZED (SELECT counter + 1 FROM first) SELECT n FROM second",
+    );
+    assert!(printed.contains("Get memory.main.hits"), "{printed}");
+    assert!(printed.contains("AS n"), "{printed}");
+}
+
+#[test]
 fn a_union_lines_the_two_sides_up_and_sorts_above_both() {
     let text = plan("SELECT counter FROM hits UNION SELECT duration FROM visits ORDER BY 1");
     assert!(text.contains("SetOp UNION DISTINCT"), "{text}");
