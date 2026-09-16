@@ -136,7 +136,10 @@ fn reads(node: &Node) -> u32 {
         | Node::Dummy
         | Node::Values { .. }
         | Node::TableFunction { .. } => 0,
-        Node::Filter { .. } | Node::Project { .. } | Node::Fetch { .. } => 1,
+        Node::Filter { .. }
+        | Node::Project { .. }
+        | Node::Fetch { .. }
+        | Node::TableFetch { .. } => 1,
         Node::Aggregate { .. } | Node::Distinct { .. } | Node::SetOp { .. } => 2,
         Node::TopN { .. } | Node::CrossProduct { .. } => 2,
         Node::Join { .. } => 3,

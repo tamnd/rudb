@@ -209,6 +209,23 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             };
             filter(plan, above, pending)
         }
+        Node::TableFetch { input, index, catalog, schema, table, columns, row } => {
+            let rebuilt = node(plan, input, Vec::new(), tables);
+            let above = if rebuilt == input {
+                at
+            } else {
+                plan.add_node(Node::TableFetch {
+                    input: rebuilt,
+                    index,
+                    catalog,
+                    schema,
+                    table,
+                    columns,
+                    row,
+                })
+            };
+            filter(plan, above, pending)
+        }
 
         // Nothing goes through a limit and the recursion happens anyway, because a filter that is
         // already below the limit still has somewhere to go. A top N is a limit with a sort inside

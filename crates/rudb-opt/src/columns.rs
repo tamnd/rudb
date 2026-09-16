@@ -244,6 +244,7 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
             list(plan, args, found);
             walk(plan, row, found);
         }
+        Node::TableFetch { row, .. } => walk(plan, row, found),
         Node::Filter { predicate, .. } => walk(plan, predicate, found),
         Node::Project { exprs, .. } => list(plan, exprs, found),
         Node::Aggregate { groups, aggregates, .. } => {

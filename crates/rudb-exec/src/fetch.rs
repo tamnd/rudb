@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_functions::open_parquet;
 use rudb_kernels::cast;
@@ -53,6 +54,83 @@ pub(crate) struct Fetch {
 pub(crate) struct Fetching {
     scratch: Scratch,
     reader: Option<Reader>,
+}
+
+/// Reads rows back from a catalog table after a top N selected their ordinals.
+#[derive(Debug)]
+pub(crate) struct TableFetch<'a> {
+    table: &'a Table,
+    columns: Vec<usize>,
+    types: Vec<LogicalType>,
+    row: Prepared,
+    schema: Schema,
+}
+
+impl<'a> TableFetch<'a> {
+    pub(crate) fn new(
+        plan: &Plan,
+        input: &Schema,
+        index: u32,
+        table: &'a Table,
+        columns: Slice,
+        row: ExprRef,
+    ) -> Result<Self> {
+        let fields = plan.field_list(columns).to_vec();
+        let positions = fields
+            .iter()
+            .map(|field| {
+                table.column_index(&field.name).ok_or_else(|| {
+                    Error::catalog(format!(
+                        "Table \"{}\" does not have a column named \"{}\"",
+                        table.name().table,
+                        field.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let types = fields.iter().map(|field| field.ty.clone()).collect();
+        Ok(Self {
+            table,
+            columns: positions,
+            types,
+            row: Prepared::one(plan, row, input)?,
+            schema: Schema::numbered(fields, index),
+        })
+    }
+
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+}
+
+impl Stream for TableFetch<'_> {
+    type Local = Scratch;
+
+    fn local(&self) -> Scratch {
+        self.row.scratch()
+    }
+
+    fn push(&self, chunk: &mut Chunk, scratch: &mut Scratch) -> Result<Progress> {
+        if chunk.is_empty() {
+            *chunk = Chunk::empty(&self.schema.types());
+            return Ok(Progress::More);
+        }
+        let ordinals = self.row.evaluate_one(chunk, scratch)?.flatten()?;
+        let count = ordinals.len();
+        let held: &[i64] = match ordinals.data() {
+            Some(Data::Int64(values)) if !ordinals.validity().has_nulls(count) => values.as_slice(),
+            _ => return Err(Error::internal("a table fetch was handed invalid row ordinals")),
+        };
+        let rows = held
+            .iter()
+            .map(|&row| {
+                u64::try_from(row)
+                    .map_err(|_| Error::internal("a table fetch was handed a negative row ordinal"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        *chunk = self.table.rows().rows_at(&self.types, &self.columns, &rows)?;
+        Ok(Progress::More)
+    }
 }
 
 impl Fetch {

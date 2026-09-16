@@ -165,22 +165,30 @@ fn fetch(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     let narrow = narrow(plan, under, &wanted, row);
     let above = top(plan, narrow, &ordering, count, offset);
     let deferred = fields(plan, scan, &columns);
-    let args = match *plan.node(scan) {
-        Node::TableFunction { args, .. } => args,
-        _ => return None,
-    };
     let ordinal = plan.add_expr(
         Expr::Column(ColumnBinding::new(narrow_index(plan, narrow), wanted.len() as u32)),
         LogicalType::BigInt,
     );
     let fetched_index = if deferred_projects.is_some() { walk::fresh_index(plan) } else { index };
-    let fetched = plan.add_node(Node::Fetch {
-        input: above,
-        index: fetched_index,
-        args,
-        columns: deferred,
-        row: ordinal,
-    });
+    let fetched = match *plan.node(scan) {
+        Node::TableFunction { args, .. } => plan.add_node(Node::Fetch {
+            input: above,
+            index: fetched_index,
+            args,
+            columns: deferred,
+            row: ordinal,
+        }),
+        Node::Get { catalog, schema, table, .. } => plan.add_node(Node::TableFetch {
+            input: above,
+            index: fetched_index,
+            catalog,
+            schema,
+            table,
+            columns: deferred,
+            row: ordinal,
+        }),
+        _ => return None,
+    };
     match deferred_projects {
         Some((scan_index, projects)) => {
             Some(replay(plan, fetched, fetched_index, scan_index, projects))
@@ -192,7 +200,7 @@ fn fetch(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
 /// The table index of the raw file row.
 fn file_index(plan: &Plan, scan: NodeRef) -> Option<u32> {
     match *plan.node(scan) {
-        Node::TableFunction { index, .. } => Some(index),
+        Node::TableFunction { index, .. } | Node::Get { index, .. } => Some(index),
         _ => None,
     }
 }
@@ -201,6 +209,9 @@ fn file_index(plan: &Plan, scan: NodeRef) -> Option<u32> {
 fn file_width(plan: &Plan, scan: NodeRef) -> Option<usize> {
     match *plan.node(scan) {
         Node::TableFunction { columns, .. } => Some(
+            plan.field_list(columns).iter().filter(|field| field.name != FILE_ROW_NUMBER).count(),
+        ),
+        Node::Get { columns, .. } => Some(
             plan.field_list(columns).iter().filter(|field| field.name != FILE_ROW_NUMBER).count(),
         ),
         _ => None,
@@ -309,7 +320,9 @@ fn top(plan: &mut Plan, input: NodeRef, ordering: &[SortKey], count: u64, offset
 /// The fields the fetch produces, which are the file's own for the columns it was asked for.
 fn fields(plan: &mut Plan, scan: NodeRef, columns: &[u32]) -> Slice {
     let held = match *plan.node(scan) {
-        Node::TableFunction { columns, .. } => plan.field_list(columns).to_vec(),
+        Node::TableFunction { columns, .. } | Node::Get { columns, .. } => {
+            plan.field_list(columns).to_vec()
+        }
         _ => Vec::new(),
     };
     let wanted: Vec<Field> =
@@ -327,7 +340,7 @@ fn chain(plan: &Plan, at: NodeRef) -> Option<Vec<NodeRef>> {
     let mut node = at;
     loop {
         match *plan.node(node) {
-            Node::TableFunction { .. } => return Some(found),
+            Node::TableFunction { .. } | Node::Get { .. } => return Some(found),
             Node::Project { input, .. }
             | Node::Filter { input, .. }
             | Node::Sort { input, .. }
@@ -372,7 +385,7 @@ fn file_columns(plan: &Plan, chain: &[NodeRef], exprs: &[u32]) -> Option<Vec<u32
                 }
                 carried = next;
             }
-            Node::TableFunction { index, .. } => {
+            Node::TableFunction { index, .. } | Node::Get { index, .. } => {
                 if carried.iter().any(|binding| binding.table != index) {
                     return None;
                 }
@@ -389,6 +402,20 @@ fn file_columns(plan: &Plan, chain: &[NodeRef], exprs: &[u32]) -> Option<Vec<u32
 /// Nothing when the scan is not a single file `read_parquet`, or when it already produces a column
 /// of that name, since the reader reads the last column being called that as the one it counted.
 fn number(plan: &mut Plan, scan: NodeRef) -> Option<ColumnBinding> {
+    if let Node::Get { index, columns, .. } = *plan.node(scan) {
+        let mut fields = plan.field_list(columns).to_vec();
+        if fields.iter().any(|field| field.name == FILE_ROW_NUMBER) {
+            return None;
+        }
+        let at = u32::try_from(fields.len()).ok()?;
+        fields.push(Field::required(FILE_ROW_NUMBER.to_string(), LogicalType::BigInt));
+        let widened = plan.add_fields(&fields);
+        match plan.node_mut(scan) {
+            Node::Get { columns, .. } => *columns = widened,
+            _ => return None,
+        }
+        return Some(ColumnBinding::new(index, at));
+    }
     let Node::TableFunction { index, function, args, options, settings, columns } =
         *plan.node(scan)
     else {
@@ -547,12 +574,14 @@ mod tests {
     }
 
     #[test]
-    fn a_top_n_over_a_base_table_is_left_alone_because_a_table_has_no_ordinals() {
+    fn a_top_n_over_a_base_table_fetches_wide_rows_after_the_limit() {
         let text = wide(&TEN, "#3.0::INTEGER ASC NULLS LAST", "").replace(
             "TableFunction read_parquet args=['hits.parquet'::VARCHAR] #1",
             "Get memory.main.t AS t #1",
         );
-        assert!(!deferred(&text).contains("Fetch"), "{text}");
+        let out = deferred(&text);
+        assert!(out.contains("TableFetch memory.main.t"), "{out}");
+        assert!(out.contains("file_row_number::BIGINT"), "{out}");
     }
 
     #[test]
