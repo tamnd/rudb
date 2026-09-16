@@ -45,7 +45,7 @@
 use std::sync::Arc;
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Cancel, Memory, Result, Session};
+use rudb_common::{Cancel, Memory, Result, Session, Value};
 use rudb_functions::TableFunction;
 use rudb_metrics::{Counters, Driver, Report};
 use rudb_parquet::{Bound, Op};
@@ -199,6 +199,7 @@ struct BuildUnder<'a> {
 struct AggregateBound {
     max_groups: Option<usize>,
     top_counts: Option<usize>,
+    having_count: Option<(usize, i64)>,
 }
 
 fn build_measured_with_sink<'a>(
@@ -311,6 +312,43 @@ fn count_top_aggregate(plan: &Plan, input: NodeRef, keys: Slice) -> Option<NodeR
         && distinct
         && filter.is_none();
     (count_star || distinct_count).then_some(aggregate)
+}
+
+/// A direct aggregate under `input` and the COUNT(*) call constrained by a simple lower bound.
+///
+/// The Filter remains in the pipeline and checks the predicate again. Recognizing only this narrow
+/// shape therefore changes how many aggregate rows are materialized and not which rows are valid.
+fn count_having_aggregate(
+    plan: &Plan,
+    input: NodeRef,
+    predicate: ExprRef,
+) -> Option<(NodeRef, usize, i64)> {
+    let Node::Aggregate { index, groups, aggregates, .. } = *plan.node(input) else { return None };
+    let Expr::Compare { op, left, right } = *plan.expr(predicate) else { return None };
+    let Expr::Column(column) = *plan.expr(left) else { return None };
+    let Expr::Constant(value) = *plan.expr(right) else { return None };
+    let Value::BigInt(value) = *plan.value(value) else { return None };
+    if column.table != index {
+        return None;
+    }
+    let call = (column.column as usize).checked_sub(plan.expr_list(groups).len())?;
+    let aggregate = *plan.expr_list(aggregates).get(call)?;
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(aggregate) else {
+        return None;
+    };
+    if plan.string(name) != "count_star"
+        || !plan.expr_list(args).is_empty()
+        || distinct
+        || filter.is_some()
+    {
+        return None;
+    }
+    let minimum = match op {
+        CompareOp::Greater => value.checked_add(1)?,
+        CompareOp::GreaterOrEqual => value,
+        _ => return None,
+    };
+    Some((input, call, minimum))
 }
 
 /// What a filter over a scan can tell that scan before it reads anything.
@@ -532,6 +570,10 @@ impl<'a> Building<'a, '_> {
             Some(bound) => aggregate.top_counts(bound),
             None => aggregate,
         };
+        let aggregate = match bound.having_count {
+            Some((call, minimum)) => aggregate.having_count(call, minimum),
+            None => aggregate,
+        };
         let schema = aggregate.schema().clone();
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
@@ -683,7 +725,28 @@ impl<'a> Building<'a, '_> {
             }
             Node::Filter { input, predicate } => {
                 self.pruning = bounds(plan, input, predicate);
-                let below = self.node(input)?;
+                let below = match count_having_aggregate(plan, input, predicate) {
+                    Some((aggregate, call, minimum)) => {
+                        let Node::Aggregate { input: under, index, groups, aggregates } =
+                            *plan.node(aggregate)
+                        else {
+                            unreachable!("count_having_aggregate returned another node")
+                        };
+                        self.aggregate(
+                            aggregate,
+                            under,
+                            index,
+                            groups,
+                            aggregates,
+                            AggregateBound {
+                                max_groups: None,
+                                top_counts: None,
+                                having_count: Some((call, minimum)),
+                            },
+                        )?
+                    }
+                    None => self.node(input)?,
+                };
                 // Cleared whether or not the scan arm took them, because a filter over anything
                 // else leaves them sitting there for whatever scan the walk reaches next.
                 self.pruning = Vec::new();
@@ -712,7 +775,7 @@ impl<'a> Building<'a, '_> {
                     index,
                     groups,
                     aggregates,
-                    AggregateBound { max_groups: None, top_counts },
+                    AggregateBound { max_groups: None, top_counts, having_count: None },
                 )?
             }
             Node::Sort { input, keys } => {
@@ -739,7 +802,11 @@ impl<'a> Building<'a, '_> {
                         index,
                         groups,
                         aggregates,
-                        AggregateBound { max_groups: Some(max_groups), top_counts: None },
+                        AggregateBound {
+                            max_groups: Some(max_groups),
+                            top_counts: None,
+                            having_count: None,
+                        },
                     )?,
                     _ => self.node(input)?,
                 };
@@ -843,9 +910,10 @@ impl<'a> Building<'a, '_> {
 
 #[cfg(test)]
 mod tests {
-    use rudb_plan::{Node, Plan};
+    use rudb_common::LogicalType;
+    use rudb_plan::{CompareOp, Expr, Node, Plan};
 
-    use super::count_top_aggregate;
+    use super::{count_having_aggregate, count_top_aggregate};
 
     fn plan(direction: &str) -> Plan {
         Plan::parse(&format!(
@@ -891,5 +959,42 @@ mod tests {
         };
         let aggregate = count_top_aggregate(&plan, input, keys).expect("the distinct count");
         assert!(matches!(plan.node(aggregate), Node::Aggregate { .. }));
+    }
+
+    #[test]
+    fn a_count_having_lower_bound_marks_the_count_call() {
+        let plan = Plan::parse(
+            "Filter (#1.2::BIGINT > 100::BIGINT)::BOOLEAN\n  \
+             Aggregate #1 groups=[#0.0::BIGINT] \
+             aggregates=[avg(#0.1::BIGINT)::DOUBLE, count_star()::BIGINT]\n    \
+             Values #0 [key::BIGINT, value::BIGINT] rows=[]",
+        )
+        .expect("an aggregate with a HAVING filter");
+        let Node::Filter { input, predicate } = *plan.node(plan.root()) else {
+            panic!("the root is a Filter")
+        };
+        let (aggregate, call, minimum) =
+            count_having_aggregate(&plan, input, predicate).expect("the count bound");
+        assert_eq!(aggregate, input);
+        assert_eq!((call, minimum), (1, 101));
+    }
+
+    #[test]
+    fn an_upper_count_having_bound_cannot_drop_aggregate_output() {
+        let mut plan = Plan::parse(
+            "Filter (#1.1::BIGINT > 100::BIGINT)::BOOLEAN\n  \
+             Aggregate #1 groups=[#0.0::BIGINT] aggregates=[count_star()::BIGINT]\n    \
+             Values #0 [key::BIGINT] rows=[]",
+        )
+        .expect("an aggregate with a HAVING filter");
+        let Node::Filter { input, predicate } = *plan.node(plan.root()) else {
+            panic!("the root is a Filter")
+        };
+        let Expr::Compare { left, right, .. } = *plan.expr(predicate) else {
+            panic!("the predicate is a comparison")
+        };
+        let less =
+            plan.add_expr(Expr::Compare { op: CompareOp::Less, left, right }, LogicalType::Boolean);
+        assert!(count_having_aggregate(&plan, input, less).is_none());
     }
 }
