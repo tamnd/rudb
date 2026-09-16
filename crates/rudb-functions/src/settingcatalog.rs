@@ -1,6 +1,6 @@
 //! What `duckdb_settings()` says about each setting this engine has.
 //!
-//! Fourteen rows represent twelve settings because two aliases have rows of their own.
+//! Seventeen rows represent fifteen settings because two aliases have rows of their own.
 //! The descriptions, input types, and alias lists were read from the pinned binary because clients may compare them with the values they already know.
 //!
 //! # The alias direction is the opposite way round from the obvious one
@@ -22,7 +22,7 @@
 //!
 //! # What is not here
 //!
-//! The pin returns 192 rows and this returns 14, because rudb has twelve settings.
+//! The pin returns 192 rows and this returns 17, because rudb has fifteen settings.
 //! The other settings are for things rudb does not do, and a row saying `SET enable_http_metadata_cache = true` worked when nothing read it would be worse than no row at all.
 //! The list grows when the engine does.
 //!
@@ -77,6 +77,13 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry {
         name: "default_order",
         description: "The order type used when none is specified (ASC or DESC)",
+        input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
+        name: "dialect_compatibility_mode",
+        description: "Enable SQL dialect compatibility for a certain engine (e.g. `SET dialect_compatibility_mode='spark'`)",
         input_type: "VARCHAR",
         scope: GLOBAL,
         aliases: &[],
@@ -211,7 +218,7 @@ mod tests {
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
-        assert_eq!(SETTINGS.len(), 16, "fourteen settings and two of them have a second spelling");
+        assert_eq!(SETTINGS.len(), 17, "fifteen settings and two of them have a second spelling");
         assert_eq!(setting_fields().len(), 7);
     }
 

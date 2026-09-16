@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry.
 //! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so this is a match on a name rather than a map.
-//! [`Settings::NAMES`] is that set, and it is sixteen names for fourteen settings because two have a second spelling.
+//! [`Settings::NAMES`] is that set, and it is seventeen names for fifteen settings because two have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
@@ -54,6 +54,8 @@ pub(crate) struct Settings {
     default_order: RwLock<String>,
     /// The installed parser dialect selected for new statements.
     current_dialect: RwLock<String>,
+    /// The selected SQL compatibility mode as written, or `NONE` for ordinary DuckDB rules.
+    dialect_compatibility_mode: RwLock<String>,
     /// The null placement mode used when an order item does not state one.
     default_null_order: RwLock<String>,
     /// Whether casts from local timestamps to zoned timestamps are refused.
@@ -81,11 +83,12 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 16] = [
+    pub(crate) const NAMES: [&'static str; 17] = [
         "TimeZone",
         "current_dialect",
         "default_null_order",
         "default_order",
+        "dialect_compatibility_mode",
         "disable_timestamptz_casts",
         "disabled_optimizers",
         "ieee_floating_point_ops",
@@ -114,6 +117,7 @@ impl Settings {
             default_time_zone,
             default_order: RwLock::new("ASCENDING".to_string()),
             current_dialect: RwLock::new("duckdb".to_string()),
+            dialect_compatibility_mode: RwLock::new("NONE".to_string()),
             default_null_order: RwLock::new("NULLS_LAST".to_string()),
             disable_timestamptz_casts: RwLock::new(false),
             ieee_floating_point_ops: RwLock::new(true),
@@ -213,6 +217,16 @@ impl Settings {
                     )));
                 }
                 *self.current_dialect.write().unwrap_or_else(|held| held.into_inner()) = written;
+            }
+            "dialect_compatibility_mode" => {
+                let written = value.map_or("NONE".to_string(), text_of);
+                if !written.eq_ignore_ascii_case("none") && !written.eq_ignore_ascii_case("spark") {
+                    return Err(Error::not_implemented(format!(
+                        "Enum value: unrecognized value \"{written}\" for enum \"DialectCompatibilityMode\"\n\nCandidates: \"NONE\""
+                    )));
+                }
+                *self.dialect_compatibility_mode.write().unwrap_or_else(|held| held.into_inner()) =
+                    written;
             }
             "default_order" => {
                 let Some(value) = value else {
@@ -370,6 +384,11 @@ impl Settings {
             "current_dialect" => {
                 Ok(self.current_dialect.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
+            "dialect_compatibility_mode" => Ok(self
+                .dialect_compatibility_mode
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .clone()),
             "default_order" => {
                 Ok(self.default_order.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
@@ -421,14 +440,14 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are eleven names and the alternative
+    /// Built once per statement rather than held, because there are seventeen names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Nine settings and eleven names means the loop below would otherwise take several locks.
+    /// Fifteen settings and seventeen names means the loop below would otherwise take several locks.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
@@ -439,6 +458,8 @@ impl Settings {
             self.default_order.read().unwrap_or_else(|held| held.into_inner()).clone();
         let current_dialect =
             self.current_dialect.read().unwrap_or_else(|held| held.into_inner()).clone();
+        let dialect_compatibility_mode =
+            self.dialect_compatibility_mode.read().unwrap_or_else(|held| held.into_inner()).clone();
         let default_null_order =
             self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone();
         let disable_timestamptz_casts =
@@ -484,6 +505,7 @@ impl Settings {
                 match canonical(name) {
                     "TimeZone" => time_zone.clone(),
                     "current_dialect" => current_dialect.clone(),
+                    "dialect_compatibility_mode" => dialect_compatibility_mode.clone(),
                     "default_order" => default_order.clone(),
                     "default_null_order" => default_null_order.clone(),
                     "disabled_optimizers" => disabled.clone(),
