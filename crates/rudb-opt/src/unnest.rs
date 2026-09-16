@@ -34,6 +34,9 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     if let Some(join) = exists(plan, left, right, kind, conditions) {
         return Some(join);
     }
+    if let Some(join) = exists_domain(plan, left, right, kind, conditions) {
+        return Some(join);
+    }
     if let Some(join) = mark(plan, left, right, kind, conditions) {
         return Some(join);
     }
@@ -113,6 +116,132 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     let names = plan.add_name_list(&projected_names);
     let right = plan.add_node(Node::Project { input, index, exprs, names });
     let all: Vec<ExprRef> = plan.expr_list(conditions).iter().copied().chain(rewritten).collect();
+    let conditions = plan.add_expr_list(&all);
+    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+}
+
+/// Evaluates arbitrary correlated existence predicates once over a distinct domain of outer keys.
+/// Equality predicates take the cheaper grouped-inner rule below, while inequalities and
+/// expressions use this general rule instead of falling back to one inner execution per outer row.
+fn exists_domain(
+    plan: &mut Plan,
+    left: NodeRef,
+    right: NodeRef,
+    kind: JoinKind,
+    conditions: rudb_plan::Slice,
+) -> Option<NodeRef> {
+    let Node::Project { input: limited, index, exprs: marker_exprs, names: marker_names } =
+        *plan.node(right)
+    else {
+        return None;
+    };
+    let [marker] = plan.expr_list(marker_exprs) else {
+        return None;
+    };
+    let marker = *marker;
+    let Node::Limit { input: selected, count: Some(1), offset: 0 } = *plan.node(limited) else {
+        return None;
+    };
+    let Node::Project { input: filtered, .. } = *plan.node(selected) else {
+        return None;
+    };
+    let Node::Filter { input, predicate } = *plan.node(filtered) else {
+        return None;
+    };
+
+    let outer = produced(plan, left);
+    let mut correlated = Vec::new();
+    let mut local = Vec::new();
+    split(plan, predicate, &mut |part| {
+        if reads(plan, part, &outer) {
+            correlated.push(part);
+        } else {
+            local.push(part);
+        }
+    });
+    if correlated.is_empty() {
+        return None;
+    }
+
+    let mut outer_keys = Vec::new();
+    for &condition in &correlated {
+        walk::columns(plan, condition, &mut |binding| {
+            if outer.contains(binding.table) && !outer_keys.contains(&binding) {
+                outer_keys.push(binding);
+            }
+        });
+    }
+    if outer_keys.is_empty() {
+        return None;
+    }
+    let mut outer_exprs = Vec::new();
+    for &binding in &outer_keys {
+        outer_exprs.push(find_column_expr(plan, predicate, binding)?);
+    }
+    let domain_index = walk::fresh_index(plan);
+    let groups = plan.add_expr_list(&outer_exprs);
+    let aggregates = plan.add_expr_list(&[]);
+    let domain =
+        plan.add_node(Node::Aggregate { input: left, index: domain_index, groups, aggregates });
+
+    let domain_outputs: HashMap<ColumnBinding, usize> =
+        outer_keys.iter().copied().enumerate().map(|(position, key)| (key, position)).collect();
+    let rewritten: Vec<ExprRef> = correlated
+        .into_iter()
+        .map(|condition| replace_inner(plan, condition, domain_index, &domain_outputs))
+        .collect();
+    let inner = make_filter(plan, input, local);
+    let domain_conditions = plan.add_expr_list(&rewritten);
+    let matches = plan.add_node(Node::Join {
+        left: domain,
+        right: inner,
+        kind: JoinKind::Inner,
+        conditions: domain_conditions,
+    });
+    let grouped_keys: Vec<ExprRef> = outer_exprs
+        .iter()
+        .enumerate()
+        .map(|(position, source)| {
+            plan.add_expr_at(
+                Expr::Column(ColumnBinding::new(domain_index, u32::try_from(position).unwrap())),
+                plan.expr_type(*source).clone(),
+                plan.expr_span(*source),
+            )
+        })
+        .collect();
+    let grouped_index = walk::fresh_index(plan);
+    let groups = plan.add_expr_list(&grouped_keys);
+    let aggregates = plan.add_expr_list(&[]);
+    let matches =
+        plan.add_node(Node::Aggregate { input: matches, index: grouped_index, groups, aggregates });
+
+    let mut projected = vec![marker];
+    let mut names = plan.name_list(marker_names).to_vec();
+    for (position, &source) in outer_exprs.iter().enumerate() {
+        projected.push(plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(grouped_index, u32::try_from(position).ok()?)),
+            plan.expr_type(source).clone(),
+            plan.expr_span(source),
+        ));
+        names.push(plan.intern(&format!("__correlated_{}", position + 1)));
+    }
+    let exprs = plan.add_expr_list(&projected);
+    let names = plan.add_name_list(&names);
+    let right = plan.add_node(Node::Project { input: matches, index, exprs, names });
+
+    let mut all = plan.expr_list(conditions).to_vec();
+    for (position, &outer_expr) in outer_exprs.iter().enumerate() {
+        let right_expr = plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(index, u32::try_from(position + 1).ok()?)),
+            plan.expr_type(outer_expr).clone(),
+            plan.expr_span(outer_expr),
+        );
+        all.push(plan.add_expr_at(
+            Expr::Compare { op: CompareOp::NotDistinctFrom, left: outer_expr, right: right_expr },
+            LogicalType::Boolean,
+            plan.expr_span(outer_expr),
+        ));
+    }
     let conditions = plan.add_expr_list(&all);
     Some(plan.add_node(Node::Join { left, right, kind, conditions }))
 }
