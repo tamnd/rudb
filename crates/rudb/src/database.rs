@@ -512,7 +512,7 @@ impl Shared {
     /// look at, and the check that would say whether a statement needs them is a walk of the parse
     /// tree that costs about what reading them costs. So it is read once per statement and the
     /// special case is gone. [`crate::settings::Settings::session`] takes two locks for it.
-    fn session(&self) -> Session {
+    pub(crate) fn session(&self) -> Session {
         self.inner.settings.session()
     }
 
@@ -526,8 +526,8 @@ impl Shared {
         let catalog = self.read();
         let seams = self.seams(sql)?;
         let context = self.optimizer(&catalog)?;
-        let ast = rudb_parse::parse_ast(sql)?;
         let session = self.session();
+        let ast = rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case())?;
         match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new(), &session)? {
             Bound::Query(mut plan) => {
                 rudb_opt::optimize_with(&mut plan, &context)?;
@@ -624,7 +624,8 @@ impl Shared {
     /// SELECT * FROM t` would otherwise read the table under a read lock, let go, and append to
     /// whatever the table had become in between.
     pub(crate) fn execute(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
-        let ast = rudb_parse::parse_ast(sql)?;
+        let session = self.session();
+        let ast = rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case())?;
         self.execute_ast(&ast, sql, &Parameters::new(), cancel)
     }
 

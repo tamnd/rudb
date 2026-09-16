@@ -3,7 +3,7 @@
 use rudb_bind::Parameters;
 use rudb_common::{Error, Result, Value};
 use rudb_parse::ast::Ast;
-use rudb_parse::parse_ast;
+use rudb_parse::parse_ast_with_case;
 
 use crate::connection::single;
 use crate::database::Shared;
@@ -45,7 +45,8 @@ pub struct Prepared {
 impl Prepared {
     /// Parses `sql` and reads the parameters out of it.
     pub(crate) fn new(shared: Shared, sql: &str) -> Result<Self> {
-        let ast = parse_ast(sql)?;
+        let session = shared.session();
+        let ast = parse_ast_with_case(sql, session.semantics().identifier_case())?;
         let names = ast.parameters().into_iter().map(str::to_string).collect();
         Ok(Self { shared, sql: sql.to_string(), ast, names })
     }
