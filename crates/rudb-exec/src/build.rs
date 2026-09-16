@@ -302,11 +302,15 @@ fn count_top_aggregate(plan: &Plan, input: NodeRef, keys: Slice) -> Option<NodeR
     let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(first) else {
         return None;
     };
-    (plan.string(name) == "count_star"
+    let count_star = plan.string(name) == "count_star"
         && plan.expr_list(args).is_empty()
         && !distinct
-        && filter.is_none())
-    .then_some(aggregate)
+        && filter.is_none();
+    let distinct_count = plan.string(name) == "count"
+        && plan.expr_list(args).len() == 1
+        && distinct
+        && filter.is_none();
+    (count_star || distinct_count).then_some(aggregate)
 }
 
 /// What a filter over a scan can tell that scan before it reads anything.
@@ -446,7 +450,7 @@ struct Building<'a, 'b> {
     /// own input, and the scan arm takes them. It is empty every other time it is read, and empty
     /// means hand out every row group, which is what every scan did before pruning existed.
     pruning: Vec<(usize, Op, Bound)>,
-    /// Aggregates whose parent TopN orders by COUNT(*) descending, and its count plus offset.
+    /// Aggregates whose parent TopN orders by COUNT descending, and its count plus offset.
     top_counts: Vec<(NodeRef, usize)>,
 }
 
@@ -871,5 +875,21 @@ mod tests {
             panic!("the root is a TopN")
         };
         assert!(count_top_aggregate(&plan, input, keys).is_none());
+    }
+
+    #[test]
+    fn distinct_count_descending_topn_marks_its_aggregate() {
+        let plan = Plan::parse(
+            "TopN 10 offset 0 [#1.1::BIGINT DESC NULLS LAST]\n  \
+             Aggregate #1 groups=[#0.0::VARCHAR] \
+             aggregates=[count(DISTINCT #0.1::BIGINT)::BIGINT]\n    \
+             Values #0 [SearchPhrase::VARCHAR, UserID::BIGINT] rows=[]",
+        )
+        .expect("a grouped distinct count plan");
+        let Node::TopN { input, keys, .. } = *plan.node(plan.root()) else {
+            panic!("the root is a TopN")
+        };
+        let aggregate = count_top_aggregate(&plan, input, keys).expect("the distinct count");
+        assert!(matches!(plan.node(aggregate), Node::Aggregate { .. }));
     }
 }
