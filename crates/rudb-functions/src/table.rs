@@ -106,6 +106,10 @@ pub enum TableFunction {
     DuckdbExtensions,
     /// `duckdb_optimizers()`, every name `SET disabled_optimizers` takes.
     DuckdbOptimizers,
+    /// `duckdb_dialects()`, every installed SQL parser dialect.
+    DuckdbDialects,
+    /// `duckdb_grammar_extensions()`, every installed grammar extension.
+    DuckdbGrammarExtensions,
     /// `pragma_table_info(name)`, the columns of one table or view, in SQLite's six columns.
     PragmaTableInfo,
     /// `pragma_show(name)`, the same columns again in the six `DESCRIBE` answers with.
@@ -149,6 +153,8 @@ impl TableFunction {
             Self::DuckdbColumns => "duckdb_columns",
             Self::DuckdbExtensions => "duckdb_extensions",
             Self::DuckdbOptimizers => "duckdb_optimizers",
+            Self::DuckdbDialects => "duckdb_dialects",
+            Self::DuckdbGrammarExtensions => "duckdb_grammar_extensions",
             Self::PragmaTableInfo => "pragma_table_info",
             Self::PragmaShow => "pragma_show",
             Self::PragmaVersion => "pragma_version",
@@ -266,6 +272,12 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("duckdb_optimizers") {
             return Some(Self::DuckdbOptimizers);
+        }
+        if name.eq_ignore_ascii_case("duckdb_dialects") {
+            return Some(Self::DuckdbDialects);
+        }
+        if name.eq_ignore_ascii_case("duckdb_grammar_extensions") {
+            return Some(Self::DuckdbGrammarExtensions);
         }
         if name.eq_ignore_ascii_case("pragma_table_info") {
             return Some(Self::PragmaTableInfo);
@@ -460,6 +472,8 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbColumns
         | TableFunction::DuckdbExtensions
         | TableFunction::DuckdbOptimizers
+        | TableFunction::DuckdbDialects
+        | TableFunction::DuckdbGrammarExtensions
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaVersion
@@ -485,6 +499,8 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::DuckdbColumns => Some(column_fields()),
         TableFunction::DuckdbExtensions => Some(extension_fields()),
         TableFunction::DuckdbOptimizers => Some(optimizer_fields()),
+        TableFunction::DuckdbDialects => Some(dialect_fields()),
+        TableFunction::DuckdbGrammarExtensions => Some(grammar_extension_fields()),
         TableFunction::PragmaVersion => Some(version_fields()),
         TableFunction::PragmaPlatform => Some(platform_fields()),
         TableFunction::PragmaUserAgent => Some(user_agent_fields()),
@@ -651,6 +667,18 @@ pub fn extension_fields() -> Vec<Field> {
 #[must_use]
 pub fn optimizer_fields() -> Vec<Field> {
     vec![Field::new("name", LogicalType::Varchar)]
+}
+
+/// The column `duckdb_dialects()` produces.
+#[must_use]
+pub fn dialect_fields() -> Vec<Field> {
+    vec![Field::new("dialect_name", LogicalType::Varchar)]
+}
+
+/// The columns `duckdb_grammar_extensions()` produces.
+#[must_use]
+pub fn grammar_extension_fields() -> Vec<Field> {
+    vec![Field::new("name", LogicalType::Varchar), Field::new("description", LogicalType::Varchar)]
 }
 
 /// The four categories DuckDB sorts a keyword into.

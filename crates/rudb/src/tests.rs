@@ -1246,7 +1246,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // This table lists itself, because it is a table function and the table lists those.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
-        vec![vec![Value::BigInt(11)]]
+        vec![vec![Value::BigInt(13)]]
     );
 }
 
@@ -2574,6 +2574,27 @@ fn the_engine_answers_for_its_optimizer_passes_and_its_extensions() {
             &db,
             "SELECT count(*) FROM duckdb_functions() \
              WHERE function_name IN ('duckdb_extensions', 'duckdb_optimizers')"
+        ),
+        vec![vec![Value::BigInt(2)]]
+    );
+}
+
+#[test]
+fn the_engine_lists_its_parser_dialect_and_no_grammar_extensions() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT * FROM duckdb_dialects()"), vec![vec![text("duckdb")]]);
+    assert!(rows(&db, "SELECT * FROM duckdb_grammar_extensions()").is_empty());
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM duckdb_grammar_extensions())"
+        ),
+        vec![vec![text("name"), text("VARCHAR")], vec![text("description"), text("VARCHAR")]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('duckdb_dialects', 'duckdb_grammar_extensions')"
         ),
         vec![vec![Value::BigInt(2)]]
     );
