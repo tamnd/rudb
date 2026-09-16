@@ -152,6 +152,56 @@ pub fn build_measured<'a>(
     session: &Session,
     report: &Report,
 ) -> Result<Query<'a>> {
+    build_measured_with_sink(
+        plan,
+        catalog,
+        BuildUnder { cancel, memory, seams, session, report },
+        None,
+    )
+}
+
+/// Builds the pipelines with their root connected to a caller supplied sink.
+///
+/// This is the write path counterpart of [`build_measured`]. It lets an `INSERT ... SELECT`
+/// consume chunks as the producing pipeline runs instead of first collecting the whole result in
+/// the root queue.
+///
+/// # Errors
+///
+/// The same as [`build_measured`].
+pub fn build_measured_into<'a>(
+    plan: &'a Plan,
+    catalog: &'a Catalog,
+    cancel: &Cancel,
+    memory: &Memory,
+    seams: &Settings,
+    session: &Session,
+    sink: Arc<dyn DynSink + 'a>,
+) -> Result<Query<'a>> {
+    let report = Report::new();
+    build_measured_with_sink(
+        plan,
+        catalog,
+        BuildUnder { cancel, memory, seams, session, report: &report },
+        Some(sink),
+    )
+}
+
+struct BuildUnder<'a> {
+    cancel: &'a Cancel,
+    memory: &'a Memory,
+    seams: &'a Settings,
+    session: &'a Session,
+    report: &'a Report,
+}
+
+fn build_measured_with_sink<'a>(
+    plan: &'a Plan,
+    catalog: &'a Catalog,
+    under: BuildUnder<'_>,
+    sink: Option<Arc<dyn DynSink + 'a>>,
+) -> Result<Query<'a>> {
+    let BuildUnder { cancel, memory, seams, session, report } = under;
     let shape = Shape::of(plan);
     for pipeline in shape.all() {
         report.pipeline(pipeline);
@@ -179,12 +229,18 @@ pub fn build_measured<'a>(
     // is going to look at. Everything else gets the root that puts them back, because the moment
     // several threads read the same file a plain `SELECT` would otherwise come back in a different
     // order on every run. It costs nothing to decide here and it means the scheduler never has to.
-    let (sink, reader) = if ordered(plan, plan.root()) {
-        root(BufferId(0), None)
+    let reader = if let Some(sink) = sink {
+        building.close(segment, ROOT, sink);
+        None
     } else {
-        root_in_order(BufferId(0), None)
+        let (sink, reader) = if ordered(plan, plan.root()) {
+            root(BufferId(0), None)
+        } else {
+            root_in_order(BufferId(0), None)
+        };
+        building.close(segment, ROOT, Arc::new(sink));
+        Some(reader)
     };
-    building.close(segment, ROOT, Arc::new(sink));
     let Building { done, drivers, .. } = building;
     Query::new(done, drivers, reader, schema)
 }
