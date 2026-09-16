@@ -2129,6 +2129,25 @@ fn uncorrelated_exists_is_a_single_joined_marker() {
 }
 
 #[test]
+fn correlated_exists_groups_keys_before_its_single_join() {
+    let db = database();
+    let exists = "SELECT k FROM (VALUES (1), (2), (3), (NULL)) o(k) WHERE EXISTS (SELECT 1 FROM (VALUES (1), (1), (3), (NULL)) i(k) WHERE i.k = o.k) ORDER BY k";
+    assert_eq!(rows(&db, exists), vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k FROM (VALUES (1), (2), (3)) o(k) WHERE NOT EXISTS (SELECT 1 FROM (VALUES (1, 5), (2, 20)) i(k, value) WHERE i.k = o.k AND value > 10) ORDER BY k"
+        ),
+        vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]
+    );
+    let plan = db.plan(exists).expect("the correlated existence query plans");
+    assert!(plan.contains("Join SINGLE"), "{plan}");
+    assert!(plan.contains("Aggregate"), "{plan}");
+    assert!(!plan.contains("DependentJoin"), "{plan}");
+    assert!(!plan.contains("Limit 1"), "{plan}");
+}
+
+#[test]
 fn uncorrelated_in_subqueries_are_mark_joins() {
     let db = database();
     let query = |subject: &str, values: &str| {
