@@ -50,6 +50,7 @@ pub(crate) struct Join<'a> {
     plan: &'a Plan,
     kind: JoinKind,
     conditions: Vec<ExprRef>,
+    marker: Option<usize>,
     left_schema: Schema,
     right_schema: Schema,
     combined: Schema,
@@ -84,6 +85,8 @@ pub(crate) struct Gathered<'s> {
     pub(crate) schema: &'s Schema,
     /// The rows, readable once the pipeline that filled them has finished.
     pub(crate) rows: Rows,
+    /// The marker's position for a mark join, when it is not the final column.
+    pub(crate) marker: Option<usize>,
 }
 
 impl<'a> Join<'a> {
@@ -106,10 +109,16 @@ impl<'a> Join<'a> {
             _ => combined.clone(),
         };
         let out = Buffered::new();
+        let marker = if kind == JoinKind::Mark {
+            right.marker.or_else(|| right.schema.bindings().len().checked_sub(1))
+        } else {
+            None
+        };
         let join = Self {
             plan,
             kind,
             conditions: plan.expr_list(conditions).to_vec(),
+            marker,
             left_schema: left.clone(),
             right_schema: right.schema.clone(),
             combined,
@@ -166,10 +175,10 @@ impl<'a> Join<'a> {
             if self.kind == JoinKind::Mark {
                 let marker = self.marker(left_row, &left_types, &right_chunks)?;
                 let mut row = pad_right(left_row, right_types.len());
-                let Some(last) = row.last_mut() else {
+                let Some(position) = self.marker else {
                     return Err(Error::internal("a mark join has no marker column"));
                 };
-                *last = marker;
+                row[left_types.len() + position] = marker;
                 out.push(row);
                 scratch.grow(out[before..].iter().map(|row| rows::footprint(row)).sum())?;
                 continue;
@@ -552,7 +561,7 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("a", 0),
-            Gathered { schema: &schema("b", 1), rows: right },
+            Gathered { schema: &schema("b", 1), rows: right, marker: None },
             JoinKind::Inner,
             Slice::EMPTY,
             &Cancel::new(),
@@ -582,7 +591,7 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("a", 0),
-            Gathered { schema: &schema("b", 1), rows: right },
+            Gathered { schema: &schema("b", 1), rows: right, marker: None },
             JoinKind::Anti,
             Slice::EMPTY,
             &Cancel::new(),
@@ -604,7 +613,7 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("a", 0),
-            Gathered { schema: &schema("b", 1), rows: right },
+            Gathered { schema: &schema("b", 1), rows: right, marker: None },
             JoinKind::Positional,
             Slice::EMPTY,
             &Cancel::new(),
