@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.21
+
+A patch release about the native columnar format, cheaper grouped aggregates, narrower late materialisation and the `PRAGMA` statement. The storage format version is unchanged.
+
+- The native columnar format writes inserts as stripes instead of keeping a row store behind a columnar name. Initial inserts stream into bounded pages, the scan prunes stripes from their zone maps, and a late read fetches only the selected values from the pages it needs.
+- Native TopN keeps row references until the final result asks for values, so rows that do not survive the limit are never materialised. Page checksums use the processor's CRC instruction where it exists and keep the portable fallback for every other target.
+- Numeric grouped `count`, `sum` and `avg` keep their common state compact and allocate the wide total only after an overflow. String group keys share radix tables, and grouped string minimum and maximum compare borrowed bytes without taking ownership for every row.
+- Flat vector slicing copies contiguous values and validity words directly. Bit-packed values are unpacked eight at a time at a width known to the compiler, which removes a branch from the inner loop.
+- Regex host extraction now agrees with DuckDB when the path contains a newline.
+- `PRAGMA name` and `PRAGMA name(args)` lower to the existing `pragma_*` table function during transform, so the executor has no pragma operator and does no extra per-row work. Errors keep the spelling the user wrote, and `PRAGMA name = value` reaches the existing setting path.
+- Fifteen pragma corpus records agree with DuckDB `cc7e7bac7f`. The shell comparison on an idle machine passed every record, but they were all below the harness timing floor, so no resource ratio is claimed for them.
+
 ## 0.3.20
 
 A patch release about the system catalog, the standard views, the two pragmas that take a name, and a parquet scan that hands out smaller pieces of work. The storage format version is unchanged.
