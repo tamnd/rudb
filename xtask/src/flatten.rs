@@ -50,7 +50,7 @@ const MARKER: &str = "flatten:";
 /// the list is short and grows a line at a time when somebody writes a shape it does not cover. A
 /// long speculative list would defeat the point, since the value of this rule is entirely in it
 /// failing on something it has not seen before.
-const ADAPTERS: [&str; 6] = ["iter", "into_iter", "copied", "cloned", "map", "filter_map"];
+const ADAPTERS: [&str; 7] = ["iter", "into_iter", "copied", "cloned", "map", "filter_map", "ok"];
 
 pub(crate) fn check(root: &Path) -> Result<(), String> {
     let mut files = Vec::new();
