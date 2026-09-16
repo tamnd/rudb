@@ -53,8 +53,8 @@ use rudb_pipeline::{
     BufferId, DynSink, DynStream, Pipeline, PipelineId, Source, Watched, root, root_in_order,
 };
 use rudb_plan::{
-    CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, PipelineRef, Plan, ROOT,
-    Shape, Slice, seams_of,
+    ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, PipelineRef,
+    Plan, ROOT, Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
 
@@ -75,7 +75,7 @@ use crate::schema::Schema;
 use crate::setop::SetOp;
 use crate::settingnames::settingnames;
 use crate::sort::Sort;
-use crate::source::{Dummy, FileScan, Scan, Series, Values};
+use crate::source::{Dummy, FileScan, Frequencies, Scan, Series, Values};
 use crate::strategies::strategies;
 use crate::stream::{Filter, Limit, Project};
 use crate::topn::TopN;
@@ -284,18 +284,20 @@ fn count_top_aggregate(plan: &Plan, input: NodeRef, keys: Slice) -> Option<NodeR
         return None;
     }
     let Expr::Column(ordered) = *plan.expr(key.expr) else { return None };
-    let (aggregate, output) = match *plan.node(input) {
-        Node::Project { input, index, exprs, .. } => {
-            if ordered.table != index {
-                return None;
+    let mut aggregate = input;
+    let mut output = ordered;
+    loop {
+        match *plan.node(aggregate) {
+            Node::Project { input, index, exprs, .. } if output.table == index => {
+                let projected = *plan.expr_list(exprs).get(output.column as usize)?;
+                let Expr::Column(next) = *plan.expr(projected) else { return None };
+                output = next;
+                aggregate = input;
             }
-            let projected = *plan.expr_list(exprs).get(ordered.column as usize)?;
-            let Expr::Column(output) = *plan.expr(projected) else { return None };
-            (input, output)
+            Node::Aggregate { index, .. } if output.table == index => break,
+            _ => return None,
         }
-        Node::Aggregate { index, .. } if ordered.table == index => (input, ordered),
-        _ => return None,
-    };
+    }
     let Node::Aggregate { index, groups, aggregates, .. } = *plan.node(aggregate) else {
         return None;
     };
@@ -383,6 +385,84 @@ fn mark_binding(plan: &Plan, right: NodeRef, kind: JoinKind) -> Option<usize> {
             .find_map(|(position, &name)| (plan.string(name) == "mark").then_some(position))?,
     };
     Some(position)
+}
+
+/// The one scan column a supported grouping expression depends on.
+fn frequency_column(
+    plan: &Plan,
+    expression: ExprRef,
+    index: u32,
+    found: &mut Option<ColumnBinding>,
+) -> bool {
+    match *plan.expr(expression) {
+        Expr::Column(column) if column.table == index => match *found {
+            None => {
+                *found = Some(column);
+                true
+            }
+            Some(held) => held == column,
+        },
+        Expr::Constant(_) => true,
+        Expr::Function { name, args } if plan.string(name) == "-" => {
+            let [left, right] = plan.expr_list(args) else { return false };
+            frequency_column(plan, *left, index, found)
+                && matches!(plan.expr(*right), Expr::Constant(_))
+        }
+        _ => false,
+    }
+}
+
+struct NativeFrequencies {
+    entries: Vec<(Value, u64)>,
+    column: usize,
+}
+
+/// Exact grouped counts already certified by a native file's frequency synopsis.
+fn native_frequencies(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+    top: usize,
+) -> Result<Option<NativeFrequencies>> {
+    let Node::Get { catalog: database, schema, table, index, columns, .. } = *plan.node(input)
+    else {
+        return Ok(None);
+    };
+    if plan.expr_list(groups).is_empty() {
+        return Ok(None);
+    }
+    let mut group = None;
+    if !plan
+        .expr_list(groups)
+        .iter()
+        .all(|&expression| frequency_column(plan, expression, index, &mut group))
+    {
+        return Ok(None);
+    }
+    let Some(group) = group else { return Ok(None) };
+    let [aggregate] = plan.expr_list(aggregates) else { return Ok(None) };
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
+        return Ok(None);
+    };
+    if plan.string(name) != "count_star"
+        || !plan.expr_list(args).is_empty()
+        || distinct
+        || filter.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(field) = plan.field_list(columns).get(group.column as usize) else {
+        return Ok(None);
+    };
+    let name = QualifiedName::new(plan.string(database), plan.string(schema), plan.string(table));
+    let table = catalog.table(&name)?;
+    let Some(column) = table.column_index(&field.name) else { return Ok(None) };
+    Ok(table
+        .rows()
+        .top_frequencies(column, top)?
+        .map(|entries| NativeFrequencies { entries, column: group.column as usize }))
 }
 
 /// What a filter over a scan can tell that scan before it reads anything.
@@ -611,6 +691,25 @@ impl<'a> Building<'a, '_> {
         let schema = aggregate.schema().clone();
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
+        if bound.max_groups.is_none()
+            && bound.having_count.is_none()
+            && let Some(top) = bound.top_counts
+            && let Some(frequencies) =
+                native_frequencies(self.plan, self.catalog, input, groups, aggregates, top)?
+        {
+            let source = Frequencies::new(
+                self.plan,
+                &below.schema,
+                schema.clone(),
+                groups,
+                frequencies.column,
+                frequencies.entries,
+                self.session,
+            )?;
+            let counters =
+                self.watch(reference, id, pipeline, "Aggregate", Some("native frequencies"));
+            return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+        }
         let counters = self.watch(reference, id, pipeline, "Aggregate", None);
         let reading = Arc::clone(&counters);
         self.close(below, pipeline, Arc::new(Watched::new(aggregate, counters)));
@@ -975,6 +1074,23 @@ mod tests {
     #[test]
     fn count_descending_topn_marks_its_aggregate() {
         let plan = plan("DESC");
+        let Node::TopN { input, keys, .. } = *plan.node(plan.root()) else {
+            panic!("the root is a TopN")
+        };
+        let aggregate = count_top_aggregate(&plan, input, keys).expect("the grouped count");
+        assert!(matches!(plan.node(aggregate), Node::Aggregate { .. }));
+    }
+
+    #[test]
+    fn count_descending_topn_crosses_several_passthrough_projects() {
+        let plan = Plan::parse(
+            "TopN 10 offset 0 [#3.1::BIGINT DESC NULLS LAST]\n  \
+             Project #3 [#2.0::INTEGER AS ClientIP, #2.1::BIGINT AS c]\n    \
+             Project #2 [#1.0::INTEGER AS column0, #1.1::BIGINT AS column1]\n      \
+             Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]\n        \
+             Values #0 [ClientIP::INTEGER] rows=[]",
+        )
+        .expect("a grouped count under two projects");
         let Node::TopN { input, keys, .. } = *plan.node(plan.root()) else {
             panic!("the root is a TopN")
         };

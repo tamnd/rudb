@@ -42,6 +42,16 @@ pub enum Rows {
 }
 
 impl Rows {
+    /// Exact leading value frequencies from a committed native snapshot.
+    ///
+    /// In-memory tables have no persisted synopsis and return `None`.
+    pub fn top_frequencies(&self, column: usize, top: usize) -> Result<Option<Vec<(Value, u64)>>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Native(reader) => reader.top_frequencies(column, top),
+        }
+    }
+
     /// Number of rows in one independently readable chunk.
     pub fn chunk_len(&self, at: usize) -> Result<usize> {
         Ok(match self {
