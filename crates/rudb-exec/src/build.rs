@@ -272,7 +272,7 @@ fn ordered(plan: &Plan, node: NodeRef) -> bool {
     }
 }
 
-/// The aggregate under a TopN whose only key is its first COUNT(*) result descending.
+/// The aggregate under a TopN whose only key is a COUNT result descending.
 ///
 /// Keeping the local prefix from every radix partition is sufficient for the global prefix: a
 /// group excluded behind `k` groups in its own partition cannot enter the first `k` overall. The
@@ -299,11 +299,12 @@ fn count_top_aggregate(plan: &Plan, input: NodeRef, keys: Slice) -> Option<NodeR
     let Node::Aggregate { index, groups, aggregates, .. } = *plan.node(aggregate) else {
         return None;
     };
-    if output.table != index || output.column as usize != plan.expr_list(groups).len() {
+    if output.table != index {
         return None;
     }
-    let first = *plan.expr_list(aggregates).first()?;
-    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(first) else {
+    let call = (output.column as usize).checked_sub(plan.expr_list(groups).len())?;
+    let aggregate_call = *plan.expr_list(aggregates).get(call)?;
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(aggregate_call) else {
         return None;
     };
     let count_star = plan.string(name) == "count_star"
@@ -972,6 +973,22 @@ mod tests {
             panic!("the root is a TopN")
         };
         let aggregate = count_top_aggregate(&plan, input, keys).expect("the distinct count");
+        assert!(matches!(plan.node(aggregate), Node::Aggregate { .. }));
+    }
+
+    #[test]
+    fn count_descending_topn_finds_a_later_aggregate_call() {
+        let plan = Plan::parse(
+            "TopN 10 offset 0 [#1.2::BIGINT DESC NULLS LAST]\n  \
+             Aggregate #1 groups=[#0.0::INTEGER] \
+             aggregates=[sum(#0.1::SMALLINT)::HUGEINT, count_star()::BIGINT, avg(#0.2::SMALLINT)::DOUBLE, count(DISTINCT #0.3::BIGINT)::BIGINT]\n    \
+             Values #0 [RegionID::INTEGER, AdvEngineID::SMALLINT, ResolutionWidth::SMALLINT, UserID::BIGINT] rows=[]",
+        )
+        .expect("a mixed aggregate plan");
+        let Node::TopN { input, keys, .. } = *plan.node(plan.root()) else {
+            panic!("the root is a TopN")
+        };
+        let aggregate = count_top_aggregate(&plan, input, keys).expect("the grouped count");
         assert!(matches!(plan.node(aggregate), Node::Aggregate { .. }));
     }
 
