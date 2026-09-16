@@ -745,6 +745,7 @@ impl<'a> Binder<'a> {
         let items = ast.order_list(query.order_by).to_vec();
         let mut keys = Vec::with_capacity(items.len());
         for item in items {
+            self.check_order_literal(ast, item.expr)?;
             let position = match self.output_position(ast, item.expr, output)? {
                 Some(position) => position,
                 None => {
@@ -782,6 +783,7 @@ impl<'a> Binder<'a> {
         let items = ast.order_list(query.order_by).to_vec();
         let mut keys = Vec::with_capacity(items.len());
         for item in items {
+            self.check_order_literal(ast, item.expr)?;
             let expr = match self.output_position(ast, item.expr, output)? {
                 Some(position) => {
                     let column = &output.columns[position];
@@ -857,6 +859,23 @@ impl<'a> Binder<'a> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Refuses a literal sort key unless the session explicitly accepts its no-op behavior.
+    fn check_order_literal(&self, ast: &Ast, item: ast::ExprRef) -> Result<()> {
+        if !self.semantics.order_by_non_integer_literal()
+            && matches!(
+                ast.expr(item),
+                ast::Expr::Literal { kind, text }
+                    if kind != LiteralKind::Number
+                        || ast.string(text).contains(['.', 'e', 'E'])
+            )
+        {
+            return Err(Error::binder(
+                "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to allow this behavior.",
+            ));
+        }
+        Ok(())
     }
 
     /// The expressions a `DISTINCT ON` names, which have to be columns of the output.

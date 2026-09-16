@@ -1,6 +1,6 @@
 //! What `duckdb_settings()` says about each setting this engine has.
 //!
-//! Nine rows for seven settings, because two of them have an alias and the pin gives an alias a row
+//! Ten rows for eight settings, because two of them have an alias and the pin gives an alias a row
 //! of its own. The descriptions, the input types and the alias lists were read off the pinned binary
 //! rather than written here, since a client that reads this table to find out what it can turn is a
 //! client that will compare the sentence against the one it already knows.
@@ -24,7 +24,7 @@
 //!
 //! # What is not here
 //!
-//! The pin returns 192 rows and this returns 9, because rudb has seven settings. The other 183 are
+//! The pin returns 192 rows and this returns 10, because rudb has eight settings. The other 182 are
 //! settings for things rudb does not do, and a row saying `SET enable_http_metadata_cache = true`
 //! worked when nothing read it would be worse than no row at all. The list grows when the engine
 //! does.
@@ -106,6 +106,13 @@ pub static SETTINGS: &[SettingEntry] = &[
         aliases: &[],
     },
     SettingEntry {
+        name: "order_by_non_integer_literal",
+        description: "Allow ordering by non-integer literals - ordering by such literals has no effect.",
+        input_type: "BOOLEAN",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
         name: "threads",
         description: "The number of total threads used by the system.",
         input_type: "BIGINT",
@@ -165,7 +172,7 @@ mod tests {
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
-        assert_eq!(SETTINGS.len(), 9, "seven settings and two of them have a second spelling");
+        assert_eq!(SETTINGS.len(), 10, "eight settings and two of them have a second spelling");
         assert_eq!(setting_fields().len(), 7);
     }
 
