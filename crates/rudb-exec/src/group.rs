@@ -34,7 +34,7 @@ use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
 use crate::buffer::Buffered;
-use crate::key::{BigIntSet, Key, RowSet};
+use crate::key::{BigIntSet, Key, RowSet, mix, spread};
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
@@ -170,6 +170,8 @@ pub(crate) struct Aggregate<'a> {
     locally: AtomicBool,
     /// A grouped count over one stable dictionary is a dense array indexed by its storage code.
     dense: OnceLock<DenseCount>,
+    /// Fixed width rows exchanged to one owner per radix partition for compact count aggregates.
+    fixed: OnceLock<FixedExchange>,
     out: Buffered,
 }
 
@@ -184,6 +186,71 @@ struct DenseCount {
 struct DensePartition {
     runs: Vec<Vec<u32>>,
     nulls: i64,
+}
+
+#[derive(Debug)]
+struct FixedExchange {
+    partitions: Vec<Mutex<FixedPartition>>,
+    held: Mutex<Vec<Reservation>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FixedRecord {
+    hash: u64,
+    first: i64,
+    second: i32,
+    sum: i16,
+    mean: i16,
+}
+
+#[derive(Debug, Default)]
+struct FixedPartition {
+    rows: Vec<FixedRecord>,
+    /// Empty while every field is valid. It is materialized only when this partition sees a null.
+    validity: Vec<u8>,
+}
+
+impl FixedRecord {
+    const FIRST: u8 = 1;
+    const SECOND: u8 = 2;
+    const SUM: u8 = 4;
+    const MEAN: u8 = 8;
+    const ALL: u8 = Self::FIRST | Self::SECOND | Self::SUM | Self::MEAN;
+}
+
+impl FixedPartition {
+    fn push(&mut self, row: FixedRecord, valid: u8) {
+        if valid != FixedRecord::ALL && self.validity.is_empty() {
+            self.validity.resize(self.rows.len(), FixedRecord::ALL);
+        }
+        self.rows.push(row);
+        if !self.validity.is_empty() {
+            self.validity.push(valid);
+        }
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        if self.rows.is_empty() {
+            std::mem::swap(self, other);
+            return;
+        }
+        if self.validity.is_empty() && !other.validity.is_empty() {
+            self.validity.resize(self.rows.len(), FixedRecord::ALL);
+        }
+        let incoming = other.rows.len();
+        self.rows.append(&mut other.rows);
+        if self.validity.is_empty() {
+            debug_assert!(other.validity.is_empty());
+        } else if other.validity.is_empty() {
+            self.validity.resize(self.validity.len() + incoming, FixedRecord::ALL);
+        } else {
+            self.validity.append(&mut other.validity);
+        }
+    }
+
+    fn footprint(&self) -> usize {
+        self.rows.capacity() * size_of::<FixedRecord>() + self.validity.capacity() * size_of::<u8>()
+    }
 }
 
 /// What the passes have finished, which is the answer as it is assembled.
@@ -382,6 +449,7 @@ impl<'a> Aggregate<'a> {
             started: AtomicUsize::new(0),
             locally: AtomicBool::new(true),
             dense: OnceLock::new(),
+            fixed: OnceLock::new(),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -429,6 +497,128 @@ impl<'a> Aggregate<'a> {
                 .push(call.filter.map(|_| values.next().expect("a prepared filter has a value")));
         }
         Ok(Rows { keys, arguments, filters, rows })
+    }
+
+    fn fixed_top_count(&self) -> bool {
+        self.compact_numeric
+            && self.top_counts.is_some()
+            && self.constants.iter().all(Option::is_none)
+            && self.keys.len() == 2
+            && self.plan.expr_type(self.keys[0]) == &LogicalType::BigInt
+            && self.plan.expr_type(self.keys[1]) == &LogicalType::Integer
+    }
+
+    fn buffer_fixed(
+        &self,
+        rows: &Rows,
+        partitions: &mut [FixedPartition],
+        memory: &mut Reservation,
+    ) -> Result<()> {
+        self.fixed.get_or_init(|| FixedExchange {
+            partitions: (0..RADIX_PARTITIONS)
+                .map(|_| Mutex::new(FixedPartition::default()))
+                .collect(),
+            held: Mutex::new(Vec::new()),
+        });
+        let [first, second] = rows.keys.as_slice() else {
+            return Err(Error::internal("a fixed radix exchange received the wrong key width"));
+        };
+        let sum = rows.arguments[1].first().expect("SUM has one argument");
+        let mean = rows.arguments[2].first().expect("AVG has one argument");
+        let before = partitions.iter().map(FixedPartition::footprint).sum::<usize>();
+        let shift = u64::BITS - RADIX_PARTITIONS.ilog2();
+        for row in 0..rows.rows {
+            let mut valid = 0;
+            let first_value = if first.is_null_at(row) {
+                0
+            } else {
+                valid |= FixedRecord::FIRST;
+                match first.signed_at(row) {
+                    Some(value) => i64::try_from(value)
+                        .map_err(|_| Error::internal("a fixed BIGINT key is out of range"))?,
+                    None => match first.try_value_at(row)? {
+                        Value::BigInt(value) => value,
+                        value => {
+                            return Err(Error::internal(format!(
+                                "a fixed BIGINT key received {value:?}"
+                            )));
+                        }
+                    },
+                }
+            };
+            let second_value = if second.is_null_at(row) {
+                0
+            } else {
+                valid |= FixedRecord::SECOND;
+                match second.signed_at(row) {
+                    Some(value) => i32::try_from(value)
+                        .map_err(|_| Error::internal("a fixed INTEGER key is out of range"))?,
+                    None => match second.try_value_at(row)? {
+                        Value::Integer(value) => value,
+                        value => {
+                            return Err(Error::internal(format!(
+                                "a fixed INTEGER key received {value:?}"
+                            )));
+                        }
+                    },
+                }
+            };
+            let sum_value = if sum.is_null_at(row) {
+                0
+            } else {
+                valid |= FixedRecord::SUM;
+                match sum.signed_at(row) {
+                    Some(value) => i16::try_from(value)
+                        .map_err(|_| Error::internal("a fixed SMALLINT sum is out of range"))?,
+                    None => match sum.try_value_at(row)? {
+                        Value::SmallInt(value) => value,
+                        value => {
+                            return Err(Error::internal(format!(
+                                "a fixed SMALLINT sum received {value:?}"
+                            )));
+                        }
+                    },
+                }
+            };
+            let mean_value = if mean.is_null_at(row) {
+                0
+            } else {
+                valid |= FixedRecord::MEAN;
+                match mean.signed_at(row) {
+                    Some(value) => i16::try_from(value)
+                        .map_err(|_| Error::internal("a fixed SMALLINT mean is out of range"))?,
+                    None => match mean.try_value_at(row)? {
+                        Value::SmallInt(value) => value,
+                        value => {
+                            return Err(Error::internal(format!(
+                                "a fixed SMALLINT mean received {value:?}"
+                            )));
+                        }
+                    },
+                }
+            };
+            const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
+            let first_word =
+                if valid & FixedRecord::FIRST != 0 { first_value as u64 } else { NOTHING };
+            let second_word = if valid & FixedRecord::SECOND != 0 {
+                i64::from(second_value) as u64
+            } else {
+                NOTHING
+            };
+            let hash = spread(mix(mix(0, first_word), second_word));
+            partitions[(hash >> shift) as usize].push(
+                FixedRecord {
+                    hash,
+                    first: first_value,
+                    second: second_value,
+                    sum: sum_value,
+                    mean: mean_value,
+                },
+                valid,
+            );
+        }
+        let after = partitions.iter().map(FixedPartition::footprint).sum::<usize>();
+        memory.grow(width_of(after.saturating_sub(before)))
     }
 
     /// Reads the whole input and builds the hash table, over as many passes as the budget needs.
@@ -1837,6 +2027,9 @@ impl Rows {
 /// The scratch one pipeline instance keeps between chunks, and its table when it has one of its own.
 #[derive(Debug)]
 pub(crate) struct Partitioned {
+    fixed: bool,
+    fixed_records: Vec<FixedPartition>,
+    fixed_memory: Reservation,
     dense: bool,
     dense_codes: Vec<Vec<u32>>,
     dense_nulls: i64,
@@ -2229,6 +2422,9 @@ impl Sink for Aggregate<'_> {
     fn local(&self) -> Partitioned {
         self.started.fetch_add(1, Ordering::Relaxed);
         Partitioned {
+            fixed: false,
+            fixed_records: (0..RADIX_PARTITIONS).map(|_| FixedPartition::default()).collect(),
+            fixed_memory: self.memory.reservation(),
             dense: false,
             dense_codes: vec![Vec::new(); DENSE_PARTITIONS],
             dense_nulls: 0,
@@ -2272,6 +2468,9 @@ impl Sink for Aggregate<'_> {
     /// behind one lock before doing any work at all.
     fn sink(&self, chunk: &Chunk, local: &mut Partitioned) -> Result<Progress> {
         let Partitioned {
+            fixed,
+            fixed_records,
+            fixed_memory,
             dense,
             dense_codes,
             dense_nulls,
@@ -2282,6 +2481,14 @@ impl Sink for Aggregate<'_> {
             own,
         } = local;
         let rows = self.read(chunk, expressions)?;
+        if self.fixed_top_count() {
+            let timing = stage::Timing::start(Stage::Scatter);
+            let buffered = self.buffer_fixed(&rows, fixed_records, fixed_memory);
+            timing.stop(0);
+            buffered?;
+            *fixed = true;
+            return Ok(Progress::More);
+        }
         if self.count_only && self.keys.len() == 1 {
             if let [key] = rows.keys.as_slice() {
                 if let Some((codes, dictionary)) = key.stable_dictionary_parts() {
@@ -2370,6 +2577,9 @@ impl Sink for Aggregate<'_> {
     /// so a table is never left whole in partition zero after the switch.
     fn combine(&self, local: Partitioned) -> Result<()> {
         let Partitioned {
+            fixed,
+            mut fixed_records,
+            fixed_memory,
             dense,
             mut dense_codes,
             dense_nulls,
@@ -2379,6 +2589,18 @@ impl Sink for Aggregate<'_> {
             mut own,
             ..
         } = local;
+        if fixed {
+            let state = self.fixed.get().expect("fixed exchange exists after a fixed sink");
+            for (partition, rows) in fixed_records.iter_mut().enumerate() {
+                if rows.rows.is_empty() {
+                    continue;
+                }
+                state.partitions[partition].lock().map_err(poisoned)?.append(rows);
+            }
+            state.held.lock().map_err(poisoned)?.push(fixed_memory);
+            self.built.lock().map_err(poisoned)?.instances += 1;
+            return Ok(());
+        }
         if dense {
             let state = self.dense.get().expect("dense state exists after a dense sink");
             for (partition, run) in dense_codes.iter_mut().enumerate() {
@@ -2462,6 +2684,50 @@ impl Sink for Aggregate<'_> {
     /// its one group is made when the instance is, and an instance is made whether or not a row
     /// arrives.
     fn finalize(&self) -> Result<()> {
+        if let Some(fixed) = self.fixed.get() {
+            let bound = self.top_counts.expect("a fixed exchange has a TopN bound");
+            let next = AtomicUsize::new(0);
+            let slots: Vec<Mutex<Option<Result<Part>>>> =
+                (0..RADIX_PARTITIONS).map(|_| Mutex::new(None)).collect();
+            let parts = std::thread::scope(|scope| {
+                let next = &next;
+                let slots = &slots;
+                let calls = &self.calls;
+                let memory = &self.memory;
+                let mut handles = Vec::with_capacity(RADIX_PARTITIONS - 1);
+                for _ in 1..RADIX_PARTITIONS {
+                    handles.push(scope.spawn(move || {
+                        finish_fixed(next, slots, fixed, bound, calls, memory);
+                        stage::here()
+                    }));
+                }
+                finish_fixed(next, slots, fixed, bound, calls, memory);
+                let mut theirs = Spent::none();
+                for handle in handles {
+                    let spent = handle
+                        .join()
+                        .map_err(|_| Error::internal("a fixed radix worker panicked"))?;
+                    theirs.add(spent);
+                }
+                stage::gained(theirs);
+                let mut parts = Vec::with_capacity(slots.len());
+                for (at, slot) in slots.iter().enumerate() {
+                    parts.push(slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
+                        Err(Error::internal(format!("nothing finished fixed radix partition {at}")))
+                    })?);
+                }
+                Ok::<_, Error>(parts)
+            })?;
+            let mut chunks = Vec::new();
+            let mut held = fixed.held.lock().map_err(poisoned)?;
+            held.clear();
+            for Part { chunks: mut part, held: charge } in parts {
+                chunks.append(&mut part);
+                held.push(charge);
+            }
+            drop(held);
+            return self.out.fill(chunks);
+        }
         if let Some(dense) = self.dense.get() {
             let mut working = self.memory.reservation();
             working.grow(width_of(dense.dictionary.len() * size_of::<i64>()))?;
@@ -2519,6 +2785,127 @@ impl Sink for Aggregate<'_> {
         drop(built);
         self.out.fill(chunks)
     }
+}
+
+fn finish_fixed(
+    next: &AtomicUsize,
+    slots: &[Mutex<Option<Result<Part>>>],
+    fixed: &FixedExchange,
+    bound: usize,
+    calls: &[Call],
+    memory: &Memory,
+) {
+    loop {
+        let at = next.fetch_add(1, Ordering::Relaxed);
+        let Some(partition) = fixed.partitions.get(at) else {
+            return;
+        };
+        let done = partition
+            .lock()
+            .map_err(poisoned)
+            .and_then(|mut rows| fixed_partition(&mut rows, bound, calls, memory));
+        if let Ok(mut slot) = slots[at].lock() {
+            *slot = Some(done);
+        }
+    }
+}
+
+fn fixed_partition(
+    partition: &mut FixedPartition,
+    bound: usize,
+    calls: &[Call],
+    memory: &Memory,
+) -> Result<Part> {
+    const EMPTY: u32 = u32::MAX;
+    let capacity = partition.rows.len().saturating_mul(2).max(64).next_power_of_two();
+    let mut working = memory.reservation();
+    working.grow(width_of(
+        capacity * size_of::<u32>() + partition.rows.len() * size_of::<CompactNumeric>(),
+    ))?;
+    let mut buckets = vec![EMPTY; capacity];
+    let mut states: Vec<CompactNumeric> = Vec::with_capacity(partition.rows.len());
+    let mut overflow = HashMap::new();
+    let mask = capacity - 1;
+    let all_valid = partition.validity.is_empty();
+    let input = partition.rows.len();
+    let timing = stage::Timing::start(Stage::Fold);
+    for source in 0..input {
+        let row = partition.rows[source];
+        let valid = if all_valid { FixedRecord::ALL } else { partition.validity[source] };
+        let mut at = row.hash as usize & mask;
+        let slot = loop {
+            let slot = buckets[at];
+            if slot == EMPTY {
+                let slot = states.len();
+                buckets[at] = u32::try_from(slot)
+                    .map_err(|_| Error::out_of_memory("a fixed radix partition is too large"))?;
+                partition.rows[slot] = row;
+                if !all_valid {
+                    partition.validity[slot] = valid;
+                }
+                states.push(CompactNumeric::default());
+                break slot;
+            }
+            let slot = slot as usize;
+            let held = partition.rows[slot];
+            let held_valid = if all_valid { FixedRecord::ALL } else { partition.validity[slot] };
+            if held.hash == row.hash
+                && held.first == row.first
+                && held.second == row.second
+                && held_valid & (FixedRecord::FIRST | FixedRecord::SECOND)
+                    == valid & (FixedRecord::FIRST | FixedRecord::SECOND)
+            {
+                break slot;
+            }
+            at = (at + 1) & mask;
+        };
+        states[slot].add(
+            slot,
+            (valid & FixedRecord::SUM != 0).then_some(row.sum),
+            (valid & FixedRecord::MEAN != 0).then_some(row.mean),
+            &mut overflow,
+        )?;
+    }
+    partition.rows.truncate(states.len());
+    if !all_valid {
+        partition.validity.truncate(states.len());
+    }
+    timing.stop(0);
+    let timing = stage::Timing::start(Stage::Emit);
+    let mut best: Vec<usize> = Vec::with_capacity(bound.min(states.len()));
+    for slot in 0..states.len() {
+        let at = best.partition_point(|&kept| states[kept].count() >= states[slot].count());
+        if at < bound {
+            best.insert(at, slot);
+            best.truncate(bound);
+        }
+    }
+    best.sort_unstable();
+    let mut output = Vec::with_capacity(best.len());
+    for slot in best {
+        let key = partition.rows[slot];
+        let valid = if all_valid { FixedRecord::ALL } else { partition.validity[slot] };
+        let state = &states[slot];
+        let (sum, mean) = state.totals(slot, &overflow);
+        output.push(vec![
+            if valid & FixedRecord::FIRST != 0 { Value::BigInt(key.first) } else { Value::Null },
+            if valid & FixedRecord::SECOND != 0 { Value::Integer(key.second) } else { Value::Null },
+            Value::BigInt(state.count()),
+            Accumulator::exact_sum(sum, state.sum_seen(), &calls[1].returns).finish()?,
+            Accumulator::exact_avg(mean, state.mean_count, &calls[2].returns).finish()?,
+        ]);
+    }
+    let mut held = memory.reservation();
+    let types = [
+        LogicalType::BigInt,
+        LogicalType::Integer,
+        LogicalType::BigInt,
+        calls[1].returns.clone(),
+        calls[2].returns.clone(),
+    ];
+    let chunks = rows::chunks(&types, &output, &mut held)?;
+    timing.stop(0);
+    Ok(Part { chunks, held })
 }
 
 fn dense_partition(
@@ -3104,7 +3491,9 @@ mod tests {
     use rudb_plan::{Plan, Slice};
     use rudb_vector::{Chunk, Data, Vector};
 
-    use super::{Aggregate, CompactNumeric, Distinct};
+    use super::{
+        Aggregate, Call, CompactNumeric, Distinct, FixedPartition, FixedRecord, fixed_partition,
+    };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
 
@@ -3190,7 +3579,7 @@ mod tests {
 
     /// The rows an aggregate answered, as values, in the order it produced them.
     fn answer(out: &Buffered) -> Vec<Vec<Value>> {
-        let mut rows = Vec::new();
+        let mut rows: Vec<Vec<Value>> = Vec::new();
         for at in 0.. {
             let Some(chunk) = out.at(at).expect("readable") else { break };
             // row at a time: reading a handful of answer rows back out in a test, where a kernel
@@ -3358,5 +3747,72 @@ mod tests {
         assert_eq!(wide.count(), 2);
         assert_eq!(wide.mean_count, 2);
         assert_eq!(size_of::<CompactNumeric>(), 32);
+    }
+
+    #[test]
+    fn fixed_radix_partition_aggregates_collisions_and_nulls_exactly() {
+        let mut partition = FixedPartition::default();
+        let row = |first, second, sum, mean| FixedRecord { hash: 7, first, second, sum, mean };
+        partition.push(row(1, 2, 3, 4), FixedRecord::ALL);
+        partition
+            .push(row(1, 2, 5, 0), FixedRecord::FIRST | FixedRecord::SECOND | FixedRecord::SUM);
+        partition.push(row(0, 2, 0, 6), FixedRecord::SECOND | FixedRecord::MEAN);
+        partition.push(row(0, 2, 7, 8), FixedRecord::SECOND | FixedRecord::SUM | FixedRecord::MEAN);
+        let calls = [
+            Call {
+                name: "count_star".into(),
+                args: Vec::new(),
+                distinct: false,
+                filter: None,
+                returns: LogicalType::BigInt,
+                affine: None,
+            },
+            Call {
+                name: "sum".into(),
+                args: Vec::new(),
+                distinct: false,
+                filter: None,
+                returns: LogicalType::HugeInt,
+                affine: None,
+            },
+            Call {
+                name: "avg".into(),
+                args: Vec::new(),
+                distinct: false,
+                filter: None,
+                returns: LogicalType::Double,
+                affine: None,
+            },
+        ];
+
+        let part = fixed_partition(&mut partition, 10, &calls, &Memory::unlimited())
+            .expect("the fixed partition");
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for chunk in part.chunks {
+            for row in 0..chunk.len() {
+                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+            }
+        }
+        rows.sort_by_key(|row| format!("{:?}", row[0]));
+        assert_eq!(
+            rows,
+            [
+                vec![
+                    Value::BigInt(1),
+                    Value::Integer(2),
+                    Value::BigInt(2),
+                    Value::HugeInt(8),
+                    Value::Double(4.0),
+                ],
+                vec![
+                    Value::Null,
+                    Value::Integer(2),
+                    Value::BigInt(2),
+                    Value::HugeInt(7),
+                    Value::Double(7.0),
+                ],
+            ]
+        );
+        assert_eq!(size_of::<FixedRecord>(), 24);
     }
 }

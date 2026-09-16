@@ -999,6 +999,26 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64]) {
         }
         return;
     }
+    if let Some(packed) = column.packed_parts() {
+        for (row, state) in hashes.iter_mut().enumerate().take(rows) {
+            if !validity.is_valid(row) {
+                *state = mix(*state, NOTHING);
+                continue;
+            }
+            let value = packed.base() + i128::from(packed.code(row));
+            *state = match column.logical_type() {
+                rudb_common::LogicalType::HugeInt | rudb_common::LogicalType::Decimal { .. } => {
+                    mix(mix(*state, value as u64), (value >> 64) as u64)
+                }
+                rudb_common::LogicalType::UHugeInt => {
+                    let value = value as u128;
+                    mix(mix(*state, value as u64), (value >> 64) as u64)
+                }
+                _ => mix(*state, value as u64),
+            };
+        }
+        return;
+    }
     /// One pass over a run of values, turning each into a word the same way the general path does.
     macro_rules! run {
         ($values:expr, $word:expr) => {{
@@ -1500,15 +1520,14 @@ mod tests {
         assert_eq!(column.value_at(7), Value::BigInt(7));
     }
 
-    /// The fallback in `holds` and `push_from`, which is the risk the two fast paths carry. A packed
-    /// column cannot hand a row over as an integer, and a probe that read that `None` as a key that
-    /// did not match would put every row of one in a group of its own.
+    /// Packed integer keys take the same typed path as flat keys and still group identically.
     #[test]
     fn a_packed_integer_column_groups_the_same_as_the_flat_one_it_stands_for() {
         let values: Vec<Value> = (0..256).map(|row| Value::BigInt(row % 7)).collect();
         let plain = flat(LogicalType::BigInt, &values);
         let packed = plain.bit_packed().expect("a column of seven small values packs");
-        assert!(packed.signed_at(0).is_none(), "a packed row is not an integer a read can reach");
+        assert_eq!(packed.signed_at(0), Some(0), "a packed row stays in code space");
+        assert_eq!(hashed(&packed), hashed(&plain), "packing does not change a key's hash");
 
         let mut grouped = Vec::new();
         for column in [&plain, &packed] {
