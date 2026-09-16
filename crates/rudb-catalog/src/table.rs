@@ -112,13 +112,13 @@ impl Rows {
         const MAX_WORKERS: usize = 8;
         let workers = columns.len().div_ceil(MIN_COLUMNS_PER_WORKER).min(MAX_WORKERS);
         if workers <= 1 {
-            return reader.read(stripe, columns);
+            return reader.read_sparse(stripe, columns);
         }
         let width = columns.len().div_ceil(workers);
         let pieces = std::thread::scope(|scope| {
             let handles = columns
                 .chunks(width)
-                .map(|columns| scope.spawn(|| reader.read(stripe, columns)))
+                .map(|columns| scope.spawn(|| reader.read_sparse(stripe, columns)))
                 .collect::<Vec<_>>();
             handles
                 .into_iter()
