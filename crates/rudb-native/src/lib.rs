@@ -22,8 +22,10 @@ use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, TextSource, Vector};
 
-const MAGIC: &[u8; 8] = b"RUDBNV7\0";
-const DIRECTORY: &[u8; 8] = b"RUDBDIR7";
+const MAGIC_V7: &[u8; 8] = b"RUDBNV7\0";
+const MAGIC: &[u8; 8] = b"RUDBNV8\0";
+const DIRECTORY_V7: &[u8; 8] = b"RUDBDIR7";
+const DIRECTORY: &[u8; 8] = b"RUDBDIR8";
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -163,6 +165,7 @@ struct FrequencySummary {
 pub struct Stripe {
     rows: usize,
     pages: Vec<Page>,
+    memberships: Vec<Option<Page>>,
     zone: Zone,
 }
 
@@ -305,17 +308,18 @@ struct PendingStripe {
     order: (u64, u64),
     rows: usize,
     pages: Vec<Vec<u8>>,
+    memberships: Vec<Option<Vec<u8>>>,
     zone: Zone,
 }
 
 const EXTENT_STRIPES: usize = 32;
 
 impl Writer {
-    /// Creates a new v7 file and its first table.
+    /// Creates a new v8 file and its first table.
     ///
     /// # Errors
     ///
-    /// If the file exists, a field has no v7 scalar encoding, or the path cannot be written.
+    /// If the file exists, a field has no v8 scalar encoding, or the path cannot be written.
     pub fn create(
         path: impl AsRef<Path>,
         name: impl Into<String>,
@@ -328,7 +332,7 @@ impl Writer {
             OpenOptions::new().write(true).read(true).create_new(true).open(path).map_err(io)?;
         let mut header = [0; HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
-        header[8..12].copy_from_slice(&7_u32.to_le_bytes());
+        header[8..12].copy_from_slice(&8_u32.to_le_bytes());
         file.write_all(&header).map_err(io)?;
         Ok(Self {
             file,
@@ -379,23 +383,31 @@ impl Writer {
             return Err(invalid("chunk width differs from table schema"));
         }
         let mut pages = Vec::with_capacity(chunk.width());
+        let mut memberships = Vec::with_capacity(chunk.width());
         for (index, field) in self.table.fields.iter().enumerate() {
             let column = chunk.column(index)?;
             if column.logical_type() != &field.ty {
                 return Err(invalid("chunk type differs from table schema"));
             }
-            let bytes = encode(column, self.dictionaries[index].as_mut())?;
+            let (bytes, membership) = encode(column, self.dictionaries[index].as_mut())?;
             if bytes.len() > MAX_PAGE {
                 return Err(invalid("column page exceeds the configured bound"));
             }
             pages.push(bytes);
+            memberships.push(membership);
         }
         self.table.rows = self
             .table
             .rows
             .checked_add(chunk.len())
             .ok_or_else(|| invalid("row count overflow"))?;
-        self.pending.push(PendingStripe { order, rows: chunk.len(), pages, zone: Zone::of(chunk) });
+        self.pending.push(PendingStripe {
+            order,
+            rows: chunk.len(),
+            pages,
+            memberships,
+            zone: Zone::of(chunk),
+        });
         if self.pending.len() == EXTENT_STRIPES {
             self.flush_pending()?;
         }
@@ -409,6 +421,7 @@ impl Writer {
         }
         let width = self.table.fields.len();
         let mut pages = vec![Vec::with_capacity(width); self.pending.len()];
+        let mut memberships = vec![vec![None; width]; self.pending.len()];
         for column in 0..width {
             for (stripe, pending) in self.pending.iter().enumerate() {
                 let bytes = &pending.pages[column];
@@ -421,9 +434,27 @@ impl Writer {
                     hash: checksum(bytes),
                 });
             }
+            for (stripe, pending) in self.pending.iter().enumerate() {
+                let Some(bytes) = &pending.memberships[column] else { continue };
+                let offset = self.file.stream_position().map_err(io)?;
+                self.file.write_all(bytes).map_err(io)?;
+                *memberships[stripe]
+                    .get_mut(column)
+                    .ok_or_else(|| invalid("membership column is missing"))? = Some(Page {
+                    offset,
+                    length: u32::try_from(bytes.len())
+                        .map_err(|_| invalid("membership page length overflow"))?,
+                    hash: checksum(bytes),
+                });
+            }
         }
-        for (pending, pages) in self.pending.drain(..).zip(pages) {
-            self.table.stripes.push(Stripe { rows: pending.rows, pages, zone: pending.zone });
+        for ((pending, pages), memberships) in self.pending.drain(..).zip(pages).zip(memberships) {
+            self.table.stripes.push(Stripe {
+                rows: pending.rows,
+                pages,
+                memberships,
+                zone: pending.zone,
+            });
             self.order.push(pending.order);
         }
         Ok(())
@@ -786,7 +817,9 @@ impl Reader {
         }
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header).map_err(io)?;
-        if &header[..8] != MAGIC || header[8..12] != 7_u32.to_le_bytes() {
+        let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        if !((&header[..8] == MAGIC && version == 8) || (&header[..8] == MAGIC_V7 && version == 7))
+        {
             return Err(invalid("magic or major version is unsupported"));
         }
         let mut selected = None;
@@ -811,7 +844,7 @@ impl Reader {
             }
         }
         let (_, bytes) = selected.ok_or_else(|| invalid("no committed directory slot is valid"))?;
-        let table = decode_directory(&bytes, size)?;
+        let table = decode_directory(&bytes, size, version)?;
         let extents = extent_parts(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
         let extent_cache = (0..table.fields.len())
@@ -928,6 +961,44 @@ impl Reader {
     /// If a stripe, column, page, or checksum is invalid.
     pub fn read_sparse(&self, stripe: usize, columns: &[usize]) -> Result<Chunk> {
         self.read_impl(stripe, columns, false)
+    }
+
+    /// Whether an exact global-code membership index proves that a stripe cannot contain any of
+    /// the sorted candidate codes.
+    ///
+    /// A file written before v8 has no membership index and conservatively keeps the stripe.
+    ///
+    /// # Errors
+    ///
+    /// If the stripe, column, index page, checksum, or delta stream is invalid.
+    pub fn skips_codes(&self, stripe: usize, column: usize, candidates: &[u32]) -> Result<bool> {
+        if candidates.is_empty() {
+            return Ok(true);
+        }
+        if candidates.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Error::internal("native code candidates are not sorted and unique"));
+        }
+        let stripe =
+            self.table.stripes.get(stripe).ok_or_else(|| invalid("stripe index out of range"))?;
+        let Some(page) = stripe.memberships.get(column).copied().flatten() else {
+            return Ok(false);
+        };
+        let mut bytes = vec![0; page.length as usize];
+        read_at(&self.file, page.offset, &mut bytes)?;
+        if checksum(&bytes) != page.hash {
+            return Err(invalid("membership page checksum differs"));
+        }
+        let codes = decode_membership(&bytes)?;
+        let mut left = 0;
+        let mut right = 0;
+        while left < codes.len() && right < candidates.len() {
+            match codes[left].cmp(&candidates[right]) {
+                Ordering::Less => left += 1,
+                Ordering::Greater => right += 1,
+                Ordering::Equal => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     fn read_impl(&self, stripe: usize, columns: &[usize], prefetch: bool) -> Result<Chunk> {
@@ -1090,7 +1161,11 @@ fn code_frequency(dictionary: &GlobalDictionary) -> FrequencySummary {
 }
 
 fn encode_directory(table: &Table) -> Result<Vec<u8>> {
-    let mut out = DIRECTORY.to_vec();
+    encode_directory_version(table, 8)
+}
+
+fn encode_directory_version(table: &Table, version: u32) -> Result<Vec<u8>> {
+    let mut out = if version == 7 { DIRECTORY_V7.to_vec() } else { DIRECTORY.to_vec() };
     let name = table.name.as_bytes();
     put_u16(&mut out, u16::try_from(name.len()).map_err(|_| invalid("table name too long"))?);
     out.extend_from_slice(name);
@@ -1124,6 +1199,18 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             put_u64(&mut out, page.offset);
             put_u32(&mut out, page.length);
             put_u64(&mut out, page.hash);
+        }
+        if version >= 8 {
+            for (field, membership) in table.fields.iter().zip(&stripe.memberships) {
+                if field.ty != LogicalType::Varchar {
+                    continue;
+                }
+                let page = membership
+                    .ok_or_else(|| invalid("string page has no code membership index"))?;
+                put_u64(&mut out, page.offset);
+                put_u32(&mut out, page.length);
+                put_u64(&mut out, page.hash);
+            }
         }
         for range in stripe.zone.columns() {
             put_bound(&mut out, range.low.as_ref())?;
@@ -1216,9 +1303,10 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
+fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
     let mut cur = Cursor { bytes, at: 0 };
-    if cur.take(8)? != DIRECTORY {
+    let expected = if version == 7 { DIRECTORY_V7 } else { DIRECTORY };
+    if cur.take(8)? != expected {
         return Err(invalid("directory magic differs"));
     }
     let name = cur.text()?;
@@ -1280,6 +1368,23 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             }
             pages.push(Page { offset, length, hash });
         }
+        let mut memberships = vec![None; width];
+        if version >= 8 {
+            for (column, field) in fields.iter().enumerate() {
+                if field.ty != LogicalType::Varchar {
+                    continue;
+                }
+                let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+                let end = page
+                    .offset
+                    .checked_add(u64::from(page.length))
+                    .ok_or_else(|| invalid("membership page offset overflow"))?;
+                if page.offset < HEADER || end > size || page.length as usize > MAX_PAGE {
+                    return Err(invalid("membership page range is outside the file"));
+                }
+                memberships[column] = Some(page);
+            }
+        }
         let mut ranges = Vec::with_capacity(width);
         for _ in 0..width {
             let low = cur.bound()?;
@@ -1290,7 +1395,12 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             }
             ranges.push(Range { low, high, nulls });
         }
-        stripes.push(Stripe { rows: stripe_rows, pages, zone: Zone::from_ranges(ranges) });
+        stripes.push(Stripe {
+            rows: stripe_rows,
+            pages,
+            memberships,
+            zone: Zone::from_ranges(ranges),
+        });
     }
     if total != rows {
         return Err(invalid("table row count differs from stripes"));
@@ -1383,7 +1493,10 @@ fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
     Ok(())
 }
 
-fn encode(vector: &Vector, global: Option<&mut GlobalDictionary>) -> Result<Vec<u8>> {
+fn encode(
+    vector: &Vector,
+    global: Option<&mut GlobalDictionary>,
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     let ty = vector.logical_type();
     // flatten: the file writer needs a uniform scalar page and does it once per loaded chunk.
     let flat = vector.flatten()?;
@@ -1399,6 +1512,7 @@ fn encode(vector: &Vector, global: Option<&mut GlobalDictionary>) -> Result<Vec<
         }
         global_codes = Some(codes);
     }
+    let membership = global_codes.as_deref().map(encode_membership);
     let dictionary = if global_codes.is_none() && ty == &LogicalType::Varchar {
         string_dictionary(&flat)?
     } else {
@@ -1441,11 +1555,11 @@ fn encode(vector: &Vector, global: Option<&mut GlobalDictionary>) -> Result<Vec<
         for code in codes {
             put_u32(&mut out, code);
         }
-        return Ok(out);
+        return Ok((out, membership));
     }
     if let Some(dictionary) = dictionary {
         out.extend_from_slice(&dictionary);
-        return Ok(out);
+        return Ok((out, membership));
     }
     if let Some(packed) = packed {
         if packed.offset() != 0 {
@@ -1460,7 +1574,7 @@ fn encode(vector: &Vector, global: Option<&mut GlobalDictionary>) -> Result<Vec<
         for word in packed.words() {
             put_u64(&mut out, *word);
         }
-        return Ok(out);
+        return Ok((out, membership));
     }
     let data = flat.data().ok_or_else(|| invalid("scalar column did not flatten"))?;
     match (ty, data) {
@@ -1500,7 +1614,74 @@ fn encode(vector: &Vector, global: Option<&mut GlobalDictionary>) -> Result<Vec<
         }
         _ => return Err(Error::not_implemented(format!("native page for {ty}"))),
     }
-    Ok(out)
+    Ok((out, membership))
+}
+
+fn put_varint(out: &mut Vec<u8>, mut value: u32) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn encode_membership(codes: &[u32]) -> Vec<u8> {
+    let mut unique = codes.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    let mut out = Vec::with_capacity(unique.len().saturating_mul(2).saturating_add(5));
+    put_varint(&mut out, u32::try_from(unique.len()).unwrap_or(u32::MAX));
+    let mut previous = 0;
+    for (at, code) in unique.into_iter().enumerate() {
+        put_varint(&mut out, if at == 0 { code } else { code - previous });
+        previous = code;
+    }
+    out
+}
+
+fn take_varint(bytes: &[u8], at: &mut usize) -> Result<u32> {
+    let mut value = 0_u32;
+    for shift in (0..35).step_by(7) {
+        let byte = *bytes.get(*at).ok_or_else(|| invalid("membership varint is truncated"))?;
+        *at += 1;
+        let part = u32::from(byte & 0x7f);
+        if shift == 28 && part > 0x0f {
+            return Err(invalid("membership varint overflow"));
+        }
+        value = value
+            .checked_add(
+                part.checked_shl(shift).ok_or_else(|| invalid("membership varint overflow"))?,
+            )
+            .ok_or_else(|| invalid("membership varint overflow"))?;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(invalid("membership varint is too long"))
+}
+
+fn decode_membership(bytes: &[u8]) -> Result<Vec<u32>> {
+    let mut at = 0;
+    let count = take_varint(bytes, &mut at)? as usize;
+    let mut codes = Vec::with_capacity(count);
+    let mut previous = 0_u32;
+    for index in 0..count {
+        let delta = take_varint(bytes, &mut at)?;
+        let code = if index == 0 {
+            delta
+        } else {
+            previous.checked_add(delta).ok_or_else(|| invalid("membership code overflow"))?
+        };
+        if index > 0 && code <= previous {
+            return Err(invalid("membership codes are not increasing"));
+        }
+        codes.push(code);
+        previous = code;
+    }
+    if at != bytes.len() {
+        return Err(invalid("membership page has trailing bytes"));
+    }
+    Ok(codes)
 }
 
 fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
@@ -1880,6 +2061,9 @@ mod tests {
         assert_eq!(sparse.width(), 1);
         assert_eq!(sparse.value_at(1, 0), Value::Null);
         assert_eq!(sparse.value_at(2, 0), Value::Varchar("long text after a slash".into()));
+        assert!(!reader.skips_codes(0, 1, &[0]).expect("alpha is in the stripe"));
+        assert!(!reader.skips_codes(0, 1, &[2]).expect("long text is in the stripe"));
+        assert!(reader.skips_codes(0, 1, &[3]).expect("unknown code is absent"));
         let count = reader.read(0, &[]).expect("no page is needed for count");
         assert_eq!(count.len(), 3);
         assert!(reader.skips(0, &[Probe { column: 0, op: Op::Greater, value: Bound::Int(100) }]));
@@ -1959,6 +2143,45 @@ mod tests {
     }
 
     #[test]
+    fn damaged_membership_cannot_skip_a_string_page() {
+        let path = path("damaged-membership");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("id", LogicalType::Integer),
+                Field::new("text", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        writer.append(&sample()).expect("stripe written");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let membership = reader.table.stripes[0].memberships[1].expect("string membership");
+        let mut file = OpenOptions::new().write(true).open(&path).expect("open membership page");
+        file.seek(SeekFrom::Start(membership.offset)).expect("membership start");
+        file.write_all(&[255]).expect("damage membership");
+        let error = reader.skips_codes(0, 1, &[3]).expect_err("corruption must not skip rows");
+        assert!(error.message().contains("membership page checksum differs"), "{error}");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn membership_delta_stream_is_sorted_exact_and_bounded() {
+        let encoded = encode_membership(&[900, 4, 4, 72, 9, u32::MAX]);
+        assert_eq!(
+            decode_membership(&encoded).expect("valid membership"),
+            [4, 9, 72, 900, u32::MAX]
+        );
+        assert!(decode_membership(&[1, 0x80]).is_err(), "a truncated varint is invalid");
+        assert!(
+            decode_membership(&[1, 0xff, 0xff, 0xff, 0xff, 0x10]).is_err(),
+            "a value past u32 is invalid"
+        );
+    }
+
+    #[test]
     fn a_global_dictionary_may_be_larger_than_one_column_page() {
         let dictionary = Page {
             offset: HEADER,
@@ -1976,7 +2199,10 @@ mod tests {
         let directory = encode_directory(&table).expect("directory");
         let file_size = dictionary.offset + u64::from(dictionary.length) + 1;
 
-        let decoded = decode_directory(&directory, file_size).expect("large lazy dictionary");
+        let decoded = decode_directory(&directory, file_size, 8).expect("large lazy dictionary");
         assert_eq!(decoded.dictionaries[0].expect("dictionary").length, dictionary.length);
+        let legacy = encode_directory_version(&table, 7).expect("legacy directory");
+        let decoded = decode_directory(&legacy, file_size, 7).expect("v7 remains readable");
+        assert_eq!(decoded.dictionaries[0].expect("legacy dictionary").length, dictionary.length);
     }
 }
