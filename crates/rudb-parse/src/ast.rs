@@ -634,6 +634,13 @@ pub enum Expr {
         /// The query.
         query: QueryRef,
     },
+    /// `EXISTS (SELECT ...)` or its negation.
+    Exists {
+        /// The query whose cardinality is tested.
+        query: QueryRef,
+        /// Whether `NOT` was written before `EXISTS`.
+        negated: bool,
+    },
 }
 
 /// One `WHEN a THEN b`.

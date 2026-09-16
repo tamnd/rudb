@@ -68,11 +68,60 @@ impl Binder<'_> {
             ast::Expr::List { items } => self.bind_list(ast, items, scope),
             ast::Expr::Parameter { name } => self.bind_parameter(ast, name),
             ast::Expr::Subquery { query } => self.bind_scalar_subquery(ast, query),
+            ast::Expr::Exists { query, negated } => self.bind_exists_subquery(ast, query, negated),
         }
     }
 
     /// Binds an uncorrelated scalar query and returns its one output as a column expression.
     fn bind_scalar_subquery(&mut self, ast: &Ast, query: ast::QueryRef) -> Result<ExprRef> {
+        let (node, scope) = self.bind_isolated_subquery(ast, query)?;
+        let [column] = scope.columns.as_slice() else {
+            return Err(Error::binder(format!(
+                "Subquery returns {} columns - expected 1",
+                scope.len()
+            )));
+        };
+        let expr = self.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
+        self.scalar_subqueries.push(node);
+        Ok(expr)
+    }
+
+    /// Binds an uncorrelated existence test as a nullable marker joined once into the outer rows.
+    fn bind_exists_subquery(
+        &mut self,
+        ast: &Ast,
+        query: ast::QueryRef,
+        negated: bool,
+    ) -> Result<ExprRef> {
+        let (node, _) = self.bind_isolated_subquery(ast, query)?;
+        let node = self.plan_mut().add_node(rudb_plan::Node::Limit {
+            input: node,
+            count: Some(1),
+            offset: 0,
+        });
+        let index = self.fresh_index();
+        let marker = self.plan_mut().add_constant(Value::Boolean(true));
+        let exprs = self.plan_mut().add_expr_list(&[marker]);
+        let name = self.plan_mut().intern("exists");
+        let names = self.plan_mut().add_name_list(&[name]);
+        let node =
+            self.plan_mut().add_node(rudb_plan::Node::Project { input: node, index, exprs, names });
+        let marker = self
+            .plan_mut()
+            .add_expr(Expr::Column(rudb_plan::ColumnBinding::new(index, 0)), LogicalType::Boolean);
+        self.scalar_subqueries.push(node);
+        self.against_null(
+            if negated { CompareOp::NotDistinctFrom } else { CompareOp::DistinctFrom },
+            marker,
+        )
+    }
+
+    /// Binds a query in its own aggregation and pending-subquery state.
+    fn bind_isolated_subquery(
+        &mut self,
+        ast: &Ast,
+        query: ast::QueryRef,
+    ) -> Result<(rudb_plan::NodeRef, Scope)> {
         let outer_aggregation = self.aggregation.take();
         let outer_in_aggregate = std::mem::replace(&mut self.in_aggregate, false);
         let outer_subqueries = std::mem::take(&mut self.scalar_subqueries);
@@ -90,15 +139,7 @@ impl Binder<'_> {
             nested_subqueries.is_empty(),
             "a nested select left scalar queries unattached"
         );
-        let [column] = scope.columns.as_slice() else {
-            return Err(Error::binder(format!(
-                "Subquery returns {} columns - expected 1",
-                scope.len()
-            )));
-        };
-        let expr = self.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
-        self.scalar_subqueries.push(node);
-        Ok(expr)
+        Ok((node, scope))
     }
 
     /// `?`, `?1`, `$1` or `$name`, which is the value the statement was prepared with.
@@ -751,7 +792,7 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
             ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
         }
         // A subquery has its own aggregation and does not make the outer block aggregate.
-        ast::Expr::Subquery { .. } => false,
+        ast::Expr::Subquery { .. } | ast::Expr::Exists { .. } => false,
     }
 }
 
@@ -952,6 +993,10 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         // the value turns out to be.
         ast::Expr::Parameter { name } => format!("${}", ast.string(name)),
         ast::Expr::Subquery { .. } => "subquery".to_string(),
+        ast::Expr::Exists { query, negated } => {
+            let exists = format!("EXISTS({})", rudb_parse::deparse::query(ast, query));
+            if negated { format!("(NOT {exists})") } else { exists }
+        }
     }
 }
 

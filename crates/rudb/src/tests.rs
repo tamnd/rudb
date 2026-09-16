@@ -2072,6 +2072,36 @@ fn scalar_subquery_multiple_row_behavior_is_a_bound_semantic() {
 }
 
 #[test]
+fn uncorrelated_exists_is_a_single_joined_marker() {
+    let db = database();
+    let answer = db.query("SELECT EXISTS (SELECT 1)").expect("EXISTS answers");
+    assert_eq!(answer.column_name(0), "EXISTS(SELECT 1)");
+    assert_eq!(answer.rows().collect::<Vec<_>>(), vec![vec![Value::Boolean(true)]]);
+    let negated = db.query("SELECT NOT EXISTS (SELECT 1 WHERE false)").expect("NOT EXISTS answers");
+    assert_eq!(negated.column_name(0), "(NOT EXISTS(SELECT 1 WHERE false))");
+    assert_eq!(negated.rows().collect::<Vec<_>>(), vec![vec![Value::Boolean(true)]]);
+    assert_eq!(
+        rows(&db, "SELECT EXISTS (SELECT 1 WHERE false)"),
+        vec![vec![Value::Boolean(false)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT EXISTS (SELECT NULL FROM range(3))"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT x FROM (VALUES (1), (2)) t(x) WHERE EXISTS (SELECT 1) ORDER BY x"),
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+    assert!(
+        rows(&db, "SELECT x FROM (VALUES (1), (2)) t(x) WHERE EXISTS (SELECT 1 WHERE false)")
+            .is_empty()
+    );
+    let plan = db.plan("SELECT EXISTS (SELECT * FROM range(1000))").expect("EXISTS plans");
+    assert!(plan.contains("Join SINGLE"), "{plan}");
+    assert!(plan.contains("Limit 1 offset 0"), "{plan}");
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
