@@ -107,6 +107,7 @@ pub fn defer(plan: &mut Plan) {
 
 /// The rewritten top of `at` when it is a top N this applies to, and nothing when it is not.
 fn fetch(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
+    let span = plan.node_span(at);
     let Node::TopN { input, keys, count, offset } = *plan.node(at) else { return None };
     if count.saturating_add(offset) > WORTH_FETCHING {
         return None;
@@ -160,33 +161,40 @@ fn fetch(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     for &node in chain.iter().rev().skip(1) {
         carried = carry(plan, node, carried);
     }
-    let row = plan.add_expr(Expr::Column(carried), LogicalType::BigInt);
+    let row = plan.add_expr_at(Expr::Column(carried), LogicalType::BigInt, span);
 
-    let narrow = narrow(plan, under, &wanted, row);
-    let above = top(plan, narrow, &ordering, count, offset);
+    let narrow = narrow(plan, under, &wanted, row, span);
+    let above = top(plan, narrow, &ordering, count, offset, span);
     let deferred = fields(plan, scan, &columns);
-    let ordinal = plan.add_expr(
+    let ordinal = plan.add_expr_at(
         Expr::Column(ColumnBinding::new(narrow_index(plan, narrow), wanted.len() as u32)),
         LogicalType::BigInt,
+        span,
     );
     let fetched_index = if deferred_projects.is_some() { walk::fresh_index(plan) } else { index };
     let fetched = match *plan.node(scan) {
-        Node::TableFunction { args, .. } => plan.add_node(Node::Fetch {
-            input: above,
-            index: fetched_index,
-            args,
-            columns: deferred,
-            row: ordinal,
-        }),
-        Node::Get { catalog, schema, table, .. } => plan.add_node(Node::TableFetch {
-            input: above,
-            index: fetched_index,
-            catalog,
-            schema,
-            table,
-            columns: deferred,
-            row: ordinal,
-        }),
+        Node::TableFunction { args, .. } => plan.add_node_at(
+            Node::Fetch {
+                input: above,
+                index: fetched_index,
+                args,
+                columns: deferred,
+                row: ordinal,
+            },
+            span,
+        ),
+        Node::Get { catalog, schema, table, .. } => plan.add_node_at(
+            Node::TableFetch {
+                input: above,
+                index: fetched_index,
+                catalog,
+                schema,
+                table,
+                columns: deferred,
+                row: ordinal,
+            },
+            span,
+        ),
         _ => return None,
     };
     match deferred_projects {
@@ -278,10 +286,9 @@ fn replay(
 fn rebase(plan: &mut Plan, expr: u32, tables: &HashMap<u32, u32>) -> u32 {
     if let Expr::Column(binding) = *plan.expr(expr) {
         let table = tables.get(&binding.table).copied().unwrap_or(binding.table);
-        return plan.add_expr(
-            Expr::Column(ColumnBinding::new(table, binding.column)),
-            plan.expr_type(expr).clone(),
-        );
+        let ty = plan.expr_type(expr).clone();
+        let span = plan.expr_span(expr);
+        return plan.add_expr_at(Expr::Column(ColumnBinding::new(table, binding.column)), ty, span);
     }
     walk::rebuild(plan, expr, &mut |plan, child| rebase(plan, child, tables))
 }
@@ -292,7 +299,13 @@ fn narrow_index(plan: &Plan, node: NodeRef) -> u32 {
 }
 
 /// The projection that goes under the top N: the ordering columns and then the ordinal.
-fn narrow(plan: &mut Plan, input: NodeRef, wanted: &[(u32, u32)], row: u32) -> NodeRef {
+fn narrow(
+    plan: &mut Plan,
+    input: NodeRef,
+    wanted: &[(u32, u32)],
+    row: u32,
+    span: rudb_common::Span,
+) -> NodeRef {
     let index = walk::fresh_index(plan);
     let mut exprs: Vec<u32> = wanted.iter().map(|&(expr, _)| expr).collect();
     let mut names: Vec<u32> = wanted.iter().map(|&(_, name)| name).collect();
@@ -300,21 +313,29 @@ fn narrow(plan: &mut Plan, input: NodeRef, wanted: &[(u32, u32)], row: u32) -> N
     names.push(plan.intern(FILE_ROW_NUMBER));
     let exprs = plan.add_expr_list(&exprs);
     let names = plan.add_name_list(&names);
-    plan.add_node(Node::Project { input, index, exprs, names })
+    plan.add_node_at(Node::Project { input, index, exprs, names }, span)
 }
 
 /// The top N over the narrowed projection, ordering by the columns it now produces.
-fn top(plan: &mut Plan, input: NodeRef, ordering: &[SortKey], count: u64, offset: u64) -> NodeRef {
+fn top(
+    plan: &mut Plan,
+    input: NodeRef,
+    ordering: &[SortKey],
+    count: u64,
+    offset: u64,
+    span: rudb_common::Span,
+) -> NodeRef {
     let index = narrow_index(plan, input);
     let mut keys = Vec::with_capacity(ordering.len());
     for (at, key) in ordering.iter().enumerate() {
         let column = u32::try_from(at).unwrap_or(u32::MAX);
         let ty = plan.expr_type(key.expr).clone();
-        let expr = plan.add_expr(Expr::Column(ColumnBinding::new(index, column)), ty);
+        let expr_span = plan.expr_span(key.expr);
+        let expr = plan.add_expr_at(Expr::Column(ColumnBinding::new(index, column)), ty, expr_span);
         keys.push(SortKey { expr, descending: key.descending, nulls_first: key.nulls_first });
     }
     let keys = plan.add_sort_keys(&keys);
-    plan.add_node(Node::TopN { input, keys, count, offset })
+    plan.add_node_at(Node::TopN { input, keys, count, offset }, span)
 }
 
 /// The fields the fetch produces, which are the file's own for the columns it was asked for.
@@ -435,7 +456,9 @@ fn number(plan: &mut Plan, scan: NodeRef) -> Option<ColumnBinding> {
     let mut names = plan.name_list(options).to_vec();
     let mut values = plan.expr_list(settings).to_vec();
     names.push(plan.intern(FILE_ROW_NUMBER));
-    values.push(plan.add_constant(Value::Boolean(true)));
+    let span = plan.node_span(scan);
+    let value = plan.add_value(Value::Boolean(true));
+    values.push(plan.add_expr_at(Expr::Constant(value), LogicalType::Boolean, span));
     let named = plan.add_name_list(&names);
     let given = plan.add_expr_list(&values);
 
@@ -456,7 +479,8 @@ fn carry(plan: &mut Plan, node: NodeRef, below: ColumnBinding) -> ColumnBinding 
     let mut held = plan.expr_list(exprs).to_vec();
     let mut labels = plan.name_list(names).to_vec();
     let at = u32::try_from(held.len()).unwrap_or(u32::MAX);
-    held.push(plan.add_expr(Expr::Column(below), LogicalType::BigInt));
+    let span = plan.node_span(node);
+    held.push(plan.add_expr_at(Expr::Column(below), LogicalType::BigInt, span));
     labels.push(plan.intern(FILE_ROW_NUMBER));
     let widened = plan.add_expr_list(&held);
     let renamed = plan.add_name_list(&labels);
