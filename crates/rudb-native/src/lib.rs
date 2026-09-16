@@ -129,6 +129,8 @@ pub struct Writer {
     file: File,
     table: Table,
     generation: u64,
+    order: Vec<(u64, u64)>,
+    next_order: u64,
 }
 
 impl Writer {
@@ -155,6 +157,8 @@ impl Writer {
             file,
             table: Table { name: name.into(), fields, stripes: Vec::new(), rows: 0 },
             generation: 1,
+            order: Vec::new(),
+            next_order: 0,
         })
     }
 
@@ -164,6 +168,21 @@ impl Writer {
     ///
     /// If its width or types differ from the declared table, or a page exceeds its bound.
     pub fn append(&mut self, chunk: &Chunk) -> Result<()> {
+        let order = (self.next_order, 0);
+        self.next_order = self.next_order.saturating_add(1);
+        self.append_at(order, chunk)
+    }
+
+    /// Writes one chunk and records its source position for directory ordering.
+    ///
+    /// Pages may be encoded by parallel pipeline instances and reach the file in completion order.
+    /// Their directory entries are sorted by this key at commit, so a scan still observes source
+    /// order without holding the page bytes until earlier work finishes.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::append`].
+    pub fn append_at(&mut self, order: (u64, u64), chunk: &Chunk) -> Result<()> {
         if chunk.is_empty() {
             return Ok(());
         }
@@ -194,6 +213,7 @@ impl Writer {
             .checked_add(chunk.len())
             .ok_or_else(|| invalid("row count overflow"))?;
         self.table.stripes.push(Stripe { rows: chunk.len(), pages });
+        self.order.push(order);
         Ok(())
     }
 
@@ -203,6 +223,9 @@ impl Writer {
     ///
     /// If directory encoding, writing, or syncing fails.
     pub fn finish(mut self) -> Result<Table> {
+        let mut stripes = self.order.into_iter().zip(self.table.stripes).collect::<Vec<_>>();
+        stripes.sort_by_key(|(order, _)| *order);
+        self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
         let directory = encode_directory(&self.table)?;
         if directory.len() > MAX_DIRECTORY {
             return Err(invalid("directory exceeds the configured bound"));

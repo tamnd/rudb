@@ -44,7 +44,7 @@ pub struct Query<'a> {
     /// The driver counters for each pipeline, in the same order.
     drivers: Vec<Arc<Driver>>,
     /// Where the last pipeline puts its rows.
-    reader: RootReader,
+    reader: Option<RootReader>,
     /// What the query produces.
     schema: Schema,
     /// CPU nanoseconds burned on threads other than the one that called [`Query::run`].
@@ -65,7 +65,7 @@ impl<'a> Query<'a> {
     pub(crate) fn new(
         pipelines: Vec<Pipeline<'a>>,
         drivers: Vec<Arc<Driver>>,
-        reader: RootReader,
+        reader: Option<RootReader>,
         schema: Schema,
     ) -> Result<Self> {
         for (at, pipeline) in pipelines.iter().enumerate() {
@@ -162,7 +162,10 @@ impl<'a> Query<'a> {
     /// [`ErrorCode::Internal`](rudb_common::ErrorCode::Internal) if a thread panicked while holding
     /// the queue.
     pub fn next_chunk(&self) -> Result<Option<Chunk>> {
-        self.reader.next_chunk()
+        self.reader
+            .as_ref()
+            .ok_or_else(|| Error::internal("a query built into a sink has no result reader"))?
+            .next_chunk()
     }
 
     /// Runs the query and collects everything it produced.
