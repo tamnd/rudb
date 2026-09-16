@@ -96,7 +96,7 @@ impl Rows {
     pub fn skips(&self, at: usize, probes: &[Probe]) -> bool {
         match self {
             Self::Memory(rows) => rows.skips(at, probes),
-            Self::Native(_) => false,
+            Self::Native(reader) => reader.skips(at, probes),
         }
     }
 
