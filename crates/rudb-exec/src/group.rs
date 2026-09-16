@@ -310,7 +310,6 @@ impl EncodedCountPartition {
 
 #[derive(Debug, Clone, Copy)]
 struct FixedRecord {
-    hash: u64,
     first: i64,
     second: i32,
     sum: i16,
@@ -330,6 +329,18 @@ impl FixedRecord {
     const SUM: u8 = 4;
     const MEAN: u8 = 8;
     const ALL: u8 = Self::FIRST | Self::SECOND | Self::SUM | Self::MEAN;
+}
+
+/// The two group keys' hash. Fixed records leave this cheap derived word out so that ten million
+/// exchanged rows occupy 160 MB rather than 240 MB. It is needed once to choose an owner and once
+/// when that owner builds its table; carrying it between those two points costs more bandwidth than
+/// the two integer mixes cost to repeat.
+fn fixed_hash(row: FixedRecord, valid: u8) -> u64 {
+    const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
+    let first = if valid & FixedRecord::FIRST != 0 { row.first as u64 } else { NOTHING };
+    let second =
+        if valid & FixedRecord::SECOND != 0 { i64::from(row.second) as u64 } else { NOTHING };
+    spread(mix(mix(0, first), second))
 }
 
 impl FixedPartition {
@@ -731,25 +742,14 @@ impl<'a> Aggregate<'a> {
                 })?)
                 .map_err(|_| Error::internal("a fixed SMALLINT mean is out of range"))?
             };
-            const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
-            let first_word =
-                if valid & FixedRecord::FIRST != 0 { first_value as u64 } else { NOTHING };
-            let second_word = if valid & FixedRecord::SECOND != 0 {
-                i64::from(second_value) as u64
-            } else {
-                NOTHING
+            let record = FixedRecord {
+                first: first_value,
+                second: second_value,
+                sum: sum_value,
+                mean: mean_value,
             };
-            let hash = spread(mix(mix(0, first_word), second_word));
-            partitions[(hash >> shift) as usize].push(
-                FixedRecord {
-                    hash,
-                    first: first_value,
-                    second: second_value,
-                    sum: sum_value,
-                    mean: mean_value,
-                },
-                valid,
-            );
+            let hash = fixed_hash(record, valid);
+            partitions[(hash >> shift) as usize].push(record, valid);
         }
         let after = partitions.iter().map(FixedPartition::footprint).sum::<usize>();
         memory.grow(width_of(after.saturating_sub(before)))
@@ -3555,7 +3555,7 @@ fn fixed_partition(
     for source in 0..input {
         let row = partition.rows[source];
         let valid = if all_valid { FixedRecord::ALL } else { partition.validity[source] };
-        let mut at = row.hash as usize & mask;
+        let mut at = fixed_hash(row, valid) as usize & mask;
         let slot = loop {
             let slot = buckets[at];
             if slot == EMPTY {
@@ -3572,8 +3572,7 @@ fn fixed_partition(
             let slot = slot as usize;
             let held = partition.rows[slot];
             let held_valid = if all_valid { FixedRecord::ALL } else { partition.validity[slot] };
-            if held.hash == row.hash
-                && held.first == row.first
+            if held.first == row.first
                 && held.second == row.second
                 && held_valid & (FixedRecord::FIRST | FixedRecord::SECOND)
                     == valid & (FixedRecord::FIRST | FixedRecord::SECOND)
@@ -4603,7 +4602,7 @@ mod tests {
     #[test]
     fn fixed_radix_partition_aggregates_collisions_and_nulls_exactly() {
         let mut partition = FixedPartition::default();
-        let row = |first, second, sum, mean| FixedRecord { hash: 7, first, second, sum, mean };
+        let row = |first, second, sum, mean| FixedRecord { first, second, sum, mean };
         partition.push(row(1, 2, 3, 4), FixedRecord::ALL);
         partition
             .push(row(1, 2, 5, 0), FixedRecord::FIRST | FixedRecord::SECOND | FixedRecord::SUM);
@@ -4664,6 +4663,6 @@ mod tests {
                 ],
             ]
         );
-        assert_eq!(size_of::<FixedRecord>(), 24);
+        assert_eq!(size_of::<FixedRecord>(), 16);
     }
 }
