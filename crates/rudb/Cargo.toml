@@ -28,6 +28,7 @@ rudb-storage.workspace = true
 rudb-vector.workspace = true
 rudb-kernels.workspace = true
 rudb-metrics.workspace = true
+rudb-native.workspace = true
 rudb-arrow.workspace = true
 rudb-io.workspace = true
 

@@ -213,10 +213,19 @@ fn a_file_that_is_not_there_is_an_error() {
 }
 
 #[test]
-fn a_database_file_says_there_is_no_storage_format_yet() {
-    let (_, err, failed) = run(&["shop.db", "SELECT 1"]);
-    assert!(failed);
-    assert!(err.contains("no storage format"), "{err}");
+fn a_database_file_is_a_native_database() {
+    let path = std::env::temp_dir().join(format!("rudb-shell-{}.db", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    let (out, err, failed) = run(&[
+        name,
+        "CREATE TABLE t (a INTEGER)",
+        "INSERT INTO t VALUES (1), (2), (3)",
+        "CHECKPOINT",
+        "SELECT sum(a) FROM t",
+    ]);
+    assert!(!failed, "{err}");
+    assert!(out.contains('6'), "{out}");
+    std::fs::remove_file(path).expect("removes the temporary database");
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! The handle everything else hangs off.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rudb_bind::{Bound, Parameters};
@@ -47,6 +48,7 @@ pub(crate) struct Shared {
 #[derive(Debug)]
 struct Inner {
     catalog: RwLock<Catalog>,
+    path: Option<PathBuf>,
     settings: Settings,
     memory: Memory,
     pool: Pool,
@@ -71,7 +73,8 @@ impl Database {
         let memory = Memory::new(config.memory_limit());
         let pool = Pool::new(config.threads());
         let settings = Settings::new(config);
-        let inner = Inner { catalog: RwLock::new(Catalog::new()), settings, memory, pool };
+        let inner =
+            Inner { catalog: RwLock::new(Catalog::new()), path: None, settings, memory, pool };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
 
@@ -161,10 +164,17 @@ impl Database {
         if path.is_empty() || path == MEMORY {
             return Ok(Self::with_config(config));
         }
-        Err(Error::not_implemented(format!(
-            "cannot open \"{path}\", because there is no storage format yet, see \
-             https://github.com/tamnd/rudb/issues/103"
-        )))
+        let path = PathBuf::from(path);
+        let mut catalog = Catalog::new();
+        if path.exists() {
+            catalog.create_native_table(rudb_native::Reader::open(&path)?)?;
+        }
+        let memory = Memory::new(config.memory_limit());
+        let pool = Pool::new(config.threads());
+        let settings = Settings::new(config);
+        let inner =
+            Inner { catalog: RwLock::new(catalog), path: Some(path), settings, memory, pool };
+        Ok(Self { shared: Shared { inner: Arc::new(inner) } })
     }
 
     /// A connection to this database.
@@ -350,6 +360,34 @@ impl Database {
     pub fn value(&self, sql: &str) -> Result<Value> {
         single(&self.query(sql)?)
     }
+}
+
+/// Writes the one-table catalog as a complete native snapshot and publishes it by rename.
+fn persist(path: &Path, catalog: &Catalog) -> Result<()> {
+    let mut tables = catalog.tables();
+    let table =
+        tables.next().ok_or_else(|| Error::not_implemented("a native database with no table"))?;
+    if tables.next().is_some() {
+        return Err(Error::not_implemented("more than one table in a native database file"));
+    }
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    if temporary.exists() {
+        std::fs::remove_file(&temporary).map_err(|error| Error::io(error.to_string()))?;
+    }
+    let mut writer = rudb_native::Writer::create(
+        &temporary,
+        table.name().table.clone(),
+        table.columns().to_vec(),
+    )?;
+    for at in 0..table.rows().chunk_count() {
+        let chunk = table.rows().chunk(at).ok_or_else(|| {
+            Error::not_implemented("checkpointing a table already backed by a native file")
+        })?;
+        writer.append(chunk)?;
+    }
+    writer.finish()?;
+    std::fs::rename(&temporary, path).map_err(|error| Error::io(error.to_string()))?;
+    Ok(())
 }
 
 impl Shared {
@@ -544,6 +582,12 @@ impl Shared {
                     setting.scope,
                     value,
                 )?;
+                Ok(QueryResult::empty())
+            }
+            Bound::Checkpoint => {
+                if let Some(path) = &self.inner.path {
+                    persist(path, &catalog)?;
+                }
                 Ok(QueryResult::empty())
             }
             Bound::CreateTable(create) => {

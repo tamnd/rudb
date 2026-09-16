@@ -41,6 +41,8 @@ pub enum Bound {
     Insert(Insert),
     /// `SET name = value`, or `RESET name`, which is the same thing with no value.
     Setting(Setting),
+    /// Flushes a persistent database snapshot.
+    Checkpoint,
     /// `EXPLAIN` over a query, holding the plan of the query rather than the query.
     ///
     /// The same `Plan` a [`Bound::Query`] would have carried, bound the same way and by the same
@@ -188,6 +190,7 @@ pub fn bind_statement_with(
         ast::Statement::Set(index) | ast::Statement::Reset(index) => {
             setting(ast, catalog, parameters, session, index)
         }
+        ast::Statement::Checkpoint => Ok(Bound::Checkpoint),
         ast::Statement::Explain { query, analyze } => {
             let mut binder = Binder::with(catalog, parameters, session);
             let (root, _) = binder.bind_query(ast, query)?;

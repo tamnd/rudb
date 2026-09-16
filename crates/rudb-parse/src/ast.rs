@@ -85,6 +85,8 @@ pub enum Statement {
     Set(SettingRef),
     /// `RESET name`, which is the same shape with nothing on the right of it.
     Reset(SettingRef),
+    /// `CHECKPOINT` or `FORCE CHECKPOINT`.
+    Checkpoint,
     /// `EXPLAIN` over a query, and whether `ANALYZE` was asked for.
     ///
     /// The query rather than a statement, because the grammar lets every statement be explained
