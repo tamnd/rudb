@@ -694,6 +694,22 @@ impl Reader {
     ///
     /// If a stripe, column, page, or checksum is invalid.
     pub fn read(&self, stripe: usize, columns: &[usize]) -> Result<Chunk> {
+        self.read_impl(stripe, columns, true)
+    }
+
+    /// Reads named columns from one stripe without prefetching adjacent stripe pages.
+    ///
+    /// This is intended for sparse row fetches after a selective TopN or filter. Sequential scans
+    /// should use [`Self::read`] so adjacent pages share one extent read.
+    ///
+    /// # Errors
+    ///
+    /// If a stripe, column, page, or checksum is invalid.
+    pub fn read_sparse(&self, stripe: usize, columns: &[usize]) -> Result<Chunk> {
+        self.read_impl(stripe, columns, false)
+    }
+
+    fn read_impl(&self, stripe: usize, columns: &[usize], prefetch: bool) -> Result<Chunk> {
         let stripe_index = stripe;
         let stripe =
             self.table.stripes.get(stripe).ok_or_else(|| invalid("stripe index out of range"))?;
@@ -710,7 +726,7 @@ impl Reader {
                 .get(stripe_index)
                 .and_then(|parts| parts.get(column))
                 .ok_or_else(|| invalid("column extent is missing"))?;
-            let bytes = if part.length == page.length as usize {
+            let bytes = if !prefetch || part.length == page.length as usize {
                 let mut bytes = vec![0; page.length as usize];
                 read_at(&self.file, page.offset, &mut bytes)?;
                 Arc::new(bytes)
@@ -741,12 +757,12 @@ impl Reader {
                     }
                 }
             };
-            let end = part
-                .page_start
+            let page_start = if prefetch { part.page_start } else { 0 };
+            let end = page_start
                 .checked_add(page.length as usize)
                 .ok_or_else(|| invalid("column page range overflow"))?;
             let page_bytes = bytes
-                .get(part.page_start..end)
+                .get(page_start..end)
                 .ok_or_else(|| invalid("column page exceeds its extent"))?;
             if checksum(page_bytes) != page.hash {
                 return Err(invalid("column page checksum differs"));
@@ -1525,6 +1541,10 @@ mod tests {
         assert_eq!(text.width(), 1);
         assert_eq!(text.value_at(1, 0), Value::Null);
         assert_eq!(text.value_at(2, 0), Value::Varchar("long text after a slash".into()));
+        let sparse = reader.read_sparse(1, &[1]).expect("one page without extent prefetch");
+        assert_eq!(sparse.width(), 1);
+        assert_eq!(sparse.value_at(1, 0), Value::Null);
+        assert_eq!(sparse.value_at(2, 0), Value::Varchar("long text after a slash".into()));
         let count = reader.read(0, &[]).expect("no page is needed for count");
         assert_eq!(count.len(), 3);
         assert!(reader.skips(0, &[Probe { column: 0, op: Op::Greater, value: Bound::Int(100) }]));
