@@ -1868,9 +1868,9 @@ impl Vector {
     /// in them. A decimal answers with its unscaled value, which is the number the column holds.
     ///
     /// `None` for a null, for an index past the end, for a column of any other type, and for the
-    /// packed and compressed forms, whose rows are not stored as integers anywhere a read can reach
-    /// without unpacking. A caller that gets `None` falls back to [`Self::value_at`], which is
-    /// correct for all of those.
+    /// compressed form. Packed integers stay in code space and answer `base + code` directly. A
+    /// caller that gets `None` falls back to [`Self::value_at`], which is correct for the remaining
+    /// forms.
     #[must_use]
     pub fn signed_at(&self, index: usize) -> Option<i128> {
         if index >= self.len || !self.validity.is_valid(index) {
@@ -1895,13 +1895,15 @@ impl Vector {
                 values.signed_at(usize::try_from(*codes.get(index)?).ok()?)
             }
             Body::Runs { ends, values } => values.signed_at(run_holding(ends, index)?),
-            // The same `None` [`Self::bytes_at`] gives, for the same reason. A packed or compressed
-            // row is not an integer anywhere until it has been unpacked, and a caller that gets
+            Body::Packed { words, width, base, offset } => Some(
+                *base + i128::from(code_at(words, (*offset + index) * *width as usize, *width)),
+            ),
+            // The same `None` [`Self::bytes_at`] gives, for the same reason. A compressed row is not
+            // an integer anywhere until it has been unpacked, and a caller that gets
             // `None` goes to `value_at` and gets the row unpacked into a value. A list row is not an
             // integer in any form, however many integers are in it, and a struct row is not one even
             // when it has exactly one integer field, since the row is the struct and not the field.
             Body::Coded { .. }
-            | Body::Packed { .. }
             | Body::Views { .. }
             | Body::ExternalText { .. }
             | Body::Nested { .. }
@@ -3985,8 +3987,7 @@ mod tests {
     }
 
     /// The forms and types that have no integer to hand back, which a caller answers by falling
-    /// back to `value_at`. Reading one of these as a key that does not match rather than as a key
-    /// that has to be built is how a packed column ends up with every row in its own group.
+    /// back to `value_at`.
     #[test]
     fn a_signed_integer_is_refused_where_it_is_not_stored_as_itself() {
         let nulls =
@@ -3994,11 +3995,7 @@ mod tests {
         assert_eq!(nulls.signed_at(0), Some(4));
         assert_eq!(nulls.signed_at(1), None, "a null is not a number");
         let packed = integers(&[1, 2, 3, 1]).bit_packed().unwrap();
-        assert_eq!(
-            packed.signed_at(0),
-            None,
-            "a packed row is not an integer until it is unpacked"
-        );
+        assert_eq!(packed.signed_at(0), Some(1), "a packed integer is read in code space");
         let mut bytes = StringColumn::new();
         bytes.push("red");
         let text = Vector::flat(LogicalType::Varchar, Data::Varlen(bytes)).unwrap();
