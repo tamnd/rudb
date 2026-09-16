@@ -2177,6 +2177,41 @@ fn uncorrelated_in_subqueries_are_mark_joins() {
 }
 
 #[test]
+fn correlated_membership_filters_unnest_to_mark_joins() {
+    let db = database();
+    let sql = "SELECT k, k IN (SELECT x FROM (VALUES (1), (2), (NULL)) i(x) WHERE i.x = o.k) FROM (VALUES (1), (3), (NULL)) o(k) ORDER BY k NULLS LAST";
+    assert_eq!(
+        rows(&db, sql),
+        vec![
+            vec![Value::Integer(1), Value::Boolean(true)],
+            vec![Value::Integer(3), Value::Boolean(false)],
+            vec![Value::Null, Value::Boolean(false)],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k FROM (VALUES (1), (2), (3)) o(k) WHERE k NOT IN (SELECT x FROM (VALUES (1), (3)) i(x) WHERE i.x = o.k) ORDER BY k"
+        ),
+        vec![vec![Value::Integer(2)]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k, k = ALL (SELECT x FROM (VALUES (1), (2)) i(x) WHERE i.x = o.k) FROM (VALUES (1), (3)) o(k) ORDER BY k"
+        ),
+        vec![
+            vec![Value::Integer(1), Value::Boolean(true)],
+            vec![Value::Integer(3), Value::Boolean(true)],
+        ]
+    );
+    let plan = db.plan(sql).expect("the correlated membership query plans");
+    assert!(plan.contains("Join MARK"), "{plan}");
+    assert!(plan.contains("IS NOT DISTINCT FROM TRUE"), "{plan}");
+    assert!(!plan.contains("DependentJoin"), "{plan}");
+}
+
+#[test]
 fn uncorrelated_any_and_all_subqueries_are_mark_joins() {
     let db = database();
     assert_eq!(
