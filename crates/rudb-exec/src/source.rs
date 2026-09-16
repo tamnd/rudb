@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_catalog::Table;
-use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_common::{Error, Field, LogicalType, Result, Session};
 use rudb_csv::Reader as CsvReader;
 use rudb_functions::{
     FILE_ROW_NUMBER, Given, TableFunction, csv_given, open_csv, open_parquet, series_length,
@@ -26,7 +26,7 @@ use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_storage::Probe;
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
-use crate::expr::evaluate_all;
+use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
 use crate::schema::Schema;
 
 /// One morsel per position, handed to whoever asks first.
@@ -256,7 +256,15 @@ impl Values {
     /// # Errors
     ///
     /// If a row is not as wide as the column list, or anything the expressions report.
-    pub(crate) fn new(plan: &Plan, index: u32, columns: Slice, rows: Slice) -> Result<Self> {
+    /// The rows evaluated with the semantics of the query session.
+    pub(crate) fn new(
+        plan: &Plan,
+        index: u32,
+        columns: Slice,
+        rows: Slice,
+        session: &Session,
+    ) -> Result<Self> {
+        let time_zone = session.session_time_zone();
         let fields = plan.field_list(columns).to_vec();
         let schema = Schema::numbered(fields, index);
         let types = schema.types();
@@ -272,7 +280,7 @@ impl Values {
                     types.len()
                 )));
             }
-            let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
+            let evaluated = evaluate_all_in_time_zone(plan, &exprs, &source, &one, time_zone)?;
             for (position, vector) in evaluated.iter().enumerate() {
                 down[position].push(vector.value_at(0));
             }

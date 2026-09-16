@@ -20,8 +20,8 @@
 //! first one, and the interesting bugs in a database are exactly the places where two such things
 //! disagree.
 
-use rudb_common::{Error, Result, Value};
-use rudb_kernels::{cast, combine, compare, is_true};
+use rudb_common::{Error, Result, SessionTimeZone, Value};
+use rudb_kernels::{cast_in_time_zone, combine, compare, is_true};
 use rudb_plan::{Expr, ExprRef, Plan};
 use rudb_vector::{Chunk, Vector};
 
@@ -38,6 +38,17 @@ use crate::written::written;
 /// If a column reference names a binding the schema does not have, if an aggregate appears outside
 /// an aggregate operator, or anything a kernel reports.
 pub fn evaluate(plan: &Plan, expr: ExprRef, schema: &Schema, chunk: &Chunk) -> Result<Vector> {
+    evaluate_in_time_zone(plan, expr, schema, chunk, SessionTimeZone::default())
+}
+
+/// Evaluates one expression using the parsed zone of the query session.
+pub(crate) fn evaluate_in_time_zone(
+    plan: &Plan,
+    expr: ExprRef,
+    schema: &Schema,
+    chunk: &Chunk,
+    time_zone: SessionTimeZone,
+) -> Result<Vector> {
     let ty = plan.expr_type(expr).clone();
     match *plan.expr(expr) {
         Expr::Column(binding) => {
@@ -53,20 +64,27 @@ pub fn evaluate(plan: &Plan, expr: ExprRef, schema: &Schema, chunk: &Chunk) -> R
             Ok(Vector::constant(ty, plan.value(reference).clone(), chunk.len()))
         }
         Expr::Cast { input, try_cast } => {
-            let inner = evaluate(plan, input, schema, chunk)?;
-            cast(&inner, &ty, try_cast)
+            let inner = evaluate_in_time_zone(plan, input, schema, chunk, time_zone)?;
+            cast_in_time_zone(&inner, &ty, try_cast, Some(time_zone))
         }
         Expr::Compare { op, left, right } => {
-            let left = evaluate(plan, left, schema, chunk)?;
-            let right = evaluate(plan, right, schema, chunk)?;
+            let left = evaluate_in_time_zone(plan, left, schema, chunk, time_zone)?;
+            let right = evaluate_in_time_zone(plan, right, schema, chunk, time_zone)?;
             compare(comparison(op), &left, &right)
         }
         Expr::Conjunction { op, children } => {
-            let children = evaluate_all(plan, plan.expr_list(children), schema, chunk)?;
+            let children = evaluate_all_in_time_zone(
+                plan,
+                plan.expr_list(children),
+                schema,
+                chunk,
+                time_zone,
+            )?;
             combine(connective(op), &children)
         }
         Expr::Function { name, args } => {
-            let args = evaluate_all(plan, plan.expr_list(args), schema, chunk)?;
+            let args =
+                evaluate_all_in_time_zone(plan, plan.expr_list(args), schema, chunk, time_zone)?;
             // The renderer runs only if a kernel asks for it, which is only on the row that divides
             // by zero, so a chunk that computes nothing but answers pays nothing for it.
             rudb_kernels::call(plan.string(name), &args, &ty, Some(&|| written(plan, expr, schema)))
@@ -84,7 +102,7 @@ pub fn evaluate(plan: &Plan, expr: ExprRef, schema: &Schema, chunk: &Chunk) -> R
                     break;
                 }
                 let narrowed = narrow(chunk, &pending)?;
-                let flags = evaluate(plan, arm.when, schema, &narrowed)?;
+                let flags = evaluate_in_time_zone(plan, arm.when, schema, &narrowed, time_zone)?;
                 let mut taken = Vec::new();
                 let mut still = Vec::new();
                 // row at a time: 2c (#57) replaces this whole arm with a selection threaded through
@@ -100,7 +118,8 @@ pub fn evaluate(plan: &Plan, expr: ExprRef, schema: &Schema, chunk: &Chunk) -> R
                 if !taken.is_empty() {
                     let positions: Vec<usize> = taken.iter().map(|&(at, _)| at).collect();
                     let matched = narrow(&narrowed, &positions)?;
-                    let results = evaluate(plan, arm.then, schema, &matched)?;
+                    let results =
+                        evaluate_in_time_zone(plan, arm.then, schema, &matched, time_zone)?;
                     // row at a time: the scatter this wants is 2c (#57), same as the loop above.
                     for (slot, &(_, row)) in taken.iter().enumerate() {
                         answers[row] = results.value_at(slot);
@@ -111,7 +130,8 @@ pub fn evaluate(plan: &Plan, expr: ExprRef, schema: &Schema, chunk: &Chunk) -> R
             if let Some(otherwise) = otherwise {
                 if !pending.is_empty() {
                     let narrowed = narrow(chunk, &pending)?;
-                    let results = evaluate(plan, otherwise, schema, &narrowed)?;
+                    let results =
+                        evaluate_in_time_zone(plan, otherwise, schema, &narrowed, time_zone)?;
                     // row at a time: the scatter this wants is 2c (#57), same as the two above.
                     for (slot, &row) in pending.iter().enumerate() {
                         answers[row] = results.value_at(slot);
@@ -134,5 +154,16 @@ pub fn evaluate_all(
     schema: &Schema,
     chunk: &Chunk,
 ) -> Result<Vec<Vector>> {
-    exprs.iter().map(|&expr| evaluate(plan, expr, schema, chunk)).collect()
+    evaluate_all_in_time_zone(plan, exprs, schema, chunk, SessionTimeZone::default())
+}
+
+/// Evaluates a list of expressions using the parsed zone of the query session.
+pub(crate) fn evaluate_all_in_time_zone(
+    plan: &Plan,
+    exprs: &[ExprRef],
+    schema: &Schema,
+    chunk: &Chunk,
+    time_zone: SessionTimeZone,
+) -> Result<Vec<Vector>> {
+    exprs.iter().map(|&expr| evaluate_in_time_zone(plan, expr, schema, chunk, time_zone)).collect()
 }

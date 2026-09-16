@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use rudb_catalog::Table;
-use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_common::{Error, Field, LogicalType, Result, Session};
 use rudb_functions::open_parquet;
 use rudb_kernels::cast;
 use rudb_metrics::Counters;
@@ -67,6 +67,13 @@ pub(crate) struct TableFetch<'a> {
 }
 
 impl<'a> TableFetch<'a> {
+    /// Applies the session semantics to the ordinal expression.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.row = self.row.in_session(session);
+        self
+    }
+
     pub(crate) fn new(
         plan: &Plan,
         input: &Schema,
@@ -134,6 +141,13 @@ impl Stream for TableFetch<'_> {
 }
 
 impl Fetch {
+    /// Applies the session semantics to the ordinal expression.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.row = self.row.in_session(session);
+        self
+    }
+
     /// # Errors
     ///
     /// If the plan names other than one file, if the ordinal expression does not resolve against

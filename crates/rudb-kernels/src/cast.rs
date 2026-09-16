@@ -38,7 +38,8 @@ use std::cmp::Ordering;
 use std::str::FromStr;
 
 use rudb_common::{
-    Error, ErrorCode, LogicalType, PhysicalType, Result, Value, civil_from_days, days_from_civil,
+    Error, ErrorCode, LogicalType, PhysicalType, Result, SessionTimeZone, Value, civil_from_days,
+    days_from_civil,
 };
 use rudb_vector::{Data, Form, Vector};
 
@@ -63,6 +64,24 @@ use crate::shape::{identity, nulls_of};
 /// If a value cannot be represented in the target type and `try_cast` is false, or if the pair of
 /// types is one this does not handle yet.
 pub fn cast(input: &Vector, target: &LogicalType, try_cast: bool) -> Result<Vector> {
+    cast_in_time_zone(input, target, try_cast, None)
+}
+
+/// Casts every value under a session time zone when the conversion is zone sensitive.
+///
+/// The ordinary cast entry point uses UTC. Prepared query expressions pass the parsed session zone,
+/// which matters when a zoned temporal value becomes text. The offset is selected per timestamp,
+/// because two rows on opposite sides of a daylight-saving transition do not share one offset.
+///
+/// # Errors
+///
+/// If [`cast`] would report an error for the same values and target.
+pub fn cast_in_time_zone(
+    input: &Vector,
+    target: &LogicalType,
+    try_cast: bool,
+    time_zone: Option<SessionTimeZone>,
+) -> Result<Vector> {
     if input.logical_type() == target {
         return Ok(input.clone());
     }
@@ -70,7 +89,7 @@ pub fn cast(input: &Vector, target: &LogicalType, try_cast: bool) -> Result<Vect
         return Ok(Vector::constant(target.clone(), Value::Null, 0));
     }
     if input.form() == Form::Constant {
-        let single = cast_value(&input.value_at(0), target, try_cast)?;
+        let single = cast_value_in_time_zone(&input.value_at(0), target, try_cast, time_zone)?;
         return Ok(Vector::constant(target.clone(), single, input.len()));
     }
     if let Some(vector) = swept(input, target) {
@@ -83,9 +102,25 @@ pub fn cast(input: &Vector, target: &LogicalType, try_cast: bool) -> Result<Vect
     // row at a time: the path recorded on the line above, which exists to be correct for a
     // conversion `swept` does not cover and counts itself so that conversion shows up.
     for index in 0..input.len() {
-        values.push(cast_value(&input.value_at(index), target, try_cast)?);
+        values.push(cast_value_in_time_zone(&input.value_at(index), target, try_cast, time_zone)?);
     }
     Vector::from_values(target.clone(), &values)
+}
+
+fn cast_value_in_time_zone(
+    value: &Value,
+    target: &LogicalType,
+    try_cast: bool,
+    time_zone: Option<SessionTimeZone>,
+) -> Result<Value> {
+    if matches!(target, LogicalType::Varchar) {
+        if let (Value::TimestampTz(micros), Some(time_zone)) = (value, time_zone) {
+            return Ok(Value::Varchar(
+                value.to_string_at_offset(time_zone.offset_seconds_at(*micros)),
+            ));
+        }
+    }
+    cast_value(value, target, try_cast)
 }
 
 /// Every value of a vector converted without a [`Value`] being built for any of them, or `None`
