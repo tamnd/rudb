@@ -1558,6 +1558,44 @@ fn a_non_integer_order_literal_needs_the_session_opt_in() {
 }
 
 #[test]
+fn regex_operator_semantics_are_resolved_while_the_expression_is_bound() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT 'abc' ~ 'b', 'abc' !~ 'b', 'ABC' ~* 'b', 'ABC' !~* 'b'"),
+        vec![vec![
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+        ]]
+    );
+    db.execute("SET regex_match_operator_semantics = 'full'").expect("full matching");
+    assert_eq!(
+        rows(&db, "SELECT 'abc' ~ 'b', 'abc' !~ 'b', 'ABC' ~* 'b', 'ABC' !~* 'b'"),
+        vec![vec![
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+        ]]
+    );
+    assert_eq!(
+        db.query("SELECT 'abc' ~ 'b'").expect("a regex match").names(),
+        ["regexp_full_match('abc', 'b')".to_string()]
+    );
+    assert_eq!(rows(&db, "SELECT 'abc' SIMILAR TO 'b'"), vec![vec![Value::Boolean(false)]]);
+    db.execute("RESET regex_match_operator_semantics").expect("partial matching");
+    assert_eq!(db.setting("regex_match_operator_semantics").expect("the setting"), "partial");
+    let error =
+        db.execute("SET regex_match_operator_semantics = 'nope'").expect_err("an unknown mode");
+    assert_eq!(error.code().duckdb_name(), "Not implemented Error");
+    assert_eq!(
+        error.message(),
+        "Enum value: unrecognized value \"nope\" for enum \"RegexMatchOperatorSemantics\"\n\nCandidates: \"FULL\""
+    );
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -1667,8 +1705,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Ten rows for eight settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(10)]]);
+    // Eleven rows for nine settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(11)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(

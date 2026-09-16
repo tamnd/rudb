@@ -754,10 +754,12 @@ pub enum BinaryOp {
     Glob,
     /// `SIMILAR TO`.
     SimilarTo,
-    /// `!~`, which the grammar calls the not-similar-to operator.
+    /// `NOT SIMILAR TO`.
     NotSimilarTo,
     /// `~`, a regex match.
     Regex,
+    /// `!~`, a negated regex match.
+    NotRegex,
     /// `~*`, a case insensitive regex match.
     RegexInsensitive,
     /// `!~*`, a negated case insensitive regex match.

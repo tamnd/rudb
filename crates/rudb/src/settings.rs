@@ -1,8 +1,8 @@
 //! The knobs `SET` turns.
 //!
-//! A setting is not a catalog entry. It is not named by a query, it has no schema, and the set of
-//! them is fixed at compile time, so this is a match on a name rather than a map. [`Settings::NAMES`]
-//! is that set, and it is ten names for eight settings because two have a second spelling.
+//! A setting is not a catalog entry.
+//! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so this is a match on a name rather than a map.
+//! [`Settings::NAMES`] is that set, and it is eleven names for nine settings because two have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
@@ -58,6 +58,8 @@ pub(crate) struct Settings {
     integer_division: RwLock<bool>,
     /// Whether an `ORDER BY` may name a non-integer literal that cannot affect the order.
     order_by_non_integer_literal: RwLock<bool>,
+    /// Whether regex match operators require the entire string to match.
+    regex_match_operator_semantics: RwLock<String>,
     /// Which implementation runs at each seam, as `SET seam.<name>` has left it.
     ///
     /// Held here rather than in [`Config`], because there are twenty seven of them and a `Config`
@@ -69,7 +71,7 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 10] = [
+    pub(crate) const NAMES: [&'static str; 11] = [
         "TimeZone",
         "default_null_order",
         "default_order",
@@ -78,6 +80,7 @@ impl Settings {
         "max_memory",
         "memory_limit",
         "order_by_non_integer_literal",
+        "regex_match_operator_semantics",
         "threads",
         "worker_threads",
     ];
@@ -98,6 +101,7 @@ impl Settings {
             default_null_order: RwLock::new("NULLS_LAST".to_string()),
             integer_division: RwLock::new(false),
             order_by_non_integer_literal: RwLock::new(false),
+            regex_match_operator_semantics: RwLock::new("partial".to_string()),
             seams: RwLock::new(rudb_seam::Settings::new()),
         }
     }
@@ -252,6 +256,29 @@ impl Settings {
                     .write()
                     .unwrap_or_else(|held| held.into_inner()) = enabled;
             }
+            "regex_match_operator_semantics" => {
+                let written = value.map_or("partial".to_string(), text_of);
+                if !written.eq_ignore_ascii_case("partial") && !written.eq_ignore_ascii_case("full")
+                {
+                    let candidate = if self
+                        .regex_match_operator_semantics
+                        .read()
+                        .unwrap_or_else(|held| held.into_inner())
+                        .eq_ignore_ascii_case("partial")
+                    {
+                        "FULL"
+                    } else {
+                        "PARTIAL"
+                    };
+                    return Err(Error::not_implemented(format!(
+                        "Enum value: unrecognized value \"{written}\" for enum \"RegexMatchOperatorSemantics\"\n\nCandidates: \"{candidate}\""
+                    )));
+                }
+                *self
+                    .regex_match_operator_semantics
+                    .write()
+                    .unwrap_or_else(|held| held.into_inner()) = written;
+            }
             "threads" => {
                 let threads = match value {
                     None => self.defaults.threads(),
@@ -305,6 +332,11 @@ impl Settings {
                 .read()
                 .unwrap_or_else(|held| held.into_inner())
                 .to_string()),
+            "regex_match_operator_semantics" => Ok(self
+                .regex_match_operator_semantics
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .clone()),
             "threads" => Ok(config.threads().to_string()),
             _ => Err(Error::catalog(rudb_functions::unknown_setting(name))),
         }
@@ -312,14 +344,14 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are ten names and the alternative
+    /// Built once per statement rather than held, because there are eleven names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Eight settings and ten names means the loop below would otherwise take several locks.
+    /// Nine settings and eleven names means the loop below would otherwise take several locks.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
@@ -334,6 +366,11 @@ impl Settings {
             *self.integer_division.read().unwrap_or_else(|held| held.into_inner());
         let order_by_non_integer_literal =
             *self.order_by_non_integer_literal.read().unwrap_or_else(|held| held.into_inner());
+        let regex_match_operator_semantics = self
+            .regex_match_operator_semantics
+            .read()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone();
         let mut session = Session::new();
         session.set_time_zone(&time_zone);
         session.set_default_descending(default_order == "DESC");
@@ -345,6 +382,7 @@ impl Settings {
         });
         session.set_integer_division(integer_division);
         session.set_order_by_non_integer_literal(order_by_non_integer_literal);
+        session.set_regex_match_full(regex_match_operator_semantics.eq_ignore_ascii_case("full"));
         for name in Self::NAMES {
             session.set(
                 name,
@@ -356,6 +394,7 @@ impl Settings {
                     "integer_division" => integer_division.to_string(),
                     "memory_limit" => memory.clone(),
                     "order_by_non_integer_literal" => order_by_non_integer_literal.to_string(),
+                    "regex_match_operator_semantics" => regex_match_operator_semantics.clone(),
                     "threads" => threads.clone(),
                     other => unreachable!("{other} is not one of NAMES"),
                 },
