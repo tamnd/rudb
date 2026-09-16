@@ -255,7 +255,9 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         // A set operation is as wide as either side, since the binder already required the two to
         // agree. A join and a cross product are as wide as the two together.
         Node::SetOp { left, .. } => output_columns(plan, left),
-        Node::Join { left, right, .. } | Node::CrossProduct { left, right } => {
+        Node::Join { left, right, .. }
+        | Node::DependentJoin { left, right, .. }
+        | Node::CrossProduct { left, right } => {
             output_columns(plan, left) + output_columns(plan, right)
         }
     }

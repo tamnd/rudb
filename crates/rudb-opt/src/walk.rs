@@ -75,6 +75,7 @@ pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
         | Node::TableFetch { input, .. }
         | Node::Distinct { input, .. } => *input = children[0],
         Node::Join { left, right, .. }
+        | Node::DependentJoin { left, right, .. }
         | Node::CrossProduct { left, right }
         | Node::SetOp { left, right, .. } => {
             *left = children[0];

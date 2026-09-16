@@ -291,6 +291,24 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             filter(plan, above, stay)
         }
 
+        // Correlation makes the two inputs one scope. Nothing crosses this boundary until the
+        // unnesting pass has replaced it with ordinary relational operators.
+        Node::DependentJoin { left, right, kind, conditions } => {
+            let rebuilt_left = node(plan, left, Vec::new(), tables);
+            let rebuilt_right = node(plan, right, Vec::new(), tables);
+            let above = if rebuilt_left == left && rebuilt_right == right {
+                at
+            } else {
+                plan.add_node(Node::DependentJoin {
+                    left: rebuilt_left,
+                    right: rebuilt_right,
+                    kind,
+                    conditions,
+                })
+            };
+            filter(plan, above, pending)
+        }
+
         // Both sides of a cross product are kept as they are, so a predicate over one side goes
         // into it. A predicate over both stays above, for the measured reason in this file's
         // opening, and #211 is where that changes.
