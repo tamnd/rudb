@@ -2119,6 +2119,33 @@ fn correlated_scalar_aggregates_group_by_hidden_correlation_keys() {
 }
 
 #[test]
+fn correlated_scalar_counts_keep_zero_for_missing_groups() {
+    let db = database();
+    let sql = "SELECT k, (SELECT count(*) FROM (VALUES (1, 10), (1, NULL), (2, 5), (NULL, 40)) i(k, value) WHERE i.k = o.k AND value > 5) FROM (VALUES (1), (2), (3), (NULL)) o(k) ORDER BY k NULLS LAST";
+    assert_eq!(
+        rows(&db, sql),
+        vec![
+            vec![Value::Integer(1), Value::BigInt(1)],
+            vec![Value::Integer(2), Value::BigInt(0)],
+            vec![Value::Integer(3), Value::BigInt(0)],
+            vec![Value::Null, Value::BigInt(0)],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k, (SELECT count(1) FROM (VALUES (1), (1), (2)) i(k) WHERE i.k = o.k) FROM (VALUES (1), (3)) o(k) ORDER BY k"
+        ),
+        vec![vec![Value::Integer(1), Value::BigInt(2)], vec![Value::Integer(3), Value::BigInt(0)],]
+    );
+    let plan = db.plan(sql).expect("the correlated scalar count plans");
+    assert!(plan.contains("Join LEFT"), "{plan}");
+    assert!(plan.contains("count(#1.0::INTEGER FILTER"), "{plan}");
+    assert!(plan.contains("IS NOT DISTINCT FROM #0.0"), "{plan}");
+    assert!(!plan.contains("DependentJoin"), "{plan}");
+}
+
+#[test]
 fn uncorrelated_exists_is_a_single_joined_marker() {
     let db = database();
     let answer = db.query("SELECT EXISTS (SELECT 1)").expect("EXISTS answers");
