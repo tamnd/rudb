@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry.
 //! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so this is a match on a name rather than a map.
-//! [`Settings::NAMES`] is that set, and it is twenty names for eighteen settings because two have a second spelling.
+//! [`Settings::NAMES`] is that set, and it is twenty one names for nineteen settings because two have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
@@ -56,6 +56,8 @@ pub(crate) struct Settings {
     default_order: RwLock<String>,
     /// The installed parser dialect selected for new statements.
     current_dialect: RwLock<String>,
+    /// Whether an extension may replace the parser selected for new statements.
+    allow_parser_override_extension: RwLock<String>,
     /// The selected SQL compatibility mode as written, or `NONE` for ordinary DuckDB rules.
     dialect_compatibility_mode: RwLock<String>,
     /// The null placement mode used when an order item does not state one.
@@ -91,8 +93,9 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 20] = [
+    pub(crate) const NAMES: [&'static str; 21] = [
         "TimeZone",
+        "allow_parser_override_extension",
         "current_dialect",
         "default_null_order",
         "default_order",
@@ -128,6 +131,7 @@ impl Settings {
             default_time_zone,
             default_order: RwLock::new("ASCENDING".to_string()),
             current_dialect: RwLock::new("duckdb".to_string()),
+            allow_parser_override_extension: RwLock::new("DEFAULT".to_string()),
             dialect_compatibility_mode: RwLock::new("NONE".to_string()),
             default_null_order: RwLock::new("NULLS_LAST".to_string()),
             disable_timestamptz_casts: RwLock::new(false),
@@ -222,6 +226,18 @@ impl Settings {
                     return Err(Error::not_implemented(format!("Unknown TimeZone '{zone}'!")));
                 }
                 *self.time_zone.write().unwrap_or_else(|held| held.into_inner()) = zone;
+            }
+            "allow_parser_override_extension" => {
+                let written = value.map_or("DEFAULT".to_string(), text_of);
+                if !written.eq_ignore_ascii_case("default") {
+                    return Err(Error::not_implemented(format!(
+                        "Enum value: unrecognized value \"{written}\" for enum \"AllowParserOverride\"\n\nCandidates: \"DEFAULT\""
+                    )));
+                }
+                *self
+                    .allow_parser_override_extension
+                    .write()
+                    .unwrap_or_else(|held| held.into_inner()) = "DEFAULT".to_string();
             }
             "current_dialect" => {
                 let written = value.map_or("duckdb".to_string(), text_of);
@@ -435,6 +451,11 @@ impl Settings {
             "TimeZone" => {
                 Ok(self.time_zone.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
+            "allow_parser_override_extension" => Ok(self
+                .allow_parser_override_extension
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .clone()),
             "current_dialect" => {
                 Ok(self.current_dialect.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
@@ -507,20 +528,25 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are twenty names and the alternative
+    /// Built once per statement rather than held, because there are twenty one names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Eighteen settings and twenty names means the loop below would otherwise take several locks.
+    /// Nineteen settings and twenty one names means the loop below would otherwise take several locks.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
         let memory = config.memory_limit().map_or_else(|| "unlimited".to_string(), human);
         let threads = config.threads().to_string();
         let time_zone = self.time_zone.read().unwrap_or_else(|held| held.into_inner()).clone();
+        let allow_parser_override_extension = self
+            .allow_parser_override_extension
+            .read()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone();
         let default_order =
             self.default_order.read().unwrap_or_else(|held| held.into_inner()).clone();
         let current_dialect =
@@ -583,6 +609,7 @@ impl Settings {
                 name,
                 match canonical(name) {
                     "TimeZone" => time_zone.clone(),
+                    "allow_parser_override_extension" => allow_parser_override_extension.clone(),
                     "current_dialect" => current_dialect.clone(),
                     "dialect_compatibility_mode" => dialect_compatibility_mode.clone(),
                     "default_order" => default_order.clone(),
