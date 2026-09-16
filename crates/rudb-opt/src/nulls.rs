@@ -178,7 +178,7 @@ fn known(plan: &Plan, expr: ExprRef, nulled: &TableSet) -> Known {
             }
         }
         Expr::Function { name, args } => function(plan, plan.string(name), args, nulled),
-        Expr::Aggregate { .. } | Expr::Case { .. } => Known::Unknown,
+        Expr::Aggregate { .. } | Expr::Window { .. } | Expr::Case { .. } => Known::Unknown,
     }
 }
 

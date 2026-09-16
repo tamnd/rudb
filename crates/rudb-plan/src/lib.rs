@@ -51,8 +51,8 @@
 //!
 //! # What is not here yet
 //!
-//! Window functions, subquery expressions, correlated references, `UNNEST`, lambdas, prepared
-//! statement parameters, and everything on the write side. The M0 transformer cannot produce any
+//! Subquery expressions, correlated references, `UNNEST`, lambdas, prepared statement parameters,
+//! and everything on the write side. The M0 transformer cannot produce any
 //! of them, so a representation for them here would be a representation nothing has ever
 //! constructed, which is a representation that is wrong in a way nobody finds out about. Neither
 //! [`Expr`] nor [`Node`] is `#[non_exhaustive]`, which is deliberate: adding a plan node should
@@ -69,7 +69,7 @@ mod seams;
 mod shape;
 
 pub use expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
-pub use node::{JoinKind, Node, SetOpKind};
+pub use node::{JoinKind, Node, SetOpKind, WindowBound, WindowExclude, WindowFrame, WindowUnit};
 pub use plan::Plan;
 pub use seams::seams_of;
 pub use shape::{ROOT, Shape};

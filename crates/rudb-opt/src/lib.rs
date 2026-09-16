@@ -248,6 +248,9 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         Node::Aggregate { groups, aggregates, .. } => {
             plan.expr_list(groups).len() + plan.expr_list(aggregates).len()
         }
+        Node::Window { input, expressions, .. } => {
+            output_columns(plan, input) + plan.expr_list(expressions).len()
+        }
         Node::Dummy => 0,
         Node::Filter { input, .. }
         | Node::Sort { input, .. }

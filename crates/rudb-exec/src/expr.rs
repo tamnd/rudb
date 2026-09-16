@@ -93,6 +93,10 @@ pub(crate) fn evaluate_in_time_zone(
             "the {} aggregate was evaluated as an ordinary expression",
             plan.string(name)
         ))),
+        Expr::Window { name, .. } => Err(Error::internal(format!(
+            "the {} window function was evaluated as an ordinary expression",
+            plan.string(name)
+        ))),
         Expr::Case { arms, otherwise } => {
             let arms = plan.arm_list(arms).to_vec();
             let mut answers = vec![Value::Null; chunk.len()];

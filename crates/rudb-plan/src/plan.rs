@@ -161,7 +161,7 @@ impl Plan {
                     include(arg);
                 }
             }
-            Expr::Aggregate { args, filter, .. } => {
+            Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
                 for &arg in self.expr_list(args) {
                     include(arg);
                 }
@@ -505,14 +505,18 @@ impl Plan {
                     return fail("is a conjunction that does not produce BOOLEAN");
                 }
             }
-            Expr::Function { name, args } | Expr::Aggregate { name, args, .. } => {
+            Expr::Function { name, args }
+            | Expr::Aggregate { name, args, .. }
+            | Expr::Window { name, args, .. } => {
                 if name as usize >= self.strings.len() {
                     return fail("names a function that is not in the string table");
                 }
                 for &arg in self.checked_expr_list(args, reference)? {
                     backwards(arg)?;
                 }
-                if let Expr::Aggregate { filter: Some(filter), .. } = *self.expr(reference) {
+                if let Expr::Aggregate { filter: Some(filter), .. }
+                | Expr::Window { filter: Some(filter), .. } = *self.expr(reference)
+                {
                     backwards(filter)?;
                     if *self.expr_type(filter) != LogicalType::Boolean {
                         return fail("has a FILTER that is not BOOLEAN");
@@ -652,6 +656,43 @@ impl Plan {
                     }
                 }
             }
+            Node::Window { partition, order, frame, expressions, .. } => {
+                self.checked_expr_list(partition, reference)?;
+                let end = order.start as usize + order.len as usize;
+                if end > self.sort_keys.len() {
+                    return fail("names a window order run that is not in the pool");
+                }
+                for key in self.sort_key_list(order) {
+                    self.checked_expr(key.expr, reference)?;
+                }
+                for bound in [frame.start, frame.end] {
+                    match bound {
+                        crate::WindowBound::Preceding(offset)
+                        | crate::WindowBound::Following(offset) => {
+                            self.checked_expr(offset, reference)?;
+                        }
+                        crate::WindowBound::UnboundedPreceding
+                        | crate::WindowBound::CurrentRow
+                        | crate::WindowBound::UnboundedFollowing => {}
+                    }
+                }
+                if matches!(frame.start, crate::WindowBound::UnboundedFollowing)
+                    || matches!(frame.end, crate::WindowBound::UnboundedPreceding)
+                {
+                    return fail("has an impossible frame boundary");
+                }
+                let expressions = self.checked_expr_list(expressions, reference)?;
+                if expressions.is_empty() {
+                    return fail("has no window expressions");
+                }
+                for &expression in expressions {
+                    if !matches!(self.expr(expression), Expr::Window { .. }) {
+                        return fail(
+                            "has something in its expression list that is not a window function",
+                        );
+                    }
+                }
+            }
             Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
                 let end = keys.start as usize + keys.len as usize;
                 if end > self.sort_keys.len() {
@@ -692,7 +733,21 @@ impl Plan {
         // per the note on Expr::Aggregate. Everything else that reaches one is a plan the printer
         // would emit and the reader would misread as a scalar function, which is a wrong answer
         // rather than an error.
-        for (expr, aggregate_allowed) in self.top_level_exprs(node) {
+        for (expr, aggregate_allowed, window_allowed) in self.top_level_exprs(node) {
+            if window_allowed {
+                if let Expr::Window { args, filter, .. } = *self.expr(expr) {
+                    let nested = self.expr_list(args).iter().chain(filter.iter()).any(|&child| {
+                        self.reaches_a_window(child) || self.reaches_an_aggregate(child)
+                    });
+                    if nested {
+                        return fail("has a window or aggregate inside a window function");
+                    }
+                    continue;
+                }
+            }
+            if self.reaches_a_window(expr) {
+                return fail("has a window function outside a window list");
+            }
             if aggregate_allowed {
                 if let Expr::Aggregate { args, filter, .. } = *self.expr(expr) {
                     let nested = self
@@ -718,9 +773,9 @@ impl Plan {
     /// One list rather than a rule restated in each arm of `validate_node`, because the rule is
     /// about the whole node set and a rule stated twelve times is a rule that is wrong in one of
     /// them. Runs after the per-operator checks, so every run named here is known to be in range.
-    fn top_level_exprs(&self, node: &Node) -> Vec<(ExprRef, bool)> {
-        let plain = |list: &[ExprRef]| -> Vec<(ExprRef, bool)> {
-            list.iter().map(|&expr| (expr, false)).collect()
+    fn top_level_exprs(&self, node: &Node) -> Vec<(ExprRef, bool, bool)> {
+        let plain = |list: &[ExprRef]| -> Vec<(ExprRef, bool, bool)> {
+            list.iter().map(|&expr| (expr, false, false)).collect()
         };
         match *node {
             Node::Get { .. }
@@ -734,19 +789,32 @@ impl Plan {
             Node::TableFunction { args, .. } => plain(self.expr_list(args)),
             Node::Fetch { args, row, .. } => {
                 let mut held = plain(self.expr_list(args));
-                held.push((row, false));
+                held.push((row, false, false));
                 held
             }
-            Node::TableFetch { row, .. } => vec![(row, false)],
-            Node::Filter { predicate, .. } => vec![(predicate, false)],
+            Node::TableFetch { row, .. } => vec![(row, false, false)],
+            Node::Filter { predicate, .. } => vec![(predicate, false, false)],
             Node::Project { exprs, .. } => plain(self.expr_list(exprs)),
             Node::Aggregate { groups, aggregates, .. } => {
                 let mut all = plain(self.expr_list(groups));
-                all.extend(self.expr_list(aggregates).iter().map(|&expr| (expr, true)));
+                all.extend(self.expr_list(aggregates).iter().map(|&expr| (expr, true, false)));
+                all
+            }
+            Node::Window { partition, order, frame, expressions, .. } => {
+                let mut all = plain(self.expr_list(partition));
+                all.extend(self.sort_key_list(order).iter().map(|key| (key.expr, false, false)));
+                for bound in [frame.start, frame.end] {
+                    if let crate::WindowBound::Preceding(offset)
+                    | crate::WindowBound::Following(offset) = bound
+                    {
+                        all.push((offset, false, false));
+                    }
+                }
+                all.extend(self.expr_list(expressions).iter().map(|&expr| (expr, false, true)));
                 all
             }
             Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
-                self.sort_key_list(keys).iter().map(|key| (key.expr, false)).collect()
+                self.sort_key_list(keys).iter().map(|key| (key.expr, false, false)).collect()
             }
             Node::Distinct { on, .. } => plain(self.expr_list(on)),
             Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
@@ -762,6 +830,10 @@ impl Plan {
     fn reaches_an_aggregate(&self, reference: ExprRef) -> bool {
         match *self.expr(reference) {
             Expr::Aggregate { .. } => true,
+            Expr::Window { args, filter, .. } => {
+                self.expr_list(args).iter().any(|&child| self.reaches_an_aggregate(child))
+                    || filter.is_some_and(|child| self.reaches_an_aggregate(child))
+            }
             Expr::Column(_) | Expr::Constant(_) => false,
             Expr::Cast { input, .. } => self.reaches_an_aggregate(input),
             Expr::Compare { left, right, .. } => {
@@ -774,6 +846,32 @@ impl Plan {
                 self.arm_list(arms).iter().any(|arm| {
                     self.reaches_an_aggregate(arm.when) || self.reaches_an_aggregate(arm.then)
                 }) || otherwise.is_some_and(|child| self.reaches_an_aggregate(child))
+            }
+        }
+    }
+
+    fn reaches_a_window(&self, reference: ExprRef) -> bool {
+        match *self.expr(reference) {
+            Expr::Window { .. } => true,
+            Expr::Column(_) | Expr::Constant(_) => false,
+            Expr::Cast { input, .. } => self.reaches_a_window(input),
+            Expr::Compare { left, right, .. } => {
+                self.reaches_a_window(left) || self.reaches_a_window(right)
+            }
+            Expr::Conjunction { children, .. }
+            | Expr::Function { args: children, .. }
+            | Expr::Aggregate { args: children, filter: None, .. } => {
+                self.expr_list(children).iter().any(|&child| self.reaches_a_window(child))
+            }
+            Expr::Aggregate { args, filter: Some(filter), .. } => {
+                self.expr_list(args).iter().any(|&child| self.reaches_a_window(child))
+                    || self.reaches_a_window(filter)
+            }
+            Expr::Case { arms, otherwise } => {
+                self.arm_list(arms)
+                    .iter()
+                    .any(|arm| self.reaches_a_window(arm.when) || self.reaches_a_window(arm.then))
+                    || otherwise.is_some_and(|child| self.reaches_a_window(child))
             }
         }
     }
@@ -992,6 +1090,29 @@ mod tests {
             plan.add_node(Node::Aggregate { input: 0, index: 1, groups: Slice::EMPTY, aggregates });
         plan.set_root(aggregate);
         plan.validate().expect("this is the one place an aggregate belongs");
+    }
+
+    #[test]
+    fn a_window_function_outside_a_window_list_is_caught() {
+        let mut plan = Plan::new();
+        let name = plan.intern("row_number");
+        let call = plan.add_expr(
+            Expr::Window {
+                name,
+                args: Slice::EMPTY,
+                distinct: false,
+                filter: None,
+                ignore_nulls: false,
+            },
+            LogicalType::BigInt,
+        );
+        let exprs = plan.add_expr_list(&[call]);
+        let label = plan.intern("n");
+        let names = plan.add_name_list(&[label]);
+        let project = plan.add_node(Node::Project { input: 0, index: 1, exprs, names });
+        plan.set_root(project);
+        let message = plan.validate().unwrap_err().to_string();
+        assert!(message.contains("window function outside"), "unhelpful message: {message}");
     }
 
     /// The backwards-reference rule is what makes a cycle impossible, so the check for it has to

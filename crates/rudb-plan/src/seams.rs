@@ -35,6 +35,7 @@ pub fn seams_of(node: &Node) -> &'static [SeamId] {
             SeamId::AggState,
             SeamId::AggParallel,
         ],
+        Node::Window { .. } => &[SeamId::Sort],
         Node::Distinct { .. } | Node::SetOp { .. } => HASHED,
         Node::Sort { .. } => &[SeamId::Sort],
         Node::TopN { .. } => &[SeamId::TopK],

@@ -20,7 +20,7 @@
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
     Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
-    SetOpKind, Slice, SortKey, StrRef,
+    SetOpKind, Slice, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
 /// How many seeds the property runs over when nothing says otherwise.
@@ -136,12 +136,23 @@ fn the_generator_reaches_every_operator_and_every_expression_form() {
             "TableFunction",
             "TopN",
             "Values",
+            "Window",
         ],
         "the generator does not build every operator"
     );
     assert_eq!(
         forms,
-        ["Aggregate", "Case", "Cast", "Column", "Compare", "Conjunction", "Constant", "Function"],
+        [
+            "Aggregate",
+            "Case",
+            "Cast",
+            "Column",
+            "Compare",
+            "Conjunction",
+            "Constant",
+            "Function",
+            "Window",
+        ],
         "the generator does not build every expression form"
     );
 }
@@ -188,6 +199,7 @@ fn form_of(expr: &Expr) -> &'static str {
         Expr::Conjunction { .. } => "Conjunction",
         Expr::Function { .. } => "Function",
         Expr::Aggregate { .. } => "Aggregate",
+        Expr::Window { .. } => "Window",
         Expr::Case { .. } => "Case",
     }
 }
@@ -530,6 +542,21 @@ impl Generator {
         self.plan.add_expr(Expr::Aggregate { name, args, distinct, filter }, ty)
     }
 
+    fn window(&mut self, depth: usize) -> ExprRef {
+        let name = self.plan.intern(self.random.pick(&AGGREGATES));
+        let count = self.random.below(3);
+        let args = self.exprs(count, depth);
+        let distinct = self.random.chance(3);
+        let filter = if self.random.chance(3) {
+            Some(self.of_type(&LogicalType::Boolean, depth))
+        } else {
+            None
+        };
+        let ignore_nulls = self.random.chance(3);
+        let ty = self.ty(0);
+        self.plan.add_expr(Expr::Window { name, args, distinct, filter, ignore_nulls }, ty)
+    }
+
     fn exprs(&mut self, count: usize, depth: usize) -> Slice {
         let list = (0..count).map(|_| self.any(depth)).collect::<Vec<_>>();
         self.plan.add_expr_list(&list)
@@ -613,7 +640,7 @@ impl Generator {
             let leaf = self.leaf();
             return self.plan.add_node(leaf);
         }
-        let node = match self.random.below(14) {
+        let node = match self.random.below(15) {
             0 => {
                 let input = self.node(depth - 1);
                 let predicate = self.of_type(&LogicalType::Boolean, EXPR_DEPTH);
@@ -642,6 +669,45 @@ impl Generator {
                 let input = self.node(depth - 1);
                 let keys = self.keys(EXPR_DEPTH);
                 Node::Sort { input, keys }
+            }
+            14 => {
+                let input = self.node(depth - 1);
+                let count = self.random.below(3);
+                let partition = self.exprs(count, EXPR_DEPTH);
+                let order = self.keys(EXPR_DEPTH);
+                let start = if self.random.chance(2) {
+                    WindowBound::UnboundedPreceding
+                } else {
+                    let offset = self.of_type(&LogicalType::Integer, EXPR_DEPTH);
+                    WindowBound::Preceding(offset)
+                };
+                let end = if self.random.chance(2) {
+                    WindowBound::CurrentRow
+                } else {
+                    let offset = self.of_type(&LogicalType::Integer, EXPR_DEPTH);
+                    WindowBound::Following(offset)
+                };
+                let frame = WindowFrame {
+                    unit: self.random.pick(&[
+                        WindowUnit::Rows,
+                        WindowUnit::Range,
+                        WindowUnit::Groups,
+                    ]),
+                    start,
+                    end,
+                    exclude: self.random.pick(&[
+                        WindowExclude::NoOthers,
+                        WindowExclude::CurrentRow,
+                        WindowExclude::Group,
+                        WindowExclude::Ties,
+                    ]),
+                };
+                let list = (0..self.random.count(1, 2))
+                    .map(|_| self.window(EXPR_DEPTH - 1))
+                    .collect::<Vec<_>>();
+                let expressions = self.plan.add_expr_list(&list);
+                let index = self.index();
+                Node::Window { input, index, partition, order, frame, expressions }
             }
             4 => {
                 let input = self.node(depth - 1);

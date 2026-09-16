@@ -910,6 +910,12 @@ impl Prepared {
                     plan.string(name)
                 )));
             }
+            Expr::Window { name, .. } => {
+                return Err(Error::internal(format!(
+                    "the {} window function was evaluated as an ordinary expression",
+                    plan.string(name)
+                )));
+            }
             Expr::Case { arms, otherwise } => {
                 let mut prepared = Vec::new();
                 for &arm in plan.arm_list(arms) {
