@@ -69,6 +69,7 @@ pub fn transform_with_case(
         anonymous: 0,
         identifier_case,
         current_span: Span::new(0, 0),
+        ctes: Vec::new(),
     };
     transform.program(tree.root())?;
     Ok(transform.ast)
@@ -84,6 +85,12 @@ struct Transform<'a> {
     anonymous: u32,
     identifier_case: IdentifierCase,
     current_span: Span,
+    /// Non-recursive CTEs visible while their containing query is transformed.
+    ///
+    /// A reference becomes an ordinary subquery source here. That is the inlined shape the binder
+    /// already understands, and keeping it at this boundary avoids teaching every later name
+    /// resolver about a second kind of relation.
+    ctes: Vec<(StrRef, QueryRef, Slice)>,
 }
 
 impl<'a> Transform<'a> {
@@ -846,8 +853,41 @@ impl<'a> Transform<'a> {
     }
 
     fn query_inner(&mut self, node: u32) -> Result<QueryRef> {
-        if self.find(node, "WithClause") != NONE {
-            return self.unsupported(self.find(node, "WithClause"));
+        let mark = self.ctes.len();
+        let with = self.find(node, "WithClause");
+        if with != NONE {
+            if self.find(with, "Recursive") != NONE {
+                return self.unsupported(self.find(with, "Recursive"));
+            }
+            for statement in self.kids(with) {
+                if self.name(statement) != "WithStatement" {
+                    continue;
+                }
+                let materialized = self.find(statement, "Materialized");
+                if materialized != NONE
+                    && !self.text(materialized).eq_ignore_ascii_case("NOT MATERIALIZED")
+                {
+                    return self.unsupported(materialized);
+                }
+                let name = self.identifier(self.first(statement));
+                let list = self.find(statement, "InsertColumnList");
+                let columns = if list == NONE {
+                    Slice::default()
+                } else {
+                    let mut names = Vec::new();
+                    for kid in self.kids(self.find(list, "ColumnList")) {
+                        names.push(self.identifier(kid));
+                    }
+                    self.part_slice(names)
+                };
+                let body = self.find(statement, "CTEBody");
+                let select = self.first(body);
+                if self.name(select) != "CTESelectBody" {
+                    return self.unsupported(body);
+                }
+                let query = self.query(self.first(select))?;
+                self.ctes.push((name, query, columns));
+            }
         }
         let chain = self.find(node, "SelectSetOpChain");
         if chain == NONE {
@@ -858,6 +898,7 @@ impl<'a> Transform<'a> {
         if modifiers != NONE {
             self.result_modifiers(query, modifiers)?;
         }
+        self.ctes.truncate(mark);
         Ok(query)
     }
 
@@ -1366,6 +1407,18 @@ impl<'a> Transform<'a> {
                 }
                 let name = self.name_parts(self.find(inner, "BaseTableName"));
                 let (alias, columns) = self.table_alias(self.find(inner, "TableAlias"));
+                if name.len == 1 {
+                    let part = self.ast.parts[name.start as usize];
+                    if let Some(&(_, query, declared)) =
+                        self.ctes.iter().rev().find(|&&(cte, _, _)| {
+                            self.ast.string(cte).eq_ignore_ascii_case(self.ast.string(part))
+                        })
+                    {
+                        let alias = if alias == NONE { part } else { alias };
+                        let columns = if columns.is_empty() { declared } else { columns };
+                        return Ok(self.push_source(Source::Subquery { query, alias, columns }));
+                    }
+                }
                 Ok(self.push_source(Source::Table { name, alias, columns }))
             }
             "TableSubquery" => {
@@ -3517,6 +3570,25 @@ mod tests {
         // Rows of different widths parse. Saying so wants the column count, which for an insert is
         // the table's, so the check belongs to the binder and not here.
         assert_eq!(round("VALUES (1), (2, 3)"), "VALUES (1), (2, 3)");
+    }
+
+    #[test]
+    fn non_recursive_ctes_inline_and_semantic_variants_are_explicit() {
+        assert_eq!(
+            round("WITH t AS (SELECT 1 AS x) SELECT x FROM t"),
+            "SELECT x FROM (SELECT 1 AS x) AS t"
+        );
+        assert_eq!(
+            round("WITH t(x) AS NOT MATERIALIZED (SELECT 1) SELECT x FROM t"),
+            "SELECT x FROM (SELECT 1) AS t"
+        );
+        for query in [
+            "WITH RECURSIVE t(x) AS (SELECT 1) SELECT x FROM t",
+            "WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT x FROM t",
+        ] {
+            let error = parse_ast(query).expect_err("the unsupported CTE shape is refused");
+            assert!(error.to_string().starts_with("Not implemented Error"), "{query}: {error}");
+        }
     }
 
     /// `DESCRIBE` is a query body, and the two spellings that name something become a star over it.
