@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.24
+
+A patch release about zero-division policy, IEEE floating point policy, guarded timestamp casts, and faster grouped aggregation. The storage format version is unchanged.
+
+- `null_on_division_by_zero` returns null for integer division, remainder, and interval division by zero after the session opt-in, while ordinary slash keeps DuckDB's IEEE infinity and NaN behavior. FLOAT divided by FLOAT now remains FLOAT.
+- `ieee_floating_point_ops` selects IEEE results or DuckDB's bind-time zero-divisor errors for floating slash and remainder. `null_on_division_by_zero` takes precedence when both settings are changed, and floating overflow remains infinity in both modes.
+- `disable_timestamptz_casts` rejects local timestamp and date conversions to TIMESTAMPTZ while binding. The check covers explicit and implicit conversions, `TRY_CAST`, comparisons, CASE, VALUES, set operations, function arguments, and INSERT, while text casts remain valid.
+- Session choices are resolved into the bound plan, so these semantics add no setting reads or branches to execution hot paths.
+- Grouped string keys remain encoded through aggregation instead of being materialised before the hash table. Fixed-width aggregate rows are exchanged by radix owner, so each finishing worker merges only the partitions it owns instead of every worker scanning every local table.
+- Performance reports now live in rudb-bench rather than the engine repository, keeping benchmark evidence beside the harness and datasets that produced it.
+- The pinned DuckDB oracle agrees on every new compatibility record in this release. No DuckDB bug was found in this work.
+
 ## 0.3.23
 
 A patch release about session-controlled integer division, constant sort keys, and regex operator matching. The storage format version is unchanged.
