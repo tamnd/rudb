@@ -2195,6 +2195,32 @@ fn correlated_exists_groups_keys_before_its_single_join() {
 }
 
 #[test]
+fn correlated_exists_uses_an_outer_domain_for_inequalities() {
+    let db = database();
+    let sql = "SELECT k FROM (VALUES (1), (2), (4)) o(k) WHERE EXISTS (SELECT 1 FROM (VALUES (1), (3)) i(x) WHERE i.x < o.k) ORDER BY k";
+    assert_eq!(rows(&db, sql), vec![vec![Value::Integer(2)], vec![Value::Integer(4)]]);
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k FROM (VALUES (1), (2), (4)) o(k) WHERE NOT EXISTS (SELECT 1 FROM (VALUES (1), (3)) i(x) WHERE i.x < o.k AND i.x > 1) ORDER BY k"
+        ),
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT EXISTS (SELECT 1 FROM (VALUES (1)) i(x) WHERE i.x IS DISTINCT FROM o.k) FROM (VALUES (NULL)) o(k)"
+        ),
+        vec![vec![Value::Boolean(true)]]
+    );
+    let plan = db.plan(sql).expect("the correlated inequality existence query plans");
+    assert!(plan.contains("Join INNER"), "{plan}");
+    assert!(plan.contains("Join SINGLE"), "{plan}");
+    assert!(plan.contains("IS NOT DISTINCT FROM"), "{plan}");
+    assert!(!plan.contains("DependentJoin"), "{plan}");
+}
+
+#[test]
 fn uncorrelated_in_subqueries_are_mark_joins() {
     let db = database();
     let query = |subject: &str, values: &str| {
