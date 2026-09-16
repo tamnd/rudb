@@ -417,6 +417,79 @@ struct NativeFrequencies {
     column: usize,
 }
 
+/// First-key values which marginal frequencies prove contain every winning two-key count.
+///
+/// For a pair `(a, b)`, inclusion-exclusion gives `count(a, b) >= count(a) + count(b) - N`.
+/// If that lower bound for `top` different `a` values is strictly greater than the total count of
+/// the next `a`, no pair belonging to any excluded `a` can enter the count-descending TopN.
+fn native_count_anchors(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+    top: usize,
+) -> Result<Option<Vec<i64>>> {
+    let Node::Get { catalog: database, schema, table, index, columns, .. } = *plan.node(input)
+    else {
+        return Ok(None);
+    };
+    let [first, second] = plan.expr_list(groups) else { return Ok(None) };
+    let Expr::Column(first) = *plan.expr(*first) else { return Ok(None) };
+    let Expr::Column(second) = *plan.expr(*second) else { return Ok(None) };
+    if first.table != index
+        || second.table != index
+        || plan.expr_type(plan.expr_list(groups)[0]) != &rudb_common::LogicalType::BigInt
+        || plan.expr_type(plan.expr_list(groups)[1]) != &rudb_common::LogicalType::Varchar
+    {
+        return Ok(None);
+    }
+    let [aggregate] = plan.expr_list(aggregates) else { return Ok(None) };
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
+        return Ok(None);
+    };
+    if top == 0
+        || plan.string(name) != "count_star"
+        || !plan.expr_list(args).is_empty()
+        || distinct
+        || filter.is_some()
+    {
+        return Ok(None);
+    }
+    let fields = plan.field_list(columns);
+    let Some(first_field) = fields.get(first.column as usize) else { return Ok(None) };
+    let Some(second_field) = fields.get(second.column as usize) else { return Ok(None) };
+    let name = QualifiedName::new(plan.string(database), plan.string(schema), plan.string(table));
+    let table = catalog.table(&name)?;
+    let Some(first_column) = table.column_index(&first_field.name) else { return Ok(None) };
+    let Some(second_column) = table.column_index(&second_field.name) else { return Ok(None) };
+    let Some(first_frequencies) =
+        table.rows().top_frequencies(first_column, top.saturating_add(1))?
+    else {
+        return Ok(None);
+    };
+    let Some(second_frequencies) = table.rows().top_frequencies(second_column, 1)? else {
+        return Ok(None);
+    };
+    let Some(&(_, second_count)) = second_frequencies.first() else { return Ok(None) };
+    let Some(&(_, excluded_count)) = first_frequencies.get(top) else { return Ok(None) };
+    let rows = u64::try_from(table.rows().len()).unwrap_or(u64::MAX);
+    let certified = first_frequencies[..top].iter().all(|(_, first_count)| {
+        first_count.saturating_add(second_count).saturating_sub(rows) > excluded_count
+    });
+    if !certified {
+        return Ok(None);
+    }
+    first_frequencies[..top]
+        .iter()
+        .map(|(value, _)| match value {
+            Value::BigInt(value) => Ok(*value),
+            _ => Err(Error::internal("a BIGINT frequency synopsis contained another type")),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
 /// Exact grouped counts already certified by a native file's frequency synopsis.
 fn native_frequencies(
     plan: &Plan,
@@ -682,6 +755,16 @@ impl<'a> Building<'a, '_> {
         };
         let aggregate = match bound.top_counts {
             Some(bound) => aggregate.top_counts(bound),
+            None => aggregate,
+        };
+        let aggregate = match bound.top_counts {
+            Some(top) => {
+                match native_count_anchors(self.plan, self.catalog, input, groups, aggregates, top)?
+                {
+                    Some(anchors) => aggregate.count_anchors(anchors),
+                    None => aggregate,
+                }
+            }
             None => aggregate,
         };
         let aggregate = match bound.having_count {

@@ -191,6 +191,11 @@ pub(crate) struct Aggregate<'a> {
     bigint_distinct: OnceLock<BigIntDistinctExchange>,
     /// Native integer and dictionary-code rows exchanged for a three-key count and TopN.
     encoded_count: OnceLock<Option<EncodedCountExchange>>,
+    /// BIGINT values proved to contain every winner of a two-key count-descending TopN.
+    ///
+    /// Empty means no such proof was available. When populated, the encoded exchange can discard
+    /// every other first key before it allocates or hashes a record.
+    count_anchors: Vec<i64>,
     /// Fixed group and BIGINT pairs exchanged for grouped distinct counts.
     grouped_distinct: OnceLock<group_distinct::Exchange>,
     /// Fixed rows exchanged for one mixed aggregate state per INTEGER group.
@@ -623,6 +628,7 @@ impl<'a> Aggregate<'a> {
             fixed: OnceLock::new(),
             bigint_distinct: OnceLock::new(),
             encoded_count: OnceLock::new(),
+            count_anchors: Vec::new(),
             grouped_distinct: OnceLock::new(),
             mixed: OnceLock::new(),
             out: out.clone(),
@@ -645,6 +651,17 @@ impl<'a> Aggregate<'a> {
             || self.mixed_numeric_distinct
         {
             self.top_counts = Some(bound);
+        }
+        self
+    }
+
+    /// Restricts a two-key encoded count to first keys certified to contain every TopN winner.
+    #[must_use]
+    pub(crate) fn count_anchors(mut self, mut anchors: Vec<i64>) -> Self {
+        if self.encoded_top_count() && self.keys.len() == 2 {
+            anchors.sort_unstable();
+            anchors.dedup();
+            self.count_anchors = anchors;
         }
         self
     }
@@ -862,6 +879,12 @@ impl<'a> Aggregate<'a> {
                 })?)
                 .map_err(|_| Error::internal("an encoded BIGINT key is out of range"))?
             };
+            if !self.count_anchors.is_empty()
+                && (valid & EncodedCountRecord::FIRST == 0
+                    || self.count_anchors.binary_search(&first_value).is_err())
+            {
+                continue;
+            }
             let second_value = if let Some(second) = second {
                 if second.is_null_at(row) {
                     0
