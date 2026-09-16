@@ -34,6 +34,7 @@ use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
 use crate::buffer::Buffered;
+use crate::group_distinct;
 use crate::key::{BigIntSet, Key, RowSet, mix, spread};
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
@@ -187,6 +188,8 @@ pub(crate) struct Aggregate<'a> {
     bigint_distinct: OnceLock<BigIntDistinctExchange>,
     /// Native integer and dictionary-code rows exchanged for a three-key count and TopN.
     encoded_count: OnceLock<Option<EncodedCountExchange>>,
+    /// Fixed group and BIGINT pairs exchanged for grouped distinct counts.
+    grouped_distinct: OnceLock<group_distinct::Exchange>,
     out: Buffered,
 }
 
@@ -580,6 +583,7 @@ impl<'a> Aggregate<'a> {
             fixed: OnceLock::new(),
             bigint_distinct: OnceLock::new(),
             encoded_count: OnceLock::new(),
+            grouped_distinct: OnceLock::new(),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -660,6 +664,14 @@ impl<'a> Aggregate<'a> {
             && self.plan.expr_type(self.keys[0]) == &LogicalType::BigInt
             && self.plan.expr_type(self.keys[1]) == &LogicalType::BigInt
             && self.plan.expr_type(self.keys[2]) == &LogicalType::Varchar
+    }
+
+    fn grouped_distinct_top_count(&self) -> bool {
+        self.distinct_count
+            && self.top_counts.is_some()
+            && self.constants.iter().all(Option::is_none)
+            && self.keys.len() == 1
+            && self.plan.expr_type(self.keys[0]) == &LogicalType::Integer
     }
 
     fn buffer_fixed(
@@ -2290,6 +2302,7 @@ impl Rows {
 /// The scratch one pipeline instance keeps between chunks, and its table when it has one of its own.
 #[derive(Debug)]
 pub(crate) struct Partitioned {
+    grouped_distinct: group_distinct::Local,
     encoded: bool,
     encoded_records: Vec<EncodedCountPartition>,
     encoded_memory: Reservation,
@@ -2738,6 +2751,7 @@ impl Sink for Aggregate<'_> {
     fn local(&self) -> Partitioned {
         self.started.fetch_add(1, Ordering::Relaxed);
         Partitioned {
+            grouped_distinct: group_distinct::Local::new(&self.memory),
             encoded: false,
             encoded_records: (0..RADIX_PARTITIONS)
                 .map(|_| EncodedCountPartition::default())
@@ -2794,6 +2808,7 @@ impl Sink for Aggregate<'_> {
     /// behind one lock before doing any work at all.
     fn sink(&self, chunk: &Chunk, local: &mut Partitioned) -> Result<Progress> {
         let Partitioned {
+            grouped_distinct,
             encoded,
             encoded_records,
             encoded_memory,
@@ -2813,6 +2828,28 @@ impl Sink for Aggregate<'_> {
             own,
         } = local;
         let rows = self.read(chunk, expressions)?;
+        if self.grouped_distinct_top_count() {
+            let [group] = rows.keys.as_slice() else {
+                return Err(Error::internal(
+                    "a grouped distinct exchange received the wrong key width",
+                ));
+            };
+            let Some(user) = rows.arguments.first().and_then(|arguments| arguments.first()) else {
+                return Err(Error::internal("a grouped distinct exchange received no argument"));
+            };
+            let timing = stage::Timing::start(Stage::Scatter);
+            let buffered = group_distinct::Exchange::buffer(
+                &self.grouped_distinct,
+                group,
+                user,
+                rows.rows,
+                grouped_distinct,
+            );
+            timing.stop(0);
+            if buffered? {
+                return Ok(Progress::More);
+            }
+        }
         if self.encoded_top_count() {
             let timing = stage::Timing::start(Stage::Scatter);
             let buffered = self.buffer_encoded_count(&rows, encoded_records, encoded_memory);
@@ -2927,6 +2964,7 @@ impl Sink for Aggregate<'_> {
     /// so a table is never left whole in partition zero after the switch.
     fn combine(&self, local: Partitioned) -> Result<()> {
         let Partitioned {
+            grouped_distinct,
             encoded,
             mut encoded_records,
             encoded_memory,
@@ -2945,6 +2983,15 @@ impl Sink for Aggregate<'_> {
             mut own,
             ..
         } = local;
+        if grouped_distinct.used() {
+            let state = self
+                .grouped_distinct
+                .get()
+                .expect("a grouped distinct exchange exists after its sink");
+            state.combine(grouped_distinct)?;
+            self.built.lock().map_err(poisoned)?.instances += 1;
+            return Ok(());
+        }
         if encoded {
             let state = self
                 .encoded_count
@@ -3071,6 +3118,13 @@ impl Sink for Aggregate<'_> {
     /// its one group is made when the instance is, and an instance is made whether or not a row
     /// arrives.
     fn finalize(&self) -> Result<()> {
+        if let Some(distinct) = self.grouped_distinct.get() {
+            let chunks = distinct.finish(
+                self.top_counts.expect("a grouped distinct exchange has a TopN bound"),
+                &self.memory,
+            )?;
+            return self.out.fill(chunks);
+        }
         if let Some(Some(encoded)) = self.encoded_count.get() {
             let next = AtomicUsize::new(0);
             let slots: Vec<Mutex<Option<Result<Part>>>> =

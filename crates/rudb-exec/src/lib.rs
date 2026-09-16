@@ -87,6 +87,7 @@ mod fetch;
 mod functionnames;
 mod gather;
 mod group;
+mod group_distinct;
 mod join;
 mod key;
 mod keywords;
