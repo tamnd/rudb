@@ -356,6 +356,9 @@ pub enum JoinKind {
     /// Left rows paired with their match, or with nulls, at most one right row each. What a
     /// correlated scalar subquery unnests to.
     Single,
+    /// Every left row plus a nullable boolean saying whether its condition matched the right side.
+    /// A null means no row matched and at least one comparison was unknown.
+    Mark,
     /// The nth left row with the nth right row, which is DuckDB's `POSITIONAL JOIN`.
     Positional,
 }
@@ -372,12 +375,13 @@ impl JoinKind {
             Self::Semi => "SEMI",
             Self::Anti => "ANTI",
             Self::Single => "SINGLE",
+            Self::Mark => "MARK",
             Self::Positional => "POSITIONAL",
         }
     }
 
     /// Every join kind, which is what the reader searches.
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Inner,
         Self::Left,
         Self::Right,
@@ -385,6 +389,7 @@ impl JoinKind {
         Self::Semi,
         Self::Anti,
         Self::Single,
+        Self::Mark,
         Self::Positional,
     ];
 }
@@ -509,7 +514,7 @@ mod tests {
 
     #[test]
     fn every_join_kind_and_set_operation_is_in_the_list_the_reader_searches() {
-        assert_eq!(JoinKind::ALL.len(), 8);
+        assert_eq!(JoinKind::ALL.len(), 9);
         assert_eq!(SetOpKind::ALL.len(), 3);
         let mut names: Vec<&str> = JoinKind::ALL.iter().map(|k| k.keyword()).collect();
         names.sort_unstable();

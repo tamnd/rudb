@@ -1747,6 +1747,10 @@ impl<'a> Transform<'a> {
                         let list = self.expr_slice(items);
                         Ok(self.push(Expr::In { operand, list, negated }))
                     }
+                    "InSelectStatement" => {
+                        let query = self.query(self.first(expression))?;
+                        Ok(self.push(Expr::InSubquery { operand, query, negated }))
+                    }
                     _ => self.unsupported(expression),
                 }
             }
@@ -2880,6 +2884,10 @@ mod tests {
             Expr::Exists { query, negated } => {
                 let exists = format!("EXISTS ({})", show_query(ast, query));
                 if negated { format!("NOT {exists}") } else { exists }
+            }
+            Expr::InSubquery { operand, query, negated } => {
+                let written = format!("{} IN ({})", show(ast, operand), show_query(ast, query));
+                if negated { format!("NOT {written}") } else { written }
             }
         }
     }

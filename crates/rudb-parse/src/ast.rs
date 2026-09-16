@@ -613,6 +613,15 @@ pub enum Expr {
         /// Whether it was written `NOT IN`.
         negated: bool,
     },
+    /// `x IN (SELECT ...)` or its negation.
+    InSubquery {
+        /// What is being tested.
+        operand: ExprRef,
+        /// The query producing the candidates.
+        query: QueryRef,
+        /// Whether it was written `NOT IN`.
+        negated: bool,
+    },
     /// A prepared statement parameter, written `?`, `?1`, `$1` or `$name`.
     Parameter {
         /// The identifier, which is the number for a positional one and the word for a named one.
