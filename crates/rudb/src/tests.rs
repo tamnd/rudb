@@ -1246,7 +1246,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // This table lists itself, because it is a table function and the table lists those.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
-        vec![vec![Value::BigInt(11)]]
+        vec![vec![Value::BigInt(13)]]
     );
 }
 
