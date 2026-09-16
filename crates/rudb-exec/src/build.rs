@@ -58,7 +58,10 @@ use rudb_plan::{
 };
 use rudb_seam::Settings;
 
-use crate::enginenames::{database_size, extensions, optimizers, platform, user_agent, version};
+use crate::enginenames::{
+    database_size, dialects, extensions, grammar_extensions, optimizers, platform, user_agent,
+    version,
+};
 use crate::entrynames::{columnnames, databasenames, schemanames, tablenames, viewnames};
 use crate::fetch::{Fetch, TableFetch};
 use crate::functionnames::functionnames;
@@ -599,6 +602,8 @@ impl<'a> Building<'a, '_> {
                         | TableFunction::DuckdbColumns
                         | TableFunction::DuckdbExtensions
                         | TableFunction::DuckdbOptimizers
+                        | TableFunction::DuckdbDialects
+                        | TableFunction::DuckdbGrammarExtensions
                         | TableFunction::PragmaVersion
                         | TableFunction::PragmaPlatform
                         | TableFunction::PragmaUserAgent
@@ -628,6 +633,10 @@ impl<'a> Building<'a, '_> {
                             }
                             TableFunction::DuckdbExtensions => extensions(plan, index, columns)?,
                             TableFunction::DuckdbOptimizers => optimizers(plan, index, columns)?,
+                            TableFunction::DuckdbDialects => dialects(plan, index, columns)?,
+                            TableFunction::DuckdbGrammarExtensions => {
+                                grammar_extensions(plan, index, columns)?
+                            }
                             TableFunction::PragmaVersion => version(plan, index, columns)?,
                             TableFunction::PragmaPlatform => platform(plan, index, columns)?,
                             TableFunction::PragmaUserAgent => user_agent(plan, index, columns)?,
