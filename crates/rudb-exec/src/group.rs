@@ -35,6 +35,7 @@ use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
 use crate::buffer::Buffered;
 use crate::group_distinct;
+use crate::group_mixed;
 use crate::key::{BigIntSet, Key, RowSet, mix, spread};
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
@@ -146,6 +147,8 @@ pub(crate) struct Aggregate<'a> {
     compact_numeric: bool,
     /// The only call is COUNT(DISTINCT BIGINT), whose completed state is ordered like COUNT(*).
     distinct_count: bool,
+    /// SUM(SMALLINT), COUNT(*), AVG(SMALLINT), and COUNT(DISTINCT BIGINT) grouped by INTEGER.
+    mixed_numeric_distinct: bool,
     /// An ungrouped COUNT(DISTINCT BIGINT) can exchange integer rows directly and count one set per
     /// radix owner instead of building and merging one general aggregate state per worker.
     radix_distinct_count: bool,
@@ -190,6 +193,8 @@ pub(crate) struct Aggregate<'a> {
     encoded_count: OnceLock<Option<EncodedCountExchange>>,
     /// Fixed group and BIGINT pairs exchanged for grouped distinct counts.
     grouped_distinct: OnceLock<group_distinct::Exchange>,
+    /// Fixed rows exchanged for one mixed aggregate state per INTEGER group.
+    mixed: OnceLock<group_mixed::Exchange>,
     out: Buffered,
 }
 
@@ -546,6 +551,28 @@ impl<'a> Aggregate<'a> {
             && calls[0].args.len() == 1
             && plan.expr_type(calls[0].args[0]) == &LogicalType::BigInt
             && calls[0].filter.is_none();
+        let mixed_numeric_distinct = !alone
+            && calls.len() == 4
+            && calls[0].name == "sum"
+            && !calls[0].distinct
+            && calls[0].args.len() == 1
+            && plan.expr_type(calls[0].args[0]) == &LogicalType::SmallInt
+            && calls[0].returns == LogicalType::HugeInt
+            && calls[1].name == "count_star"
+            && !calls[1].distinct
+            && calls[1].args.is_empty()
+            && calls[1].returns == LogicalType::BigInt
+            && calls[2].name == "avg"
+            && !calls[2].distinct
+            && calls[2].args.len() == 1
+            && plan.expr_type(calls[2].args[0]) == &LogicalType::SmallInt
+            && calls[2].returns == LogicalType::Double
+            && calls[3].name == "count"
+            && calls[3].distinct
+            && calls[3].args.len() == 1
+            && plan.expr_type(calls[3].args[0]) == &LogicalType::BigInt
+            && calls[3].returns == LogicalType::BigInt
+            && calls.iter().all(|call| call.filter.is_none());
         let radix_distinct_count = alone
             && calls.len() == 1
             && calls[0].name == "count"
@@ -570,6 +597,7 @@ impl<'a> Aggregate<'a> {
                 && calls[0].filter.is_none(),
             compact_numeric,
             distinct_count,
+            mixed_numeric_distinct,
             radix_distinct_count,
             top_counts: None,
             having_count: None,
@@ -595,6 +623,7 @@ impl<'a> Aggregate<'a> {
             bigint_distinct: OnceLock::new(),
             encoded_count: OnceLock::new(),
             grouped_distinct: OnceLock::new(),
+            mixed: OnceLock::new(),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -609,7 +638,11 @@ impl<'a> Aggregate<'a> {
     /// Keeps only the groups that can still reach a count-descending TopN above this aggregate.
     #[must_use]
     pub(crate) fn top_counts(mut self, bound: usize) -> Self {
-        if self.count_only || self.compact_numeric || self.distinct_count {
+        if self.count_only
+            || self.compact_numeric
+            || self.distinct_count
+            || self.mixed_numeric_distinct
+        {
             self.top_counts = Some(bound);
         }
         self
@@ -679,6 +712,14 @@ impl<'a> Aggregate<'a> {
 
     fn grouped_distinct_top_count(&self) -> bool {
         self.distinct_count
+            && self.top_counts.is_some()
+            && self.constants.iter().all(Option::is_none)
+            && self.keys.len() == 1
+            && self.plan.expr_type(self.keys[0]) == &LogicalType::Integer
+    }
+
+    fn mixed_top_count(&self) -> bool {
+        self.mixed_numeric_distinct
             && self.top_counts.is_some()
             && self.constants.iter().all(Option::is_none)
             && self.keys.len() == 1
@@ -2302,6 +2343,7 @@ impl Rows {
 /// The scratch one pipeline instance keeps between chunks, and its table when it has one of its own.
 #[derive(Debug)]
 pub(crate) struct Partitioned {
+    mixed: group_mixed::Local,
     grouped_distinct: group_distinct::Local,
     encoded: bool,
     encoded_records: Vec<EncodedCountPartition>,
@@ -2751,6 +2793,7 @@ impl Sink for Aggregate<'_> {
     fn local(&self) -> Partitioned {
         self.started.fetch_add(1, Ordering::Relaxed);
         Partitioned {
+            mixed: group_mixed::Local::new(&self.memory),
             grouped_distinct: group_distinct::Local::new(&self.memory),
             encoded: false,
             encoded_records: (0..RADIX_PARTITIONS)
@@ -2808,6 +2851,7 @@ impl Sink for Aggregate<'_> {
     /// behind one lock before doing any work at all.
     fn sink(&self, chunk: &Chunk, local: &mut Partitioned) -> Result<Progress> {
         let Partitioned {
+            mixed,
             grouped_distinct,
             encoded,
             encoded_records,
@@ -2828,6 +2872,31 @@ impl Sink for Aggregate<'_> {
             own,
         } = local;
         let rows = self.read(chunk, expressions)?;
+        if self.mixed_top_count() {
+            let [group] = rows.keys.as_slice() else {
+                return Err(Error::internal("a mixed radix exchange received the wrong key width"));
+            };
+            let [sum] = rows.arguments[0].as_slice() else {
+                return Err(Error::internal("a mixed radix exchange received no SUM argument"));
+            };
+            let [mean] = rows.arguments[2].as_slice() else {
+                return Err(Error::internal("a mixed radix exchange received no AVG argument"));
+            };
+            let [user] = rows.arguments[3].as_slice() else {
+                return Err(Error::internal(
+                    "a mixed radix exchange received no distinct argument",
+                ));
+            };
+            let buffered = group_mixed::Exchange::buffer(
+                &self.mixed,
+                &self.memory,
+                [group, sum, mean, user],
+                rows.rows,
+                mixed,
+            );
+            buffered?;
+            return Ok(Progress::More);
+        }
         if self.grouped_distinct_top_count() {
             let [group] = rows.keys.as_slice() else {
                 return Err(Error::internal(
@@ -2964,6 +3033,7 @@ impl Sink for Aggregate<'_> {
     /// so a table is never left whole in partition zero after the switch.
     fn combine(&self, local: Partitioned) -> Result<()> {
         let Partitioned {
+            mixed,
             grouped_distinct,
             encoded,
             mut encoded_records,
@@ -2983,6 +3053,12 @@ impl Sink for Aggregate<'_> {
             mut own,
             ..
         } = local;
+        if mixed.used() {
+            let state = self.mixed.get().expect("a mixed exchange exists after its sink");
+            state.combine(mixed)?;
+            self.built.lock().map_err(poisoned)?.instances += 1;
+            return Ok(());
+        }
         if grouped_distinct.used() {
             let state = self
                 .grouped_distinct
@@ -3118,6 +3194,13 @@ impl Sink for Aggregate<'_> {
     /// its one group is made when the instance is, and an instance is made whether or not a row
     /// arrives.
     fn finalize(&self) -> Result<()> {
+        if let Some(mixed) = self.mixed.get() {
+            let chunks = mixed.finish(
+                self.top_counts.expect("a mixed exchange has a TopN bound"),
+                &self.memory,
+            )?;
+            return self.out.fill(chunks);
+        }
         if let Some(distinct) = self.grouped_distinct.get() {
             let chunks = distinct.finish(
                 self.top_counts.expect("a grouped distinct exchange has a TopN bound"),
