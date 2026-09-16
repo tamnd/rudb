@@ -251,6 +251,7 @@ impl BigIntDistinctPartition {
 #[derive(Debug)]
 struct EncodedCountExchange {
     dictionary: Arc<Vector>,
+    keys: usize,
     partitions: Vec<Mutex<EncodedCountPartition>>,
     held: Mutex<Vec<Reservation>>,
 }
@@ -701,13 +702,24 @@ impl<'a> Aggregate<'a> {
     }
 
     fn encoded_top_count(&self) -> bool {
-        self.count_only
-            && self.top_counts.is_some()
-            && self.constants.iter().all(Option::is_none)
-            && self.keys.len() == 3
-            && self.plan.expr_type(self.keys[0]) == &LogicalType::BigInt
-            && self.plan.expr_type(self.keys[1]) == &LogicalType::BigInt
-            && self.plan.expr_type(self.keys[2]) == &LogicalType::Varchar
+        if !self.count_only
+            || self.top_counts.is_none()
+            || !self.constants.iter().all(Option::is_none)
+        {
+            return false;
+        }
+        match self.keys.as_slice() {
+            [first, second] => {
+                self.plan.expr_type(*first) == &LogicalType::BigInt
+                    && self.plan.expr_type(*second) == &LogicalType::Varchar
+            }
+            [first, second, third] => {
+                self.plan.expr_type(*first) == &LogicalType::BigInt
+                    && self.plan.expr_type(*second) == &LogicalType::BigInt
+                    && self.plan.expr_type(*third) == &LogicalType::Varchar
+            }
+            _ => false,
+        }
     }
 
     fn grouped_distinct_top_count(&self) -> bool {
@@ -802,13 +814,20 @@ impl<'a> Aggregate<'a> {
         partitions: &mut [EncodedCountPartition],
         memory: &mut Reservation,
     ) -> Result<bool> {
-        let [first, second, third] = rows.keys.as_slice() else {
-            return Err(Error::internal("an encoded count exchange received the wrong key width"));
+        let (first, second, third) = match rows.keys.as_slice() {
+            [first, third] => (first, None, third),
+            [first, second, third] => (first, Some(second), third),
+            _ => {
+                return Err(Error::internal(
+                    "an encoded count exchange received the wrong key width",
+                ));
+            }
         };
         let dictionary = third.stable_dictionary_parts();
         let state = self.encoded_count.get_or_init(|| {
             dictionary.as_ref().map(|(_, dictionary)| EncodedCountExchange {
                 dictionary: Arc::clone(dictionary),
+                keys: rows.keys.len(),
                 partitions: (0..RADIX_PARTITIONS)
                     .map(|_| Mutex::new(EncodedCountPartition::default()))
                     .collect(),
@@ -826,11 +845,14 @@ impl<'a> Aggregate<'a> {
                 "an encoded count exchange received two string code spaces",
             ));
         }
+        if state.keys != rows.keys.len() {
+            return Err(Error::internal("an encoded count exchange changed key width"));
+        }
         let before = partitions.iter().map(EncodedCountPartition::footprint).sum::<usize>();
         let shift = u32::BITS - RADIX_PARTITIONS.ilog2();
         const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
         for (row, &third_code) in codes.iter().enumerate().take(rows.rows) {
-            let mut valid = 0;
+            let mut valid = if second.is_none() { EncodedCountRecord::SECOND } else { 0 };
             let first_value = if first.is_null_at(row) {
                 0
             } else {
@@ -840,14 +862,18 @@ impl<'a> Aggregate<'a> {
                 })?)
                 .map_err(|_| Error::internal("an encoded BIGINT key is out of range"))?
             };
-            let second_value = if second.is_null_at(row) {
-                0
+            let second_value = if let Some(second) = second {
+                if second.is_null_at(row) {
+                    0
+                } else {
+                    valid |= EncodedCountRecord::SECOND;
+                    i64::try_from(second.signed_at(row).ok_or_else(|| {
+                        Error::internal("an encoded BIGINT key has no signed representation")
+                    })?)
+                    .map_err(|_| Error::internal("an encoded BIGINT key is out of range"))?
+                }
             } else {
-                valid |= EncodedCountRecord::SECOND;
-                i64::try_from(second.signed_at(row).ok_or_else(|| {
-                    Error::internal("an encoded BIGINT key has no signed representation")
-                })?)
-                .map_err(|_| Error::internal("an encoded BIGINT key is out of range"))?
+                0
             };
             let third_value = if third.is_null_at(row) {
                 0
@@ -3432,7 +3458,7 @@ fn finish_encoded_count(
             return;
         };
         let done = partition.lock().map_err(poisoned).and_then(|mut rows| {
-            encoded_count_partition(&mut rows, &encoded.dictionary, bound, memory)
+            encoded_count_partition(&mut rows, &encoded.dictionary, encoded.keys, bound, memory)
         });
         if let Ok(mut slot) = slots[at].lock() {
             *slot = Some(done);
@@ -3443,9 +3469,13 @@ fn finish_encoded_count(
 fn encoded_count_partition(
     partition: &mut EncodedCountPartition,
     dictionary: &Vector,
+    keys: usize,
     bound: usize,
     memory: &Memory,
 ) -> Result<Part> {
+    if !(2..=3).contains(&keys) {
+        return Err(Error::internal("an encoded count partition has an unsupported key width"));
+    }
     const EMPTY: u32 = u32::MAX;
     let capacity = partition.rows.len().saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
@@ -3510,28 +3540,35 @@ fn encoded_count_partition(
     for slot in best {
         let key = partition.rows[slot];
         let valid = if all_valid { EncodedCountRecord::ALL } else { partition.validity[slot] };
-        output.push(vec![
-            if valid & EncodedCountRecord::FIRST != 0 {
-                Value::BigInt(key.first)
-            } else {
-                Value::Null
-            },
-            if valid & EncodedCountRecord::SECOND != 0 {
+        let first = if valid & EncodedCountRecord::FIRST != 0 {
+            Value::BigInt(key.first)
+        } else {
+            Value::Null
+        };
+        let third = if valid & EncodedCountRecord::THIRD != 0 {
+            dictionary.try_value_at(key.third as usize)?
+        } else {
+            Value::Null
+        };
+        let mut row = Vec::with_capacity(keys + 1);
+        row.push(first);
+        if keys == 3 {
+            row.push(if valid & EncodedCountRecord::SECOND != 0 {
                 Value::BigInt(key.second)
             } else {
                 Value::Null
-            },
-            if valid & EncodedCountRecord::THIRD != 0 {
-                dictionary.try_value_at(key.third as usize)?
-            } else {
-                Value::Null
-            },
-            Value::BigInt(counts[slot]),
-        ]);
+            });
+        }
+        row.push(third);
+        row.push(Value::BigInt(counts[slot]));
+        output.push(row);
     }
     let mut held = memory.reservation();
-    let types =
-        [LogicalType::BigInt, LogicalType::BigInt, LogicalType::Varchar, LogicalType::BigInt];
+    let types = if keys == 2 {
+        vec![LogicalType::BigInt, LogicalType::Varchar, LogicalType::BigInt]
+    } else {
+        vec![LogicalType::BigInt, LogicalType::BigInt, LogicalType::Varchar, LogicalType::BigInt]
+    };
     let chunks = rows::chunks(&types, &output, &mut held)?;
     timing.stop(0);
     Ok(Part { chunks, held })
@@ -4291,6 +4328,7 @@ fn poisoned<T>(_: T) -> Error {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use rudb_common::{Field, LogicalType, Memory, Value};
     use rudb_pipeline::Sink;
@@ -4653,8 +4691,9 @@ mod tests {
         partition.push(row(1, 2, 0), EncodedCountRecord::ALL);
         partition.push(row(1, 2, 1), EncodedCountRecord::ALL);
         partition.push(row(0, 2, 0), EncodedCountRecord::SECOND | EncodedCountRecord::THIRD);
-        let part = encoded_count_partition(&mut partition, &dictionary, 10, &Memory::unlimited())
-            .expect("the encoded partition");
+        let part =
+            encoded_count_partition(&mut partition, &dictionary, 3, 10, &Memory::unlimited())
+                .expect("the encoded partition");
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for chunk in part.chunks {
             for row in 0..chunk.len() {
@@ -4680,6 +4719,87 @@ mod tests {
         expected.sort_by_key(|row| format!("{row:?}"));
         assert_eq!(rows, expected);
         assert_eq!(size_of::<EncodedCountRecord>(), 24);
+    }
+
+    #[test]
+    fn a_two_key_encoded_count_omits_the_unused_integer() {
+        let dictionary = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("one".into()), Value::Varchar("two".into())],
+        )
+        .expect("a string dictionary");
+        let row = |first, third| EncodedCountRecord { first, second: 0, hash: 7, third };
+        let mut partition = EncodedCountPartition::default();
+        partition.push(row(1, 0), EncodedCountRecord::ALL);
+        partition.push(row(1, 0), EncodedCountRecord::ALL);
+        partition.push(row(1, 1), EncodedCountRecord::ALL);
+        partition.push(row(0, 0), EncodedCountRecord::SECOND | EncodedCountRecord::THIRD);
+        let part =
+            encoded_count_partition(&mut partition, &dictionary, 2, 10, &Memory::unlimited())
+                .expect("the encoded partition");
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for chunk in part.chunks {
+            for row in 0..chunk.len() {
+                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+            }
+        }
+        rows.sort_by_key(|row| format!("{row:?}"));
+        let mut expected = vec![
+            vec![Value::BigInt(1), Value::Varchar("one".into()), Value::BigInt(2)],
+            vec![Value::BigInt(1), Value::Varchar("two".into()), Value::BigInt(1)],
+            vec![Value::Null, Value::Varchar("one".into()), Value::BigInt(1)],
+        ];
+        expected.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn a_bigint_and_stable_string_top_count_takes_the_encoded_path() {
+        let plan = Plan::parse(concat!(
+            "Aggregate #1 groups=[#0.0::BIGINT, #0.1::VARCHAR] ",
+            "aggregates=[count_star()::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [x::BIGINT, y::VARCHAR]",
+        ))
+        .expect("a two-key count plan");
+        let schema = Schema::numbered(
+            vec![Field::new("x", LogicalType::BigInt), Field::new("y", LogicalType::Varchar)],
+            0,
+        );
+        let rudb_plan::Node::Aggregate { groups, aggregates, .. } = *plan.node(plan.root()) else {
+            panic!("the root is an aggregate")
+        };
+        let (aggregate, out) =
+            Aggregate::new(&plan, &schema, 1, groups, aggregates, &Memory::unlimited())
+                .expect("a count aggregate");
+        let aggregate = aggregate.top_counts(10);
+        let users = Vector::from_values(
+            LogicalType::BigInt,
+            &[Value::BigInt(7), Value::BigInt(7), Value::BigInt(8)],
+        )
+        .expect("user ids");
+        let dictionary = Arc::new(
+            Vector::from_values(
+                LogicalType::Varchar,
+                &[Value::Varchar("one".into()), Value::Varchar("two".into())],
+            )
+            .expect("search phrases"),
+        );
+        let phrases = Vector::stable_dictionary(vec![0, 0, 1], dictionary)
+            .expect("stable search phrase codes");
+        let input = Chunk::new(vec![users, phrases]).expect("two aligned columns");
+        let mut local = aggregate.local();
+        aggregate.sink(&input, &mut local).expect("three rows");
+        aggregate.combine(local).expect("the one instance");
+        assert!(aggregate.encoded_count.get().is_some(), "the compact path was selected");
+        aggregate.finalize().expect("the answer");
+        let mut rows = answer(&out);
+        rows.sort_by_key(|row| format!("{row:?}"));
+        let mut expected = vec![
+            vec![Value::BigInt(7), Value::Varchar("one".into()), Value::BigInt(2)],
+            vec![Value::BigInt(8), Value::Varchar("two".into()), Value::BigInt(1)],
+        ];
+        expected.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(rows, expected);
     }
 
     #[test]
