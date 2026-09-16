@@ -83,7 +83,7 @@ impl Rows {
             let (chunk, row) =
                 found.ok_or_else(|| Error::internal("row ordinal is past the table"))?;
             if cached.as_ref().is_none_or(|(held, _)| *held != chunk) {
-                cached = Some((chunk, self.read(chunk, columns)?));
+                cached = Some((chunk, self.read_for_fetch(chunk, columns)?));
             }
             let Some((_, held)) = &cached else {
                 return Err(Error::internal("row chunk was not cached"));
@@ -98,6 +98,43 @@ impl Rows {
             .map(|(values, ty)| Vector::from_values(ty.clone(), &values))
             .collect::<Result<Vec<_>>>()?;
         Chunk::with_rows(vectors, ordinals.len())
+    }
+
+    /// Reads a wide row fetch across independent native columns in parallel.
+    ///
+    /// Ordinary scans already parallelize by stripe in the pipeline above the reader. A late fetch
+    /// is deliberately one pipeline instance, has only a handful of winning rows, and commonly
+    /// asks for all hundred ClickBench columns from one stripe. Its useful parallel dimension is
+    /// therefore columns rather than stripes.
+    fn read_for_fetch(&self, stripe: usize, columns: &[usize]) -> Result<Chunk> {
+        let Self::Native(reader) = self else { return self.read(stripe, columns) };
+        const MIN_COLUMNS_PER_WORKER: usize = 16;
+        const MAX_WORKERS: usize = 8;
+        let workers = columns.len().div_ceil(MIN_COLUMNS_PER_WORKER).min(MAX_WORKERS);
+        if workers <= 1 {
+            return reader.read(stripe, columns);
+        }
+        let width = columns.len().div_ceil(workers);
+        let pieces = std::thread::scope(|scope| {
+            let handles = columns
+                .chunks(width)
+                .map(|columns| scope.spawn(|| reader.read(stripe, columns)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| Error::internal("a native row fetch worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let rows = pieces.first().map_or(0, Chunk::len);
+        let mut vectors = Vec::with_capacity(columns.len());
+        for piece in pieces {
+            vectors.extend(piece.into_columns());
+        }
+        Chunk::with_rows(vectors, rows)
     }
 
     /// Column types.
