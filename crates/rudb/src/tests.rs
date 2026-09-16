@@ -3606,11 +3606,9 @@ fn every_name_the_binary_accepts_is_a_name_the_statement_accepts() {
         assert_eq!(db.setting("disabled_optimizers").unwrap(), name);
     }
     assert_eq!(rudb_opt::UPSTREAM.len(), 44, "the pinned binary lists forty four");
-    // Every pass rudb built answers to a name the binary knows, which is what makes the corpus
-    // files mean the same thing on both engines.
-    for name in crate::optimizers() {
-        assert!(rudb_opt::UPSTREAM.contains(&name), "{name} is not a name duckdb has");
-    }
+    // The table remains DuckDB's list. A local pass may have a local name, but adding one must not
+    // make an introspection query claim that DuckDB has it too.
+    assert!(!rudb_opt::UPSTREAM.contains(&"dependent_group_keys"));
 }
 
 #[test]
