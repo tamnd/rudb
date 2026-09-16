@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.22
+
+A patch release about session time zones, zoned timestamp rendering, sort defaults, and smaller hot paths in the optimizer and grouped string aggregates. The storage format version is unchanged.
+
+- A session owns its time zone and starts with the host zone, while `SET TimeZone`, `RESET TimeZone`, and `current_setting('TimeZone')` use DuckDB's names and errors. The one argument `age(timestamp)` overload reads that zone once while binding the statement and turns the session instant into local civil time before doing calendar arithmetic.
+- Casting `TIMESTAMP WITH TIME ZONE` to `VARCHAR` renders the instant in the session zone, including the offset that applies at that instant across daylight saving transitions. Prepared expressions carry a parsed zone, so neither the zone database nor a setting lock is touched per row or per chunk. The optimizer leaves that cast unfolded because a constant folder without a session cannot choose the right text.
+- `default_order` and `default_null_order` control an omitted sort direction and null placement with DuckDB's accepted aliases, readback values, reset behavior, and errors. The binder resolves both settings into every sort key once, and an explicit direction or `NULLS FIRST` or `NULLS LAST` still wins. The ordinary default is now `NULLS LAST` in both directions.
+- Optimizer pass selection keeps its normalised setting name local instead of allocating and retaining a second copy. Grouped string minimum and maximum share the output arena that already belongs to the result vector instead of allocating one buffer per group.
+- The pinned DuckDB oracle agrees on all session time zone and sort semantics records added with this release. No DuckDB bug was found in this work.
+
 ## 0.3.21
 
 A patch release about the native columnar format, cheaper grouped aggregates, narrower late materialisation and the `PRAGMA` statement. The storage format version is unchanged.
