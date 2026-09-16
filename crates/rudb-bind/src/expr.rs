@@ -67,10 +67,38 @@ impl Binder<'_> {
             }
             ast::Expr::List { items } => self.bind_list(ast, items, scope),
             ast::Expr::Parameter { name } => self.bind_parameter(ast, name),
-            ast::Expr::Subquery { .. } => {
-                Err(Error::not_implemented("a scalar subquery".to_string()))
-            }
+            ast::Expr::Subquery { query } => self.bind_scalar_subquery(ast, query),
         }
+    }
+
+    /// Binds an uncorrelated scalar query and returns its one output as a column expression.
+    fn bind_scalar_subquery(&mut self, ast: &Ast, query: ast::QueryRef) -> Result<ExprRef> {
+        let outer_aggregation = self.aggregation.take();
+        let outer_in_aggregate = std::mem::replace(&mut self.in_aggregate, false);
+        let outer_subqueries = std::mem::take(&mut self.scalar_subqueries);
+        let outer_clause = std::mem::replace(&mut self.clause, "SELECT clause");
+
+        let bound = self.bind_query(ast, query);
+        let nested_subqueries = std::mem::take(&mut self.scalar_subqueries);
+        self.aggregation = outer_aggregation;
+        self.in_aggregate = outer_in_aggregate;
+        self.scalar_subqueries = outer_subqueries;
+        self.clause = outer_clause;
+
+        let (node, scope) = bound?;
+        debug_assert!(
+            nested_subqueries.is_empty(),
+            "a nested select left scalar queries unattached"
+        );
+        let [column] = scope.columns.as_slice() else {
+            return Err(Error::binder(format!(
+                "Subquery returns {} columns - expected 1",
+                scope.len()
+            )));
+        };
+        let expr = self.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
+        self.scalar_subqueries.push(node);
+        Ok(expr)
     }
 
     /// `?`, `?1`, `$1` or `$name`, which is the value the statement was prepared with.
