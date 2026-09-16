@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry.
 //! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so this is a match on a name rather than a map.
-//! [`Settings::NAMES`] is that set, and it is eighteen names for sixteen settings because two have a second spelling.
+//! [`Settings::NAMES`] is that set, and it is nineteen names for seventeen settings because two have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
@@ -76,6 +76,8 @@ pub(crate) struct Settings {
     regex_match_operator_semantics: RwLock<String>,
     /// How a bare name following `SHOW` is resolved.
     show_behavior: RwLock<String>,
+    /// Whether warnings are promoted to errors.
+    warnings_as_errors: RwLock<bool>,
     /// Which implementation runs at each seam, as `SET seam.<name>` has left it.
     ///
     /// Held here rather than in [`Config`], because there are twenty seven of them and a `Config`
@@ -87,7 +89,7 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 18] = [
+    pub(crate) const NAMES: [&'static str; 19] = [
         "TimeZone",
         "current_dialect",
         "default_null_order",
@@ -105,6 +107,7 @@ impl Settings {
         "regex_match_operator_semantics",
         "show_behavior",
         "threads",
+        "warnings_as_errors",
         "worker_threads",
     ];
 
@@ -132,6 +135,7 @@ impl Settings {
             order_by_non_integer_literal: RwLock::new(false),
             regex_match_operator_semantics: RwLock::new("partial".to_string()),
             show_behavior: RwLock::new("AUTO".to_string()),
+            warnings_as_errors: RwLock::new(false),
             seams: RwLock::new(rudb_seam::Settings::new()),
         }
     }
@@ -393,6 +397,15 @@ impl Settings {
                 // that nothing obeys.
                 pool.resize(threads);
             }
+            "warnings_as_errors" => {
+                let enabled = value.map_or(Ok(false), boolean_of)?;
+                if enabled {
+                    return Err(Error::settings(
+                        "Can not set 'warnings_as_errors=true'; no logger is available. To solve, run: 'SET enable_logging=true;'",
+                    ));
+                }
+                *self.warnings_as_errors.write().unwrap_or_else(|held| held.into_inner()) = false;
+            }
             _ => unreachable!("the name was one of NAMES a moment ago"),
         }
         Ok(())
@@ -472,20 +485,25 @@ impl Settings {
                 Ok(self.show_behavior.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
             "threads" => Ok(config.threads().to_string()),
+            "warnings_as_errors" => Ok(self
+                .warnings_as_errors
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .to_string()),
             _ => Err(Error::catalog(rudb_functions::unknown_setting(name))),
         }
     }
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are eighteen names and the alternative
+    /// Built once per statement rather than held, because there are nineteen names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Sixteen settings and eighteen names means the loop below would otherwise take several locks.
+    /// Seventeen settings and nineteen names means the loop below would otherwise take several locks.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
@@ -519,6 +537,8 @@ impl Settings {
             .clone();
         let show_behavior =
             self.show_behavior.read().unwrap_or_else(|held| held.into_inner()).clone();
+        let warnings_as_errors =
+            *self.warnings_as_errors.read().unwrap_or_else(|held| held.into_inner());
         let mut session = Session::new();
         session.set_time_zone(&time_zone);
         session.set_default_descending(default_order == "DESC");
@@ -544,6 +564,7 @@ impl Settings {
             "TABLE" => ShowBehavior::Table,
             _ => ShowBehavior::Auto,
         });
+        session.set_warnings_as_errors(warnings_as_errors);
         for name in Self::NAMES {
             session.set(
                 name,
@@ -564,6 +585,7 @@ impl Settings {
                     "regex_match_operator_semantics" => regex_match_operator_semantics.clone(),
                     "show_behavior" => show_behavior.clone(),
                     "threads" => threads.clone(),
+                    "warnings_as_errors" => warnings_as_errors.to_string(),
                     other => unreachable!("{other} is not one of NAMES"),
                 },
             );
