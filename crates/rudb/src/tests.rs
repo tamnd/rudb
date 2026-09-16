@@ -1911,6 +1911,32 @@ fn preserve_identifier_case_keeps_legacy_boolean_aliases_and_metadata() {
 }
 
 #[test]
+fn warnings_as_errors_matches_the_pin_without_a_logger() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('warnings_as_errors')"),
+        vec![vec![Value::Boolean(false)]]
+    );
+    db.execute("SET warnings_as_errors = false").expect("warnings stay warnings");
+    db.execute("SET warnings_as_errors = 'no'").expect("the boolean alias");
+    let error = db.execute("SET warnings_as_errors = true").expect_err("there is no logger");
+    assert_eq!(error.code().duckdb_name(), "Settings Error");
+    assert_eq!(
+        error.message(),
+        "Can not set 'warnings_as_errors=true'; no logger is available. To solve, run: 'SET enable_logging=true;'"
+    );
+    assert_eq!(db.setting("warnings_as_errors").expect("the setting"), "false");
+    db.execute("RESET warnings_as_errors").expect("the default");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'warnings_as_errors'"
+        ),
+        vec![vec![text("Escalate all warnings to errors."), text("BOOLEAN"), text("GLOBAL")]]
+    );
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
@@ -2020,8 +2046,8 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Eighteen rows for sixteen settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(18)]]);
+    // Nineteen rows for seventeen settings, because the pin gives an alias a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(19)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
