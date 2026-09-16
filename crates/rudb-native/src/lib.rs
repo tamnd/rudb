@@ -19,8 +19,8 @@ use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, Vector};
 
-const MAGIC: &[u8; 8] = b"RUDBNV4\0";
-const DIRECTORY: &[u8; 8] = b"RUDBDIR4";
+const MAGIC: &[u8; 8] = b"RUDBNV5\0";
+const DIRECTORY: &[u8; 8] = b"RUDBDIR5";
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -35,9 +35,62 @@ fn invalid(message: &str) -> Error {
 }
 
 fn checksum(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    })
+    const P1: u64 = 11_400_714_785_074_694_791;
+    const P2: u64 = 14_029_467_366_897_019_727;
+    const P3: u64 = 1_609_587_929_392_839_161;
+    const P4: u64 = 9_650_029_242_287_828_579;
+    const P5: u64 = 2_870_177_450_012_600_261;
+    let round = |state: u64, word: u64| {
+        state.wrapping_add(word.wrapping_mul(P2)).rotate_left(31).wrapping_mul(P1)
+    };
+    let merge = |state: u64, lane: u64| (state ^ round(0, lane)).wrapping_mul(P1).wrapping_add(P4);
+    let word =
+        |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight checksum bytes"));
+
+    let mut at = 0;
+    let mut hash = if bytes.len() >= 32 {
+        let mut one = P1.wrapping_add(P2);
+        let mut two = P2;
+        let mut three = 0;
+        let mut four = 0_u64.wrapping_sub(P1);
+        while at + 32 <= bytes.len() {
+            one = round(one, word(at));
+            two = round(two, word(at + 8));
+            three = round(three, word(at + 16));
+            four = round(four, word(at + 24));
+            at += 32;
+        }
+        let combined = one
+            .rotate_left(1)
+            .wrapping_add(two.rotate_left(7))
+            .wrapping_add(three.rotate_left(12))
+            .wrapping_add(four.rotate_left(18));
+        merge(merge(merge(merge(combined, one), two), three), four)
+    } else {
+        P5
+    };
+    hash = hash.wrapping_add(bytes.len() as u64);
+    while at + 8 <= bytes.len() {
+        hash ^= round(0, word(at));
+        hash = hash.rotate_left(27).wrapping_mul(P1).wrapping_add(P4);
+        at += 8;
+    }
+    if at + 4 <= bytes.len() {
+        let tail = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four checksum bytes"));
+        hash ^= u64::from(tail).wrapping_mul(P1);
+        hash = hash.rotate_left(23).wrapping_mul(P2).wrapping_add(P3);
+        at += 4;
+    }
+    while at < bytes.len() {
+        hash ^= u64::from(bytes[at]).wrapping_mul(P5);
+        hash = hash.rotate_left(11).wrapping_mul(P1);
+        at += 1;
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(P2);
+    hash ^= hash >> 29;
+    hash = hash.wrapping_mul(P3);
+    hash ^ (hash >> 32)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,11 +190,11 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Creates a new v3 file and its first table.
+    /// Creates a new v5 file and its first table.
     ///
     /// # Errors
     ///
-    /// If the file exists, a field has no v3 scalar encoding, or the path cannot be written.
+    /// If the file exists, a field has no v5 scalar encoding, or the path cannot be written.
     pub fn create(
         path: impl AsRef<Path>,
         name: impl Into<String>,
@@ -154,7 +207,7 @@ impl Writer {
             OpenOptions::new().write(true).read(true).create_new(true).open(path).map_err(io)?;
         let mut header = [0; HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
-        header[8..12].copy_from_slice(&4_u32.to_le_bytes());
+        header[8..12].copy_from_slice(&5_u32.to_le_bytes());
         file.write_all(&header).map_err(io)?;
         Ok(Self {
             file,
@@ -271,7 +324,7 @@ impl Reader {
         }
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header).map_err(io)?;
-        if &header[..8] != MAGIC || header[8..12] != 4_u32.to_le_bytes() {
+        if &header[..8] != MAGIC || header[8..12] != 5_u32.to_le_bytes() {
             return Err(invalid("magic or major version is unsupported"));
         }
         let mut selected = None;
@@ -860,6 +913,13 @@ mod tests {
     use rudb_common::bounds::Op;
 
     use super::*;
+
+    #[test]
+    fn checksum_matches_fixed_vectors() {
+        assert_eq!(checksum(b""), 0xef46_db37_51d8_e999);
+        assert_eq!(checksum(b"a"), 0xd24e_c4f1_a98c_6e5b);
+        assert_eq!(checksum(b"abc"), 0x44bc_2cf5_ad77_0999);
+    }
 
     fn path(label: &str) -> PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("time advances").as_nanos();
