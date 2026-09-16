@@ -83,6 +83,13 @@ pub static SETTINGS: &[SettingEntry] = &[
         aliases: &[],
     },
     SettingEntry {
+        name: "ieee_floating_point_ops",
+        description: "Use IEEE 754 behavior for supported floating point operations, returning NAN/INF instead of errors/NULL.",
+        input_type: "BOOLEAN",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
         name: "integer_division",
         description: "Whether or not the / operator defaults to integer division, or to floating point division",
         input_type: "BOOLEAN",
@@ -184,7 +191,7 @@ mod tests {
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
-        assert_eq!(SETTINGS.len(), 12, "ten settings and two of them have a second spelling");
+        assert_eq!(SETTINGS.len(), 13, "eleven settings and two of them have a second spelling");
         assert_eq!(setting_fields().len(), 7);
     }
 

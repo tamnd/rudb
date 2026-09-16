@@ -574,8 +574,8 @@ fn binary(
     rows: usize,
     written: Written<'_>,
 ) -> Result<Option<Vector>> {
-    if let Some(op) = arithmetic_op(name) {
-        return arithmetic_of(op, left, right, returns, written);
+    if let Some((op, floating_zero_errors)) = arithmetic_op(name) {
+        return arithmetic_of(op, floating_zero_errors, left, right, returns, written);
     }
     match name {
         "/" => slash_of(left, right, returns),
@@ -587,15 +587,16 @@ fn binary(
 }
 
 /// The spelling of an arithmetic operator as the operator, and `None` for anything else.
-fn arithmetic_op(name: &str) -> Option<Op> {
-    match name {
-        "+" => Some(Op::Add),
-        "-" => Some(Op::Subtract),
-        "*" => Some(Op::Multiply),
-        "//" => Some(Op::Divide),
-        "%" => Some(Op::Modulo),
-        _ => None,
-    }
+fn arithmetic_op(name: &str) -> Option<(Op, bool)> {
+    Some(match name {
+        "+" => (Op::Add, false),
+        "-" => (Op::Subtract, false),
+        "*" => (Op::Multiply, false),
+        "//" | "__rudb_checked_slash" => (Op::Divide, true),
+        "%" => (Op::Modulo, false),
+        "__rudb_checked_remainder" => (Op::Modulo, true),
+        _ => return None,
+    })
 }
 
 /// The form pairings a binary kernel in this file has a loop for.
@@ -674,6 +675,7 @@ macro_rules! by_form {
 /// `+`, `-`, `*`, `//` and `%`, on the types the binder has already made match.
 fn arithmetic_of(
     op: Op,
+    floating_zero_errors: bool,
     left: &Vector,
     right: &Vector,
     returns: &LogicalType,
@@ -694,7 +696,7 @@ fn arithmetic_of(
     if !lined_up {
         return Ok(None);
     }
-    by_form!(left, right, arithmetic_runs, op, left, right, returns, written)
+    by_form!(left, right, arithmetic_runs, op, floating_zero_errors, left, right, returns, written)
 }
 
 /// One optimistic pass over the two runs, with the operator hoisted out of the loop.
@@ -755,6 +757,7 @@ fn arithmetic_runs<L, R>(
     other: &Data,
     at_right: R,
     op: Op,
+    floating_zero_errors: bool,
     left: &Vector,
     right: &Vector,
     returns: &LogicalType,
@@ -777,7 +780,17 @@ where
     // already null before it raises on a zero, so it keeps the careful loop.
     if matches!(op, Op::Divide | Op::Modulo) {
         return guarded_runs(
-            one, at_left, other, at_right, op, base, left, right, returns, written,
+            one,
+            at_left,
+            other,
+            at_right,
+            op,
+            floating_zero_errors,
+            base,
+            left,
+            right,
+            returns,
+            written,
         );
     }
     fast_runs(one, at_left, other, at_right, op, &base, returns, rows)
@@ -890,6 +903,7 @@ fn guarded_runs<L, R>(
     other: &Data,
     at_right: R,
     op: Op,
+    floating_zero_errors: bool,
     base: Validity,
     left: &Vector,
     right: &Vector,
@@ -950,7 +964,7 @@ where
                 let mut out = vec![0 as $native; rows];
                 let validity = over_valid(rows, base, |index| {
                     let (x, y) = (a[at_left(index)], b[at_right(index)]);
-                    if y == 0.0 && matches!(op, Op::Divide) {
+                    if y == 0.0 && floating_zero_errors {
                         return Err(divided_by_zero(
                             written,
                             op.symbol(),
@@ -1911,6 +1925,16 @@ pub fn call_values(
         ("*", [left, right]) => arithmetic(Op::Multiply, left, right, returns, written),
         ("%", [left, right]) => arithmetic(Op::Modulo, left, right, returns, written),
         ("//", [left, right]) => arithmetic(Op::Divide, left, right, returns, written),
+        ("__rudb_checked_slash", [left, right]) => {
+            arithmetic(Op::Divide, left, right, returns, written)
+        }
+        ("__rudb_checked_remainder", [left, right]) => {
+            if approximate(right) == Some(0.0) {
+                Err(divided_by_zero(written, "%", left, right))
+            } else {
+                arithmetic(Op::Modulo, left, right, returns, written)
+            }
+        }
         ("/", [left, right]) => divide(left, right, returns),
         ("||", [left, right]) => Ok(Value::Varchar(format!("{left}{right}"))),
         ("lower", [only]) => Ok(Value::Varchar(only.to_string().to_lowercase())),

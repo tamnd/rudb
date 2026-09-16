@@ -54,6 +54,8 @@ pub(crate) struct Settings {
     default_order: RwLock<String>,
     /// The null placement mode used when an order item does not state one.
     default_null_order: RwLock<String>,
+    /// Whether floating division and remainder use IEEE answers for zero divisors.
+    ieee_floating_point_ops: RwLock<bool>,
     /// Whether `/` binds to integer division instead of floating point division.
     integer_division: RwLock<bool>,
     /// Whether a zero divisor that normally raises returns null.
@@ -73,11 +75,12 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 12] = [
+    pub(crate) const NAMES: [&'static str; 13] = [
         "TimeZone",
         "default_null_order",
         "default_order",
         "disabled_optimizers",
+        "ieee_floating_point_ops",
         "integer_division",
         "max_memory",
         "memory_limit",
@@ -102,6 +105,7 @@ impl Settings {
             default_time_zone,
             default_order: RwLock::new("ASCENDING".to_string()),
             default_null_order: RwLock::new("NULLS_LAST".to_string()),
+            ieee_floating_point_ops: RwLock::new(true),
             integer_division: RwLock::new(false),
             null_on_division_by_zero: RwLock::new(false),
             order_by_non_integer_literal: RwLock::new(false),
@@ -237,6 +241,11 @@ impl Settings {
                 let tidy = rudb_opt::pass::Context::tidy(&text)?;
                 *self.disabled.write().unwrap_or_else(|held| held.into_inner()) = tidy;
             }
+            "ieee_floating_point_ops" => {
+                let enabled = value.map_or(Ok(true), boolean_of)?;
+                *self.ieee_floating_point_ops.write().unwrap_or_else(|held| held.into_inner()) =
+                    enabled;
+            }
             "integer_division" => {
                 let enabled = value.map_or(Ok(false), boolean_of)?;
                 *self.integer_division.write().unwrap_or_else(|held| held.into_inner()) = enabled;
@@ -327,6 +336,11 @@ impl Settings {
                 Ok(self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
             "disabled_optimizers" => Ok(self.disabled_optimizers()),
+            "ieee_floating_point_ops" => Ok(self
+                .ieee_floating_point_ops
+                .read()
+                .unwrap_or_else(|held| held.into_inner())
+                .to_string()),
             "integer_division" => Ok(self
                 .integer_division
                 .read()
@@ -376,6 +390,8 @@ impl Settings {
             self.default_order.read().unwrap_or_else(|held| held.into_inner()).clone();
         let default_null_order =
             self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone();
+        let ieee_floating_point_ops =
+            *self.ieee_floating_point_ops.read().unwrap_or_else(|held| held.into_inner());
         let integer_division =
             *self.integer_division.read().unwrap_or_else(|held| held.into_inner());
         let null_on_division_by_zero =
@@ -396,6 +412,7 @@ impl Settings {
             "POSTGRES" => DefaultNullOrder::Postgres,
             _ => DefaultNullOrder::Last,
         });
+        session.set_ieee_floating_point_ops(ieee_floating_point_ops);
         session.set_integer_division(integer_division);
         session.set_null_on_division_by_zero(null_on_division_by_zero);
         session.set_order_by_non_integer_literal(order_by_non_integer_literal);
@@ -408,6 +425,7 @@ impl Settings {
                     "default_order" => default_order.clone(),
                     "default_null_order" => default_null_order.clone(),
                     "disabled_optimizers" => disabled.clone(),
+                    "ieee_floating_point_ops" => ieee_floating_point_ops.to_string(),
                     "integer_division" => integer_division.to_string(),
                     "null_on_division_by_zero" => null_on_division_by_zero.to_string(),
                     "memory_limit" => memory.clone(),

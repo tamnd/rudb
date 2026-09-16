@@ -1360,6 +1360,7 @@ mod tests {
     /// The same scan with bounds tests on it, which is what a filter above the scan compiles to.
     fn pruned(tests: Vec<(usize, Op, Bound)>) -> FileScan {
         let path = format!("{}/../rudb-parquet/testdata/mixed.parquet", env!("CARGO_MANIFEST_DIR"));
+        let path = path.replace('\\', "\\\\").replace('\'', "''");
         let text = format!(
             "TableFunction read_parquet args=['{path}'::VARCHAR] #0 [a::INTEGER, b::BIGINT]"
         );

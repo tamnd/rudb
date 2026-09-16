@@ -195,6 +195,12 @@ struct BuildUnder<'a> {
     report: &'a Report,
 }
 
+#[derive(Clone, Copy, Default)]
+struct AggregateBound {
+    max_groups: Option<usize>,
+    top_counts: Option<usize>,
+}
+
 fn build_measured_with_sink<'a>(
     plan: &'a Plan,
     catalog: &'a Catalog,
@@ -508,18 +514,17 @@ impl<'a> Building<'a, '_> {
         index: u32,
         groups: Slice,
         aggregates: Slice,
-        max_groups: Option<usize>,
-        top_counts: Option<usize>,
+        bound: AggregateBound,
     ) -> Result<Segment<'a>> {
         let below = self.node(input)?;
         let (aggregate, out) =
             Aggregate::new(self.plan, &below.schema, index, groups, aggregates, self.memory)?;
         let aggregate = aggregate.in_session(self.session);
-        let aggregate = match max_groups {
+        let aggregate = match bound.max_groups {
             Some(limit) => aggregate.limit_groups(limit),
             None => aggregate,
         };
-        let aggregate = match top_counts {
+        let aggregate = match bound.top_counts {
             Some(bound) => aggregate.top_counts(bound),
             None => aggregate,
         };
@@ -697,7 +702,14 @@ impl<'a> Building<'a, '_> {
                     .top_counts
                     .iter()
                     .find_map(|&(aggregate, bound)| (aggregate == reference).then_some(bound));
-                self.aggregate(reference, input, index, groups, aggregates, None, top_counts)?
+                self.aggregate(
+                    reference,
+                    input,
+                    index,
+                    groups,
+                    aggregates,
+                    AggregateBound { max_groups: None, top_counts },
+                )?
             }
             Node::Sort { input, keys } => {
                 let below = self.node(input)?;
@@ -723,8 +735,7 @@ impl<'a> Building<'a, '_> {
                         index,
                         groups,
                         aggregates,
-                        Some(max_groups),
-                        None,
+                        AggregateBound { max_groups: Some(max_groups), top_counts: None },
                     )?,
                     _ => self.node(input)?,
                 };

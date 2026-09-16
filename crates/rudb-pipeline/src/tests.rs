@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_common::{Cancel, Cause, ErrorCode, LogicalType, Value, slow};
-use rudb_metrics::Counters;
+use rudb_metrics::{Counters, thread_cpu_ns};
 use rudb_vector::{Chunk, Vector};
 
 use crate::dynamic::{DynSink, DynStream, LocalState};
@@ -830,7 +830,12 @@ fn the_parallel_driver_reports_what_its_workers_burned() {
 
     let spent = run_parallel(&built, &Cancel::new(), 4).expect("it runs");
 
-    assert!(spent > 0, "three of the four threads were not the caller's and they did something");
+    if thread_cpu_ns().is_some() {
+        assert!(
+            spent > 0,
+            "three of the four threads were not the caller's and they did something"
+        );
+    }
 }
 
 #[test]
