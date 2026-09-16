@@ -192,7 +192,7 @@ impl Database {
     /// A parse error. A name that does not resolve or a type that does not work out is an error at
     /// execution rather than here, because a parameter has no type until it has a value.
     pub fn prepare(&self, sql: &str) -> Result<Prepared> {
-        Prepared::new(self.shared.clone(), sql)
+        Prepared::new(self.shared.clone(), sql).map_err(|error| self.shared.process_error(error))
     }
 
     /// Reads the catalog.
@@ -321,7 +321,9 @@ impl Database {
     /// A parse error, a binder error, or anything the operators raise while running, which is
     /// mostly cast failures and arithmetic that leaves the range of its type.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
-        self.shared.query(sql, &self.shared.token())
+        self.shared
+            .query(sql, &self.shared.token())
+            .map_err(|error| self.shared.process_error(error))
     }
 
     /// Runs one statement, which may change the database.
@@ -330,7 +332,9 @@ impl Database {
     ///
     /// A parse error, a binder error, a catalog error, or anything the operators raise.
     pub fn execute(&self, sql: &str) -> Result<QueryResult> {
-        self.shared.execute(sql, &self.shared.token())
+        self.shared
+            .execute(sql, &self.shared.token())
+            .map_err(|error| self.shared.process_error(error))
     }
 
     /// The plan for a query, in the textual form `spec/07-execution.md` describes, without running
@@ -345,7 +349,7 @@ impl Database {
     ///
     /// A parse error or a binder error.
     pub fn plan(&self, sql: &str) -> Result<String> {
-        self.shared.plan(sql)
+        self.shared.plan(sql).map_err(|error| self.shared.process_error(error))
     }
 
     /// Runs a query and returns the single value it produced.
@@ -484,6 +488,11 @@ impl Sink for NativeSink {
 }
 
 impl Shared {
+    /// Applies the session's public error rendering mode at the API boundary.
+    pub(crate) fn process_error(&self, error: Error) -> Error {
+        if self.session().semantics().errors_as_json() { error.into_json() } else { error }
+    }
+
     /// The catalog, for reading.
     ///
     /// A poisoned lock is taken rather than reported. Poisoning says some thread panicked while it

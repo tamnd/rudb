@@ -56,7 +56,7 @@ impl Connection {
     /// A parse error, a binder error, or anything the operators raise while running, which is
     /// mostly cast failures and arithmetic that leaves the range of its type.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
-        self.shared.query(sql, &self.token())
+        self.shared.query(sql, &self.token()).map_err(|error| self.shared.process_error(error))
     }
 
     /// Runs one statement, which may change the database.
@@ -69,7 +69,7 @@ impl Connection {
     ///
     /// A parse error, a binder error, a catalog error, or anything the operators raise.
     pub fn execute(&self, sql: &str) -> Result<QueryResult> {
-        self.shared.execute(sql, &self.token())
+        self.shared.execute(sql, &self.token()).map_err(|error| self.shared.process_error(error))
     }
 
     /// The plan for a query, in the textual form `spec/07-execution.md` describes, without running
@@ -79,7 +79,7 @@ impl Connection {
     ///
     /// A parse error or a binder error.
     pub fn plan(&self, sql: &str) -> Result<String> {
-        self.shared.plan(sql)
+        self.shared.plan(sql).map_err(|error| self.shared.process_error(error))
     }
 
     /// Parses a statement so it can be run more than once, with values for its parameters.
@@ -89,7 +89,7 @@ impl Connection {
     /// A parse error. A name that does not resolve or a type that does not work out is an error at
     /// execution rather than here, because a parameter has no type until it has a value.
     pub fn prepare(&self, sql: &str) -> Result<Prepared> {
-        Prepared::new(self.shared.clone(), sql)
+        Prepared::new(self.shared.clone(), sql).map_err(|error| self.shared.process_error(error))
     }
 
     /// Runs a query and returns the single value it produced.

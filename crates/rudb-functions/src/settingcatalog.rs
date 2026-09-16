@@ -1,6 +1,6 @@
 //! What `duckdb_settings()` says about each setting this engine has.
 //!
-//! Nineteen rows represent seventeen settings because two aliases have rows of their own.
+//! Twenty rows represent eighteen settings because two aliases have rows of their own.
 //! The descriptions, input types, and alias lists were read from the pinned binary because clients may compare them with the values they already know.
 //!
 //! # The alias direction is the opposite way round from the obvious one
@@ -22,7 +22,7 @@
 //!
 //! # What is not here
 //!
-//! The pin returns 192 rows and this returns 19, because rudb has seventeen settings.
+//! The pin returns 192 rows and this returns 20, because rudb has eighteen settings.
 //! The other settings are for things rudb does not do, and a row saying `SET enable_http_metadata_cache = true` worked when nothing read it would be worse than no row at all.
 //! The list grows when the engine does.
 //!
@@ -99,6 +99,13 @@ pub static SETTINGS: &[SettingEntry] = &[
         name: "disabled_optimizers",
         description: "DEBUG SETTING: disable a specific set of optimizers (comma separated)",
         input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
+        name: "errors_as_json",
+        description: "Output error messages as structured JSON instead of as a raw string",
+        input_type: "BOOLEAN",
         scope: GLOBAL,
         aliases: &[],
     },
@@ -232,7 +239,7 @@ mod tests {
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
-        assert_eq!(SETTINGS.len(), 19, "seventeen settings and two of them have a second spelling");
+        assert_eq!(SETTINGS.len(), 20, "eighteen settings and two of them have a second spelling");
         assert_eq!(setting_fields().len(), 7);
     }
 

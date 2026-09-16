@@ -2,7 +2,7 @@
 //!
 //! A setting is not a catalog entry.
 //! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so this is a match on a name rather than a map.
-//! [`Settings::NAMES`] is that set, and it is nineteen names for seventeen settings because two have a second spelling.
+//! [`Settings::NAMES`] is that set, and it is twenty names for eighteen settings because two have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
@@ -62,6 +62,8 @@ pub(crate) struct Settings {
     default_null_order: RwLock<String>,
     /// Whether casts from local timestamps to zoned timestamps are refused.
     disable_timestamptz_casts: RwLock<bool>,
+    /// Whether errors are returned as structured JSON.
+    errors_as_json: RwLock<bool>,
     /// Whether floating division and remainder use IEEE answers for zero divisors.
     ieee_floating_point_ops: RwLock<bool>,
     /// Whether `/` binds to integer division instead of floating point division.
@@ -89,7 +91,7 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 19] = [
+    pub(crate) const NAMES: [&'static str; 20] = [
         "TimeZone",
         "current_dialect",
         "default_null_order",
@@ -97,6 +99,7 @@ impl Settings {
         "dialect_compatibility_mode",
         "disable_timestamptz_casts",
         "disabled_optimizers",
+        "errors_as_json",
         "ieee_floating_point_ops",
         "integer_division",
         "max_memory",
@@ -128,6 +131,7 @@ impl Settings {
             dialect_compatibility_mode: RwLock::new("NONE".to_string()),
             default_null_order: RwLock::new("NULLS_LAST".to_string()),
             disable_timestamptz_casts: RwLock::new(false),
+            errors_as_json: RwLock::new(false),
             ieee_floating_point_ops: RwLock::new(true),
             integer_division: RwLock::new(false),
             preserve_identifier_case: RwLock::new("preserve_case".to_string()),
@@ -291,6 +295,10 @@ impl Settings {
                 *self.disable_timestamptz_casts.write().unwrap_or_else(|held| held.into_inner()) =
                     enabled;
             }
+            "errors_as_json" => {
+                let enabled = value.map_or(Ok(false), boolean_of)?;
+                *self.errors_as_json.write().unwrap_or_else(|held| held.into_inner()) = enabled;
+            }
             "ieee_floating_point_ops" => {
                 let enabled = value.map_or(Ok(true), boolean_of)?;
                 *self.ieee_floating_point_ops.write().unwrap_or_else(|held| held.into_inner()) =
@@ -447,6 +455,9 @@ impl Settings {
                 .read()
                 .unwrap_or_else(|held| held.into_inner())
                 .to_string()),
+            "errors_as_json" => {
+                Ok(self.errors_as_json.read().unwrap_or_else(|held| held.into_inner()).to_string())
+            }
             "ieee_floating_point_ops" => Ok(self
                 .ieee_floating_point_ops
                 .read()
@@ -496,14 +507,14 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are nineteen names and the alternative
+    /// Built once per statement rather than held, because there are twenty names and the alternative
     /// is a second copy of the settings that has to be kept in step with this one. An alias reports
     /// the same value as the name it resolves to, which is the same thing reading either spelling
     /// back gives, and it is what the binary returns for both halves of each pair.
     ///
     /// The two locks are taken once each here rather than once per name through [`Settings::value`],
     /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Seventeen settings and nineteen names means the loop below would otherwise take several locks.
+    /// Eighteen settings and twenty names means the loop below would otherwise take several locks.
     pub(crate) fn session(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
@@ -520,6 +531,7 @@ impl Settings {
             self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone();
         let disable_timestamptz_casts =
             *self.disable_timestamptz_casts.read().unwrap_or_else(|held| held.into_inner());
+        let errors_as_json = *self.errors_as_json.read().unwrap_or_else(|held| held.into_inner());
         let ieee_floating_point_ops =
             *self.ieee_floating_point_ops.read().unwrap_or_else(|held| held.into_inner());
         let integer_division =
@@ -549,6 +561,7 @@ impl Settings {
             _ => DefaultNullOrder::Last,
         });
         session.set_disable_timestamptz_casts(disable_timestamptz_casts);
+        session.set_errors_as_json(errors_as_json);
         session.set_ieee_floating_point_ops(ieee_floating_point_ops);
         session.set_integer_division(integer_division);
         session.set_null_on_division_by_zero(null_on_division_by_zero);
@@ -576,6 +589,7 @@ impl Settings {
                     "default_null_order" => default_null_order.clone(),
                     "disabled_optimizers" => disabled.clone(),
                     "disable_timestamptz_casts" => disable_timestamptz_casts.to_string(),
+                    "errors_as_json" => errors_as_json.to_string(),
                     "ieee_floating_point_ops" => ieee_floating_point_ops.to_string(),
                     "integer_division" => integer_division.to_string(),
                     "null_on_division_by_zero" => null_on_division_by_zero.to_string(),
