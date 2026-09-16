@@ -265,17 +265,17 @@ fn cells(result: &QueryResult, settings: &Settings) -> Vec<Vec<String>> {
     (0..result.len())
         .map(|row| {
             (0..result.width())
-                .map(|column| cell(&result.value_at(row, column), settings))
+                .map(|column| cell(result, &result.value_at(row, column), settings))
                 .collect()
         })
         .collect()
 }
 
 /// One value as text.
-fn cell(value: &Value, settings: &Settings) -> String {
+fn cell(result: &QueryResult, value: &Value, settings: &Settings) -> String {
     match value {
         Value::Null => settings.nullvalue.clone(),
-        other => other.to_string(),
+        other => result.value_text(other),
     }
 }
 
@@ -784,7 +784,7 @@ fn json(result: &QueryResult, settings: &Settings, array: bool) -> String {
                 format!(
                     "{}:{}",
                     json_string(&result.names()[column]),
-                    json_value(&result.value_at(row, column))
+                    json_value(result, &result.value_at(row, column))
                 )
             })
             .collect();
@@ -832,23 +832,23 @@ fn json_string(text: &str) -> String {
 }
 
 /// One JSON value, which is a number for a number and a string for everything that is not one.
-fn json_value(value: &Value) -> String {
+fn json_value(result: &QueryResult, value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
         Value::Boolean(flag) => flag.to_string(),
         Value::List { values, .. } => {
-            let parts: Vec<String> = values.iter().map(json_value).collect();
+            let parts: Vec<String> = values.iter().map(|value| json_value(result, value)).collect();
             format!("[{}]", parts.join(","))
         }
         Value::Struct(fields) => {
             let parts: Vec<String> = fields
                 .iter()
-                .map(|(name, value)| format!("{}:{}", json_string(name), json_value(value)))
+                .map(|(name, value)| format!("{}:{}", json_string(name), json_value(result, value)))
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
         other if is_number(other) => other.to_string(),
-        other => json_string(&other.to_string()),
+        other => json_string(&result.value_text(other)),
     }
 }
 
@@ -883,8 +883,9 @@ fn quote(result: &QueryResult, settings: &Settings) -> String {
     }
     // row at a time: the output is one quoted row per line, so there is nothing to batch.
     for row in 0..result.len() {
-        let parts: Vec<String> =
-            (0..result.width()).map(|column| sql_literal(&result.value_at(row, column))).collect();
+        let parts: Vec<String> = (0..result.width())
+            .map(|column| sql_literal(result, &result.value_at(row, column)))
+            .collect();
         out.push_str(&parts.join(&settings.separator));
         out.push_str(&settings.newline);
     }
@@ -897,8 +898,9 @@ fn insert(result: &QueryResult, settings: &Settings) -> String {
     let columns = result.names().join(",");
     // row at a time: the output is one INSERT statement per row, which is the shape of the mode.
     for row in 0..result.len() {
-        let parts: Vec<String> =
-            (0..result.width()).map(|column| sql_literal(&result.value_at(row, column))).collect();
+        let parts: Vec<String> = (0..result.width())
+            .map(|column| sql_literal(result, &result.value_at(row, column)))
+            .collect();
         let _ = writeln!(
             out,
             "INSERT INTO \"{}\"({}) VALUES({});",
@@ -911,12 +913,12 @@ fn insert(result: &QueryResult, settings: &Settings) -> String {
 }
 
 /// A value as it would be written in SQL.
-fn sql_literal(value: &Value) -> String {
+fn sql_literal(result: &QueryResult, value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         other if is_number(other) => other.to_string(),
         Value::Boolean(flag) => flag.to_string(),
-        other => format!("'{}'", other.to_string().replace('\'', "''")),
+        other => format!("'{}'", result.value_text(other).replace('\'', "''")),
     }
 }
 

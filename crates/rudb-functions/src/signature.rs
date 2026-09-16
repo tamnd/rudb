@@ -449,7 +449,7 @@ const TABLE: &[Entry] = &[
     Entry {
         name: "age",
         kind: FunctionKind::Scalar,
-        arity: Arity::exactly(2),
+        arity: Arity::one_of(&[1, 2]),
         shape: Shape::WidenedTogether(Fixed::Timestamp, Fixed::Interval),
         numeric_only: false,
     },
