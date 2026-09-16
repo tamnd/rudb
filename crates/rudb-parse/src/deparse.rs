@@ -333,6 +333,12 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
             let any = format!("({} = ANY({}))", expr(ast, operand), query(ast, inner));
             if negated { format!("(NOT {any})") } else { any }
         }
+        Expr::QuantifiedSubquery { operand, op, query: inner, all } => {
+            let (op, negate) = if all { (negated_comparison(op), true) } else { (op, false) };
+            let word = comparison_word(op);
+            let any = format!("({} {word} ANY({}))", expr(ast, operand), query(ast, inner));
+            if negate { format!("(NOT {any})") } else { any }
+        }
         Expr::Parameter { name } => format!("${}", ast.string(name)),
         // A bracketed list is a call to `list_value`, including when it is empty.
         Expr::List { items } => format!("list_value({})", exprs(ast, items)),
@@ -344,6 +350,30 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
             let exists = format!("EXISTS({})", query(ast, inner));
             if negated { format!("(NOT {exists})") } else { exists }
         }
+    }
+}
+
+fn comparison_word(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Eq => "=",
+        BinaryOp::NotEq => "!=",
+        BinaryOp::Lt => "<",
+        BinaryOp::Gt => ">",
+        BinaryOp::LtEq => "<=",
+        BinaryOp::GtEq => ">=",
+        _ => unreachable!("the grammar permits only a comparison before ANY or ALL"),
+    }
+}
+
+fn negated_comparison(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Eq => BinaryOp::NotEq,
+        BinaryOp::NotEq => BinaryOp::Eq,
+        BinaryOp::Lt => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::LtEq,
+        BinaryOp::LtEq => BinaryOp::Gt,
+        BinaryOp::GtEq => BinaryOp::Lt,
+        _ => unreachable!("the grammar permits only a comparison before ANY or ALL"),
     }
 }
 
@@ -924,6 +954,11 @@ mod tests {
         assert_eq!(
             body("SELECT x NOT IN (SELECT y FROM t)"),
             "SELECT (NOT (x = ANY(SELECT y FROM t)))"
+        );
+        assert_eq!(body("SELECT x = ANY (SELECT y FROM t)"), "SELECT (x = ANY(SELECT y FROM t))");
+        assert_eq!(
+            body("SELECT x > ALL (SELECT y FROM t)"),
+            "SELECT (NOT (x <= ANY(SELECT y FROM t)))"
         );
     }
 

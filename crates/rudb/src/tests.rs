@@ -2131,6 +2131,46 @@ fn uncorrelated_in_subqueries_are_mark_joins() {
 }
 
 #[test]
+fn uncorrelated_any_and_all_subqueries_are_mark_joins() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT 2 = ANY (SELECT x FROM (VALUES (1), (2)) t(x))"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT 2 <> ANY (SELECT x FROM (VALUES (2), (3)) t(x))"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT 2 > ALL (SELECT x FROM (VALUES (0), (1)) t(x))"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT 2 = ALL (SELECT x FROM (VALUES (2), (NULL)) t(x))"),
+        vec![vec![Value::Null]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT NULL = ANY (SELECT x FROM (VALUES (1)) t(x) WHERE false)"),
+        vec![vec![Value::Boolean(false)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT NULL = ALL (SELECT x FROM (VALUES (1)) t(x) WHERE false)"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    let answer = db
+        .query("SELECT 2 > ALL (SELECT x FROM (VALUES (0), (1)) t(x))")
+        .expect("the universal comparison answers");
+    assert_eq!(
+        answer.column_name(0),
+        "(NOT (2 <= ANY(SELECT x FROM (SELECT * FROM (VALUES (0), (1)) AS valueslist) AS t(x))))"
+    );
+    let plan = db
+        .plan("SELECT 2 = ANY (SELECT x FROM (VALUES (1), (2)) t(x))")
+        .expect("the quantified comparison plans");
+    assert!(plan.contains("Join MARK"), "{plan}");
+}
+
+#[test]
 fn the_settings_table_reads_back_what_set_left_behind() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
