@@ -183,12 +183,7 @@ fn a_syntax_error_goes_to_stderr_with_a_caret_and_exits_one() {
     assert!(err.contains('^'), "{err}");
 }
 
-/// A binder error prints its message and sets the exit code, and it prints no caret.
-///
-/// DuckDB points at the column it could not find. rudb cannot yet, because the binder raises its
-/// errors without a span, and a caret under the wrong token would be worse than none. The shell
-/// side of it is done: as soon as the binder attaches spans this prints the same three lines a
-/// parser error does, which is what the test above already checks.
+/// A binder error prints its message and points at the expression that did not bind.
 #[test]
 fn a_binder_error_says_what_is_wrong_and_exits_one() {
     let (out, err, failed) = run(&["-c", "SELECT nosuch"]);
@@ -196,6 +191,18 @@ fn a_binder_error_says_what_is_wrong_and_exits_one() {
     assert!(out.is_empty(), "nothing should have been printed, got {out}");
     assert!(err.contains("Binder Error"), "{err}");
     assert!(err.contains("nosuch"), "{err}");
+    assert!(err.contains("LINE 1: SELECT nosuch"), "{err}");
+    assert!(err.contains("               ^"), "{err}");
+}
+
+#[test]
+fn a_runtime_error_points_at_the_expression_that_raised() {
+    let (out, err, failed) = run(&["-c", "SELECT range // 0 FROM range(1)"]);
+    assert!(failed);
+    assert!(out.is_empty(), "nothing should have been printed, got {out}");
+    assert!(err.contains("Invalid Input Error: Division by zero"), "{err}");
+    assert!(err.contains("LINE 1: SELECT range // 0 FROM range(1)"), "{err}");
+    assert!(err.contains("               ^"), "{err}");
 }
 
 #[test]

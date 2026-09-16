@@ -37,8 +37,10 @@ impl Binder<'_> {
         expr: ast::ExprRef,
         scope: &Scope,
     ) -> Result<ExprRef> {
-        let outer = std::mem::replace(&mut self.current_span, ast.expr_span(expr));
-        let result = self.bind_expr_inner(ast, expr, scope);
+        let span = ast.expr_span(expr);
+        let outer = std::mem::replace(&mut self.current_span, span);
+        let result =
+            self.bind_expr_inner(ast, expr, scope).map_err(|error| error.with_fallback_span(span));
         self.current_span = outer;
         result
     }

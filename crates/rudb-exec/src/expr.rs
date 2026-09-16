@@ -50,7 +50,7 @@ pub(crate) fn evaluate_in_time_zone(
     time_zone: SessionTimeZone,
 ) -> Result<Vector> {
     let ty = plan.expr_type(expr).clone();
-    match *plan.expr(expr) {
+    let result = match *plan.expr(expr) {
         Expr::Column(binding) => {
             let position = schema.position_of(binding).ok_or_else(|| {
                 Error::internal(format!(
@@ -140,7 +140,8 @@ pub(crate) fn evaluate_in_time_zone(
             }
             Vector::from_values(ty, &answers)
         }
-    }
+    };
+    result.map_err(|error| error.with_fallback_span(plan.expr_span(expr)))
 }
 
 /// Evaluates a list of expressions over one chunk.

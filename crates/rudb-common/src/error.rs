@@ -176,6 +176,15 @@ impl Error {
         self
     }
 
+    /// Attaches the range only when a more specific caller has not already attached one.
+    #[must_use]
+    pub fn with_fallback_span(mut self, span: Span) -> Self {
+        if self.0.span.is_none() && !span.is_empty() {
+            self.0.span = Some(span);
+        }
+        self
+    }
+
     /// What kind of thing went wrong.
     #[must_use]
     pub fn code(&self) -> ErrorCode {
@@ -411,6 +420,17 @@ mod tests {
         assert_eq!(error.span(), Some(Span::new(7, 11)));
         assert_eq!(error.span().map(Span::len), Some(4));
         assert_eq!(error.code(), ErrorCode::Parser);
+    }
+
+    #[test]
+    fn a_fallback_span_keeps_the_more_specific_range() {
+        let specific = Error::binder("missing")
+            .with_span(Span::new(7, 14))
+            .with_fallback_span(Span::new(0, 20));
+        assert_eq!(specific.span(), Some(Span::new(7, 14)));
+        let fallback = Error::binder("missing").with_fallback_span(Span::new(0, 20));
+        assert_eq!(fallback.span(), Some(Span::new(0, 20)));
+        assert_eq!(Error::binder("missing").with_fallback_span(Span::new(0, 0)).span(), None);
     }
 
     #[test]

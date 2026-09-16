@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use rudb_common::{Field, LogicalType, Value, days_from_civil};
+use rudb_common::{Field, LogicalType, Span, Value, days_from_civil};
 
 use crate::{Config, Database, arrow};
 
@@ -3833,6 +3833,8 @@ fn dividing_by_zero_says_what_duckdb_says() {
         let expected = format!("Division by zero in expression {quoted}. {advice}");
         assert_eq!(failure(&db, sql), expected, "{sql}");
     }
+    let error = db.query("SELECT a // 0 FROM z").expect_err("integer division by zero raises");
+    assert_eq!(error.span(), Some(Span::new(7, 13)));
 }
 
 /// The sum of the two largest `DECIMAL(18,0)` values, which does not fit in a `DECIMAL(18,0)`.

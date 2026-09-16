@@ -231,8 +231,10 @@ impl<'a> Binder<'a> {
         ast: &Ast,
         query: ast::QueryRef,
     ) -> Result<(NodeRef, Scope)> {
-        let outer = std::mem::replace(&mut self.current_span, ast.query_span(query));
-        let result = self.bind_query_inner(ast, query);
+        let span = ast.query_span(query);
+        let outer = std::mem::replace(&mut self.current_span, span);
+        let result =
+            self.bind_query_inner(ast, query).map_err(|error| error.with_fallback_span(span));
         self.current_span = outer;
         result
     }
