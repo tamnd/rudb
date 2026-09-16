@@ -457,6 +457,16 @@ pub enum Source {
         alias: StrRef,
         /// Column aliases from `AS t(a, b)`, as a run of [`StrRef`].
         columns: Slice,
+        /// Whether the call was written as `PRAGMA name` rather than as a function call.
+        ///
+        /// The two are the same query, because `PRAGMA table_info('t')` is rewritten to
+        /// `SELECT * FROM pragma_table_info('t')` here the way upstream rewrites it, and the
+        /// rewritten form is what the plan and the deparser see. What the flag is for is the two
+        /// messages a bad call produces, which upstream writes in the spelling the user used:
+        /// `table_info()` rather than `pragma_table_info()`, and a candidate line reading
+        /// `PRAGMA "table_info"(VARCHAR)`. A user who wrote a pragma and is told about a function
+        /// they did not name has been handed the rewrite to debug rather than their own statement.
+        pragma: bool,
     },
     /// A `VALUES` in the `FROM` clause.
     Values {

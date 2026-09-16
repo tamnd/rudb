@@ -1829,6 +1829,55 @@ fn the_size_pragma_reports_the_attached_database_and_the_live_memory_budget() {
     assert_eq!(after[0], rows(&db, "SELECT current_setting('memory_limit')").remove(0)[0]);
 }
 
+/// `PRAGMA name` is the call it stands for, so the statement form answers what the function does.
+#[test]
+fn the_pragma_statement_answers_what_the_function_of_that_name_answers() {
+    let db = database();
+    for (statement, call) in [
+        ("PRAGMA version", "SELECT * FROM pragma_version()"),
+        ("PRAGMA platform", "SELECT * FROM pragma_platform()"),
+        ("PRAGMA user_agent", "SELECT * FROM pragma_user_agent()"),
+        ("PRAGMA database_size", "SELECT * FROM pragma_database_size()"),
+        ("PRAGMA table_info('t')", "SELECT * FROM pragma_table_info('t')"),
+        ("PRAGMA table_info(t)", "SELECT * FROM pragma_table_info('t')"),
+        ("PRAGMA table_info(main.t)", "SELECT * FROM pragma_table_info('main.t')"),
+        // The name is looked up without regard to case, the same way every other name is.
+        ("PRAGMA VERSION", "SELECT * FROM pragma_version()"),
+        // A view rather than a function, which the pragma namespace holds as well.
+        ("PRAGMA database_list", "SELECT * FROM pragma_database_list"),
+    ] {
+        assert_eq!(rows(&db, statement), rows(&db, call), "{statement}");
+    }
+}
+
+/// `PRAGMA name = value` is a `SET` written another way and it moves the same setting.
+#[test]
+fn a_pragma_with_an_equals_sign_sets_the_setting_a_plain_set_would() {
+    let db = database();
+    db.execute("PRAGMA memory_limit = '1GiB'").expect("a size");
+    assert_eq!(rows(&db, "SELECT current_setting('memory_limit')"), vec![vec![text("1.0 GiB")]]);
+    db.execute("PRAGMA threads = 4").expect("a count");
+    assert_eq!(rows(&db, "SELECT current_setting('threads')"), vec![vec![Value::BigInt(4)]]);
+}
+
+/// What a pragma says when it is not one, and when it is one and was called wrongly.
+#[test]
+fn a_pragma_that_is_wrong_is_complained_about_in_the_spelling_it_was_written_in() {
+    let db = database();
+    // The name goes back out as it was typed, including its case, which is what the pin does.
+    assert_eq!(failure(&db, "PRAGMA nope"), "Pragma Function with name nope does not exist!");
+    assert_eq!(failure(&db, "PRAGMA NOPE"), "Pragma Function with name NOPE does not exist!");
+    // A pragma that exists and was handed the wrong arguments is told about a pragma and not
+    // about the `pragma_` name it was rewritten into, because the rewrite is not what was written.
+    let message = failure(&db, "PRAGMA table_info");
+    assert!(message.contains("'table_info()'"), "{message}");
+    assert!(message.ends_with("\tPRAGMA \"table_info\"(VARCHAR)\n"), "{message}");
+    let message = failure(&db, "PRAGMA table_info(1)");
+    assert!(message.contains("'table_info(INTEGER)'"), "{message}");
+    let message = failure(&db, "PRAGMA version(1)");
+    assert!(message.ends_with("\tPRAGMA \"version\"\n"), "{message}");
+}
+
 /// A view the engine ships with goes in unbound and is bound at the first read, which is a fact
 /// about two columns of `duckdb_views()` and was measured on the pin twice over.
 #[test]

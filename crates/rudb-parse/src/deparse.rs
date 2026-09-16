@@ -230,7 +230,7 @@ fn source(ast: &Ast, index: SourceRef) -> String {
         Source::Subquery { query: inner, alias, columns } => {
             label(ast, format!("({})", query(ast, inner)), alias, columns)
         }
-        Source::Function { name, args, alias, columns } => {
+        Source::Function { name, args, alias, columns, .. } => {
             let written: Vec<String> =
                 ast.target_list(args).iter().map(|arg| argument(ast, arg)).collect();
             let call = format!("{}({})", parts(ast, name), written.join(", "));

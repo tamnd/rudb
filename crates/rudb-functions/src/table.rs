@@ -403,6 +403,43 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
     })
 }
 
+/// The same resolution for a call the user wrote as `PRAGMA name`, whose messages spell it so.
+///
+/// Every pragma is an ordinary table function under a longer name, so the resolution is
+/// [`resolve_table`] and nothing else. What changes is what a bad call says. Upstream writes both
+/// halves of that message in the form the user used, so `PRAGMA table_info('a', 'b')` is
+/// `'table_info(VARCHAR, VARCHAR)'` with a candidate line reading `PRAGMA "table_info"(VARCHAR)`.
+/// Handing back a complaint about a `pragma_table_info` nobody typed would be handing the user the
+/// rewrite to debug rather than their own statement.
+///
+/// Only two shapes can reach this. A pragma never reads a file and is never `range`, so the
+/// overload it has is either one name or nothing at all, and the candidate line says which.
+///
+/// # Errors
+///
+/// When the function has that name and not those arguments, and otherwise whatever
+/// [`resolve_table`] says.
+pub fn resolve_pragma(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTable> {
+    let error = match resolve_table(name, arguments) {
+        Ok(resolved) => return Ok(resolved),
+        Err(error) => error,
+    };
+    let Some(function) = TableFunction::lookup(name) else {
+        return Err(error);
+    };
+    let spelled = name.strip_prefix("pragma_").unwrap_or(name);
+    // A pragma that takes nothing prints no parentheses at all on the candidate line, where the
+    // function spelling of the same complaint prints an empty pair. Measured on the pin, which
+    // answers `PRAGMA version(1)` with a candidate reading `PRAGMA "version"` and stopping there.
+    let takes = if function.takes_a_name() { "(VARCHAR)" } else { "" };
+    let written: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+    Err(Error::binder(format!(
+        "No function matches the given name and argument types '{spelled}({})'. You might need to \
+         add explicit type casts.\n\tCandidate functions:\n\tPRAGMA \"{spelled}\"{takes}\n",
+        written.join(", ")
+    )))
+}
+
 /// Where a file reading table function's columns come from, and `None` for one that does not read
 /// a file.
 fn file_columns(function: TableFunction) -> Option<Columns> {
@@ -1043,6 +1080,37 @@ mod tests {
         // an integer to a name any more than it casts one to a path.
         let error = resolve_table("pragma_show", &[LogicalType::Integer]).expect_err("a name");
         assert!(error.message().contains("'pragma_show(INTEGER)'"), "{error}");
+    }
+
+    /// The same call written as a statement gets the same complaint spelled the way it was written.
+    #[test]
+    fn a_pragma_written_as_a_statement_is_complained_about_as_one() {
+        let error = resolve_pragma("pragma_table_info", &integers(2)).expect_err("one name");
+        assert!(
+            error.message().starts_with(
+                "No function matches the given name and argument types 'table_info(BIGINT, \
+                 BIGINT)'"
+            ),
+            "{error}"
+        );
+        assert!(error.message().contains("\tPRAGMA \"table_info\"(VARCHAR)\n"), "{error}");
+        // A pragma that takes nothing prints no parentheses on the candidate line at all, which is
+        // the pin's spelling and is not the same as the empty pair the function form prints.
+        let error = resolve_pragma("pragma_version", &integers(1)).expect_err("nothing");
+        assert!(error.message().contains("'version(BIGINT)'"), "{error}");
+        assert!(error.message().ends_with("\tPRAGMA \"version\"\n"), "{error}");
+    }
+
+    /// A call that resolves comes back the same either way, because it is the same function.
+    #[test]
+    fn a_pragma_that_resolves_resolves_to_what_the_function_spelling_does() {
+        let name = [LogicalType::Varchar];
+        let written = resolve_pragma("pragma_table_info", &name).expect("one name");
+        let called = resolve_table("pragma_table_info", &name).expect("one name");
+        assert_eq!(written.function, called.function);
+        assert_eq!(written.arguments, called.arguments);
+        let written = resolve_pragma("pragma_version", &[]).expect("nothing");
+        assert_eq!(written.function, TableFunction::PragmaVersion);
     }
 
     #[test]
