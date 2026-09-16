@@ -292,6 +292,12 @@ fn one_of<A: Fn(usize) -> usize>(
     arg: &Vector,
 ) -> Result<Option<Vector>> {
     match name {
+        "__rudb_zero_to_null" => {
+            let validity = Validity::from_iter(rows, |index| {
+                base.is_valid(index) && approximate(&arg.value_at(index)) != Some(0.0)
+            });
+            Ok(Some(arg.clone().with_validity(validity)))
+        }
         "not" => not_of(data, at, base, rows, returns),
         "-" | "abs" if arg.logical_type() == returns => {
             sign_of(name, data, at, base, rows, returns, arg)
@@ -1070,7 +1076,7 @@ fn float_step(op: Op, x: f64, y: f64) -> f64 {
 
 /// `/`, which the binder has already promoted both sides to `DOUBLE` for.
 fn slash_of(left: &Vector, right: &Vector, returns: &LogicalType) -> Result<Option<Vector>> {
-    if !matches!(returns, LogicalType::Double)
+    if !matches!(returns, LogicalType::Float | LogicalType::Double)
         || left.logical_type() != returns
         || right.logical_type() != returns
     {
@@ -1093,18 +1099,23 @@ where
     L: Fn(usize) -> usize,
     R: Fn(usize) -> usize,
 {
-    let (Data::Float64(a), Data::Float64(b)) = (one, other) else {
-        return Ok(None);
-    };
     let rows = left.len();
     let base = nulls_of(left).and(&nulls_of(right), rows);
-    let mut out = vec![0.0f64; rows];
-    let validity = over_valid(rows, base, |index| {
-        let (x, y) = (a[at_left(index)], b[at_right(index)]);
-        out[index] = x / y;
-        Ok(())
-    })?;
-    finish(returns, Data::Float64(out.into()), validity)
+    macro_rules! slash {
+        ($variant:ident, $native:ty) => {
+            if let (Data::$variant(a), Data::$variant(b)) = (one, other) {
+                let mut out = vec![0.0 as $native; rows];
+                let validity = over_valid(rows, base, |index| {
+                    out[index] = a[at_left(index)] / b[at_right(index)];
+                    Ok(())
+                })?;
+                return finish(returns, Data::$variant(out.into()), validity);
+            }
+        };
+    }
+    slash!(Float32, f32);
+    slash!(Float64, f64);
+    Ok(None)
 }
 
 /// `||`, where both sides are already strings.
@@ -1719,6 +1730,9 @@ pub fn call_values(
     returns: &LogicalType,
     written: Written<'_>,
 ) -> Result<Value> {
+    if let ("__rudb_zero_to_null", [value]) = (name, args) {
+        return Ok(if approximate(value) == Some(0.0) { Value::Null } else { value.clone() });
+    }
     if name == "coalesce" {
         let found = args.iter().find(|value| !value.is_null());
         return Ok(found.cloned().unwrap_or(Value::Null));
@@ -1792,7 +1806,7 @@ pub fn call_values(
         ("*", [left, right]) => arithmetic(Op::Multiply, left, right, returns, written),
         ("%", [left, right]) => arithmetic(Op::Modulo, left, right, returns, written),
         ("//", [left, right]) => arithmetic(Op::Divide, left, right, returns, written),
-        ("/", [left, right]) => divide(left, right),
+        ("/", [left, right]) => divide(left, right, returns),
         ("||", [left, right]) => Ok(Value::Varchar(format!("{left}{right}"))),
         ("lower", [only]) => Ok(Value::Varchar(only.to_string().to_lowercase())),
         ("upper", [only]) => Ok(Value::Varchar(only.to_string().to_uppercase())),
@@ -2129,8 +2143,8 @@ fn unscaled_at(value: &Value, scale: u8) -> Option<i128> {
     }
 }
 
-/// `/`, which the binder has already promoted both sides to `DOUBLE` for.
-fn divide(left: &Value, right: &Value) -> Result<Value> {
+/// `/`, which the binder has already promoted both sides to the result type.
+fn divide(left: &Value, right: &Value, returns: &LogicalType) -> Result<Value> {
     let (a, b) = match (approximate(left), approximate(right)) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -2141,8 +2155,12 @@ fn divide(left: &Value, right: &Value) -> Result<Value> {
             )));
         }
     };
-    // No guard. `/` promotes both sides to a double and is IEEE arithmetic from there, so a zero
-    // divisor is an infinity or a nan and never an error, whatever the arguments were written as.
+    // No guard. `/` uses IEEE arithmetic, so a zero divisor is an infinity or a nan and never an
+    // error, whatever the arguments were written as. Two floats keep their width upstream.
+    if returns == &LogicalType::Float {
+        #[expect(clippy::cast_possible_truncation, reason = "the resolved result is FLOAT")]
+        return Ok(Value::Float((a / b) as f32));
+    }
     Ok(Value::Double(a / b))
 }
 

@@ -104,6 +104,13 @@ pub static SETTINGS: &[SettingEntry] = &[
         aliases: &[],
     },
     SettingEntry {
+        name: "null_on_division_by_zero",
+        description: "Return NULL instead of throwing an error when dividing by zero.",
+        input_type: "BOOLEAN",
+        scope: GLOBAL,
+        aliases: &[],
+    },
+    SettingEntry {
         name: "order_by_non_integer_literal",
         description: "Allow ordering by non-integer literals - ordering by such literals has no effect.",
         input_type: "BOOLEAN",
@@ -177,7 +184,7 @@ mod tests {
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
-        assert_eq!(SETTINGS.len(), 11, "nine settings and two of them have a second spelling");
+        assert_eq!(SETTINGS.len(), 12, "ten settings and two of them have a second spelling");
         assert_eq!(setting_fields().len(), 7);
     }
 

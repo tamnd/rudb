@@ -232,7 +232,7 @@ impl Binder<'_> {
             return Ok(self.conjunction(connective, vec![left, right]));
         }
         let left = self.bind_expr(ast, left, scope)?;
-        let right = self.bind_expr(ast, right, scope)?;
+        let mut right = self.bind_expr(ast, right, scope)?;
         if let Some(comparison) = comparison_of(op) {
             return self.compare(comparison, left, right);
         }
@@ -251,10 +251,25 @@ impl Binder<'_> {
             }
             _ => {}
         }
+        if self.semantics.null_on_division_by_zero()
+            && (matches!(op, BinaryOp::IntegerDivide | BinaryOp::Modulo)
+                || (op == BinaryOp::Divide
+                    && self.plan().expr_type(left) == &LogicalType::Interval))
+        {
+            right = self.zero_to_null(right);
+        }
         match function_of(op) {
             Some(name) => self.call(name, vec![left, right]),
             None => Err(Error::not_implemented(format!("the {} operator", spelling(ast, op)))),
         }
+    }
+
+    /// Turns a zero divisor into null before the ordinary arithmetic kernel sees it.
+    fn zero_to_null(&mut self, divisor: ExprRef) -> ExprRef {
+        let returns = self.plan().expr_type(divisor).clone();
+        let args = self.plan_mut().add_expr_list(&[divisor]);
+        let name = self.plan_mut().intern("__rudb_zero_to_null");
+        self.plan_mut().add_expr(Expr::Function { name, args }, returns)
     }
 
     /// Binds one of the regex operators to the ordinary regex function it means.
@@ -482,6 +497,9 @@ impl Binder<'_> {
             .get(known.name)
             .ok_or_else(|| Error::catalog(rudb_functions::unknown_setting(&name)))?;
         let value = match known.input_type {
+            "BOOLEAN" => Value::Boolean(text.parse().map_err(|_| {
+                Error::internal(format!("{} is set to {text}, which is not a boolean", known.name))
+            })?),
             "BIGINT" => Value::BigInt(text.parse().map_err(|_| {
                 Error::internal(format!("{} is set to {text}, which is not a number", known.name))
             })?),
