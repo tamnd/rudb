@@ -2146,6 +2146,46 @@ fn correlated_scalar_counts_keep_zero_for_missing_groups() {
 }
 
 #[test]
+fn correlated_scalar_aggregates_use_an_outer_domain_for_arbitrary_predicates() {
+    let db = database();
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k, (SELECT count(*) FROM (VALUES (1), (2), (3)) i(x) WHERE i.x < o.k) FROM (VALUES (1), (2), (4)) o(k) ORDER BY k"
+        ),
+        vec![
+            vec![Value::Integer(1), Value::BigInt(0)],
+            vec![Value::Integer(2), Value::BigInt(1)],
+            vec![Value::Integer(4), Value::BigInt(3)],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k, (SELECT sum(value) FROM (VALUES (1, 10), (2, 20), (3, 30)) i(x, value) WHERE i.x < o.k) FROM (VALUES (1), (2), (4)) o(k) ORDER BY k"
+        ),
+        vec![
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::HugeInt(10)],
+            vec![Value::Integer(4), Value::HugeInt(60)],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k, (SELECT count(*) FROM (VALUES (10), (20)) i(x) WHERE o.k > 1) FROM (VALUES (1), (2)) o(k) ORDER BY k"
+        ),
+        vec![vec![Value::Integer(1), Value::BigInt(0)], vec![Value::Integer(2), Value::BigInt(2)],]
+    );
+    let sql = "SELECT (SELECT count(*) FROM (VALUES (NULL), (1)) i(x) WHERE i.x IS DISTINCT FROM o.k) FROM (VALUES (NULL)) o(k)";
+    assert_eq!(rows(&db, sql), vec![vec![Value::BigInt(1)]]);
+    let plan = db.plan(sql).expect("the arbitrary correlated aggregate plans");
+    assert!(plan.contains("Join LEFT"), "{plan}");
+    assert!(plan.contains("__inner_"), "{plan}");
+    assert!(!plan.contains("DependentJoin"), "{plan}");
+}
+
+#[test]
 fn uncorrelated_exists_is_a_single_joined_marker() {
     let db = database();
     let answer = db.query("SELECT EXISTS (SELECT 1)").expect("EXISTS answers");

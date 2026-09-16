@@ -3,7 +3,7 @@
 //! Binding keeps correlation explicit as a dependent join.
 //! Execution never implements that node because each rule here has to remove the dependency before the plan can run.
 //! Scalar projections over correlated filters carry inner filter columns as hidden outputs before the dependent join becomes an ordinary `SINGLE` join.
-//! Scalar aggregates add equality correlation keys to their grouping, so the inner input is still scanned and aggregated once rather than once per outer row.
+//! Scalar aggregates add equality keys directly to their grouping or join against a distinct outer-key domain for arbitrary predicates, so the inner input is still scanned and aggregated once rather than once per outer row.
 
 use std::collections::HashMap;
 
@@ -38,6 +38,9 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
         return Some(join);
     }
     if let Some(join) = mark(plan, left, right, kind, conditions) {
+        return Some(join);
+    }
+    if let Some(join) = scalar_aggregate_domain(plan, left, right, kind, conditions) {
         return Some(join);
     }
     if let Some(join) = scalar_count_aggregate(plan, left, right, kind, conditions) {
@@ -233,6 +236,202 @@ fn exists_domain(
     for (position, &outer_expr) in outer_exprs.iter().enumerate() {
         let right_expr = plan.add_expr_at(
             Expr::Column(ColumnBinding::new(index, u32::try_from(position + 1).ok()?)),
+            plan.expr_type(outer_expr).clone(),
+            plan.expr_span(outer_expr),
+        );
+        all.push(plan.add_expr_at(
+            Expr::Compare { op: CompareOp::NotDistinctFrom, left: outer_expr, right: right_expr },
+            LogicalType::Boolean,
+            plan.expr_span(outer_expr),
+        ));
+    }
+    let conditions = plan.add_expr_list(&all);
+    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+}
+
+/// Decorrelates scalar aggregates whose predicates need more than equality keys.
+///
+/// The inner side carries a non-null marker through a left join from the distinct outer domain.
+/// Counts use that marker to distinguish a real inner row from the padded row that represents an
+/// empty group. This also covers predicates such as `IS DISTINCT FROM` and predicates that read
+/// only the outer row, where no ordinary inner column is a reliable presence test.
+fn scalar_aggregate_domain(
+    plan: &mut Plan,
+    left: NodeRef,
+    right: NodeRef,
+    kind: JoinKind,
+    conditions: rudb_plan::Slice,
+) -> Option<NodeRef> {
+    if kind != JoinKind::Single {
+        return None;
+    }
+    let Node::Project { input: grouped, index, exprs, names } = *plan.node(right) else {
+        return None;
+    };
+    let Node::Aggregate { input: filtered, index: aggregate_index, groups, aggregates } =
+        *plan.node(grouped)
+    else {
+        return None;
+    };
+    let Node::Filter { input, predicate } = *plan.node(filtered) else {
+        return None;
+    };
+
+    let outer = produced(plan, left);
+    let inner = produced(plan, input);
+    let mut correlated = Vec::new();
+    let mut local = Vec::new();
+    split(plan, predicate, &mut |part| {
+        if reads(plan, part, &outer) {
+            correlated.push(part);
+        } else {
+            local.push(part);
+        }
+    });
+    if correlated.is_empty()
+        || correlated.iter().all(|&part| equality_pair(plan, part, &outer, &inner).is_some())
+    {
+        return None;
+    }
+
+    let mut outer_keys = Vec::new();
+    let mut inner_keys = Vec::new();
+    let mut relevant = correlated.clone();
+    relevant.extend_from_slice(plan.expr_list(groups));
+    relevant.extend_from_slice(plan.expr_list(aggregates));
+    for &expr in &relevant {
+        walk::columns(plan, expr, &mut |binding| {
+            if outer.contains(binding.table) && !outer_keys.contains(&binding) {
+                outer_keys.push(binding);
+            }
+            if inner.contains(binding.table) && !inner_keys.contains(&binding) {
+                inner_keys.push(binding);
+            }
+        });
+    }
+    if outer_keys.is_empty() {
+        return None;
+    }
+    let source = |binding| relevant.iter().find_map(|&expr| find_column_expr(plan, expr, binding));
+    let outer_exprs: Vec<ExprRef> =
+        outer_keys.iter().map(|&binding| source(binding)).collect::<Option<_>>()?;
+    let inner_exprs: Vec<ExprRef> =
+        inner_keys.iter().map(|&binding| source(binding)).collect::<Option<_>>()?;
+
+    let domain_index = walk::fresh_index(plan);
+    let domain_groups = plan.add_expr_list(&outer_exprs);
+    let no_aggregates = plan.add_expr_list(&[]);
+    let domain = plan.add_node(Node::Aggregate {
+        input: left,
+        index: domain_index,
+        groups: domain_groups,
+        aggregates: no_aggregates,
+    });
+    let domain_outputs: HashMap<ColumnBinding, usize> =
+        outer_keys.iter().copied().enumerate().map(|(position, key)| (key, position)).collect();
+
+    let inner_input = make_filter(plan, input, local);
+    let inner_index = walk::fresh_index(plan);
+    let mut carried = inner_exprs.clone();
+    let marker_position = carried.len();
+    let marker = plan.add_constant(Value::Boolean(true));
+    carried.push(marker);
+    let carried_names: Vec<_> =
+        (0..carried.len()).map(|position| plan.intern(&format!("__inner_{position}"))).collect();
+    let carried = plan.add_expr_list(&carried);
+    let carried_names = plan.add_name_list(&carried_names);
+    let inner_input = plan.add_node(Node::Project {
+        input: inner_input,
+        index: inner_index,
+        exprs: carried,
+        names: carried_names,
+    });
+    let inner_outputs: HashMap<ColumnBinding, usize> =
+        inner_keys.iter().copied().enumerate().map(|(position, key)| (key, position)).collect();
+    let presence = plan.add_expr_at(
+        Expr::Column(ColumnBinding::new(inner_index, u32::try_from(marker_position).ok()?)),
+        LogicalType::Boolean,
+        plan.expr_span(predicate),
+    );
+
+    let domain_conditions: Vec<ExprRef> = correlated
+        .iter()
+        .map(|&condition| {
+            let condition = replace_inner(plan, condition, inner_index, &inner_outputs);
+            replace_inner(plan, condition, domain_index, &domain_outputs)
+        })
+        .collect();
+    let domain_conditions = plan.add_expr_list(&domain_conditions);
+    let joined = plan.add_node(Node::Join {
+        left: domain,
+        right: inner_input,
+        kind: JoinKind::Left,
+        conditions: domain_conditions,
+    });
+
+    let original_groups = plan.expr_list(groups).to_vec();
+    let mut grouped_exprs: Vec<ExprRef> = original_groups
+        .iter()
+        .map(|&group| replace_inner(plan, group, inner_index, &inner_outputs))
+        .collect();
+    for (position, &source) in outer_exprs.iter().enumerate() {
+        grouped_exprs.push(plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(domain_index, u32::try_from(position).ok()?)),
+            plan.expr_type(source).clone(),
+            plan.expr_span(source),
+        ));
+    }
+    let calls: Vec<ExprRef> = plan
+        .expr_list(aggregates)
+        .to_vec()
+        .into_iter()
+        .map(|call| {
+            let call = replace_inner(plan, call, inner_index, &inner_outputs);
+            count_with_presence(plan, call, presence)
+        })
+        .collect();
+
+    let added = outer_exprs.len();
+    let mut projected: Vec<ExprRef> = plan
+        .expr_list(exprs)
+        .to_vec()
+        .into_iter()
+        .map(|expr| {
+            shift_aggregate_outputs(plan, expr, aggregate_index, original_groups.len(), added)
+        })
+        .collect();
+    let mut projected_names = plan.name_list(names).to_vec();
+    for (position, &source) in outer_exprs.iter().enumerate() {
+        let output = projected.len();
+        projected.push(plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(
+                aggregate_index,
+                u32::try_from(original_groups.len() + position).ok()?,
+            )),
+            plan.expr_type(source).clone(),
+            plan.expr_span(source),
+        ));
+        projected_names.push(plan.intern(&format!("__correlated_{output}")));
+    }
+    let groups = plan.add_expr_list(&grouped_exprs);
+    let aggregates = plan.add_expr_list(&calls);
+    let grouped = plan.add_node(Node::Aggregate {
+        input: joined,
+        index: aggregate_index,
+        groups,
+        aggregates,
+    });
+    let exprs = plan.add_expr_list(&projected);
+    let names = plan.add_name_list(&projected_names);
+    let right = plan.add_node(Node::Project { input: grouped, index, exprs, names });
+
+    let mut all = plan.expr_list(conditions).to_vec();
+    for (position, &outer_expr) in outer_exprs.iter().enumerate() {
+        let right_expr = plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(
+                index,
+                u32::try_from(plan.expr_list(exprs).len() - added + position).ok()?,
+            )),
             plan.expr_type(outer_expr).clone(),
             plan.expr_span(outer_expr),
         );
