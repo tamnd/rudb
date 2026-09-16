@@ -53,8 +53,8 @@ use rudb_pipeline::{
     BufferId, DynSink, DynStream, Pipeline, PipelineId, Source, Watched, root, root_in_order,
 };
 use rudb_plan::{
-    CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, PipelineRef, Plan, ROOT, Shape, Slice,
-    seams_of,
+    CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, PipelineRef, Plan, ROOT,
+    Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
 
@@ -353,6 +353,36 @@ fn count_having_aggregate(
         _ => return None,
     };
     Some((input, call, minimum))
+}
+
+fn mark_binding(plan: &Plan, right: NodeRef, kind: JoinKind) -> Option<usize> {
+    if kind != JoinKind::Mark {
+        return None;
+    }
+    let Node::Project { exprs, names, .. } = *plan.node(right) else {
+        return None;
+    };
+    let positions: Vec<usize> = plan
+        .expr_list(exprs)
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &expr)| {
+            let Expr::Constant(value) = *plan.expr(expr) else {
+                return None;
+            };
+            (*plan.value(value) == Value::Boolean(true)).then_some(position)
+        })
+        .collect();
+    let position = match positions.as_slice() {
+        [position] => *position,
+        _ => plan
+            .name_list(names)
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(position, &name)| (plan.string(name) == "mark").then_some(position))?,
+    };
+    Some(position)
 }
 
 /// What a filter over a scan can tell that scan before it reads anything.
@@ -857,6 +887,7 @@ impl<'a> Building<'a, '_> {
                 // one the hash join builds on. The probing side is a pipeline of its own rather than
                 // part of the one above it, because it ends in a sink, and it waits for the build
                 // side.
+                let marker = mark_binding(plan, right, kind);
                 let gather_id = self.gathered(reference);
                 let gathering = self.shape.pipeline(right);
                 let right = self.node(right)?;
@@ -865,7 +896,7 @@ impl<'a> Building<'a, '_> {
                 let kept = self.watch(reference, gather_id, gathering, "Gather", None);
                 self.close(right, gathering, Arc::new(Watched::new(gather, kept)));
                 let mut left = self.node(left)?;
-                let side = Gathered { schema: &right_schema, rows: gathered };
+                let side = Gathered { schema: &right_schema, rows: gathered, marker };
                 let (join, out) =
                     Join::new(plan, &left.schema, side, kind, conditions, self.cancel, memory);
                 let join = join.in_session(self.session);

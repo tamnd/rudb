@@ -124,7 +124,8 @@ fn mark(
     let Node::Project { input: selected, index, exprs, names } = *plan.node(right) else {
         return None;
     };
-    let projected = plan.expr_list(exprs).to_vec();
+    let mut projected = plan.expr_list(exprs).to_vec();
+    let mut projected_names = plan.name_list(names).to_vec();
     if projected.len() < 2 {
         return None;
     }
@@ -156,7 +157,8 @@ fn mark(
         return None;
     }
 
-    let selected_outputs = plan.expr_list(selected_exprs);
+    let mut selected_outputs = plan.expr_list(selected_exprs).to_vec();
+    let mut selected_output_names = plan.name_list(selected_names).to_vec();
     let mut outputs = HashMap::new();
     for (position, &expr) in projected[..projected.len() - 1].iter().enumerate() {
         let Expr::Column(binding) = *plan.expr(expr) else {
@@ -171,26 +173,57 @@ fn mark(
         }
     }
     for &condition in &correlated {
-        let mut available = true;
+        let mut bindings = Vec::new();
         walk::columns(plan, condition, &mut |binding| {
-            if inner.contains(binding.table) {
-                available &= outputs.contains_key(&binding);
-            } else if !outer.contains(binding.table) {
-                available = false;
+            if inner.contains(binding.table)
+                && !outputs.contains_key(&binding)
+                && !bindings.contains(&binding)
+            {
+                bindings.push(binding);
             }
         });
-        if !available {
+        for binding in bindings {
+            let source = find_column_expr(plan, condition, binding)?;
+            let selected_position = selected_outputs.len();
+            selected_outputs.push(source);
+            selected_output_names.push(plan.intern(&format!("__correlated_{selected_position}")));
+            let projected_position = projected.len();
+            let projected_source = plan.add_expr_at(
+                Expr::Column(ColumnBinding::new(
+                    selected_index,
+                    u32::try_from(selected_position).ok()?,
+                )),
+                plan.expr_type(source).clone(),
+                plan.expr_span(source),
+            );
+            projected.push(projected_source);
+            projected_names.push(plan.intern(&format!("__correlated_{projected_position}")));
+            outputs.insert(binding, projected_position);
+        }
+    }
+
+    for &condition in &correlated {
+        let mut valid = true;
+        walk::columns(plan, condition, &mut |binding| {
+            valid &= outer.contains(binding.table)
+                || (inner.contains(binding.table) && outputs.contains_key(&binding));
+        });
+        if !valid {
             return None;
         }
     }
 
     let input = make_filter(plan, input, local);
+    let selected_exprs = plan.add_expr_list(&selected_outputs);
+    let selected_names = plan.add_name_list(&selected_output_names);
     let selected = plan.add_node(Node::Project {
         input,
         index: selected_index,
         exprs: selected_exprs,
         names: selected_names,
     });
+    let exprs = plan.add_expr_list(&projected);
+    let names = plan.add_name_list(&projected_names);
     let right = plan.add_node(Node::Project { input: selected, index, exprs, names });
     let mut all = plan.expr_list(conditions).to_vec();
     for condition in correlated {
