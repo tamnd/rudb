@@ -720,6 +720,43 @@ pub fn update_scattered(
     if matches!(nulls, Validity::AllInvalid) {
         return Ok(());
     }
+    if matches!(first.state, State::Extreme { .. })
+        && input.logical_type() == &LogicalType::Varchar
+        && matches!(input.form(), Form::Flat | Form::Dictionary | Form::StringView | Form::Rle)
+    {
+        // row at a time: each input belongs to one group; only a new extreme owns its text.
+        for row in 0..rows {
+            if !nulls.is_valid(row) {
+                continue;
+            }
+            let Some(index) = into.index(row) else { continue };
+            let text = input.text_at(row).ok_or_else(|| {
+                Error::internal("a valid varchar row had no borrowed text".to_string())
+            })?;
+            let State::Extreme { held, least } = &mut states[index].state else {
+                return Err(Error::internal("a string extreme into another state".to_string()));
+            };
+            let replace = match held {
+                None => true,
+                Some(current) => {
+                    let Value::Varchar(previous) = current.as_ref() else {
+                        return Err(Error::internal(
+                            "a varchar extreme held another type".to_string(),
+                        ));
+                    };
+                    if *least {
+                        text.as_bytes() < previous.as_bytes()
+                    } else {
+                        text.as_bytes() > previous.as_bytes()
+                    }
+                }
+            };
+            if replace {
+                *held = Some(Box::new(Value::Varchar(text.to_owned())));
+            }
+        }
+        return Ok(());
+    }
     let feed = feed_of(first, input.logical_type());
     if let Some(feed) = feed {
         if spread(states, into, input, rows, &nulls, feed)? {
@@ -1808,7 +1845,7 @@ mod tests {
         let mut states = vec![Accumulator::new("min", &LogicalType::Varchar).expect("known"); 2];
         update_scattered(&mut states, &slots, 1, 0, Some(&words), 3).expect("folds them in");
         assert_eq!(states[0].finish().expect("finishes"), Value::Varchar("a".into()));
-        assert_eq!(fallback::count(Kernel::Aggregate, Form::Flat, Form::Flat), 1);
+        assert_eq!(fallback::count(Kernel::Aggregate, Form::Flat, Form::Flat), 0);
     }
 
     /// The point of the shared accessor. A run length column goes down the same loop a dictionary
