@@ -6,6 +6,19 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.27
+
+A patch release about SQL session compatibility, structured errors, and faster grouped distinct aggregation. The storage format version is unchanged.
+
+- `dialect_compatibility_mode` accepts the pinned NONE and SPARK modes, preserves the accepted spelling, resets to NONE, and returns DuckDB's enum error and candidate list for any other value.
+- `preserve_identifier_case` folds unquoted identifiers once during parsing under preserve, lowercase, or uppercase policy. Quoted identifiers, strings and single-quoted file paths keep their written case, and prepared statements capture the policy when they are prepared.
+- `warnings_as_errors` matches DuckDB's no-logger configuration. False and reset succeed, while true returns the exact Settings Error and leaves the setting unchanged. Settings Error is now part of the public error taxonomy.
+- `errors_as_json` applies to query, execute, plan, prepare and prepared execution. Structured messages preserve the typed Rust error code and carry DuckDB-style exception fields, source positions where spans exist, and core error subtypes.
+- The build gate proves that language policy types stop at the binder and do not leak into the plan, optimizer or executor.
+- Grouped distinct aggregation exchanges encoded count keys through radix owners and counts grouped distinct pairs in their owning partitions instead of rebuilding a shared set on one finishing thread.
+- All session choices are resolved before execution, and JSON conversion runs only on an error path, so these compatibility changes add no row-loop work.
+- The pinned DuckDB oracle agrees on the new committed compatibility records. No DuckDB bug was found in this work.
+
 ## 0.3.26
 
 A replacement patch release for 0.3.25, whose release gate stopped before publishing, with faster distinct aggregation and a stricter hot-loop check. The storage format version is unchanged.
