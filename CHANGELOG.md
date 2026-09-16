@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.26
+
+A replacement patch release for 0.3.25, whose release gate stopped before publishing, with faster distinct aggregation and a stricter hot-loop check. The storage format version is unchanged.
+
+- This release includes the SHOW resolution, SQL dialect registry, metadata tables, native scan improvements and aggregation improvements described under 0.3.25. The v0.3.25 tag exists, but no GitHub release or package was published from it.
+- Distinct BIGINT aggregation assigns radix partitions to finishing workers and merges each value into one owner instead of rebuilding one set from every worker on one thread.
+- The fixed aggregate exchange reads BIGINT, INTEGER and SMALLINT columns through their native signed layouts. It no longer materialises owned values in its row loop.
+- The release gate recognises `Option::ok` as a standard adapter while still requiring every vector flatten to be reviewed. This is the gate correction that lets the valid random fetch flatten pass without hiding a new vector flatten.
+- The full release gate and the committed compatibility corpus pass. No DuckDB bug was found in this work.
+
 ## 0.3.25
 
 A patch release about SHOW resolution, the SQL dialect registry, and lower aggregation and native scan costs. The storage format version is unchanged.
