@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.28
+
+A patch release that begins D3 with set-based uncorrelated subqueries and finishes the D2 session setting list. The storage format version is unchanged.
+
+- Uncorrelated scalar subqueries become `SINGLE` joins and produce DuckDB's empty, nested, multi-column and multi-row behavior. `scalar_subquery_error_on_multiple_rows` selects the strict error or one arbitrary row while binding the plan.
+- `EXISTS` and `NOT EXISTS` become one joined marker pipeline with an early limit, so the inner query runs once and stops after proving that a row exists.
+- `IN`, `NOT IN`, `ANY` and `ALL` use a three-valued mark join. Matches stop early, NULL comparisons remain unknown, empty inputs keep the SQL identities, and no cross product is materialized.
+- Generated result names and `DESCRIBE` output for every new subquery form match the pinned DuckDB binary.
+- `allow_parser_override_extension` completes the pinned D2 session setting surface without installing a parser extension rudb does not ship.
+- The committed compatibility corpus grew from 29 to 33 files and passes through the library, shell, isolated runner, four shards and optimizer-disabled path.
+- The full gate passes on Rust 1.85. No DuckDB bug was found in this work.
+
 ## 0.3.27
 
 A patch release about SQL session compatibility, structured errors, and faster grouped distinct aggregation. The storage format version is unchanged.
