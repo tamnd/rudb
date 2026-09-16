@@ -131,6 +131,7 @@ fn the_generator_reaches_every_operator_and_every_expression_form() {
             "Project",
             "SetOp",
             "Sort",
+            "TableFetch",
             "TableFunction",
             "TopN",
             "Values",
@@ -611,7 +612,7 @@ impl Generator {
             let leaf = self.leaf();
             return self.plan.add_node(leaf);
         }
-        let node = match self.random.below(12) {
+        let node = match self.random.below(13) {
             0 => {
                 let input = self.node(depth - 1);
                 let predicate = self.of_type(&LogicalType::Boolean, EXPR_DEPTH);
@@ -674,7 +675,19 @@ impl Generator {
                 let on = self.exprs(count, EXPR_DEPTH);
                 Node::Distinct { input, on }
             }
-            8 | 9 => {
+            8 => {
+                let input = self.node(depth - 1);
+                let catalog = self.plan.intern("memory");
+                let schema = self.plan.intern("main");
+                let table = self.plan.intern("t");
+                let binding = ColumnBinding::new(self.index(), self.random.below(6) as u32);
+                let row = self.plan.add_expr(Expr::Column(binding), LogicalType::BigInt);
+                let count = self.random.count(1, 3);
+                let columns = self.fields(count);
+                let index = self.index();
+                Node::TableFetch { input, index, catalog, schema, table, columns, row }
+            }
+            9 | 10 => {
                 let left = self.node(depth - 1);
                 let right = self.node(depth - 1);
                 let kind = self.random.pick(&[
@@ -691,7 +704,7 @@ impl Generator {
                 let conditions = self.booleans(count, EXPR_DEPTH);
                 Node::Join { left, right, kind, conditions }
             }
-            10 => {
+            11 => {
                 let left = self.node(depth - 1);
                 let right = self.node(depth - 1);
                 Node::CrossProduct { left, right }

@@ -203,6 +203,16 @@ pub enum Node {
         /// The input column holding the ordinal, which has to be `BIGINT`.
         row: ExprRef,
     },
+    /// Rows of a catalog table read back by their table-wide ordinal.
+    TableFetch {
+        input: NodeRef,
+        index: u32,
+        catalog: StrRef,
+        schema: StrRef,
+        table: StrRef,
+        columns: Slice,
+        row: ExprRef,
+    },
     /// Duplicate elimination, over the whole row or over named expressions.
     Distinct {
         /// The input.
@@ -267,6 +277,7 @@ impl Node {
             Self::Limit { .. } => "Limit",
             Self::TopN { .. } => "TopN",
             Self::Fetch { .. } => "Fetch",
+            Self::TableFetch { .. } => "TableFetch",
             Self::Distinct { .. } => "Distinct",
             Self::Join { .. } => "Join",
             Self::CrossProduct { .. } => "CrossProduct",
@@ -292,6 +303,7 @@ impl Node {
             | Self::Limit { input, .. }
             | Self::TopN { input, .. }
             | Self::Fetch { input, .. }
+            | Self::TableFetch { input, .. }
             | Self::Distinct { input, .. } => [Some(input), None],
             Self::Join { left, right, .. }
             | Self::CrossProduct { left, right }
@@ -314,6 +326,7 @@ impl Node {
             | Self::TableFunction { index, .. }
             | Self::Project { index, .. }
             | Self::Fetch { index, .. }
+            | Self::TableFetch { index, .. }
             | Self::Aggregate { index, .. }
             | Self::SetOp { index, .. } => Some(index),
             _ => None,

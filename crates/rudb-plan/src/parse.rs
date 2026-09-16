@@ -198,6 +198,27 @@ impl Reader<'_> {
                 let columns = read_schema(plan, c)?;
                 Ok(Built::unary(move |input| Node::Fetch { input, index, args, columns, row }))
             }
+            "TableFetch" => {
+                let catalog = read_name(plan, c)?;
+                c.expect(".")?;
+                let schema = read_name(plan, c)?;
+                c.expect(".")?;
+                let table = read_name(plan, c)?;
+                c.expect_word("row")?;
+                c.expect("=")?;
+                let row = read_expr(plan, c)?;
+                let index = read_table_index(c)?;
+                let columns = read_schema(plan, c)?;
+                Ok(Built::unary(move |input| Node::TableFetch {
+                    input,
+                    index,
+                    catalog,
+                    schema,
+                    table,
+                    columns,
+                    row,
+                }))
+            }
             "Filter" => {
                 let predicate = read_expr(plan, c)?;
                 Ok(Built::unary(move |input| Node::Filter { input, predicate }))

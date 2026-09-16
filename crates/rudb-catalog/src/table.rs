@@ -3,7 +3,7 @@
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_native::Reader as NativeReader;
 use rudb_storage::{MemoryTable, Probe};
-use rudb_vector::{Chunk, Form};
+use rudb_vector::{Chunk, Form, Vector};
 
 use crate::catalog::DETACHED;
 use crate::name::{QualifiedName, same_name};
@@ -42,6 +42,62 @@ pub enum Rows {
 }
 
 impl Rows {
+    /// Number of rows in one independently readable chunk.
+    pub fn chunk_len(&self, at: usize) -> Result<usize> {
+        Ok(match self {
+            Self::Memory(rows) => rows
+                .chunk(at)
+                .ok_or_else(|| Error::internal("row ordinal names a missing chunk"))?
+                .len(),
+            Self::Native(reader) => reader
+                .table()
+                .stripes()
+                .get(at)
+                .ok_or_else(|| Error::internal("row ordinal names a missing stripe"))?
+                .rows(),
+        })
+    }
+
+    /// Reads selected rows by table-wide ordinal in the order requested.
+    pub fn rows_at(
+        &self,
+        types: &[LogicalType],
+        columns: &[usize],
+        ordinals: &[u64],
+    ) -> Result<Chunk> {
+        let mut values = vec![Vec::with_capacity(ordinals.len()); columns.len()];
+        let mut cached: Option<(usize, Chunk)> = None;
+        for &ordinal in ordinals {
+            let ordinal = usize::try_from(ordinal)
+                .map_err(|_| Error::internal("row ordinal does not fit this platform"))?;
+            let mut start = 0_usize;
+            let mut found = None;
+            for chunk in 0..self.chunk_count() {
+                let len = self.chunk_len(chunk)?;
+                if ordinal < start.saturating_add(len) {
+                    found = Some((chunk, ordinal - start));
+                    break;
+                }
+                start = start.saturating_add(len);
+            }
+            let (chunk, row) =
+                found.ok_or_else(|| Error::internal("row ordinal is past the table"))?;
+            if cached.as_ref().is_none_or(|(held, _)| *held != chunk) {
+                cached = Some((chunk, self.read(chunk, columns)?));
+            }
+            let held = &cached.as_ref().expect("cached above").1;
+            for (at, values) in values.iter_mut().enumerate() {
+                values.push(held.value_at(row, at));
+            }
+        }
+        let vectors = values
+            .into_iter()
+            .zip(types)
+            .map(|(values, ty)| Vector::from_values(ty.clone(), &values))
+            .collect::<Result<Vec<_>>>()?;
+        Chunk::with_rows(vectors, ordinals.len())
+    }
+
     /// Column types.
     #[must_use]
     pub fn types(&self) -> Vec<LogicalType> {

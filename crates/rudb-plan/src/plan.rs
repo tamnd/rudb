@@ -511,6 +511,18 @@ impl Plan {
                     return fail("takes its ordinals from an expression that is not BIGINT");
                 }
             }
+            Node::TableFetch { catalog, schema, table, columns, row, .. } => {
+                for name in [catalog, schema, table] {
+                    if name as usize >= self.strings.len() {
+                        return fail("names a string that is not in the table");
+                    }
+                }
+                self.checked_field_list(columns, reference)?;
+                self.checked_expr(row, reference)?;
+                if *self.expr_type(row) != LogicalType::BigInt {
+                    return fail("takes its ordinals from an expression that is not BIGINT");
+                }
+            }
             Node::Filter { predicate, .. } => {
                 self.checked_expr(predicate, reference)?;
                 if *self.expr_type(predicate) != LogicalType::Boolean {
@@ -621,6 +633,7 @@ impl Plan {
                 held.push((row, false));
                 held
             }
+            Node::TableFetch { row, .. } => vec![(row, false)],
             Node::Filter { predicate, .. } => vec![(predicate, false)],
             Node::Project { exprs, .. } => plain(self.expr_list(exprs)),
             Node::Aggregate { groups, aggregates, .. } => {

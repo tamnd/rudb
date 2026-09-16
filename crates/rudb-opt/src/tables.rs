@@ -174,6 +174,7 @@ fn collect(plan: &Plan, at: NodeRef, set: &mut TableSet) {
         | Node::TableFunction { index, .. }
         | Node::Project { index, .. }
         | Node::Fetch { index, .. }
+        | Node::TableFetch { index, .. }
         | Node::Aggregate { index, .. }
         | Node::SetOp { index, .. } => set.insert(index),
         Node::Dummy => {}
