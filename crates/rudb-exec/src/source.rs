@@ -90,7 +90,8 @@ fn poisoned<T>(_: T) -> Error {
 #[derive(Debug)]
 pub(crate) struct Scan<'a> {
     table: &'a Table,
-    columns: Vec<usize>,
+    columns: Vec<Option<usize>>,
+    offsets: Vec<i64>,
     probes: Vec<Probe>,
     schema: Schema,
     chunks: Handout,
@@ -114,6 +115,10 @@ impl<'a> Scan<'a> {
         let fields = plan.field_list(projection).to_vec();
         let mut columns = Vec::with_capacity(fields.len());
         for field in &fields {
+            if field.name == FILE_ROW_NUMBER {
+                columns.push(None);
+                continue;
+            }
             let position = table.column_index(&field.name).ok_or_else(|| {
                 Error::catalog(format!(
                     "Table \"{}\" does not have a column named \"{}\"",
@@ -121,18 +126,27 @@ impl<'a> Scan<'a> {
                     field.name
                 ))
             })?;
-            columns.push(position);
+            columns.push(Some(position));
         }
         // A test names a column of the projection and a zone names a column of the table, so the
         // test is moved onto the table's numbering here rather than at every chunk. A test on a
         // column that is somehow not projected is dropped, which costs a chunk that gets read.
         let probes = tests
             .into_iter()
-            .filter_map(|(at, op, value)| Some(Probe { column: *columns.get(at)?, op, value }))
+            .filter_map(|(at, op, value)| {
+                Some(Probe { column: columns.get(at)?.as_ref().copied()?, op, value })
+            })
             .collect();
         let schema = Schema::numbered(fields, index);
         let chunks = Handout::new(table.rows().chunk_count());
-        Ok(Self { table, columns, probes, schema, chunks, skipped: AtomicUsize::new(0) })
+        let mut next = 0_i64;
+        let mut offsets = Vec::with_capacity(table.rows().chunk_count());
+        for at in 0..table.rows().chunk_count() {
+            offsets.push(next);
+            next =
+                next.saturating_add(i64::try_from(table.rows().chunk_len(at)?).unwrap_or(i64::MAX));
+        }
+        Ok(Self { table, columns, offsets, probes, schema, chunks, skipped: AtomicUsize::new(0) })
     }
 
     /// What this scan produces.
@@ -165,7 +179,23 @@ impl Source for Scan<'_> {
             *out = Chunk::empty(&self.schema.types());
             return Ok(Progress::Done);
         }
-        *out = self.table.rows().read(at, &self.columns)?;
+        let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
+        let read = self.table.rows().read(at, &projected)?;
+        if self.columns.iter().all(Option::is_some) {
+            *out = read;
+            return Ok(Progress::Done);
+        }
+        let mut held = Vec::with_capacity(self.columns.len());
+        let mut real = 0;
+        for column in &self.columns {
+            if column.is_some() {
+                held.push(read.column(real)?.clone());
+                real += 1;
+            } else {
+                held.push(Vector::sequence(self.offsets[at], 1, read.len()));
+            }
+        }
+        *out = Chunk::with_rows(held, read.len())?;
         Ok(Progress::Done)
     }
 }
@@ -1447,7 +1477,8 @@ mod tests {
             tests.into_iter().map(|(column, op, value)| Probe { column, op, value }).collect();
         Scan {
             table,
-            columns: vec![0],
+            columns: vec![Some(0)],
+            offsets: vec![0],
             probes,
             schema: Schema::numbered(fields, 0),
             chunks: Handout::new(table.rows().chunk_count()),

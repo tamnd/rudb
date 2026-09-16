@@ -240,7 +240,8 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         Node::Get { columns, .. }
         | Node::Values { columns, .. }
         | Node::TableFunction { columns, .. }
-        | Node::Fetch { columns, .. } => plan.field_list(columns).len(),
+        | Node::Fetch { columns, .. }
+        | Node::TableFetch { columns, .. } => plan.field_list(columns).len(),
         Node::Project { exprs, .. } => plan.expr_list(exprs).len(),
         Node::Aggregate { groups, aggregates, .. } => {
             plan.expr_list(groups).len() + plan.expr_list(aggregates).len()

@@ -60,7 +60,7 @@ use rudb_seam::Settings;
 
 use crate::enginenames::{database_size, extensions, optimizers, platform, user_agent, version};
 use crate::entrynames::{columnnames, databasenames, schemanames, tablenames, viewnames};
-use crate::fetch::Fetch;
+use crate::fetch::{Fetch, TableFetch};
 use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
@@ -598,6 +598,25 @@ impl<'a> Building<'a, '_> {
                 let counters = self.watch(reference, id, pipeline, "Fetch", None);
                 let fetch = Fetch::new(plan, &below.schema, index, args, columns, row)?
                     .watched(counters.clone());
+                let schema = fetch.schema().clone();
+                below.then(Arc::new(Watched::new(fetch, counters)), schema)
+            }
+            Node::TableFetch { input, index, catalog, schema, table, columns, row } => {
+                let below = self.node(input)?;
+                let name = QualifiedName::new(
+                    plan.string(catalog),
+                    plan.string(schema),
+                    plan.string(table),
+                );
+                let counters = self.watch(reference, id, pipeline, "TableFetch", None);
+                let fetch = TableFetch::new(
+                    plan,
+                    &below.schema,
+                    index,
+                    self.catalog.table(&name)?,
+                    columns,
+                    row,
+                )?;
                 let schema = fetch.schema().clone();
                 below.then(Arc::new(Watched::new(fetch, counters)), schema)
             }

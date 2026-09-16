@@ -47,6 +47,31 @@ fn rows(database: &Database, sql: &str) -> Vec<Vec<Value>> {
     result.rows().collect()
 }
 
+fn table() -> Database {
+    let database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE t AS SELECT i AS a, i + 1 AS b, i + 2 AS c, i + 3 AS d, \
+             i + 4 AS e, i + 5 AS f, i + 6 AS g, i + 7 AS h, i + 8 AS j, \
+             CAST(i AS VARCHAR) AS text FROM range(5000) r(i)",
+        )
+        .expect("wide table");
+    database
+}
+
+#[test]
+fn a_wide_top_n_over_a_catalog_table_fetches_only_the_winners() {
+    let sql = "SELECT * FROM t WHERE a % 7 = 3 ORDER BY b DESC LIMIT 10 OFFSET 4";
+    let deferred = table();
+    let plan = deferred.plan(sql).expect("binds");
+    assert!(plan.contains("TableFetch memory.main.t"), "{plan}");
+    assert!(plan.contains("file_row_number::BIGINT"), "{plan}");
+
+    let plain = table();
+    plain.execute("SET disabled_optimizers = 'late_materialization'").expect("disable pass");
+    assert_eq!(rows(&deferred, sql), rows(&plain, sql));
+}
+
 #[test]
 fn a_wide_top_n_over_a_file_scans_the_ordering_column_and_fetches_the_rest() {
     let database = Database::new();

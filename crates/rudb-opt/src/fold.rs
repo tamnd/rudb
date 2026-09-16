@@ -138,6 +138,7 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
         Node::Get { .. }
         | Node::Dummy
         | Node::Limit { .. }
+        | Node::TableFetch { .. }
         | Node::SetOp { .. }
         | Node::CrossProduct { .. } => {}
         Node::Values { rows, .. } => {
