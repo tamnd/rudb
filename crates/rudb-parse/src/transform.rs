@@ -2442,12 +2442,17 @@ impl<'a> Transform<'a> {
 
     /// `SubqueryExpression <- SubqueryNot? SubqueryExists? SubqueryReference`.
     fn subquery(&mut self, node: u32) -> Result<ExprRef> {
-        if self.find(node, "SubqueryNot") != NONE || self.find(node, "SubqueryExists") != NONE {
-            return self.unsupported(node);
-        }
+        let negated = self.find(node, "SubqueryNot") != NONE;
+        let exists = self.find(node, "SubqueryExists") != NONE;
         let reference = self.find(node, "SubqueryReference");
         let query = self.query(self.first(reference))?;
-        Ok(self.push(Expr::Subquery { query }))
+        Ok(if exists {
+            self.push(Expr::Exists { query, negated })
+        } else if negated {
+            return self.unsupported(node);
+        } else {
+            self.push(Expr::Subquery { query })
+        })
     }
 
     /// The value of a string literal, with the quotes gone and the escapes resolved.
@@ -2872,6 +2877,10 @@ mod tests {
             Expr::Parameter { name } => format!("${}", ast.string(name)),
             Expr::Row { items } => format!("ROW({})", list(items)),
             Expr::Subquery { query } => format!("({})", show_query(ast, query)),
+            Expr::Exists { query, negated } => {
+                let exists = format!("EXISTS ({})", show_query(ast, query));
+                if negated { format!("NOT {exists}") } else { exists }
+            }
         }
     }
 
