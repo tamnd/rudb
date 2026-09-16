@@ -700,7 +700,8 @@ impl Column {
         };
         let valid = &self.valid;
         let validity = rudb_vector::Validity::from_iter(len, |index| valid[start + index]);
-        Ok(Vector::flat(ty.clone(), data)?.with_validity(validity))
+        let vector = Vector::flat(ty.clone(), data)?.with_validity(validity);
+        if matches!(self.data, StoredData::Varchar(_)) { vector.shared_text() } else { Ok(vector) }
     }
 
     fn values(&self, range: std::ops::Range<usize>) -> Vec<Value> {
