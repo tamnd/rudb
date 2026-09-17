@@ -297,6 +297,11 @@ impl Source for Scan<'_> {
 }
 
 fn native_instances(rows: usize) -> usize {
+    if let Ok(cap) = std::env::var("RUDB_NATIVE_INSTANCES") {
+        if let Ok(cap) = cap.parse::<usize>() {
+            return cap.max(1);
+        }
+    }
     let small = rows.div_ceil(50_000).min(4);
     let large = rows.div_ceil(625_000).min(16);
     small.max(large).max(1)
