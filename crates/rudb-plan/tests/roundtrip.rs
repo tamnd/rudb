@@ -147,14 +147,14 @@ fn a_complete_window_contract_survives_the_round_trip() {
     plan.set_root(window);
 
     let expected = "\
-Window #1 partition=[#0.0::INTEGER] order= [#0.1::BIGINT DESC NULLS LAST] frame=GROUPS 1::INTEGER PRECEDING TO 2::INTEGER FOLLOWING EXCLUDE TIES expressions=[sum(DISTINCT #0.1::BIGINT FILTER (#0.1::BIGINT > 0::BIGINT)::BOOLEAN IGNORE NULLS)::HUGEINT]\n  Get memory.main.events AS events #0 [group_id::INTEGER, value::BIGINT]\n";
+Window #1 partition=[#0.0::INTEGER] order=[#0.1::BIGINT DESC NULLS LAST] frame=GROUPS 1::INTEGER PRECEDING TO 2::INTEGER FOLLOWING EXCLUDE TIES expressions=[sum(DISTINCT #0.1::BIGINT FILTER (#0.1::BIGINT > 0::BIGINT)::BOOLEAN IGNORE NULLS)::HUGEINT]\n  Get memory.main.events AS events #0 [group_id::INTEGER, value::BIGINT]\n";
     assert_eq!(round_trips(&plan), expected);
     reads_back(concat!(
-        "Window #1 partition=[] order= [] frame=RANGE UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING EXCLUDE NO OTHERS expressions=[row_number()::BIGINT]\n",
+        "Window #1 partition=[] order=[] frame=RANGE UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING EXCLUDE NO OTHERS expressions=[row_number()::BIGINT]\n",
         "  Dummy\n",
     ));
     reads_back(concat!(
-        "Window #1 partition=[] order= [] frame=ROWS CURRENT ROW TO CURRENT ROW EXCLUDE CURRENT ROW expressions=[rank()::BIGINT]\n",
+        "Window #1 partition=[] order=[] frame=ROWS CURRENT ROW TO CURRENT ROW EXCLUDE CURRENT ROW expressions=[rank()::BIGINT]\n",
         "  Dummy\n",
     ));
 }
