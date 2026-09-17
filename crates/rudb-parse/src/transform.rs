@@ -25,7 +25,7 @@ use crate::ast::{
     Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, CreateView, Distinct, DropTable, Expr, ExprRef,
     Insert, JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef,
     Scope, Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement, StrRef, Target,
-    UnaryOp,
+    UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -70,6 +70,7 @@ pub fn transform_with_case(
         identifier_case,
         current_span: Span::new(0, 0),
         ctes: Vec::new(),
+        named_windows: Vec::new(),
     };
     transform.program(tree.root())?;
     Ok(transform.ast)
@@ -91,6 +92,13 @@ struct Transform<'a> {
     /// already understands, and keeping it at this boundary avoids teaching every later name
     /// resolver about a second kind of relation.
     ctes: Vec<(StrRef, QueryRef, Slice)>,
+    /// Windows named by a `WINDOW` clause, with whether the definition wrote a frame.
+    ///
+    /// Scoped the way the CTE list is scoped, and for the same reason. A subquery written inside a
+    /// select block can use that block's names, which was measured: the inner half of
+    /// `SELECT (SELECT sum(j) OVER w FROM s) FROM t WINDOW w AS (ORDER BY j)` resolves `w` on the
+    /// reference binary and comes back out of the catalog with it inlined.
+    named_windows: Vec<(StrRef, WindowRef, bool)>,
 }
 
 impl<'a> Transform<'a> {
@@ -232,6 +240,20 @@ impl<'a> Transform<'a> {
         let index = self.ast.selects.len() as u32;
         self.ast.selects.push(select);
         index
+    }
+
+    /// Push a window and return its index.
+    fn push_window(&mut self, spec: WindowSpec) -> WindowRef {
+        let index = self.ast.windows.len() as u32;
+        self.ast.windows.push(spec);
+        index
+    }
+
+    /// Turn a vector of order by entries into a slice of the order item arena.
+    fn order_slice(&mut self, items: Vec<OrderItem>) -> Slice {
+        let start = self.ast.order_items.len() as u32;
+        self.ast.order_items.extend(items);
+        Slice { start, len: self.ast.order_items.len() as u32 - start }
     }
 
     /// Turn a vector of expressions into a slice of the expression list arena.
@@ -1119,10 +1141,7 @@ impl<'a> Transform<'a> {
         let order = self.find(node, "OrderByClause");
         if order != NONE {
             let (items, all) = self.order_by(order)?;
-            let start = self.ast.order_items.len() as u32;
-            self.ast.order_items.extend(items);
-            self.ast.queries[query as usize].order_by =
-                Slice { start, len: self.ast.order_items.len() as u32 - start };
+            self.ast.queries[query as usize].order_by = self.order_slice(items);
             self.ast.queries[query as usize].order_by_all = all;
         }
         let limit = self.find(node, "LimitOffset");
@@ -1187,11 +1206,18 @@ impl<'a> Transform<'a> {
     /// `SimpleSelect <- SelectFrom WhereClause? GroupByClause? HavingClause? WindowClause?
     /// QualifyClause? SampleClause?`.
     fn simple_select(&mut self, node: u32) -> Result<SelectRef> {
-        for name in ["WindowClause", "QualifyClause", "SampleClause"] {
+        for name in ["QualifyClause", "SampleClause"] {
             let clause = self.find(node, name);
             if clause != NONE {
                 return self.unsupported(clause);
             }
+        }
+        // The named windows go in before anything that could use one is walked, which is every
+        // other clause of the block, including the target list that the grammar puts first.
+        let mark = self.named_windows.len();
+        let windows = self.find(node, "WindowClause");
+        if windows != NONE {
+            self.window_clause(windows)?;
         }
         let mut select = Select::empty();
         self.select_from(&mut select, self.first(node))?;
@@ -1207,6 +1233,7 @@ impl<'a> Transform<'a> {
         if having != NONE {
             select.having = self.expr(self.first(having))?;
         }
+        self.named_windows.truncate(mark);
         Ok(self.push_select(select))
     }
 
@@ -2109,23 +2136,30 @@ impl<'a> Transform<'a> {
     /// `FunctionExpression <- FunctionIdentifier FunctionExpressionArguments WithinGroupClause?
     /// FilterClause? ExportClause? OverClause?`.
     fn function(&mut self, node: u32) -> Result<ExprRef> {
-        for name in ["WithinGroupClause", "FilterClause", "ExportClause", "OverClause"] {
+        for name in ["WithinGroupClause", "FilterClause", "ExportClause"] {
             let clause = self.find(node, name);
             if clause != NONE {
                 return self.unsupported(clause);
             }
         }
+        let over = self.find(node, "OverClause");
         let name = self.name_parts(self.first(node));
         // `FunctionExpressionArguments <- Parens(FunctionExpressionArgumentList)` and
         // `FunctionExpressionArgumentList <- DistinctOrAll? FunctionArgumentList? OrderByClause?
         // IgnoreOrRespectNulls?`, so a call with no arguments still has both wrappers.
         let list = self.first(self.nth(node, 1));
-        for name in ["OrderByClause", "IgnoreOrRespectNulls"] {
-            let clause = self.find(list, name);
-            if clause != NONE {
-                return self.unsupported(clause);
-            }
+        if self.find(list, "OrderByClause") != NONE {
+            return self.unsupported(self.find(list, "OrderByClause"));
         }
+        // Either word is a window modifier and nothing else carries one, so an ordinary call that
+        // writes one is turned down here, in the sentence the pin turns it down with.
+        let nulls = self.find(list, "IgnoreOrRespectNulls");
+        if nulls != NONE && over == NONE {
+            return Err(Error::parser(
+                "RESPECT/IGNORE NULLS is not supported for non-window functions",
+            ));
+        }
+        let ignore_nulls = nulls != NONE && self.name(self.first(nulls)) == "IgnoreNulls";
         let distinct = self.quantifier(self.find(list, "DistinctOrAll")) == Quantifier::Distinct;
         let mut args = Vec::new();
         let arguments = self.find(list, "FunctionArgumentList");
@@ -2133,6 +2167,15 @@ impl<'a> Transform<'a> {
             for kid in self.kids(arguments) {
                 args.push(self.argument(kid)?);
             }
+        }
+        // A call with an `OVER` on it is a window call and none of the rewrites below apply to it.
+        // The reference binary agrees on the one case where that is visible: `ifnull(1) OVER ()`
+        // keeps its name and its one argument and is turned down for not naming an aggregate,
+        // where the same call without the `OVER` is a rewrite and an arity error.
+        if over != NONE {
+            let args = self.expr_slice(args);
+            let spec = self.over(over)?;
+            return Ok(self.push(Expr::Window { name, args, distinct, ignore_nulls, spec }));
         }
         // `IFNULL` is an ordinary call in the grammar and is not one by the time DuckDB's parser is
         // done with it: `ifnull(NULL, 3)` comes back named `COALESCE(NULL, 3)` there, and so does
@@ -2149,6 +2192,220 @@ impl<'a> Transform<'a> {
         }
         let args = self.expr_slice(args);
         Ok(self.push(Expr::Function { name, args, distinct }))
+    }
+
+    // Windows.
+
+    /// `WindowClause <- 'WINDOW' List(WindowDefinition)` and
+    /// `WindowDefinition <- Identifier 'AS' WindowFrameDefinition`.
+    ///
+    /// The definitions are read in the order they were written and each one can see the ones before
+    /// it, so `WINDOW w AS (ORDER BY i), v AS (w)` defines two windows that order the same way.
+    fn window_clause(&mut self, node: u32) -> Result<()> {
+        for kid in self.kids(node) {
+            if self.name(kid) != "WindowDefinition" {
+                continue;
+            }
+            let name = self.identifier(self.first(kid));
+            let definition = self.find(kid, "WindowFrameDefinition");
+            if definition == NONE {
+                return self.unsupported(kid);
+            }
+            let (spec, framed) = self.window_definition(definition)?;
+            let spec = self.push_window(spec);
+            self.named_windows.push((name, spec, framed));
+        }
+        Ok(())
+    }
+
+    /// `OverClause <- 'OVER' WindowFrame` and
+    /// `WindowFrame <- ParensIdentifier / WindowFrameDefinition / IdentifierWindowFrame`.
+    ///
+    /// The first and the third spelling are a bare reference, written `OVER (w)` and `OVER w`, and
+    /// both resolve to the window that name was given. A reference is resolved here rather than
+    /// carried, because that is where the reference binary resolves it: a name nobody defined is a
+    /// `Parser Error` there, and a view written with one comes back out of the catalog with the
+    /// definition written in its place.
+    fn over(&mut self, node: u32) -> Result<WindowRef> {
+        let mut frame = self.first(node);
+        if self.name(frame) == "WindowFrame" {
+            frame = self.first(frame);
+        }
+        match self.name(frame) {
+            "ParensIdentifier" | "IdentifierWindowFrame" => {
+                let name = self.identifier(self.first(frame));
+                let (spec, _) = self.named_window(name)?;
+                Ok(spec)
+            }
+            "WindowFrameDefinition" => {
+                let (spec, _) = self.window_definition(frame)?;
+                Ok(self.push_window(spec))
+            }
+            _ => self.unsupported(frame),
+        }
+    }
+
+    /// The window a name stands for, and whether its definition wrote a frame clause.
+    fn named_window(&self, name: StrRef) -> Result<(WindowRef, bool)> {
+        let written = self.ast.string(name);
+        let found = self
+            .named_windows
+            .iter()
+            .rev()
+            .find(|&&(defined, _, _)| self.ast.string(defined).eq_ignore_ascii_case(written));
+        match found {
+            Some(&(_, spec, framed)) => Ok((spec, framed)),
+            // The doubled quotes are upstream's and not a slip here. It writes the name with the
+            // quoting a printed identifier gets and then writes quotes around that as well, so a
+            // window called `w` is reported as `""w""`.
+            None => Err(Error::parser(format!("window \"\"{written}\"\" does not exist"))),
+        }
+    }
+
+    /// `WindowFrameDefinition <- WindowFrameNameContentsParens / WindowFrameContentsParens`,
+    /// `WindowFrameNameContents <- BaseWindowName? WindowFrameContents` and
+    /// `WindowFrameContents <- WindowPartition? OrderByClause? FrameClause?`.
+    ///
+    /// Returns the window and whether a frame clause was written, which the caller needs because a
+    /// definition that wrote one cannot be used as the base of another.
+    fn window_definition(&mut self, node: u32) -> Result<(WindowSpec, bool)> {
+        let held = self.first(self.first(node));
+        let (base, contents) = match self.name(held) {
+            "WindowFrameNameContents" => {
+                (self.find(held, "BaseWindowName"), self.find(held, "WindowFrameContents"))
+            }
+            "WindowFrameContents" => (NONE, held),
+            _ => return self.unsupported(held),
+        };
+        if contents == NONE {
+            return self.unsupported(node);
+        }
+        let partition = self.find(contents, "WindowPartition");
+        let order = self.find(contents, "OrderByClause");
+        let frame = self.find(contents, "FrameClause");
+        let mut spec = WindowSpec::empty();
+        if base != NONE {
+            let name = self.identifier(self.first(base));
+            let written = self.ast.string(name).to_string();
+            let (found, framed) = self.named_window(name)?;
+            // The three refusals are upstream's, in its words. What they have in common is that a
+            // base window is copied and not merged, so anything the copy would have to combine with
+            // something the base already said is turned down rather than guessed at.
+            if framed {
+                return Err(Error::parser(format!(
+                    "cannot copy window \"{written}\" because it has a frame clause"
+                )));
+            }
+            spec = self.ast.window(found);
+            if partition != NONE && !spec.partition.is_empty() {
+                return Err(Error::parser(format!(
+                    "Cannot override PARTITION BY clause of window \"{written}\""
+                )));
+            }
+            if order != NONE && !spec.order.is_empty() {
+                return Err(Error::parser(format!(
+                    "Cannot override ORDER BY clause of window \"{written}\""
+                )));
+            }
+        }
+        if partition != NONE {
+            let mut items = Vec::new();
+            for kid in self.kids(partition) {
+                items.push(self.expr(kid)?);
+            }
+            spec.partition = self.expr_slice(items);
+        }
+        if order != NONE {
+            let (items, all) = self.order_by(order)?;
+            if all {
+                return self.unsupported(order);
+            }
+            spec.order = self.order_slice(items);
+        }
+        if frame != NONE {
+            self.frame_clause(&mut spec, frame)?;
+        }
+        Ok((spec, frame != NONE))
+    }
+
+    /// `FrameClause <- Framing FrameExtent WindowExcludeClause?`.
+    ///
+    /// One normalisation happens here and it is the reference binary's. A frame that runs from the
+    /// first row of the partition to the last says the same thing however it is measured, so
+    /// `RANGE` and `GROUPS` become `ROWS` when both ends are unbounded. It matters because the
+    /// printed form of a window is the column name a target with no alias gets, and upstream prints
+    /// `ROWS` for all three spellings.
+    fn frame_clause(&mut self, spec: &mut WindowSpec, node: u32) -> Result<()> {
+        let framing = self.first(self.find(node, "Framing"));
+        spec.unit = match self.name(framing) {
+            "RowsFraming" => WindowUnit::Rows,
+            "RangeFraming" => WindowUnit::Range,
+            "GroupsFraming" => WindowUnit::Groups,
+            _ => return self.unsupported(framing),
+        };
+        let extent = self.first(self.find(node, "FrameExtent"));
+        match self.name(extent) {
+            // `SingleFrameExtent <- FrameBound`, which names the start and leaves the end at the
+            // current row.
+            "SingleFrameExtent" => {
+                spec.start = self.frame_bound(self.first(extent))?;
+                spec.end = WindowBound::CurrentRow;
+            }
+            // `BetweenFrameExtent <- 'BETWEEN' FrameBound 'AND' FrameBound`.
+            "BetweenFrameExtent" => {
+                spec.start = self.frame_bound(self.first(extent))?;
+                spec.end = self.frame_bound(self.nth(extent, 1))?;
+            }
+            _ => return self.unsupported(extent),
+        }
+        let exclude = self.find(node, "WindowExcludeClause");
+        if exclude != NONE {
+            let element = self.first(self.first(exclude));
+            spec.exclude = match self.name(element) {
+                "ExcludeCurrentRow" => WindowExclude::CurrentRow,
+                "ExcludeGroup" => WindowExclude::Group,
+                "ExcludeTies" => WindowExclude::Ties,
+                "ExcludeNoOthers" => WindowExclude::NoOthers,
+                _ => return self.unsupported(element),
+            };
+        }
+        if spec.start == WindowBound::UnboundedPreceding
+            && spec.end == WindowBound::UnboundedFollowing
+        {
+            spec.unit = WindowUnit::Rows;
+        }
+        Ok(())
+    }
+
+    /// `FrameBound <- FrameUnbounded / FrameCurrentRow / FrameExpression`.
+    fn frame_bound(&mut self, node: u32) -> Result<WindowBound> {
+        let inner = if self.name(node) == "FrameBound" { self.first(node) } else { node };
+        match self.name(inner) {
+            "FrameCurrentRow" => Ok(WindowBound::CurrentRow),
+            // `FrameUnbounded <- 'UNBOUNDED' PrecedingOrFollowing`.
+            "FrameUnbounded" => {
+                if self.preceding(self.first(inner)) {
+                    Ok(WindowBound::UnboundedPreceding)
+                } else {
+                    Ok(WindowBound::UnboundedFollowing)
+                }
+            }
+            // `FrameExpression <- Expression PrecedingOrFollowing`.
+            "FrameExpression" => {
+                let offset = self.expr(self.first(inner))?;
+                if self.preceding(self.nth(inner, 1)) {
+                    Ok(WindowBound::Preceding(offset))
+                } else {
+                    Ok(WindowBound::Following(offset))
+                }
+            }
+            _ => self.unsupported(inner),
+        }
+    }
+
+    /// `PrecedingOrFollowing <- PrecedingFrame / FollowingFrame`, which of the two it was.
+    fn preceding(&self, node: u32) -> bool {
+        self.name(self.first(node)) == "PrecedingFrame"
     }
 
     /// `CoalesceExpression <- 'COALESCE' Parens(List(Expression))`.
@@ -2961,6 +3218,34 @@ mod tests {
             Expr::Function { name, args, distinct } => {
                 let distinct = if distinct { "DISTINCT " } else { "" };
                 format!("{}({distinct}{})", ast.name_text(name), list(args))
+            }
+            Expr::Window { name, args, distinct, ignore_nulls, spec } => {
+                let distinct = if distinct { "DISTINCT " } else { "" };
+                let nulls = if ignore_nulls { " IGNORE NULLS" } else { "" };
+                let held = ast.window(spec);
+                let order = ast
+                    .order_list(held.order)
+                    .iter()
+                    .map(|item| {
+                        format!("{} {:?} {:?}", show(ast, item.expr), item.order, item.nulls)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let bound = |end: WindowBound| match end {
+                    WindowBound::Preceding(offset) => format!("Preceding({})", show(ast, offset)),
+                    WindowBound::Following(offset) => format!("Following({})", show(ast, offset)),
+                    other => format!("{other:?}"),
+                };
+                format!(
+                    "{}({distinct}{}{nulls}) OVER [{}] [{order}] [{:?} {} {} {:?}]",
+                    ast.name_text(name),
+                    list(args),
+                    list(held.partition),
+                    held.unit,
+                    bound(held.start),
+                    bound(held.end),
+                    held.exclude
+                )
             }
             Expr::Cast { operand, ty, try_cast } => {
                 let word = if try_cast { "TRY_CAST" } else { "CAST" };
@@ -4279,6 +4564,148 @@ mod tests {
         // does not match, which is where the pin's parser error comes from as well.
         let error = parse_ast("PRAGMA version()").unwrap_err().to_string();
         assert!(error.contains("syntax error at or near \")\""), "{error}");
+    }
+
+    #[test]
+    fn a_window_call_carries_its_partition_its_order_and_its_frame() {
+        assert_eq!(
+            round("SELECT row_number() OVER () FROM t"),
+            "SELECT row_number() OVER [] [] [Range UnboundedPreceding CurrentRow NoOthers] FROM t"
+        );
+        assert_eq!(
+            round("SELECT sum(a) OVER (PARTITION BY b, c ORDER BY d DESC NULLS FIRST) FROM t"),
+            "SELECT sum(a) OVER [b, c] [d Descending First] \
+             [Range UnboundedPreceding CurrentRow NoOthers] FROM t"
+        );
+        assert_eq!(
+            round(
+                "SELECT sum(a) OVER (ORDER BY b GROUPS BETWEEN 1 PRECEDING AND 2 FOLLOWING EXCLUDE TIES) FROM t"
+            ),
+            "SELECT sum(a) OVER [] [b Unstated Unstated] \
+             [Groups Preceding(1) Following(2) Ties] FROM t"
+        );
+    }
+
+    /// A frame over the whole partition is the same frame however it was measured, so the three
+    /// units collapse to one here rather than three ways of saying it reaching the binder.
+    #[test]
+    fn a_frame_with_both_ends_unbounded_is_counted_in_rows() {
+        for unit in ["ROWS", "RANGE", "GROUPS"] {
+            let query = format!(
+                "SELECT sum(a) OVER (ORDER BY b {unit} BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t"
+            );
+            assert_eq!(
+                round(&query),
+                "SELECT sum(a) OVER [] [b Unstated Unstated] \
+                 [Rows UnboundedPreceding UnboundedFollowing NoOthers] FROM t"
+            );
+        }
+    }
+
+    /// A single bound names the start and the end is the current row, which is the standard's rule
+    /// and is why the two spellings below have to arrive as the same frame.
+    #[test]
+    fn a_frame_written_with_one_bound_ends_at_the_current_row() {
+        assert_eq!(
+            round("SELECT sum(a) OVER (ORDER BY b ROWS UNBOUNDED PRECEDING) FROM t"),
+            round(
+                "SELECT sum(a) OVER (ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t"
+            )
+        );
+    }
+
+    #[test]
+    fn a_named_window_is_resolved_here_and_not_carried_any_further() {
+        let inlined = round("SELECT sum(a) OVER (PARTITION BY b ORDER BY c) FROM t");
+        assert_eq!(
+            round("SELECT sum(a) OVER w FROM t WINDOW w AS (PARTITION BY b ORDER BY c)"),
+            inlined
+        );
+        assert_eq!(
+            round("SELECT sum(a) OVER (w) FROM t WINDOW w AS (PARTITION BY b ORDER BY c)"),
+            inlined
+        );
+        // A definition can build on one written before it, and a copy can add the half the base
+        // did not say.
+        assert_eq!(
+            round("SELECT sum(a) OVER v FROM t WINDOW w AS (PARTITION BY b), v AS (w ORDER BY c)"),
+            inlined
+        );
+        assert_eq!(
+            round("SELECT sum(a) OVER (w ORDER BY c) FROM t WINDOW w AS (PARTITION BY b)"),
+            inlined
+        );
+        // The name is matched without regard to case, the way every other name here is.
+        assert_eq!(
+            round("SELECT sum(a) OVER W FROM t WINDOW w AS (PARTITION BY b ORDER BY c)"),
+            inlined
+        );
+    }
+
+    /// A window clause is visible to the whole block it was written on, including a subquery
+    /// inside it, which was measured on the pin.
+    #[test]
+    fn a_named_window_reaches_a_subquery_written_in_the_same_block() {
+        let ast = parse_ast("SELECT (SELECT sum(b) OVER w FROM u) FROM t WINDOW w AS (ORDER BY b)");
+        assert!(ast.is_ok(), "{:?}", ast.err());
+        // And no further than that: the next statement in the script starts with none of them.
+        let error =
+            parse_ast("SELECT 1 FROM t WINDOW w AS (ORDER BY b); SELECT sum(a) OVER w FROM u;")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("window \"\"w\"\" does not exist"), "{error}");
+    }
+
+    /// All four are the pin's sentences, in the pin's words, including the doubled quotes in the
+    /// first one.
+    #[test]
+    fn the_four_complaints_about_a_named_window_are_upstreams() {
+        let cases = [
+            ("SELECT sum(a) OVER w FROM t", "window \"\"w\"\" does not exist"),
+            (
+                "SELECT sum(a) OVER (w PARTITION BY b) FROM t WINDOW w AS (PARTITION BY b)",
+                "Cannot override PARTITION BY clause of window \"w\"",
+            ),
+            (
+                "SELECT sum(a) OVER (w ORDER BY b) FROM t WINDOW w AS (ORDER BY b)",
+                "Cannot override ORDER BY clause of window \"w\"",
+            ),
+            (
+                "SELECT sum(a) OVER (w ROWS UNBOUNDED PRECEDING) FROM t WINDOW w AS (ORDER BY b ROWS UNBOUNDED PRECEDING)",
+                "cannot copy window \"w\" because it has a frame clause",
+            ),
+        ];
+        for (query, expected) in cases {
+            let error = parse_ast(query).expect_err(query).to_string();
+            assert!(error.contains(expected), "{query}: {error}");
+        }
+    }
+
+    /// `IGNORE NULLS` is a window modifier, so a call without an `OVER` still has nowhere to put
+    /// it, and `EXCLUDE` needs a framing keyword in front of it on both engines.
+    #[test]
+    fn the_modifiers_that_only_a_window_takes_are_turned_down_without_one() {
+        let error = parse_ast("SELECT first_value(a IGNORE NULLS) FROM t").unwrap_err().to_string();
+        assert!(
+            error.contains("RESPECT/IGNORE NULLS is not supported for non-window functions"),
+            "{error}"
+        );
+        let error = parse_ast("SELECT sum(a) OVER (ORDER BY b EXCLUDE TIES) FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("syntax error at or near \"EXCLUDE\""), "{error}");
+    }
+
+    /// A call with an `OVER` on it skips the rewrites an ordinary call goes through, which is
+    /// visible on the one name that has a rewrite and an arity check of its own.
+    #[test]
+    fn a_window_call_is_not_put_through_the_rewrites_a_plain_call_is() {
+        assert_eq!(
+            round("SELECT ifnull(1) OVER () FROM t"),
+            "SELECT ifnull(1) OVER [] [] [Range UnboundedPreceding CurrentRow NoOthers] FROM t"
+        );
+        let error = parse_ast("SELECT ifnull(1) FROM t").unwrap_err().to_string();
+        assert!(error.contains("Wrong number of arguments to IFNULL."), "{error}");
     }
 
     #[test]

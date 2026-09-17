@@ -57,6 +57,12 @@ impl Binder<'_> {
             ast::Expr::Function { name, args, distinct } => {
                 self.bind_call(ast, name, args, distinct, scope)
             }
+            // The parser understands a window and the plan has an operator for one, but nothing
+            // joins the two yet, so this is the whole of window support in the binder today.
+            ast::Expr::Window { name, .. } => Err(Error::not_implemented(format!(
+                "{} as a window function",
+                ast.name(name).last().unwrap_or_default()
+            ))),
             ast::Expr::Cast { operand, ty, try_cast } => {
                 let input = self.bind_expr(ast, operand, scope)?;
                 let target = LogicalType::parse(ast.string(ty))?;
@@ -918,6 +924,15 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
         ast::Expr::List { items } => {
             ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
         }
+        // A window call is not an aggregate and is evaluated after the grouping rather than by it,
+        // but what it is given to read can be one: `sum(count(x)) OVER ()` aggregates the block.
+        // The partition and the order keys count for the same reason.
+        ast::Expr::Window { args, spec, .. } => {
+            let held = ast.window(spec);
+            ast.expr_list(args).iter().any(|&arg| has_aggregate(ast, arg))
+                || ast.expr_list(held.partition).iter().any(|&key| has_aggregate(ast, key))
+                || ast.order_list(held.order).iter().any(|item| has_aggregate(ast, item.expr))
+        }
         // A subquery has its own aggregation and does not make the outer block aggregate.
         ast::Expr::Subquery { .. } | ast::Expr::Exists { .. } => false,
     }
@@ -955,6 +970,10 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             }
         }
         ast::Expr::Column { name } => quoted(ast.name(name).last().unwrap_or_default()),
+        // The deparser is the answer for a window and not an approximation of one. Every other
+        // shape here is written out again because the name DuckDB gives it is not quite what its
+        // own deparser would write, and a window is the one where the two agree.
+        ast::Expr::Window { .. } => rudb_parse::deparse::expression(ast, expr),
         ast::Expr::Literal { kind, text } => match kind {
             LiteralKind::Null => "NULL".to_string(),
             LiteralKind::True => "true".to_string(),

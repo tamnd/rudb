@@ -65,6 +65,8 @@ pub type DropTableRef = u32;
 pub type InsertRef = u32;
 /// An index into `Ast::settings`.
 pub type SettingRef = u32;
+/// An index into `Ast::windows`.
+pub type WindowRef = u32;
 
 /// One statement.
 ///
@@ -425,6 +427,102 @@ pub enum Nulls {
     Last,
 }
 
+/// How a window frame measures the distance to its bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowUnit {
+    /// `ROWS`, so a bound counts rows.
+    Rows,
+    /// `RANGE`, so a bound is a value offset from the current row's sort key.
+    Range,
+    /// `GROUPS`, so a bound counts runs of rows that tie on the sort key.
+    Groups,
+}
+
+/// One end of a window frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowBound {
+    /// `UNBOUNDED PRECEDING`, the first row of the partition.
+    UnboundedPreceding,
+    /// `n PRECEDING`, holding the offset expression.
+    Preceding(ExprRef),
+    /// `CURRENT ROW`.
+    CurrentRow,
+    /// `n FOLLOWING`, holding the offset expression.
+    Following(ExprRef),
+    /// `UNBOUNDED FOLLOWING`, the last row of the partition.
+    UnboundedFollowing,
+}
+
+/// Which peers of the current row the frame drops once its bounds have been applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowExclude {
+    /// `EXCLUDE NO OTHERS`, which is also what an unwritten clause means.
+    NoOthers,
+    /// `EXCLUDE CURRENT ROW`.
+    CurrentRow,
+    /// `EXCLUDE GROUP`, dropping the current row and everything that ties with it.
+    Group,
+    /// `EXCLUDE TIES`, dropping everything that ties with the current row but keeping it.
+    Ties,
+}
+
+/// Everything inside the parentheses of an `OVER`.
+///
+/// A named window is resolved here rather than downstream, because the resolution is a parser
+/// question on the reference binary: a reference to a window nobody defined is a `Parser Error`
+/// there, and a view written with `OVER w` comes back out of the catalog with the definition
+/// inlined. So nothing after the transform ever sees a name, and there is no window clause on
+/// [`Select`] for it to see one in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowSpec {
+    /// The `PARTITION BY` list, as a run of [`ExprRef`], empty when there was no clause.
+    pub partition: Slice,
+    /// The `ORDER BY` list, as a run of [`OrderItem`], empty when there was no clause.
+    pub order: Slice,
+    /// Which of the three units the bounds are measured in.
+    pub unit: WindowUnit,
+    /// Where the frame starts.
+    pub start: WindowBound,
+    /// Where the frame ends.
+    pub end: WindowBound,
+    /// Which peers the frame drops.
+    pub exclude: WindowExclude,
+}
+
+impl WindowSpec {
+    /// The frame a window with no frame clause gets, which the standard fixes and DuckDB follows.
+    pub const DEFAULT_UNIT: WindowUnit = WindowUnit::Range;
+    /// The start a window with no frame clause gets.
+    pub const DEFAULT_START: WindowBound = WindowBound::UnboundedPreceding;
+    /// The end a window with no frame clause gets.
+    pub const DEFAULT_END: WindowBound = WindowBound::CurrentRow;
+
+    /// A window with no clauses at all, which is what `OVER ()` means.
+    pub const fn empty() -> Self {
+        Self {
+            partition: Slice { start: 0, len: 0 },
+            order: Slice { start: 0, len: 0 },
+            unit: Self::DEFAULT_UNIT,
+            start: Self::DEFAULT_START,
+            end: Self::DEFAULT_END,
+            exclude: WindowExclude::NoOthers,
+        }
+    }
+
+    /// Whether the frame is the one an unwritten frame clause means.
+    ///
+    /// This is what decides whether the frame is printed, which is not a matter of taste: the
+    /// printed form is the column name a window target gets when the query wrote no alias, so
+    /// `SELECT sum(x) OVER (ORDER BY x)` has to be named without a frame in it to agree with the
+    /// reference binary.
+    pub fn frame_is_default(&self) -> bool {
+        self.unit == Self::DEFAULT_UNIT
+            && self.start == Self::DEFAULT_START
+            && self.end == Self::DEFAULT_END
+            && self.exclude == WindowExclude::NoOthers
+    }
+}
+
 /// One entry in a `FROM` clause, which is a tree because joins nest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -575,6 +673,26 @@ pub enum Expr {
         args: Slice,
         /// Whether the call said `DISTINCT`.
         distinct: bool,
+    },
+    /// A function call with an `OVER` on the end of it.
+    ///
+    /// Kept apart from [`Expr::Function`] rather than given an optional window, because the two
+    /// are different things by every rule that applies to them: a window call is refused in a
+    /// `WHERE` and in a `HAVING`, it may not appear inside an aggregate, and it resolves against a
+    /// different set of names. A variant that only some of the code has to remember to look at is
+    /// a variant the rest of the code gets wrong.
+    Window {
+        /// The name, as a run of [`StrRef`], so `main.sum` is two parts.
+        name: Slice,
+        /// The arguments, as a run of [`ExprRef`].
+        args: Slice,
+        /// Whether the call said `DISTINCT`.
+        distinct: bool,
+        /// Whether the call said `IGNORE NULLS`. `RESPECT NULLS` is the default and is not kept,
+        /// because the reference binary drops it: a view written with it comes back without it.
+        ignore_nulls: bool,
+        /// The window itself, into `Ast::windows`.
+        spec: WindowRef,
     },
     /// `CAST(x AS t)` or `TRY_CAST(x AS t)`.
     Cast {
@@ -873,6 +991,8 @@ pub struct Ast {
     pub name_lists: Vec<Slice>,
     /// Backing store for the rows of a `VALUES`, each of which is a run of expressions.
     pub rows: Vec<Slice>,
+    /// The window arena, holding what was inside the parentheses of every `OVER`.
+    pub windows: Vec<WindowSpec>,
 }
 
 impl Ast {
@@ -936,6 +1056,11 @@ impl Ast {
     /// One select block.
     pub fn select(&self, index: SelectRef) -> Select {
         self.selects[index as usize]
+    }
+
+    /// One window.
+    pub fn window(&self, index: WindowRef) -> WindowSpec {
+        self.windows[index as usize]
     }
 
     /// The expressions of a list.
