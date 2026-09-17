@@ -17,12 +17,15 @@ use rudb_common::{
     Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Value,
 };
 use rudb_functions::{
-    Columns, FILE_ROW_NUMBER, Given, TableFunction, csv_fields, csv_given, files, is_file,
-    is_pattern, parquet_fields, resolve, resolve_pragma, resolve_table,
+    Columns, FILE_ROW_NUMBER, FunctionKind, Given, Resolved, TableFunction, csv_fields, csv_given,
+    files, is_file, is_pattern, kind_of, parquet_fields, resolve, resolve_pragma, resolve_table,
 };
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, identifier_parts, parse_ast_with_case};
-use rudb_plan::{ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey};
+use rudb_plan::{
+    ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey, WindowBound,
+    WindowExclude, WindowFrame, WindowUnit,
+};
 
 use crate::expr::{describe, has_aggregate};
 use crate::parameters::Parameters;
@@ -98,6 +101,56 @@ pub(crate) struct Aggregation {
     pub(crate) aggregates: Vec<ExprRef>,
 }
 
+/// One run of window calls that agree on where the rows come from and in what order.
+///
+/// The run is the unit the plan has an operator for, so two calls that write the same partition,
+/// the same order and the same frame are one operator and one sort, and a third that writes a
+/// different order is a second operator stacked on the first. Nothing here merges runs that only
+/// look compatible, because a window is evaluated over the rows the operator below it produced and
+/// deciding two runs are the same is the optimizer's job rather than the binder's.
+#[derive(Debug)]
+pub(crate) struct WindowRun {
+    /// The table index the run's result columns bind against.
+    index: u32,
+    /// What divides the input into independent partitions.
+    partition: Vec<ExprRef>,
+    /// The order within a partition.
+    order: Vec<SortKey>,
+    /// The frame every call in the run shares.
+    frame: WindowFrame,
+    /// The calls, in the order their columns are appended.
+    calls: Vec<ExprRef>,
+}
+
+/// One window call as it was written, before any of it has been bound.
+///
+/// These five travel together from the parser all the way to the run they end up filed under, and
+/// carrying them as one thing keeps the call that binds them readable.
+pub(crate) struct WindowCall<'a> {
+    /// The function name, as written and not yet resolved.
+    pub(crate) name: &'a str,
+    /// The arguments, which may include a star that only `count` is allowed to be given.
+    pub(crate) args: &'a [ast::ExprRef],
+    /// Whether `DISTINCT` was written inside the parens.
+    pub(crate) distinct: bool,
+    /// Whether `IGNORE NULLS` was written inside the parens, which is where DuckDB puts it.
+    pub(crate) ignore_nulls: bool,
+    /// The `OVER`, which the parser has already resolved against any `WINDOW` clause.
+    pub(crate) spec: ast::WindowRef,
+}
+
+/// Everything inside one window call once it is bound, which is what decides its run.
+struct WindowParts {
+    /// The arguments, before the casts the resolved signature asks for.
+    args: Vec<ExprRef>,
+    /// What divides the input into independent partitions.
+    partition: Vec<ExprRef>,
+    /// The order within a partition.
+    order: Vec<SortKey>,
+    /// The frame, with both ends and the exclusion.
+    frame: WindowFrame,
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingSubquery {
     pub(crate) node: NodeRef,
@@ -124,6 +177,10 @@ pub(crate) struct Binder<'a> {
     pub(crate) aggregation: Option<Aggregation>,
     /// Set while an aggregate's own arguments are being bound, so nesting is caught.
     pub(crate) in_aggregate: bool,
+    /// The window runs this select block has collected, in the order they were first written.
+    pub(crate) windows: Vec<WindowRun>,
+    /// Set while a window call's own arguments and keys are being bound, so nesting is caught.
+    pub(crate) in_window: bool,
     /// Uncorrelated scalar queries waiting to be joined into the select block that uses them.
     pub(crate) scalar_subqueries: Vec<PendingSubquery>,
     pub(crate) outer_scopes: Vec<Scope>,
@@ -152,6 +209,8 @@ impl<'a> Binder<'a> {
             current_span: Span::new(0, 0),
             aggregation: None,
             in_aggregate: false,
+            windows: Vec::new(),
+            in_window: false,
             scalar_subqueries: Vec::new(),
             outer_scopes: Vec::new(),
             correlations: Vec::new(),
@@ -568,6 +627,10 @@ impl<'a> Binder<'a> {
         query: &ast::Query,
     ) -> Result<(NodeRef, Scope)> {
         let written = ast.select(select);
+        // A window belongs to the block that wrote it, and a block can be bound inside another one
+        // without a subquery in between, so the outer block's runs are put aside for the duration
+        // rather than left where a nested block would append to them.
+        let outer_windows = std::mem::take(&mut self.windows);
         let (mut node, input) = self.bind_from(ast, written.from)?;
         node = self.attach_scalar_subqueries(node);
 
@@ -646,6 +709,23 @@ impl<'a> Binder<'a> {
         }
         if let Some(predicate) = having {
             node = self.add_node(Node::Filter { input: node, predicate });
+        }
+
+        // After the grouping and after `HAVING`, which is where the reference binary puts it:
+        // `SELECT j, sum(count(i)) OVER () FROM t GROUP BY j HAVING count(i) > 1` totals only the
+        // groups that survived the filter.
+        for run in std::mem::replace(&mut self.windows, outer_windows) {
+            let partition = self.plan.add_expr_list(&run.partition);
+            let order = self.plan.add_sort_keys(&run.order);
+            let expressions = self.plan.add_expr_list(&run.calls);
+            node = self.add_node(Node::Window {
+                input: node,
+                index: run.index,
+                partition,
+                order,
+                frame: run.frame,
+                expressions,
+            });
         }
 
         let interned: Vec<u32> = names.iter().map(|name| self.plan.intern(name)).collect();
@@ -1950,6 +2030,196 @@ impl<'a> Binder<'a> {
         Ok(self.column(index, groups + at, ty))
     }
 
+    // ----------------------------------------------------------------- windows
+
+    /// Binds a window call, files it under the run it belongs to, and hands back its column.
+    ///
+    /// The result is a column of a [`Node::Window`] rather than the call itself, for the reason the
+    /// aggregate path returns a column too: the operator produces the value and everything above it
+    /// reads the value, so a target that wraps a window in arithmetic is arithmetic over a column.
+    pub(crate) fn bind_window(
+        &mut self,
+        ast: &Ast,
+        written: &WindowCall<'_>,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let WindowCall { name, args, distinct, ignore_nulls, spec } = *written;
+        if self.in_aggregate {
+            return Err(Error::binder(
+                "aggregate function calls cannot contain window function calls",
+            ));
+        }
+        if self.in_window {
+            return Err(Error::binder("window function calls cannot be nested"));
+        }
+        // A join condition is part of the `WHERE` clause as far as this one sentence is concerned,
+        // which is upstream's wording and not a simplification: `ON sum(a.i) OVER () = b.i` is
+        // refused there with the words a window in a `WHERE` is refused with.
+        let clause = if self.clause == "JOIN condition" { "WHERE clause" } else { self.clause };
+        if clause != "SELECT clause" && clause != "ORDER BY clause" {
+            return Err(Error::binder(format!("{clause} cannot contain window functions!")));
+        }
+
+        // `count(*)` is a different function from `count(x)` here for the reason it is a different
+        // function in an ordinary call: one counts rows and the other counts the rows where its
+        // argument is not null. A star is not an expression and nothing below this binds one.
+        let starred = args.iter().any(|&arg| {
+            matches!(ast.expr(arg), ast::Expr::Star { qualifier, replacements }
+                if qualifier.is_empty() && replacements.is_empty())
+        });
+        let (name, args): (&str, &[ast::ExprRef]) = if starred {
+            if !same_name(name, "count") || args.len() != 1 {
+                return Err(Error::binder(format!("* is not allowed in {name}()")));
+            }
+            ("count_star", &[])
+        } else {
+            (name, args)
+        };
+
+        let held = ast.window(spec);
+        self.in_window = true;
+        let parts = self.window_parts(ast, args, held, scope);
+        self.in_window = false;
+        let parts = parts?;
+        // Upstream's rule, in its words. A `RANGE` offset is a distance from the current row's sort
+        // key, so there has to be exactly one sort key for it to be a distance from.
+        let offsets = [parts.frame.start, parts.frame.end]
+            .iter()
+            .any(|end| matches!(end, WindowBound::Preceding(_) | WindowBound::Following(_)));
+        if parts.frame.unit == WindowUnit::Range && offsets && parts.order.len() != 1 {
+            return Err(Error::binder("RANGE frames must have only one ORDER BY expression"));
+        }
+
+        let types: Vec<LogicalType> =
+            parts.args.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
+        let resolved = window_signature(name, &types)?;
+        let mut cast = Vec::with_capacity(parts.args.len());
+        for (arg, wanted) in parts.args.iter().zip(&resolved.arguments) {
+            cast.push(self.checked_cast_to(*arg, wanted, false)?);
+        }
+        let args = self.plan.add_expr_list(&cast);
+        let name = self.plan.intern(resolved.name);
+        let ty = resolved.returns;
+        let call = self.plan.add_expr(
+            Expr::Window { name, args, distinct, filter: None, ignore_nulls },
+            ty.clone(),
+        );
+
+        let at = self.window_run(parts.partition, parts.order, parts.frame, call);
+        let index = self.windows.last().expect("the run was just filed").index;
+        Ok(self.column(index, at, ty))
+    }
+
+    /// Files a call under the run that matches it, or opens a new run, and says which column it is.
+    ///
+    /// The run that matches is only ever the last one, because a query that goes back to an earlier
+    /// partitioning after using a different one in between wants the operators in the order it wrote
+    /// them. Merging the two would be a rewrite, and a rewrite over a window is the optimizer's to
+    /// make once it knows what the sort below each one costs.
+    fn window_run(
+        &mut self,
+        partition: Vec<ExprRef>,
+        order: Vec<SortKey>,
+        frame: WindowFrame,
+        call: ExprRef,
+    ) -> usize {
+        let matches = self.windows.last().is_some_and(|run| {
+            run.frame == frame
+                && run.partition.len() == partition.len()
+                && run.order.len() == order.len()
+                && run.partition.iter().zip(&partition).all(|(&l, &r)| self.same_expr(l, r))
+                && run.order.iter().zip(&order).all(|(l, r)| {
+                    l.descending == r.descending
+                        && l.nulls_first == r.nulls_first
+                        && self.same_expr(l.expr, r.expr)
+                })
+        });
+        if !matches {
+            let index = self.fresh_index();
+            self.windows.push(WindowRun { index, partition, order, frame, calls: Vec::new() });
+        }
+        // Two identical calls over one run are one column, the same way two identical aggregates
+        // over one grouping are. `SELECT sum(i) OVER (), sum(i) OVER () + 1` totals once.
+        let calls = self.windows.last().expect("a run is open").calls.clone();
+        if let Some(at) = calls.iter().position(|&held| self.same_expr(held, call)) {
+            return at;
+        }
+        let run = self.windows.last_mut().expect("a run is open");
+        run.calls.push(call);
+        run.calls.len() - 1
+    }
+
+    /// Binds the arguments and everything inside the `OVER`, with the aggregate rule applied.
+    ///
+    /// The aggregate rule applies to all of it, which is measured rather than assumed: over a
+    /// grouped block `sum(count(i)) OVER ()` binds and `sum(i) OVER ()` is the ungrouped column
+    /// complaint, and the same pair of answers comes back for a partition key and for an order key.
+    fn window_parts(
+        &mut self,
+        ast: &Ast,
+        args: &[ast::ExprRef],
+        held: ast::WindowSpec,
+        scope: &Scope,
+    ) -> Result<WindowParts> {
+        let mut bound = Vec::with_capacity(args.len());
+        for &arg in args {
+            let expr = self.bind_expr(ast, arg, scope)?;
+            bound.push(self.over_aggregate(expr, scope)?);
+        }
+        let mut partition = Vec::new();
+        for &key in ast.expr_list(held.partition) {
+            let expr = self.bind_expr(ast, key, scope)?;
+            partition.push(self.over_aggregate(expr, scope)?);
+        }
+        let mut order = Vec::new();
+        for item in ast.order_list(held.order).to_vec() {
+            let expr = self.bind_expr(ast, item.expr, scope)?;
+            let expr = self.over_aggregate(expr, scope)?;
+            order.push(self.sort_key(expr, item));
+        }
+        let frame = WindowFrame {
+            unit: match held.unit {
+                ast::WindowUnit::Rows => WindowUnit::Rows,
+                ast::WindowUnit::Range => WindowUnit::Range,
+                ast::WindowUnit::Groups => WindowUnit::Groups,
+            },
+            start: self.window_bound(ast, held.start, scope)?,
+            end: self.window_bound(ast, held.end, scope)?,
+            exclude: match held.exclude {
+                ast::WindowExclude::NoOthers => WindowExclude::NoOthers,
+                ast::WindowExclude::CurrentRow => WindowExclude::CurrentRow,
+                ast::WindowExclude::Group => WindowExclude::Group,
+                ast::WindowExclude::Ties => WindowExclude::Ties,
+            },
+        };
+        Ok(WindowParts { args: bound, partition, order, frame })
+    }
+
+    /// One end of a frame, with its offset bound where it has one.
+    fn window_bound(
+        &mut self,
+        ast: &Ast,
+        bound: ast::WindowBound,
+        scope: &Scope,
+    ) -> Result<WindowBound> {
+        let offset = |binder: &mut Self, written| {
+            let expr = binder.bind_expr(ast, written, scope)?;
+            binder.over_aggregate(expr, scope)
+        };
+        Ok(match bound {
+            ast::WindowBound::UnboundedPreceding => WindowBound::UnboundedPreceding,
+            ast::WindowBound::CurrentRow => WindowBound::CurrentRow,
+            ast::WindowBound::UnboundedFollowing => WindowBound::UnboundedFollowing,
+            ast::WindowBound::Preceding(written) => WindowBound::Preceding(offset(self, written)?),
+            ast::WindowBound::Following(written) => WindowBound::Following(offset(self, written)?),
+        })
+    }
+
+    /// Whether a column is the result of a window this block is building.
+    fn is_window_output(&self, binding: ColumnBinding) -> bool {
+        self.windows.iter().any(|run| run.index == binding.table)
+    }
+
     /// Rewrites a bound expression into one the aggregate's output can answer.
     ///
     /// A subexpression that is one of the group expressions becomes a reference to that group. A
@@ -1970,6 +2240,11 @@ impl<'a> Binder<'a> {
         let ty = self.plan.expr_type(expr).clone();
         match self.plan.expr(expr).clone() {
             Expr::Column(binding) if binding.table == index => Ok(expr),
+            // A window result is not a column of the input and the grouping rule has nothing to say
+            // about it. It reads the aggregate's output rather than the table's, which is why
+            // `SELECT sum(count(i)) OVER () FROM t GROUP BY j` binds and `sum(i) OVER ()` over the
+            // same block does not.
+            Expr::Column(binding) if self.is_window_output(binding) => Ok(expr),
             Expr::Column(binding) => {
                 let name =
                     scope.columns.iter().find(|column| column.binding == binding).map_or_else(
@@ -2108,6 +2383,47 @@ fn missing_replacement(name: &str, input: &Scope) -> Error {
     ))
 }
 
+/// The names that are only ever windows, which the reference binary has and this tree does not.
+///
+/// They are listed rather than looked up because the list is the point: a call that names one of
+/// them is a window this tree cannot answer yet, and saying so is a different sentence from saying
+/// the name is not a function at all. `duckdb_functions()` on the pin returns these 13 and no
+/// others with a window kind.
+const WINDOW_ONLY: [&str; 13] = [
+    "cume_dist",
+    "dense_rank",
+    "fill",
+    "first_value",
+    "lag",
+    "last_value",
+    "lead",
+    "nth_value",
+    "ntile",
+    "percent_rank",
+    "rank",
+    "rank_dense",
+    "row_number",
+];
+
+/// Resolves the call written inside an `OVER`.
+///
+/// Every aggregate is also a window, which is why this goes through the same signature table the
+/// aggregate path uses. Everything else is one of three refusals, and all three are the reference
+/// binary's: a name it only knows as a window, a name it knows as a scalar, and a name it does not
+/// know at all each get their own sentence there.
+fn window_signature(name: &str, types: &[LogicalType]) -> Result<Resolved> {
+    if WINDOW_ONLY.iter().any(|held| held.eq_ignore_ascii_case(name)) {
+        return Err(Error::not_implemented(format!("{name} as a window function")));
+    }
+    match kind_of(name) {
+        Some(FunctionKind::Aggregate) => resolve(name, types),
+        Some(FunctionKind::Scalar) => {
+            Err(Error::catalog(format!("{name} is not an aggregate function")))
+        }
+        None => Err(Error::catalog(format!("Aggregate Function with name {name} does not exist!"))),
+    }
+}
+
 /// Structural equality over two expressions of one plan.
 fn same_expr(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
     if left == right {
@@ -2161,6 +2477,35 @@ fn same_expr(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
         ) => {
             plan.string(*left_name) == plan.string(*right_name)
                 && left_distinct == right_distinct
+                && match (left_filter, right_filter) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => same_expr(plan, *left, *right),
+                    _ => false,
+                }
+                && lists(*left_args, *right_args)
+        }
+        // The partition, the order and the frame are not compared here and do not need to be. Two
+        // window calls are only ever asked about when they are already in the same run, which is
+        // what agreeing on all three means.
+        (
+            Expr::Window {
+                name: left_name,
+                args: left_args,
+                distinct: left_distinct,
+                filter: left_filter,
+                ignore_nulls: left_nulls,
+            },
+            Expr::Window {
+                name: right_name,
+                args: right_args,
+                distinct: right_distinct,
+                filter: right_filter,
+                ignore_nulls: right_nulls,
+            },
+        ) => {
+            plan.string(*left_name) == plan.string(*right_name)
+                && left_distinct == right_distinct
+                && left_nulls == right_nulls
                 && match (left_filter, right_filter) {
                     (None, None) => true,
                     (Some(left), Some(right)) => same_expr(plan, *left, *right),
