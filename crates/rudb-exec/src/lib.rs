@@ -109,6 +109,7 @@ mod stream;
 mod table;
 mod topn;
 mod typenames;
+mod window;
 mod written;
 
 #[cfg(test)]
