@@ -187,6 +187,15 @@ impl Chunk {
     /// vector rather than copied, so a filter that keeps one row in a thousand still costs the
     /// selection and nothing else.
     ///
+    /// A column that is already a stable dictionary is the one exception, and it composes the two
+    /// levels of codes instead of stacking them. Stacking is just as cheap here and it hides the
+    /// thing that matters: a stable dictionary is a promise that codes from separate chunks name the
+    /// same values, and the aggregate, the group key store and the string kernels all read that
+    /// promise off the outermost body. Wrapping it in a second dictionary breaks the promise, so a
+    /// `GROUP BY SearchPhrase` behind a `WHERE SearchPhrase <> ''` fell off the code path and hashed
+    /// strings instead, which measured at 30 ms of processor time against 4 ms for the same group by
+    /// with nothing in front of it. Composing costs one lookup per kept row and keeps the promise.
+    ///
     /// # Errors
     ///
     /// If the selection points past the end of the chunk.
@@ -201,7 +210,11 @@ impl Chunk {
         let codes = selection.indices();
         let mut columns = Vec::with_capacity(self.columns.len());
         for column in self.columns {
-            columns.push(Vector::dictionary(codes.to_vec(), column)?);
+            if column.stable_dictionary_parts().is_some() {
+                columns.push(column.gather(codes)?);
+            } else {
+                columns.push(Vector::dictionary(codes.to_vec(), column)?);
+            }
         }
         Self::with_rows(columns, rows)
     }
@@ -316,6 +329,8 @@ impl Chunk {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rudb_common::LogicalType;
 
     use super::*;
@@ -384,6 +399,23 @@ mod tests {
         let kept = Selection::from_predicate(4, |index| index == 0);
         let chunk = chunk.select(&kept).expect("row zero exists");
         assert_eq!(chunk.column(0).expect("one column").form(), Form::Dictionary);
+    }
+
+    /// The promise a stable dictionary makes is about the outermost body, so a filter in front of a
+    /// group by has to compose the codes rather than stack a second dictionary on top of them.
+    #[test]
+    fn selecting_a_stable_dictionary_composes_the_codes_instead_of_stacking_them() {
+        let values = Arc::new(integers(&[10, 20, 30]));
+        let column = Vector::stable_dictionary(vec![2, 0, 1, 2], values).expect("three codes");
+        let chunk = Chunk::new(vec![column]).expect("four rows");
+        let kept = Selection::from_predicate(4, |index| index % 2 == 1);
+        let chunk = chunk.select(&kept).expect("rows one and three exist");
+        let column = chunk.column(0).expect("one column");
+        let (codes, values) = column.stable_dictionary_parts().expect("still a stable dictionary");
+        assert_eq!(codes, [0, 2]);
+        assert_eq!(values.len(), 3);
+        assert_eq!(column.value_at(0), Value::Integer(10));
+        assert_eq!(column.value_at(1), Value::Integer(30));
     }
 
     #[test]
