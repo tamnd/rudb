@@ -6,6 +6,19 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.31
+
+A patch release that binds window functions, carries `OVER` through the parser, and makes native integer storage and page buffer costs explicit. The storage format version is unchanged.
+
+- `OVER` parses in full, with partitions, orders, every frame form, `EXCLUDE`, `IGNORE NULLS` and a `WINDOW` clause whose names are resolved and inlined where they are used.
+- Window calls bind to the window operator, grouped into runs that share a partition, an order and a frame, with two identical calls in one run becoming one column and a call that disagrees getting its own operator. The operator lands after the grouping and after `HAVING`, which is where the reference binary puts it.
+- The grouping rule applies inside the `OVER` as well as to the arguments, including partition keys and order keys, and every clause refusal matches the reference binary word for word, including a window in a join condition naming the `WHERE` clause rather than one of its own.
+- Every integer width is stored in the native format rather than only the signed ones.
+- The page buffer memset cost is recorded along with why the two obvious ways around it are worse.
+- A column totals through a slice or a padded dictionary instead of one bounds checked index at a time.
+- Window execution is still explicit follow-up work, so every window query in this release binds to a plan and none of them run.
+- The full gate passes on Rust 1.85. No DuckDB bug was found in this work.
+
 ## 0.3.30
 
 A patch release that broadens D3 correlated subqueries, adds non-recursive CTE inlining, establishes the window plan contract, and improves native grouped TopN metadata. The storage format version is unchanged.
