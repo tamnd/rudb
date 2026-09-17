@@ -480,9 +480,14 @@ impl Writer {
         let ty = &self.table.fields[column].ty;
         if !matches!(
             ty,
-            LogicalType::SmallInt
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
                 | LogicalType::Integer
                 | LogicalType::BigInt
+                | LogicalType::UTinyInt
+                | LogicalType::USmallInt
+                | LogicalType::UInteger
+                | LogicalType::UBigInt
                 | LogicalType::Date
                 | LogicalType::Timestamp
         ) {
@@ -571,8 +576,21 @@ impl Writer {
                 let value = if vector.is_null_at(row) {
                     FrequencyValue::Null
                 } else {
-                    FrequencyValue::Integer(vector.signed_at(row).ok_or_else(|| {
-                        invalid("numeric frequency page did not contain a signed value")
+                    // An unsigned column has no signed reading, and the documented fallback is the
+                    // value itself. Every unsigned width the format stores fits in the `i128` a
+                    // candidate is keyed by, so nothing is lost on the way through.
+                    let widened = match vector.signed_at(row) {
+                        Some(value) => Some(value),
+                        None => match vector.value_at(row) {
+                            Value::UTinyInt(value) => Some(i128::from(value)),
+                            Value::USmallInt(value) => Some(i128::from(value)),
+                            Value::UInteger(value) => Some(i128::from(value)),
+                            Value::UBigInt(value) => Some(i128::from(value)),
+                            _ => None,
+                        },
+                    };
+                    FrequencyValue::Integer(widened.ok_or_else(|| {
+                        invalid("numeric frequency page did not contain an integer value")
                     })?)
                 };
                 visit(start.saturating_add(row as u64), value);
@@ -592,9 +610,14 @@ impl Writer {
             .filter_map(|(column, field)| {
                 matches!(
                     field.ty,
-                    LogicalType::SmallInt
+                    LogicalType::TinyInt
+                        | LogicalType::SmallInt
                         | LogicalType::Integer
                         | LogicalType::BigInt
+                        | LogicalType::UTinyInt
+                        | LogicalType::USmallInt
+                        | LogicalType::UInteger
+                        | LogicalType::UBigInt
                         | LogicalType::Date
                         | LogicalType::Timestamp
                 )
@@ -987,6 +1010,26 @@ impl Reader {
             let value = match entry.value {
                 FrequencyValue::Null => Value::Null,
                 FrequencyValue::Integer(value) => match field.ty {
+                    LogicalType::TinyInt => Value::TinyInt(
+                        i8::try_from(value)
+                            .map_err(|_| invalid("frequency TINYINT is out of range"))?,
+                    ),
+                    LogicalType::UTinyInt => Value::UTinyInt(
+                        u8::try_from(value)
+                            .map_err(|_| invalid("frequency UTINYINT is out of range"))?,
+                    ),
+                    LogicalType::USmallInt => Value::USmallInt(
+                        u16::try_from(value)
+                            .map_err(|_| invalid("frequency USMALLINT is out of range"))?,
+                    ),
+                    LogicalType::UInteger => Value::UInteger(
+                        u32::try_from(value)
+                            .map_err(|_| invalid("frequency UINTEGER is out of range"))?,
+                    ),
+                    LogicalType::UBigInt => Value::UBigInt(
+                        u64::try_from(value)
+                            .map_err(|_| invalid("frequency UBIGINT is out of range"))?,
+                    ),
                     LogicalType::SmallInt => Value::SmallInt(
                         i16::try_from(value)
                             .map_err(|_| invalid("frequency SMALLINT is out of range"))?,
@@ -1219,6 +1262,11 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::Date => Ok(5),
         LogicalType::Timestamp => Ok(6),
         LogicalType::Boolean => Ok(7),
+        LogicalType::TinyInt => Ok(8),
+        LogicalType::UTinyInt => Ok(9),
+        LogicalType::USmallInt => Ok(10),
+        LogicalType::UInteger => Ok(11),
+        LogicalType::UBigInt => Ok(12),
         _ => Err(Error::not_implemented(format!("native storage for {ty}"))),
     }
 }
@@ -1232,6 +1280,11 @@ fn tag_type(tag: u8) -> Result<LogicalType> {
         5 => Ok(LogicalType::Date),
         6 => Ok(LogicalType::Timestamp),
         7 => Ok(LogicalType::Boolean),
+        8 => Ok(LogicalType::TinyInt),
+        9 => Ok(LogicalType::UTinyInt),
+        10 => Ok(LogicalType::USmallInt),
+        11 => Ok(LogicalType::UInteger),
+        12 => Ok(LogicalType::UBigInt),
         _ => Err(invalid("column type tag is unknown")),
     }
 }
@@ -1601,9 +1654,14 @@ fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
                             (_, FrequencyValue::Null)
                                 | (LogicalType::Varchar, FrequencyValue::Code(_))
                                 | (
-                                    LogicalType::SmallInt
+                                    LogicalType::TinyInt
+                                        | LogicalType::SmallInt
                                         | LogicalType::Integer
                                         | LogicalType::BigInt
+                                        | LogicalType::UTinyInt
+                                        | LogicalType::USmallInt
+                                        | LogicalType::UInteger
+                                        | LogicalType::UBigInt
                                         | LogicalType::Date
                                         | LogicalType::Timestamp,
                                     FrequencyValue::Integer(_),
@@ -1769,7 +1827,32 @@ fn encode(
     }
     let data = flat.data().ok_or_else(|| invalid("scalar column did not flatten"))?;
     match (ty, data) {
+        (LogicalType::TinyInt, Data::Int8(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        (LogicalType::UTinyInt, Data::UInt8(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
         (LogicalType::SmallInt, Data::Int16(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        (LogicalType::USmallInt, Data::UInt16(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        (LogicalType::UInteger, Data::UInt32(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        (LogicalType::UBigInt, Data::UInt64(values)) => {
             for value in &**values {
                 out.extend_from_slice(&value.to_le_bytes());
             }
@@ -2114,6 +2197,11 @@ fn decode(
         return Err(invalid("page codec is unknown"));
     }
     let data = match ty {
+        LogicalType::TinyInt => {
+            let values = cur.take(rows)?;
+            Data::Int8(values.iter().map(|item| *item as i8).collect::<Vec<_>>().into())
+        }
+        LogicalType::UTinyInt => Data::UInt8(cur.take(rows)?.to_vec().into()),
         LogicalType::SmallInt => {
             let values =
                 cur.take(rows.checked_mul(2).ok_or_else(|| invalid("page size overflow"))?)?;
@@ -2121,6 +2209,39 @@ fn decode(
                 values
                     .chunks_exact(2)
                     .map(|item| i16::from_le_bytes(item.try_into().expect("two bytes")))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+        LogicalType::USmallInt => {
+            let values =
+                cur.take(rows.checked_mul(2).ok_or_else(|| invalid("page size overflow"))?)?;
+            Data::UInt16(
+                values
+                    .chunks_exact(2)
+                    .map(|item| u16::from_le_bytes(item.try_into().expect("two bytes")))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+        LogicalType::UInteger => {
+            let values =
+                cur.take(rows.checked_mul(4).ok_or_else(|| invalid("page size overflow"))?)?;
+            Data::UInt32(
+                values
+                    .chunks_exact(4)
+                    .map(|item| u32::from_le_bytes(item.try_into().expect("four bytes")))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+        LogicalType::UBigInt => {
+            let values =
+                cur.take(rows.checked_mul(8).ok_or_else(|| invalid("page size overflow"))?)?;
+            Data::UInt64(
+                values
+                    .chunks_exact(8)
+                    .map(|item| u64::from_le_bytes(item.try_into().expect("eight bytes")))
                     .collect::<Vec<_>>()
                     .into(),
             )
@@ -2269,6 +2390,50 @@ mod tests {
         assert!(strings.contains(&(Value::Null, 2)));
         assert!(strings.contains(&(Value::Varchar("alpha".into()), 2)));
         assert!(strings.contains(&(Value::Varchar("long text after a slash".into()), 2)));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Every integer width the format knows about, written and read back.
+    ///
+    /// The unsigned ones are the reason ClickBench can be stored at all: `hits` types `EventDate`
+    /// as `USMALLINT`, and one unsupported column meant the whole table was refused. The extremes
+    /// are in here on purpose, because a width that round trips through the wrong signedness only
+    /// goes wrong at the end of its range.
+    #[test]
+    fn every_integer_width_round_trips_through_a_page() {
+        let path = path("integer-widths");
+        let columns = [
+            (LogicalType::TinyInt, vec![Value::TinyInt(i8::MIN), Value::TinyInt(i8::MAX)]),
+            (LogicalType::UTinyInt, vec![Value::UTinyInt(0), Value::UTinyInt(u8::MAX)]),
+            (LogicalType::SmallInt, vec![Value::SmallInt(i16::MIN), Value::SmallInt(i16::MAX)]),
+            (LogicalType::USmallInt, vec![Value::USmallInt(0), Value::USmallInt(u16::MAX)]),
+            (LogicalType::Integer, vec![Value::Integer(i32::MIN), Value::Integer(i32::MAX)]),
+            (LogicalType::UInteger, vec![Value::UInteger(0), Value::UInteger(u32::MAX)]),
+            (LogicalType::BigInt, vec![Value::BigInt(i64::MIN), Value::BigInt(i64::MAX)]),
+            (LogicalType::UBigInt, vec![Value::UBigInt(0), Value::UBigInt(u64::MAX)]),
+        ];
+        let fields = columns
+            .iter()
+            .enumerate()
+            .map(|(at, (ty, _))| Field::required(format!("c{at}"), ty.clone()))
+            .collect::<Vec<_>>();
+        let vectors = columns
+            .iter()
+            .map(|(ty, values)| Vector::from_values(ty.clone(), values).expect("a vector"))
+            .collect::<Vec<_>>();
+        let mut writer = Writer::create(&path, "widths", fields).expect("new file");
+        writer.append(&Chunk::new(vectors).expect("matching rows")).expect("one stripe");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let wanted = (0..columns.len()).collect::<Vec<_>>();
+        let read = reader.read(0, &wanted).expect("every column");
+        assert_eq!(read.len(), 2);
+        // row at a time: each column has its own type and its own pair of extremes.
+        for (at, (ty, values)) in columns.iter().enumerate() {
+            assert_eq!(read.value_at(0, at), values[0], "the low end of {ty}");
+            assert_eq!(read.value_at(1, at), values[1], "the high end of {ty}");
+        }
         fs::remove_file(path).expect("remove scratch file");
     }
 
