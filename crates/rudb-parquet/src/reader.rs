@@ -1329,6 +1329,30 @@ impl Cursor {
     }
 
     /// The whole page, given the prefix a [`Self::peek`] already read.
+    ///
+    /// The `resize` below is a memset of the whole page body, and it is expensive: on a ten column
+    /// scan of ClickBench's `hits` it is 23.6M instructions, about six percent of the program, and
+    /// every byte of it is overwritten by the read on the next line. Two ways out of it have been
+    /// measured and both are worse, so the memset stays until the reader can borrow a page rather
+    /// than copy one.
+    ///
+    /// # Why not keep the buffer across pages
+    ///
+    /// Holding it at its high water mark and growing it only when a page needs more is correct, and
+    /// it measured ten percent slower on one thread and thirty four percent slower on thirty two.
+    /// It also cannot help a DuckDB written file, because those put one page in a column chunk and a
+    /// cursor covers one column of one row group, so there is no second page to reuse it for. This
+    /// is the same answer `arena.rs` records for parking buffers between cursors.
+    ///
+    /// # Why not ask the allocator for zeros
+    ///
+    /// Because `alloc_zeroed` does not make the zeroing free, it moves it into the kernel. A page
+    /// body is above the allocator's mmap threshold, so `vec![0u8; total]` can come back as fresh
+    /// pages that are already zero and skip the memset, and it does: the memset dropped from 43.5M
+    /// instructions to 37.5M and the program from 364.5M to 358.8M. Wall clock went the other way,
+    /// by a lot. Every one of those pages then takes a fault on first touch, and the mmap and the
+    /// faults are kernel work under locks the whole process shares, which a memset is not. Unchanged
+    /// on one thread and twenty four percent slower on thirty two, confirmed twice.
     fn body(&mut self, file: &dyn File, prefix: Vec<u8>, total: usize) -> Result<Vec<u8>> {
         let mut encoded = Vec::with_capacity(total);
         encoded.extend_from_slice(&prefix[..prefix.len().min(total)]);
