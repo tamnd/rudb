@@ -324,9 +324,122 @@ fn simplify(plan: &mut Plan, expr: ExprRef) -> ExprRef {
     match *plan.expr(expr) {
         Expr::Conjunction { op, children } => conjunction(plan, expr, op, children),
         Expr::Case { arms, otherwise } => case(plan, expr, arms, otherwise),
-        Expr::Compare { op, left, right } => null_comparison(plan, expr, op, left, right),
+        Expr::Compare { op, left, right } => {
+            match narrowed_comparison(plan, expr, op, left, right) {
+                Some(narrowed) => narrowed,
+                None => null_comparison(plan, expr, op, left, right),
+            }
+        }
         _ => expr,
     }
+}
+
+/// Moves a widening cast off the column and onto the literal it is compared against.
+///
+/// The binder types `AdvEngineID <> 0` by widening both sides to the type that holds them both,
+/// which on a SMALLINT column against an INTEGER literal means casting a million values up one
+/// width to compare each against a constant that fits in the width they were already in. Comparing
+/// the column to `0::SMALLINT` asks the same question and reads the same answer off the stored
+/// values without touching them. On ClickBench query 1 the widening cast was 38 percent of the
+/// instructions the whole query ran, because the fallback it lands in walks the column a value at a
+/// time through the scalar cast rather than a vector at a time.
+///
+/// # Why the subset test and not just a width test
+///
+/// The rewrite is only sound when the cast is an embedding, which is to say injective and order
+/// preserving over the whole of the narrow type. That is exactly the condition that the narrow
+/// type's range sits inside the wide type's, and it is not the same as the narrow type being
+/// smaller: INTEGER into UBIGINT is four bytes into eight and still throws away every negative
+/// value. Testing the ranges rather than the widths gets the signed and unsigned mixtures right
+/// without a table of pairs.
+///
+/// # Why a literal that does not fit is left alone
+///
+/// `CAST(small AS INTEGER) = 100000` has a constant answer, since no SMALLINT is a hundred thousand,
+/// but the constant is not `false`. A null column value compares null, not false, so folding the
+/// whole comparison away would change what a nullable column returns. Deciding it properly needs
+/// the null handling that `IS NOT NULL` would carry, which is a rule about ranges rather than a rule
+/// about casts, so this one declines and the plan keeps the cast.
+fn narrowed_comparison(
+    plan: &mut Plan,
+    expr: ExprRef,
+    op: CompareOp,
+    left: ExprRef,
+    right: ExprRef,
+) -> Option<ExprRef> {
+    let (cast, literal, cast_on_the_left) = match (plan.expr(left), plan.expr(right)) {
+        (&Expr::Cast { input, .. }, Expr::Constant(_)) => (input, right, true),
+        (Expr::Constant(_), &Expr::Cast { input, .. }) => (input, left, false),
+        _ => return None,
+    };
+    let wide = plan.expr_type(if cast_on_the_left { left } else { right }).clone();
+    let narrow = plan.expr_type(cast).clone();
+    let (narrow_low, narrow_high) = integer_range(&narrow)?;
+    let (wide_low, wide_high) = integer_range(&wide)?;
+    if wide_low > narrow_low || wide_high < narrow_high {
+        return None;
+    }
+    let value = integer_value(&constant(plan, literal)?)?;
+    let narrowed = integer_of(&narrow, value)?;
+    let held = plan.add_value(narrowed);
+    let constant = plan.add_expr_at(Expr::Constant(held), narrow, plan.expr_span(literal));
+    let (left, right) = if cast_on_the_left { (cast, constant) } else { (constant, cast) };
+    let ty = plan.expr_type(expr).clone();
+    Some(plan.add_expr_at(Expr::Compare { op, left, right }, ty, plan.expr_span(expr)))
+}
+
+/// The inclusive range of an integer type, in the widest signed integer a plan value holds.
+///
+/// UHUGEINT is missing because its top half does not fit in an `i128`, and nothing narrows into it
+/// anyway, so leaving it out costs no rewrite that would otherwise have fired.
+fn integer_range(ty: &LogicalType) -> Option<(i128, i128)> {
+    let range = match *ty {
+        LogicalType::TinyInt => (i128::from(i8::MIN), i128::from(i8::MAX)),
+        LogicalType::SmallInt => (i128::from(i16::MIN), i128::from(i16::MAX)),
+        LogicalType::Integer => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        LogicalType::BigInt => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        LogicalType::HugeInt => (i128::MIN, i128::MAX),
+        LogicalType::UTinyInt => (0, i128::from(u8::MAX)),
+        LogicalType::USmallInt => (0, i128::from(u16::MAX)),
+        LogicalType::UInteger => (0, i128::from(u32::MAX)),
+        LogicalType::UBigInt => (0, i128::from(u64::MAX)),
+        _ => return None,
+    };
+    Some(range)
+}
+
+/// An integer value as an `i128`, or `None` for anything that is not an integer.
+fn integer_value(value: &Value) -> Option<i128> {
+    let value = match *value {
+        Value::TinyInt(value) => i128::from(value),
+        Value::SmallInt(value) => i128::from(value),
+        Value::Integer(value) => i128::from(value),
+        Value::BigInt(value) => i128::from(value),
+        Value::HugeInt(value) => value,
+        Value::UTinyInt(value) => i128::from(value),
+        Value::USmallInt(value) => i128::from(value),
+        Value::UInteger(value) => i128::from(value),
+        Value::UBigInt(value) => i128::from(value),
+        _ => return None,
+    };
+    Some(value)
+}
+
+/// `value` as an integer of `ty`, or `None` when it does not fit.
+fn integer_of(ty: &LogicalType, value: i128) -> Option<Value> {
+    let value = match *ty {
+        LogicalType::TinyInt => Value::TinyInt(i8::try_from(value).ok()?),
+        LogicalType::SmallInt => Value::SmallInt(i16::try_from(value).ok()?),
+        LogicalType::Integer => Value::Integer(i32::try_from(value).ok()?),
+        LogicalType::BigInt => Value::BigInt(i64::try_from(value).ok()?),
+        LogicalType::HugeInt => Value::HugeInt(value),
+        LogicalType::UTinyInt => Value::UTinyInt(u8::try_from(value).ok()?),
+        LogicalType::USmallInt => Value::USmallInt(u16::try_from(value).ok()?),
+        LogicalType::UInteger => Value::UInteger(u32::try_from(value).ok()?),
+        LogicalType::UBigInt => Value::UBigInt(u64::try_from(value).ok()?),
+        _ => return None,
+    };
+    Some(value)
 }
 
 /// The value of an expression all of whose operands are constants, if it has one.
@@ -606,6 +719,59 @@ mod tests {
     }
 
     const SCAN: &str = "  Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR, c::BOOLEAN]\n";
+
+    /// A scan whose columns cover the integer widths the narrowing rule reasons about.
+    const WIDTHS: &str = "  Get memory.main.t AS t #0 [s::SMALLINT, u::UINTEGER, g::BIGINT]\n";
+
+    #[test]
+    fn a_literal_narrows_onto_the_column_rather_than_the_column_widening_onto_the_literal() {
+        let before = format!(
+            "Filter (CAST(#0.0::SMALLINT)::INTEGER <> 0::INTEGER)::BOOLEAN\n{WIDTHS}"
+        );
+        let after = format!("Filter (#0.0::SMALLINT <> 0::SMALLINT)::BOOLEAN\n{WIDTHS}");
+        assert_eq!(folded(&before), after);
+    }
+
+    #[test]
+    fn a_literal_on_the_left_narrows_the_same_way_and_stays_on_the_left() {
+        let before = format!(
+            "Filter (5000::INTEGER < CAST(#0.0::SMALLINT)::INTEGER)::BOOLEAN\n{WIDTHS}"
+        );
+        let after = format!("Filter (5000::SMALLINT < #0.0::SMALLINT)::BOOLEAN\n{WIDTHS}");
+        assert_eq!(folded(&before), after);
+    }
+
+    #[test]
+    fn a_literal_no_smallint_can_equal_keeps_the_cast_because_a_null_row_is_not_false() {
+        let before =
+            format!("Filter (CAST(#0.0::SMALLINT)::INTEGER = 100000::INTEGER)::BOOLEAN\n{WIDTHS}");
+        assert_eq!(folded(&before), before);
+    }
+
+    #[test]
+    fn a_narrowing_cast_is_left_alone_because_it_is_not_injective() {
+        // `CAST(g AS INTEGER) = 5` is true for more than one BIGINT, so answering it against the
+        // BIGINT column would not be the same question.
+        let before =
+            format!("Filter (CAST(#0.2::BIGINT)::INTEGER = 5::INTEGER)::BOOLEAN\n{WIDTHS}");
+        assert_eq!(folded(&before), before);
+    }
+
+    #[test]
+    fn an_unsigned_column_widened_into_a_signed_type_narrows_back_the_same_way() {
+        let before =
+            format!("Filter (CAST(#0.1::UINTEGER)::BIGINT = 5::BIGINT)::BOOLEAN\n{WIDTHS}");
+        let after = format!("Filter (#0.1::UINTEGER = 5::UINTEGER)::BOOLEAN\n{WIDTHS}");
+        assert_eq!(folded(&before), after);
+    }
+
+    #[test]
+    fn a_wider_type_that_does_not_contain_the_narrow_one_is_left_alone() {
+        // UBIGINT is eight bytes to INTEGER's four and still holds none of INTEGER's negatives, so
+        // width is not the test and the rule declines.
+        let before = format!("Filter (CAST(#0.0::INTEGER)::UBIGINT = 5::UBIGINT)::BOOLEAN\n{SCAN}");
+        assert_eq!(folded(&before), before);
+    }
 
     #[test]
     fn arithmetic_over_constants_becomes_the_number() {
