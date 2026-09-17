@@ -56,8 +56,7 @@
 //!
 //! A body the parser refuses never gets here, so none of the following is a divergence today. They
 //! were measured anyway, at the same time as the rest, because the measurement is the expensive part
-//! and whoever adds the syntax will need the answer. A window is printed with its clause spelled out
-//! and a named one is inlined, so `OVER w` with `WINDOW w AS (ORDER BY x)` is `OVER (ORDER BY x)`. A
+//! and whoever adds the syntax will need the answer. A
 //! `FILTER` keeps its own parentheses and parenthesises the condition inside them. `EXISTS` is
 //! written without a space before the parenthesis. `x IN (SELECT ...)` is `(x = ANY(SELECT ...))` and
 //! `x > ALL (SELECT ...)` is `(NOT (x <= ANY(SELECT ...)))`. A `WITH` loses the space after the last
@@ -71,7 +70,7 @@
 use crate::ast::{
     Ast, BinaryOp, CaseArm, CreateViewRef, Distinct, Expr, ExprRef, JoinKind, LiteralKind, Nulls,
     Order, OrderItem, Quantifier, QueryBody, QueryRef, SelectRef, SetOp, Slice, Source, SourceRef,
-    StrRef, Target, UnaryOp,
+    StrRef, Target, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowUnit,
 };
 use crate::matcher::NONE;
 use crate::tokenize::quoted;
@@ -302,6 +301,15 @@ fn values(ast: &Ast, rows: Slice) -> String {
     format!("VALUES {}", written.join(", "))
 }
 
+/// One expression, written back out.
+///
+/// Public because the binder names an unaliased target after the text that produced it, and for a
+/// window call that text is this one: `SELECT sum(x) OVER (ORDER BY x)` has a column called
+/// `sum(x) OVER (ORDER BY x)` and getting there any other way would be a second deparser.
+pub fn expression(ast: &Ast, index: ExprRef) -> String {
+    expr(ast, index)
+}
+
 /// One expression.
 fn expr(ast: &Ast, index: ExprRef) -> String {
     match ast.expr(index) {
@@ -311,6 +319,9 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         Expr::Unary { op, operand } => unary(ast, op, operand),
         Expr::Binary { op, left, right } => binary(ast, op, left, right),
         Expr::Function { name, args, distinct } => call(ast, name, args, distinct),
+        Expr::Window { name, args, distinct, ignore_nulls, spec } => {
+            window(ast, name, args, distinct, ignore_nulls, spec)
+        }
         Expr::Cast { operand, ty, try_cast } => {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
             format!("{word}({} AS {})", expr(ast, operand), typename(ast.string(ty)))
@@ -603,6 +614,73 @@ fn call(ast: &Ast, name: Slice, args: Slice, distinct: bool) -> String {
     }
     let word = if distinct { "DISTINCT " } else { "" };
     format!("{}({word}{})", operator(ast, name, &written), exprs(ast, args))
+}
+
+/// A call with its window, which is the form a window target with no alias is named after.
+///
+/// The frame is printed only when it is not the default one, which is what upstream does and which
+/// is why `sum(x) OVER (ORDER BY x RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` comes back
+/// as `sum(x) OVER (ORDER BY x)`. A single bound is printed as the pair it stands for, so
+/// `ROWS UNBOUNDED PRECEDING` comes back as `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
+fn window(
+    ast: &Ast,
+    name: Slice,
+    args: Slice,
+    distinct: bool,
+    ignore_nulls: bool,
+    spec: WindowRef,
+) -> String {
+    let word = if distinct { "DISTINCT " } else { "" };
+    // `RESPECT NULLS` is the default and upstream drops it, so only the other one is written.
+    let nulls = if ignore_nulls { " IGNORE NULLS" } else { "" };
+    let written = parts(ast, name);
+    // `count(*) OVER ()` comes back as `count() OVER ()`, where the same call without a window
+    // comes back as `count_star()`. The star goes and the name stays, which is upstream's answer
+    // and not the one the ordinary call path gives.
+    let list = ast.expr_list(args);
+    let bare = list.len() == 1
+        && matches!(ast.expr(list[0]), Expr::Star { qualifier, replacements }
+            if qualifier.is_empty() && replacements.is_empty());
+    let inner = if bare { String::new() } else { exprs(ast, args) };
+    let call = format!("{}({word}{inner}{nulls})", operator(ast, name, &written));
+    let held = ast.window(spec);
+    let mut inside: Vec<String> = Vec::new();
+    if !held.partition.is_empty() {
+        inside.push(format!("PARTITION BY {}", exprs(ast, held.partition)));
+    }
+    if !held.order.is_empty() {
+        let items: Vec<String> =
+            ast.order_list(held.order).iter().map(|item| order(ast, item)).collect();
+        inside.push(format!("ORDER BY {}", items.join(", ")));
+    }
+    if !held.frame_is_default() {
+        let unit = match held.unit {
+            WindowUnit::Rows => "ROWS",
+            WindowUnit::Range => "RANGE",
+            WindowUnit::Groups => "GROUPS",
+        };
+        let mut frame =
+            format!("{unit} BETWEEN {} AND {}", bound(ast, held.start), bound(ast, held.end));
+        frame += match held.exclude {
+            WindowExclude::NoOthers => "",
+            WindowExclude::CurrentRow => " EXCLUDE CURRENT ROW",
+            WindowExclude::Group => " EXCLUDE GROUP",
+            WindowExclude::Ties => " EXCLUDE TIES",
+        };
+        inside.push(frame);
+    }
+    format!("{call} OVER ({})", inside.join(" "))
+}
+
+/// One end of a window frame.
+fn bound(ast: &Ast, end: WindowBound) -> String {
+    match end {
+        WindowBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+        WindowBound::Preceding(offset) => format!("{} PRECEDING", expr(ast, offset)),
+        WindowBound::CurrentRow => "CURRENT ROW".to_string(),
+        WindowBound::Following(offset) => format!("{} FOLLOWING", expr(ast, offset)),
+        WindowBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+    }
 }
 
 /// The name a call is written back under, which is the name it was written with for all but two.
@@ -1235,5 +1313,144 @@ mod tests {
     #[test]
     fn a_describe_gets_parentheses_round_what_it_describes() {
         assert_eq!(body("DESCRIBE SELECT 1"), "DESCRIBE (SELECT 1)");
+    }
+
+    /// Every string on the right was read out of `duckdb_views()` on the pin for the query on the
+    /// left, which is also the column name the same window gets when the target has no alias.
+    #[test]
+    fn a_window_is_written_with_the_parts_that_were_written_in_it() {
+        assert_eq!(
+            body("SELECT row_number() OVER () AS n FROM t"),
+            "SELECT row_number() OVER () AS n FROM t"
+        );
+        assert_eq!(
+            body(
+                "SELECT row_number() OVER (PARTITION BY a ORDER BY b DESC NULLS FIRST) AS n FROM t"
+            ),
+            "SELECT row_number() OVER (PARTITION BY a ORDER BY b DESC NULLS FIRST) AS n FROM t"
+        );
+        assert_eq!(
+            body(
+                "SELECT sum(i) OVER (PARTITION BY i, i+1 ORDER BY i ASC NULLS LAST, i DESC) AS n FROM t"
+            ),
+            "SELECT sum(i) OVER (PARTITION BY i, (i + 1) ORDER BY i ASC NULLS LAST, i DESC) AS n FROM t"
+        );
+        assert_eq!(
+            body("SELECT sum(DISTINCT i) OVER (ORDER BY i) AS n FROM t"),
+            "SELECT sum(DISTINCT i) OVER (ORDER BY i) AS n FROM t"
+        );
+        assert_eq!(
+            body("SELECT first_value(i IGNORE NULLS) OVER (ORDER BY i) AS n FROM t"),
+            "SELECT first_value(i IGNORE NULLS) OVER (ORDER BY i) AS n FROM t"
+        );
+        assert_eq!(
+            body("SELECT first_value(i RESPECT NULLS) OVER (ORDER BY i) AS n FROM t"),
+            "SELECT first_value(i) OVER (ORDER BY i) AS n FROM t"
+        );
+        assert_eq!(
+            body("SELECT count(*) OVER () AS n FROM t"),
+            "SELECT count() OVER () AS n FROM t"
+        );
+        assert_eq!(
+            body("SELECT main.sum(i) OVER (ORDER BY i) AS n FROM t"),
+            "SELECT main.sum(i) OVER (ORDER BY i) AS n FROM t"
+        );
+    }
+
+    /// The default frame is not written, and neither is the `RANGE` that was written in its place.
+    #[test]
+    fn a_frame_is_written_only_when_it_is_not_the_one_that_was_assumed() {
+        assert_eq!(
+            body(
+                "SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS n FROM t"
+            ),
+            "SELECT sum(i) OVER (ORDER BY i) AS n FROM t"
+        );
+        assert_eq!(
+            body("SELECT sum(i) OVER (ORDER BY i RANGE UNBOUNDED PRECEDING) AS n FROM t"),
+            "SELECT sum(i) OVER (ORDER BY i) AS n FROM t"
+        );
+        assert_eq!(
+            body(
+                "SELECT sum(i) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE NO OTHERS) AS n FROM t"
+            ),
+            "SELECT sum(i) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS n FROM t"
+        );
+        assert_eq!(
+            body("SELECT sum(i) OVER (ORDER BY i ROWS CURRENT ROW) AS n FROM t"),
+            "SELECT sum(i) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS n FROM t"
+        );
+        assert_eq!(
+            body(
+                "SELECT sum(i) OVER (ORDER BY i ROWS BETWEEN (1+1) PRECEDING AND CURRENT ROW) AS n FROM t"
+            ),
+            "SELECT sum(i) OVER (ORDER BY i ROWS BETWEEN (1 + 1) PRECEDING AND CURRENT ROW) AS n FROM t"
+        );
+        assert_eq!(
+            body(
+                "SELECT sum(i) OVER (ORDER BY i GROUPS BETWEEN CURRENT ROW AND 2 FOLLOWING EXCLUDE CURRENT ROW) AS n FROM t"
+            ),
+            "SELECT sum(i) OVER (ORDER BY i GROUPS BETWEEN CURRENT ROW AND 2 FOLLOWING EXCLUDE CURRENT ROW) AS n FROM t"
+        );
+        assert_eq!(
+            body(
+                "SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) AS n FROM t"
+            ),
+            "SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) AS n FROM t"
+        );
+        assert_eq!(
+            body(
+                "SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS n FROM t"
+            ),
+            "SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS n FROM t"
+        );
+    }
+
+    /// A frame over the whole partition measures the same however it says it does, and the three
+    /// spellings come back as the one upstream picks.
+    #[test]
+    fn a_frame_that_covers_the_partition_is_written_as_a_row_count() {
+        for unit in ["ROWS", "RANGE", "GROUPS"] {
+            assert_eq!(
+                body(&format!(
+                    "SELECT sum(i) OVER (ORDER BY i {unit} BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS n FROM t"
+                )),
+                "SELECT sum(i) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS n FROM t"
+            );
+        }
+        assert_eq!(
+            body(
+                "SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) AS n FROM t"
+            ),
+            "SELECT sum(i) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) AS n FROM t"
+        );
+    }
+
+    /// A named window is gone by the time anything is written back out, which is upstream's answer
+    /// as well: the `WINDOW` clause does not survive a round trip through the catalog there.
+    #[test]
+    fn a_named_window_is_written_out_where_it_was_used() {
+        assert_eq!(
+            body("SELECT sum(i) OVER w AS n FROM t WINDOW w AS (PARTITION BY i ORDER BY i)"),
+            "SELECT sum(i) OVER (PARTITION BY i ORDER BY i) AS n FROM t"
+        );
+        assert_eq!(
+            body("SELECT sum(i) OVER (w) AS n FROM t WINDOW w AS (ORDER BY i)"),
+            "SELECT sum(i) OVER (ORDER BY i) AS n FROM t"
+        );
+        assert_eq!(
+            body(
+                "SELECT sum(i) OVER (w ROWS UNBOUNDED PRECEDING) AS n FROM t WINDOW w AS (PARTITION BY i)"
+            ),
+            "SELECT sum(i) OVER (PARTITION BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS n FROM t"
+        );
+        assert_eq!(
+            body("SELECT sum(i) OVER (w PARTITION BY i) AS n FROM t WINDOW w AS (ORDER BY i)"),
+            "SELECT sum(i) OVER (PARTITION BY i ORDER BY i) AS n FROM t"
+        );
+        assert_eq!(
+            body("SELECT sum(i) OVER v AS n FROM t WINDOW w AS (ORDER BY i), v AS (w)"),
+            "SELECT sum(i) OVER (ORDER BY i) AS n FROM t"
+        );
     }
 }
