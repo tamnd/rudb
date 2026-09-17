@@ -169,7 +169,10 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             out.write_str(" expressions=")?;
             write_expr_list(plan, out, expressions)
         }
-        Node::Sort { keys, .. } => write_sort_keys(plan, out, keys),
+        Node::Sort { keys, .. } => {
+            out.write_char(' ')?;
+            write_sort_keys(plan, out, keys)
+        }
         Node::Limit { count, offset, .. } => {
             match count {
                 Some(count) => write!(out, " {count}")?,
@@ -178,7 +181,7 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             write!(out, " offset {offset}")
         }
         Node::TopN { keys, count, offset, .. } => {
-            write!(out, " {count} offset {offset}")?;
+            write!(out, " {count} offset {offset} ")?;
             write_sort_keys(plan, out, keys)
         }
         Node::Distinct { on, .. } => {
@@ -210,8 +213,12 @@ fn write_schema<W: Write>(plan: &Plan, out: &mut W, columns: Slice) -> fmt::Resu
 }
 
 /// The keys of a sort, in priority order, each with its direction and its null placement.
+///
+/// The caller writes whatever goes in front, because the two callers want different things there.
+/// A sort node wants a space and a window node wants an equals sign, and having this write a space
+/// of its own gave the window node `order= [` with a gap in the middle of it.
 fn write_sort_keys<W: Write>(plan: &Plan, out: &mut W, keys: Slice) -> fmt::Result {
-    out.write_str(" [")?;
+    out.write_char('[')?;
     for (position, key) in plan.sort_key_list(keys).iter().enumerate() {
         if position > 0 {
             out.write_str(", ")?;

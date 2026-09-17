@@ -16,7 +16,7 @@ use rudb_parse::Ast;
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
 use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef};
 
-use crate::binder::{Binder, PendingSubquery};
+use crate::binder::{Binder, PendingSubquery, WindowCall};
 use crate::scope::Scope;
 
 impl Binder<'_> {
@@ -57,12 +57,12 @@ impl Binder<'_> {
             ast::Expr::Function { name, args, distinct } => {
                 self.bind_call(ast, name, args, distinct, scope)
             }
-            // The parser understands a window and the plan has an operator for one, but nothing
-            // joins the two yet, so this is the whole of window support in the binder today.
-            ast::Expr::Window { name, .. } => Err(Error::not_implemented(format!(
-                "{} as a window function",
-                ast.name(name).last().unwrap_or_default()
-            ))),
+            ast::Expr::Window { name, args, distinct, ignore_nulls, spec } => {
+                let written = ast.name(name).last().unwrap_or_default().to_string();
+                let args = ast.expr_list(args).to_vec();
+                let call = WindowCall { name: &written, args: &args, distinct, ignore_nulls, spec };
+                self.bind_window(ast, &call, scope)
+            }
             ast::Expr::Cast { operand, ty, try_cast } => {
                 let input = self.bind_expr(ast, operand, scope)?;
                 let target = LogicalType::parse(ast.string(ty))?;

@@ -694,3 +694,194 @@ fn a_correlated_exists_subquery_records_a_dependent_join() {
     );
     assert!(printed.contains("DependentJoin SINGLE"), "{printed}");
 }
+
+#[test]
+fn a_window_is_an_operator_and_the_target_reads_its_column() {
+    // The call is not in the projection. The operator computes it and the projection reads column
+    // zero of the operator, which is the same shape the aggregate path produces and for the same
+    // reason: everything above the operator is arithmetic over a column it already has.
+    assert_eq!(
+        plan("SELECT sum(counter) OVER () FROM hits"),
+        "Project #2 [#1.0::HUGEINT AS \"sum(counter) OVER ()\"]\n  \
+         Window #1 partition=[] order=[] \
+         frame=RANGE UNBOUNDED PRECEDING TO CURRENT ROW EXCLUDE NO OTHERS \
+         expressions=[sum(#0.2::INTEGER)::HUGEINT]\n    \
+         Get memory.main.hits AS hits #0 [UserID::BIGINT, url::VARCHAR, counter::INTEGER]\n"
+    );
+}
+
+#[test]
+fn the_default_frame_is_the_one_the_standard_gives_a_window_with_no_frame_written() {
+    // Written out because it is the answer to a question people get wrong. A window with an order
+    // and no frame is a running total, not a total, and the frame above says so: it runs from the
+    // start of the partition to the current row.
+    let printed = plan("SELECT sum(counter) OVER (PARTITION BY url ORDER BY counter) FROM hits");
+    assert!(
+        printed.contains(
+            "Window #1 partition=[#0.1::VARCHAR] order=[#0.2::INTEGER ASC NULLS LAST] \
+             frame=RANGE UNBOUNDED PRECEDING TO CURRENT ROW EXCLUDE NO OTHERS"
+        ),
+        "{printed}"
+    );
+}
+
+#[test]
+fn two_calls_that_agree_on_everything_are_one_operator_and_one_column() {
+    // The same rule two identical aggregates over one grouping get. The sum is computed once and
+    // both targets read it, so the arithmetic in the first target is over the same column the
+    // second target is.
+    let printed = plan("SELECT sum(counter) OVER () + 1, sum(counter) OVER () FROM hits");
+    assert_eq!(printed.matches("Window #1").count(), 1, "{printed}");
+    assert!(printed.contains("expressions=[sum(#0.2::INTEGER)::HUGEINT]"), "{printed}");
+    assert_eq!(printed.matches("#1.0::HUGEINT").count(), 2, "{printed}");
+}
+
+#[test]
+fn two_calls_that_disagree_are_two_operators_stacked_in_the_order_they_were_written() {
+    // They disagree on the order, so they cannot share a sort, so they cannot share an operator.
+    // The first one written ends up at the bottom, which is the order somebody reading the plan
+    // next to the query expects to find them in.
+    let printed = plan("SELECT sum(counter) OVER (), count(*) OVER (ORDER BY counter) FROM hits");
+    let first = printed.find("Window #2").expect("the second run");
+    let second = printed.find("Window #1").expect("the first run");
+    assert!(first < second, "the run written first should be the deeper one\n{printed}");
+    assert!(printed[first..].contains("expressions=[count_star()::BIGINT]"), "{printed}");
+}
+
+#[test]
+fn a_star_inside_a_window_is_count_star_and_nothing_else_takes_one() {
+    let printed = plan("SELECT count(*) OVER () FROM hits");
+    assert!(printed.contains("expressions=[count_star()::BIGINT]"), "{printed}");
+    assert_eq!(failure("SELECT sum(*) OVER () FROM hits"), "* is not allowed in sum()");
+}
+
+#[test]
+fn the_window_runs_after_the_grouping_and_after_the_having() {
+    // Measured on the pinned binary rather than reasoned about. The window totals one group here,
+    // the one that survived the filter, which is only true if the operator sits above the filter.
+    // Putting it below would total both groups and the query would answer a different number.
+    let printed = plan(
+        "SELECT url, sum(count(counter)) OVER () FROM hits GROUP BY url HAVING count(counter) > 1",
+    );
+    let aggregate = printed.find("Aggregate #1").expect("the grouping");
+    let filter = printed.find("Filter").expect("the having");
+    let window = printed.find("Window #2").expect("the window");
+    assert!(window < filter && filter < aggregate, "{printed}");
+    // And it reads the aggregate's output rather than the table's, which is the whole point of
+    // being allowed to write a window over a grouped block at all.
+    assert!(printed.contains("expressions=[sum(#1.1::BIGINT)::HUGEINT]"), "{printed}");
+}
+
+#[test]
+fn the_grouping_rule_applies_inside_the_over_as_well_as_to_the_arguments() {
+    // A window does not exempt anything from the grouping rule. The column has to be grouped or
+    // aggregated wherever it appears, and that includes the partition keys and the order keys,
+    // which is the part that is easy to leave out.
+    for query in [
+        "SELECT sum(counter) OVER () FROM hits GROUP BY url",
+        "SELECT count(*) OVER (PARTITION BY counter) FROM hits GROUP BY url",
+        "SELECT count(*) OVER (ORDER BY counter) FROM hits GROUP BY url",
+    ] {
+        assert_eq!(
+            failure(query),
+            "column \"counter\" must appear in the GROUP BY clause or must be part of an \
+             aggregate function",
+            "{query}"
+        );
+    }
+    let printed =
+        plan("SELECT count(*) OVER (PARTITION BY url ORDER BY url) FROM hits GROUP BY url");
+    assert!(printed.contains("partition=[#1.0::VARCHAR]"), "{printed}");
+}
+
+#[test]
+fn a_window_belongs_in_the_select_or_the_order_by_and_nowhere_else() {
+    assert_eq!(
+        failure("SELECT counter FROM hits WHERE sum(counter) OVER () > 1"),
+        "WHERE clause cannot contain window functions!"
+    );
+    assert_eq!(
+        failure("SELECT counter FROM hits GROUP BY counter HAVING sum(counter) OVER () > 1"),
+        "HAVING clause cannot contain window functions!"
+    );
+    assert_eq!(
+        failure("SELECT counter FROM hits GROUP BY sum(counter) OVER ()"),
+        "GROUP BY clause cannot contain window functions!"
+    );
+    // A join condition says the `WHERE` sentence, which is upstream's wording and not a shortcut
+    // taken here. The pinned binary refuses `ON sum(a.i) OVER () = b.i` with those exact words.
+    assert_eq!(
+        failure("SELECT h.url FROM hits h JOIN visits v ON sum(h.counter) OVER () = v.UserID"),
+        "WHERE clause cannot contain window functions!"
+    );
+    // And the two places it belongs both work. A window written only in the `ORDER BY` still has
+    // to be computed, so it goes through the hidden target the sort keys already use and the
+    // operator lands under the sort rather than over it.
+    let printed = plan("SELECT counter FROM hits ORDER BY sum(counter) OVER ()");
+    let sort = printed.find("Sort").expect("the sort");
+    let window = printed.find("Window").expect("the window");
+    assert!(sort < window, "{printed}");
+}
+
+#[test]
+fn a_window_and_an_aggregate_cannot_be_written_inside_each_other() {
+    assert_eq!(
+        failure("SELECT sum(sum(counter) OVER ()) FROM hits"),
+        "aggregate function calls cannot contain window function calls"
+    );
+    assert_eq!(
+        failure("SELECT sum(sum(counter) OVER ()) OVER () FROM hits"),
+        "window function calls cannot be nested"
+    );
+}
+
+#[test]
+fn the_name_inside_an_over_has_to_be_one_that_can_be_a_window() {
+    // Three different refusals for three different situations, which is what the pinned binary
+    // does and is worth keeping apart. A scalar name, a name nothing knows, and a name that is a
+    // window there and is not implemented here are three separate things to tell somebody.
+    assert_eq!(
+        failure("SELECT abs(counter) OVER () FROM hits"),
+        "abs is not an aggregate function"
+    );
+    assert_eq!(
+        failure("SELECT nosuchwindow(counter) OVER () FROM hits"),
+        "Aggregate Function with name nosuchwindow does not exist!"
+    );
+    assert_eq!(failure("SELECT row_number() OVER () FROM hits"), "row_number as a window function");
+}
+
+#[test]
+fn a_range_frame_with_an_offset_needs_exactly_one_thing_to_measure_the_offset_from() {
+    // A `RANGE` offset is a distance from the current row's key, so there has to be one key for it
+    // to be a distance from. `ROWS` counts rows instead and does not care.
+    assert_eq!(
+        failure("SELECT sum(counter) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM hits"),
+        "RANGE frames must have only one ORDER BY expression"
+    );
+    assert_eq!(
+        failure(
+            "SELECT sum(counter) OVER (ORDER BY url, counter \
+             RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM hits"
+        ),
+        "RANGE frames must have only one ORDER BY expression"
+    );
+    let printed =
+        plan("SELECT sum(counter) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM hits");
+    assert!(printed.contains("frame=ROWS 1::INTEGER PRECEDING TO CURRENT ROW"), "{printed}");
+    let printed = plan(
+        "SELECT sum(counter) OVER (ORDER BY counter \
+         RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM hits",
+    );
+    assert!(printed.contains("frame=RANGE 1::INTEGER PRECEDING TO CURRENT ROW"), "{printed}");
+}
+
+#[test]
+fn a_window_in_a_subquery_stays_in_the_block_that_wrote_it() {
+    // A block can be bound inside another one without a subquery expression in between, so the
+    // collected runs have to be put aside for the duration. If they were not, the inner window
+    // would come out attached to the outer block and the plan would be wrong in a way that only
+    // shows up on a query with a window on both sides.
+    let printed = plan("SELECT sum(counter) OVER () FROM (SELECT counter FROM hits) t");
+    assert_eq!(printed.matches("Window").count(), 1, "{printed}");
+}
