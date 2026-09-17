@@ -1329,15 +1329,22 @@ impl Cursor {
     }
 
     /// The whole page, given the prefix a [`Self::peek`] already read.
+    ///
+    /// The buffer is asked for zeroed rather than grown into, which sounds like more work and is
+    /// less. There is no way to hand the kernel an uninitialised buffer without unsafe code, so
+    /// every byte past the prefix has to be written once before the read overwrites it. Asking for
+    /// capacity and then resizing does that write as a memset the allocator cannot see through.
+    /// Asking for zeros goes to `alloc_zeroed`, and a page body is far enough above the allocator's
+    /// threshold to come back as fresh kernel pages, which are already zero, so the memset never
+    /// happens. On a ten column scan of ClickBench's `hits` the resize was 23.6M instructions, six
+    /// percent of the program.
     fn body(&mut self, file: &dyn File, prefix: Vec<u8>, total: usize) -> Result<Vec<u8>> {
-        let mut encoded = Vec::with_capacity(total);
-        encoded.extend_from_slice(&prefix[..prefix.len().min(total)]);
-        if encoded.len() < total {
-            let old = encoded.len();
-            encoded.resize(total, 0);
-            file.read_exact_at(self.start + self.at as u64 + old as u64, &mut encoded[old..])?;
-        } else {
-            encoded.truncate(total);
+        let carried = prefix.len().min(total);
+        let mut encoded = vec![0_u8; total];
+        encoded[..carried].copy_from_slice(&prefix[..carried]);
+        if carried < total {
+            let at = self.start + self.at as u64 + carried as u64;
+            file.read_exact_at(at, &mut encoded[carried..])?;
         }
         self.bytes_read = self.bytes_read.saturating_add(total as u64);
         Ok(encoded)
