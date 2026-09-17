@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 
 use rudb_common::bounds::Bound;
@@ -726,7 +726,7 @@ pub struct Reader {
     table: Arc<Table>,
     dictionaries: Arc<Vec<OnceLock<Arc<Vector>>>>,
     extents: Arc<Vec<Vec<ExtentPart>>>,
-    extent_cache: Arc<Vec<Mutex<Vec<CachedExtent>>>>,
+    extent_cache: Arc<Vec<RwLock<Option<CachedExtent>>>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -742,7 +742,32 @@ struct CachedExtent {
     bytes: Arc<Vec<u8>>,
 }
 
+/// How many of a column's bounded reads are kept, and how many locks that is.
+///
+/// One lock for a whole column put every scanning thread behind every other one on every chunk. The
+/// scan takes it twice per chunk and holds it for a pointer copy, which sounds free and is not: at
+/// sixteen instances a ClickBench scan spent thirty times longer parked in futex than it spent
+/// reading the file, and running more instances made the query slower rather than faster from four
+/// instances upward. Giving each cached extent its own lock means two threads on different extents
+/// never meet, and a hit takes the read lock so the threads walking one extent together, which is
+/// what a sequential scan does, do not queue either.
+///
+/// The cache is direct mapped rather than least recently used, so two extents that land on the same
+/// slot evict each other however recently either was read. A scan walks extents in file order and
+/// the offsets are spread across the slots by a multiply and a shift, so the few that are live at
+/// once land on different slots. What the old policy bought over this one is a working set that is
+/// scattered rather than sequential, and there is no such reader today.
 const CACHED_EXTENTS_PER_COLUMN: usize = 8;
+
+/// Which of a column's cache slots holds the extent starting at `offset`.
+///
+/// A multiply and a shift rather than the low bits of the offset, because extents inside one column
+/// are a fixed number of stripes apart and a stride that shares a factor with the slot count would
+/// put every one of them on the same slot.
+fn extent_slot(offset: u64) -> usize {
+    const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+    (offset.wrapping_mul(MIX) >> 32) as usize % CACHED_EXTENTS_PER_COLUMN
+}
 
 type CrossingCache = OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>;
 
@@ -961,8 +986,8 @@ impl Reader {
         let table = decode_directory(&bytes, size, version)?;
         let extents = extent_parts(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
-        let extent_cache = (0..table.fields.len())
-            .map(|_| Mutex::new(Vec::with_capacity(CACHED_EXTENTS_PER_COLUMN)))
+        let extent_cache = (0..table.fields.len() * CACHED_EXTENTS_PER_COLUMN)
+            .map(|_| RwLock::new(None))
             .collect::<Vec<_>>();
         Ok(Self {
             file: Arc::new(file),
@@ -1183,11 +1208,15 @@ impl Reader {
                 read_at(&self.file, page.offset, &mut bytes)?;
                 Arc::new(bytes)
             } else {
-                let cached = self.extent_cache[column]
-                    .lock()
+                let slot = self
+                    .extent_cache
+                    .get(column * CACHED_EXTENTS_PER_COLUMN + extent_slot(part.offset))
+                    .ok_or_else(|| invalid("column extent cache slot is missing"))?;
+                let cached = slot
+                    .read()
                     .map_err(|_| invalid("column extent cache is poisoned"))?
-                    .iter()
-                    .find(|cached| cached.offset == part.offset)
+                    .as_ref()
+                    .filter(|cached| cached.offset == part.offset)
                     .map(|cached| Arc::clone(&cached.bytes));
                 if let Some(bytes) = cached {
                     bytes
@@ -1195,18 +1224,9 @@ impl Reader {
                     let mut bytes = vec![0; part.length];
                     read_at(&self.file, part.offset, &mut bytes)?;
                     let bytes = Arc::new(bytes);
-                    let mut cache = self.extent_cache[column]
-                        .lock()
-                        .map_err(|_| invalid("column extent cache is poisoned"))?;
-                    if let Some(cached) = cache.iter().find(|cached| cached.offset == part.offset) {
-                        Arc::clone(&cached.bytes)
-                    } else {
-                        if cache.len() == CACHED_EXTENTS_PER_COLUMN {
-                            cache.remove(0);
-                        }
-                        cache.push(CachedExtent { offset: part.offset, bytes: Arc::clone(&bytes) });
-                        bytes
-                    }
+                    *slot.write().map_err(|_| invalid("column extent cache is poisoned"))? =
+                        Some(CachedExtent { offset: part.offset, bytes: Arc::clone(&bytes) });
+                    bytes
                 }
             };
             let page_start = if prefetch { part.page_start } else { 0 };
