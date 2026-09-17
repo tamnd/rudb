@@ -1152,16 +1152,26 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
             if data.len() < rows {
                 return None;
             }
-            collect(data, identity, rows, nulls, want)
+            // `DIRECT` says the mapping is the identity, which the loops below turn into a slice
+            // of the first `rows` values. That is the only way the compiler gets to see that an
+            // index cannot be out of range, and a bounds check per row was most of what this cost.
+            collect::<true, _>(data, identity, rows, nulls, want)
         }
         Form::Dictionary | Form::Rle => {
             let (codes, values) = input.positions()?;
-            if codes.len() < rows {
-                return None;
+            // Cut to the rows wanted rather than checked against them, so that the loops below can
+            // see that a row number is inside the codes and drop the check they would otherwise do
+            // on every row. The codes are the half of the read that can say this: which value a
+            // code lands on is a number out of the data and nothing knows it is in range until it
+            // has been looked at.
+            let codes = codes.get(..rows)?;
+            let data = values.data()?;
+            if let (Want::Whole, Validity::AllValid) = (want, nulls) {
+                if let Some(total) = tally(data, codes) {
+                    return Some(Contribution::Whole(total));
+                }
             }
-            // Every code is inside the dictionary because `Vector::dictionary` checks that on the
-            // way in, so the gather below indexes without a bound of its own.
-            collect(values.data()?, |index| codes[index] as usize, rows, nulls, want)
+            collect::<false, _>(data, |index| codes[index] as usize, rows, nulls, want)
         }
         Form::BitPacked => {
             let packed = input.packed_parts()?;
@@ -1212,7 +1222,106 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
     }
 }
 
-fn collect<M: Fn(usize) -> usize>(
+/// The widest dictionary [`tally`] copies, and a power of two.
+///
+/// The copy is per vector and the gather it speeds up is per row, so a dictionary wide enough that
+/// copying it costs more than the fifteen hundred or so rows of a vector is one to leave alone.
+/// `UserID` has about half a million distinct values, which is where the idea stops working
+/// entirely, and the cut is well below that because the copy also has to stay in the first level
+/// cache to be worth anything.
+const TALLY_LIMIT: usize = 256;
+
+/// The total of a dictionary encoded column, read through a padded copy of the dictionary.
+///
+/// The loop this replaces is `values[codes[row]]` for every row, and its cost is not the two loads.
+/// It is that a code is data, so nothing knows it is inside the dictionary until it has been read,
+/// so there is a bounds check and a branch in the middle of the loop on every row. That is about
+/// thirteen instructions a value with no unrolling, and on a ten column integer scan of ClickBench's
+/// `hits` it was the largest single thing in the program at twenty three percent.
+///
+/// So the dictionary is copied into an array whose length is a power of two known at compile time,
+/// and the code is masked with that length instead of checked against it. Now the index is inside
+/// the array by construction, the compiler can see it, the check and the branch are gone and the
+/// loop unrolls. About seven instructions a value, and no branch in it that can be mispredicted.
+///
+/// The array is sized to the dictionary by a ladder rather than fixed at [`TALLY_LIMIT`], because it
+/// has to be zeroed before the copy and a two entry dictionary should not pay for a two hundred and
+/// fifty six entry one.
+///
+/// # Why not count the codes instead
+///
+/// Because it is slower, which is not what the instruction count says. Counting how often each code
+/// appears and then taking one product per dictionary entry moves the multiplications off the per
+/// row path entirely and measured six percent fewer instructions than the version here. It also
+/// measured nine percent slower on one thread and twenty eight percent slower on thirty two, because
+/// the row loop becomes a read modify write against memory at an address that comes out of the data.
+/// Four counters per entry were not enough to keep consecutive rows off the same address, and every
+/// repeat waits for the previous store to forward. A load has no such problem, and the loop here is
+/// loads.
+///
+/// `None` when the dictionary is too wide to copy, and for a layout with no fixed width. A code past
+/// the end of the dictionary reads one of the zeros the copy was padded with rather than raising,
+/// and cannot happen: `Vector::dictionary` refuses one on the way in, which is the same invariant
+/// the gather this replaces was already relying on to index without a bound of its own.
+fn tally(data: &Data, codes: &[u32]) -> Option<i128> {
+    // Each rung covers dictionaries up to its own size, and every rung is a power of two so that the
+    // mask below is the bounds check.
+    match data.len() {
+        0..=8 => tally_into::<8>(data, codes),
+        9..=32 => tally_into::<32>(data, codes),
+        33..=128 => tally_into::<128>(data, codes),
+        129..=TALLY_LIMIT => tally_into::<TALLY_LIMIT>(data, codes),
+        _ => None,
+    }
+}
+
+/// [`tally`] with the rung it decided on, `SLOTS` entries wide.
+fn tally_into<const SLOTS: usize>(data: &Data, codes: &[u32]) -> Option<i128> {
+    macro_rules! padded {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => padded!(@run values, $zero),)+
+                _ => return None,
+            }
+        };
+        (@run $values:expr, $zero:expr) => {{
+            let values = $values.as_slice();
+            if values.len() > SLOTS {
+                return None;
+            }
+            let mut table = [$zero; SLOTS];
+            table[..values.len()].copy_from_slice(values);
+            let mut total: i128 = 0;
+            // row at a time: this is the loop the whole function is. Masked rather than bounds
+            // checked, which is the point: `SLOTS` is a power of two and is the length of `table`,
+            // so the index is inside it by construction and the compiler can see that without any
+            // unsafe code.
+            for &code in codes {
+                total += i128::from(table[code as usize & (SLOTS - 1)]);
+            }
+            total
+        }};
+    }
+    Some(rudb_vector::for_each_layout!(narrow, padded))
+}
+
+/// The first `rows` values as one slice, when the mapping into them is the identity.
+///
+/// This is the whole of what `DIRECT` buys. A loop written as `values[at(index)]` has to check the
+/// index against the length on every row, because nothing in the loop tells the compiler that `at`
+/// answers something in range, and on a scan that check was most of what the sum cost. A loop over
+/// a slice has the length in hand before it starts, so there is no check, the trip count is known
+/// and the addition can go four at a time.
+///
+/// `None` when the mapping is not the identity, and also when the run is shorter than the rows
+/// asked for, which is a caller whose data and length disagree and which goes the careful way
+/// rather than panicking.
+fn straight<const DIRECT: bool, T>(values: &[T], rows: usize) -> Option<&[T]> {
+    if DIRECT { values.get(..rows) } else { None }
+}
+
+/// `DIRECT` says `at` is the identity, which is the flat case and is the one worth writing twice.
+fn collect<const DIRECT: bool, M: Fn(usize) -> usize>(
     data: &Data,
     at: M,
     rows: usize,
@@ -1220,9 +1329,11 @@ fn collect<M: Fn(usize) -> usize>(
     want: Want,
 ) -> Option<Contribution> {
     match want {
-        Want::Whole => whole_sum(data, at, rows, nulls).map(Contribution::Whole),
-        Want::Real { scale, from } => real_sum(data, at, rows, nulls, scale, from),
-        Want::Extreme(least) => extreme(data, at, rows, nulls, least).map(Contribution::Extreme),
+        Want::Whole => whole_sum::<DIRECT, M>(data, at, rows, nulls).map(Contribution::Whole),
+        Want::Real { scale, from } => real_sum::<DIRECT, M>(data, at, rows, nulls, scale, from),
+        Want::Extreme(least) => {
+            extreme::<DIRECT, M>(data, at, rows, nulls, least).map(Contribution::Extreme)
+        }
     }
 }
 
@@ -1232,7 +1343,7 @@ fn collect<M: Fn(usize) -> usize>(
 /// would have to be about 2^63 rows long before its own total could overflow. That is what lets the
 /// only overflow check be the one where this total meets the running total, which in turn is what
 /// lets the loop vectorize at all.
-fn whole_sum<M: Fn(usize) -> usize>(
+fn whole_sum<const DIRECT: bool, M: Fn(usize) -> usize>(
     data: &Data,
     at: M,
     rows: usize,
@@ -1250,14 +1361,22 @@ fn whole_sum<M: Fn(usize) -> usize>(
             }
         };
         (@run $values:expr) => {{
-            let values = $values;
+            let values = $values.as_slice();
+            let run = straight::<DIRECT, _>(values, rows);
             let mut total: i128 = 0;
             match nulls {
-                Validity::AllValid => {
-                    for index in 0..rows {
-                        total += i128::from(values[at(index)]);
+                Validity::AllValid => match run {
+                    Some(run) => {
+                        for &value in run {
+                            total += i128::from(value);
+                        }
                     }
-                }
+                    None => {
+                        for index in 0..rows {
+                            total += i128::from(values[at(index)]);
+                        }
+                    }
+                },
                 Validity::AllInvalid => {}
                 Validity::Mask(mask) => {
                     // A word of the mask at a time, and a conditional move rather than a branch
@@ -1266,7 +1385,10 @@ fn whole_sum<M: Fn(usize) -> usize>(
                     for start in (0..rows).step_by(64) {
                         let word = mask.word(start / 64);
                         for index in start..(start + 64).min(rows) {
-                            let number = i128::from(values[at(index)]);
+                            let number = match run {
+                                Some(run) => i128::from(run[index]),
+                                None => i128::from(values[at(index)]),
+                            };
                             total += if word >> (index - start) & 1 == 1 { number } else { 0 };
                         }
                     }
@@ -1289,7 +1411,7 @@ fn whole_sum<M: Fn(usize) -> usize>(
     clippy::cast_precision_loss,
     reason = "a wide integer past 2^53 losing digits is what a double is, and this is the float path"
 )]
-fn real_sum<M: Fn(usize) -> usize>(
+fn real_sum<const DIRECT: bool, M: Fn(usize) -> usize>(
     data: &Data,
     at: M,
     rows: usize,
@@ -1314,8 +1436,9 @@ fn real_sum<M: Fn(usize) -> usize>(
             }
         };
         (@run $values:expr, $convert:expr) => {{
-            let values = $values;
+            let values = $values.as_slice();
             let convert = $convert;
+            let run = straight::<DIRECT, _>(values, rows);
             let mut total = from;
             let mut seen: i64 = 0;
             // Which rows count is decided once for the vector rather than once per row. A match on
@@ -1323,9 +1446,19 @@ fn real_sum<M: Fn(usize) -> usize>(
             // an addition that takes one, which is a thing worth finding out by measuring.
             match nulls {
                 Validity::AllValid => {
-                    for index in 0..rows {
-                        let number = convert(values[at(index)]);
-                        total += if scaled { number / factor } else { number };
+                    match run {
+                        Some(run) => {
+                            for &value in run {
+                                let number = convert(value);
+                                total += if scaled { number / factor } else { number };
+                            }
+                        }
+                        None => {
+                            for index in 0..rows {
+                                let number = convert(values[at(index)]);
+                                total += if scaled { number / factor } else { number };
+                            }
+                        }
                     }
                     seen = all;
                 }
@@ -1337,7 +1470,10 @@ fn real_sum<M: Fn(usize) -> usize>(
                             if word >> (index - start) & 1 == 0 {
                                 continue;
                             }
-                            let number = convert(values[at(index)]);
+                            let number = match run {
+                                Some(run) => convert(run[index]),
+                                None => convert(values[at(index)]),
+                            };
                             total += if scaled { number / factor } else { number };
                             seen += 1;
                         }
@@ -1352,7 +1488,7 @@ fn real_sum<M: Fn(usize) -> usize>(
 }
 
 /// Which row holds the smallest or largest number, or none if every row is null.
-fn extreme<M: Fn(usize) -> usize>(
+fn extreme<const DIRECT: bool, M: Fn(usize) -> usize>(
     data: &Data,
     at: M,
     rows: usize,
@@ -1371,7 +1507,8 @@ fn extreme<M: Fn(usize) -> usize>(
             }
         };
         (@run $values:expr) => {{
-            let values = $values;
+            let values = $values.as_slice();
+            let run = straight::<DIRECT, _>(values, rows);
             // The winner is a row number and a number, not an `Option` of a pair. Carrying the
             // option into the loop puts a discriminant test on every row, and the first row is the
             // only row that needs one, so the seed is the first row that is not null and the loop
@@ -1379,12 +1516,12 @@ fn extreme<M: Fn(usize) -> usize>(
             let mut held = usize::MAX;
             let mut mark: i128 = 0;
             match nulls {
-                Validity::AllValid => {
-                    if rows > 0 {
-                        mark = i128::from(values[at(0)]);
+                Validity::AllValid => match run {
+                    Some(run) if !run.is_empty() => {
+                        mark = i128::from(run[0]);
                         held = 0;
-                        for index in 1..rows {
-                            let number = i128::from(values[at(index)]);
+                        for (index, &value) in run.iter().enumerate().skip(1) {
+                            let number = i128::from(value);
                             let win = if least { number < mark } else { number > mark };
                             if win {
                                 mark = number;
@@ -1392,7 +1529,22 @@ fn extreme<M: Fn(usize) -> usize>(
                             }
                         }
                     }
-                }
+                    Some(_) => {}
+                    None => {
+                        if rows > 0 {
+                            mark = i128::from(values[at(0)]);
+                            held = 0;
+                            for index in 1..rows {
+                                let number = i128::from(values[at(index)]);
+                                let win = if least { number < mark } else { number > mark };
+                                if win {
+                                    mark = number;
+                                    held = index;
+                                }
+                            }
+                        }
+                    }
+                },
                 Validity::AllInvalid => {}
                 Validity::Mask(mask) => {
                     for start in (0..rows).step_by(64) {
@@ -1401,7 +1553,10 @@ fn extreme<M: Fn(usize) -> usize>(
                             if word >> (index - start) & 1 == 0 {
                                 continue;
                             }
-                            let number = i128::from(values[at(index)]);
+                            let number = match run {
+                                Some(run) => i128::from(run[index]),
+                                None => i128::from(values[at(index)]),
+                            };
                             let win = if least { number < mark } else { number > mark };
                             if held == usize::MAX || win {
                                 mark = number;
@@ -1993,6 +2148,79 @@ mod tests {
         assert_eq!(
             a_vector_at_a_time("min", &LogicalType::Integer, batch).expect("finds one"),
             Value::Integer(5)
+        );
+    }
+
+    /// The flat sum reads the first `rows` values as one slice rather than one index at a time, so
+    /// a vector that is asked for fewer rows than it holds has to stop where it was told rather
+    /// than where the data ends.
+    #[test]
+    fn a_run_shorter_than_the_vector_totals_only_the_rows_it_was_asked_for() {
+        let rows: Vec<Value> = (1..=10).map(Value::Integer).collect();
+        let vector = Vector::from_values(LogicalType::Integer, &rows).expect("a vector");
+        let batch = std::slice::from_ref(&vector);
+        // row at a time: the point is that each count gives a different answer, so there is
+        // nothing to batch.
+        for count in 0..=10usize {
+            let mut accumulator =
+                Accumulator::new("sum", &LogicalType::HugeInt).expect("a known one");
+            accumulator.update_run(batch, count).expect("totals");
+            let wanted = (count * (count + 1) / 2) as i128;
+            let got = accumulator.finish().expect("a total");
+            if count == 0 {
+                assert_eq!(got, Value::Null, "no rows is no total");
+            } else {
+                assert_eq!(got, Value::HugeInt(wanted), "the first {count} rows");
+            }
+        }
+    }
+
+    /// The padded copy and the plain gather are two ways to the same number, and which one runs
+    /// depends on how wide the dictionary is. So the answer is held against the flat sum of the same
+    /// rows at every width that matters: on each rung of the ladder, on the boundary between two of
+    /// them, and past the last one where the copy is refused and the gather answers instead.
+    #[test]
+    fn a_dictionary_read_through_a_padded_copy_totals_what_the_same_rows_total_laid_out_flat() {
+        // row at a time: each width is its own vector and its own expected answer.
+        for distinct in [1usize, 2, 7, 255, TALLY_LIMIT, TALLY_LIMIT + 1, TALLY_LIMIT * 3] {
+            let entries: Vec<Value> =
+                (0..distinct).map(|slot| Value::Integer(slot as i32 * 7 - 11)).collect();
+            let values = Vector::from_values(LogicalType::Integer, &entries).expect("a dictionary");
+            // A stride that shares no factor with the rungs, so the codes walk the whole dictionary
+            // rather than the first few entries of it.
+            let codes: Vec<u32> = (0..1500u32).map(|row| row * 13 % distinct as u32).collect();
+            let flat: Vec<Value> =
+                codes.iter().map(|&code| entries[code as usize].clone()).collect();
+
+            let coded = Vector::dictionary(codes, values).expect("codes are in range");
+            let mut counted = Accumulator::new("sum", &LogicalType::HugeInt).expect("a known one");
+            counted.update_run(std::slice::from_ref(&coded), 1500).expect("totals");
+
+            let laid_out = Vector::from_values(LogicalType::Integer, &flat).expect("a vector");
+            let mut gathered = Accumulator::new("sum", &LogicalType::HugeInt).expect("a known one");
+            gathered.update_run(std::slice::from_ref(&laid_out), 1500).expect("totals");
+
+            assert_eq!(
+                counted.finish().expect("a total"),
+                gathered.finish().expect("a total"),
+                "a dictionary of {distinct} entries"
+            );
+        }
+    }
+
+    /// The copy is read for the rows it was asked for and not the ones past them, which the masking
+    /// of the index would hide if the loop went over the whole code run.
+    #[test]
+    fn a_padded_dictionary_stops_at_the_rows_it_was_asked_for() {
+        let entries = [Value::Integer(1), Value::Integer(100)];
+        let values = Vector::from_values(LogicalType::Integer, &entries).expect("a dictionary");
+        let coded = Vector::dictionary(vec![0, 0, 0, 1, 1], values).expect("codes are in range");
+        let mut accumulator = Accumulator::new("sum", &LogicalType::HugeInt).expect("a known one");
+        accumulator.update_run(std::slice::from_ref(&coded), 3).expect("totals");
+        assert_eq!(
+            accumulator.finish().expect("a total"),
+            Value::HugeInt(3),
+            "only the three ones"
         );
     }
 
