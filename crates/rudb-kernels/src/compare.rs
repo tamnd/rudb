@@ -471,6 +471,22 @@ where
             return Some(coded_against(op, &coded, &wanted, len, map));
         }
     }
+    // A dictionary column against a literal, decided once for each value the dictionary holds and
+    // then read off by code. It is the reason the form exists, and until this branch the comparison
+    // was the one pair of forms that walked a chunk a value at a time, building a `Value` and
+    // dropping it for every row.
+    if let (Some((codes, values)), Some(wanted)) = (left.dictionary_parts(), right.constant_value())
+    {
+        if let Some(answers) = dictionary_against(op, codes, values, wanted, len, map) {
+            return Some(answers);
+        }
+    }
+    if let (Some(wanted), Some((codes, values))) = (left.constant_value(), right.dictionary_parts())
+    {
+        if let Some(answers) = dictionary_against(op.swapped(), codes, values, wanted, len, map) {
+            return Some(answers);
+        }
+    }
     // A string column against another one or against a literal, with the views read where they are.
     // It catches the string view form, whose bytes live in an arena the vector shares and so has no
     // data slice for the branches above to find, and it catches the flat form as well so that the
@@ -576,6 +592,60 @@ fn encoded(
     let column = readied(held, ty, value)?;
     let (views, arena) = column.text_parts()?;
     Some(coded.encode(views.first()?.bytes_in(arena)?))
+}
+
+/// A dictionary column against a literal, decided once for each value the dictionary holds.
+///
+/// `Vector::dictionary_parts` puts the argument for this next to the accessor: a dictionary column
+/// of 1024 rows over 40 distinct values is 40 comparisons and 1024 lookups, not 1024 comparisons.
+/// The reason it matters more than the count suggests is what a comparison costs on this pair of
+/// forms without it. There is no slice to hand a specialized loop, so the pair fell through to the
+/// row at a time path, which builds a `Value` for each side of each row and drops it again. On a
+/// string column that is a heap allocation and a free per row. ClickBench query 25 ran this on
+/// every one of its 975 chunks and nothing else.
+///
+/// # Why it declines when the dictionary is the larger side
+///
+/// A page whose codes point at one table wide dictionary, which is what the native format writes
+/// for a string column it has seen enough of, has hundreds of thousands of values standing behind
+/// two thousand rows. Deciding every one of them to answer two thousand rows is the trade the wrong
+/// way round, so the comparison goes back to the path that reads the rows. The test is against the
+/// rows actually being read rather than the length of the code run, because a conjunct earlier in
+/// the same predicate may have narrowed the chunk to a handful of rows already.
+///
+/// # Why the answers come from `compare_values`
+///
+/// It is the same function the row at a time path calls, so the answer this returns and the answer
+/// it replaces are the same answer by construction rather than by being tested against each other.
+/// A null in the dictionary compares null, which is false here, and the caller blanks the row
+/// anyway because `nulls_of` resolves a dictionary's validity through its codes. The two total
+/// comparisons get their real answer from the same call, which is why they are not excluded.
+fn dictionary_against<M>(
+    op: Comparison,
+    codes: &[u32],
+    values: &Vector,
+    wanted: &Value,
+    len: usize,
+    map: M,
+) -> Option<Vec<bool>>
+where
+    M: Fn(usize) -> usize + Copy,
+{
+    if values.len() >= len {
+        return None;
+    }
+    let mut table = Vec::with_capacity(values.len());
+    for code in 0..values.len() {
+        let value = values.try_value_at(code).ok()?;
+        table.push(is_true(&compare_values(op, &value, wanted).ok()?));
+    }
+    let mut answers = Vec::with_capacity(len);
+    // row at a time: a table lookup per row, which is what this function trades the comparison per
+    // row for. There is nothing wider to do, since the codes decide where each read lands.
+    for slot in 0..len {
+        answers.push(*table.get(*codes.get(map(slot))? as usize)?);
+    }
+    Some(answers)
 }
 
 /// A compressed column against a literal, tested without decompressing a row of it.

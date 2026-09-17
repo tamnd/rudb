@@ -13,6 +13,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, Ordering as Memory};
 use std::sync::{Arc, OnceLock};
 
 use rudb_common::bounds::Bound;
@@ -734,12 +735,28 @@ struct ExtentPart {
     offset: u64,
     length: usize,
     page_start: usize,
+    /// Which of the extent's pages this is, counting from the start of the extent.
+    ///
+    /// It is what picks this page's bit out of [`CachedExtent::verified`], and it fits in a `u32`
+    /// because an extent holds at most [`EXTENT_STRIPES`] pages.
+    slot: u32,
 }
 
+/// One bounded read of a column, kept so that the pages inside it are read and checked once.
 #[derive(Debug)]
 struct CachedExtent {
     offset: u64,
     bytes: Arc<Vec<u8>>,
+    /// One bit per page of the extent, set once that page's checksum has been agreed with.
+    ///
+    /// Checking a page every time it is read was 21.6 percent of the instructions a ClickBench scan
+    /// of `URL` ran, which is a whole extra pass over every byte of the column pulled through the
+    /// cache on top of the pass that decodes it. The bytes in an extent came from one read, so
+    /// agreeing with the checksum once says exactly what agreeing with it on every read said, and
+    /// the guarantee is the same one. A bit is set with a relaxed or because two threads that check
+    /// the same page at the same time both get the right answer and the loser has only done the
+    /// work twice.
+    verified: Arc<AtomicU32>,
 }
 
 /// How many of a column's bounded reads are kept, and how many locks that is.
@@ -931,11 +948,13 @@ fn extent_parts(table: &Table) -> Result<Vec<Vec<ExtentPart>>> {
         }
         let length = usize::try_from(end - offset)
             .map_err(|_| invalid("column extent length exceeds this platform"))?;
-        for &(_, _, stripe, _) in &refs[first..last] {
+        for (slot, &(_, _, stripe, _)) in refs[first..last].iter().enumerate() {
             let page = table.stripes[stripe].pages[column];
             let page_start = usize::try_from(page.offset - offset)
                 .map_err(|_| invalid("column page offset exceeds this platform"))?;
-            parts[stripe][column] = ExtentPart { offset, length, page_start };
+            let slot =
+                u32::try_from(slot).map_err(|_| invalid("column extent holds too many pages"))?;
+            parts[stripe][column] = ExtentPart { offset, length, page_start, slot };
         }
         first = last;
     }
@@ -1203,6 +1222,10 @@ impl Reader {
                 .get(stripe_index)
                 .and_then(|parts| parts.get(column))
                 .ok_or_else(|| invalid("column extent is missing"))?;
+            // Whether this page has already been agreed with, and the record to say so in. A page
+            // read on its own is checked every time, because nothing kept the bytes it came from.
+            let mut verified = false;
+            let mut checked: Option<Arc<AtomicU32>> = None;
             let bytes = if !prefetch || part.length == page.length as usize {
                 let mut bytes = vec![0; page.length as usize];
                 read_at(&self.file, page.offset, &mut bytes)?;
@@ -1217,16 +1240,27 @@ impl Reader {
                     .map_err(|_| invalid("column extent cache is poisoned"))?
                     .as_ref()
                     .filter(|cached| cached.offset == part.offset)
-                    .map(|cached| Arc::clone(&cached.bytes));
-                if let Some(bytes) = cached {
-                    bytes
-                } else {
-                    let mut bytes = vec![0; part.length];
-                    read_at(&self.file, part.offset, &mut bytes)?;
-                    let bytes = Arc::new(bytes);
-                    *slot.write().map_err(|_| invalid("column extent cache is poisoned"))? =
-                        Some(CachedExtent { offset: part.offset, bytes: Arc::clone(&bytes) });
-                    bytes
+                    .map(|cached| (Arc::clone(&cached.bytes), Arc::clone(&cached.verified)));
+                match cached {
+                    Some((bytes, seen)) => {
+                        verified = seen.load(Memory::Relaxed) & (1 << (part.slot % 32)) != 0;
+                        checked = Some(seen);
+                        bytes
+                    }
+                    None => {
+                        let mut bytes = vec![0; part.length];
+                        read_at(&self.file, part.offset, &mut bytes)?;
+                        let bytes = Arc::new(bytes);
+                        let seen = Arc::new(AtomicU32::new(0));
+                        *slot.write().map_err(|_| invalid("column extent cache is poisoned"))? =
+                            Some(CachedExtent {
+                                offset: part.offset,
+                                bytes: Arc::clone(&bytes),
+                                verified: Arc::clone(&seen),
+                            });
+                        checked = Some(seen);
+                        bytes
+                    }
                 }
             };
             let page_start = if prefetch { part.page_start } else { 0 };
@@ -1236,8 +1270,13 @@ impl Reader {
             let page_bytes = bytes
                 .get(page_start..end)
                 .ok_or_else(|| invalid("column page exceeds its extent"))?;
-            if checksum(page_bytes) != page.hash {
-                return Err(invalid("column page checksum differs"));
+            if !verified {
+                if checksum(page_bytes) != page.hash {
+                    return Err(invalid("column page checksum differs"));
+                }
+                if let Some(seen) = checked {
+                    seen.fetch_or(1 << (part.slot % 32), Memory::Relaxed);
+                }
             }
             let dictionary = self.dictionary(column)?;
             picked.push(decode(&field.ty, stripe.rows, page_bytes, dictionary)?);

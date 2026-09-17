@@ -725,18 +725,16 @@ mod tests {
 
     #[test]
     fn a_literal_narrows_onto_the_column_rather_than_the_column_widening_onto_the_literal() {
-        let before = format!(
-            "Filter (CAST(#0.0::SMALLINT)::INTEGER <> 0::INTEGER)::BOOLEAN\n{WIDTHS}"
-        );
+        let before =
+            format!("Filter (CAST(#0.0::SMALLINT)::INTEGER <> 0::INTEGER)::BOOLEAN\n{WIDTHS}");
         let after = format!("Filter (#0.0::SMALLINT <> 0::SMALLINT)::BOOLEAN\n{WIDTHS}");
         assert_eq!(folded(&before), after);
     }
 
     #[test]
     fn a_literal_on_the_left_narrows_the_same_way_and_stays_on_the_left() {
-        let before = format!(
-            "Filter (5000::INTEGER < CAST(#0.0::SMALLINT)::INTEGER)::BOOLEAN\n{WIDTHS}"
-        );
+        let before =
+            format!("Filter (5000::INTEGER < CAST(#0.0::SMALLINT)::INTEGER)::BOOLEAN\n{WIDTHS}");
         let after = format!("Filter (5000::SMALLINT < #0.0::SMALLINT)::BOOLEAN\n{WIDTHS}");
         assert_eq!(folded(&before), after);
     }
