@@ -1165,7 +1165,18 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
             // code lands on is a number out of the data and nothing knows it is in range until it
             // has been looked at.
             let codes = codes.get(..rows)?;
-            let data = values.data()?;
+            let Some(data) = values.data() else {
+                // A dictionary whose values sit in a file rather than in a run of memory, which is
+                // what a scan of a native column hands over. There is nothing for the loops below
+                // to read, but an extreme is decided on the bytes and the bytes can be asked for
+                // one code at a time, so that much still works here.
+                return match want {
+                    Want::Extreme(least) => {
+                        extreme_bytes(values, codes, nulls, least).map(Contribution::Extreme)
+                    }
+                    _ => None,
+                };
+            };
             if let (Want::Whole, Validity::AllValid) = (want, nulls) {
                 if let Some(total) = tally(data, codes) {
                     return Some(Contribution::Whole(total));
@@ -1220,6 +1231,61 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
         // produces, so both wait for the counter to ask for them.
         _ => None,
     }
+}
+
+/// The row that wins an extreme over a dictionary whose values are not a run in memory.
+///
+/// `MIN` and `MAX` over a text column of a native file used to fall all the way back to the row at
+/// a time path, because the dictionary a scan hands over keeps its payload in the file and so has
+/// no `Data` to read. That path built one `Value::Varchar` per row, which is an allocation and a
+/// copy of the string for every row of the column, and it was about ninety nanoseconds a row.
+///
+/// Winning is decided on the bytes and nothing else, which [`order`](crate::compare::order) says
+/// for both of the types that arrive this way, so this compares the candidate against the bytes of
+/// the row that is winning and never builds a value at all. The winner's bytes are kept here rather
+/// than read again per row, since reading them can mean going back to the file.
+///
+/// The check against the code that is already winning is what makes this cheap on real data. A
+/// column read out of a file repeats its codes, so most rows never reach the comparison.
+///
+/// `None` means this declines and the caller falls back, which is what happens for a type that does
+/// not order on its bytes and for a code that lands on a dictionary entry that is null.
+fn extreme_bytes(
+    values: &Vector,
+    codes: &[u32],
+    nulls: &Validity,
+    least: bool,
+) -> Option<Option<usize>> {
+    if !matches!(values.logical_type(), LogicalType::Varchar | LogicalType::Blob) {
+        return None;
+    }
+    let mut winner: Option<(usize, u32)> = None;
+    let mut best: Vec<u8> = Vec::new();
+    // row at a time: a dictionary in a file answers one code at a time and there is no run to read.
+    for (row, &code) in codes.iter().enumerate() {
+        if !nulls.is_valid(row) {
+            continue;
+        }
+        if let Some((_, held)) = winner {
+            if held == code {
+                continue;
+            }
+        }
+        let candidate = values.try_bytes_at(code as usize).ok()??;
+        let ahead = match winner {
+            None => true,
+            Some(_) => {
+                let ordering = candidate.cmp(best.as_slice());
+                if least { ordering.is_lt() } else { ordering.is_gt() }
+            }
+        };
+        if ahead {
+            best.clear();
+            best.extend_from_slice(candidate);
+            winner = Some((row, code));
+        }
+    }
+    Some(winner.map(|(row, _)| row))
 }
 
 /// The widest dictionary [`tally`] copies, and a power of two.
@@ -2149,6 +2215,51 @@ mod tests {
             a_vector_at_a_time("min", &LogicalType::Integer, batch).expect("finds one"),
             Value::Integer(5)
         );
+    }
+
+    /// Stands in for the text a native file keeps, which is reachable one value at a time and is
+    /// not a run of bytes anything can take a slice of.
+    #[derive(Debug)]
+    struct Filed(Vec<Vec<u8>>);
+
+    impl rudb_vector::TextSource for Filed {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
+            Ok(self.0.get(index).map(Vec::as_slice))
+        }
+
+        fn footprint(&self) -> usize {
+            self.0.iter().map(Vec::len).sum()
+        }
+    }
+
+    /// A scan of a native text column hands over a dictionary whose payload is still in the file,
+    /// so there is nothing for the gather to read and a minimum over one used to build a value per
+    /// row. It is decided on the bytes, and the bytes can be asked for a code at a time.
+    #[test]
+    fn an_extreme_over_a_dictionary_that_keeps_its_bytes_in_a_file_is_decided_on_the_bytes() {
+        let source =
+            std::sync::Arc::new(Filed(vec![b"pear".to_vec(), b"apple".to_vec(), b"plum".to_vec()]));
+        let values = Vector::external_text(LogicalType::Varchar, source).expect("three values");
+        let coded = Vector::dictionary(vec![0, 2, 1, 2, 0], values).expect("codes are in range");
+        let batch = std::slice::from_ref(&coded);
+        assert_eq!(
+            a_vector_at_a_time("min", &LogicalType::Varchar, batch).expect("finds one"),
+            Value::Varchar("apple".into())
+        );
+        assert_eq!(
+            a_vector_at_a_time("max", &LogicalType::Varchar, batch).expect("finds one"),
+            Value::Varchar("plum".into())
+        );
+        // The answers above are right either way, since falling back gets them too. These say the
+        // vector path is the one that found them, and which row each of them won on.
+        let smallest = gather(&coded, 5, &Validity::AllValid, Want::Extreme(true));
+        assert!(matches!(smallest, Some(Contribution::Extreme(Some(2)))));
+        let largest = gather(&coded, 5, &Validity::AllValid, Want::Extreme(false));
+        assert!(matches!(largest, Some(Contribution::Extreme(Some(1)))));
     }
 
     /// The flat sum reads the first `rows` values as one slice rather than one index at a time, so
