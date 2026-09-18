@@ -47,14 +47,18 @@
 //! plan a hash join wants and because a condition means the join stops materializing pairs that the
 //! filter above it was going to throw away.
 //!
-//! What a cross product does not do is become an inner join. It is the same rewrite, it is the one
-//! every textbook has and the one #102 wants, and it is a pessimization here today. Ten thousand
-//! rows against fifty thousand with `a.x = b.x` over them takes 1.25 seconds as a cross product with
-//! a filter above it and 10.7 seconds as a join with a condition, measured on server2. The reason is
-//! in `crates/rudb-exec/src/join.rs`: every join is a nested loop that pairs one left row against a
-//! chunk of the right side at a time, where the cross product hands whole chunks on and lets the
-//! filter run over them. Writing the better plan for the slower operator is how a pass makes a query
-//! slower while looking correct, so this waits for #211.
+//! What a cross product does not do yet is become an inner join. It is the same rewrite, it is the
+//! one every textbook has and the one #102 wants, and it was a pessimization when it was taken out:
+//! ten thousand rows against fifty thousand with `a.x = b.x` over them took 1.25 seconds as a cross
+//! product with a filter above it and 10.7 seconds as a join with a condition, measured on server2,
+//! because every join was a nested loop that paired one left row against a chunk of the right side
+//! at a time where the cross product handed whole chunks on and let the filter run over them.
+//!
+//! That is no longer where the numbers are. An equality between two columns is answered by a lookup
+//! now, and the same pair on a MacBook Air M4 is 1.01 seconds as a cross product with a filter and
+//! 0.56 as a join with a condition. What is left before the rewrite comes back is memory rather than
+//! time: a join holds both of its sides and all of its output at once, and a cross product with a
+//! filter above it holds one side and throws each pair away as it goes. #211 has the order.
 //!
 //! Before any of that, the join is asked what kind of join it really is. An outer join exists to
 //! produce rows padded with nulls, so a predicate above it that cannot be true of a padded row turns

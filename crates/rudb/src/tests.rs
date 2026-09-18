@@ -422,6 +422,49 @@ fn a_left_join_keeps_the_left_row_and_pads_the_right() {
     );
 }
 
+/// The hash path against the loop it replaces, on the rows that tell them apart.
+///
+/// An equality between two columns is answered by a lookup and anything else is answered by the
+/// nested loop, so `ON l.k = r.k AND l.k >= r.k` runs the loop over a join that means exactly what
+/// `ON l.k = r.k` means: the second conjunct is implied by the first whenever the first is true,
+/// and when either side is null both of them are null. That gives an oracle inside one engine, and
+/// it is the same oracle the hash join in #351 keeps the loop around for.
+///
+/// The rows are the cases the two disagree about if the lookup gets its null rule from grouping.
+/// Nulls on both sides, which match nothing rather than each other. Duplicates on both sides, so a
+/// key with two rows on the left and three on the right is six pairs. A key on one side only, for
+/// the padding each outer kind does. A two column key, because the key is a row and not a value.
+#[test]
+fn an_equality_is_looked_up_and_answers_what_the_loop_answers() {
+    let db = Database::new();
+    db.execute("CREATE TABLE l (k INTEGER, j INTEGER, tag VARCHAR)").unwrap();
+    db.execute(
+        "INSERT INTO l VALUES (1, 1, 'one'), (1, 1, 'one again'), (2, 2, 'two'), \
+         (NULL, 1, 'null key'), (3, NULL, 'null second'), (4, 4, 'left only')",
+    )
+    .unwrap();
+    db.execute("CREATE TABLE r (k INTEGER, j INTEGER, tag VARCHAR)").unwrap();
+    db.execute(
+        "INSERT INTO r VALUES (1, 1, 'a'), (1, 1, 'b'), (1, 1, 'c'), (2, 9, 'wrong second'), \
+         (NULL, 1, 'null key'), (5, 5, 'right only')",
+    )
+    .unwrap();
+    for kind in ["INNER", "LEFT", "RIGHT", "FULL"] {
+        for on in ["l.k = r.k", "l.k = r.k AND l.j = r.j"] {
+            let listing = |condition: &str| {
+                let sql = format!(
+                    "SELECT l.tag, r.tag FROM l {kind} JOIN r ON {condition} \
+                     ORDER BY l.tag NULLS FIRST, r.tag NULLS FIRST"
+                );
+                rows(&db, &sql)
+            };
+            let looked_up = listing(on);
+            let looped = listing(&format!("{on} AND l.k >= r.k"));
+            assert_eq!(looked_up, looped, "{kind} JOIN ON {on}");
+        }
+    }
+}
+
 #[test]
 fn a_union_deduplicates_and_union_all_does_not() {
     let db = database();
@@ -4695,12 +4738,16 @@ fn a_join_that_runs_too_long_is_stopped_partway_through_its_own_loop() {
     // which failed the gate here on a setup line rather than on anything this test is about. A
     // second is two hundred times what the setup needs and a sixtieth of what the join needs, so it
     // still proves the only thing at issue, which is that the join is stopped inside its own loop.
+    //
+    // The condition is `<` rather than `=` because an equality is answered by a lookup now and this
+    // test is about the loop. A join that finishes in four hundred milliseconds proves nothing
+    // about a clock read at the end of one.
     let db = Database::with_config(Config::new().with_query_timeout(Duration::from_secs(1)));
     db.execute("CREATE TABLE l AS SELECT i AS k FROM range(50000) t(i)").unwrap();
     db.execute("CREATE TABLE r AS SELECT i * 2 AS k FROM range(20000) t(i)").unwrap();
     let started = std::time::Instant::now();
     let error =
-        db.query("SELECT count(*) FROM l JOIN r ON l.k = r.k").expect_err("that does not finish");
+        db.query("SELECT count(*) FROM l JOIN r ON l.k < r.k").expect_err("that does not finish");
     assert_eq!(error.code().duckdb_name(), "Interrupt Error");
     // One left row's pass over the right side is what it may overshoot by, which is milliseconds.
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
