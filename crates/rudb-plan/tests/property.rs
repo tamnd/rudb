@@ -19,8 +19,9 @@
 
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
-    Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
-    SetOpKind, Slice, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame, WindowUnit,
+    Arm, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
+    NodeRef, Plan, SetOpKind, Slice, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame,
+    WindowUnit,
 };
 
 /// How many seeds the property runs over when nothing says otherwise.
@@ -769,7 +770,8 @@ impl Generator {
                 ]);
                 let count = self.random.below(3);
                 let conditions = self.booleans(count, EXPR_DEPTH);
-                Node::Join { left, right, kind, conditions }
+                let build = self.random.pick(&[BuildSide::Right, BuildSide::Left]);
+                Node::Join { left, right, kind, conditions, build }
             }
             11 => {
                 let left = self.node(depth - 1);

@@ -9,7 +9,8 @@ use std::collections::HashMap;
 
 use rudb_common::{LogicalType, Result, Value};
 use rudb_plan::{
-    ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+    BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef,
+    Plan,
 };
 
 use crate::tables::produced;
@@ -123,7 +124,7 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     let right = plan.add_node(Node::Project { input, index, exprs, names });
     let all: Vec<ExprRef> = plan.expr_list(conditions).iter().copied().chain(rewritten).collect();
     let conditions = plan.add_expr_list(&all);
-    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+    Some(plan.add_node(Node::Join { left, right, kind, conditions, build: BuildSide::default() }))
 }
 
 /// Replays a scalar projection over the distinct outer values it reads.
@@ -210,7 +211,7 @@ fn scalar_projection_domain(
         ));
     }
     let conditions = plan.add_expr_list(&all);
-    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+    Some(plan.add_node(Node::Join { left, right, kind, conditions, build: BuildSide::default() }))
 }
 
 /// Evaluates arbitrary correlated existence predicates once over a distinct domain of outer keys.
@@ -290,6 +291,7 @@ fn exists_domain(
         right: inner,
         kind: JoinKind::Inner,
         conditions: domain_conditions,
+        build: BuildSide::default(),
     });
     let grouped_keys: Vec<ExprRef> = outer_exprs
         .iter()
@@ -336,7 +338,7 @@ fn exists_domain(
         ));
     }
     let conditions = plan.add_expr_list(&all);
-    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+    Some(plan.add_node(Node::Join { left, right, kind, conditions, build: BuildSide::default() }))
 }
 
 /// Decorrelates scalar aggregates whose predicates need more than equality keys.
@@ -467,6 +469,7 @@ fn scalar_aggregate_domain(
         right: inner_input,
         kind: JoinKind::Left,
         conditions: domain_conditions,
+        build: BuildSide::default(),
     });
 
     let original_groups = plan.expr_list(groups).to_vec();
@@ -546,7 +549,7 @@ fn scalar_aggregate_domain(
         ));
     }
     let conditions = plan.add_expr_list(&all);
-    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+    Some(plan.add_node(Node::Join { left, right, kind, conditions, build: BuildSide::default() }))
 }
 
 /// Builds the distinct outer-key domain needed by correlated counts.
@@ -636,6 +639,7 @@ fn scalar_count_aggregate(
         right: inner_input,
         kind: JoinKind::Left,
         conditions: domain_conditions,
+        build: BuildSide::default(),
     });
 
     let presence = keys.first()?.1;
@@ -699,7 +703,7 @@ fn scalar_count_aggregate(
         .collect();
     let all: Vec<ExprRef> = plan.expr_list(conditions).iter().copied().chain(rewritten).collect();
     let conditions = plan.add_expr_list(&all);
-    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+    Some(plan.add_node(Node::Join { left, right, kind, conditions, build: BuildSide::default() }))
 }
 
 fn null_safe_equality(plan: &mut Plan, expr: ExprRef) -> ExprRef {
@@ -850,7 +854,7 @@ fn scalar_aggregate(
         .collect();
     let all: Vec<ExprRef> = plan.expr_list(conditions).iter().copied().chain(rewritten).collect();
     let conditions = plan.add_expr_list(&all);
-    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+    Some(plan.add_node(Node::Join { left, right, kind, conditions, build: BuildSide::default() }))
 }
 
 fn shift_aggregate_outputs(
@@ -1007,7 +1011,7 @@ fn mark(
         ));
     }
     let conditions = plan.add_expr_list(&all);
-    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+    Some(plan.add_node(Node::Join { left, right, kind, conditions, build: BuildSide::default() }))
 }
 
 fn exists(
@@ -1086,7 +1090,7 @@ fn exists(
         all.push(replace_inner(plan, condition, index, &outputs));
     }
     let conditions = plan.add_expr_list(&all);
-    Some(plan.add_node(Node::Join { left, right, kind, conditions }))
+    Some(plan.add_node(Node::Join { left, right, kind, conditions, build: BuildSide::default() }))
 }
 
 fn equality_key(

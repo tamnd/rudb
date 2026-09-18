@@ -9,8 +9,8 @@
 
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
-    Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
-    SetOpKind, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame, WindowUnit,
+    Arm, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
+    NodeRef, Plan, SetOpKind, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
 /// Print, read, print, and insist the two dumps agree. Returns the dump so a test can also assert
@@ -195,6 +195,7 @@ fn a_three_way_join_survives_the_round_trip() {
         right: lineitem,
         kind: JoinKind::Inner,
         conditions,
+        build: BuildSide::Right,
     });
 
     let cust_key = column(&mut plan, 0, 1, LogicalType::BigInt);
@@ -204,11 +205,14 @@ fn a_three_way_join_survives_the_round_trip() {
         LogicalType::Boolean,
     );
     let conditions = plan.add_expr_list(&[on_customer]);
+    // The one join here that is not on the side the binder emits, so that the dump below has
+    // both spellings in it: the flag printed and the flag left out.
     let outer = plan.add_node(Node::Join {
         left: inner,
         right: customer,
         kind: JoinKind::Left,
         conditions,
+        build: BuildSide::Left,
     });
 
     let price = column(&mut plan, 1, 1, LogicalType::Double);
@@ -244,6 +248,8 @@ fn a_three_way_join_survives_the_round_trip() {
     let dump = round_trips(&plan);
     assert!(dump.contains("Join INNER on="), "the inner join is not in\n{dump}");
     assert!(dump.contains("Join LEFT on="), "the outer join is not in\n{dump}");
+    assert!(dump.contains(" build=left"), "the build side is not in\n{dump}");
+    assert_eq!(dump.matches("build=").count(), 1, "the default side was printed too\n{dump}");
     assert!(dump.contains(" OR "), "the disjunction is not in\n{dump}");
 }
 
@@ -318,6 +324,7 @@ fn the_keyword_operators_survive_the_round_trip() {
         right: other,
         kind: JoinKind::Positional,
         conditions: rudb_plan::Slice::EMPTY,
+        build: BuildSide::default(),
     });
     let cross = get(&mut plan, "d", 4, &[("z", LogicalType::Integer)]);
     let product = plan.add_node(Node::CrossProduct { left: positional, right: cross });

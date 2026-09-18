@@ -22,6 +22,7 @@ pub mod late;
 pub mod limit;
 pub mod nulls;
 pub mod pass;
+pub mod sides;
 pub mod tables;
 pub mod topn;
 mod transitive;
@@ -80,10 +81,18 @@ pub const RANK: u8 = 11;
 /// output fires, which is the idempotence assertion below failing. Folding has no opinion about
 /// either spelling of an aggregate, so nothing is given up by putting it in front.
 ///
-/// Top N is last, because it is the one pass that fuses two operators into one rather than moving
-/// something around. Everything before it is written against a sort and a limit, and a pass that had
-/// to know about both spellings of the same plan is a pass with two of every rule in it.
-pub static PASSES: [&(dyn Pass + Sync); 9] = [
+/// Top N is last of the passes that rewrite the shape of a plan, because it is the one that fuses
+/// two operators into one rather than moving something around. Everything before it is written
+/// against a sort and a limit, and a pass that had to know about both spellings of the same plan is
+/// a pass with two of every rule in it.
+///
+/// The build side is chosen after all of them, and that is not an ordering preference so much as a
+/// consequence of what it reads. It picks a side per join from an estimate of how many rows each
+/// side produces, and a filter that has not been pushed down yet, a limit that has not reached the
+/// scan yet and a subtree that empty result pullup is about to delete are all estimates of a plan
+/// nobody is going to run. It is also the only pass here that writes a field rather than moving a
+/// node, so nothing after it would have anything to do with what it wrote.
+pub static PASSES: [&(dyn Pass + Sync); 10] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -93,12 +102,13 @@ pub static PASSES: [&(dyn Pass + Sync); 9] = [
     &limit::LimitPushdown,
     &topn::TopN,
     &late::LateMaterialization,
+    &sides::BuildSideProbeSide,
 ];
 
 /// Every name `SET disabled_optimizers` accepts, which is every name DuckDB accepts.
 ///
 /// `SELECT name FROM duckdb_optimizers()` on the pinned binary, sorted, all forty four of them.
-/// [`PASSES`] is the seven rudb has built and every name here is one rudb takes without complaint,
+/// [`PASSES`] is the ten rudb has built and every name here is one rudb takes without complaint,
 /// because turning off a pass that does not exist is a thing that has already happened.
 ///
 /// Accepting the other thirty seven is the whole point. Forty five files in the upstream corpus run
