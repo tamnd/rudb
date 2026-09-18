@@ -397,10 +397,16 @@ fn persist(path: &Path, catalog: &Catalog) -> Result<()> {
     Ok(())
 }
 
+/// One pipeline instance's place in the source, and the run of chunks it is holding.
+///
+/// The run is what makes the sink safe to instance. A stripe has to be a contiguous run of the
+/// source in order, and the writer cannot work out which of several interleaved callers a chunk
+/// belongs to, so each instance groups its own and hands over whole stripes.
 #[derive(Debug, Default)]
 struct NativePlace {
     morsel: u64,
     chunk: u64,
+    held: Vec<((u64, u64), Chunk)>,
 }
 
 /// The root of a file-backed initial insert.
@@ -428,13 +434,32 @@ impl NativeSink {
             fields,
         })
     }
+
+    /// Hands whatever this instance is holding to the writer as one stripe.
+    fn hand_over(&self, place: &mut NativePlace) -> Result<()> {
+        if place.held.is_empty() {
+            return Ok(());
+        }
+        let parts = std::mem::take(&mut place.held);
+        let mut writer =
+            self.writer.lock().map_err(|_| Error::internal("native writer panicked"))?;
+        writer
+            .as_mut()
+            .ok_or_else(|| Error::internal("native writer was already committed"))?
+            .append_stripe(parts)
+    }
 }
 
 impl Sink for NativeSink {
     type Local = NativePlace;
 
     fn parallel(&self) -> bool {
-        false
+        // The writer is one file behind one lock, so the encode and the write of a stripe still
+        // happen one at a time. What more than one instance buys is the read: the source is a
+        // Parquet scan and decoding a row group is the single largest thing this pipeline does on
+        // one thread. Saying yes here lets the instances that are not holding the lock decode the
+        // next row groups while the one that is encodes the last stripe.
+        true
     }
 
     fn local(&self) -> Self::Local {
@@ -442,6 +467,10 @@ impl Sink for NativeSink {
     }
 
     fn at(&self, morsel: &Morsel, place: &mut Self::Local) -> Result<()> {
+        // A stripe never spans two morsels, so that its parts are a run of the source with nothing
+        // from another instance in the middle of them. The cost is a short stripe at the end of
+        // each morsel, and a morsel on ClickBench is a whole row group of about a million rows.
+        self.hand_over(place)?;
         place.morsel = morsel.index();
         place.chunk = 0;
         Ok(())
@@ -461,18 +490,16 @@ impl Sink for NativeSink {
                 )));
             }
         }
-        let mut writer =
-            self.writer.lock().map_err(|_| Error::internal("native writer panicked"))?;
-        writer
-            .as_mut()
-            .ok_or_else(|| Error::internal("native writer was already committed"))?
-            .append_at((place.morsel, place.chunk), chunk)?;
+        place.held.push(((place.morsel, place.chunk), chunk.clone()));
         place.chunk = place.chunk.saturating_add(1);
+        if place.held.len() == rudb_native::STRIPE_PARTS {
+            self.hand_over(place)?;
+        }
         Ok(Progress::More)
     }
 
-    fn combine(&self, _local: Self::Local) -> Result<()> {
-        Ok(())
+    fn combine(&self, mut local: Self::Local) -> Result<()> {
+        self.hand_over(&mut local)
     }
 
     fn finalize(&self) -> Result<()> {
