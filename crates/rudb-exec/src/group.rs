@@ -196,7 +196,7 @@ pub(crate) struct Aggregate<'a> {
     /// Native integer and dictionary-code rows exchanged for a three-key count and TopN.
     encoded_count: OnceLock<Option<EncodedCountExchange>>,
     /// Fixed group and BIGINT pairs exchanged for grouped distinct counts.
-    grouped_distinct: OnceLock<group_distinct::Exchange>,
+    grouped_distinct: OnceLock<Option<group_distinct::Exchange>>,
     /// Fixed rows exchanged for one mixed aggregate state per INTEGER group.
     mixed: OnceLock<group_mixed::Exchange>,
     out: Buffered,
@@ -726,12 +726,21 @@ impl<'a> Aggregate<'a> {
         }
     }
 
+    /// Whether the grouped distinct radix exchange can own this aggregate.
+    ///
+    /// A `VARCHAR` key is admitted alongside an `INTEGER` one because a string column that arrives
+    /// with a stable dictionary has a four byte code per row that picks out exactly the groups the
+    /// strings do. Whether it does arrive that way is not known until a chunk turns up, so the type
+    /// is all that is asked here and the exchange decides the rest on its first chunk.
     fn grouped_distinct_top_count(&self) -> bool {
         self.distinct_count
             && self.top_counts.is_some()
             && self.constants.iter().all(Option::is_none)
             && self.keys.len() == 1
-            && self.plan.expr_type(self.keys[0]) == &LogicalType::Integer
+            && matches!(
+                self.plan.expr_type(self.keys[0]),
+                LogicalType::Integer | LogicalType::Varchar
+            )
     }
 
     fn mixed_top_count(&self) -> bool {
@@ -3096,10 +3105,27 @@ impl Sink for Aggregate<'_> {
             let Some(user) = rows.arguments.first().and_then(|arguments| arguments.first()) else {
                 return Err(Error::internal("a grouped distinct exchange received no argument"));
             };
+            // What the group is read as, which for a string key is its dictionary code when the
+            // column brought one and nothing at all when it did not. A dictionary that holds a null
+            // is left out: a code would then stand for a null as well as the key's own validity
+            // does, and two ways of being null in one group column is a way to get the count wrong.
+            let codes = if self.plan.expr_type(self.keys[0]) == &LogicalType::Varchar {
+                match group.stable_dictionary_parts() {
+                    Some((codes, dictionary))
+                        if !dictionary.validity().has_nulls(dictionary.len()) =>
+                    {
+                        group_distinct::Codes::Dictionary(codes, dictionary)
+                    }
+                    _ => group_distinct::Codes::Loose,
+                }
+            } else {
+                group_distinct::Codes::Signed
+            };
             let timing = stage::Timing::start(Stage::Scatter);
             let buffered = group_distinct::Exchange::buffer(
                 &self.grouped_distinct,
                 group,
+                codes,
                 user,
                 rows.rows,
                 grouped_distinct,
@@ -3258,7 +3284,8 @@ impl Sink for Aggregate<'_> {
             let state = self
                 .grouped_distinct
                 .get()
-                .expect("a grouped distinct exchange exists after its sink");
+                .and_then(Option::as_ref)
+                .expect("a grouped distinct exchange exists after its sink buffered a chunk");
             state.combine(grouped_distinct)?;
             self.built.lock().map_err(poisoned)?.instances += 1;
             return Ok(());
@@ -3397,7 +3424,7 @@ impl Sink for Aggregate<'_> {
             )?;
             return self.out.fill(chunks);
         }
-        if let Some(distinct) = self.grouped_distinct.get() {
+        if let Some(Some(distinct)) = self.grouped_distinct.get() {
             let chunks = distinct.finish(
                 self.top_counts.expect("a grouped distinct exchange has a TopN bound"),
                 &self.memory,
