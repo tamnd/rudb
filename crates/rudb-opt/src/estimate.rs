@@ -35,7 +35,7 @@
 
 use std::collections::BTreeMap;
 
-use rudb_common::stat::{Class, Source, Stat};
+use rudb_common::stat::{Class, Direction, Provenance, Stat};
 use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind};
 
 use crate::walk;
@@ -101,11 +101,14 @@ impl Statistics {
 }
 
 /// The class of a number that came out of one of the constants above.
+const GUESSED: Class = Class::Estimated;
+
+/// Where a number that came out of one of the constants above says it came from.
 ///
-/// [`Source::Constant`] and not [`Source::Propagation`], because the guess is the constant and the
-/// propagation only carried it. The point of printing the source in `EXPLAIN` is to find the place
-/// where nobody had a number, and this is that place.
-const GUESSED: Class = Class::Estimated { source: Source::Constant };
+/// [`Provenance::Default`] and not [`Provenance::Propagation`], because the guess is the constant
+/// and the propagation only carried it. The point of printing the provenance in `EXPLAIN` is to
+/// find the place where nobody had a number, and this is that place.
+const FROM_A_CONSTANT: Provenance = Provenance::Default;
 
 /// The class of a number that is a proven ceiling with nothing under it.
 ///
@@ -113,18 +116,23 @@ const GUESSED: Class = Class::Estimated { source: Source::Constant };
 /// certain from above and the relative error can be the whole of it, which is a bound of one. That
 /// is the weakest certificate there is and it is still worth telling apart from a guess: a guess
 /// can be exceeded and this cannot.
-const CEILING: Class = Class::Certified { bound: 1.0 };
+const CEILING: Class = Class::Certified { bound: 1.0, direction: Direction::AtMost };
 
 /// How many rows this node is guessed to produce, where a guess can be made at all.
 ///
 /// `None` means nothing downstream of here should pretend to know, which is the answer for a scan
 /// of a table nobody measured, for every table function, and for anything above either of those.
 ///
-/// The same answer as [`rows_stat`] with the class dropped. Callers that only have to compare two
-/// numbers want this one; the class matters to `EXPLAIN` and to the histogram.
+/// The same answer as [`rows_stat`] read for the Decide use of `spec/stats/05-every-query.md`
+/// section 5.1.1, which is the only use a cardinality is ever put to: it chooses between two plans
+/// that produce the same rows, so every class is allowed through and a caller that gets `None` has
+/// to fall back to a documented default rather than to a number. A caller that wants to answer a
+/// query from this, or to license a rewrite with it, has to call [`rows_stat`] and ask with
+/// [`Stat::answer`] or [`Stat::enable`], and both of those will refuse almost everything this
+/// module produces. That is the point.
 #[must_use]
 pub fn rows(plan: &Plan, node: NodeRef, stats: &Statistics) -> Option<u64> {
-    rows_stat(plan, node, stats).value().copied()
+    rows_stat(plan, node, stats).decide().copied()
 }
 
 /// How many rows this node produces, and how much of that is knowledge.
@@ -144,21 +152,20 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
     let of = |child: NodeRef| rows_stat(plan, child, stats);
     match *plan.node(node) {
         // One row with no columns, which is what a `SELECT` with no `FROM` is bound against.
-        Node::Dummy => Stat::exact(1),
+        Node::Dummy => Stat::exact(1, Provenance::RowCount),
         // The catalog counted these rather than estimating them, so the count is the count. That
         // is the one exact number a plan starts from today and it is why the histogram does not
         // read all unknown: a scan knows, and everything above it stops knowing.
         Node::Get { catalog, schema, table, .. } => {
             match stats.rows_in(plan.string(catalog), plan.string(schema), plan.string(table)) {
-                Some(rows) => Stat::exact(rows),
+                Some(rows) => Stat::exact(rows, Provenance::RowCount),
                 None => Stat::Unknown,
             }
         }
         // Counted rather than guessed. A literal row list is the one place in a plan where the
         // number of rows is written down.
-        Node::Values { rows: list, .. } => {
-            u64::try_from(plan.row_list(list).len()).map_or(Stat::Unknown, Stat::exact)
-        }
+        Node::Values { rows: list, .. } => u64::try_from(plan.row_list(list).len())
+            .map_or(Stat::Unknown, |rows| Stat::exact(rows, Provenance::RowCount)),
         // A table function is an open door. `read_parquet` could answer this from the footer and
         // one day should, but the answer would have to come from the reader rather than from here,
         // and a function nobody taught this about would still be unknown. Guessing on behalf of all
@@ -180,7 +187,7 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
             // much as over a billion, which is the one case here that is a fact rather than a
             // guess. `empty_result_pullup` stops at this node for the same reason.
             if plan.expr_list(groups).is_empty() {
-                return Stat::exact(1);
+                return Stat::exact(1, Provenance::RowCount);
             }
             guess(of(input), KEPT_BY_A_GROUP_BY)
         }
@@ -199,13 +206,17 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
                 // it. An input that was counted keeps its class, because the smaller of two known
                 // numbers is known.
                 Some(count) => match input {
-                    Stat::Unknown => Stat::Known { value: count, class: CEILING },
+                    Stat::Unknown => {
+                        Stat::Known { value: count, class: CEILING, provenance: FROM_A_CONSTANT }
+                    }
                     known => known.map(|n| n.saturating_sub(offset).min(count)),
                 },
             }
         }
         Node::TopN { input, count, offset, .. } => match of(input) {
-            Stat::Unknown => Stat::Known { value: count, class: CEILING },
+            Stat::Unknown => {
+                Stat::Known { value: count, class: CEILING, provenance: FROM_A_CONSTANT }
+            }
             known => known.map(|n| n.saturating_sub(offset).min(count)),
         },
         Node::Join { left, right, kind, conditions, .. } => {
@@ -248,9 +259,11 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
 fn guess(input: Stat<u64>, kept: f64) -> Stat<u64> {
     match input {
         Stat::Unknown => Stat::Unknown,
-        Stat::Known { value, class } => {
-            Stat::Known { value: scale(value, kept).max(1), class: class.combine(GUESSED) }
-        }
+        Stat::Known { value, class, .. } => Stat::Known {
+            value: scale(value, kept).max(1),
+            class: class.combine(GUESSED),
+            provenance: FROM_A_CONSTANT,
+        },
     }
 }
 
@@ -258,7 +271,9 @@ fn guess(input: Stat<u64>, kept: f64) -> Stat<u64> {
 fn ceiling(stat: Stat<u64>) -> Stat<u64> {
     match stat {
         Stat::Unknown => Stat::Unknown,
-        Stat::Known { value, class } => Stat::Known { value, class: class.combine(CEILING) },
+        Stat::Known { value, class, provenance } => {
+            Stat::Known { value, class: class.combine(CEILING), provenance }
+        }
     }
 }
 
@@ -302,16 +317,23 @@ fn join(left: Stat<u64>, right: Stat<u64>, kind: JoinKind, conditions: usize) ->
         JoinKind::Positional => left.zip(right, u64::min),
         _ => {
             let (
-                Stat::Known { value: left, class: left_class },
-                Stat::Known { value: right, class: right_class },
+                Stat::Known { value: left, class: left_class, provenance: left_from },
+                Stat::Known { value: right, class: right_class, provenance: right_from },
             ) = (left, right)
             else {
                 return Stat::Unknown;
             };
             let both = left_class.combine(right_class);
+            // Two sides that came from different places make a number that came from the
+            // arithmetic, which is what a reader chasing this node needs to be told.
+            let from = if left_from == right_from { left_from } else { Provenance::Propagation };
             // A join with no condition is a cross product wearing a different node.
             if conditions == 0 {
-                return Stat::Known { value: left.saturating_mul(right), class: both };
+                return Stat::Known {
+                    value: left.saturating_mul(right),
+                    class: both,
+                    provenance: from,
+                };
             }
             // The containment assumption: every row of the smaller side finds a match, so an
             // equijoin produces about as many rows as its larger side. It is the standard guess and
@@ -331,7 +353,7 @@ fn join(left: Stat<u64>, right: Stat<u64>, kind: JoinKind, conditions: usize) ->
             // were. Two counted tables joined on a column nobody has a distinct count for is the
             // single most common way a plan goes wrong, and a class saying exact here would hide
             // exactly that.
-            Stat::Known { value, class: both.combine(GUESSED) }
+            Stat::Known { value, class: both.combine(GUESSED), provenance: FROM_A_CONSTANT }
         }
     }
 }
@@ -350,7 +372,7 @@ fn scale(rows: u64, by: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::stat::{Class, Source, Stat};
+    use rudb_common::stat::{Class, Direction, Provenance, Stat};
     use rudb_plan::Plan;
 
     use super::{Statistics, rows, rows_stat};
@@ -386,7 +408,7 @@ mod tests {
     }
 
     /// The guess this module has always made, spelled out.
-    const GUESSED: Class = Class::Estimated { source: Source::Constant };
+    const GUESSED: Class = Class::Estimated;
 
     #[test]
     fn a_scan_is_what_the_catalog_said_and_nothing_when_nobody_said() {
@@ -541,6 +563,38 @@ mod tests {
     }
 
     #[test]
+    fn every_number_here_says_where_it_came_from() {
+        // The scan is the catalog's count and says so. The filter over it is the constant and says
+        // that, which is the word somebody searches an `EXPLAIN` for when a plan went wrong,
+        // because it means nobody had a number at that node at all.
+        assert_eq!(stat(&scan("t", 0), &[("t", 5000)]).provenance(), Some(Provenance::RowCount));
+        let text = format!("Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n  {}", scan("t", 0));
+        assert_eq!(stat(&text, &[("t", 1000)]).provenance(), Some(Provenance::Default));
+    }
+
+    #[test]
+    fn a_cardinality_is_for_deciding_and_answers_nothing() {
+        // A filtered count is a guess, so the build side chooser is welcome to it and nothing that
+        // changes an answer is. This is the rule of section 5.1.1 read off one node, and it is the
+        // one a later pass is most likely to break in good faith.
+        let text = format!("Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n  {}", scan("t", 0));
+        let guessed = stat(&text, &[("t", 1000)]);
+        assert_eq!(guessed.decide(), Some(&200));
+        assert_eq!(guessed.answer(), None);
+        assert_eq!(guessed.enable(), None);
+        // A scan is the one node in here that could answer, and it still only does so because the
+        // catalog counted rather than because the walk was clever.
+        let counted = stat(&scan("t", 0), &[("t", 5000)]);
+        assert_eq!(counted.answer(), Some(&5000));
+        assert_eq!(counted.enable(), Some(&5000));
+        // Nobody measured the table, so every use gets nothing rather than a zero.
+        let nothing = stat(&scan("t", 0), &[]);
+        assert_eq!(nothing.decide(), None);
+        assert_eq!(nothing.answer(), None);
+        assert_eq!(nothing.enable(), None);
+    }
+
+    #[test]
     fn one_guess_anywhere_under_a_node_makes_the_node_a_guess() {
         // Exact combined with a guess is the guess. A filter over a counted table is not a counted
         // number any more, and reading the class back as exact is what would make somebody fold a
@@ -568,7 +622,10 @@ mod tests {
         // Ten is not a guess about what the scan produces, it is the most this node can emit, so a
         // caller asking whether the number can be exceeded gets the right answer.
         let text = format!("Limit 10 offset 0\n  {}", scan("t", 0));
-        assert_eq!(stat(&text, &[]).class(), Some(Class::Certified { bound: 1.0 }));
+        assert_eq!(
+            stat(&text, &[]).class(),
+            Some(Class::Certified { bound: 1.0, direction: Direction::AtMost })
+        );
         // Over a counted input the count wins and the answer is a fact again.
         assert_eq!(stat(&text, &[("t", 3)]).class(), Some(Class::Exact));
     }
