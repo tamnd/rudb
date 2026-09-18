@@ -580,7 +580,8 @@ impl Plan {
                     }
                 }
             }
-            Node::TableFunction { function, args, options, settings, columns, .. } => {
+            Node::TableFunction { function, args, options, settings, columns, .. }
+            | Node::LateralFunction { function, args, options, settings, columns, .. } => {
                 if function as usize >= self.strings.len() {
                     return fail("names a string that is not in the table");
                 }
@@ -800,7 +801,9 @@ impl Plan {
             Node::Values { rows, .. } => {
                 self.row_list(rows).iter().flat_map(|row| plain(self.expr_list(*row))).collect()
             }
-            Node::TableFunction { args, .. } => plain(self.expr_list(args)),
+            Node::TableFunction { args, .. } | Node::LateralFunction { args, .. } => {
+                plain(self.expr_list(args))
+            }
             Node::Fetch { args, row, .. } => {
                 let mut held = plain(self.expr_list(args));
                 held.push((row, false, false));

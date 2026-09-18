@@ -148,10 +148,14 @@ fn reads(node: &Node) -> u32 {
         // filter this is counting for is either in the definition, where the write is the pass, or
         // in the body, where this node is not on the path at all.
         Node::MaterializedCte { .. } => 1,
+        // A lateral call reads its chunk once to work out the calls and once more to copy the rows
+        // out beside what they produced, which is the same order of work as a fetch and is counted
+        // the same way.
         Node::Filter { .. }
         | Node::Project { .. }
         | Node::Fetch { .. }
-        | Node::TableFetch { .. } => 1,
+        | Node::TableFetch { .. }
+        | Node::LateralFunction { .. } => 1,
         Node::Aggregate { .. }
         | Node::Window { .. }
         | Node::Distinct { .. }

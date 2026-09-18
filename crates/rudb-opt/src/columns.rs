@@ -251,7 +251,9 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
                 list(plan, row, found);
             }
         }
-        Node::TableFunction { args, .. } => list(plan, args, found),
+        Node::TableFunction { args, .. } | Node::LateralFunction { args, .. } => {
+            list(plan, args, found)
+        }
         // The ordinal column is read by the fetch and by nothing above it, so a pass that did not
         // count it here would prune the column the fetch works from out of the scan under it.
         Node::Fetch { args, row, .. } => {

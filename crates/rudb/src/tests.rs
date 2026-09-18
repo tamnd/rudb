@@ -4739,15 +4739,18 @@ fn a_table_function_joins_and_aggregates_like_anything_else_in_a_from_clause() {
 }
 
 #[test]
-fn the_arguments_are_expressions_and_they_cannot_see_a_column() {
+fn the_arguments_are_expressions_and_a_column_in_one_is_lateral() {
     let db = database();
     assert_eq!(rows(&db, "SELECT count(*) FROM range(2 + 3)"), vec![vec![Value::BigInt(5)]]);
-    // `FROM t, range(t.x)` is LATERAL and the name does resolve now, but a table function's
-    // arguments are evaluated to produce the rows rather than over rows that already exist, so
-    // there is nothing underneath it for the domain to be pushed into and no plan for it yet. The
-    // refusal names what was written instead of pretending the column is not there.
-    let message = failure(&db, "SELECT count(*) FROM t, range(t.x)");
-    assert!(message.contains("a table function reading a LATERAL column"), "{message}");
+    // `FROM t, range(t.x)` is LATERAL, and the rows of `t` are 3, 1, 2 and 1, so this is seven.
+    // There is nothing underneath a table function for the domain to be pushed into, since its
+    // arguments are what produce its rows, so the domain is what the call is made over instead.
+    // See `Node::LateralFunction`.
+    assert_eq!(rows(&db, "SELECT count(*) FROM t, range(t.x)"), vec![vec![Value::BigInt(7)]]);
+    // Only the entries to the left. `range` is the first entry here and there is nothing for `t.x`
+    // to name, which is a binder error and not a lateral reference read backwards.
+    let message = failure(&db, "SELECT count(*) FROM range(t.x), t");
+    assert!(message.contains("t"), "{message}");
 }
 
 #[test]

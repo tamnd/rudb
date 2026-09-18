@@ -93,7 +93,8 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             }
             out.write_char(']')
         }
-        Node::TableFunction { index, function, args, options, settings, columns } => {
+        Node::TableFunction { index, function, args, options, settings, columns }
+        | Node::LateralFunction { index, function, args, options, settings, columns, .. } => {
             out.write_char(' ')?;
             write_identifier(out, plan.string(function))?;
             out.write_str(" args=")?;
