@@ -9,7 +9,7 @@ use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Va
 use rudb_metrics::{Document, Report, Span};
 
 use rudb_parse::ast::Ast;
-use rudb_pipeline::{Morsel, Pool, Progress, Sink};
+use rudb_pipeline::{Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_vector::{Chunk, Form, Vector};
 
 use crate::config::Config;
@@ -60,6 +60,18 @@ impl Default for Database {
     }
 }
 
+/// The two things a database sets up before it will run anything, neither of which is per query.
+///
+/// The threads are the obvious one. The other is the system allocator, which by default hands every
+/// large block back to the kernel the moment a query is done with it and then faults the same pages
+/// in again on the next one, and which is asked here to stop. Both of them are process wide or
+/// database wide rather than query wide, both of them are cheap to set and expensive to find out
+/// about later, and opening a database is the one place that knows a query is coming.
+fn runtime(config: &Config) -> Pool {
+    keep_pages();
+    Pool::new(config.threads())
+}
+
 impl Database {
     /// An empty database with the default catalog and schema, held in memory.
     #[must_use]
@@ -71,7 +83,7 @@ impl Database {
     #[must_use]
     pub fn with_config(config: Config) -> Self {
         let memory = Memory::new(config.memory_limit());
-        let pool = Pool::new(config.threads());
+        let pool = runtime(&config);
         let settings = Settings::new(config);
         let inner =
             Inner { catalog: RwLock::new(Catalog::new()), path: None, settings, memory, pool };
@@ -170,7 +182,7 @@ impl Database {
             catalog.create_native_table(rudb_native::Reader::open(&path)?)?;
         }
         let memory = Memory::new(config.memory_limit());
-        let pool = Pool::new(config.threads());
+        let pool = runtime(&config);
         let settings = Settings::new(config);
         let inner =
             Inner { catalog: RwLock::new(catalog), path: Some(path), settings, memory, pool };
