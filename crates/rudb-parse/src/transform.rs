@@ -76,6 +76,26 @@ pub fn transform_with_case(
     Ok(transform.ast)
 }
 
+/// Whether a bare `PRAGMA name` is a statement rather than a query.
+///
+/// This is a question about shape and not about meaning, which is why it is answered here and the
+/// catalog answers the rest. `PRAGMA version` returns rows and `PRAGMA disable_optimizer` returns
+/// none, and the difference between the two is visible from the name alone on all thirty eight the
+/// pin has: the ones that do something are the `enable_` and `disable_` pairs, plus `force_checkpoint`
+/// and `verify_parallelism`, which are the two that toggle a flag without saying so in the name.
+///
+/// A name of that shape that is not one the engine knows still reaches the catalog, and the catalog
+/// says the same thing about it that it says about a missing `pragma_*` function. That is why this
+/// can be a rule about spelling rather than a second copy of the list: being wrong here means the
+/// error arrives from one place instead of another and says the same sentence either way.
+fn is_statement(name: &str) -> bool {
+    let folded = name.to_ascii_lowercase();
+    folded.starts_with("enable_")
+        || folded.starts_with("disable_")
+        || folded == "force_checkpoint"
+        || folded == "verify_parallelism"
+}
+
 struct Transform<'a> {
     query: &'a str,
     tokens: &'a [Token],
@@ -432,7 +452,7 @@ impl<'a> Transform<'a> {
         let kids: Vec<u32> = self.kids(list).collect();
         if kids.len() == 1 && self.contains(list, "DefaultExpression") {
             let index = self.ast.settings.len() as u32;
-            self.ast.settings.push(Setting { name, scope, value: NONE });
+            self.ast.settings.push(Setting { name, scope, value: NONE, pragma: false });
             return Ok(Statement::Reset(index));
         }
         let mut values = Vec::new();
@@ -446,7 +466,7 @@ impl<'a> Transform<'a> {
             return self.unsupported(list);
         };
         let index = self.ast.settings.len() as u32;
-        self.ast.settings.push(Setting { name, scope, value });
+        self.ast.settings.push(Setting { name, scope, value, pragma: false });
         Ok(Statement::Set(index))
     }
 
@@ -456,7 +476,12 @@ impl<'a> Transform<'a> {
         let name = self.intern("TimeZone");
         if matches!(self.name(zone), "ZoneDefault" | "ZoneLocal") {
             let index = self.ast.settings.len() as u32;
-            self.ast.settings.push(Setting { name, scope: Scope::Unwritten, value: NONE });
+            self.ast.settings.push(Setting {
+                name,
+                scope: Scope::Unwritten,
+                value: NONE,
+                pragma: false,
+            });
             return Ok(Statement::Reset(index));
         }
         let text = match self.name(zone) {
@@ -471,7 +496,7 @@ impl<'a> Transform<'a> {
         let text = self.intern(&text);
         let value = self.push(Expr::Literal { kind: LiteralKind::String, text });
         let index = self.ast.settings.len() as u32;
-        self.ast.settings.push(Setting { name, scope: Scope::Unwritten, value });
+        self.ast.settings.push(Setting { name, scope: Scope::Unwritten, value, pragma: false });
         Ok(Statement::Set(index))
     }
 
@@ -479,7 +504,7 @@ impl<'a> Transform<'a> {
     fn reset_statement(&mut self, node: u32) -> Result<Statement> {
         let (name, scope) = self.setting_name(self.find(node, "SetVariableOrSetting"))?;
         let index = self.ast.settings.len() as u32;
-        self.ast.settings.push(Setting { name, scope, value: NONE });
+        self.ast.settings.push(Setting { name, scope, value: NONE, pragma: false });
         Ok(Statement::Reset(index))
     }
 
@@ -518,7 +543,7 @@ impl<'a> Transform<'a> {
             return self.unsupported(list);
         };
         let index = self.ast.settings.len() as u32;
-        self.ast.settings.push(Setting { name, scope: Scope::Unwritten, value });
+        self.ast.settings.push(Setting { name, scope: Scope::Unwritten, value, pragma: false });
         Ok(Statement::Set(index))
     }
 
@@ -532,14 +557,29 @@ impl<'a> Transform<'a> {
     /// `PRAGMA version()` with empty parentheses is a parser error rather than a call, on both
     /// engines, and that falls out of the grammar here without anything being done about it:
     /// `PragmaParameters` is `Parens(List(Expression))` and a list of no expressions does not match.
+    ///
+    /// The other half of the family is not a query at all. `PRAGMA disable_optimizer` writes a
+    /// setting and returns no rows, so it becomes the [`Statement::Set`] it stands for rather than
+    /// a call, with the name carrying both halves of the assignment and [`is_statement`] deciding
+    /// which of the two a pragma is.
     fn pragma_function(&mut self, node: u32) -> Result<Statement> {
         let interned = self.identifier(self.find(node, "PragmaName"));
         let written = self.ast.string(interned).to_string();
-        let part = self.intern(&format!("pragma_{written}"));
-        let name = self.part_slice(vec![part]);
         // The parameters are optional in the rule, so `PRAGMA version` has no node here at all
         // rather than a node covering nothing.
         let parameters = self.find(node, "PragmaParameters");
+        if parameters == NONE && is_statement(&written) {
+            let index = self.ast.settings.len() as u32;
+            self.ast.settings.push(Setting {
+                name: interned,
+                scope: Scope::Unwritten,
+                value: NONE,
+                pragma: true,
+            });
+            return Ok(Statement::Set(index));
+        }
+        let part = self.intern(&format!("pragma_{written}"));
+        let name = self.part_slice(vec![part]);
         let mut args = Vec::new();
         if parameters != NONE {
             for kid in self.kids(parameters) {
@@ -3538,6 +3578,9 @@ mod tests {
                 }
                 out + &format!(" {}", show_query(&ast, insert.source))
             }
+            Statement::Set(index) if ast.setting(index).pragma => {
+                format!("PRAGMA {}", ast.string(ast.setting(index).name))
+            }
             Statement::Set(index) => {
                 let setting = ast.setting(index);
                 let scope = match setting.scope.keyword() {
@@ -4538,6 +4581,24 @@ mod tests {
         // pragma that does not exist and the pin prints it back as it was typed.
         assert_eq!(round("PRAGMA VERSION"), "SELECT * FROM pragma_VERSION()");
         assert_eq!(round("PRAGMA table_info('t')"), "SELECT * FROM pragma_table_info('t')");
+    }
+
+    #[test]
+    fn a_pragma_that_is_a_statement_stays_one_rather_than_becoming_a_call() {
+        // These write a setting and return no rows, so there is nothing to select from. The name
+        // carries the value as well, and which name means what is decided a layer up.
+        assert_eq!(round_statement("PRAGMA disable_optimizer"), "PRAGMA disable_optimizer");
+        assert_eq!(round_statement("PRAGMA enable_profiling"), "PRAGMA enable_profiling");
+        assert_eq!(round_statement("PRAGMA force_checkpoint"), "PRAGMA force_checkpoint");
+        assert_eq!(round_statement("PRAGMA verify_parallelism"), "PRAGMA verify_parallelism");
+        // A name of the same shape that no engine has gets here too, and the catalog is what turns
+        // it down, so that the sentence about it is the one the catalog says about any pragma.
+        assert_eq!(round_statement("PRAGMA enable_nothing_at_all"), "PRAGMA enable_nothing_at_all");
+        // With parentheses it is a call again, because a pragma that takes an argument returns rows.
+        assert_eq!(
+            round("PRAGMA disable_optimizer('x')"),
+            "SELECT * FROM pragma_disable_optimizer('x')"
+        );
     }
 
     #[test]

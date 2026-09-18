@@ -512,6 +512,30 @@ impl Settings {
         Ok(())
     }
 
+    /// Runs a pragma that is a statement, which is a `SET` with the name and the value in one word.
+    ///
+    /// Nine of the nineteen write nothing, because on the pin they move a flag `duckdb_settings()`
+    /// does not list or they are deprecated and do nothing at all. Those succeed and leave
+    /// everything where it was, which is what the pin does with them.
+    ///
+    /// # Errors
+    ///
+    /// For a name that is not one of the nineteen, in the words the catalog uses for a pragma it
+    /// does not have.
+    pub(crate) fn toggle(&self, name: &str) -> Result<()> {
+        let Some(pragma) = rudb_functions::pragma_named(name) else {
+            return Err(Error::catalog(format!(
+                "Pragma Function with name {name} does not exist!"
+            )));
+        };
+        let Some((setting, value)) = pragma.writes else {
+            return Ok(());
+        };
+        let entry = rudb_functions::setting_named(setting)
+            .expect("a pragma writes a setting the registry has, which its own test checks");
+        self.carry(entry, Some(&Value::Varchar(value.to_string())))
+    }
+
     /// What a setting rudb does not read is at now, which is its default until a statement sets it.
     fn carried(&self, entry: &SettingEntry) -> String {
         let default = match entry.behaviour {
