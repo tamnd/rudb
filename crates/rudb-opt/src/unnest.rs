@@ -13,6 +13,7 @@ use rudb_plan::{
     Plan,
 };
 
+use crate::domain;
 use crate::tables::produced;
 use crate::walk;
 
@@ -53,6 +54,25 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     if let Some(join) = scalar_projection_domain(plan, left, right, kind, conditions) {
         return Some(join);
     }
+    if let Some(join) = scalar_correlated_filter(plan, left, right, kind, conditions) {
+        return Some(join);
+    }
+    domain::lower(plan, left, right, kind, conditions)
+}
+
+/// Turns a correlated filter under a scalar projection into an ordinary join on the keys it reads.
+///
+/// The shape the binder produces for the common correlated subquery, and the plan it gives is the
+/// one an equality join would have been written as by hand. The general rule in [`crate::domain`]
+/// answers the same query and answers it with a domain and a second read of the outer side, so this
+/// is asked first rather than left out.
+fn scalar_correlated_filter(
+    plan: &mut Plan,
+    left: NodeRef,
+    right: NodeRef,
+    kind: JoinKind,
+    conditions: rudb_plan::Slice,
+) -> Option<NodeRef> {
     let Node::Project { input: filtered, index, exprs, names } = *plan.node(right) else {
         return None;
     };

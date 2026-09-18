@@ -14,6 +14,7 @@ pub mod columns;
 pub mod cte;
 pub mod dependent;
 pub mod distinct;
+mod domain;
 pub mod empty;
 pub mod estimate;
 pub mod explain;

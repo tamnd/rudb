@@ -22,7 +22,7 @@
 //!
 //! [`Plan::validate`]: rudb_plan::Plan::validate
 
-use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice};
+use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice, WindowBound};
 
 use crate::fold::VOLATILE;
 
@@ -214,36 +214,117 @@ pub(crate) fn list(
 
 /// Calls `found` for every column `expr` reads.
 pub(crate) fn columns(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ColumnBinding)) {
+    columns_at(plan, expr, &mut |_, binding| found(binding));
+}
+
+/// The same walk, handing back the reference to the column as well as the column.
+///
+/// A pass that has to write one of those columns down somewhere else needs its type and its span,
+/// and the plan records both per expression rather than per binding, so the binding on its own is
+/// not enough to build a second reference to the same column with.
+pub(crate) fn columns_at(
+    plan: &Plan,
+    expr: ExprRef,
+    found: &mut impl FnMut(ExprRef, ColumnBinding),
+) {
     match *plan.expr(expr) {
-        Expr::Column(binding) => found(binding),
+        Expr::Column(binding) => found(expr, binding),
         Expr::Constant(_) => {}
-        Expr::Cast { input, .. } => columns(plan, input, found),
+        Expr::Cast { input, .. } => columns_at(plan, input, found),
         Expr::Compare { left, right, .. } => {
-            columns(plan, left, found);
-            columns(plan, right, found);
+            columns_at(plan, left, found);
+            columns_at(plan, right, found);
         }
         Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
             for &child in plan.expr_list(children) {
-                columns(plan, child, found);
+                columns_at(plan, child, found);
             }
         }
         Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
             for &arg in plan.expr_list(args) {
-                columns(plan, arg, found);
+                columns_at(plan, arg, found);
             }
             if let Some(inner) = filter {
-                columns(plan, inner, found);
+                columns_at(plan, inner, found);
             }
         }
         Expr::Case { arms, otherwise } => {
             for arm in plan.arm_list(arms) {
-                columns(plan, arm.when, found);
-                columns(plan, arm.then, found);
+                columns_at(plan, arm.when, found);
+                columns_at(plan, arm.then, found);
             }
             if let Some(inner) = otherwise {
-                columns(plan, inner, found);
+                columns_at(plan, inner, found);
             }
         }
+    }
+}
+
+/// Calls `found` for every column one node reads, not counting the nodes under it.
+///
+/// The node on its own rather than the subtree, because the pass that wants this is asking where a
+/// column is read rather than whether it is read anywhere, and the walk down is its own business.
+pub(crate) fn node_columns(
+    plan: &Plan,
+    at: NodeRef,
+    found: &mut impl FnMut(ExprRef, ColumnBinding),
+) {
+    match *plan.node(at) {
+        Node::Get { .. }
+        | Node::Dummy
+        | Node::CteScan { .. }
+        | Node::MaterializedCte { .. }
+        | Node::CrossProduct { .. }
+        | Node::SetOp { .. }
+        | Node::Limit { .. } => {}
+        Node::Values { rows, .. } => {
+            for &row in plan.row_list(rows) {
+                each(plan, row, found);
+            }
+        }
+        Node::TableFunction { args, settings, .. } => {
+            each(plan, args, found);
+            each(plan, settings, found);
+        }
+        Node::Filter { predicate, .. } => columns_at(plan, predicate, found),
+        Node::Project { exprs, .. } => each(plan, exprs, found),
+        Node::Aggregate { groups, aggregates, .. } => {
+            each(plan, groups, found);
+            each(plan, aggregates, found);
+        }
+        Node::Window { partition, order, frame, expressions, .. } => {
+            each(plan, partition, found);
+            for key in plan.sort_key_list(order) {
+                columns_at(plan, key.expr, found);
+            }
+            for bound in [frame.start, frame.end] {
+                if let WindowBound::Preceding(offset) | WindowBound::Following(offset) = bound {
+                    columns_at(plan, offset, found);
+                }
+            }
+            each(plan, expressions, found);
+        }
+        Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
+            for key in plan.sort_key_list(keys) {
+                columns_at(plan, key.expr, found);
+            }
+        }
+        Node::Fetch { args, row, .. } => {
+            each(plan, args, found);
+            columns_at(plan, row, found);
+        }
+        Node::TableFetch { row, .. } => columns_at(plan, row, found),
+        Node::Distinct { on, .. } => each(plan, on, found),
+        Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
+            each(plan, conditions, found);
+        }
+    }
+}
+
+/// The same walk over a run of expressions.
+fn each(plan: &Plan, slice: Slice, found: &mut impl FnMut(ExprRef, ColumnBinding)) {
+    for &expr in plan.expr_list(slice) {
+        columns_at(plan, expr, found);
     }
 }
 
