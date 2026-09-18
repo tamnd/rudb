@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.34
+
+A patch release that finishes DuckDB's 13 window function names, answers three ClickBench queries out of the file's directory, and cuts the native directory by a factor of sixty four. The storage format version is unchanged at 9, and there is no version 9 reader for the old native directory layout, which is developer facing and has no file on disk that had to survive it.
+
+- All five value window names answer: `first_value`, `last_value`, `nth_value`, `lag` and `lead`. The first three read the frame and obey its exclusion, the last two read the partition and ignore whatever frame was written around them, and `IGNORE NULLS` makes all five count values rather than rows.
+- `fill` answers, which is the thirteenth name and the only one that reads neither a position nor a row. It reads the straight line through the nearest value on either side of each gap, measured along the sort key rather than by counting rows, so both ends carry the line on rather than flattening out. Its five binder refusals are its own and all of them match the reference binary word for word.
+- Two DuckDB bugs were found in `fill` and both are answered correctly here rather than reproduced. The reference binary extrapolates by putting the smaller of the two values first and negating the distance with it, which turns the line around for any column that falls as the sort key rises and for every descending `ORDER BY`, and it checks the container a DECIMAL is stored in rather than the declared width, so it can put 1997 in a `DECIMAL(3,0)` column. Both are filed against the fork with reproductions.
+- `COUNT(*)`, `COUNT(column)`, `COUNT(DISTINCT column)` on a string, and `MIN` and `MAX` on a string are answered from the native file's directory rather than by reading rows, when the column has no nulls in it. The check runs before the input is built, because a pipeline that exists is a pipeline that runs.
+- The native format splits a stripe into sixty four parts. A part is one appended chunk and stays the scan unit, and a stripe becomes the directory and IO unit, which takes a hundred million rows of the hundred and five column ClickBench table from over seven hundred megabytes of directory to the low tens of megabytes. A sparse fetch reads one index section and then the part it needs rather than a whole page.
+- A native scan asks for eight instances below six hundred thousand rows instead of four, and has no ceiling above that beyond the threads the database was given. Over the million row ClickBench suite that is 188.1ms at sixteen instances against 261.3ms at four.
+- The full gate passes on Rust 1.85.
+
 ## 0.3.33
 
 A patch release that gives a global dictionary its sorted order, so a filter on a string column resolves the literal to a code by binary search instead of comparing values. **The storage format version moves from 8 to 9.** A version 9 reader still opens a version 7 or version 8 file, and a version 8 reader cannot open a version 9 one.
