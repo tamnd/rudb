@@ -47,7 +47,7 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 15;
+const FORMAT: u32 = 16;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -3286,8 +3286,10 @@ impl chooser::Chooser for Codes {
 /// Wider than [`Codes`] because the values are not codes and carry whatever shape the column has.
 /// A timestamp column climbs, so delta is the one that matters and is the reason this exists at
 /// all: three timestamp columns in ClickBench were coming out at exactly eight bytes a row with
-/// nothing asked of them. A column that is one value with a handful of exceptions is sparse. What
-/// is still left out is the dictionary, for the same reason as in [`Codes`]: it is the most
+/// nothing asked of them. The same three columns are why the stride is here, since a timestamp
+/// loaded from a source that recorded whole seconds is microseconds with twenty zero bits under
+/// every value. A column that is one value with a handful of exceptions is sparse. What is still
+/// left out is the dictionary, for the same reason as in [`Codes`]: it is the most
 /// expensive candidate to try and this file already puts the columns that want one through a
 /// dictionary of their own before they ever reach here.
 #[derive(Debug)]
@@ -3320,6 +3322,7 @@ impl chooser::Chooser for Fixed {
                 integer::Kind::Delta,
                 integer::Kind::Rle,
                 integer::Kind::Sparse,
+                integer::Kind::Strided,
             ]
         } else {
             &[integer::Kind::Constant, integer::Kind::Packed, integer::Kind::Delta]
