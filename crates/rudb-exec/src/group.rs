@@ -223,32 +223,30 @@ struct FixedExchange {
 
 #[derive(Debug)]
 struct BigIntDistinctExchange {
-    partitions: Vec<Mutex<BigIntDistinctPartition>>,
+    partitions: Vec<Mutex<BigIntDistinctRuns>>,
     held: Mutex<Vec<Reservation>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct BigIntDistinctRecord {
-    hash: u64,
-    value: i64,
+/// One radix partition's values, as the run each instance handed over rather than one flat run.
+///
+/// An instance that finishes used to append its values onto the shared run, which is a copy of every
+/// value in the table except the first instance's, sixteen megabytes of it on a million rows, done
+/// while holding the partition's lock. Handing the run over instead is a move, so the copy and the
+/// time under the lock both go away, and the pass that counts the distinct values walks the runs one
+/// after another and cannot tell the difference.
+#[derive(Debug, Default)]
+struct BigIntDistinctRuns {
+    runs: Vec<Vec<i64>>,
 }
 
 #[derive(Debug, Default)]
 struct BigIntDistinctPartition {
-    rows: Vec<BigIntDistinctRecord>,
+    rows: Vec<i64>,
 }
 
 impl BigIntDistinctPartition {
-    fn append(&mut self, other: &mut Self) {
-        if self.rows.is_empty() {
-            std::mem::swap(self, other);
-        } else {
-            self.rows.append(&mut other.rows);
-        }
-    }
-
     fn footprint(&self) -> usize {
-        self.rows.capacity() * size_of::<BigIntDistinctRecord>()
+        self.rows.capacity() * size_of::<i64>()
     }
 }
 
@@ -932,7 +930,7 @@ impl<'a> Aggregate<'a> {
     ) -> Result<()> {
         self.bigint_distinct.get_or_init(|| BigIntDistinctExchange {
             partitions: (0..RADIX_PARTITIONS)
-                .map(|_| Mutex::new(BigIntDistinctPartition::default()))
+                .map(|_| Mutex::new(BigIntDistinctRuns::default()))
                 .collect(),
             held: Mutex::new(Vec::new()),
         });
@@ -3290,7 +3288,8 @@ impl Sink for Aggregate<'_> {
                 if rows.rows.is_empty() {
                     continue;
                 }
-                state.partitions[partition].lock().map_err(poisoned)?.append(rows);
+                let run = std::mem::take(&mut rows.rows);
+                state.partitions[partition].lock().map_err(poisoned)?.runs.push(run);
             }
             state.held.lock().map_err(poisoned)?.push(radix_distinct_memory);
             self.built.lock().map_err(poisoned)?.instances += 1;
@@ -3471,7 +3470,12 @@ impl Sink for Aggregate<'_> {
             let input = distinct
                 .partitions
                 .iter()
-                .map(|partition| partition.lock().map(|rows| rows.rows.len()).map_err(poisoned))
+                .map(|partition| {
+                    partition
+                        .lock()
+                        .map(|held| held.runs.iter().map(Vec::len).sum::<usize>())
+                        .map_err(poisoned)
+                })
                 .sum::<Result<usize>>()?;
             let degree = input.div_ceil(65_536).clamp(1, RADIX_PARTITIONS);
             let total = std::thread::scope(|scope| {
@@ -3774,41 +3778,47 @@ fn finish_bigint_distinct(
 ///
 /// The shift leaves exactly the bits that index [`RADIX_PARTITIONS`] of them, so the index is always
 /// in range and the bounds check never fires.
+///
+/// Only the value is kept. The hash it was placed by is four instructions to work out again and
+/// eight bytes a row to carry, and on a million rows those eight bytes are written once, moved once
+/// and read once, so the count that reads them pays for them three times over.
 #[inline]
 fn scatter_bigint(partitions: &mut [BigIntDistinctPartition], shift: u32, value: i64) {
     let hash = spread(mix(0, value as u64));
-    partitions[(hash >> shift) as usize].rows.push(BigIntDistinctRecord { hash, value });
+    partitions[(hash >> shift) as usize].rows.push(value);
 }
 
-fn bigint_distinct_partition(
-    partition: &mut BigIntDistinctPartition,
-    memory: &Memory,
-) -> Result<i64> {
-    const EMPTY: u32 = u32::MAX;
-    let capacity = partition.rows.len().saturating_mul(2).max(64).next_power_of_two();
+/// How many distinct values one radix partition holds, across the runs its instances handed over.
+///
+/// The table is the values themselves with a bit a slot saying which ones are filled, rather than an
+/// index into the run the way it was when there was one run to index. Nothing is moved into place, so
+/// the runs are only ever read.
+fn bigint_distinct_partition(partition: &mut BigIntDistinctRuns, memory: &Memory) -> Result<i64> {
+    let held: usize = partition.runs.iter().map(Vec::len).sum();
+    let capacity = held.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
-    working.grow(width_of(capacity * size_of::<u32>()))?;
-    let mut buckets = vec![EMPTY; capacity];
+    working.grow(width_of(capacity * size_of::<i64>() + capacity.div_ceil(8)))?;
+    let mut slots = vec![0_i64; capacity];
+    let mut filled = vec![0_u64; capacity.div_ceil(64)];
     let mask = capacity - 1;
     let mut unique = 0_usize;
     let timing = stage::Timing::start(Stage::Fold);
-    for source in 0..partition.rows.len() {
-        let row = partition.rows[source];
-        let mut at = row.hash as usize & mask;
-        loop {
-            let slot = buckets[at];
-            if slot == EMPTY {
-                buckets[at] = u32::try_from(unique)
-                    .map_err(|_| Error::out_of_memory("a distinct radix partition is too large"))?;
-                partition.rows[unique] = row;
-                unique += 1;
-                break;
+    for run in &partition.runs {
+        for &value in run {
+            let mut at = spread(mix(0, value as u64)) as usize & mask;
+            loop {
+                let bit = 1_u64 << (at % 64);
+                if filled[at / 64] & bit == 0 {
+                    filled[at / 64] |= bit;
+                    slots[at] = value;
+                    unique += 1;
+                    break;
+                }
+                if slots[at] == value {
+                    break;
+                }
+                at = (at + 1) & mask;
             }
-            let held = partition.rows[slot as usize];
-            if held.hash == row.hash && held.value == row.value {
-                break;
-            }
-            at = (at + 1) & mask;
         }
     }
     timing.stop(0);
@@ -4521,9 +4531,9 @@ mod tests {
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Aggregate, BigIntDistinct, BigIntDistinctPartition, BigIntDistinctRecord, Call,
-        CompactNumeric, Distinct, EncodedCountPartition, EncodedCountRecord, FixedPartition,
-        FixedRecord, bigint_distinct_partition, encoded_count_partition, fixed_partition,
+        Aggregate, BigIntDistinct, BigIntDistinctRuns, Call, CompactNumeric, Distinct,
+        EncodedCountPartition, EncodedCountRecord, FixedPartition, FixedRecord,
+        bigint_distinct_partition, encoded_count_partition, fixed_partition,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -4901,22 +4911,30 @@ mod tests {
     }
 
     #[test]
-    fn a_bigint_radix_partition_counts_unique_values_across_hash_collisions() {
-        let mut partition = BigIntDistinctPartition {
-            rows: vec![
-                BigIntDistinctRecord { hash: 7, value: 11 },
-                BigIntDistinctRecord { hash: 7, value: 12 },
-                BigIntDistinctRecord { hash: 7, value: 11 },
-                BigIntDistinctRecord { hash: 23, value: 13 },
-            ],
-        };
+    fn a_bigint_radix_partition_counts_unique_values_across_the_runs_it_was_handed() {
+        let mut partition =
+            BigIntDistinctRuns { runs: vec![vec![11, 12, 11], vec![13, 11], Vec::new(), vec![12]] };
         assert_eq!(
             bigint_distinct_partition(&mut partition, &Memory::unlimited())
                 .expect("the distinct partition"),
             3,
-            "equal hashes still compare their integer values"
+            "a value counts once however many instances handed it over"
         );
-        assert_eq!(size_of::<BigIntDistinctRecord>(), 16);
+    }
+
+    #[test]
+    fn a_bigint_radix_partition_tells_apart_values_that_probe_past_each_other() {
+        // Enough values to fill the table past the point where a probe walks, which is what checks
+        // that a slot is compared by the value in it and not only by being taken.
+        let mut partition = BigIntDistinctRuns {
+            runs: vec![(0..300).map(i64::from).collect(), (150..450).map(i64::from).collect()],
+        };
+        assert_eq!(
+            bigint_distinct_partition(&mut partition, &Memory::unlimited())
+                .expect("the distinct partition"),
+            450,
+            "four hundred and fifty different values are four hundred and fifty groups"
+        );
     }
 
     #[test]
