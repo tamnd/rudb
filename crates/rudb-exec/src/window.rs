@@ -38,6 +38,7 @@ use std::cmp::Ordering;
 use std::sync::Mutex;
 
 use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Session, Value};
+use rudb_functions::resolve;
 use rudb_kernels::Accumulator;
 use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{
@@ -172,6 +173,32 @@ struct Offsets {
     end: Option<usize>,
 }
 
+/// How to move the current row's order key by a distance, for a `RANGE` end.
+///
+/// A `RANGE` distance is not a count of rows, it is a distance in the values the query ordered by,
+/// so the end of the frame is the place where the key reaches `key + offset` or `key - offset`.
+/// DuckDB works that out by binding the addition as an ordinary call, which is why asking for
+/// `ORDER BY a_varchar RANGE BETWEEN 1 PRECEDING` says there is no `-(VARCHAR, INTEGER_LITERAL)`.
+/// The same resolution happens here, once when the operator is built rather than per row.
+#[derive(Debug, Clone)]
+struct Moved {
+    /// `+` or `-`, which is the direction the sort key runs as much as the word that was written.
+    name: &'static str,
+    /// What the key is cast to before the call, which is what the overload takes.
+    key: LogicalType,
+    /// What the distance is cast to before the call.
+    offset: LogicalType,
+    /// What the call gives back, which is compared against the other rows' keys.
+    returns: LogicalType,
+}
+
+/// Both ends of a `RANGE` frame that was written with a distance.
+#[derive(Debug, Clone, Default)]
+struct Ranged {
+    start: Option<Moved>,
+    end: Option<Moved>,
+}
+
 /// A window node as the plan wrote it, which is everything about the window except its input.
 ///
 /// These five arrive together and are read together, and carrying them as one thing keeps the call
@@ -202,6 +229,7 @@ pub(crate) struct Window {
     calls: Vec<Call>,
     frame: WindowFrame,
     offsets: Offsets,
+    ranged: Ranged,
     /// The input's types followed by one per call, which are the output's.
     types: Vec<LogicalType>,
     schema: Schema,
@@ -249,7 +277,6 @@ impl Window {
         memory: &Memory,
     ) -> Result<(Self, Buffered)> {
         let Written { index, partition, order, frame, expressions } = *written;
-        refuse_unanswerable(frame)?;
         let order = plan.sort_key_list(order).to_vec();
         let mut gathered: Vec<ExprRef> = plan.expr_list(partition).to_vec();
         let partitions = gathered.len();
@@ -309,6 +336,18 @@ impl Window {
         let mut types = input.types();
         types.extend(calls.iter().map(|call| call.returns.clone()));
 
+        // Worked out here rather than per row, because the types are the plan's and do not change
+        // between rows. A `RANGE` end with no distance is the peer group and needs none of this.
+        let ranged = if frame.unit == WindowUnit::Range {
+            let key = order.first().map(|key| plan.expr_type(key.expr).clone());
+            Ranged {
+                start: moved(plan, key.as_ref(), frame.start, &order)?,
+                end: moved(plan, key.as_ref(), frame.end, &order)?,
+            }
+        } else {
+            Ranged::default()
+        };
+
         let out = Buffered::new();
         let window = Self {
             values: Prepared::new(plan, &gathered, input)?,
@@ -318,6 +357,7 @@ impl Window {
             calls,
             frame,
             offsets,
+            ranged,
             types,
             schema,
             memory: memory.clone(),
@@ -356,6 +396,17 @@ impl Window {
     }
 }
 
+/// Whether a distance runs the wrong way, which `RANGE` refuses and `ROWS` and `GROUPS` accept.
+///
+/// `ROWS BETWEEN -1 PRECEDING` is an empty frame upstream and `RANGE BETWEEN -1 PRECEDING` is an
+/// error, which is not an inconsistency: a row count that runs backwards still names a row, and a
+/// distance in values that runs backwards names a frame whose start is past its end in the order
+/// the query asked for. A distance this cannot read as a number is not negative, because the only
+/// distances that are not numbers are intervals and an interval's sign is not one comparison.
+fn negative(offset: &Value) -> bool {
+    offset.as_i64().is_some_and(|written| written < 0)
+}
+
 /// The expression one end of a frame was written with, for the ends that were written as one.
 fn distance(bound: WindowBound) -> Option<ExprRef> {
     match bound {
@@ -364,23 +415,40 @@ fn distance(bound: WindowBound) -> Option<ExprRef> {
     }
 }
 
-/// Says no to the frames this operator cannot answer yet, before any row has been read.
+/// How one end of a `RANGE` frame moves the order key, or `None` when it does not move it at all.
 ///
-/// One gap, and it is the one the milestone keeps as a line of its own. A `RANGE` distance is
-/// measured from the current row's order key, so answering it means adding the distance to that
-/// key, and the key can be a number or a timestamp while the distance can be a number or an
-/// interval. That arithmetic belongs to the scalar kernel and reaching it from here means building
-/// an expression the plan does not contain. `RANGE` with no distance is the default frame and is
-/// answered, because its ends are the peer group and the ends of the partition rather than a
-/// distance from anything.
-fn refuse_unanswerable(frame: WindowFrame) -> Result<()> {
-    if frame.unit != WindowUnit::Range {
-        return Ok(());
-    }
-    if distance(frame.start).is_some() || distance(frame.end).is_some() {
-        return Err(Error::not_implemented("a RANGE frame with an offset"));
-    }
-    Ok(())
+/// The word that was written is only half of the direction. `1 PRECEDING` means a smaller key under
+/// `ORDER BY x` and a larger one under `ORDER BY x DESC`, because preceding means earlier in the
+/// order the query asked for and not smaller. So the sort direction decides the sign and the word
+/// decides whether the direction is followed or reversed.
+fn moved(
+    plan: &Plan,
+    key: Option<&LogicalType>,
+    bound: WindowBound,
+    order: &[SortKey],
+) -> Result<Option<Moved>> {
+    let (offset, back) = match bound {
+        WindowBound::Preceding(offset) => (offset, true),
+        WindowBound::Following(offset) => (offset, false),
+        _ => return Ok(None),
+    };
+    // The binder refuses a `RANGE` distance with anything other than one order key, so a distance
+    // that gets here without one is the binder and this disagreeing rather than a query's mistake.
+    let (Some(key), Some(sort)) = (key, order.first()) else {
+        return Err(Error::internal("a RANGE distance with no single order key"));
+    };
+    let name = if back == sort.descending { "+" } else { "-" };
+    let offset = plan.expr_type(offset).clone();
+    let resolved = resolve(name, &[key.clone(), offset])?;
+    let [key, offset] = resolved.arguments.as_slice() else {
+        return Err(Error::internal("an arithmetic overload that does not take two arguments"));
+    };
+    Ok(Some(Moved {
+        name: resolved.name,
+        key: key.clone(),
+        offset: offset.clone(),
+        returns: resolved.returns,
+    }))
 }
 
 impl Sink for Window {
@@ -528,6 +596,11 @@ impl Window {
                 WindowUnit::Rows => at,
                 _ => first_of(peers, peers[at]),
             },
+            WindowBound::Preceding(_) | WindowBound::Following(_)
+                if self.frame.unit == WindowUnit::Range =>
+            {
+                self.reached(rows, peers, at, self.offsets.start, &self.ranged.start, false)?
+            }
             WindowBound::Preceding(_) => {
                 self.away(rows, peers, at, self.offsets.start, true, false)?
             }
@@ -544,6 +617,11 @@ impl Window {
                 WindowUnit::Rows => at + 1,
                 _ => last_of(peers, peers[at]) + 1,
             },
+            WindowBound::Preceding(_) | WindowBound::Following(_)
+                if self.frame.unit == WindowUnit::Range =>
+            {
+                self.reached(rows, peers, at, self.offsets.end, &self.ranged.end, true)?
+            }
             WindowBound::Preceding(_) => {
                 self.away(rows, peers, at, self.offsets.end, true, true)?
             }
@@ -555,6 +633,78 @@ impl Window {
             }
         };
         Ok(from..to.min(last).max(from))
+    }
+
+    /// One end of a `RANGE` frame, as a row number.
+    ///
+    /// The distance is in the values and not in the rows, so this asks where the key would have to
+    /// be and then finds that place. The rows of a partition are already sorted by the one order
+    /// key a `RANGE` distance is allowed to have, so finding it is a binary search rather than a
+    /// walk, which is what keeps a frame that moves with the row off the quadratic path.
+    ///
+    /// A row whose key is null is its own case and not an arithmetic failure. Nulls are all peers
+    /// of each other and there is no distance from a null to anything, so the frame around one is
+    /// the peer group, which is what `CURRENT ROW` would have given.
+    fn reached(
+        &self,
+        rows: &[Windowed],
+        peers: &[usize],
+        at: usize,
+        column: Option<usize>,
+        moved: &Option<Moved>,
+        after: bool,
+    ) -> Result<usize> {
+        let sort = *self
+            .sorting
+            .get(self.partitions)
+            .ok_or_else(|| Error::internal("a RANGE distance with no order key to measure from"))?;
+        let key = &rows[at].0[self.partitions];
+        if key.is_null() {
+            return Ok(if after {
+                last_of(peers, peers[at]) + 1
+            } else {
+                first_of(peers, peers[at])
+            });
+        }
+        let moved =
+            moved.as_ref().ok_or_else(|| Error::internal("a RANGE distance with no arithmetic"))?;
+        let column =
+            column.ok_or_else(|| Error::internal("a frame distance the window did not gather"))?;
+        let offset = &rows[at].0[column];
+        if offset.is_null() {
+            return Err(Error::binder("Window RANGE expressions cannot be NULL"));
+        }
+        if negative(offset) {
+            let written = if after { self.frame.end } else { self.frame.start };
+            let end = match written {
+                WindowBound::Preceding(_) => "PRECEDING",
+                _ => "FOLLOWING",
+            };
+            return Err(Error::out_of_range(format!("Invalid RANGE {end} value")));
+        }
+        let args = [
+            rudb_kernels::cast_value(key, &moved.key, false)?,
+            rudb_kernels::cast_value(offset, &moved.offset, false)?,
+        ];
+        let wanted = rudb_kernels::call_values(moved.name, &args, &moved.returns, None)?;
+        // Half open on both ends: the start is the first row that is not before the place, and the
+        // end is the first row that is past it, so a frame covering nothing comes out empty rather
+        // than inverted.
+        let mut low = 0;
+        let mut high = rows.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let held = &rows[middle].0[self.partitions];
+            let ordering = crate::sort::rank(held, &wanted, sort)?;
+            let before =
+                if after { ordering != Ordering::Greater } else { ordering == Ordering::Less };
+            if before {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low)
     }
 
     /// One end of a frame that was written as a distance, as a row number.
