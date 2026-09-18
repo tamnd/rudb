@@ -47,7 +47,7 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 14;
+const FORMAT: u32 = 15;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -1207,12 +1207,14 @@ impl Writer {
             let offset = self.at;
             self.put(&encoded.index)?;
             self.put(&encoded.ranks)?;
-            self.put(&encoded.payload)?;
-            let length = encoded
-                .index
-                .len()
-                .checked_add(encoded.ranks.len())
-                .and_then(|len| len.checked_add(encoded.payload.len()))
+            for block in &encoded.payload {
+                self.put(block)?;
+            }
+            let payload_len =
+                encoded.payload.iter().try_fold(0_usize, |len, block| len.checked_add(block.len()));
+            let length = payload_len
+                .and_then(|len| len.checked_add(encoded.index.len()))
+                .and_then(|len| len.checked_add(encoded.ranks.len()))
                 .ok_or_else(|| invalid("dictionary page length overflow"))?;
             self.table.dictionaries[index] = Some(Page {
                 offset,
@@ -1375,8 +1377,6 @@ const CACHED_STRIPES_PER_COLUMN: usize = 4;
 /// The sieves of one stripe of one column, once somebody has asked for them.
 type SieveSlot = OnceLock<Arc<Vec<Option<Sieve>>>>;
 
-type CrossingCache = OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>;
-
 #[derive(Debug)]
 struct NativeText {
     file: Arc<File>,
@@ -1397,37 +1397,32 @@ struct NativeText {
     /// and that reader was going to read the payload of this column once per row otherwise.
     code_ranks: OnceLock<Option<Vec<u32>>>,
     payload: u64,
+    /// How many bytes the payload holds once it is decoded, which is what the offsets index into.
     payload_len: usize,
+    /// Where each block of the payload ends in the file, as a byte offset from `payload`. The
+    /// blocks are stored back to back, so a block starts where the one before it ended.
+    ends: Vec<u64>,
     hashes: Vec<u64>,
-    /// The payload, read and kept an extent at a time. See [`TEXT_PAYLOAD_EXTENT`].
-    payload_extents: Vec<OnceLock<Result<Vec<u8>>>>,
-    crossing: Vec<CrossingCache>,
+    /// The payload, read and decoded a block at a time and kept after that.
+    blocks: Vec<OnceLock<Result<Vec<u8>>>>,
 }
 
-const TEXT_PAYLOAD_BLOCK: usize = 64 * 1024;
-
-/// How many blocks are read, allocated and waited on as one.
+/// How many values of a dictionary go in one block of the payload.
 ///
-/// The block is what a checksum covers and it is written into the file, so it cannot move without
-/// the format moving. What a reader does with it can. A scan of a string column ends up wanting
-/// every block, because the codes a part holds are spread over the whole dictionary, and reading
-/// them one at a time made a hundred million row `LIKE` spend more than half its time in the kernel
-/// rather than in the predicate: a pread and a `Vec` per sixty four kilobytes, over a dictionary
-/// that is more than a gigabyte, is twenty thousand of each. Under a poor man's profile of ClickBench
-/// query 21, 58 percent of the samples were in a syscall, 18 percent were in `mprotect` with the
-/// allocator growing the heap by sixty four kilobytes at a time, and 20 percent were threads parked
-/// on a `OnceLock` somebody else was filling.
+/// The block is the unit the string cascade encodes, the unit a checksum covers, and the unit a
+/// reader has to decode to get at a single value, so it is the one number the payload format turns
+/// on. Blocking by values rather than by bytes is what keeps a value out of two blocks at once: the
+/// block holding a code is `code / TEXT_PAYLOAD_VALUES` and nothing has to be stitched.
 ///
-/// Eight blocks is half a megabyte, which is one read, one allocation the allocator takes straight
-/// from `mmap` rather than off the heap, and one wait. The cost is paid by a query that wants a few
-/// values rather than a column of them, which now reads half a megabyte to get at sixty four
-/// kilobytes, and that is what picks the number. Over the queries that go each way, with the scan
-/// being ClickBench query 21 and the few value read being query 34, which takes its answer out of
-/// the frequency page and then looks ten codes up: four blocks is 1.318s and 0.075s, eight is 1.168s
-/// and 0.084s, sixteen is 1.205s and 0.116s. The scan stops improving after eight and the lookup
-/// keeps getting worse.
-const TEXT_PAYLOAD_EXTENT: usize = 8;
-const TEXT_CROSSING_BLOCK: usize = 1024;
+/// A probe on the five ClickBench columns that have a dictionary worth the name, written up on
+/// #347, measured the ratio and the decode speed at 128, 256, 512, 1,024 and 4,096 values. Both get
+/// better all the way up, because front coding and the LZ matcher have more to look back at and
+/// because the per chunk setup is spread over more values. What stops it is the point read: a query
+/// that wants ten values has to decode ten blocks, so the block is what a lookup costs. At 1,024
+/// values a block is between 67 KB and 394 KB decoded across those five columns, and the ratios are
+/// 2.3 to 4.5. Going up to 4,096 buys two to six percent more and makes a block as much as 1.5 MB.
+/// Going down to 512 gives up five to nine percent.
+const TEXT_PAYLOAD_VALUES: usize = 1024;
 
 /// How many entries of a dictionary's sorted order sit in one block that is read and checked as a
 /// unit.
@@ -1444,43 +1439,50 @@ const TEXT_RANK_BLOCK: usize = 512;
 const RANK_ENTRY: usize = size_of::<u64>() + size_of::<u32>();
 
 impl NativeText {
+    /// One block of the payload, read and decoded the first time anything asks for a value in it.
+    ///
+    /// The bytes handed back are the values of the block laid end to end, which is what the offsets
+    /// describe, so a caller slices it with the offsets it already has. Where the block sits in the
+    /// file is the only thing the caller cannot work out for itself, because the stored form is
+    /// shorter than the decoded one and by a different amount in every block.
     fn payload_block(&self, block: usize) -> Result<Option<&[u8]>> {
-        if block >= self.hashes.len() {
-            return Ok(None);
-        }
-        let extent = block / TEXT_PAYLOAD_EXTENT;
-        let Some(slot) = self.payload_extents.get(extent) else { return Ok(None) };
+        let Some(slot) = self.blocks.get(block) else { return Ok(None) };
         let bytes = slot
             .get_or_init(|| {
-                let start = extent
-                    .checked_mul(TEXT_PAYLOAD_EXTENT * TEXT_PAYLOAD_BLOCK)
-                    .ok_or_else(|| invalid("global dictionary block offset overflow"))?;
-                let len = (TEXT_PAYLOAD_EXTENT * TEXT_PAYLOAD_BLOCK).min(
-                    self.payload_len
-                        .checked_sub(start)
-                        .ok_or_else(|| invalid("global dictionary block starts past payload"))?,
-                );
-                let mut bytes = vec![0; len];
-                read_at(&self.file, self.payload + start as u64, &mut bytes)?;
-                // The checksums are per block and stay per block, because they are in the file. The
-                // extent is only how much of the file one read and one allocation cover.
-                for (within, piece) in bytes.chunks(TEXT_PAYLOAD_BLOCK).enumerate() {
-                    if checksum(piece)
-                        != *self
-                            .hashes
-                            .get(extent * TEXT_PAYLOAD_EXTENT + within)
-                            .ok_or_else(|| invalid("global dictionary block has no checksum"))?
-                    {
-                        return Err(invalid("global dictionary payload checksum differs"));
-                    }
+                let start = if block == 0 { 0 } else { self.ends[block - 1] };
+                let end = self.ends[block];
+                let len = end
+                    .checked_sub(start)
+                    .ok_or_else(|| invalid("global dictionary block ends before it starts"))?;
+                let mut stored = vec![
+                    0;
+                    usize::try_from(len).map_err(|_| invalid(
+                        "global dictionary block does not fit in memory"
+                    ))?
+                ];
+                read_at(&self.file, self.payload + start, &mut stored)?;
+                if checksum(&stored) != self.hashes[block] {
+                    return Err(invalid("global dictionary payload checksum differs"));
+                }
+                let first = block * TEXT_PAYLOAD_VALUES;
+                let last = (first + TEXT_PAYLOAD_VALUES).min(self.offsets.len() - 1);
+                let want = (self.offsets[last] - self.offsets[first]) as usize;
+                let values = string::decode(&stored)?;
+                if values.len() != last - first {
+                    return Err(invalid("global dictionary block holds the wrong value count"));
+                }
+                let mut bytes = Vec::with_capacity(want);
+                for value in &values {
+                    bytes.extend_from_slice(value);
+                }
+                if bytes.len() != want {
+                    return Err(invalid("global dictionary block decodes to the wrong length"));
                 }
                 Ok(bytes)
             })
             .as_ref()
             .map_err(Clone::clone)?;
-        let within = (block % TEXT_PAYLOAD_EXTENT) * TEXT_PAYLOAD_BLOCK;
-        let end = (within + TEXT_PAYLOAD_BLOCK).min(bytes.len());
-        Ok(bytes.get(within..end))
+        Ok(Some(bytes.as_slice()))
     }
 
     /// The block of the sorted order that holds `rank`, and where in it that rank sits.
@@ -1539,41 +1541,13 @@ impl TextSource for NativeText {
         if start == end {
             return Ok(Some(&[]));
         }
-        let first = start as usize / TEXT_PAYLOAD_BLOCK;
-        let last = (end as usize - 1) / TEXT_PAYLOAD_BLOCK;
-        if first == last {
-            let Some(block) = self.payload_block(first)? else { return Ok(None) };
-            let within = start as usize % TEXT_PAYLOAD_BLOCK;
-            return Ok(block.get(within..within + (end - start) as usize));
-        }
-        let Some(crossing) = self.crossing.get(index / TEXT_CROSSING_BLOCK) else {
-            return Ok(None);
-        };
-        let block = crossing.get_or_init(|| {
-            (0..TEXT_CROSSING_BLOCK).map(|_| OnceLock::new()).collect::<Vec<_>>().into_boxed_slice()
-        });
-        block[index % TEXT_CROSSING_BLOCK]
-            .get_or_init(|| {
-                let mut bytes = Vec::with_capacity((end - start) as usize);
-                for part in first..=last {
-                    let source = self
-                        .payload_block(part)?
-                        .ok_or_else(|| invalid("global dictionary block is missing"))?;
-                    let from = if part == first { start as usize % TEXT_PAYLOAD_BLOCK } else { 0 };
-                    let to = if part == last {
-                        (end as usize - 1) % TEXT_PAYLOAD_BLOCK + 1
-                    } else {
-                        source.len()
-                    };
-                    bytes.extend_from_slice(source.get(from..to).ok_or_else(|| {
-                        invalid("global dictionary value exceeds its payload block")
-                    })?);
-                }
-                Ok(bytes)
-            })
-            .as_ref()
-            .map(|bytes| Some(bytes.as_slice()))
-            .map_err(Clone::clone)
+        // A block holds a fixed number of values rather than a fixed number of bytes, so the value
+        // is in one block and the only arithmetic is where in it.
+        let block = index / TEXT_PAYLOAD_VALUES;
+        let Some(bytes) = self.payload_block(block)? else { return Ok(None) };
+        let base = self.offsets[block * TEXT_PAYLOAD_VALUES];
+        let within = (start - base) as usize;
+        Ok(bytes.get(within..within + (end - start) as usize))
     }
 
     fn bytes_len_at(&self, index: usize) -> Result<Option<usize>> {
@@ -1662,29 +1636,15 @@ impl TextSource for NativeText {
                 .filter_map(|result| result.as_ref().ok())
                 .map(Vec::capacity)
                 .sum::<usize>()
-            + self.payload_extents.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
+            + self.blocks.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
             + self.hashes.capacity() * size_of::<u64>()
+            + self.ends.capacity() * size_of::<u64>()
             + self
-                .payload_extents
+                .blocks
                 .iter()
                 .filter_map(OnceLock::get)
                 .filter_map(|result| result.as_ref().ok())
                 .map(Vec::capacity)
-                .sum::<usize>()
-            + self.crossing.capacity() * size_of::<CrossingCache>()
-            + self
-                .crossing
-                .iter()
-                .filter_map(OnceLock::get)
-                .map(|block| {
-                    block.len() * size_of::<OnceLock<Result<Vec<u8>>>>()
-                        + block
-                            .iter()
-                            .filter_map(OnceLock::get)
-                            .filter_map(|result| result.as_ref().ok())
-                            .map(Vec::capacity)
-                            .sum::<usize>()
-                })
                 .sum::<usize>()
     }
 }
@@ -3880,7 +3840,9 @@ fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
 struct EncodedDictionary {
     index: Vec<u8>,
     ranks: Vec<u8>,
-    payload: Vec<u8>,
+    /// The payload as the blocks it is written as, kept apart rather than joined because joining
+    /// them is a second copy of a thing that is already gigabytes on the columns that matter.
+    payload: Vec<Vec<u8>>,
 }
 
 /// The first eight bytes of a value as an integer that sorts the way the bytes sort.
@@ -3950,16 +3912,20 @@ fn encode_global_dictionary(
     if order.len() != values {
         return Err(invalid("global dictionary order does not cover its values"));
     }
-    let payload_len = dictionary.payload.len();
-    let blocks = payload_len.div_ceil(TEXT_PAYLOAD_BLOCK);
+    let blocks = values.div_ceil(TEXT_PAYLOAD_VALUES);
+    let payload = encode_payload(&dictionary)?;
+    if payload.len() != blocks {
+        return Err(invalid("global dictionary payload is not the blocks it says it is"));
+    }
     let ranks = encode_ranks(order);
     let rank_blocks = values.div_ceil(TEXT_RANK_BLOCK);
-    let mut index = Vec::with_capacity(12 + (values + 1) * 4 + (blocks + rank_blocks) * 8);
+    let mut index =
+        Vec::with_capacity(12 + (values + 1) * 4 + (blocks * 2 + rank_blocks) * 8);
     put_u32(
         &mut index,
         u32::try_from(values).map_err(|_| invalid("global dictionary has too many values"))?,
     );
-    put_u32(&mut index, TEXT_PAYLOAD_BLOCK as u32);
+    put_u32(&mut index, TEXT_PAYLOAD_VALUES as u32);
     put_u32(
         &mut index,
         u32::try_from(blocks).map_err(|_| invalid("global dictionary has too many blocks"))?,
@@ -3967,13 +3933,164 @@ fn encode_global_dictionary(
     for offset in dictionary.offsets {
         put_u32(&mut index, offset);
     }
-    for block in dictionary.payload.chunks(TEXT_PAYLOAD_BLOCK) {
+    // Where each block ends, so a reader can find one. The stored blocks are shorter than the
+    // decoded ones and by a different amount each, so this is the one thing the offsets above no
+    // longer say.
+    let mut at = 0_u64;
+    for block in &payload {
+        at = at
+            .checked_add(block.len() as u64)
+            .ok_or_else(|| invalid("global dictionary payload overflow"))?;
+        put_u64(&mut index, at);
+    }
+    for block in &payload {
         put_u64(&mut index, checksum(block));
     }
     for block in ranks.chunks(TEXT_RANK_BLOCK * RANK_ENTRY) {
         put_u64(&mut index, checksum(block));
     }
-    Ok(EncodedDictionary { index, ranks, payload: dictionary.payload })
+    Ok(EncodedDictionary { index, ranks, payload })
+}
+
+/// How many blocks of the payload the shape is settled on.
+///
+/// Eight blocks is 8,192 values, which is the sample `chooser::Sampled` draws and is that size for
+/// the same reason. They are spread across the dictionary rather than taken off the front, because
+/// a dictionary is in the order values were first seen and the front of it is the first morsel of
+/// the load.
+const PAYLOAD_SAMPLE_BLOCKS: usize = 8;
+
+/// The shapes the payload encoder picks between.
+///
+/// Narrow on purpose. The exhaustive search encodes every candidate at every level and runs at two
+/// to six megabytes a second on this data, which over the twelve gigabytes of dictionary `hits`
+/// carries is about an hour of processor time, so it cannot be what a load does. Each of these
+/// settles the outer level and the one below it, which is where almost all of that hour goes, and
+/// leaves the levels under them to the exhaustive search where the chunks are small enough for it
+/// to cost nothing.
+///
+/// Measured on the five ClickBench columns that have a dictionary worth the name, at 1,024 values a
+/// block, against the exhaustive search over the same blocks:
+///
+/// | column | exhaustive | FRONT then LZ | LZ then FSST | LZ then PLAIN |
+/// |---|---|---|---|---|
+/// | 2 | 2.923 at 4.3 MB/s | 2.587 at 21.2 | 2.593 at 36.1 | 2.538 at 53.6 |
+/// | 13 | 3.093 at 3.1 | 3.029 at 36.4 | 2.921 at 35.7 | 2.770 at 82.9 |
+/// | 14 | 2.330 at 2.1 | 2.283 at 24.3 | 2.213 at 23.5 | 2.113 at 67.6 |
+/// | 39 | 2.459 at 5.3 | 2.147 at 10.6 | 2.145 at 29.3 | 2.088 at 43.1 |
+/// | 56 | 4.694 at 6.3 | 4.381 at 51.0 | 4.172 at 50.6 | 3.983 at 86.8 |
+///
+/// The best of the three per column is 98 percent of the exhaustive ratio for a tenth of the time.
+/// `FSST` and `PLAIN` on their own are in the list as a floor rather than to win. `FSST` is the
+/// right answer for text that does not share prefixes with its neighbours, and `PLAIN` is there so
+/// that a column nothing compresses is found out in the sample and written at a gigabyte a second
+/// rather than searched for an answer that does not exist.
+fn payload_shapes() -> Vec<chooser::Settled> {
+    let integers = vec![integer::Kind::Packed];
+    [
+        vec![string::Kind::Front, string::Kind::Lz],
+        vec![string::Kind::Lz, string::Kind::Fsst],
+        vec![string::Kind::Lz, string::Kind::Plain],
+        vec![string::Kind::Fsst],
+        vec![string::Kind::Plain],
+    ]
+    .into_iter()
+    .map(|strings| chooser::Settled::new(strings, integers.clone()))
+    .collect()
+}
+
+/// The payload as encoded blocks of [`TEXT_PAYLOAD_VALUES`] values each.
+///
+/// Across threads because this is the only part of committing a file that is real work rather than
+/// bookkeeping. The blocks are the same size and cost about the same, so an index each is enough of
+/// a queue and there is nothing to weight the way the numeric synopses are weighted.
+fn encode_payload(dictionary: &GlobalDictionary) -> Result<Vec<Vec<u8>>> {
+    let values = dictionary.offsets.len() - 1;
+    let blocks = values.div_ceil(TEXT_PAYLOAD_VALUES);
+    let run = |block: usize| {
+        let first = block * TEXT_PAYLOAD_VALUES;
+        let last = (first + TEXT_PAYLOAD_VALUES).min(values);
+        (first..last)
+            .map(|value| {
+                let from = dictionary.offsets[value] as usize;
+                let to = dictionary.offsets[value + 1] as usize;
+                &dictionary.payload[from..to]
+            })
+            .collect::<Vec<_>>()
+    };
+    // A dictionary small enough to be the sample is small enough to search in full, and searching
+    // it costs less than deciding not to.
+    let shape = (blocks > PAYLOAD_SAMPLE_BLOCKS).then(|| settle_shape(&run, blocks)).transpose()?;
+    let one = |block: usize| match &shape {
+        Some(shape) => string::encode_with(&run(block), shape),
+        None => string::encode(&run(block)),
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_FREQUENCY_WORKERS)
+        .min(blocks);
+    if workers <= 1 {
+        return (0..blocks).map(one).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let pieces = std::thread::scope(|scope| {
+        (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let block = next.fetch_add(1, Atomic::Relaxed);
+                        if block >= blocks {
+                            break;
+                        }
+                        mine.push((block, one(block)?));
+                    }
+                    Ok(mine)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| {
+                handle.join().map_err(|_| Error::internal("a dictionary encode worker panicked"))?
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    let mut payload = vec![Vec::new(); blocks];
+    for piece in pieces {
+        for (block, bytes) in piece {
+            payload[block] = bytes;
+        }
+    }
+    Ok(payload)
+}
+
+/// Which of [`payload_shapes`] comes out smallest over a sample of the blocks.
+///
+/// Every shape is encoded over the same sample and the smallest wins, which is the exhaustive
+/// search moved up a level: over shapes of a column rather than over candidates of a chunk. The
+/// sample is spread across the dictionary so that the first and last blocks are both in it, because
+/// a dictionary written in first seen order has its common values at the front and its long tail at
+/// the back, and those do not compress alike.
+fn settle_shape<'a>(
+    run: &dyn Fn(usize) -> Vec<&'a [u8]>,
+    blocks: usize,
+) -> Result<chooser::Settled> {
+    let last = blocks - 1;
+    let sample = (0..PAYLOAD_SAMPLE_BLOCKS)
+        .map(|region| run(region * last / (PAYLOAD_SAMPLE_BLOCKS - 1)))
+        .collect::<Vec<_>>();
+    let mut best: Option<(chooser::Settled, usize)> = None;
+    for shape in payload_shapes() {
+        let mut size = 0;
+        for block in &sample {
+            size += string::encode_with(block, &shape)?.len();
+        }
+        if best.as_ref().is_none_or(|(_, smallest)| size < *smallest) {
+            best = Some((shape, size));
+        }
+    }
+    best.map(|(shape, _)| shape)
+        .ok_or_else(|| invalid("no shape applies to a global dictionary payload"))
 }
 
 /// The sorted order laid out the way a reader reads it, in blocks of [`TEXT_RANK_BLOCK`] entries.
@@ -4002,10 +4119,13 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
     let mut header = [0; 12];
     read_at(&file, page.offset, &mut header)?;
     let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
-    let block_size = u32::from_le_bytes(header[4..8].try_into().expect("four bytes")) as usize;
+    let per_block = u32::from_le_bytes(header[4..8].try_into().expect("four bytes")) as usize;
     let blocks = u32::from_le_bytes(header[8..12].try_into().expect("four bytes")) as usize;
-    if block_size != TEXT_PAYLOAD_BLOCK {
+    if per_block != TEXT_PAYLOAD_VALUES {
         return Err(invalid("global dictionary block width differs"));
+    }
+    if blocks != count.div_ceil(TEXT_PAYLOAD_VALUES) {
+        return Err(invalid("global dictionary block count differs from its value count"));
     }
     let offset_len = (count + 1)
         .checked_mul(4)
@@ -4018,9 +4138,12 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
     let rank_blocks = ranks.div_ceil(TEXT_RANK_BLOCK);
     let rank_len =
         ranks.checked_mul(RANK_ENTRY).ok_or_else(|| invalid("global dictionary rank overflow"))?;
+    // Two words a block, one for where it ends in the file and one for its checksum, then one a
+    // rank block.
     let hash_len = blocks
-        .checked_add(rank_blocks)
-        .and_then(|count| count.checked_mul(8))
+        .checked_mul(2)
+        .and_then(|words| words.checked_add(rank_blocks))
+        .and_then(|words| words.checked_mul(8))
         .ok_or_else(|| invalid("global dictionary block count overflow"))?;
     let index_len = 12usize
         .checked_add(offset_len)
@@ -4042,25 +4165,25 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
         .chunks_exact(4)
         .map(|part| u32::from_le_bytes(part.try_into().expect("four bytes")))
         .collect::<Vec<_>>();
-    let mut hashes = index[12 + offset_len..]
+    let mut words = index[12 + offset_len..]
         .chunks_exact(8)
         .map(|part| u64::from_le_bytes(part.try_into().expect("eight bytes")))
         .collect::<Vec<_>>();
+    let mut hashes = words.split_off(blocks);
     let rank_hashes = hashes.split_off(blocks);
-    let payload_len = page.length as usize - body_len;
-    if blocks != payload_len.div_ceil(TEXT_PAYLOAD_BLOCK) {
-        return Err(invalid("global dictionary block count differs from its payload"));
-    }
-    if offsets.first() != Some(&0)
-        || offsets.last().copied().map(|last| last as usize) != Some(payload_len)
-        || offsets.windows(2).any(|pair| pair[0] > pair[1])
+    let ends = words;
+    // The offsets say how long the payload is once it is decoded. The last block end says how much
+    // of the file it takes as stored, and those are two different numbers now.
+    let payload_len = offsets.last().copied().unwrap_or_default() as usize;
+    let stored_len = page.length as usize - body_len;
+    if ends.last().copied().unwrap_or_default() as usize != stored_len
+        || ends.windows(2).any(|pair| pair[0] > pair[1])
     {
+        return Err(invalid("global dictionary blocks do not bound the payload"));
+    }
+    if offsets.first() != Some(&0) || offsets.windows(2).any(|pair| pair[0] > pair[1]) {
         return Err(invalid("global dictionary offsets do not bound the payload"));
     }
-    let payload_extents = (0..payload_len.div_ceil(TEXT_PAYLOAD_BLOCK * TEXT_PAYLOAD_EXTENT))
-        .map(|_| OnceLock::new())
-        .collect();
-    let crossing = (0..count.div_ceil(TEXT_CROSSING_BLOCK)).map(|_| OnceLock::new()).collect();
     Vector::external_text(
         LogicalType::Varchar,
         Arc::new(NativeText {
@@ -4073,9 +4196,9 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
             code_ranks: OnceLock::new(),
             payload: page.offset + body_len as u64,
             payload_len,
+            ends,
             hashes,
-            payload_extents,
-            crossing,
+            blocks: (0..blocks).map(|_| OnceLock::new()).collect(),
         }),
     )
 }
@@ -5177,15 +5300,15 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A payload that spans more than one extent still reads and checks every block of it.
+    /// A payload of many blocks reads and checks every block of it.
     ///
-    /// The test above has a dictionary of three values, so it says nothing about the grouping a
-    /// reader does over the blocks the checksums are written for. This one is over a megabyte,
-    /// which is more than one extent, and it reads a value out of the first extent and a value out
-    /// of the last and then damages the last and asks for it again.
+    /// The test above has a dictionary of three values, which is one block, so it says nothing
+    /// about a reader finding the right block among many. This one has thirty thousand values,
+    /// which is thirty blocks, and it reads a value out of the first block and a value out of the
+    /// last and then damages the last and asks for it again.
     #[test]
-    fn a_dictionary_over_one_extent_checks_every_block_of_it() {
-        let path = path("dictionary-extents");
+    fn a_dictionary_over_many_blocks_checks_every_block_of_it() {
+        let path = path("dictionary-blocks");
         let value =
             |row: usize| format!("{row:07} a value long enough to be worth a payload block");
         let parts = 30;
@@ -5208,8 +5331,8 @@ mod tests {
         let reader = Reader::open(&path).expect("reopen from disk");
         let dictionary = reader.table.dictionaries[0].expect("string dictionary page");
         assert!(
-            dictionary.length as usize > TEXT_PAYLOAD_BLOCK * TEXT_PAYLOAD_EXTENT,
-            "the dictionary has to be over one extent for this to be testing anything"
+            parts * per_part > TEXT_PAYLOAD_VALUES * 4,
+            "the dictionary has to be several blocks for this to be testing anything"
         );
         for part in [0, parts - 1] {
             let chunk = reader.read(part, &[0]).expect("a part");
