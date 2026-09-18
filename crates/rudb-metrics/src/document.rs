@@ -9,7 +9,7 @@
 //! purpose: this is the shape the numbers are reported in, and the code that produces them is the
 //! instrumentation shim that sits around the push operators.
 
-use rudb_common::stat::{Class, Classes};
+use rudb_common::stat::{Class, Classes, Provenance};
 use rudb_common::{Spent, Tally};
 
 use crate::SCHEMA;
@@ -200,6 +200,10 @@ impl Document {
                     out.maybe_words(
                         "estimate_class",
                         operator.estimate_class.map(|class| class.to_string()).as_deref(),
+                    );
+                    out.maybe_words(
+                        "estimate_provenance",
+                        operator.estimate_provenance.map(|from| from.to_string()).as_deref(),
                     );
                     out.count("wall_ns", operator.wall_ns);
                     out.count("cpu_ns", operator.cpu_ns);
@@ -566,6 +570,14 @@ pub struct Operator {
     /// had a number here. The two always agree, and they are two fields rather than one because a
     /// reader that wants the count should not have to parse a word to get it.
     pub estimate_class: Option<Class>,
+    /// Where that number came from, when there was one.
+    ///
+    /// A third field rather than a word inside the class, because an exact count out of the catalog
+    /// and an exact join cardinality out of a link header are different kinds of exact and a reader
+    /// chasing a bad plan has to be able to tell them apart. `spec/stats/02-the-catalogue.md`
+    /// section 2.1.1. `default` is the one to search for, since it means nobody had a number at
+    /// that operator at all.
+    pub estimate_provenance: Option<Provenance>,
     /// Wall time inside it.
     pub wall_ns: u64,
     /// CPU time inside it, across every instance.
@@ -636,6 +648,7 @@ impl Operator {
             rows_out: 0,
             estimated_rows: None,
             estimate_class: None,
+            estimate_provenance: None,
             wall_ns: 0,
             cpu_ns: 0,
             bytes_read: 0,
@@ -668,7 +681,7 @@ pub struct Memory {
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::stat::{Class, Source};
+    use rudb_common::stat::{Class, Direction, Provenance};
     use rudb_common::{Cause, Spent, Stage, Tally};
 
     use super::{Document, Engine, Implementation, Machine, Operator, Outcome, Pipeline, Strategy};
@@ -726,6 +739,7 @@ mod tests {
         read.rows_out = 99_997_497;
         read.estimated_rows = Some(99_997_497);
         read.estimate_class = Some(Class::Exact);
+        read.estimate_provenance = Some(Provenance::RowCount);
         read.wall_ns = 620_000_000;
         read.cpu_ns = 4_800_000_000;
         read.bytes_read = 1_420_000_000;
@@ -740,7 +754,8 @@ mod tests {
         group.rows_in = 99_997_497;
         group.rows_out = 41_983_110;
         group.estimated_rows = Some(2_400_000);
-        group.estimate_class = Some(Class::Estimated { source: Source::Constant });
+        group.estimate_class = Some(Class::Estimated);
+        group.estimate_provenance = Some(Provenance::Default);
         group.wall_ns = 360_000_000;
         group.cpu_ns = 2_800_000_000;
         group.memory.high_water = 894_000_000;
@@ -755,7 +770,8 @@ mod tests {
         sort.rows_in = 41_983_110;
         sort.rows_out = 10;
         sort.estimated_rows = Some(10);
-        sort.estimate_class = Some(Class::Certified { bound: 1.0 });
+        sort.estimate_class = Some(Class::Certified { bound: 1.0, direction: Direction::AtMost });
+        sort.estimate_provenance = Some(Provenance::Default);
         sort.wall_ns = 343_000_000;
         sort.cpu_ns = 2_280_000_000;
         sort.bytes_spilled = 12_000_000;
