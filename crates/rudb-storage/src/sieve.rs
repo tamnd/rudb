@@ -38,6 +38,11 @@
 //! keeping one per chunk rather than one per stripe: the finer one skips sixty four times more
 //! precisely for the same space, and the only thing the extra granularity costs is the directory
 //! entries pointing at them.
+//!
+//! The values are counted rather than assumed, which on a real table is most of what this costs. A
+//! column of identifiers holds a distinct value in every row and the two numbers are the same, but
+//! `hits` has a dozen columns of timings holding a few dozen distinct numbers in every thousand
+//! rows, and a filter sized for their rows is twenty times the filter sized for their values.
 
 use rudb_common::LogicalType;
 use rudb_common::bounds::Bound;
@@ -135,17 +140,33 @@ impl Sieve {
         if rows == 0 {
             return None;
         }
-        let mut sieve = match dense(range) {
-            Some(dense) => Self::Dense(dense),
-            None => Self::Blocked(blocked(distinct_bound(vector).min(rows), budget)?),
-        };
-        if !fill(vector, &mut sieve) {
-            return None;
+        if let Some(dense) = dense(range) {
+            let mut sieve = Self::Dense(dense);
+            if !fill(vector, &mut sieve) {
+                return None;
+            }
+            if !sieve.worth_keeping() {
+                return None;
+            }
+            return Some(sieve);
         }
-        if !sieve.worth_keeping() {
-            return None;
+        // A filter is sized for the values it holds and not for the rows it was handed. The two are
+        // the same on a column of identifiers and nowhere near it on a column of timings, where a
+        // thousand rows are forty distinct numbers, and the difference is a whole 8 KiB page against
+        // fifty bytes. Nothing cheaper than the values themselves answers this: a flat vector knows
+        // its length and nothing else, and the encoder that does count them runs after this.
+        //
+        // So the hashes are taken first, sorted and deduplicated, and the filter is sized from what
+        // is left and filled from it. The pass over the vector is the one `fill` would have made, and
+        // the sort is the price, which is a thousand integers already in a buffer.
+        let mut hashes = hashes(vector)?;
+        hashes.sort_unstable();
+        hashes.dedup();
+        let mut filter = blocked(hashes.len(), budget)?;
+        for hash in &hashes {
+            filter.add(*hash);
         }
-        Some(sieve)
+        Some(Self::Blocked(filter))
     }
 
     /// Whether this sieve rules out enough to be worth the bytes it takes.
@@ -396,6 +417,9 @@ fn dense(range: &Range) -> Option<Dense> {
 
 /// The blocked filter `values` distinct entries get inside `budget` bytes, or `None` when the budget
 /// leaves it too little to be worth keeping.
+///
+/// `values` is the count the caller took, so the smallest filter here is one block for a stretch
+/// holding up to fifty one values, which is 64 bytes of words and 69 on disk.
 fn blocked(values: usize, budget: usize) -> Option<Blocked> {
     let wanted = values.checked_mul(BITS_PER_VALUE)?.div_ceil(BLOCK_BITS).max(1);
     let blocks = wanted.min(budget / (BLOCK_WORDS * 8));
@@ -405,20 +429,34 @@ fn blocked(values: usize, budget: usize) -> Option<Blocked> {
     Some(Blocked { words: vec![0; blocks.checked_mul(BLOCK_WORDS)?] })
 }
 
-/// How many distinct values a column could hold, from the form it arrived in.
+/// The hash of every value the stretch holds, or `None` when a row cannot be read.
 ///
-/// A dictionary and a run encoding both name their values once, so a column of two thousand rows
-/// over a dictionary of nine is nine values and not two thousand, and sizing a filter for the rows
-/// would spend two hundred times the bytes it needs. Anything else answers with the rows, which is
-/// the bound every column has.
-fn distinct_bound(vector: &Vector) -> usize {
-    if let Some((_, values)) = vector.dictionary_parts() {
-        return values.len();
+/// The same three readers as [`fill`] in the same order and for the same reasons, and the same
+/// answer to a row none of them can read. It exists beside `fill` rather than inside it because a
+/// blocked filter has to know how many distinct values it is sizing for before there is anywhere to
+/// put them, and a second pass over the column to find out would cost more than the bytes it saves.
+fn hashes(vector: &Vector) -> Option<Vec<u64>> {
+    let nullable = vector.validity().has_nulls(vector.len());
+    let mut hashes = Vec::with_capacity(vector.len());
+    for row in 0..vector.len() {
+        if nullable && vector.is_null_at(row) {
+            continue;
+        }
+        if let Some(number) = vector.signed_at(row) {
+            hashes.push(hash_int(number));
+            continue;
+        }
+        if let Some(bytes) = vector.bytes_at(row) {
+            hashes.push(hash_bytes(bytes));
+            continue;
+        }
+        match Bound::of_value(&vector.value_at(row)) {
+            Some(Bound::Int(number)) => hashes.push(hash_int(number)),
+            Some(Bound::Bytes(bytes)) => hashes.push(hash_bytes(&bytes)),
+            Some(Bound::Real(_)) | None => return None,
+        }
     }
-    match vector.run_parts() {
-        Some((_, values)) => values.len(),
-        None => vector.len(),
-    }
+    Some(hashes)
 }
 
 /// Puts every value of `vector` into `sieve`, answering whether it could read all of them.
@@ -658,6 +696,30 @@ mod tests {
         assert_eq!(blocked.words.len(), BLOCK_WORDS, "two values fit in one block");
         assert!(!sieve.excludes(&int(1 << 40)));
         assert!(!sieve.excludes(&int(1 << 41)));
+    }
+
+    /// A flat column is sized by its values too, which is the case the dictionary one hides.
+    ///
+    /// A dictionary vector says how many values it holds in its shape, and the column this is really
+    /// about does not. A thousand rows over forty distinct timings arrive as a flat vector of a
+    /// thousand numbers, and sizing the filter for the length spends 1,285 bytes where sixty four
+    /// hold everything there is. That is a dozen columns of `hits` and most of what the filters cost.
+    #[test]
+    fn a_flat_column_is_sized_by_its_values_and_not_by_its_rows() {
+        let held: Vec<Value> =
+            (0..1024_i64).map(|row| Value::BigInt((row % 40).wrapping_mul(982_451_653))).collect();
+        let sieve = sieve_of(LogicalType::BigInt, &held).expect("a sieve");
+        let Sieve::Blocked(blocked) = &sieve else { panic!("a wide range is a filter") };
+        assert_eq!(blocked.words.len(), BLOCK_WORDS, "forty values fit in one block");
+        for value in &held {
+            let Value::BigInt(number) = value else { panic!("a big integer") };
+            assert!(!sieve.excludes(&int(i128::from(*number))), "value {number} was given");
+        }
+        // One block of 512 bits holding forty values is about a percent of false positives, so this
+        // asks that nearly all of a hundred it never saw are ruled out rather than all of them.
+        let absent = (0..100_i64).map(|n| i128::from(n.wrapping_mul(982_451_653)) + 1);
+        let kept = absent.filter(|number| !sieve.excludes(&int(*number))).count();
+        assert!(kept < 10, "a filter of one block kept {kept} of 100 values it never saw");
     }
 
     #[test]
