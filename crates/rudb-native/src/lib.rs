@@ -33,8 +33,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::Mutex;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::bounds::Bound;
 use rudb_common::{Error, Field, LogicalType, Result, Value};
@@ -888,7 +888,10 @@ pub struct Reader {
     dictionaries: Arc<Vec<OnceLock<Arc<Vector>>>>,
     /// Which stripe and which part of it every part of the table is, by table wide part number.
     places: Arc<Vec<Place>>,
-    cache: Arc<Vec<Mutex<Vec<CachedColumn>>>>,
+    cache: Arc<Vec<Mutex<Cached>>>,
+    /// How many whole stripe pages have been read, which is what the sharing above is judged on. A
+    /// scan of a column should read each of its stripes once however many workers it has.
+    pages: Arc<AtomicUsize>,
 }
 
 /// Where one table wide part number lands.
@@ -919,12 +922,23 @@ struct CachedColumn {
     page: Option<Arc<Vec<u8>>>,
 }
 
+/// One column's stripes a reader holds, and which of them somebody is reading right now.
+///
+/// The second list is what keeps a scan from reading the same page once per worker. It is a list
+/// and not a set because it holds at most one stripe per worker on the column and is walked far
+/// less often than a hash of it would be built.
+#[derive(Debug, Default)]
+struct Cached {
+    pages: Vec<CachedColumn>,
+    loading: Vec<usize>,
+}
+
 /// Stripes of one column a reader keeps the bytes of.
 ///
-/// Every live scan instance is somewhere different in the table, so this has to hold at least as
-/// many stripes as there are workers on a column or the workers evict each other's pages and read
-/// them again. It also multiplies by the page size, which is a quarter of a megabyte for a four
-/// byte column, and by the number of columns a query touches.
+/// This has to hold at least as many stripes as a column has workers straddling a stripe boundary
+/// at once, or the workers evict each other's pages and read them again. Parts are handed out in
+/// order so that is a small number. It multiplies by the page size, which is a quarter of a
+/// megabyte for a four byte column, and by the number of columns a query touches.
 const CACHED_STRIPES_PER_COLUMN: usize = 4;
 
 type CrossingCache = OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>;
@@ -1228,6 +1242,25 @@ fn part_bytes(page: &[u8], span: PartSpan) -> Result<&[u8]> {
     page.get(span.start..end).ok_or_else(|| invalid("part exceeds its column page"))
 }
 
+/// Puts one stripe of one column in the cache, dropping the stripe that has been there longest.
+fn remember(cached: &mut Cached, held: &CachedColumn) {
+    match cached.pages.iter().position(|page| page.stripe == held.stripe) {
+        // An index only read and a page read can both be in flight over the same stripe, and
+        // letting the first land on top of the second would throw away a page somebody read.
+        Some(found) => {
+            if held.page.is_some() || cached.pages[found].page.is_none() {
+                cached.pages[found] = held.clone();
+            }
+        }
+        None => {
+            if cached.pages.len() == CACHED_STRIPES_PER_COLUMN {
+                cached.pages.remove(0);
+            }
+            cached.pages.push(held.clone());
+        }
+    }
+}
+
 impl Reader {
     /// Opens the highest valid directory slot.
     ///
@@ -1271,15 +1304,15 @@ impl Reader {
         let table = decode_directory(&bytes, size)?;
         let places = places(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
-        let cache = (0..table.fields.len())
-            .map(|_| Mutex::new(Vec::with_capacity(CACHED_STRIPES_PER_COLUMN)))
-            .collect::<Vec<_>>();
+        let cache =
+            (0..table.fields.len()).map(|_| Mutex::new(Cached::default())).collect::<Vec<_>>();
         Ok(Self {
             file: Arc::new(file),
             table: Arc::new(table),
             dictionaries: Arc::new(dictionaries),
             places: Arc::new(places),
             cache: Arc::new(cache),
+            pages: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1575,22 +1608,67 @@ impl Reader {
 
     /// The page index of one column of one stripe, and its page when the caller wants all of it.
     ///
-    /// The file is never read under the lock. Two workers that want the same page at the same time
-    /// can both read it, and the second one to finish finds the first one's copy and drops its own,
-    /// which costs one duplicated read and never costs a worker a wait.
+    /// A scan hands parts out in order, so every worker on a column crosses into a new stripe within
+    /// a few parts of the others and they all want the same page at the same moment. This used to
+    /// let all of them read it, which cost the scan as many copies of every page as it had workers.
+    /// On the full ClickBench file a `MIN(EventDate), MAX(EventDate)` moved 3.2 GB off the disk to
+    /// look at 400 MB of column.
+    ///
+    /// A worker that finds the page it wants already being read neither waits for it nor reads it
+    /// again. It comes back with the index alone, which sends [`Reader::read_impl`] down the path
+    /// that reads the one part it came for, a few kilobytes against a quarter of a megabyte, and it
+    /// picks the page up from the cache on its next part. Waiting would be the other way to avoid
+    /// the duplicate read and it is worse: the pages that matter are the wide string ones, they take
+    /// milliseconds to copy even warm, and every other worker would be stopped for all of it.
+    ///
+    /// The file is never read under the lock.
     fn held(&self, at: usize, stripe: &Stripe, column: usize, whole: bool) -> Result<CachedColumn> {
         let cache = self.cache.get(column).ok_or_else(|| invalid("column index out of range"))?;
-        let found = {
-            let held = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
-            held.iter().find(|held| held.stripe == at).cloned()
-        };
-        if let Some(found) = found {
+        let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
+        let found = cached.pages.iter().find(|held| held.stripe == at).cloned();
+        if let Some(found) = found.clone() {
             if !whole || found.page.is_some() {
                 return Ok(found);
             }
         }
+        if cached.loading.contains(&at) {
+            drop(cached);
+            if let Some(found) = found {
+                return Ok(found);
+            }
+            let held = self.page_of(stripe, column, at, false)?;
+            let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
+            remember(&mut cached, &held);
+            return Ok(held);
+        }
+        cached.loading.push(at);
+        drop(cached);
+
+        let read = self.page_of(stripe, column, at, whole);
+
+        // The stripe leaves the loading list and its page enters the cache under one lock. Doing
+        // them separately would leave a moment where another worker sees neither and reads the
+        // page a second time, which is the whole thing this is here to stop.
+        let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
+        if let Some(position) = cached.loading.iter().position(|loading| *loading == at) {
+            cached.loading.remove(position);
+        }
+        let held = read?;
+        remember(&mut cached, &held);
+        Ok(held)
+    }
+
+    /// Reads one stripe's index for a column, and its page when the caller wants all of it.
+    fn page_of(
+        &self,
+        stripe: &Stripe,
+        column: usize,
+        at: usize,
+        whole: bool,
+    ) -> Result<CachedColumn> {
         let index = Arc::new(read_index(&self.file, stripe, column)?);
         let page = if whole {
+            self.pages.fetch_add(1, Atomic::Relaxed);
             let span = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
             let mut bytes = vec![0; span.length as usize];
             read_at(&self.file, span.offset, &mut bytes)?;
@@ -1598,18 +1676,7 @@ impl Reader {
         } else {
             None
         };
-        let held = CachedColumn { stripe: at, index, page };
-        let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
-        match cached.iter().position(|held| held.stripe == at) {
-            Some(found) => cached[found] = held.clone(),
-            None => {
-                if cached.len() == CACHED_STRIPES_PER_COLUMN {
-                    cached.remove(0);
-                }
-                cached.push(held.clone());
-            }
-        }
-        Ok(held)
+        Ok(CachedColumn { stripe: at, index, page })
     }
 
     fn read_impl(&self, at: usize, columns: &[usize], whole: bool) -> Result<Chunk> {
@@ -3118,6 +3185,57 @@ mod tests {
         let above = [Probe { column: 0, op: Op::Greater, value: Bound::Int(100) }];
         assert!(reader.skips(0, &above), "the first stripe stops at 63");
         assert!(!reader.skips(STRIPE_PARTS * 2, &above), "the third stripe reaches 130");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Eight workers over one stripe read it once between them.
+    ///
+    /// This is the shape a scan actually has. Parts are handed out in order, so every worker on a
+    /// column crosses into a stripe within a few parts of the others, and before [`Reader::held`]
+    /// started sharing the read every one of them read the whole page. On the full ClickBench file
+    /// that was a `MIN(EventDate), MAX(EventDate)` moving 3.2 GB off the disk to look at 400 MB of
+    /// column, which is most of what a first touch costs.
+    ///
+    /// The workers that lose the race still answer, out of the part reads they do instead, which is
+    /// what the values below are checking.
+    #[test]
+    fn workers_that_want_the_same_stripe_read_it_once() {
+        let path = path("single-flight");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        for part in 0..STRIPE_PARTS {
+            let id = part as i32;
+            let chunk = Chunk::new(vec![
+                Vector::from_values(
+                    LogicalType::Integer,
+                    &[Value::Integer(id), Value::Integer(-id)],
+                )
+                .expect("integers"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        assert_eq!(reader.table().stripes().len(), 1, "one stripe is the point of the test");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let reader = &reader;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for part in (worker..STRIPE_PARTS).step_by(8) {
+                        let chunk = reader.read(part, &[0]).expect("a whole page read");
+                        assert_eq!(chunk.value_at(0, 0), Value::Integer(part as i32));
+                        assert_eq!(chunk.value_at(1, 0), Value::Integer(-(part as i32)));
+                    }
+                });
+            }
+        });
+        assert_eq!(reader.pages.load(Atomic::Relaxed), 1, "one stripe, one page read, whoever won");
         fs::remove_file(path).expect("remove scratch file");
     }
 
