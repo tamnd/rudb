@@ -324,6 +324,28 @@ impl Rows {
         }
     }
 
+    /// The parts of each stripe, in the same numbering [`Self::read`] takes.
+    ///
+    /// Empty for an in memory table, which has chunks and no stripes. A scan uses it to hand a
+    /// whole stripe to one worker instead of handing its parts to whoever asks first.
+    #[must_use]
+    pub fn stripe_parts(&self) -> Vec<std::ops::Range<usize>> {
+        match self {
+            Self::Memory(_) => Vec::new(),
+            Self::Native(reader) => reader.stripe_parts(),
+        }
+    }
+
+    /// Asks a native reader to keep `stripes` stripes of every column it reads.
+    ///
+    /// Nothing for an in memory table, which holds all of its chunks anyway.
+    pub fn keep_stripes(&self, stripes: usize) {
+        match self {
+            Self::Memory(_) => {}
+            Self::Native(reader) => reader.keep_stripes(stripes),
+        }
+    }
+
     /// Reads only projected columns.
     pub fn read(&self, at: usize, columns: &[usize]) -> Result<Chunk> {
         match self {

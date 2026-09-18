@@ -28,7 +28,7 @@
 #![forbid(unsafe_code)]
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
@@ -938,6 +938,9 @@ pub struct Reader {
     /// How many index sections have been read. A scan of a column should read each of its stripes
     /// once here too, and the test that says so is the only thing keeping it that way.
     indexes: Arc<AtomicUsize>,
+    /// How many stripes of one column the page cache keeps. See [`CACHED_STRIPES_PER_COLUMN`] for
+    /// what sets it and [`Reader::keep_stripes`] for who raises it.
+    kept: Arc<AtomicUsize>,
 }
 
 /// Where one table wide part number lands.
@@ -970,28 +973,42 @@ struct CachedColumn {
 
 /// One column's stripes a reader holds, and which of them somebody is reading right now.
 ///
-/// The second list is what keeps a scan from reading the same page once per worker. It is a list
-/// and not a set because it holds at most one stripe per worker on the column and is walked far
-/// less often than a hash of it would be built.
+/// The pages are one slot per stripe of the table rather than a list of the ones being kept, so
+/// finding a page is an index and not a walk. That matters because the walk happened under the
+/// lock, once per part per column, and a scan that gives a whole stripe to each of thirty two
+/// workers keeps enough pages that walking them was the longest thing the lock was held for. The
+/// slots cost a pointer per stripe per column, which on the ClickBench file is eight kilobytes
+/// against the forty megabytes of pages they point at. `order` is which of them are filled, oldest
+/// first, because that is the one thing the slots cannot say by themselves.
 ///
-/// The third is every index this reader has ever read for the column, one slot per stripe, and it
-/// is never evicted. An index is a few hundred bytes and a page is a quarter of a megabyte, so the
-/// two do not belong under the same budget. Riding in the page cache meant a worker that came back
-/// to a stripe after its page had been evicted read the index again with it, which on the full
+/// `loading` is what keeps a scan from reading the same page once per worker. It is a list and not
+/// a set because it holds at most one stripe per worker on the column and is walked far less often
+/// than a hash of it would be built.
+///
+/// `index` is every index this reader has ever read for the column, one slot per stripe, and it is
+/// never evicted. An index is a few hundred bytes and a page is a quarter of a megabyte, so the two
+/// do not belong under the same budget. Riding in the page cache meant a worker that came back to a
+/// stripe after its page had been evicted read the index again with it, which on the full
 /// ClickBench file was about thirteen hundred reads out of a hundred and fourteen thousand.
 #[derive(Debug, Default)]
 struct Cached {
-    pages: Vec<CachedColumn>,
+    pages: Vec<Option<Arc<Vec<u8>>>>,
+    order: VecDeque<usize>,
     loading: Vec<usize>,
     index: Vec<Option<Arc<Vec<PartSpan>>>>,
 }
 
-/// Stripes of one column a reader keeps the bytes of.
+/// Stripes of one column a reader keeps the bytes of, when nobody has asked for more.
 ///
-/// This has to hold at least as many stripes as a column has workers straddling a stripe boundary
-/// at once, or the workers evict each other's pages and read them again. Parts are handed out in
-/// order so that is a small number. It multiplies by the page size, which is a quarter of a
-/// megabyte for a four byte column, and by the number of columns a query touches.
+/// This has to hold at least as many stripes as a column has workers in it at once, or the workers
+/// evict each other's pages and read them again. Four is what a scan that hands parts out in order
+/// needs, because then every worker is within a few parts of every other and at most a couple of
+/// stripes are open at a time. A scan that hands a whole stripe to each worker has one stripe open
+/// per worker for the length of that stripe, and it says so with [`Reader::keep_stripes`] rather
+/// than paying for sixteen slots on every table that is read one part at a time.
+///
+/// It multiplies by the page size, which is a quarter of a megabyte for a four byte column, and by
+/// the number of columns a query touches.
 const CACHED_STRIPES_PER_COLUMN: usize = 4;
 
 /// The sieves of one stripe of one column, once somebody has asked for them.
@@ -1334,26 +1351,24 @@ fn part_bytes(page: &[u8], span: PartSpan) -> Result<&[u8]> {
 
 /// Puts one stripe of one column in the cache, dropping the stripe that has been there longest.
 ///
-/// The index goes in its own slot and stays. Only the page is under the budget.
-fn remember(cached: &mut Cached, held: &CachedColumn) {
+/// The index goes in its own slot and stays. Only the page is under the budget, and `kept` is how
+/// many pages that budget is.
+fn remember(cached: &mut Cached, held: &CachedColumn, kept: usize) {
     if let Some(slot) = cached.index.get_mut(held.stripe) {
         if slot.is_none() {
             *slot = Some(Arc::clone(&held.index));
         }
     }
-    match cached.pages.iter().position(|page| page.stripe == held.stripe) {
-        // An index only read and a page read can both be in flight over the same stripe, and
-        // letting the first land on top of the second would throw away a page somebody read.
-        Some(found) => {
-            if held.page.is_some() || cached.pages[found].page.is_none() {
-                cached.pages[found] = held.clone();
-            }
-        }
-        None => {
-            if cached.pages.len() == CACHED_STRIPES_PER_COLUMN {
-                cached.pages.remove(0);
-            }
-            cached.pages.push(held.clone());
+    let Some(page) = held.page.clone() else { return };
+    let Some(slot) = cached.pages.get_mut(held.stripe) else { return };
+    if slot.is_none() {
+        cached.order.push_back(held.stripe);
+    }
+    *slot = Some(page);
+    while cached.order.len() > kept.max(1) {
+        let Some(oldest) = cached.order.pop_front() else { break };
+        if let Some(slot) = cached.pages.get_mut(oldest) {
+            *slot = None;
         }
     }
 }
@@ -1405,6 +1420,7 @@ impl Reader {
         let cache = (0..table.fields.len())
             .map(|_| {
                 Mutex::new(Cached {
+                    pages: (0..stripes).map(|_| None).collect(),
                     index: (0..stripes).map(|_| None).collect(),
                     ..Cached::default()
                 })
@@ -1422,6 +1438,7 @@ impl Reader {
             cache: Arc::new(cache),
             pages: Arc::new(AtomicUsize::new(0)),
             indexes: Arc::new(AtomicUsize::new(0)),
+            kept: Arc::new(AtomicUsize::new(CACHED_STRIPES_PER_COLUMN)),
         })
     }
 
@@ -1429,6 +1446,34 @@ impl Reader {
     #[must_use]
     pub fn parts(&self) -> usize {
         self.places.len()
+    }
+
+    /// The parts of each stripe, in table wide part numbers.
+    ///
+    /// A scan that wants one worker to own the page it reads hands work out in these runs. The
+    /// stripes are contiguous in part numbering and all but the last hold sixty four parts, but a
+    /// stripe can be flushed early when rows arrive out of order, so the runs are read off the
+    /// directory rather than worked out from a constant.
+    #[must_use]
+    pub fn stripe_parts(&self) -> Vec<std::ops::Range<usize>> {
+        let mut runs = Vec::with_capacity(self.table.stripes.len());
+        let mut start = 0;
+        for stripe in &self.table.stripes {
+            let end = start + stripe.parts.len();
+            runs.push(start..end);
+            start = end;
+        }
+        runs
+    }
+
+    /// Asks the page cache to keep `stripes` stripes of every column instead of the default.
+    ///
+    /// This only ever raises the number. A scan that gives each worker a whole stripe has one page
+    /// per column per worker open at once, and a cache smaller than that is worse than no cache at
+    /// all: every worker's page is evicted by the others before it has finished its stripe, so it
+    /// reads a quarter of a megabyte for every part it takes out of it.
+    pub fn keep_stripes(&self, stripes: usize) {
+        self.kept.fetch_max(stripes, Atomic::Relaxed);
     }
 
     /// Rows in one part, or zero when the part number is past the table.
@@ -1817,24 +1862,24 @@ impl Reader {
     fn held(&self, at: usize, stripe: &Stripe, column: usize, whole: bool) -> Result<CachedColumn> {
         let cache = self.cache.get(column).ok_or_else(|| invalid("column index out of range"))?;
         let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
-        let found = cached.pages.iter().find(|held| held.stripe == at).cloned();
-        if let Some(found) = found.clone() {
-            if !whole || found.page.is_some() {
-                return Ok(found);
+        let known = cached.index.get(at).and_then(Clone::clone);
+        let page = cached.pages.get(at).and_then(Clone::clone);
+        if let Some(index) = known.clone() {
+            if !whole || page.is_some() {
+                return Ok(CachedColumn { stripe: at, index, page });
             }
         }
-        let known = cached.index.get(at).and_then(Clone::clone);
         if cached.loading.contains(&at) {
             drop(cached);
-            if let Some(found) = found {
-                return Ok(found);
-            }
             // The index is almost always already here, because somebody read this stripe to get
             // into the loading list in the first place, so this branch usually costs no read at
-            // all and the part read below it is the only one the losing worker pays for.
-            let held = self.page_of(stripe, column, at, false, known)?;
+            // all and the one part read in `read_impl` is all the losing worker pays for.
+            if let Some(index) = known {
+                return Ok(CachedColumn { stripe: at, index, page: None });
+            }
+            let held = self.page_of(stripe, column, at, false, None)?;
             let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
-            remember(&mut cached, &held);
+            remember(&mut cached, &held, self.kept.load(Atomic::Relaxed));
             return Ok(held);
         }
         cached.loading.push(at);
@@ -1850,7 +1895,7 @@ impl Reader {
             cached.loading.remove(position);
         }
         let held = read?;
-        remember(&mut cached, &held);
+        remember(&mut cached, &held, self.kept.load(Atomic::Relaxed));
         Ok(held)
     }
 
@@ -3739,6 +3784,60 @@ mod tests {
             "the pages are the ones that get read again, which is what makes the index count mean \
              something"
         );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A worker per stripe reads its stripe once, once the cache has been told how many there are.
+    ///
+    /// This is the shape a scan has when it hands out a whole stripe per morsel rather than a part.
+    /// Nobody races for a page any more, but every worker holds a different one for the length of a
+    /// stripe, so a cache that keeps four pages while eight workers are in eight stripes evicts
+    /// every one of them before its owner has finished with it, and the owner reads a quarter of a
+    /// megabyte again for the next part. The barrier is what makes that certain rather than likely:
+    /// without it a worker can run a whole stripe before the next one starts and never collide.
+    #[test]
+    fn a_worker_per_stripe_reads_its_page_once_when_the_cache_was_told_to_expect_it() {
+        let workers = CACHED_STRIPES_PER_COLUMN + 4;
+        let path = path("stripe-per-worker");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        for part in 0..STRIPE_PARTS * workers {
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Integer, &[Value::Integer(part as i32)])
+                    .expect("integers"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let read = |told: bool| {
+            let reader = Reader::open(&path).expect("reopen from disk");
+            assert_eq!(reader.table().stripes().len(), workers, "a stripe per worker");
+            if told {
+                reader.keep_stripes(workers);
+            }
+            let barrier = std::sync::Barrier::new(workers);
+            std::thread::scope(|scope| {
+                for (worker, run) in reader.stripe_parts().into_iter().enumerate() {
+                    let reader = &reader;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        for part in run {
+                            barrier.wait();
+                            let chunk = reader.read(part, &[0]).expect("a part of my own stripe");
+                            assert_eq!(chunk.value_at(0, 0), Value::Integer(part as i32));
+                        }
+                        assert!(worker < workers);
+                    });
+                }
+            });
+            reader.pages.load(Atomic::Relaxed)
+        };
+
+        assert_eq!(read(true), workers, "one page read per stripe and no more");
+        assert!(read(false) > workers, "a cache that small is read again on every part");
         fs::remove_file(path).expect("remove scratch file");
     }
 
