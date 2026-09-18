@@ -57,7 +57,13 @@ const FREQUENCY_CANDIDATES: usize = 32_768;
 const FREQUENCY_ENTRIES: usize = 512;
 const FREQUENCY_BUILD_RANK: usize = 10;
 const FREQUENCY_ORDINALS: usize = 65_536;
-const MAX_FREQUENCY_WORKERS: usize = 16;
+/// The most threads the two per column passes at the end of a commit are spread over.
+///
+/// A table like `hits` has ninety numeric columns, so on a machine with more cores than this the
+/// cap is what decides how long the frequencies take rather than the columns are. It is here at all
+/// because each worker holds a candidate table and a decoded part, and a hundred of those at once
+/// on a narrow machine would be worse than waiting.
+const MAX_FREQUENCY_WORKERS: usize = 32;
 
 /// The most threads one stripe's encode is spread over.
 ///
@@ -1093,8 +1099,14 @@ impl Writer {
     }
 
     /// Builds independent numeric synopses concurrently after all column pages are committed.
+    ///
+    /// The columns go through a queue rather than being cut into equal runs, because they are not
+    /// equally expensive and they are not shuffled. A `BIGINT` column carries eight times the bytes
+    /// of a `TINYINT` through the decode, and a run of them sits together in a schema the way it
+    /// sits together in `hits`, so a worker that was handed the wrong six columns finishes long
+    /// after one that was handed the right six and the whole phase waits for it.
     fn numeric_frequencies(&self) -> Result<Vec<Option<FrequencySummary>>> {
-        let columns = self
+        let mut columns = self
             .table
             .fields
             .iter()
@@ -1127,16 +1139,24 @@ impl Writer {
             }
             return Ok(frequencies);
         }
-        let width = columns.len().div_ceil(workers);
+        // Popped from the back, so the expensive columns are the ones taken first and the cheap ones
+        // are what is left to fill in behind them.
+        columns.sort_by_key(|&column| weight(&self.table.fields[column].ty));
+        let queue = Mutex::new(columns);
         let pieces = std::thread::scope(|scope| {
-            columns
-                .chunks(width)
-                .map(|columns| {
+            (0..workers)
+                .map(|_| {
                     scope.spawn(|| {
-                        columns
-                            .iter()
-                            .map(|&column| Ok((column, self.numeric_frequency(column)?)))
-                            .collect::<Result<Vec<_>>>()
+                        let mut mine = Vec::new();
+                        loop {
+                            let taken = queue
+                                .lock()
+                                .map_err(|_| Error::internal("a native frequency worker panicked"))?
+                                .pop();
+                            let Some(column) = taken else { break };
+                            mine.push((column, self.numeric_frequency(column)?));
+                        }
+                        Ok(mine)
                     })
                 })
                 .collect::<Vec<_>>()
