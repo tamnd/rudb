@@ -146,6 +146,50 @@ impl Source for Frequencies {
     }
 }
 
+/// A whole-table aggregate answered from what the file already wrote down.
+///
+/// One row, worked out before the pipeline starts, so there is nothing to scan and nothing to
+/// combine. What can be answered this way is decided in the builder, and this only carries the
+/// answer, because the interesting part is which questions a file can settle and not how a single
+/// row is handed out.
+#[derive(Debug)]
+pub(crate) struct Summary {
+    row: Chunk,
+    handout: Handout,
+}
+
+impl Summary {
+    /// The one row, with a value per aggregate in the order the aggregates were written.
+    pub(crate) fn new(schema: &Schema, values: &[Value]) -> Result<Self> {
+        let types = schema.types();
+        if types.len() != values.len() {
+            return Err(Error::internal("a summary has a different number of values and columns"));
+        }
+        let columns = types
+            .iter()
+            .zip(values)
+            .map(|(ty, value)| Vector::from_values(ty.clone(), std::slice::from_ref(value)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { row: Chunk::with_rows(columns, 1)?, handout: Handout::new(1) })
+    }
+}
+
+impl Source for Summary {
+    fn morsel(&self) -> Option<Morsel> {
+        self.handout.take()
+    }
+
+    fn morsels(&self, _threads: usize) -> Option<usize> {
+        Some(self.handout.total())
+    }
+
+    fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
+        *out = self.row.clone();
+        morsel.advance(1);
+        Ok(Progress::Done)
+    }
+}
+
 fn poisoned<T>(_: T) -> Error {
     Error::internal("a thread panicked while reading a file")
 }

@@ -44,8 +44,8 @@
 
 use std::sync::Arc;
 
-use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Cancel, Error, Memory, Result, Session, Value};
+use rudb_catalog::{Catalog, QualifiedName, Table};
+use rudb_common::{Cancel, Error, Field, Memory, Result, Session, Value};
 use rudb_functions::TableFunction;
 use rudb_metrics::{Counters, Driver, Report};
 use rudb_parquet::{Bound, Op};
@@ -75,7 +75,7 @@ use crate::schema::Schema;
 use crate::setop::SetOp;
 use crate::settingnames::settingnames;
 use crate::sort::Sort;
-use crate::source::{Dummy, FileScan, Frequencies, Scan, Series, Values};
+use crate::source::{Dummy, FileScan, Frequencies, Scan, Series, Summary, Values};
 use crate::strategies::strategies;
 use crate::stream::{Filter, Limit, Project};
 use crate::topn::TopN;
@@ -466,6 +466,186 @@ fn native_frequencies(
         .map(|entries| NativeFrequencies { entries, column: group.column as usize }))
 }
 
+/// The stored table one node reads straight through, with no filter and nothing else in the way.
+///
+/// Everything below answers questions about a whole table, so a node that drops rows or invents
+/// them has to stop the search here. A `Get` is the only node that reads a table and changes
+/// nothing about it.
+///
+/// A table still being built in memory is passed over even though it could count its own rows,
+/// because everything else below needs a directory and a table with no file behind it has none.
+/// Answering one of these from memory and the rest from a file would mean two paths to keep
+/// agreeing with each other for one count that is already cheap.
+fn whole_table<'a>(
+    plan: &Plan,
+    catalog: &'a Catalog,
+    node: NodeRef,
+) -> Result<Option<(&'a Table, u32, Slice)>> {
+    let Node::Get { catalog: database, schema, table, index, columns, .. } = *plan.node(node)
+    else {
+        return Ok(None);
+    };
+    let name = QualifiedName::new(plan.string(database), plan.string(schema), plan.string(table));
+    let table = catalog.table(&name)?;
+    Ok(table.rows().is_native().then_some((table, index, columns)))
+}
+
+/// Which column of the stored table a binding into `index` names, by name rather than by position.
+fn stored_column(
+    plan: &Plan,
+    table: &Table,
+    index: u32,
+    columns: Slice,
+    binding: ColumnBinding,
+) -> Option<usize> {
+    if binding.table != index {
+        return None;
+    }
+    let field = plan.field_list(columns).get(binding.column as usize)?;
+    table.column_index(&field.name)
+}
+
+/// The stored column a grouping with no aggregates puts a whole table into groups by.
+///
+/// This is the shape `COUNT(DISTINCT column)` is planned as: one grouping that throws the rows away
+/// and keeps the distinct values, with a count of those values over it. The one column it produces
+/// is the group, so a binding into it names position zero and nothing else.
+fn grouped_column<'a>(
+    plan: &Plan,
+    catalog: &'a Catalog,
+    node: NodeRef,
+) -> Result<Option<(&'a Table, u32, usize)>> {
+    let Node::Aggregate { input, index: produced, groups, aggregates } = *plan.node(node) else {
+        return Ok(None);
+    };
+    if !plan.expr_list(aggregates).is_empty() {
+        return Ok(None);
+    }
+    let [group] = plan.expr_list(groups) else { return Ok(None) };
+    let Expr::Column(binding) = *plan.expr(*group) else { return Ok(None) };
+    let Some((table, index, columns)) = whole_table(plan, catalog, input)? else {
+        return Ok(None);
+    };
+    Ok(stored_column(plan, table, index, columns, binding).map(|column| (table, produced, column)))
+}
+
+/// How many rows a node produces, when that can be known without producing them.
+///
+/// A `Get` knows because the file wrote down its row count. A grouping with no aggregates knows when
+/// the file knows how many distinct values the grouping column has, which for a string column of
+/// this format it does exactly, because the dictionary holds every distinct value once and holds
+/// nothing else. That is the difference between reading the answer and building a hash table with a
+/// hundred thousand rows in it.
+///
+/// `None` means go and count them.
+fn known_rows(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Option<u64>> {
+    if let Some((table, _, _)) = whole_table(plan, catalog, node)? {
+        return Ok(Some(table.rows().len() as u64));
+    }
+    let Some((table, _, column)) = grouped_column(plan, catalog, node)? else { return Ok(None) };
+    // A grouping puts every null in a group of its own and a distinct count does not count it, so
+    // the two would differ on a column with a null in it. They cannot differ here, because a file
+    // only answers this for a column it knows has none.
+    table.rows().distinct_values(column)
+}
+
+/// Every aggregate of a whole table aggregation, answered from the directory of a native file.
+///
+/// `None` the moment one of them cannot be, because a query that reads the rows for one aggregate
+/// may as well read them for all of them. What is answerable here is deliberately small and exact.
+/// A count is a number the file wrote down, a distinct count is the size of a dictionary that holds
+/// every distinct value once, and the extremes of a string column are the two ends of the order
+/// written beside that dictionary. None of these is a sketch and none of them is a bound that is
+/// allowed to be wide, so none of them can be off by one.
+fn native_summary(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+) -> Result<Option<Vec<Value>>> {
+    if !plan.expr_list(groups).is_empty() || plan.expr_list(aggregates).is_empty() {
+        return Ok(None);
+    }
+    let below = whole_table(plan, catalog, input)?;
+    let mut values = Vec::with_capacity(plan.expr_list(aggregates).len());
+    for &aggregate in plan.expr_list(aggregates) {
+        let Expr::Aggregate { name, args, distinct, filter: None } = *plan.expr(aggregate) else {
+            return Ok(None);
+        };
+        if distinct {
+            return Ok(None);
+        }
+        let call = plan.string(name);
+        let args = plan.expr_list(args);
+        if call == "count_star" && args.is_empty() {
+            let Some(rows) = known_rows(plan, catalog, input)? else { return Ok(None) };
+            values.push(count(rows)?);
+            continue;
+        }
+        let [only] = args else { return Ok(None) };
+        let Expr::Column(binding) = *plan.expr(*only) else { return Ok(None) };
+        // Counting the one column a grouping produced is counting its distinct values, which is the
+        // other half of how `COUNT(DISTINCT column)` is planned. The count drops the null group and
+        // the distinct count never had it, so the two agree.
+        if call == "count" {
+            if let Some((table, produced, column)) = grouped_column(plan, catalog, input)? {
+                if binding.table == produced && binding.column == 0 {
+                    let Some(distinct) = table.rows().distinct_values(column)? else {
+                        return Ok(None);
+                    };
+                    values.push(count(distinct)?);
+                    continue;
+                }
+            }
+        }
+        let Some((table, index, columns)) = below else { return Ok(None) };
+        let Some(column) = stored_column(plan, table, index, columns, binding) else {
+            return Ok(None);
+        };
+        match call {
+            // Counting a column is counting the rows that are not null, and both of those numbers
+            // are written down.
+            "count" => {
+                let Some(nulls) = table.rows().null_count(column)? else { return Ok(None) };
+                values.push(count(table.rows().len() as u64 - nulls)?);
+            }
+            "min" | "max" => {
+                let Some((low, high)) = table.rows().text_extremes(column)? else {
+                    return Ok(None);
+                };
+                values.push(if call == "min" { low } else { high });
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(values))
+}
+
+/// What an ungrouped aggregation produces, worked out from the plan rather than from its input.
+///
+/// With no groups the output is one field per aggregate, named after the call and typed by what the
+/// binder decided it returns, and none of that depends on the rows underneath. That is what lets a
+/// summary answer without building the operators below it, which is the whole point: an input that
+/// gets built also gets run.
+fn summary_schema(plan: &Plan, index: u32, aggregates: Slice) -> Result<Schema> {
+    let mut fields = Vec::with_capacity(plan.expr_list(aggregates).len());
+    for &reference in plan.expr_list(aggregates) {
+        let Expr::Aggregate { name, .. } = *plan.expr(reference) else {
+            return Err(Error::internal("an aggregate list holds something that is not a call"));
+        };
+        fields.push(Field::new(plan.string(name).to_string(), plan.expr_type(reference).clone()));
+    }
+    Ok(Schema::numbered(fields, index))
+}
+
+/// A row count as the BIGINT every count aggregate produces.
+fn count(rows: u64) -> Result<Value> {
+    Ok(Value::BigInt(
+        i64::try_from(rows).map_err(|_| Error::internal("a stored row count exceeds BIGINT"))?,
+    ))
+}
+
 /// What a filter over a scan can tell that scan before it reads anything.
 ///
 /// Both kinds of scan keep the smallest and the largest value of each of their columns: a Parquet
@@ -673,6 +853,22 @@ impl<'a> Building<'a, '_> {
         aggregates: Slice,
         bound: AggregateBound,
     ) -> Result<Segment<'a>> {
+        // Before the input is built, because building it is what puts it in a pipeline and a
+        // pipeline that exists is a pipeline that runs. A summary that let the rows be counted
+        // underneath it would answer in no time and take exactly as long as it always did.
+        if bound.max_groups.is_none() && bound.having_count.is_none() {
+            if let Some(values) =
+                native_summary(self.plan, self.catalog, input, groups, aggregates)?
+            {
+                let schema = summary_schema(self.plan, index, aggregates)?;
+                let source = Summary::new(&schema, &values)?;
+                let id = self.shape.operator(reference);
+                let pipeline = self.shape.pipeline(reference);
+                let counters =
+                    self.watch(reference, id, pipeline, "Aggregate", Some("native summary"));
+                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+            }
+        }
         let below = self.node(input)?;
         let (aggregate, out) =
             Aggregate::new(self.plan, &below.schema, index, groups, aggregates, self.memory)?;
