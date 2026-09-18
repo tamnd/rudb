@@ -12,6 +12,31 @@ Every statistic and every piece of metadata rudb keeps, what class of truth it i
 
 Every consumer interface returns the class along with the value, and `EXPLAIN` prints it. A planner that cannot tell an exact row count from a default guess produces bad plans that nobody can attribute, and the attribution is worth more than the accuracy.
 
+## 2.1.1 The shape of the return, and the fourth class
+
+The three classes above are about what is written. A consumer also has to deal with what is not, so the interface carries one more class and two more fields, and all of it is defined here rather than in the planner so that `rudb-opt`, `rudb-phys` and `rudb-exec` cannot each invent their own. `../planner-v2/04-facts-not-estimates.md` section 4.2 is the consuming side of this.
+
+```
+Fact {
+    value:      f64,
+    class:      Class,
+    provenance: Provenance,
+}
+
+Class {
+    Exact,
+    Certified { bound: f64, direction: Bound },
+    Estimated,
+    Unknown,
+}
+```
+
+**Unknown** means nobody computed anything. Not written, not resident, or not applicable. It is not the same as `Estimated`, which means somebody computed a number and has no proof of it, and a consumer that conflates the two treats a missing statistic as a guess and produces a plan it cannot attribute. Document 04 says no query ever waits on a statistic, so `Unknown` is the normal answer for a fact whose load has just been scheduled, and it is the honest one.
+
+**`Bound`** says which side a certificate bounds. `AtMost` for a frequency synopsis `omitted_max`, `AtLeast` for a lower bound on a distinct count out of a sketch, `Within` with an epsilon for a quantile boundary.
+
+**`Provenance`** names the source rather than the value, and it is what `EXPLAIN` prints next to the class: `RowCount`, `ZoneMap`, `NullCount`, `Sketch`, `FrequencySynopsis`, `Quantiles`, `Dictionary`, `Sortedness`, `Distinctness`, `LinkHeader`, `DegreeDistribution`, `Sample`, `Default`, `Observed`, `Propagation`. Three of those are worth calling out. `Default` is how a hardcoded constant admits to being one, which is the only way a reader ever finds out that a plan was chosen on Selinger's fifth. `Observed` is a tier 1 correction out of document 06, and keeping it distinguishable from a measured statistic is what lets a reader tell a fact about the file from a fact about a previous execution. `Propagation` is what a number derived from two facts of different provenance says about itself, because naming either side would be picking one arbitrarily and a reader chasing a bad plan needs to know the arithmetic is where to look rather than the input.
+
 ## 2.2 The granularity ladder
 
 The file is already parts of 1000 rows inside stripes of 64 parts. Statistics attach at four levels and the level is a cost decision, not a taste one:

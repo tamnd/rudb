@@ -10,6 +10,18 @@ The ClickBench profile is the reason to believe that: at ten million rows, FileS
 
 Under-reserving memory spills; over-reserving starves. Under-sizing a hash table rehashes; over-sizing wastes a cache. A point estimate says 0.125 and is wrong in an unknown direction. A certified statistic says "between 0.11 and 0.14" and lets the operator pick the end of the range whose failure it can afford. This is what the `Certified { bound }` class in document 04 section 4.1 is *for*, and it is the single most valuable difference between this design and one that stores the same numbers without their proofs.
 
+## 5.1.1 The three uses, and the class each is entitled to
+
+The rules below say which statistic changes which decision. They do not, on their own, say which class of statistic each decision is allowed to read, and without that a reader can reasonably conclude that a certified frequency synopsis licenses a sort elimination, which it does not. The missing column is the *use*, and there are three of them. `../planner-v2/04-facts-not-estimates.md` section 4.3 is the consuming side.
+
+**Answer.** The statistic is the result. `COUNT(*)`, `COUNT(c)`, `COUNT(DISTINCT c)` on a dictionary column, `MIN` and `MAX` out of merged zone maps, a top-k group by out of a frequency synopsis. Entitled to `Exact` always, and to `Certified` only where the consumer can discharge the proof obligation and has a fallback for when it cannot. Never `Estimated`, never `Unknown`, in no mode and behind no setting.
+
+**Decide.** The statistic chooses between two plans that produce the same rows. Build side, grouping strategy, join order, reduction schedule, memory reservation, parallel degree. Entitled to any class, including `Unknown`, because a decision made from `Unknown` is a decision made from a documented default and the worst case is a slow query with a printed reason. This is where most of the catalogue goes and it is why `Estimated` is allowed to exist at all.
+
+**Enable.** The statistic licenses a rewrite that would be wrong if the statistic were wrong. Join elimination, sort elimination, distinct elimination, group by elimination, partition pruning, an exact `IN` list filter. Entitled to `Exact` only. Never `Certified`, because a bound is not an equality and these rewrites need an equality. This is the strictest of the three and the one easiest to get wrong, because an enabling rewrite on a stale statistic does not produce a slow query, it produces a wrong answer.
+
+The split is worth stating as an interface obligation rather than as advice. A consumer declares its use, the class rule follows from the use, and `EXPLAIN` prints which use happened.
+
 ## 5.2 Scan
 
 The largest consumer, because it is the largest cost.
