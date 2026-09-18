@@ -14,6 +14,19 @@
 //! The filters are written to leave survivors in different places on purpose: at the front, at the
 //! back, in the middle, scattered, and nowhere at all. A walk that ran one part too far or stopped
 //! one part too early would come out right on some of those and wrong on the rest.
+//!
+//! Two different things rule a part out and they are not equally fine, which decides what each test
+//! here can reach. A range is answered by the zone map a morsel carries, and that covers the whole
+//! morsel, so a range either rules a morsel out entirely or rules nothing in it out. An equality is
+//! answered per part, so it can rule out the parts on either side of the one row it wants. Only the
+//! second kind makes the scan walk ruled out parts and then read one in the same call, which is the
+//! case an off by one would lose a row on, so there is a test here with an equality in it for that
+//! reason and the comment on it says so.
+//!
+//! Which test reaches which path was checked rather than assumed, by gating a panic on each and
+//! rerunning. Eight of the nine walk. The one that does not is the filter that rules out nothing,
+//! which is the case with no walking in it by design. One of the eight walks and then reads, which
+//! is the equality one.
 
 use rudb::Database;
 use rudb_common::Value;
@@ -156,6 +169,25 @@ fn two_ranges_far_apart_are_both_found() {
     let pair = Pair::new("two", &climbing(ROWS));
     let far = ROWS - 2;
     pair.gives("SELECT i FROM t WHERE k = 1 ORDER BY i", &[0, 1, far, far + 1]);
+}
+
+#[test]
+fn a_single_row_deep_inside_a_morsel_is_reached_by_walking_to_it() {
+    // The one that walks and then reads in the same call, which the others do not.
+    //
+    // A range on `i` is ruled out by the zone map a morsel carries, and that is a whole morsel at a
+    // time, so a morsel either has nothing in it and drains or has the row at the front of it. An
+    // equality on `j` is ruled out finer than that, because a value that is in no part of a morsel
+    // can still be in one part of it, and then the walk crosses the parts before it and reads the
+    // part it lands on without ever handing the ones between them up. That last bit is where a walk
+    // that took one step too many would lose the row, and nothing else here would notice.
+    //
+    // `j` scrambles `i` by a multiplier that shares no factor with a prime modulus, so every row
+    // has a `j` of its own and this filter matches exactly one row, chosen well inside the table.
+    let pair = Pair::new("deep", &climbing(ROWS));
+    let row = 200_000;
+    let wanted = (row * 7919) % 1_000_003;
+    pair.gives(&format!("SELECT i FROM t WHERE j = {wanted}"), &[row]);
 }
 
 #[test]
