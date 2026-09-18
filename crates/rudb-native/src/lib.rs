@@ -4495,8 +4495,8 @@ mod tests {
             Writer::create(&path, "overlapping", vec![Field::new("v", LogicalType::BigInt)])
                 .expect("new file");
         let one = |order: (u64, u64)| {
-            let column = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)])
-                .expect("a column");
+            let column =
+                Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)]).expect("a column");
             (order, Chunk::new(vec![column]).expect("one column"))
         };
         // The second run sits inside the first rather than after it, which is a thing no instance
