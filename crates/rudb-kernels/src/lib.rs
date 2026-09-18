@@ -66,6 +66,7 @@ pub mod fallback;
 pub mod logic;
 pub mod membership;
 mod number;
+mod peel;
 pub mod prepare;
 mod regexp;
 pub mod scalar;
