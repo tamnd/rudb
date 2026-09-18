@@ -465,6 +465,75 @@ fn an_equality_is_looked_up_and_answers_what_the_loop_answers() {
     }
 }
 
+/// The other three kinds the streaming probe answers, against the same oracle.
+///
+/// `INNER` and `LEFT` are two of the five and the test above has them. The other three are `SEMI`,
+/// `ANTI` and `SINGLE`, and they are the ones with the least written about them and the most to get
+/// wrong: a semi join keeps a driving row once however many times it matched, an anti join is that
+/// question inverted, and a single join refuses a driving row that matched twice. A null rule one row
+/// out shows up here and in none of the four above.
+///
+/// The same trick forces the loop. The second conjunct is implied by the first whenever the first is
+/// true and is null whenever the first is null, so the two spellings mean the same thing and are
+/// answered two different ways.
+#[test]
+fn a_semi_an_anti_and_a_single_join_answer_what_the_loop_answers() {
+    let db = Database::new();
+    db.execute("CREATE TABLE l (k INTEGER, tag VARCHAR)").unwrap();
+    db.execute(
+        "INSERT INTO l VALUES (1, 'one'), (1, 'one again'), (2, 'two'), (NULL, 'null key'), \
+         (4, 'left only')",
+    )
+    .unwrap();
+    db.execute("CREATE TABLE r (k INTEGER, v INTEGER)").unwrap();
+    // Two rows on key 1, so a semi join has to produce the driving row once rather than twice.
+    db.execute("INSERT INTO r VALUES (1, 10), (1, 11), (2, 20), (NULL, 30), (5, 50)").unwrap();
+    let shapes = [
+        "SELECT l.tag FROM l SEMI JOIN r ON r.k = l.k{extra}",
+        "SELECT l.tag FROM l ANTI JOIN r ON r.k = l.k{extra}",
+        // A scalar subquery is a single join, and this one is over the keys that match at most once
+        // because the point here is the null rule rather than the error a second match raises.
+        "SELECT tag, (SELECT v FROM r WHERE r.k = l.k{extra} AND r.k <> 1) FROM l",
+    ];
+    for shape in shapes {
+        let listing = |extra: &str| {
+            rows(&db, &format!("{} ORDER BY 1 NULLS FIRST", shape.replace("{extra}", extra)))
+        };
+        assert_eq!(listing(""), listing(" AND r.k >= l.k"), "{shape}");
+    }
+}
+
+/// One driving row matching more rows than fit in a chunk.
+///
+/// The streaming probe answers a driving chunk into an output chunk, and a chunk holds 1024 rows, so
+/// a key with five thousand rows behind it is a row that cannot be finished by the call that started
+/// it. It has to come out over five calls, each picking up where the last one stopped. Getting that
+/// wrong loses the tail of a popular key, which is a wrong answer that only appears on data skewed
+/// enough to have one, and skew is what real data is.
+#[test]
+fn a_driving_row_that_matches_more_rows_than_a_chunk_holds_produces_all_of_them() {
+    let db = Database::new();
+    db.execute("CREATE TABLE l (k INTEGER, tag VARCHAR)").unwrap();
+    db.execute("INSERT INTO l VALUES (1, 'popular'), (2, 'rare'), (3, 'absent')").unwrap();
+    db.execute("CREATE TABLE r (k INTEGER, v BIGINT)").unwrap();
+    db.execute("INSERT INTO r SELECT 1, i FROM range(5000) AS series(i)").unwrap();
+    db.execute("INSERT INTO r VALUES (2, -1)").unwrap();
+    // Every one of the five thousand, once each, and the rare key beside them rather than lost
+    // behind them.
+    assert_eq!(
+        rows(&db, "SELECT count(*), count(DISTINCT r.v), sum(r.v) FROM l JOIN r ON l.k = r.k"),
+        vec![vec![Value::BigInt(5001), Value::BigInt(5001), Value::HugeInt(12_497_499)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT l.tag, count(*) FROM l LEFT JOIN r ON l.k = r.k GROUP BY 1 ORDER BY 1"),
+        vec![
+            vec![text("absent"), Value::BigInt(1)],
+            vec![text("popular"), Value::BigInt(5000)],
+            vec![text("rare"), Value::BigInt(1)],
+        ]
+    );
+}
+
 #[test]
 fn a_union_deduplicates_and_union_all_does_not() {
     let db = database();
@@ -5299,18 +5368,42 @@ fn a_join_is_three_pipelines_in_the_order_they_have_to_run() {
     let metrics = result.metrics().expect("a query that ran has metrics");
     assert_eq!(metrics.pipelines.len(), 3, "one to gather the build side, one to probe, one above");
     let gather = operator(metrics, "Gather");
-    let join = operator(metrics, "Join");
+    let probe = operator(metrics, "Probe");
     assert_eq!(
         metrics.pipelines[0].depends_on,
-        vec![join.pipeline],
+        vec![probe.pipeline],
         "the root waits for the probe"
     );
     assert_eq!(
-        metrics.pipelines[usize::try_from(join.pipeline).unwrap()].depends_on,
+        metrics.pipelines[usize::try_from(probe.pipeline).unwrap()].depends_on,
         vec![gather.pipeline],
         "the probe waits for the side that is gathered first"
     );
     assert_eq!(gather.rows_in, 4, "the whole right side was gathered");
+    // The driving side is not gathered, which is the whole of what the streaming probe bought.
+    // Three pipelines either way, and the difference is that the third one now has the scan in it
+    // rather than waiting for one to finish before this one starts on its rows.
+    let driving = metrics
+        .operators
+        .iter()
+        .filter(|operator| operator.kind == "Scan")
+        .find(|scan| scan.pipeline == probe.pipeline)
+        .expect("the driving scan is in the probe's own pipeline");
+    assert_eq!(driving.rows_out, 4, "every driving row went straight into the probe");
+}
+
+/// The name in the profile says which of the two operators answered, because they cost very
+/// different things and a profile that called both of them a join would not let anybody tell.
+#[test]
+fn a_join_no_lookup_answers_says_so_in_the_profile() {
+    let db = database();
+    let result = db.query("SELECT t.x FROM t JOIN t AS u ON t.x < u.x").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    operator(metrics, "Join");
+    assert!(
+        !metrics.operators.iter().any(|operator| operator.kind == "Probe"),
+        "a range condition is not a lookup"
+    );
 }
 
 #[test]

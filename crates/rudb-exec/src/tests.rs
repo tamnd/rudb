@@ -519,10 +519,13 @@ fn every_pipeline_breaker_cuts_the_plan_in_two() {
 }
 
 /// A node with two inputs is two pipelines, not one, and the one that gathers has to be first.
+///
+/// The condition is a range one so that this is the join that gathers both sides. An equality is
+/// answered by the streaming probe below, which gathers one side and no more.
 #[test]
 fn the_gathered_side_of_a_join_is_a_pipeline_of_its_own_and_it_runs_first() {
     let text = concat!(
-        "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+        "Join INNER on=[(#0.0::INTEGER < #1.0::INTEGER)::BOOLEAN]\n",
         "  Get memory.main.t AS t #0 [x::INTEGER]\n",
         "  Get memory.main.empty AS empty #1 [x::INTEGER]\n",
     );
@@ -530,6 +533,21 @@ fn the_gathered_side_of_a_join_is_a_pipeline_of_its_own_and_it_runs_first() {
     assert_eq!(pipelines(text), 3);
     // If the order were wrong the join would probe a gather nobody had filled and answer with no
     // rows rather than failing, which is why `Query::new` checks it rather than trusting the walk.
+    assert!(run(text).is_empty(), "nothing matches an empty table");
+}
+
+/// A join a lookup answers is the second two input operator that does not start a pipeline of its
+/// own, and it is the one that matters: every join in a query past the simplest one is an equality,
+/// so this is the difference between a plan of four joins being five pipelines and it being nine.
+#[test]
+fn a_join_a_lookup_answers_stays_in_the_pipeline_its_driving_rows_came_from() {
+    let text = concat!(
+        "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+        "  Get memory.main.t AS t #0 [x::INTEGER]\n",
+        "  Get memory.main.empty AS empty #1 [x::INTEGER]\n",
+    );
+    // The right side into the gather, and then everything else.
+    assert_eq!(pipelines(text), 2);
     assert!(run(text).is_empty(), "nothing matches an empty table");
 }
 
@@ -1166,7 +1184,7 @@ fn the_ids_the_builder_tags_its_counters_with_are_the_ones_the_plan_says() {
     report.fill(&mut document);
     let ids: Vec<u32> = document.operators.iter().map(|operator| operator.id).collect();
     assert_eq!(ids, (0..shape.operators()).collect::<Vec<_>>(), "every id and no other");
-    let join = document.operators.iter().find(|operator| operator.kind == "Join").expect("a join");
+    let join = document.operators.iter().find(|operator| operator.kind == "Probe").expect("a join");
     assert_eq!(join.id, shape.operator(plan.root()));
     let gather =
         document.operators.iter().find(|operator| operator.kind == "Gather").expect("a gather");

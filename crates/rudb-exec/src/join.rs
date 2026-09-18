@@ -19,6 +19,22 @@
 //! list of positions in the gathered side in the order that side holds them, and everything that
 //! decides what a kind does with that list reads it without knowing which path made it.
 //!
+//! # Two operators
+//!
+//! There are two types here doing the join rather than one, and what separates them is not the
+//! condition but the kind. [`Probe`] is the lookup written as a [`Stream`]: it holds the table and
+//! nothing else, answers a driving chunk into an output chunk, and hands that chunk downstream
+//! before it looks at the next one. [`Join`] is a [`Sink`]: it gathers the whole driving side,
+//! answers all of it in `finalize`, and holds the whole answer until something reads it.
+//!
+//! The reason both exist is that five of the eight kinds decide about a driving row from that row's
+//! own matches, and three do not. A `RIGHT` or a `FULL` join has to produce the gathered rows
+//! nothing matched, and which those are is not known until the last driving row has been through. A
+//! `MARK` join asks a question of the whole gathered side per driving row, and its answer
+//! distinguishes no match from a match nobody could decide, which no list of positions carries. A
+//! `POSITIONAL` join is not a lookup at all. Those three stay on the sink, along with every join
+//! whose condition a lookup cannot answer, and [`streamed`] is where the line is drawn.
+//!
 //! What the lookup does not share with the grouping next door is the null rule. A group key answers
 //! `IS NOT DISTINCT FROM`, where two nulls are one key, and `=` answers null for a null on either
 //! side, so a row whose key holds a null takes part in no pair. The key encoding is the same one and
@@ -43,14 +59,14 @@
 //! side's columns first and the plan asked for the plan's left side first, so [`Join::swapped`] is
 //! set and [`Sink::finalize`] puts the two halves back before anything downstream sees them.
 //!
-//! The driving side is held whole as well, and that is the part the lookup has not fixed. A probe
-//! needs no state past the match flags, so the rows could go through a chunk at a time and the
-//! answer could come out as they do, and the shape here is already the one that wants: the rows
-//! arrive at [`Sink::sink`] chunk by chunk, and it is [`Sink::finalize`] that keeps them rather than
-//! the interface. What holding both sides costs is memory rather than time, it is what a cross
-//! product with a filter above it does not cost, and it is the next thing #211 asks for.
+//! What the gathered side costs is the one cost a join cannot get out of. The table is the reason
+//! the answer is cheap and there is no table until the rows are in it, so a join is a pipeline
+//! breaker on that side and always will be. The driving side is a different matter and used to be
+//! held for no reason at all, which is what [`Probe`] is: on the kinds that allow it, a join now
+//! costs one side rather than two sides and the answer, which is the memory half of #211 and is what
+//! stood between the cross product rewrite and coming back.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::{
     Cancel, Error, LogicalType, Memory, Reservation, Result, Session, SessionTimeZone, Value,
@@ -58,7 +74,7 @@ use rudb_common::{
 use rudb_kernels::{Connective, combine, is_true};
 use rudb_pipeline::{Progress, Sink, Stream};
 use rudb_plan::{CompareOp, Expr, ExprRef, JoinKind, Plan, Slice};
-use rudb_vector::{Chunk, Vector};
+use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
 use crate::expr::evaluate_all_in_time_zone;
@@ -213,9 +229,15 @@ impl<'a> Join<'a> {
         // A mark join asks a question about the whole of the gathered side rather than collecting
         // the rows that match, and its answer distinguishes no match from a match nobody could
         // decide, so it stays on the loop until it has a rule of its own.
-        let equalities = if self.kind == JoinKind::Mark { None } else { self.equalities() };
+        let equalities = if self.kind == JoinKind::Mark {
+            None
+        } else {
+            equalities(self.plan, &self.conditions, &self.left_schema, &self.right_schema)
+        };
         let index = match &equalities {
-            Some(equalities) => Some(self.index(right_rows, &equalities.right, &mut scratch)?),
+            Some(equalities) => {
+                Some(index(right_rows, &equalities.right, &self.cancel, &mut scratch)?)
+            }
             None => None,
         };
         // Nothing evaluates a condition over the gathered side when the index answers it, and these
@@ -246,13 +268,7 @@ impl<'a> Join<'a> {
             }
             let scanned;
             let hits: &[usize] = match (&equalities, &index) {
-                (Some(equalities), Some(index)) => match key(left_row, &equalities.left) {
-                    // A null on this side matches nothing for the same reason a null on the other
-                    // side was never stored, and a row with no match is a row the kind decides
-                    // about rather than one that is dropped here.
-                    None => &[],
-                    Some(key) => index.get(&Key(key)).map_or(&[], Vec::as_slice),
-                },
+                (Some(equalities), Some(index)) => hits(index, left_row, &equalities.left),
                 _ => {
                     scanned = self.matching(left_row, &left_types, &right_chunks)?;
                     &scanned
@@ -275,10 +291,7 @@ impl<'a> Join<'a> {
                 }
                 JoinKind::Single => {
                     if hits.len() > 1 {
-                        return Err(Error::invalid_input(
-                            "More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to revert to previous behavior of returning a random row."
-                                .to_string(),
-                        ));
+                        return Err(too_many_rows());
                     }
                     match hits.first() {
                         Some(&hit) => out.push(pair(left_row, &right_rows[hit])),
@@ -309,97 +322,6 @@ impl<'a> Join<'a> {
             }
         }
         Ok(out)
-    }
-
-    /// The columns this join's conditions line up, when every one of them lines two columns up.
-    ///
-    /// This is the question that decides whether the loop below runs at all. An equality between a
-    /// column of one side and a column of the other is answerable by looking the value up, and a
-    /// condition that is anything else is not, so a join whose conditions are all equalities is a
-    /// join that never has to compare a pair to find out whether it is a pair.
-    ///
-    /// All of them or none of them, for now. A join with an equality and something else could still
-    /// use the equality to find candidates and evaluate the rest over those, and that is the shape
-    /// this wants next. What it takes is building a chunk of the candidate rows to evaluate over,
-    /// which is a second copy of part of a side, and doing it before the plain case is measured
-    /// would be adding the complicated half first.
-    ///
-    /// Only `=`. `IS NOT DISTINCT FROM` is the same lookup with the opposite null rule and is left
-    /// out because no plan in the suite writes one, and a rule with no query behind it is a rule
-    /// nothing checks.
-    fn equalities(&self) -> Option<Equalities> {
-        if self.conditions.is_empty() {
-            return None;
-        }
-        let mut found = Equalities { left: Vec::new(), right: Vec::new() };
-        for &condition in &self.conditions {
-            let Expr::Compare { op: CompareOp::Equal, left, right } = *self.plan.expr(condition)
-            else {
-                return None;
-            };
-            // The two sides of the equality have to be the same type, because what answers it is a
-            // hash table and a hash table has one bucket for one value. The binder puts a cast in
-            // where the types differ, and a cast is not a column, so this is a check rather than a
-            // conversion: an equality that needed one has already failed the match below.
-            if self.plan.expr_type(left) != self.plan.expr_type(right)
-                || !looked_up(self.plan.expr_type(left))
-            {
-                return None;
-            }
-            let (&Expr::Column(one), &Expr::Column(other)) =
-                (self.plan.expr(left), self.plan.expr(right))
-            else {
-                return None;
-            };
-            let across = match (
-                self.left_schema.position_of(one).zip(self.right_schema.position_of(other)),
-                self.left_schema.position_of(other).zip(self.right_schema.position_of(one)),
-            ) {
-                (Some(across), _) | (None, Some(across)) => across,
-                // Both columns on one side, which is a predicate that should have been pushed into
-                // that side and is not this operator's to be clever about.
-                (None, None) => return None,
-            };
-            found.left.push(across.0);
-            found.right.push(across.1);
-        }
-        Some(found)
-    }
-
-    /// The gathered side's rows, by the values the equalities read out of them.
-    ///
-    /// A row whose key holds a null is left out rather than stored under a null key. `NULL = NULL`
-    /// is null and not true, so such a row matches nothing, and leaving it out is what says so.
-    /// That is the one place the key encoding here parts company with the one grouping uses, which
-    /// answers `IS NOT DISTINCT FROM` and puts every null in the same group.
-    ///
-    /// The positions come out of one pass in order, so each entry's list is ascending and the rows
-    /// a probe finds arrive in the order the gathered side holds them. The loop below produced them
-    /// in that order too, which is why this is a faster way to the same answer rather than the same
-    /// answer in a different order.
-    fn index(
-        &self,
-        rows: &[Vec<Value>],
-        at: &[usize],
-        scratch: &mut Reservation,
-    ) -> Result<RowMap<Vec<usize>>> {
-        let mut index: RowMap<Vec<usize>> = RowMap::default();
-        scratch.grow(rows::buckets(rows.len()))?;
-        for (position, row) in rows.iter().enumerate() {
-            let Some(key) = key(row, at) else { continue };
-            // The key's own values and the position stored beside it. The list an entry holds grows
-            // by one `usize` per row and the vector behind it doubles, so this charges the row it
-            // is about rather than trying to say when a doubling happened.
-            scratch.grow(rows::footprint(&key) + 8)?;
-            index.entry(Key(key)).or_default().push(position);
-            // Once per gathered row, which is the same granularity the loop below checks at. A
-            // build over a side nobody bounded is the one part of this operator that can run long
-            // without producing anything.
-            if position % 1024 == 0 {
-                self.cancel.check()?;
-            }
-        }
-        Ok(index)
     }
 
     /// The right side rows one left row matches, by position in the right side.
@@ -624,6 +546,246 @@ impl Stream for CrossProduct {
     }
 }
 
+/// A join answered by looking rows up, a chunk of the driving side at a time.
+///
+/// This is the same answer [`Join`] gives and a different shape to give it in. The gathered side
+/// goes into a table once, and then a driving row is answered by reading one entry out of that
+/// table, which is a decision about that row and nothing else. Nothing about it needs the rows that
+/// came before it or the rows that come after it, so nothing has to be held to make it, and an
+/// operator that holds nothing is a [`Stream`] rather than a [`Sink`].
+///
+/// Three things follow from that and all three are the point. The driving side is never gathered, so
+/// a join over a billion row scan costs the table and not the scan. The answer leaves as it is
+/// produced rather than being collected and handed on at the end, so a join that produces more rows
+/// than fit in memory is a join that runs. And the driving pipeline is no longer pinned to one
+/// thread by a sink that says [`Sink::parallel`] is false: every instance reads the same table and
+/// writes nobody's state, so the scan underneath can use every thread there is. The order the rows
+/// come out in is then whichever instance got there first, which is an order no join ever promised
+/// and is what DuckDB's own hash join does.
+///
+/// What it cannot do is the kinds that have something to say about the gathered side. A `RIGHT` or a
+/// `FULL` join keeps the gathered rows nothing matched, and which those are is not known until every
+/// driving row has been through, so those stay on [`Join`] with its `finalize`. A `MARK` join asks a
+/// question of the whole gathered side per driving row, and a `POSITIONAL` one is not a lookup at
+/// all. [`streamed`] is the list.
+#[derive(Debug)]
+pub(crate) struct Probe {
+    kind: JoinKind,
+    equalities: Equalities,
+    /// How wide a driving row is, which is how far to rotate a swapped one.
+    left_width: usize,
+    /// How wide a gathered row is, which is how much padding an unmatched driving row takes.
+    right_width: usize,
+    types: Vec<LogicalType>,
+    schema: Schema,
+    /// Whether this operator's left side is the plan's right one. See [`Join::swapped`].
+    swapped: bool,
+    /// The same token the `cancel` module wraps every node in, held here as well.
+    ///
+    /// The build is one call that reads a whole side, the same way the nested loop is, so the
+    /// wrapper checking between chunks would not look at the token while it ran.
+    cancel: Cancel,
+    /// The gathered side, filled by the pipeline this one depends on.
+    gathered: Rows,
+    /// The rows and the table over them, built by whichever instance asks first.
+    built: OnceLock<Result<Arc<Built>>>,
+    /// What the table is charged, held for as long as it is readable.
+    ///
+    /// The rows themselves are not charged again here. They were charged as they were gathered and
+    /// the gather holds that reservation until the pipeline that depends on it is done, so charging
+    /// them a second time on the way into this operator would count one copy twice.
+    held: Mutex<Reservation>,
+}
+
+/// The gathered side and the table that finds rows in it.
+#[derive(Debug)]
+struct Built {
+    rows: Vec<Vec<Value>>,
+    index: RowMap<Vec<usize>>,
+}
+
+/// Where one instance of a probe is in the driving chunk it was given.
+#[derive(Debug)]
+pub(crate) struct Probing {
+    /// The driving chunk being walked, held while there is any of it left to answer.
+    left: Option<Chunk>,
+    row: usize,
+    /// How many of the current row's matches have already come out.
+    ///
+    /// One driving row can match more rows than fit in a chunk, so a row is not always finished by
+    /// the call that started it. Without this the join would either produce an oversized chunk or
+    /// silently drop the rest of a popular key.
+    hit: usize,
+}
+
+/// The kinds a lookup on its own answers.
+///
+/// Every one of these decides about a driving row from that row's matches alone, which is what makes
+/// the answer a stream. The rest need something the whole pass knows, and they are on [`Join`].
+pub(crate) fn streamed(kind: JoinKind) -> bool {
+    matches!(
+        kind,
+        JoinKind::Inner | JoinKind::Left | JoinKind::Semi | JoinKind::Anti | JoinKind::Single
+    )
+}
+
+impl Probe {
+    /// The probe for this join, or nothing when this is not a join a lookup answers.
+    ///
+    /// `left` is the schema of the side whose rows arrive here and `right` is the side the pipeline
+    /// before this one gathered, with `kind` stated in those terms, all exactly as [`Join::new`]
+    /// takes them.
+    pub(crate) fn new(
+        plan: &Plan,
+        left: &Schema,
+        right: &Gathered<'_>,
+        kind: JoinKind,
+        conditions: Slice,
+        cancel: &Cancel,
+        memory: &Memory,
+    ) -> Option<Self> {
+        if !streamed(kind) {
+            return None;
+        }
+        let swapped = right.swapped;
+        let right_schema = right.schema;
+        let equalities = equalities(plan, plan.expr_list(conditions), left, right_schema)?;
+        let schema = match kind {
+            JoinKind::Semi | JoinKind::Anti => left.clone(),
+            // The plan's order rather than this operator's, for the reason [`Join::new`] gives.
+            _ if swapped => Schema::concat(right_schema, left),
+            _ => Schema::concat(left, right_schema),
+        };
+        Some(Self {
+            kind,
+            equalities,
+            left_width: left.width(),
+            right_width: right_schema.width(),
+            types: schema.types(),
+            schema,
+            swapped,
+            cancel: cancel.clone(),
+            gathered: right.rows.clone(),
+            built: OnceLock::new(),
+            held: Mutex::new(memory.reservation()),
+        })
+    }
+
+    /// What this operator produces, which is both sides' columns unless the kind throws one away.
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// The gathered rows and the table over them, built once however many instances there are.
+    ///
+    /// Whichever instance asks first builds it and the others wait, which is what [`OnceLock`] does
+    /// and is why the table is here rather than in the instance state. A failure is remembered the
+    /// same way: the thing that fails is running out of memory building the table, and an instance
+    /// that retried it would be retrying it against a budget that has not got any larger.
+    fn built(&self) -> Result<Arc<Built>> {
+        self.built
+            .get_or_init(|| {
+                let rows = self.gathered.take()?;
+                let mut held = self.held.lock().map_err(poisoned)?;
+                let index = index(&rows, &self.equalities.right, &self.cancel, &mut held)?;
+                Ok(Arc::new(Built { rows, index }))
+            })
+            .clone()
+    }
+}
+
+impl Stream for Probe {
+    type Local = Probing;
+
+    fn local(&self) -> Probing {
+        Probing { left: None, row: 0, hit: 0 }
+    }
+
+    fn push(&self, chunk: &mut Chunk, local: &mut Probing) -> Result<Progress> {
+        let built = self.built()?;
+        let left = match local.left.take() {
+            // Being asked again, so the chunk holds whatever was downstream of it and the driving
+            // rows are the ones this instance kept.
+            Some(left) => left,
+            None => {
+                local.row = 0;
+                local.hit = 0;
+                chunk.clone()
+            }
+        };
+        let mut out: Vec<Vec<Value>> = Vec::new();
+        while local.row < left.len() && out.len() < VECTOR_SIZE {
+            // Once per driving row, the same granularity the nested loop checks at, and the only
+            // place in this operator that runs long once the table is built.
+            self.cancel.check()?;
+            let row: Vec<Value> = left.row(local.row).collect();
+            let found = hits(&built.index, &row, &self.equalities.left);
+            match self.kind {
+                JoinKind::Semi => {
+                    if !found.is_empty() {
+                        out.push(row);
+                    }
+                }
+                JoinKind::Anti => {
+                    if found.is_empty() {
+                        out.push(row);
+                    }
+                }
+                JoinKind::Single => {
+                    if found.len() > 1 {
+                        return Err(too_many_rows());
+                    }
+                    match found.first() {
+                        Some(&hit) => out.push(pair(&row, &built.rows[hit])),
+                        None => out.push(pad_right(&row, self.right_width)),
+                    }
+                }
+                JoinKind::Left if found.is_empty() => {
+                    out.push(pad_right(&row, self.right_width));
+                }
+                // An inner join with no match produces nothing, which is this arm with an empty
+                // list, and the rest of it is one output row per match.
+                _ => {
+                    let room = VECTOR_SIZE - out.len();
+                    let end = (local.hit + room).min(found.len());
+                    for &hit in &found[local.hit..end] {
+                        out.push(pair(&row, &built.rows[hit]));
+                    }
+                    if end < found.len() {
+                        // A key with more matches than fit in a chunk. The row stays where it is and
+                        // the next call picks up from the match this one stopped at.
+                        local.hit = end;
+                        break;
+                    }
+                    local.hit = 0;
+                }
+            }
+            local.row += 1;
+        }
+        if self.swapped {
+            // Back into the plan's order, for the reason [`Sink::finalize`] gives below. On the rows
+            // rather than the chunk because the rows are owned here and the chunk is not built yet.
+            for row in &mut out {
+                row.rotate_left(self.left_width);
+            }
+        }
+        *chunk = rows::pack(&self.types, &out)?;
+        if local.row < left.len() {
+            local.left = Some(left);
+            return Ok(Progress::Again);
+        }
+        Ok(Progress::More)
+    }
+}
+
+/// What a scalar subquery says when it turns out not to be scalar.
+fn too_many_rows() -> Error {
+    Error::invalid_input(
+        "More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to revert to previous behavior of returning a random row."
+            .to_string(),
+    )
+}
+
 /// The columns a join's equalities line up, by position on each side.
 ///
 /// Two lists rather than a list of pairs because each of them is read whole: one builds the key of
@@ -635,6 +797,111 @@ struct Equalities {
     left: Vec<usize>,
     /// Positions in a row of the gathered side, in the order the driving side's are in.
     right: Vec<usize>,
+}
+
+/// The columns a join's conditions line up, when every one of them lines two columns up.
+///
+/// This is the question that decides whether the nested loop runs at all. An equality between a
+/// column of one side and a column of the other is answerable by looking the value up, and a
+/// condition that is anything else is not, so a join whose conditions are all equalities is a join
+/// that never has to compare a pair to find out whether it is a pair. It is also the question
+/// `crates/rudb-exec/src/build.rs` asks to decide which of the two operators here to build, which is
+/// why it is a function of the plan rather than a method on either of them.
+///
+/// All of them or none of them, for now. A join with an equality and something else could still use
+/// the equality to find candidates and evaluate the rest over those, and that is the shape this
+/// wants next. What it takes is building a chunk of the candidate rows to evaluate over, which is a
+/// second copy of part of a side, and doing it before the plain case is measured would be adding the
+/// complicated half first.
+///
+/// Only `=`. `IS NOT DISTINCT FROM` is the same lookup with the opposite null rule and is left out
+/// because no plan in the suite writes one, and a rule with no query behind it is a rule nothing
+/// checks.
+fn equalities(
+    plan: &Plan,
+    conditions: &[ExprRef],
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Option<Equalities> {
+    if conditions.is_empty() {
+        return None;
+    }
+    let mut found = Equalities { left: Vec::new(), right: Vec::new() };
+    for &condition in conditions {
+        let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
+            return None;
+        };
+        // The two sides of the equality have to be the same type, because what answers it is a hash
+        // table and a hash table has one bucket for one value. The binder puts a cast in where the
+        // types differ, and a cast is not a column, so this is a check rather than a conversion: an
+        // equality that needed one has already failed the match below.
+        if plan.expr_type(left) != plan.expr_type(right) || !looked_up(plan.expr_type(left)) {
+            return None;
+        }
+        let (&Expr::Column(one), &Expr::Column(other)) = (plan.expr(left), plan.expr(right)) else {
+            return None;
+        };
+        let across = match (
+            left_schema.position_of(one).zip(right_schema.position_of(other)),
+            left_schema.position_of(other).zip(right_schema.position_of(one)),
+        ) {
+            (Some(across), _) | (None, Some(across)) => across,
+            // Both columns on one side, which is a predicate that should have been pushed into that
+            // side and is not this operator's to be clever about.
+            (None, None) => return None,
+        };
+        found.left.push(across.0);
+        found.right.push(across.1);
+    }
+    Some(found)
+}
+
+/// The gathered side's rows, by the values the equalities read out of them.
+///
+/// A row whose key holds a null is left out rather than stored under a null key. `NULL = NULL` is
+/// null and not true, so such a row matches nothing, and leaving it out is what says so. That is the
+/// one place the key encoding here parts company with the one grouping uses, which answers
+/// `IS NOT DISTINCT FROM` and puts every null in the same group.
+///
+/// The positions come out of one pass in order, so each entry's list is ascending and the rows a
+/// probe finds arrive in the order the gathered side holds them. The nested loop produced them in
+/// that order too, which is why this is a faster way to the same answer rather than the same answer
+/// in a different order.
+fn index(
+    rows: &[Vec<Value>],
+    at: &[usize],
+    cancel: &Cancel,
+    scratch: &mut Reservation,
+) -> Result<RowMap<Vec<usize>>> {
+    let mut index: RowMap<Vec<usize>> = RowMap::default();
+    scratch.grow(rows::buckets(rows.len()))?;
+    for (position, row) in rows.iter().enumerate() {
+        let Some(key) = key(row, at) else { continue };
+        // The key's own values and the position stored beside it. The list an entry holds grows by
+        // one `usize` per row and the vector behind it doubles, so this charges the row it is about
+        // rather than trying to say when a doubling happened.
+        scratch.grow(rows::footprint(&key) + 8)?;
+        index.entry(Key(key)).or_default().push(position);
+        // Once per gathered row, which is the same granularity the probe checks at. A build over a
+        // side nobody bounded is the one part of this operator that can run long without producing
+        // anything.
+        if position % 1024 == 0 {
+            cancel.check()?;
+        }
+    }
+    Ok(index)
+}
+
+/// The gathered rows one driving row matches, by position in the gathered side.
+///
+/// Nothing for a driving row whose key holds a null, which matches nothing for the same reason a
+/// null on the other side was never stored. A row with no match is a row the join kind decides about
+/// rather than one that is dropped here.
+fn hits<'i>(index: &'i RowMap<Vec<usize>>, row: &[Value], at: &[usize]) -> &'i [usize] {
+    match key(row, at) {
+        None => &[],
+        Some(key) => index.get(&Key(key)).map_or(&[], Vec::as_slice),
+    }
 }
 
 /// The values at `at`, or nothing when one of them is null.
