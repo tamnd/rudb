@@ -4537,11 +4537,12 @@ fn a_table_function_joins_and_aggregates_like_anything_else_in_a_from_clause() {
 fn the_arguments_are_expressions_and_they_cannot_see_a_column() {
     let db = database();
     assert_eq!(rows(&db, "SELECT count(*) FROM range(2 + 3)"), vec![vec![Value::BigInt(5)]]);
-    // `FROM t, range(t.x)` is LATERAL, which is a different node and is not bound yet. Resolving
-    // the name against whatever is to the left would make the answer depend on the order the two
-    // sources were written in.
+    // `FROM t, range(t.x)` is LATERAL and the name does resolve now, but a table function's
+    // arguments are evaluated to produce the rows rather than over rows that already exist, so
+    // there is nothing underneath it for the domain to be pushed into and no plan for it yet. The
+    // refusal names what was written instead of pretending the column is not there.
     let message = failure(&db, "SELECT count(*) FROM t, range(t.x)");
-    assert!(message.contains("not found in FROM clause"), "{message}");
+    assert!(message.contains("a table function reading a LATERAL column"), "{message}");
 }
 
 #[test]
