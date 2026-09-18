@@ -640,7 +640,7 @@ mod tests {
 
     use rudb_vector::Chunk;
 
-    use super::{BLOCK_WORDS, Sieve};
+    use super::{BLOCK_WORDS, Counter, Sieve, hash_int};
     use crate::zone::Zone;
 
     /// The sieve of a one column chunk holding `values`, with a generous budget.
