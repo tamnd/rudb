@@ -189,8 +189,13 @@ fn scalar_projection_domain(
     let domain_index = walk::fresh_index(plan);
     let groups = plan.add_expr_list(&outer_exprs);
     let aggregates = plan.add_expr_list(&[]);
-    let domain =
-        plan.add_node(Node::Aggregate { input: left, index: domain_index, groups, aggregates });
+    let domain_input = domain::narrow(plan, left, &outer_keys);
+    let domain = plan.add_node(Node::Aggregate {
+        input: domain_input,
+        index: domain_index,
+        groups,
+        aggregates,
+    });
     let replay_input = if matches!(plan.node(input), Node::Dummy) {
         domain
     } else {
@@ -295,8 +300,13 @@ fn exists_domain(
     let domain_index = walk::fresh_index(plan);
     let groups = plan.add_expr_list(&outer_exprs);
     let aggregates = plan.add_expr_list(&[]);
-    let domain =
-        plan.add_node(Node::Aggregate { input: left, index: domain_index, groups, aggregates });
+    let domain_input = domain::narrow(plan, left, &outer_keys);
+    let domain = plan.add_node(Node::Aggregate {
+        input: domain_input,
+        index: domain_index,
+        groups,
+        aggregates,
+    });
 
     let domain_outputs: HashMap<ColumnBinding, usize> =
         outer_keys.iter().copied().enumerate().map(|(position, key)| (key, position)).collect();
@@ -443,8 +453,9 @@ fn scalar_aggregate_domain(
     let domain_index = walk::fresh_index(plan);
     let domain_groups = plan.add_expr_list(&outer_exprs);
     let no_aggregates = plan.add_expr_list(&[]);
+    let domain_input = domain::narrow(plan, left, &outer_keys);
     let domain = plan.add_node(Node::Aggregate {
-        input: left,
+        input: domain_input,
         index: domain_index,
         groups: domain_groups,
         aggregates: no_aggregates,
@@ -632,8 +643,10 @@ fn scalar_count_aggregate(
     let domain_groups: Vec<ExprRef> = keys.iter().map(|(_, _, outer_expr)| *outer_expr).collect();
     let domain_groups = plan.add_expr_list(&domain_groups);
     let no_aggregates = plan.add_expr_list(&[]);
+    let domain_keys: Vec<ColumnBinding> = keys.iter().map(|(binding, _, _)| *binding).collect();
+    let domain_input = domain::narrow(plan, left, &domain_keys);
     let domain = plan.add_node(Node::Aggregate {
-        input: left,
+        input: domain_input,
         index: domain_index,
         groups: domain_groups,
         aggregates: no_aggregates,

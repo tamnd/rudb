@@ -41,6 +41,76 @@ use rudb_plan::{
 use crate::tables::{TableSet, produced};
 use crate::walk;
 
+/// The part of the outer side the domain has to be built from, which is rarely all of it.
+///
+/// The domain is the distinct values the correlated columns take, and every rule that builds one
+/// wrote `Aggregate` straight over the outer side, which is the whole `FROM` list. At the point
+/// these rules run the `FROM` list is still a cross product, because nothing has turned the `WHERE`
+/// into joins yet, so a subquery correlated on one table was reading the product of all of them.
+/// TPC-H q21 correlates on two columns of `lineitem` and its outer side is supplier, lineitem,
+/// orders and nation, so the domain was a grouping over two and a quarter quintillion rows to find
+/// the distinct values of a column of a six million row table.
+///
+/// So this walks down into the branch that still has every table the keys come from, and the domain
+/// is built there instead. It stops where no single branch has them all, which is where the product
+/// is genuinely the thing being grouped.
+///
+/// The result is a superset of the values the keys take at `left` rather than exactly them, because
+/// the branch is what the product drew those rows from and the product can drop rows but cannot
+/// invent them. A superset is what the domain is allowed to be. Every rule joins the domain's
+/// answer back to the real outer rows on the correlated columns, so a domain value no outer row has
+/// carries its answer to nothing, and none of them turn into an extra output row. What a superset
+/// must not do is turn one answer into two, and it does not, because the answer is grouped by the
+/// domain columns and extra values are extra groups rather than extra rows in a group.
+///
+/// Which branches [`narrow`] may walk into is [`passes_through`].
+///
+/// A projection is not one of them, and nothing has to say so: a projection's output is its own
+/// table, so a key that reads it does not read the table underneath and the test on the way down
+/// refuses the branch on its own.
+pub(crate) fn narrow(plan: &Plan, left: NodeRef, keys: &[ColumnBinding]) -> NodeRef {
+    let mut at = left;
+    loop {
+        let sides = match *plan.node(at) {
+            Node::CrossProduct { left, right } | Node::Join { left, right, .. } => [left, right],
+            _ => return at,
+        };
+        let found = passes_through(plan, at).iter().map(|&which| sides[which]).find(|&side| {
+            let there = produced(plan, side);
+            keys.iter().all(|key| there.contains(key.table))
+        });
+        match found {
+            Some(side) => at = side,
+            None => return at,
+        }
+    }
+}
+
+/// Which of a node's two branches it passes through as they are, as positions into left and right.
+///
+/// A branch is one [`narrow`] may walk into only where the node above it leaves that branch's
+/// columns alone. A cross product and an inner join do that for both branches: they drop and repeat
+/// rows, but every value in a column came from the branch it names. A left, single, semi, anti or
+/// mark join does it for its left branch, which it keeps whole and untouched, and does not do it for
+/// its right, which it pads with nulls the right branch never held. A right join is the mirror of
+/// that. A full join and a positional join pad both sides, so neither branch is one to walk into.
+fn passes_through(plan: &Plan, at: NodeRef) -> &'static [usize] {
+    match *plan.node(at) {
+        Node::CrossProduct { .. } => &[0, 1],
+        Node::Join { kind, .. } => match kind {
+            JoinKind::Inner => &[0, 1],
+            JoinKind::Left
+            | JoinKind::Single
+            | JoinKind::Semi
+            | JoinKind::Anti
+            | JoinKind::Mark => &[0],
+            JoinKind::Right => &[1],
+            JoinKind::Full | JoinKind::Positional => &[],
+        },
+        _ => &[],
+    }
+}
+
 /// One outer column that the right side of a dependent join reads.
 struct Key {
     /// Where the column is in the left side's output.
@@ -83,7 +153,9 @@ pub(crate) fn lower(
     let groups = plan.add_expr_list(&group_exprs);
     let aggregates = plan.add_expr_list(&[]);
     let index = walk::fresh_index(plan);
-    let domain = plan.add_node(Node::Aggregate { input: left, index, groups, aggregates });
+    let bindings: Vec<ColumnBinding> = keys.iter().map(|key| key.binding).collect();
+    let input = narrow(plan, left, &bindings);
+    let domain = plan.add_node(Node::Aggregate { input, index, groups, aggregates });
 
     let pushed = push(plan, right, domain, index, &keys, &outer)?;
 
