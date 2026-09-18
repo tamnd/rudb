@@ -205,13 +205,14 @@ impl Rows {
             return Chunk::with_rows(vectors, ordinals.len());
         }
         let width = columns.len().div_ceil(workers);
+        let locations = &locations;
         let pieces = std::thread::scope(|scope| {
             let handles = columns
                 .chunks(width)
                 .zip(types.chunks(width))
                 .map(|(columns, types)| {
                     scope.spawn(move || {
-                        Self::read_native_columns(reader, columns, types, &locations, dense)
+                        Self::read_native_columns(reader, columns, types, locations, dense)
                     })
                 })
                 .collect::<Vec<_>>();
