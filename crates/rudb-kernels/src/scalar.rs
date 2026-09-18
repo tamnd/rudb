@@ -51,7 +51,7 @@
 use memchr::memmem;
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::cast;
@@ -1286,10 +1286,97 @@ pub(crate) struct Like {
     stable: OnceLock<StableLike>,
 }
 
+/// How many dictionary values one decision of the stable memo covers.
+///
+/// It is what the native format puts in a payload block, so deciding a group reads one block of the
+/// dictionary and reads all of it, in the order it decodes to. A dictionary that groups its values
+/// some other way still gets the locality, since what this is really buying is a run of consecutive
+/// values rather than a scatter, and it is a whole number of words either way.
+const LIKE_GROUP: usize = 1024;
+
+/// A `LIKE` answered once per distinct value, for a dictionary that outlives the chunk.
+///
+/// The memo used to be a byte a value holding unknown, no or yes, and the row loop probed it at a
+/// random position once a row. On ClickBench `URL` that is a byte array of 18.3 million probed a
+/// hundred million times, and eighteen megabytes across a dozen threads does not stay in the last
+/// level cache, so the loop was paying a miss a row to answer a question it had already answered.
+/// The substring search was not the cost: the same query with a pattern that matches nothing, and
+/// the same query written as a prefix, both cost what `%google%` costs to the hundredth of a
+/// second.
+///
+/// So the answer is a bit a value and whether it has been decided is another, which is 2.3 MB each
+/// for `URL` against the eighteen a byte a value took, and the memo decides a whole group at a time
+/// rather than a value at a time. Deciding a group is a walk over 1,024 consecutive dictionary
+/// values, which is one payload block read in the order it decodes to rather than a scatter across
+/// a gigabyte of them.
+///
+/// A group is only worth deciding whole where the chunk asking is a scan rather than what a
+/// selective filter left behind. A chunk of ten rows that happen to point at ten distant values has
+/// no use for the ten thousand values either side of them, so it decides the ten. The rule is the
+/// chunk holding at least a group's worth of rows, which is a guess about intent and not a fact
+/// about the query, and it is wrong in the cheap direction: deciding one value at a time is what
+/// this always did.
+///
+/// Two threads can decide the same value or the same group at the same time. They walk the same
+/// values with the same pattern and reach the same answer, so the race is benign: the group write
+/// and the single value write agree wherever they overlap, and neither can clear a bit the other
+/// set. The decided bit is written last with a release and read with an acquire, which is what
+/// makes the answer visible to a thread that skips the walk.
 #[derive(Debug)]
 struct StableLike {
     dictionary: Arc<Vector>,
-    answers: Vec<AtomicU8>,
+    /// One bit a value, set where the value matches, meaningful once its decided bit is set.
+    answers: Vec<AtomicU64>,
+    /// One bit a value, set once that value's answer is written.
+    decided: Vec<AtomicU64>,
+}
+
+impl StableLike {
+    /// Whether `code` has been decided already.
+    fn is_decided(&self, code: usize) -> bool {
+        self.decided
+            .get(code / 64)
+            .is_some_and(|word| word.load(Ordering::Acquire) >> (code % 64) & 1 == 1)
+    }
+
+    /// Decides one value, which is what a chunk too small to be a scan asks for.
+    fn decide_one(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
+        if like.holds_vector(&self.dictionary, code, characters)? {
+            self.word(&self.answers, code)?.fetch_or(1 << (code % 64), Ordering::Relaxed);
+        }
+        self.word(&self.decided, code)?.fetch_or(1 << (code % 64), Ordering::Release);
+        Ok(())
+    }
+
+    /// Decides every value of the group holding `code`, which reads one payload block in order.
+    fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
+        let group = code / LIKE_GROUP;
+        let first = group * LIKE_GROUP;
+        let last = (first + LIKE_GROUP).min(self.dictionary.len());
+        for word in (first..last).step_by(64) {
+            let mut bits = 0_u64;
+            for bit in 0..(last - word).min(64) {
+                if like.holds_vector(&self.dictionary, word + bit, characters)? {
+                    bits |= 1 << bit;
+                }
+            }
+            self.word(&self.answers, word)?.fetch_or(bits, Ordering::Relaxed);
+            let all = if last - word >= 64 { u64::MAX } else { (1 << (last - word)) - 1 };
+            self.word(&self.decided, word)?.fetch_or(all, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Whether `code` matches, which is only asked once it has been decided.
+    fn answer(&self, code: usize) -> Result<bool> {
+        Ok(self.word(&self.answers, code)?.load(Ordering::Relaxed) >> (code % 64) & 1 == 1)
+    }
+
+    /// The word of `bits` that `code` lives in.
+    fn word<'memo>(&self, bits: &'memo [AtomicU64], code: usize) -> Result<&'memo AtomicU64> {
+        bits.get(code / 64)
+            .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))
+    }
 }
 
 impl Like {
@@ -1402,27 +1489,30 @@ fn like_stable(
     rows: usize,
     returns: &LogicalType,
 ) -> Result<Option<Vector>> {
-    let cache = like.stable.get_or_init(|| StableLike {
-        dictionary: Arc::clone(dictionary),
-        answers: (0..dictionary.len()).map(|_| AtomicU8::new(0)).collect(),
+    let cache = like.stable.get_or_init(|| {
+        let words = dictionary.len().div_ceil(64);
+        StableLike {
+            dictionary: Arc::clone(dictionary),
+            answers: (0..words).map(|_| AtomicU64::new(0)).collect(),
+            decided: (0..words).map(|_| AtomicU64::new(0)).collect(),
+        }
     });
     if !Arc::ptr_eq(&cache.dictionary, dictionary) {
         return like_vector_run(dictionary, codes, like, base, rows, returns);
     }
+    let bulk = rows >= LIKE_GROUP;
     let mut out = vec![false; rows];
     let mut characters = Vec::new();
     let validity = over_valid(rows, base, |index| {
         let code = codes[index] as usize;
-        let answer = cache
-            .answers
-            .get(code)
-            .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?;
-        let mut state = answer.load(Ordering::Relaxed);
-        if state == 0 {
-            state = u8::from(like.holds_vector(dictionary, code, &mut characters)?) + 1;
-            answer.store(state, Ordering::Relaxed);
+        if !cache.is_decided(code) {
+            if bulk {
+                cache.decide_group(code, like, &mut characters)?;
+            } else {
+                cache.decide_one(code, like, &mut characters)?;
+            }
         }
-        out[index] = state == 2;
+        out[index] = cache.answer(code)?;
         Ok(())
     })?;
     finish(returns, Data::Bool(out.into()), validity)
