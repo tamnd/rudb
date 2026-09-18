@@ -42,23 +42,47 @@
 //!
 //! What is left over reads both sides. Over an inner join it becomes a condition, because a
 //! condition and a filter above the join mean the same thing there and the condition is the one that
-//! runs while the pairs are being built. Over anything else it stays where it was. That one measures
-//! as a wash today, within the noise on 2000 rows against 50000, and it is kept because it is the
-//! plan a hash join wants and because a condition means the join stops materializing pairs that the
-//! filter above it was going to throw away.
+//! runs while the pairs are being built. Over anything else it stays where it was.
 //!
-//! What a cross product does not do yet is become an inner join. It is the same rewrite, it is the
-//! one every textbook has and the one #102 wants, and it was a pessimization when it was taken out:
-//! ten thousand rows against fifty thousand with `a.x = b.x` over them took 1.25 seconds as a cross
-//! product with a filter above it and 10.7 seconds as a join with a condition, measured on server2,
-//! because every join was a nested loop that paired one left row against a chunk of the right side
-//! at a time where the cross product handed whole chunks on and let the filter run over them.
+//! # Which leftovers a join wants
 //!
-//! That is no longer where the numbers are. An equality between two columns is answered by a lookup
-//! now, and the same pair on a MacBook Air M4 is 1.01 seconds as a cross product with a filter and
-//! 0.56 as a join with a condition. What is left before the rewrite comes back is memory rather than
-//! time: a join holds both of its sides and all of its output at once, and a cross product with a
-//! filter above it holds one side and throws each pair away as it goes. #211 has the order.
+//! Not all of them, and which ones is the difference between a join that builds a table and a join
+//! that compares every pair. The join operator answers its conditions with a hash table when all of
+//! them are an equality between a column of one side and a column of the other, and reads the whole
+//! gathered side once per driving row when any one of them is not. So a predicate moved onto a join
+//! that was going to use a table takes the table away from it, and a filter above a join that uses a
+//! table beats a condition on a join that cannot. `answered` is that question and it is asked of
+//! every leftover before it moves.
+//!
+//! When the join was never going to use a table anyway, every leftover moves onto it, since a
+//! condition on a nested loop is evaluated while the pair is in hand and a filter above one is
+//! evaluated after the pair has been written down.
+//!
+//! # A cross product that is a join
+//!
+//! A cross product under a filter that equates a column of one side with a column of the other is an
+//! inner join written the long way, and rewriting it is the one every textbook has and the one #102
+//! wants. It was a pessimization when it was taken out: ten thousand rows against fifty thousand
+//! with `a.x = b.x` over them took 1.25 seconds as a cross product with a filter above it and 10.7
+//! seconds as a join with a condition, measured on server2, because every join was a nested loop that
+//! paired one left row against a chunk of the right side at a time where the cross product handed
+//! whole chunks on and let the filter run over them.
+//!
+//! Neither half of that is true any more. The equality is answered by a lookup rather than by a
+//! scan, and since #844 the lookup holds the gathered side and nothing else, so a join now costs what
+//! a cross product costs in memory and far less in time. The same ten thousand against fifty
+//! thousand on a MacBook Air M4, both plans out of one binary with `SET disabled_optimizers` picking
+//! which, is 1.38 seconds as a cross product with a filter above it and 0.010 seconds as a join. That
+//! is the same query and the same answer, and it is the largest single number this pass has ever
+//! produced.
+//!
+//! It is only the equalities that move, and the same two tables say why. A cross product under a
+//! filter of `a.x < b.x` answers in 0.71 seconds, because the cross product hands each chunk of pairs
+//! on and the filter throws most of them away. The join it would have been rewritten into answers
+//! `Out of Memory Error: could not allocate 5.7 MiB (19.1 GiB/19.1 GiB used)`, because a join that no
+//! lookup answers is still a sink that gathers both sides and collects all two hundred and fifty
+//! million pairs before anything reads one. So a cross product under a predicate a lookup cannot
+//! answer stays a cross product.
 //!
 //! Before any of that, the join is asked what kind of join it really is. An outer join exists to
 //! produce rows padded with nulls, so a predicate above it that cannot be true of a padded row turns
@@ -93,7 +117,9 @@
 //! few nodes on a plan and is the reason every pass walks from the root rather than over the arena.
 
 use rudb_common::{LogicalType, Result};
-use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
+use rudb_plan::{
+    BuildSide, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+};
 
 use crate::pass::{Context, Pass};
 use crate::tables::{TableSet, Tables, produced};
@@ -296,8 +322,11 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
                 sides(plan, tables, pending, &below, kept(kind));
             to_left.extend(extra_left);
             to_right.extend(extra_right);
-            let (added, stay) =
-                if kind == JoinKind::Inner { (over, Vec::new()) } else { (Vec::new(), over) };
+            let (added, stay) = if kind == JoinKind::Inner {
+                onto(plan, tables, &held, over, &below)
+            } else {
+                (Vec::new(), over)
+            };
             let rebuilt_left = node(plan, left, to_left, tables);
             let rebuilt_right = node(plan, right, to_right, tables);
             let rebuilt_conditions = if added.is_empty() && held == plan.expr_list(conditions) {
@@ -346,19 +375,34 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         }
 
         // Both sides of a cross product are kept as they are, so a predicate over one side goes
-        // into it. A predicate over both stays above, for the measured reason in this file's
-        // opening, and #211 is where that changes.
+        // into it. A predicate over both becomes the condition of an inner join when it is one a
+        // lookup answers, which is the rewrite this file's opening is about, and stays above when it
+        // is not, because a nested loop under the same filter is the slower of the two shapes.
         Node::CrossProduct { left, right } => {
             let below = (produced(plan, left), produced(plan, right));
             let (to_left, to_right, over) = sides(plan, tables, pending, &below, (true, true));
+            let (conditions, stay) = joined(plan, tables, over, &below);
             let rebuilt_left = node(plan, left, to_left, tables);
             let rebuilt_right = node(plan, right, to_right, tables);
-            let above = if rebuilt_left == left && rebuilt_right == right {
-                at
+            let above = if conditions.is_empty() {
+                if rebuilt_left == left && rebuilt_right == right {
+                    at
+                } else {
+                    plan.add_node(Node::CrossProduct { left: rebuilt_left, right: rebuilt_right })
+                }
             } else {
-                plan.add_node(Node::CrossProduct { left: rebuilt_left, right: rebuilt_right })
+                let conditions = plan.add_expr_list(&conditions);
+                // The build side the binder puts on a join it has just made. The pass that chooses
+                // one runs after this and reads the sides as they end up.
+                plan.add_node(Node::Join {
+                    left: rebuilt_left,
+                    right: rebuilt_right,
+                    kind: JoinKind::Inner,
+                    conditions,
+                    build: BuildSide::default(),
+                })
             };
-            filter(plan, above, over)
+            filter(plan, above, stay)
         }
 
         Node::SetOp { left, right, kind, all, index } => {
@@ -458,6 +502,78 @@ fn sides(
         }
     }
     (to_left, to_right, over)
+}
+
+/// Whether a lookup answers this predicate, which is the question `rudb_exec`'s join asks of every
+/// one of its conditions before it decides how to run.
+///
+/// An equality between a column of one side and a column of the other, of a type a hash table has
+/// one bucket per value of. The join builds its table on exactly this and on nothing else, so a join
+/// whose conditions are all of this shape reads the gathered side once and answers a driving row by
+/// reading one entry out of it, and a join with a single condition of any other shape reads the whole
+/// gathered side once per driving row instead.
+///
+/// The two sides of the equality have to be the same type, since the table has one bucket for one
+/// value. Where they differ the binder puts a cast in, and a cast is an expression rather than a
+/// column, so that case is already out by the time the type is looked at.
+fn answered(plan: &Plan, tables: &mut Tables, part: ExprRef, below: &(TableSet, TableSet)) -> bool {
+    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(part) else {
+        return false;
+    };
+    if !matches!((plan.expr(left), plan.expr(right)), (Expr::Column(_), Expr::Column(_))) {
+        return false;
+    }
+    if plan.expr_type(left) != plan.expr_type(right) || !plan.expr_type(left).is_keyed() {
+        return false;
+    }
+    let (one, other) = (tables.of(plan, left), tables.of(plan, right));
+    (one.is_subset_of(&below.0) && other.is_subset_of(&below.1))
+        || (one.is_subset_of(&below.1) && other.is_subset_of(&below.0))
+}
+
+/// Which of the predicates that read both sides of an inner join become conditions of it, and which
+/// stay above.
+///
+/// `held` is what the join already has. When a lookup answers the join once the move is done, only
+/// the predicates a lookup answers move, because the ones that do not would cost the join its table
+/// and a filter above a join that uses a table is cheaper than a condition on a join that cannot.
+/// When no lookup was available either way, everything moves, since a condition on a nested loop is
+/// evaluated with the pair in hand and a filter above one is evaluated after the pair has been
+/// written down.
+fn onto(
+    plan: &Plan,
+    tables: &mut Tables,
+    held: &[ExprRef],
+    over: Vec<ExprRef>,
+    below: &(TableSet, TableSet),
+) -> (Vec<ExprRef>, Vec<ExprRef>) {
+    let (fit, unfit): (Vec<ExprRef>, Vec<ExprRef>) =
+        over.into_iter().partition(|&part| answered(plan, tables, part, below));
+    // A join with no conditions at all is a nested loop over every pair, so an empty `held` with
+    // nothing to add to it is not a lookup however few conditions failed the question.
+    let lookup = !(held.is_empty() && fit.is_empty())
+        && held.iter().all(|&part| answered(plan, tables, part, below));
+    if lookup {
+        return (fit, unfit);
+    }
+    (fit.into_iter().chain(unfit).collect(), Vec::new())
+}
+
+/// Which of the predicates over a cross product become the conditions of an inner join, and which
+/// stay above.
+///
+/// Only the ones a lookup answers, and when there are none the cross product stays a cross product.
+/// This is the one place where the alternative to a condition is not a nested loop that exists
+/// anyway but a nested loop this pass would be creating, and creating one is how an optimizer turns
+/// a query that answers into a query that runs out of memory. The opening of this file has the pair
+/// of tables where that is exactly what happens.
+fn joined(
+    plan: &Plan,
+    tables: &mut Tables,
+    over: Vec<ExprRef>,
+    below: &(TableSet, TableSet),
+) -> (Vec<ExprRef>, Vec<ExprRef>) {
+    over.into_iter().partition(|&part| answered(plan, tables, part, below))
 }
 
 /// Puts `parts` back as one filter over `input`, or hands back `input` when there are none.
@@ -1079,9 +1195,10 @@ CrossProduct
     }
 
     #[test]
-    fn a_cross_product_does_not_become_a_join_while_the_join_is_the_slower_operator() {
-        // The rewrite every textbook has, kept out until #211, with the measurement in this file's
-        // opening. The half of the predicate that reads one side still goes into that side.
+    fn a_cross_product_under_an_equality_becomes_an_inner_join() {
+        // The rewrite every textbook has and the one #102 wants. The half of the predicate that
+        // reads one side still goes into that side, and the half that reads both is now the
+        // condition of a join rather than a filter over every pair.
         let before = "\
 Filter ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN
   CrossProduct
@@ -1089,11 +1206,90 @@ Filter ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER
     Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
 ";
         let after = "\
-Filter (#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN
+Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+  Filter (#0.1::INTEGER > 5::INTEGER)::BOOLEAN
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_cross_product_under_a_comparison_that_is_not_an_equality_stays_a_cross_product() {
+        // The join this would become is a sink that gathers both sides and collects every pair, and
+        // this file's opening has the query where that is an out of memory error against a cross
+        // product answering the same thing in under a second. So the predicate stays above.
+        let before = "\
+Filter (#0.0::INTEGER < #1.0::INTEGER)::BOOLEAN
   CrossProduct
-    Filter (#0.1::INTEGER > 5::INTEGER)::BOOLEAN
-      Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), before);
+    }
+
+    #[test]
+    fn an_equality_between_a_column_and_an_expression_does_not_make_a_join() {
+        // A lookup is a table keyed by a column's values, so an equality one side of which is
+        // computed is not one it answers, and a join built on it would compare every pair.
+        let before = "\
+Filter (#0.0::INTEGER = \"+\"(#1.0::INTEGER, 1::INTEGER)::INTEGER)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), before);
+    }
+
+    #[test]
+    fn the_equalities_over_a_cross_product_become_conditions_and_the_rest_stays_above() {
+        // Both halves at once. The equality is what the table is built on and the comparison is
+        // what runs over the rows that came out of it, which is fewer rows than the cross product
+        // was producing, so the filter above is cheaper as well.
+        let before = "\
+Filter ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER < #1.1::INTEGER)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Filter (#0.1::INTEGER < #1.1::INTEGER)::BOOLEAN
+  Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_predicate_a_lookup_cannot_answer_does_not_join_a_join_that_uses_one() {
+        // The rule the streaming probe of #844 made matter. Moving this comparison onto the join
+        // would cost it the table it was going to build, and then every driving row would read the
+        // whole gathered side rather than one entry of it.
+        let before = "\
+Filter (#0.1::INTEGER < #1.1::INTEGER)::BOOLEAN
+  Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), before);
+    }
+
+    #[test]
+    fn a_predicate_over_both_sides_of_a_join_no_lookup_answers_becomes_a_condition() {
+        // The other side of the same rule. This join compares every pair whatever happens to the
+        // predicate, and a condition is evaluated with the pair in hand where a filter above is
+        // evaluated after the pair has been written down.
+        let before = "\
+Filter (#0.1::INTEGER < #1.1::INTEGER)::BOOLEAN
+  Join INNER on=[(#0.0::INTEGER < #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Join INNER on=[(#0.0::INTEGER < #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER < #1.1::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
 ";
         assert_eq!(pushed(before), after);
     }
