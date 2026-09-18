@@ -336,12 +336,22 @@ Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
     fn a_condition_over_the_padded_side_of_a_left_join_derives_nothing_for_the_other() {
         // `ON b.x > 5` is not something the rows of `a` have to satisfy. An `a` row that fails it
         // comes out padded rather than not at all, so copying it onto `a` would delete rows.
+        //
+        // It does go into `b`, which is `filter`'s rule and happens in the same visit. A `b` row that
+        // fails the condition matches no `a` row, and a left join drops a `b` row that matched
+        // nothing, so removing it from `b` first is the same join with one condition instead of two.
         let before = "\
 Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#1.0::INTEGER > 5::INTEGER)::BOOLEAN]
   Get memory.main.t AS a #0 [a::INTEGER]
   Get memory.main.t AS b #1 [a::INTEGER]
 ";
-        assert_eq!(pushed(before), before);
+        let after = "\
+Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER]
+  Filter (#1.0::INTEGER > 5::INTEGER)::BOOLEAN
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
     }
 
     #[test]

@@ -58,6 +58,22 @@
 //! condition on a nested loop is evaluated while the pair is in hand and a filter above one is
 //! evaluated after the pair has been written down.
 //!
+//! # A join condition that is really a filter
+//!
+//! The traffic goes the other way as well. A condition that reads one side only is a filter on that
+//! side written into the `ON` clause, and leaving it there costs the join its table for a predicate
+//! the side could have applied to itself. Which sides may take one is a different table from `kept`
+//! and is `unmatched`: a condition is read while the pairs are being made, so a row that fails one
+//! matched nothing, and the side may take the condition exactly where the join drops a row that
+//! matched nothing.
+//!
+//! TPC-H q13 is the query that makes the point. It is the one of the twenty two written with the
+//! `JOIN` keyword, and what it writes is `customer LEFT OUTER JOIN orders ON c_custkey = o_custkey
+//! AND o_comment NOT LIKE '%special%requests%'`. The `NOT LIKE` reads orders alone. With it in the
+//! condition list the join is a nested loop over 150,000 customers and 1,500,000 orders and the
+//! query does not finish in five minutes. With it in the scan of orders the one condition left is an
+//! equality, the join is a lookup, and the query answers in 3.9 seconds.
+//!
 //! # A cross product that is a join
 //!
 //! A cross product under a filter that equates a column of one side with a column of the other is an
@@ -322,6 +338,11 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
                 sides(plan, tables, pending, &below, kept(kind));
             to_left.extend(extra_left);
             to_right.extend(extra_right);
+            // A condition that reads one side only goes into that side, where the join drops the
+            // rows it rejects anyway. That is q13 and the reason is in `alone`.
+            let (held, own_left, own_right) = alone(plan, tables, held, &below, unmatched(kind));
+            to_left.extend(own_left);
+            to_right.extend(own_right);
             let (added, stay) = if kind == JoinKind::Inner {
                 onto(plan, tables, &held, over, &below)
             } else {
@@ -473,6 +494,89 @@ pub(crate) fn kept(kind: JoinKind) -> (bool, bool) {
         JoinKind::Right => (false, true),
         JoinKind::Full | JoinKind::Positional => (false, false),
     }
+}
+
+/// Which sides of a join lose a row that takes part in no match.
+///
+/// The side a condition of the join may be pushed into, which is a different question from the one
+/// `kept` answers and comes out differently on almost every kind. A condition is read while the
+/// pairs are being made, so a row that fails one is a row that matched nothing, and where the join
+/// drops such a row the condition may as well have removed it from that side to begin with. Where
+/// the join keeps such a row, moving the condition into the side deletes a row the join was going to
+/// emit.
+///
+/// An inner join drops both, since a row of either side is only ever seen through a pair. A left
+/// join emits every left row and so keeps the left, and a right join is the mirror of it. A full
+/// join keeps both, which is what makes it full.
+///
+/// The four one sided kinds all emit left rows and never emit right ones, and they split on what
+/// they do with a left row that matched nothing. A semi drops it, so a left condition moves. An
+/// anti, a mark and a single are the three that emit it, as a row, as a false and as a row padded
+/// with nulls, so a left condition stays.
+///
+/// Three of those four move a right condition, because the right side is only ever a question asked
+/// about the left rows and a right row that fails the condition answers nothing. A mark join is the
+/// exception and the reason is nulls. It answers true, false or NULL, and the NULL means it found no
+/// match but saw a comparison it could not resolve, so the right rows it did not match are part of
+/// its answer rather than rows it merely ignored. `SELECT 3 IN (SELECT x FROM (VALUES (1), (NULL)))`
+/// is NULL, and it is NULL because the row holding NULL was there to be compared against. Filtering
+/// that row out ahead of the join turns the answer into false.
+///
+/// A positional join moves neither, for the reason `kept` gives: its pairs are made by counting
+/// rather than by matching, so it has no row that took part in no match.
+fn unmatched(kind: JoinKind) -> (bool, bool) {
+    match kind {
+        JoinKind::Inner | JoinKind::Semi => (true, true),
+        JoinKind::Left | JoinKind::Anti | JoinKind::Single => (false, true),
+        JoinKind::Right => (true, false),
+        JoinKind::Full | JoinKind::Positional | JoinKind::Mark => (false, false),
+    }
+}
+
+/// Sorts the join's own conditions into the ones that belong to one side and the ones that stay.
+///
+/// A condition that reads one side only is a filter on that side wearing a join's clothes, and it
+/// costs the join a great deal to keep wearing it. The operator takes its lookup only when every
+/// condition is an equality across the two sides, so one single sided condition drops the join to
+/// reading the whole gathered side once per driving row, and the condition it dropped for is one the
+/// side could have applied to itself before the join ever saw it.
+///
+/// TPC-H q13 is the query that says this out loud. It is the one of the twenty two written with the
+/// `JOIN` keyword, and what it writes is `customer LEFT OUTER JOIN orders ON c_custkey = o_custkey
+/// AND o_comment NOT LIKE '%special%requests%'`. The `NOT LIKE` reads orders and nothing else, and
+/// with it in the condition list the join is a nested loop over 150,000 customers and 1,500,000
+/// orders, which does not finish. With it moved into the scan of orders the one condition left is an
+/// equality and the join is a lookup.
+/// The last condition never moves. A join that has one condition and reads one side with it would be
+/// left with an empty list, and an empty list is not a join with nothing to check but a join that
+/// pairs every row with every row, which is a different query on every kind that is not inner. The
+/// operators downstream do not expect it either, and say so with an internal error about a
+/// conjunction with no children.
+fn alone(
+    plan: &Plan,
+    tables: &mut Tables,
+    held: Vec<ExprRef>,
+    below: &(TableSet, TableSet),
+    moves: (bool, bool),
+) -> (Vec<ExprRef>, Vec<ExprRef>, Vec<ExprRef>) {
+    let mut stay = Vec::new();
+    let mut to_left = Vec::new();
+    let mut to_right = Vec::new();
+    let last = held.len();
+    for (seen, part) in held.into_iter().enumerate() {
+        let read = tables.of(plan, part);
+        let only = stay.is_empty() && seen + 1 == last;
+        if only {
+            stay.push(part);
+        } else if moves.0 && read.is_subset_of(&below.0) {
+            to_left.push(part);
+        } else if moves.1 && read.is_subset_of(&below.1) {
+            to_right.push(part);
+        } else {
+            stay.push(part);
+        }
+    }
+    (stay, to_left, to_right)
 }
 
 /// Sorts `pending` into what goes into the left side, what goes into the right, and what is left.
@@ -1318,6 +1422,122 @@ Join INNER on=[(#0.0::INTEGER < #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER < #1.1::
   Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
 ";
         assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_join_condition_that_reads_one_side_goes_into_that_side() {
+        // TPC-H q13 in miniature. The condition left behind is an equality across the sides, which is
+        // the whole point: with the single sided one still in the list the operator compares every
+        // pair, and without it the operator builds a table.
+        let before = "\
+Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#1.1::INTEGER > 5::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Filter (#1.1::INTEGER > 5::INTEGER)::BOOLEAN
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_left_join_keeps_a_condition_that_reads_the_side_it_preserves() {
+        // The left side of a left join comes out whether it matched or not, so a left row failing the
+        // condition is a row the join still emits, padded. Moving the condition into the side would
+        // delete it.
+        let before = "\
+Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER > 5::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), before);
+    }
+
+    #[test]
+    fn an_anti_join_keeps_a_condition_that_reads_its_left_side() {
+        // An anti join emits the left rows that matched nothing, so a left row failing the condition
+        // matches nothing and is emitted. A semi join drops the same row, which is why the two kinds
+        // are on opposite sides of this rule.
+        let before = "\
+Join ANTI on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER > 5::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), before);
+    }
+
+    #[test]
+    fn a_semi_join_moves_a_condition_that_reads_its_left_side() {
+        let before = "\
+Join SEMI on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER > 5::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Join SEMI on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+  Filter (#0.1::INTEGER > 5::INTEGER)::BOOLEAN
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn an_anti_join_still_moves_a_condition_that_reads_the_side_it_never_emits() {
+        // The right side of an anti join is a question asked about the left rows, and a right row
+        // that fails the condition answers nothing, so it may as well not be there.
+        let before = "\
+Join ANTI on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#1.1::INTEGER > 5::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Join ANTI on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Filter (#1.1::INTEGER > 5::INTEGER)::BOOLEAN
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_mark_join_keeps_a_condition_that_reads_the_side_it_never_emits() {
+        // A mark join answers true, false or NULL, and the NULL says it found no match but saw a
+        // comparison it could not resolve. The right rows it did not match are part of that answer,
+        // so filtering them out ahead of it turns a NULL into a false. The corpus caught this as
+        // `SELECT 3 IN (SELECT x FROM (VALUES (1), (NULL)))` answering 0 instead of NULL.
+        let before = "\
+Join MARK on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#1.1::INTEGER > 5::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), before);
+    }
+
+    #[test]
+    fn the_only_condition_a_join_has_stays_whatever_it_reads() {
+        // Moving it would leave an empty condition list, which is not a join with nothing to check
+        // but a join that pairs every row with every row.
+        let before = "\
+Join INNER on=[(#1.0::INTEGER > 5::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER]
+";
+        assert_eq!(pushed(before), before);
+    }
+
+    #[test]
+    fn a_full_join_keeps_a_condition_that_reads_either_side() {
+        // A full join preserves both sides, so neither side may lose a row.
+        let before = "\
+Join FULL on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#1.1::INTEGER > 5::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), before);
     }
 
     #[test]
