@@ -23,9 +23,12 @@ use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, TextSource, Vector};
 
 const MAGIC_V7: &[u8; 8] = b"RUDBNV7\0";
-const MAGIC: &[u8; 8] = b"RUDBNV8\0";
+const MAGIC_V8: &[u8; 8] = b"RUDBNV8\0";
+const MAGIC: &[u8; 8] = b"RUDBNV9\0";
 const DIRECTORY_V7: &[u8; 8] = b"RUDBDIR7";
-const DIRECTORY: &[u8; 8] = b"RUDBDIR8";
+const DIRECTORY_V8: &[u8; 8] = b"RUDBDIR8";
+const DIRECTORY: &[u8; 8] = b"RUDBDIR9";
+const FORMAT: u32 = 9;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -199,6 +202,10 @@ pub struct Table {
     rows: usize,
     dictionaries: Vec<Option<Page>>,
     frequencies: Vec<Option<FrequencySummary>>,
+    /// The format version of the file this came out of, which is what says how to read a
+    /// dictionary page. Version 9 writes the sorted order beside the values and earlier ones do
+    /// not, and a reader that guesses wrong reads the offsets as the order.
+    version: u32,
 }
 
 impl Table {
@@ -290,6 +297,34 @@ impl GlobalDictionary {
         Ok(code)
     }
 
+    /// This dictionary's codes in sorted value order, so `order[rank]` is the code of the value
+    /// that sits at `rank` when the values are sorted by their bytes.
+    ///
+    /// Codes themselves stay in first appearance order, which is what lets the writer hand one out
+    /// the moment it sees a value rather than waiting for the last stripe, and which also keeps a
+    /// stripe's codes close together because the data is clustered. The order is what puts the
+    /// values back in order for anything that needs it, and it is a separate array so that getting
+    /// it costs a sort of the distinct values at the end rather than a rewrite of every code page.
+    ///
+    /// The sort compares the first eight bytes as one integer before it compares the values, which
+    /// settles almost every pair without touching the payload. Padding with zero on the right is
+    /// order preserving for byte strings, because a shorter value differs from a longer one that
+    /// starts the same way at a position where the shorter one has run out, and zero is below every
+    /// byte that could be there. A pair the head cannot settle falls through to the bytes.
+    fn sorted_order(&self) -> Vec<u32> {
+        let count = self.offsets.len() - 1;
+        let mut ranked = (0..count)
+            .map(|code| {
+                let code = code as u32;
+                (head(self.bytes(code).unwrap_or_default()), code)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| self.bytes(left.1).cmp(&self.bytes(right.1)))
+        });
+        ranked.into_iter().map(|(_, code)| code).collect()
+    }
+
     fn observe(&mut self, code: u32, null: bool) -> Result<()> {
         if null {
             self.nulls = self.nulls.saturating_add(1);
@@ -328,11 +363,11 @@ struct PendingStripe {
 const EXTENT_STRIPES: usize = 32;
 
 impl Writer {
-    /// Creates a new v8 file and its first table.
+    /// Creates a new v9 file and its first table.
     ///
     /// # Errors
     ///
-    /// If the file exists, a field has no v8 scalar encoding, or the path cannot be written.
+    /// If the file exists, a field has no scalar encoding, or the path cannot be written.
     pub fn create(
         path: impl AsRef<Path>,
         name: impl Into<String>,
@@ -345,7 +380,7 @@ impl Writer {
             OpenOptions::new().write(true).read(true).create_new(true).open(path).map_err(io)?;
         let mut header = [0; HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
-        header[8..12].copy_from_slice(&8_u32.to_le_bytes());
+        header[8..12].copy_from_slice(&FORMAT.to_le_bytes());
         file.write_all(&header).map_err(io)?;
         Ok(Self {
             file,
@@ -360,6 +395,7 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
+                version: FORMAT,
             },
             generation: 1,
             order: Vec::new(),
@@ -679,10 +715,12 @@ impl Writer {
         stripes.sort_by_key(|(order, _)| *order);
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
         self.table.frequencies = self.numeric_frequencies()?;
-        for (index, dictionary) in self.dictionaries.into_iter().enumerate() {
+        let dictionaries = std::mem::take(&mut self.dictionaries);
+        let orders = sorted_orders(&dictionaries)?;
+        for (index, (dictionary, order)) in dictionaries.into_iter().zip(orders).enumerate() {
             let Some(dictionary) = dictionary else { continue };
             self.table.frequencies[index] = Some(code_frequency(&dictionary));
-            let encoded = encode_global_dictionary(dictionary)?;
+            let encoded = encode_global_dictionary(dictionary, &order)?;
             let offset = self.file.stream_position().map_err(io)?;
             self.file.write_all(&encoded.index).map_err(io)?;
             self.file.write_all(&encoded.payload).map_err(io)?;
@@ -750,6 +788,9 @@ type CrossingCache = OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>;
 struct NativeText {
     file: Arc<File>,
     offsets: Vec<u32>,
+    /// Codes in sorted value order, so `order[rank]` is the code of the value at that rank. Empty
+    /// for a file written before version 9, which did not store one.
+    order: Vec<u32>,
     payload: u64,
     payload_len: usize,
     hashes: Vec<u64>,
@@ -848,8 +889,13 @@ impl TextSource for NativeText {
         Ok(Some((end - start) as usize))
     }
 
+    fn sorted_order(&self) -> Option<&[u32]> {
+        (!self.order.is_empty()).then_some(self.order.as_slice())
+    }
+
     fn footprint(&self) -> usize {
         self.offsets.capacity() * size_of::<u32>()
+            + self.order.capacity() * size_of::<u32>()
             + self.payload_blocks.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
             + self.hashes.capacity() * size_of::<u64>()
             + self
@@ -932,8 +978,8 @@ impl Reader {
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header).map_err(io)?;
         let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-        if !((&header[..8] == MAGIC && version == 8) || (&header[..8] == MAGIC_V7 && version == 7))
-        {
+        let known = [(MAGIC, FORMAT), (MAGIC_V8, 8), (MAGIC_V7, 7)];
+        if !known.iter().any(|(magic, known)| &header[..8] == *magic && version == *known) {
             return Err(invalid("magic or major version is unsupported"));
         }
         let mut selected = None;
@@ -1097,6 +1143,7 @@ impl Reader {
             Arc::clone(&self.file),
             page,
             &self.table.fields[column].ty,
+            self.table.version >= 9,
         )?);
         let _ = self.dictionaries[column].set(Arc::clone(&dictionary));
         Ok(Some(self.dictionaries[column].get().map_or(dictionary, Arc::clone)))
@@ -1338,11 +1385,20 @@ fn code_frequency(dictionary: &GlobalDictionary) -> FrequencySummary {
 }
 
 fn encode_directory(table: &Table) -> Result<Vec<u8>> {
-    encode_directory_version(table, 8)
+    encode_directory_version(table, FORMAT)
+}
+
+/// The eight byte tag that starts a directory of this version.
+fn directory_magic(version: u32) -> &'static [u8; 8] {
+    match version {
+        7 => DIRECTORY_V7,
+        8 => DIRECTORY_V8,
+        _ => DIRECTORY,
+    }
 }
 
 fn encode_directory_version(table: &Table, version: u32) -> Result<Vec<u8>> {
-    let mut out = if version == 7 { DIRECTORY_V7.to_vec() } else { DIRECTORY.to_vec() };
+    let mut out = directory_magic(version).to_vec();
     let name = table.name.as_bytes();
     put_u16(&mut out, u16::try_from(name.len()).map_err(|_| invalid("table name too long"))?);
     out.extend_from_slice(name);
@@ -1517,8 +1573,7 @@ impl<'a> Cursor<'a> {
 
 fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
     let mut cur = Cursor { bytes, at: 0 };
-    let expected = if version == 7 { DIRECTORY_V7 } else { DIRECTORY };
-    if cur.take(8)? != expected {
+    if cur.take(8)? != directory_magic(version) {
         return Err(invalid("directory magic differs"));
     }
     let name = cur.text()?;
@@ -1719,7 +1774,7 @@ fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
     if cur.at != bytes.len() {
         return Err(invalid("directory has trailing bytes"));
     }
-    Ok(Table { name, fields, stripes, rows, dictionaries, frequencies })
+    Ok(Table { name, fields, stripes, rows, dictionaries, frequencies, version })
 }
 
 fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
@@ -2020,11 +2075,78 @@ struct EncodedDictionary {
     payload: Vec<u8>,
 }
 
-fn encode_global_dictionary(dictionary: GlobalDictionary) -> Result<EncodedDictionary> {
+/// The first eight bytes of a value as an integer that sorts the way the bytes sort.
+fn head(bytes: &[u8]) -> u64 {
+    let mut word = [0; 8];
+    let take = bytes.len().min(8);
+    word[..take].copy_from_slice(&bytes[..take]);
+    u64::from_be_bytes(word)
+}
+
+/// The sorted order of every global dictionary, one entry per column and empty where there is no
+/// dictionary.
+///
+/// One column's sort has nothing to do with another's, and a table like `hits` has fifteen string
+/// columns, so this runs across threads the way the numeric synopses above do. It is the only part
+/// of committing a file that is more than bookkeeping, and doing it serially would show up as a
+/// pause at the end of a load that thirty two threads had been busy with until then.
+fn sorted_orders(dictionaries: &[Option<GlobalDictionary>]) -> Result<Vec<Vec<u32>>> {
+    let present =
+        dictionaries.iter().enumerate().filter(|(_, held)| held.is_some()).map(|(at, _)| at);
+    let present = present.collect::<Vec<_>>();
+    let mut orders = vec![Vec::new(); dictionaries.len()];
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_FREQUENCY_WORKERS)
+        .min(present.len());
+    if workers <= 1 {
+        for at in present {
+            if let Some(dictionary) = &dictionaries[at] {
+                orders[at] = dictionary.sorted_order();
+            }
+        }
+        return Ok(orders);
+    }
+    let width = present.len().div_ceil(workers);
+    let pieces = std::thread::scope(|scope| {
+        present
+            .chunks(width)
+            .map(|columns| {
+                scope.spawn(|| {
+                    columns
+                        .iter()
+                        .filter_map(|&at| {
+                            dictionaries[at].as_ref().map(|held| (at, held.sorted_order()))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| {
+                handle.join().map_err(|_| Error::internal("a dictionary sort worker panicked"))
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    for piece in pieces {
+        for (at, order) in piece {
+            orders[at] = order;
+        }
+    }
+    Ok(orders)
+}
+
+fn encode_global_dictionary(
+    dictionary: GlobalDictionary,
+    order: &[u32],
+) -> Result<EncodedDictionary> {
     let values = dictionary.offsets.len() - 1;
+    if order.len() != values {
+        return Err(invalid("global dictionary order does not cover its values"));
+    }
     let payload_len = dictionary.payload.len();
     let blocks = payload_len.div_ceil(TEXT_PAYLOAD_BLOCK);
-    let mut index = Vec::with_capacity(12 + (values + 1) * 4 + blocks * 8);
+    let mut index = Vec::with_capacity(12 + (values * 2 + 1) * 4 + blocks * 8);
     put_u32(
         &mut index,
         u32::try_from(values).map_err(|_| invalid("global dictionary has too many values"))?,
@@ -2037,13 +2159,21 @@ fn encode_global_dictionary(dictionary: GlobalDictionary) -> Result<EncodedDicti
     for offset in dictionary.offsets {
         put_u32(&mut index, offset);
     }
+    for &code in order {
+        put_u32(&mut index, code);
+    }
     for block in dictionary.payload.chunks(TEXT_PAYLOAD_BLOCK) {
         put_u64(&mut index, checksum(block));
     }
     Ok(EncodedDictionary { index, payload: dictionary.payload })
 }
 
-fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Result<Vector> {
+fn open_global_dictionary(
+    file: Arc<File>,
+    page: Page,
+    ty: &LogicalType,
+    ordered: bool,
+) -> Result<Vector> {
     if ty != &LogicalType::Varchar {
         return Err(invalid("global dictionary belongs to a non-string column"));
     }
@@ -2058,10 +2188,16 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
     let offset_len = (count + 1)
         .checked_mul(4)
         .ok_or_else(|| invalid("global dictionary offset count overflow"))?;
+    let order_len = if ordered {
+        count.checked_mul(4).ok_or_else(|| invalid("global dictionary order count overflow"))?
+    } else {
+        0
+    };
     let hash_len =
         blocks.checked_mul(8).ok_or_else(|| invalid("global dictionary block count overflow"))?;
     let index_len = 12usize
         .checked_add(offset_len)
+        .and_then(|len| len.checked_add(order_len))
         .and_then(|len| len.checked_add(hash_len))
         .ok_or_else(|| invalid("global dictionary header overflow"))?;
     if index_len > page.length as usize {
@@ -2077,10 +2213,17 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
         .chunks_exact(4)
         .map(|part| u32::from_le_bytes(part.try_into().expect("four bytes")))
         .collect::<Vec<_>>();
-    let hashes = index[12 + offset_len..]
+    let order = index[12 + offset_len..12 + offset_len + order_len]
+        .chunks_exact(4)
+        .map(|part| u32::from_le_bytes(part.try_into().expect("four bytes")))
+        .collect::<Vec<_>>();
+    let hashes = index[12 + offset_len + order_len..]
         .chunks_exact(8)
         .map(|part| u64::from_le_bytes(part.try_into().expect("eight bytes")))
         .collect::<Vec<_>>();
+    if order.iter().any(|&code| code as usize >= count) {
+        return Err(invalid("global dictionary order names a code it does not have"));
+    }
     let payload_len = page.length as usize - index_len;
     if blocks != payload_len.div_ceil(TEXT_PAYLOAD_BLOCK) {
         return Err(invalid("global dictionary block count differs from its payload"));
@@ -2099,6 +2242,7 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
         Arc::new(NativeText {
             file,
             offsets,
+            order,
             payload: page.offset + index_len as u64,
             payload_len,
             hashes,
@@ -2513,7 +2657,12 @@ mod tests {
 
         let reader = Reader::open(&path).expect("valid directory");
         let dictionary = reader.table.dictionaries[1].expect("string dictionary page");
-        let index_len = 12_u64 + 4 * 4 + 8;
+        // Read the count out of the page rather than writing it here, so that adding something
+        // else to the index does not silently turn this into a test that damages the index.
+        let mut header = [0; 12];
+        read_at(&reader.file, dictionary.offset, &mut header).expect("dictionary header");
+        let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
+        let index_len = 12 + (count + 1) * 4 + count * 4 + 8;
         let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
         file.seek(SeekFrom::Start(dictionary.offset + index_len))
             .expect("inside dictionary payload");
@@ -2523,6 +2672,52 @@ mod tests {
         let error =
             chunk.validate_external().expect_err("payload corruption must reach the caller");
         assert!(error.message().contains("payload checksum differs"), "{error}");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Codes stay in first appearance order and the sorted order is written beside them, so a
+    /// reader can put the values back in order without the writer having had to know them all
+    /// before it handed out the first code.
+    #[test]
+    fn a_global_dictionary_carries_the_sorted_order_of_its_values() {
+        // Chosen so the sort cannot be decided on the first eight bytes alone. Three values share
+        // a nine byte prefix, one is a prefix of another, and one is empty.
+        let spellings = ["overlong1z", "b", "", "overlong1a", "overlong", "ab", "a", "overlong1"];
+        let path = path("dictionary-order");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        writer
+            .append(
+                &Chunk::new(vec![
+                    Vector::from_values(
+                        LogicalType::Varchar,
+                        &spellings.map(|text| Value::Varchar(text.into())),
+                    )
+                    .expect("strings"),
+                ])
+                .expect("one column"),
+            )
+            .expect("stripe written");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        let order = dictionary.sorted_order().expect("a v9 file stores one").to_vec();
+        assert_eq!(order.len(), spellings.len(), "every distinct value has a rank");
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..spellings.len() as u32).collect::<Vec<_>>(), "a permutation of codes");
+
+        let ranked = order
+            .iter()
+            .map(|&code| {
+                dictionary.try_bytes_at(code as usize).expect("read").expect("a value").to_vec()
+            })
+            .collect::<Vec<_>>();
+        let mut expected = spellings.map(|text| text.as_bytes().to_vec()).to_vec();
+        expected.sort();
+        assert_eq!(ranked, expected, "rank order is value order");
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -2579,14 +2774,22 @@ mod tests {
             rows: 0,
             dictionaries: vec![Some(dictionary)],
             frequencies: vec![None],
+            version: FORMAT,
         };
         let directory = encode_directory(&table).expect("directory");
         let file_size = dictionary.offset + u64::from(dictionary.length) + 1;
 
-        let decoded = decode_directory(&directory, file_size, 8).expect("large lazy dictionary");
+        let decoded =
+            decode_directory(&directory, file_size, FORMAT).expect("large lazy dictionary");
         assert_eq!(decoded.dictionaries[0].expect("dictionary").length, dictionary.length);
-        let legacy = encode_directory_version(&table, 7).expect("legacy directory");
-        let decoded = decode_directory(&legacy, file_size, 7).expect("v7 remains readable");
-        assert_eq!(decoded.dictionaries[0].expect("legacy dictionary").length, dictionary.length);
+        for old in [8, 7] {
+            let legacy = encode_directory_version(&table, old).expect("legacy directory");
+            let decoded =
+                decode_directory(&legacy, file_size, old).expect("an older directory still reads");
+            assert_eq!(
+                decoded.dictionaries[0].expect("legacy dictionary").length,
+                dictionary.length
+            );
+        }
     }
 }

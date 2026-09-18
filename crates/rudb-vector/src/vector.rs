@@ -442,6 +442,25 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
     }
     /// Resident bytes retained by this source.
     fn footprint(&self) -> usize;
+    /// This source's positions in sorted value order, when it knows them, so that `order[rank]` is
+    /// the position of the value that sits at `rank` once the values are sorted by their bytes.
+    ///
+    /// A storage format that keeps a dictionary for a whole column can afford to sort the distinct
+    /// values once when it writes the file, and what that buys is worth a lot more than the four
+    /// bytes a value it costs. A literal is found by binary search rather than by asking every
+    /// value whether it matches. An extreme is the first or the last entry that the rows actually
+    /// use. An ordering by the text is an ordering by the rank. None of that is available to a
+    /// reader that only knows the values are distinct.
+    ///
+    /// `None` means the source does not know, which is the honest answer for anything built in
+    /// memory and for a file written before its format stored one. Nothing is allowed to depend on
+    /// this for correctness, only for speed.
+    ///
+    /// A source that answers with `Some` promises the slice is a permutation of `0..len` and that
+    /// `bytes_at(order[rank])` is nondecreasing in `rank`.
+    fn sorted_order(&self) -> Option<&[u32]> {
+        None
+    }
     /// Whether another source presents the same values.
     fn equal(&self, other: &dyn TextSource) -> bool {
         self.len() == other.len()
@@ -1810,6 +1829,19 @@ impl Vector {
             },
             Body::ExternalText { source } => source.bytes_len_at(index),
             _ => Ok(self.bytes_at(index).map(<[u8]>::len)),
+        }
+    }
+
+    /// This vector's positions in sorted value order, when whatever holds the values knows them.
+    ///
+    /// See [`TextSource::sorted_order`] for what the slice means and what a source promises by
+    /// answering with one. Only a vector whose values come from storage can answer, because only
+    /// storage is in a position to have sorted them once and written the answer down.
+    #[must_use]
+    pub fn sorted_order(&self) -> Option<&[u32]> {
+        match &self.body {
+            Body::ExternalText { source } => source.sorted_order(),
+            _ => None,
         }
     }
 
