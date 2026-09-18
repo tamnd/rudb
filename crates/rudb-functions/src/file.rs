@@ -157,6 +157,27 @@ pub fn parquet_fields(path: &str) -> Result<Vec<Field>> {
     Ok(open_parquet(path)?.fields())
 }
 
+/// How many rows the Parquet files `pattern` names hold, added up.
+///
+/// The footer of every one of them, which is two small reads a file and no column data at all. The
+/// planner asks this, so it is worth being clear about what it costs: a query over one file pays
+/// one footer read it was going to pay anyway when the scan opened, and a query over a directory of
+/// a thousand files pays a thousand small reads before it starts. That is the same shape as what
+/// the CSV reader already does at bind time, where every file is opened and sampled.
+///
+/// `None` rather than an error for anything that goes wrong, because the caller is deciding which
+/// side of a join to gather and a missing number is an answer it already handles. A file that
+/// cannot be opened here is a file the scan is about to fail on for the same reason, with a better
+/// message than this could give.
+#[must_use]
+pub fn parquet_rows(pattern: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    for path in files(pattern).ok()? {
+        total = total.checked_add(open_parquet(&path).ok()?.rows())?;
+    }
+    Some(total)
+}
+
 /// The columns a `read_csv` of `paths` produces, sniffed out of the front of every one of them.
 ///
 /// Every file and not only the first, which is the one place this differs from Parquet and is

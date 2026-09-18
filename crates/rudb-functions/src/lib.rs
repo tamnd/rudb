@@ -28,6 +28,7 @@ pub use entrycatalog::{
 };
 pub use file::{
     csv_fields, csv_given, files, is_file, is_pattern, open_csv, open_parquet, parquet_fields,
+    parquet_rows,
 };
 pub use functioncatalog::{
     CONSISTENT, FUNCTION_CATALOG, FUNCTION_SCHEMA, FunctionEntry, function_entries, function_fields,
