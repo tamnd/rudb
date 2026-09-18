@@ -31,7 +31,7 @@ use rudb_common::{
 use rudb_kernels::{Accumulator, NOWHERE, is_true, update_scattered};
 use rudb_pipeline::{Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
-use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
+use rudb_vector::{Chunk, Data, Form, VECTOR_SIZE, Validity, Vector};
 
 use crate::buffer::Buffered;
 use crate::group_distinct;
@@ -265,6 +265,13 @@ struct EncodedCountExchange {
     /// width is what lets a radix partition be one type. These are what the width came from and
     /// what it goes back to.
     leading: Vec<LogicalType>,
+    /// Whether the string key can be null through the dictionary rather than through its own mask.
+    ///
+    /// Settled when the exchange is built rather than per chunk, because it is the same dictionary
+    /// for every chunk and the `URL` one on the ClickBench file holds half a million entries. A form
+    /// that keeps its nulls somewhere other than its own mask counts as holding one, since the mask
+    /// is then not the whole answer and the scatter has to ask the vector row by row.
+    dictionary_nulls: bool,
     partitions: Vec<Mutex<EncodedCountPartition>>,
     held: Mutex<Vec<Reservation>>,
 }
@@ -292,12 +299,19 @@ impl EncodedCountRecord {
 }
 
 impl EncodedCountPartition {
+    /// Takes one record, and starts keeping validity if this is the first null this has seen.
+    ///
+    /// An empty validity vector means every record here is valid, so the moment one is not the
+    /// vector has to say so for all of them by name. The condition is whether validity is being kept
+    /// at all rather than whether it is empty, because the first record a partition ever sees can
+    /// itself be the null one, and there is nothing to fill in behind it.
     fn push(&mut self, row: EncodedCountRecord, valid: u8) {
-        if valid != EncodedCountRecord::ALL && self.validity.is_empty() {
+        let keeping = !self.validity.is_empty() || valid != EncodedCountRecord::ALL;
+        if keeping {
             self.validity.resize(self.rows.len(), EncodedCountRecord::ALL);
         }
         self.rows.push(row);
-        if !self.validity.is_empty() {
+        if keeping {
             self.validity.push(valid);
         }
     }
@@ -363,12 +377,15 @@ fn fixed_hash(row: FixedRecord, valid: u8) -> u64 {
 }
 
 impl FixedPartition {
+    /// Takes one record, keeping validity from the first null this partition sees. The same shape as
+    /// [`EncodedCountPartition::push`], and null on the first record for the same reason.
     fn push(&mut self, row: FixedRecord, valid: u8) {
-        if valid != FixedRecord::ALL && self.validity.is_empty() {
+        let keeping = !self.validity.is_empty() || valid != FixedRecord::ALL;
+        if keeping {
             self.validity.resize(self.rows.len(), FixedRecord::ALL);
         }
         self.rows.push(row);
-        if !self.validity.is_empty() {
+        if keeping {
             self.validity.push(valid);
         }
     }
@@ -864,6 +881,8 @@ impl<'a> Aggregate<'a> {
                     .iter()
                     .map(|&key| self.plan.expr_type(key).clone())
                     .collect(),
+                dictionary_nulls: dictionary.validity().has_nulls(dictionary.len())
+                    || !nulls_are_in_the_mask(dictionary),
                 partitions: (0..RADIX_PARTITIONS)
                     .map(|_| Mutex::new(EncodedCountPartition::default()))
                     .collect(),
@@ -887,6 +906,48 @@ impl<'a> Aggregate<'a> {
         let before = partitions.iter().map(EncodedCountPartition::footprint).sum::<usize>();
         let shift = u32::BITS - RADIX_PARTITIONS.ilog2();
         const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
+        // Every key of this chunk read the way the chunk holds it, once, and `None` as soon as one
+        // of them has a null in it or is in a form the run reader does not cover. The loop below
+        // that covers every form and every null is still there and still right, and this is the same
+        // lift #237 did for the group hash, #539 for the key comparison and #800 for the distinct
+        // scatter: what a row at a time reader does per row is mostly deciding what it is reading.
+        let plain = Signed::of(first, rows.rows).zip(match second {
+            Some(second) => Signed::of(second, rows.rows).map(Some),
+            None => Some(None),
+        });
+        let plain = plain.filter(|_| {
+            !state.dictionary_nulls
+                && third.len() >= rows.rows
+                && !third.validity().has_nulls(rows.rows)
+        });
+        if let Some((first, second)) = plain {
+            for (row, &third_code) in codes.iter().enumerate().take(rows.rows) {
+                if third_code as usize >= dictionary.len() {
+                    return Err(Error::internal("an encoded string code is out of range"));
+                }
+                let first_value = first.at(row);
+                // Zero rather than the stand-in for a null when there is no second key, which is
+                // what the row at a time loop hashes for an absent one, so both agree about a group.
+                let second_value = second.map_or(0, |second| second.at(row));
+                let wide = spread(mix(
+                    mix(mix(0, first_value as u64), second_value as u64),
+                    u64::from(third_code),
+                ));
+                let hash = (wide ^ (wide >> 32)) as u32;
+                partitions[(hash >> shift) as usize].push(
+                    EncodedCountRecord {
+                        first: first_value,
+                        second: second_value,
+                        hash,
+                        third: third_code,
+                    },
+                    EncodedCountRecord::ALL,
+                );
+            }
+            let after = partitions.iter().map(EncodedCountPartition::footprint).sum::<usize>();
+            memory.grow(width_of(after.saturating_sub(before)))?;
+            return Ok(true);
+        }
         for (row, &third_code) in codes.iter().enumerate().take(rows.rows) {
             let mut valid = if second.is_none() { EncodedCountRecord::SECOND } else { 0 };
             let first_value = if first.is_null_at(row) {
@@ -4224,6 +4285,59 @@ impl Aggregate<'_> {
 /// of the column does not matter and only the signedness and the integerness do. `DATE` and
 /// `TIMESTAMP` have a signed representation too and are deliberately not here, because putting one
 /// back together is more than a narrowing and nothing asks for it yet.
+/// Whether every null this vector has is one its own mask knows about.
+///
+/// [`Vector::is_null_at`] reads through a dictionary or a run to the vector standing behind it and
+/// answers from the mask for every other form, so those two are where a chunk wide null check is not
+/// the whole answer and a caller has to keep asking row by row.
+fn nulls_are_in_the_mask(column: &Vector) -> bool {
+    !matches!(column.form(), Form::Dictionary | Form::Rle)
+}
+
+/// One signed key column of a chunk with its layout settled once rather than once per row.
+///
+/// Asking a vector for a signed value a row at a time costs a match on the form, a match on the
+/// width, a widening to a hundred and twenty eight bits and a checked narrowing back on the way out,
+/// and none of that depends on the row. On the million row ClickBench file that is most of what a
+/// scatter over a `BIGINT` key does. The forms here are the ones whose nulls all live in the
+/// vector's own mask, so a chunk with none has none for every row of it and the row loop stops
+/// asking about validity at all.
+#[derive(Debug, Clone, Copy)]
+enum Signed<'a> {
+    Int8(&'a [i8]),
+    Int16(&'a [i16]),
+    Int32(&'a [i32]),
+    Int64(&'a [i64]),
+}
+
+impl<'a> Signed<'a> {
+    /// How `column` holds its first `rows` values, and `None` when one of them is null or the column
+    /// is in a form this does not read.
+    fn of(column: &'a Vector, rows: usize) -> Option<Self> {
+        if column.validity().has_nulls(rows) {
+            return None;
+        }
+        match column.data()? {
+            Data::Int8(values) => values.get(..rows).map(Signed::Int8),
+            Data::Int16(values) => values.get(..rows).map(Signed::Int16),
+            Data::Int32(values) => values.get(..rows).map(Signed::Int32),
+            Data::Int64(values) => values.get(..rows).map(Signed::Int64),
+            _ => None,
+        }
+    }
+
+    /// The value at `row`, which is inside the length this was built with.
+    #[inline]
+    fn at(self, row: usize) -> i64 {
+        match self {
+            Self::Int8(values) => i64::from(values[row]),
+            Self::Int16(values) => i64::from(values[row]),
+            Self::Int32(values) => i64::from(values[row]),
+            Self::Int64(values) => values[row],
+        }
+    }
+}
+
 fn signed_key(ty: &LogicalType) -> bool {
     matches!(
         ty,
@@ -4658,7 +4772,7 @@ mod tests {
 
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, Call, CompactNumeric, Distinct,
-        EncodedCountPartition, EncodedCountRecord, FixedPartition, FixedRecord,
+        EncodedCountPartition, EncodedCountRecord, FixedPartition, FixedRecord, Signed,
         bigint_distinct_partition, encoded_count_partition, fixed_partition,
     };
     use crate::buffer::Buffered;
@@ -5234,6 +5348,110 @@ mod tests {
         ];
         expected.sort_by_key(|row| format!("{row:?}"));
         assert_eq!(rows, expected);
+    }
+
+    /// A radix partition keeps no validity until it sees its first null, and fills in what it did
+    /// not keep when it does. Filling in behind nothing fills in nothing, so a partition whose very
+    /// first record is the null one used to keep no validity at all and read that record back as
+    /// valid, holding the zero a record carries where a null was. That is a group nobody asked for
+    /// and a count missing from the group that should have had it.
+    #[test]
+    fn a_null_in_the_first_record_of_a_partition_is_kept() {
+        let mut encoded = EncodedCountPartition::default();
+        let row = EncodedCountRecord { first: 0, second: 0, hash: 7, third: 0 };
+        let some = EncodedCountRecord::SECOND | EncodedCountRecord::THIRD;
+        encoded.push(row, some);
+        encoded.push(row, EncodedCountRecord::ALL);
+        assert_eq!(encoded.validity, vec![some, EncodedCountRecord::ALL]);
+        let mut fixed = FixedPartition::default();
+        let row = FixedRecord { first: 0, second: 0, sum: 0, mean: 0 };
+        let some = FixedRecord::SECOND | FixedRecord::SUM | FixedRecord::MEAN;
+        fixed.push(row, some);
+        fixed.push(row, FixedRecord::ALL);
+        assert_eq!(fixed.validity, vec![some, FixedRecord::ALL]);
+    }
+
+    /// Runs one chunk through the encoded count scatter and gives back the answer, sorted.
+    fn encoded_count_answer(users: Vector, phrases: Vector) -> Vec<Vec<Value>> {
+        let plan = Plan::parse(concat!(
+            "Aggregate #1 groups=[#0.0::BIGINT, #0.1::VARCHAR] ",
+            "aggregates=[count_star()::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [x::BIGINT, y::VARCHAR]",
+        ))
+        .expect("a two-key count plan");
+        let schema = Schema::numbered(
+            vec![Field::new("x", LogicalType::BigInt), Field::new("y", LogicalType::Varchar)],
+            0,
+        );
+        let rudb_plan::Node::Aggregate { groups, aggregates, .. } = *plan.node(plan.root()) else {
+            panic!("the root is an aggregate")
+        };
+        let (aggregate, out) =
+            Aggregate::new(&plan, &schema, 1, groups, aggregates, &Memory::unlimited())
+                .expect("a count aggregate");
+        let aggregate = aggregate.top_counts(10);
+        let input = Chunk::new(vec![users, phrases]).expect("two aligned columns");
+        let mut local = aggregate.local();
+        aggregate.sink(&input, &mut local).expect("the chunk");
+        aggregate.combine(local).expect("the one instance");
+        assert!(aggregate.encoded_count.get().is_some(), "the compact path was selected");
+        aggregate.finalize().expect("the answer");
+        let mut rows = answer(&out);
+        rows.sort_by_key(|row| format!("{row:?}"));
+        rows
+    }
+
+    /// The scatter has two loops that have to agree about what a group is. The first reads the words
+    /// the chunk holds and the second asks the vector a row at a time, and which one a chunk gets is
+    /// decided by the form its columns turned up in, so the same rows in two forms are the same
+    /// query down two paths and the answer cannot depend on which.
+    #[test]
+    fn the_run_reader_and_the_row_at_a_time_scatter_count_the_same_groups() {
+        let phrases = || {
+            let dictionary = Arc::new(
+                Vector::from_values(
+                    LogicalType::Varchar,
+                    &[Value::Varchar("one".into()), Value::Varchar("two".into())],
+                )
+                .expect("search phrases"),
+            );
+            Vector::stable_dictionary(vec![0, 0, 1], dictionary).expect("stable codes")
+        };
+        let values = [Value::BigInt(7), Value::BigInt(7), Value::BigInt(8)];
+        let flat = Vector::from_values(LogicalType::BigInt, &values).expect("user ids");
+        let coded = Vector::stable_dictionary(
+            vec![0, 0, 1],
+            Arc::new(
+                Vector::from_values(LogicalType::BigInt, &[Value::BigInt(7), Value::BigInt(8)])
+                    .expect("distinct user ids"),
+            ),
+        )
+        .expect("coded user ids");
+        assert!(Signed::of(&flat, 3).is_some(), "a flat key is read as a run of words");
+        assert!(Signed::of(&coded, 3).is_none(), "a coded key goes down the row at a time loop");
+        assert_eq!(encoded_count_answer(flat, phrases()), encoded_count_answer(coded, phrases()));
+    }
+
+    /// A null in a leading key is what sends a chunk down the row at a time loop, since the run
+    /// reader has nowhere to put one, and the group it opens is still its own group.
+    #[test]
+    fn a_null_leading_key_still_gets_a_group_of_its_own() {
+        let dictionary = Arc::new(
+            Vector::from_values(LogicalType::Varchar, &[Value::Varchar("one".into())])
+                .expect("search phrases"),
+        );
+        let phrases = Vector::stable_dictionary(vec![0, 0, 0], dictionary).expect("stable codes");
+        let users =
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(7), Value::Null, Value::Null])
+                .expect("user ids");
+        assert!(Signed::of(&users, 3).is_none(), "a key with a null is not read as a run of words");
+        assert_eq!(
+            encoded_count_answer(users, phrases),
+            vec![
+                vec![Value::BigInt(7), Value::Varchar("one".into()), Value::BigInt(1)],
+                vec![Value::Null, Value::Varchar("one".into()), Value::BigInt(2)],
+            ]
+        );
     }
 
     #[test]
