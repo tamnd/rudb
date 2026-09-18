@@ -217,6 +217,12 @@ struct DensePartition {
 
 #[derive(Debug)]
 struct FixedExchange {
+    /// The two key types, which the emit puts the record's two integers back into.
+    ///
+    /// A record holds the first key as eight bytes and the second as four whatever their columns
+    /// were, because one width is what lets a radix partition be one type. These are what the
+    /// widths came from and what they go back to.
+    keys: [LogicalType; 2],
     partitions: Vec<Mutex<FixedPartition>>,
     held: Mutex<Vec<Reservation>>,
 }
@@ -701,13 +707,20 @@ impl<'a> Aggregate<'a> {
         Ok(Rows { keys, arguments, filters, rows })
     }
 
+    /// Whether the fixed width radix exchange can own this aggregate.
+    ///
+    /// The two keys are signed integers. The first can be any width, because the record holds it as
+    /// eight bytes and the emit puts it back in the type the query asked for. The second has to fit
+    /// in four, because that is what the record gives it and widening the field would cost every
+    /// exchanged row four bytes to buy nothing. That is what lets `GROUP BY SearchEngineID,
+    /// ClientIP` reach this: the first column is a `SMALLINT` and the second is already four bytes.
     fn fixed_top_count(&self) -> bool {
         self.compact_numeric
             && self.top_counts.is_some()
             && self.constants.iter().all(Option::is_none)
             && self.keys.len() == 2
-            && self.plan.expr_type(self.keys[0]) == &LogicalType::BigInt
-            && self.plan.expr_type(self.keys[1]) == &LogicalType::Integer
+            && signed_key(self.plan.expr_type(self.keys[0]))
+            && narrow_key(self.plan.expr_type(self.keys[1]))
     }
 
     /// Whether the encoded count radix exchange can own this aggregate.
@@ -761,6 +774,10 @@ impl<'a> Aggregate<'a> {
         memory: &mut Reservation,
     ) -> Result<()> {
         self.fixed.get_or_init(|| FixedExchange {
+            keys: [
+                self.plan.expr_type(self.keys[0]).clone(),
+                self.plan.expr_type(self.keys[1]).clone(),
+            ],
             partitions: (0..RADIX_PARTITIONS)
                 .map(|_| Mutex::new(FixedPartition::default()))
                 .collect(),
@@ -780,18 +797,18 @@ impl<'a> Aggregate<'a> {
             } else {
                 valid |= FixedRecord::FIRST;
                 i64::try_from(first.signed_at(row).ok_or_else(|| {
-                    Error::internal("a fixed BIGINT key has no signed representation")
+                    Error::internal("a fixed first key has no signed representation")
                 })?)
-                .map_err(|_| Error::internal("a fixed BIGINT key is out of range"))?
+                .map_err(|_| Error::internal("a fixed first key is out of range"))?
             };
             let second_value = if second.is_null_at(row) {
                 0
             } else {
                 valid |= FixedRecord::SECOND;
                 i32::try_from(second.signed_at(row).ok_or_else(|| {
-                    Error::internal("a fixed INTEGER key has no signed representation")
+                    Error::internal("a fixed second key has no signed representation")
                 })?)
-                .map_err(|_| Error::internal("a fixed INTEGER key is out of range"))?
+                .map_err(|_| Error::internal("a fixed second key is out of range"))?
             };
             let sum_value = if sum.is_null_at(row) {
                 0
@@ -3873,7 +3890,7 @@ fn finish_fixed(
         let done = partition
             .lock()
             .map_err(poisoned)
-            .and_then(|mut rows| fixed_partition(&mut rows, bound, calls, memory));
+            .and_then(|mut rows| fixed_partition(&mut rows, &fixed.keys, bound, calls, memory));
         if let Ok(mut slot) = slots[at].lock() {
             *slot = Some(done);
         }
@@ -3882,6 +3899,7 @@ fn finish_fixed(
 
 fn fixed_partition(
     partition: &mut FixedPartition,
+    keys: &[LogicalType; 2],
     bound: usize,
     calls: &[Call],
     memory: &Memory,
@@ -3957,8 +3975,16 @@ fn fixed_partition(
         let state = &states[slot];
         let (sum, mean) = state.totals(slot, &overflow);
         output.push(vec![
-            if valid & FixedRecord::FIRST != 0 { Value::BigInt(key.first) } else { Value::Null },
-            if valid & FixedRecord::SECOND != 0 { Value::Integer(key.second) } else { Value::Null },
+            if valid & FixedRecord::FIRST != 0 {
+                signed_value(&keys[0], key.first)?
+            } else {
+                Value::Null
+            },
+            if valid & FixedRecord::SECOND != 0 {
+                signed_value(&keys[1], i64::from(key.second))?
+            } else {
+                Value::Null
+            },
             Value::BigInt(state.count()),
             Accumulator::exact_sum(sum, state.sum_seen(), &calls[1].returns).finish()?,
             Accumulator::exact_avg(mean, state.mean_count, &calls[2].returns).finish()?,
@@ -3966,8 +3992,8 @@ fn fixed_partition(
     }
     let mut held = memory.reservation();
     let types = [
-        LogicalType::BigInt,
-        LogicalType::Integer,
+        keys[0].clone(),
+        keys[1].clone(),
         LogicalType::BigInt,
         calls[1].returns.clone(),
         calls[2].returns.clone(),
@@ -4179,6 +4205,15 @@ fn signed_key(ty: &LogicalType) -> bool {
         ty,
         LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer | LogicalType::BigInt
     )
+}
+
+/// Whether a group key is a signed integer that fits in the four byte half of a fixed record.
+///
+/// This is [`signed_key`] without `BIGINT`. The record keeps its second key four bytes wide so that
+/// the whole thing stays sixteen, and a wider column there would have to be turned away rather than
+/// truncated.
+fn narrow_key(ty: &LogicalType) -> bool {
+    matches!(ty, LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer)
 }
 
 /// One signed integer key put back into the type the query asked for.
@@ -5178,7 +5213,10 @@ mod tests {
             },
         ];
 
-        let part = fixed_partition(&mut partition, 10, &calls, &Memory::unlimited())
+        // q30's key shape. The record held the first key as eight bytes and the emit has to hand it
+        // back two bytes wide, or the answer has the wrong column type in it.
+        let keys = [LogicalType::SmallInt, LogicalType::Integer];
+        let part = fixed_partition(&mut partition, &keys, 10, &calls, &Memory::unlimited())
             .expect("the fixed partition");
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for chunk in part.chunks {
@@ -5191,18 +5229,18 @@ mod tests {
             rows,
             [
                 vec![
-                    Value::BigInt(1),
-                    Value::Integer(2),
-                    Value::BigInt(2),
-                    Value::HugeInt(8),
-                    Value::Double(4.0),
-                ],
-                vec![
                     Value::Null,
                     Value::Integer(2),
                     Value::BigInt(2),
                     Value::HugeInt(7),
                     Value::Double(7.0),
+                ],
+                vec![
+                    Value::SmallInt(1),
+                    Value::Integer(2),
+                    Value::BigInt(2),
+                    Value::HugeInt(8),
+                    Value::Double(4.0),
                 ],
             ]
         );
