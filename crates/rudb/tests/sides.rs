@@ -58,20 +58,30 @@ fn agreed(sql: &str) -> Vec<Vec<Value>> {
     with
 }
 
+/// These two join on an equality, so the operator answers them with a hash table and the side to
+/// gather is the smaller one. The binder already emits the right side, so with the big table written
+/// first the pass agrees with what it was given and the printer leaves the field out.
 #[test]
-fn the_larger_input_is_the_one_the_plan_says_to_gather() {
+fn the_smaller_input_is_the_one_the_plan_says_to_gather() {
     let database = tables();
     let text = database.plan("SELECT * FROM big JOIN small ON big.k = small.k").expect("plans");
+    assert!(!text.contains("build="), "the small side was already the right one\n{text}");
+}
+
+#[test]
+fn the_smaller_input_on_the_left_is_the_one_the_pass_moves_to() {
+    let database = tables();
+    let text = database.plan("SELECT * FROM small JOIN big ON big.k = small.k").expect("plans");
     assert!(text.contains("build=left"), "the pass did not fire\n{text}");
 }
 
-/// The other way round, which is the side the binder already emitted, so the pass writes nothing
-/// and the printer leaves the field out.
+/// A condition no lookup answers is a nested loop, and a nested loop wants the larger side gathered,
+/// so the same two tables come out the other way round.
 #[test]
-fn the_smaller_input_on_the_left_leaves_the_plan_as_the_binder_wrote_it() {
+fn a_join_no_lookup_answers_still_gathers_the_larger_input() {
     let database = tables();
-    let text = database.plan("SELECT * FROM small JOIN big ON big.k = small.k").expect("plans");
-    assert!(!text.contains("build="), "the default side was written down\n{text}");
+    let text = database.plan("SELECT * FROM big JOIN small ON big.k > small.k").expect("plans");
+    assert!(text.contains("build=left"), "the pass did not fire\n{text}");
 }
 
 #[test]

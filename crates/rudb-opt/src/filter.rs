@@ -641,7 +641,12 @@ fn sides(
 /// The two sides of the equality have to be the same type, since the table has one bucket for one
 /// value. Where they differ the binder puts a cast in, and a cast is an expression rather than a
 /// column, so that case is already out by the time the type is looked at.
-fn answered(plan: &Plan, tables: &mut Tables, part: ExprRef, below: &(TableSet, TableSet)) -> bool {
+pub(crate) fn answered(
+    plan: &Plan,
+    tables: &mut Tables,
+    part: ExprRef,
+    below: &(TableSet, TableSet),
+) -> bool {
     let Expr::Compare { op: CompareOp::Equal | CompareOp::NotDistinctFrom, left, right } =
         *plan.expr(part)
     else {
@@ -684,6 +689,22 @@ fn onto(
         return (fit, unfit);
     }
     (fit.into_iter().chain(unfit).collect(), Vec::new())
+}
+
+/// Whether the join operator will answer this whole condition list with a hash table.
+///
+/// Every condition has to be one a lookup answers, and there has to be at least one, since a join
+/// with nothing to check pairs every row with every row and has no key to build a table on. This is
+/// `rudb_exec`'s `equalities` asked of a finished plan rather than of one being rewritten, and it is
+/// what `crate::sides` needs, because which side a join would rather gather is the opposite question
+/// for a hash table than for a nested loop.
+pub(crate) fn lookup(
+    plan: &Plan,
+    tables: &mut Tables,
+    conditions: &[ExprRef],
+    below: &(TableSet, TableSet),
+) -> bool {
+    !conditions.is_empty() && conditions.iter().all(|&part| answered(plan, tables, part, below))
 }
 
 /// Which of the predicates over a cross product become the conditions of an inner join, and which
