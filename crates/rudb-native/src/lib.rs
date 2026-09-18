@@ -3058,7 +3058,7 @@ fn cascaded(
     let plain = values.len().saturating_mul(width);
     let best = match packed {
         // The tag, the base, the word count and the words, which is what the codec 2 branch writes.
-        Some(packed) => plain.min(21 + packed.words().len() * size_of::<u64>()),
+        Some(packed) => plain.min(21 + std::mem::size_of_val(packed.words())),
         None => plain,
     };
     let out = integer::encode_with(&values, &Fixed)?;
