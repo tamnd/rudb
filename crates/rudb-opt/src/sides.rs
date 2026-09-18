@@ -11,13 +11,18 @@
 //!
 //! # Which side is the right one
 //!
-//! Not the one the name suggests. "Build side" is hash join vocabulary, where the rule is to build
-//! from the smaller input because the hash table is what has to fit in memory. rudb has no hash
-//! join yet: #62 is where it lands, and until then every join is the nested loop in
-//! `crates/rudb-exec/src/join.rs`, which has the opposite preference.
+//! It depends on which operator is going to run, and there are two, which want opposite things.
 //!
-//! The nested loop holds the gathered side as chunks and, for each row of the other side, walks
-//! every one of those chunks and evaluates the conditions over it. So the number of calls into the
+//! "Build side" is hash join vocabulary, where the rule is to build from the smaller input because
+//! the hash table is what has to fit in memory and building it is paid for once per gathered row
+//! where reading it is paid for once per driving row. That operator now exists. It arrived in 0.3.41
+//! as the lookup in `crates/rudb-exec/src/join.rs` and became a stream in 0.3.42, and it runs
+//! whenever every condition the join holds is an equality between a column of one side and a column
+//! of the other.
+//!
+//! When any condition is not, the same file's nested loop runs instead, and it has the opposite
+//! preference. It holds the gathered side as chunks and, for each row of the other side, walks every
+//! one of those chunks and evaluates the conditions over it. So the number of calls into the
 //! vectorized evaluator is the driving side's row count times the gathered side's chunk count, and
 //! each call does a chunk's worth of work. Rows of the driving side are paid for one at a time and
 //! rows of the gathered side are paid for two thousand at a time, which means the cheap thing to do
@@ -32,14 +37,18 @@
 //! big(400_000) driving, tiny(4) gathered        3_566ms     5.07x
 //! ```
 //!
-//! The ratio grows with the ratio between the sides, which is what the count above predicts, so
-//! this is the shape of the operator rather than a constant factor somewhere.
+//! The ratio grows with the ratio between the sides, which is what the count above predicts, so this
+//! is the shape of the operator rather than a constant factor somewhere.
 //!
-//! When #62 lands, this rule inverts and `prefers` below is the one function that changes. That is
-//! why the flag on the node says *which side is gathered* rather than *which side is smaller*: the
-//! first is a fact about the plan that both operators agree on, and the second is a policy that
-//! they disagree about. A flag that meant "the small one" would have to be rewritten in every plan
-//! in the repository on the day the hash join arrives.
+//! So this pass asks which operator the join will get before it asks which side is bigger, and
+//! `crate::filter::lookup` is that question, asked of the finished condition list rather than of one
+//! being rewritten. Between the lookup landing and this, every hash join in rudb was building its
+//! table out of the larger of its two inputs, because this pass was still written for the operator
+//! that used to be the only one.
+//!
+//! The flag on the node says *which side is gathered* rather than *which side is smaller*, and that
+//! is what lets the two operators share it: the first is a fact about the plan they agree on and the
+//! second is a policy they disagree about.
 //!
 //! # What it leaves alone
 //!
@@ -62,7 +71,9 @@ use rudb_plan::{BuildSide, Node, Plan};
 use rudb_common::Result;
 
 use crate::estimate::{self, Statistics};
+use crate::filter;
 use crate::pass::{Context, Pass, top_down};
+use crate::tables::{Tables, produced};
 
 /// Sets the build side on every join that has an estimate for both of its inputs.
 ///
@@ -83,16 +94,26 @@ impl Pass for BuildSideProbeSide {
     }
 }
 
-/// Which side the nested loop would rather have gathered, given what each side is guessed to hold.
+/// Which side the operator would rather have gathered, given what each side is guessed to hold.
 ///
-/// The larger one, for the reason in the module documentation: the gathered side is walked a chunk
-/// at a time and the driving side a row at a time. `None` when the two are equal, which is not a
-/// preference.
+/// It depends on which operator, and the two want opposite things. A hash table is built out of the
+/// gathered side and then read once per driving row, so the smaller side is the one to gather: it is
+/// the side that has to fit in memory, and building it is the part that is paid for per row rather
+/// than per lookup. A nested loop walks the gathered side a chunk at a time for each driving row, so
+/// it wants the larger side gathered, which is the reasoning in the module documentation and the
+/// measurements there.
+///
+/// `None` when the two are equal, which is not a preference.
 #[must_use]
-fn prefers(left: u64, right: u64) -> Option<BuildSide> {
+fn prefers(left: u64, right: u64, lookup: bool) -> Option<BuildSide> {
+    let (bigger, smaller) = if lookup {
+        (BuildSide::Right, BuildSide::Left)
+    } else {
+        (BuildSide::Left, BuildSide::Right)
+    };
     match left.cmp(&right) {
-        std::cmp::Ordering::Greater => Some(BuildSide::Left),
-        std::cmp::Ordering::Less => Some(BuildSide::Right),
+        std::cmp::Ordering::Greater => Some(bigger),
+        std::cmp::Ordering::Less => Some(smaller),
         std::cmp::Ordering::Equal => None,
     }
 }
@@ -106,19 +127,23 @@ fn prefers(left: u64, right: u64) -> Option<BuildSide> {
 /// Idempotent by construction: the answer is a function of the two estimates and the kind, none of
 /// which this pass touches, so a second run writes what is already there.
 fn choose(plan: &mut Plan, stats: &Statistics) {
+    let mut tables = Tables::new();
     for node in top_down(plan) {
-        let Node::Join { left, right, kind, .. } = *plan.node(node) else {
+        let Node::Join { left, right, kind, conditions, .. } = *plan.node(node) else {
             continue;
         };
         if kind.mirrored().is_none() {
             continue;
         }
+        let below = (produced(plan, left), produced(plan, right));
+        let held: Vec<_> = plan.expr_list(conditions).to_vec();
+        let lookup = filter::lookup(plan, &mut tables, &held, &below);
         let (Some(left), Some(right)) =
             (estimate::rows(plan, left, stats), estimate::rows(plan, right, stats))
         else {
             continue;
         };
-        let Some(wanted) = prefers(left, right) else {
+        let Some(wanted) = prefers(left, right, lookup) else {
             continue;
         };
         if let Node::Join { build, .. } = plan.node_mut(node) {
@@ -163,15 +188,63 @@ mod tests {
         build
     }
 
+    /// The same as `chosen`, with an equality across the sides so that the join takes the lookup.
+    fn keyed(kind: &str, left: u64, right: u64) -> BuildSide {
+        let text = format!(
+            "Join {kind} on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n  Get memory.main.l AS l #0 [a::BIGINT]\n  Get memory.main.r AS r #1 [b::BIGINT]\n"
+        );
+        side(&text, left, right)
+    }
+
+    /// Runs the pass over a plan written out in full and reports the side it wrote on the root.
+    fn side(text: &str, left: u64, right: u64) -> BuildSide {
+        let mut plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        let mut statistics = Statistics::new();
+        statistics.record("memory", "main", "l", left);
+        statistics.record("memory", "main", "r", right);
+        let mut context = Context::new();
+        context.measure(statistics);
+        BuildSideProbeSide.run(&mut plan, &context).expect("the pass does not fail");
+        let Node::Join { build, .. } = *plan.node(plan.root()) else {
+            panic!("the root stopped being a join");
+        };
+        build
+    }
+
     #[test]
     fn the_larger_side_is_the_one_gathered_because_the_nested_loop_walks_it_a_chunk_at_a_time() {
-        assert_eq!(prefers(100_000, 4), Some(BuildSide::Left));
-        assert_eq!(prefers(4, 100_000), Some(BuildSide::Right));
+        assert_eq!(prefers(100_000, 4, false), Some(BuildSide::Left));
+        assert_eq!(prefers(4, 100_000, false), Some(BuildSide::Right));
+    }
+
+    #[test]
+    fn the_smaller_side_is_the_one_gathered_when_a_hash_table_is_going_to_be_built_out_of_it() {
+        assert_eq!(prefers(100_000, 4, true), Some(BuildSide::Right));
+        assert_eq!(prefers(4, 100_000, true), Some(BuildSide::Left));
     }
 
     #[test]
     fn two_sides_of_the_same_size_are_not_a_preference() {
-        assert_eq!(prefers(500, 500), None);
+        assert_eq!(prefers(500, 500, false), None);
+        assert_eq!(prefers(500, 500, true), None);
+    }
+
+    #[test]
+    fn a_join_with_an_equality_gathers_the_small_side_and_the_same_join_without_one_does_not() {
+        // The same two tables and the same estimates, differing only in whether the condition is one
+        // the operator answers with a table. This is the whole of the change: a join of 400,000 rows
+        // against 4 on a key used to gather the 400,000.
+        assert_eq!(keyed("INNER", 400_000, 4), BuildSide::Right);
+        assert_eq!(chosen("INNER", 400_000, 4), BuildSide::Left);
+    }
+
+    #[test]
+    fn a_condition_no_lookup_answers_still_gathers_the_larger_side() {
+        // One condition that is not a cross side equality is enough to put the nested loop back, and
+        // the preference goes back with it.
+        let text = "Join INNER on=[(#0.0::BIGINT < #1.0::BIGINT)::BOOLEAN]\n  Get memory.main.l AS l #0 [a::BIGINT]\n  Get memory.main.r AS r #1 [b::BIGINT]\n";
+        assert_eq!(side(text, 400_000, 4), BuildSide::Left);
     }
 
     #[test]
