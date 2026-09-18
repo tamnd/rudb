@@ -123,15 +123,83 @@ fn a_column_with_a_null_in_it_is_counted_the_ordinary_way() {
 }
 
 #[test]
-fn a_filter_or_a_grouping_sends_the_query_back_to_the_rows() {
+fn one_comparison_against_a_constant_is_counted_out_of_the_frequency_synopsis() {
     let pair =
         Pair::new("filtered", "SELECT i % 7 AS n, 'v' || (i % 13) AS s FROM range(5000) r(i)");
+    // Seven values and thirteen values, both far inside the budget the synopsis keeps, so neither
+    // column ever had to drop one and both lists are the whole column with an exact count.
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n = 1"), Value::BigInt(715));
-    assert!(!pair.summarised("SELECT COUNT(*) FROM t WHERE n = 1"), "a filter was ignored");
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n = 1"), "the rows were read anyway");
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n <> 1"), Value::BigInt(4285));
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n <> 1"), "the rows were read anyway");
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s <> 'v0'"), Value::BigInt(4615));
-    assert!(!pair.summarised("SELECT COUNT(*) FROM t WHERE s <> 'v0'"), "a filter was ignored");
-    // A grouped count is a different question and the synopsis answers that one, not this.
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE s <> 'v0'"), "the rows were read anyway");
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s = 'v0'"), Value::BigInt(385));
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE s = 'v0'"), "the rows were read anyway");
+    // Written the other way round is the same question and neither side depends on the other.
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE 1 = n"), Value::BigInt(715));
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE 1 = n"), "the rows were read anyway");
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE 'v0' <> s"), Value::BigInt(4615));
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE 'v0' <> s"), "the rows were read anyway");
+    // A value the column does not have is the same walk and the answer is none of the rows, which
+    // is worth asking because it is the one case where the count comes out of an empty sum.
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n = 99"), Value::BigInt(0));
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n = 99"), "the rows were read anyway");
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n <> 99"), Value::BigInt(5000));
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n <> 99"), "the rows were read anyway");
+    // A grouped count is a different question and the synopsis answers that one too.
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t GROUP BY n LIMIT 1"), Value::BigInt(715));
+}
+
+#[test]
+fn a_filter_over_a_column_with_nulls_leaves_the_nulls_out_of_both_comparisons() {
+    let pair = Pair::new(
+        "filternulls",
+        "SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i % 7 END AS n, \
+         CASE WHEN i % 11 = 0 THEN NULL ELSE 'v' || (i % 13) END AS s FROM range(5000) r(i)",
+    );
+    // The synopsis counts a null as a value of its own rather than skipping it, so a count over its
+    // entries that just compared would hand the 455 null rows to `<>` and SQL hands them to neither.
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n = 1"), Value::BigInt(650));
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n = 1"), "the rows were read anyway");
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n <> 1"), Value::BigInt(3895));
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n <> 1"), "the rows were read anyway");
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s = 'v0'"), Value::BigInt(350));
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE s = 'v0'"), "the rows were read anyway");
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s <> 'v0'"), Value::BigInt(4195));
+    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE s <> 'v0'"), "the rows were read anyway");
+    // The two sides of that add up to the rows that are not null rather than to the whole table.
+    assert_eq!(pair.agree("SELECT COUNT(n) FROM t"), Value::BigInt(4545));
+}
+
+#[test]
+fn a_filter_the_synopsis_cannot_decide_sends_the_query_back_to_the_rows() {
+    let pair = Pair::new("filterback", "SELECT i % 7 AS n, i AS wide FROM range(5000) r(i)");
+    // An ordering comparison is a different question from picking entries out of a list, and the
+    // shortcut turns it away rather than guessing at it.
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n > 1"), Value::BigInt(3570));
+    assert!(!pair.summarised("SELECT COUNT(*) FROM t WHERE n > 1"), "a filter was ignored");
+    // So is more than one of them.
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n = 1 AND wide < 100"), Value::BigInt(15));
+    assert!(
+        !pair.summarised("SELECT COUNT(*) FROM t WHERE n = 1 AND wide < 100"),
+        "filter ignored"
+    );
+    // Five thousand distinct values overflow the budget, so the file kept the leading ones and a
+    // bound on what it dropped, and a bound cannot be counted with.
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE wide = 1"), Value::BigInt(1));
+    assert!(
+        !pair.summarised("SELECT COUNT(*) FROM t WHERE wide = 1"),
+        "a partial list was counted"
+    );
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE wide <> 1"), Value::BigInt(4999));
+    assert!(
+        !pair.summarised("SELECT COUNT(*) FROM t WHERE wide <> 1"),
+        "a partial list was counted"
+    );
+    // A null constant compares unknown against every row whatever the column holds, so the answer
+    // is none of them, and that is the operator's own rule rather than something worth a shape.
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n = NULL"), Value::BigInt(0));
 }
 
 #[test]

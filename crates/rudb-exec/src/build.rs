@@ -535,6 +535,87 @@ fn grouped_column<'a>(
     Ok(stored_column(plan, table, index, columns, binding).map(|column| (table, produced, column)))
 }
 
+/// A filter over a stored table whose rows the file can count without reading any of them.
+///
+/// The shape is one equality or inequality against a constant, over a column the file wrote a
+/// complete frequency synopsis for. That synopsis is every distinct value of the column with an
+/// exact count, so which values the predicate keeps and how many rows hold them are both already
+/// known, and the whole of `WHERE AdvEngineID <> 0` is a walk over fourteen entries rather than a
+/// million.
+struct CertainFilter {
+    /// Every value of the column the predicate names, with its exact row count.
+    entries: Vec<(Value, u64)>,
+    /// The constant the predicate compares against, never null.
+    against: Value,
+    /// Whether the predicate keeps the rows that differ rather than the ones that match.
+    differs: bool,
+}
+
+impl CertainFilter {
+    /// How many rows the predicate keeps, or `None` if any entry cannot be decided.
+    fn rows(&self) -> Option<u64> {
+        let mut kept = 0_u64;
+        for (value, count) in &self.entries {
+            if self.keeps(value)? {
+                kept = kept.checked_add(*count)?;
+            }
+        }
+        Some(kept)
+    }
+
+    /// Whether the predicate keeps the rows holding one value.
+    ///
+    /// `Value`'s `PartialEq` is Rust equality rather than SQL equality, and it says so, so leaning on
+    /// it here needs an argument. The two places they differ are nulls, which it calls equal and SQL
+    /// calls unknown, and NaNs, which it calls equal and SQL does not. Neither can arrive: a null is
+    /// answered above without being compared, a null constant is turned away when the filter is
+    /// recognised, and a float column never has a synopsis at all. What is left is integers, dates,
+    /// timestamps and strings of one declared type, and for those two the two equalities are the same
+    /// relation.
+    fn keeps(&self, value: &Value) -> Option<bool> {
+        // A null row answers unknown to both comparisons and a filter keeps neither, which is the one
+        // thing a count over the entries would get wrong if it just compared.
+        if value.is_null() {
+            return Some(false);
+        }
+        if value.logical_type() != self.against.logical_type() {
+            return None;
+        }
+        Some((value == &self.against) != self.differs)
+    }
+}
+
+/// The filter above a stored table that [`CertainFilter`] can answer, if this node is one.
+fn certain_filter(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Option<CertainFilter>> {
+    let Node::Filter { input, predicate } = *plan.node(node) else { return Ok(None) };
+    let Some((table, index, columns)) = whole_table(plan, catalog, input)? else {
+        return Ok(None);
+    };
+    let Expr::Compare { op, left, right } = *plan.expr(predicate) else { return Ok(None) };
+    let differs = match op {
+        CompareOp::Equal => false,
+        CompareOp::NotEqual => true,
+        _ => return Ok(None),
+    };
+    // Written either way round is the same question, since neither side depends on the other.
+    let (binding, constant) = match (plan.expr(left), plan.expr(right)) {
+        (&Expr::Column(binding), &Expr::Constant(value))
+        | (&Expr::Constant(value), &Expr::Column(binding)) => (binding, value),
+        _ => return Ok(None),
+    };
+    let against = plan.value(constant).clone();
+    // A null constant makes the comparison unknown for every row whatever the column holds, so the
+    // answer is no rows and it is not worth a shape of its own. The operator says so already.
+    if against.is_null() {
+        return Ok(None);
+    }
+    let Some(column) = stored_column(plan, table, index, columns, binding) else {
+        return Ok(None);
+    };
+    let Some(entries) = table.rows().exact_frequencies(column)? else { return Ok(None) };
+    Ok(Some(CertainFilter { entries, against, differs }))
+}
+
 /// How many rows a node produces, when that can be known without producing them.
 ///
 /// A `Get` knows because the file wrote down its row count. A grouping with no aggregates knows when
@@ -543,10 +624,17 @@ fn grouped_column<'a>(
 /// nothing else. That is the difference between reading the answer and building a hash table with a
 /// hundred thousand rows in it.
 ///
+/// A filter knows when it is one comparison against a constant over a column with a complete
+/// frequency synopsis, because then the file already holds how many rows every value has and the
+/// predicate only has to pick which of them count.
+///
 /// `None` means go and count them.
 fn known_rows(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Option<u64>> {
     if let Some((table, _, _)) = whole_table(plan, catalog, node)? {
         return Ok(Some(table.rows().len() as u64));
+    }
+    if let Some(filter) = certain_filter(plan, catalog, node)? {
+        return Ok(filter.rows());
     }
     let Some((table, _, column)) = grouped_column(plan, catalog, node)? else { return Ok(None) };
     // A grouping puts every null in a group of its own and a distinct count does not count it, so
