@@ -10,7 +10,9 @@
 //! itself is M2 work and it replaces the inside of that type rather than the shape of it.
 
 pub mod memory;
+pub mod sieve;
 pub mod zone;
 
 pub use memory::MemoryTable;
+pub use sieve::Sieve;
 pub use zone::{Probe, Range, Zone};
