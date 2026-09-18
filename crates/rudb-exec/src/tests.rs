@@ -934,8 +934,8 @@ fn the_functions_table_is_one_row_per_name_and_argument_count() {
     for row in rows.iter().filter(|row| row[1] == text("table")) {
         assert_eq!(row[2], Value::Null, "{:?}", row[0]);
     }
-    // Everything else has one, and nothing here is a macro or a pragma or a window function because
-    // rudb has none of the three.
+    // Everything else has one, and nothing here is a macro or a pragma because rudb has neither.
+    // The window kind is the ranking family, which is only ever written inside an OVER.
     let mut kinds: Vec<String> = rows
         .iter()
         .map(|row| match &row[1] {
@@ -945,7 +945,7 @@ fn the_functions_table_is_one_row_per_name_and_argument_count() {
         .collect();
     kinds.sort();
     kinds.dedup();
-    assert_eq!(kinds, ["aggregate", "scalar", "table"]);
+    assert_eq!(kinds, ["aggregate", "scalar", "table", "window"]);
 }
 
 #[test]
