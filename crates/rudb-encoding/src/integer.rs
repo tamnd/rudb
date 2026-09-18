@@ -139,7 +139,7 @@ pub fn encode_with(values: &[i64], chooser: &dyn Chooser) -> Result<Vec<u8>> {
 /// with each other.
 pub fn decode(bytes: &[u8]) -> Result<Vec<i64>> {
     let mut reader = Reader::new(bytes);
-    let values = decode_chunk(&mut reader)?;
+    let values = with_decoding(|scratch| decode_chunk(&mut reader, scratch))?;
     if reader.remaining() != 0 {
         return Err(Error::internal(format!(
             "{} bytes left over after decoding a chunk",
@@ -160,7 +160,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i64>> {
 /// As [`decode`], except that trailing bytes are what the caller asked about rather than an error.
 pub fn decode_prefix(bytes: &[u8]) -> Result<(Vec<i64>, usize)> {
     let mut reader = Reader::new(bytes);
-    let values = decode_chunk(&mut reader)?;
+    let values = with_decoding(|scratch| decode_chunk(&mut reader, scratch))?;
     Ok((values, reader.used()))
 }
 
@@ -369,17 +369,26 @@ fn encode_as(
 /// [`bitpack::pack_tail`] instead. The transposed layout has no partial form and would charge a
 /// five entry dictionary for 1024 entries.
 fn encode_packed(values: &[i64], out: &mut Vec<u8>) -> Result<()> {
+    // The same three buffers for every unit, for the reason written on `Decoding` on the other side.
+    // The chooser encodes every candidate it is offered before it picks one, so this loop runs more
+    // often on the way in than the decoding loop does on the way out.
+    let mut offsets: Vec<u64> = Vec::with_capacity(VALUES);
+    // Held at the width 64 length for the reason written on `Decoding`, so a narrower unit writes
+    // the front of it and the resize per unit goes away.
+    let mut packed: Vec<u64> = vec![0; bitpack::packed_len::<u64>(64)];
+    let mut transposed = bitpack::Scratch::<u64>::new();
     for unit in values.chunks(VALUES) {
         let base = unit.iter().copied().min().unwrap_or(0);
-        let offsets: Vec<u64> = unit.iter().map(|value| offset_from(*value, base)).collect();
+        offsets.clear();
+        offsets.extend(unit.iter().map(|value| offset_from(*value, base)));
         let width = bitpack::required_width(&offsets);
         put_i64(out, base);
         put_u8(out, u8::try_from(width).map_err(|_| Error::internal("impossible width"))?);
         if unit.len() == VALUES {
-            let mut packed = vec![0u64; bitpack::packed_len::<u64>(width)];
-            bitpack::pack(&offsets, width, &mut packed)?;
-            for word in packed {
-                put_u64(out, word);
+            let words = bitpack::packed_len::<u64>(width);
+            bitpack::pack_with(&offsets, width, &mut packed[..words], &mut transposed)?;
+            for word in &packed[..words] {
+                put_u64(out, *word);
             }
         } else {
             bitpack::pack_tail(&offsets, width, out)?;
@@ -388,25 +397,96 @@ fn encode_packed(values: &[i64], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<i64>> {
+/// The buffers a decode reuses from one unit of 1024 values to the next.
+///
+/// Every one of these used to be allocated inside the loop, and because they were allocated with a
+/// value rather than grown, the allocator zeroed them and then the decode overwrote every byte. In a
+/// ClickBench profile that zeroing was the single largest item, ahead of the unpacking it was making
+/// room for, because a scan pays it once per 1024 rows of every packed integer column it reads.
+///
+/// It is threaded through the recursion rather than made per call because a chunk is a cascade. A
+/// dictionary of deltas is three nested decodes, and each of them would otherwise make its own.
+///
+/// All three start empty and are grown on the first unit that needs them, to their largest size
+/// rather than to the size that unit wants, so that every unit after the first finds them the right
+/// length already and nothing is zeroed or resized again.
+///
+/// It lives on the thread rather than in the caller, which is worth saying why. A chunk is a row
+/// group, and a row group in the native format is about a thousand rows, which is one unit. So there
+/// is no second unit in a chunk to reuse anything and holding this per call is strictly worse than
+/// allocating per unit was: it was tried, and it cost more in the growing than it saved in the
+/// zeroing. What there are many of is chunks, one per part per column, and the thread that reads
+/// them reads them one after another. That is the loop the reuse belongs to, and reaching it by
+/// passing a buffer down would mean a parameter through every page decoder in the storage layer for
+/// a buffer none of them has an opinion about.
+struct Decoding {
+    /// The packed words of one unit, as read off the wire. Held at the width 64 length, which is the
+    /// largest a unit can be, so a narrower unit uses the front of it.
+    packed: Vec<u64>,
+    /// One unit of unpacked offsets, before the base is added back.
+    unit: Vec<u64>,
+    /// What the unpack transposes through.
+    transposed: bitpack::Scratch<u64>,
+}
+
+thread_local! {
+    /// The buffers this thread decodes through. See [`Decoding`].
+    static DECODING: std::cell::RefCell<Decoding> =
+        const { std::cell::RefCell::new(Decoding::new()) };
+}
+
+/// Runs a decode over this thread's buffers.
+///
+/// Nothing inside a decode calls back into one, so the borrow is never already taken. It is asked
+/// for rather than assumed anyway, and a decode that somehow arrives while another is running gets
+/// buffers of its own rather than a panic, because the alternative is a crash in a reader on a
+/// path nobody exercised.
+fn with_decoding<T>(run: impl FnOnce(&mut Decoding) -> T) -> T {
+    DECODING.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => run(&mut scratch),
+        Err(_) => run(&mut Decoding::new()),
+    })
+}
+
+impl Decoding {
+    /// Buffers that have not made room for anything yet.
+    const fn new() -> Self {
+        Self { packed: Vec::new(), unit: Vec::new(), transposed: bitpack::Scratch::new() }
+    }
+
+    /// Makes room for one unit. A no op every time after the first.
+    fn ready(&mut self) {
+        if self.unit.len() != VALUES {
+            self.unit.resize(VALUES, 0);
+            self.packed.resize(bitpack::packed_len::<u64>(64), 0);
+        }
+    }
+}
+
+fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i64>> {
     let kind = Kind::from_tag(reader.u8()?)?;
     let count = reader.u32()? as usize;
     match kind {
         Kind::Constant => Ok(vec![reader.i64()?; count]),
         Kind::Packed => {
             let mut values = Vec::with_capacity(count);
+            scratch.ready();
             while values.len() < count {
                 let base = reader.i64()?;
                 let width = reader.u8()? as usize;
                 let wanted = (count - values.len()).min(VALUES);
                 if wanted == VALUES {
-                    let mut packed = vec![0u64; bitpack::packed_len::<u64>(width)];
-                    for word in &mut packed {
+                    let words = bitpack::packed_len::<u64>(width);
+                    for word in &mut scratch.packed[..words] {
                         *word = reader.u64()?;
                     }
-                    let mut unit = vec![0u64; VALUES];
-                    bitpack::unpack(&packed, width, &mut unit)?;
-                    values.extend(unit.iter().map(|offset| value_from(*offset, base)));
+                    bitpack::unpack_with(
+                        &scratch.packed[..words],
+                        width,
+                        &mut scratch.unit,
+                        &mut scratch.transposed,
+                    )?;
+                    values.extend(scratch.unit.iter().map(|offset| value_from(*offset, base)));
                 } else {
                     let bytes = reader.bytes(bitpack::tail_len(wanted, width))?;
                     let unit = bitpack::unpack_tail(bytes, width, wanted)?;
@@ -417,7 +497,7 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<i64>> {
         }
         Kind::Delta => {
             let first = reader.i64()?;
-            let deltas = decode_chunk(reader)?;
+            let deltas = decode_chunk(reader, scratch)?;
             let mut values = Vec::with_capacity(count);
             values.push(first);
             let mut current = first;
@@ -429,8 +509,8 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<i64>> {
             Ok(values)
         }
         Kind::Rle => {
-            let run_values = decode_chunk(reader)?;
-            let run_lengths = decode_chunk(reader)?;
+            let run_values = decode_chunk(reader, scratch)?;
+            let run_lengths = decode_chunk(reader, scratch)?;
             if run_values.len() != run_lengths.len() {
                 return Err(Error::internal("an RLE chunk has more runs than run lengths"));
             }
@@ -444,8 +524,8 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<i64>> {
             Ok(values)
         }
         Kind::Dict => {
-            let dictionary = decode_chunk(reader)?;
-            let codes = decode_chunk(reader)?;
+            let dictionary = decode_chunk(reader, scratch)?;
+            let codes = decode_chunk(reader, scratch)?;
             let mut values = Vec::with_capacity(count);
             for code in codes {
                 let index =
@@ -460,8 +540,8 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<i64>> {
         Kind::Sparse => {
             let value = reader.i64()?;
             let exception_count = reader.u32()? as usize;
-            let positions = decode_chunk(reader)?;
-            let exceptions = decode_chunk(reader)?;
+            let positions = decode_chunk(reader, scratch)?;
+            let exceptions = decode_chunk(reader, scratch)?;
             if positions.len() != exception_count || exceptions.len() != exception_count {
                 return Err(Error::internal("a sparse chunk disagrees about its exception count"));
             }
@@ -912,6 +992,48 @@ mod tests {
             let values: Vec<i64> = (0..len).map(|index| (index * 31 % 97) as i64).collect();
             round_trip(&values);
         }
+    }
+
+    #[test]
+    fn units_of_different_widths_in_one_chunk_do_not_read_each_others_leftovers() {
+        // A decode reuses its buffers from one unit to the next instead of getting a zeroed one
+        // each time, so a unit that wrote fewer bits than the unit before it would come back with
+        // the older unit's values in the bits it did not write. Each run of 1024 here needs a
+        // different width and the widths go up and down, and the last run repeats the first, which
+        // is the pair that would agree by accident if the reuse were wrong in the obvious way.
+        //
+        // The values are random rather than written out because this has to stay one packed chunk
+        // of six units to be testing anything, and the first version of it was arithmetic and got
+        // cascaded into a delta of runs where every nested array was under a unit long. That was
+        // caught by gating a panic on the second unit and rerunning, which this version reaches and
+        // the old one did not, and the assertion on the shape below is there so it stays reached.
+        let mut random = Random::new();
+        let mut values = Vec::new();
+        for width in [40u32, 3, 61, 1, 17, 40] {
+            for _ in 0..1024 {
+                values.push((random.next() & ((1u64 << width) - 1)) as i64);
+            }
+        }
+        let bytes = encode(&values).unwrap();
+        let described = describe(&bytes).unwrap();
+        assert!(described.starts_with("FOR+BITPACK"), "expected one packed chunk, got {described}");
+        assert_eq!(decode(&bytes).unwrap(), values, "{described}");
+    }
+
+    #[test]
+    fn a_cascade_decodes_the_same_through_a_shared_scratch_as_through_its_own() {
+        // The scratch is threaded through the recursion, so a dictionary of deltas is three nested
+        // decodes sharing one set of buffers. Nothing in the nesting arms holds a buffer across the
+        // call it makes, and this is the test that says so: a chunk long enough to cascade and wide
+        // enough to bit pack at more than one level, decoded whole.
+        let mut values = Vec::new();
+        for index in 0..8192i64 {
+            values.push(1_600_000_000 + index / 4 + (index % 7) * 1_000);
+        }
+        let bytes = encode(&values).unwrap();
+        let described = describe(&bytes).unwrap();
+        assert!(described.contains('('), "expected a cascade, got {described}");
+        assert_eq!(decode(&bytes).unwrap(), values, "{described}");
     }
 
     #[test]
