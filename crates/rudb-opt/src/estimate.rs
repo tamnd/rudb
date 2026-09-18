@@ -35,8 +35,11 @@
 
 use std::collections::BTreeMap;
 
+use rudb_common::Value;
 use rudb_common::stat::{Class, Direction, Provenance, Stat};
-use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind};
+use rudb_plan::{
+    ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, Slice, StrRef,
+};
 
 use crate::walk;
 
@@ -58,13 +61,19 @@ const KEPT_BY_A_CONDITION: f64 = 0.2;
 /// this is a middle that is wrong for both rather than a guess that favours one.
 const KEPT_BY_A_GROUP_BY: f64 = 0.1;
 
-/// The row counts the optimizer was handed, by table.
+/// The row counts the optimizer was handed, by table and by file.
 ///
 /// A side table rather than a field on [`Node::Get`], and a plain count rather than a handle on the
 /// catalog. Both of those are so that a plan stays a value: the optimizer's own tests build plans
 /// out of text with no database anywhere near them, `Plan::parse` of a printed plan gives back the
 /// plan it was printed from, and neither of those survives a node that carries a number only a
 /// live catalog could have filled in.
+///
+/// The files half is the same idea about a different source. A Parquet footer states exactly how
+/// many rows the file holds, which is a better number than anything in this module computes, and it
+/// arrives here rather than being read here for the reason above: this module opens nothing. The
+/// key is the path as the call wrote it, pattern and all, because that is what the plan holds and
+/// expanding a pattern is another thing this module will not do.
 ///
 /// Empty is the ordinary state for anything that is not a real query, and an empty one makes every
 /// scan unknown rather than making every scan zero. A scan of a table nobody measured and a scan of
@@ -73,6 +82,7 @@ const KEPT_BY_A_GROUP_BY: f64 = 0.1;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Statistics {
     tables: BTreeMap<(String, String, String), u64>,
+    files: BTreeMap<String, u64>,
 }
 
 impl Statistics {
@@ -93,10 +103,24 @@ impl Statistics {
         self.tables.get(&(catalog.to_owned(), schema.to_owned(), table.to_owned())).copied()
     }
 
+    /// Record what the files one path argument names held, counting every one of them.
+    ///
+    /// `pattern` is the argument as it was written, so a glob is stored under the glob. The count
+    /// is the total across everything the glob matched, since that is what the call produces.
+    pub fn record_file(&mut self, pattern: &str, rows: u64) {
+        self.files.insert(pattern.to_owned(), rows);
+    }
+
+    /// What that path argument named, where anybody counted it.
+    #[must_use]
+    pub fn rows_in_file(&self, pattern: &str) -> Option<u64> {
+        self.files.get(pattern).copied()
+    }
+
     /// Whether anything at all was recorded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
+        self.tables.is_empty() && self.files.is_empty()
     }
 }
 
@@ -166,11 +190,13 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
         // number of rows is written down.
         Node::Values { rows: list, .. } => u64::try_from(plan.row_list(list).len())
             .map_or(Stat::Unknown, |rows| Stat::exact(rows, Provenance::RowCount)),
-        // A table function is an open door. `read_parquet` could answer this from the footer and
-        // one day should, but the answer would have to come from the reader rather than from here,
-        // and a function nobody taught this about would still be unknown. Guessing on behalf of all
+        // A table function is an open door, and `read_parquet` is the one of them that has been
+        // taught. The footer counted the rows, so the answer is exact, and it comes in through
+        // `Statistics` rather than being read here, because this module opens no files. A function
+        // nobody taught this about is still unknown, which is the point: guessing on behalf of all
         // of them is the failure mode this module exists to avoid.
-        Node::TableFunction { .. } | Node::LateralFunction { .. } => Stat::Unknown,
+        Node::TableFunction { function, args, .. } => in_file(plan, function, args, stats),
+        Node::LateralFunction { .. } => Stat::Unknown,
         Node::Filter { input, predicate } => {
             let kept = KEPT_BY_A_CONDITION.powi(conjuncts(plan, predicate));
             guess(of(input), kept)
@@ -248,6 +274,38 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
                 _ => ceiling(total),
             }
         }
+    }
+}
+
+/// What a table function call over a file was counted to produce, where anybody counted it.
+///
+/// Only `read_parquet`, and only a call whose path is one written out string. That is what the
+/// footer answers exactly and it is the call TPC-H and every other file based benchmark makes, so
+/// it is the case worth having. A list of paths is left unknown rather than half answered, because
+/// the key here is one string and a list is not one, and a number covering some of the files would
+/// be worse than no number at all.
+///
+/// `read_csv` is not here and should not be. A CSV file states nothing about how many rows it has,
+/// so the only way to answer would be to read the whole thing, and a planner that reads the file
+/// twice to decide how to read it once is not a planner.
+fn in_file(plan: &Plan, function: StrRef, args: Slice, stats: &Statistics) -> Stat<u64> {
+    if plan.string(function) != "read_parquet" {
+        return Stat::Unknown;
+    }
+    let [path] = plan.expr_list(args) else {
+        return Stat::Unknown;
+    };
+    let Expr::Constant(value) = *plan.expr(*path) else {
+        return Stat::Unknown;
+    };
+    let Value::Varchar(pattern) = plan.value(value) else {
+        return Stat::Unknown;
+    };
+    // Exact, because the footer counted rather than sampled. This is the second place a plan starts
+    // from a number nobody guessed, and for the queries that read files it is the only one.
+    match stats.rows_in_file(pattern) {
+        Some(rows) => Stat::exact(rows, Provenance::RowCount),
+        None => Stat::Unknown,
     }
 }
 
@@ -650,6 +708,45 @@ mod tests {
         assert_eq!(stat(text, &[]), Stat::Unknown);
     }
 
+    /// The estimate for a plan written as text, against the files named here rather than tables.
+    fn over_files(text: &str, files: &[(&str, u64)]) -> Stat<u64> {
+        let mut stats = Statistics::new();
+        for (path, count) in files {
+            stats.record_file(path, *count);
+        }
+        let plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        rows_stat(&plan, plan.root(), &stats)
+    }
+
+    /// A `read_parquet` of one written out path, which is the call this module answers.
+    fn read_parquet(path: &str) -> String {
+        format!("TableFunction read_parquet args=['{path}'::VARCHAR] #0 [a::BIGINT]\n")
+    }
+
+    #[test]
+    fn a_parquet_file_somebody_counted_is_exact_because_the_footer_counted_it() {
+        let text = read_parquet("lineitem.parquet");
+        let stat = over_files(&text, &[("lineitem.parquet", 6_001_215)]);
+        assert_eq!(stat.value().copied(), Some(6_001_215));
+        assert_eq!(stat.class(), Some(Class::Exact));
+    }
+
+    #[test]
+    fn a_parquet_file_nobody_counted_is_unknown_rather_than_zero() {
+        assert_eq!(over_files(&read_parquet("gone.parquet"), &[]), Stat::Unknown);
+        // Keyed on the path the call wrote, so a count filed under another path is not this one.
+        assert_eq!(over_files(&read_parquet("a.parquet"), &[("b.parquet", 10)]), Stat::Unknown);
+    }
+
+    #[test]
+    fn a_reader_that_is_not_parquet_is_unknown_whatever_was_counted() {
+        // A CSV file says nothing about its own length, so a number filed against one would have
+        // had to come from reading the whole thing, and nobody is going to do that to plan a query.
+        let text = "TableFunction read_csv args=['t.csv'::VARCHAR] #0 [a::BIGINT]\n";
+        assert_eq!(over_files(text, &[("t.csv", 500)]), Stat::Unknown);
+    }
+
     #[test]
     fn statistics_that_nobody_filled_in_say_so() {
         let mut stats = Statistics::new();
@@ -659,5 +756,14 @@ mod tests {
         assert_eq!(stats.rows_in("memory", "main", "t"), Some(7));
         // The three names are one key. A table of the same name in another schema is another table.
         assert_eq!(stats.rows_in("memory", "other", "t"), None);
+    }
+
+    #[test]
+    fn a_file_count_on_its_own_is_something_known() {
+        let mut stats = Statistics::new();
+        stats.record_file("t.parquet", 12);
+        assert!(!stats.is_empty(), "a database with no tables and one file knows something");
+        assert_eq!(stats.rows_in_file("t.parquet"), Some(12));
+        assert_eq!(stats.rows_in_file("other.parquet"), None);
     }
 }
