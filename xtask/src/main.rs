@@ -25,6 +25,7 @@ mod grammar;
 mod io;
 mod kernels;
 mod layers;
+mod native;
 mod parquet;
 mod rowloop;
 mod ruletable;
@@ -93,6 +94,8 @@ fn main() -> ExitCode {
         // The committed corpus from tamnd/rudb-compat, against the shell this tree builds. Not
         // `differential` above, which compares two engines over a file somebody downloaded. This
         // one has its answers written down in the repository that owns them.
+        // Where a native file's bytes went, per column, out of the directory alone.
+        Some("native") => native::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("conform") => conform::run(&root()),
         Some("smoke") => smoke::run(),
         Some("ci") => ci(std::env::args().nth(2).as_deref() == Some("--full")),
@@ -158,6 +161,9 @@ fn usage() {
     println!("           what the sample saves in time and what it gives up in size");
     println!("           --sampled makes the thread sweep use the sampled chooser, so that what");
     println!("           the ablation buys can be checked against the cores rather than assumed");
+    println!("  native <file.db>       where a native file's bytes went, per column and per kind");
+    println!("           of byte, out of the committed directory alone, so it costs the same on");
+    println!("           a 45 GB table as on an empty one. --all prints every column, not 20");
     println!("  parquet [files...]     what a Parquet read costs in rudb next to duckdb, over the");
     println!("           same files and the same SQL, one row per shape from the footer alone up");
     println!("           to every column of every row. process start is measured and subtracted");
