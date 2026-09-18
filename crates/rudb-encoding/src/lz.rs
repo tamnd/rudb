@@ -192,17 +192,47 @@ pub(crate) fn rebuild(
     offsets: &[i64],
     total: usize,
 ) -> Result<Vec<u8>> {
-    if literals.len() != lengths.len() || lengths.len() != offsets.len() {
+    let mut out = Vec::with_capacity(total);
+    replay(literals.len(), |index| &literals[index], lengths, offsets, &mut out)?;
+    Ok(out)
+}
+
+/// [`rebuild`] appending to a buffer somebody else owns, with the literal runs still packed.
+///
+/// The string decoder builds its output as one buffer, so the bytes this produces are the values
+/// rather than something to cut the values out of afterwards. Appending rather than returning is
+/// what makes that true, and a copy offset counts back from where the replay has got to rather than
+/// from the start of the buffer, so anything already in it is out of reach and stays that way.
+///
+/// # Errors
+///
+/// As [`rebuild`].
+pub(crate) fn rebuild_into(
+    literals: &crate::string::Flat,
+    lengths: &[i64],
+    offsets: &[i64],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    replay(literals.len(), |index| literals.get(index).expect("in range"), lengths, offsets, out)
+}
+
+fn replay<'a>(
+    runs: usize,
+    run: impl Fn(usize) -> &'a [u8],
+    lengths: &[i64],
+    offsets: &[i64],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if runs != lengths.len() || lengths.len() != offsets.len() {
         return Err(Error::internal(format!(
-            "a matched chunk has {} literal runs, {} lengths and {} offsets",
-            literals.len(),
+            "a matched chunk has {runs} literal runs, {} lengths and {} offsets",
             lengths.len(),
             offsets.len()
         )));
     }
-    let mut out = Vec::with_capacity(total);
-    for (index, run) in literals.iter().enumerate() {
-        out.extend_from_slice(run);
+    let base = out.len();
+    for index in 0..runs {
+        out.extend_from_slice(run(index));
         let length = usize::try_from(lengths[index])
             .map_err(|_| Error::internal("a negative copy length"))?;
         if length == 0 {
@@ -210,10 +240,10 @@ pub(crate) fn rebuild(
         }
         let offset = usize::try_from(offsets[index])
             .map_err(|_| Error::internal("a negative copy offset"))?;
-        if offset == 0 || offset > out.len() {
+        if offset == 0 || offset > out.len() - base {
             return Err(Error::internal(format!(
                 "a copy reaches {offset} bytes back into {} bytes of output",
-                out.len()
+                out.len() - base
             )));
         }
         // Byte at a time because a copy is allowed to overlap itself, which is how a run of one
@@ -224,7 +254,7 @@ pub(crate) fn rebuild(
             out.push(byte);
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn hash(bytes: &[u8]) -> usize {

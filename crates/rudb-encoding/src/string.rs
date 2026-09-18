@@ -168,6 +168,107 @@ pub fn encode_with(values: &[&[u8]], chooser: &dyn Chooser) -> Result<Vec<u8>> {
     encode_at(values, 0, chooser)
 }
 
+/// A decoded chunk as one buffer with the values laid end to end, and where each one ends in it.
+///
+/// This is what the decoder builds and [`decode`] is a copy out of it. The cascade is why: a nest
+/// like `FRONT(LZ(FSST))` decodes three levels to produce one, and a level that hands its caller a
+/// `Vec<Vec<u8>>` has allocated once per value and copied every byte it holds. Three levels of that
+/// on a chunk of a thousand URLs is three thousand allocations to produce a thousand strings that
+/// the caller almost always wants back to back anyway.
+///
+/// It also makes the levels cheaper on their own terms. `PLAIN` is one `memcpy` of the whole
+/// payload because the values are already end to end in the file. `FRONT` copies a shared prefix
+/// out of the buffer it is writing into, so the previous value never has to be somewhere else.
+/// `LZ` replays straight into the buffer, which is what its copy offsets meant in the first place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Flat {
+    bytes: Vec<u8>,
+    /// Where each value ends, so a value starts where the one before it ended and the last entry
+    /// is the length of `bytes`. Ends rather than offsets because a value is appended and its end
+    /// is what is known at that moment.
+    ends: Vec<usize>,
+}
+
+impl Flat {
+    fn with_capacity(count: usize, bytes: usize) -> Self {
+        Self { bytes: Vec::with_capacity(bytes), ends: Vec::with_capacity(count) }
+    }
+
+    fn push(&mut self, value: &[u8]) {
+        self.bytes.extend_from_slice(value);
+        self.ends.push(self.bytes.len());
+    }
+
+    /// Where the value at `index` starts, which is where the one before it ended.
+    fn start(&self, index: usize) -> usize {
+        if index == 0 { 0 } else { self.ends[index - 1] }
+    }
+
+    /// How many values the chunk holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Whether the chunk holds no values at all, which is not the same as holding empty ones.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The values laid end to end. A caller that already knows the boundaries, which is what a
+    /// global dictionary's offsets are, needs nothing else.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The value at `index`, or `None` past the end.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        let end = *self.ends.get(index)?;
+        self.bytes.get(self.start(index)..end)
+    }
+
+    /// Every value in order.
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        (0..self.len()).map(|index| self.get(index).expect("in range"))
+    }
+
+    /// The buffer on its own, for a caller that wanted the bytes rather than the values.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    fn into_values(self) -> Vec<Vec<u8>> {
+        let mut values = Vec::with_capacity(self.len());
+        let mut at = 0;
+        for end in &self.ends {
+            values.push(self.bytes[at..*end].to_vec());
+            at = *end;
+        }
+        values
+    }
+}
+
+/// Decodes a chunk written by [`encode`] without taking it apart into a value each.
+///
+/// # Errors
+///
+/// As [`decode`].
+pub fn decode_flat(bytes: &[u8]) -> Result<Flat> {
+    let mut reader = Reader::new(bytes);
+    let flat = decode_chunk(&mut reader)?;
+    if reader.remaining() != 0 {
+        return Err(Error::internal(format!(
+            "{} bytes left over after decoding a string chunk",
+            reader.remaining()
+        )));
+    }
+    Ok(flat)
+}
+
 /// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
 ///
 /// A column group holds one of these per column, and the decoder on that side cannot know where
@@ -179,7 +280,7 @@ pub fn encode_with(values: &[&[u8]], chooser: &dyn Chooser) -> Result<Vec<u8>> {
 pub fn decode_prefix(bytes: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     let mut reader = Reader::new(bytes);
     let values = decode_chunk(&mut reader)?;
-    Ok((values, reader.used()))
+    Ok((values.into_values(), reader.used()))
 }
 
 /// [`describe`] over a chunk at the front of a longer buffer, and how many bytes it took.
@@ -199,15 +300,7 @@ pub fn describe_prefix(bytes: &[u8]) -> Result<(String, usize)> {
 ///
 /// If the bytes are truncated, carry an unknown tag, or describe a chunk whose parts disagree.
 pub fn decode(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let mut reader = Reader::new(bytes);
-    let values = decode_chunk(&mut reader)?;
-    if reader.remaining() != 0 {
-        return Err(Error::internal(format!(
-            "{} bytes left over after decoding a string chunk",
-            reader.remaining()
-        )));
-    }
-    Ok(values)
+    Ok(decode_flat(bytes)?.into_values())
 }
 
 /// The size of every candidate that applies, for a report that wants to say what was chosen over
@@ -449,35 +542,54 @@ fn encode_as(
     Ok(Some(out))
 }
 
-fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<Vec<u8>>> {
+fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
     let kind = Kind::from_tag(reader.u8()?)?;
     let count = reader.u32()? as usize;
     match kind {
         Kind::Constant => {
             let len = reader.u32()? as usize;
-            let value = reader.bytes(len)?.to_vec();
-            Ok(vec![value; count])
+            let value = reader.bytes(len)?;
+            let mut flat = Flat::with_capacity(count, len.saturating_mul(count));
+            for _ in 0..count {
+                flat.push(value);
+            }
+            Ok(flat)
         }
         Kind::Plain => {
             let lengths = decode_lengths(reader, count)?;
-            let mut values = Vec::with_capacity(count);
+            // One copy of the whole payload rather than one a value, which the file already laid
+            // out end to end and which is the layout wanted back.
+            let total = sum_of(&lengths)?;
+            let payload = reader.bytes(total)?;
+            let mut flat = Flat::with_capacity(count, total);
+            flat.bytes.extend_from_slice(payload);
+            let mut at = 0;
             for length in lengths {
-                values.push(reader.bytes(length)?.to_vec());
+                at += length;
+                flat.ends.push(at);
             }
-            Ok(values)
+            Ok(flat)
         }
         Kind::Fsst => {
             let (table, used) = SymbolTable::deserialize(reader.rest())?;
             reader.skip(used)?;
             let lengths = decode_lengths(reader, count)?;
-            let mut values = Vec::with_capacity(count);
+            // The compressed total is what the buffer has to hold and it is also the only sane
+            // guess at the decompressed one, so it is checked before it is believed.
+            let compressed_len = sum_of(&lengths)?;
+            if compressed_len > reader.remaining() {
+                return Err(Error::internal(format!(
+                    "a compressed chunk says it holds {compressed_len} bytes and has {}",
+                    reader.remaining()
+                )));
+            }
+            let mut flat = Flat::with_capacity(count, compressed_len);
             for length in lengths {
                 let compressed = reader.bytes(length)?;
-                let mut value = Vec::new();
-                table.decompress(compressed, &mut value)?;
-                values.push(value);
+                table.decompress(compressed, &mut flat.bytes)?;
+                flat.ends.push(flat.bytes.len());
             }
-            Ok(values)
+            Ok(flat)
         }
         Kind::Dict => {
             let dictionary = decode_chunk(reader)?;
@@ -488,15 +600,15 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<Vec<u8>>> {
                     codes.len()
                 )));
             }
-            let mut values = Vec::with_capacity(count);
+            let mut flat = Flat::with_capacity(count, dictionary.bytes.len());
             for code in codes {
                 let entry =
                     usize::try_from(code).ok().and_then(|index| dictionary.get(index)).ok_or_else(
                         || Error::internal(format!("code {code} is not in the dictionary")),
                     )?;
-                values.push(entry.clone());
+                flat.push(entry);
             }
-            Ok(values)
+            Ok(flat)
         }
         Kind::Front => {
             let prefixes = decode_integers(reader)?;
@@ -508,7 +620,27 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<Vec<u8>>> {
                     suffixes.len()
                 )));
             }
-            front_decode(&prefixes, suffixes)
+            // The shared prefix is copied out of the buffer being written into, so a value never
+            // has to exist anywhere but where it belongs.
+            let mut flat = Flat::with_capacity(count, suffixes.bytes.len());
+            for index in 0..count {
+                let shared = usize::try_from(prefixes[index])
+                    .map_err(|_| Error::internal("a negative shared prefix length"))?;
+                let (from, previous) = if index == 0 {
+                    (0, 0)
+                } else {
+                    (flat.start(index - 1), flat.ends[index - 1] - flat.start(index - 1))
+                };
+                if shared > previous {
+                    return Err(Error::internal(format!(
+                        "a value shares {shared} bytes with a value {previous} bytes long"
+                    )));
+                }
+                flat.bytes.extend_from_within(from..from + shared);
+                flat.bytes.extend_from_slice(suffixes.get(index).expect("in range"));
+                flat.ends.push(flat.bytes.len());
+            }
+            Ok(flat)
         }
         Kind::Lz => {
             let sizes = decode_integers(reader)?;
@@ -526,23 +658,27 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<Vec<u8>>> {
             for size in sizes {
                 let width = usize::try_from(size)
                     .map_err(|_| Error::internal("a negative string length"))?;
-                total += width;
+                total = total
+                    .checked_add(width)
+                    .ok_or_else(|| Error::internal("a string chunk longer than memory"))?;
                 widths.push(width);
             }
-            let joined = lz::rebuild(&literals, &lengths, &offsets, total)?;
-            if joined.len() != total {
+            // The copies point back into the bytes already replayed, which is the buffer the values
+            // are going into, so the replay is the decode and there is nothing to cut up after it.
+            let mut flat = Flat::with_capacity(count, total);
+            lz::rebuild_into(&literals, &lengths, &offsets, &mut flat.bytes)?;
+            if flat.bytes.len() != total {
                 return Err(Error::internal(format!(
                     "a matched chunk rebuilt {} bytes where its lengths add up to {total}",
-                    joined.len()
+                    flat.bytes.len()
                 )));
             }
-            let mut values = Vec::with_capacity(count);
             let mut at = 0;
             for width in widths {
-                values.push(joined[at..at + width].to_vec());
                 at += width;
+                flat.ends.push(at);
             }
-            Ok(values)
+            Ok(flat)
         }
     }
 }
@@ -616,6 +752,18 @@ fn decode_lengths(reader: &mut Reader<'_>, count: usize) -> Result<Vec<usize>> {
             usize::try_from(length).map_err(|_| Error::internal("a negative string length"))
         })
         .collect()
+}
+
+/// How long the values add up to, refusing a length array that adds up to more than memory.
+///
+/// A truncated chunk used to be caught by the read of the value that ran off the end. Reading the
+/// payload in one go means the total has to be trusted before the read rather than after it, and a
+/// corrupt length array is the only thing that could overflow it.
+fn sum_of(lengths: &[usize]) -> Result<usize> {
+    lengths
+        .iter()
+        .try_fold(0usize, |total, length| total.checked_add(*length))
+        .ok_or_else(|| Error::internal("a string chunk longer than memory"))
 }
 
 /// Reads one nested integer chunk. The integer decoder wants a slice of exactly its own chunk and
@@ -804,11 +952,58 @@ mod tests {
         let bytes = encode(&borrowed).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(back, values, "{}", describe(&bytes).unwrap());
+        check_flat(&bytes, values);
         bytes
+    }
+
+    /// The flat form holds the same values and lays them out the way a caller with its own offsets
+    /// expects. Called from [`round_trip`], so every shape any test in here reaches is checked.
+    fn check_flat(bytes: &[u8], values: &[Vec<u8>]) {
+        let flat = decode_flat(bytes).unwrap();
+        let shape = describe(bytes).unwrap();
+        assert_eq!(flat.len(), values.len(), "{shape}");
+        assert_eq!(flat.iter().collect::<Vec<_>>(), borrow(values), "{shape}");
+        assert_eq!(flat.bytes(), values.concat(), "{shape}");
+        assert_eq!(flat.get(values.len()), None, "{shape}");
     }
 
     fn kind_of(bytes: &[u8]) -> Kind {
         Kind::from_tag(bytes[0]).unwrap()
+    }
+
+    #[test]
+    fn every_shape_decodes_flat_to_what_it_decodes_split() {
+        // round_trip only sees the shape the chooser picked, which on any one column is one of the
+        // six. This walks all of them, so PLAIN reading its payload in one go and FRONT copying a
+        // prefix out of the buffer it is filling are both covered on data they apply to.
+        let columns = [urls(600), keyed(urls(600)), vec![b"same".to_vec(); 400], vec![Vec::new(); 7]];
+        for values in &columns {
+            let borrowed = borrow(values);
+            for kind in offered(&borrowed) {
+                let Some(bytes) = encode_only(kind, &borrowed).unwrap() else {
+                    continue;
+                };
+                assert_eq!(decode(&bytes).unwrap(), *values, "{}", kind.name());
+                let flat = decode_flat(&bytes).unwrap();
+                assert_eq!(flat.iter().collect::<Vec<_>>(), borrowed, "{}", kind.name());
+                assert_eq!(flat.bytes(), values.concat(), "{}", kind.name());
+            }
+        }
+    }
+
+    #[test]
+    fn a_front_coded_chunk_that_shares_more_than_it_has_is_an_error() {
+        // The prefix chain is the one place the flat decoder reads back out of the buffer it is
+        // filling, so a prefix longer than the value before it is what would hand back somebody
+        // else's bytes rather than fail. Built by hand because no encoder produces one.
+        let suffixes: [&[u8]; 2] = [b"abc", b"x"];
+        let mut bytes = vec![Kind::Front.tag()];
+        put_u32(&mut bytes, 2);
+        bytes.extend_from_slice(&integer::encode(&[0, 9]).unwrap());
+        bytes.extend_from_slice(&encode_only(Kind::Plain, &suffixes).unwrap().unwrap());
+        let error = decode_flat(&bytes).expect_err("a nine byte prefix of a three byte value");
+        assert_eq!(error.message(), "a value shares 9 bytes with a value 3 bytes long");
+        assert_eq!(decode(&bytes).unwrap_err().message(), error.message());
     }
 
     #[test]

@@ -1481,14 +1481,11 @@ impl NativeText {
                 let first = block * TEXT_PAYLOAD_VALUES;
                 let last = (first + TEXT_PAYLOAD_VALUES).min(self.offsets.len() - 1);
                 let want = (self.offsets[last] - self.offsets[first]) as usize;
-                let values = string::decode(&stored)?;
+                let values = string::decode_flat(&stored)?;
                 if values.len() != last - first {
                     return Err(invalid("global dictionary block holds the wrong value count"));
                 }
-                let mut bytes = Vec::with_capacity(want);
-                for value in &values {
-                    bytes.extend_from_slice(value);
-                }
+                let bytes = values.into_bytes();
                 if bytes.len() != want {
                     return Err(invalid("global dictionary block decodes to the wrong length"));
                 }
