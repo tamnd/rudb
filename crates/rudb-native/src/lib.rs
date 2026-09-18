@@ -77,7 +77,9 @@ const MAX_ENCODE_WORKERS: usize = 32;
 ///
 /// A part is a thousand rows, so a filter sized for every one of them being distinct is about
 /// thirteen hundred bytes and this never binds in practice. It is here so that a part that somehow
-/// arrives much wider than a vector cannot put an unbounded index in the file.
+/// arrives much wider than a vector cannot put an unbounded index in the file. What does bind is the
+/// rule in `encode_column` that a sieve may not be as large as the part it indexes, which is a cap
+/// per column rather than one number for the whole file.
 const SIEVE_BUDGET: usize = 8 * 1024;
 
 fn io(error: std::io::Error) -> Error {
@@ -774,9 +776,18 @@ impl Writer {
             // so an approximate one beside it would cost a hash of every string in the table to
             // answer a question that is already answered. What it would buy is the finer grain, a
             // part rather than a stripe, and that is worth coming back for on its own.
+            //
+            // A sieve at least as large as the part it indexes is not written. A reader reads the
+            // sieve to decide whether to read the part, so when the sieve is the larger of the two
+            // it has already spent more than the read it is trying to avoid, and that holds even if
+            // it rejects every time. It is a necessary condition rather than the whole rule, which
+            // is that a sieve pays when its bytes are under the rejection rate times the part's,
+            // but the rejection rate depends on what a query probes for and the writer does not
+            // know that. The necessary half needs two numbers that are both in hand here.
             let sieve = match dictionary {
                 Some(_) => None,
-                None => Sieve::of(column, &range, SIEVE_BUDGET),
+                None => Sieve::of(column, &range, SIEVE_BUDGET)
+                    .filter(|sieve| sieve.len() < bytes.len()),
             };
             stripe.pages.push(bytes);
             stripe.codes.push(unique);
@@ -4794,7 +4805,10 @@ mod tests {
             Writer::create(&path, "hits", vec![Field::required("id", LogicalType::BigInt)])
                 .expect("new file");
         let parts = STRIPE_PARTS + 3;
-        let per_part = 8;
+        // Big enough that the filter is worth its bytes. A part of eight numbers packs to under a
+        // hundred bytes and the smallest filter there is is sixty nine, so a filter over a part
+        // that small costs about as much to read as the rows do and is no longer written.
+        let per_part = 128;
         for part in 0..parts {
             let held: Vec<Value> = (0..per_part)
                 .map(|row| Value::BigInt(scattered((part * per_part + row) as i64)))
@@ -4812,14 +4826,19 @@ mod tests {
             op: Op::Equal,
             value: Bound::Int(i128::from(scattered(value))),
         };
-        for wanted in [0_i64, 9, (parts * per_part - 1) as i64] {
+        for wanted in [0_i64, (per_part + 1) as i64, (parts * per_part - 1) as i64] {
             let tests = [probe(wanted)];
             let kept: Vec<usize> = (0..parts).filter(|&part| !reader.skips(part, &tests)).collect();
             let home = wanted as usize / per_part;
-            assert_eq!(kept, vec![home], "only the part holding {wanted} is read");
+            assert!(kept.contains(&home), "the part holding {wanted} is read");
+            // A filter answers maybe, so a part it keeps need not hold the value. Sixty seven parts
+            // of a hundred and twenty eight numbers each, at a dozen bits a value, is about one
+            // stray part across the whole file and that is what this leaves room for.
+            assert!(kept.len() <= 2, "{wanted} keeps {kept:?}, which is more than one stray part");
         }
         let absent = [probe((parts * per_part) as i64 + 1)];
-        assert!((0..parts).all(|part| reader.skips(part, &absent)), "no part holds it");
+        let kept = (0..parts).filter(|&part| !reader.skips(part, &absent)).count();
+        assert!(kept <= 1, "{kept} parts of {parts} kept a value no part holds");
         // The same probes against the bounds alone, which is what this replaces. A column of
         // scattered numbers has a range per stripe that covers nearly the whole type.
         let tests = [probe(0)];
@@ -4827,6 +4846,70 @@ mod tests {
             reader.table().stripes().iter().all(|stripe| !stripe.zone.skips(&tests)),
             "the bounds rule out no stripe at all"
         );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A sieve bigger than the part it indexes is not written, and one smaller than it still is.
+    ///
+    /// Both columns hold values spread over the whole of `BIGINT`, so neither gets a bitmap and both
+    /// reach the filter. They differ in what the part costs to read. `spread` is a thousand distinct
+    /// numbers and packs to eight kilobytes, so a filter of about thirteen hundred bytes is a good
+    /// trade. `repeated` is the same thousand rows over four numbers in runs and encodes to
+    /// almost nothing, but the filter is sized for the rows rather than the values it turns out to
+    /// hold, so it comes out larger than the data. Reading it to decide whether to read the part spends more than
+    /// the part, every time, and that is the case this drops.
+    #[test]
+    fn a_sieve_larger_than_the_part_it_indexes_is_not_written() {
+        let path = path("sieve-pays");
+        let fields = vec![
+            Field::required("spread", LogicalType::BigInt),
+            Field::required("repeated", LogicalType::BigInt),
+        ];
+        let mut writer = Writer::create(&path, "hits", fields).expect("new file");
+        let parts = 3;
+        let per_part = 1024;
+        for part in 0..parts {
+            let base = (part * per_part) as i64;
+            let spread: Vec<Value> =
+                (0..per_part).map(|row| Value::BigInt(scattered(base + row as i64))).collect();
+            let repeated: Vec<Value> =
+                (0..per_part).map(|row| Value::BigInt(scattered((row / 256) as i64))).collect();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::BigInt, &spread).expect("numbers"),
+                Vector::from_values(LogicalType::BigInt, &repeated).expect("numbers"),
+            ])
+            .expect("two columns");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let layout = reader.layout();
+        let spread = &layout.columns[0];
+        let repeated = &layout.columns[1];
+        assert!(spread.sieves > 0, "a column whose parts are worth a filter keeps one");
+        assert_eq!(
+            repeated.sieves, 0,
+            "a column whose filter costs more than its parts keeps none"
+        );
+        // Per part this is the rule itself, so it holds over the column as well: a part without a
+        // sieve adds to one side of this and to nothing on the other.
+        for column in &layout.columns {
+            assert!(
+                column.sieves < column.pages,
+                "{} spends {} on sieves over {} of data",
+                column.name,
+                column.sieves,
+                column.pages
+            );
+        }
+        // The filter that was kept still does what it is for.
+        let absent = [Probe {
+            column: 0,
+            op: Op::Equal,
+            value: Bound::Int(i128::from(scattered((parts * per_part) as i64 + 1))),
+        }];
+        assert!((0..parts).all(|part| reader.skips(part, &absent)), "no part holds it");
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -4841,7 +4924,8 @@ mod tests {
         let mut writer =
             Writer::create(&path, "hits", vec![Field::required("id", LogicalType::BigInt)])
                 .expect("new file");
-        let held: Vec<Value> = (0..8).map(|row| Value::BigInt(scattered(row))).collect();
+        let rows = 128;
+        let held: Vec<Value> = (0..rows).map(|row| Value::BigInt(scattered(row))).collect();
         let chunk =
             Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &held).expect("numbers")])
                 .expect("one column");
@@ -4859,7 +4943,10 @@ mod tests {
         let absent =
             [Probe { column: 0, op: Op::Equal, value: Bound::Int(i128::from(scattered(99))) }];
         assert!(!reader.skips(0, &absent), "a sieve that cannot be read skips nothing");
-        assert_eq!(reader.read(0, &[0]).expect("the rows are untouched").len(), 8);
+        assert_eq!(
+            reader.read(0, &[0]).expect("the rows are untouched").len(),
+            usize::try_from(rows).expect("a small count")
+        );
         fs::remove_file(path).expect("remove scratch file");
     }
 
