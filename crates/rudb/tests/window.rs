@@ -377,3 +377,224 @@ fn a_window_answers_the_same_on_one_thread_as_on_eight() {
     assert_eq!(answers[0], answers[1]);
     assert_eq!(answers[0], totals(&[1, 3, 4, 5, 7, 4]));
 }
+
+/// A column of INTEGER values with nulls in it, which is what the five value windows answer with.
+fn ints(values: &[Option<i32>]) -> Vec<Value> {
+    values.iter().map(|held| held.map_or(Value::Null, Value::Integer)).collect()
+}
+
+/// A database holding `n(k INTEGER, v INTEGER)` where every other value is null.
+///
+/// The gaps are the point. `IGNORE NULLS` is the clause that separates counting rows from counting
+/// values, and a column with no nulls in it cannot tell the two apart.
+fn gapped() -> Database {
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("CREATE TABLE n(k INTEGER, v INTEGER)").expect("creates the table");
+    connection
+        .execute("INSERT INTO n VALUES (1,10),(2,NULL),(3,NULL),(4,40),(5,NULL),(6,60)")
+        .expect("inserts six rows");
+    database
+}
+
+/// The window column of a query over the gapped table, ordered so the rows arrive known.
+fn gapped_answer(sql: &str) -> Vec<Value> {
+    let database = gapped();
+    let sql = format!("SELECT {sql} FROM n ORDER BY k");
+    column(&database, &sql, 0)
+}
+
+#[test]
+fn lag_and_lead_read_the_partition_and_the_frame_written_around_them_changes_nothing() {
+    // The rule that is easy to get wrong, because every other window on this page reads the frame.
+    // These two are about where a row sits in its partition, so a frame of one row and an exclusion
+    // that drops the current row both leave the answer where it was.
+    let plain = ints(&[None, Some(1), Some(2), Some(2), Some(3), Some(4)]);
+    assert_eq!(answered("lag(i) OVER (ORDER BY i)"), plain);
+    assert_eq!(
+        answered("lag(i) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND CURRENT ROW)"),
+        plain
+    );
+    assert_eq!(
+        answered(
+            "lag(i) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING \
+             EXCLUDE CURRENT ROW)"
+        ),
+        plain
+    );
+    assert_eq!(
+        answered("lead(i) OVER (ORDER BY i)"),
+        ints(&[Some(2), Some(2), Some(3), Some(4), None, None])
+    );
+}
+
+#[test]
+fn a_lag_takes_a_count_and_a_default_and_a_negative_count_is_a_lead() {
+    // The count defaults to one, a count of zero is the row itself, and a negative count turns each
+    // of these into the other rather than being refused. The default is answered only where the
+    // count ran off the end of the partition.
+    assert_eq!(
+        answered("lag(i, 2) OVER (ORDER BY i)"),
+        ints(&[None, None, Some(1), Some(2), Some(2), Some(3)])
+    );
+    assert_eq!(
+        answered("lag(i, 1, -1) OVER (ORDER BY i)"),
+        ints(&[Some(-1), Some(1), Some(2), Some(2), Some(3), Some(4)])
+    );
+    assert_eq!(
+        answered("lag(i, 0) OVER (ORDER BY i)"),
+        ints(&[Some(1), Some(2), Some(2), Some(3), Some(4), None])
+    );
+    assert_eq!(answered("lag(i, -1) OVER (ORDER BY i)"), answered("lead(i) OVER (ORDER BY i)"));
+}
+
+#[test]
+fn a_count_that_is_null_answers_null_and_a_count_off_a_column_is_read_per_row() {
+    // Both of these are about when the count is read. It is read off the current row and not once
+    // for the partition, which is what lets a column supply it, and a null there is an answer of
+    // null rather than the default.
+    assert_eq!(gapped_answer("lag(k, NULL) OVER (ORDER BY k)"), vec![Value::Null; 6]);
+    assert_eq!(gapped_answer("lag(k, k) OVER (ORDER BY k)"), vec![Value::Null; 6]);
+}
+
+#[test]
+fn ignore_nulls_makes_lag_and_lead_count_values_rather_than_rows() {
+    // The walk steps over every null it meets without spending a count on it, so the fourth row of
+    // a column reading 10, null, null, 40 looks back past two nulls and lands on the 10.
+    assert_eq!(
+        gapped_answer("lag(v IGNORE NULLS) OVER (ORDER BY k)"),
+        ints(&[None, Some(10), Some(10), Some(10), Some(40), Some(40)])
+    );
+    assert_eq!(
+        gapped_answer("lead(v IGNORE NULLS) OVER (ORDER BY k)"),
+        ints(&[Some(40), Some(40), Some(40), Some(60), Some(60), None])
+    );
+    assert_eq!(
+        gapped_answer("lag(v, 2 IGNORE NULLS) OVER (ORDER BY k)"),
+        ints(&[None, None, None, None, Some(10), Some(10)])
+    );
+}
+
+#[test]
+fn first_value_and_last_value_read_the_frame_and_obey_its_exclusion() {
+    // Which is exactly what lag and lead do not do, and it is the same six rows either way, so the
+    // two tests read as a pair. The default frame ends at the current row's peer group, which is
+    // why the tied rows both answer 2 rather than one of them answering it.
+    assert_eq!(
+        answered("last_value(i) OVER (ORDER BY i)"),
+        ints(&[Some(1), Some(2), Some(2), Some(3), Some(4), None])
+    );
+    assert_eq!(
+        answered(
+            "first_value(i) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED \
+             FOLLOWING EXCLUDE CURRENT ROW)"
+        ),
+        ints(&[Some(2), Some(1), Some(1), Some(1), Some(1), Some(1)])
+    );
+    assert_eq!(
+        answered("first_value(i) OVER (ORDER BY i ROWS BETWEEN 3 PRECEDING AND 2 PRECEDING)"),
+        ints(&[None, None, Some(1), Some(1), Some(2), Some(2)])
+    );
+}
+
+#[test]
+fn nth_value_counts_from_one_and_answers_null_wherever_the_count_does_not_reach() {
+    // Four ways to get a null out of it and only one of them is the frame running out. Zero, a
+    // negative count and a null count are the other three, and none of them is an error.
+    let whole = "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING";
+    assert_eq!(
+        answered(&format!("nth_value(i, 3) OVER (ORDER BY i {whole})")),
+        ints(&[Some(2); 6])
+    );
+    assert_eq!(
+        answered(&format!("nth_value(i, 10) OVER (ORDER BY i {whole})")),
+        vec![Value::Null; 6]
+    );
+    assert_eq!(answered("nth_value(i, 0) OVER (ORDER BY i)"), vec![Value::Null; 6]);
+    assert_eq!(answered("nth_value(i, -1) OVER (ORDER BY i)"), vec![Value::Null; 6]);
+    assert_eq!(answered("nth_value(i, NULL) OVER (ORDER BY i)"), vec![Value::Null; 6]);
+    // Read off the column, so each row counts to a different place in the same frame.
+    assert_eq!(
+        gapped_answer(&format!("nth_value(k, k) OVER (ORDER BY k {whole})")),
+        ints(&[Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)])
+    );
+}
+
+#[test]
+fn ignore_nulls_makes_the_picking_windows_count_values_too() {
+    // Same clause and the same meaning as it has on lag, which is worth pinning on both because the
+    // two answer through different code and the clause is written the same way in the query.
+    assert_eq!(
+        gapped_answer("first_value(v IGNORE NULLS) OVER (ORDER BY k)"),
+        ints(&[Some(10); 6])
+    );
+    assert_eq!(
+        gapped_answer(
+            "last_value(v IGNORE NULLS) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND \
+             CURRENT ROW)"
+        ),
+        ints(&[Some(10), Some(10), Some(10), Some(40), Some(40), Some(60)])
+    );
+    assert_eq!(
+        gapped_answer(
+            "nth_value(v, 2 IGNORE NULLS) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND \
+             UNBOUNDED FOLLOWING)"
+        ),
+        ints(&[Some(40); 6])
+    );
+}
+
+#[test]
+fn a_value_window_answers_the_type_of_the_column_it_read() {
+    // Not an ANY and not a widened one. The pin says VARCHAR for a lag over a string column and
+    // INTEGER for the other four over an integer one, which is what makes the default cast to the
+    // column's type rather than the other way round.
+    let database = built();
+    let sql = "SELECT typeof(lag(j) OVER (ORDER BY i)), typeof(first_value(i) OVER ()), \
+               typeof(nth_value(i, 1) OVER ()) FROM t LIMIT 1";
+    let connection = database.connect();
+    let result = connection.query(sql).expect("the query runs");
+    let row: Vec<Value> = result.rows().next().expect("one row").to_vec();
+    assert_eq!(
+        row,
+        vec![
+            Value::Varchar("VARCHAR".to_owned()),
+            Value::Varchar("INTEGER".to_owned()),
+            Value::Varchar("INTEGER".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn a_default_of_another_type_is_cast_to_the_columns_and_one_that_will_not_cast_says_so() {
+    // Upstream casts the default rather than widening the answer, so 0.5 into an INTEGER column is
+    // the integer 1 and the string z into one is a conversion error at run time. Both of those are
+    // the cast talking and neither is a binder error.
+    assert_eq!(
+        answered("lag(i, 1, 0.5) OVER (ORDER BY i)"),
+        ints(&[Some(1), Some(1), Some(2), Some(2), Some(3), Some(4)])
+    );
+    let database = built();
+    let connection = database.connect();
+    let error = connection
+        .query("SELECT lag(i, 1, 'z') OVER (ORDER BY i) FROM t")
+        .expect_err("z is not an integer");
+    assert!(error.message().contains("Could not convert string 'z'"), "{error}");
+}
+
+#[test]
+fn distinct_inside_a_value_window_is_refused_the_way_the_pin_refuses_it() {
+    // Doubled quotes and all. There is nothing for a DISTINCT to collapse when the call picks one
+    // row rather than folding several, and upstream says so rather than ignoring it.
+    let database = built();
+    let connection = database.connect();
+    let error = connection
+        .query("SELECT first_value(DISTINCT i) OVER (ORDER BY i) FROM t")
+        .expect_err("a distinct value window is refused");
+    assert!(
+        error
+            .message()
+            .contains("DISTINCT is not implemented for the window function \"\"first_value\"\""),
+        "{error}"
+    );
+}

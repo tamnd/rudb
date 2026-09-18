@@ -848,7 +848,25 @@ fn the_name_inside_an_over_has_to_be_one_that_can_be_a_window() {
         failure("SELECT nosuchwindow(counter) OVER () FROM hits"),
         "Aggregate Function with name nosuchwindow does not exist!"
     );
-    assert_eq!(failure("SELECT lead(counter) OVER () FROM hits"), "lead as a window function");
+    assert_eq!(failure("SELECT fill(counter) OVER () FROM hits"), "fill as a window function");
+}
+
+#[test]
+fn a_value_window_binds_with_the_first_arguments_type_and_a_count_that_is_a_bigint() {
+    // Five names and one shape. What is worth checking is the part the shape decides rather than
+    // the part the executor does: the answer is the value's own type, the count is cast to a
+    // BIGINT, and the default is cast to the value's type rather than left where it started.
+    let read = plan("SELECT first_value(url) OVER (ORDER BY counter) FROM hits");
+    assert!(read.contains("expressions=[first_value(#0.1::VARCHAR)::VARCHAR]"), "{read}");
+    let shifted = plan("SELECT lag(counter, 2) OVER (ORDER BY counter) FROM hits");
+    assert!(
+        shifted.contains("expressions=[lag(#0.2::INTEGER, CAST(2::INTEGER)::BIGINT)::INTEGER]"),
+        "{shifted}"
+    );
+    let defaulted = plan("SELECT lag(counter, 1, 0.5) OVER (ORDER BY counter) FROM hits");
+    assert!(defaulted.contains("CAST(0.5::DECIMAL(2,1))::INTEGER"), "{defaulted}");
+    let nth = plan("SELECT nth_value(url, 3) OVER (ORDER BY counter) FROM hits");
+    assert!(nth.contains("nth_value(#0.1::VARCHAR, CAST(3::INTEGER)::BIGINT)::VARCHAR"), "{nth}");
 }
 
 #[test]
