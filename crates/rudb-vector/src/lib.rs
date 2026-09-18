@@ -41,6 +41,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod assemble;
 pub mod buffer;
 pub mod chunk;
 pub mod fsst;
@@ -50,6 +51,7 @@ pub mod string;
 pub mod validity;
 pub mod vector;
 
+pub use assemble::Assembly;
 pub use buffer::{Buffer, Pin};
 pub use chunk::Chunk;
 pub use selection::Selection;

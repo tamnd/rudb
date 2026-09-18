@@ -41,7 +41,7 @@ use rudb_kernels::{
     in_set, is_true, refine_flags, refine_prepared, selection,
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
-use rudb_vector::{Chunk, Selection, Vector};
+use rudb_vector::{Assembly, Chunk, Selection, Vector};
 use std::collections::HashMap;
 
 use crate::ordering::Ordering;
@@ -802,9 +802,19 @@ impl Prepared {
     ///
     /// The same shape [`evaluate`](crate::evaluate) has, because the thing that makes it that shape
     /// is a correctness rule rather than a performance one: `CASE WHEN x <> 0 THEN 1 / x ELSE 0 END`
-    /// divides by zero on the rows the arm excludes if the arm is evaluated for them. What is left
-    /// of it after #57 is the same rule expressed as a selection rather than as a narrowed chunk,
-    /// with the answers scattered back instead of assembled out of a `Vec<Value>`.
+    /// divides by zero on the rows the arm excludes if the arm is evaluated for them.
+    ///
+    /// Each arm answers the rows no earlier arm claimed, so the answers come back short and out of
+    /// order and have to be put back in the order the rows arrived in. That is what [`Assembly`] is:
+    /// the arms are laid end to end into one run of data and the interleave is a single typed copy
+    /// over it. It used to be a `Vec<Value>` filled a row at a time and handed to
+    /// `Vector::from_values`, which is a heap allocation and a drop for every string in the answer.
+    /// On the ClickBench query that groups by a `CASE` over `Referer` that was about a quarter of
+    /// the whole query.
+    ///
+    /// What is left of #57 here is the narrowing. An arm still narrows the whole chunk rather than
+    /// the columns it reads, and the selection threading that replaces the narrowing entirely is
+    /// the item this one was carved out of.
     fn case(
         &self,
         chunk: &Chunk,
@@ -812,50 +822,62 @@ impl Prepared {
         otherwise: Option<&Prepared>,
         ty: &LogicalType,
     ) -> Result<Vector> {
-        let mut answers = vec![Value::Null; chunk.len()];
+        let mut built = Assembly::new(ty.clone(), chunk.len())?;
         let mut pending: Vec<usize> = (0..chunk.len()).collect();
         for arm in arms {
             if pending.is_empty() {
                 break;
             }
-            let narrowed = narrow(chunk, &pending)?;
+            // `pending` starts as every row in order and only ever shrinks, so the same length is
+            // the same rows in the same order and there is nothing to cut. That is the whole of the
+            // first arm of a one armed `CASE`, which is the shape of the ClickBench query this was
+            // measured on, and cutting it was a copy of every column in the chunk for nothing.
+            let cut;
+            let narrowed = if pending.len() == chunk.len() {
+                chunk
+            } else {
+                cut = narrow(chunk, &pending)?;
+                &cut
+            };
             let mut scratch = arm.when.scratch();
-            let flags = arm.when.evaluate_one(&narrowed, &mut scratch)?;
+            let flags = arm.when.evaluate_one(narrowed, &mut scratch)?;
             let mut taken = Vec::new();
+            let mut claimed = Vec::new();
             let mut still = Vec::new();
-            // row at a time: the scatter that replaces these three loops is #57, and this variant
-            // goes with it.
+            // row at a time: splitting the rows an arm claims from the ones it leaves is a test per
+            // row, and what replaces it is the selection threading the rest of #57 asks for rather
+            // than anything that can be done here.
             for (at, &row) in pending.iter().enumerate() {
                 if is_true(&flags.value_at(at)) {
-                    taken.push((at, row));
+                    taken.push(at);
+                    claimed.push(row);
                 } else {
                     still.push(row);
                 }
             }
             if !taken.is_empty() {
-                let positions: Vec<usize> = taken.iter().map(|&(at, _)| at).collect();
-                let matched = narrow(&narrowed, &positions)?;
+                let matched = narrow(narrowed, &taken)?;
                 let mut scratch = arm.then.scratch();
                 let results = arm.then.evaluate_one(&matched, &mut scratch)?;
-                // row at a time: the scatter this wants is #57, same as the loop above.
-                for (slot, &(_, row)) in taken.iter().enumerate() {
-                    answers[row] = results.try_value_at(slot)?;
-                }
+                built.place(&placed(&claimed)?, results)?;
             }
             pending = still;
         }
         if let Some(otherwise) = otherwise {
             if !pending.is_empty() {
-                let narrowed = narrow(chunk, &pending)?;
+                let cut;
+                let narrowed = if pending.len() == chunk.len() {
+                    chunk
+                } else {
+                    cut = narrow(chunk, &pending)?;
+                    &cut
+                };
                 let mut scratch = otherwise.scratch();
-                let results = otherwise.evaluate_one(&narrowed, &mut scratch)?;
-                // row at a time: the scatter this wants is #57, same as the two above.
-                for (slot, &row) in pending.iter().enumerate() {
-                    answers[row] = results.try_value_at(slot)?;
-                }
+                let results = otherwise.evaluate_one(narrowed, &mut scratch)?;
+                built.place(&placed(&pending)?, results)?;
             }
         }
-        Vector::from_values(ty.clone(), &answers)
+        built.finish()
     }
 
     /// Flattens one expression, appending its steps and returning the index of its last one.
@@ -1104,6 +1126,19 @@ fn missing(index: usize) -> Error {
     Error::internal(format!("step {index} was used as an operand before it produced anything"))
 }
 
+/// Chunk rows as the positions an [`Assembly`] places a piece at.
+///
+/// A chunk is at most [`VECTOR_SIZE`](rudb_vector::VECTOR_SIZE) rows, so the conversion cannot fail
+/// in practice. It is checked rather than cast because a silent truncation here would put a value in
+/// the wrong row, and a wrong row is the one kind of bug nothing downstream can notice.
+fn placed(rows: &[usize]) -> Result<Vec<u32>> {
+    rows.iter()
+        .map(|&row| {
+            u32::try_from(row).map_err(|_| Error::internal("a chunk of more than u32 rows"))
+        })
+        .collect()
+}
+
 /// The chunk cut down to the given rows.
 ///
 /// The reason `CASE` is written with this rather than by evaluating every arm over the whole chunk
@@ -1277,6 +1312,81 @@ mod tests {
     fn a_case_agrees() {
         agrees(
             "CASE WHEN (#0.0::INTEGER > 1::INTEGER)::BOOLEAN THEN 10::INTEGER \
+             ELSE 20::INTEGER END::INTEGER AS a",
+        );
+    }
+
+    /// A second arm, which is the first one that sees a cut chunk rather than the whole one.
+    ///
+    /// The first arm of any `CASE` runs over every row, so it takes the path that does not cut at
+    /// all, and a `CASE` of one arm never exercises the other one. Two arms and an `ELSE` puts a
+    /// different set of rows in front of each of the three.
+    ///
+    /// That this is the only test here reaching the cut was checked rather than assumed, by gating a
+    /// panic on it and rerunning the seven. This one failed and the other six did not.
+    #[test]
+    fn a_case_of_two_arms_agrees() {
+        agrees(
+            "CASE WHEN (#0.0::INTEGER > 2::INTEGER)::BOOLEAN THEN 10::INTEGER \
+             WHEN (#0.0::INTEGER > 1::INTEGER)::BOOLEAN THEN 20::INTEGER \
+             ELSE 30::INTEGER END::INTEGER AS a",
+        );
+    }
+
+    /// No `ELSE`, so the rows no arm claims are null rather than anything.
+    ///
+    /// The case a run of data with a hole in it gets wrong: a null still occupies a position, and an
+    /// assembly that skipped it would put every value after it one row early.
+    #[test]
+    fn a_case_with_no_else_agrees() {
+        agrees(
+            "CASE WHEN (#0.0::INTEGER > 2::INTEGER)::BOOLEAN THEN 10::INTEGER \
+             END::INTEGER AS a",
+        );
+    }
+
+    /// An arm no row takes, so it contributes nothing to the answer and must not shift it.
+    #[test]
+    fn a_case_whose_arm_claims_nothing_agrees() {
+        agrees(
+            "CASE WHEN (#0.0::INTEGER > 99::INTEGER)::BOOLEAN THEN 10::INTEGER \
+             ELSE 20::INTEGER END::INTEGER AS a",
+        );
+    }
+
+    /// Strings, which is the case that used to allocate one of them per row and drop it afterwards.
+    ///
+    /// The arm reads a column and the `ELSE` is a constant, which is the shape of the ClickBench
+    /// query this path was rewritten for: the arm arrives as views over an arena and the `ELSE` as
+    /// one value repeated, and the two have to be laid end to end into a single arena.
+    #[test]
+    fn a_case_over_strings_agrees() {
+        agrees(
+            "CASE WHEN (#0.0::INTEGER > 1::INTEGER)::BOOLEAN THEN #0.1::VARCHAR \
+             ELSE ''::VARCHAR END::VARCHAR AS a",
+        );
+    }
+
+    /// A null inside an arm, which is a different thing from a row no arm claimed.
+    ///
+    /// Both come out null and they reach the validity mask by different routes, so a mask built for
+    /// one of them and not the other reads correct on whichever test only has the other in it.
+    #[test]
+    fn a_case_whose_arm_answers_null_agrees() {
+        agrees(
+            "CASE WHEN (#0.0::INTEGER > 1::INTEGER)::BOOLEAN THEN #0.1::VARCHAR \
+             ELSE NULL::VARCHAR END::VARCHAR AS a",
+        );
+    }
+
+    /// A `WHEN` over a column that is null on some rows, which is neither true nor false there.
+    ///
+    /// A three valued `WHEN` is what decides whether a row goes to the arm or falls through, and
+    /// treating unknown as true would claim a row the `ELSE` should have had.
+    #[test]
+    fn a_case_whose_test_is_null_on_some_rows_agrees() {
+        agrees(
+            "CASE WHEN (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN THEN 10::INTEGER \
              ELSE 20::INTEGER END::INTEGER AS a",
         );
     }
