@@ -291,15 +291,9 @@ impl Source for Scan<'_> {
         if !self.table.rows().is_native() {
             return Some(chunks);
         }
-        // A native stripe is cheap enough that launching every available worker costs more than
-        // it saves on small snapshots. Keep enough rows behind each worker to amortize its thread,
-        // local operator state, and final combine. The upper bound also avoids the sharp cache and
-        // scheduler regression measured above sixteen workers on dense code aggregation. Four
-        // remains the ceiling for small snapshots: sixteen made the 1M ClickBench suite 16.6%
-        // slower. Large snapshots have enough work to amortize more instances, and sixteen made
-        // the 10M suite 23.2% faster. The two slopes preserve the old choices through 1M and grow
-        // smoothly to sixteen at ten million rows instead of putting an abrupt threshold between
-        // the two.
+        // An instance is not free, so a scan asks for as many as the rows behind it can pay for
+        // rather than for every worker the machine has. What one costs is a thread, and what it
+        // buys is a share of the work, and `native_instances` is where those two are weighed.
         let useful = native_instances(self.table.rows().len());
         Some(chunks.min(threads).min(useful))
     }
@@ -340,9 +334,37 @@ impl Source for Scan<'_> {
     }
 }
 
+/// How many instances of a scan over a stored table are worth running.
+///
+/// An instance costs a thread, and on this machine a scoped thread is about sixteen microseconds to
+/// start and join, paid on the thread that starts it before it does any work of its own. Sixteen
+/// instances is a quarter of a millisecond spent before the first row is read. That is nothing on a
+/// query that was going to take thirty milliseconds and it is most of a query that was going to
+/// take one, which is the whole of the tension this function sits in.
+///
+/// Two slopes, and the larger wins. The first grows to eight and is what a small table uses, where
+/// there are not many rows to divide and dividing them further buys less than the threads cost. The
+/// second has no ceiling of its own and takes over past about half a million rows, where there is
+/// enough work behind each instance that another one pays for itself. What actually stops it is the
+/// pool, since [`Pipeline::degree`](rudb_pipeline::Pipeline::degree) clamps this to the threads the
+/// database was given.
+///
+/// The numbers are measured rather than reasoned. Over the whole of ClickBench on the 999,975 row
+/// `hits` sample, warm, with the cap forced to a fixed value: four is 261.3 ms, eight is 198.9,
+/// sixteen is 188.1 and thirty two is 192.5. On the same suite over a 100,000 row sample: two is
+/// 42.2 ms, four is 31.5, eight is 31.4 and sixteen is 35.9. So a million rows wants sixteen, a
+/// hundred thousand wants four to eight, and both of those are what these two slopes give.
+///
+/// The old shape of this capped small tables at four and only grew past six hundred thousand rows,
+/// on a measurement that said sixteen instances made the million row suite 16.6 percent slower.
+/// That is no longer true of this engine and it is worth saying why rather than quietly changing
+/// the constant: the per instance cost that measurement was paying has come down, and what is left
+/// is the thread, so the cap moved with it. It should be measured again when the thread stops being
+/// created per pipeline per run, because that is the last fixed cost in here and removing it would
+/// take both slopes up again.
 fn native_instances(rows: usize) -> usize {
-    let small = rows.div_ceil(50_000).min(4);
-    let large = rows.div_ceil(625_000).min(16);
+    let small = rows.div_ceil(25_000).min(8);
+    let large = rows.div_ceil(62_500);
     small.max(large).max(1)
 }
 
@@ -1771,17 +1793,22 @@ mod tests {
         }
     }
 
+    /// The two measured points are the hundred thousand row line and the million row line, and both
+    /// of them are here rather than only in the comment, because a constant with a benchmark behind
+    /// it should fail a test when somebody changes it without running one.
     #[test]
-    fn native_workers_grow_only_after_a_snapshot_can_amortize_them() {
+    fn native_workers_grow_with_the_rows_there_are_to_divide() {
         for (rows, workers) in [
             (0, 1),
-            (50_000, 1),
-            (100_000, 2),
-            (1_000_000, 4),
-            (2_500_000, 4),
-            (5_000_000, 8),
-            (9_999_750, 16),
-            (100_000_000, 16),
+            (1_000, 1),
+            (25_000, 1),
+            (50_000, 2),
+            (100_000, 4),
+            (200_000, 8),
+            (500_000, 8),
+            (1_000_000, 16),
+            (2_500_000, 40),
+            (9_999_750, 160),
         ] {
             assert_eq!(native_instances(rows), workers, "{rows} rows");
         }
