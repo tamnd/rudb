@@ -2869,6 +2869,50 @@ mod tests {
         }
     }
 
+    /// A stable dictionary `LIKE` answers the same whichever way the memo filled.
+    ///
+    /// The memo fills a whole group of `LIKE_GROUP` values where the chunk is big enough to be a
+    /// scan and fills the one value it was asked about where it is not, so the two have to agree
+    /// over the same dictionary, and a memo a scan filled has to answer for a chunk that comes after
+    /// it. The dictionary here is 2,500 values, which is two whole groups and a part of a third, and
+    /// the codes step by a prime so a chunk lands in every group without repeating a code in order.
+    /// The big chunk runs first so the small one reads decisions it did not make.
+    #[test]
+    fn a_stable_dictionary_like_agrees_whichever_way_the_memo_filled() {
+        let values: Vec<Value> = (0..2_500)
+            .map(|index| match index % 7 {
+                0 => Value::Null,
+                1 => Value::Varchar(format!("http://google.com/{index}")),
+                2 => Value::Varchar(format!("http://goggle.com/{index}")),
+                _ => Value::Varchar(format!("row {index}")),
+            })
+            .collect();
+        let dictionary =
+            Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("builds"));
+        let like = Like::of("~~", "%google%").expect("a literal pattern compiles");
+        for rows in [2_000_usize, 64] {
+            let codes: Vec<u32> =
+                (0..rows).map(|row| ((row * 991) % values.len()) as u32).collect();
+            let picked: Vec<Value> =
+                codes.iter().map(|&code| values[code as usize].clone()).collect();
+            let flat = Vector::from_values(LogicalType::Varchar, &picked).expect("builds");
+            let pattern =
+                Vector::constant(LogicalType::Varchar, Value::Varchar("%google%".into()), rows);
+            let answer = |text: &Vector| {
+                like_of("~~", Some(&like), text, &pattern, &LogicalType::Boolean, rows)
+                    .expect("the call is written")
+                    .expect("text in this form has a loop of its own")
+            };
+            let column = Vector::stable_dictionary(codes, Arc::clone(&dictionary))
+                .expect("codes are in range");
+            let want = answer(&flat);
+            let got = answer(&column);
+            for row in 0..rows {
+                assert_eq!(got.value_at(row), want.value_at(row), "{rows} rows, row {row}");
+            }
+        }
+    }
+
     /// The one argument kernels and the date ones enter their loop on a dictionary.
     ///
     /// The same argument as the `LIKE` test above. `agrees` is satisfied when the row at a time path
