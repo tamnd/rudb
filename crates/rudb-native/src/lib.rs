@@ -1388,8 +1388,18 @@ impl Reader {
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header).map_err(io)?;
         let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-        if &header[..8] != MAGIC || version != FORMAT {
-            return Err(invalid("magic or major version is unsupported"));
+        // The two halves are worth telling apart. A wrong magic is a file that was never ours and
+        // the answer is to look at the path. A wrong version is our own file from another build,
+        // and the number this build wants is the only thing that tells the reader whether to
+        // rebuild the file or to go back to the binary that wrote it.
+        if &header[..8] != MAGIC {
+            return Err(invalid("the header does not begin with a rudb native magic"));
+        }
+        if version != FORMAT {
+            return Err(invalid(&format!(
+                "the file is format {version} and this build reads format {FORMAT}, so it has to \
+                 be written again"
+            )));
         }
         let mut selected = None;
         for start in [16, 16 + SLOT_BYTES] {
@@ -3937,6 +3947,43 @@ mod tests {
         assert!(occurrences.ordinals.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&occurrences.ordinals[..1_000], &(0_u64..1_000).collect::<Vec<_>>());
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// The bug this is here for cost a 43 GB ClickBench table and an hour of reloading it. The
+    /// format went from 11 to 12, every binary built after that said "magic or major version is
+    /// unsupported" about the file, and there was no way to tell from the message whether the path
+    /// was wrong, the file was truncated, or it was ours and simply older. The number this build
+    /// wants is the whole answer and it was the one thing the message did not carry.
+    #[test]
+    fn a_file_from_another_format_says_which_format_it_is() {
+        let older = path("older-format");
+        let mut writer =
+            Writer::create(&older, "items", vec![Field::new("id", LogicalType::Integer)])
+                .expect("new file");
+        let chunk = Chunk::new(vec![
+            Vector::flat(LogicalType::Integer, Data::Int32(vec![1, 2, 3].into()))
+                .expect("integers"),
+        ])
+        .expect("chunk");
+        writer.append(&chunk).expect("page written");
+        writer.finish().expect("commit");
+
+        let mut file = OpenOptions::new().write(true).open(&older).expect("open for the header");
+        file.seek(SeekFrom::Start(8)).expect("the version follows the magic");
+        file.write_all(&(FORMAT - 1).to_le_bytes()).expect("write an older version");
+        drop(file);
+        let complaint = Reader::open(&older).expect_err("an older format is refused").to_string();
+        assert!(complaint.contains(&format!("format {}", FORMAT - 1)), "{complaint}");
+        assert!(complaint.contains(&format!("format {FORMAT}")), "{complaint}");
+
+        let mut file = OpenOptions::new().write(true).open(&older).expect("open for the header");
+        file.seek(SeekFrom::Start(0)).expect("the magic is first");
+        file.write_all(b"NOTRUDB!").expect("write another engine's magic");
+        drop(file);
+        let complaint = Reader::open(&older).expect_err("a foreign file is refused").to_string();
+        assert!(complaint.contains("magic"), "{complaint}");
+        assert!(!complaint.contains("format"), "a version has nothing to do with it: {complaint}");
+        fs::remove_file(older).expect("remove scratch file");
     }
 
     #[test]
