@@ -122,6 +122,7 @@ impl Binder<'_> {
             kind: rudb_plan::JoinKind::Single,
             conditions: Vec::new(),
             dependent: !correlations.is_empty(),
+            index: column.binding.table,
         });
         Ok(expr)
     }
@@ -150,6 +151,7 @@ impl Binder<'_> {
             kind: rudb_plan::JoinKind::Single,
             conditions: Vec::new(),
             dependent: !correlations.is_empty(),
+            index,
         });
         self.against_null(
             if negated { CompareOp::NotDistinctFrom } else { CompareOp::DistinctFrom },
@@ -705,6 +707,7 @@ impl Binder<'_> {
             kind: rudb_plan::JoinKind::Mark,
             conditions: vec![condition],
             dependent: !correlations.is_empty(),
+            index: projected,
         });
         if negate { self.call("not", vec![marker]) } else { Ok(marker) }
     }
