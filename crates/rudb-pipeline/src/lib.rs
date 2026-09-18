@@ -61,8 +61,16 @@
 //! [`Pool`] is the thread budget and the threads themselves, and it belongs to the database rather
 //! than to the query, because two queries on a sixteen core machine should use sixteen threads
 //! between them. Its workers park between queries rather than being started per pipeline, and the
-//! one `unsafe` block in this crate is what lets a parked thread run work that borrows a plan. Its
-//! own documentation has the invariant that makes that sound.
+//! `unsafe` block in `pool.rs` is what lets a parked thread run work that borrows a plan. Its own
+//! documentation has the invariant that makes that sound.
+//!
+//! [`keep_pages`] is the same idea about memory, which is why it is in this crate and not in one
+//! about files or about values. A thread that is made per query costs sixteen microseconds and a
+//! page that is faulted in per query costs about the same for every forty of them, so a query that
+//! touches forty megabytes of memory it freed at the end of the last one pays a third of its CPU
+//! time to the kernel for the privilege. Keeping the threads and keeping the pages are the same
+//! sentence said about two resources, and both of them belong to the database rather than to the
+//! query.
 //!
 //! What this crate knows about waiting is that an operator can report [`Progress::Blocked`] for
 //! exactly four reasons, which is what makes the wait for graph finite and a deadlock a bug report
@@ -74,6 +82,7 @@
 mod compact;
 mod dynamic;
 mod morsel;
+mod pages;
 mod parallel;
 mod pipeline;
 mod pool;
@@ -89,6 +98,7 @@ mod tests;
 pub use compact::{Compaction, Copied, Gauge, compaction, narrow};
 pub use dynamic::{DynSink, DynStream, LocalState};
 pub use morsel::Morsel;
+pub use pages::keep_pages;
 pub use parallel::run_parallel;
 pub use pipeline::{Locals, Pipeline};
 pub use pool::{Lease, Pool};
