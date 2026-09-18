@@ -1,8 +1,15 @@
 //! Fixed-width radix ownership for grouped `COUNT(DISTINCT BIGINT)` with a TopN parent.
+//!
+//! The group key here is four bytes wide whatever the query said it was. An `INTEGER` key already
+//! is, and a `VARCHAR` key becomes one when the column arrives with a stable dictionary, because
+//! then the code and the string it stands for pick out the same groups and the code is what this
+//! can put in a record. That is the whole of why `GROUP BY SearchPhrase` reaches this at all: the
+//! dictionary is written once for the column and shared by every chunk of it, so grouping on the
+//! code is grouping on the string with none of the payload.
 
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Spent, Stage, Value, stage};
 use rudb_vector::{Chunk, Vector};
@@ -17,8 +24,44 @@ const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
 
 #[derive(Debug)]
 pub(crate) struct Exchange {
+    /// The code space the groups are in, and `None` when the key was an integer to begin with.
+    ///
+    /// Held so that the emit can turn a code back into the string it stands for, and so that a
+    /// later chunk arriving in a different code space is caught rather than counted as if the two
+    /// agreed on what a code means.
+    dictionary: Option<Arc<Vector>>,
     partitions: Vec<Mutex<Held>>,
     held: Mutex<Vec<Reservation>>,
+}
+
+/// What stands in for the group key of one chunk.
+pub(crate) enum Codes<'a> {
+    /// The key is a signed integer, so the vector is read where it lies.
+    Signed,
+    /// The key is a string and its stable dictionary code stands in for it.
+    Dictionary(&'a [u32], &'a Arc<Vector>),
+    /// The key is a string with no stable dictionary, so there is no code to group on.
+    Loose,
+}
+
+/// One chunk's group key, with the layout decided once instead of once a row.
+enum GroupReader<'a> {
+    Signed(SignedReader<'a>),
+    Dictionary(&'a [u32]),
+}
+
+impl GroupReader<'_> {
+    /// The group key at one row, narrowed to the four bytes a record holds.
+    ///
+    /// A code is in range because [`Exchange::buffer`] checks the whole run against the dictionary
+    /// before reading any of it, and a signed key is in range because the binder typed it `INTEGER`.
+    #[inline]
+    fn at(&self, row: usize) -> i32 {
+        match self {
+            Self::Signed(reader) => reader.at(row) as i32,
+            Self::Dictionary(codes) => codes[row] as i32,
+        }
+    }
 }
 
 /// One radix partition's rows, as the run each instance handed over rather than one flat run.
@@ -103,28 +146,65 @@ impl Local {
 
 impl Exchange {
     /// Buffers one chunk when its group representation can remain fixed width.
+    ///
+    /// Whether it can is decided by the first chunk and never asked again, which is what the
+    /// `Option` inside the slot records. A string key with no stable dictionary leaves `None` there
+    /// and every instance then falls through to the general table together, rather than some of the
+    /// rows being counted here and the rest being counted there.
     pub(crate) fn buffer(
-        slot: &OnceLock<Self>,
+        slot: &OnceLock<Option<Self>>,
         group: &Vector,
+        codes: Codes<'_>,
         user: &Vector,
         rows: usize,
         local: &mut Local,
     ) -> Result<bool> {
-        slot.get_or_init(|| Self {
-            partitions: (0..PARTITIONS).map(|_| Mutex::new(Held::default())).collect(),
-            held: Mutex::new(Vec::new()),
+        let state = slot.get_or_init(|| match codes {
+            Codes::Loose => None,
+            Codes::Signed => Some(Self::new(None)),
+            Codes::Dictionary(_, dictionary) => Some(Self::new(Some(Arc::clone(dictionary)))),
         });
+        let Some(state) = state else { return Ok(false) };
+        let reader = match (&state.dictionary, codes) {
+            (None, Codes::Signed) => GroupReader::Signed(SignedReader::new(group)),
+            (Some(held), Codes::Dictionary(codes, dictionary)) if Arc::ptr_eq(held, dictionary) => {
+                // Checked for the whole run here rather than once a row, so that the read below is a
+                // load and nothing else. A row whose key is null has whatever code the dictionary
+                // vector happened to leave there, which is why the null rows are exempt.
+                //
+                // The width is checked against `i32::MAX` and not just against the run because a
+                // record holds four signed bytes. A code above that would narrow to a negative
+                // number and land on some other code's group.
+                let width = dictionary.len();
+                if i32::try_from(width).is_err() {
+                    return Err(Error::internal(
+                        "a stable dictionary has more codes than a group record holds",
+                    ));
+                }
+                let loose = codes[..rows]
+                    .iter()
+                    .enumerate()
+                    .any(|(row, &code)| code as usize >= width && !group.is_null_at(row));
+                if loose {
+                    return Err(Error::internal("a stable dictionary code is out of range"));
+                }
+                GroupReader::Dictionary(codes)
+            }
+            _ => {
+                return Err(Error::internal(
+                    "a grouped distinct exchange received two group code spaces",
+                ));
+            }
+        };
         let before = local.partitions.iter().map(Run::footprint).sum::<usize>();
         let shift = u32::BITS - PARTITIONS.ilog2();
         let all_valid = !group.validity().has_nulls(rows) && !user.validity().has_nulls(rows);
         if all_valid {
             // Neither column has a null, so the layout is the only thing that changes between rows
             // and it is picked once here rather than once a row. See `SignedReader`.
-            let group = SignedReader::new(group);
             let user = SignedReader::new(user);
             for row in 0..rows {
-                let group = group.at(row) as i32;
-                scatter(&mut local.partitions, shift, group, true, user.at(row) as i64);
+                scatter(&mut local.partitions, shift, reader.at(row), true, user.at(row) as i64);
             }
         } else {
             for row in 0..rows {
@@ -136,14 +216,7 @@ impl Exchange {
                 })?)
                 .map_err(|_| Error::internal("a distinct BIGINT value is out of range"))?;
                 let valid = !group.is_null_at(row);
-                let group = if !valid {
-                    0
-                } else {
-                    i32::try_from(group.signed_at(row).ok_or_else(|| {
-                        Error::internal("an INTEGER group has no signed representation")
-                    })?)
-                    .map_err(|_| Error::internal("an INTEGER group is out of range"))?
-                };
+                let group = if valid { reader.at(row) } else { 0 };
                 scatter(&mut local.partitions, shift, group, valid, user);
             }
         }
@@ -151,6 +224,14 @@ impl Exchange {
         local.memory.grow(width(after.saturating_sub(before)))?;
         local.used = true;
         Ok(true)
+    }
+
+    fn new(dictionary: Option<Arc<Vector>>) -> Self {
+        Self {
+            dictionary,
+            partitions: (0..PARTITIONS).map(|_| Mutex::new(Held::default())).collect(),
+            held: Mutex::new(Vec::new()),
+        }
     }
 
     pub(crate) fn combine(&self, mut local: Local) -> Result<()> {
@@ -221,10 +302,9 @@ impl Exchange {
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
             let Some(partition) = self.partitions.get(at) else { return };
-            let done = partition
-                .lock()
-                .map_err(poisoned)
-                .and_then(|mut rows| finish_partition(&mut rows, bound, memory));
+            let done = partition.lock().map_err(poisoned).and_then(|mut rows| {
+                finish_partition(&mut rows, self.dictionary.as_ref(), bound, memory)
+            });
             if let Ok(mut slot) = slots[at].lock() {
                 *slot = Some(done);
             }
@@ -237,7 +317,12 @@ struct Output {
     held: Reservation,
 }
 
-fn finish_partition(partition: &mut Held, bound: usize, memory: &Memory) -> Result<Output> {
+fn finish_partition(
+    partition: &mut Held,
+    dictionary: Option<&Arc<Vector>>,
+    bound: usize,
+    memory: &Memory,
+) -> Result<Output> {
     let held_rows = partition.rows();
     let pair_capacity = held_rows.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
@@ -370,11 +455,21 @@ fn finish_partition(partition: &mut Held, bound: usize, memory: &Memory) -> Resu
         let source = group_rows[slot];
         let row = partition.rows[source];
         let valid = all_valid || partition.validity[source];
-        let group = if !valid { Value::Null } else { Value::Integer(row.group) };
+        // The code goes back to being the string it stood for here and nowhere earlier, so what is
+        // copied is one string per group that reached the bound rather than one per row.
+        let group = match (valid, dictionary) {
+            (false, _) => Value::Null,
+            (true, None) => Value::Integer(row.group),
+            (true, Some(dictionary)) => dictionary.try_value_at(row.group as usize)?,
+        };
         output.push(vec![group, Value::BigInt(counts[slot])]);
     }
+    let key = match dictionary {
+        Some(_) => LogicalType::Varchar,
+        None => LogicalType::Integer,
+    };
     let mut held = memory.reservation();
-    let chunks = rows::chunks(&[LogicalType::Integer, LogicalType::BigInt], &output, &mut held)?;
+    let chunks = rows::chunks(&[key, LogicalType::BigInt], &output, &mut held)?;
     timing.stop(0);
     Ok(Output { chunks, held })
 }
@@ -408,8 +503,10 @@ fn poisoned<T>(_: T) -> Error {
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
+    use std::sync::Arc;
 
-    use rudb_common::{Memory, Value};
+    use rudb_common::{LogicalType, Memory, Value};
+    use rudb_vector::Vector;
 
     use super::{Held, Record, Run, finish_partition};
 
@@ -428,15 +525,7 @@ mod tests {
         third.push(row(4, 10, 5), true);
         third.push(row(0, 10, 5), false);
         let mut partition = Held { runs: vec![first, Run::default(), second, third] };
-        let output = finish_partition(&mut partition, 10, &Memory::unlimited())
-            .expect("a grouped distinct partition");
-        let mut rows = Vec::new();
-        for chunk in output.chunks {
-            for row in 0..chunk.len() {
-                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
-            }
-        }
-        rows.sort_by_key(|row: &Vec<Value>| format!("{row:?}"));
+        let rows = finished(&mut partition, None);
         assert_eq!(
             rows,
             [
@@ -446,5 +535,45 @@ mod tests {
             ]
         );
         assert_eq!(size_of::<Record>(), 16);
+    }
+
+    #[test]
+    fn a_group_held_as_a_dictionary_code_comes_out_as_the_string_the_code_stands_for() {
+        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        let mut run = Run::default();
+        run.push(row(2, 10, 5), true);
+        run.push(row(2, 11, 5), true);
+        run.push(row(2, 10, 5), true);
+        run.push(row(1, 10, 5), true);
+        run.push(row(0, 10, 5), false);
+        let words = ["zero", "one", "two"].map(|word| Value::Varchar(word.to_string()));
+        let dictionary =
+            Arc::new(Vector::from_values(LogicalType::Varchar, &words).expect("a dictionary"));
+        let mut partition = Held { runs: vec![run] };
+        let rows = finished(&mut partition, Some(&dictionary));
+        // Code 0 is "zero" in the dictionary and the group whose key was null still answers NULL,
+        // because what makes a group null is the key's validity and not what its code points at.
+        assert_eq!(
+            rows,
+            [
+                vec![Value::Null, Value::BigInt(1)],
+                vec![Value::Varchar("one".to_string()), Value::BigInt(1)],
+                vec![Value::Varchar("two".to_string()), Value::BigInt(2)],
+            ]
+        );
+    }
+
+    /// One partition finished and flattened into rows, sorted so the partition order does not show.
+    fn finished(partition: &mut Held, dictionary: Option<&Arc<Vector>>) -> Vec<Vec<Value>> {
+        let output = finish_partition(partition, dictionary, 10, &Memory::unlimited())
+            .expect("a grouped distinct partition");
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for chunk in output.chunks {
+            for row in 0..chunk.len() {
+                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+            }
+        }
+        rows.sort_by_key(|row| format!("{row:?}"));
+        rows
     }
 }
