@@ -916,6 +916,14 @@ impl<'a> Aggregate<'a> {
         Ok(true)
     }
 
+    /// Every value of one chunk into the radix partition its hash picks.
+    ///
+    /// There are two loops here and they do the same thing. The second one asks the vector for a row
+    /// at a time, which costs a match on the layout, a widening to 128 bits and a checked narrowing
+    /// back, on every row of the table. The first one reads the run of words where it lies and costs
+    /// none of that, and it is the shape a `BIGINT` column of scattered identifiers actually arrives
+    /// in, because a range that wide is not worth bit packing. This is the same lift #237 did for the
+    /// group hash and #539 did for the key comparison, arriving at the third loop that had it.
     fn buffer_bigint_distinct(
         &self,
         rows: &Rows,
@@ -933,16 +941,27 @@ impl<'a> Aggregate<'a> {
         };
         let before = partitions.iter().map(BigIntDistinctPartition::footprint).sum::<usize>();
         let shift = u64::BITS - RADIX_PARTITIONS.ilog2();
-        for row in 0..rows.rows {
-            if column.is_null_at(row) {
-                continue;
+        let flat = match column.data() {
+            Some(Data::Int64(values)) if !column.validity().has_nulls(rows.rows) => {
+                values.get(..rows.rows)
             }
-            let value = i64::try_from(column.signed_at(row).ok_or_else(|| {
-                Error::internal("a distinct BIGINT value has no signed representation")
-            })?)
-            .map_err(|_| Error::internal("a distinct BIGINT value is out of range"))?;
-            let hash = spread(mix(0, value as u64));
-            partitions[(hash >> shift) as usize].rows.push(BigIntDistinctRecord { hash, value });
+            _ => None,
+        };
+        if let Some(values) = flat {
+            for &value in values {
+                scatter_bigint(partitions, shift, value);
+            }
+        } else {
+            for row in 0..rows.rows {
+                if column.is_null_at(row) {
+                    continue;
+                }
+                let value = i64::try_from(column.signed_at(row).ok_or_else(|| {
+                    Error::internal("a distinct BIGINT value has no signed representation")
+                })?)
+                .map_err(|_| Error::internal("a distinct BIGINT value is out of range"))?;
+                scatter_bigint(partitions, shift, value);
+            }
         }
         let after = partitions.iter().map(BigIntDistinctPartition::footprint).sum::<usize>();
         memory.grow(width_of(after.saturating_sub(before)))
@@ -3745,6 +3764,20 @@ fn finish_bigint_distinct(
             *slot = Some(done);
         }
     }
+}
+
+/// One value into the partition its hash picks, which is the top bits of the hash.
+///
+/// Pulled out of [`Aggregate::buffer_bigint_distinct`] so that the loop that reads a flat run of
+/// words and the loop that asks the vector a row at a time cannot drift apart on which partition a
+/// value belongs in or on what its hash is.
+///
+/// The shift leaves exactly the bits that index [`RADIX_PARTITIONS`] of them, so the index is always
+/// in range and the bounds check never fires.
+#[inline]
+fn scatter_bigint(partitions: &mut [BigIntDistinctPartition], shift: u32, value: i64) {
+    let hash = spread(mix(0, value as u64));
+    partitions[(hash >> shift) as usize].rows.push(BigIntDistinctRecord { hash, value });
 }
 
 fn bigint_distinct_partition(
