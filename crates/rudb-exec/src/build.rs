@@ -54,8 +54,8 @@ use rudb_pipeline::{
     BufferId, DynSink, DynStream, Pipeline, PipelineId, Source, Watched, root, root_in_order,
 };
 use rudb_plan::{
-    ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, PipelineRef,
-    Plan, ROOT, Shape, Slice, seams_of,
+    BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef,
+    PipelineRef, Plan, ROOT, Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
 
@@ -1235,22 +1235,41 @@ impl<'a> Building<'a, '_> {
                 self.close(below, pipeline, Arc::new(Watched::new(distinct, counters)));
                 Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
-            Node::Join { left, right, kind, conditions } => {
-                // The right side runs first, because no left row can be answered until every right
+            Node::Join { left, right, kind, conditions, build } => {
+                // One side runs first, because no row of the other one can be answered until every
                 // row it might match has been seen. That is the dependency edge, and it is the same
-                // one the hash join builds on. The probing side is a pipeline of its own rather than
+                // one the hash join builds on. The driving side is a pipeline of its own rather than
                 // part of the one above it, because it ends in a sink, and it waits for the build
                 // side.
+                //
+                // Which side is which is the flag, written by `rudb_opt`'s `sides` pass from an
+                // estimate of how many rows each input produces. Running the two the other way
+                // round means running the mirror of the join kind, because a kind names its sides:
+                // a `LEFT` join with its inputs swapped is a `RIGHT` join over the same rows. The
+                // pass only ever sets the flag on the kinds that have a mirror, and this refuses
+                // the rest rather than producing the wrong answer quietly.
                 let marker = mark_binding(plan, right, kind);
+                let swapped = build == BuildSide::Left;
+                let (held, driving) = if swapped { (left, right) } else { (right, left) };
+                let kind = if swapped {
+                    kind.mirrored().ok_or_else(|| {
+                        Error::internal(format!(
+                            "a {} join was given a build side it has no mirror for",
+                            kind.keyword()
+                        ))
+                    })?
+                } else {
+                    kind
+                };
                 let gather_id = self.gathered(reference);
-                let gathering = self.shape.pipeline(right);
-                let right = self.node(right)?;
-                let right_schema = right.schema.clone();
+                let gathering = self.shape.pipeline(held);
+                let held = self.node(held)?;
+                let held_schema = held.schema.clone();
                 let (gather, gathered) = Gather::new(memory);
                 let kept = self.watch(reference, gather_id, gathering, "Gather", None);
-                self.close(right, gathering, Arc::new(Watched::new(gather, kept)));
-                let mut left = self.node(left)?;
-                let side = Gathered { schema: &right_schema, rows: gathered, marker };
+                self.close(held, gathering, Arc::new(Watched::new(gather, kept)));
+                let mut left = self.node(driving)?;
+                let side = Gathered { schema: &held_schema, rows: gathered, marker, swapped };
                 let (join, out) =
                     Join::new(plan, &left.schema, side, kind, conditions, self.cancel, memory);
                 let join = join.in_session(self.session);

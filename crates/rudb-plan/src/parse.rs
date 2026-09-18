@@ -16,7 +16,9 @@ use std::ops::Range;
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 
 use crate::expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
-use crate::node::{JoinKind, Node, SetOpKind, WindowBound, WindowExclude, WindowFrame, WindowUnit};
+use crate::node::{
+    BuildSide, JoinKind, Node, SetOpKind, WindowBound, WindowExclude, WindowFrame, WindowUnit,
+};
 use crate::plan::Plan;
 use crate::{ExprRef, NodeRef, Slice};
 
@@ -305,13 +307,20 @@ impl Reader<'_> {
                 c.expect("=")?;
                 let conditions = read_expr_list(plan, c)?;
                 let dependent = keyword == "DependentJoin";
+                // Absent means the side the binder emits, which is what the printer leaves out.
+                let build = if c.eat_word("build") {
+                    c.expect("=")?;
+                    read_keyword(c, &BuildSide::ALL, BuildSide::keyword, "a build side")?
+                } else {
+                    BuildSide::default()
+                };
                 Ok(Built {
                     arity: 2,
                     assemble: Box::new(move |left, right| {
                         if dependent {
                             Node::DependentJoin { left, right, kind, conditions }
                         } else {
-                            Node::Join { left, right, kind, conditions }
+                            Node::Join { left, right, kind, conditions, build }
                         }
                     }),
                 })

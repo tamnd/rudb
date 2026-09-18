@@ -17,11 +17,21 @@
 //!
 //! # Two pipelines and an edge
 //!
-//! A join is two inputs, and two inputs is two pipelines with a dependency between them. The right
-//! side ends in a [`Gather`](crate::gather::Gather), which keeps its rows and does nothing else, and
-//! the left side ends here. The order is not a choice: no left row can be answered until every right
-//! row it might match has been seen, and that is the edge the scheduler will read off the plan. It
-//! is also the edge the hash join in #62 builds on, with the build side where the gather is now.
+//! A join is two inputs, and two inputs is two pipelines with a dependency between them. One side
+//! ends in a [`Gather`](crate::gather::Gather), which keeps its rows and does nothing else, and the
+//! other ends here. The order is not a choice: no row of the second side can be answered until every
+//! row of the first it might match has been seen, and that is the edge the scheduler will read off
+//! the plan. It is also the edge the hash join in #62 builds on, with the build side where the
+//! gather is now.
+//!
+//! Which of the plan's two inputs is gathered is `build` on `Node::Join`, chosen by `rudb_opt`'s
+//! `sides` pass from a cardinality estimate. Everything below is written as though the gathered side
+//! were the right one, because when it is not, `crates/rudb-exec/src/build.rs` hands this operator
+//! the two inputs the other way round and the mirror of the plan's join kind. `LEFT` with its inputs
+//! swapped is `RIGHT`, which is a kind the rules below already have, so the swap costs no second
+//! spelling of any rule. What it does cost is the column order: the operator produces its own left
+//! side's columns first and the plan asked for the plan's left side first, so [`Join::swapped`] is
+//! set and [`Sink::finalize`] puts the two halves back before anything downstream sees them.
 //!
 //! The left side is held whole as well, which the nested loop always did and the hash join will not.
 //! What replaces it is a probe that runs a chunk at a time and needs no state past the match bitmap,
@@ -55,6 +65,14 @@ pub(crate) struct Join<'a> {
     right_schema: Schema,
     combined: Schema,
     schema: Schema,
+    /// Whether this operator's left side is the plan's right one.
+    ///
+    /// Read once per output chunk, in [`Sink::finalize`], where it says to put the two halves of
+    /// every row back the way the plan asked for them. Nothing else in the operator looks at it:
+    /// the conditions are resolved through [`Schema::position_of`], which searches by binding
+    /// rather than counting columns, so a condition over either side finds its columns wherever
+    /// they ended up.
+    swapped: bool,
     memory: Memory,
     /// The same token the `cancel` module wraps every node in, held here as well.
     ///
@@ -87,13 +105,24 @@ pub(crate) struct Gathered<'s> {
     pub(crate) rows: Rows,
     /// The marker's position for a mark join, when it is not the final column.
     pub(crate) marker: Option<usize>,
+    /// Whether this is the plan's left input rather than its right one.
+    ///
+    /// Here rather than beside the kind because it is a fact about which side was gathered, which
+    /// is the one thing this type is about. What reads it is the column order of the answer.
+    pub(crate) swapped: bool,
 }
 
 impl<'a> Join<'a> {
-    /// The sink for the left side, and the source the answer comes out of.
+    /// The sink for the driving side, and the source the answer comes out of.
     ///
-    /// `left` is the left input's schema and `right` is the side the pipeline before this one
-    /// gathered.
+    /// `left` is the schema of the side whose rows arrive here and `right` is the side the pipeline
+    /// before this one gathered. `kind` is stated in those terms too, which is the plan's kind
+    /// mirrored when `swapped`.
+    ///
+    /// [`Gathered::swapped`] says the caller handed the plan's two inputs over the other way round,
+    /// which only changes the order the columns come out in. A kind with no mirror is never
+    /// swapped, so the kinds that throw one side's columns away are only ever seen the way the plan
+    /// wrote them.
     pub(crate) fn new(
         plan: &'a Plan,
         left: &Schema,
@@ -103,9 +132,14 @@ impl<'a> Join<'a> {
         cancel: &Cancel,
         memory: &Memory,
     ) -> (Self, Buffered) {
+        let swapped = right.swapped;
         let combined = Schema::concat(left, right.schema);
         let schema = match kind {
             JoinKind::Semi | JoinKind::Anti => left.clone(),
+            // The plan's order rather than this operator's. What is downstream was built against
+            // the plan and asks for its columns by binding, and a binding that resolves to the
+            // wrong position is the one way this operator can be wrong without failing.
+            _ if swapped => Schema::concat(right.schema, left),
             _ => combined.clone(),
         };
         let out = Buffered::new();
@@ -123,6 +157,7 @@ impl<'a> Join<'a> {
             right_schema: right.schema.clone(),
             combined,
             schema,
+            swapped,
             memory: memory.clone(),
             cancel: cancel.clone(),
             right: right.rows,
@@ -341,7 +376,18 @@ impl Sink for Join<'_> {
     fn finalize(&self) -> Result<()> {
         let left_rows = std::mem::take(&mut *self.left.lock().map_err(poisoned)?);
         let right_rows = self.right.take()?;
-        let out = self.joined(&left_rows, &right_rows)?;
+        let mut out = self.joined(&left_rows, &right_rows)?;
+        if self.swapped {
+            // Back into the plan's order. Every row here is this operator's left half followed by
+            // its right half, and the plan asked for the other way round, so one rotation by the
+            // width of the half that is in front puts each row right. In place and on the rows
+            // rather than on the chunks, because the rows are already owned and the chunks are not
+            // built until the next line.
+            let width = self.left_schema.width();
+            for row in &mut out {
+                row.rotate_left(width);
+            }
+        }
         // Both sides go before the answer is built, because the answer is as large as both of them
         // together and holding three copies is what the budget exists to stop.
         drop(left_rows);
@@ -508,7 +554,7 @@ fn widen(left_row: &[Value], left_types: &[LogicalType], right: &Chunk) -> Resul
 #[cfg(test)]
 mod tests {
     use rudb_common::{Cancel, Field, LogicalType, Memory, Value};
-    use rudb_plan::{JoinKind, Plan, Slice};
+    use rudb_plan::{ColumnBinding, JoinKind, Plan, Slice};
     use rudb_vector::{Data, Vector};
 
     use super::{Buffered, Chunk, CrossProduct, Gathered, Join, Progress, Schema, Sink, Stream};
@@ -561,7 +607,7 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("a", 0),
-            Gathered { schema: &schema("b", 1), rows: right, marker: None },
+            Gathered { schema: &schema("b", 1), rows: right, marker: None, swapped: false },
             JoinKind::Inner,
             Slice::EMPTY,
             &Cancel::new(),
@@ -581,6 +627,72 @@ mod tests {
         );
     }
 
+    /// The same join built the other way round, which is what the builder does when the plan asks
+    /// for the left input to be the gathered one.
+    ///
+    /// The operator's own left side is table 1 here, because table 1 is the side driving it, and
+    /// the answer still comes out with table 0's column first, because that is what the plan said
+    /// the join produces and everything above it was built against that.
+    #[test]
+    fn a_swapped_join_produces_the_plans_columns_in_the_plans_order() {
+        let plan = Plan::new();
+        let memory = Memory::unlimited();
+        let (_gather, gathered_side) = gathered(&memory, &[1, 2]);
+        let (join, out) = Join::new(
+            &plan,
+            &schema("b", 1),
+            Gathered { schema: &schema("a", 0), rows: gathered_side, marker: None, swapped: true },
+            JoinKind::Inner,
+            Slice::EMPTY,
+            &Cancel::new(),
+            &memory,
+        );
+
+        run(&join, &[10, 20]);
+
+        assert_eq!(join.schema().position_of(ColumnBinding::new(0, 0)), Some(0));
+        assert_eq!(join.schema().position_of(ColumnBinding::new(1, 0)), Some(1));
+        // Every pair the unswapped version of this produces, and only the order the rows arrive in
+        // differs, because the nested loop walks the driving side outermost either way.
+        assert_eq!(
+            rows(&out, 2),
+            [
+                vec![Value::Integer(1), Value::Integer(10)],
+                vec![Value::Integer(2), Value::Integer(10)],
+                vec![Value::Integer(1), Value::Integer(20)],
+                vec![Value::Integer(2), Value::Integer(20)],
+            ]
+        );
+    }
+
+    /// A `LEFT` join asked for with its inputs swapped is run as a `RIGHT` join, which is what the
+    /// builder passes in. The padding has to land on the plan's right side rather than on the
+    /// operator's, and this is the test that says which one that is.
+    #[test]
+    fn a_swapped_outer_join_pads_the_side_the_plan_called_the_right_one() {
+        let plan = Plan::new();
+        let memory = Memory::unlimited();
+        let (_gather, gathered_side) = gathered(&memory, &[1, 2]);
+        let (join, out) = Join::new(
+            &plan,
+            &schema("b", 1),
+            Gathered { schema: &schema("a", 0), rows: gathered_side, marker: None, swapped: true },
+            JoinKind::Right,
+            Slice::EMPTY,
+            &Cancel::new(),
+            &memory,
+        );
+
+        // No driving rows at all, so every gathered row is unmatched and the mirrored kind is what
+        // keeps them.
+        run(&join, &[]);
+
+        assert_eq!(
+            rows(&out, 2),
+            [vec![Value::Integer(1), Value::Null], vec![Value::Integer(2), Value::Null],]
+        );
+    }
+
     /// The kind that keeps the left row rather than pairing it, and the side of it that a right
     /// side with nothing in it is the easiest way to reach.
     #[test]
@@ -591,7 +703,7 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("a", 0),
-            Gathered { schema: &schema("b", 1), rows: right, marker: None },
+            Gathered { schema: &schema("b", 1), rows: right, marker: None, swapped: false },
             JoinKind::Anti,
             Slice::EMPTY,
             &Cancel::new(),
@@ -613,7 +725,7 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("a", 0),
-            Gathered { schema: &schema("b", 1), rows: right, marker: None },
+            Gathered { schema: &schema("b", 1), rows: right, marker: None, swapped: false },
             JoinKind::Positional,
             Slice::EMPTY,
             &Cancel::new(),

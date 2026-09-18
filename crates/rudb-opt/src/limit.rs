@@ -122,7 +122,7 @@ fn shared(plan: &Plan) -> Vec<NodeRef> {
 
 #[cfg(test)]
 mod tests {
-    use rudb_plan::{JoinKind, Node, Plan, Slice};
+    use rudb_plan::{BuildSide, JoinKind, Node, Plan, Slice};
 
     use super::push;
 
@@ -235,6 +235,7 @@ mod tests {
             right: project,
             kind: JoinKind::Inner,
             conditions: Slice::EMPTY,
+            build: BuildSide::default(),
         });
         plan.set_root(join);
         let before = plan.to_string();

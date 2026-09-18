@@ -23,8 +23,8 @@ use rudb_functions::{
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, identifier_parts, parse_ast_with_case};
 use rudb_plan::{
-    ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey, WindowBound,
-    WindowExclude, WindowFrame, WindowUnit,
+    BuildSide, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey,
+    WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
 use crate::expr::{describe, has_aggregate};
@@ -291,7 +291,13 @@ impl<'a> Binder<'a> {
             input = if dependent {
                 self.add_node(Node::DependentJoin { left: input, right, kind, conditions })
             } else {
-                self.add_node(Node::Join { left: input, right, kind, conditions })
+                self.add_node(Node::Join {
+                    left: input,
+                    right,
+                    kind,
+                    conditions,
+                    build: BuildSide::default(),
+                })
             };
         }
         input
@@ -1961,8 +1967,13 @@ impl<'a> Binder<'a> {
             ast::JoinKind::Positional => JoinKind::Positional,
         };
         let conditions = self.plan.add_expr_list(&conditions);
-        let node =
-            self.add_node(Node::Join { left: left_node, right: right_node, kind, conditions });
+        let node = self.add_node(Node::Join {
+            left: left_node,
+            right: right_node,
+            kind,
+            conditions,
+            build: BuildSide::default(),
+        });
         Ok((node, scope))
     }
 

@@ -272,7 +272,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         // the join hands that side's rows on as they are. What is left over reads both sides, and
         // for an inner join a condition and a filter above it mean the same thing, so it becomes a
         // condition and runs while the pairs are being built rather than after.
-        Node::Join { left, right, kind: written, conditions } => {
+        Node::Join { left, right, kind: written, conditions, build } => {
             let below = (produced(plan, left), produced(plan, right));
             let kind = nulls::narrow(plan, written, &pending, (&below.0, &below.1));
             let held = plan.expr_list(conditions).to_vec();
@@ -300,11 +300,15 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             {
                 at
             } else {
+                // The build side is carried over rather than reset. Pushing a predicate into a
+                // side makes that side smaller, which is an argument for choosing again, and the
+                // pass that chooses runs after this one and will.
                 plan.add_node(Node::Join {
                     left: rebuilt_left,
                     right: rebuilt_right,
                     kind,
                     conditions: rebuilt_conditions,
+                    build,
                 })
             };
             filter(plan, above, stay)

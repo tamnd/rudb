@@ -16,7 +16,7 @@
 //! same constant rather than a second copy of it. Accepting a name for a pass rudb has not written
 //! is not a pretence: turning off a pass that does not exist is a request that has already been
 //! granted, and refusing it would fail a `SET` and end a corpus file over a pass whose absence
-//! changes no answer. `rudb_opt::PASSES` is the eight that are actually written and it is not what
+//! changes no answer. `rudb_opt::PASSES` is the ten that are actually written and it is not what
 //! this table returns, because a client reading this table is asking what it may name.
 //!
 //! `duckdb_extensions()` is the other way round. The names and the descriptions and the aliases are
