@@ -192,17 +192,47 @@ pub(crate) fn rebuild(
     offsets: &[i64],
     total: usize,
 ) -> Result<Vec<u8>> {
-    if literals.len() != lengths.len() || lengths.len() != offsets.len() {
+    let mut out = Vec::with_capacity(total);
+    replay(literals.len(), |index| &literals[index], lengths, offsets, &mut out)?;
+    Ok(out)
+}
+
+/// [`rebuild`] appending to a buffer somebody else owns, with the literal runs still packed.
+///
+/// The string decoder builds its output as one buffer, so the bytes this produces are the values
+/// rather than something to cut the values out of afterwards. Appending rather than returning is
+/// what makes that true, and a copy offset counts back from where the replay has got to rather than
+/// from the start of the buffer, so anything already in it is out of reach and stays that way.
+///
+/// # Errors
+///
+/// As [`rebuild`].
+pub(crate) fn rebuild_into(
+    literals: &crate::string::Flat,
+    lengths: &[i64],
+    offsets: &[i64],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    replay(literals.len(), |index| literals.get(index).expect("in range"), lengths, offsets, out)
+}
+
+fn replay<'a>(
+    runs: usize,
+    run: impl Fn(usize) -> &'a [u8],
+    lengths: &[i64],
+    offsets: &[i64],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if runs != lengths.len() || lengths.len() != offsets.len() {
         return Err(Error::internal(format!(
-            "a matched chunk has {} literal runs, {} lengths and {} offsets",
-            literals.len(),
+            "a matched chunk has {runs} literal runs, {} lengths and {} offsets",
             lengths.len(),
             offsets.len()
         )));
     }
-    let mut out = Vec::with_capacity(total);
-    for (index, run) in literals.iter().enumerate() {
-        out.extend_from_slice(run);
+    let base = out.len();
+    for index in 0..runs {
+        out.extend_from_slice(run(index));
         let length = usize::try_from(lengths[index])
             .map_err(|_| Error::internal("a negative copy length"))?;
         if length == 0 {
@@ -210,21 +240,29 @@ pub(crate) fn rebuild(
         }
         let offset = usize::try_from(offsets[index])
             .map_err(|_| Error::internal("a negative copy offset"))?;
-        if offset == 0 || offset > out.len() {
+        if offset == 0 || offset > out.len() - base {
             return Err(Error::internal(format!(
                 "a copy reaches {offset} bytes back into {} bytes of output",
-                out.len()
+                out.len() - base
             )));
         }
-        // Byte at a time because a copy is allowed to overlap itself, which is how a run of one
-        // repeated byte is written as a single token.
         let from = out.len() - offset;
-        for step in 0..length {
-            let byte = out[from + step];
-            out.push(byte);
+        if offset >= length {
+            // Nothing the copy reads is anything it writes, so it is a block move and the compiler
+            // gets to use one. This is the common case by a long way: an overlapping copy is how a
+            // repeating run is written and a run is a small part of real text.
+            out.extend_from_within(from..from + length);
+        } else {
+            // Byte at a time because the copy reads what it just wrote, which is how a run of one
+            // repeated byte is written as a single token.
+            out.reserve(length);
+            for step in 0..length {
+                let byte = out[from + step];
+                out.push(byte);
+            }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn hash(bytes: &[u8]) -> usize {
@@ -278,6 +316,49 @@ mod tests {
         round_trip(&input);
         let tokens = tokens_of(&input);
         assert!(tokens.lengths.len() < 8, "{} tokens for one repeated byte", tokens.lengths.len());
+    }
+
+    #[test]
+    fn a_copy_that_overlaps_by_part_of_itself_round_trips() {
+        // Three byte period, so a copy of any length past the third byte reads bytes it is still
+        // writing but not the one it wrote last. That is the case either branch of rebuild could
+        // get wrong on its own and neither a run of one byte nor a clean repeat reaches it.
+        let input: Vec<u8> = (0..8192).map(|index| b"abc"[index % 3]).collect();
+        round_trip(&input);
+        let tokens = tokens_of(&input);
+        assert!(
+            tokens
+                .offsets
+                .iter()
+                .zip(&tokens.lengths)
+                .any(|(offset, length)| *offset > 1 && *offset < *length),
+            "no partly overlapping copy emitted"
+        );
+    }
+
+    #[test]
+    fn rebuilding_into_a_buffer_cannot_reach_what_was_already_in_it() {
+        // The string decoder replays into the buffer the values are going into, and that buffer
+        // holds other values by the time it gets there. A copy offset counts back from where the
+        // replay started, so the bytes before it are not something a corrupt chunk can reach.
+        let input = b"the same sentence twice, the same sentence twice";
+        let tokens = tokens_of(input);
+        let packed =
+            crate::string::encode_only(crate::string::Kind::Plain, &tokens.literals).unwrap();
+        let literals = crate::string::decode_flat(&packed.expect("plain applies")).unwrap();
+        let mut out = b"something that was here first".to_vec();
+        let base = out.len();
+        rebuild_into(&literals, &tokens.lengths, &tokens.offsets, &mut out).unwrap();
+        assert_eq!(&out[..base], b"something that was here first");
+        assert_eq!(&out[base..], input);
+
+        let mut offsets = tokens.offsets.clone();
+        let copy = offsets.iter().position(|offset| *offset > 0).expect("a copy");
+        offsets[copy] += base as i64;
+        let mut out = vec![0; base];
+        let error = rebuild_into(&literals, &tokens.lengths, &offsets, &mut out)
+            .expect_err("a copy reaching before the base");
+        assert!(error.message().starts_with("a copy reaches"), "{}", error.message());
     }
 
     #[test]
