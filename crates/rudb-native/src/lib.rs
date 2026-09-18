@@ -3302,7 +3302,8 @@ impl Shape {
         // A part of one repeated value is worth naming whatever the part before it was, because
         // `Constant` is thirteen bytes against the twenty one a zero width bit pack costs and the
         // check is one pass with no allocation in it.
-        let constant = values.first().is_some_and(|first| values.iter().all(|value| value == first));
+        let constant =
+            values.first().is_some_and(|first| values.iter().all(|value| value == first));
         let guess = match (constant, &self) {
             (true, _) => Some(integer::Kind::Constant),
             (false, Self::Kind(kind)) => Some(*kind),
@@ -5330,8 +5331,9 @@ mod tests {
             if part < 40 { 7 } else { at * 1_000_003 }
         }
         let path = path("changing-shape");
-        let mut writer = Writer::create(&path, "changing", vec![Field::new("v", LogicalType::BigInt)])
-            .expect("new file");
+        let mut writer =
+            Writer::create(&path, "changing", vec![Field::new("v", LogicalType::BigInt)])
+                .expect("new file");
         for part in 0..70_usize {
             let values =
                 (0..64_usize).map(|row| Value::BigInt(value(part, row))).collect::<Vec<_>>();
