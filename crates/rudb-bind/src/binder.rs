@@ -124,7 +124,7 @@ pub(crate) struct WindowRun {
 
 /// One window call as it was written, before any of it has been bound.
 ///
-/// These five travel together from the parser all the way to the run they end up filed under, and
+/// These six travel together from the parser all the way to the run they end up filed under, and
 /// carrying them as one thing keeps the call that binds them readable.
 pub(crate) struct WindowCall<'a> {
     /// The function name, as written and not yet resolved.
@@ -133,6 +133,8 @@ pub(crate) struct WindowCall<'a> {
     pub(crate) args: &'a [ast::ExprRef],
     /// Whether `DISTINCT` was written inside the parens.
     pub(crate) distinct: bool,
+    /// The `FILTER (WHERE ...)` predicate, which is written before the `OVER`, or `NONE`.
+    pub(crate) filter: ast::ExprRef,
     /// Whether `IGNORE NULLS` was written inside the parens, which is where DuckDB puts it.
     pub(crate) ignore_nulls: bool,
     /// The `OVER`, which the parser has already resolved against any `WINDOW` clause.
@@ -177,6 +179,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) aggregation: Option<Aggregation>,
     /// Set while an aggregate's own arguments are being bound, so nesting is caught.
     pub(crate) in_aggregate: bool,
+    /// Set while an aggregate's `FILTER` is being bound, which is refused its own aggregate.
+    pub(crate) in_filter: bool,
     /// The window runs this select block has collected, in the order they were first written.
     pub(crate) windows: Vec<WindowRun>,
     /// Set while a window call's own arguments and keys are being bound, so nesting is caught.
@@ -209,6 +213,7 @@ impl<'a> Binder<'a> {
             current_span: Span::new(0, 0),
             aggregation: None,
             in_aggregate: false,
+            in_filter: false,
             windows: Vec::new(),
             in_window: false,
             scalar_subqueries: Vec::new(),
@@ -1963,6 +1968,24 @@ impl<'a> Binder<'a> {
 
     // -------------------------------------------------------------- aggregates
 
+    /// Binds a `FILTER (WHERE ...)` predicate, or says there was none.
+    ///
+    /// The predicate is a condition over the input rows and not over the answer, so it is bound in
+    /// the scope the arguments are bound in, and it is cast to `BOOLEAN` the way a `WHERE` is:
+    /// `FILTER (WHERE i)` over an integer column is a filter on whether the integer is not zero.
+    fn bind_filter(
+        &mut self,
+        ast: &Ast,
+        filter: ast::ExprRef,
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        if filter == NONE {
+            return Ok(None);
+        }
+        let bound = self.bind_expr(ast, filter, scope)?;
+        Ok(Some(self.checked_cast_to(bound, &LogicalType::Boolean, false)?))
+    }
+
     /// Binds an aggregate call, records it, and hands back a reference to where its result lands.
     pub(crate) fn bind_aggregate(
         &mut self,
@@ -1970,8 +1993,12 @@ impl<'a> Binder<'a> {
         name: &str,
         args: &[ast::ExprRef],
         distinct: bool,
+        filter: ast::ExprRef,
         scope: &Scope,
     ) -> Result<ExprRef> {
+        if self.in_filter {
+            return Err(Error::binder("aggregate functions are not allowed in FILTER"));
+        }
         if self.in_aggregate {
             return Err(Error::binder(format!(
                 "aggregate function calls cannot be nested, and {name}() is inside one"
@@ -1983,6 +2010,17 @@ impl<'a> Binder<'a> {
                 self.clause
             )));
         }
+        // The predicate goes first, which is the order the messages come out in upstream: a call
+        // whose argument and whose filter both name columns that are not there is refused over the
+        // filter. It is bound as if it were inside the call, so an aggregate in it is caught, and a
+        // window in it is refused with the words a window inside an aggregate is refused with.
+        self.in_aggregate = true;
+        self.in_filter = true;
+        let filter = self.bind_filter(ast, filter, scope);
+        self.in_filter = false;
+        self.in_aggregate = false;
+        let filter = filter?;
+
         self.in_aggregate = true;
         let mut bound = Vec::with_capacity(args.len());
         let mut failure = None;
@@ -2010,8 +2048,7 @@ impl<'a> Binder<'a> {
         let args = self.plan.add_expr_list(&cast);
         let name = self.plan.intern(resolved.name);
         let ty = resolved.returns;
-        let call =
-            self.plan.add_expr(Expr::Aggregate { name, args, distinct, filter: None }, ty.clone());
+        let call = self.plan.add_expr(Expr::Aggregate { name, args, distinct, filter }, ty.clone());
 
         // Two identical aggregates are one column of the aggregate's output. `SELECT sum(x),
         // sum(x) / count(*)` computes one sum, not two.
@@ -2043,7 +2080,7 @@ impl<'a> Binder<'a> {
         written: &WindowCall<'_>,
         scope: &Scope,
     ) -> Result<ExprRef> {
-        let WindowCall { name, args, distinct, ignore_nulls, spec } = *written;
+        let WindowCall { name, args, distinct, filter, ignore_nulls, spec } = *written;
         if self.in_aggregate {
             return Err(Error::binder(
                 "aggregate function calls cannot contain window function calls",
@@ -2083,8 +2120,14 @@ impl<'a> Binder<'a> {
         let held = ast.window(spec);
         self.in_window = true;
         let parts = self.window_parts(ast, args, held, scope);
+        // The predicate goes last here, which is the other way round from an ordinary aggregate and
+        // is again the order the messages come out in upstream. It is still inside the window, so a
+        // window in it is a nested window, while an aggregate in it is an ordinary aggregate over
+        // the same rows and is answered.
+        let filter = if parts.is_ok() { self.bind_filter(ast, filter, scope) } else { Ok(None) };
         self.in_window = false;
         let parts = parts?;
+        let filter = filter?;
         // Upstream's rule, in its words. A `RANGE` offset is a distance from the current row's sort
         // key, so there has to be exactly one sort key for it to be a distance from.
         let offsets = [parts.frame.start, parts.frame.end]
@@ -2112,6 +2155,13 @@ impl<'a> Binder<'a> {
                 "DISTINCT is not implemented for the window function \"\"{name}\"\""
             )));
         }
+        // The same sentence for the same reason. A ranking window reads no values, so there is
+        // nothing for a predicate over the values to keep or drop.
+        if filter.is_some() && kind_of(resolved.name) == Some(FunctionKind::Window) {
+            return Err(Error::binder(format!(
+                "FILTER is not implemented for the window function \"\"{name}\"\""
+            )));
+        }
         let mut cast = Vec::with_capacity(parts.args.len());
         for (arg, wanted) in parts.args.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
@@ -2119,10 +2169,9 @@ impl<'a> Binder<'a> {
         let args = self.plan.add_expr_list(&cast);
         let name = self.plan.intern(resolved.name);
         let ty = resolved.returns;
-        let call = self.plan.add_expr(
-            Expr::Window { name, args, distinct, filter: None, ignore_nulls },
-            ty.clone(),
-        );
+        let call = self
+            .plan
+            .add_expr(Expr::Window { name, args, distinct, filter, ignore_nulls }, ty.clone());
 
         let at = self.window_run(parts.partition, parts.order, parts.frame, call);
         let index = self.windows.last().expect("the run was just filed").index;

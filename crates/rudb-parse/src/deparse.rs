@@ -318,9 +318,9 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         Expr::Literal { kind, text } => literal(ast, kind, text),
         Expr::Unary { op, operand } => unary(ast, op, operand),
         Expr::Binary { op, left, right } => binary(ast, op, left, right),
-        Expr::Function { name, args, distinct } => call(ast, name, args, distinct),
-        Expr::Window { name, args, distinct, ignore_nulls, spec } => {
-            window(ast, name, args, distinct, ignore_nulls, spec)
+        Expr::Function { name, args, distinct, filter } => call(ast, name, args, distinct, filter),
+        Expr::Window { name, args, distinct, filter, ignore_nulls, spec } => {
+            window(ast, name, args, distinct, filter, ignore_nulls, spec)
         }
         Expr::Cast { operand, ty, try_cast } => {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
@@ -600,7 +600,7 @@ fn binary(ast: &Ast, op: BinaryOp, left: ExprRef, right: ExprRef) -> String {
 }
 
 /// A function call.
-fn call(ast: &Ast, name: Slice, args: Slice, distinct: bool) -> String {
+fn call(ast: &Ast, name: Slice, args: Slice, distinct: bool, filter: ExprRef) -> String {
     let written = parts(ast, name);
     let list = ast.expr_list(args);
     // `count(*)` is a different function from `count`, and the star is how it is spelled rather than
@@ -611,11 +611,24 @@ fn call(ast: &Ast, name: Slice, args: Slice, distinct: bool) -> String {
             && matches!(ast.expr(list[0]), Expr::Star { qualifier, replacements }
                 if qualifier.is_empty() && replacements.is_empty());
         if starred || list.is_empty() {
-            return "count_star()".to_string();
+            return format!("count_star(){}", filtered(ast, filter));
         }
     }
     let word = if distinct { "DISTINCT " } else { "" };
-    format!("{}({word}{})", operator(ast, name, &written), exprs(ast, args))
+    format!(
+        "{}({word}{}){}",
+        operator(ast, name, &written),
+        exprs(ast, args),
+        filtered(ast, filter)
+    )
+}
+
+/// The `FILTER` a call was written with, or nothing at all when it was written without one.
+///
+/// The word `WHERE` is always printed even when it was not written, because upstream prints it: a
+/// view defined with `FILTER (x > 1)` comes back with `FILTER (WHERE (x > 1))`.
+fn filtered(ast: &Ast, filter: ExprRef) -> String {
+    if filter == NONE { String::new() } else { format!(" FILTER (WHERE {})", expr(ast, filter)) }
 }
 
 /// A call with its window, which is the form a window target with no alias is named after.
@@ -629,6 +642,7 @@ fn window(
     name: Slice,
     args: Slice,
     distinct: bool,
+    filter: ExprRef,
     ignore_nulls: bool,
     spec: WindowRef,
 ) -> String {
@@ -644,7 +658,8 @@ fn window(
         && matches!(ast.expr(list[0]), Expr::Star { qualifier, replacements }
             if qualifier.is_empty() && replacements.is_empty());
     let inner = if bare { String::new() } else { exprs(ast, args) };
-    let call = format!("{}({word}{inner}{nulls})", operator(ast, name, &written));
+    let call =
+        format!("{}({word}{inner}{nulls}){}", operator(ast, name, &written), filtered(ast, filter));
     let held = ast.window(spec);
     let mut inside: Vec<String> = Vec::new();
     if !held.partition.is_empty() {
@@ -1357,6 +1372,40 @@ mod tests {
         assert_eq!(
             body("SELECT main.sum(i) OVER (ORDER BY i) AS n FROM t"),
             "SELECT main.sum(i) OVER (ORDER BY i) AS n FROM t"
+        );
+    }
+
+    /// Every string on the right was read out of `duckdb_views()` on the pin. The word `WHERE` is
+    /// written back whether or not it was written, because the pin writes it back either way.
+    #[test]
+    fn a_filter_is_written_after_the_call_and_before_the_over() {
+        assert_eq!(
+            body("SELECT sum(x) FILTER (WHERE y > 1) FROM t"),
+            "SELECT sum(x) FILTER (WHERE (y > 1)) FROM t"
+        );
+        assert_eq!(
+            body("SELECT sum(x) FILTER (y > 1) FROM t"),
+            "SELECT sum(x) FILTER (WHERE (y > 1)) FROM t"
+        );
+        assert_eq!(
+            body("SELECT count(*) FILTER (WHERE b) FROM t"),
+            "SELECT count_star() FILTER (WHERE b) FROM t"
+        );
+        assert_eq!(
+            body("SELECT count() FILTER (WHERE b) FROM t"),
+            "SELECT count_star() FILTER (WHERE b) FROM t"
+        );
+        assert_eq!(
+            body("SELECT sum(x) FILTER (WHERE y > 1) OVER (ORDER BY x) FROM t"),
+            "SELECT sum(x) FILTER (WHERE (y > 1)) OVER (ORDER BY x) FROM t"
+        );
+        assert_eq!(
+            body("SELECT sum(DISTINCT x) FILTER (WHERE b) OVER () FROM t"),
+            "SELECT sum(DISTINCT x) FILTER (WHERE b) OVER () FROM t"
+        );
+        assert_eq!(
+            body("SELECT count(*) FILTER (WHERE b) OVER () FROM t"),
+            "SELECT count() FILTER (WHERE b) OVER () FROM t"
         );
     }
 
