@@ -837,9 +837,9 @@ fn a_window_and_an_aggregate_cannot_be_written_inside_each_other() {
 
 #[test]
 fn the_name_inside_an_over_has_to_be_one_that_can_be_a_window() {
-    // Three different refusals for three different situations, which is what the pinned binary
-    // does and is worth keeping apart. A scalar name, a name nothing knows, and a name that is a
-    // window there and is not implemented here are three separate things to tell somebody.
+    // Two different refusals for two different situations, which is what the pinned binary does
+    // and is worth keeping apart. A name it knows as a scalar and a name it does not know at all
+    // each get their own sentence there.
     assert_eq!(
         failure("SELECT abs(counter) OVER () FROM hits"),
         "abs is not an aggregate function"
@@ -848,7 +848,53 @@ fn the_name_inside_an_over_has_to_be_one_that_can_be_a_window() {
         failure("SELECT nosuchwindow(counter) OVER () FROM hits"),
         "Aggregate Function with name nosuchwindow does not exist!"
     );
-    assert_eq!(failure("SELECT fill(counter) OVER () FROM hits"), "fill as a window function");
+}
+
+#[test]
+fn fill_asks_the_query_for_one_sort_key_and_a_type_it_can_subtract() {
+    // Every one of these sentences came off the pinned binary, including the order they come in.
+    // The argument is checked before the sort key even when both are wrong, an `OVER` with no
+    // order at all is refused with the same words two sort keys are, and the two lists of types
+    // are not the same list: a TIMETZ can be ordered by and cannot be filled, and an INTERVAL is
+    // neither. The doubled quotes in the DISTINCT sentence are upstream's too.
+    assert_eq!(
+        failure("SELECT fill(counter) OVER () FROM hits"),
+        "FILL functions must have only one ORDER BY expression"
+    );
+    assert_eq!(
+        failure("SELECT fill(counter) OVER (ORDER BY counter, url) FROM hits"),
+        "FILL functions must have only one ORDER BY expression"
+    );
+    assert_eq!(
+        failure("SELECT fill(url) OVER (ORDER BY counter) FROM hits"),
+        "FILL argument must support subtraction"
+    );
+    assert_eq!(
+        failure("SELECT fill(counter) OVER (ORDER BY url) FROM hits"),
+        "FILL ordering must support subtraction"
+    );
+    assert_eq!(
+        failure("SELECT fill(url) OVER (ORDER BY counter, url) FROM hits"),
+        "FILL argument must support subtraction"
+    );
+    assert_eq!(
+        failure("SELECT fill(DISTINCT counter) OVER (ORDER BY counter) FROM hits"),
+        "DISTINCT is not implemented for the window function \"\"fill\"\""
+    );
+    assert_eq!(
+        failure("SELECT fill(counter IGNORE NULLS) OVER (ORDER BY counter) FROM hits"),
+        "RESPECT/IGNORE NULLS is not supported for the window function \"fill\""
+    );
+}
+
+#[test]
+fn fill_binds_with_the_type_it_was_given_and_nothing_is_cast_on_the_way_in() {
+    // The pin prints the row as `fill(col0 ANY) -> ANY`, so the declaration says nothing and the
+    // argument says everything. A DECIMAL stays the DECIMAL it arrived as, width and scale and all.
+    let counted = plan("SELECT fill(counter) OVER (ORDER BY counter) FROM hits");
+    assert!(counted.contains("expressions=[fill(#0.2::INTEGER)::INTEGER]"), "{counted}");
+    let scaled = plan("SELECT fill(counter * 1.5) OVER (ORDER BY counter) FROM hits");
+    assert!(scaled.contains("::DECIMAL(12,1))::DECIMAL(12,1)]"), "{scaled}");
 }
 
 #[test]

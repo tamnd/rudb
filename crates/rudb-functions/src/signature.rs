@@ -180,6 +180,14 @@ enum Shape {
     /// three, which is the same rule written two ways, and a table that prints what the pin prints
     /// has to know which way each row goes.
     ValueThenCountThenValue(Spelled),
+    /// One argument, nothing is cast, and the result is that argument's own type. `fill`.
+    ///
+    /// The pin prints it as `fill(col0 ANY) -> ANY` and `typeof(fill(x) OVER (ORDER BY k))` there
+    /// gives back whatever `x` was, INTEGER for an INTEGER column and DECIMAL(10,2) for a decimal
+    /// one, so the declaration says nothing and the argument says everything. The rule that the
+    /// argument has to be a type arithmetic can reach is the binder's rather than this table's,
+    /// since it is the sort key and not just the argument that has to satisfy it.
+    AsGiven,
     /// No arguments at all and a fixed result. `now()` and `current_schema()`.
     ///
     /// The session context functions, which are the ones whose answer comes from the connection
@@ -663,6 +671,16 @@ const TABLE: &[Entry] = &[
     value_window("last_value", Arity::exactly(1), Spelled::Any),
     value_window("lead", Arity::between(1, 3), Spelled::Same),
     value_window("nth_value", Arity::exactly(2), Spelled::Any),
+    // The thirteenth window name, which reads neither a position nor a row. It fills the gaps in a
+    // column by interpolating between the values on either side of each one, so the answer is the
+    // argument's own type and there is nothing else to declare.
+    Entry {
+        name: "fill",
+        kind: FunctionKind::Window,
+        arity: Arity::exactly(1),
+        shape: Shape::AsGiven,
+        numeric_only: false,
+    },
 ];
 
 /// A scalar that takes numbers.
@@ -951,6 +969,7 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             }
             (cast_to, first)
         }
+        Shape::AsGiven => (vec![arguments[0].clone()], arguments[0].clone()),
         Shape::PromotedToFirst => {
             let common = promote_all(name, arguments)?;
             // An untyped null keeps nothing to hand back, so it takes the promoted type the way
@@ -1556,6 +1575,9 @@ impl Shape {
                     .collect();
                 (names, spelled.name())
             }
+            // One `ANY` in and one `ANY` out, which is the pin's row for `fill` and is the whole of
+            // what it declares.
+            Self::AsGiven => (all(ANY), ANY),
             // One overload with an `ANY` return, which is the pin's row for it. The name decides
             // the type and a name is not something a signature can hold.
             Self::Setting => (all(Fixed::Varchar.name()), ANY),

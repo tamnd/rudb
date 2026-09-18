@@ -2093,6 +2093,13 @@ impl<'a> Binder<'a> {
         let types: Vec<LogicalType> =
             parts.args.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
         let resolved = window_signature(name, &types)?;
+        // `fill` reads the sort key rather than the frame, so what it needs from the query is not
+        // what any other window needs and it is refused on its own terms.
+        if resolved.name == "fill" {
+            let keys: Vec<LogicalType> =
+                parts.order.iter().map(|key| self.plan.expr_type(key.expr).clone()).collect();
+            refuse_fill(&types[0], &keys, distinct, ignore_nulls)?;
+        }
         // Upstream's sentence, doubled quotes and all. A DISTINCT over an aggregate inside an OVER
         // is ordinary and answered, and a DISTINCT over a ranking window is refused there, because
         // there is nothing for it to collapse when the call reads no values in the first place.
@@ -2391,28 +2398,74 @@ fn missing_replacement(name: &str, input: &Scope) -> Error {
     ))
 }
 
-/// The window names the reference binary has and this tree does not answer yet.
+/// Whether a type is one `fill` can interpolate over, which is the pin's phrase for it.
 ///
-/// They are listed rather than looked up because the list is the point: a call that names one of
-/// them is a window this tree cannot answer yet, and saying so is a different sentence from saying
-/// the name is not a function at all. `duckdb_functions()` on the pin returns 13 names with a
-/// window kind. Twelve are in the signature table now, the seven that count where the current row
-/// sits and the five that read another row, and `fill` is the one left because it does neither: it
-/// interpolates between the values on either side of a gap and needs arithmetic over the sort key
-/// that nothing here reaches yet.
-const WINDOW_ONLY: [&str; 1] = ["fill"];
+/// The pin refuses `fill` with `FILL argument must support subtraction` and its sort key with
+/// `FILL ordering must support subtraction`, and the two lists are not the same list, which is why
+/// this takes a flag rather than answering one question. Every number is on both, so are `DATE`,
+/// `TIME` and the two timestamps, and `TIME WITH TIME ZONE` is a sort key there but not an
+/// argument. `INTERVAL` is on neither, which is worth saying out loud because an interval does
+/// subtract: the sentence names subtraction and the rule is narrower than the sentence.
+fn subtractable(ty: &LogicalType, ordering: bool) -> bool {
+    if ty.is_numeric() {
+        return true;
+    }
+    match ty {
+        LogicalType::Date
+        | LogicalType::Time
+        | LogicalType::Timestamp
+        | LogicalType::TimestampS
+        | LogicalType::TimestampMs
+        | LogicalType::TimestampNs
+        | LogicalType::TimestampTz => true,
+        LogicalType::TimeTz => ordering,
+        _ => false,
+    }
+}
+
+/// Refuses a `fill` call the way the pin refuses one, in the pin's order.
+///
+/// The order was measured and it is not the order the clauses are written in. A `fill` over a
+/// `VARCHAR` with no `ORDER BY` at all complains about the argument, so the argument is looked at
+/// before the sort key is counted, and a `fill` with `DISTINCT` and no `ORDER BY` complains about
+/// the `ORDER BY`, so the count comes before the clauses. `IGNORE NULLS` is refused here rather
+/// than being answered as a no-op, since there is nothing for it to skip: `fill` is the one window
+/// whose whole job is the nulls.
+fn refuse_fill(
+    argument: &LogicalType,
+    order: &[LogicalType],
+    distinct: bool,
+    ignore_nulls: bool,
+) -> Result<()> {
+    if !subtractable(argument, false) {
+        return Err(Error::binder("FILL argument must support subtraction"));
+    }
+    let [key] = order else {
+        return Err(Error::binder("FILL functions must have only one ORDER BY expression"));
+    };
+    if !subtractable(key, true) {
+        return Err(Error::binder("FILL ordering must support subtraction"));
+    }
+    if distinct {
+        return Err(Error::binder(
+            "DISTINCT is not implemented for the window function \"\"fill\"\"",
+        ));
+    }
+    if ignore_nulls {
+        return Err(Error::binder(
+            "RESPECT/IGNORE NULLS is not supported for the window function \"fill\"",
+        ));
+    }
+    Ok(())
+}
 
 /// Resolves the call written inside an `OVER`.
 ///
 /// Every aggregate is also a window, which is why this goes through the same signature table the
 /// aggregate path uses, and the ranking windows go through it too because they are rows in the same
 /// table. Everything else is one of three refusals, and all three are the reference binary's: a name
-/// it only knows as a window, a name it knows as a scalar, and a name it does not know at all each
-/// get their own sentence there.
+/// it knows as a scalar and a name it does not know at all each get their own sentence there.
 fn window_signature(name: &str, types: &[LogicalType]) -> Result<Resolved> {
-    if WINDOW_ONLY.iter().any(|held| held.eq_ignore_ascii_case(name)) {
-        return Err(Error::not_implemented(format!("{name} as a window function")));
-    }
     match kind_of(name) {
         Some(FunctionKind::Aggregate | FunctionKind::Window) => resolve(name, types),
         Some(FunctionKind::Scalar) => {

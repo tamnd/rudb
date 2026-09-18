@@ -52,7 +52,7 @@ use crate::rows;
 use crate::schema::Schema;
 use crate::sort::{Arrival, Place, compare};
 
-/// What a call reads to answer, which is four entirely different things.
+/// What a call reads to answer, which is five entirely different things.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reads {
     /// The rows the frame covers, through an accumulator. Every aggregate.
@@ -66,6 +66,9 @@ enum Reads {
     /// One row of the partition, a distance from this one. `lag` and `lead`, which read the
     /// partition and not the frame.
     Shifted(Looks),
+    /// The values on either side of a gap, read along the sort key. `fill`, which is answered for
+    /// the whole partition at once rather than a row at a time.
+    Filled,
 }
 
 impl Reads {
@@ -81,6 +84,7 @@ impl Reads {
             "nth_value" => Self::Picked(Picks::Nth),
             "lag" => Self::Shifted(Looks::Back),
             "lead" => Self::Shifted(Looks::Forward),
+            "fill" => Self::Filled,
             _ => Self::Frame,
         }
     }
@@ -464,11 +468,22 @@ impl Window {
     /// Answers every row of one partition and appends the answered rows to `answered`.
     fn over(&self, rows: &[Windowed], answered: &mut Vec<Vec<Value>>) -> Result<()> {
         let peers = self.peer_groups(rows)?;
+        // `fill` is answered for the whole partition in one go rather than a row at a time, because
+        // every gap in it is read from the nearest value on either side and looking for those per
+        // row would walk the partition again for each one.
+        let filled: Vec<Option<Vec<Value>>> = self
+            .calls
+            .iter()
+            .map(|call| (call.reads == Reads::Filled).then(|| self.filling(call, rows)))
+            .collect();
         for at in 0..rows.len() {
             let frame = self.frame_of(rows, &peers, at)?;
             let mut row = rows[at].1.clone();
-            for call in &self.calls {
-                row.push(self.answer(call, rows, &peers, at, frame.clone())?);
+            for (which, call) in self.calls.iter().enumerate() {
+                match &filled[which] {
+                    Some(column) => row.push(column[at].clone()),
+                    None => row.push(self.answer(call, rows, &peers, at, frame.clone())?),
+                }
             }
             answered.push(row);
         }
@@ -631,6 +646,9 @@ impl Window {
             Reads::Position(ranking) => return ranked(ranking, call, rows, peers, at),
             Reads::Picked(pick) => return self.picked(pick, call, rows, peers, at, frame),
             Reads::Shifted(look) => return shifted(look, call, rows, at),
+            // `over` answers this one for the whole partition before it asks about any row, so
+            // getting here means the two of them disagree about which calls those are.
+            Reads::Filled => return Err(Error::internal("fill is answered a partition at a time")),
             Reads::Frame => {}
         }
         let mut accumulator = Accumulator::new(&call.name, &call.returns)?;
@@ -716,6 +734,58 @@ impl Window {
         // Reaching the end means the count ran past the frame for the two that count, and means the
         // answer for the one that wanted the end of it.
         Ok(if wanted.is_none() { last } else { Value::Null })
+    }
+
+    /// One `fill` call's whole column for one partition.
+    ///
+    /// A row that already has a value keeps it. A gap is read off the straight line through the
+    /// nearest value before it and the nearest value after it, measured along the sort key rather
+    /// than by counting rows, so an uneven key spaces the answers unevenly too. A gap that has
+    /// nothing before it borrows the first two values in the partition and a gap that has nothing
+    /// after it borrows the last two, which is what makes the ends extend the line rather than
+    /// repeat the end value. With one value in the whole partition there is no line and that value
+    /// is carried everywhere, and with none the column stays as it was.
+    ///
+    /// Only the stretch of rows whose sort key is usable takes part. A null key sorts to one end of
+    /// the partition and an infinite one to the other, so that stretch is a single run in the
+    /// middle, and a row outside it keeps whatever it already had.
+    fn filling(&self, call: &Call, rows: &[Windowed]) -> Vec<Value> {
+        let mut out: Vec<Value> = rows.iter().map(|row| row.0[call.args_at].clone()).collect();
+        // The binder has already refused any `fill` whose `OVER` does not order by exactly one
+        // expression, so the sort key is the one gathered value that follows the partition keys.
+        let sorted = self.partitions;
+        let keys: Vec<Option<f64>> = rows.iter().map(|row| placement(&row.0[sorted])).collect();
+        let Some(first) = keys.iter().position(Option::is_some) else {
+            return out;
+        };
+        let last =
+            keys[first..].iter().position(Option::is_none).map_or(keys.len(), |past| first + past);
+        let anchors: Vec<(usize, f64, f64)> = (first..last)
+            .filter_map(|at| Some((at, keys[at]?, placement(&rows[at].0[call.args_at])?)))
+            .collect();
+        if anchors.is_empty() {
+            return out;
+        }
+        let mut behind = 0;
+        for at in first..last {
+            while behind < anchors.len() && anchors[behind].0 <= at {
+                behind += 1;
+            }
+            if !out[at].is_null() {
+                continue;
+            }
+            // `behind` now counts the anchors before this row, so the pair is the one on each side
+            // when there is one on each side, and the two nearest on the one side when there is not.
+            let (from, to) = match (behind.checked_sub(1), behind < anchors.len()) {
+                (Some(before), true) => (before, behind),
+                (Some(before), false) => (before.saturating_sub(1), before),
+                (None, _) => (0, usize::min(1, anchors.len() - 1)),
+            };
+            let (_, x0, y0) = anchors[from];
+            let (_, x1, y1) = anchors[to];
+            out[at] = blended(y0, y1, gradient(keys[at].unwrap_or(x0), x0, x1), &call.returns);
+        }
+        out
     }
 
     /// Whether `row` is left out of the frame around `at` by the frame's exclusion.
@@ -865,6 +935,155 @@ fn away_over_nulls(
         left -= 1;
     }
     Some(row)
+}
+
+/// Where a value sits on the number line that `fill` interpolates over, or nothing when it cannot
+/// be an anchor.
+///
+/// This is the value as it is stored and not as it reads, so a `DECIMAL(10,2)` gives its unscaled
+/// integer and a `DATE` gives its day count. Both sides of the ratio are measured the same way and
+/// the scale cancels, so nothing is lost by it and the arithmetic stays where upstream puts it. A
+/// null is not an anchor and neither is a NaN or an infinity, since a line through one of those
+/// leads nowhere.
+fn placement(value: &Value) -> Option<f64> {
+    let number = match *value {
+        Value::TinyInt(held) => f64::from(held),
+        Value::SmallInt(held) => f64::from(held),
+        Value::Integer(held) => f64::from(held),
+        Value::BigInt(held) => held as f64,
+        Value::HugeInt(held) => held as f64,
+        Value::UTinyInt(held) => f64::from(held),
+        Value::USmallInt(held) => f64::from(held),
+        Value::UInteger(held) => f64::from(held),
+        Value::UBigInt(held) => held as f64,
+        Value::UHugeInt(held) => held as f64,
+        Value::Float(held) => f64::from(held),
+        Value::Double(held) => held,
+        Value::Decimal { unscaled, .. } => unscaled as f64,
+        Value::Date(held) => f64::from(held),
+        Value::Time(held)
+        | Value::TimeTz(held)
+        | Value::Timestamp(held)
+        | Value::TimestampTz(held) => held as f64,
+        _ => return None,
+    };
+    number.is_finite().then_some(number)
+}
+
+/// How far along the line from `x0` to `x1` the key `x` sits, which is 0 at the first and 1 at the
+/// second and outside that range on either side of them.
+///
+/// Two keys in the same place have no line between them and answer 0, which makes the first of the
+/// two values the answer. A spread wide enough to overflow a double is measured again with both
+/// ends divided by the larger of them, which upstream does as well and which keeps the ratio when
+/// the difference itself will not fit.
+fn gradient(x: f64, x0: f64, x1: f64) -> f64 {
+    let mut den = x1 - x0;
+    if den == 0.0 {
+        return 0.0;
+    }
+    let mut num = x - x0;
+    if !den.is_finite() {
+        let scale = x0.abs().max(x1.abs());
+        num = x / scale - x0 / scale;
+        den = x1 / scale - x0 / scale;
+    }
+    num / den
+}
+
+/// The point at `d` along the line from `y0` to `y1`, as a value of the type the call returns.
+///
+/// Between the two ends the answer is truncated toward zero and past them it is rounded, which
+/// looks arbitrary and is measured: upstream interpolates with a lossy cast and extrapolates by
+/// casting the distance it travels, and the two casts round differently. A result the type cannot
+/// hold is null rather than an error, which is upstream's answer too.
+///
+/// One deliberate difference from the pinned binary lives here. Upstream extrapolates by putting
+/// the smaller of the two values first and negating the distance with it, comparing the values
+/// rather than the keys they are ordered by, so its line runs the wrong way for any column that
+/// falls as the key rises and for every descending `ORDER BY`. This reads the line in the direction
+/// the keys give it, which agrees with upstream wherever the values rise and disagrees where they
+/// fall. Upstream's own tests cover only the rising case, so nothing in the corpus pins the values
+/// this differs on.
+fn blended(y0: f64, y1: f64, d: f64, returns: &LogicalType) -> Value {
+    if matches!(*returns, LogicalType::Float | LogicalType::Double) {
+        // Written out this way and not as `y0 + (y1 - y0) * d`, which is the same line and not the
+        // same double: upstream weighs the two ends against each other and the last bit of the
+        // answer follows from that, so `fill(1.0 .. 2.0)` a third of the way along is
+        // 1.3333333333333335 there and 1.3333333333333333 the other way.
+        let number = y0 * (1.0 - d) + y1 * d;
+        return match *returns {
+            LogicalType::Float => Value::Float(number as f32),
+            _ => Value::Double(number),
+        };
+    }
+    let delta = y1 - y0;
+    let number = if (0.0..=1.0).contains(&d) {
+        (y0 + delta * d).trunc()
+    } else {
+        let offset = (delta.abs() * d.abs()).round();
+        if (delta >= 0.0) == (d >= 0.0) { y0 + offset } else { y0 - offset }
+    };
+    seated(number, returns)
+}
+
+/// A number the line arrived at, put back into the type it came from, or null when it does not fit.
+fn seated(number: f64, returns: &LogicalType) -> Value {
+    // A double outside this range has no `i128` to round to at all, and the cast below saturates
+    // rather than refusing, so the range is checked before the cast and not after it.
+    if !number.is_finite() || number.abs() >= 1.701_411_834_604_692_3e38 {
+        return Value::Null;
+    }
+    let whole = number as i128;
+    let fits = |low: i128, high: i128| (low..=high).contains(&whole);
+    match *returns {
+        LogicalType::TinyInt if fits(i128::from(i8::MIN), i128::from(i8::MAX)) => {
+            Value::TinyInt(whole as i8)
+        }
+        LogicalType::SmallInt if fits(i128::from(i16::MIN), i128::from(i16::MAX)) => {
+            Value::SmallInt(whole as i16)
+        }
+        LogicalType::Integer if fits(i128::from(i32::MIN), i128::from(i32::MAX)) => {
+            Value::Integer(whole as i32)
+        }
+        LogicalType::BigInt if fits(i128::from(i64::MIN), i128::from(i64::MAX)) => {
+            Value::BigInt(whole as i64)
+        }
+        LogicalType::HugeInt => Value::HugeInt(whole),
+        LogicalType::UTinyInt if fits(0, i128::from(u8::MAX)) => Value::UTinyInt(whole as u8),
+        LogicalType::USmallInt if fits(0, i128::from(u16::MAX)) => Value::USmallInt(whole as u16),
+        LogicalType::UInteger if fits(0, i128::from(u32::MAX)) => Value::UInteger(whole as u32),
+        LogicalType::UBigInt if fits(0, i128::from(u64::MAX)) => Value::UBigInt(whole as u64),
+        LogicalType::UHugeInt if whole >= 0 => Value::UHugeInt(whole as u128),
+        LogicalType::Decimal { width, scale } if digits(whole) <= u32::from(width) => {
+            Value::Decimal { unscaled: whole, width, scale }
+        }
+        LogicalType::Date if fits(i128::from(i32::MIN), i128::from(i32::MAX)) => {
+            Value::Date(whole as i32)
+        }
+        _ if !fits(i128::from(i64::MIN), i128::from(i64::MAX)) => Value::Null,
+        LogicalType::Time => Value::Time(whole as i64),
+        LogicalType::TimeTz => Value::TimeTz(whole as i64),
+        LogicalType::Timestamp
+        | LogicalType::TimestampS
+        | LogicalType::TimestampMs
+        | LogicalType::TimestampNs => Value::Timestamp(whole as i64),
+        LogicalType::TimestampTz => Value::TimestampTz(whole as i64),
+        // Every type the binder lets through is above, so this is the overflow arm for the ones
+        // that named a range and missed it.
+        _ => Value::Null,
+    }
+}
+
+/// How many decimal digits an unscaled value takes, which is what a `DECIMAL` width counts.
+fn digits(unscaled: i128) -> u32 {
+    let mut left = unscaled.unsigned_abs();
+    let mut counted = 1;
+    while left >= 10 {
+        left /= 10;
+        counted += 1;
+    }
+    counted
 }
 
 /// The first row of the peer group numbered `group`.
