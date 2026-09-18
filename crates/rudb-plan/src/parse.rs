@@ -189,6 +189,24 @@ impl Reader<'_> {
                     columns,
                 }))
             }
+            "LateralFunction" => {
+                let function = read_name(plan, c)?;
+                c.expect_word("args")?;
+                c.expect("=")?;
+                let args = read_expr_list(plan, c)?;
+                let (options, settings) = read_options(plan, c)?;
+                let index = read_table_index(c)?;
+                let columns = read_schema(plan, c)?;
+                Ok(Built::unary(move |input| Node::LateralFunction {
+                    input,
+                    index,
+                    function,
+                    args,
+                    options,
+                    settings,
+                    columns,
+                }))
+            }
             "Fetch" => {
                 c.expect_word("args")?;
                 c.expect("=")?;

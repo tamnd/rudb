@@ -74,6 +74,7 @@ use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join, Probe};
 use crate::keywords::keywords;
+use crate::lateral::LateralSeries;
 use crate::query::Query;
 use crate::register::registries;
 use crate::schema::Schema;
@@ -1225,6 +1226,23 @@ impl<'a> Building<'a, '_> {
                         Segment::new(Arc::new(Watched::new(series, counters)), schema)
                     }
                 }
+            }
+            Node::LateralFunction { input, index, function, args, columns, .. } => {
+                let below = self.node(input)?;
+                let name = plan.string(function);
+                let lateral = LateralSeries::new(
+                    plan,
+                    &below.schema,
+                    index,
+                    name,
+                    args,
+                    columns,
+                    self.cancel,
+                )?
+                .in_session(self.session);
+                let schema = lateral.schema().clone();
+                let counters = self.watch(reference, id, pipeline, "Series", Some(name));
+                below.then(Arc::new(Watched::new(lateral, counters)), schema)
             }
             Node::Fetch { input, index, args, columns, row } => {
                 let below = self.node(input)?;

@@ -182,7 +182,9 @@ fn collect(plan: &Plan, at: NodeRef, set: &mut TableSet) {
         // own indexes are not among them: nothing above can name a column of the held query except
         // through a read of it, and a read has an index of its own.
         Node::MaterializedCte { body, .. } => collect(plan, body, set),
-        Node::Window { input, index, .. } => {
+        // Both of these append their own columns to the row they were given rather than replacing
+        // it, so what is in scope above them is their input's indexes and theirs.
+        Node::Window { input, index, .. } | Node::LateralFunction { input, index, .. } => {
             collect(plan, input, set);
             set.insert(index);
         }

@@ -92,6 +92,7 @@ mod group_mixed;
 mod join;
 mod key;
 mod keywords;
+mod lateral;
 mod metadata;
 mod ordering;
 mod pairs;

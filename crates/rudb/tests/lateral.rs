@@ -7,7 +7,7 @@
 //!
 //! A lateral entry is bound as a dependent join and then lowered by the general rule in
 //! `rudb-opt/src/domain.rs`, so what these check is that the binding produces a plan that rule has
-//! an answer for, and that the two things the pinned build refuses are refused in its words.
+//! an answer for, and that what the pinned build refuses is refused in its words.
 //!
 //! The outer table has a NULL key, because the lowering joins the domain back with a null safe
 //! comparison and a row whose key is NULL has to come back with the rest rather than disappear.
@@ -240,14 +240,96 @@ fn a_lateral_entry_cannot_read_the_entry_written_after_it() {
     assert!(error.message().contains("Referenced table \"o\" not found"), "{error}");
 }
 
+/// A pair whose right half is what a series produces, which is a BIGINT and not the INTEGER a
+/// column of `o` holds.
+fn series(left: i32, right: i64) -> (Value, Value) {
+    (Value::Integer(left), Value::BigInt(right))
+}
+
 #[test]
-fn a_table_function_reading_a_lateral_column_says_so() {
+fn a_table_function_can_read_a_lateral_column() {
     let database = database();
-    // The pinned build answers this one. Its arguments are evaluated to produce the rows rather
-    // than over rows that already exist, so there is nothing under it for the domain to be pushed
-    // into, and this is the message until there is an operator that evaluates a source per value.
-    let error = database
-        .query("SELECT o.k, g.g FROM o, LATERAL generate_series(1, o.n) g(g)")
-        .expect_err("a table function reading a lateral column");
-    assert_eq!(error.message(), "a table function reading a LATERAL column");
+    // The one shape where the domain has nowhere to be pushed into, because a table function's
+    // arguments are what produce its rows rather than something read over rows that already exist.
+    // The domain becomes the input instead and the call is made once per row of it, which is
+    // `Node::LateralFunction`.
+    assert_eq!(
+        pairs(
+            &database,
+            "SELECT o.k, g.g FROM o, LATERAL generate_series(1, o.n) g(g) ORDER BY 1, 2"
+        ),
+        vec![
+            series(1, 1),
+            series(1, 2),
+            series(2, 1),
+            series(2, 2),
+            series(2, 3),
+            (Value::Null, Value::BigInt(1))
+        ]
+    );
+    // The comma form says the same thing, and `range` counts from zero where `generate_series`
+    // counts from its first argument.
+    assert_eq!(
+        pairs(&database, "SELECT o.k, r.i FROM o, range(o.n) r(i) ORDER BY 1, 2"),
+        vec![
+            series(1, 0),
+            series(1, 1),
+            series(2, 0),
+            series(2, 1),
+            series(2, 2),
+            (Value::Null, Value::BigInt(0))
+        ]
+    );
+}
+
+#[test]
+fn an_outer_row_a_lateral_table_function_makes_no_rows_for_survives_a_left_join() {
+    let database = database();
+    // `o.n` is NULL on one row and a series of a NULL is no rows at all, which is the row a left
+    // join has to keep. The outer row whose key is NULL is the other half of it: the domain is
+    // joined back null safely, so that row is asked about like any other and its one row comes
+    // back rather than disappearing.
+    assert_eq!(
+        pairs(
+            &database,
+            "SELECT o.k, r.i FROM o LEFT JOIN LATERAL range(o.n) r(i) ON true ORDER BY 1, 2"
+        ),
+        vec![
+            series(1, 0),
+            series(1, 1),
+            series(2, 0),
+            series(2, 1),
+            series(2, 2),
+            (Value::Integer(3), Value::Null),
+            (Value::Null, Value::BigInt(0)),
+        ]
+    );
+}
+
+#[test]
+fn a_lateral_table_function_is_one_call_per_distinct_argument_and_not_per_row() {
+    let database = database();
+    // Two outer rows that ask for the same series are one row of the domain and one call, and the
+    // join back still gives each of them its own copy of the answer. Which is the whole bargain the
+    // unnesting pass strikes, said in the one place where the call is visible.
+    database.execute("INSERT INTO o VALUES (9, 2), (10, 2)").expect("more rows");
+    let counted: Vec<(Value, Value)> =
+        pairs(&database, "SELECT o.k, count(*) FROM o, range(o.n) r(i) GROUP BY 1 ORDER BY 1");
+    assert_eq!(
+        counted,
+        vec![
+            (Value::Integer(1), Value::BigInt(2)),
+            (Value::Integer(2), Value::BigInt(3)),
+            (Value::Integer(9), Value::BigInt(2)),
+            (Value::Integer(10), Value::BigInt(2)),
+            (Value::Null, Value::BigInt(1)),
+        ]
+    );
+    let plan = database
+        .query("EXPLAIN SELECT o.k, r.i FROM o, range(o.n) r(i)")
+        .expect("a plan")
+        .value_at(0, 1)
+        .to_string();
+    assert!(plan.contains("LateralFunction range"), "{plan}");
+    assert!(!plan.contains("DependentJoin"), "{plan}");
 }

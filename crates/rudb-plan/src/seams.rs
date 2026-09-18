@@ -45,6 +45,7 @@ pub fn seams_of(node: &Node) -> &'static [SeamId] {
         Node::Dummy
         | Node::Values { .. }
         | Node::TableFunction { .. }
+        | Node::LateralFunction { .. }
         | Node::Fetch { .. }
         | Node::TableFetch { .. }
         | Node::Limit { .. }

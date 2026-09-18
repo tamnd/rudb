@@ -163,7 +163,7 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
         // one day should, but the answer would have to come from the reader rather than from here,
         // and a function nobody taught this about would still be unknown. Guessing on behalf of all
         // of them is the failure mode this module exists to avoid.
-        Node::TableFunction { .. } => Stat::Unknown,
+        Node::TableFunction { .. } | Node::LateralFunction { .. } => Stat::Unknown,
         Node::Filter { input, predicate } => {
             let kept = KEPT_BY_A_CONDITION.powi(conjuncts(plan, predicate));
             guess(of(input), kept)

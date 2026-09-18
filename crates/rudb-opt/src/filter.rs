@@ -483,6 +483,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         Node::Get { .. }
         | Node::Values { .. }
         | Node::TableFunction { .. }
+        | Node::LateralFunction { .. }
         | Node::Dummy
         | Node::CteScan { .. } => filter(plan, at, pending),
     }
