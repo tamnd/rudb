@@ -3,6 +3,27 @@
 //! A committed directory names independently readable column pages. The first version handles
 //! scalar columns and one table; the file header already has two generation slots so an unfinished
 //! replacement directory cannot hide the last complete one.
+//!
+//! # Parts and stripes
+//!
+//! A part is one appended chunk, which is a thousand rows, and it is the unit a scan decodes and
+//! hands to the pipeline. A stripe is sixty four parts, and it is the unit the directory describes
+//! and the unit the file is laid out in: one page per column per stripe, holding that column's
+//! sixty four part payloads end to end.
+//!
+//! The two are separate because they are sized by different pressures. A part wants to be small
+//! because it is a vector and vectors live in cache. A stripe wants to be large because everything
+//! the directory holds is per stripe and the directory is one buffer that has to be read and
+//! decoded before a single row can be answered. A hundred million rows of the hundred and five
+//! column ClickBench table is ninety seven thousand parts, and a directory with a page entry and a
+//! pair of bounds per part per column is several hundred megabytes, which is what made that load
+//! fail before this split existed. Sixty four parts to a stripe divides that by sixty four.
+//!
+//! Where the parts of a page start is not in the directory either, for the same reason. Each
+//! stripe writes one index page holding a length and a checksum per part per column, and a reader
+//! preads the sixty four entries belonging to the column it wants. A scan reads the whole column
+//! page once and slices it; a sparse row fetch reads the index entries and then only the part it
+//! needs.
 
 #![forbid(unsafe_code)]
 
@@ -22,18 +43,13 @@ use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, TextSource, Vector};
 
-const MAGIC_V7: &[u8; 8] = b"RUDBNV7\0";
-const MAGIC_V8: &[u8; 8] = b"RUDBNV8\0";
-const MAGIC: &[u8; 8] = b"RUDBNV9\0";
-const DIRECTORY_V7: &[u8; 8] = b"RUDBDIR7";
-const DIRECTORY_V8: &[u8; 8] = b"RUDBDIR8";
-const DIRECTORY: &[u8; 8] = b"RUDBDIR9";
-const FORMAT: u32 = 9;
+const MAGIC: &[u8; 8] = b"RUDBNV10";
+const DIRECTORY: &[u8; 8] = b"RUDBDI10";
+const FORMAT: u32 = 10;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
 const MAX_DIRECTORY: usize = 128 * 1024 * 1024;
-const FREQUENCIES_V1: &[u8; 8] = b"RUDBFQ1\0";
 const FREQUENCIES: &[u8; 8] = b"RUDBFQ2\0";
 const FREQUENCY_CANDIDATES: usize = 32_768;
 const FREQUENCY_ENTRIES: usize = 512;
@@ -176,11 +192,30 @@ pub struct FrequencyOccurrences {
     pub ordinals: Vec<u64>,
 }
 
+/// Where one column's page for one stripe sits in the file.
+///
+/// A column page has no checksum of its own because every part inside it carries one, and the
+/// stripe's index page holds those. Checking a part on the way out of the page covers exactly the
+/// bytes a reader is about to decode, and covers them once whether the reader took the whole page
+/// or pulled one part out of the middle of it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Span {
+    offset: u64,
+    length: u32,
+}
+
 /// One independently readable stripe of a table.
 #[derive(Debug, Clone)]
 pub struct Stripe {
     rows: usize,
-    pages: Vec<Page>,
+    /// Rows in each part, in source order. Kept in the directory so that mapping a row ordinal to a
+    /// part, which every sparse fetch does, never reads the file.
+    parts: Vec<u32>,
+    /// The index page: one section per column, holding a length and a checksum for every part and
+    /// then a checksum of the section itself, so that a reader can pread one column's section and
+    /// still know it is intact.
+    index: Span,
+    pages: Vec<Span>,
     memberships: Vec<Option<Page>>,
     zone: Zone,
 }
@@ -190,6 +225,12 @@ impl Stripe {
     #[must_use]
     pub fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// Number of parts in this stripe.
+    #[must_use]
+    pub fn parts(&self) -> usize {
+        self.parts.len()
     }
 }
 
@@ -202,10 +243,6 @@ pub struct Table {
     rows: usize,
     dictionaries: Vec<Option<Page>>,
     frequencies: Vec<Option<FrequencySummary>>,
-    /// The format version of the file this came out of, which is what says how to read a
-    /// dictionary page. Version 9 writes the sorted order beside the values and earlier ones do
-    /// not, and a reader that guesses wrong reads the offsets as the order.
-    version: u32,
 }
 
 impl Table {
@@ -350,25 +387,44 @@ pub struct Writer {
     file: File,
     table: Table,
     generation: u64,
-    order: Vec<(u64, u64)>,
+    /// The first and the last source position in every stripe, in the order the stripes were
+    /// written.
+    order: Vec<((u64, u64), (u64, u64))>,
     next_order: u64,
     dictionaries: Vec<Option<GlobalDictionary>>,
-    pending: Vec<PendingStripe>,
+    pending: Vec<PendingPart>,
 }
 
 #[derive(Debug)]
-struct PendingStripe {
+struct PendingPart {
     order: (u64, u64),
     rows: usize,
     pages: Vec<Vec<u8>>,
-    memberships: Vec<Option<Vec<u8>>>,
+    codes: Vec<Option<Vec<u32>>>,
     zone: Zone,
 }
 
-const EXTENT_STRIPES: usize = 32;
+/// Parts in one stripe.
+///
+/// Sixty four thousand rows is the smallest stripe that keeps the ClickBench directory in single
+/// digit megabytes at a hundred million rows, and it puts a four byte column's page at a quarter of
+/// a megabyte, which is the size a sequential read wants. Larger stripes buy a smaller directory
+/// and cost a sparse fetch, which has to read a page index before it can reach one part.
+const STRIPE_PARTS: usize = 64;
+
+/// Bytes one part takes in a stripe's index page: four for the length, eight for the checksum.
+const INDEX_ENTRY: usize = size_of::<u32>() + size_of::<u64>();
+
+/// Bytes one column's section of a stripe's index page takes, including its own trailing checksum.
+fn index_section(parts: usize) -> Result<usize> {
+    parts
+        .checked_mul(INDEX_ENTRY)
+        .and_then(|bytes| bytes.checked_add(size_of::<u64>()))
+        .ok_or_else(|| invalid("index page length overflow"))
+}
 
 impl Writer {
-    /// Creates a new v9 file and its first table.
+    /// Creates a new v10 file and its first table.
     ///
     /// # Errors
     ///
@@ -400,12 +456,11 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
-                version: FORMAT,
             },
             generation: 1,
             order: Vec::new(),
             next_order: 0,
-            pending: Vec::with_capacity(EXTENT_STRIPES),
+            pending: Vec::with_capacity(STRIPE_PARTS),
         })
     }
 
@@ -423,8 +478,9 @@ impl Writer {
     /// Writes one chunk and records its source position for directory ordering.
     ///
     /// Pages may be encoded by parallel pipeline instances and reach the file in completion order.
-    /// Their directory entries are sorted by this key at commit, so a scan still observes source
-    /// order without holding the page bytes until earlier work finishes.
+    /// The stripe they land in is sorted by this key at commit, and [`Self::finish`] rejects a
+    /// sequence whose parts do not come out in source order once the stripes are sorted, because a
+    /// stripe groups whatever arrived together and cannot put a late part back where it belongs.
     ///
     /// # Errors
     ///
@@ -437,80 +493,126 @@ impl Writer {
             return Err(invalid("chunk width differs from table schema"));
         }
         let mut pages = Vec::with_capacity(chunk.width());
-        let mut memberships = Vec::with_capacity(chunk.width());
+        let mut codes = Vec::with_capacity(chunk.width());
         for (index, field) in self.table.fields.iter().enumerate() {
             let column = chunk.column(index)?;
             if column.logical_type() != &field.ty {
                 return Err(invalid("chunk type differs from table schema"));
             }
-            let (bytes, membership) = encode(column, self.dictionaries[index].as_mut())?;
+            let (bytes, unique) = encode(column, self.dictionaries[index].as_mut())?;
             if bytes.len() > MAX_PAGE {
                 return Err(invalid("column page exceeds the configured bound"));
             }
             pages.push(bytes);
-            memberships.push(membership);
+            codes.push(unique);
         }
         self.table.rows = self
             .table
             .rows
             .checked_add(chunk.len())
             .ok_or_else(|| invalid("row count overflow"))?;
-        self.pending.push(PendingStripe {
+        if self.pending.last().is_some_and(|last| last.order > order) {
+            self.flush_pending()?;
+        }
+        self.pending.push(PendingPart {
             order,
             rows: chunk.len(),
             pages,
-            memberships,
+            codes,
             zone: Zone::of(chunk),
         });
-        if self.pending.len() == EXTENT_STRIPES {
+        if self.pending.len() == STRIPE_PARTS {
             self.flush_pending()?;
         }
         Ok(())
     }
 
-    /// Writes one bounded group of stripes with each column contiguous on disk.
+    /// Writes the buffered parts as one stripe, each column's parts contiguous on disk.
     fn flush_pending(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
         let width = self.table.fields.len();
-        let mut pages = vec![Vec::with_capacity(width); self.pending.len()];
-        let mut memberships = vec![vec![None; width]; self.pending.len()];
+        let parts = self.pending.len();
+        let mut pages = Vec::with_capacity(width);
+        let mut memberships = vec![None; width];
+        let mut ranges = Vec::with_capacity(width);
+        let mut index = Vec::with_capacity(width.saturating_mul(index_section(parts)?));
         for column in 0..width {
-            for (stripe, pending) in self.pending.iter().enumerate() {
+            let offset = self.file.stream_position().map_err(io)?;
+            let section = index.len();
+            let mut length = 0_usize;
+            for pending in &self.pending {
                 let bytes = &pending.pages[column];
-                let offset = self.file.stream_position().map_err(io)?;
                 self.file.write_all(bytes).map_err(io)?;
-                pages[stripe].push(Page {
-                    offset,
-                    length: u32::try_from(bytes.len())
-                        .map_err(|_| invalid("page length overflow"))?,
-                    hash: checksum(bytes),
-                });
+                put_u32(
+                    &mut index,
+                    u32::try_from(bytes.len()).map_err(|_| invalid("part length overflow"))?,
+                );
+                put_u64(&mut index, checksum(bytes));
+                length = length
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| invalid("column page length overflow"))?;
             }
-            for (stripe, pending) in self.pending.iter().enumerate() {
-                let Some(bytes) = &pending.memberships[column] else { continue };
-                let offset = self.file.stream_position().map_err(io)?;
-                self.file.write_all(bytes).map_err(io)?;
-                *memberships[stripe]
-                    .get_mut(column)
-                    .ok_or_else(|| invalid("membership column is missing"))? = Some(Page {
-                    offset,
-                    length: u32::try_from(bytes.len())
-                        .map_err(|_| invalid("membership page length overflow"))?,
-                    hash: checksum(bytes),
-                });
+            let hash = checksum(&index[section..]);
+            put_u64(&mut index, hash);
+            if length > MAX_PAGE {
+                return Err(invalid("column page exceeds the configured bound"));
             }
-        }
-        for ((pending, pages), memberships) in self.pending.drain(..).zip(pages).zip(memberships) {
-            self.table.stripes.push(Stripe {
-                rows: pending.rows,
-                pages,
-                memberships,
-                zone: pending.zone,
+            pages.push(Span {
+                offset,
+                length: u32::try_from(length).map_err(|_| invalid("page length overflow"))?,
             });
-            self.order.push(pending.order);
+            ranges.push(merged_range(self.pending.iter().map(|pending| {
+                pending.zone.column(column).cloned().unwrap_or_default()
+            })));
         }
+        for column in 0..width {
+            if self.pending.iter().all(|pending| pending.codes[column].is_none()) {
+                continue;
+            }
+            let lists = self
+                .pending
+                .iter()
+                .map(|pending| pending.codes[column].clone().unwrap_or_default())
+                .collect::<Vec<_>>();
+            let bytes = encode_membership(&merged_codes(lists));
+            let offset = self.file.stream_position().map_err(io)?;
+            self.file.write_all(&bytes).map_err(io)?;
+            memberships[column] = Some(Page {
+                offset,
+                length: u32::try_from(bytes.len())
+                    .map_err(|_| invalid("membership page length overflow"))?,
+                hash: checksum(&bytes),
+            });
+        }
+        let offset = self.file.stream_position().map_err(io)?;
+        self.file.write_all(&index).map_err(io)?;
+        let index = Span {
+            offset,
+            length: u32::try_from(index.len()).map_err(|_| invalid("index page length overflow"))?,
+        };
+        let mut rows = 0_usize;
+        let mut lengths = Vec::with_capacity(parts);
+        let mut span = None;
+        for pending in self.pending.drain(..) {
+            rows = rows.checked_add(pending.rows).ok_or_else(|| invalid("row count overflow"))?;
+            lengths.push(
+                u32::try_from(pending.rows).map_err(|_| invalid("part row count overflow"))?,
+            );
+            span = Some(span.map_or((pending.order, pending.order), |(first, _)| {
+                (first, pending.order)
+            }));
+        }
+        self.order.push(span.ok_or_else(|| invalid("a stripe was flushed with no parts"))?);
+        self.table.stripes.push(Stripe {
+            rows,
+            parts: lengths,
+            index,
+            pages,
+            memberships,
+            zone: Zone::from_ranges(ranges),
+        });
         Ok(())
     }
 
@@ -605,38 +707,43 @@ impl Writer {
         let ty = &self.table.fields[column].ty;
         let mut start = 0_u64;
         for stripe in &self.table.stripes {
+            let spans = read_index(&self.file, stripe, column)?;
             let page = stripe.pages[column];
             let mut bytes = vec![0; page.length as usize];
             read_at(&self.file, page.offset, &mut bytes)?;
-            if checksum(&bytes) != page.hash {
-                return Err(invalid("column page checksum differs while building frequencies"));
-            }
-            let vector = decode(ty, stripe.rows, &bytes, None)?;
-            // row at a time: frequency construction visits decoded values to update bounded candidates.
-            for row in 0..stripe.rows {
-                let value = if vector.is_null_at(row) {
-                    FrequencyValue::Null
-                } else {
-                    // An unsigned column has no signed reading, and the documented fallback is the
-                    // value itself. Every unsigned width the format stores fits in the `i128` a
-                    // candidate is keyed by, so nothing is lost on the way through.
-                    let widened = match vector.signed_at(row) {
-                        Some(value) => Some(value),
-                        None => match vector.value_at(row) {
-                            Value::UTinyInt(value) => Some(i128::from(value)),
-                            Value::USmallInt(value) => Some(i128::from(value)),
-                            Value::UInteger(value) => Some(i128::from(value)),
-                            Value::UBigInt(value) => Some(i128::from(value)),
-                            _ => None,
-                        },
+            for (span, &rows) in spans.iter().zip(&stripe.parts) {
+                let part = part_bytes(&bytes, *span)?;
+                if checksum(part) != span.hash {
+                    return Err(invalid("column page checksum differs while building frequencies"));
+                }
+                let rows = rows as usize;
+                let vector = decode(ty, rows, part, None)?;
+                // row at a time: frequency construction visits decoded values to update bounded candidates.
+                for row in 0..rows {
+                    let value = if vector.is_null_at(row) {
+                        FrequencyValue::Null
+                    } else {
+                        // An unsigned column has no signed reading, and the documented fallback is
+                        // the value itself. Every unsigned width the format stores fits in the
+                        // `i128` a candidate is keyed by, so nothing is lost on the way through.
+                        let widened = match vector.signed_at(row) {
+                            Some(value) => Some(value),
+                            None => match vector.value_at(row) {
+                                Value::UTinyInt(value) => Some(i128::from(value)),
+                                Value::USmallInt(value) => Some(i128::from(value)),
+                                Value::UInteger(value) => Some(i128::from(value)),
+                                Value::UBigInt(value) => Some(i128::from(value)),
+                                _ => None,
+                            },
+                        };
+                        FrequencyValue::Integer(widened.ok_or_else(|| {
+                            invalid("numeric frequency page did not contain an integer value")
+                        })?)
                     };
-                    FrequencyValue::Integer(widened.ok_or_else(|| {
-                        invalid("numeric frequency page did not contain an integer value")
-                    })?)
-                };
-                visit(start.saturating_add(row as u64), value);
+                    visit(start.saturating_add(row as u64), value);
+                }
+                start = start.saturating_add(rows as u64);
             }
-            start = start.saturating_add(stripe.rows as u64);
         }
         Ok(())
     }
@@ -717,7 +824,14 @@ impl Writer {
             .into_iter()
             .zip(std::mem::take(&mut self.table.stripes))
             .collect::<Vec<_>>();
-        stripes.sort_by_key(|(order, _)| *order);
+        stripes.sort_by_key(|(order, _)| order.0);
+        let mut previous: Option<(u64, u64)> = None;
+        for ((first, last), _) in &stripes {
+            if previous.is_some_and(|previous| previous >= *first) {
+                return Err(invalid("chunks did not arrive in source order"));
+            }
+            previous = Some(*last);
+        }
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
         self.table.frequencies = self.numeric_frequencies()?;
         let dictionaries = std::mem::take(&mut self.dictionaries);
@@ -770,24 +884,46 @@ pub struct Reader {
     file: Arc<File>,
     table: Arc<Table>,
     dictionaries: Arc<Vec<OnceLock<Arc<Vector>>>>,
-    extents: Arc<Vec<Vec<ExtentPart>>>,
-    extent_cache: Arc<Vec<Mutex<Vec<CachedExtent>>>>,
+    /// Which stripe and which part of it every part of the table is, by table wide part number.
+    places: Arc<Vec<Place>>,
+    cache: Arc<Vec<Mutex<Vec<CachedColumn>>>>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct ExtentPart {
-    offset: u64,
+/// Where one table wide part number lands.
+#[derive(Debug, Clone, Copy)]
+struct Place {
+    stripe: u32,
+    part: u32,
+    rows: u32,
+}
+
+/// One part's bytes inside one column page.
+#[derive(Debug, Clone, Copy)]
+struct PartSpan {
+    start: usize,
     length: usize,
-    page_start: usize,
+    hash: u64,
 }
 
-#[derive(Debug)]
-struct CachedExtent {
-    offset: u64,
-    bytes: Arc<Vec<u8>>,
+/// What a reader holds for one stripe of one column.
+///
+/// The index is small and is loaded whether the caller wants the whole page or one part of it. The
+/// page is loaded only by a scan, because a sparse fetch that wants a thousand rows out of sixty
+/// four thousand would be reading sixty four times what it uses.
+#[derive(Debug, Clone)]
+struct CachedColumn {
+    stripe: usize,
+    index: Arc<Vec<PartSpan>>,
+    page: Option<Arc<Vec<u8>>>,
 }
 
-const CACHED_EXTENTS_PER_COLUMN: usize = 8;
+/// Stripes of one column a reader keeps the bytes of.
+///
+/// Every live scan instance is somewhere different in the table, so this has to hold at least as
+/// many stripes as there are workers on a column or the workers evict each other's pages and read
+/// them again. It also multiplies by the page size, which is a quarter of a megabyte for a four
+/// byte column, and by the number of columns a query touches.
+const CACHED_STRIPES_PER_COLUMN: usize = 4;
 
 type CrossingCache = OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>;
 
@@ -795,8 +931,7 @@ type CrossingCache = OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>;
 struct NativeText {
     file: Arc<File>,
     offsets: Vec<u32>,
-    /// How many entries the sorted order has, which is the value count for a file that stores one
-    /// and zero for a file written before version 9, which did not.
+    /// How many entries the sorted order has, which is the value count.
     ranks: usize,
     /// Where the sorted order starts in the file. It is read a block at a time and only when
     /// something searches it, so a query that never compares this column against a literal never
@@ -1029,44 +1164,67 @@ impl TextSource for NativeText {
     }
 }
 
-/// Maps each logical page to the bounded contiguous read that contains it.
-fn extent_parts(table: &Table) -> Result<Vec<Vec<ExtentPart>>> {
-    let mut refs = Vec::with_capacity(table.stripes.len().saturating_mul(table.fields.len()));
-    for (stripe, entry) in table.stripes.iter().enumerate() {
-        for (column, page) in entry.pages.iter().enumerate() {
-            refs.push((page.offset, column, stripe, page.length as usize));
+/// Every table wide part number in order, with the stripe it belongs to.
+fn places(table: &Table) -> Result<Vec<Place>> {
+    let mut places = Vec::with_capacity(table.stripes.len().saturating_mul(STRIPE_PARTS));
+    for (at, stripe) in table.stripes.iter().enumerate() {
+        let index = u32::try_from(at).map_err(|_| invalid("too many stripes"))?;
+        for (part, &rows) in stripe.parts.iter().enumerate() {
+            places.push(Place {
+                stripe: index,
+                part: u32::try_from(part).map_err(|_| invalid("too many parts in a stripe"))?,
+                rows,
+            });
         }
     }
-    refs.sort_unstable_by_key(|entry| entry.0);
-    let mut parts = vec![vec![ExtentPart::default(); table.fields.len()]; table.stripes.len()];
-    let mut first = 0;
-    while first < refs.len() {
-        let (offset, column, _, first_len) = refs[first];
-        let mut end = offset
-            .checked_add(first_len as u64)
-            .ok_or_else(|| invalid("column extent range overflow"))?;
-        let mut last = first + 1;
-        while last < refs.len()
-            && last - first < EXTENT_STRIPES
-            && refs[last].1 == column
-            && refs[last].0 == end
-        {
-            end = end
-                .checked_add(refs[last].3 as u64)
-                .ok_or_else(|| invalid("column extent range overflow"))?;
-            last += 1;
-        }
-        let length = usize::try_from(end - offset)
-            .map_err(|_| invalid("column extent length exceeds this platform"))?;
-        for &(_, _, stripe, _) in &refs[first..last] {
-            let page = table.stripes[stripe].pages[column];
-            let page_start = usize::try_from(page.offset - offset)
-                .map_err(|_| invalid("column page offset exceeds this platform"))?;
-            parts[stripe][column] = ExtentPart { offset, length, page_start };
-        }
-        first = last;
+    Ok(places)
+}
+
+/// Reads one column's section of a stripe's index page.
+///
+/// The section carries its own checksum, so a reader that wants one column out of a hundred and
+/// five preads a few hundred bytes and still knows that what it got is what was written.
+fn read_index(file: &File, stripe: &Stripe, column: usize) -> Result<Vec<PartSpan>> {
+    let parts = stripe.parts.len();
+    let section = index_section(parts)?;
+    let at = column.checked_mul(section).ok_or_else(|| invalid("index page offset overflow"))?;
+    let end = at.checked_add(section).ok_or_else(|| invalid("index page offset overflow"))?;
+    if end > stripe.index.length as usize {
+        return Err(invalid("index page is shorter than its columns"));
     }
-    Ok(parts)
+    let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
+    let mut bytes = vec![0; section];
+    let offset = stripe
+        .index
+        .offset
+        .checked_add(at as u64)
+        .ok_or_else(|| invalid("index page offset overflow"))?;
+    read_at(file, offset, &mut bytes)?;
+    let entries = section - size_of::<u64>();
+    let stored = u64::from_le_bytes(bytes[entries..].try_into().expect("eight bytes"));
+    if checksum(&bytes[..entries]) != stored {
+        return Err(invalid("index page section checksum differs"));
+    }
+    let mut spans = Vec::with_capacity(parts);
+    let mut start = 0_usize;
+    for part in 0..parts {
+        let at = part * INDEX_ENTRY;
+        let length =
+            u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes")) as usize;
+        let hash = u64::from_le_bytes(bytes[at + 4..at + 12].try_into().expect("eight bytes"));
+        spans.push(PartSpan { start, length, hash });
+        start = start.checked_add(length).ok_or_else(|| invalid("column page length overflow"))?;
+    }
+    if start != page.length as usize {
+        return Err(invalid("column page length differs from its index"));
+    }
+    Ok(spans)
+}
+
+/// One part's bytes out of a whole column page.
+fn part_bytes(page: &[u8], span: PartSpan) -> Result<&[u8]> {
+    let end = span.start.checked_add(span.length).ok_or_else(|| invalid("part range overflow"))?;
+    page.get(span.start..end).ok_or_else(|| invalid("part exceeds its column page"))
 }
 
 impl Reader {
@@ -1084,8 +1242,7 @@ impl Reader {
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header).map_err(io)?;
         let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-        let known = [(MAGIC, FORMAT), (MAGIC_V8, 8), (MAGIC_V7, 7)];
-        if !known.iter().any(|(magic, known)| &header[..8] == *magic && version == *known) {
+        if &header[..8] != MAGIC || version != FORMAT {
             return Err(invalid("magic or major version is unsupported"));
         }
         let mut selected = None;
@@ -1110,19 +1267,31 @@ impl Reader {
             }
         }
         let (_, bytes) = selected.ok_or_else(|| invalid("no committed directory slot is valid"))?;
-        let table = decode_directory(&bytes, size, version)?;
-        let extents = extent_parts(&table)?;
+        let table = decode_directory(&bytes, size)?;
+        let places = places(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
-        let extent_cache = (0..table.fields.len())
-            .map(|_| Mutex::new(Vec::with_capacity(CACHED_EXTENTS_PER_COLUMN)))
+        let cache = (0..table.fields.len())
+            .map(|_| Mutex::new(Vec::with_capacity(CACHED_STRIPES_PER_COLUMN)))
             .collect::<Vec<_>>();
         Ok(Self {
             file: Arc::new(file),
             table: Arc::new(table),
             dictionaries: Arc::new(dictionaries),
-            extents: Arc::new(extents),
-            extent_cache: Arc::new(extent_cache),
+            places: Arc::new(places),
+            cache: Arc::new(cache),
         })
+    }
+
+    /// How many parts the table has, which is how many chunks a scan of it reads.
+    #[must_use]
+    pub fn parts(&self) -> usize {
+        self.places.len()
+    }
+
+    /// Rows in one part, or zero when the part number is past the table.
+    #[must_use]
+    pub fn part_rows(&self, at: usize) -> usize {
+        self.places.get(at).map_or(0, |place| place.rows as usize)
     }
 
     /// The committed table directory.
@@ -1330,50 +1499,50 @@ impl Reader {
             Arc::clone(&self.file),
             page,
             &self.table.fields[column].ty,
-            self.table.version >= 9,
         )?);
         let _ = self.dictionaries[column].set(Arc::clone(&dictionary));
         Ok(Some(self.dictionaries[column].get().map_or(dictionary, Arc::clone)))
     }
 
-    /// Reads only the named columns from one stripe.
+    /// Reads only the named columns from one part.
+    ///
+    /// The whole stripe page each column lives in is read and kept, because a scan asks for the
+    /// parts of a stripe one after another and this is what turns sixty four reads into one.
     ///
     /// # Errors
     ///
-    /// If a stripe, column, page, or checksum is invalid.
-    pub fn read(&self, stripe: usize, columns: &[usize]) -> Result<Chunk> {
-        self.read_impl(stripe, columns, true)
+    /// If a part, column, page, or checksum is invalid.
+    pub fn read(&self, part: usize, columns: &[usize]) -> Result<Chunk> {
+        self.read_impl(part, columns, true)
     }
 
-    /// Reads named columns from one stripe without prefetching adjacent stripe pages.
+    /// Reads named columns from one part without keeping the stripe page it came out of.
     ///
-    /// This is intended for sparse row fetches after a selective TopN or filter. Sequential scans
-    /// should use [`Self::read`] so adjacent pages share one extent read.
+    /// This is for sparse row fetches after a selective TopN or filter, which reach a few parts of
+    /// a stripe rather than all of them. A caller that will read most of a stripe should use
+    /// [`Self::read`] instead, because this reads and discards the page index every time.
     ///
     /// # Errors
     ///
-    /// If a stripe, column, page, or checksum is invalid.
-    pub fn read_sparse(&self, stripe: usize, columns: &[usize]) -> Result<Chunk> {
-        self.read_impl(stripe, columns, false)
+    /// If a part, column, page, or checksum is invalid.
+    pub fn read_sparse(&self, part: usize, columns: &[usize]) -> Result<Chunk> {
+        self.read_impl(part, columns, false)
     }
 
-    /// Whether an exact global-code membership index proves that a stripe cannot contain any of
-    /// the sorted candidate codes.
-    ///
-    /// A file written before v8 has no membership index and conservatively keeps the stripe.
+    /// Whether an exact global-code membership index proves that the stripe holding a part cannot
+    /// contain any of the sorted candidate codes.
     ///
     /// # Errors
     ///
-    /// If the stripe, column, index page, checksum, or delta stream is invalid.
-    pub fn skips_codes(&self, stripe: usize, column: usize, candidates: &[u32]) -> Result<bool> {
+    /// If the part, column, index page, checksum, or delta stream is invalid.
+    pub fn skips_codes(&self, part: usize, column: usize, candidates: &[u32]) -> Result<bool> {
         if candidates.is_empty() {
             return Ok(true);
         }
         if candidates.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(Error::internal("native code candidates are not sorted and unique"));
         }
-        let stripe =
-            self.table.stripes.get(stripe).ok_or_else(|| invalid("stripe index out of range"))?;
+        let stripe = self.stripe_of(part)?;
         let Some(page) = stripe.memberships.get(column).copied().flatten() else {
             return Ok(false);
         };
@@ -1395,10 +1564,63 @@ impl Reader {
         Ok(true)
     }
 
-    fn read_impl(&self, stripe: usize, columns: &[usize], prefetch: bool) -> Result<Chunk> {
-        let stripe_index = stripe;
-        let stripe =
-            self.table.stripes.get(stripe).ok_or_else(|| invalid("stripe index out of range"))?;
+    fn stripe_of(&self, part: usize) -> Result<&Stripe> {
+        let place = self.places.get(part).ok_or_else(|| invalid("part index out of range"))?;
+        self.table
+            .stripes
+            .get(place.stripe as usize)
+            .ok_or_else(|| invalid("stripe index out of range"))
+    }
+
+    /// The page index of one column of one stripe, and its page when the caller wants all of it.
+    ///
+    /// The file is never read under the lock. Two workers that want the same page at the same time
+    /// can both read it, and the second one to finish finds the first one's copy and drops its own,
+    /// which costs one duplicated read and never costs a worker a wait.
+    fn held(&self, at: usize, stripe: &Stripe, column: usize, whole: bool) -> Result<CachedColumn> {
+        let cache =
+            self.cache.get(column).ok_or_else(|| invalid("column index out of range"))?;
+        let found = {
+            let held = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
+            held.iter().find(|held| held.stripe == at).cloned()
+        };
+        if let Some(found) = found {
+            if !whole || found.page.is_some() {
+                return Ok(found);
+            }
+        }
+        let index = Arc::new(read_index(&self.file, stripe, column)?);
+        let page = if whole {
+            let span = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
+            let mut bytes = vec![0; span.length as usize];
+            read_at(&self.file, span.offset, &mut bytes)?;
+            Some(Arc::new(bytes))
+        } else {
+            None
+        };
+        let held = CachedColumn { stripe: at, index, page };
+        let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
+        match cached.iter().position(|held| held.stripe == at) {
+            Some(found) => cached[found] = held.clone(),
+            None => {
+                if cached.len() == CACHED_STRIPES_PER_COLUMN {
+                    cached.remove(0);
+                }
+                cached.push(held.clone());
+            }
+        }
+        Ok(held)
+    }
+
+    fn read_impl(&self, at: usize, columns: &[usize], whole: bool) -> Result<Chunk> {
+        let place = *self.places.get(at).ok_or_else(|| invalid("part index out of range"))?;
+        let index = place.stripe as usize;
+        let stripe = self
+            .table
+            .stripes
+            .get(index)
+            .ok_or_else(|| invalid("stripe index out of range"))?;
+        let rows = place.rows as usize;
         let mut picked = Vec::with_capacity(columns.len());
         for &column in columns {
             let field = self
@@ -1407,62 +1629,41 @@ impl Reader {
                 .get(column)
                 .ok_or_else(|| invalid("column index out of range"))?;
             let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
-            let part = self
-                .extents
-                .get(stripe_index)
-                .and_then(|parts| parts.get(column))
-                .ok_or_else(|| invalid("column extent is missing"))?;
-            let bytes = if !prefetch || part.length == page.length as usize {
-                let mut bytes = vec![0; page.length as usize];
-                read_at(&self.file, page.offset, &mut bytes)?;
-                Arc::new(bytes)
-            } else {
-                let cached = self.extent_cache[column]
-                    .lock()
-                    .map_err(|_| invalid("column extent cache is poisoned"))?
-                    .iter()
-                    .find(|cached| cached.offset == part.offset)
-                    .map(|cached| Arc::clone(&cached.bytes));
-                if let Some(bytes) = cached {
-                    bytes
-                } else {
-                    let mut bytes = vec![0; part.length];
-                    read_at(&self.file, part.offset, &mut bytes)?;
-                    let bytes = Arc::new(bytes);
-                    let mut cache = self.extent_cache[column]
-                        .lock()
-                        .map_err(|_| invalid("column extent cache is poisoned"))?;
-                    if let Some(cached) = cache.iter().find(|cached| cached.offset == part.offset) {
-                        Arc::clone(&cached.bytes)
-                    } else {
-                        if cache.len() == CACHED_EXTENTS_PER_COLUMN {
-                            cache.remove(0);
-                        }
-                        cache.push(CachedExtent { offset: part.offset, bytes: Arc::clone(&bytes) });
-                        bytes
-                    }
+            let held = self.held(index, stripe, column, whole)?;
+            let span = *held
+                .index
+                .get(place.part as usize)
+                .ok_or_else(|| invalid("part index out of range"))?;
+            let owned;
+            let bytes = match &held.page {
+                Some(held) => part_bytes(held, span)?,
+                None => {
+                    let offset = page
+                        .offset
+                        .checked_add(span.start as u64)
+                        .ok_or_else(|| invalid("part range overflow"))?;
+                    let mut bytes = vec![0; span.length];
+                    read_at(&self.file, offset, &mut bytes)?;
+                    owned = bytes;
+                    &owned
                 }
             };
-            let page_start = if prefetch { part.page_start } else { 0 };
-            let end = page_start
-                .checked_add(page.length as usize)
-                .ok_or_else(|| invalid("column page range overflow"))?;
-            let page_bytes = bytes
-                .get(page_start..end)
-                .ok_or_else(|| invalid("column page exceeds its extent"))?;
-            if checksum(page_bytes) != page.hash {
+            if checksum(bytes) != span.hash {
                 return Err(invalid("column page checksum differs"));
             }
             let dictionary = self.dictionary(column)?;
-            picked.push(decode(&field.ty, stripe.rows, page_bytes, dictionary)?);
+            picked.push(decode(&field.ty, rows, bytes, dictionary)?);
         }
-        Chunk::with_rows(picked, stripe.rows)
+        Chunk::with_rows(picked, rows)
     }
 
-    /// Whether persisted bounds prove that a stripe cannot match the predicates.
+    /// Whether persisted bounds prove that the stripe holding a part cannot match the predicates.
+    ///
+    /// The bounds are per stripe, so every part of a stripe gets the same answer. A scan that skips
+    /// one part of a stripe this way skips all of them.
     #[must_use]
-    pub fn skips(&self, stripe: usize, probes: &[Probe]) -> bool {
-        self.table.stripes.get(stripe).is_some_and(|stripe| stripe.zone.skips(probes))
+    pub fn skips(&self, part: usize, probes: &[Probe]) -> bool {
+        self.stripe_of(part).is_ok_and(|stripe| stripe.zone.skips(probes))
     }
 }
 
@@ -1581,20 +1782,7 @@ fn code_frequency(dictionary: &GlobalDictionary) -> FrequencySummary {
 }
 
 fn encode_directory(table: &Table) -> Result<Vec<u8>> {
-    encode_directory_version(table, FORMAT)
-}
-
-/// The eight byte tag that starts a directory of this version.
-fn directory_magic(version: u32) -> &'static [u8; 8] {
-    match version {
-        7 => DIRECTORY_V7,
-        8 => DIRECTORY_V8,
-        _ => DIRECTORY,
-    }
-}
-
-fn encode_directory_version(table: &Table, version: u32) -> Result<Vec<u8>> {
-    let mut out = directory_magic(version).to_vec();
+    let mut out = DIRECTORY.to_vec();
     let name = table.name.as_bytes();
     put_u16(&mut out, u16::try_from(name.len()).map_err(|_| invalid("table name too long"))?);
     out.extend_from_slice(name);
@@ -1622,24 +1810,26 @@ fn encode_directory_version(table: &Table, version: u32) -> Result<Vec<u8>> {
     for stripe in &table.stripes {
         put_u32(
             &mut out,
-            u32::try_from(stripe.rows).map_err(|_| invalid("stripe row count overflow"))?,
+            u32::try_from(stripe.parts.len()).map_err(|_| invalid("too many parts in a stripe"))?,
         );
+        for &rows in &stripe.parts {
+            put_u32(&mut out, rows);
+        }
+        put_u64(&mut out, stripe.index.offset);
+        put_u32(&mut out, stripe.index.length);
         for page in &stripe.pages {
             put_u64(&mut out, page.offset);
             put_u32(&mut out, page.length);
-            put_u64(&mut out, page.hash);
         }
-        if version >= 8 {
-            for (field, membership) in table.fields.iter().zip(&stripe.memberships) {
-                if field.ty != LogicalType::Varchar {
-                    continue;
-                }
-                let page = membership
-                    .ok_or_else(|| invalid("string page has no code membership index"))?;
-                put_u64(&mut out, page.offset);
-                put_u32(&mut out, page.length);
-                put_u64(&mut out, page.hash);
+        for (field, membership) in table.fields.iter().zip(&stripe.memberships) {
+            if field.ty != LogicalType::Varchar {
+                continue;
             }
+            let page =
+                membership.ok_or_else(|| invalid("string page has no code membership index"))?;
+            put_u64(&mut out, page.offset);
+            put_u32(&mut out, page.length);
+            put_u64(&mut out, page.hash);
         }
         for range in stripe.zone.columns() {
             put_bound(&mut out, range.low.as_ref())?;
@@ -1767,9 +1957,9 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
+fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     let mut cur = Cursor { bytes, at: 0 };
-    if cur.take(8)? != directory_magic(version) {
+    if cur.take(8)? != DIRECTORY {
         return Err(invalid("directory magic differs"));
     }
     let name = cur.text()?;
@@ -1812,41 +2002,63 @@ fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
     let mut stripes = Vec::with_capacity(count);
     let mut total = 0_usize;
     for _ in 0..count {
-        let stripe_rows = cur.u32()? as usize;
-        if stripe_rows == 0 {
-            return Err(invalid("empty stripe"));
+        let count = cur.u32()? as usize;
+        if count == 0 || count > STRIPE_PARTS {
+            return Err(invalid("stripe part count is outside its bound"));
+        }
+        let mut parts = Vec::with_capacity(count);
+        let mut stripe_rows = 0_usize;
+        for _ in 0..count {
+            let rows = cur.u32()?;
+            if rows == 0 {
+                return Err(invalid("empty part"));
+            }
+            parts.push(rows);
+            stripe_rows = stripe_rows
+                .checked_add(rows as usize)
+                .ok_or_else(|| invalid("stripe row count overflow"))?;
         }
         total =
             total.checked_add(stripe_rows).ok_or_else(|| invalid("stripe row count overflow"))?;
+        let index = Span { offset: cur.u64()?, length: cur.u32()? };
+        let section = index_section(count)?;
+        let wanted = section
+            .checked_mul(width)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| invalid("index page length overflow"))?;
+        let end = index
+            .offset
+            .checked_add(u64::from(index.length))
+            .ok_or_else(|| invalid("index page offset overflow"))?;
+        if index.offset < HEADER || end > size || index.length != wanted {
+            return Err(invalid("index page range is outside the file"));
+        }
         let mut pages = Vec::with_capacity(width);
         for _ in 0..width {
             let offset = cur.u64()?;
             let length = cur.u32()?;
-            let hash = cur.u64()?;
             let end = offset
                 .checked_add(u64::from(length))
                 .ok_or_else(|| invalid("page offset overflow"))?;
             if offset < HEADER || end > size || length as usize > MAX_PAGE {
                 return Err(invalid("page range is outside the file"));
             }
-            pages.push(Page { offset, length, hash });
+            pages.push(Span { offset, length });
         }
         let mut memberships = vec![None; width];
-        if version >= 8 {
-            for (column, field) in fields.iter().enumerate() {
-                if field.ty != LogicalType::Varchar {
-                    continue;
-                }
-                let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
-                let end = page
-                    .offset
-                    .checked_add(u64::from(page.length))
-                    .ok_or_else(|| invalid("membership page offset overflow"))?;
-                if page.offset < HEADER || end > size || page.length as usize > MAX_PAGE {
-                    return Err(invalid("membership page range is outside the file"));
-                }
-                memberships[column] = Some(page);
+        for (column, field) in fields.iter().enumerate() {
+            if field.ty != LogicalType::Varchar {
+                continue;
             }
+            let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+            let end = page
+                .offset
+                .checked_add(u64::from(page.length))
+                .ok_or_else(|| invalid("membership page offset overflow"))?;
+            if page.offset < HEADER || end > size || page.length as usize > MAX_PAGE {
+                return Err(invalid("membership page range is outside the file"));
+            }
+            memberships[column] = Some(page);
         }
         let mut ranges = Vec::with_capacity(width);
         for _ in 0..width {
@@ -1860,6 +2072,8 @@ fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
         }
         stripes.push(Stripe {
             rows: stripe_rows,
+            parts,
+            index,
             pages,
             memberships,
             zone: Zone::from_ranges(ranges),
@@ -1871,11 +2085,9 @@ fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
     let frequencies = if cur.at == bytes.len() {
         vec![None; width]
     } else {
-        let frequency_version = match cur.take(8)? {
-            magic if magic == FREQUENCIES_V1 => 1,
-            magic if magic == FREQUENCIES => 2,
-            _ => return Err(invalid("directory extension magic differs")),
-        };
+        if cur.take(8)? != FREQUENCIES {
+            return Err(invalid("directory extension magic differs"));
+        }
         if cur.u16()? as usize != width {
             return Err(invalid("frequency column count differs"));
         }
@@ -1930,9 +2142,7 @@ fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
                     if entries.windows(2).any(|pair| pair[0].count < pair[1].count) {
                         return Err(invalid("frequency entries are not descending"));
                     }
-                    let ordinals = if frequency_version == 1 {
-                        Vec::new()
-                    } else {
+                    let ordinals = {
                         let ordinal_count = cur.u32()? as usize;
                         if ordinal_count > FREQUENCY_ORDINALS || ordinal_count > rows {
                             return Err(invalid("frequency ordinal count exceeds its bound"));
@@ -1970,7 +2180,7 @@ fn decode_directory(bytes: &[u8], size: u64, version: u32) -> Result<Table> {
     if cur.at != bytes.len() {
         return Err(invalid("directory has trailing bytes"));
     }
-    Ok(Table { name, fields, stripes, rows, dictionaries, frequencies, version })
+    Ok(Table { name, fields, stripes, rows, dictionaries, frequencies })
 }
 
 fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
@@ -1996,7 +2206,7 @@ fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
 fn encode(
     vector: &Vector,
     global: Option<&mut GlobalDictionary>,
-) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+) -> Result<(Vec<u8>, Option<Vec<u32>>)> {
     let ty = vector.logical_type();
     // flatten: the file writer needs a uniform scalar page and does it once per loaded chunk.
     let flat = vector.flatten()?;
@@ -2012,7 +2222,7 @@ fn encode(
         }
         global_codes = Some(codes);
     }
-    let membership = global_codes.as_deref().map(encode_membership);
+    let membership = global_codes.as_deref().map(unique_codes);
     let dictionary = if global_codes.is_none() && ty == &LogicalType::Varchar {
         string_dictionary(&flat)?
     } else {
@@ -2150,14 +2360,93 @@ fn put_varint(out: &mut Vec<u8>, mut value: u32) {
     out.push(value as u8);
 }
 
-fn encode_membership(codes: &[u32]) -> Vec<u8> {
+/// The distinct codes of one part, which is what a stripe's membership index is merged from.
+fn unique_codes(codes: &[u32]) -> Vec<u32> {
     let mut unique = codes.to_vec();
     unique.sort_unstable();
     unique.dedup();
+    unique
+}
+
+/// The union of the sorted distinct codes of every part in a stripe.
+///
+/// Pairwise up a tree rather than one long list concatenated and sorted. Both are the same order of
+/// work on paper and the tree is the one that does not sort what is already in order: sixty four
+/// sorted lists become one in six passes over the values.
+fn merged_codes(lists: Vec<Vec<u32>>) -> Vec<u32> {
+    let mut lists = lists;
+    while lists.len() > 1 {
+        let mut next = Vec::with_capacity(lists.len().div_ceil(2));
+        for pair in lists.chunks(2) {
+            match pair {
+                [left, right] => next.push(merged_pair(left, right)),
+                [only] => next.push(only.clone()),
+                _ => {}
+            }
+        }
+        lists = next;
+    }
+    lists.pop().unwrap_or_default()
+}
+
+fn merged_pair(left: &[u32], right: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(left.len().saturating_add(right.len()));
+    let mut at = 0;
+    let mut to = 0;
+    while at < left.len() && to < right.len() {
+        match left[at].cmp(&right[to]) {
+            Ordering::Less => {
+                out.push(left[at]);
+                at += 1;
+            }
+            Ordering::Greater => {
+                out.push(right[to]);
+                to += 1;
+            }
+            Ordering::Equal => {
+                out.push(left[at]);
+                at += 1;
+                to += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&left[at..]);
+    out.extend_from_slice(&right[to..]);
+    out
+}
+
+/// The widest bounds and the total null count of a stripe, from the bounds of its parts.
+///
+/// A bound that is missing from any part is missing from the stripe, because a missing bound means
+/// nothing is known and a stripe that holds an unknown cannot claim one.
+fn merged_range(ranges: impl Iterator<Item = Range>) -> Range {
+    let mut merged = Range::default();
+    let mut first = true;
+    for range in ranges {
+        merged.nulls = merged.nulls.saturating_add(range.nulls);
+        if first {
+            merged.low = range.low;
+            merged.high = range.high;
+            first = false;
+            continue;
+        }
+        merged.low = match (merged.low.take(), range.low) {
+            (Some(held), Some(next)) => Some(held.smaller(next)),
+            _ => None,
+        };
+        merged.high = match (merged.high.take(), range.high) {
+            (Some(held), Some(next)) => Some(held.larger(next)),
+            _ => None,
+        };
+    }
+    merged
+}
+
+fn encode_membership(unique: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(unique.len().saturating_mul(2).saturating_add(5));
     put_varint(&mut out, u32::try_from(unique.len()).unwrap_or(u32::MAX));
     let mut previous = 0;
-    for (at, code) in unique.into_iter().enumerate() {
+    for (at, &code) in unique.iter().enumerate() {
         put_varint(&mut out, if at == 0 { code } else { code - previous });
         previous = code;
     }
@@ -2384,12 +2673,7 @@ fn encode_ranks(order: &[(u64, u32)]) -> Vec<u8> {
     out
 }
 
-fn open_global_dictionary(
-    file: Arc<File>,
-    page: Page,
-    ty: &LogicalType,
-    ordered: bool,
-) -> Result<Vector> {
+fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Result<Vector> {
     if ty != &LogicalType::Varchar {
         return Err(invalid("global dictionary belongs to a non-string column"));
     }
@@ -2404,11 +2688,11 @@ fn open_global_dictionary(
     let offset_len = (count + 1)
         .checked_mul(4)
         .ok_or_else(|| invalid("global dictionary offset count overflow"))?;
-    // A file written before version 9 has no sorted order, and one that has it keeps it out of the
-    // index on purpose. The index is read and checksummed in full the moment the column is first
-    // touched, and the order is two thirds the size of the offsets, so putting it there would make
-    // every query that reads a string column pay for a search that most of them never make.
-    let ranks = if ordered { count } else { 0 };
+    // The sorted order is kept out of the index on purpose. The index is read and checksummed in
+    // full the moment the column is first touched, and the order is two thirds the size of the
+    // offsets, so putting it there would make every query that reads a string column pay for a
+    // search that most of them never make.
+    let ranks = count;
     let rank_blocks = ranks.div_ceil(TEXT_RANK_BLOCK);
     let rank_len =
         ranks.checked_mul(RANK_ENTRY).ok_or_else(|| invalid("global dictionary rank overflow"))?;
@@ -2711,6 +2995,14 @@ mod tests {
         .expect("matching rows")
     }
 
+    fn sample_ids() -> Chunk {
+        Chunk::new(vec![
+            Vector::flat(LogicalType::Integer, Data::Int32(vec![7, 8, 9].into()))
+                .expect("integers"),
+        ])
+        .expect("one column")
+    }
+
     #[test]
     fn committed_file_reopens_and_reads_only_requested_columns() {
         let path = path("reopen");
@@ -2723,17 +3015,22 @@ mod tests {
             ],
         )
         .expect("new file");
-        writer.append(&sample()).expect("first stripe");
-        writer.append(&sample()).expect("second stripe");
+        writer.append(&sample()).expect("first part");
+        writer.append(&sample()).expect("second part");
         writer.finish().expect("commit");
         let reader = Reader::open(&path).expect("reopen from disk");
         assert_eq!(reader.table().rows(), 6);
-        assert_eq!(reader.table().stripes().len(), 2);
+        // Two appends below the stripe bound are two parts of one stripe, which is the whole point
+        // of the split: the directory describes the stripe and the scan still reads a part.
+        assert_eq!(reader.table().stripes().len(), 1);
+        assert_eq!(reader.parts(), 2);
+        assert_eq!(reader.part_rows(0), 3);
+        assert_eq!(reader.part_rows(1), 3);
         let text = reader.read(1, &[1]).expect("only text page");
         assert_eq!(text.width(), 1);
         assert_eq!(text.value_at(1, 0), Value::Null);
         assert_eq!(text.value_at(2, 0), Value::Varchar("long text after a slash".into()));
-        let sparse = reader.read_sparse(1, &[1]).expect("one page without extent prefetch");
+        let sparse = reader.read_sparse(1, &[1]).expect("one part without its whole page");
         assert_eq!(sparse.width(), 1);
         assert_eq!(sparse.value_at(1, 0), Value::Null);
         assert_eq!(sparse.value_at(2, 0), Value::Varchar("long text after a slash".into()));
@@ -2754,6 +3051,97 @@ mod tests {
         assert!(strings.contains(&(Value::Null, 2)));
         assert!(strings.contains(&(Value::Varchar("alpha".into()), 2)));
         assert!(strings.contains(&(Value::Varchar("long text after a slash".into()), 2)));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Parts past the stripe bound start a new stripe, and every part stays addressable on its own.
+    ///
+    /// This is the shape the format exists for, so both ends of the split are checked here. The
+    /// directory holds three stripes rather than a hundred and thirty one, and a read of any one
+    /// part still answers with that part's rows rather than with its whole stripe's.
+    #[test]
+    fn parts_past_the_stripe_bound_start_a_new_stripe() {
+        let path = path("stripe-bound");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("id", LogicalType::Integer),
+                Field::new("text", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        let parts = STRIPE_PARTS * 2 + 3;
+        for part in 0..parts {
+            let id = part as i32;
+            let chunk = Chunk::new(vec![
+                Vector::from_values(
+                    LogicalType::Integer,
+                    &[Value::Integer(id), Value::Integer(-id)],
+                )
+                .expect("integers"),
+                Vector::from_values(
+                    LogicalType::Varchar,
+                    &[Value::Varchar(format!("value {part}")), Value::Null],
+                )
+                .expect("strings"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        assert_eq!(reader.parts(), parts);
+        assert_eq!(reader.table().rows(), parts * 2);
+        assert_eq!(reader.table().stripes().len(), parts.div_ceil(STRIPE_PARTS));
+        assert_eq!(reader.table().stripes()[0].parts(), STRIPE_PARTS);
+        assert_eq!(reader.table().stripes()[0].rows(), STRIPE_PARTS * 2);
+        assert_eq!(reader.table().stripes()[2].parts(), 3);
+        // Backwards on purpose. The reader keeps four stripes a column, so a scan that walks the
+        // table the other way is what catches a cache that only ever holds what it just read.
+        for part in (0..parts).rev() {
+            let dense = reader.read(part, &[0, 1]).expect("a whole page read");
+            let sparse = reader.read_sparse(part, &[0, 1]).expect("one part read");
+            for chunk in [&dense, &sparse] {
+                assert_eq!(chunk.len(), 2, "part {part} has its own row count");
+                assert_eq!(chunk.value_at(0, 0), Value::Integer(part as i32));
+                assert_eq!(chunk.value_at(1, 0), Value::Integer(-(part as i32)));
+                assert_eq!(chunk.value_at(0, 1), Value::Varchar(format!("value {part}")));
+                assert_eq!(chunk.value_at(1, 1), Value::Null);
+            }
+        }
+        // The bounds are merged over the stripe, so they answer for the range the whole stripe
+        // covers and not for the part that was asked about.
+        let above = [Probe { column: 0, op: Op::Greater, value: Bound::Int(100) }];
+        assert!(reader.skips(0, &above), "the first stripe stops at 63");
+        assert!(!reader.skips(STRIPE_PARTS * 2, &above), "the third stripe reaches 130");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A damaged index page is caught before anything decodes a part out of it.
+    ///
+    /// The index is the one structure a reader trusts to find bytes with, so it carries a checksum
+    /// per column section rather than one for the page, and this is what says that check runs.
+    #[test]
+    fn a_damaged_index_page_is_an_error() {
+        let path = path("damaged-index");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        writer.append(&sample_ids()).expect("first part");
+        writer.append(&sample_ids()).expect("second part");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let index = reader.table.stripes[0].index;
+        let mut byte = [0; 1];
+        read_at(&reader.file, index.offset, &mut byte).expect("the first part length");
+        let mut file = OpenOptions::new().write(true).open(&path).expect("open index page");
+        file.seek(SeekFrom::Start(index.offset)).expect("index start");
+        file.write_all(&[!byte[0]]).expect("damage the first part length");
+        let error = reader.read(1, &[0]).expect_err("a damaged index must not be used");
+        assert!(error.message().contains("index page section checksum differs"), "{error}");
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -2963,7 +3351,7 @@ mod tests {
 
         let reader = Reader::open(&path).expect("valid directory");
         let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
-        let count = dictionary.ranks().expect("a v9 file stores one");
+        let count = dictionary.ranks().expect("a v10 file stores one");
         assert_eq!(count, spellings.len(), "every distinct value has a rank");
         let order = (0..count)
             .map(|rank| dictionary.code_at_rank(rank).expect("a code"))
@@ -3054,22 +3442,11 @@ mod tests {
             rows: 0,
             dictionaries: vec![Some(dictionary)],
             frequencies: vec![None],
-            version: FORMAT,
         };
         let directory = encode_directory(&table).expect("directory");
         let file_size = dictionary.offset + u64::from(dictionary.length) + 1;
 
-        let decoded =
-            decode_directory(&directory, file_size, FORMAT).expect("large lazy dictionary");
+        let decoded = decode_directory(&directory, file_size).expect("large lazy dictionary");
         assert_eq!(decoded.dictionaries[0].expect("dictionary").length, dictionary.length);
-        for old in [8, 7] {
-            let legacy = encode_directory_version(&table, old).expect("legacy directory");
-            let decoded =
-                decode_directory(&legacy, file_size, old).expect("an older directory still reads");
-            assert_eq!(
-                decoded.dictionaries[0].expect("legacy dictionary").length,
-                dictionary.length
-            );
-        }
     }
 }
