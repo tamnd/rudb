@@ -1,23 +1,32 @@
 //! The knobs `SET` turns.
 //!
 //! A setting is not a catalog entry.
-//! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so this is a match on a name rather than a map.
-//! [`Settings::NAMES`] is that set, and it is twenty two names for twenty settings because two have a second spelling.
+//! It is not named by a query, it has no schema, and the set of them is fixed at compile time, so which names exist lives in `rudb_functions::settingcatalog` and this is a match on a name rather than a map.
+//! There are a hundred and ninety two names for a hundred and eighty five settings, because seven of them have a second spelling.
 //! `max_memory` is `memory_limit` and `worker_threads` is `threads`, both ways round, which is what the binary does and what a client that writes the other spelling expects.
 //! [`canonical`] is the one place that mapping lives, so a name arriving through `SET`, through
 //! `RESET` or through a read of the value all land on the same setting.
 //!
+//! Twenty three of the names are settings the engine reads, and each of those has a field here.
+//! The other hundred and sixty nine name parts of DuckDB rudb has no counterpart for, they are read
+//! and written through their name and nothing else, and [`Settings::carried`] is where they live.
+//! `rudb_functions::Behaviour` is which of the two a name is and, for a carried one, whether taking
+//! any value but its default would be a lie. That split is argued for in the catalog's own module
+//! documentation, since it is a statement about the table rather than about this file.
+//!
 //! The seam settings are the exception to the fixed set, and they are a separate set rather than
 //! three more names. `SET seam.hash.table = 'unchained'` picks which implementation runs at one of
 //! the twenty seven seams in `rudb_seam`, there are twenty seven of them plus the policy, and none
-//! of them is a DuckDB setting, so putting them in [`Settings::NAMES`] would make `duckdb_settings()`
+//! of them is a DuckDB setting, so putting them in the settings table would make `duckdb_settings()`
 //! list twenty eight names the binary has never heard of. They go through the same [`Settings::apply`]
 //! anyway, because a second door into the settings is a second place for a scope rule to be wrong.
 //!
-//! Every setting here is global, which is the scope DuckDB gives them. `SET LOCAL` is
-//! refused with the sentence the binary prints, and `SET SESSION` is refused with the one it prints
-//! for a global setting, which is a different sentence and says which of the two the writer got
-//! wrong.
+//! Every setting the engine reads is global, which is the scope DuckDB gives it, and for those
+//! `SET LOCAL` is refused with the sentence the binary prints and `SET SESSION` with the one it
+//! prints for a global setting, which is a different sentence and says which of the two the writer
+//! got wrong. Fifteen of the carried names are per connection on the pin, and for those all three
+//! spellings are taken and land in the same place, because rudb has one connection's worth of state
+//! and nothing reads the value anyway.
 //!
 //! `duckdb_settings()` and `current_setting()` read these back from SQL, and both do it through
 //! [`Settings::session`] rather than by reaching in here, because neither the binder nor the
@@ -25,11 +34,13 @@
 //! is folded at binding, so the session is read once per statement and handed to both.
 //! [`crate::Database::setting`] is the Rust side of the same read.
 
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 use rudb_common::{
     DefaultNullOrder, Error, IdentifierCase, Memory, Result, Session, ShowBehavior, Value, human,
 };
+use rudb_functions::{Behaviour, LOCAL, SETTINGS, SettingEntry};
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
@@ -84,6 +95,13 @@ pub(crate) struct Settings {
     show_behavior: RwLock<String>,
     /// Whether warnings are promoted to errors.
     warnings_as_errors: RwLock<bool>,
+    /// The settings rudb takes and does not act on, as the statements have left them.
+    ///
+    /// Every setting above has a field of its own, because the engine reads it and a field is where
+    /// a thing that is read belongs. These are the other hundred and sixty nine, they are written
+    /// and read back through their name and nothing else looks at them, so one map holds the lot. A
+    /// name that is not in the map is at its default, which is why `RESET` is a removal here.
+    carried: RwLock<BTreeMap<&'static str, String>>,
     /// Which implementation runs at each seam, as `SET seam.<name>` has left it.
     ///
     /// Held here rather than in [`Config`], because there are twenty seven of them and a `Config`
@@ -94,32 +112,6 @@ pub(crate) struct Settings {
 }
 
 impl Settings {
-    /// Every setting name, in the order `duckdb_settings()` lists them.
-    pub(crate) const NAMES: [&'static str; 22] = [
-        "TimeZone",
-        "allow_parser_override_extension",
-        "current_dialect",
-        "default_null_order",
-        "default_order",
-        "dialect_compatibility_mode",
-        "disable_timestamptz_casts",
-        "disabled_optimizers",
-        "errors_as_json",
-        "ieee_floating_point_ops",
-        "integer_division",
-        "max_memory",
-        "memory_limit",
-        "null_on_division_by_zero",
-        "order_by_non_integer_literal",
-        "preserve_identifier_case",
-        "regex_match_operator_semantics",
-        "scalar_subquery_error_on_multiple_rows",
-        "show_behavior",
-        "threads",
-        "warnings_as_errors",
-        "worker_threads",
-    ];
-
     /// The settings a database opened with this configuration starts at.
     pub(crate) fn new(config: Config) -> Self {
         let default_time_zone = iana_time_zone::get_timezone()
@@ -148,6 +140,7 @@ impl Settings {
             scalar_subquery_error_on_multiple_rows: RwLock::new(true),
             show_behavior: RwLock::new("AUTO".to_string()),
             warnings_as_errors: RwLock::new(false),
+            carried: RwLock::new(BTreeMap::new()),
             seams: RwLock::new(rudb_seam::Settings::new()),
         }
     }
@@ -192,16 +185,21 @@ impl Settings {
     ) -> Result<()> {
         let word = if value.is_some() { "SET" } else { "RESET" };
         let verb = if value.is_some() { "set" } else { "reset" };
+        // Every setting rudb reads is global, and so is every seam, so naming the session or a local
+        // copy is naming something that does not exist. Fifteen of the names rudb carries and does
+        // not read are per connection on the pin, and those take all three spellings and land in the
+        // same place, because there is one connection's worth of state here and nothing reads the
+        // value either way.
+        let per_connection =
+            rudb_functions::setting_named(name).is_some_and(|it| it.scope == LOCAL);
         match scope {
-            Scope::Local => {
+            Scope::Local if !per_connection => {
                 return Err(Error::not_implemented(format!("{word} LOCAL is not implemented.")));
             }
-            // Every setting here is global, so naming the session is naming a copy that does not
-            // exist. The day one of them is per connection this becomes a question about the name.
-            Scope::Session => {
+            Scope::Session if !per_connection => {
                 return Err(Error::catalog(format!("option \"{name}\" cannot be {verb} locally")));
             }
-            Scope::Global | Scope::Unwritten => {}
+            _ => {}
         }
         if is_seam(name) {
             // `RESET seam.hash.table` is the same thing as setting it to `default`, which is the
@@ -217,8 +215,11 @@ impl Settings {
                 .unwrap_or_else(|held| held.into_inner())
                 .set(name, text.trim());
         }
-        if !Self::NAMES.iter().any(|known| known.eq_ignore_ascii_case(name)) {
+        let Some(entry) = rudb_functions::setting_named(canonical(name)) else {
             return Err(Error::catalog(rudb_functions::unknown_setting(name)));
+        };
+        if entry.behaviour != Behaviour::Honoured {
+            return self.carry(entry, value);
         }
         match canonical(name) {
             "TimeZone" => {
@@ -441,9 +442,54 @@ impl Settings {
                 }
                 *self.warnings_as_errors.write().unwrap_or_else(|held| held.into_inner()) = false;
             }
-            _ => unreachable!("the name was one of NAMES a moment ago"),
+            _ => unreachable!("the name was an honoured setting a moment ago"),
         }
         Ok(())
+    }
+
+    /// Takes a value for a setting rudb does not read, and refuses one that would be a promise.
+    ///
+    /// A `RESET` is a removal rather than a write of the default, so the map only ever holds the
+    /// names a statement actually set and a default that changes does not leave stale copies behind.
+    ///
+    /// # Errors
+    ///
+    /// For a value the setting's own type cannot read, and for any value but the default of a
+    /// setting whose default is the only thing rudb does.
+    fn carry(&self, entry: &'static SettingEntry, value: Option<&Value>) -> Result<()> {
+        let default = match entry.behaviour {
+            Behaviour::Honoured => unreachable!("an honoured setting has a field of its own"),
+            Behaviour::Knob(default) | Behaviour::DefaultOnly(default) => default,
+        };
+        let Some(value) = value else {
+            self.carried.write().unwrap_or_else(|held| held.into_inner()).remove(entry.name);
+            return Ok(());
+        };
+        let written = typed(entry, value)?;
+        if matches!(entry.behaviour, Behaviour::DefaultOnly(_))
+            && !written.eq_ignore_ascii_case(default)
+        {
+            return Err(Error::not_implemented(format!(
+                "SET {} = '{written}' is not implemented. rudb behaves as if {} were '{default}' and takes no other value, because a setting it accepted and did not act on would be a wrong answer one statement later.",
+                entry.name, entry.name
+            )));
+        }
+        self.carried.write().unwrap_or_else(|held| held.into_inner()).insert(entry.name, written);
+        Ok(())
+    }
+
+    /// What a setting rudb does not read is at now, which is its default until a statement sets it.
+    fn carried(&self, entry: &SettingEntry) -> String {
+        let default = match entry.behaviour {
+            Behaviour::Honoured => unreachable!("an honoured setting has a field of its own"),
+            Behaviour::Knob(default) | Behaviour::DefaultOnly(default) => default,
+        };
+        self.carried
+            .read()
+            .unwrap_or_else(|held| held.into_inner())
+            .get(entry.name)
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
     }
 
     /// One setting, in the spelling DuckDB prints for it.
@@ -456,6 +502,12 @@ impl Settings {
             return self.seams().get(name).ok_or_else(|| {
                 Error::catalog(format!("no seam called {name}, see rudb_strategies() for the list"))
             });
+        }
+        let Some(entry) = rudb_functions::setting_named(canonical(name)) else {
+            return Err(Error::catalog(rudb_functions::unknown_setting(name)));
+        };
+        if entry.behaviour != Behaviour::Honoured {
+            return Ok(self.carried(entry));
         }
         let config = self.config();
         match canonical(name) {
@@ -625,7 +677,12 @@ impl Settings {
             _ => ShowBehavior::Auto,
         });
         session.set_warnings_as_errors(warnings_as_errors);
-        for name in Self::NAMES {
+        for entry in SETTINGS {
+            if entry.behaviour != Behaviour::Honoured {
+                session.set(entry.name, self.carried(entry));
+                continue;
+            }
+            let name = entry.name;
             session.set(
                 name,
                 match canonical(name) {
@@ -651,7 +708,7 @@ impl Settings {
                     "show_behavior" => show_behavior.clone(),
                     "threads" => threads.clone(),
                     "warnings_as_errors" => warnings_as_errors.to_string(),
-                    other => unreachable!("{other} is not one of NAMES"),
+                    other => unreachable!("{other} is not an honoured setting"),
                 },
             );
         }
@@ -663,29 +720,34 @@ impl Settings {
     }
 }
 
-/// The setting a name means, which is itself for every name but the two aliases.
+/// The setting a name means, which is itself for every name but one half of each alias pair.
 ///
-/// DuckDB puts the alias list on `max_memory` and `worker_threads` and leaves it empty on
-/// `memory_limit` and `threads`, so by its own table the second of each pair is the canonical one.
-/// That is the way round it is here too, because `memory_limit` and `threads` are the names the
-/// documentation uses and the names everything else in rudb already spells.
+/// Seven settings have two spellings and the pin gives each spelling a row of its own, so one of the
+/// two has to be the one everything else here reads and writes. For the three rudb acts on that is
+/// the spelling the rest of the engine already uses, which is `memory_limit`, `threads` and
+/// `default_null_order`. For the other four nothing here reads either spelling, so it is whichever
+/// one the pin puts in the other's alias list, the way round the first two of the three landed
+/// anyway.
+///
+/// A name that is not a setting comes back as written, so that whoever asked gets to say so.
+const ALIASES: [(&str, &str); 7] = [
+    ("max_memory", "memory_limit"),
+    ("worker_threads", "threads"),
+    ("null_order", "default_null_order"),
+    ("checkpoint_threshold", "wal_autocheckpoint"),
+    ("max_streaming_buffer_size", "streaming_buffer_size"),
+    ("profiling_output", "profile_output"),
+    ("username", "user"),
+];
+
+/// The setting a name means, in the spelling this file and the settings table both use for it.
 fn canonical(name: &str) -> &str {
-    if name.eq_ignore_ascii_case("timezone") {
-        return "TimeZone";
+    for (written, meant) in ALIASES {
+        if name.eq_ignore_ascii_case(written) {
+            return meant;
+        }
     }
-    if name.eq_ignore_ascii_case("default_order") {
-        return "default_order";
-    }
-    if name.eq_ignore_ascii_case("default_null_order") {
-        return "default_null_order";
-    }
-    if name.eq_ignore_ascii_case("max_memory") {
-        return "memory_limit";
-    }
-    if name.eq_ignore_ascii_case("worker_threads") {
-        return "threads";
-    }
-    Settings::NAMES.iter().copied().find(|known| known.eq_ignore_ascii_case(name)).unwrap_or(name)
+    rudb_functions::setting_named(name).map_or(name, |entry| entry.name)
 }
 
 /// Whether this name is a seam rather than one of the settings DuckDB has.
@@ -699,7 +761,7 @@ fn canonical(name: &str) -> &str {
 /// day DuckDB adds a setting whose name collides with a seam of ours, the compatible answer is the
 /// one that wins and the prefixed spelling is still there for the other one.
 fn is_seam(name: &str) -> bool {
-    if Settings::NAMES.contains(&name) {
+    if rudb_functions::setting_named(name).is_some() {
         return false;
     }
     name.starts_with(SEAM_PREFIX) || rudb_seam::seam_named(name).is_some()
@@ -746,26 +808,75 @@ fn boolean_of(value: &Value) -> Result<bool> {
     })
 }
 
-/// The thread count a value names.
-fn threads_of(value: &Value) -> Result<usize> {
-    let count = match value {
+/// A value in the text its setting's own type reads it back as.
+///
+/// The pin type checks a `SET` whether or not it goes on to read the setting, and rudb has to as
+/// well, or `SET partitioned_write_max_open_files = 'blue'` is a number setting holding a word and
+/// the mistake surfaces at whatever reads it instead of at the statement that made it. The types
+/// here are the pin's spellings from the settings table, so this is a match on those and not on a
+/// [`rudb_common::LogicalType`]. Anything else is text, which is what `VARCHAR`, `VARCHAR[]` and the
+/// one `MAP` among them all want.
+fn typed(entry: &SettingEntry, value: &Value) -> Result<String> {
+    match entry.input_type {
+        "BOOLEAN" => Ok(boolean_of(value)?.to_string()),
+        "BIGINT" => Ok(integer_of(value, "INT64")?.to_string()),
+        "UBIGINT" => {
+            let count = integer_of(value, "UINT64")?;
+            if count < 0 {
+                return Err(Error::invalid_input(format!(
+                    "Failed to cast value: Could not convert string '{count}' to UINT64"
+                )));
+            }
+            Ok(count.to_string())
+        }
+        "DOUBLE" => Ok(double_of(value)?.to_string()),
+        _ => Ok(text_of(value)),
+    }
+}
+
+/// The whole number a value names, with the pin's type name in the sentence when it is not one.
+fn integer_of(value: &Value, wanted: &str) -> Result<i128> {
+    Ok(match value {
         Value::TinyInt(count) => i128::from(*count),
         Value::SmallInt(count) => i128::from(*count),
         Value::Integer(count) => i128::from(*count),
         Value::BigInt(count) => i128::from(*count),
         Value::HugeInt(count) => *count,
+        Value::UTinyInt(count) => i128::from(*count),
+        Value::USmallInt(count) => i128::from(*count),
+        Value::UInteger(count) => i128::from(*count),
+        Value::UBigInt(count) => i128::from(*count),
         Value::Varchar(text) => text.trim().parse::<i128>().map_err(|_| {
             Error::invalid_input(format!(
-                "Failed to cast value: Could not convert string '{text}' to INT64"
+                "Failed to cast value: Could not convert string '{text}' to {wanted}"
             ))
         })?,
         other => {
             return Err(Error::invalid_input(format!(
-                "Failed to cast value: Could not convert {} to INT64",
+                "Failed to cast value: Could not convert {} to {wanted}",
                 other.logical_type()
             )));
         }
-    };
+    })
+}
+
+/// The number a value names, for the one setting in the table whose type is `DOUBLE`.
+fn double_of(value: &Value) -> Result<f64> {
+    match value {
+        Value::Float(number) => Ok(f64::from(*number)),
+        Value::Double(number) => Ok(*number),
+        Value::Varchar(text) => text.trim().parse::<f64>().map_err(|_| {
+            Error::invalid_input(format!(
+                "Failed to cast value: Could not convert string '{text}' to DOUBLE"
+            ))
+        }),
+        other => integer_of(other, "DOUBLE").map(|count| count as f64),
+    }
+}
+
+/// The thread count a value names.
+fn threads_of(value: &Value) -> Result<usize> {
+    let count = integer_of(value, "INT64")?;
     // A `Syntax Error` for a value that is the right type and the wrong number is not the class
     // anybody would pick, and it is the class the binary prints, so it is the class here.
     usize::try_from(count)
@@ -856,17 +967,16 @@ mod tests {
     }
 
     #[test]
-    fn a_name_that_is_not_a_setting_says_so_with_the_names_there_are() {
+    fn a_name_that_is_not_a_setting_says_so_and_offers_the_nearest_ones() {
         let (settings, memory) = settings();
         let error = settings
             .apply(&memory, &Pool::default(), "bogus", Scope::Unwritten, None)
             .expect_err("not a setting");
         assert_eq!(error.code().duckdb_name(), "Catalog Error");
-        assert!(
-            error.message().starts_with("unrecognized configuration parameter \"bogus\""),
-            "{}",
-            error.message()
-        );
+        assert_eq!(error.message(), "unrecognized configuration parameter \"bogus\"");
+        let error = settings
+            .apply(&memory, &Pool::default(), "memory_limitt", Scope::Unwritten, None)
+            .expect_err("not a setting");
         assert!(error.message().contains("\"memory_limit\""), "{}", error.message());
     }
 
@@ -892,6 +1002,119 @@ mod tests {
             .apply(&memory, &Pool::default(), "threads", Scope::Session, None)
             .expect_err("no session copy");
         assert_eq!(error.message(), "option \"threads\" cannot be reset locally");
+    }
+
+    /// A knob is taken, kept and handed back, and nothing under it runs differently for it. The
+    /// point of taking it at all is that a script that sets one in its preamble gets to keep going.
+    #[test]
+    fn a_setting_the_engine_does_not_read_is_taken_and_read_back() {
+        let (settings, memory) = settings();
+        let pool = Pool::default();
+        assert_eq!(settings.value("enable_http_metadata_cache").expect("a setting"), "false");
+        settings
+            .apply(
+                &memory,
+                &pool,
+                "enable_http_metadata_cache",
+                Scope::Global,
+                Some(&Value::Boolean(true)),
+            )
+            .expect("a knob takes a value");
+        assert_eq!(settings.value("enable_http_metadata_cache").expect("a setting"), "true");
+        // A `RESET` puts back the default, which here is forgetting rather than writing.
+        settings
+            .apply(&memory, &pool, "enable_http_metadata_cache", Scope::Global, None)
+            .expect("a knob resets");
+        assert_eq!(settings.value("enable_http_metadata_cache").expect("a setting"), "false");
+        // The type is checked even though nothing reads the value, so the mistake lands on the
+        // statement that made it.
+        let text = Value::Varchar("blue".to_string());
+        let error = settings
+            .apply(&memory, &pool, "enable_http_metadata_cache", Scope::Global, Some(&text))
+            .expect_err("not a boolean");
+        assert_eq!(
+            error.message(),
+            "Failed to cast value: Could not convert string 'blue' to BOOL"
+        );
+        let error = settings
+            .apply(&memory, &pool, "partitioned_write_max_open_files", Scope::Global, Some(&text))
+            .expect_err("not a number");
+        assert_eq!(
+            error.message(),
+            "Failed to cast value: Could not convert string 'blue' to UINT64"
+        );
+    }
+
+    /// The other half of the rule. A setting that would change an answer is taken at the value rudb
+    /// already behaves as and refused at every other, because taking it and doing nothing about it
+    /// would turn one clear error into a wrong answer a statement later.
+    #[test]
+    fn a_setting_that_would_change_an_answer_is_taken_only_at_its_default() {
+        let (settings, memory) = settings();
+        let pool = Pool::default();
+        settings
+            .apply(
+                &memory,
+                &pool,
+                "preserve_insertion_order",
+                Scope::Global,
+                Some(&Value::Boolean(true)),
+            )
+            .expect("the value it already behaves as");
+        let error = settings
+            .apply(
+                &memory,
+                &pool,
+                "preserve_insertion_order",
+                Scope::Global,
+                Some(&Value::Boolean(false)),
+            )
+            .expect_err("rudb cannot stop preserving it");
+        assert_eq!(error.code().duckdb_name(), "Not implemented Error");
+        assert!(error.message().contains("rudb behaves as if"), "{error}");
+        // A reset is always fine, since it is asking for what it already is.
+        settings
+            .apply(&memory, &pool, "preserve_insertion_order", Scope::Global, None)
+            .expect("a reset asks for the default");
+    }
+
+    /// Fifteen of the carried names are per connection on the pin. rudb has one connection's worth
+    /// of state and reads none of the fifteen, so all three spellings are taken and land together.
+    #[test]
+    fn a_setting_the_pin_keeps_per_connection_takes_all_three_scopes() {
+        let (settings, memory) = settings();
+        let pool = Pool::default();
+        let renderer = Value::Varchar("json".to_string());
+        for scope in [Scope::Global, Scope::Session, Scope::Local, Scope::Unwritten] {
+            settings
+                .apply(&memory, &pool, "profiling_renderer_settings", scope, Some(&renderer))
+                .expect("a local setting takes every scope");
+        }
+        assert_eq!(settings.value("profiling_renderer_settings").expect("a setting"), "json");
+    }
+
+    /// Seven settings have two spellings, and both spellings are one setting however they are mixed.
+    #[test]
+    fn either_spelling_of_an_alias_pair_writes_what_the_other_one_reads() {
+        let (settings, memory) = settings();
+        let pool = Pool::default();
+        let pairs = [
+            ("checkpoint_threshold", "wal_autocheckpoint", "32.0 MiB"),
+            ("max_streaming_buffer_size", "streaming_buffer_size", "1.0 MiB"),
+            ("profiling_output", "profile_output", "somewhere"),
+            ("username", "user", "someone"),
+        ];
+        for (written, other, value) in pairs {
+            let held = Value::Varchar(value.to_string());
+            settings.apply(&memory, &pool, written, Scope::Global, Some(&held)).expect("a setting");
+            assert_eq!(settings.value(other).expect("a setting"), value, "{written}");
+            settings.apply(&memory, &pool, other, Scope::Global, None).expect("a setting");
+            assert_eq!(
+                settings.value(written).expect("a setting"),
+                settings.value(other).expect("a setting"),
+                "{written}"
+            );
+        }
     }
 
     #[test]

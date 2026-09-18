@@ -753,6 +753,16 @@ impl Binder<'_> {
             "BIGINT" => Value::BigInt(text.parse().map_err(|_| {
                 Error::internal(format!("{} is set to {text}, which is not a number", known.name))
             })?),
+            "UBIGINT" => Value::UBigInt(text.parse().map_err(|_| {
+                Error::internal(format!("{} is set to {text}, which is not a number", known.name))
+            })?),
+            "DOUBLE" => Value::Double(text.parse().map_err(|_| {
+                Error::internal(format!("{} is set to {text}, which is not a number", known.name))
+            })?),
+            // `VARCHAR`, and the six `VARCHAR[]` and one `MAP` among them, which come back as the
+            // text the pin prints for them rather than as a built list. A caller reading one of
+            // those is reading a setting rudb carries and does not act on, so the text is the whole
+            // of what there is to say about it.
             _ => Value::Varchar(text.to_string()),
         };
         Ok(Some(self.add_constant(value)))
