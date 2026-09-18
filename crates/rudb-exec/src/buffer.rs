@@ -19,26 +19,38 @@ use rudb_common::{Error, Result};
 use rudb_pipeline::{Morsel, Progress, Source};
 use rudb_vector::Chunk;
 
-/// A list of finished chunks and the cursor that hands them out.
+/// A list of finished chunks.
 #[derive(Debug, Default)]
 struct Shared {
     chunks: Mutex<Vec<Chunk>>,
-    handed: AtomicU64,
 }
 
 /// Chunks somebody else built, read back out one at a time.
 ///
-/// Cloning one gives another handle on the same list, which is how the sink half and the source
-/// half of a pipeline breaker end up looking at the same thing.
+/// Cloning one gives another handle on the same list and the same cursor, which is how the sink
+/// half and the source half of a pipeline breaker end up looking at the same thing. Reading the
+/// list a second time from the start is [`Buffered::reader`] instead.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Buffered {
     shared: Arc<Shared>,
+    handed: Arc<AtomicU64>,
 }
 
 impl Buffered {
     /// Nothing yet.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// The same chunks with a cursor of its own, so this handle sees all of them.
+    ///
+    /// A pipeline breaker wants the shared cursor, because the rows go past once and the threads
+    /// reading them are splitting one pass between them. A materialised `WITH` is the other case:
+    /// the rows are held so that every read of the name gets the whole list, and a read that only
+    /// saw the chunks another read had not taken yet would be a wrong answer rather than a slower
+    /// one.
+    pub(crate) fn reader(&self) -> Self {
+        Self { shared: Arc::clone(&self.shared), handed: Arc::new(AtomicU64::new(0)) }
     }
 
     /// Hand the finished chunks over, which is what a [`Sink::finalize`] does with its result.
@@ -74,7 +86,7 @@ impl Buffered {
 impl Source for Buffered {
     fn morsel(&self) -> Option<Morsel> {
         let chunks = self.shared.chunks.lock().ok()?.len() as u64;
-        let index = self.shared.handed.fetch_add(1, Ordering::Relaxed);
+        let index = self.handed.fetch_add(1, Ordering::Relaxed);
         if index >= chunks {
             return None;
         }
@@ -162,6 +174,23 @@ mod tests {
         let mut out = Chunk::empty(&[]);
         let why = buffered.read(&mut invented, &mut out).expect_err("there is no chunk four");
         assert!(why.to_string().contains("a chunk nobody built"), "{why}");
+    }
+
+    /// Two reads of a materialised `WITH` both get the whole list, and a clone is still the same
+    /// reader as the one it was cloned from.
+    #[test]
+    fn a_reader_starts_again_and_a_clone_carries_on() {
+        let buffered = Buffered::new();
+        buffered.fill(vec![chunk(&[1]), chunk(&[2])]).expect("two chunks");
+
+        let one = buffered.reader();
+        let two = buffered.reader();
+        assert!(one.morsel().is_some(), "the first reader takes the first chunk");
+        assert_eq!(two.morsel().expect("the second reader starts again").cursor(), 0);
+
+        let along = one.clone();
+        assert_eq!(along.morsel().expect("the clone carries on").cursor(), 1);
+        assert!(one.morsel().is_none(), "and the pair of them have taken both");
     }
 
     #[test]

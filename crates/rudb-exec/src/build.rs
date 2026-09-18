@@ -59,6 +59,7 @@ use rudb_plan::{
 };
 use rudb_seam::Settings;
 
+use crate::buffer::Buffered;
 use crate::enginenames::{
     database_size, dialects, extensions, grammar_extensions, optimizers, platform, user_agent,
     version,
@@ -237,6 +238,7 @@ fn build_measured_with_sink<'a>(
         drivers: Vec::new(),
         pruning: Vec::new(),
         top_counts: Vec::new(),
+        held: Vec::new(),
     };
     let segment = building.node(plan.root())?;
     let schema = segment.schema.clone();
@@ -825,6 +827,18 @@ struct Building<'a, 'b> {
     pruning: Vec<(usize, Op, Bound)>,
     /// Aggregates whose parent TopN orders by COUNT descending, and its count plus offset.
     top_counts: Vec<(NodeRef, usize)>,
+    /// The materialisations whose bodies are being walked, innermost last.
+    held: Vec<Held>,
+}
+
+/// A materialised `WITH` that has been built, for the reads of it under the body being walked.
+struct Held {
+    /// The number the plan pairs a read with what it reads by.
+    cte: u32,
+    /// What the definition filled, which every read takes a reader of its own on.
+    chunks: Buffered,
+    /// The pipeline that fills it, which every pipeline a read is in has to wait for.
+    filling: PipelineRef,
 }
 
 impl<'a> Building<'a, '_> {
@@ -1332,6 +1346,41 @@ impl<'a> Building<'a, '_> {
                 let reading = Arc::clone(&counters);
                 self.close(below, pipeline, Arc::new(Watched::new(window, counters)));
                 Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
+            }
+            Node::MaterializedCte { definition, body, cte, .. } => {
+                // The definition runs first and the rows are held, which is what the word
+                // materialized asked for. This node is the sink of the pipeline that fills them,
+                // the same way a sort is the sink of the pipeline under it, and the body carries on
+                // in whatever pipeline the parent was in because it is never held.
+                //
+                // The pipeline is closed before the body is walked, so it is on the list ahead of
+                // everything the body builds and the rows exist by the time anything reads them.
+                let held = self.node(definition)?;
+                let (keep, chunks) = Keep::new(memory);
+                let counters = self.watch(reference, id, pipeline, "MaterializedCTE", None);
+                self.close(held, pipeline, Arc::new(Watched::new(keep, counters)));
+                self.held.push(Held { cte, chunks, filling: pipeline });
+                let segment = self.node(body);
+                self.held.pop();
+                segment?
+            }
+            Node::CteScan { index, cte, columns, .. } => {
+                // A read of the held rows, which is a leaf the same way a scan of a table is. Each
+                // one takes a reader of its own, because the rows were held so that every read gets
+                // all of them and a shared cursor would split one pass between the reads instead.
+                //
+                // The columns are bound against this node's own index rather than the definition's,
+                // which is what everything above it was bound against.
+                let Some(source) = self.held.iter().rev().find(|held| held.cte == cte) else {
+                    return Err(Error::internal(
+                        "a read of a materialisation that is not being filled",
+                    ));
+                };
+                let filling = source.filling;
+                let source = source.chunks.reader();
+                let schema = Schema::numbered(plan.field_list(columns).to_vec(), index);
+                let counters = self.watch(reference, id, pipeline, "CteScan", None);
+                Segment::reading(Arc::new(Watched::new(source, counters)), schema, filling)
             }
         };
         Ok(segment)

@@ -316,6 +316,45 @@ pub enum Node {
         /// The right input.
         right: NodeRef,
     },
+    /// A `WITH name AS MATERIALIZED (...)`, which is run once and read wherever it is named.
+    ///
+    /// The left input is the definition and the right input is the query that reads it. They are
+    /// in that order because that is the order they run in: the definition is a pipeline breaker
+    /// whichever operators are in it, since nothing above may start until the rows are all there.
+    ///
+    /// A plain `WITH` is not this. The reference binary inlines one at every use whatever its
+    /// shape and however many times it is named, and the only decision left is whether the rows
+    /// are needed at all, which is why an unused one is dropped rather than run for nothing.
+    MaterializedCte {
+        /// The query whose rows are held.
+        definition: NodeRef,
+        /// The query that reads them, which is where every [`Node::CteScan`] for this one is.
+        body: NodeRef,
+        /// The name it was written with, which is what the printer and an error message say.
+        name: StrRef,
+        /// Which materialisation this is, matching the `cte` of the scans that read it.
+        ///
+        /// A number of its own rather than the table index, because a scan binds against its own
+        /// index and two scans of one materialisation have two of those.
+        cte: u32,
+        /// The held columns with their types, into the field pool.
+        columns: Slice,
+    },
+    /// A read of a [`Node::MaterializedCte`] that has already run.
+    ///
+    /// A leaf, the same way a table scan is. What it reads was computed by a node above it rather
+    /// than by a node under it, which is the one place in the plan where that is true, and it is
+    /// why the materialisation holds its body as an input rather than sitting beside it.
+    CteScan {
+        /// The table index that this read's columns bind against.
+        index: u32,
+        /// Which materialisation it reads.
+        cte: u32,
+        /// The name it was written with.
+        name: StrRef,
+        /// The produced columns with their types, into the field pool.
+        columns: Slice,
+    },
     /// `UNION`, `EXCEPT` or `INTERSECT`.
     SetOp {
         /// The left input.
@@ -354,6 +393,8 @@ impl Node {
             Self::Join { .. } => "Join",
             Self::DependentJoin { .. } => "DependentJoin",
             Self::CrossProduct { .. } => "CrossProduct",
+            Self::MaterializedCte { .. } => "MaterializedCte",
+            Self::CteScan { .. } => "CteScan",
             Self::SetOp { .. } => "SetOp",
         }
     }
@@ -366,9 +407,11 @@ impl Node {
     #[must_use]
     pub fn children(&self) -> [Option<NodeRef>; 2] {
         match *self {
-            Self::Get { .. } | Self::Dummy | Self::Values { .. } | Self::TableFunction { .. } => {
-                [None, None]
-            }
+            Self::Get { .. }
+            | Self::Dummy
+            | Self::Values { .. }
+            | Self::TableFunction { .. }
+            | Self::CteScan { .. } => [None, None],
             Self::Filter { input, .. }
             | Self::Project { input, .. }
             | Self::Aggregate { input, .. }
@@ -383,6 +426,7 @@ impl Node {
             | Self::DependentJoin { left, right, .. }
             | Self::CrossProduct { left, right }
             | Self::SetOp { left, right, .. } => [Some(left), Some(right)],
+            Self::MaterializedCte { definition, body, .. } => [Some(definition), Some(body)],
         }
     }
 
@@ -404,6 +448,7 @@ impl Node {
             | Self::TableFetch { index, .. }
             | Self::Aggregate { index, .. }
             | Self::Window { index, .. }
+            | Self::CteScan { index, .. }
             | Self::SetOp { index, .. } => Some(index),
             _ => None,
         }

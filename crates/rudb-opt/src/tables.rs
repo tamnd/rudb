@@ -176,7 +176,12 @@ fn collect(plan: &Plan, at: NodeRef, set: &mut TableSet) {
         | Node::Fetch { index, .. }
         | Node::TableFetch { index, .. }
         | Node::Aggregate { index, .. }
-        | Node::SetOp { index, .. } => set.insert(index),
+        | Node::SetOp { index, .. }
+        | Node::CteScan { index, .. } => set.insert(index),
+        // What a materialisation makes visible is what the body makes visible. The definition's
+        // own indexes are not among them: nothing above can name a column of the held query except
+        // through a read of it, and a read has an index of its own.
+        Node::MaterializedCte { body, .. } => collect(plan, body, set),
         Node::Window { input, index, .. } => {
             collect(plan, input, set);
             set.insert(index);

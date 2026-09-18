@@ -38,7 +38,10 @@
 //!   it, with the second waiting for the first and the parent's waiting for the second,
 //! - a cross product keeps its left side and itself in the parent's pipeline, because the product
 //!   is produced a chunk at a time and never held, and puts its right side in a new one, because
-//!   that side is kept whole to be replayed.
+//!   that side is kept whole to be replayed,
+//! - a materialised `WITH` is the sink of a new pipeline that its definition fills, and its body
+//!   stays in the parent's, with the pipeline holding each read of the name waiting for the one
+//!   that fills it.
 //!
 //! There is no scheduler reading any of this yet. It is written down because it is known, and an
 //! edge reconstructed later from a tree somebody has already flattened is an edge somebody has to
@@ -70,6 +73,11 @@ pub struct Shape {
     waits: Vec<Vec<PipelineRef>>,
     /// How many operators there are.
     operators: OperatorRef,
+    /// The pipeline each materialisation currently being walked over is filled by.
+    ///
+    /// A stack rather than a map, because a materialised `WITH` inside another one is a `WITH`
+    /// inside the body of the first, and the inner name is the one a scan under it reads.
+    holding: Vec<(u32, PipelineRef)>,
 }
 
 /// One node's place in the shape.
@@ -85,8 +93,12 @@ impl Shape {
     /// Works out the shape of a plan.
     #[must_use]
     pub fn of(plan: &Plan) -> Self {
-        let mut shape =
-            Self { of: vec![None; plan.node_count()], waits: vec![Vec::new()], operators: 0 };
+        let mut shape = Self {
+            of: vec![None; plan.node_count()],
+            waits: vec![Vec::new()],
+            operators: 0,
+            holding: Vec::new(),
+        };
         shape.walk(plan, plan.root(), ROOT);
         shape
     }
@@ -215,6 +227,35 @@ impl Shape {
                 self.walk(plan, right, first);
                 self.walk(plan, left, second);
             }
+            // The definition is held whole and the body reads it, so the node is the sink of the
+            // pipeline that fills it, the same way a sort is the sink of the pipeline under it. The
+            // body stays where the parent is, because it produces into the parent a chunk at a time
+            // and is never held.
+            //
+            // The edge is recorded at every scan rather than here, because that is where the
+            // waiting actually is: a scan under a sort in the body is in a pipeline of its own, and
+            // it is that pipeline which cannot start until the rows exist. A body that reads the
+            // name nowhere waits for nothing, which is the shape of a materialisation the optimizer
+            // is about to drop.
+            Node::MaterializedCte { definition, body, cte, .. } => {
+                let filling = self.fresh();
+                self.of[node as usize] =
+                    Some(Placed { operator, gathered: None, pipeline: filling });
+                self.walk(plan, definition, filling);
+                self.holding.push((cte, filling));
+                self.walk(plan, body, pipeline);
+                self.holding.pop();
+            }
+            Node::CteScan { cte, .. } => {
+                self.of[node as usize] = Some(Placed { operator, gathered: None, pipeline });
+                if let Some(&(_, filled)) =
+                    self.holding.iter().rev().find(|&&(held, _)| held == cte)
+                {
+                    if !self.waits[pipeline as usize].contains(&filled) {
+                        self.waits_on(pipeline, filled);
+                    }
+                }
+            }
             Node::CrossProduct { left, right } => {
                 let gathered = self.number();
                 let aside = self.fresh();
@@ -305,6 +346,52 @@ mod tests {
         assert_eq!(shape.pipeline(left.unwrap()), 0, "and so does the side it streams");
         assert_eq!(shape.pipeline(right.unwrap()), 1, "the side that is kept is its own");
         assert_eq!(shape.waits_for(0), [1]);
+    }
+
+    #[test]
+    fn a_materialisation_is_the_sink_of_the_pipeline_that_fills_it() {
+        let (plan, shape) = shaped(concat!(
+            "MaterializedCte c @0 [a::INTEGER]\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER]\n",
+            "  Project #2 [#1.0::INTEGER AS a]\n",
+            "    CteScan c @0 #1 [a::INTEGER]\n",
+        ));
+        let [definition, body] = plan.node(plan.root()).children();
+        assert_eq!(shape.pipelines(), 2);
+        assert_eq!(shape.pipeline(plan.root()), 1, "the node is what the definition fills");
+        assert_eq!(shape.pipeline(definition.unwrap()), 1, "and the definition is under it");
+        assert_eq!(shape.pipeline(body.unwrap()), 0, "the body produces the answer");
+        assert_eq!(shape.waits_for(0), [1], "and cannot start before the rows are there");
+    }
+
+    #[test]
+    fn the_pipeline_that_waits_is_the_one_the_read_is_in() {
+        let (plan, shape) = shaped(concat!(
+            "MaterializedCte c @0 [a::INTEGER]\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER]\n",
+            "  Sort [#1.0::INTEGER ASC NULLS LAST]\n",
+            "    CteScan c @0 #1 [a::INTEGER]\n",
+        ));
+        assert_eq!(shape.pipelines(), 3);
+        assert_eq!(shape.waits_for(0), [2], "the answer waits for the sort");
+        assert_eq!(shape.waits_for(2), [1], "and the sort waits for the rows it reads");
+        assert!(shape.waits_for(1).is_empty(), "which wait for nothing");
+        let [_, body] = plan.node(plan.root()).children();
+        assert_eq!(shape.pipeline(body.unwrap()), 2);
+    }
+
+    /// A body that never names the materialisation waits for nothing, which is the shape the pass
+    /// that drops an unread one is about to remove.
+    #[test]
+    fn a_body_that_reads_nothing_waits_for_nothing() {
+        let (_, shape) = shaped(concat!(
+            "MaterializedCte c @0 [a::INTEGER]\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER]\n",
+            "  Project #2 [1::INTEGER AS one]\n",
+            "    Dummy\n",
+        ));
+        assert_eq!(shape.pipelines(), 2);
+        assert!(shape.waits_for(0).is_empty());
     }
 
     #[test]

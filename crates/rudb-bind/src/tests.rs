@@ -333,6 +333,59 @@ fn later_ctes_can_read_earlier_ones_and_rename_their_columns() {
 }
 
 #[test]
+fn a_materialized_cte_is_computed_once_and_read_where_it_is_named() {
+    let printed = plan(
+        "WITH chosen AS MATERIALIZED (SELECT UserID, url FROM hits) SELECT a.url FROM chosen AS a, chosen AS b",
+    );
+    assert_eq!(printed.matches("MaterializedCte chosen @0").count(), 1, "{printed}");
+    assert_eq!(printed.matches("Get memory.main.hits").count(), 1, "{printed}");
+    assert_eq!(printed.matches("CteScan chosen @0").count(), 2, "{printed}");
+    // Two reads of one thing held once, so the two have table indexes of their own and the columns
+    // of each are that read's columns rather than a second name for the same ones.
+    assert!(printed.contains("CteScan chosen @0 #3 [UserID::BIGINT, url::VARCHAR]"), "{printed}");
+    assert!(printed.contains("CteScan chosen @0 #4 [UserID::BIGINT, url::VARCHAR]"), "{printed}");
+}
+
+#[test]
+fn a_materialized_cte_holds_the_columns_its_column_list_named() {
+    let printed = plan(
+        "WITH chosen(who, where_) AS MATERIALIZED (SELECT UserID, url FROM hits) SELECT where_ FROM chosen",
+    );
+    assert!(
+        printed.contains("MaterializedCte chosen @0 [who::BIGINT, where_::VARCHAR]"),
+        "{printed}"
+    );
+    assert!(printed.contains("AS where_"), "{printed}");
+    // More names than the definition has columns is not an error, which is the pinned build going
+    // its own way and is written out on `Scope::rename_prefix`.
+    let printed = plan(
+        "WITH chosen(a, b, c, d) AS MATERIALIZED (SELECT UserID FROM hits) SELECT a FROM chosen",
+    );
+    assert!(printed.contains("MaterializedCte chosen @0 [a::BIGINT]"), "{printed}");
+}
+
+#[test]
+fn a_materialized_cte_inside_another_one_is_held_separately() {
+    let printed = plan(
+        "WITH outer_ AS MATERIALIZED (WITH inner_ AS MATERIALIZED (SELECT counter FROM hits) SELECT counter FROM inner_) SELECT counter FROM outer_",
+    );
+    assert!(printed.contains("MaterializedCte outer_ @1"), "{printed}");
+    assert!(printed.contains("MaterializedCte inner_ @0"), "{printed}");
+    assert!(printed.contains("CteScan inner_ @0"), "{printed}");
+    assert!(printed.contains("CteScan outer_ @1"), "{printed}");
+}
+
+#[test]
+fn a_materialized_cte_can_be_read_by_a_later_one() {
+    let printed = plan(
+        "WITH first AS MATERIALIZED (SELECT counter FROM hits), second AS MATERIALIZED (SELECT counter + 1 AS n FROM first) SELECT n FROM second",
+    );
+    assert!(printed.contains("MaterializedCte first @0"), "{printed}");
+    assert!(printed.contains("MaterializedCte second @1 [n::INTEGER]"), "{printed}");
+    assert!(printed.contains("CteScan first @0"), "{printed}");
+}
+
+#[test]
 fn a_union_lines_the_two_sides_up_and_sorts_above_both() {
     let text = plan("SELECT counter FROM hits UNION SELECT duration FROM visits ORDER BY 1");
     assert!(text.contains("SetOp UNION DISTINCT"), "{text}");

@@ -219,6 +219,15 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
         // Every set operation is bounded above by both sides together, and `UNION ALL` reaches it.
         // The deduplicating ones and `EXCEPT` are somewhere below it and nothing here knows where,
         // so the bound is what they get, and the bound is what their class says they got.
+        // Holding rows does not change how many there are, so a materialisation is as tall as the
+        // query that reads it and the definition it holds is counted where it is read.
+        Node::MaterializedCte { body, .. } => of(body),
+        // What a read produces is what the definition produced, and the definition is above this
+        // node rather than under it, which is the one place in a plan where that is true. A walk
+        // that only sees the subtree cannot reach it, so this says so rather than guessing. Giving
+        // a real answer takes the count being recorded when the definition is walked, which is
+        // worth doing when something asks a question this would change the answer to.
+        Node::CteScan { .. } => Stat::Unknown,
         Node::SetOp { left, right, kind, all, .. } => {
             let total = of(left).zip(of(right), u64::saturating_add);
             match (kind, all) {
