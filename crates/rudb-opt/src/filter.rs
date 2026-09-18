@@ -279,7 +279,17 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         Node::Join { left, right, kind: written, conditions, build } => {
             let below = (produced(plan, left), produced(plan, right));
             let kind = nulls::narrow(plan, written, &pending, (&below.0, &below.1));
-            let held = plan.expr_list(conditions).to_vec();
+            // The condition list is read with an `AND` between its entries, so a condition that is
+            // itself an `AND` says the same thing as its two parts written separately. It is worth
+            // splitting because of who reads the list. The executor takes the lookup path only when
+            // every entry is an equality between the two sides, and a conjunction is not an
+            // equality however its parts are spelled, so `ON a = b AND c = d` fell to the nested
+            // loop while the same query with the second equality in a `WHERE` did not. That is
+            // tamnd/rudb#845.
+            let mut held = Vec::new();
+            for &condition in plan.expr_list(conditions) {
+                split(plan, condition, &mut held);
+            }
             let (extra_left, extra_right) =
                 transitive::across(plan, tables, kind, &held, &pending, (&below.0, &below.1));
             let (mut to_left, mut to_right, over) =
@@ -290,11 +300,10 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
                 if kind == JoinKind::Inner { (over, Vec::new()) } else { (Vec::new(), over) };
             let rebuilt_left = node(plan, left, to_left, tables);
             let rebuilt_right = node(plan, right, to_right, tables);
-            let rebuilt_conditions = if added.is_empty() {
+            let rebuilt_conditions = if added.is_empty() && held == plan.expr_list(conditions) {
                 conditions
             } else {
-                let all: Vec<ExprRef> =
-                    plan.expr_list(conditions).to_vec().into_iter().chain(added).collect();
+                let all: Vec<ExprRef> = held.into_iter().chain(added).collect();
                 plan.add_expr_list(&all)
             };
             let above = if rebuilt_left == left
@@ -868,6 +877,55 @@ Filter (#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN
 ";
         let after = "\
 Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn an_and_written_inside_a_join_condition_becomes_two_conditions() {
+        // The same query as the test above with the second equality written in the ON clause
+        // instead of above the join, which is where it started before that test's filter moved it.
+        // Both have to reach the executor as two conditions, because a conjunction is not an
+        // equality and the lookup path wants every entry to be one.
+        let before = "\
+Join INNER on=[((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn an_or_written_inside_a_join_condition_stays_one_condition() {
+        // An OR is one predicate however it is written, since neither half of it decides anything
+        // on its own, and a join of an outer kind would answer something else entirely if it were
+        // split. This is the same line `split` already holds for a filter.
+        let before = "\
+Join LEFT on=[((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN OR (#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), before);
+    }
+
+    #[test]
+    fn splitting_a_join_condition_leaves_an_outer_join_the_kind_it_was() {
+        // The list is read with an AND between its entries on every kind, so what a LEFT join pads
+        // is decided by the same thing before and after. The kind is what would give that away.
+        let before = "\
+Join LEFT on=[((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN]
   Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
   Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
 ";
