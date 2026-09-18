@@ -2609,11 +2609,16 @@ fn the_settings_table_answers_the_question_a_client_asks_it() {
     // The seams are not settings, which is decided in the settings module and checked here because
     // this is the table a reader would find them in if the decision ever changed by accident.
     assert!(rows(&db, "SELECT name FROM duckdb_settings() WHERE name LIKE 'seam%'").is_empty());
-    // Every row has a value, including the hundred and sixty nine rudb does not read, because a
-    // client reading this table to find out what an engine is set to should not find a hole.
+    // Every row has a value except the three the pin itself leaves unset, including the hundred and
+    // sixty nine rudb does not read, because a client reading this table to find out what an engine
+    // is set to should not find a hole where the pin has a value.
     assert_eq!(
-        rows(&db, "SELECT count(*) FROM duckdb_settings() WHERE value IS NULL"),
-        vec![vec![Value::BigInt(0)]]
+        rows(&db, "SELECT name FROM duckdb_settings() WHERE value IS NULL ORDER BY name"),
+        vec![
+            vec![text("enable_profiling")],
+            vec![text("operator_memory_limit")],
+            vec![text("parquet_prefetch_column_gap")],
+        ]
     );
 }
 
@@ -2644,6 +2649,111 @@ fn a_setting_the_engine_does_not_read_still_answers_every_way_of_asking() {
     let error = db.execute("SET preserve_insertion_order = false").unwrap_err();
     assert_eq!(error.code().duckdb_name(), "Not implemented Error");
     db.execute("SET preserve_insertion_order = true").expect("the value it already behaves as");
+}
+
+/// A pragma that is a statement writes the setting it stands for, and the name carries the value.
+///
+/// Measured against the pin by snapshotting `duckdb_settings()` either side of each one, which is
+/// the only way to fill that table in: `PRAGMA disable_print_progress_bar` writes a setting called
+/// `enable_progress_bar_print` and `PRAGMA enable_profiling` writes a word into a `VARCHAR` rather
+/// than true into a boolean.
+#[test]
+fn a_pragma_that_is_a_statement_writes_the_setting_it_stands_for() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    let optimizer = "SELECT value FROM duckdb_settings() WHERE name = 'enable_optimizer'";
+    assert_eq!(rows(&db, optimizer), vec![vec![text("true")]]);
+    db.execute("PRAGMA disable_optimizer").expect("a pragma that is a statement");
+    assert_eq!(rows(&db, optimizer), vec![vec![text("false")]]);
+    db.execute("PRAGMA enable_optimizer").expect("and back");
+    assert_eq!(rows(&db, optimizer), vec![vec![text("true")]]);
+    db.execute("PRAGMA disable_print_progress_bar").expect("the one whose name is not the setting");
+    assert_eq!(
+        rows(&db, "SELECT current_setting('enable_progress_bar_print')"),
+        vec![vec![Value::Boolean(false)]]
+    );
+    db.execute("PRAGMA enable_profiling").expect("a word rather than a boolean");
+    assert_eq!(
+        rows(&db, "SELECT current_setting('enable_profiling')"),
+        vec![vec![text("query_tree")]]
+    );
+    // And the pair that turns it off puts it back to nothing rather than to the empty string.
+    db.execute("PRAGMA disable_profile").expect("the other spelling of the same statement");
+    assert_eq!(rows(&db, "SELECT current_setting('enable_profiling')"), vec![vec![Value::Null]]);
+}
+
+/// Nine of the nineteen change nothing a query can see, and succeeding is the whole of what they do.
+///
+/// Four are deprecated upstream and say so in a warning while doing nothing, and the other five
+/// move a flag on the database that `duckdb_settings()` does not list. 692 corpus records are
+/// charged to `disable_checkpoint_on_shutdown` alone, all of them a file that says something about
+/// checkpoints in its preamble and then goes on to test something else.
+#[test]
+fn a_pragma_that_changes_nothing_a_query_can_see_still_succeeds() {
+    let db = database();
+    for statement in [
+        "PRAGMA disable_checkpoint_on_shutdown",
+        "PRAGMA enable_checkpoint_on_shutdown",
+        "PRAGMA disable_object_cache",
+        "PRAGMA enable_object_cache",
+        "PRAGMA disable_verification",
+        "PRAGMA enable_verification",
+        "PRAGMA disable_verify_parallelism",
+        "PRAGMA verify_parallelism",
+        "PRAGMA force_checkpoint",
+    ] {
+        db.execute(statement).unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    // A name of the same shape that no engine has is the catalog's complaint, in the words it uses
+    // about a pragma rather than the words it uses about a setting.
+    let error = db.execute("PRAGMA enable_nothing_at_all").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Catalog Error");
+    assert_eq!(
+        error.to_string(),
+        "Catalog Error: Pragma Function with name enable_nothing_at_all does not exist!"
+    );
+}
+
+/// Three settings are unset on a fresh connection rather than empty, and null is what they read as.
+#[test]
+fn a_setting_the_pin_leaves_unset_reads_as_null_rather_than_as_the_empty_string() {
+    let db = database();
+    let unset = "SELECT name FROM duckdb_settings() WHERE value IS NULL ORDER BY name";
+    let text = |value: &str| Value::Varchar(value.to_string());
+    assert_eq!(
+        rows(&db, unset),
+        vec![
+            vec![text("enable_profiling")],
+            vec![text("operator_memory_limit")],
+            vec![text("parquet_prefetch_column_gap")],
+        ]
+    );
+    // The one that is a number is the reason this matters more than a rendering detail. Reading it
+    // as its own type went through the empty string and came out an internal error.
+    assert_eq!(
+        rows(&db, "SELECT current_setting('parquet_prefetch_column_gap')"),
+        vec![vec![Value::Null]]
+    );
+    db.execute("SET parquet_prefetch_column_gap = 64").expect("and it still takes a number");
+    assert_eq!(
+        rows(&db, "SELECT current_setting('parquet_prefetch_column_gap')"),
+        vec![vec![Value::UBigInt(64)]]
+    );
+}
+
+/// Every pragma in the catalog is one the parser sends to the catalog.
+///
+/// The parser decides which pragmas are a statement by their spelling and the catalog decides what
+/// each one means, so an entry here that the parser reads as a query would never run at all. This
+/// is the join between the two halves, and it is a test rather than a shared list because what it
+/// is really checking is that a statement written out reaches the place that answers it.
+#[test]
+fn every_pragma_the_catalog_has_is_one_the_parser_sends_to_it() {
+    let db = database();
+    for entry in rudb_functions::PRAGMAS {
+        let statement = format!("PRAGMA {}", entry.name);
+        db.execute(&statement).unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
 }
 
 #[test]
