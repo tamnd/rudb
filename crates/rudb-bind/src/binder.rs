@@ -2223,6 +2223,17 @@ impl<'a> Binder<'a> {
             let node = self.add_node(Node::CrossProduct { left: left_node, right: right_node });
             return Ok((node, scope));
         }
+        // A semi join and an anti join ask a question about the right side rather than producing
+        // any of it, so what is in scope after one is the left side alone. The condition is bound
+        // above and is the last thing that can name the right side. Without this, `SELECT *` over
+        // one expanded to both sides and the projection asked a join whose output is the left side
+        // for columns it does not have, which came out as an internal error about a column not
+        // being in the schema. That is tamnd/rudb#847. The reference binary refuses `b.w` here with
+        // a binder error naming `a` as the only candidate table, which is the same rule said from
+        // the other end.
+        if matches!(kind, ast::JoinKind::Semi | ast::JoinKind::Anti) {
+            scope.truncate(split);
+        }
         let kind = match kind {
             ast::JoinKind::Inner | ast::JoinKind::Cross => JoinKind::Inner,
             ast::JoinKind::Left => JoinKind::Left,
