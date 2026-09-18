@@ -19,9 +19,8 @@ use rudb_pipeline::{Progress, Sink};
 use rudb_vector::Chunk;
 
 use crate::buffer::Buffered;
-use crate::expr::evaluate_all_in_time_zone;
 use crate::rows;
-use crate::sideways::{Extremes, Sideways};
+use crate::sideways::{self, Sideways};
 
 /// Rows somebody gathered, readable once the pipeline that filled them has finished.
 ///
@@ -154,8 +153,8 @@ pub(crate) fn take(chunk: &Chunk, local: &mut Gathering) -> Result<()> {
 /// What it fills is a [`Buffered`], because that is already the source that reads finished chunks
 /// back out and there is no reason for a second one.
 ///
-/// A join also asks it to watch one column on the way past. See [`Sideways`], and see
-/// [`Keep::extremes`] for what that costs.
+/// A join also asks it what its key column turned out to hold. See [`Sideways`], and see
+/// [`Keep::fill`] for what that costs.
 #[derive(Debug)]
 pub(crate) struct Keep<'a> {
     memory: Memory,
@@ -164,12 +163,10 @@ pub(crate) struct Keep<'a> {
     /// the operator that depends on them is running.
     charged: Mutex<Vec<Reservation>>,
     out: Buffered,
-    /// The range of the join key this side is about to be looked up by, where the operator on the
-    /// other side of the dependency edge is a join that can use one. Empty for everything else,
+    /// The runtime filter of the join this side is about to be looked up by, where the operator on
+    /// the other side of the dependency edge is a join that can use one. Empty for everything else,
     /// including every cross product, which is the other operator that keeps its side this way.
     sideways: Option<Arc<Sideways<'a>>>,
-    /// What the instances saw between them, merged as they combine.
-    seen: Mutex<Extremes>,
 }
 
 /// What one instance of a keep is holding.
@@ -177,9 +174,6 @@ pub(crate) struct Keep<'a> {
 pub(crate) struct Kept {
     chunks: Vec<Chunk>,
     charged: Reservation,
-    /// The smallest and largest join key this instance went past, `None` where there is no join
-    /// waiting for one.
-    extremes: Option<Extremes>,
 }
 
 impl<'a> Keep<'a> {
@@ -200,27 +194,24 @@ impl<'a> Keep<'a> {
             charged: Mutex::new(Vec::new()),
             out: out.clone(),
             sideways,
-            seen: Mutex::new(Extremes::default()),
         };
         (keep, out)
     }
 
-    /// Widens this instance's range by one chunk's worth of join keys.
+    /// Fills the runtime filter from the chunks this side turned out to hold.
     ///
-    /// One evaluation of the key expression and one pass over the column it produces, per chunk of
-    /// the side that is going into the hash table. That is the same expression the table itself is
-    /// built on and so it is evaluated twice, once here and once there, which is a pass over the
-    /// smaller side of the join to save reading part of the larger one. The alternative is building
-    /// the table here instead of at the first probe, which is a better answer and a larger change
-    /// than this one.
-    fn extremes(&self, chunk: &Chunk, local: &mut Kept) -> Result<()> {
-        let Some(keyed) = self.sideways.as_ref().and_then(|sideways| sideways.keyed()) else {
-            return Ok(());
-        };
-        let (plan, exprs, schema, time_zone) = keyed.parts();
-        let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
-        let Some(keys) = keys.first() else { return Ok(()) };
-        local.extremes.get_or_insert_with(Extremes::default).widen(keys);
+    /// One evaluation of the key expression and one hash per chunk, over the side that is going
+    /// into the hash table. That is the same expression the table itself is built on and so it is
+    /// evaluated twice, once here and once there, which is a pass over the smaller side of the join
+    /// to save reading part of the larger one. The alternative is building the table here instead of
+    /// at the first probe, which is a better answer and a larger change than this one.
+    ///
+    /// Here rather than in [`Sink::sink`] because the filter is sized from the exact row count, and
+    /// the exact row count is what a side has only once it is finished.
+    fn fill(&self, chunks: &[Chunk]) -> Result<()> {
+        let Some(sideways) = self.sideways.as_ref() else { return Ok(()) };
+        let Some(keyed) = sideways.keyed() else { return Ok(()) };
+        sideways.found(sideways::found(keyed, chunks)?);
         Ok(())
     }
 }
@@ -229,7 +220,7 @@ impl Sink for Keep<'_> {
     type Local = Kept;
 
     fn local(&self) -> Kept {
-        Kept { chunks: Vec::new(), charged: self.memory.reservation(), extremes: None }
+        Kept { chunks: Vec::new(), charged: self.memory.reservation() }
     }
 
     /// Not yet, for the reason the gather above gives. A cross product replays these chunks in the
@@ -244,7 +235,6 @@ impl Sink for Keep<'_> {
         // pair every one of its rows with it and produce nothing each time.
         if !chunk.is_empty() {
             local.charged.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
-            self.extremes(chunk, local)?;
             local.chunks.push(chunk.clone());
         }
         Ok(Progress::More)
@@ -253,20 +243,14 @@ impl Sink for Keep<'_> {
     fn combine(&self, local: Kept) -> Result<()> {
         self.chunks.lock().map_err(poisoned)?.extend(local.chunks);
         self.charged.lock().map_err(poisoned)?.push(local.charged);
-        if let Some(extremes) = local.extremes {
-            self.seen.lock().map_err(poisoned)?.absorb(extremes);
-        }
         Ok(())
     }
 
     fn finalize(&self) -> Result<()> {
-        // Before the chunks are handed on, because handing them on is what lets the pipeline that
-        // depends on this one start, and the scan in that pipeline reads the range as it starts.
-        if let Some(sideways) = self.sideways.as_ref() {
-            let seen = std::mem::take(&mut *self.seen.lock().map_err(poisoned)?);
-            sideways.found(seen.into_range());
-        }
         let chunks = std::mem::take(&mut *self.chunks.lock().map_err(poisoned)?);
+        // Before the chunks are handed on, because handing them on is what lets the pipeline that
+        // depends on this one start, and the scan in that pipeline reads the filter as it starts.
+        self.fill(&chunks)?;
         self.out.fill(chunks)
     }
 }
