@@ -1,5 +1,6 @@
 //! A table: a name, some columns, and the rows.
 
+use rudb_common::bounds::Bound;
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_native::{FrequencyOccurrences, Reader as NativeReader};
 use rudb_storage::{MemoryTable, Probe};
@@ -78,6 +79,22 @@ impl Rows {
         match self {
             Self::Memory(_) => Ok(None),
             Self::Native(reader) => reader.text_extremes(column),
+        }
+    }
+
+    /// The smallest and the largest value of one column, when every stripe of it wrote exact ends.
+    pub fn exact_extremes(&self, column: usize) -> Result<Option<(Bound, Bound)>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Native(reader) => reader.exact_extremes(column),
+        }
+    }
+
+    /// The sum of one integer column and the rows that went into it, when the file wrote them down.
+    pub fn exact_sum(&self, column: usize) -> Result<Option<(i128, u64)>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Native(reader) => reader.exact_sum(column),
         }
     }
 
