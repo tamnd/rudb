@@ -99,6 +99,16 @@ impl Focus {
 /// "what did I just change" when the answer is one commit.
 pub(crate) fn detect(root: &Path) -> Focus {
     if let Some((base, paths)) = handed_over() {
+        // A list that arrived joined onto one line is a caller that put the diff through `tr` or an
+        // unquoted `echo`. Every path in it then names a file that does not exist, the narrowing
+        // reaches no crate, and the gate compiles nothing and calls itself green. That is the one
+        // way this module can lie, so it runs everything and says what it saw.
+        if let Some(run_together) = joined(&paths) {
+            let reason = format!(
+                "RUDB_CI_CHANGED holds \"{run_together}\", which is more than one path on a line"
+            );
+            return Focus::everything(&reason);
+        }
         return from_paths(root, base, paths);
     }
     let Some(base) = base(root) else {
@@ -132,7 +142,8 @@ pub(crate) fn detect(root: &Path) -> Focus {
 /// only exists on the machine the copy came from. So the caller works the diff out where git works
 /// and sets these two, and the whole of the narrowing below runs on paths rather than on a
 /// repository. `RUDB_CI_BASE` is what says a diff was handed over at all, because an empty
-/// `RUDB_CI_CHANGED` is a real answer and means nothing changed.
+/// `RUDB_CI_CHANGED` is a real answer and means nothing changed. One path per line, and [`detect`]
+/// refuses a list that arrived any other way.
 fn handed_over() -> Option<(String, Vec<String>)> {
     let base = std::env::var("RUDB_CI_BASE").ok().filter(|base| !base.trim().is_empty())?;
     let changed = std::env::var("RUDB_CI_CHANGED").unwrap_or_default();
@@ -145,6 +156,15 @@ fn handed_over() -> Option<(String, Vec<String>)> {
         .into_iter()
         .collect();
     Some((base.trim().to_string(), paths))
+}
+
+/// The first handed over path with a space in it, which is what a joined list looks like from here.
+///
+/// No path this repository tracks has a space in it, so one arriving with a space is not a file the
+/// gate should go looking for. It is the whole diff on one line, and the caller that made it is
+/// usually a shell that wrote `$(git diff --name-only ...)` without the quotes.
+fn joined(paths: &[String]) -> Option<&String> {
+    paths.iter().find(|path| path.contains(char::is_whitespace))
 }
 
 /// What a list of changed paths means for each part of the gate.
@@ -306,7 +326,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{against, closure, from_paths, manifest_of, members};
+    use super::{against, closure, from_paths, joined, manifest_of, members};
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -405,6 +425,19 @@ mod tests {
     fn no_merge_base_is_not_an_answer() {
         assert_eq!(against(None, "abc", true), None);
         assert_eq!(against(None, "abc", false), None);
+    }
+
+    /// The bug this is here for: my own gate script set `RUDB_CI_CHANGED` with the diff piped
+    /// through `tr '\n' ' '`, so the whole list arrived as one path, matched no crate, and the gate
+    /// printed "no crate is affected, so nothing is compiled" on a change that did not compile. It
+    /// said so out loud and I still read past it, which is why a joined list is now refused rather
+    /// than narrowed with.
+    #[test]
+    fn a_diff_that_arrived_on_one_line_is_not_a_path() {
+        let one_line = vec!["crates/rudb-exec/src/source.rs crates/rudb-native/src/lib.rs".into()];
+        assert!(joined(&one_line).is_some());
+        assert!(joined(&["crates/rudb-exec/src/source.rs".to_string()]).is_none());
+        assert!(joined(&[]).is_none());
     }
 
     #[test]
