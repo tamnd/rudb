@@ -177,6 +177,20 @@ fn explain_analyze_reports_the_whole_query_under_its_own_key() {
 }
 
 #[test]
+fn explain_analyze_says_what_the_query_spent_planning() {
+    // The totals line used to be the build, the run and a total that was the two of them added up,
+    // so a reader could see every phase of a query except the one that decided what the query was
+    // going to do. An optimizer that has become too expensive is invisible on a line like that, and
+    // this is the line somebody reads with their own eyes rather than through the harness.
+    let database = with_rows(100);
+    let text = explained(&database, "EXPLAIN ANALYZE SELECT a, COUNT(*) FROM t GROUP BY a");
+    assert!(text.contains(" planning, "), "{text}");
+    // Not a duration: a zero prints as a duration too, and a zero is exactly what this line said
+    // before the planner had a clock on it.
+    assert!(!text.contains("  0ns planning, "), "{text}");
+}
+
+#[test]
 fn explaining_something_that_is_not_a_query_is_refused() {
     // Each refusal names the statement it refused, rather than being the generic error a wrong
     // turn somewhere else in this path would also produce.

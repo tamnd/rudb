@@ -536,17 +536,21 @@ impl Shared {
         let seams = self.seams(sql)?;
         let context = self.optimizer(&catalog)?;
         let session = self.session();
-        let ast = rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case())?;
-        match rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new(), &session)? {
+        let (ast, parse_ns) =
+            timed(|| rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case()))?;
+        let (bound, bind_ns) =
+            timed(|| rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new(), &session))?;
+        match bound {
             Bound::Query(mut plan) => {
-                rudb_opt::optimize_with(&mut plan, &context)?;
+                let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let budget = self.budget();
                 let under =
-                    Under::new(budget, context.statistics(), &seams, &session, Rows::ForACaller);
+                    Under::new(budget, context.statistics(), &seams, &session, Rows::ForACaller)
+                        .after(Planning { parse_ns, bind_ns, optimize_ns });
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
-                rudb_opt::optimize_with(&mut plan, &context)?;
+                let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
                     &plan,
@@ -558,6 +562,7 @@ impl Shared {
                     &session,
                     analyze,
                     sql,
+                    Planning { parse_ns, bind_ns, optimize_ns },
                 )
             }
             _ => Err(Error::not_implemented("a statement that is not a query, on the query path")),
@@ -634,35 +639,46 @@ impl Shared {
     /// whatever the table had become in between.
     pub(crate) fn execute(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let session = self.session();
-        let ast = rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case())?;
-        self.execute_ast(&ast, sql, &Parameters::new(), cancel)
+        let (ast, parse_ns) =
+            timed(|| rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case()))?;
+        self.execute_ast(&ast, sql, &Parameters::new(), cancel, parse_ns)
     }
 
     /// Runs one parsed statement, with values for its parameters.
     ///
     /// The prepared statement path, and the path an ordinary statement takes once it is parsed, so
     /// that there is one description of what running a statement does.
+    ///
+    /// `parse_ns` is how long the caller spent getting the AST, because this function is below the
+    /// parse and the metrics document is below this. A prepared statement passes zero, which is not
+    /// a missing measurement: the parse happened once at `PREPARE` and charging it again to every
+    /// execution would make a statement prepared once and run a thousand times report the same
+    /// parse a thousand times.
     pub(crate) fn execute_ast(
         &self,
         ast: &Ast,
         sql: &str,
         parameters: &Parameters,
         cancel: &Cancel,
+        parse_ns: u64,
     ) -> Result<QueryResult> {
         let seams = self.seams(sql)?;
         let mut catalog = self.write();
         let context = self.optimizer(&catalog)?;
         let session = self.session();
-        match rudb_bind::bind_statement_with(ast, &catalog, parameters, &session)? {
+        let (bound, bind_ns) =
+            timed(|| rudb_bind::bind_statement_with(ast, &catalog, parameters, &session))?;
+        match bound {
             Bound::Query(mut plan) => {
-                rudb_opt::optimize_with(&mut plan, &context)?;
+                let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let budget = self.budget();
                 let under =
-                    Under::new(budget, context.statistics(), &seams, &session, Rows::ForACaller);
+                    Under::new(budget, context.statistics(), &seams, &session, Rows::ForACaller)
+                        .after(Planning { parse_ns, bind_ns, optimize_ns });
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
-                rudb_opt::optimize_with(&mut plan, &context)?;
+                let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
                     &plan,
@@ -674,6 +690,7 @@ impl Shared {
                     &session,
                     analyze,
                     sql,
+                    Planning { parse_ns, bind_ns, optimize_ns },
                 )
             }
             Bound::Setting(setting) if setting.pragma => {
@@ -728,7 +745,8 @@ impl Shared {
                 // implementation detail. `INSERT INTO t SELECT * FROM t` reads the table it writes,
                 // and a version of this that appended chunk by chunk would either read its own
                 // output forever or depend on how the scan holds its chunks.
-                rudb_opt::optimize_with(&mut insert.source, &context)?;
+                let ((), optimize_ns) =
+                    timed(|| rudb_opt::optimize_with(&mut insert.source, &context))?;
                 if let Some(path) = &self.inner.path {
                     let target = catalog.table(&insert.name)?;
                     if target.rows().is_empty() {
@@ -755,7 +773,8 @@ impl Shared {
                 }
                 let statistics = context.statistics();
                 let under =
-                    Under::new(self.budget(), statistics, &seams, &session, Rows::ForATable);
+                    Under::new(self.budget(), statistics, &seams, &session, Rows::ForATable)
+                        .after(Planning { parse_ns, bind_ns, optimize_ns });
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let table = catalog.table_mut(&insert.name)?;
                 for chunk in result.into_chunks() {
@@ -793,8 +812,8 @@ fn planned(
 /// This is also the one place a metrics document is made. Everything in it below the top level
 /// comes out of the report the builder filled, and the two spans here are the two things only this
 /// function knows: how long the tree took to build and how long it took to drain. Parsing, binding
-/// and optimizing happened before this was called and their timings stay at zero until the clock
-/// moves up to the statement path.
+/// and optimizing happened before this was called, so they are measured up there and arrive in
+/// [`Under::planning`], and a caller that does not know says zero rather than guessing.
 ///
 /// A query that fails part way through has a document too, and it is thrown away here, because an
 /// error is a [`rudb_common::Error`] and that type is two ranks below the one the document lives
@@ -834,12 +853,53 @@ enum Rows {
     ForATable,
 }
 
+/// What a statement spent before there was a plan to build, in nanoseconds.
+///
+/// Parsing, binding and optimizing all happen on the statement path, above the function that makes
+/// the metrics document, so until this existed those three fields were zero in every document ever
+/// written and `total_ns` was the physical build plus the run. Planning was the one cost of a query
+/// that nothing could see.
+///
+/// That is the case milestone E1 asks for a column and an assertion about, and it states it as
+/// plainly as it can be stated: a query that plans for four hundred milliseconds and runs for two
+/// hundred is a query the optimizer made slower, and without a number nobody finds out, because
+/// nobody profiles the planner. An optimizer only ever gets added to, every pass costs something to
+/// run, and the pass that pays for itself on a scan of ten million rows does not pay for itself on
+/// a point lookup.
+///
+/// Wall clock and not CPU. All three phases are single threaded, so the two are the same number up
+/// to scheduling noise, and the wall clock is the one a caller waited.
+#[derive(Clone, Copy, Default, Debug)]
+struct Planning {
+    parse_ns: u64,
+    bind_ns: u64,
+    optimize_ns: u64,
+}
+
+impl Planning {
+    /// Everything before the physical build, which is what a budget is asserted against.
+    fn total_ns(self) -> u64 {
+        self.parse_ns.saturating_add(self.bind_ns).saturating_add(self.optimize_ns)
+    }
+}
+
+/// Run something and say how long it took, in wall nanoseconds.
+///
+/// Here so that the three phases are timed the same way rather than three ways, and so that adding
+/// a span around a call that already existed does not also re-indent it. A failure is not timed,
+/// because there is no document to put the number in and a partial phase is not a phase.
+fn timed<T>(what: impl FnOnce() -> Result<T>) -> Result<(T, u64)> {
+    let span = Span::start();
+    let out = what()?;
+    Ok((out, span.stop().0))
+}
+
 /// Everything a query runs under that is not the plan, the catalog or the cancel flag.
 ///
-/// The same reasoning as [`Budget`], one level out. These five travel together because every caller
-/// of `run` has to say all five and none of them is a property of the plan, and passing them as one
-/// keeps the argument list from growing a slot every time something new turns out to be true of a
-/// running query rather than of the query itself.
+/// The same reasoning as [`Budget`], one level out. These travel together because every caller of
+/// `run` has to say all of them and none is a property of the plan, and passing them as one keeps
+/// the argument list from growing a slot every time something new turns out to be true of a running
+/// query rather than of the query itself.
 #[derive(Clone, Copy)]
 struct Under<'a> {
     budget: Budget<'a>,
@@ -847,6 +907,7 @@ struct Under<'a> {
     seams: &'a rudb_seam::Settings,
     session: &'a Session,
     going: Rows,
+    planning: Planning,
 }
 
 impl<'a> Under<'a> {
@@ -857,7 +918,20 @@ impl<'a> Under<'a> {
         session: &'a Session,
         going: Rows,
     ) -> Self {
-        Self { budget, statistics, seams, session, going }
+        Self { budget, statistics, seams, session, going, planning: Planning::default() }
+    }
+
+    /// What the statement path spent getting to this plan.
+    ///
+    /// Separate from [`Under::new`] and defaulting to zero, because not every path that runs a plan
+    /// knows. A prepared statement parsed at `PREPARE` time and an `EXPLAIN ANALYZE` that is handed
+    /// a plan somebody else optimized both run a query whose planning happened somewhere this
+    /// cannot see, and a zero there says so. The alternative is a number one of those paths made up
+    /// out of the part it did measure, which is the kind of thing a budget is later asserted
+    /// against and nobody remembers is partly invented.
+    fn after(mut self, planning: Planning) -> Self {
+        self.planning = planning;
+        self
     }
 }
 
@@ -868,7 +942,8 @@ fn run(
     cancel: &Cancel,
     under: Under<'_>,
 ) -> Result<QueryResult> {
-    let Under { budget: Budget { memory, pool }, statistics, seams, session, going } = under;
+    let Under { budget: Budget { memory, pool }, statistics, seams, session, going, planning } =
+        under;
     // The budget is shared by the database and its high-water mark survives a query. Reset it to
     // what is live now before measuring this execution, otherwise a metrics document either says
     // zero forever (when nobody copies the mark) or inherits the largest earlier query. A caller
@@ -912,9 +987,16 @@ fn run(
     let mut metrics = Document::new(sql);
     metrics.settings.memory_limit = memory.limit();
     metrics.settings.threads = u32::try_from(pool.threads()).unwrap_or(u32::MAX);
+    metrics.timing.parse_ns = planning.parse_ns;
+    metrics.timing.bind_ns = planning.bind_ns;
+    metrics.timing.optimize_ns = planning.optimize_ns;
     metrics.timing.physical_ns = built_wall;
     metrics.timing.execute_ns = ran_wall;
-    metrics.timing.total_ns = built_wall.saturating_add(ran_wall);
+    // Every phase and not the two this function timed itself. A total that left the planner out was
+    // the reason planning time could grow without anything going up, and the harness reads this
+    // field as the cost of the statement.
+    metrics.timing.total_ns =
+        planning.total_ns().saturating_add(built_wall).saturating_add(ran_wall);
     // The span above reads this thread's CPU clock, which is the only clock that says which thread
     // did the work and therefore the one clock that cannot see the workers. The query counted what
     // they burned as they finished, so it goes on here rather than going missing.
@@ -948,6 +1030,7 @@ fn explaining(
     session: &Session,
     analyze: bool,
     sql: &str,
+    planning: Planning,
 ) -> Result<QueryResult> {
     let statistics = context.statistics();
     if !analyze {
@@ -956,7 +1039,12 @@ fn explaining(
             &rudb_opt::explain::explain_with(plan, statistics, seams),
         );
     }
-    let under = Under::new(budget, statistics, seams.settings(), session, Rows::ForACaller);
+    // `EXPLAIN ANALYZE` is the one place a person reads these numbers with their own eyes rather
+    // than through the harness, so the planning that produced the plan being printed has to reach
+    // the document. It is the planning of the inner query and not of the `EXPLAIN`: the bind above
+    // is what turned the statement into this plan and the optimize above is what ran on it.
+    let under =
+        Under::new(budget, statistics, seams.settings(), session, Rows::ForACaller).after(planning);
     let result = run(sql, plan, catalog, cancel, under)?;
     let measured = result.metrics().expect("a query that ran reports what it did");
     let text = rudb_opt::explain::analyzed(plan, statistics, seams, measured);
