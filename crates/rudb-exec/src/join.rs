@@ -253,8 +253,13 @@ impl<'a> Join<'a> {
             return Ok(positional(left_rows, &rows, left_types.len(), right_types.len()));
         }
         // A mark join asks a question about the whole of the gathered side rather than collecting
-        // the rows that match, and its answer distinguishes no match from a match nobody could
-        // decide, so it stays on the loop until it has a rule of its own.
+        // the rows that match, so the rest of this function, which is written around a list of
+        // matches, has nothing it can do for it. It gets its answer above the loop where a lookup
+        // gives one and stays on the loop where none does.
+        let marks = match self.kind {
+            JoinKind::Mark => self.marks(left_rows, right_chunks, &mut scratch)?,
+            _ => None,
+        };
         let equalities = if self.kind == JoinKind::Mark {
             None
         } else {
@@ -313,7 +318,10 @@ impl<'a> Join<'a> {
             self.cancel.check()?;
             let before = out.len();
             if self.kind == JoinKind::Mark {
-                let marker = self.marker(left_row, &left_types, scanned_over)?;
+                let marker = match &marks {
+                    Some(marks) => marks[position].clone(),
+                    None => self.marker(left_row, &left_types, scanned_over)?,
+                };
                 let mut row = pad_right(left_row, right_types.len());
                 let Some(position) = self.marker else {
                     return Err(Error::internal("a mark join has no marker column"));
@@ -456,6 +464,90 @@ impl<'a> Join<'a> {
             }
         }
         Ok(if unknown { Value::Null } else { Value::Boolean(false) })
+    }
+
+    /// Every driving row's marker, answered by lookup, or `None` where no lookup answers it.
+    ///
+    /// A mark join's answer is three valued and it is about the whole gathered side: true where
+    /// some row of it satisfies the condition, false where no row does, null where no row does but
+    /// some row could not be decided. [`Join::marker`] gets that by evaluating the condition over
+    /// every pair of the two sides, which is the two sides multiplied. TPC-H q18 asks whether each
+    /// of a million and a half orders is one of the fifty seven the subquery returned, so that is
+    /// eighty five million evaluations to answer a question one pass over each side answers.
+    ///
+    /// The rule below is exact for one equality and is not exact for more than one, so one is what
+    /// this takes. Read the condition as `d = g` over a gathered side with rows in it. A hit means
+    /// some `g` equalled `d`, so the answer is true. A miss means no `g` equalled `d`, so the
+    /// answer is false unless some pair came out null rather than false, and `d = g` is null
+    /// exactly when one of its operands is: when `d` is null, or when the gathered side holds a
+    /// null. Neither of those is a question about which row missed, so both are settled outside the
+    /// lookup. A gathered side with no rows in it has no pairs at all, so every marker is false.
+    ///
+    /// Two equalities are handed back to the loop, because `d1 = g1 AND d2 = g2` is false whenever
+    /// either half is false whatever the other half is. A miss is null there only where some
+    /// gathered row agreed on every column it had a value for, which is a question about rows and
+    /// not about the side, and answering it as though it were the one above would call a false
+    /// marker null. Every mark join in TPC-H is one equality on one column.
+    ///
+    /// A residual is handed back for the same reason: the rows the lookup found still have to be
+    /// filtered, and the rows it did not find are the ones the null rule is about.
+    ///
+    /// `IS NOT DISTINCT FROM` needs nothing extra. It is never null, and the table holds nulls as
+    /// values, so the marker is whether the lookup hit and the null rule below never fires.
+    fn marks(
+        &self,
+        left_rows: &[Vec<Value>],
+        right_chunks: &[Chunk],
+        scratch: &mut Reservation,
+    ) -> Result<Option<Vec<Value>>> {
+        let Some(found) =
+            equalities(self.plan, &self.conditions, &self.left_schema, &self.right_schema)
+        else {
+            return Ok(None);
+        };
+        if found.left.len() != 1 || !found.residual.is_empty() {
+            return Ok(None);
+        }
+        if right_chunks.iter().all(Chunk::is_empty) {
+            return Ok(Some(vec![Value::Boolean(false); left_rows.len()]));
+        }
+        let nulls_are_values = found.null_is_a_value[0];
+        let gathered = found.gathered(self.plan, &self.right_schema, self.time_zone);
+        // One pass over the gathered side, asked once here rather than once per driving row,
+        // because what it decides is the same for all of them.
+        let undecided = !nulls_are_values && any_null_key(gathered, right_chunks, &self.cancel)?;
+        let index = lookup(gathered, right_chunks, &self.cancel, scratch)?;
+        let types = self.left_schema.types();
+        scratch.grow(u64::try_from(left_rows.len()).unwrap_or(u64::MAX))?;
+        let mut marks = Vec::with_capacity(left_rows.len());
+        let mut probing = Scratch::default();
+        let mut slots = Vec::new();
+        for batch in left_rows.chunks(VECTOR_SIZE) {
+            // Once per batch, for the same reason the build and the probe below check there. A side
+            // nobody bounded is what makes this run long and it produces nothing until it is done.
+            self.cancel.check()?;
+            let chunk = rows::pack(&types, batch)?;
+            let columns = evaluate_all_in_time_zone(
+                self.plan,
+                &found.left,
+                &self.left_schema,
+                &chunk,
+                self.time_zone,
+            )?;
+            index.slots(&columns, batch.len(), &found.null_is_a_value, &mut probing, &mut slots);
+            // row at a time: which of the three answers a driving row gets depends on that row's
+            // own slot and its own key, and a slot is not something the boolean kernel reduces.
+            for (row, &slot) in slots.iter().take(batch.len()).enumerate() {
+                marks.push(if slot != MISS {
+                    Value::Boolean(true)
+                } else if undecided || (!nulls_are_values && columns[0].is_null_at(row)) {
+                    Value::Null
+                } else {
+                    Value::Boolean(false)
+                });
+            }
+        }
+        Ok(Some(marks))
     }
 }
 
@@ -1334,6 +1426,24 @@ fn lookup(
     lookup.seal();
     scratch.shrink(charged.saturating_sub(lookup.footprint()));
     Ok(lookup)
+}
+
+/// Whether any row of this side has a null anywhere in its key.
+///
+/// One pass over the side that is about to go into the table, in the chunks it is already held in
+/// and through the evaluator the build uses, reading a validity mask rather than values. What asks
+/// is [`Join::marks`], where a null on the gathered side is what turns a miss from false into null.
+/// That is a fact about the side and not about any row of it, which is why it is asked once.
+fn any_null_key(keying: Keying<'_>, chunks: &[Chunk], cancel: &Cancel) -> Result<bool> {
+    let Keying { plan, exprs, schema, time_zone, .. } = keying;
+    for chunk in chunks {
+        cancel.check()?;
+        let columns = evaluate_all_in_time_zone(plan, exprs, schema, chunk, time_zone)?;
+        if columns.iter().any(|column| column.validity().has_nulls(chunk.len())) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Everything a pipeline breaker put in a buffer, as one list.
