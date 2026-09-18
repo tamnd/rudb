@@ -430,6 +430,21 @@ pub fn pack_tail(values: &[u64], width: usize, output: &mut Vec<u8>) -> Result<(
 
 /// Unpacks what [`pack_tail`] wrote.
 ///
+/// The writer has a dependency chain because it has to know how many bits are left over from the
+/// value before, but the reader does not, and this does not carry one. Value `index` occupies the
+/// `width` bits starting at bit `index * width`, so its position is arithmetic rather than history,
+/// and since it begins at most seven bits into a byte and runs at most sixty four, it always lies
+/// inside sixteen bytes read from that byte. One unaligned load, one shift and one mask.
+///
+/// That matters more than the module documentation lets on. The argument there is that a tail is at
+/// most 1023 values and so is bounded by a number that does not grow with the data, which is true
+/// per call and misleading in aggregate, because a cascade puts a short array in every chunk and a
+/// scan reads every chunk. ClickBench 9 is where it showed. UserID is nearly unique, so its
+/// dictionary holds about a thousand sixty four bit values per part and lands one value short of a
+/// full unit, which sends the whole column down this path: nine hundred and seventy four parts,
+/// about a million values, and the byte at a time version fed eight bytes through a `u128` for each
+/// one. That was fifty five percent of the instructions of a scan of that column on its own.
+///
 /// # Errors
 ///
 /// If `count` is not below [`VALUES`], if `width` exceeds 64, or if the input is shorter than
@@ -448,21 +463,46 @@ pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>>
     }
     let mask = u128::from(low_mask(width));
     let mut values = Vec::with_capacity(count);
-    let mut accumulator: u128 = 0;
-    let mut available = 0usize;
-    let mut at = 0usize;
-    for _ in 0..count {
-        while available < width {
-            accumulator |= u128::from(input[at]) << available;
-            at += 1;
-            available += 8;
+    let read = |window: u128, bit: usize| ((window >> bit) & mask) as u64;
+    // A buffer shorter than a window is one load for the whole call, because everything it holds is
+    // inside it. Short arrays are most of what a cascade stores, so this is the common case by
+    // count of calls even though it is the rare one by count of values.
+    if input.len() < WINDOW {
+        let mut window = [0u8; WINDOW];
+        window[..input.len()].copy_from_slice(input);
+        let word = u128::from_le_bytes(window);
+        for index in 0..count {
+            values.push(read(word, index * width));
         }
-        values.push((accumulator & mask) as u64);
-        accumulator >>= width;
-        available -= width;
+        return Ok(values);
+    }
+    // Otherwise a value is read where it lies, until the window would run off the end.
+    let whole = (((input.len() - WINDOW) * 8) / width + 1).min(count);
+    for index in 0..whole {
+        let bit = index * width;
+        let mut window = [0u8; WINDOW];
+        window.copy_from_slice(&input[bit / 8..bit / 8 + WINDOW]);
+        values.push(read(u128::from_le_bytes(window), bit % 8));
+    }
+    if whole < count {
+        // Every value left over begins past the sixteenth byte from the end, by the definition of
+        // `whole` just above, and the buffer stops on the byte holding the top bits of the last
+        // one. So all of them lie inside the final window and one load serves the lot.
+        let base = input.len() - WINDOW;
+        let mut window = [0u8; WINDOW];
+        window.copy_from_slice(&input[base..]);
+        let word = u128::from_le_bytes(window);
+        for index in whole..count {
+            values.push(read(word, index * width - base * 8));
+        }
     }
     Ok(values)
 }
+
+/// The bytes a single tail value can span, which is a shift of at most seven plus a width of at
+/// most sixty four, so seventy one bits and therefore nine bytes, rounded up to the load that
+/// covers it.
+const WINDOW: usize = 16;
 
 fn check_tail(count: usize, width: usize) -> Result<()> {
     if count >= VALUES {
@@ -698,14 +738,51 @@ mod tests {
     #[test]
     fn a_tail_round_trips_at_every_width_and_every_length() {
         let mut random = Random::new();
-        for width in [0usize, 1, 3, 7, 8, 13, 31, 32, 33, 63, 64] {
+        for width in 0..=64usize {
             for count in [0usize, 1, 2, 7, 8, 9, 100, 1023] {
                 let values: Vec<u64> =
                     (0..count).map(|_| random.next() & low_mask(width)).collect();
                 let mut bytes = Vec::new();
                 pack_tail(&values, width, &mut bytes).unwrap();
                 assert_eq!(bytes.len(), tail_len(count, width), "{count} at {width}");
-                assert_eq!(unpack_tail(&bytes, width, count).unwrap(), values);
+                assert_eq!(
+                    unpack_tail(&bytes, width, count).unwrap(),
+                    values,
+                    "{count} at {width}"
+                );
+            }
+        }
+    }
+
+    /// The two halves of the reader agree with each other.
+    ///
+    /// A value is read with one sixteen byte load, which the values near the end of the buffer
+    /// cannot have because the buffer stops on the byte holding the top bits of the last one. Those
+    /// go through a zero padded copy instead, and the split between the two is arithmetic on
+    /// lengths, which is the kind of thing that is off by one. Handing the same bytes to the reader
+    /// twice, once exactly sized so the last values take the padded path and once with slack on the
+    /// end so every value takes the fast one, makes the two paths check each other at every width.
+    #[test]
+    fn the_padded_end_of_a_tail_reads_the_same_as_the_windowed_start() {
+        let mut random = Random::new();
+        for width in 1..=64usize {
+            for count in [1usize, 2, 3, 17, 129, 1023] {
+                let values: Vec<u64> =
+                    (0..count).map(|_| random.next() & low_mask(width)).collect();
+                let mut exact = Vec::new();
+                pack_tail(&values, width, &mut exact).unwrap();
+                let mut slack = exact.clone();
+                slack.extend_from_slice(&[0u8; WINDOW]);
+                assert_eq!(
+                    unpack_tail(&exact, width, count).unwrap(),
+                    values,
+                    "{count} at {width}"
+                );
+                assert_eq!(
+                    unpack_tail(&slack, width, count).unwrap(),
+                    values,
+                    "{count} at {width}"
+                );
             }
         }
     }

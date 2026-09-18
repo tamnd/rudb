@@ -1249,6 +1249,19 @@ pub struct Reader {
     file: Arc<File>,
     table: Arc<Table>,
     dictionaries: Arc<Vec<OnceLock<Arc<Vector>>>>,
+    /// Held while a global dictionary is being opened, one per column.
+    ///
+    /// The [`OnceLock`] above says whether one has been opened, which is the question a reader that
+    /// already has it needs answered and is free. It does not say whether one is being opened, and
+    /// the difference matters because every worker of a scan wants the same dictionary at the same
+    /// moment. Without this they all miss, all read the page, all verify it and all decode it, and
+    /// all but one throw the answer away. ClickBench 38 reads the URL dictionary, which is 515,958
+    /// entries, and was paying for it twice.
+    loading: Arc<Vec<Mutex<()>>>,
+    /// How many global dictionaries have been opened. A scan of a dictionary column should open its
+    /// dictionary once however many workers it has, and the test that says so is the only thing
+    /// keeping it that way.
+    opened: Arc<AtomicUsize>,
     /// The membership sieves of one stripe of one column, by column and then by stripe, read the
     /// first time a probe asks about them. A query filters on one or two columns and never looks at
     /// the rest, so reading these at open would be the whole index for the sake of a fraction of it.
@@ -1302,6 +1315,9 @@ pub struct Reads {
     pub pages: usize,
     /// Index sections read since.
     pub indexes: usize,
+    /// Global dictionaries opened since. One per dictionary column that a query touched, however
+    /// many workers touched it, which is a claim only a test can keep true.
+    pub dictionaries: usize,
 }
 
 /// Where one table wide part number lands.
@@ -1838,6 +1854,7 @@ impl Reader {
         let table = decode_directory(&bytes, size)?;
         let places = places(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
+        let table_fields = table.fields.len();
         let stripes = table.stripes.len();
         let cache = (0..table.fields.len())
             .map(|_| {
@@ -1855,6 +1872,8 @@ impl Reader {
             file: Arc::new(file),
             table: Arc::new(table),
             dictionaries: Arc::new(dictionaries),
+            loading: Arc::new((0..table_fields).map(|_| Mutex::new(())).collect()),
+            opened: Arc::new(AtomicUsize::new(0)),
             sieves: Arc::new(sieves),
             places: Arc::new(places),
             cache: Arc::new(cache),
@@ -1879,6 +1898,7 @@ impl Reader {
             opening: self.opening,
             pages: self.pages.load(Atomic::Relaxed),
             indexes: self.indexes.load(Atomic::Relaxed),
+            dictionaries: self.opened.load(Atomic::Relaxed),
         }
     }
 
@@ -2277,18 +2297,31 @@ impl Reader {
         Ok(Some((total, rows)))
     }
 
+    /// The global dictionary of a column, opened once however many workers ask for it at once.
+    ///
+    /// The unlocked look is first because it is the answer every time after the first and it costs a
+    /// load. Everybody who misses it queues on [`Self::loading`] and looks again on the way in, so
+    /// the one who arrived first does the reading and the rest take what it left. Waiting is the
+    /// cheaper thing to do: the work behind the lock is a page read, a checksum and the decode of a
+    /// dictionary that can hold half a million entries, and the alternative is every worker of the
+    /// scan doing all of it and all but one dropping the result on the floor.
     fn dictionary(&self, column: usize) -> Result<Option<Arc<Vector>>> {
         let Some(page) = self.table.dictionaries[column] else { return Ok(None) };
         if let Some(dictionary) = self.dictionaries[column].get() {
             return Ok(Some(Arc::clone(dictionary)));
         }
+        let _queued = self.loading[column].lock().map_err(|_| invalid("a poisoned dictionary"))?;
+        if let Some(dictionary) = self.dictionaries[column].get() {
+            return Ok(Some(Arc::clone(dictionary)));
+        }
+        self.opened.fetch_add(1, Atomic::Relaxed);
         let dictionary = Arc::new(open_global_dictionary(
             Arc::clone(&self.file),
             page,
             &self.table.fields[column].ty,
         )?);
         let _ = self.dictionaries[column].set(Arc::clone(&dictionary));
-        Ok(Some(self.dictionaries[column].get().map_or(dictionary, Arc::clone)))
+        Ok(Some(dictionary))
     }
 
     /// Reads only the named columns from one part.
@@ -5225,6 +5258,64 @@ mod tests {
         let chunk = reader.read(parts - 1, &[0]).expect("the code page remains valid");
         let error = chunk.validate_external().expect_err("the damage must reach the caller");
         assert!(error.message().contains("payload checksum differs"), "{error}");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Every worker of a scan wants the dictionary at the same moment and one of them fetches it.
+    ///
+    /// Asking a `OnceLock` whether it holds something answers the question a worker that already has
+    /// the dictionary is asking and not the one a worker without it is asking, which is whether
+    /// somebody is already on their way with it. Sixteen workers that all miss will all read the
+    /// page, all verify it and all decode it, and fifteen will drop the result. Nothing about that
+    /// is incorrect, which is why it went unnoticed, and it showed up as ClickBench 38 getting
+    /// slower when the scan in front of it got faster and stopped staggering the arrivals.
+    ///
+    /// The barrier is what makes the test about that rather than about luck. Without it the first
+    /// thread is usually finished before the last one starts and the count is one either way.
+    #[test]
+    fn a_global_dictionary_is_opened_once_however_many_workers_ask_at_once() {
+        let path = path("dictionary-once");
+        let parts = 8;
+        let per_part = 500;
+        let value =
+            |row: usize| format!("{row:07} a value long enough to be worth a payload block");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in 0..parts {
+            let values = (0..per_part)
+                .map(|row| Value::Varchar(value(part * per_part + row)))
+                .collect::<Vec<_>>();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Varchar, &values).expect("strings"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        assert!(reader.table.dictionaries[0].is_some(), "the column has to have one to share");
+        assert_eq!(reader.reads().dictionaries, 0, "opening the file does not open a dictionary");
+
+        let workers = 16;
+        let gate = std::sync::Barrier::new(workers);
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                let reader = reader.clone();
+                let gate = &gate;
+                scope.spawn(move || {
+                    gate.wait();
+                    let chunk = reader.read(worker % parts, &[0]).expect("a part");
+                    assert_eq!(
+                        chunk.value_at(0, 0),
+                        Value::Varchar(value((worker % parts) * per_part))
+                    );
+                });
+            }
+        });
+
+        assert_eq!(reader.reads().dictionaries, 1, "sixteen workers, one dictionary, one open");
         fs::remove_file(path).expect("remove scratch file");
     }
 
