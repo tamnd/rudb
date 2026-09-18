@@ -245,71 +245,121 @@ impl Exchange {
         Ok(())
     }
 
+    /// Throws duplicate pairs away a partition at a time and then counts groups a split at a time.
+    ///
+    /// The two passes are partitioned on different things and that is the point of there being two
+    /// of them. Throwing duplicates away is the expensive pass, because its table holds a row per
+    /// distinct pair and every probe into it is a cache miss, so the rows are partitioned on the
+    /// pair and every partition gets an equal share of them whatever the grouping column looks
+    /// like. Counting is the cheap pass, because its table holds a row per group and a query with
+    /// few enough groups to be lopsided has a table small enough to sit in cache, so it is
+    /// partitioned on the group, which puts every group in one split and lets each split take its
+    /// own top rows with nobody to agree with afterwards.
+    ///
+    /// Partitioning on the group throughout is what this used to do, and it gave the whole of a
+    /// group's deduplicating to one thread. On the million row ClickBench file one region holds
+    /// eighteen percent of the distinct pairs, so one of sixteen partitions did three times the
+    /// average share and the other fifteen waited for it.
     pub(crate) fn finish(&self, bound: usize, memory: &Memory) -> Result<Vec<Chunk>> {
         let input = self
             .partitions
             .iter()
             .map(|partition| partition.lock().map(|held| held.rows()).map_err(poisoned))
             .sum::<Result<usize>>()?;
-        let degree = input.div_ceil(65_536).clamp(1, PARTITIONS);
-        let next = AtomicUsize::new(0);
-        let slots: Vec<Mutex<Option<Result<Output>>>> =
-            (0..PARTITIONS).map(|_| Mutex::new(None)).collect();
-        let outputs = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(degree - 1);
-            for _ in 1..degree {
-                handles.push(scope.spawn(|| {
-                    self.finish_next(&next, &slots, bound, memory);
-                    stage::here()
-                }));
-            }
-            self.finish_next(&next, &slots, bound, memory);
-            let mut theirs = Spent::none();
-            for handle in handles {
-                let spent = handle
-                    .join()
-                    .map_err(|_| Error::internal("a grouped distinct radix worker panicked"))?;
-                theirs.add(spent);
-            }
-            stage::gained(theirs);
-            let mut outputs = Vec::with_capacity(PARTITIONS);
-            for (at, slot) in slots.iter().enumerate() {
-                outputs.push(slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
-                    Err(Error::internal(format!(
-                        "nothing finished grouped distinct radix partition {at}"
-                    )))
-                })?);
-            }
-            Ok::<_, Error>(outputs)
+        // Sixteen thousand rows is worth a thread here, where a plain aggregate asks for sixty five
+        // thousand before it takes one. A row costs more on this path: it probes a table that holds
+        // a slot per distinct pair, which is most of the way to a slot per row, so the probe misses
+        // cache where a plain aggregate's probe into a table of groups usually does not. Measured on
+        // the million row ClickBench file, dropping the ask from sixty five thousand to sixteen took
+        // twelve percent off the two queries it moves and left the rest where they were, and asking
+        // for less than sixteen thousand bought nothing back.
+        let degree = input.div_ceil(16_384).clamp(1, PARTITIONS);
+        // Either every split or one of it. A split is a vector per pair partition, so there are as
+        // many of them as the two counts multiplied, and a query that is going to finish on one
+        // thread should not be paying for a hundred vectors to hand itself its own rows. Anything
+        // that is worth a second thread is worth the full spread, because the counting pass is
+        // skewed by the grouping column in a way the deduplicating pass no longer is.
+        let splits = if degree > 1 { PARTITIONS } else { 1 };
+        let counted =
+            in_parallel(PARTITIONS, degree, "deduplicated the pairs of radix partition", |at| {
+                let mut partition = self.partitions[at].lock().map_err(poisoned)?;
+                distinct_pairs(&mut partition, splits, memory)
+            })?;
+        let merged = in_parallel(splits, degree, "counted the groups of split", |at| {
+            count_groups(&counted, at, self.dictionary.as_ref(), bound, memory)
         })?;
+        // The distinct pairs are read for the last time by the pass above, so the room they took
+        // goes back here rather than at the end of the query.
+        for part in counted {
+            drop(part.held);
+        }
         let mut chunks = Vec::new();
         let mut held = self.held.lock().map_err(poisoned)?;
         held.clear();
-        for Output { chunks: mut part, held: charge } in outputs {
+        for Output { chunks: mut part, held: charge } in merged {
             chunks.append(&mut part);
             held.push(charge);
         }
         Ok(chunks)
     }
+}
 
-    fn finish_next(
-        &self,
-        next: &AtomicUsize,
-        slots: &[Mutex<Option<Result<Output>>>],
-        bound: usize,
-        memory: &Memory,
-    ) {
+/// Runs `count` pieces of work across `degree` threads and hands back what they made, in order.
+///
+/// Both passes have the same shape, so they share this. The pieces are taken off one counter rather
+/// than dealt out in advance, because they are not the same size and a thread that draws a cheap one
+/// should pick up the next piece instead of finishing early. The calling thread takes a share too.
+///
+/// `what` only ever reaches an error message, and reads as "nothing <what> 3".
+fn in_parallel<T: Send>(
+    count: usize,
+    degree: usize,
+    what: &str,
+    run: impl Fn(usize) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<Result<T>>>> = (0..count).map(|_| Mutex::new(None)).collect();
+    let step = || {
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
-            let Some(partition) = self.partitions.get(at) else { return };
-            let done = partition.lock().map_err(poisoned).and_then(|mut rows| {
-                finish_partition(&mut rows, self.dictionary.as_ref(), bound, memory)
-            });
+            if at >= count {
+                return;
+            }
+            let done = run(at);
             if let Ok(mut slot) = slots[at].lock() {
                 *slot = Some(done);
             }
         }
-    }
+    };
+    std::thread::scope(|scope| {
+        let degree = degree.min(count);
+        let mut handles = Vec::with_capacity(degree - 1);
+        for _ in 1..degree {
+            handles.push(scope.spawn(|| {
+                step();
+                stage::here()
+            }));
+        }
+        step();
+        let mut theirs = Spent::none();
+        for handle in handles {
+            let spent = handle
+                .join()
+                .map_err(|_| Error::internal("a grouped distinct radix worker panicked"))?;
+            theirs.add(spent);
+        }
+        stage::gained(theirs);
+        let mut out = Vec::with_capacity(count);
+        for (at, slot) in slots.iter().enumerate() {
+            out.push(
+                slot.lock()
+                    .map_err(poisoned)?
+                    .take()
+                    .unwrap_or_else(|| Err(Error::internal(format!("nothing {what} {at}"))))?,
+            );
+        }
+        Ok::<_, Error>(out)
+    })
 }
 
 struct Output {
@@ -317,12 +367,38 @@ struct Output {
     held: Reservation,
 }
 
-fn finish_partition(
-    partition: &mut Held,
-    dictionary: Option<&Arc<Vector>>,
-    bound: usize,
-    memory: &Memory,
-) -> Result<Output> {
+/// What one pair partition found, split by group hash so the count can take one split each.
+struct Counted {
+    splits: Vec<Vec<Grouped>>,
+    /// What the splits cost, given back when [`Exchange::finish`] has read the last of them.
+    held: Reservation,
+}
+
+/// The group of one distinct pair, on its way from the partition that found it to its split.
+///
+/// The hash rides along because the two sides want it once each, to pick the split the group belongs
+/// in and then to find the group inside that split, and working it out again on the other side would
+/// be the same arithmetic on the same number.
+#[derive(Debug, Clone, Copy)]
+struct Grouped {
+    group: i32,
+    group_hash: u32,
+    valid: bool,
+}
+
+/// Which of `splits` a group belongs to, by the top bits of its hash.
+///
+/// The top bits, so that the table inside the split still has all the low ones to probe with. It is
+/// a multiply rather than the shift the pair partitions use because the number of splits is decided
+/// per query and can be one, and a shift that has to throw away all thirty two bits is not a shift
+/// Rust will do.
+#[inline]
+fn split_of(group_hash: u32, splits: usize) -> usize {
+    ((u64::from(group_hash) * splits as u64) >> u32::BITS) as usize
+}
+
+/// Deduplicates one pair partition and hands over the group of each pair that survived.
+fn distinct_pairs(partition: &mut Held, splits: usize, memory: &Memory) -> Result<Counted> {
     let held_rows = partition.rows();
     let pair_capacity = held_rows.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
@@ -376,73 +452,102 @@ fn finish_partition(
     ))?;
     let partition = Run { rows: unique, validity: unique_validity };
 
-    let mut group_buckets = vec![EMPTY; 64];
-    let mut group_rows: Vec<usize> = Vec::with_capacity(32);
-    let mut counts: Vec<i64> = Vec::with_capacity(32);
-    working.grow(width(
-        group_buckets.capacity() * size_of::<u32>()
-            + group_rows.capacity() * size_of::<usize>()
-            + counts.capacity() * size_of::<i64>(),
-    ))?;
+    // Every distinct pair is one for its group to count, and the group goes to the split its hash
+    // picks so that the pass below finds all of a group's pairs together. The user is not carried
+    // over because nothing after this asks which user it was, only how many there were.
+    //
+    // Counting the groups here first, and leaving the pass below only the partial counts to add up,
+    // was tried and is the wrong trade. It collapses a partition's pairs down to its groups, which
+    // is worth a pass when a group has hundreds of pairs and is worth nothing when it has one, and
+    // the second kind is `GROUP BY SearchPhrase`, where there are nearly as many phrases as there
+    // are pairs. Doing it in both places cost ten percent there and bought two percent on the
+    // lopsided queries it was meant for, because the pass below probes a table with one row per
+    // group and a query with few enough groups to skew has a table small enough to sit in cache.
+    //
+    // Each split is asked for an even share of the pairs up front and not left to double its way
+    // there. A hash spreads the groups evenly enough that the guess is close, and the alternative is
+    // every one of the vectors reallocating five or six times on a pass whose whole job is to move
+    // twelve bytes a pair.
+    let even = pairs.div_ceil(splits);
+    let share = (even + even.isqrt() * 4).min(pairs);
+    let mut parts: Vec<Vec<Grouped>> = (0..splits).map(|_| Vec::with_capacity(share)).collect();
     for row in 0..pairs {
-        if (group_rows.len() + 1) * 2 > group_buckets.len() {
-            let old = group_buckets.len();
-            let new = old * 2;
-            working.grow(width((new - old) * size_of::<u32>()))?;
-            let mut grown = vec![EMPTY; new];
-            let mask = new - 1;
-            for (slot, &source) in group_rows.iter().enumerate() {
-                let valid = all_valid || partition.validity[source];
-                let mut at = group_hash(partition.rows[source], valid) as usize & mask;
-                while grown[at] != EMPTY {
-                    at = (at + 1) & mask;
-                }
-                grown[at] = slot as u32;
-            }
-            group_buckets = grown;
-        }
-        if group_rows.len() == group_rows.capacity() {
-            let old = group_rows.capacity();
-            let new = old.max(1) * 2;
-            working.grow(width((new - old) * (size_of::<usize>() + size_of::<i64>())))?;
-            group_rows.reserve_exact(new - old);
-            counts.reserve_exact(new - old);
-        }
         let record = partition.rows[row];
         let valid = all_valid || partition.validity[row];
-        let mask = group_buckets.len() - 1;
-        let hash = group_hash(record, valid);
-        let mut at = hash as usize & mask;
-        let slot = loop {
-            let slot = group_buckets[at];
-            if slot == EMPTY {
-                let slot = group_rows.len();
-                group_buckets[at] = slot as u32;
-                group_rows.push(row);
-                counts.push(0);
-                break slot;
-            }
-            let slot = slot as usize;
-            let held_row = group_rows[slot];
-            let held = partition.rows[held_row];
-            let held_valid = all_valid || partition.validity[held_row];
-            if group_hash(held, held_valid) == hash
-                && held.group == record.group
-                && held_valid == valid
-            {
-                break slot;
-            }
-            at = (at + 1) & mask;
-        };
-        counts[slot] = counts[slot]
-            .checked_add(1)
-            .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
+        let group_hash = group_hash(record, valid);
+        parts[split_of(group_hash, splits)].push(Grouped {
+            group: record.group,
+            group_hash,
+            valid,
+        });
     }
+    let mut held = memory.reservation();
+    held.grow(width(
+        parts.iter().map(|split| split.capacity() * size_of::<Grouped>()).sum::<usize>(),
+    ))?;
+    timing.stop(0);
+    Ok(Counted { splits: parts, held })
+}
+
+/// Adds up one split's groups across every pair partition and takes the best `bound` of them.
+///
+/// Every pair of a group lands in the same split, because the split is picked by the group hash, so
+/// nothing here has to agree with any other split about a count and the top rows it picks are final.
+///
+/// The table is made once at the size the input can need, rather than started small and doubled,
+/// because the number of pairs coming in is known before any of them are read and a group cannot
+/// appear more often than that.
+fn count_groups(
+    counted: &[Counted],
+    split: usize,
+    dictionary: Option<&Arc<Vector>>,
+    bound: usize,
+    memory: &Memory,
+) -> Result<Output> {
+    let timing = stage::Timing::start(Stage::Fold);
+    let input = counted.iter().map(|part| part.splits[split].len()).sum::<usize>();
+    let capacity = input.saturating_mul(2).max(64).next_power_of_two();
+    let mut working = memory.reservation();
+    working.grow(width(capacity * size_of::<u32>()))?;
+    let mut buckets = vec![EMPTY; capacity];
+    let mask = capacity - 1;
+    let mut groups: Vec<Grouped> = Vec::new();
+    let mut counts: Vec<i64> = Vec::new();
+    for part in counted {
+        for pair in &part.splits[split] {
+            let mut at = pair.group_hash as usize & mask;
+            loop {
+                let slot = buckets[at];
+                if slot == EMPTY {
+                    buckets[at] = u32::try_from(groups.len()).map_err(|_| {
+                        Error::out_of_memory("a grouped distinct radix split is too large")
+                    })?;
+                    groups.push(*pair);
+                    counts.push(1);
+                    break;
+                }
+                let slot = slot as usize;
+                if groups[slot].group_hash == pair.group_hash
+                    && groups[slot].group == pair.group
+                    && groups[slot].valid == pair.valid
+                {
+                    counts[slot] = counts[slot]
+                        .checked_add(1)
+                        .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
+                    break;
+                }
+                at = (at + 1) & mask;
+            }
+        }
+    }
+    working.grow(width(
+        groups.capacity() * size_of::<Grouped>() + counts.capacity() * size_of::<i64>(),
+    ))?;
     timing.stop(0);
 
     let timing = stage::Timing::start(Stage::Emit);
-    let mut best = Vec::with_capacity(bound.min(counts.len()));
-    for slot in 0..counts.len() {
+    let mut best: Vec<usize> = Vec::with_capacity(bound.min(groups.len()));
+    for slot in 0..groups.len() {
         let at = best.partition_point(|&kept| counts[kept] >= counts[slot]);
         if at < bound {
             best.insert(at, slot);
@@ -452,15 +557,13 @@ fn finish_partition(
     best.sort_unstable();
     let mut output = Vec::with_capacity(best.len());
     for slot in best {
-        let source = group_rows[slot];
-        let row = partition.rows[source];
-        let valid = all_valid || partition.validity[source];
+        let found = groups[slot];
         // The code goes back to being the string it stood for here and nowhere earlier, so what is
         // copied is one string per group that reached the bound rather than one per row.
-        let group = match (valid, dictionary) {
+        let group = match (found.valid, dictionary) {
             (false, _) => Value::Null,
-            (true, None) => Value::Integer(row.group),
-            (true, Some(dictionary)) => dictionary.try_value_at(row.group as usize)?,
+            (true, None) => Value::Integer(found.group),
+            (true, Some(dictionary)) => dictionary.try_value_at(found.group as usize)?,
         };
         output.push(vec![group, Value::BigInt(counts[slot])]);
     }
@@ -474,22 +577,26 @@ fn finish_partition(
     Ok(Output { chunks, held })
 }
 
-/// One row into the radix partition its group hash picks.
+/// One row into the radix partition its pair hash picks.
+///
+/// The pair and not the group, because the work the partitions are there to spread is deduplicating
+/// pairs and a grouping column is allowed to be as lopsided as it likes. Grouping on the pair leaves
+/// a group's pairs in several partitions, which is what the second pass in [`Exchange::finish`] is
+/// for.
 ///
 /// Pulled out of [`Exchange::buffer`] so that the loop that reads both columns where they lie and the
 /// loop that asks the vectors a row at a time cannot drift apart on which partition a row belongs in
-/// or on what its hashes are.
+/// or on what its hash is.
 ///
 /// The shift leaves exactly the bits that index [`PARTITIONS`] of them, so the index is always in
-/// range and the bounds check never fires.
+/// range and the bounds check never fires. The partition takes the top bits and the table inside it
+/// probes with the low ones, so the bits the partition used are not the bits it then goes without.
 #[inline]
 fn scatter(partitions: &mut [Run], shift: u32, group: i32, valid: bool, user: i64) {
     let group_word = if valid { i64::from(group) as u64 } else { NOTHING };
-    let wide_group = spread(mix(0, group_word));
-    let wide_pair = spread(mix(wide_group, user as u64));
-    let group_hash = (wide_group ^ (wide_group >> 32)) as u32;
+    let wide_pair = spread(mix(spread(mix(0, group_word)), user as u64));
     let pair_hash = (wide_pair ^ (wide_pair >> 32)) as u32;
-    partitions[(group_hash >> shift) as usize].push(Record { user, group, pair_hash }, valid);
+    partitions[(pair_hash >> shift) as usize].push(Record { user, group, pair_hash }, valid);
 }
 
 fn width(value: usize) -> u64 {
@@ -508,7 +615,7 @@ mod tests {
     use rudb_common::{LogicalType, Memory, Value};
     use rudb_vector::Vector;
 
-    use super::{Held, Record, Run, finish_partition};
+    use super::{Held, Record, Run, count_groups, distinct_pairs};
 
     #[test]
     fn one_partition_deduplicates_pairs_and_counts_groups_across_the_runs_it_was_handed() {
@@ -563,14 +670,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_group_whose_pairs_landed_in_different_partitions_comes_out_with_one_count() {
+        // What the two passes are for. The same group is counted separately by two pair partitions
+        // and the merge has to add the two parts up rather than report a group twice, which is what
+        // partitioning on the pair costs and what the second pass buys back.
+        //
+        // At one split as well as at several, because a query small enough to finish on one thread
+        // asks for one split and that is the arithmetic in `split_of` that has no bits left to shift.
+        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        for splits in [1, SPLITS] {
+            let mut first = Run::default();
+            first.push(row(3, 10, 5), true);
+            first.push(row(3, 11, 5), true);
+            let mut second = Run::default();
+            second.push(row(3, 12, 9), true);
+            second.push(row(4, 12, 9), true);
+            let mut left = Held { runs: vec![first] };
+            let mut right = Held { runs: vec![second] };
+            let memory = Memory::unlimited();
+            let counted = vec![
+                distinct_pairs(&mut left, splits, &memory).expect("a pair partition"),
+                distinct_pairs(&mut right, splits, &memory).expect("a pair partition"),
+            ];
+            assert_eq!(
+                rows_of(&counted, splits, None),
+                [
+                    vec![Value::Integer(3), Value::BigInt(3)],
+                    vec![Value::Integer(4), Value::BigInt(1)],
+                ]
+            );
+        }
+    }
+
+    /// How many splits the tests count over, picked to be neither one nor the sixteen a big query gets.
+    const SPLITS: usize = 4;
+
     /// One partition finished and flattened into rows, sorted so the partition order does not show.
     fn finished(partition: &mut Held, dictionary: Option<&Arc<Vector>>) -> Vec<Vec<Value>> {
-        let output = finish_partition(partition, dictionary, 10, &Memory::unlimited())
-            .expect("a grouped distinct partition");
+        let counted = vec![
+            distinct_pairs(partition, SPLITS, &Memory::unlimited()).expect("a pair partition"),
+        ];
+        rows_of(&counted, SPLITS, dictionary)
+    }
+
+    /// Every split merged and flattened into rows, sorted so the split order does not show.
+    fn rows_of(
+        counted: &[super::Counted],
+        splits: usize,
+        dictionary: Option<&Arc<Vector>>,
+    ) -> Vec<Vec<Value>> {
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        for chunk in output.chunks {
-            for row in 0..chunk.len() {
-                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+        for split in 0..splits {
+            let output = count_groups(counted, split, dictionary, 10, &Memory::unlimited())
+                .expect("a grouped distinct split");
+            for chunk in output.chunks {
+                for row in 0..chunk.len() {
+                    rows.push(
+                        (0..chunk.width()).map(|column| chunk.value_at(row, column)).collect(),
+                    );
+                }
             }
         }
         rows.sort_by_key(|row| format!("{row:?}"));
