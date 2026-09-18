@@ -33,5 +33,10 @@ rudb-functions.workspace = true
 rudb-csv.workspace = true
 rudb-parquet.workspace = true
 
+[dev-dependencies]
+# For writing a native file a scan can be pointed at, which is the only way to test what a scan
+# does with stripes.
+rudb-native.workspace = true
+
 [lints]
 workspace = true

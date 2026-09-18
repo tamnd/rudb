@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_catalog::Table;
@@ -56,6 +56,15 @@ impl Handout {
     pub(crate) fn take(&self) -> Option<Morsel> {
         let at = self.next.fetch_add(1, Ordering::Relaxed);
         (at < self.total).then(|| Morsel::new(at, at, at + 1))
+    }
+
+    /// The next position, as a number rather than as a morsel covering it.
+    ///
+    /// For a source whose morsel covers something other than the position it counted, which is a
+    /// scan handing out stripes: it counts stripes here and looks up the parts they hold.
+    pub(crate) fn number(&self) -> Option<u64> {
+        let at = self.next.fetch_add(1, Ordering::Relaxed);
+        (at < self.total).then_some(at)
     }
 }
 
@@ -204,9 +213,9 @@ fn poisoned<T>(_: T) -> Error {
 /// as the difference between 20 GB and 200 MB on ClickBench.
 ///
 /// A morsel here is one stored chunk, because that is the unit the table hands back and reading
-/// half of one costs the same as reading all of it. When the storage format's blocks are what is
-/// scanned rather than an in memory table, a morsel becomes a run of rows inside a block and the
-/// only thing that changes is what the numbers in it mean.
+/// half of one costs the same as reading all of it. Over a native file with enough stripes to go
+/// round it is a whole stripe instead, which is sixty four chunks, for the reason [`Scan::stripes`]
+/// gives.
 ///
 /// `probes` is what the filter above this scan already knows, in the same shape [`FileScan`] takes
 /// it, and it is answered against the table's zone maps a chunk at a time. That is a finer unit than
@@ -221,6 +230,25 @@ pub(crate) struct Scan<'a> {
     probes: Vec<Probe>,
     schema: Schema,
     chunks: Handout,
+    /// The parts of each stripe, empty when the rows are not native.
+    ///
+    /// A part is a quarter of a megabyte of a column and a stripe holds sixty four of them under
+    /// one page, so a worker that takes a part takes a sixty fourth of a read. Handing parts out
+    /// one at a time puts every worker in the same stripe at the same moment, and the reader can
+    /// only let one of them read the page: the other fifteen read their own part out of the same
+    /// bytes, and the winner reads those bytes again as part of the page. On the ClickBench file a
+    /// cold column comes off the disk at 550 MB/s that way, on a disk that does 4 GB/s with one
+    /// reader and 7 GB/s with eight, because a quarter of the bytes move twice and the rest move in
+    /// reads too small to keep the queue full.
+    ///
+    /// A morsel that is a whole stripe fixes it at the source. Each worker owns the page it reads,
+    /// nobody loses a race, and sixteen workers put sixteen quarter megabyte reads in flight.
+    stripes: Vec<Range<usize>>,
+    /// The handout over `stripes`, used instead of `chunks` when `whole` is set.
+    runs: Handout,
+    /// Whether a morsel is a whole stripe. See [`Source::morsels`], which is where it is decided
+    /// and is the one moment the scan knows how many workers it will face.
+    whole: AtomicBool,
     skipped: AtomicUsize,
 }
 
@@ -272,7 +300,20 @@ impl<'a> Scan<'a> {
             next =
                 next.saturating_add(i64::try_from(table.rows().chunk_len(at)?).unwrap_or(i64::MAX));
         }
-        Ok(Self { table, columns, offsets, probes, schema, chunks, skipped: AtomicUsize::new(0) })
+        let stripes = table.rows().stripe_parts();
+        let runs = Handout::new(stripes.len());
+        Ok(Self {
+            table,
+            columns,
+            offsets,
+            probes,
+            schema,
+            chunks,
+            stripes,
+            runs,
+            whole: AtomicBool::new(false),
+            skipped: AtomicUsize::new(0),
+        })
     }
 
     /// What this scan produces.
@@ -283,7 +324,14 @@ impl<'a> Scan<'a> {
 
 impl Source for Scan<'_> {
     fn morsel(&self) -> Option<Morsel> {
-        self.chunks.take()
+        if !self.whole.load(Ordering::Relaxed) {
+            return self.chunks.take();
+        }
+        let index = self.runs.number()?;
+        let run = self.stripes.get(usize::try_from(index).unwrap_or(usize::MAX))?;
+        let start = u64::try_from(run.start).unwrap_or(u64::MAX);
+        let end = u64::try_from(run.end).unwrap_or(u64::MAX);
+        Some(Morsel::new(index, start, end))
     }
 
     fn morsels(&self, threads: usize) -> Option<usize> {
@@ -295,12 +343,27 @@ impl Source for Scan<'_> {
         // rather than for every worker the machine has. What one costs is a thread, and what it
         // buys is a share of the work, and `native_instances` is where those two are weighed.
         let useful = native_instances(self.table.rows().len());
-        Some(chunks.min(threads).min(useful))
+        let instances = chunks.min(threads).min(useful);
+        // A stripe per worker only divides the work when there are at least as many stripes as
+        // workers. Below that it would leave workers with nothing, and the duplicate reads it
+        // avoids are cheaper than the half of the machine it would cost, so a small table keeps
+        // handing out parts. The reader is told what is coming before any of it starts, because a
+        // page cache smaller than the number of workers in it evicts pages that are still in use.
+        if instances > 1 && self.stripes.len() >= instances {
+            // Twice the workers rather than exactly the workers. The cache drops the page that has
+            // been there longest, which with a slot per worker is always the page of whoever
+            // entered their stripe first, which is the worker still in it. Room for the stripe
+            // each worker has moved on to as well as the one it is in is what stops a straggler
+            // reading its own page again, and it costs a page per worker per column.
+            self.table.rows().keep_stripes(instances.saturating_mul(2));
+            self.whole.store(true, Ordering::Relaxed);
+        }
+        Some(instances)
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let at = position(morsel);
-        if at >= self.table.rows().chunk_count() {
+        if at >= self.table.rows().chunk_count() || morsel.is_drained() {
             *out = Chunk::empty(&self.schema.types());
             return Ok(Progress::Done);
         }
@@ -311,13 +374,13 @@ impl Source for Scan<'_> {
         if !self.probes.is_empty() && self.table.rows().skips(at, &self.probes) {
             self.skipped.fetch_add(1, Ordering::Relaxed);
             *out = Chunk::empty(&self.schema.types());
-            return Ok(Progress::Done);
+            return Ok(more(morsel));
         }
         let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
         let read = self.table.rows().read(at, &projected)?;
         if self.columns.iter().all(Option::is_some) {
             *out = read;
-            return Ok(Progress::Done);
+            return Ok(more(morsel));
         }
         let mut held = Vec::with_capacity(self.columns.len());
         let mut real = 0;
@@ -330,8 +393,13 @@ impl Source for Scan<'_> {
             }
         }
         *out = Chunk::with_rows(held, read.len())?;
-        Ok(Progress::Done)
+        Ok(more(morsel))
     }
+}
+
+/// Whether a morsel the scan has just taken a part out of has another one in it.
+fn more(morsel: &Morsel) -> Progress {
+    if morsel.is_drained() { Progress::Done } else { Progress::More }
 }
 
 /// How many instances of a scan over a stored table are worth running.
@@ -1419,8 +1487,8 @@ mod tests {
     use rudb_vector::Chunk;
 
     use super::{
-        Bound, FileScan, Handout, Op, Probe, RUN, Scan, Schema, Series, VECTOR_SIZE, cut_rows,
-        native_instances, next_piece, parts,
+        AtomicBool, Bound, FileScan, Handout, Op, Probe, RUN, Scan, Schema, Series, VECTOR_SIZE,
+        cut_rows, native_instances, next_piece, parts,
     };
 
     /// Every morsel a row group of `rows` rows is cut into, by asking for them the way `cut` does.
@@ -1514,6 +1582,110 @@ mod tests {
         assert_eq!(taken, [0, 1, 2]);
         assert!(handout.take().is_none());
         assert!(handout.take().is_none());
+    }
+
+    /// A native file of `parts` parts of `rows` rows each, and the catalog table over it.
+    ///
+    /// The file is written rather than faked because the thing under test is what the scan does
+    /// with the stripes the format puts the parts in, and only the format knows where those are.
+    fn native(label: &str, parts: usize, rows: usize) -> (Table, std::path::PathBuf) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time advances")
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("rudb-exec-{label}-{}-{stamp}.rdb", std::process::id()));
+        let mut writer = rudb_native::Writer::create(
+            &path,
+            "items",
+            vec![Field::required("id", LogicalType::Integer)],
+        )
+        .expect("a new file");
+        for part in 0..parts {
+            let values: Vec<Value> =
+                (0..rows).map(|row| Value::Integer((part * rows + row) as i32)).collect();
+            let chunk = Chunk::new(vec![
+                rudb_vector::Vector::from_values(LogicalType::Integer, &values).expect("integers"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+        let reader = rudb_native::Reader::open(&path).expect("reopen from disk");
+        let table = Table::native(QualifiedName::new("memory", "main", "items"), reader)
+            .expect("a native table");
+        (table, path)
+    }
+
+    /// A scan of a table, built the way the builder builds one.
+    fn scan_of(table: &Table) -> Scan<'_> {
+        let plan = Plan::parse("Get memory.main.items AS items #0 [id::INTEGER]")
+            .expect("the plan text round trips");
+        let Node::Get { index, columns, .. } = *plan.node(plan.root()) else {
+            panic!("the plan is a get");
+        };
+        Scan::new(&plan, table, index, columns, Vec::new()).expect("the column is there")
+    }
+
+    /// Every morsel the scan hands out, as the parts it covers and the rows that came out of it.
+    fn taken(scan: &Scan<'_>) -> Vec<(std::ops::Range<u64>, usize)> {
+        let mut out = Vec::new();
+        while let Some(mut morsel) = scan.morsel() {
+            let mut rows = 0;
+            loop {
+                let mut chunk = Chunk::empty(&[]);
+                let progress = scan.read(&mut morsel, &mut chunk).expect("a part reads");
+                rows += chunk.len();
+                if progress == Progress::Done {
+                    break;
+                }
+            }
+            out.push((morsel.start()..morsel.end(), rows));
+        }
+        out
+    }
+
+    /// A whole stripe per morsel, once there are at least as many stripes as workers.
+    ///
+    /// This is what stops the workers racing for a page. Handing out parts puts every worker in the
+    /// same stripe at once, one of them reads the page and the rest read their own part out of the
+    /// same bytes, so a quarter of what a cold column moves is moved twice and the rest moves in
+    /// reads too small to keep the disk busy. A morsel that is a whole stripe gives the page to one
+    /// worker and there is nothing left to race for.
+    #[test]
+    fn a_native_scan_with_a_stripe_for_every_worker_hands_out_stripes() {
+        let (table, path) = native("stripes", 128, 200);
+        let scan = scan_of(&table);
+        let stripes = table.rows().stripe_parts();
+        assert_eq!(stripes.len(), 2, "two full stripes of sixty four parts");
+
+        assert_eq!(scan.morsels(2), Some(2), "one instance per stripe");
+        let taken = taken(&scan);
+
+        assert_eq!(taken.len(), 2, "one morsel per stripe");
+        assert_eq!(taken[0].0, 0..64);
+        assert_eq!(taken[1].0, 64..128);
+        assert_eq!(taken.iter().map(|(_, rows)| rows).sum::<usize>(), 128 * 200);
+        std::fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A table with fewer stripes than workers keeps handing out parts.
+    ///
+    /// A stripe per worker would leave every worker but one with nothing at all, and the duplicate
+    /// reads it saves are worth less than the rest of the machine.
+    #[test]
+    fn a_native_scan_with_one_stripe_hands_out_parts() {
+        let (table, path) = native("one-stripe", 64, 400);
+        let scan = scan_of(&table);
+        assert_eq!(table.rows().stripe_parts().len(), 1, "one stripe and more workers than that");
+
+        assert_eq!(scan.morsels(4), Some(2), "the rows behind it pay for two instances");
+        let taken = taken(&scan);
+
+        assert_eq!(taken.len(), 64, "one morsel per part");
+        assert_eq!(taken[0].0, 0..1);
+        assert_eq!(taken.iter().map(|(_, rows)| rows).sum::<usize>(), 64 * 400);
+        std::fs::remove_file(path).expect("remove scratch file");
     }
 
     /// A scan of the `rudb-parquet` fixture, which is 4096 rows in two row groups.
@@ -1668,6 +1840,9 @@ mod tests {
             probes,
             schema: Schema::numbered(fields, 0),
             chunks: Handout::new(table.rows().chunk_count()),
+            stripes: Vec::new(),
+            runs: Handout::new(0),
+            whole: AtomicBool::new(false),
             skipped: AtomicUsize::new(0),
         }
     }
