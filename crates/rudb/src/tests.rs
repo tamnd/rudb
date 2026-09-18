@@ -465,6 +465,62 @@ fn an_equality_is_looked_up_and_answers_what_the_loop_answers() {
     }
 }
 
+/// `IS NOT DISTINCT FROM` looked up, against the loop, on the rows where the null rule decides.
+///
+/// This comparison is the same lookup as `=` with the opposite answer about a null, so two nulls are
+/// one key here rather than two rows that match nothing. The oracle is `coalesce` on both sides
+/// against a value no row holds, which says the same thing and is a call rather than a column, so it
+/// is answered by the loop.
+///
+/// The third condition is the one worth the most. One join with both comparisons in it is what the
+/// unnesting rules write, since the domain key is equated null safely and the condition the query
+/// wrote next to it is an ordinary `=`, and a table built with one rule for every column answers
+/// that one wrong in a way no single comparison test would show.
+#[test]
+fn a_null_safe_equality_is_looked_up_and_answers_what_the_loop_answers() {
+    let db = Database::new();
+    db.execute("CREATE TABLE l (k INTEGER, j INTEGER, tag VARCHAR)").unwrap();
+    db.execute(
+        "INSERT INTO l VALUES (1, 1, 'one'), (1, 1, 'one again'), (2, 2, 'two'), \
+         (NULL, 1, 'null key'), (NULL, 2, 'null key again'), (4, 4, 'left only')",
+    )
+    .unwrap();
+    db.execute("CREATE TABLE r (k INTEGER, j INTEGER, tag VARCHAR)").unwrap();
+    db.execute(
+        "INSERT INTO r VALUES (1, 1, 'a'), (1, 1, 'b'), (2, 9, 'wrong second'), \
+         (NULL, 1, 'null key'), (NULL, 9, 'null key again'), (5, 5, 'right only')",
+    )
+    .unwrap();
+    let conditions = [
+        ("l.k IS NOT DISTINCT FROM r.k", "coalesce(l.k, -1) = coalesce(r.k, -1)"),
+        (
+            "l.k IS NOT DISTINCT FROM r.k AND l.j IS NOT DISTINCT FROM r.j",
+            "coalesce(l.k, -1) = coalesce(r.k, -1) AND coalesce(l.j, -1) = coalesce(r.j, -1)",
+        ),
+        (
+            "l.k IS NOT DISTINCT FROM r.k AND l.j = r.j",
+            "coalesce(l.k, -1) = coalesce(r.k, -1) AND l.j = r.j",
+        ),
+    ];
+    for kind in ["INNER", "LEFT", "RIGHT", "FULL", "SEMI", "ANTI"] {
+        for (on, oracle) in conditions {
+            // A semi join and an anti join produce the driving side's columns and nothing else, so
+            // there is no `r.tag` to name or to sort on.
+            let one_sided = kind == "SEMI" || kind == "ANTI";
+            let listing = |condition: &str| {
+                let columns = if one_sided { "l.tag" } else { "l.tag, r.tag" };
+                let order =
+                    if one_sided { "1 NULLS FIRST" } else { "1 NULLS FIRST, 2 NULLS FIRST" };
+                let sql = format!(
+                    "SELECT {columns} FROM l {kind} JOIN r ON {condition} ORDER BY {order}"
+                );
+                rows(&db, &sql)
+            };
+            assert_eq!(listing(on), listing(oracle), "{kind} JOIN ON {on}");
+        }
+    }
+}
+
 /// The other three kinds the streaming probe answers, against the same oracle.
 ///
 /// `INNER` and `LEFT` are two of the five and the test above has them. The other three are `SEMI`,
