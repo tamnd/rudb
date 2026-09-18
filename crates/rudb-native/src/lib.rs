@@ -4830,7 +4830,11 @@ mod tests {
             let tests = [probe(wanted)];
             let kept: Vec<usize> = (0..parts).filter(|&part| !reader.skips(part, &tests)).collect();
             let home = wanted as usize / per_part;
-            assert_eq!(kept, vec![home], "only the part holding {wanted} is read");
+            assert!(kept.contains(&home), "the part holding {wanted} is read");
+            // A filter answers maybe, so a part it keeps need not hold the value. Sixty seven parts
+            // of a hundred and twenty eight numbers each, at a dozen bits a value, is about one
+            // stray part across the whole file and that is what this leaves room for.
+            assert!(kept.len() <= 2, "{wanted} keeps {kept:?}, which is more than one stray part");
         }
         let absent = [probe((parts * per_part) as i64 + 1)];
         assert!((0..parts).all(|part| reader.skips(part, &absent)), "no part holds it");
