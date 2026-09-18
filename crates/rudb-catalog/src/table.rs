@@ -190,7 +190,7 @@ impl Rows {
         // that reaches a handful of rows is not, because a page is sixty four parts wide and it
         // would be reading all of them to use one. An eighth of the parts is where the bytes a page
         // read wastes stop being worth the calls it saves.
-        let mut distinct = 0;
+        let mut distinct = 0_usize;
         for (at, location) in locations.iter().enumerate() {
             if at == 0 || locations[at - 1].0 != location.0 {
                 distinct += 1;
