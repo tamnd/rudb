@@ -706,6 +706,7 @@ dependencies = [
  "rudb-exec",
  "rudb-io",
  "rudb-kernels",
+ "rudb-native",
  "rudb-parse",
  "rudb-plan",
  "rudb-vector",
