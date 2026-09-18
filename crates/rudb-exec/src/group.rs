@@ -223,7 +223,7 @@ struct FixedExchange {
     /// were, because one width is what lets a radix partition be one type. These are what the
     /// widths came from and what they go back to.
     keys: [LogicalType; 2],
-    partitions: Vec<Mutex<FixedPartition>>,
+    partitions: Vec<Mutex<FixedRuns>>,
     held: Mutex<Vec<Reservation>>,
 }
 
@@ -272,9 +272,58 @@ struct EncodedCountExchange {
     /// that keeps its nulls somewhere other than its own mask counts as holding one, since the mask
     /// is then not the whole answer and the scatter has to ask the vector row by row.
     dictionary_nulls: bool,
-    partitions: Vec<Mutex<EncodedCountPartition>>,
+    partitions: Vec<Mutex<EncodedCountRuns>>,
     held: Mutex<Vec<Reservation>>,
 }
+
+/// One radix partition's records, as the run each instance handed over rather than one flat run.
+///
+/// The same move [`BigIntDistinctRuns`] is, for the same reason and with the same saving. An
+/// instance used to append its records onto the shared run while holding the partition's lock, which
+/// on the million row ClickBench file is twenty two of the twenty four megabytes it scattered copied
+/// a second time, with sixteen instances queueing behind sixteen locks to do it. Handing the run
+/// over is a move, and the fold walks the runs one after another instead of one flat array.
+#[derive(Debug, Default)]
+struct EncodedCountRuns {
+    runs: Vec<EncodedCountPartition>,
+}
+
+/// One radix partition's records for the fixed exchange, one run per instance. See
+/// [`EncodedCountRuns`], which this is the same thing as for a different record.
+#[derive(Debug, Default)]
+struct FixedRuns {
+    runs: Vec<FixedPartition>,
+}
+
+impl EncodedCountRuns {
+    /// The run the rest fold into, which is the widest so that the most records stay where they are,
+    /// and how many records every run holds between them.
+    fn seed(&mut self) -> (EncodedCountPartition, usize) {
+        let total = self.runs.iter().map(|run| run.rows.len()).sum();
+        let widest = widest_run(self.runs.iter().map(|run| run.rows.len()));
+        let seed = widest.map(|at| self.runs.swap_remove(at)).unwrap_or_default();
+        (seed, total)
+    }
+}
+
+impl FixedRuns {
+    /// The run the rest fold into, and how many records every run holds between them. See
+    /// [`EncodedCountRuns::seed`].
+    fn seed(&mut self) -> (FixedPartition, usize) {
+        let total = self.runs.iter().map(|run| run.rows.len()).sum();
+        let widest = widest_run(self.runs.iter().map(|run| run.rows.len()));
+        let seed = widest.map(|at| self.runs.swap_remove(at)).unwrap_or_default();
+        (seed, total)
+    }
+}
+
+/// Which of these runs holds the most records, or `None` when there are no runs at all.
+fn widest_run(lengths: impl Iterator<Item = usize>) -> Option<usize> {
+    lengths.enumerate().max_by_key(|&(_, rows)| rows).map(|(at, _)| at)
+}
+
+/// The bucket value that says a slot in a radix partition's open addressed table is free.
+const EMPTY_SLOT: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy)]
 struct EncodedCountRecord {
@@ -313,25 +362,6 @@ impl EncodedCountPartition {
         self.rows.push(row);
         if keeping {
             self.validity.push(valid);
-        }
-    }
-
-    fn append(&mut self, other: &mut Self) {
-        if self.rows.is_empty() {
-            std::mem::swap(self, other);
-            return;
-        }
-        if self.validity.is_empty() && !other.validity.is_empty() {
-            self.validity.resize(self.rows.len(), EncodedCountRecord::ALL);
-        }
-        let incoming = other.rows.len();
-        self.rows.append(&mut other.rows);
-        if self.validity.is_empty() {
-            debug_assert!(other.validity.is_empty());
-        } else if other.validity.is_empty() {
-            self.validity.resize(self.validity.len() + incoming, EncodedCountRecord::ALL);
-        } else {
-            self.validity.append(&mut other.validity);
         }
     }
 
@@ -387,25 +417,6 @@ impl FixedPartition {
         self.rows.push(row);
         if keeping {
             self.validity.push(valid);
-        }
-    }
-
-    fn append(&mut self, other: &mut Self) {
-        if self.rows.is_empty() {
-            std::mem::swap(self, other);
-            return;
-        }
-        if self.validity.is_empty() && !other.validity.is_empty() {
-            self.validity.resize(self.rows.len(), FixedRecord::ALL);
-        }
-        let incoming = other.rows.len();
-        self.rows.append(&mut other.rows);
-        if self.validity.is_empty() {
-            debug_assert!(other.validity.is_empty());
-        } else if other.validity.is_empty() {
-            self.validity.resize(self.validity.len() + incoming, FixedRecord::ALL);
-        } else {
-            self.validity.append(&mut other.validity);
         }
     }
 
@@ -795,9 +806,7 @@ impl<'a> Aggregate<'a> {
                 self.plan.expr_type(self.keys[0]).clone(),
                 self.plan.expr_type(self.keys[1]).clone(),
             ],
-            partitions: (0..RADIX_PARTITIONS)
-                .map(|_| Mutex::new(FixedPartition::default()))
-                .collect(),
+            partitions: (0..RADIX_PARTITIONS).map(|_| Mutex::new(FixedRuns::default())).collect(),
             held: Mutex::new(Vec::new()),
         });
         let [first, second] = rows.keys.as_slice() else {
@@ -884,7 +893,7 @@ impl<'a> Aggregate<'a> {
                 dictionary_nulls: dictionary.validity().has_nulls(dictionary.len())
                     || !nulls_are_in_the_mask(dictionary),
                 partitions: (0..RADIX_PARTITIONS)
-                    .map(|_| Mutex::new(EncodedCountPartition::default()))
+                    .map(|_| Mutex::new(EncodedCountRuns::default()))
                     .collect(),
                 held: Mutex::new(Vec::new()),
             })
@@ -3408,7 +3417,8 @@ impl Sink for Aggregate<'_> {
                 if rows.rows.is_empty() {
                     continue;
                 }
-                state.partitions[partition].lock().map_err(poisoned)?.append(rows);
+                let run = std::mem::take(rows);
+                state.partitions[partition].lock().map_err(poisoned)?.runs.push(run);
             }
             state.held.lock().map_err(poisoned)?.push(encoded_memory);
             self.built.lock().map_err(poisoned)?.instances += 1;
@@ -3436,7 +3446,8 @@ impl Sink for Aggregate<'_> {
                 if rows.rows.is_empty() {
                     continue;
                 }
-                state.partitions[partition].lock().map_err(poisoned)?.append(rows);
+                let run = std::mem::take(rows);
+                state.partitions[partition].lock().map_err(poisoned)?.runs.push(run);
             }
             state.held.lock().map_err(poisoned)?.push(fixed_memory);
             self.built.lock().map_err(poisoned)?.instances += 1;
@@ -3546,7 +3557,12 @@ impl Sink for Aggregate<'_> {
             let input = encoded
                 .partitions
                 .iter()
-                .map(|partition| partition.lock().map(|rows| rows.rows.len()).map_err(poisoned))
+                .map(|partition| {
+                    partition
+                        .lock()
+                        .map(|runs| runs.runs.iter().map(|run| run.rows.len()).sum::<usize>())
+                        .map_err(poisoned)
+                })
                 .sum::<Result<usize>>()?;
             let degree = input.div_ceil(65_536).clamp(1, RADIX_PARTITIONS);
             let parts = std::thread::scope(|scope| {
@@ -3776,8 +3792,42 @@ fn finish_encoded_count(
     }
 }
 
+/// Where `row` sits in the group table, as the slot holding it or the free bucket to open for it.
+///
+/// Split out because the fold reads it twice, once to compact the run it took as the table and once
+/// for every other run, and those two differ only in what they do with a miss.
+#[inline]
+fn encoded_slot(
+    buckets: &[u32],
+    groups: &EncodedCountPartition,
+    row: EncodedCountRecord,
+    valid: u8,
+) -> std::result::Result<usize, usize> {
+    let mask = buckets.len() - 1;
+    let all_valid = groups.validity.is_empty();
+    let mut at = row.hash as usize & mask;
+    loop {
+        let slot = buckets[at];
+        if slot == EMPTY_SLOT {
+            return Err(at);
+        }
+        let slot = slot as usize;
+        let held = groups.rows[slot];
+        let held_valid = if all_valid { EncodedCountRecord::ALL } else { groups.validity[slot] };
+        if held.hash == row.hash
+            && held.first == row.first
+            && held.second == row.second
+            && held.third == row.third
+            && held_valid == valid
+        {
+            return Ok(slot);
+        }
+        at = (at + 1) & mask;
+    }
+}
+
 fn encoded_count_partition(
-    partition: &mut EncodedCountPartition,
+    runs: &mut EncodedCountRuns,
     dictionary: &Vector,
     leading: &[LogicalType],
     bound: usize,
@@ -3787,46 +3837,41 @@ fn encoded_count_partition(
     if !(2..=3).contains(&keys) {
         return Err(Error::internal("an encoded count partition has an unsupported key width"));
     }
-    const EMPTY: u32 = u32::MAX;
-    let capacity = partition.rows.len().saturating_mul(2).max(64).next_power_of_two();
+    let (mut partition, total) = runs.seed();
+    let capacity = total.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
-    working
-        .grow(width_of(capacity * size_of::<u32>() + partition.rows.len() * size_of::<i64>()))?;
-    let mut buckets = vec![EMPTY; capacity];
-    let mut counts: Vec<i64> = Vec::with_capacity(partition.rows.len());
-    let mask = capacity - 1;
-    let all_valid = partition.validity.is_empty();
+    let room = total.saturating_sub(partition.rows.len());
+    working.grow(width_of(
+        capacity * size_of::<u32>()
+            + total * size_of::<i64>()
+            + room * size_of::<EncodedCountRecord>(),
+    ))?;
+    let mut buckets = vec![EMPTY_SLOT; capacity];
+    let mut counts: Vec<i64> = Vec::with_capacity(total);
+    // The table grows by one group per record the other runs hold that this one has not seen, and
+    // reserving for all of them up front is one allocation instead of a doubling walk under a fold.
+    partition.rows.reserve(room);
     let timing = stage::Timing::start(Stage::Fold);
-    for source in 0..partition.rows.len() {
+    // The run this took as the table, compacted in place: the group for a record always lands at a
+    // slot at or behind where the record was read from, so nothing unread is ever written over.
+    let seeded = partition.rows.len();
+    let all_valid = partition.validity.is_empty();
+    for source in 0..seeded {
         let row = partition.rows[source];
         let valid = if all_valid { EncodedCountRecord::ALL } else { partition.validity[source] };
-        let mut at = row.hash as usize & mask;
-        let slot = loop {
-            let slot = buckets[at];
-            if slot == EMPTY {
+        let slot = match encoded_slot(&buckets, &partition, row, valid) {
+            Ok(slot) => slot,
+            Err(bucket) => {
                 let slot = counts.len();
-                buckets[at] = u32::try_from(slot)
+                buckets[bucket] = u32::try_from(slot)
                     .map_err(|_| Error::out_of_memory("an encoded radix partition is too large"))?;
                 partition.rows[slot] = row;
                 if !all_valid {
                     partition.validity[slot] = valid;
                 }
                 counts.push(0);
-                break slot;
+                slot
             }
-            let slot = slot as usize;
-            let held = partition.rows[slot];
-            let held_valid =
-                if all_valid { EncodedCountRecord::ALL } else { partition.validity[slot] };
-            if held.hash == row.hash
-                && held.first == row.first
-                && held.second == row.second
-                && held.third == row.third
-                && held_valid == valid
-            {
-                break slot;
-            }
-            at = (at + 1) & mask;
         };
         counts[slot] = counts[slot]
             .checked_add(1)
@@ -3836,6 +3881,31 @@ fn encoded_count_partition(
     if !all_valid {
         partition.validity.truncate(counts.len());
     }
+    // Every other instance's run, folded into that table and given back one run at a time rather
+    // than all at the end, so the records this has finished with stop costing anything.
+    for run in std::mem::take(&mut runs.runs) {
+        let all_valid = run.validity.is_empty();
+        for (source, &row) in run.rows.iter().enumerate() {
+            let valid = if all_valid { EncodedCountRecord::ALL } else { run.validity[source] };
+            let slot = match encoded_slot(&buckets, &partition, row, valid) {
+                Ok(slot) => slot,
+                Err(bucket) => {
+                    let slot = counts.len();
+                    buckets[bucket] = u32::try_from(slot).map_err(|_| {
+                        Error::out_of_memory("an encoded radix partition is too large")
+                    })?;
+                    partition.push(row, valid);
+                    counts.push(0);
+                    slot
+                }
+            };
+            counts[slot] = counts[slot]
+                .checked_add(1)
+                .ok_or_else(|| Error::out_of_range("a grouped COUNT overflowed BIGINT"))?;
+        }
+    }
+    // Read again because a run past the first can have been what gave this partition its first null.
+    let all_valid = partition.validity.is_empty();
     timing.stop(0);
     let timing = stage::Timing::start(Stage::Emit);
     let mut best = Vec::with_capacity(bound.min(counts.len()));
@@ -3982,54 +4052,74 @@ fn finish_fixed(
     }
 }
 
+/// Where `row` sits in the group table, as the slot holding it or the free bucket to open for it.
+/// The same split [`encoded_slot`] is, for the fixed record's two keys.
+#[inline]
+fn fixed_slot(
+    buckets: &[u32],
+    groups: &FixedPartition,
+    row: FixedRecord,
+    valid: u8,
+) -> std::result::Result<usize, usize> {
+    const KEYS: u8 = FixedRecord::FIRST | FixedRecord::SECOND;
+    let mask = buckets.len() - 1;
+    let all_valid = groups.validity.is_empty();
+    let mut at = fixed_hash(row, valid) as usize & mask;
+    loop {
+        let slot = buckets[at];
+        if slot == EMPTY_SLOT {
+            return Err(at);
+        }
+        let slot = slot as usize;
+        let held = groups.rows[slot];
+        let held_valid = if all_valid { FixedRecord::ALL } else { groups.validity[slot] };
+        if held.first == row.first && held.second == row.second && held_valid & KEYS == valid & KEYS
+        {
+            return Ok(slot);
+        }
+        at = (at + 1) & mask;
+    }
+}
+
 fn fixed_partition(
-    partition: &mut FixedPartition,
+    runs: &mut FixedRuns,
     keys: &[LogicalType; 2],
     bound: usize,
     calls: &[Call],
     memory: &Memory,
 ) -> Result<Part> {
-    const EMPTY: u32 = u32::MAX;
-    let capacity = partition.rows.len().saturating_mul(2).max(64).next_power_of_two();
+    let (mut partition, total) = runs.seed();
+    let capacity = total.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
+    let room = total.saturating_sub(partition.rows.len());
     working.grow(width_of(
-        capacity * size_of::<u32>() + partition.rows.len() * size_of::<CompactNumeric>(),
+        capacity * size_of::<u32>()
+            + total * size_of::<CompactNumeric>()
+            + room * size_of::<FixedRecord>(),
     ))?;
-    let mut buckets = vec![EMPTY; capacity];
-    let mut states: Vec<CompactNumeric> = Vec::with_capacity(partition.rows.len());
+    let mut buckets = vec![EMPTY_SLOT; capacity];
+    let mut states: Vec<CompactNumeric> = Vec::with_capacity(total);
     let mut overflow = HashMap::new();
-    let mask = capacity - 1;
-    let all_valid = partition.validity.is_empty();
-    let input = partition.rows.len();
+    partition.rows.reserve(room);
     let timing = stage::Timing::start(Stage::Fold);
-    for source in 0..input {
+    let seeded = partition.rows.len();
+    let all_valid = partition.validity.is_empty();
+    for source in 0..seeded {
         let row = partition.rows[source];
         let valid = if all_valid { FixedRecord::ALL } else { partition.validity[source] };
-        let mut at = fixed_hash(row, valid) as usize & mask;
-        let slot = loop {
-            let slot = buckets[at];
-            if slot == EMPTY {
+        let slot = match fixed_slot(&buckets, &partition, row, valid) {
+            Ok(slot) => slot,
+            Err(bucket) => {
                 let slot = states.len();
-                buckets[at] = u32::try_from(slot)
+                buckets[bucket] = u32::try_from(slot)
                     .map_err(|_| Error::out_of_memory("a fixed radix partition is too large"))?;
                 partition.rows[slot] = row;
                 if !all_valid {
                     partition.validity[slot] = valid;
                 }
                 states.push(CompactNumeric::default());
-                break slot;
+                slot
             }
-            let slot = slot as usize;
-            let held = partition.rows[slot];
-            let held_valid = if all_valid { FixedRecord::ALL } else { partition.validity[slot] };
-            if held.first == row.first
-                && held.second == row.second
-                && held_valid & (FixedRecord::FIRST | FixedRecord::SECOND)
-                    == valid & (FixedRecord::FIRST | FixedRecord::SECOND)
-            {
-                break slot;
-            }
-            at = (at + 1) & mask;
         };
         states[slot].add(
             slot,
@@ -4042,6 +4132,32 @@ fn fixed_partition(
     if !all_valid {
         partition.validity.truncate(states.len());
     }
+    for run in std::mem::take(&mut runs.runs) {
+        let all_valid = run.validity.is_empty();
+        for (source, &row) in run.rows.iter().enumerate() {
+            let valid = if all_valid { FixedRecord::ALL } else { run.validity[source] };
+            let slot = match fixed_slot(&buckets, &partition, row, valid) {
+                Ok(slot) => slot,
+                Err(bucket) => {
+                    let slot = states.len();
+                    buckets[bucket] = u32::try_from(slot).map_err(|_| {
+                        Error::out_of_memory("a fixed radix partition is too large")
+                    })?;
+                    partition.push(row, valid);
+                    states.push(CompactNumeric::default());
+                    slot
+                }
+            };
+            states[slot].add(
+                slot,
+                (valid & FixedRecord::SUM != 0).then_some(row.sum),
+                (valid & FixedRecord::MEAN != 0).then_some(row.mean),
+                &mut overflow,
+            )?;
+        }
+    }
+    // Read again because a run past the first can have been what gave this partition its first null.
+    let all_valid = partition.validity.is_empty();
     timing.stop(0);
     let timing = stage::Timing::start(Stage::Emit);
     let mut best: Vec<usize> = Vec::with_capacity(bound.min(states.len()));
@@ -4772,8 +4888,8 @@ mod tests {
 
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, Call, CompactNumeric, Distinct,
-        EncodedCountPartition, EncodedCountRecord, FixedPartition, FixedRecord, Signed,
-        bigint_distinct_partition, encoded_count_partition, fixed_partition,
+        EncodedCountPartition, EncodedCountRecord, EncodedCountRuns, FixedPartition, FixedRecord,
+        FixedRuns, Signed, bigint_distinct_partition, encoded_count_partition, fixed_partition,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -5227,7 +5343,7 @@ mod tests {
         partition.push(row(0, 2, 0), EncodedCountRecord::SECOND | EncodedCountRecord::THIRD);
         let leading = [LogicalType::BigInt, LogicalType::BigInt];
         let part = encoded_count_partition(
-            &mut partition,
+            &mut EncodedCountRuns { runs: vec![partition] },
             &dictionary,
             &leading,
             10,
@@ -5262,6 +5378,51 @@ mod tests {
     }
 
     #[test]
+    fn an_encoded_count_partition_folds_every_run_into_the_widest_one() {
+        let dictionary = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("one".into()), Value::Varchar("two".into())],
+        )
+        .expect("a string dictionary");
+        let row = |first, third| EncodedCountRecord { first, second: 0, hash: 7, third };
+        let mut narrow = EncodedCountPartition::default();
+        narrow.push(row(1, 0), EncodedCountRecord::ALL);
+        let mut widest = EncodedCountPartition::default();
+        for _ in 0..3 {
+            widest.push(row(1, 0), EncodedCountRecord::ALL);
+        }
+        widest.push(row(2, 1), EncodedCountRecord::ALL);
+        // The run that carries the only null is not the one the fold takes as its table, so the
+        // table starts out with no validity at all and has to grow one when this arrives.
+        let mut late = EncodedCountPartition::default();
+        late.push(row(0, 0), EncodedCountRecord::SECOND | EncodedCountRecord::THIRD);
+        late.push(row(1, 0), EncodedCountRecord::ALL);
+        let leading = [LogicalType::BigInt];
+        let part = encoded_count_partition(
+            &mut EncodedCountRuns { runs: vec![narrow, widest, late] },
+            &dictionary,
+            &leading,
+            10,
+            &Memory::unlimited(),
+        )
+        .expect("the encoded partition");
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for chunk in part.chunks {
+            for row in 0..chunk.len() {
+                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+            }
+        }
+        rows.sort_by_key(|row| format!("{row:?}"));
+        let mut expected = vec![
+            vec![Value::BigInt(1), Value::Varchar("one".into()), Value::BigInt(5)],
+            vec![Value::BigInt(2), Value::Varchar("two".into()), Value::BigInt(1)],
+            vec![Value::Null, Value::Varchar("one".into()), Value::BigInt(1)],
+        ];
+        expected.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(rows, expected, "a group is one group however many runs it arrived in");
+    }
+
+    #[test]
     fn a_two_key_encoded_count_omits_the_unused_integer_and_narrows_the_one_it_keeps() {
         let dictionary = Vector::from_values(
             LogicalType::Varchar,
@@ -5278,7 +5439,7 @@ mod tests {
         // emit has to hand it back two bytes wide or the answer has the wrong column type in it.
         let leading = [LogicalType::SmallInt];
         let part = encoded_count_partition(
-            &mut partition,
+            &mut EncodedCountRuns { runs: vec![partition] },
             &dictionary,
             &leading,
             10,
@@ -5493,8 +5654,14 @@ mod tests {
         // q30's key shape. The record held the first key as eight bytes and the emit has to hand it
         // back two bytes wide, or the answer has the wrong column type in it.
         let keys = [LogicalType::SmallInt, LogicalType::Integer];
-        let part = fixed_partition(&mut partition, &keys, 10, &calls, &Memory::unlimited())
-            .expect("the fixed partition");
+        let part = fixed_partition(
+            &mut FixedRuns { runs: vec![partition] },
+            &keys,
+            10,
+            &calls,
+            &Memory::unlimited(),
+        )
+        .expect("the fixed partition");
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for chunk in part.chunks {
             for row in 0..chunk.len() {
