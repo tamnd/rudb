@@ -16,7 +16,6 @@
 pub mod entrycatalog;
 pub mod file;
 pub mod functioncatalog;
-pub mod pragmacatalog;
 pub mod settingcatalog;
 pub mod signature;
 pub mod table;
@@ -32,10 +31,9 @@ pub use file::{
 pub use functioncatalog::{
     CONSISTENT, FUNCTION_CATALOG, FUNCTION_SCHEMA, FunctionEntry, function_entries, function_fields,
 };
-pub use pragmacatalog::{PRAGMAS, PragmaEntry, pragma_named};
 pub use rudb_csv::Given;
 pub use settingcatalog::{
-    Behaviour, GLOBAL, LOCAL, SETTINGS, SettingEntry, UNSET, setting_fields, setting_named,
+    Behaviour, GLOBAL, LOCAL, SETTINGS, SettingEntry, setting_fields, setting_named,
     unknown_setting,
 };
 pub use signature::{
