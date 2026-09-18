@@ -35,11 +35,12 @@
 //! `POSITIONAL` join is not a lookup at all. Those three stay on the sink, along with every join
 //! whose condition a lookup cannot answer, and [`streamed`] is where the line is drawn.
 //!
-//! What the lookup does not share with the grouping next door is the null rule. A group key answers
-//! `IS NOT DISTINCT FROM`, where two nulls are one key, and `=` answers null for a null on either
-//! side, so a row whose key holds a null takes part in no pair. The key encoding is the same one and
-//! the rows that would hash to a null key are left out of both the table and the probe, which is the
-//! whole of the difference and is the one place these two are easy to quietly unify.
+//! The null rule is per column and not per table. A group key answers `IS NOT DISTINCT FROM`, where
+//! two nulls are one key, and `=` answers null for a null on either side, so a row whose key holds a
+//! null takes part in no pair. Both comparisons turn up here, because a query writes `=` and the
+//! unnesting rules write `IS NOT DISTINCT FROM` to equate a domain key, and one join can hold both.
+//! The key encoding is the one grouping uses either way, so what the two differ in is only whether a
+//! row with a null in that column goes into the table and the probe at all.
 //!
 //! # Two pipelines and an edge
 //!
@@ -235,9 +236,13 @@ impl<'a> Join<'a> {
             equalities(self.plan, &self.conditions, &self.left_schema, &self.right_schema)
         };
         let index = match &equalities {
-            Some(equalities) => {
-                Some(index(right_rows, &equalities.right, &self.cancel, &mut scratch)?)
-            }
+            Some(equalities) => Some(index(
+                right_rows,
+                &equalities.right,
+                &equalities.null_is_a_value,
+                &self.cancel,
+                &mut scratch,
+            )?),
             None => None,
         };
         // Nothing evaluates a condition over the gathered side when the index answers it, and these
@@ -268,7 +273,9 @@ impl<'a> Join<'a> {
             }
             let scanned;
             let hits: &[usize] = match (&equalities, &index) {
-                (Some(equalities), Some(index)) => hits(index, left_row, &equalities.left),
+                (Some(equalities), Some(index)) => {
+                    hits(index, left_row, &equalities.left, &equalities.null_is_a_value)
+                }
                 _ => {
                     scanned = self.matching(left_row, &left_types, &right_chunks)?;
                     &scanned
@@ -687,7 +694,13 @@ impl Probe {
             .get_or_init(|| {
                 let rows = self.gathered.take()?;
                 let mut held = self.held.lock().map_err(poisoned)?;
-                let index = index(&rows, &self.equalities.right, &self.cancel, &mut held)?;
+                let index = index(
+                    &rows,
+                    &self.equalities.right,
+                    &self.equalities.null_is_a_value,
+                    &self.cancel,
+                    &mut held,
+                )?;
                 Ok(Arc::new(Built { rows, index }))
             })
             .clone()
@@ -719,7 +732,8 @@ impl Stream for Probe {
             // place in this operator that runs long once the table is built.
             self.cancel.check()?;
             let row: Vec<Value> = left.row(local.row).collect();
-            let found = hits(&built.index, &row, &self.equalities.left);
+            let found =
+                hits(&built.index, &row, &self.equalities.left, &self.equalities.null_is_a_value);
             match self.kind {
                 JoinKind::Semi => {
                     if !found.is_empty() {
@@ -797,6 +811,14 @@ struct Equalities {
     left: Vec<usize>,
     /// Positions in a row of the gathered side, in the order the driving side's are in.
     right: Vec<usize>,
+    /// Whether a null in this column is a value to match on, one entry per column above.
+    ///
+    /// True where the condition was `IS NOT DISTINCT FROM`, which two nulls answer true, and false
+    /// where it was `=`, which they answer null. It is per column rather than per join because one
+    /// join can be written both ways, and the unnesting rules write exactly that: the domain key is
+    /// equated with `IS NOT DISTINCT FROM` so that an outer row whose key is null finds its own
+    /// answer, while the condition the query wrote next to it is still an ordinary `=`.
+    null_is_a_value: Vec<bool>,
 }
 
 /// The columns a join's conditions line up, when every one of them lines two columns up.
@@ -814,9 +836,10 @@ struct Equalities {
 /// second copy of part of a side, and doing it before the plain case is measured would be adding the
 /// complicated half first.
 ///
-/// Only `=`. `IS NOT DISTINCT FROM` is the same lookup with the opposite null rule and is left out
-/// because no plan in the suite writes one, and a rule with no query behind it is a rule nothing
-/// checks.
+/// `=` and `IS NOT DISTINCT FROM`, which are the same lookup with opposite null rules. The table
+/// already holds a row under a key that may contain a null, because [`crate::key::Key`] compares
+/// column by column the way grouping does, so what the two spellings differ in is whether a null
+/// goes into the table at all. That is one flag per column and not a second kind of table.
 fn equalities(
     plan: &Plan,
     conditions: &[ExprRef],
@@ -826,9 +849,11 @@ fn equalities(
     if conditions.is_empty() {
         return None;
     }
-    let mut found = Equalities { left: Vec::new(), right: Vec::new() };
+    let mut found = Equalities { left: Vec::new(), right: Vec::new(), null_is_a_value: Vec::new() };
     for &condition in conditions {
-        let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
+        let Expr::Compare { op: op @ (CompareOp::Equal | CompareOp::NotDistinctFrom), left, right } =
+            *plan.expr(condition)
+        else {
             return None;
         };
         // The two sides of the equality have to be the same type, because what answers it is a hash
@@ -852,16 +877,18 @@ fn equalities(
         };
         found.left.push(across.0);
         found.right.push(across.1);
+        found.null_is_a_value.push(op == CompareOp::NotDistinctFrom);
     }
     Some(found)
 }
 
 /// The gathered side's rows, by the values the equalities read out of them.
 ///
-/// A row whose key holds a null is left out rather than stored under a null key. `NULL = NULL` is
-/// null and not true, so such a row matches nothing, and leaving it out is what says so. That is the
-/// one place the key encoding here parts company with the one grouping uses, which answers
-/// `IS NOT DISTINCT FROM` and puts every null in the same group.
+/// A row whose key holds a null in a column the join compares with `=` is left out rather than
+/// stored under a null key. `NULL = NULL` is null and not true, so such a row matches nothing, and
+/// leaving it out is what says so. A column the join compares with `IS NOT DISTINCT FROM` is the
+/// other rule and the null is stored, which the key encoding has always been able to hold, since it
+/// is the encoding grouping uses and grouping puts every null in the same group.
 ///
 /// The positions come out of one pass in order, so each entry's list is ascending and the rows a
 /// probe finds arrive in the order the gathered side holds them. The nested loop produced them in
@@ -870,13 +897,14 @@ fn equalities(
 fn index(
     rows: &[Vec<Value>],
     at: &[usize],
+    nulls: &[bool],
     cancel: &Cancel,
     scratch: &mut Reservation,
 ) -> Result<RowMap<Vec<usize>>> {
     let mut index: RowMap<Vec<usize>> = RowMap::default();
     scratch.grow(rows::buckets(rows.len()))?;
     for (position, row) in rows.iter().enumerate() {
-        let Some(key) = key(row, at) else { continue };
+        let Some(key) = key(row, at, nulls) else { continue };
         // The key's own values and the position stored beside it. The list an entry holds grows by
         // one `usize` per row and the vector behind it doubles, so this charges the row it is about
         // rather than trying to say when a doubling happened.
@@ -894,26 +922,32 @@ fn index(
 
 /// The gathered rows one driving row matches, by position in the gathered side.
 ///
-/// Nothing for a driving row whose key holds a null, which matches nothing for the same reason a
-/// null on the other side was never stored. A row with no match is a row the join kind decides about
-/// rather than one that is dropped here.
-fn hits<'i>(index: &'i RowMap<Vec<usize>>, row: &[Value], at: &[usize]) -> &'i [usize] {
-    match key(row, at) {
+/// Nothing for a driving row whose key holds a null in a column compared with `=`, which matches
+/// nothing for the same reason a null on the other side was never stored. A row with no match is a
+/// row the join kind decides about rather than one that is dropped here.
+fn hits<'i>(
+    index: &'i RowMap<Vec<usize>>,
+    row: &[Value],
+    at: &[usize],
+    nulls: &[bool],
+) -> &'i [usize] {
+    match key(row, at, nulls) {
         None => &[],
         Some(key) => index.get(&Key(key)).map_or(&[], Vec::as_slice),
     }
 }
 
-/// The values at `at`, or nothing when one of them is null.
+/// The values at `at`, or nothing when one of them is a null the join's comparison rejects.
 ///
 /// Nothing rather than a key holding a null, because the caller's two uses of that answer are the
 /// same one: a null on either side of `=` makes the comparison null, so the row takes part in no
-/// pair and there is nothing to look up or to store.
-fn key(row: &[Value], at: &[usize]) -> Option<Vec<Value>> {
+/// pair and there is nothing to look up or to store. `IS NOT DISTINCT FROM` says the opposite about
+/// the same value, and `nulls` is which of the two each column was written with.
+fn key(row: &[Value], at: &[usize], nulls: &[bool]) -> Option<Vec<Value>> {
     let mut key = Vec::with_capacity(at.len());
-    for &column in at {
+    for (&column, &kept) in at.iter().zip(nulls) {
         let value = &row[column];
-        if matches!(value, Value::Null) {
+        if !kept && matches!(value, Value::Null) {
             return None;
         }
         key.push(value.clone());
