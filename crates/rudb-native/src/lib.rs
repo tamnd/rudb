@@ -297,13 +297,14 @@ impl GlobalDictionary {
         Ok(code)
     }
 
-    /// This dictionary's codes in sorted value order, so `order[rank]` is the code of the value
-    /// that sits at `rank` when the values are sorted by their bytes.
+    /// This dictionary's values in sorted order, each as the first eight bytes of the value and the
+    /// code that holds it, so entry `rank` describes the value that sits at `rank` when the values
+    /// are sorted by their bytes.
     ///
     /// Codes themselves stay in first appearance order, which is what lets the writer hand one out
     /// the moment it sees a value rather than waiting for the last stripe, and which also keeps a
-    /// stripe's codes close together because the data is clustered. The order is what puts the
-    /// values back in order for anything that needs it, and it is a separate array so that getting
+    /// stripe's codes close together because the data is clustered. This is what puts the values
+    /// back in order for anything that needs it, and it is separate from the codes so that getting
     /// it costs a sort of the distinct values at the end rather than a rewrite of every code page.
     ///
     /// The sort compares the first eight bytes as one integer before it compares the values, which
@@ -311,7 +312,11 @@ impl GlobalDictionary {
     /// order preserving for byte strings, because a shorter value differs from a longer one that
     /// starts the same way at a position where the shorter one has run out, and zero is below every
     /// byte that could be there. A pair the head cannot settle falls through to the bytes.
-    fn sorted_order(&self) -> Vec<u32> {
+    ///
+    /// The heads are kept rather than thrown away once the sort is over, because a reader searching
+    /// this order wants exactly the same comparison and for exactly the same reason. Eight bytes an
+    /// entry of file is what buys a binary search that reads no values at all in the ordinary case.
+    fn ranked(&self) -> Vec<(u64, u32)> {
         let count = self.offsets.len() - 1;
         let mut ranked = (0..count)
             .map(|code| {
@@ -322,7 +327,7 @@ impl GlobalDictionary {
         ranked.sort_unstable_by(|left, right| {
             left.0.cmp(&right.0).then_with(|| self.bytes(left.1).cmp(&self.bytes(right.1)))
         });
-        ranked.into_iter().map(|(_, code)| code).collect()
+        ranked
     }
 
     fn observe(&mut self, code: u32, null: bool) -> Result<()> {
@@ -716,18 +721,20 @@ impl Writer {
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
         self.table.frequencies = self.numeric_frequencies()?;
         let dictionaries = std::mem::take(&mut self.dictionaries);
-        let orders = sorted_orders(&dictionaries)?;
+        let orders = rankings(&dictionaries)?;
         for (index, (dictionary, order)) in dictionaries.into_iter().zip(orders).enumerate() {
             let Some(dictionary) = dictionary else { continue };
             self.table.frequencies[index] = Some(code_frequency(&dictionary));
             let encoded = encode_global_dictionary(dictionary, &order)?;
             let offset = self.file.stream_position().map_err(io)?;
             self.file.write_all(&encoded.index).map_err(io)?;
+            self.file.write_all(&encoded.ranks).map_err(io)?;
             self.file.write_all(&encoded.payload).map_err(io)?;
             let length = encoded
                 .index
                 .len()
-                .checked_add(encoded.payload.len())
+                .checked_add(encoded.ranks.len())
+                .and_then(|len| len.checked_add(encoded.payload.len()))
                 .ok_or_else(|| invalid("dictionary page length overflow"))?;
             self.table.dictionaries[index] = Some(Page {
                 offset,
@@ -788,9 +795,15 @@ type CrossingCache = OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>;
 struct NativeText {
     file: Arc<File>,
     offsets: Vec<u32>,
-    /// Codes in sorted value order, so `order[rank]` is the code of the value at that rank. Empty
-    /// for a file written before version 9, which did not store one.
-    order: Vec<u32>,
+    /// How many entries the sorted order has, which is the value count for a file that stores one
+    /// and zero for a file written before version 9, which did not.
+    ranks: usize,
+    /// Where the sorted order starts in the file. It is read a block at a time and only when
+    /// something searches it, so a query that never compares this column against a literal never
+    /// touches it at all.
+    rank_at: u64,
+    rank_hashes: Vec<u64>,
+    rank_blocks: Vec<OnceLock<Result<Vec<u8>>>>,
     payload: u64,
     payload_len: usize,
     hashes: Vec<u64>,
@@ -800,6 +813,20 @@ struct NativeText {
 
 const TEXT_PAYLOAD_BLOCK: usize = 64 * 1024;
 const TEXT_CROSSING_BLOCK: usize = 1024;
+
+/// How many entries of a dictionary's sorted order sit in one block that is read and checked as a
+/// unit.
+///
+/// Five hundred and twelve entries is six kilobytes, which is a page and a half. A binary search
+/// over half a million entries makes nineteen probes, and the first ten land in ten different
+/// blocks while the last nine land in the one block that holds the answer, so the whole search
+/// reads about sixty six kilobytes of a two megabyte order. A smaller block would save a little on
+/// the early probes and cost a checksum list four times as long. A larger one would read more than
+/// it uses on every probe.
+const TEXT_RANK_BLOCK: usize = 512;
+
+/// Bytes one entry of the sorted order takes: eight for the head and four for the code.
+const RANK_ENTRY: usize = size_of::<u64>() + size_of::<u32>();
 
 impl NativeText {
     fn payload_block(&self, block: usize) -> Result<Option<&[u8]>> {
@@ -828,6 +855,48 @@ impl NativeText {
         .as_ref()
         .map(|bytes| Some(bytes.as_slice()))
         .map_err(Clone::clone)
+    }
+
+    /// The block of the sorted order that holds `rank`, and where in it that rank sits.
+    ///
+    /// The block is read from the file and checked against the hash the index carries for it the
+    /// first time anything asks, and kept after that, the same way a payload block is. A search
+    /// makes about as many probes as the order has bits, so the whole search reads a handful of
+    /// these and never the rest.
+    fn rank_parts(&self, rank: usize) -> Result<(&[u8], usize)> {
+        let slot = self
+            .rank_blocks
+            .get(rank / TEXT_RANK_BLOCK)
+            .ok_or_else(|| invalid("global dictionary rank is past the order"))?;
+        let block = slot
+            .get_or_init(|| {
+                let first = rank / TEXT_RANK_BLOCK * TEXT_RANK_BLOCK;
+                let len = TEXT_RANK_BLOCK.min(self.ranks - first) * RANK_ENTRY;
+                let mut bytes = vec![0; len];
+                read_at(&self.file, self.rank_at + (first * RANK_ENTRY) as u64, &mut bytes)?;
+                if checksum(&bytes)
+                    != *self
+                        .rank_hashes
+                        .get(rank / TEXT_RANK_BLOCK)
+                        .ok_or_else(|| invalid("global dictionary rank block has no checksum"))?
+                {
+                    return Err(invalid("global dictionary rank checksum differs"));
+                }
+                Ok(bytes)
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok((block.as_slice(), rank % TEXT_RANK_BLOCK))
+    }
+
+    /// The first eight bytes of the value at `rank`, as the integer a comparison reads.
+    fn head_at(&self, rank: usize) -> Result<u64> {
+        let (block, within) = self.rank_parts(rank)?;
+        let at = within * size_of::<u64>();
+        let bytes = block
+            .get(at..at + size_of::<u64>())
+            .ok_or_else(|| invalid("global dictionary rank block is short of heads"))?;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("eight bytes")))
     }
 }
 
@@ -889,13 +958,50 @@ impl TextSource for NativeText {
         Ok(Some((end - start) as usize))
     }
 
-    fn sorted_order(&self) -> Option<&[u32]> {
-        (!self.order.is_empty()).then_some(self.order.as_slice())
+    fn ranks(&self) -> Option<usize> {
+        (self.ranks > 0).then_some(self.ranks)
+    }
+
+    fn compare_rank(&self, rank: usize, wanted: &[u8]) -> Result<Ordering> {
+        // The head settles the probe unless the two values start with the same eight bytes, and
+        // only then is a value read. On a column of URLs that is the difference between a search
+        // that touches one block of the payload and a search that touches nineteen of them.
+        let settled = self.head_at(rank)?.cmp(&head(wanted));
+        if settled != Ordering::Equal {
+            return Ok(settled);
+        }
+        let code = self.code_at_rank(rank)?;
+        let bytes = self
+            .bytes_at(code as usize)?
+            .ok_or_else(|| invalid("global dictionary order names a code it does not have"))?;
+        Ok(bytes.cmp(wanted))
+    }
+
+    fn code_at_rank(&self, rank: usize) -> Result<u32> {
+        let (block, within) = self.rank_parts(rank)?;
+        let heads = block.len() / RANK_ENTRY * size_of::<u64>();
+        let at = heads + within * size_of::<u32>();
+        let bytes = block
+            .get(at..at + size_of::<u32>())
+            .ok_or_else(|| invalid("global dictionary rank block is short of codes"))?;
+        let code = u32::from_le_bytes(bytes.try_into().expect("four bytes"));
+        if code as usize >= self.len() {
+            return Err(invalid("global dictionary order names a code it does not have"));
+        }
+        Ok(code)
     }
 
     fn footprint(&self) -> usize {
         self.offsets.capacity() * size_of::<u32>()
-            + self.order.capacity() * size_of::<u32>()
+            + self.rank_hashes.capacity() * size_of::<u64>()
+            + self.rank_blocks.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
+            + self
+                .rank_blocks
+                .iter()
+                .filter_map(OnceLock::get)
+                .filter_map(|result| result.as_ref().ok())
+                .map(Vec::capacity)
+                .sum::<usize>()
             + self.payload_blocks.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
             + self.hashes.capacity() * size_of::<u64>()
             + self
@@ -2072,6 +2178,7 @@ fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
 
 struct EncodedDictionary {
     index: Vec<u8>,
+    ranks: Vec<u8>,
     payload: Vec<u8>,
 }
 
@@ -2090,7 +2197,7 @@ fn head(bytes: &[u8]) -> u64 {
 /// columns, so this runs across threads the way the numeric synopses above do. It is the only part
 /// of committing a file that is more than bookkeeping, and doing it serially would show up as a
 /// pause at the end of a load that thirty two threads had been busy with until then.
-fn sorted_orders(dictionaries: &[Option<GlobalDictionary>]) -> Result<Vec<Vec<u32>>> {
+fn rankings(dictionaries: &[Option<GlobalDictionary>]) -> Result<Vec<Vec<(u64, u32)>>> {
     let present =
         dictionaries.iter().enumerate().filter(|(_, held)| held.is_some()).map(|(at, _)| at);
     let present = present.collect::<Vec<_>>();
@@ -2102,7 +2209,7 @@ fn sorted_orders(dictionaries: &[Option<GlobalDictionary>]) -> Result<Vec<Vec<u3
     if workers <= 1 {
         for at in present {
             if let Some(dictionary) = &dictionaries[at] {
-                orders[at] = dictionary.sorted_order();
+                orders[at] = dictionary.ranked();
             }
         }
         return Ok(orders);
@@ -2115,9 +2222,7 @@ fn sorted_orders(dictionaries: &[Option<GlobalDictionary>]) -> Result<Vec<Vec<u3
                 scope.spawn(|| {
                     columns
                         .iter()
-                        .filter_map(|&at| {
-                            dictionaries[at].as_ref().map(|held| (at, held.sorted_order()))
-                        })
+                        .filter_map(|&at| dictionaries[at].as_ref().map(|held| (at, held.ranked())))
                         .collect::<Vec<_>>()
                 })
             })
@@ -2138,7 +2243,7 @@ fn sorted_orders(dictionaries: &[Option<GlobalDictionary>]) -> Result<Vec<Vec<u3
 
 fn encode_global_dictionary(
     dictionary: GlobalDictionary,
-    order: &[u32],
+    order: &[(u64, u32)],
 ) -> Result<EncodedDictionary> {
     let values = dictionary.offsets.len() - 1;
     if order.len() != values {
@@ -2146,7 +2251,9 @@ fn encode_global_dictionary(
     }
     let payload_len = dictionary.payload.len();
     let blocks = payload_len.div_ceil(TEXT_PAYLOAD_BLOCK);
-    let mut index = Vec::with_capacity(12 + (values * 2 + 1) * 4 + blocks * 8);
+    let ranks = encode_ranks(order);
+    let rank_blocks = values.div_ceil(TEXT_RANK_BLOCK);
+    let mut index = Vec::with_capacity(12 + (values + 1) * 4 + (blocks + rank_blocks) * 8);
     put_u32(
         &mut index,
         u32::try_from(values).map_err(|_| invalid("global dictionary has too many values"))?,
@@ -2159,13 +2266,32 @@ fn encode_global_dictionary(
     for offset in dictionary.offsets {
         put_u32(&mut index, offset);
     }
-    for &code in order {
-        put_u32(&mut index, code);
-    }
     for block in dictionary.payload.chunks(TEXT_PAYLOAD_BLOCK) {
         put_u64(&mut index, checksum(block));
     }
-    Ok(EncodedDictionary { index, payload: dictionary.payload })
+    for block in ranks.chunks(TEXT_RANK_BLOCK * RANK_ENTRY) {
+        put_u64(&mut index, checksum(block));
+    }
+    Ok(EncodedDictionary { index, ranks, payload: dictionary.payload })
+}
+
+/// The sorted order laid out the way a reader reads it, in blocks of [`TEXT_RANK_BLOCK`] entries.
+///
+/// Each block holds its heads first and then its codes, rather than pairing them, because a search
+/// asks for a head at every probe and for a code about once a search. Keeping the heads together
+/// means a probe touches eight bytes of a block rather than twelve spread over it, and the last few
+/// probes of a search, which are the ones that land in the same block, touch the same cache line.
+fn encode_ranks(order: &[(u64, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(order.len() * RANK_ENTRY);
+    for block in order.chunks(TEXT_RANK_BLOCK) {
+        for &(head, _) in block {
+            put_u64(&mut out, head);
+        }
+        for &(_, code) in block {
+            put_u32(&mut out, code);
+        }
+    }
+    out
 }
 
 fn open_global_dictionary(
@@ -2188,19 +2314,26 @@ fn open_global_dictionary(
     let offset_len = (count + 1)
         .checked_mul(4)
         .ok_or_else(|| invalid("global dictionary offset count overflow"))?;
-    let order_len = if ordered {
-        count.checked_mul(4).ok_or_else(|| invalid("global dictionary order count overflow"))?
-    } else {
-        0
-    };
-    let hash_len =
-        blocks.checked_mul(8).ok_or_else(|| invalid("global dictionary block count overflow"))?;
+    // A file written before version 9 has no sorted order, and one that has it keeps it out of the
+    // index on purpose. The index is read and checksummed in full the moment the column is first
+    // touched, and the order is two thirds the size of the offsets, so putting it there would make
+    // every query that reads a string column pay for a search that most of them never make.
+    let ranks = if ordered { count } else { 0 };
+    let rank_blocks = ranks.div_ceil(TEXT_RANK_BLOCK);
+    let rank_len =
+        ranks.checked_mul(RANK_ENTRY).ok_or_else(|| invalid("global dictionary rank overflow"))?;
+    let hash_len = blocks
+        .checked_add(rank_blocks)
+        .and_then(|count| count.checked_mul(8))
+        .ok_or_else(|| invalid("global dictionary block count overflow"))?;
     let index_len = 12usize
         .checked_add(offset_len)
-        .and_then(|len| len.checked_add(order_len))
         .and_then(|len| len.checked_add(hash_len))
         .ok_or_else(|| invalid("global dictionary header overflow"))?;
-    if index_len > page.length as usize {
+    let body_len = index_len
+        .checked_add(rank_len)
+        .ok_or_else(|| invalid("global dictionary header overflow"))?;
+    if body_len > page.length as usize {
         return Err(invalid("global dictionary offset index exceeds its page"));
     }
     let mut index = vec![0; index_len];
@@ -2213,18 +2346,12 @@ fn open_global_dictionary(
         .chunks_exact(4)
         .map(|part| u32::from_le_bytes(part.try_into().expect("four bytes")))
         .collect::<Vec<_>>();
-    let order = index[12 + offset_len..12 + offset_len + order_len]
-        .chunks_exact(4)
-        .map(|part| u32::from_le_bytes(part.try_into().expect("four bytes")))
-        .collect::<Vec<_>>();
-    let hashes = index[12 + offset_len + order_len..]
+    let mut hashes = index[12 + offset_len..]
         .chunks_exact(8)
         .map(|part| u64::from_le_bytes(part.try_into().expect("eight bytes")))
         .collect::<Vec<_>>();
-    if order.iter().any(|&code| code as usize >= count) {
-        return Err(invalid("global dictionary order names a code it does not have"));
-    }
-    let payload_len = page.length as usize - index_len;
+    let rank_hashes = hashes.split_off(blocks);
+    let payload_len = page.length as usize - body_len;
     if blocks != payload_len.div_ceil(TEXT_PAYLOAD_BLOCK) {
         return Err(invalid("global dictionary block count differs from its payload"));
     }
@@ -2242,8 +2369,11 @@ fn open_global_dictionary(
         Arc::new(NativeText {
             file,
             offsets,
-            order,
-            payload: page.offset + index_len as u64,
+            ranks,
+            rank_at: page.offset + index_len as u64,
+            rank_hashes,
+            rank_blocks: (0..rank_blocks).map(|_| OnceLock::new()).collect(),
+            payload: page.offset + body_len as u64,
             payload_len,
             hashes,
             payload_blocks,
@@ -2662,7 +2792,10 @@ mod tests {
         let mut header = [0; 12];
         read_at(&reader.file, dictionary.offset, &mut header).expect("dictionary header");
         let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
-        let index_len = 12 + (count + 1) * 4 + count * 4 + 8;
+        let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
+        let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
+        let index_len =
+            12 + (count + 1) * 4 + (blocks + rank_blocks) * 8 + count * RANK_ENTRY as u64;
         let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
         file.seek(SeekFrom::Start(dictionary.offset + index_len))
             .expect("inside dictionary payload");
@@ -2672,6 +2805,43 @@ mod tests {
         let error =
             chunk.validate_external().expect_err("payload corruption must reach the caller");
         assert!(error.message().contains("payload checksum differs"), "{error}");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// The sorted order sits outside the index the page checksum covers, because a query that
+    /// never searches a dictionary should not read it, so it carries its own checksums and this is
+    /// what says they are checked. A search that trusted a damaged order would give a wrong answer
+    /// rather than a slow one.
+    #[test]
+    fn a_damaged_sorted_order_is_an_error() {
+        let path = path("damaged-order");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("id", LogicalType::Integer),
+                Field::new("text", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        writer.append(&sample()).expect("stripe written");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let page = reader.table.dictionaries[1].expect("string dictionary page");
+        let mut header = [0; 12];
+        read_at(&reader.file, page.offset, &mut header).expect("dictionary header");
+        let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
+        let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
+        let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
+        let index_len = 12 + (count + 1) * 4 + (blocks + rank_blocks) * 8;
+        let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
+        file.seek(SeekFrom::Start(page.offset + index_len)).expect("the first head");
+        file.write_all(&[255]).expect("damage the order");
+
+        let dictionary = reader.dictionary(1).expect("read").expect("a string column has one");
+        let error = dictionary.compare_rank(0, b"anything").expect_err("a damaged order is caught");
+        assert!(error.message().contains("rank checksum differs"), "{error}");
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -2703,8 +2873,11 @@ mod tests {
 
         let reader = Reader::open(&path).expect("valid directory");
         let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
-        let order = dictionary.sorted_order().expect("a v9 file stores one").to_vec();
-        assert_eq!(order.len(), spellings.len(), "every distinct value has a rank");
+        let count = dictionary.ranks().expect("a v9 file stores one");
+        assert_eq!(count, spellings.len(), "every distinct value has a rank");
+        let order = (0..count)
+            .map(|rank| dictionary.code_at_rank(rank).expect("a code"))
+            .collect::<Vec<_>>();
         let mut seen = order.clone();
         seen.sort_unstable();
         assert_eq!(seen, (0..spellings.len() as u32).collect::<Vec<_>>(), "a permutation of codes");
@@ -2718,6 +2891,23 @@ mod tests {
         let mut expected = spellings.map(|text| text.as_bytes().to_vec()).to_vec();
         expected.sort();
         assert_eq!(ranked, expected, "rank order is value order");
+
+        // What a search asks, on the values themselves rather than through a kernel, so that a
+        // file whose heads disagree with its bytes is caught here rather than as a wrong answer.
+        for (rank, value) in expected.iter().enumerate() {
+            assert_eq!(
+                dictionary.compare_rank(rank, value).expect("compare"),
+                Ordering::Equal,
+                "rank {rank} is its own value"
+            );
+            if rank > 0 {
+                assert_eq!(
+                    dictionary.compare_rank(rank - 1, value).expect("compare"),
+                    Ordering::Less,
+                    "rank {rank} follows the one before it"
+                );
+            }
+        }
         fs::remove_file(path).expect("remove scratch file");
     }
 

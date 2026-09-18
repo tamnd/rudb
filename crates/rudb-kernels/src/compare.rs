@@ -1974,8 +1974,18 @@ mod tests {
             self.values.iter().map(Vec::len).sum()
         }
 
-        fn sorted_order(&self) -> Option<&[u32]> {
-            Some(&self.order)
+        fn ranks(&self) -> Option<usize> {
+            Some(self.order.len())
+        }
+
+        fn compare_rank(&self, rank: usize, wanted: &[u8]) -> Result<Ordering> {
+            // Plain bytes rather than the head the native format compares first, because what this
+            // test is about is the answer the comparison gives and not how few reads it took.
+            Ok(self.values[self.order[rank] as usize].as_slice().cmp(wanted))
+        }
+
+        fn code_at_rank(&self, rank: usize) -> Result<u32> {
+            Ok(self.order[rank])
         }
     }
 

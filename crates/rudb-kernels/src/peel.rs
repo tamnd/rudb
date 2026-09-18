@@ -33,16 +33,22 @@
 //!
 //! # When the dictionary is sorted, do not peel at all
 //!
-//! A peel still has to read every distinct value once, and for `Referer` on `hits` that is four
-//! hundred thousand reads out of the file before the memo has anything in it. A dictionary that
-//! comes with its sorted order can do better than that for the one question that matters most,
-//! which is whether a value equals a literal, because the answer is a binary search: about
-//! nineteen reads for the whole query rather than four hundred thousand, and after it the filter
-//! is an integer compare against one code with no memo to consult.
+//! A peel still has to read every distinct value the rows use, and for `Referer` on `hits` that is
+//! four hundred thousand reads out of the file. A dictionary that comes with its sorted order can
+//! do better than that for the one question that matters most, which is whether a value equals a
+//! literal, because the answer is a binary search: about nineteen probes for the whole query, and
+//! after it the filter is an integer compare against one code with no memo to consult.
 //!
-//! [`Lookup`] is that search, memoized the same way and for the same reason. It only answers
-//! equality. A `LIKE`, a regular expression or any other scalar function still needs the peel, and
-//! always will, because no ordering of the values tells you which of them match a pattern.
+//! [`Lookup`] is that search, memoized the same way and for the same reason. A probe asks the
+//! values how they compare rather than asking them for bytes, which is what lets a format that
+//! keeps the start of each value beside its rank answer nineteen probes out of nineteen without
+//! going near the payload. That matters more than it sounds: the values a binary search lands on
+//! are scattered all over the column, so nineteen reads of them is nineteen different blocks of
+//! the file, which is more than the peel behind a selective filter would have read.
+//!
+//! It only answers equality. A `LIKE`, a regular expression or any other scalar function still
+//! needs the peel, and always will, because no ordering of the values tells you which of them
+//! match a pattern.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -140,10 +146,9 @@ impl Lookup {
         if let Some(memo) = self.memo.get() {
             return Arc::ptr_eq(&memo.dictionary, dictionary).then_some(Ok(memo.found));
         }
-        let order = dictionary.sorted_order()?;
-        let found = match search(dictionary, order, wanted) {
-            Ok(Some(found)) => found,
-            Ok(None) => return None,
+        let ranks = dictionary.ranks()?;
+        let found = match search(dictionary, ranks, wanted) {
+            Ok(found) => found,
             Err(error) => return Some(Err(error)),
         };
         // Two threads that get here at once do the same search and set the same answer, and the
@@ -155,25 +160,25 @@ impl Lookup {
 
 /// The code of `wanted` in a dictionary, by binary search over its sorted order.
 ///
-/// `Ok(None)` declines, which happens when the order names an entry that has no bytes to compare.
-/// Nothing in the format writes one, so this is the impossible case rather than the rare one, and
-/// declining leaves the caller on the path it would have taken anyway.
-fn search(dictionary: &Vector, order: &[u32], wanted: &[u8]) -> Result<Option<Found>> {
+/// The search is here and the comparison is in the source on purpose. What the search does is the
+/// same for every format, and it is short enough to read in one go and to swap for something else.
+/// What one probe costs is entirely up to whoever wrote the file, and a format that keeps the start
+/// of each value beside its rank answers almost every probe without reading a value at all. Asking
+/// the source to compare rather than asking it for a position is what leaves room for that.
+fn search(dictionary: &Vector, ranks: usize, wanted: &[u8]) -> Result<Found> {
     let mut low = 0;
-    let mut high = order.len();
+    let mut high = ranks;
     while low < high {
         let middle = low + (high - low) / 2;
-        let code = *order
-            .get(middle)
-            .ok_or_else(|| Error::internal("a dictionary order is shorter than it said"))?;
-        let Some(bytes) = dictionary.try_bytes_at(code as usize)? else { return Ok(None) };
-        match bytes.cmp(wanted) {
+        match dictionary.compare_rank(middle, wanted)? {
             std::cmp::Ordering::Less => low = middle + 1,
             std::cmp::Ordering::Greater => high = middle,
-            std::cmp::Ordering::Equal => return Ok(Some(Found::At(code))),
+            std::cmp::Ordering::Equal => {
+                return Ok(Found::At(dictionary.code_at_rank(middle)?));
+            }
         }
     }
-    Ok(Some(Found::Absent))
+    Ok(Found::Absent)
 }
 
 impl Answers {
@@ -302,17 +307,39 @@ mod tests {
     #[derive(Debug)]
     struct Filed {
         values: Vec<Vec<u8>>,
-        order: Vec<u32>,
+        /// Codes in sorted value order with the head of each value beside it, which is what the
+        /// native format writes and what lets a probe answer without reading a value.
+        order: Vec<(u64, u32)>,
         reads: AtomicUsize,
+    }
+
+    /// The first eight bytes of a value as an integer that sorts the way the bytes sort, which is
+    /// what the native format stores per rank.
+    fn head(bytes: &[u8]) -> u64 {
+        let mut word = [0; 8];
+        let take = bytes.len().min(8);
+        word[..take].copy_from_slice(&bytes[..take]);
+        u64::from_be_bytes(word)
     }
 
     impl Filed {
         /// `values` in the order the writer handed out codes, which is not sorted order.
         fn new(values: &[&str]) -> Self {
             let values: Vec<Vec<u8>> = values.iter().map(|text| text.as_bytes().to_vec()).collect();
-            let mut order = (0..values.len() as u32).collect::<Vec<_>>();
-            order.sort_by(|&left, &right| values[left as usize].cmp(&values[right as usize]));
+            let mut order = (0..values.len() as u32)
+                .map(|code| (head(&values[code as usize]), code))
+                .collect::<Vec<_>>();
+            order.sort_by(|&(_, left), &(_, right)| {
+                values[left as usize].cmp(&values[right as usize])
+            });
             Self { values, order, reads: AtomicUsize::new(0) }
+        }
+
+        fn at(&self, rank: usize) -> Result<(u64, u32)> {
+            self.order
+                .get(rank)
+                .copied()
+                .ok_or_else(|| Error::internal("a rank past the end of the order"))
         }
     }
 
@@ -330,8 +357,21 @@ mod tests {
             self.values.iter().map(Vec::len).sum()
         }
 
-        fn sorted_order(&self) -> Option<&[u32]> {
-            Some(&self.order)
+        fn ranks(&self) -> Option<usize> {
+            Some(self.order.len())
+        }
+
+        fn compare_rank(&self, rank: usize, wanted: &[u8]) -> Result<std::cmp::Ordering> {
+            let (found, code) = self.at(rank)?;
+            let settled = found.cmp(&head(wanted));
+            if settled != std::cmp::Ordering::Equal {
+                return Ok(settled);
+            }
+            Ok(self.bytes_at(code as usize)?.unwrap_or_default().cmp(wanted))
+        }
+
+        fn code_at_rank(&self, rank: usize) -> Result<u32> {
+            Ok(self.at(rank)?.1)
         }
     }
 
@@ -359,6 +399,50 @@ mod tests {
         assert_eq!(source.values[code as usize], b"value-0700");
         let reads = source.reads.load(Ordering::Relaxed);
         assert!(reads <= 11, "a search of 1024 values read {reads} of them");
+    }
+
+    /// The point of writing the start of each value beside its rank. Every probe of this search is
+    /// settled by eight bytes the search already has, so the only value it reads is the one it
+    /// found, and a literal the dictionary does not hold costs no reads at all.
+    #[test]
+    fn a_search_over_values_that_differ_early_reads_only_the_one_it_finds() {
+        let source = Arc::new(Filed::new(&["cherry", "apple", "date", "banana"]));
+        let values = Vector::external_text(LogicalType::Varchar, Arc::clone(&source) as Arc<_>)
+            .expect("a filed vector");
+        let column = Vector::stable_dictionary(vec![0, 1, 2, 3], Arc::new(values)).expect("codes");
+        assert_eq!(
+            Lookup::default().find(&column, b"cherry").expect("searchable").expect("read"),
+            Found::At(0)
+        );
+        assert_eq!(source.reads.load(Ordering::Relaxed), 1, "only the value it found");
+        assert_eq!(
+            Lookup::default().find(&column, b"fig").expect("searchable").expect("read"),
+            Found::Absent
+        );
+        assert_eq!(source.reads.load(Ordering::Relaxed), 1, "and nothing for the one it did not");
+    }
+
+    /// Two values that start the same way cannot be told apart by their first eight bytes, so the
+    /// search has to read them, and the answer has to come out right anyway.
+    #[test]
+    fn values_that_share_their_first_eight_bytes_are_still_told_apart() {
+        let source = Arc::new(Filed::new(&["prefixed-two", "prefixed-one", "prefixed-three"]));
+        let values = Vector::external_text(LogicalType::Varchar, Arc::clone(&source) as Arc<_>)
+            .expect("a filed vector");
+        let column = Vector::stable_dictionary(vec![0, 1, 2], Arc::new(values)).expect("codes");
+        for (wanted, expected) in [
+            (&b"prefixed-one"[..], Found::At(1)),
+            (b"prefixed-two", Found::At(0)),
+            (b"prefixed-three", Found::At(2)),
+            (b"prefixed-four", Found::Absent),
+        ] {
+            assert_eq!(
+                Lookup::default().find(&column, wanted).expect("searchable").expect("read"),
+                expected,
+                "searching for {}",
+                String::from_utf8_lossy(wanted)
+            );
+        }
     }
 
     #[test]
