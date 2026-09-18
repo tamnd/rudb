@@ -425,15 +425,33 @@ struct NativeFrequencies {
 }
 
 /// Exact grouped counts already certified by a native file's frequency synopsis.
+///
+/// There are two ways the file can certify them. A `top` bound asks only for the leading groups, and
+/// the synopsis answers that whenever the last one it would return beats the bound on everything it
+/// dropped, which is the usual case for a column with a long tail. With no bound the whole grouping
+/// has to come out of the synopsis, so it is only an answer when the synopsis is complete, which is
+/// what a column with few enough distinct values gives.
+///
+/// A filter between the grouping and the table is allowed when it names the same column being
+/// grouped, because then it only decides which of the groups survive and never splits or merges one.
+/// That is the whole of `WHERE AdvEngineID <> 0 GROUP BY AdvEngineID`, and it needs the complete
+/// synopsis for the same reason the unbounded case does.
 fn native_frequencies(
     plan: &Plan,
     catalog: &Catalog,
     input: NodeRef,
     groups: Slice,
     aggregates: Slice,
-    top: usize,
+    top: Option<usize>,
 ) -> Result<Option<NativeFrequencies>> {
-    let Node::Get { catalog: database, schema, table, index, columns, .. } = *plan.node(input)
+    let (source, certain) = match *plan.node(input) {
+        Node::Filter { input: under, .. } => match certain_filter(plan, catalog, input)? {
+            Some(certain) => (under, Some(certain)),
+            None => return Ok(None),
+        },
+        _ => (input, None),
+    };
+    let Node::Get { catalog: database, schema, table, index, columns, .. } = *plan.node(source)
     else {
         return Ok(None);
     };
@@ -466,10 +484,17 @@ fn native_frequencies(
     let name = QualifiedName::new(plan.string(database), plan.string(schema), plan.string(table));
     let table = catalog.table(&name)?;
     let Some(column) = table.column_index(&field.name) else { return Ok(None) };
-    Ok(table
-        .rows()
-        .top_frequencies(column, top)?
-        .map(|entries| NativeFrequencies { entries, column: group.column as usize }))
+    let entries = match certain {
+        // A filter over some other column would decide rows inside a group rather than whole groups,
+        // and the synopsis of the grouping column says nothing about which of its rows those are.
+        Some(certain) if certain.column == column => certain.kept(),
+        Some(_) => return Ok(None),
+        None => match top {
+            Some(top) => table.rows().top_frequencies(column, top)?,
+            None => table.rows().exact_frequencies(column)?,
+        },
+    };
+    Ok(entries.map(|entries| NativeFrequencies { entries, column: group.column as usize }))
 }
 
 /// The stored table one node reads straight through, with no filter and nothing else in the way.
@@ -545,6 +570,8 @@ fn grouped_column<'a>(
 struct CertainFilter {
     /// Every value of the column the predicate names, with its exact row count.
     entries: Vec<(Value, u64)>,
+    /// Which column of the stored table the predicate names.
+    column: usize,
     /// The constant the predicate compares against, never null.
     against: Value,
     /// Whether the predicate keeps the rows that differ rather than the ones that match.
@@ -561,6 +588,21 @@ impl CertainFilter {
             }
         }
         Some(kept)
+    }
+
+    /// The entries the predicate keeps, which are the groups a grouping of that column would make.
+    ///
+    /// One entry is one distinct value, and a grouping of the column it came from puts every row
+    /// holding that value in one group, so the surviving entries are the answer to a grouped count
+    /// and not just an input to one.
+    fn kept(&self) -> Option<Vec<(Value, u64)>> {
+        let mut out = Vec::with_capacity(self.entries.len());
+        for (value, count) in &self.entries {
+            if self.keeps(value)? {
+                out.push((value.clone(), *count));
+            }
+        }
+        Some(out)
     }
 
     /// Whether the predicate keeps the rows holding one value.
@@ -613,7 +655,7 @@ fn certain_filter(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Optio
         return Ok(None);
     };
     let Some(entries) = table.rows().exact_frequencies(column)? else { return Ok(None) };
-    Ok(Some(CertainFilter { entries, against, differs }))
+    Ok(Some(CertainFilter { entries, column, against, differs }))
 }
 
 /// How many rows a node produces, when that can be known without producing them.
@@ -1031,28 +1073,22 @@ impl<'a> Building<'a, '_> {
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
         if bound.max_groups.is_none() && bound.having_count.is_none() {
-            if let Some(top) = bound.top_counts {
-                if let Some(frequencies) =
-                    native_frequencies(self.plan, self.catalog, input, groups, aggregates, top)?
-                {
-                    let source = Frequencies::new(
-                        self.plan,
-                        &below.schema,
-                        schema.clone(),
-                        groups,
-                        frequencies.column,
-                        frequencies.entries,
-                        self.session,
-                    )?;
-                    let counters = self.watch(
-                        reference,
-                        id,
-                        pipeline,
-                        "Aggregate",
-                        Some("native frequencies"),
-                    );
-                    return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
-                }
+            let top = bound.top_counts;
+            if let Some(frequencies) =
+                native_frequencies(self.plan, self.catalog, input, groups, aggregates, top)?
+            {
+                let source = Frequencies::new(
+                    self.plan,
+                    &below.schema,
+                    schema.clone(),
+                    groups,
+                    frequencies.column,
+                    frequencies.entries,
+                    self.session,
+                )?;
+                let counters =
+                    self.watch(reference, id, pipeline, "Aggregate", Some("native frequencies"));
+                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
             }
         }
         let counters = self.watch(reference, id, pipeline, "Aggregate", None);
