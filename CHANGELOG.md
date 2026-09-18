@@ -6,6 +6,13 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.40
+
+A patch release about two places a subquery was going wrong, one of which is TPC-H q11. The storage format version is unchanged at 9. The native directory format is unchanged at 14.
+
+- A `HAVING` can compare a group against a query of its own. An uncorrelated scalar subquery written anywhere in a select block was joined below the grouping, which is right for a `SELECT` and for a `WHERE` and wrong here: the single row becomes a column of every row going into the aggregate, and the grouping rule then demands that column in the `GROUP BY`, so the query was refused with a message about a column that does not exist. It was refused with an empty column name, in fact, which is how the doubled word in "column a column must appear in the GROUP BY clause" got there. A `HAVING` subquery is held back and joined above the aggregate instead, since what it produces is one row per query and not one row per group. A correlated one still goes underneath, because what it correlates to is a column of the rows going into the grouping and there is nothing above the grouping for it to read. A mark join carries its comparison rather than the predicate carrying it, and that comparison is written over the outer rows, so it takes the same rewrite. TPC-H q11 binds, and rudb and DuckDB v1.5.5 both answer 1048 rows for it at SF1 with the files byte identical.
+- The domain is pushed through a window. The domain columns partition first, which is one evaluation of the window per outer row, and the ordering, the window expressions and the frame bounds are rewritten to read the domain. Five shapes match the pinned build exactly and all five were refused by 0.3.39.
+
 ## 0.3.39
 
 A patch release about correlated subqueries, which no longer have to match a shape somebody wrote down to be answered, and about five ClickBench queries. The storage format version is unchanged at 9. The native directory format is unchanged at 14.
