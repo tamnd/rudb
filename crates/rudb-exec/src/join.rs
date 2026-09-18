@@ -786,6 +786,26 @@ impl<'a> Probe<'a> {
         &self.schema
     }
 
+    /// The key this join can hand to the scan under its driving side, if there is one.
+    ///
+    /// The gathered side's key expression, which is what the range is measured over, and the driving
+    /// column it is compared against, which is what a scan can be told about.
+    /// [`Sideways`](crate::sideways::Sideways) has the argument for each of the three refusals here:
+    /// the kind has to be one that drops a driving row with no match, the equality has to be the
+    /// rule under which a null key matches nothing, and the driving half has to be a column rather
+    /// than an expression, because a range about a value says nothing about what an expression over
+    /// it produces.
+    pub(crate) fn sideways(&self) -> Option<(ExprRef, ColumnBinding)> {
+        if !matches!(self.kind, JoinKind::Inner | JoinKind::Semi) {
+            return None;
+        }
+        let at = self.equalities.null_is_a_value.iter().position(|&stored| !stored)?;
+        let Expr::Column(binding) = *self.plan.expr(*self.equalities.left.get(at)?) else {
+            return None;
+        };
+        Some((*self.equalities.right.get(at)?, binding))
+    }
+
     /// The conjuncts the lookup did not answer, over a pair of this join's two sides.
     fn residual(&self) -> Residual<'_> {
         Residual {
@@ -1531,7 +1551,7 @@ mod tests {
     }
 
     /// The right side of a join, run to the end the way the pipeline before this one would.
-    fn gathered(memory: &Memory, values: &[i32]) -> (Keep, Buffered) {
+    fn gathered(memory: &Memory, values: &[i32]) -> (Keep<'static>, Buffered) {
         let (keep, chunks) = Keep::new(memory);
         let mut local = keep.local();
         if !values.is_empty() {
@@ -1730,7 +1750,7 @@ mod tests {
     }
 
     /// The right side as two chunks, so that the walk over them is exercised rather than assumed.
-    fn kept(memory: &Memory, first: &[i32], second: &[i32]) -> (Keep, Buffered) {
+    fn kept(memory: &Memory, first: &[i32], second: &[i32]) -> (Keep<'static>, Buffered) {
         let (keep, out) = Keep::new(memory);
         let mut local = keep.local();
         keep.sink(&chunk(first), &mut local).expect("the first right chunk");
@@ -1984,6 +2004,104 @@ mod tests {
             probed(&probe, &pair_chunk(&[(2, 10)]), 4),
             [vec![Value::Integer(2), Value::Integer(10), Value::Null, Value::Null]]
         );
+    }
+
+    /// What one probe over `left` and `right` offers the scan under its driving side.
+    fn offered(
+        plan: &Plan,
+        left: &Schema,
+        right: &Schema,
+        kind: JoinKind,
+        conditions: Slice,
+    ) -> Option<(ExprRef, ColumnBinding)> {
+        let memory = Memory::unlimited();
+        let (keep, rows) = Keep::new(&memory);
+        let local = keep.local();
+        keep.combine(local).expect("the one instance");
+        keep.finalize().expect("the chunks");
+        let probe = Probe::new(
+            plan,
+            left,
+            &Gathered { schema: right, chunks: rows, marker: None, swapped: false },
+            kind,
+            conditions,
+            &Cancel::new(),
+            &memory,
+        )
+        .expect("one equality is enough to look up");
+
+        probe.sideways()
+    }
+
+    /// The plain shape, which is the one the filter is for: the gathered side's key to measure the
+    /// range over, and the driving column the scan is to be told about.
+    #[test]
+    fn an_inner_join_on_a_column_offers_its_key_to_the_scan_below() {
+        let mut plan = Plan::new();
+        let (left, right) = (pair_schema(0), pair_schema(1));
+        let one = column_at(&mut plan, 0, 0, LogicalType::Integer);
+        let other = column_at(&mut plan, 1, 0, LogicalType::Integer);
+        let condition = equal(&mut plan, one, other);
+        let conditions = plan.add_expr_list(&[condition]);
+
+        assert_eq!(
+            offered(&plan, &left, &right, JoinKind::Inner, conditions),
+            Some((other, ColumnBinding::new(0, 0)))
+        );
+        assert_eq!(
+            offered(&plan, &left, &right, JoinKind::Semi, conditions),
+            Some((other, ColumnBinding::new(0, 0))),
+            "a semi join drops an unmatched driving row too"
+        );
+    }
+
+    /// A left join answers with a driving row that matched nothing, so a scan that dropped that row
+    /// would lose it from the result.
+    #[test]
+    fn a_join_that_keeps_an_unmatched_driving_row_offers_nothing() {
+        let mut plan = Plan::new();
+        let (left, right) = (pair_schema(0), pair_schema(1));
+        let one = column_at(&mut plan, 0, 0, LogicalType::Integer);
+        let other = column_at(&mut plan, 1, 0, LogicalType::Integer);
+        let condition = equal(&mut plan, one, other);
+        let conditions = plan.add_expr_list(&[condition]);
+
+        for kind in [JoinKind::Left, JoinKind::Anti, JoinKind::Single] {
+            assert_eq!(offered(&plan, &left, &right, kind, conditions), None, "{kind:?}");
+        }
+    }
+
+    /// Two nulls match under `IS NOT DISTINCT FROM`, and a range is about order, which has nothing
+    /// to say about a null.
+    #[test]
+    fn an_equality_that_matches_two_nulls_offers_nothing() {
+        let mut plan = Plan::new();
+        let (left, right) = (pair_schema(0), pair_schema(1));
+        let one = column_at(&mut plan, 0, 0, LogicalType::Integer);
+        let other = column_at(&mut plan, 1, 0, LogicalType::Integer);
+        let condition = plan.add_expr(
+            Expr::Compare { op: CompareOp::NotDistinctFrom, left: one, right: other },
+            LogicalType::Boolean,
+        );
+        let conditions = plan.add_expr_list(&[condition]);
+
+        assert_eq!(offered(&plan, &left, &right, JoinKind::Inner, conditions), None);
+    }
+
+    /// A range about the values in a column says nothing about what an expression over that column
+    /// produces, so only a plain column is offered.
+    #[test]
+    fn a_driving_key_that_is_an_expression_offers_nothing() {
+        let mut plan = Plan::new();
+        let (left, right) = sides();
+        let narrow = column(&mut plan, 0, LogicalType::Integer);
+        let widened =
+            plan.add_expr(Expr::Cast { input: narrow, try_cast: false }, LogicalType::BigInt);
+        let other = column(&mut plan, 1, LogicalType::BigInt);
+        let condition = equal(&mut plan, widened, other);
+        let conditions = plan.add_expr_list(&[condition]);
+
+        assert_eq!(offered(&plan, &left, &right, JoinKind::Inner, conditions), None);
     }
 
     /// The sink half, where a gathered row counts as matched only once the residual has had it.
