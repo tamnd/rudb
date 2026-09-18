@@ -26,11 +26,9 @@
 //! that carries it, and the answer for that row would be a missing row rather than whatever the
 //! subquery says about NULL.
 //!
-//! Not every operator has a rule here. A full join is refused because it preserves both of its
-//! sides, so neither copy of the domain is filled in on every row it produces and the value the
-//! join back needs is a column neither side has.
-//! Everything with no rule leaves the dependent join in place and the query is refused, which is the
-//! honest end rather than a plan that answers a different question.
+//! Not every operator has a rule here. Everything with no rule leaves the dependent join in place
+//! and the query is refused, which is the honest end rather than a plan that answers a different
+//! question.
 
 use std::collections::HashMap;
 
@@ -285,13 +283,13 @@ fn push(
             let empty = plan.add_expr_list(&[]);
             sides(plan, left, right, JoinKind::Inner, empty, domain, index, keys, outer)
         }
-        // A full join is the one with no answer here. Both of its sides are preserved, so neither
-        // copy of the domain is filled in on every row it produces, and the value the join back
-        // needs is a column neither side has.
+        // A semi, anti or mark join is what is left out. Those produce one side's rows and not both
+        // sides put end to end, so there is no second half to push the domain into and no place in
+        // the output for it to come back out of.
         Node::Join {
             left,
             right,
-            kind: kind @ (JoinKind::Inner | JoinKind::Left | JoinKind::Right),
+            kind: kind @ (JoinKind::Inner | JoinKind::Left | JoinKind::Right | JoinKind::Full),
             conditions,
             ..
         } => sides(plan, left, right, kind, conditions, domain, index, keys, outer),
@@ -871,15 +869,25 @@ fn sides(
 ) -> Option<Pushed> {
     let left_reads = correlated(plan, left, outer);
     let right_reads = correlated(plan, right, outer);
-    let keeps_right = kind == JoinKind::Right;
+    let keeps_left = matches!(kind, JoinKind::Left | JoinKind::Full);
+    let keeps_right = matches!(kind, JoinKind::Right | JoinKind::Full);
     let carry_right = right_reads || keeps_right;
     // Nothing forces the domain on to either side of an inner join whose condition is the only
     // thing that reads the outer row, and it has to be somewhere, so it goes on the left.
-    let carry_left = left_reads || kind == JoinKind::Left || !carry_right;
+    let carry_left = left_reads || keeps_left || !carry_right;
+
+    // A full join is the one rule that has to tell the two copies of the domain apart, so it gets a
+    // second one bound against an index of its own. Every other rule here shares the one copy, since
+    // a row that reaches it came from one side and the value is the same on both sides of a pairing.
+    let (other_domain, other_index) =
+        if keeps_left && keeps_right { twin(plan, domain)? } else { (domain, index) };
 
     let first = if carry_left { Some(push(plan, left, domain, index, keys, outer)?) } else { None };
-    let second =
-        if carry_right { Some(push(plan, right, domain, index, keys, outer)?) } else { None };
+    let second = if carry_right {
+        Some(push(plan, right, other_domain, other_index, keys, outer)?)
+    } else {
+        None
+    };
 
     let mut moved = HashMap::new();
     for side in [first.as_ref(), second.as_ref()].into_iter().flatten() {
@@ -923,10 +931,119 @@ fn sides(
 
     // Which copy of the domain is filled in on every row the join produces. A right join pads its
     // left side, so the left copy is NULL on the rows that matched nothing and the right copy is
-    // the one to carry up. Everything else here preserves its left side or neither side, and the
-    // left copy is filled in on both of those.
+    // the one to carry up. A left join and an inner join preserve their left side or neither side,
+    // and the left copy is filled in on both of those. A full join pads both sides and is the one
+    // case where neither copy will do.
+    if keeps_left && keeps_right {
+        let one = first.as_ref()?.keys.clone();
+        let other = second.as_ref()?.keys.clone();
+        return either(plan, node, &one, &other, keys, moved);
+    }
     let carried = if keeps_right { second.as_ref()?.keys.clone() } else { carrier.keys.clone() };
     Some(Pushed { node, keys: carried, moved })
+}
+
+/// A second copy of the domain, bound against an index of its own.
+///
+/// The domain is one node that every side of the push shares, so two sides that both carry it carry
+/// it with the same binding and nothing downstream can say which of them it is reading. That is fine
+/// everywhere but a full join, where which copy is filled in is exactly the question.
+///
+/// This is the same relation described twice and not a second relation. The node written here reads
+/// the input the first one reads, so what it holds is the same rows. It is evaluated twice, which is
+/// the price of being able to name the two copies apart, and it is bounded by the number of distinct
+/// outer values rather than by the number of outer rows.
+fn twin(plan: &mut Plan, domain: NodeRef) -> Option<(NodeRef, u32)> {
+    let Node::Aggregate { input, groups, aggregates, .. } = *plan.node(domain) else {
+        return None;
+    };
+    let index = walk::fresh_index(plan);
+    Some((plan.add_node(Node::Aggregate { input, index, groups, aggregates }), index))
+}
+
+/// Whichever copy of the domain a full join left filled in, as a column of its own.
+///
+/// A full join preserves both sides, so both carry the domain and each copy is filled in exactly
+/// when the row came from that side. A row that matched has both and they agree, because the join
+/// condition equates them. A row that matched nothing has the other side padded with NULLs, so the
+/// copy from the side it came from is the one to read. Taking whichever of the two is not NULL
+/// answers all three cases, and it answers the outer row whose key really is NULL as well, since
+/// then both copies are NULL and NULL is what that row's domain value is.
+///
+/// This is a column neither side has, so it takes a projection, and a projection rebinds everything
+/// under it. Every other column the join produced is listed again so that it is still there, and
+/// every binding that moved is reported so that whatever reads it above is told where it went.
+fn either(
+    plan: &mut Plan,
+    node: NodeRef,
+    left: &[ColumnBinding],
+    right: &[ColumnBinding],
+    keys: &[Key],
+    moved: HashMap<ColumnBinding, ColumnBinding>,
+) -> Option<Pushed> {
+    let span = plan.expr_span(keys.first()?.expr);
+    let produced = walk::outputs(plan, node)?;
+    // Nothing below adds a node from here on, so the index the projection will get is already
+    // settled and the bindings written into the map below are the ones it ends up with.
+    let at_index = walk::fresh_index(plan);
+
+    let mut exprs = Vec::new();
+    let mut names = Vec::new();
+    let mut relabel = HashMap::new();
+    for (binding, ty) in produced {
+        // The two copies of the domain are what the coalesced column replaces, so they are not
+        // listed again and nothing above is told where they went, because nothing above reads
+        // them by binding. The keys are how they are reached.
+        if left.contains(&binding) || right.contains(&binding) {
+            continue;
+        }
+        let position = exprs.len();
+        relabel.insert(binding, at(at_index, position));
+        exprs.push(plan.add_expr_at(Expr::Column(binding), ty, span));
+        names.push(plan.intern(&format!("__kept_{position}")));
+    }
+
+    let mut carried = Vec::new();
+    for (position, (key, (&here, &there))) in keys.iter().zip(left.iter().zip(right)).enumerate() {
+        let ty = plan.expr_type(key.expr).clone();
+        let mine = plan.add_expr_at(Expr::Column(here), ty.clone(), span);
+        let tested = plan.add_expr_at(Expr::Column(here), ty.clone(), span);
+        let yours = plan.add_expr_at(Expr::Column(there), ty.clone(), span);
+        let nothing = plan.add_value(Value::Null);
+        let absent = plan.add_expr_at(Expr::Constant(nothing), ty.clone(), span);
+        // `IS DISTINCT FROM NULL` is the null safe way to ask whether a value is there, and the
+        // rule already writes that comparison, so this needs no function to be resolved.
+        let filled = plan.add_expr_at(
+            Expr::Compare { op: CompareOp::DistinctFrom, left: tested, right: absent },
+            LogicalType::Boolean,
+            span,
+        );
+        let arms = plan.add_arms(&[Arm { when: filled, then: mine }]);
+        carried.push(at(at_index, exprs.len()));
+        exprs.push(plan.add_expr_at(Expr::Case { arms, otherwise: Some(yours) }, ty, span));
+        names.push(plan.intern(&format!("__domain_{position}")));
+    }
+
+    // The map the operators above need is from where a column was in the subtree they were written
+    // against to where it is now, and what is in hand is two halves of that. A column nothing moved
+    // has the same binding in both halves, so starting from the relabelling and then following each
+    // move through it composes the two.
+    let mut told = relabel.clone();
+    for (before, between) in moved {
+        if let Some(&now) = relabel.get(&between) {
+            told.insert(before, now);
+        }
+    }
+
+    let exprs = plan.add_expr_list(&exprs);
+    let names = plan.add_name_list(&names);
+    let node = plan.add_node(Node::Project { input: node, index: at_index, exprs, names });
+    Some(Pushed { node, keys: carried, moved: told })
+}
+
+/// A binding at a position that came from counting columns rather than from the plan.
+fn at(index: u32, position: usize) -> ColumnBinding {
+    ColumnBinding::new(index, u32::try_from(position).expect("a column count fits in a u32"))
 }
 
 /// What an operator has to rewrite its own expressions with, given what its input did.
@@ -1311,12 +1428,40 @@ mod tests {
     }
 
     #[test]
-    fn a_full_join_inside_the_subquery_is_refused() {
+    fn a_full_join_reads_whichever_copy_of_the_domain_is_filled_in() {
         let mut plan = correlated_join("FULL", READS, QUIET);
-        unnest::lower(&mut plan).expect("unnesting runs");
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
         let after = plan.to_string();
-        // Both sides are preserved, so neither copy of the domain is filled in on every row, and
-        // the value the join back needs is a column neither side has.
-        assert!(after.contains("DependentJoin"), "{after}");
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("Join FULL"), "{after}");
+        // Both sides are preserved, so both are given the domain and the two copies are equated.
+        assert_eq!(after.matches("CrossProduct").count(), 2, "{after}");
+        // The projection over the join is what the other kinds do not need. It picks the copy that
+        // is there, which is a column neither side has.
+        assert!(after.contains("CASE WHEN"), "{after}");
+        assert!(after.contains("IS DISTINCT FROM NULL"), "{after}");
+        assert!(after.contains("AS __domain_0"), "{after}");
+        // The two copies have to be two columns. One domain node shared by both sides gives both of
+        // them the same binding, and then the CASE reads one column twice and can never pick.
+        assert_eq!(after.matches("groups=[#0.0::INTEGER] aggregates=[]").count(), 2, "{after}");
+        let case = after.split("CASE WHEN ").nth(1).expect("a CASE in the plan");
+        let then = case.split("THEN ").nth(1).expect("a THEN");
+        let otherwise = case.split("ELSE ").nth(1).expect("an ELSE");
+        let column = |text: &str| text.split_whitespace().next().expect("a column").to_owned();
+        assert_ne!(column(then), column(otherwise), "{after}");
+    }
+
+    #[test]
+    fn a_full_join_keeps_the_columns_it_did_not_replace() {
+        let mut plan = correlated_join("FULL", QUIET, READS);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        // The projection rebinds everything under it, so every column the join produced has to be
+        // listed again or the query above loses it. Four data columns across the two sides.
+        assert!(after.contains("AS __kept_3"), "{after}");
+        assert!(!after.contains("AS __kept_4"), "{after}");
     }
 }
