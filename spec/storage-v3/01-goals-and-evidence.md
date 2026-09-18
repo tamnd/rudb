@@ -1,0 +1,19 @@
+# Storage v3: goals and evidence
+
+Storage v3 is rudb's own single-file columnar database format. It is designed for SQL tables, not as a Parquet wrapper or a copy of another engine's file layout. The first milestone must load a Parquet file through the same `CREATE TABLE`, `INSERT INTO ... SELECT ...`, and `CHECKPOINT` SQL used for DuckDB, close the process, reopen one rudb file, and answer all 43 ClickBench queries correctly. It must report load wall time, child CPU, peak child RSS, file bytes, and the same query metrics for DuckDB Parquet, rudb Parquet, DuckDB native, and rudb native.
+
+The current 10m audit is 5.765 seconds of summed rudb Parquet query timers against 4.108 seconds for DuckDB Parquet and 2.974 seconds for DuckDB native. Peak child RSS is 1,350 MiB for rudb Parquet, 2,724 MiB for DuckDB Parquet, and 1,655 MiB for DuckDB native. These sums hide different query shapes. Query 29 spends most of its work in grouping and Parquet scan, while query 33's near-unique groups set rudb's peak RSS. The existing loader also assembles all insert output chunks before appending them. The native format must remove Parquet decoding from repeated queries without replacing it with a full-table memory copy.
+
+First-principles requirements:
+
+1. A query reads only referenced columns and only row stripes that survive its predicates. An unprojected string column must cause no payload read, decode, or allocation.
+2. One row stripe is independently readable by one worker. Parallel readers share immutable metadata and file bytes but no sequential reader lock.
+3. A scan emits rudb vectors in bounded chunks. It preserves encoded forms when a downstream kernel can consume them, so low-cardinality group keys need not become strings per row.
+4. A load streams chunks from the query pipeline to the file writer. Its working set depends on stripe and writer concurrency, not table row count.
+5. A committed file survives process exit. A failed or interrupted append leaves the last committed footer readable. Recovery never guesses from a partly written page.
+6. The metadata records logical SQL types, nullability, table names, row counts, per-stripe column locations, and statistics. Future versions can add nested columns, delete masks, and indexes without reinterpreting old bytes.
+7. Query speed, load time, file size, and RSS are independent measurements. No format choice is accepted solely because it shrinks the file.
+
+Research informs the tradeoffs but does not dictate the layout. A 2024 analytical-format study finds that Arrow, Parquet, and ORC each have workload-dependent limitations and calls for co-design of memory and disk representations: https://arxiv.org/abs/2411.14331. The 2025 Lance paper shows that structural encoding and page granularity matter for both scans and random access, with memory and scan tradeoffs: https://arxiv.org/abs/2504.15247. Apache Arrow's 2025 late-materialization work explains why a selection should be carried to the payload reader rather than decoding all payload first: https://arrow.apache.org/blog/2025/12/11/parquet-late-materialization-deep-dive/. DuckDB's documented persistent row groups provide a comparison baseline, not the v3 format design: https://duckdb.org/docs/current/internals/storage.
+
+The first ClickBench experiments must sweep stripe size and encoding by column. TPC-H will later test joins, selective lookup, and updates; changes motivated by that workload require their own measurements and a new compatible format version where necessary.
