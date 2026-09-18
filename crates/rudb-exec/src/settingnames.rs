@@ -16,7 +16,7 @@
 //! is where that is written down.
 
 use rudb_common::{LogicalType, Result, Session, Value};
-use rudb_functions::{SETTINGS, setting_fields};
+use rudb_functions::{SETTINGS, UNSET, setting_fields};
 use rudb_plan::{Plan, Slice};
 
 use crate::metadata::{Metadata, text};
@@ -34,7 +34,12 @@ pub(crate) fn settingnames(
 ) -> Result<Metadata> {
     let mut rows = Vec::with_capacity(SETTINGS.len());
     for entry in SETTINGS {
-        let value = session.get(entry.name).map_or(Value::Null, text);
+        // A setting that is unset reads as null and not as the empty string, and so does a setting
+        // in a session nobody filled in. Three of the rows are unset on a fresh connection.
+        let value = match session.get(entry.name) {
+            None | Some(UNSET) => Value::Null,
+            Some(held) => text(held),
+        };
         rows.push(vec![
             text(entry.name),
             value.clone(),

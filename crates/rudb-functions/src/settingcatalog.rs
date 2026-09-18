@@ -81,6 +81,17 @@ pub enum Behaviour {
     DefaultOnly(&'static str),
 }
 
+/// The default of a setting the pin answers `NULL` for rather than a value.
+///
+/// Three of the hundred and ninety two are unset on a fresh connection rather than empty, and the
+/// difference is visible twice: `duckdb_settings()` prints null for them where it prints the empty
+/// string for the twenty two that really are empty, and `current_setting('parquet_prefetch_column_gap')`
+/// is null rather than a number. The three are `enable_profiling`, `operator_memory_limit` and
+/// `parquet_prefetch_column_gap`. A NUL byte is what stands for it because it is the one string no
+/// `SET` statement can write, so a setting can only be unset by being at its default or by
+/// `PRAGMA disable_profiling`, which is the one statement that puts a setting back to nothing.
+pub const UNSET: &str = "\0";
+
 /// The scope of a setting that is one per database.
 pub const GLOBAL: &str = "GLOBAL";
 
@@ -826,7 +837,7 @@ pub static SETTINGS: &[SettingEntry] = &[
         input_type: "VARCHAR",
         scope: LOCAL,
         aliases: &[],
-        behaviour: Behaviour::Knob(""),
+        behaviour: Behaviour::Knob(UNSET),
     },
     SettingEntry {
         name: "enable_progress_bar",
@@ -1234,7 +1245,7 @@ pub static SETTINGS: &[SettingEntry] = &[
         input_type: "VARCHAR",
         scope: LOCAL,
         aliases: &[],
-        behaviour: Behaviour::Knob(""),
+        behaviour: Behaviour::Knob(UNSET),
     },
     SettingEntry {
         name: "order_by_non_integer_literal",
@@ -1266,7 +1277,7 @@ pub static SETTINGS: &[SettingEntry] = &[
         input_type: "UBIGINT",
         scope: GLOBAL,
         aliases: &[],
-        behaviour: Behaviour::Knob(""),
+        behaviour: Behaviour::Knob(UNSET),
     },
     SettingEntry {
         name: "partitioned_write_flush_threshold",
