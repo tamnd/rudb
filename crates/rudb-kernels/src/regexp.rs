@@ -305,7 +305,7 @@ impl<'a> Source<'a> {
 mod tests {
     use rudb_common::Value;
 
-    use super::{Call, host};
+    use super::{Call, host, value};
 
     #[test]
     fn clickbench_host_extraction_keeps_the_regex_boundaries() {
@@ -318,6 +318,20 @@ mod tests {
         assert_eq!(host("https://example.com/a\n"), "https://example.com/a\n");
         assert_eq!(host("https://exa\nmple.com/a"), "exa\nmple.com");
         assert_eq!(host("http://www./a"), "www.");
+    }
+
+    /// The bug this is here for: a group index that does not fit a `usize` is read as
+    /// `usize::MAX`, which means a group no pattern has, and the doubling on the way to the slot
+    /// overflowed. `SELECT regexp_extract('a', 'a', -1)` panicked the process while the optimizer
+    /// folded the call, before a row existed. It answers the empty string now, the same as any
+    /// other group the pattern does not have. Refusing it the way DuckDB does is #496.
+    #[test]
+    fn a_group_index_that_is_not_a_group_extracts_nothing() {
+        let empty = Value::Varchar(String::new());
+        let args = [Value::Varchar("a".into()), Value::Varchar("a".into()), Value::BigInt(-1)];
+        assert_eq!(value("regexp_extract", &args).expect("no panic"), empty);
+        let past = [Value::Varchar("a".into()), Value::Varchar("a".into()), Value::BigInt(7)];
+        assert_eq!(value("regexp_extract", &past).expect("no panic"), empty);
     }
 
     #[test]

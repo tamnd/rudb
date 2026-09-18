@@ -290,10 +290,16 @@ impl Captures {
     }
 
     /// Where a group begins and ends, or `None` if it took no part in the match.
+    ///
+    /// A group index no pattern could have answers `None` rather than overflowing on the way to
+    /// the slot. Callers use a large index as a sentinel for one they could not read, and a group
+    /// past the end of the pattern is already a `None` here, so the two land in the same place.
     #[must_use]
     pub fn group(&self, index: usize) -> Option<(usize, usize)> {
-        let from = self.slots.get(index * 2).copied().flatten()?;
-        let to = self.slots.get(index * 2 + 1).copied().flatten()?;
+        // Doubling gives an even number, so the slot after it cannot be the one that overflows.
+        let at = index.checked_mul(2)?;
+        let from = self.slots.get(at).copied().flatten()?;
+        let to = self.slots.get(at + 1).copied().flatten()?;
         Some((from, to))
     }
 }
@@ -444,6 +450,20 @@ mod tests {
         let found = regex.find_at("b", 0).expect("matches");
         assert_eq!(found.group(1), None);
         assert_eq!(found.group(2), Some((0, 1)));
+    }
+
+    /// The bug this is here for: `regexp_extract` reads a group index it cannot hold as
+    /// `usize::MAX`, meaning a group no pattern has, and this doubled it. Debug panicked on the
+    /// multiply and release wrapped to `usize::MAX - 1` and read whatever slot that landed on,
+    /// which is the quieter and worse half. `SELECT regexp_extract('a', 'a', -1)` killed the
+    /// process during constant folding, before a row was touched.
+    #[test]
+    fn a_group_index_no_pattern_could_have_is_not_a_slot() {
+        let regex = Regex::new("(a)").expect("compiles");
+        let found = regex.find_at("a", 0).expect("matches");
+        assert_eq!(found.group(usize::MAX), None);
+        assert_eq!(found.group(usize::MAX / 2 + 1), None);
+        assert_eq!(found.group(1), Some((0, 1)));
     }
 
     #[test]
