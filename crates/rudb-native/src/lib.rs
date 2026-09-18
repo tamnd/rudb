@@ -567,7 +567,7 @@ impl Writer {
                 pending.zone.column(column).cloned().unwrap_or_default()
             })));
         }
-        for column in 0..width {
+        for (column, membership) in memberships.iter_mut().enumerate() {
             if self.pending.iter().all(|pending| pending.codes[column].is_none()) {
                 continue;
             }
@@ -579,7 +579,7 @@ impl Writer {
             let bytes = encode_membership(&merged_codes(lists));
             let offset = self.file.stream_position().map_err(io)?;
             self.file.write_all(&bytes).map_err(io)?;
-            memberships[column] = Some(Page {
+            *membership = Some(Page {
                 offset,
                 length: u32::try_from(bytes.len())
                     .map_err(|_| invalid("membership page length overflow"))?,
