@@ -460,6 +460,12 @@ impl Binder<'_> {
         if kind_of(&written) == Some(FunctionKind::Aggregate) {
             return self.bind_aggregate(ast, &written, &arguments, distinct, scope);
         }
+        // A ranking window with no `OVER` after it. Upstream says this and not that the name is
+        // missing, because the name is there and it is the place it was written that is wrong:
+        // `row_number()` has no answer until something says which rows it is counting through.
+        if kind_of(&written) == Some(FunctionKind::Window) {
+            return Err(Error::binder("Window functions are not supported here"));
+        }
         if distinct {
             return Err(Error::binder(format!(
                 "DISTINCT is not applicable to the scalar function {written}"

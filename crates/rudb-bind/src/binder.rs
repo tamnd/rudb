@@ -2093,6 +2093,14 @@ impl<'a> Binder<'a> {
         let types: Vec<LogicalType> =
             parts.args.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
         let resolved = window_signature(name, &types)?;
+        // Upstream's sentence, doubled quotes and all. A DISTINCT over an aggregate inside an OVER
+        // is ordinary and answered, and a DISTINCT over a ranking window is refused there, because
+        // there is nothing for it to collapse when the call reads no values in the first place.
+        if distinct && kind_of(resolved.name) == Some(FunctionKind::Window) {
+            return Err(Error::binder(format!(
+                "DISTINCT is not implemented for the window function \"\"{name}\"\""
+            )));
+        }
         let mut cast = Vec::with_capacity(parts.args.len());
         for (arg, wanted) in parts.args.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
@@ -2383,40 +2391,28 @@ fn missing_replacement(name: &str, input: &Scope) -> Error {
     ))
 }
 
-/// The names that are only ever windows, which the reference binary has and this tree does not.
+/// The window names the reference binary has and this tree does not answer yet.
 ///
 /// They are listed rather than looked up because the list is the point: a call that names one of
 /// them is a window this tree cannot answer yet, and saying so is a different sentence from saying
-/// the name is not a function at all. `duckdb_functions()` on the pin returns these 13 and no
-/// others with a window kind.
-const WINDOW_ONLY: [&str; 13] = [
-    "cume_dist",
-    "dense_rank",
-    "fill",
-    "first_value",
-    "lag",
-    "last_value",
-    "lead",
-    "nth_value",
-    "ntile",
-    "percent_rank",
-    "rank",
-    "rank_dense",
-    "row_number",
-];
+/// the name is not a function at all. `duckdb_functions()` on the pin returns 13 names with a
+/// window kind, the seven ranking ones are in the signature table now, and these six read another
+/// row of the partition rather than counting where the current one sits.
+const WINDOW_ONLY: [&str; 6] = ["fill", "first_value", "lag", "last_value", "lead", "nth_value"];
 
 /// Resolves the call written inside an `OVER`.
 ///
 /// Every aggregate is also a window, which is why this goes through the same signature table the
-/// aggregate path uses. Everything else is one of three refusals, and all three are the reference
-/// binary's: a name it only knows as a window, a name it knows as a scalar, and a name it does not
-/// know at all each get their own sentence there.
+/// aggregate path uses, and the ranking windows go through it too because they are rows in the same
+/// table. Everything else is one of three refusals, and all three are the reference binary's: a name
+/// it only knows as a window, a name it knows as a scalar, and a name it does not know at all each
+/// get their own sentence there.
 fn window_signature(name: &str, types: &[LogicalType]) -> Result<Resolved> {
     if WINDOW_ONLY.iter().any(|held| held.eq_ignore_ascii_case(name)) {
         return Err(Error::not_implemented(format!("{name} as a window function")));
     }
     match kind_of(name) {
-        Some(FunctionKind::Aggregate) => resolve(name, types),
+        Some(FunctionKind::Aggregate | FunctionKind::Window) => resolve(name, types),
         Some(FunctionKind::Scalar) => {
             Err(Error::catalog(format!("{name} is not an aggregate function")))
         }

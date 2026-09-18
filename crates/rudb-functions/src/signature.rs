@@ -18,7 +18,7 @@
 
 use rudb_common::{Error, LogicalType, MAX_DECIMAL_WIDTH, Result};
 
-/// Whether a name is a scalar function or an aggregate.
+/// Whether a name is a scalar function, an aggregate or a window.
 ///
 /// The binder needs to ask before it knows which slot the call goes in, since an aggregate is only
 /// legal in an aggregate list and the error for one in the wrong place should say so.
@@ -28,6 +28,12 @@ pub enum FunctionKind {
     Scalar,
     /// Many rows in, one row out.
     Aggregate,
+    /// Many rows in, one row out per row, and the answer comes from where the row sits.
+    ///
+    /// Every aggregate is also usable as a window, so this is not the kind of everything that can
+    /// go inside an `OVER`. It is the kind of the names that can go nowhere else, which is why a
+    /// call to one without an `OVER` is an error rather than a call.
+    Window,
 }
 
 /// A resolved call.
@@ -600,6 +606,17 @@ const TABLE: &[Entry] = &[
     aggregate("avg", Arity::exactly(1), Shape::PromotedTo(Fixed::Double), true),
     aggregate("min", Arity::exactly(1), Shape::Promoted, false),
     aggregate("max", Arity::exactly(1), Shape::Promoted, false),
+    // The ranking windows, which answer from where the row sits in its partition rather than from
+    // anything in it. Six names and seven rows, since `rank_dense` is an alias upstream reports
+    // with `dense_rank` in its `alias_of`. The three that count rows are BIGINT and the two that
+    // divide one count by another are DOUBLE, which was read off the pin with `typeof` rather than
+    // assumed, and `ntile` takes the one argument the family has and takes it as a BIGINT.
+    ranking("cume_dist", Arity::exactly(0), Shape::AnyTo(Fixed::Double)),
+    ranking("dense_rank", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt)),
+    ranking("ntile", Arity::exactly(1), Shape::FixedTo(Fixed::BigInt, Fixed::BigInt)),
+    ranking("percent_rank", Arity::exactly(0), Shape::AnyTo(Fixed::Double)),
+    ranking("rank", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt)),
+    ranking("row_number", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt)),
 ];
 
 /// A scalar that takes numbers.
@@ -642,6 +659,11 @@ const fn session(name: &'static str, returns: Fixed) -> Entry {
 
 const fn aggregate(name: &'static str, arity: Arity, shape: Shape, numeric_only: bool) -> Entry {
     Entry { name, kind: FunctionKind::Aggregate, arity, shape, numeric_only }
+}
+
+/// A window that reads where the row sits rather than what is in it.
+const fn ranking(name: &'static str, arity: Arity, shape: Shape) -> Entry {
+    Entry { name, kind: FunctionKind::Window, arity, shape, numeric_only: false }
 }
 
 /// Whether a name is a function at all, and which kind.
@@ -1506,6 +1528,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("list_extract", "array_extract"),
     ("list_element", "array_extract"),
     ("list_slice", "array_slice"),
+    ("rank_dense", "dense_rank"),
 ];
 
 #[cfg(test)]
