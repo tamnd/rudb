@@ -281,6 +281,46 @@ pub fn unpack_transposed<T: Packable>(input: &[T], width: usize, output: &mut [T
     Ok(())
 }
 
+/// The buffer [`pack_with`] and [`unpack_with`] transpose through, kept so it can be reused.
+///
+/// Going between row order and the transposed layout needs somewhere to put the other order, and
+/// that somewhere is [`VALUES`] values, which is 8 KB for a `u64`. Allocating it per call is not the
+/// expensive part. Zeroing it is, because the allocator hands back a page it has to clear and the
+/// transpose then writes every element of it anyway. On a scan of a packed integer column that is
+/// once per 1024 rows, and it showed up as the largest single item in a ClickBench profile, larger
+/// than the unpacking it was making room for.
+///
+/// So a caller that unpacks more than one unit should make one of these and pass it in.
+///
+/// It starts empty and grows on the first unit that needs it, because a caller holds one for a whole
+/// decode and most chunks are not bit packed at all. Making the buffer in the constructor was tried
+/// and was worse than what it replaced, by more than the zeroing it saved.
+#[derive(Debug)]
+pub struct Scratch<T: Packable> {
+    transposed: Vec<T>,
+}
+
+impl<T: Packable> Scratch<T> {
+    /// A scratch buffer that has not made room for anything yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { transposed: Vec::new() }
+    }
+
+    /// Makes room for one unit. A no op every time after the first.
+    fn ready(&mut self) {
+        if self.transposed.len() != VALUES {
+            self.transposed.resize(VALUES, T::from_u64(0));
+        }
+    }
+}
+
+impl<T: Packable> Default for Scratch<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Packs a vector given in row order, transposing it first.
 ///
 /// The engine does not use this. Data written by the storage layer is transposed once on the way
@@ -291,10 +331,24 @@ pub fn unpack_transposed<T: Packable>(input: &[T], width: usize, output: &mut [T
 ///
 /// As [`pack_transposed`].
 pub fn pack<T: Packable>(input: &[T], width: usize, output: &mut [T]) -> Result<()> {
+    pack_with(input, width, output, &mut Scratch::new())
+}
+
+/// As [`pack`], through a buffer the caller keeps rather than one allocated per call.
+///
+/// # Errors
+///
+/// As [`pack_transposed`].
+pub fn pack_with<T: Packable>(
+    input: &[T],
+    width: usize,
+    output: &mut [T],
+    scratch: &mut Scratch<T>,
+) -> Result<()> {
     check_vector_len(input.len(), "input")?;
-    let mut transposed = vec![T::from_u64(0); VALUES];
-    transpose(input, &mut transposed)?;
-    pack_transposed(&transposed, width, output)
+    scratch.ready();
+    transpose(input, &mut scratch.transposed)?;
+    pack_transposed(&scratch.transposed, width, output)
 }
 
 /// Unpacks into row order. The inverse of [`pack`], and see its note about who should call it.
@@ -303,10 +357,24 @@ pub fn pack<T: Packable>(input: &[T], width: usize, output: &mut [T]) -> Result<
 ///
 /// As [`unpack_transposed`].
 pub fn unpack<T: Packable>(input: &[T], width: usize, output: &mut [T]) -> Result<()> {
+    unpack_with(input, width, output, &mut Scratch::new())
+}
+
+/// As [`unpack`], through a buffer the caller keeps rather than one allocated per call.
+///
+/// # Errors
+///
+/// As [`unpack_transposed`].
+pub fn unpack_with<T: Packable>(
+    input: &[T],
+    width: usize,
+    output: &mut [T],
+    scratch: &mut Scratch<T>,
+) -> Result<()> {
     check_vector_len(output.len(), "output")?;
-    let mut transposed = vec![T::from_u64(0); VALUES];
-    unpack_transposed(input, width, &mut transposed)?;
-    untranspose(&transposed, output)
+    scratch.ready();
+    unpack_transposed(input, width, &mut scratch.transposed)?;
+    untranspose(&scratch.transposed, output)
 }
 
 /// How many bytes [`pack_tail`] writes for `count` values at `width` bits.
@@ -482,6 +550,27 @@ mod tests {
         }
         for width in 0..=64 {
             round_trip::<u64>(width);
+        }
+    }
+
+    #[test]
+    fn a_reused_scratch_gives_what_a_fresh_one_gives() {
+        // The buffer a unit transposes through is now handed in so it is not zeroed per call, which
+        // is only sound if every element of it is written every time. If some were not, a narrow
+        // unit following a wide one would read whatever the wide one left behind, so the widths here
+        // go up and down rather than in order and each answer is checked against the same unit
+        // unpacked through a buffer nothing has touched.
+        let mut scratch = Scratch::<u64>::new();
+        for width in [64, 1, 33, 7, 64, 0, 17, 60, 3] {
+            let values = sample::<u64>(width);
+            let mut packed = vec![0u64; packed_len::<u64>(width)];
+            pack_with(&values, width, &mut packed, &mut scratch).unwrap();
+            let mut reused = vec![0u64; VALUES];
+            unpack_with(&packed, width, &mut reused, &mut scratch).unwrap();
+            let mut fresh = vec![0u64; VALUES];
+            unpack(&packed, width, &mut fresh).unwrap();
+            assert_eq!(reused, fresh, "at {width} bits after a wider unit");
+            assert_eq!(reused, values, "at {width} bits");
         }
     }
 
