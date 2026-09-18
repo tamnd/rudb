@@ -476,7 +476,12 @@ impl<'a> Transform<'a> {
         let name = self.intern("TimeZone");
         if matches!(self.name(zone), "ZoneDefault" | "ZoneLocal") {
             let index = self.ast.settings.len() as u32;
-            self.ast.settings.push(Setting { name, scope: Scope::Unwritten, value: NONE, pragma: false });
+            self.ast.settings.push(Setting {
+                name,
+                scope: Scope::Unwritten,
+                value: NONE,
+                pragma: false,
+            });
             return Ok(Statement::Reset(index));
         }
         let text = match self.name(zone) {
