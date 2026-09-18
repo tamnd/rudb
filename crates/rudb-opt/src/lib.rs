@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Twelve passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
+//! Thirteen passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
 //! the start of it. Column pruning came first, because it is the pass whose absence is measured in
 //! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -23,6 +23,7 @@ pub mod fold;
 pub mod late;
 pub mod limit;
 pub mod nulls;
+pub mod order;
 pub mod pass;
 pub mod semi;
 pub mod sides;
@@ -57,6 +58,15 @@ pub const RANK: u8 = 11;
 /// Before pruning, because moving a filter below a projection rewrites it in terms of columns the
 /// projection reads, and pruning has to see the plan after the move or it drops a column that
 /// something now refers to.
+///
+/// Join ordering is immediately after filter pushdown, because pushdown is what turns the binder's
+/// cross products into joins with conditions on them, and which cross products are left over after
+/// it has placed every condition it can is the whole of what this pass reads. Running it first would
+/// be reading a plan where every join is still a cross product and none of the conditions have been
+/// placed, which says nothing about anything. Before everything else after that, because every later
+/// pass reads a join as it ends up. The build side is the clearest of those and is chosen last, but
+/// empty result pullup, column pruning and late materialisation all walk the join tree and all of
+/// them should walk the tree that is going to run.
 ///
 /// Empty result pullup is after filter pushdown, because pushdown is what moves an unsatisfiable
 /// predicate down to the scan it should stop and what drops the conjuncts that were always true, so
@@ -102,11 +112,12 @@ pub const RANK: u8 = 11;
 /// on the next run instead, which is the fixed sequence not settling. Before the rest, because the
 /// subtree it removes is a subtree they would otherwise walk, and because the operators it leaves
 /// next to each other are the pairs limit pushdown and top N are looking for.
-pub static PASSES: [&(dyn Pass + Sync); 12] = [
+pub static PASSES: [&(dyn Pass + Sync); 13] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
     &filter::FilterPushdown,
+    &order::JoinOrder,
     &semi::MarkToSemi,
     &empty::EmptyResultPullup,
     &cte::UnusedMaterialization,
@@ -120,12 +131,12 @@ pub static PASSES: [&(dyn Pass + Sync); 12] = [
 /// Every name `SET disabled_optimizers` accepts, which is every name DuckDB accepts.
 ///
 /// `SELECT name FROM duckdb_optimizers()` on the pinned binary, sorted, all forty four of them.
-/// [`PASSES`] is the eleven rudb has built and every name here is one rudb takes without complaint,
-/// because turning off a pass that does not exist is a thing that has already happened.
+/// Eleven of them name a pass [`PASSES`] holds, and every name here is one rudb takes without
+/// complaint, because turning off a pass that does not exist is a thing that has already happened.
 ///
-/// Accepting the other thirty four is the whole point. Forty five files in the upstream corpus run
-/// a `SET disabled_optimizers`, and most of them name a pass rudb has not written, `join_order` and
-/// `deliminator` and `statistics_propagation` and the rest. Refusing those makes the
+/// Accepting the other thirty three is the whole point. Forty five files in the upstream corpus run
+/// a `SET disabled_optimizers`, and most of them name a pass rudb has not written, `deliminator` and
+/// `statistics_propagation` and `compressed_materialization` and the rest. Refusing those makes the
 /// `SET` fail, and a failed `SET` in a sqllogictest file ends the file, so every record after it
 /// goes unasked over a pass whose absence changes no answer.
 ///
