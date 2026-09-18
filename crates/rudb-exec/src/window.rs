@@ -52,7 +52,7 @@ use crate::rows;
 use crate::schema::Schema;
 use crate::sort::{Arrival, Place, compare};
 
-/// What a call reads to answer, which is one of two entirely different things.
+/// What a call reads to answer, which is four entirely different things.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reads {
     /// The rows the frame covers, through an accumulator. Every aggregate.
@@ -60,6 +60,46 @@ enum Reads {
     /// Where the row sits in its partition. The ranking windows, which have no arguments to read
     /// and no frame to read them over, and which answer the same whatever frame was written.
     Position(Ranking),
+    /// One row of the frame, found by counting through it. `first_value`, `last_value` and
+    /// `nth_value`.
+    Picked(Picks),
+    /// One row of the partition, a distance from this one. `lag` and `lead`, which read the
+    /// partition and not the frame.
+    Shifted(Looks),
+}
+
+impl Reads {
+    /// What a name reads, which is the name and nothing else. Anything unrecognised is an
+    /// aggregate, since the binder has already refused every name that is neither.
+    fn of(name: &str) -> Self {
+        if let Some(ranking) = Ranking::of(name) {
+            return Self::Position(ranking);
+        }
+        match name {
+            "first_value" => Self::Picked(Picks::First),
+            "last_value" => Self::Picked(Picks::Last),
+            "nth_value" => Self::Picked(Picks::Nth),
+            "lag" => Self::Shifted(Looks::Back),
+            "lead" => Self::Shifted(Looks::Forward),
+            _ => Self::Frame,
+        }
+    }
+}
+
+/// Which row of the frame a picking window answers with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Picks {
+    First,
+    Last,
+    /// The one the second argument counts to, one-based and read off the current row.
+    Nth,
+}
+
+/// Which way a shifting window counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Looks {
+    Back,
+    Forward,
 }
 
 /// The ranking windows, which count rather than aggregate.
@@ -233,7 +273,7 @@ impl Window {
             });
             let written = plan.string(*name);
             calls.push(Call {
-                reads: Ranking::of(written).map_or(Reads::Frame, Reads::Position),
+                reads: Reads::of(written),
                 name: written.to_string(),
                 returns: plan.expr_type(expr).clone(),
                 args_at,
@@ -587,8 +627,11 @@ impl Window {
         at: usize,
         frame: std::ops::Range<usize>,
     ) -> Result<Value> {
-        if let Reads::Position(ranking) = call.reads {
-            return ranked(ranking, call, rows, peers, at);
+        match call.reads {
+            Reads::Position(ranking) => return ranked(ranking, call, rows, peers, at),
+            Reads::Picked(pick) => return self.picked(pick, call, rows, peers, at, frame),
+            Reads::Shifted(look) => return shifted(look, call, rows, at),
+            Reads::Frame => {}
         }
         let mut accumulator = Accumulator::new(&call.name, &call.returns)?;
         let mut seen: Vec<Vec<Value>> = Vec::new();
@@ -614,6 +657,65 @@ impl Window {
             accumulator.update(&args)?;
         }
         accumulator.finish()
+    }
+
+    /// The row of the frame that `first_value`, `last_value` or `nth_value` answers with.
+    ///
+    /// These three read the frame, which is what separates them from `lag` and `lead`, and they
+    /// obey `EXCLUDE` for the same reason. They count rows rather than values, so an argument that
+    /// is null still takes up a place, unless `IGNORE NULLS` was written, which is what that clause
+    /// means here: the nulls are passed over and the counting goes on around them.
+    ///
+    /// A count that does not reach a row is null and not an error. `nth_value(i, 10)` over a frame
+    /// of five rows is null upstream, and so are `nth_value(i, 0)`, `nth_value(i, -1)` and
+    /// `nth_value(i, NULL)`, which is three different reasons for the same answer.
+    fn picked(
+        &self,
+        pick: Picks,
+        call: &Call,
+        rows: &[Windowed],
+        peers: &[usize],
+        at: usize,
+        frame: std::ops::Range<usize>,
+    ) -> Result<Value> {
+        // The count is read off the current row rather than once for the partition, because
+        // upstream reads it there: `nth_value(k, k)` gives each row a count of its own.
+        let wanted = match pick {
+            Picks::First => Some(1),
+            Picks::Last => None,
+            Picks::Nth => {
+                let written = &rows[at].0[call.args_at + 1];
+                if written.is_null() {
+                    return Ok(Value::Null);
+                }
+                let count = written.as_i64().ok_or_else(|| {
+                    Error::invalid_input("Argument for nth_value must be a number")
+                })?;
+                if count <= 0 {
+                    return Ok(Value::Null);
+                }
+                Some(usize::try_from(count).unwrap_or(usize::MAX))
+            }
+        };
+        let mut seen = 0_usize;
+        let mut last = Value::Null;
+        for row in frame {
+            if self.excluded(peers, at, row) {
+                continue;
+            }
+            let value = rows[row].0[call.args_at].clone();
+            if call.ignore_nulls && value.is_null() {
+                continue;
+            }
+            seen += 1;
+            if wanted == Some(seen) {
+                return Ok(value);
+            }
+            last = value;
+        }
+        // Reaching the end means the count ran past the frame for the two that count, and means the
+        // answer for the one that wanted the end of it.
+        Ok(if wanted.is_none() { last } else { Value::Null })
     }
 
     /// Whether `row` is left out of the frame around `at` by the frame's exclusion.
@@ -696,6 +798,73 @@ fn ntile(call: &Call, rows: &[Windowed], at: usize, total: usize) -> Result<Valu
     };
     let bucket = i64::try_from(bucket + 1).map_err(|_| Error::internal("too many buckets"))?;
     Ok(Value::BigInt(bucket))
+}
+
+/// The value `lag` or `lead` answers with, which is another row of the partition.
+///
+/// The frame is not consulted and neither is `EXCLUDE`, which is the thing to know about these two
+/// and is measured rather than assumed: `lag(i) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND
+/// CURRENT ROW)` answers the same column as `lag(i) OVER (ORDER BY i)` on the pin, and so does the
+/// same call with `EXCLUDE CURRENT ROW` written on it. They are about where a row sits in its
+/// partition, the way the ranking windows are, and a frame is about a row's neighbourhood.
+///
+/// Three arguments, of which two are optional. The count defaults to one, is read off the current
+/// row so a column can supply it, and answers null when it is null. A negative count turns each of
+/// these into the other rather than being refused, and a count of zero is the row itself. The
+/// default is the third argument, also read off the current row, and it was cast to the column's
+/// type when the call was bound.
+fn shifted(look: Looks, call: &Call, rows: &[Windowed], at: usize) -> Result<Value> {
+    let held = &rows[at].0[call.args_at..call.args_at + call.args];
+    let count = match held.get(1) {
+        None => 1,
+        Some(value) if value.is_null() => return Ok(Value::Null),
+        Some(value) => value.as_i64().ok_or_else(|| {
+            Error::invalid_input(format!("Argument for {} must be a number", call.name))
+        })?,
+    };
+    let back = match look {
+        Looks::Back => count >= 0,
+        Looks::Forward => count < 0,
+    };
+    let steps = usize::try_from(count.unsigned_abs()).unwrap_or(usize::MAX);
+    let landed = if call.ignore_nulls {
+        // `IGNORE NULLS` counts values rather than rows, so the walk steps over every null it meets
+        // and does not spend a count on it. The current row is passed over whether it is null or
+        // not, since a count of one means the one before this and never this one.
+        away_over_nulls(call, rows, at, back, steps)
+    } else if back {
+        at.checked_sub(steps)
+    } else {
+        at.checked_add(steps).filter(|&row| row < rows.len())
+    };
+    Ok(match landed {
+        Some(row) => rows[row].0[call.args_at].clone(),
+        None => held.get(2).cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// The row `steps` non-null values away from `at`, or nothing when the partition runs out first.
+fn away_over_nulls(
+    call: &Call,
+    rows: &[Windowed],
+    at: usize,
+    back: bool,
+    steps: usize,
+) -> Option<usize> {
+    let mut left = steps;
+    let mut row = at;
+    while left > 0 {
+        row = if back {
+            row.checked_sub(1)?
+        } else {
+            row.checked_add(1).filter(|&row| row < rows.len())?
+        };
+        if rows[row].0[call.args_at].is_null() {
+            continue;
+        }
+        left -= 1;
+    }
+    Some(row)
 }
 
 /// The first row of the peer group numbered `group`.

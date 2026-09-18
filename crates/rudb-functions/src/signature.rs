@@ -163,6 +163,23 @@ enum Shape {
     /// the way the fold cannot happen, which is an argument that is not a constant, and that is the
     /// case the pin refuses in the same words.
     Setting,
+    /// The first argument is the value and its type is the answer, the second is a row count, and
+    /// the third is another value of the first's type. The five windows that read a row rather than
+    /// aggregate one.
+    ///
+    /// The pin prints the widest of them as `lag(col T, "offset" BIGINT := 1, "default" ANY := NULL)
+    /// -> T`, and `nth_value(col0 ANY, col1 BIGINT) -> ANY` and `first_value(col0 ANY) -> ANY` are
+    /// that rule with the tail cut off, so one shape covers all five. The count is a BIGINT and the
+    /// default is cast to the column's type rather than left alone, which is why `lag(i, 1, 0.5)`
+    /// over an INTEGER column answers 1 and `lag(k, 1, 'z')` over one raises a conversion error at
+    /// run time rather than a binder error at bind time. The cast is legal and it is the value that
+    /// will not go through it.
+    ///
+    /// The spelling is carried because the pin does not use one for all five. `duckdb_functions()`
+    /// there says `[T, BIGINT, ANY] -> T` for `lag` and `lead` and `[ANY] -> ANY` for the other
+    /// three, which is the same rule written two ways, and a table that prints what the pin prints
+    /// has to know which way each row goes.
+    ValueThenCountThenValue(Spelled),
     /// No arguments at all and a fixed result. `now()` and `current_schema()`.
     ///
     /// The session context functions, which are the ones whose answer comes from the connection
@@ -172,6 +189,26 @@ enum Shape {
     /// `duckdb_functions()` reports, and what `now(1)` says, which is the arity error rather than a
     /// missing function.
     Constant(Fixed),
+}
+
+/// How a shape names the argument whose type the call decides, and the result that follows it.
+///
+/// `T` says the two are the same type and `ANY` says the name does not commit to one. They mean the
+/// same thing to the binder, since both resolve from what was passed, and they are different words
+/// in the table `duckdb_functions()` prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spelled {
+    Same,
+    Any,
+}
+
+impl Spelled {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Same => SAME,
+            Self::Any => ANY,
+        }
+    }
 }
 
 /// The return types a signature can name outright.
@@ -617,6 +654,15 @@ const TABLE: &[Entry] = &[
     ranking("percent_rank", Arity::exactly(0), Shape::AnyTo(Fixed::Double)),
     ranking("rank", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt)),
     ranking("row_number", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt)),
+    // The windows that read a row rather than count one. Five names, one shape, and the answer is
+    // the first argument's own type in every case, which was read off the pin with `typeof` the way
+    // the ranking types were. `lag` and `lead` take an optional count and an optional default, and
+    // `nth_value` takes a count it requires.
+    value_window("first_value", Arity::exactly(1), Spelled::Any),
+    value_window("lag", Arity::between(1, 3), Spelled::Same),
+    value_window("last_value", Arity::exactly(1), Spelled::Any),
+    value_window("lead", Arity::between(1, 3), Spelled::Same),
+    value_window("nth_value", Arity::exactly(2), Spelled::Any),
 ];
 
 /// A scalar that takes numbers.
@@ -664,6 +710,17 @@ const fn aggregate(name: &'static str, arity: Arity, shape: Shape, numeric_only:
 /// A window that reads where the row sits rather than what is in it.
 const fn ranking(name: &'static str, arity: Arity, shape: Shape) -> Entry {
     Entry { name, kind: FunctionKind::Window, arity, shape, numeric_only: false }
+}
+
+/// A window that reads a row of the partition rather than aggregating one.
+const fn value_window(name: &'static str, arity: Arity, spelled: Spelled) -> Entry {
+    Entry {
+        name,
+        kind: FunctionKind::Window,
+        arity,
+        shape: Shape::ValueThenCountThenValue(spelled),
+        numeric_only: false,
+    }
 }
 
 /// Whether a name is a function at all, and which kind.
@@ -885,6 +942,14 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
                 *slot = LogicalType::Varchar;
             }
             (cast_to, result.ty())
+        }
+        Shape::ValueThenCountThenValue(_) => {
+            let first = arguments[0].clone();
+            let mut cast_to = vec![first.clone(); arguments.len()];
+            if let Some(count) = cast_to.get_mut(1) {
+                *count = LogicalType::BigInt;
+            }
+            (cast_to, first)
         }
         Shape::PromotedToFirst => {
             let common = promote_all(name, arguments)?;
@@ -1476,6 +1541,20 @@ impl Shape {
             Self::Sliced => (leading(1, SAME, "BIGINT"), SAME),
             Self::TextThenIndex(taken, to) => {
                 (leading(taken, Fixed::Varchar.name(), "BIGINT"), to.name())
+            }
+            // The value, then a row count, then another value of the first one's type. The third
+            // one is `ANY` and not the spelling of the first, which is the pin's row for `lag` and
+            // is where the declaration stops being the rule: the binder casts the default to the
+            // column's type whatever the table says here.
+            Self::ValueThenCountThenValue(spelled) => {
+                let names = (0..count)
+                    .map(|at| match at {
+                        0 => spelled.name(),
+                        1 => "BIGINT",
+                        _ => ANY,
+                    })
+                    .collect();
+                (names, spelled.name())
             }
             // One overload with an `ANY` return, which is the pin's row for it. The name decides
             // the type and a name is not something a signature can hold.

@@ -2396,9 +2396,11 @@ fn missing_replacement(name: &str, input: &Scope) -> Error {
 /// They are listed rather than looked up because the list is the point: a call that names one of
 /// them is a window this tree cannot answer yet, and saying so is a different sentence from saying
 /// the name is not a function at all. `duckdb_functions()` on the pin returns 13 names with a
-/// window kind, the seven ranking ones are in the signature table now, and these six read another
-/// row of the partition rather than counting where the current one sits.
-const WINDOW_ONLY: [&str; 6] = ["fill", "first_value", "lag", "last_value", "lead", "nth_value"];
+/// window kind. Twelve are in the signature table now, the seven that count where the current row
+/// sits and the five that read another row, and `fill` is the one left because it does neither: it
+/// interpolates between the values on either side of a gap and needs arithmetic over the sort key
+/// that nothing here reaches yet.
+const WINDOW_ONLY: [&str; 1] = ["fill"];
 
 /// Resolves the call written inside an `OVER`.
 ///
