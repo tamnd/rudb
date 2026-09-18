@@ -341,6 +341,14 @@ impl Source for Scan<'_> {
 }
 
 fn native_instances(rows: usize) -> usize {
+    // EXPERIMENT: an override so the cap can be swept without a rebuild per point.
+    if let Ok(text) = std::env::var("RUDB_SCAN_INSTANCES") {
+        if let Ok(forced) = text.parse::<usize>() {
+            if forced > 0 {
+                return forced;
+            }
+        }
+    }
     let small = rows.div_ceil(50_000).min(4);
     let large = rows.div_ceil(625_000).min(16);
     small.max(large).max(1)
