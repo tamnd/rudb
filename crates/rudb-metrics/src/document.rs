@@ -9,6 +9,7 @@
 //! purpose: this is the shape the numbers are reported in, and the code that produces them is the
 //! instrumentation shim that sits around the push operators.
 
+use rudb_common::stat::{Class, Classes};
 use rudb_common::{Spent, Tally};
 
 use crate::SCHEMA;
@@ -31,6 +32,14 @@ pub struct Document {
     pub timing: Timing,
     /// What it used.
     pub resource: Resource,
+    /// How much the planner knew, one decision per operator.
+    ///
+    /// The class histogram of `spec/stats/09-measurement.md` section 9.5. A harness sums these over
+    /// a suite and gets the fraction of the planner's cardinality decisions that rested on a
+    /// counted number, a bounded one, a guess or nothing at all. That fraction is the direct
+    /// measurement of whether the statistics layer is doing its job, and it is the number the G
+    /// series is trying to move.
+    pub estimates: Classes,
     /// What was chosen at each seam, and who chose it.
     pub strategies: Vec<Strategy>,
     /// One row per pipeline.
@@ -52,6 +61,7 @@ impl Document {
             outcome: Outcome::Succeeded,
             timing: Timing::default(),
             resource: Resource::default(),
+            estimates: Classes::new(),
             strategies: Vec::new(),
             pipelines: Vec::new(),
             operators: Vec::new(),
@@ -130,6 +140,13 @@ impl Document {
             out.count("bytes_read_back", self.resource.bytes_read_back);
             out.count("io_requests", self.resource.io_requests);
         });
+        out.key("estimates");
+        out.object(|out| {
+            out.count("exact", self.estimates.exact());
+            out.count("certified", self.estimates.certified());
+            out.count("estimated", self.estimates.estimated());
+            out.count("unknown", self.estimates.unknown());
+        });
         out.key("strategies");
         out.array(|out| {
             for strategy in &self.strategies {
@@ -180,6 +197,10 @@ impl Document {
                     out.count("rows_in", operator.rows_in);
                     out.count("rows_out", operator.rows_out);
                     out.maybe_count("estimated_rows", operator.estimated_rows);
+                    out.maybe_words(
+                        "estimate_class",
+                        operator.estimate_class.map(|class| class.to_string()).as_deref(),
+                    );
                     out.count("wall_ns", operator.wall_ns);
                     out.count("cpu_ns", operator.cpu_ns);
                     out.count("bytes_read", operator.bytes_read);
@@ -539,6 +560,12 @@ pub struct Operator {
     pub rows_out: u64,
     /// What the optimizer thought it would produce, when it thought anything.
     pub estimated_rows: Option<u64>,
+    /// How much of that was knowledge, when it thought anything.
+    ///
+    /// `None` is the same answer [`Operator::estimated_rows`] gives as `None`, which is that nobody
+    /// had a number here. The two always agree, and they are two fields rather than one because a
+    /// reader that wants the count should not have to parse a word to get it.
+    pub estimate_class: Option<Class>,
     /// Wall time inside it.
     pub wall_ns: u64,
     /// CPU time inside it, across every instance.
@@ -608,6 +635,7 @@ impl Operator {
             rows_in: 0,
             rows_out: 0,
             estimated_rows: None,
+            estimate_class: None,
             wall_ns: 0,
             cpu_ns: 0,
             bytes_read: 0,
@@ -640,6 +668,7 @@ pub struct Memory {
 
 #[cfg(test)]
 mod tests {
+    use rudb_common::stat::{Class, Source};
     use rudb_common::{Cause, Spent, Stage, Tally};
 
     use super::{Document, Engine, Implementation, Machine, Operator, Outcome, Pipeline, Strategy};
@@ -696,6 +725,7 @@ mod tests {
         read.detail = Some("hits".to_string());
         read.rows_out = 99_997_497;
         read.estimated_rows = Some(99_997_497);
+        read.estimate_class = Some(Class::Exact);
         read.wall_ns = 620_000_000;
         read.cpu_ns = 4_800_000_000;
         read.bytes_read = 1_420_000_000;
@@ -710,6 +740,7 @@ mod tests {
         group.rows_in = 99_997_497;
         group.rows_out = 41_983_110;
         group.estimated_rows = Some(2_400_000);
+        group.estimate_class = Some(Class::Estimated { source: Source::Constant });
         group.wall_ns = 360_000_000;
         group.cpu_ns = 2_800_000_000;
         group.memory.high_water = 894_000_000;
@@ -723,6 +754,8 @@ mod tests {
         let mut sort = Operator::new(7, 1, "Sort");
         sort.rows_in = 41_983_110;
         sort.rows_out = 10;
+        sort.estimated_rows = Some(10);
+        sort.estimate_class = Some(Class::Certified { bound: 1.0 });
         sort.wall_ns = 343_000_000;
         sort.cpu_ns = 2_280_000_000;
         sort.bytes_spilled = 12_000_000;
@@ -733,6 +766,9 @@ mod tests {
             is_reference: true,
         });
         sort.reference_impl = true;
+        for operator in [&read, &group, &sort] {
+            metrics.estimates.record_class(operator.estimate_class);
+        }
         metrics.operators.extend([read, group, sort]);
         metrics
     }

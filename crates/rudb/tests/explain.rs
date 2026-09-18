@@ -39,11 +39,12 @@ fn explain_answers_with_the_plan_and_an_estimate_on_every_line() {
     let database = with_rows(1000);
     let text = explained(&database, "EXPLAIN SELECT a FROM t WHERE a > 5");
     assert!(text.contains("Get memory.main.t"), "{text}");
-    // The scan knows its size because the catalog does, and the filter is a fifth of it.
-    assert!(text.contains("[~1000 rows]"), "{text}");
-    assert!(text.contains("[~200 rows]"), "{text}");
+    // The scan knows its size because the catalog does, so it is a count rather than a guess, and
+    // the filter is a fifth of it, which is a guess and says which guess.
+    assert!(text.contains("[1000 rows exact]"), "{text}");
+    assert!(text.contains("[~200 rows estimated from constant]"), "{text}");
     for line in tree(&text) {
-        assert!(line.contains(" rows]"), "a line with no estimate on it: {line}");
+        assert!(line.contains(" rows"), "a line with no estimate on it: {line}");
     }
 }
 
@@ -75,8 +76,10 @@ fn an_estimate_nobody_can_make_says_so_rather_than_saying_zero() {
 fn an_ungrouped_count_is_one_row_over_a_table_of_any_size() {
     let database = with_rows(5000);
     let text = explained(&database, "EXPLAIN SELECT count(*) FROM t");
-    assert!(text.contains("[~1 rows]"), "{text}");
-    assert!(text.contains("[~5000 rows]"), "{text}");
+    // One row is a fact about what an ungrouped aggregate does rather than a guess about the data,
+    // and it reads as one whatever is under it.
+    assert!(text.contains("[1 rows exact]"), "{text}");
+    assert!(text.contains("[5000 rows exact]"), "{text}");
 }
 
 #[test]
@@ -131,7 +134,9 @@ fn explain_analyze_runs_the_query_and_prints_what_each_operator_actually_did() {
     let database = with_rows(1000);
     let text = explained(&database, "EXPLAIN ANALYZE SELECT a FROM t WHERE a > 5");
     for line in tree(&text) {
-        assert!(line.contains("[~"), "a line with no estimate on it: {line}");
+        let estimated =
+            line.contains(" rows exact]") || line.contains(" rows estimated from constant]");
+        assert!(estimated, "a line with no estimate on it: {line}");
         assert!(line.contains(" rows, "), "a line with no measurement on it: {line}");
     }
     assert!(text.contains("[994 rows, "), "{text}");
