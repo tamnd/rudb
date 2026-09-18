@@ -734,7 +734,11 @@ mod tests {
                 let mut bytes = Vec::new();
                 pack_tail(&values, width, &mut bytes).unwrap();
                 assert_eq!(bytes.len(), tail_len(count, width), "{count} at {width}");
-                assert_eq!(unpack_tail(&bytes, width, count).unwrap(), values, "{count} at {width}");
+                assert_eq!(
+                    unpack_tail(&bytes, width, count).unwrap(),
+                    values,
+                    "{count} at {width}"
+                );
             }
         }
     }
@@ -758,8 +762,16 @@ mod tests {
                 pack_tail(&values, width, &mut exact).unwrap();
                 let mut slack = exact.clone();
                 slack.extend_from_slice(&[0u8; WINDOW]);
-                assert_eq!(unpack_tail(&exact, width, count).unwrap(), values, "{count} at {width}");
-                assert_eq!(unpack_tail(&slack, width, count).unwrap(), values, "{count} at {width}");
+                assert_eq!(
+                    unpack_tail(&exact, width, count).unwrap(),
+                    values,
+                    "{count} at {width}"
+                );
+                assert_eq!(
+                    unpack_tail(&slack, width, count).unwrap(),
+                    values,
+                    "{count} at {width}"
+                );
             }
         }
     }
