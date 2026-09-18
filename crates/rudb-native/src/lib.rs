@@ -3048,7 +3048,11 @@ fn plain_width(ty: &LogicalType) -> Option<usize> {
 /// What it has to beat is whatever the page would otherwise have cost, which is the bit packed form
 /// where there is one and the plain width where there is not. Both are cheaper to decode than a
 /// cascade, so a tie goes to them.
-fn cascaded(flat: &Vector, ty: &LogicalType, packed: Option<&Packed<'_>>) -> Result<Option<Vec<u8>>> {
+fn cascaded(
+    flat: &Vector,
+    ty: &LogicalType,
+    packed: Option<&Packed<'_>>,
+) -> Result<Option<Vec<u8>>> {
     let (Some(width), Some(data)) = (plain_width(ty), flat.data()) else { return Ok(None) };
     let Some(values) = widened(data) else { return Ok(None) };
     let plain = values.len().saturating_mul(width);
