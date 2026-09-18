@@ -22,7 +22,10 @@
 //!
 //! [`Plan::validate`]: rudb_plan::Plan::validate
 
-use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice, WindowBound};
+use rudb_common::LogicalType;
+use rudb_plan::{
+    Arm, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice, WindowBound,
+};
 
 use crate::fold::VOLATILE;
 
@@ -92,6 +95,99 @@ pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
         | Node::TableFunction { .. }
         | Node::CteScan { .. } => {}
     }
+}
+
+/// Every column an operator produces, in the order it produces them, with the type of each.
+///
+/// What this is for is writing a projection that reproduces an operator's output. The width alone
+/// is not enough for that: a projection needs an expression per column, and an expression that
+/// reads a column needs the binding and the type of it.
+///
+/// `None` when the output cannot be described this way, which is not a failure to look hard enough
+/// but a shape this answer does not fit. A semi or anti join produces the rows of one side and a
+/// mark join produces one side plus a column that is not either side's, so a caller that took the
+/// two inputs and put them end to end would be writing expressions that read a column nobody has.
+/// Saying nothing is what lets the caller refuse rather than build that.
+pub(crate) fn outputs(plan: &Plan, at: NodeRef) -> Option<Vec<(ColumnBinding, LogicalType)>> {
+    match *plan.node(at) {
+        Node::Get { index, columns, .. }
+        | Node::Values { index, columns, .. }
+        | Node::TableFunction { index, columns, .. }
+        | Node::Fetch { index, columns, .. }
+        | Node::TableFetch { index, columns, .. }
+        | Node::CteScan { index, columns, .. } => Some(
+            plan.field_list(columns)
+                .iter()
+                .enumerate()
+                .map(|(position, field)| (binding(index, position), field.ty.clone()))
+                .collect(),
+        ),
+        Node::Dummy => Some(Vec::new()),
+        Node::Project { index, exprs, .. } => Some(listed(plan, index, 0, exprs)),
+        Node::Aggregate { index, groups, aggregates, .. } => {
+            let mut found = listed(plan, index, 0, groups);
+            let width = found.len();
+            found.extend(listed(plan, index, width, aggregates));
+            Some(found)
+        }
+        // A window appends its results to the row it was given rather than replacing it, so its
+        // input's columns are still there with the bindings they had.
+        Node::Window { input, index, expressions, .. } => {
+            let mut found = outputs(plan, input)?;
+            found.extend(listed(plan, index, 0, expressions));
+            Some(found)
+        }
+        Node::Filter { input, .. }
+        | Node::Sort { input, .. }
+        | Node::Limit { input, .. }
+        | Node::TopN { input, .. }
+        | Node::Distinct { input, .. } => outputs(plan, input),
+        // A materialisation produces what the query reading it produces. The held columns go to the
+        // scans that name it and never past this node.
+        Node::MaterializedCte { body, .. } => outputs(plan, body),
+        // A set operation binds its output against an index of its own, since it is neither side's
+        // columns, and the binder already required the two sides to agree on how many there are.
+        Node::SetOp { left, index, .. } => Some(
+            outputs(plan, left)?
+                .into_iter()
+                .enumerate()
+                .map(|(position, (_, ty))| (binding(index, position), ty))
+                .collect(),
+        ),
+        Node::Join {
+            left,
+            right,
+            kind:
+                JoinKind::Inner
+                | JoinKind::Left
+                | JoinKind::Right
+                | JoinKind::Full
+                | JoinKind::Single
+                | JoinKind::Positional,
+            ..
+        }
+        | Node::DependentJoin { left, right, .. }
+        | Node::CrossProduct { left, right } => {
+            let mut found = outputs(plan, left)?;
+            found.extend(outputs(plan, right)?);
+            Some(found)
+        }
+        Node::Join { .. } => None,
+    }
+}
+
+/// One column of an operator that binds its own expressions, starting at a position.
+fn listed(plan: &Plan, index: u32, from: usize, exprs: Slice) -> Vec<(ColumnBinding, LogicalType)> {
+    plan.expr_list(exprs)
+        .iter()
+        .enumerate()
+        .map(|(position, &expr)| (binding(index, from + position), plan.expr_type(expr).clone()))
+        .collect()
+}
+
+/// A binding at a position that came from counting columns rather than from the plan.
+fn binding(index: u32, position: usize) -> ColumnBinding {
+    ColumnBinding::new(index, u32::try_from(position).expect("a column count fits in a u32"))
 }
 
 /// A table index no node in the plan is using.
