@@ -976,7 +976,8 @@ mod tests {
         // round_trip only sees the shape the chooser picked, which on any one column is one of the
         // six. This walks all of them, so PLAIN reading its payload in one go and FRONT copying a
         // prefix out of the buffer it is filling are both covered on data they apply to.
-        let columns = [urls(600), keyed(urls(600)), vec![b"same".to_vec(); 400], vec![Vec::new(); 7]];
+        let columns =
+            [urls(600), keyed(urls(600)), vec![b"same".to_vec(); 400], vec![Vec::new(); 7]];
         for values in &columns {
             let borrowed = borrow(values);
             for kind in offered(&borrowed) {
