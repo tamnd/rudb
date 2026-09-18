@@ -28,11 +28,10 @@
 //!
 //! Not every operator has a rule here. A limit inside a correlated subquery means the limit is per
 //! domain value rather than over the whole of the inner side, and the same is true of a top N, so
-//! both are left alone rather than pushed through into a different query. A window is the same
-//! question again and has an answer, which is that the domain columns join the partition keys, and
-//! it is not written yet. A set operation has an answer too, which is that the domain is pushed into
-//! every branch and the branches then have to agree on where the domain columns sit, and that is not
-//! written yet either. A right or full join is refused because a row of the side that is not there
+//! both are left alone rather than pushed through into a different query. A set operation has an
+//! answer, which is that the domain is pushed into every branch and the branches then have to agree
+//! on where the domain columns sit, and that is not written yet. A right or full join is refused
+//! because a row of the side that is not there
 //! carries no domain value, and the join back would then look for an outer row whose key is NULL.
 //! Everything with no rule leaves the dependent join in place and the query is refused, which is the
 //! honest end rather than a plan that answers a different question.
@@ -42,7 +41,7 @@ use std::collections::HashMap;
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
     Arm, BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice,
-    SortKey,
+    SortKey, WindowBound, WindowFrame,
 };
 
 use crate::tables::{TableSet, produced};
@@ -252,6 +251,10 @@ fn push(
             let node = plan.add_node(Node::Sort { input: below.node, keys: order });
             Some(Pushed { node, keys: below.keys, moved: below.moved })
         }
+        Node::Window { input, index: at_index, partition, order, frame, expressions } => {
+            let below = push(plan, input, domain, index, keys, outer)?;
+            window(plan, below, at_index, partition, order, frame, expressions, keys)
+        }
         Node::Values { index: at_index, columns, rows } => {
             values(plan, at_index, columns, rows, domain, index, keys)
         }
@@ -270,6 +273,92 @@ fn push(
             ..
         } => sides(plan, left, right, kind, conditions, domain, index, keys, outer),
         _ => None,
+    }
+}
+
+/// A window inside a correlated subquery, which has to be evaluated once per outer row.
+///
+/// `(SELECT max(rank) FROM (SELECT row_number() OVER (ORDER BY w) AS rank FROM i WHERE i.k = o.k))`
+/// numbers the rows of one outer row's matches, starting again at one for the next outer row. The
+/// domain makes every outer row's matches arrive in the same relation, so a window left alone here
+/// would number across all of them at once and answer a different question.
+///
+/// The fix is the whole of it: the domain columns partition first. A partition is the unit a window
+/// is evaluated over, so partitioning by the domain value is exactly one evaluation per outer row,
+/// and the ordering and the frame then apply inside that. It is the same trick the sort rule uses
+/// for the same reason, and like the sort it is one pass over everything rather than a pass per
+/// value.
+///
+/// Nothing is moved. A window appends its results to the row it was given rather than replacing it,
+/// so the domain columns the input carried are still there above with the bindings they had, which
+/// is why `below.keys` goes back out unchanged.
+#[allow(clippy::too_many_arguments)]
+fn window(
+    plan: &mut Plan,
+    below: Pushed,
+    at_index: u32,
+    partition: Slice,
+    order: Slice,
+    frame: WindowFrame,
+    expressions: Slice,
+    keys: &[Key],
+) -> Option<Pushed> {
+    let map = mapping(keys, &below);
+    // The domain columns come first so that what the query wrote still breaks ties inside a value
+    // rather than the other way round, which would put rows of different outer rows in one
+    // partition whenever they agreed on the written columns.
+    let mut divided = Vec::new();
+    for (key, &binding) in keys.iter().zip(&below.keys) {
+        let ty = plan.expr_type(key.expr).clone();
+        let span = plan.expr_span(key.expr);
+        divided.push(plan.add_expr_at(Expr::Column(binding), ty, span));
+    }
+    for expr in plan.expr_list(partition).to_vec() {
+        divided.push(remap(plan, expr, &map));
+    }
+    let partition = plan.add_expr_list(&divided);
+
+    let mut ordering = Vec::new();
+    for key in plan.sort_key_list(order).to_vec() {
+        let expr = remap(plan, key.expr, &map);
+        ordering.push(SortKey { expr, ..key });
+    }
+    let order = plan.add_sort_keys(&ordering);
+
+    // A frame bound is a constant in every query anybody writes, but it is an expression in the
+    // plan and an expression that reads the outer row would be left pointing at a table that is no
+    // longer underneath this. Rewriting it costs nothing and not rewriting it is a wrong plan.
+    let frame = WindowFrame {
+        start: bound(plan, frame.start, &map),
+        end: bound(plan, frame.end, &map),
+        ..frame
+    };
+
+    let held = plan.expr_list(expressions).to_vec();
+    let rewritten: Vec<ExprRef> = held.into_iter().map(|expr| remap(plan, expr, &map)).collect();
+    let expressions = plan.add_expr_list(&rewritten);
+
+    let node = plan.add_node(Node::Window {
+        input: below.node,
+        index: at_index,
+        partition,
+        order,
+        frame,
+        expressions,
+    });
+    Some(Pushed { node, keys: below.keys, moved: below.moved })
+}
+
+/// One end of a frame with its expression rewritten, when it has one.
+fn bound(
+    plan: &mut Plan,
+    at: WindowBound,
+    map: &HashMap<ColumnBinding, ColumnBinding>,
+) -> WindowBound {
+    match at {
+        WindowBound::Preceding(expr) => WindowBound::Preceding(remap(plan, expr, map)),
+        WindowBound::Following(expr) => WindowBound::Following(remap(plan, expr, map)),
+        other => other,
     }
 }
 
@@ -713,6 +802,38 @@ mod tests {
             after.contains("Sort [#2.1::INTEGER ASC NULLS LAST, #2.0::INTEGER ASC NULLS LAST]"),
             "{after}"
         );
+    }
+
+    /// A frame that says nothing, which is what a window with no `OVER` clause contents gets.
+    const FRAME: &str = "frame=RANGE UNBOUNDED PRECEDING TO CURRENT ROW EXCLUDE NO OTHERS";
+
+    #[test]
+    fn a_window_inside_the_subquery_partitions_by_the_domain() {
+        let mut plan = correlated(&format!(
+            "  Window #2 partition=[] order=[#1.1::INTEGER ASC NULLS LAST] {FRAME} expressions=[row_number()::BIGINT]\n"
+        ));
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        // A window with nothing to partition by across the whole inner side would number every
+        // outer row's matches in one run. Partitioning by the domain is one run per outer row.
+        assert!(after.contains("partition=[#3.0::INTEGER]"), "{after}");
+    }
+
+    #[test]
+    fn a_window_that_already_partitions_puts_the_domain_in_front() {
+        let mut plan = correlated(&format!(
+            "  Window #2 partition=[#1.1::INTEGER] order=[] {FRAME} expressions=[rank()::BIGINT]\n"
+        ));
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        // In front rather than behind. Behind would put rows of two outer rows in one partition
+        // whenever they agreed on the column the query wrote, which is the wrong answer and not a
+        // slower one.
+        assert!(after.contains("partition=[#3.0::INTEGER, #1.1::INTEGER]"), "{after}");
     }
 
     #[test]
