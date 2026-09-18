@@ -513,11 +513,19 @@ fn sides(
 /// reading one entry out of it, and a join with a single condition of any other shape reads the whole
 /// gathered side once per driving row instead.
 ///
+/// `IS NOT DISTINCT FROM` counts as well as `=`, because the two differ only in whether a null goes
+/// into the table, which is one flag per column rather than a second kind of table. That is #848 and
+/// the two questions have to be kept saying the same thing: this one deciding a predicate may not
+/// move when the operator would have answered it anyway costs a plan that was available, and the
+/// disagreement is silent because nothing is wrong with the answer.
+///
 /// The two sides of the equality have to be the same type, since the table has one bucket for one
 /// value. Where they differ the binder puts a cast in, and a cast is an expression rather than a
 /// column, so that case is already out by the time the type is looked at.
 fn answered(plan: &Plan, tables: &mut Tables, part: ExprRef, below: &(TableSet, TableSet)) -> bool {
-    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(part) else {
+    let Expr::Compare { op: CompareOp::Equal | CompareOp::NotDistinctFrom, left, right } =
+        *plan.expr(part)
+    else {
         return false;
     };
     if !matches!((plan.expr(left), plan.expr(right)), (Expr::Column(_), Expr::Column(_))) {
@@ -1210,6 +1218,24 @@ Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
   Filter (#0.1::INTEGER > 5::INTEGER)::BOOLEAN
     Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
   Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_cross_product_under_a_null_safe_equality_becomes_an_inner_join_too() {
+        // The join answers `IS NOT DISTINCT FROM` with the same table it answers `=` with, since the
+        // two differ only in whether a null goes into it, so the rewrite applies to both. #848.
+        let before = "\
+Filter (#0.0::INTEGER IS NOT DISTINCT FROM #1.0::INTEGER)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER]
+";
+        let after = "\
+Join INNER on=[(#0.0::INTEGER IS NOT DISTINCT FROM #1.0::INTEGER)::BOOLEAN]
+  Get memory.main.t AS a #0 [a::INTEGER]
+  Get memory.main.t AS b #1 [a::INTEGER]
 ";
         assert_eq!(pushed(before), after);
     }
