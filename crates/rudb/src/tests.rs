@@ -559,6 +559,43 @@ fn a_semi_an_anti_and_a_single_join_answer_what_the_loop_answers() {
     }
 }
 
+/// `*` over a semi or an anti join is the left side, and the right side is out of scope after one.
+///
+/// These two kinds produce the left side's rows and nothing else, so a star that expanded to both
+/// sides asked the join for columns it does not have and the query died with an internal error about
+/// a column not being in the schema. That is tamnd/rudb#847. The condition is still bound against
+/// both sides, which is the whole point of writing one, so what changes is only what is visible
+/// after the join is built.
+///
+/// The `USING` case is here because that clause drops a column of the right side on its way past, so
+/// the boundary between the two sides has to be the one taken before the drop rather than after it.
+/// Getting that wrong takes a column of the left side out of the answer.
+#[test]
+fn a_star_over_a_semi_or_an_anti_join_is_the_left_side_alone() {
+    let db = Database::new();
+    db.execute("CREATE TABLE a (k INTEGER, v INTEGER)").unwrap();
+    db.execute("INSERT INTO a VALUES (1, 10), (2, 20)").unwrap();
+    db.execute("CREATE TABLE b (k INTEGER, w INTEGER)").unwrap();
+    db.execute("INSERT INTO b VALUES (1, 100)").unwrap();
+
+    let matched = vec![vec![integer(1), integer(10)]];
+    assert_eq!(rows(&db, "SELECT * FROM a SEMI JOIN b ON a.k = b.k"), matched);
+    assert_eq!(rows(&db, "SELECT * FROM a SEMI JOIN b USING (k)"), matched);
+    assert_eq!(rows(&db, "SELECT * FROM a NATURAL SEMI JOIN b"), matched);
+    assert_eq!(rows(&db, "SELECT * FROM (SELECT * FROM a SEMI JOIN b ON a.k = b.k) t"), matched);
+    assert_eq!(
+        rows(&db, "SELECT * FROM a ANTI JOIN b ON a.k = b.k"),
+        vec![vec![integer(2), integer(20)]]
+    );
+
+    // Naming the right side after the join is a binder error rather than a query about a column
+    // nothing produces, which is what the reference binary says too.
+    assert!(
+        failure(&db, "SELECT b.w FROM a SEMI JOIN b ON a.k = b.k").contains("\"b\""),
+        "the right side should be out of scope after a semi join"
+    );
+}
+
 /// One driving row matching more rows than fit in a chunk.
 ///
 /// The streaming probe answers a driving chunk into an output chunk, and a chunk holds 1024 rows, so
