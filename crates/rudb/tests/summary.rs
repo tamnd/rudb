@@ -62,12 +62,23 @@ impl Pair {
     /// text cannot tell the two apart. A scan is folded into the operator above it either way, so
     /// the `Get` line says the same thing whether the rows were read or never looked at.
     fn summarised(&self, query: &str) -> bool {
+        self.answered(query, "native summary")
+    }
+
+    /// Whether the file built the groups of this out of the synopsis rather than out of the rows.
+    ///
+    /// A different operator from the one above, because a grouped count is answered by reading a
+    /// list of groups out of the file and an ungrouped one by adding a few numbers up, so the two
+    /// say different things about themselves.
+    fn grouped(&self, query: &str) -> bool {
+        self.answered(query, "native frequencies")
+    }
+
+    /// Whether any operator of this query is the one named.
+    fn answered(&self, query: &str, detail: &str) -> bool {
         let result = self.file.query(query).expect("the query ran");
         let metrics = result.metrics().expect("the query was measured");
-        metrics
-            .operators
-            .iter()
-            .any(|operator| operator.detail.as_deref() == Some("native summary"))
+        metrics.operators.iter().any(|operator| operator.detail.as_deref() == Some(detail))
     }
 }
 
@@ -200,6 +211,70 @@ fn a_filter_the_synopsis_cannot_decide_sends_the_query_back_to_the_rows() {
     // A null constant compares unknown against every row whatever the column holds, so the answer
     // is none of them, and that is the operator's own rule rather than something worth a shape.
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n = NULL"), Value::BigInt(0));
+}
+
+#[test]
+fn a_grouped_count_over_a_complete_synopsis_is_read_out_of_it_filter_and_all() {
+    let pair = Pair::new("grouped", "SELECT i % 7 AS n, i AS wide FROM range(5000) r(i)");
+    // Seven groups and the file holds all seven with an exact count, so there is nothing to build.
+    assert_eq!(
+        pair.agree("SELECT COUNT(*) FROM t GROUP BY n ORDER BY 1 DESC LIMIT 1"),
+        Value::BigInt(715)
+    );
+    assert!(pair.grouped("SELECT n, COUNT(*) FROM t GROUP BY n"), "the rows were grouped anyway");
+    // A filter over the column being grouped only decides which groups survive, so it rides along.
+    assert!(
+        pair.grouped("SELECT n, COUNT(*) FROM t WHERE n <> 1 GROUP BY n ORDER BY 2 DESC"),
+        "the rows were grouped anyway"
+    );
+    assert_eq!(
+        pair.agree("SELECT COUNT(*) FROM (SELECT n, COUNT(*) FROM t WHERE n <> 1 GROUP BY n) g"),
+        Value::BigInt(6),
+    );
+    // A filter over some other column decides rows inside a group instead, and the synopsis of the
+    // grouped column says nothing about which of its rows those are.
+    assert!(
+        !pair.grouped("SELECT n, COUNT(*) FROM t WHERE wide = 3 GROUP BY n"),
+        "a filter over another column was ignored"
+    );
+    assert_eq!(
+        pair.agree("SELECT COUNT(*) FROM (SELECT n, COUNT(*) FROM t WHERE wide = 3 GROUP BY n) g"),
+        Value::BigInt(1),
+    );
+    // And a column whose values overflow the budget has no complete list to group out of.
+    assert!(
+        !pair.grouped("SELECT wide, COUNT(*) FROM t GROUP BY wide"),
+        "a partial list was grouped out of"
+    );
+}
+
+#[test]
+fn a_grouped_count_over_a_complete_synopsis_keeps_the_null_group_the_rows_would() {
+    let pair = Pair::new(
+        "groupnulls",
+        "SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i % 7 END AS n FROM range(5000) r(i)",
+    );
+    // Eight groups, because a grouping puts the nulls in one of their own and the synopsis counts
+    // them as a value of their own, which is the pair of facts that makes these agree.
+    assert_eq!(
+        pair.agree("SELECT COUNT(*) FROM (SELECT n, COUNT(*) FROM t GROUP BY n) g"),
+        Value::BigInt(8),
+    );
+    assert!(pair.grouped("SELECT n, COUNT(*) FROM t GROUP BY n"), "the rows were grouped anyway");
+    // With a filter on the same column the null group goes, because the comparison keeps neither
+    // side of it, and that leaves the six groups the seven minus the filtered one comes to.
+    assert_eq!(
+        pair.agree("SELECT COUNT(*) FROM (SELECT n, COUNT(*) FROM t WHERE n <> 1 GROUP BY n) g"),
+        Value::BigInt(6),
+    );
+    assert!(
+        pair.grouped("SELECT n, COUNT(*) FROM t WHERE n <> 1 GROUP BY n"),
+        "the rows were grouped anyway"
+    );
+    assert_eq!(
+        pair.agree("SELECT SUM(c) FROM (SELECT COUNT(*) AS c FROM t WHERE n <> 1 GROUP BY n) g"),
+        Value::HugeInt(3895)
+    );
 }
 
 #[test]
