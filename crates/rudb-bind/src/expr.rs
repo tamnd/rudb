@@ -746,11 +746,6 @@ impl Binder<'_> {
             .session
             .get(known.name)
             .ok_or_else(|| Error::catalog(rudb_functions::unknown_setting(&name)))?;
-        // A setting that is unset reads as null whatever its type says, which is what the pin
-        // answers for the three of them that are unset until something writes one.
-        if text == rudb_functions::UNSET {
-            return Ok(Some(self.add_constant(Value::Null)));
-        }
         let value = match known.input_type {
             "BOOLEAN" => Value::Boolean(text.parse().map_err(|_| {
                 Error::internal(format!("{} is set to {text}, which is not a boolean", known.name))
