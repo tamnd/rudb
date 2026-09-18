@@ -6,10 +6,11 @@ use std::sync::{Mutex, OnceLock, TryLockError};
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Spent, Stage, Value, stage};
 use rudb_kernels::Accumulator;
-use rudb_vector::{Chunk, Data, Packed, Vector};
+use rudb_vector::{Chunk, Vector};
 
 use crate::key::{mix, spread};
 use crate::rows;
+use crate::signed::SignedReader;
 
 const PARTITIONS: usize = 16;
 const EMPTY: u32 = u32::MAX;
@@ -25,56 +26,6 @@ fn group_hash(group: i32, valid: bool) -> u32 {
     let word = if valid { i64::from(group) as u64 } else { NULL_GROUP };
     let wide = spread(mix(0, word));
     (wide ^ (wide >> 32)) as u32
-}
-
-enum SignedReader<'a> {
-    Int16(&'a [i16]),
-    Int32(&'a [i32]),
-    Int64(&'a [i64]),
-    Packed(Packed<'a>),
-    Other(&'a Vector),
-}
-
-impl<'a> SignedReader<'a> {
-    fn new(vector: &'a Vector) -> Self {
-        match vector.data() {
-            Some(Data::Int16(values)) => Self::Int16(values.as_slice()),
-            Some(Data::Int32(values)) => Self::Int32(values.as_slice()),
-            Some(Data::Int64(values)) => Self::Int64(values.as_slice()),
-            _ => match vector.packed_parts() {
-                Some(packed) => Self::Packed(packed),
-                None => Self::Other(vector),
-            },
-        }
-    }
-
-    fn at(&self, row: usize) -> i128 {
-        match self {
-            Self::Int16(values) => i128::from(values[row]),
-            Self::Int32(values) => i128::from(values[row]),
-            Self::Int64(values) => i128::from(values[row]),
-            Self::Packed(packed) => {
-                let words = packed.words();
-                let width = packed.width();
-                let bit = (packed.offset() + row) * width as usize;
-                let word = bit / u64::BITS as usize;
-                let shift = (bit % u64::BITS as usize) as u32;
-                let mask = u64::MAX >> (u64::BITS - width);
-                let low = words.get(word).copied().unwrap_or(0) >> shift;
-                let taken = u64::BITS - shift;
-                let code = if taken >= width {
-                    low & mask
-                } else {
-                    let high = words.get(word + 1).copied().unwrap_or(0) << taken;
-                    (low | high) & mask
-                };
-                packed.base() + i128::from(code)
-            }
-            Self::Other(vector) => {
-                vector.signed_at(row).expect("the typed mixed aggregate input is a signed value")
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
