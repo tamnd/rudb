@@ -127,6 +127,24 @@ impl Comparison {
             same => same,
         }
     }
+
+    /// Whether this comparison is true of two sides that sit in this order.
+    ///
+    /// For the six ordinary comparisons only. The two total ones read a null as a value and an
+    /// `Ordering` has no way to say which side was null, so there is nothing sensible to return for
+    /// them and they answer false rather than pretending.
+    #[must_use]
+    fn holds(self, order: Ordering) -> bool {
+        match self {
+            Self::Equal => order == Ordering::Equal,
+            Self::NotEqual => order != Ordering::Equal,
+            Self::Less => order == Ordering::Less,
+            Self::LessOrEqual => order != Ordering::Greater,
+            Self::Greater => order == Ordering::Greater,
+            Self::GreaterOrEqual => order != Ordering::Less,
+            Self::DistinctFrom | Self::NotDistinctFrom => false,
+        }
+    }
 }
 
 /// Compares two vectors of the same length, producing a `BOOLEAN` vector.
@@ -308,12 +326,21 @@ pub fn refine_prepared(
     Ok(Selection::from_indices(out))
 }
 
-/// Equality between storage-backed text and a literal, without constructing row values.
+/// One of the six ordinary comparisons between storage-backed text and a literal, without
+/// constructing row values.
 ///
-/// Where the column is a dictionary that shares its values and the caller brought the literal it
-/// was built with, this decides once per distinct value instead of once per row. See
-/// the `peel` module. Everything else reads the column a row at a time, which is still better
-/// than the general path because it never builds a value.
+/// Where the comparison is an equality, the column is a dictionary that shares its values and the
+/// caller brought the literal it was built with, this decides once per distinct value instead of
+/// once per row. See the `peel` module. Everything else reads the column a row at a time, which is
+/// still better than the general path because it never builds a value.
+///
+/// An ordering comparison gets none of that and is here anyway, because what the general path costs
+/// on a text column is not the comparison. It is `try_value_at`, which allocates a `String` a row so
+/// that `compare_values` has a `Value` to look at, and then drops it. Reading the bytes where they
+/// lie and comparing those is the same answer with neither the allocation nor the dispatch, and the
+/// caller this matters most to is the top N: it asks every chunk whether any row can still beat the
+/// worst candidate it holds, and the constant it asks about changes as it goes, so nothing is memoized
+/// and the row loop is the whole of it.
 fn external_text_literal<M>(
     op: Comparison,
     left: &Vector,
@@ -325,7 +352,7 @@ fn external_text_literal<M>(
 where
     M: Fn(usize) -> usize + Copy,
 {
-    if !matches!(op, Comparison::Equal | Comparison::NotEqual)
+    if op.is_total()
         || left.logical_type() != &LogicalType::Varchar
         || right.logical_type() != &LogicalType::Varchar
     {
@@ -340,43 +367,63 @@ where
         }
         _ => return Ok(None),
     };
-    let same = if swapped { op.swapped() } else { op } == Comparison::Equal;
-    // The literal has to be the one the memo was filled against, which it is when the caller took
-    // both from the same comparison node. A caller that gets it wrong is slow rather than wrong,
-    // which is the rule the rest of `Held` keeps.
-    if let Some(held) = held.filter(|held| held.text() == Some(literal)) {
-        // A dictionary that came with its sorted order answers this without reading any value more
-        // than the search does, so try that before filling a memo one value at a time.
-        if let Some(found) = held.lookup().find(column, literal) {
-            return Ok(Some(against_code(column, found?, len, map, same)?));
-        }
-        let decide = |dictionary: &Vector, code: usize| -> Result<bool> {
-            let found = if literal.is_empty() {
-                dictionary.try_bytes_len_at(code)?.is_some_and(|length| length == 0)
-            } else {
-                dictionary.try_bytes_at(code)?.is_some_and(|bytes| bytes == literal)
-            };
-            Ok(found)
-        };
-        if let Some(answers) = held.peel().answer(column, len, map, decide) {
-            let mut answers = answers?;
-            if !same {
-                for answer in &mut answers {
-                    *answer = !*answer;
-                }
+    // The column is on the left from here on, so an inequality written the other way round is
+    // turned around once rather than once a row.
+    let op = if swapped { op.swapped() } else { op };
+    let same = op == Comparison::Equal;
+    if matches!(op, Comparison::Equal | Comparison::NotEqual) {
+        // The literal has to be the one the memo was filled against, which it is when the caller
+        // took both from the same comparison node. A caller that gets it wrong is slow rather than
+        // wrong, which is the rule the rest of `Held` keeps.
+        if let Some(held) = held.filter(|held| held.text() == Some(literal)) {
+            // A dictionary that came with its sorted order answers this without reading any value
+            // more than the search does, so try that before filling a memo one value at a time.
+            if let Some(found) = held.lookup().find(column, literal) {
+                return Ok(Some(against_code(column, found?, len, map, same)?));
             }
-            return Ok(Some(answers));
+            let decide = |dictionary: &Vector, code: usize| -> Result<bool> {
+                let found = if literal.is_empty() {
+                    dictionary.try_bytes_len_at(code)?.is_some_and(|length| length == 0)
+                } else {
+                    dictionary.try_bytes_at(code)?.is_some_and(|bytes| bytes == literal)
+                };
+                Ok(found)
+            };
+            if let Some(answers) = held.peel().answer(column, len, map, decide) {
+                let mut answers = answers?;
+                if !same {
+                    for answer in &mut answers {
+                        *answer = !*answer;
+                    }
+                }
+                return Ok(Some(answers));
+            }
         }
+        let mut answers = Vec::with_capacity(len);
+        for slot in 0..len {
+            let row = map(slot);
+            // An empty literal is settled by the length alone, which for a dictionary is one load
+            // of two offsets rather than a walk to wherever the value's bytes live.
+            let equal = if literal.is_empty() {
+                column.try_bytes_len_at(row)?.is_some_and(|length| length == 0)
+            } else {
+                column.try_bytes_at(row)?.is_some_and(|bytes| bytes == literal)
+            };
+            answers.push(equal == same);
+        }
+        return Ok(Some(answers));
     }
     let mut answers = Vec::with_capacity(len);
     for slot in 0..len {
         let row = map(slot);
-        let equal = if literal.is_empty() {
-            column.try_bytes_len_at(row)?.is_some_and(|length| length == 0)
-        } else {
-            column.try_bytes_at(row)?.is_some_and(|bytes| bytes == literal)
+        // A null row's bytes are whatever the column left there, and the answer for it is thrown
+        // away by the caller, which blanks every position the validity says is null. Equal is what
+        // is written there because it is the cheapest thing to write and it is never read.
+        let order = match column.try_bytes_at(row)? {
+            Some(bytes) => bytes.cmp(literal),
+            None => Ordering::Equal,
         };
-        answers.push(equal == same);
+        answers.push(op.holds(order));
     }
     Ok(Some(answers))
 }
@@ -1564,6 +1611,42 @@ mod tests {
         assert_eq!(result.value_at(2), Value::Boolean(false));
         assert_eq!(result.value_at(3), Value::Null);
         assert_eq!(result.value_at(4), Value::Boolean(true));
+    }
+
+    /// An ordering comparison on a text column reads the bytes where they lie rather than building a
+    /// `Value` a row.
+    ///
+    /// The assertion that matters is the counter at the end. The answers were already right through
+    /// the row at a time path, and what was wrong was the cost: `ORDER BY <varchar> LIMIT 10` asks
+    /// every chunk whether any row in it can still beat the worst candidate the top N holds, and that
+    /// question used to allocate a `String` for every row of every chunk. On the ClickBench file that
+    /// was eighteen times the CPU of the same query with an integer sort key.
+    #[test]
+    fn an_ordering_on_text_against_a_literal_does_not_fall_back() {
+        let before = fallback::count(Kernel::Compare, Form::Dictionary, Form::Constant);
+        let values = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("apple".into()), Value::Null, Value::Varchar("pear".into())],
+        )
+        .expect("three values");
+        let column = Vector::dictionary(vec![0, 1, 2, 0], values).expect("codes are in range");
+        let cut = Vector::constant(LogicalType::Varchar, Value::Varchar("melon".into()), 4);
+        let result = compare(Comparison::Less, &column, &cut).expect("compares");
+        assert_eq!(result.value_at(0), Value::Boolean(true));
+        assert_eq!(result.value_at(1), Value::Null);
+        assert_eq!(result.value_at(2), Value::Boolean(false));
+        assert_eq!(result.value_at(3), Value::Boolean(true));
+        // The literal on the left, which is the same question with the comparison turned around, and
+        // it has to be turned around once rather than once a row.
+        let other = compare(Comparison::Greater, &cut, &column).expect("compares");
+        assert_eq!(other.value_at(0), Value::Boolean(true));
+        assert_eq!(other.value_at(1), Value::Null);
+        assert_eq!(other.value_at(2), Value::Boolean(false));
+        // The selection entry point, which is the one the filter and the top N reach.
+        let kept = refine(Comparison::GreaterOrEqual, &column, &cut, &Selection::identity(4))
+            .expect("refines");
+        assert_eq!(kept.indices(), [2]);
+        assert_eq!(fallback::count(Kernel::Compare, Form::Dictionary, Form::Constant), before);
     }
 
     /// A form pair with no loop is answered correctly and counted, which is the whole contract of
