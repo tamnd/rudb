@@ -208,7 +208,7 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
             Stat::Unknown => Stat::Known { value: count, class: CEILING },
             known => known.map(|n| n.saturating_sub(offset).min(count)),
         },
-        Node::Join { left, right, kind, conditions } => {
+        Node::Join { left, right, kind, conditions, .. } => {
             join(of(left), of(right), kind, plan.expr_list(conditions).len())
         }
         // The right cardinality is a function of each left row until decorrelation, so treating it

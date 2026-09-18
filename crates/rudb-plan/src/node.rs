@@ -284,6 +284,12 @@ pub enum Node {
         /// with no condition, which for an inner join is a cross product and for an outer join
         /// is not.
         conditions: Slice,
+        /// Which input is gathered whole before the other one starts.
+        ///
+        /// The binder emits [`BuildSide::Right`] for everything, because at binding time there is
+        /// nothing to choose with. `rudb_opt`'s `sides` pass overwrites it from an estimate, and
+        /// the executor honours whatever it finds here.
+        build: BuildSide,
     },
     /// A join whose right input can refer to columns produced by its left input.
     ///
@@ -462,6 +468,57 @@ impl JoinKind {
         Self::Mark,
         Self::Positional,
     ];
+
+    /// The same join with its two inputs the other way round, for the kinds where there is one.
+    ///
+    /// Swapping the inputs of a `LEFT` join makes a `RIGHT` join and the other way round, because
+    /// the kind names a side. `INNER` and `FULL` name neither and are their own mirror. The rest
+    /// return `None`: `SEMI`, `ANTI`, `SINGLE` and `MARK` produce the left side's rows, or a
+    /// column about them, so their left input is not a side but the subject, and `POSITIONAL`
+    /// pairs the nth with the nth, which no reordering of one input preserves.
+    #[must_use]
+    pub fn mirrored(self) -> Option<Self> {
+        match self {
+            Self::Inner => Some(Self::Inner),
+            Self::Left => Some(Self::Right),
+            Self::Right => Some(Self::Left),
+            Self::Full => Some(Self::Full),
+            Self::Semi | Self::Anti | Self::Single | Self::Mark | Self::Positional => None,
+        }
+    }
+}
+
+/// Which input of a join is gathered whole before the other one starts.
+///
+/// A join is two inputs and a dependency edge between them: one side is finished and held, and then
+/// the other side's rows are matched against what was held. This says which side that is. It is
+/// where the hash table goes when the hash join in #62 lands, and it is the side today's nested
+/// loop turns into chunks and rescans once per row of the other one.
+///
+/// Which side that should be is not a property of the join and is not decided here. It is decided
+/// by [`sides`](../../rudb_opt/sides/index.html) from a cardinality estimate, and the rule it uses
+/// belongs to whichever operator is reading this, not to the flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BuildSide {
+    /// The right input, which is what the binder emits and what every join did before this existed.
+    #[default]
+    Right,
+    /// The left input, which means the executor swaps the two and puts the answer back in order.
+    Left,
+}
+
+impl BuildSide {
+    /// The spelling used in the textual form.
+    #[must_use]
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Right => "right",
+            Self::Left => "left",
+        }
+    }
+
+    /// Both sides, which is what the reader searches.
+    pub(crate) const ALL: [Self; 2] = [Self::Right, Self::Left];
 }
 
 /// Which set operation.
@@ -524,7 +581,13 @@ mod tests {
             Node::Sort { input: 0, keys: Slice::EMPTY },
             Node::Limit { input: 0, count: None, offset: 0 },
             Node::Distinct { input: 0, on: Slice::EMPTY },
-            Node::Join { left: 0, right: 1, kind: JoinKind::Inner, conditions: Slice::EMPTY },
+            Node::Join {
+                left: 0,
+                right: 1,
+                kind: JoinKind::Inner,
+                conditions: Slice::EMPTY,
+                build: BuildSide::default(),
+            },
             Node::DependentJoin {
                 left: 0,
                 right: 1,
