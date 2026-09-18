@@ -239,6 +239,74 @@ impl Chooser for Sampled {
     }
 }
 
+/// Encode one shape that somebody else settled on, and do not search at all.
+///
+/// [`Sampled`] decides per chunk, which is right when a chunk is big enough to pay for the sample
+/// and when neighbouring chunks are different from each other. Neither holds for a caller that has
+/// thousands of small chunks cut out of one column, because the sample would cost as much as the
+/// encode and because the answer would come out the same thousands of times. Such a caller decides
+/// once, over as much of the column as it likes, and hands the answer here.
+///
+/// A shape is one kind per level of the cascade, which is a simplification of a real one: `FRONT`
+/// produces an integer chunk of prefixes and a string chunk of suffixes at the next level, and both
+/// are narrowed to the same entry. That is enough on real data because the tree is narrow and
+/// because the levels below the second are small. Any level the shape does not reach is searched
+/// exhaustively, which is what makes the shape a hint about the expensive part rather than a
+/// decision about all of it.
+///
+/// An entry that does not apply to a chunk is ignored and the chunk is searched instead. The kinds
+/// that apply are a property of the values, and this is a chooser rather than a way round the
+/// filter, so a shape can never produce something that will not decode.
+#[derive(Debug, Clone)]
+pub struct Settled {
+    strings: Vec<string::Kind>,
+    integers: Vec<integer::Kind>,
+}
+
+impl Settled {
+    /// A shape, outermost level first, for the string levels and the integer levels.
+    #[must_use]
+    pub fn new(strings: Vec<string::Kind>, integers: Vec<integer::Kind>) -> Self {
+        Self { strings, integers }
+    }
+
+    /// The string kinds of the shape, outermost first, which is what a report prints.
+    #[must_use]
+    pub fn strings(&self) -> &[string::Kind] {
+        &self.strings
+    }
+}
+
+impl Chooser for Settled {
+    fn name(&self) -> &'static str {
+        "settled"
+    }
+
+    fn narrow_strings(
+        &self,
+        _values: &[&[u8]],
+        offered: &[string::Kind],
+        depth: u8,
+    ) -> Vec<string::Kind> {
+        match self.strings.get(depth as usize) {
+            Some(kind) if offered.contains(kind) => vec![*kind],
+            _ => offered.to_vec(),
+        }
+    }
+
+    fn narrow_integers(
+        &self,
+        _values: &[i64],
+        offered: &[integer::Kind],
+        depth: u8,
+    ) -> Vec<integer::Kind> {
+        match self.integers.get(depth as usize) {
+            Some(kind) if offered.contains(kind) => vec![*kind],
+            _ => offered.to_vec(),
+        }
+    }
+}
+
 /// `regions` windows of `window` consecutive values each, spread evenly across the input.
 ///
 /// The starts are spread over the whole range a window can start at, so the first window begins at
