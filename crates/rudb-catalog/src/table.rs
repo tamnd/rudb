@@ -374,6 +374,19 @@ impl Rows {
         }
     }
 
+    /// Whether the bounds of a whole stripe prove that none of it can match.
+    ///
+    /// Always false for an in memory table, which has no stripes and so has nothing to say at that
+    /// size. This is the half of [`Self::skips`] that reads nothing, which is what makes it the one
+    /// to ask when the question is where the work is rather than whether a part holds any.
+    #[must_use]
+    pub fn stripe_skips(&self, stripe: usize, probes: &[Probe]) -> bool {
+        match self {
+            Self::Memory(_) => false,
+            Self::Native(reader) => reader.stripe_skips(stripe, probes),
+        }
+    }
+
     /// One whole in-memory chunk, used by checkpointing and tests.
     #[must_use]
     pub fn chunk(&self, at: usize) -> Option<&Chunk> {

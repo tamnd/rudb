@@ -2517,6 +2517,21 @@ impl Reader {
         probes.iter().any(|probe| self.sifted(place, probe))
     }
 
+    /// Whether the bounds of one stripe prove that none of its parts can match the predicates.
+    ///
+    /// The cheap half of [`Self::skips`], asked about a whole stripe at once. The bounds live in the
+    /// directory and are already in memory, so this answers without touching the file, and that is
+    /// the reason it is worth having on its own: a caller that wants to know roughly where the work
+    /// is before it starts any workers can ask this about sixteen stripes for nothing, where asking
+    /// [`Self::skips`] about nine hundred parts would read and decode a sieve page per stripe first.
+    ///
+    /// It keeps stripes that [`Self::skips`] would rule out part by part, which is the right way for
+    /// it to be wrong: the parts are still checked when they are read.
+    #[must_use]
+    pub fn stripe_skips(&self, stripe: usize, probes: &[Probe]) -> bool {
+        self.table.stripes.get(stripe).is_some_and(|held| held.zone.skips(probes))
+    }
+
     /// Whether the sieve of one part rules out one probe.
     ///
     /// Only equality. An ordered comparison is what the bounds are for and a sieve says nothing
