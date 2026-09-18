@@ -241,6 +241,21 @@ pub struct Insert {
     pub source: QueryRef,
 }
 
+/// A `WITH name AS MATERIALIZED (query)`, which is run once and read wherever it is named.
+///
+/// Only the materialised ones are here. A plain `WITH` and a `NOT MATERIALIZED` one are put into
+/// every place they are named while the tree is being built, the way the reference binary does it,
+/// so by the time anything reads an [`Ast`] there is no name left to resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cte {
+    /// The name it was written with.
+    pub name: StrRef,
+    /// What produces its rows.
+    pub query: QueryRef,
+    /// The column names from `AS name(a, b)`, as a run of [`StrRef`], empty when there were none.
+    pub columns: Slice,
+}
+
 /// A query: a body, plus the modifiers that apply to whatever the body produced.
 ///
 /// The split is the grammar's, not an invention. `SelectStatementInternal <- WithClause?
@@ -249,6 +264,13 @@ pub struct Insert {
 /// the second half of it. Hanging them off `Select` instead would have made that unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Query {
+    /// The materialised `WITH` definitions this query introduces, as a run of indexes into
+    /// `Ast::ctes` held in `Ast::cte_lists`, outermost first.
+    ///
+    /// A list of indexes rather than a run of the arena itself, because a materialised `WITH`
+    /// inside another one is pushed while the outer one is still being built, so what one query
+    /// owns is not a contiguous stretch of the arena.
+    pub ctes: Slice,
     /// What produces the rows.
     pub body: QueryBody,
     /// The `ORDER BY` list, as a run of [`OrderItem`].
@@ -267,6 +289,7 @@ impl Query {
     /// A query with no modifiers on it.
     pub const fn bare(body: QueryBody) -> Self {
         Self {
+            ctes: Slice { start: 0, len: 0 },
             body,
             order_by: Slice { start: 0, len: 0 },
             order_by_all: false,
@@ -539,6 +562,18 @@ pub enum Source {
         /// The alias, or `NONE`.
         alias: StrRef,
         /// Column aliases from `AS t(a, b)`, as a run of [`StrRef`].
+        columns: Slice,
+    },
+    /// A materialised `WITH` named where a table goes.
+    ///
+    /// Which definition it reads is settled here rather than left as a name, because shadowing is
+    /// a question about where the name was written and this is the only place that still knows.
+    Cte {
+        /// Which definition, as an index into `Ast::ctes`.
+        cte: u32,
+        /// The alias, or `NONE`, which for a bare name is the name itself.
+        alias: StrRef,
+        /// Column aliases from `AS c(a, b)`, as a run of [`StrRef`].
         columns: Slice,
     },
     /// A parenthesised query in the `FROM` clause.
@@ -1006,6 +1041,10 @@ pub struct Ast {
     pub rows: Vec<Slice>,
     /// The window arena, holding what was inside the parentheses of every `OVER`.
     pub windows: Vec<WindowSpec>,
+    /// The materialised `WITH` arena.
+    pub ctes: Vec<Cte>,
+    /// Backing store for every [`Slice`] of materialised `WITH` indexes.
+    pub cte_lists: Vec<u32>,
 }
 
 impl Ast {
@@ -1074,6 +1113,16 @@ impl Ast {
     /// One window.
     pub fn window(&self, index: WindowRef) -> WindowSpec {
         self.windows[index as usize]
+    }
+
+    /// One materialised `WITH` definition.
+    pub fn cte(&self, index: u32) -> Cte {
+        self.ctes[index as usize]
+    }
+
+    /// The materialised `WITH` definitions a query introduces, outermost first.
+    pub fn cte_list(&self, slice: Slice) -> &[u32] {
+        &self.cte_lists[slice.range()]
     }
 
     /// The expressions of a list.

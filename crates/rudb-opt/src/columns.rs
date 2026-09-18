@@ -222,6 +222,15 @@ fn untouched(plan: &Plan, order: &[NodeRef]) -> HashSet<NodeRef> {
             Node::Distinct { input, on } if on.is_empty() => {
                 found.insert(input);
             }
+            // A materialisation is read through the scans that name it, and each of those binds to
+            // an index of its own, so what is read of the definition is not something this walk can
+            // see: the definition's own index is bound by nothing at all and narrowing it to that
+            // would hold no columns. Doing better takes the union over every scan of it and a
+            // rewrite of the held column list to match, which is a rule worth writing and is not
+            // written here.
+            Node::MaterializedCte { definition, .. } => {
+                found.insert(definition);
+            }
             _ => {}
         }
     }
@@ -231,7 +240,12 @@ fn untouched(plan: &Plan, order: &[NodeRef]) -> HashSet<NodeRef> {
 /// Every expression one node holds, operands included, each one once.
 fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
     match *plan.node(node) {
-        Node::Get { .. } | Node::Dummy | Node::SetOp { .. } | Node::CrossProduct { .. } => {}
+        Node::Get { .. }
+        | Node::Dummy
+        | Node::SetOp { .. }
+        | Node::CrossProduct { .. }
+        | Node::MaterializedCte { .. }
+        | Node::CteScan { .. } => {}
         Node::Values { rows, .. } => {
             for &row in plan.row_list(rows) {
                 list(plan, row, found);

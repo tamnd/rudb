@@ -82,7 +82,15 @@ pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
             *left = children[0];
             *right = children[1];
         }
-        Node::Get { .. } | Node::Dummy | Node::Values { .. } | Node::TableFunction { .. } => {}
+        Node::MaterializedCte { definition, body, .. } => {
+            *definition = children[0];
+            *body = children[1];
+        }
+        Node::Get { .. }
+        | Node::Dummy
+        | Node::Values { .. }
+        | Node::TableFunction { .. }
+        | Node::CteScan { .. } => {}
     }
 }
 

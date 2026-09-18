@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Six passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
+//! Eleven passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
 //! the start of it. Column pruning came first, because it is the pass whose absence is measured in
 //! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod columns;
+pub mod cte;
 pub mod dependent;
 pub mod distinct;
 pub mod empty;
@@ -92,12 +93,20 @@ pub const RANK: u8 = 11;
 /// scan yet and a subtree that empty result pullup is about to delete are all estimates of a plan
 /// nobody is going to run. It is also the only pass here that writes a field rather than moving a
 /// node, so nothing after it would have anything to do with what it wrote.
-pub static PASSES: [&(dyn Pass + Sync); 10] = [
+///
+/// Dropping an unread materialisation is after the empty result pullup and before everything that
+/// moves an operator around. After, because the pullup is what turns a body into an empty relation
+/// and a body that has become one reads nothing, so a run that looked before it would find the work
+/// on the next run instead, which is the fixed sequence not settling. Before the rest, because the
+/// subtree it removes is a subtree they would otherwise walk, and because the operators it leaves
+/// next to each other are the pairs limit pushdown and top N are looking for.
+pub static PASSES: [&(dyn Pass + Sync); 11] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
     &filter::FilterPushdown,
     &empty::EmptyResultPullup,
+    &cte::UnusedMaterialization,
     &columns::UnusedColumns,
     &limit::LimitPushdown,
     &topn::TopN,
@@ -108,12 +117,12 @@ pub static PASSES: [&(dyn Pass + Sync); 10] = [
 /// Every name `SET disabled_optimizers` accepts, which is every name DuckDB accepts.
 ///
 /// `SELECT name FROM duckdb_optimizers()` on the pinned binary, sorted, all forty four of them.
-/// [`PASSES`] is the ten rudb has built and every name here is one rudb takes without complaint,
+/// [`PASSES`] is the eleven rudb has built and every name here is one rudb takes without complaint,
 /// because turning off a pass that does not exist is a thing that has already happened.
 ///
-/// Accepting the other thirty seven is the whole point. Forty five files in the upstream corpus run
+/// Accepting the other thirty four is the whole point. Forty five files in the upstream corpus run
 /// a `SET disabled_optimizers`, and most of them name a pass rudb has not written, `join_order` and
-/// `build_side_probe_side` and `statistics_propagation` and the rest. Refusing those makes the
+/// `deliminator` and `statistics_propagation` and the rest. Refusing those makes the
 /// `SET` fail, and a failed `SET` in a sqllogictest file ends the file, so every record after it
 /// goes unasked over a pass whose absence changes no answer.
 ///
@@ -253,7 +262,8 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         | Node::Values { columns, .. }
         | Node::TableFunction { columns, .. }
         | Node::Fetch { columns, .. }
-        | Node::TableFetch { columns, .. } => plan.field_list(columns).len(),
+        | Node::TableFetch { columns, .. }
+        | Node::CteScan { columns, .. } => plan.field_list(columns).len(),
         Node::Project { exprs, .. } => plan.expr_list(exprs).len(),
         Node::Aggregate { groups, aggregates, .. } => {
             plan.expr_list(groups).len() + plan.expr_list(aggregates).len()
@@ -267,6 +277,9 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         | Node::Limit { input, .. }
         | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => output_columns(plan, input),
+        // A materialisation returns what the query that reads it returns. The held columns are not
+        // part of that: they go to the reads of it and never past this node.
+        Node::MaterializedCte { body, .. } => output_columns(plan, body),
         // A set operation is as wide as either side, since the binder already required the two to
         // agree. A join and a cross product are as wide as the two together.
         Node::SetOp { left, .. } => output_columns(plan, left),

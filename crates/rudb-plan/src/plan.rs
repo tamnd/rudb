@@ -726,6 +726,18 @@ impl Plan {
                     }
                 }
             }
+            Node::MaterializedCte { name, columns, .. } => {
+                if name as usize >= self.strings.len() {
+                    return fail("names a string that is not in the table");
+                }
+                self.checked_field_list(columns, reference)?;
+            }
+            Node::CteScan { name, columns, .. } => {
+                if name as usize >= self.strings.len() {
+                    return fail("names a string that is not in the table");
+                }
+                self.checked_field_list(columns, reference)?;
+            }
             Node::SetOp { .. } => {}
         }
 
@@ -781,6 +793,8 @@ impl Plan {
             Node::Get { .. }
             | Node::Dummy
             | Node::CrossProduct { .. }
+            | Node::MaterializedCte { .. }
+            | Node::CteScan { .. }
             | Node::SetOp { .. }
             | Node::Limit { .. } => Vec::new(),
             Node::Values { rows, .. } => {

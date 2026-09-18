@@ -173,10 +173,21 @@ impl Scope {
                 names.len()
             )));
         }
+        self.rename_prefix(names);
+        Ok(())
+    }
+
+    /// Replaces the column names, ignoring every name past the last column.
+    ///
+    /// The column list a `WITH` definition is written with is the one list DuckDB does not report
+    /// as too long. `WITH c(a, b, d, e) AS (SELECT 1, 2) SELECT * FROM c` answers two columns named
+    /// `a` and `b` on the pinned build, where the same list on a table alias is refused and where
+    /// PostgreSQL refuses both. That is reproduced rather than corrected, and it is filed as
+    /// tamnd/duckdb#8.
+    pub(crate) fn rename_prefix(&mut self, names: &[&str]) {
         for (column, name) in self.columns.iter_mut().zip(names) {
             column.name = (*name).to_string();
         }
-        Ok(())
     }
 
     /// The visible columns as fields, which is what a view writes down for the catalog tables.

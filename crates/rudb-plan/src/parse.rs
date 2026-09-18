@@ -325,6 +325,28 @@ impl Reader<'_> {
                     }),
                 })
             }
+            "MaterializedCte" => {
+                let name = read_name(plan, c)?;
+                let cte = read_cte_index(c)?;
+                let columns = read_schema(plan, c)?;
+                Ok(Built {
+                    arity: 2,
+                    assemble: Box::new(move |definition, body| Node::MaterializedCte {
+                        definition,
+                        body,
+                        name,
+                        cte,
+                        columns,
+                    }),
+                })
+            }
+            "CteScan" => {
+                let name = read_name(plan, c)?;
+                let cte = read_cte_index(c)?;
+                let index = read_table_index(c)?;
+                let columns = read_schema(plan, c)?;
+                Ok(Built::leaf(Node::CteScan { index, cte, name, columns }))
+            }
             "SetOp" => {
                 let kind = read_keyword(c, &SetOpKind::ALL, SetOpKind::keyword, "a set operation")?;
                 let all = if c.eat_word("ALL") {
@@ -368,6 +390,12 @@ impl Built {
 }
 
 // Node arguments.
+
+/// Which materialisation a line names, written `@0` so that it does not read as a table index.
+fn read_cte_index(c: &mut Cursor<'_>) -> Result<u32> {
+    c.expect("@")?;
+    read_number(c)
+}
 
 fn read_table_index(c: &mut Cursor<'_>) -> Result<u32> {
     c.expect("#")?;
