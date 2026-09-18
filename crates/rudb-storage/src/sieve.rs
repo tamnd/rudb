@@ -438,6 +438,8 @@ fn blocked(values: usize, budget: usize) -> Option<Blocked> {
 fn hashes(vector: &Vector) -> Option<Vec<u64>> {
     let nullable = vector.validity().has_nulls(vector.len());
     let mut hashes = Vec::with_capacity(vector.len());
+    // row at a time: the third reader has no vectorised form, and a row it cannot read is a sieve
+    // that has to be abandoned rather than a row that can be left out.
     for row in 0..vector.len() {
         if nullable && vector.is_null_at(row) {
             continue;
