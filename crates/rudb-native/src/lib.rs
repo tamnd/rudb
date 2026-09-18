@@ -3558,7 +3558,8 @@ mod tests {
     #[test]
     fn a_dictionary_over_one_extent_checks_every_block_of_it() {
         let path = path("dictionary-extents");
-        let value = |row: usize| format!("{row:07} a value long enough to be worth a payload block");
+        let value =
+            |row: usize| format!("{row:07} a value long enough to be worth a payload block");
         let parts = 30;
         let per_part = 1000;
         let mut writer =
@@ -3568,10 +3569,10 @@ mod tests {
             let values = (0..per_part)
                 .map(|row| Value::Varchar(value(part * per_part + row)))
                 .collect::<Vec<_>>();
-            let chunk =
-                Chunk::new(vec![Vector::from_values(LogicalType::Varchar, &values)
-                    .expect("strings")])
-                .expect("matching rows");
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Varchar, &values).expect("strings"),
+            ])
+            .expect("matching rows");
             writer.append(&chunk).expect("a part");
         }
         writer.finish().expect("commit");
