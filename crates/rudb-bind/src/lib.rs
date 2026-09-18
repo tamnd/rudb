@@ -14,7 +14,7 @@
 //! [`Bound`], which is a plan for a query and a resolved catalog operation for `CREATE TABLE`,
 //! `DROP TABLE` and `INSERT`. DDL is not a plan node, for the reason `statement.rs` gives.
 //!
-//! What it does not do yet is a table function whose arguments read a LATERAL column, and every statement outside the implemented set. Each gap is an error naming what was written rather than a silently wrong plan, which is the rule the whole front end follows.
+//! What it does not do yet is `UNION BY NAME`, a `LIMIT` written as a percentage, a `LIMIT` or `OFFSET` that is not a constant, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, the `~` and `!` operators, and every statement outside the implemented set. Each gap is an error naming what was written rather than a silently wrong plan, which is the rule the whole front end follows.
 
 #![forbid(unsafe_code)]
 
