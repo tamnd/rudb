@@ -77,7 +77,9 @@ const MAX_ENCODE_WORKERS: usize = 32;
 ///
 /// A part is a thousand rows, so a filter sized for every one of them being distinct is about
 /// thirteen hundred bytes and this never binds in practice. It is here so that a part that somehow
-/// arrives much wider than a vector cannot put an unbounded index in the file.
+/// arrives much wider than a vector cannot put an unbounded index in the file. What does bind is the
+/// rule in `encode_column` that a sieve may not be as large as the part it indexes, which is a cap
+/// per column rather than one number for the whole file.
 const SIEVE_BUDGET: usize = 8 * 1024;
 
 fn io(error: std::io::Error) -> Error {
@@ -774,9 +776,19 @@ impl Writer {
             // so an approximate one beside it would cost a hash of every string in the table to
             // answer a question that is already answered. What it would buy is the finer grain, a
             // part rather than a stripe, and that is worth coming back for on its own.
+            //
+            // A sieve at least as large as the part it indexes is not written. A reader reads the
+            // sieve to decide whether to read the part, so when the sieve is the larger of the two
+            // it has already spent more than the read it is trying to avoid, and that holds even if
+            // it rejects every time. It is a necessary condition rather than the whole rule, which
+            // is that a sieve pays when its bytes are under the rejection rate times the part's,
+            // but the rejection rate depends on what a query probes for and the writer does not
+            // know that. The necessary half needs two numbers that are both in hand here.
             let sieve = match dictionary {
                 Some(_) => None,
-                None => Sieve::of(column, &range, SIEVE_BUDGET),
+                None => {
+                    Sieve::of(column, &range, SIEVE_BUDGET).filter(|sieve| sieve.len() < bytes.len())
+                }
             };
             stripe.pages.push(bytes);
             stripe.codes.push(unique);
@@ -4827,6 +4839,67 @@ mod tests {
             reader.table().stripes().iter().all(|stripe| !stripe.zone.skips(&tests)),
             "the bounds rule out no stripe at all"
         );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A sieve bigger than the part it indexes is not written, and one smaller than it still is.
+    ///
+    /// Both columns hold values spread over the whole of `BIGINT`, so neither gets a bitmap and both
+    /// reach the filter. They differ in what the part costs to read. `spread` is a thousand distinct
+    /// numbers and packs to eight kilobytes, so a filter of about thirteen hundred bytes is a good
+    /// trade. `repeated` is the same thousand rows over four numbers and encodes to a few hundred
+    /// bytes, but the filter is sized for the rows rather than the values it turns out to hold, so it
+    /// comes out larger than the data. Reading it to decide whether to read the part spends more than
+    /// the part, every time, and that is the case this drops.
+    #[test]
+    fn a_sieve_larger_than_the_part_it_indexes_is_not_written() {
+        let path = path("sieve-pays");
+        let fields = vec![
+            Field::required("spread", LogicalType::BigInt),
+            Field::required("repeated", LogicalType::BigInt),
+        ];
+        let mut writer = Writer::create(&path, "hits", fields).expect("new file");
+        let parts = 3;
+        let per_part = 1024;
+        for part in 0..parts {
+            let base = (part * per_part) as i64;
+            let spread: Vec<Value> =
+                (0..per_part).map(|row| Value::BigInt(scattered(base + row as i64))).collect();
+            let repeated: Vec<Value> =
+                (0..per_part).map(|row| Value::BigInt(scattered((row % 4) as i64))).collect();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::BigInt, &spread).expect("numbers"),
+                Vector::from_values(LogicalType::BigInt, &repeated).expect("numbers"),
+            ])
+            .expect("two columns");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let layout = reader.layout();
+        let spread = &layout.columns[0];
+        let repeated = &layout.columns[1];
+        assert!(spread.sieves > 0, "a column whose parts are worth a filter keeps one");
+        assert_eq!(repeated.sieves, 0, "a column whose filter costs more than its parts keeps none");
+        // Per part this is the rule itself, so it holds over the column as well: a part without a
+        // sieve adds to one side of this and to nothing on the other.
+        for column in &layout.columns {
+            assert!(
+                column.sieves < column.pages,
+                "{} spends {} on sieves over {} of data",
+                column.name,
+                column.sieves,
+                column.pages
+            );
+        }
+        // The filter that was kept still does what it is for.
+        let absent = [Probe {
+            column: 0,
+            op: Op::Equal,
+            value: Bound::Int(i128::from(scattered((parts * per_part) as i64 + 1))),
+        }];
+        assert!((0..parts).all(|part| reader.skips(part, &absent)), "no part holds it");
         fs::remove_file(path).expect("remove scratch file");
     }
 
