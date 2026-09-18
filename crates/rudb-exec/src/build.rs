@@ -80,6 +80,7 @@ use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
 use crate::settingnames::settingnames;
+use crate::sideways::{Keyed, Sideways};
 use crate::sort::Sort;
 use crate::source::{Dummy, FileScan, Frequencies, Scan, Series, Summary, Values};
 use crate::strategies::strategies;
@@ -238,6 +239,7 @@ fn build_measured_with_sink<'a>(
         done: Vec::new(),
         drivers: Vec::new(),
         pruning: Vec::new(),
+        sideways: None,
         top_counts: Vec::new(),
         held: Vec::new(),
     };
@@ -956,6 +958,15 @@ struct Building<'a, 'b> {
     /// own input, and the scan arm takes them. It is empty every other time it is read, and empty
     /// means hand out every row group, which is what every scan did before pruning existed.
     pruning: Vec<(usize, Op, Bound)>,
+    /// The runtime filter of the join whose driving side is being walked into, for the scan at the
+    /// bottom of it.
+    ///
+    /// The same one step down that `pruning` is, except that it survives more than one step: a scan
+    /// under a filter under a join is the shape this is worth the most on. What it does not survive
+    /// is anything that decides which rows come out by counting rather than by value, because a scan
+    /// that drops rows under a `LIMIT` changes which rows reach the limit. [`Builder::node`] clears
+    /// it for every node that is not a scan, a filter or a projection.
+    sideways: Option<Arc<Sideways<'a>>>,
     /// Aggregates whose parent TopN orders by COUNT descending, and its count plus offset.
     top_counts: Vec<(NodeRef, usize)>,
     /// The materialisations whose bodies are being walked, innermost last.
@@ -1104,6 +1115,15 @@ impl<'a> Building<'a, '_> {
         let memory = self.memory;
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
+        // A runtime filter reaches a scan through a filter and a projection and through nothing
+        // else, because everything else either rebinds the column it is about or decides which rows
+        // come out by counting them. See `Builder::sideways`.
+        if !matches!(
+            *plan.node(reference),
+            Node::Get { .. } | Node::Filter { .. } | Node::Project { .. }
+        ) {
+            self.sideways = None;
+        }
         let segment = match *plan.node(reference) {
             Node::Get { catalog: database, schema, table, index, columns, .. } => {
                 let name = QualifiedName::new(
@@ -1112,7 +1132,9 @@ impl<'a> Building<'a, '_> {
                     plan.string(table),
                 );
                 let tests = std::mem::take(&mut self.pruning);
-                let scan = Scan::new(plan, self.catalog.table(&name)?, index, columns, tests)?;
+                let runtime = self.sideways.take();
+                let scan =
+                    Scan::new(plan, self.catalog.table(&name)?, index, columns, tests, runtime)?;
                 let schema = scan.schema().clone();
                 let counters =
                     self.watch(reference, id, pipeline, "Scan", Some(plan.string(table)));
@@ -1421,14 +1443,23 @@ impl<'a> Building<'a, '_> {
                 let gathering = self.shape.pipeline(held);
                 let held = self.node(held)?;
                 let held_schema = held.schema.clone();
+                // The edge this join's runtime filter crosses, made before either side is built
+                // because the sink on one side fills it and the scan on the other reads it. It stays
+                // inert unless the join arms it below, which most joins cannot. See
+                // `crate::sideways`.
+                let sideways = Sideways::new();
                 // The chunks as chunks rather than a row per row. A join reads this side by
                 // position, to build its table and then once per match, so taking it apart into a
                 // `Vec<Value>` per row here would be an allocation per row for a layout the join
                 // then has to transpose back into columns. See `crate::side::Build`.
-                let (gather, gathered) = Keep::new(memory);
+                let (gather, gathered) = Keep::watching(memory, Some(Arc::clone(&sideways)));
                 let watched = self.watch(reference, gather_id, gathering, "Gather", None);
                 self.close(held, gathering, Arc::new(Watched::new(gather, watched)));
+                // Offered to the driving side while it is built, which is how it reaches the scan
+                // down there. Cleared afterwards so that nothing built later picks it up.
+                self.sideways = Some(Arc::clone(&sideways));
                 let mut left = self.node(driving)?;
+                self.sideways = None;
                 let side = Gathered { schema: &held_schema, chunks: gathered, marker, swapped };
                 // A lookup answers this join and the kind decides about a driving row from that
                 // row's own matches, so nothing has to be held and the driving side streams
@@ -1448,6 +1479,19 @@ impl<'a> Building<'a, '_> {
                     Probe::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)
                 {
                     let probe = probe.in_session(self.session);
+                    // Armed now rather than when the filter was made, because whether there is a key
+                    // to hand over is a question about the conditions and only this operator has
+                    // split them. A join that answers nothing leaves the filter inert, which is a
+                    // scan that reads everything exactly as it did before.
+                    if let Some((key, binding)) = probe.sideways() {
+                        sideways.keying(Keyed::new(
+                            plan,
+                            key,
+                            held_schema.clone(),
+                            self.session.session_time_zone(),
+                        ));
+                        sideways.about(binding);
+                    }
                     let schema = probe.schema().clone();
                     let counters = self.watch(reference, id, pipeline, "Probe", None);
                     left.after.push(gathering);

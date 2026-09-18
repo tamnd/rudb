@@ -107,6 +107,7 @@ mod schema;
 mod setop;
 mod settingnames;
 mod side;
+mod sideways;
 mod signed;
 mod sort;
 mod source;

@@ -28,6 +28,7 @@ use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
 use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
 use crate::schema::Schema;
+use crate::sideways::Sideways;
 
 /// One morsel per position, handed to whoever asks first.
 ///
@@ -222,12 +223,28 @@ fn poisoned<T>(_: T) -> Error {
 /// the Parquet path gets: a row group on the files this engine is measured against is a hundred
 /// thousand rows and a chunk is two thousand and forty eight, and on a selective filter over a
 /// clustered column that is most of the difference between the two paths.
+///
+/// `sideways` is the other source of the same kind of test, and it is one a plan cannot carry: the
+/// range of the key a join above this scan is about to look every one of these rows up by, which is
+/// not known until that join's other side has finished. See [`crate::sideways`].
 #[derive(Debug)]
 pub(crate) struct Scan<'a> {
     table: &'a Table,
     columns: Vec<Option<usize>>,
     offsets: Vec<i64>,
     probes: Vec<Probe>,
+    /// The runtime filter of the join this scan drives, empty for a scan that drives no join.
+    sideways: Option<Arc<Sideways<'a>>>,
+    /// Which table index this scan's columns bind against, which is how the runtime filter knows
+    /// whether it is about one of them.
+    index: u32,
+    /// `probes` and whatever the runtime filter turned out to hold, worked out the first time the
+    /// scan is asked anything.
+    ///
+    /// Once rather than per chunk, and lazily rather than at construction, because the one moment
+    /// both are known is after the pipeline this one depends on has finished and before this one has
+    /// started. That is [`Source::morsels`], and every read is after it.
+    testing: OnceLock<Vec<Probe>>,
     schema: Schema,
     chunks: Handout,
     /// The parts of each stripe, empty when the rows are not native.
@@ -250,6 +267,20 @@ pub(crate) struct Scan<'a> {
     /// workers it will face and so the one moment it can decide how finely to cut.
     spread: OnceLock<Spread>,
     skipped: AtomicUsize,
+}
+
+/// Moves tests from the projection's numbering onto the table's.
+///
+/// A test names a column of the projection and a zone names a column of the table, so the move
+/// happens once here rather than at every chunk. A test on a column that is somehow not projected is
+/// dropped, which costs a chunk that gets read.
+fn onto(columns: &[Option<usize>], tests: Vec<(usize, Op, Bound)>) -> Vec<Probe> {
+    tests
+        .into_iter()
+        .filter_map(|(at, op, value)| {
+            Some(Probe { column: columns.get(at)?.as_ref().copied()?, op, value })
+        })
+        .collect()
 }
 
 /// How a native scan cuts its parts into morsels.
@@ -276,6 +307,7 @@ impl<'a> Scan<'a> {
         index: u32,
         projection: Slice,
         tests: Vec<(usize, Op, Bound)>,
+        sideways: Option<Arc<Sideways<'a>>>,
     ) -> Result<Self> {
         let fields = plan.field_list(projection).to_vec();
         let mut columns = Vec::with_capacity(fields.len());
@@ -293,15 +325,7 @@ impl<'a> Scan<'a> {
             })?;
             columns.push(Some(position));
         }
-        // A test names a column of the projection and a zone names a column of the table, so the
-        // test is moved onto the table's numbering here rather than at every chunk. A test on a
-        // column that is somehow not projected is dropped, which costs a chunk that gets read.
-        let probes = tests
-            .into_iter()
-            .filter_map(|(at, op, value)| {
-                Some(Probe { column: columns.get(at)?.as_ref().copied()?, op, value })
-            })
-            .collect();
+        let probes = onto(&columns, tests);
         let schema = Schema::numbered(fields, index);
         let chunks = Handout::new(table.rows().chunk_count());
         let mut next = 0_i64;
@@ -317,11 +341,28 @@ impl<'a> Scan<'a> {
             columns,
             offsets,
             probes,
+            sideways,
+            index,
+            testing: OnceLock::new(),
             schema,
             chunks,
             stripes,
             spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
+        })
+    }
+
+    /// Every test this scan has, which is the plan's and whatever a join above it worked out.
+    ///
+    /// Settled on the first call and the same afterwards, because a filter that answered one thing
+    /// while the morsels were cut and another while they were read would be a scan whose work was
+    /// divided by one set of rows and done over a different one.
+    fn testing(&self) -> &[Probe] {
+        self.testing.get_or_init(|| {
+            let Some(sideways) = self.sideways.as_ref() else { return self.probes.clone() };
+            let mut probes = self.probes.clone();
+            probes.extend(onto(&self.columns, sideways.tests(self.index)));
+            probes
         })
     }
 
@@ -347,12 +388,13 @@ impl<'a> Scan<'a> {
     fn living(&self, threads: usize) -> (Vec<Vec<usize>>, usize) {
         let (mut live, rows) = self.bounded();
         let working = live.iter().filter(|parts| !parts.is_empty()).count();
-        if self.probes.is_empty() || !worth_sifting(working, threads, rows) {
+        let probes = self.testing();
+        if probes.is_empty() || !worth_sifting(working, threads, rows) {
             return (live, rows);
         }
         let mut sifted = 0;
         for parts in &mut live {
-            parts.retain(|&at| !self.table.rows().skips(at, &self.probes));
+            parts.retain(|&at| !self.table.rows().skips(at, probes));
             for &at in parts.iter() {
                 sifted += self.table.rows().chunk_len(at).unwrap_or(0);
             }
@@ -362,10 +404,11 @@ impl<'a> Scan<'a> {
 
     /// The first of those two passes, the one that reads nothing.
     fn bounded(&self) -> (Vec<Vec<usize>>, usize) {
+        let probes = self.testing();
         let mut rows = 0;
         let mut live = Vec::with_capacity(self.stripes.len());
         for (stripe, parts) in self.stripes.iter().enumerate() {
-            if !self.probes.is_empty() && self.table.rows().stripe_skips(stripe, &self.probes) {
+            if !probes.is_empty() && self.table.rows().stripe_skips(stripe, probes) {
                 live.push(Vec::new());
                 continue;
             }
@@ -486,6 +529,7 @@ impl Source for Scan<'_> {
         // Walking rather than returning is safe because a part that skips has nothing the caller
         // could want, so the only thing the old return said that this does not is how far the
         // morsel had got, and nothing outside asks that between one part and the next.
+        let probes = self.testing();
         let at = loop {
             let at = position(morsel);
             if at >= self.table.rows().chunk_count() || morsel.is_drained() {
@@ -493,7 +537,7 @@ impl Source for Scan<'_> {
                 return Ok(Progress::Done);
             }
             morsel.advance(1);
-            if self.probes.is_empty() || !self.table.rows().skips(at, &self.probes) {
+            if probes.is_empty() || !self.table.rows().skips(at, probes) {
                 break at;
             }
             self.skipped.fetch_add(1, Ordering::Relaxed);
@@ -1605,12 +1649,12 @@ mod tests {
     use rudb_common::{Field, LogicalType, Value};
     use rudb_functions::TableFunction;
     use rudb_pipeline::{Progress, Source};
-    use rudb_plan::{Node, Plan};
+    use rudb_plan::{ColumnBinding, Node, Plan};
     use rudb_vector::Chunk;
 
     use super::{
-        Bound, FileScan, Handout, OnceLock, Op, Probe, RUN, Scan, Schema, Series, VECTOR_SIZE,
-        cut_rows, native_instances, next_piece, parts, runs_of, worth_sifting,
+        Bound, FileScan, Handout, OnceLock, Op, Probe, RUN, Scan, Schema, Series, Sideways,
+        VECTOR_SIZE, cut_rows, native_instances, next_piece, parts, runs_of, worth_sifting,
     };
 
     /// Every morsel a row group of `rows` rows is cut into, by asking for them the way `cut` does.
@@ -1746,7 +1790,7 @@ mod tests {
         let Node::Get { index, columns, .. } = *plan.node(plan.root()) else {
             panic!("the plan is a get");
         };
-        Scan::new(&plan, table, index, columns, Vec::new()).expect("the column is there")
+        Scan::new(&plan, table, index, columns, Vec::new(), None).expect("the column is there")
     }
 
     /// Every morsel the scan hands out, as the parts it covers and the rows that came out of it.
@@ -1817,7 +1861,7 @@ mod tests {
         let Node::Get { index, columns, .. } = *plan.node(plan.root()) else {
             panic!("the plan is a get");
         };
-        Scan::new(&plan, table, index, columns, tests).expect("the column is there")
+        Scan::new(&plan, table, index, columns, tests, None).expect("the column is there")
     }
 
     /// A predicate that leaves one stripe of two still divides the work between two workers.
@@ -2033,6 +2077,9 @@ mod tests {
             columns: vec![Some(0)],
             offsets: vec![0],
             probes,
+            sideways: None,
+            index: 0,
+            testing: OnceLock::new(),
             schema: Schema::numbered(fields, 0),
             chunks: Handout::new(table.rows().chunk_count()),
             stripes: Vec::new(),
@@ -2074,6 +2121,35 @@ mod tests {
     fn a_scan_with_no_tests_reads_every_chunk() {
         let table = counted(VECTOR_SIZE * 3);
         let scan = scanning(&table, Vec::new());
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 3);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 0);
+    }
+
+    /// The same skipping, from a range no plan could have carried: what a join above this scan found
+    /// on its other side. Five chunks hold 0 to 10239 and the build side held keys 5000 to 5100, so
+    /// only the chunk those fall in is read.
+    #[test]
+    fn a_scan_skips_the_chunks_a_joins_build_side_ruled_out() {
+        let table = counted(VECTOR_SIZE * 5);
+        let sideways = Sideways::new();
+        sideways.about(ColumnBinding::new(0, 0));
+        sideways.found(Some((Bound::Int(5_000), Bound::Int(5_100))));
+        let mut scan = scanning(&table, Vec::new());
+        scan.sideways = Some(sideways);
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE, "one chunk's worth");
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
+    }
+
+    /// A join that never armed one, and a build side with no rows, both leave the scan reading
+    /// everything. This is the case that must not regress, because every join that cannot use a
+    /// runtime filter still makes one.
+    #[test]
+    fn a_scan_under_a_join_that_offered_nothing_reads_every_chunk() {
+        let table = counted(VECTOR_SIZE * 3);
+        let mut scan = scanning(&table, Vec::new());
+        scan.sideways = Some(Sideways::new());
 
         assert_eq!(counted_rows(&scan), VECTOR_SIZE * 3);
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 0);
