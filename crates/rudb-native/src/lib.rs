@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::bounds::{Bound, Op};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_encoding::integer;
+use rudb_encoding::{chooser, integer, string};
 use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
@@ -2768,6 +2768,60 @@ fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
     Ok(())
 }
 
+/// Which cascades are worth trying on a run of dictionary codes.
+///
+/// The exhaustive chooser encodes every candidate at every level of a cascade three deep and keeps
+/// the smallest, which on a part of 1024 codes is around a hundred full encodes to decide something
+/// three candidates were always going to win. It is the right default for a crate that does not
+/// know what it is looking at. Here we do know. Codes are counted from zero in the order the values
+/// were first seen, so a part of them is one value, or a narrow band, or a few long runs, and those
+/// are constant, frame of reference and run length. Nothing else has ever come first on this data.
+///
+/// A dictionary of dictionary codes is the one candidate that can never pay, because the codes are
+/// already the dictionary, and it is also the most expensive one to try. Below the top level the
+/// streams are an RLE's run values and run lengths, which are integers in their own right with no
+/// runs left in them, so only the two flat candidates go down there.
+///
+/// This is size given up for time on purpose, and the ablation is this chooser against
+/// [`chooser::EXHAUSTIVE`] on the same file.
+#[derive(Debug)]
+struct Codes;
+
+impl chooser::Chooser for Codes {
+    fn name(&self) -> &'static str {
+        "codes"
+    }
+
+    fn narrow_strings(
+        &self,
+        _values: &[&[u8]],
+        offered: &[string::Kind],
+        _depth: u8,
+    ) -> Vec<string::Kind> {
+        // Never reached, because nothing here encodes strings through the cascade. The trait asks
+        // for it and the honest answer to a question we have no opinion on is the whole list.
+        offered.to_vec()
+    }
+
+    fn narrow_integers(
+        &self,
+        _values: &[i64],
+        offered: &[integer::Kind],
+        depth: u8,
+    ) -> Vec<integer::Kind> {
+        let keep: &[integer::Kind] = if depth == 0 {
+            &[integer::Kind::Constant, integer::Kind::Packed, integer::Kind::Rle]
+        } else {
+            &[integer::Kind::Constant, integer::Kind::Packed]
+        };
+        let narrowed: Vec<integer::Kind> =
+            offered.iter().copied().filter(|kind| keep.contains(kind)).collect();
+        // The contract is a non empty subset, and a chunk that offers none of the three is a chunk
+        // this has no opinion about rather than one that cannot be written.
+        if narrowed.is_empty() { offered.to_vec() } else { narrowed }
+    }
+}
+
 /// A part's dictionary codes through the integer cascade, or `None` when the cascade did not pay.
 ///
 /// Until now this stream was a `u32` a row with nothing asked of it, and on ClickBench that was
@@ -2781,7 +2835,7 @@ fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
 /// values, and there is no reason to pay for the decode when it does.
 fn encoded_codes(codes: &[u32]) -> Result<Option<Vec<u8>>> {
     let wide: Vec<i64> = codes.iter().map(|code| i64::from(*code)).collect();
-    let coded = integer::encode(&wide)?;
+    let coded = integer::encode_with(&wide, &Codes)?;
     let plain = codes.len().saturating_mul(size_of::<u32>());
     Ok((coded.len() < plain).then_some(coded))
 }
