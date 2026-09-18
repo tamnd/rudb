@@ -26,13 +26,11 @@
 //! that carries it, and the answer for that row would be a missing row rather than whatever the
 //! subquery says about NULL.
 //!
-//! Not every operator has a rule here. A limit inside a correlated subquery means the limit is per
-//! domain value rather than over the whole of the inner side, and the same is true of a top N, so
-//! both are left alone rather than pushed through into a different query. A set operation has an
-//! answer, which is that the domain is pushed into every branch and the branches then have to agree
-//! on where the domain columns sit, and that is not written yet. A right or full join is refused
-//! because a row of the side that is not there
-//! carries no domain value, and the join back would then look for an outer row whose key is NULL.
+//! Not every operator has a rule here. A set operation has an answer, which is that the domain is
+//! pushed into every branch and the branches then have to agree on where the domain columns sit,
+//! and that is not written yet. A right or full join is refused because a row of the side that is
+//! not there carries no domain value, and the join back would then look for an outer row whose key
+//! is NULL.
 //! Everything with no rule leaves the dependent join in place and the query is refused, which is the
 //! honest end rather than a plan that answers a different question.
 
@@ -40,8 +38,8 @@ use std::collections::HashMap;
 
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
-    Arm, BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice,
-    SortKey, WindowBound, WindowFrame,
+    Arm, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
+    NodeRef, Plan, Slice, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
 use crate::tables::{TableSet, produced};
@@ -255,6 +253,14 @@ fn push(
             let below = push(plan, input, domain, index, keys, outer)?;
             window(plan, below, at_index, partition, order, frame, expressions, keys)
         }
+        Node::Limit { input, count, offset } => {
+            let below = push(plan, input, domain, index, keys, outer)?;
+            limited(plan, below, None, count, offset, keys)
+        }
+        Node::TopN { input, keys: order, count, offset } => {
+            let below = push(plan, input, domain, index, keys, outer)?;
+            limited(plan, below, Some(order), Some(count), offset, keys)
+        }
         Node::Values { index: at_index, columns, rows } => {
             values(plan, at_index, columns, rows, domain, index, keys)
         }
@@ -346,6 +352,125 @@ fn window(
         frame,
         expressions,
     });
+    Some(Pushed { node, keys: below.keys, moved: below.moved })
+}
+
+/// A limit or a top N inside a correlated subquery, which is a limit per outer row.
+///
+/// `(SELECT w FROM i WHERE i.k = o.k ORDER BY w LIMIT 1)` wants the first row of each outer row's
+/// matches, and the domain puts every outer row's matches in one relation, so the operator as
+/// written would keep one row out of all of them and answer nothing for everybody else. The limit
+/// is per domain value the same way the window was, and it is written with a window for exactly
+/// that reason: number the rows inside each domain value and keep the numbers the limit asked for.
+///
+/// `LIMIT n OFFSET m` becomes `row_number() OVER (PARTITION BY domain) BETWEEN m + 1 AND m + n`,
+/// and a top N is the same with its own keys as the window's ordering, which is what makes the
+/// numbering agree with what the query wanted ordered. `LIMIT ALL OFFSET m` has no upper bound and
+/// writes only the one comparison.
+///
+/// What this gives up is the top N's own bound. A top N holds `count + offset` rows and throws the
+/// rest away as it goes, and a window numbering a partition sees all of it, so this is a sort of
+/// everything where the operator it replaces was not. That is the same trade the sort rule makes
+/// and it is the one worth making, because the alternative on offer is not a cheaper plan, it is
+/// refusing the query.
+fn limited(
+    plan: &mut Plan,
+    below: Pushed,
+    order: Option<Slice>,
+    count: Option<u64>,
+    offset: u64,
+    keys: &[Key],
+) -> Option<Pushed> {
+    // `LIMIT ALL` with no offset keeps every row of every outer row's matches, which is what the
+    // relation under it already holds, so there is nothing to number and nothing to drop.
+    if count.is_none() && offset == 0 {
+        return Some(below);
+    }
+    let map = mapping(keys, &below);
+    let span = plan.expr_span(keys.first()?.expr);
+
+    let mut divided = Vec::new();
+    for (key, &binding) in keys.iter().zip(&below.keys) {
+        let ty = plan.expr_type(key.expr).clone();
+        divided.push(plan.add_expr_at(Expr::Column(binding), ty, span));
+    }
+    let partition = plan.add_expr_list(&divided);
+
+    // A plain `LIMIT` has no ordering, and that is not an omission. Which rows it keeps is not
+    // defined by the query, so any of them will do, and numbering them in whatever order they
+    // arrive is the same freedom the operator being replaced already had.
+    let mut ordering = Vec::new();
+    for key in order.map(|order| plan.sort_key_list(order).to_vec()).unwrap_or_default() {
+        let expr = remap(plan, key.expr, &map);
+        ordering.push(SortKey { expr, ..key });
+    }
+    let order = plan.add_sort_keys(&ordering);
+
+    // `row_number` reads no rows but its own position, so the frame it is given cannot change what
+    // it answers. This is the one the binder writes for an `OVER` clause with an ordering in it.
+    let frame = WindowFrame {
+        unit: WindowUnit::Range,
+        start: WindowBound::UnboundedPreceding,
+        end: WindowBound::CurrentRow,
+        exclude: WindowExclude::NoOthers,
+    };
+    let name = plan.intern("row_number");
+    let args = plan.add_expr_list(&[]);
+    let call = plan.add_expr_at(
+        Expr::Window { name, args, distinct: false, filter: None, ignore_nulls: false },
+        LogicalType::BigInt,
+        span,
+    );
+    let expressions = plan.add_expr_list(&[call]);
+    let at_index = walk::fresh_index(plan);
+    let node = plan.add_node(Node::Window {
+        input: below.node,
+        index: at_index,
+        partition,
+        order,
+        frame,
+        expressions,
+    });
+
+    let numbered =
+        plan.add_expr_at(Expr::Column(ColumnBinding::new(at_index, 0)), LogicalType::BigInt, span);
+    let mut bounds = Vec::new();
+    if offset > 0 {
+        let at = i64::try_from(offset).ok()?;
+        let value = plan.add_value(Value::BigInt(at));
+        let right = plan.add_expr_at(Expr::Constant(value), LogicalType::BigInt, span);
+        bounds.push(plan.add_expr_at(
+            Expr::Compare { op: CompareOp::Greater, left: numbered, right },
+            LogicalType::Boolean,
+            span,
+        ));
+    }
+    if let Some(count) = count {
+        // The offset rows are skipped by being numbered and then dropped, so the upper bound counts
+        // from the start of the partition and not from where the query starts reading.
+        let at = i64::try_from(offset.saturating_add(count)).ok()?;
+        let value = plan.add_value(Value::BigInt(at));
+        let right = plan.add_expr_at(Expr::Constant(value), LogicalType::BigInt, span);
+        bounds.push(plan.add_expr_at(
+            Expr::Compare { op: CompareOp::LessOrEqual, left: numbered, right },
+            LogicalType::Boolean,
+            span,
+        ));
+    }
+    let predicate = match bounds.len() {
+        // Both bounds absent is the early return at the top of this, so there is always one here.
+        0 => return None,
+        1 => bounds[0],
+        _ => {
+            let children = plan.add_expr_list(&bounds);
+            plan.add_expr_at(
+                Expr::Conjunction { op: ConjunctionOp::And, children },
+                LogicalType::Boolean,
+                span,
+            )
+        }
+    };
+    let node = plan.add_node(Node::Filter { input: node, predicate });
     Some(Pushed { node, keys: below.keys, moved: below.moved })
 }
 
@@ -837,6 +962,47 @@ mod tests {
     }
 
     #[test]
+    fn a_top_n_inside_the_subquery_becomes_a_row_number_per_domain_value() {
+        let mut plan = correlated("  TopN 1 offset 0 [#1.1::INTEGER ASC NULLS LAST]\n");
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        // The operator is gone and what replaced it numbers inside one outer row's matches and
+        // keeps the first, rather than keeping one row out of every outer row's matches together.
+        assert!(!after.contains("TopN"), "{after}");
+        assert!(after.contains("row_number()"), "{after}");
+        assert!(after.contains("partition=[#2.0::INTEGER]"), "{after}");
+        assert!(after.contains("<= 1::BIGINT"), "{after}");
+    }
+
+    #[test]
+    fn an_offset_is_the_lower_bound_and_the_count_is_still_measured_from_the_start() {
+        let mut plan = correlated("  Limit 2 offset 3\n");
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        // Rows four and five of each outer row's matches. The upper bound is five and not two,
+        // because the skipped rows are numbered before they are dropped.
+        assert!(after.contains("> 3::BIGINT"), "{after}");
+        assert!(after.contains("<= 5::BIGINT"), "{after}");
+    }
+
+    #[test]
+    fn a_plain_limit_numbers_the_rows_in_whatever_order_they_arrive() {
+        let mut plan = correlated("  Limit 1 offset 0\n");
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        // No ordering, because `LIMIT` without `ORDER BY` does not say which rows it keeps and the
+        // operator being replaced did not say either.
+        assert!(after.contains("order=[] "), "{after}");
+        assert!(after.contains("<= 1::BIGINT"), "{after}");
+    }
+
+    #[test]
     fn a_grouped_aggregate_adds_the_domain_to_the_groups() {
         let mut plan =
             correlated("  Aggregate #2 groups=[#1.1::INTEGER] aggregates=[count_star()::BIGINT]\n");
@@ -879,14 +1045,15 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_inside_the_subquery_is_refused() {
+    fn a_limit_over_a_projection_reads_the_domain_the_projection_carried_up() {
         let mut plan = correlated("  Limit 1 offset 0\n    Project #2 [#1.1::INTEGER AS value]\n");
-        unnest::lower(&mut plan).expect("unnesting runs");
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
         let after = plan.to_string();
-        // A limit inside a correlated subquery is per outer row, pushing the domain under it would
-        // make it one limit over the whole inner side, and answering a different query is worse
-        // than saying no.
-        assert!(after.contains("DependentJoin"), "{after}");
+        assert!(!after.contains("DependentJoin"), "{after}");
+        // The projection between the two is the case worth having, since the limit partitions by a
+        // binding the projection produced and not by the one the table underneath it has.
+        assert!(after.contains("partition=[#2.1::INTEGER]"), "{after}");
     }
 
     /// A `VALUES` on the right of a dependent join, which is what `LATERAL (VALUES ...)` binds to.
