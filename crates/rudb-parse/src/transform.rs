@@ -1059,11 +1059,11 @@ impl<'a> Transform<'a> {
     /// `DescribeStatement <- ShowTables / ShowDeprecatedSelect / DescribeSelect / ShowAllTables /
     /// ShowByName / DescribeByName`.
     ///
-    /// Two of the six are done and they are the two that describe a relation. The four that are
-    /// not are `SHOW`, which is a different statement wearing this rule: three of its four forms
-    /// list what the database has rather than what a query returns, and the fourth is `SHOW <query>`,
-    /// which upstream documents as deprecated. Describing something through a deprecated spelling
-    /// is not worth implementing before the spelling that replaced it has users.
+    /// Three of the six are done. The two that describe a relation are, and so is `SHOW ALL`, which
+    /// lists every table and view rather than describing one. The three that are not are `SHOW
+    /// TABLES FROM <name>`, which wants a schema this cannot name yet, `SHOW <query>`, which upstream
+    /// documents as deprecated, and the special forms `SCHEMAS` and `VARIABLES`, which answer from
+    /// places rudb has not built.
     ///
     /// `SUMMARIZE` shares `DescribeByName` and `DescribeSelect` with `DESCRIBE` and is refused
     /// here, because it returns twelve columns of statistics rather than six of schema and reading
@@ -1082,16 +1082,24 @@ impl<'a> Transform<'a> {
                 if target == NONE {
                     return self.unsupported(inner);
                 }
+                let name = self.name_parts(target);
+                if let Some(query) = self.special_form(name) {
+                    return Ok(query);
+                }
                 let source = self.describe_target(target)?;
                 let query = self.star_over(source);
                 Ok(self.push_query(Query::bare(QueryBody::Describe(query))))
             }
+            "ShowAllTables" => Ok(self.pragma_query("pragma_show_tables_expanded")),
             "ShowByName" => {
                 let target = self.find(inner, "ShowTarget");
                 if target == NONE {
                     return self.unsupported(inner);
                 }
                 let name = self.name_parts(target);
+                if let Some(query) = self.special_form(name) {
+                    return Ok(query);
+                }
                 let source = self.push_source(Source::Table {
                     name,
                     alias: NONE,
@@ -1102,6 +1110,43 @@ impl<'a> Transform<'a> {
             }
             _ => self.unsupported(inner),
         }
+    }
+
+    /// The names `SHOW` and `DESCRIBE` answer from the catalog instead of looking up.
+    ///
+    /// The pin reads these before the name reaches the catalog, so `SHOW tables` lists the tables
+    /// even when a table is named `tables`, and `DESCRIBE tables` does the same rather than
+    /// describing that table. A qualified name is never one of these, because `DESCRIBE main.tables`
+    /// is the table and the pin describes it.
+    fn special_form(&mut self, name: Slice) -> Option<QueryRef> {
+        if name.len != 1 {
+            return None;
+        }
+        let written = self.ast.name_text(name);
+        let pragma = match written.to_ascii_lowercase().as_str() {
+            "tables" => "pragma_show_tables",
+            "databases" => "pragma_show_databases",
+            _ => return None,
+        };
+        Some(self.pragma_query(pragma))
+    }
+
+    /// `SELECT * FROM <name>()`, which is what a special form turns into.
+    ///
+    /// Marked as a pragma call because that is the half of the catalog these three live in, and a
+    /// name in that half is not a name a `FROM` clause can reach.
+    fn pragma_query(&mut self, pragma: &str) -> QueryRef {
+        let part = self.intern(pragma);
+        let name = self.part_slice(vec![part]);
+        let args = self.target_slice(Vec::new());
+        let source = self.push_source(Source::Function {
+            name,
+            args,
+            alias: NONE,
+            columns: Slice::default(),
+            pragma: true,
+        });
+        self.star_over(source)
     }
 
     /// `DescribeOrSummarize <- DescribeRule / Summarize`, where only the first is done.

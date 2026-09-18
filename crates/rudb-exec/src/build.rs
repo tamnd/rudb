@@ -63,7 +63,10 @@ use crate::enginenames::{
     database_size, dialects, extensions, grammar_extensions, optimizers, platform, user_agent,
     version,
 };
-use crate::entrynames::{columnnames, databasenames, schemanames, tablenames, viewnames};
+use crate::entrynames::{
+    columnnames, databasenames, schemanames, showdatabases, showtables, showtablesexpanded,
+    tablenames, viewnames,
+};
 use crate::fetch::{Fetch, TableFetch};
 use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
@@ -1019,7 +1022,10 @@ impl<'a> Building<'a, '_> {
                         | TableFunction::PragmaVersion
                         | TableFunction::PragmaPlatform
                         | TableFunction::PragmaUserAgent
-                        | TableFunction::PragmaDatabaseSize),
+                        | TableFunction::PragmaDatabaseSize
+                        | TableFunction::PragmaShowTables
+                        | TableFunction::PragmaShowDatabases
+                        | TableFunction::PragmaShowTablesExpanded),
                     ) => {
                         let table = match function {
                             TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
@@ -1054,6 +1060,15 @@ impl<'a> Building<'a, '_> {
                             TableFunction::PragmaUserAgent => user_agent(plan, index, columns)?,
                             TableFunction::PragmaDatabaseSize => {
                                 database_size(self.catalog, self.memory, plan, index, columns)?
+                            }
+                            TableFunction::PragmaShowTables => {
+                                showtables(self.catalog, plan, index, columns)?
+                            }
+                            TableFunction::PragmaShowDatabases => {
+                                showdatabases(self.catalog, plan, index, columns)?
+                            }
+                            TableFunction::PragmaShowTablesExpanded => {
+                                showtablesexpanded(self.catalog, plan, index, columns)?
                             }
                             _ => strategies(plan, index, columns)?,
                         };

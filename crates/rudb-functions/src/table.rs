@@ -62,7 +62,8 @@
 use rudb_common::{Error, Field, LogicalType, Result};
 
 use crate::entrycatalog::{
-    column_fields, database_fields, schema_fields, table_fields, view_fields,
+    column_fields, database_fields, schema_fields, show_database_fields, show_expanded_fields,
+    show_table_fields, table_fields, view_fields,
 };
 use crate::functioncatalog::function_fields;
 use crate::settingcatalog::setting_fields;
@@ -122,6 +123,12 @@ pub enum TableFunction {
     PragmaUserAgent,
     /// `pragma_database_size()`, what each attached database costs on disk and in memory.
     PragmaDatabaseSize,
+    /// `PRAGMA show_tables`, the name of everything an unqualified name can reach.
+    PragmaShowTables,
+    /// `PRAGMA show_databases`, the name of everything that is attached.
+    PragmaShowDatabases,
+    /// `PRAGMA show_tables_expanded`, every table and view anywhere with its columns beside it.
+    PragmaShowTablesExpanded,
 }
 
 /// The name of the column `file_row_number=True` adds.
@@ -161,7 +168,27 @@ impl TableFunction {
             Self::PragmaPlatform => "pragma_platform",
             Self::PragmaUserAgent => "pragma_user_agent",
             Self::PragmaDatabaseSize => "pragma_database_size",
+            Self::PragmaShowTables => "pragma_show_tables",
+            Self::PragmaShowDatabases => "pragma_show_databases",
+            Self::PragmaShowTablesExpanded => "pragma_show_tables_expanded",
         }
+    }
+
+    /// Whether the name can be written where a table goes, rather than only after the word `PRAGMA`.
+    ///
+    /// Nine of the pin's nineteen query pragmas answer to `pragma_name()` in a `FROM` clause and ten
+    /// do not, and which is which was measured rather than guessed. `SELECT * FROM
+    /// pragma_show_tables()` on the pin is `Catalog Error: Table Function with name
+    /// pragma_show_tables does not exist!` while `PRAGMA show_tables` returns rows, so the two
+    /// namespaces really are separate and a name in one is not a name in the other. These three are
+    /// the ones rudb has from the pragma only half of that, and the rest of that half are `ATTACH`
+    /// and `COPY` in disguise or want something rudb has not written.
+    #[must_use]
+    pub const fn reachable_as_a_function(self) -> bool {
+        !matches!(
+            self,
+            Self::PragmaShowTables | Self::PragmaShowDatabases | Self::PragmaShowTablesExpanded
+        )
     }
 
     /// Whether the call takes one table name and answers about whatever that names.
@@ -297,6 +324,15 @@ impl TableFunction {
         if name.eq_ignore_ascii_case("pragma_database_size") {
             return Some(Self::PragmaDatabaseSize);
         }
+        if name.eq_ignore_ascii_case("pragma_show_tables") {
+            return Some(Self::PragmaShowTables);
+        }
+        if name.eq_ignore_ascii_case("pragma_show_databases") {
+            return Some(Self::PragmaShowDatabases);
+        }
+        if name.eq_ignore_ascii_case("pragma_show_tables_expanded") {
+            return Some(Self::PragmaShowTablesExpanded);
+        }
         None
     }
 }
@@ -345,9 +381,23 @@ pub struct ResolvedTable {
 ///
 /// When no table function has that name, or when it has that name and not those arguments.
 pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTable> {
-    let Some(function) = TableFunction::lookup(name) else {
-        return Err(Error::catalog(format!("Table Function with name {name} does not exist!")));
+    let function = match TableFunction::lookup(name) {
+        // A pragma only name written in a `FROM` clause is a name that does not exist there, which
+        // is the pin's answer and not a shortcut: the two namespaces are separate and this is the
+        // side of the fence the caller is standing on.
+        Some(function) if function.reachable_as_a_function() => function,
+        _ => {
+            return Err(Error::catalog(format!("Table Function with name {name} does not exist!")));
+        }
     };
+    resolve_found(function, arguments)
+}
+
+/// The same resolution once the name has been settled, which is where the two spellings meet.
+///
+/// Split out of [`resolve_table`] because a pragma only name has to get here without going past the
+/// check that turns it down in a `FROM` clause.
+fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<ResolvedTable> {
     if let Some(columns) = file_columns(function) {
         // Two overloads, one path and a list of them, which is DuckDB's pair. The list is where
         // `read_parquet(['a.parquet', 'b.parquet'])` binds, and an empty list arrives typed
@@ -432,13 +482,14 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
 /// When the function has that name and not those arguments, and otherwise whatever
 /// [`resolve_table`] says.
 pub fn resolve_pragma(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTable> {
-    let error = match resolve_table(name, arguments) {
-        Ok(resolved) => return Ok(resolved),
-        Err(error) => error,
-    };
     let Some(function) = TableFunction::lookup(name) else {
-        return Err(error);
+        return Err(Error::catalog(format!("Table Function with name {name} does not exist!")));
     };
+    // Through [`resolve_found`] rather than [`resolve_table`], because three of these names only
+    // exist after the word `PRAGMA` and the other spelling is where they are turned down.
+    if let Ok(resolved) = resolve_found(function, arguments) {
+        return Ok(resolved);
+    }
     let spelled = name.strip_prefix("pragma_").unwrap_or(name);
     // A pragma that takes nothing prints no parentheses at all on the candidate line, where the
     // function spelling of the same complaint prints an empty pair. Measured on the pin, which
@@ -479,7 +530,10 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::PragmaVersion
         | TableFunction::PragmaPlatform
         | TableFunction::PragmaUserAgent
-        | TableFunction::PragmaDatabaseSize => None,
+        | TableFunction::PragmaDatabaseSize
+        | TableFunction::PragmaShowTables
+        | TableFunction::PragmaShowDatabases
+        | TableFunction::PragmaShowTablesExpanded => None,
     }
 }
 
@@ -505,6 +559,9 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::PragmaPlatform => Some(platform_fields()),
         TableFunction::PragmaUserAgent => Some(user_agent_fields()),
         TableFunction::PragmaDatabaseSize => Some(database_size_fields()),
+        TableFunction::PragmaShowTables => Some(show_table_fields()),
+        TableFunction::PragmaShowDatabases => Some(show_database_fields()),
+        TableFunction::PragmaShowTablesExpanded => Some(show_expanded_fields()),
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::ReadParquet
