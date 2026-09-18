@@ -41,7 +41,7 @@ use rudb_kernels::{
     in_set, is_true, refine_flags, refine_prepared, selection,
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
-use rudb_vector::{Chunk, Selection, Vector};
+use rudb_vector::{Assembly, Chunk, Selection, Vector};
 use std::collections::HashMap;
 
 use crate::ordering::Ordering;
@@ -802,9 +802,19 @@ impl Prepared {
     ///
     /// The same shape [`evaluate`](crate::evaluate) has, because the thing that makes it that shape
     /// is a correctness rule rather than a performance one: `CASE WHEN x <> 0 THEN 1 / x ELSE 0 END`
-    /// divides by zero on the rows the arm excludes if the arm is evaluated for them. What is left
-    /// of it after #57 is the same rule expressed as a selection rather than as a narrowed chunk,
-    /// with the answers scattered back instead of assembled out of a `Vec<Value>`.
+    /// divides by zero on the rows the arm excludes if the arm is evaluated for them.
+    ///
+    /// Each arm answers the rows no earlier arm claimed, so the answers come back short and out of
+    /// order and have to be put back in the order the rows arrived in. That is what [`Assembly`] is:
+    /// the arms are laid end to end into one run of data and the interleave is a single typed copy
+    /// over it. It used to be a `Vec<Value>` filled a row at a time and handed to
+    /// `Vector::from_values`, which is a heap allocation and a drop for every string in the answer.
+    /// On the ClickBench query that groups by a `CASE` over `Referer` that was about a quarter of
+    /// the whole query.
+    ///
+    /// What is left of #57 here is the narrowing. An arm still narrows the whole chunk rather than
+    /// the columns it reads, and the selection threading that replaces the narrowing entirely is
+    /// the item this one was carved out of.
     fn case(
         &self,
         chunk: &Chunk,
@@ -812,7 +822,7 @@ impl Prepared {
         otherwise: Option<&Prepared>,
         ty: &LogicalType,
     ) -> Result<Vector> {
-        let mut answers = vec![Value::Null; chunk.len()];
+        let mut built = Assembly::new(ty.clone(), chunk.len())?;
         let mut pending: Vec<usize> = (0..chunk.len()).collect();
         for arm in arms {
             if pending.is_empty() {
@@ -822,25 +832,24 @@ impl Prepared {
             let mut scratch = arm.when.scratch();
             let flags = arm.when.evaluate_one(&narrowed, &mut scratch)?;
             let mut taken = Vec::new();
+            let mut claimed = Vec::new();
             let mut still = Vec::new();
-            // row at a time: the scatter that replaces these three loops is #57, and this variant
-            // goes with it.
+            // row at a time: splitting the rows an arm claims from the ones it leaves is a test per
+            // row, and what replaces it is the selection threading the rest of #57 asks for rather
+            // than anything that can be done here.
             for (at, &row) in pending.iter().enumerate() {
                 if is_true(&flags.value_at(at)) {
-                    taken.push((at, row));
+                    taken.push(at);
+                    claimed.push(row);
                 } else {
                     still.push(row);
                 }
             }
             if !taken.is_empty() {
-                let positions: Vec<usize> = taken.iter().map(|&(at, _)| at).collect();
-                let matched = narrow(&narrowed, &positions)?;
+                let matched = narrow(&narrowed, &taken)?;
                 let mut scratch = arm.then.scratch();
                 let results = arm.then.evaluate_one(&matched, &mut scratch)?;
-                // row at a time: the scatter this wants is #57, same as the loop above.
-                for (slot, &(_, row)) in taken.iter().enumerate() {
-                    answers[row] = results.try_value_at(slot)?;
-                }
+                built.place(&placed(&claimed)?, results)?;
             }
             pending = still;
         }
@@ -849,13 +858,10 @@ impl Prepared {
                 let narrowed = narrow(chunk, &pending)?;
                 let mut scratch = otherwise.scratch();
                 let results = otherwise.evaluate_one(&narrowed, &mut scratch)?;
-                // row at a time: the scatter this wants is #57, same as the two above.
-                for (slot, &row) in pending.iter().enumerate() {
-                    answers[row] = results.try_value_at(slot)?;
-                }
+                built.place(&placed(&pending)?, results)?;
             }
         }
-        Vector::from_values(ty.clone(), &answers)
+        built.finish()
     }
 
     /// Flattens one expression, appending its steps and returning the index of its last one.
@@ -1102,6 +1108,19 @@ fn touching(ty: &LogicalType) -> f64 {
 /// writes a pass that reorders the array is the day it stops holding.
 fn missing(index: usize) -> Error {
     Error::internal(format!("step {index} was used as an operand before it produced anything"))
+}
+
+/// Chunk rows as the positions an [`Assembly`] places a piece at.
+///
+/// A chunk is at most [`VECTOR_SIZE`](rudb_vector::VECTOR_SIZE) rows, so the conversion cannot fail
+/// in practice. It is checked rather than cast because a silent truncation here would put a value in
+/// the wrong row, and a wrong row is the one kind of bug nothing downstream can notice.
+fn placed(rows: &[usize]) -> Result<Vec<u32>> {
+    rows.iter()
+        .map(|&row| {
+            u32::try_from(row).map_err(|_| Error::internal("a chunk of more than u32 rows"))
+        })
+        .collect()
 }
 
 /// The chunk cut down to the given rows.

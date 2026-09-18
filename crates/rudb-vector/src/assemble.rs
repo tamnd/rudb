@@ -1,0 +1,398 @@
+//! One vector built out of pieces that each answer a different set of its rows.
+//!
+//! The inverse of [`Vector::gather`]. A gather says where each output row reads from, so it wants
+//! one source and a position per row. An assembly says where each input row writes to, so it takes
+//! several sources and a position per row of each of them, and the rows no source claims come out
+//! null.
+//!
+//! `CASE` is the shape that wants this. Each arm is evaluated over the rows no earlier arm claimed,
+//! which is a correctness rule rather than a performance one, since `CASE WHEN x <> 0 THEN 1 / x
+//! ELSE 0 END` divides by zero on the rows the arm excludes if the arm is evaluated for them. So the
+//! arms produce several short answers that have to end up interleaved in the order the rows arrived
+//! in, and interleaving them is what this is. A join assembling a payload out of a matched side and
+//! an unmatched side wants the same thing.
+//!
+//! # Why it is not a `Vec<Value>`
+//!
+//! Because that is a heap allocation per string and a drop per string afterwards, on top of the
+//! walk through the enum that a `Value` is. On the ClickBench query that groups by a `CASE` over
+//! `Referer`, building the answer that way was about a quarter of the whole query: a quarter of the
+//! instructions were in `value_at`, the `Value` drop glue, `malloc` and `free`, for an answer whose
+//! bytes were already sitting in a string arena and only needed to be pointed at.
+//!
+//! What happens instead is that the pieces are laid end to end into one run of data and the
+//! interleave is then a single gather over that run, which is a typed loop per physical layout and
+//! is the same loop [`Vector::gather`] already goes down. A string's bytes are copied once, into one
+//! arena that was sized before any of them moved.
+//!
+//! # The shape of the interface
+//!
+//! A builder rather than a function taking a slice of pieces, because the caller producing the
+//! pieces is usually borrowing scratch space to produce each one and cannot hold two of them at
+//! once. [`Assembly::place`] reads a piece and is done with it, so the borrow ends between arms and
+//! nothing has to be cloned to keep it alive.
+
+use rudb_common::{Error, LogicalType, Result, Value};
+
+use crate::string::StringView;
+use crate::validity::Validity;
+use crate::vector::{Data, NOWHERE, Vector, copy_of, empty_data_for, layout_of};
+
+/// A vector being built out of pieces, each landing at the positions it is given.
+///
+/// Build one with [`Assembly::new`], call [`Assembly::place`] once per piece, and finish it with
+/// [`Assembly::finish`]. A row no piece claims is null.
+#[derive(Debug)]
+pub struct Assembly {
+    ty: LogicalType,
+    rows: usize,
+    /// The pieces laid end to end, for a type that has a flat layout to lay them in.
+    data: Data,
+    /// Where each output row reads from in `data`, or [`NOWHERE`] for a row no piece claimed.
+    at: Vec<usize>,
+    /// Whether each output row holds a value rather than a null.
+    live: Vec<bool>,
+    /// The fallback for the nested types, which have no run of data to lay anything end to end in.
+    ///
+    /// A `LIST`, a `STRUCT` and a `MAP` are a child vector and a run of entries rather than a run of
+    /// values, so laying two of them end to end is not an append to one buffer and the copy loop
+    /// this is built around has nothing to walk. They go through values, which is what they did
+    /// before this existed and is not a regression for them. Nothing on a ClickBench or TPC-H path
+    /// reaches it.
+    values: Option<Vec<Value>>,
+}
+
+impl Assembly {
+    /// An assembly of `rows` rows of `ty`, with every row null until a piece claims it.
+    ///
+    /// # Errors
+    ///
+    /// If the type is one there is no flat layout for yet, which today means `ARRAY` and `UNION`.
+    pub fn new(ty: LogicalType, rows: usize) -> Result<Self> {
+        let nested =
+            matches!(ty, LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _));
+        let values = if nested { Some(vec![Value::Null; rows]) } else { None };
+        let data = if nested { Data::Empty } else { empty_data_for(&ty)? };
+        Ok(Self { ty, rows, data, at: vec![NOWHERE; rows], live: vec![false; rows], values })
+    }
+
+    /// How many rows the finished vector will have.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Writes row `n` of `piece` at output row `positions[n]`, for every row of `piece`.
+    ///
+    /// A row claimed twice takes the value the later call gave it, which is not a case `CASE`
+    /// produces, since its arms run over disjoint sets of rows, and is defined rather than left
+    /// open so that a caller that does it gets an answer instead of whichever of the two the copy
+    /// loop happened to reach.
+    ///
+    /// # Errors
+    ///
+    /// If `piece` has a different number of rows than there are positions, if a position is past the
+    /// end of the assembly, or if `piece` is not of a layout that can be laid after what is already
+    /// there.
+    pub fn place(&mut self, positions: &[u32], piece: &Vector) -> Result<()> {
+        if positions.len() != piece.len() {
+            return Err(Error::internal(format!(
+                "a piece of {} rows placed at {} positions",
+                piece.len(),
+                positions.len()
+            )));
+        }
+        for &row in positions {
+            if row as usize >= self.rows {
+                return Err(Error::internal(format!(
+                    "row {row} placed in an assembly of {} rows",
+                    self.rows
+                )));
+            }
+        }
+        if let Some(values) = &mut self.values {
+            for (slot, &row) in positions.iter().enumerate() {
+                values[row as usize] = piece.value_at(slot);
+            }
+            return Ok(());
+        }
+        // Flat is the one form the copy loop below reads, and flattening is itself a typed loop per
+        // layout rather than a walk through values, so a constant, a dictionary or a packed run of
+        // codes is written out once here rather than read a row at a time later.
+        let flat = piece.flatten()?;
+        let Some(from) = flat.data() else {
+            return Err(Error::internal("a flattened vector with no run of data in it"));
+        };
+        let start = self.data.len();
+        let appended = extend(&mut self.data, from)?;
+        for (slot, &row) in positions.iter().enumerate() {
+            let row = row as usize;
+            // A piece whose data is empty is the untyped null, so it claims its rows and they are
+            // null, which is what leaving them at `NOWHERE` says.
+            if slot < appended {
+                self.at[row] = start + slot;
+                self.live[row] = !piece.is_null_at(slot);
+            } else {
+                self.at[row] = NOWHERE;
+                self.live[row] = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// The finished vector.
+    ///
+    /// # Errors
+    ///
+    /// If the run of data that came out of the pieces is not one the type can hold.
+    pub fn finish(self) -> Result<Vector> {
+        if let Some(values) = self.values {
+            return Vector::from_values(self.ty, &values);
+        }
+        // An untyped null has no run of data to gather out of, and a gather over one would give a
+        // vector of no values calling itself `rows` long.
+        if matches!(self.data, Data::Empty) {
+            return Ok(Vector::constant(self.ty, Value::Null, self.rows));
+        }
+        let gathered = copy_of(&self.data, &self.at);
+        Ok(Vector::flat(self.ty, gathered)?.with_validity(Validity::from_run(&self.live)))
+    }
+}
+
+/// Lays a run of data end to end after another, answering how many values it appended.
+///
+/// The typed loop per layout is the whole point: an append of a thousand `i64` is one `memcpy` and
+/// an append of a thousand strings is one arena growth and a thousand sixteen byte views, neither of
+/// which touches a `Value`.
+fn extend(into: &mut Data, from: &Data) -> Result<usize> {
+    macro_rules! extended {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match (&mut *into, from) {
+                // Nothing to append, which is what an untyped null piece is. The caller reads the
+                // count and leaves those rows null rather than pointing them anywhere.
+                (_, Data::Empty) => Ok(0),
+                $((Data::$variant(out), Data::$variant(values)) => {
+                    out.extend_from_slice(values.as_slice());
+                    Ok(values.len())
+                })+
+                // The one layout where an append is a copy of bytes rather than a copy of fixed
+                // width slots. The arena is grown once for all of them, because a view carries its
+                // length so the total is known before any of the bytes move.
+                (Data::Varlen(out), Data::Varlen(values)) => {
+                    out.reserve_views(values.len());
+                    out.reserve_bytes(
+                        values
+                            .views()
+                            .iter()
+                            .filter(|view| !view.is_inline())
+                            .map(StringView::len)
+                            .sum(),
+                    );
+                    for index in 0..values.len() {
+                        out.push_from(values, index);
+                    }
+                    Ok(values.len())
+                }
+                (out, from) => Err(Error::internal(format!(
+                    "a run of {:?} values cannot be laid after a run of {:?} ones",
+                    layout_of(from),
+                    layout_of(out)
+                ))),
+            }
+        };
+    }
+    crate::for_each_layout!(fixed, extended)
+}
+
+/// Unit tests for the assembly.
+///
+/// That the engine actually goes through here rather than through the old path was checked rather
+/// than assumed, by gating a panic on [`Assembly::place`] and running the `rudb` suite with it
+/// armed. Three tests failed and no others: the one that is a `CASE` by name, the one that runs the
+/// catalog views the engine ships with, and the one over the native frequency synopsis. All three
+/// have a `CASE` in them and nothing else in the suite does.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Chunk;
+
+    /// Every row of a vector, as values, which is what an assembly is checked against.
+    fn values(vector: &Vector) -> Vec<Value> {
+        (0..vector.len()).map(|row| vector.value_at(row)).collect()
+    }
+
+    /// The answer the assembly has to reach, written the slow obvious way.
+    ///
+    /// A `Vec<Value>` filled by scattering and then handed to [`Vector::from_values`] is exactly
+    /// what `CASE` used to do, so this is the reference rather than a second opinion.
+    fn scattered(ty: &LogicalType, rows: usize, pieces: &[(Vec<u32>, Vector)]) -> Vector {
+        let mut answers = vec![Value::Null; rows];
+        for (positions, piece) in pieces {
+            for (slot, &row) in positions.iter().enumerate() {
+                answers[row as usize] = piece.value_at(slot);
+            }
+        }
+        Vector::from_values(ty.clone(), &answers).expect("the reference builds")
+    }
+
+    /// Builds an assembly out of pieces and checks it against the slow way of getting there.
+    fn agrees(ty: &LogicalType, rows: usize, pieces: &[(Vec<u32>, Vector)]) -> Vector {
+        let mut assembly = Assembly::new(ty.clone(), rows).expect("an assembly of this type");
+        for (positions, piece) in pieces {
+            assembly.place(positions, piece).expect("the piece is placed");
+        }
+        let built = assembly.finish().expect("the assembly finishes");
+        assert_eq!(built.len(), rows, "an assembly of {rows} rows");
+        assert_eq!(values(&built), values(&scattered(ty, rows, pieces)), "against the slow way");
+        built
+    }
+
+    #[test]
+    fn two_pieces_interleave_back_into_the_order_the_rows_came_in() {
+        let evens = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(0), Value::BigInt(2)])
+            .expect("a vector");
+        let odds = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1), Value::BigInt(3)])
+            .expect("a vector");
+        let built =
+            agrees(&LogicalType::BigInt, 4, &[(vec![0, 2], evens), (vec![1, 3], odds)]);
+        assert_eq!(
+            values(&built),
+            vec![Value::BigInt(0), Value::BigInt(1), Value::BigInt(2), Value::BigInt(3)]
+        );
+    }
+
+    #[test]
+    fn a_row_no_piece_claims_is_null() {
+        // Which is what a `CASE` with no `ELSE` leaves behind, and the case where a run of data with
+        // a hole in it would put every value after the hole at the wrong index.
+        let piece = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(7)]).expect("a vector");
+        let built = agrees(&LogicalType::BigInt, 3, &[(vec![1], piece)]);
+        assert_eq!(values(&built), vec![Value::Null, Value::BigInt(7), Value::Null]);
+    }
+
+    #[test]
+    fn no_pieces_at_all_is_a_column_of_nulls_of_the_right_length() {
+        let built = agrees(&LogicalType::Integer, 5, &[]);
+        assert!(built.is_null_at(4), "every row of it is null");
+    }
+
+    #[test]
+    fn a_null_inside_a_piece_stays_null_where_the_piece_put_it() {
+        // The validity has to survive the copy, and the value under it has to not be read, which is
+        // two different things a single run of data with a mask over it can get wrong separately.
+        let piece = Vector::from_values(
+            LogicalType::BigInt,
+            &[Value::BigInt(1), Value::Null, Value::BigInt(3)],
+        )
+        .expect("a vector");
+        let built = agrees(&LogicalType::BigInt, 3, &[(vec![2, 0, 1], piece)]);
+        assert!(built.is_null_at(0), "the null landed where the piece put it");
+        assert_eq!(built.value_at(2), Value::BigInt(1));
+    }
+
+    #[test]
+    fn strings_are_assembled_without_going_through_a_value_each() {
+        let left = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("a short one".into()), Value::Varchar("another".into())],
+        )
+        .expect("a vector");
+        let right = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("a string that is far too long to live inline in a view".into())],
+        )
+        .expect("a vector");
+        let built = agrees(&LogicalType::Varchar, 3, &[(vec![0, 2], left), (vec![1], right)]);
+        assert_eq!(built.value_at(0), Value::Varchar("a short one".into()));
+        assert_eq!(built.value_at(1), Value::Varchar("a string that is far too long to live inline in a view".into()));
+        assert_eq!(built.value_at(2), Value::Varchar("another".into()));
+    }
+
+    #[test]
+    fn a_constant_piece_is_written_out_rather_than_read_a_row_at_a_time() {
+        // The `ELSE ''` half of the ClickBench query this was built for, which arrives as a constant
+        // over however many rows the arms did not claim.
+        let arm = Vector::from_values(LogicalType::Varchar, &[Value::Varchar("kept".into())])
+            .expect("a vector");
+        let otherwise = Vector::constant(LogicalType::Varchar, Value::Varchar("".into()), 3);
+        let built =
+            agrees(&LogicalType::Varchar, 4, &[(vec![2], arm), (vec![0, 1, 3], otherwise)]);
+        assert_eq!(built.value_at(0), Value::Varchar("".into()));
+        assert_eq!(built.value_at(2), Value::Varchar("kept".into()));
+    }
+
+    #[test]
+    fn a_dictionary_piece_is_walked_to_its_values() {
+        // A scanned string column arrives as codes over a shared dictionary, so this is the form the
+        // `THEN Referer` arm of the ClickBench query actually hands over.
+        let dictionary =
+            Vector::from_values(LogicalType::Varchar, &[Value::Varchar("one".into()), Value::Varchar("two".into())])
+                .expect("a dictionary");
+        let piece = Vector::dictionary(vec![1, 0, 1], dictionary).expect("a dictionary vector");
+        let built = agrees(&LogicalType::Varchar, 3, &[(vec![0, 1, 2], piece)]);
+        assert_eq!(values(&built), vec![Value::Varchar("two".into()), Value::Varchar("one".into()), Value::Varchar("two".into())]);
+    }
+
+    #[test]
+    fn a_piece_placed_at_the_wrong_number_of_positions_is_an_error() {
+        let piece = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)]).expect("a vector");
+        let mut assembly = Assembly::new(LogicalType::BigInt, 4).expect("an assembly");
+        assert!(assembly.place(&[0, 1], &piece).is_err(), "two positions for one row");
+    }
+
+    #[test]
+    fn a_position_past_the_end_is_an_error_rather_than_a_lost_row() {
+        let piece = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)]).expect("a vector");
+        let mut assembly = Assembly::new(LogicalType::BigInt, 2).expect("an assembly");
+        assert!(assembly.place(&[9], &piece).is_err(), "a row past the end of the assembly");
+    }
+
+    #[test]
+    fn a_piece_of_the_wrong_layout_is_an_error_rather_than_a_wrong_answer() {
+        // Two runs of data that cannot be laid end to end, which is a bug in whoever built the
+        // pieces and has to say so rather than silently keep the first one.
+        let piece = Vector::from_values(LogicalType::Varchar, &[Value::Varchar("x".into())]).expect("text");
+        let mut assembly = Assembly::new(LogicalType::BigInt, 1).expect("an assembly");
+        assert!(assembly.place(&[0], &piece).is_err(), "text laid after integers");
+    }
+
+    #[test]
+    fn every_layout_assembles_the_way_it_scatters() {
+        // One case per physical layout, because the copy loop is generated per layout and a layout
+        // missing from it is a wrong answer for that type alone, which no single typed test finds.
+        let cases: Vec<(LogicalType, Vec<Value>)> = vec![
+            (LogicalType::Boolean, vec![Value::Boolean(true), Value::Boolean(false)]),
+            (LogicalType::TinyInt, vec![Value::TinyInt(1), Value::TinyInt(-2)]),
+            (LogicalType::SmallInt, vec![Value::SmallInt(3), Value::SmallInt(-4)]),
+            (LogicalType::Integer, vec![Value::Integer(5), Value::Integer(-6)]),
+            (LogicalType::BigInt, vec![Value::BigInt(7), Value::BigInt(-8)]),
+            (LogicalType::HugeInt, vec![Value::HugeInt(9), Value::HugeInt(-10)]),
+            (LogicalType::UTinyInt, vec![Value::UTinyInt(11), Value::UTinyInt(12)]),
+            (LogicalType::USmallInt, vec![Value::USmallInt(13), Value::USmallInt(14)]),
+            (LogicalType::UInteger, vec![Value::UInteger(15), Value::UInteger(16)]),
+            (LogicalType::UBigInt, vec![Value::UBigInt(17), Value::UBigInt(18)]),
+            (LogicalType::Float, vec![Value::Float(1.5), Value::Float(-2.5)]),
+            (LogicalType::Double, vec![Value::Double(3.5), Value::Double(-4.5)]),
+            (LogicalType::Varchar, vec![Value::Varchar("first".into()), Value::Varchar("second".into())]),
+            (LogicalType::Date, vec![Value::Date(19), Value::Date(20)]),
+        ];
+        for (ty, pair) in cases {
+            let left = Vector::from_values(ty.clone(), &pair[..1]).expect("a vector");
+            let right = Vector::from_values(ty.clone(), &pair[1..]).expect("a vector");
+            let built = agrees(&ty, 2, &[(vec![1], left), (vec![0], right)]);
+            assert_eq!(built.value_at(0), pair[1], "{ty:?} at row 0");
+            assert_eq!(built.value_at(1), pair[0], "{ty:?} at row 1");
+        }
+    }
+
+    #[test]
+    fn an_assembly_is_a_chunk_column_like_any_other() {
+        // The point of building a vector rather than a `Vec<Value>` is that what comes out goes
+        // straight into a chunk, so this checks it actually does.
+        let piece = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1), Value::BigInt(2)])
+            .expect("a vector");
+        let built = agrees(&LogicalType::BigInt, 2, &[(vec![1, 0], piece)]);
+        let chunk = Chunk::new(vec![built]).expect("a chunk of one column");
+        assert_eq!(chunk.len(), 2, "two rows");
+    }
+}

@@ -2816,7 +2816,7 @@ fn boundaries(data: &Data, validity: &Validity, len: usize) -> Vec<u32> {
 ///
 /// `usize::MAX` rather than an `Option<usize>`, because the copy loop's bounds check rejects it for
 /// free and an `Option` would put a second branch next to the one already there.
-const NOWHERE: usize = usize::MAX;
+pub(crate) const NOWHERE: usize = usize::MAX;
 
 /// A run of data copied at the given positions, with a zero wherever the position is [`NOWHERE`].
 ///
@@ -2879,7 +2879,7 @@ fn run_of(data: &Data, at: usize, end: usize) -> Data {
     crate::for_each_layout!(fixed, run)
 }
 
-fn copy_of(data: &Data, at: &[usize]) -> Data {
+pub(crate) fn copy_of(data: &Data, at: &[usize]) -> Data {
     macro_rules! copied {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match data {
@@ -2925,7 +2925,7 @@ fn copy_of(data: &Data, at: &[usize]) -> Data {
 ///
 /// The two enums name their variants the same way on purpose, so this is one generated arm rather
 /// than sixteen chances to pair the wrong two up.
-fn layout_of(data: &Data) -> rudb_common::PhysicalType {
+pub(crate) fn layout_of(data: &Data) -> rudb_common::PhysicalType {
     use rudb_common::PhysicalType as P;
     macro_rules! layouts {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
@@ -3031,7 +3031,7 @@ fn bytes_as(ty: &LogicalType, bytes: &[u8]) -> Value {
 }
 
 /// An empty run of data of the right layout for a type.
-fn empty_data_for(ty: &LogicalType) -> Result<Data> {
+pub(crate) fn empty_data_for(ty: &LogicalType) -> Result<Data> {
     use rudb_common::PhysicalType as P;
     macro_rules! empties {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
