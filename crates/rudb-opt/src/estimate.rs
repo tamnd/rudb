@@ -14,11 +14,12 @@
 //! a formula.
 //!
 //! [`rows_stat`] is the same walk with the class kept, and it is the one that says which numbers
-//! are not guesses. A scan is the catalog's count and is exact, a cross product of two counted
-//! sides is arithmetic on counted numbers and is exact, a `LIMIT` over an unknown input is a real
-//! ceiling, and everything above the first filter, group by or equijoin is an estimate from a
-//! constant. Both functions walk the same tree and the numbers they give back are the same numbers,
-//! so a caller that only compares two sides can go on using [`rows`] and ignore all of this.
+//! are not guesses. A scan is the catalog's count and is exact, a Parquet read is the sum of the
+//! footers the binder read and is exact too, a cross product of two counted sides is arithmetic on
+//! counted numbers and is exact, a `LIMIT` over an unknown input is a real ceiling, and everything
+//! above the first filter, group by or equijoin is an estimate from a constant. Both functions walk
+//! the same tree and the numbers they give back are the same numbers, so a caller that only
+//! compares two sides can go on using [`rows`] and ignore all of this.
 //!
 //! The constants are the textbook ones, which is to say they are DuckDB's, which is to say they
 //! are Selinger's. They are wrong for any particular query and they are wrong in a direction that
@@ -35,11 +36,8 @@
 
 use std::collections::BTreeMap;
 
-use rudb_common::Value;
 use rudb_common::stat::{Class, Direction, Provenance, Stat};
-use rudb_plan::{
-    ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, Slice, StrRef,
-};
+use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind};
 
 use crate::walk;
 
@@ -61,7 +59,7 @@ const KEPT_BY_A_CONDITION: f64 = 0.2;
 /// this is a middle that is wrong for both rather than a guess that favours one.
 const KEPT_BY_A_GROUP_BY: f64 = 0.1;
 
-/// The row counts the optimizer was handed, by table and by file.
+/// The row counts the optimizer was handed, by table.
 ///
 /// A side table rather than a field on [`Node::Get`], and a plain count rather than a handle on the
 /// catalog. Both of those are so that a plan stays a value: the optimizer's own tests build plans
@@ -69,11 +67,9 @@ const KEPT_BY_A_GROUP_BY: f64 = 0.1;
 /// plan it was printed from, and neither of those survives a node that carries a number only a
 /// live catalog could have filled in.
 ///
-/// The files half is the same idea about a different source. A Parquet footer states exactly how
-/// many rows the file holds, which is a better number than anything in this module computes, and it
-/// arrives here rather than being read here for the reason above: this module opens nothing. The
-/// key is the path as the call wrote it, pattern and all, because that is what the plan holds and
-/// expanding a pattern is another thing this module will not do.
+/// Files are not in here. What a Parquet call produces is counted by the binder, which is the only
+/// thing in the chain holding the file open, and it rides on the plan against the table index of
+/// the call. See [`Plan::measured`].
 ///
 /// Empty is the ordinary state for anything that is not a real query, and an empty one makes every
 /// scan unknown rather than making every scan zero. A scan of a table nobody measured and a scan of
@@ -82,7 +78,6 @@ const KEPT_BY_A_GROUP_BY: f64 = 0.1;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Statistics {
     tables: BTreeMap<(String, String, String), u64>,
-    files: BTreeMap<String, u64>,
 }
 
 impl Statistics {
@@ -103,24 +98,10 @@ impl Statistics {
         self.tables.get(&(catalog.to_owned(), schema.to_owned(), table.to_owned())).copied()
     }
 
-    /// Record what the files one path argument names held, counting every one of them.
-    ///
-    /// `pattern` is the argument as it was written, so a glob is stored under the glob. The count
-    /// is the total across everything the glob matched, since that is what the call produces.
-    pub fn record_file(&mut self, pattern: &str, rows: u64) {
-        self.files.insert(pattern.to_owned(), rows);
-    }
-
-    /// What that path argument named, where anybody counted it.
-    #[must_use]
-    pub fn rows_in_file(&self, pattern: &str) -> Option<u64> {
-        self.files.get(pattern).copied()
-    }
-
     /// Whether anything at all was recorded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tables.is_empty() && self.files.is_empty()
+        self.tables.is_empty()
     }
 }
 
@@ -145,7 +126,8 @@ const CEILING: Class = Class::Certified { bound: 1.0, direction: Direction::AtMo
 /// How many rows this node is guessed to produce, where a guess can be made at all.
 ///
 /// `None` means nothing downstream of here should pretend to know, which is the answer for a scan
-/// of a table nobody measured, for every table function, and for anything above either of those.
+/// of a table nobody measured, for a table function nobody measured either, and for anything above
+/// either of those.
 ///
 /// The same answer as [`rows_stat`] read for the Decide use of `spec/stats/05-every-query.md`
 /// section 5.1.1, which is the only use a cardinality is ever put to: it chooses between two plans
@@ -190,12 +172,15 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
         // number of rows is written down.
         Node::Values { rows: list, .. } => u64::try_from(plan.row_list(list).len())
             .map_or(Stat::Unknown, |rows| Stat::exact(rows, Provenance::RowCount)),
-        // A table function is an open door, and `read_parquet` is the one of them that has been
-        // taught. The footer counted the rows, so the answer is exact, and it comes in through
-        // `Statistics` rather than being read here, because this module opens no files. A function
-        // nobody taught this about is still unknown, which is the point: guessing on behalf of all
-        // of them is the failure mode this module exists to avoid.
-        Node::TableFunction { function, args, .. } => in_file(plan, function, args, stats),
+        // Whatever the binder measured, which for a Parquet read is the sum of the footers and is
+        // exact, and for every other table function is unknown. The answer comes from the binder
+        // because the binder is the only thing in the chain with the file open, and it is read from
+        // the plan rather than worked out here because a function nobody taught this about has to
+        // stay unknown. Guessing on behalf of all of them is the failure mode this module exists to
+        // avoid.
+        Node::TableFunction { index, .. } => plan.measured(index),
+        // Once per row of whatever is on its left, and nothing here knows how many rows that is or
+        // how many the call gives back for each of them.
         Node::LateralFunction { .. } => Stat::Unknown,
         Node::Filter { input, predicate } => {
             let kept = KEPT_BY_A_CONDITION.powi(conjuncts(plan, predicate));
@@ -274,38 +259,6 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
                 _ => ceiling(total),
             }
         }
-    }
-}
-
-/// What a table function call over a file was counted to produce, where anybody counted it.
-///
-/// Only `read_parquet`, and only a call whose path is one written out string. That is what the
-/// footer answers exactly and it is the call TPC-H and every other file based benchmark makes, so
-/// it is the case worth having. A list of paths is left unknown rather than half answered, because
-/// the key here is one string and a list is not one, and a number covering some of the files would
-/// be worse than no number at all.
-///
-/// `read_csv` is not here and should not be. A CSV file states nothing about how many rows it has,
-/// so the only way to answer would be to read the whole thing, and a planner that reads the file
-/// twice to decide how to read it once is not a planner.
-fn in_file(plan: &Plan, function: StrRef, args: Slice, stats: &Statistics) -> Stat<u64> {
-    if plan.string(function) != "read_parquet" {
-        return Stat::Unknown;
-    }
-    let [path] = plan.expr_list(args) else {
-        return Stat::Unknown;
-    };
-    let Expr::Constant(value) = *plan.expr(*path) else {
-        return Stat::Unknown;
-    };
-    let Value::Varchar(pattern) = plan.value(value) else {
-        return Stat::Unknown;
-    };
-    // Exact, because the footer counted rather than sampled. This is the second place a plan starts
-    // from a number nobody guessed, and for the queries that read files it is the only one.
-    match stats.rows_in_file(pattern) {
-        Some(rows) => Stat::exact(rows, Provenance::RowCount),
-        None => Stat::Unknown,
     }
 }
 
@@ -703,48 +656,86 @@ mod tests {
     }
 
     #[test]
-    fn a_table_function_is_unknown_and_stays_unknown_over_it() {
+    fn a_table_function_nobody_measured_is_unknown_and_stays_unknown_over_it() {
         let text = "TableFunction range args=[] #0 [a::BIGINT]\n";
         assert_eq!(stat(text, &[]), Stat::Unknown);
     }
 
-    /// The estimate for a plan written as text, against the files named here rather than tables.
-    fn over_files(text: &str, files: &[(&str, u64)]) -> Stat<u64> {
-        let mut stats = Statistics::new();
-        for (path, count) in files {
-            stats.record_file(path, *count);
-        }
-        let plan =
-            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
-        rows_stat(&plan, plan.root(), &stats)
-    }
-
-    /// A `read_parquet` of one written out path, which is the call this module answers.
-    fn read_parquet(path: &str) -> String {
-        format!("TableFunction read_parquet args=['{path}'::VARCHAR] #0 [a::BIGINT]\n")
+    #[test]
+    fn a_table_function_the_binder_measured_is_as_tall_as_the_binder_said() {
+        // What a Parquet read looks like from here. The number is the footer's and this module has
+        // no opinion about it beyond passing it on with the class it arrived with.
+        let text = "TableFunction read_parquet args=[] #0 [a::BIGINT]\n";
+        let mut plan = Plan::parse(text).expect("a table function");
+        plan.measure(0, Stat::exact(6_001_215, Provenance::RowCount));
+        assert_eq!(
+            rows_stat(&plan, plan.root(), &Statistics::new()),
+            Stat::exact(6_001_215, Provenance::RowCount)
+        );
     }
 
     #[test]
-    fn a_parquet_file_somebody_counted_is_exact_because_the_footer_counted_it() {
-        let text = read_parquet("lineitem.parquet");
-        let stat = over_files(&text, &[("lineitem.parquet", 6_001_215)]);
-        assert_eq!(stat.value().copied(), Some(6_001_215));
-        assert_eq!(stat.class(), Some(Class::Exact));
+    fn a_table_function_is_measured_against_its_index_and_not_against_its_name() {
+        // Two reads of two different files in one statement. The index is what tells them apart,
+        // and it is the one identifier a rewrite cannot move without rewriting every expression
+        // above it, which is why the measurement is filed under it.
+        let text = concat!(
+            "Join INNER on=[]\n",
+            "  TableFunction read_parquet args=[] #0 [a::BIGINT]\n",
+            "  TableFunction read_parquet args=[] #1 [b::BIGINT]\n"
+        );
+        let mut plan = Plan::parse(text).expect("two table functions");
+        plan.measure(0, Stat::exact(3, Provenance::RowCount));
+        plan.measure(1, Stat::exact(5, Provenance::RowCount));
+        assert_eq!(
+            rows_stat(&plan, plan.root(), &Statistics::new()),
+            Stat::exact(15, Provenance::RowCount)
+        );
     }
 
     #[test]
-    fn a_parquet_file_nobody_counted_is_unknown_rather_than_zero() {
-        assert_eq!(over_files(&read_parquet("gone.parquet"), &[]), Stat::Unknown);
-        // Keyed on the path the call wrote, so a count filed under another path is not this one.
-        assert_eq!(over_files(&read_parquet("a.parquet"), &[("b.parquet", 10)]), Stat::Unknown);
+    fn a_table_function_nobody_measured_is_unknown_even_beside_one_that_was() {
+        // A CSV read says nothing about its own length, so it stays unknown while the Parquet read
+        // next to it is counted, and the join over the two is unknown because one side is.
+        let text = concat!(
+            "Join INNER on=[]\n",
+            "  TableFunction read_parquet args=[] #0 [a::BIGINT]\n",
+            "  TableFunction read_csv args=[] #1 [b::BIGINT]\n"
+        );
+        let mut plan = Plan::parse(text).expect("two table functions");
+        plan.measure(0, Stat::exact(3, Provenance::RowCount));
+        assert_eq!(rows_stat(&plan, plan.root(), &Statistics::new()), Stat::Unknown);
     }
 
     #[test]
-    fn a_reader_that_is_not_parquet_is_unknown_whatever_was_counted() {
-        // A CSV file says nothing about its own length, so a number filed against one would have
-        // had to come from reading the whole thing, and nobody is going to do that to plan a query.
-        let text = "TableFunction read_csv args=['t.csv'::VARCHAR] #0 [a::BIGINT]\n";
-        assert_eq!(over_files(text, &[("t.csv", 500)]), Stat::Unknown);
+    fn a_guess_over_a_measured_file_is_a_guess_with_a_number_under_it() {
+        // The point of measuring the file. Before it the filter had nothing to multiply and came
+        // out unknown, and the two constants in this module were dead code on every query over a
+        // Parquet file, which is every ClickBench query.
+        let text = concat!(
+            "Filter (#0.0::BIGINT > 5::BIGINT)::BOOLEAN\n",
+            "  TableFunction read_parquet args=[] #0 [a::BIGINT]\n"
+        );
+        let mut plan = Plan::parse(text).expect("a filter over a table function");
+        assert_eq!(rows_stat(&plan, plan.root(), &Statistics::new()), Stat::Unknown);
+        plan.measure(0, Stat::exact(1000, Provenance::RowCount));
+        let over = rows_stat(&plan, plan.root(), &Statistics::new());
+        assert_eq!(over.value().copied(), Some(200));
+        assert_eq!(over.class(), Some(Class::Estimated));
+        assert_eq!(over.provenance(), Some(Provenance::Default));
+    }
+
+    #[test]
+    fn a_lateral_function_is_unknown_however_well_the_file_beside_it_is_measured() {
+        // It runs once per row of its input and nothing here knows how many rows it gives back for
+        // each of them, so a measurement of some other table says nothing about this one.
+        let text = concat!(
+            "LateralFunction range args=[#0.0::INTEGER] #1 [a::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER]\n"
+        );
+        let mut plan = Plan::parse(text).expect("a lateral function");
+        plan.measure(1, Stat::exact(4096, Provenance::RowCount));
+        assert_eq!(rows_stat(&plan, plan.root(), &Statistics::new()), Stat::Unknown);
     }
 
     #[test]
@@ -756,14 +747,5 @@ mod tests {
         assert_eq!(stats.rows_in("memory", "main", "t"), Some(7));
         // The three names are one key. A table of the same name in another schema is another table.
         assert_eq!(stats.rows_in("memory", "other", "t"), None);
-    }
-
-    #[test]
-    fn a_file_count_on_its_own_is_something_known() {
-        let mut stats = Statistics::new();
-        stats.record_file("t.parquet", 12);
-        assert!(!stats.is_empty(), "a database with no tables and one file knows something");
-        assert_eq!(stats.rows_in_file("t.parquet"), Some(12));
-        assert_eq!(stats.rows_in_file("other.parquet"), None);
     }
 }

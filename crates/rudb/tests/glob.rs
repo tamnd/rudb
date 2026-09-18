@@ -159,3 +159,26 @@ fn a_pattern_can_be_loaded_into_a_table_like_any_other_query() {
     assert_eq!(database.value("SELECT count(*) FROM parts").expect("runs"), Value::BigInt(9));
     assert_eq!(database.value("SELECT sum(a) FROM parts").expect("runs"), Value::HugeInt(250));
 }
+
+#[test]
+fn a_pattern_is_as_tall_as_all_the_footers_it_matched_added_up() {
+    // Nine rows over three files, and the planner is told nine rather than told nothing. A pattern
+    // pays one footer read per file at bind time for this, against a scan that is about to read
+    // every one of those files in full.
+    let database = Database::new();
+    let sql = format!("EXPLAIN SELECT a FROM {}", parquet("**/p*.parquet"));
+    let result = database.query(&sql).expect("the explain ran");
+    let Value::Varchar(text) = result.value_at(0, 1) else { panic!("the plan is not text") };
+    assert!(text.contains("[9 rows exact from row count]"), "{text}");
+}
+
+#[test]
+fn a_csv_pattern_stays_unknown_because_nothing_counted_it() {
+    // A CSV file states nothing about how many rows it holds, so the only way to know is to read
+    // it, and reading it at bind time to plan it better is a worse trade than planning it blind.
+    let database = Database::new();
+    let sql = format!("EXPLAIN SELECT a FROM {}", csv("c*.csv"));
+    let result = database.query(&sql).expect("the explain ran");
+    let Value::Varchar(text) = result.value_at(0, 1) else { panic!("the plan is not text") };
+    assert!(text.contains("[rows unknown]"), "{text}");
+}

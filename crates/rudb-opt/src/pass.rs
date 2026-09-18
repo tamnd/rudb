@@ -172,16 +172,6 @@ impl Context {
         self.statistics = statistics;
     }
 
-    /// Adds what the files one path argument names were counted to hold.
-    ///
-    /// Separate from [`Context::measure`] and additive rather than replacing, because the two
-    /// numbers are found at different times. The catalog can be read before anything is parsed,
-    /// and a file cannot: the plan is what says which files the query reads, so this is the caller
-    /// that already has the bound plan in its hand.
-    pub fn measure_file(&mut self, pattern: &str, rows: u64) {
-        self.statistics.record_file(pattern, rows);
-    }
-
     /// What is known about how large the tables are.
     #[must_use]
     pub fn statistics(&self) -> &crate::estimate::Statistics {

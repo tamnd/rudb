@@ -108,6 +108,14 @@ Two present limitations of the exact path are worth recording because they are t
 
 **`distinct_values` only answers for string columns,** because it is really "dictionary size". Numeric columns have no exact distinct count today. The KMV sketch closes it as certified-or-estimated, and `is_exact` closes it as *exact* for low-cardinality numeric columns, which is most dimension keys, most enumerations, and most of what people group by.
 
+## 2.6.1 The foreign file path, and what a footer already answers
+
+A query over a Parquet file never reaches the catalogue at all, and until recently it never reached a statistic either. `read_parquet` is a table function, a table function answered `Unknown`, and so did everything above it, so the two selectivity constants in `crates/rudb-opt/src/estimate.rs` never got a number to multiply. Measured over the 43 ClickBench queries against the ten million row file: 235 cardinalities in the printed plans, 179 of them `Unknown`, 38 a `Certified at most` ceiling from a `LIMIT`, 18 `Exact` from the one row of an ungrouped aggregate, and not one of them `Estimated`. The planner was not guessing badly. It had nothing to guess from.
+
+The fix was not a new statistic. A Parquet footer states the row count of the file, the binder already opens that footer to settle the schema before the rest of the statement can bind, and the number was being read and dropped. Keeping it takes those same 235 cardinalities to 78 `Exact` with provenance `RowCount` and 157 `Estimated` with provenance `Default`, and nothing unknown.
+
+That is the order the rest of the suppliers should arrive in. A statistic that is already on disk and already being read is worth more than a better formula over nothing. The same footer holds more than the count: per row group row counts, and per column chunk minimum, maximum, null count and distinct count wherever the writer wrote them. Those are section 2.2's per part zone maps arriving for free on foreign data, and they are the next entry rather than a later one.
+
 ## 2.7 What is deliberately not in the catalogue
 
 **Multidimensional histograms.** `../planner/06-cardinality-and-cost.md` section 06.6 rules them out; the dependence term covers the case they exist for.

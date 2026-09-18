@@ -561,7 +561,7 @@ impl Shared {
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
         let catalog = self.read();
         let seams = self.seams(sql)?;
-        let mut context = self.optimizer(&catalog)?;
+        let context = self.optimizer(&catalog)?;
         let session = self.session();
         let (ast, parse_ns) =
             timed(|| rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case()))?;
@@ -569,7 +569,6 @@ impl Shared {
             timed(|| rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new(), &session))?;
         match bound {
             Bound::Query(mut plan) => {
-                measure_files(&plan, &mut context);
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let budget = self.budget();
                 let under =
@@ -578,7 +577,6 @@ impl Shared {
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
-                measure_files(&plan, &mut context);
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
@@ -657,8 +655,8 @@ impl Shared {
     /// The plan a query runs.
     pub(crate) fn plan(&self, sql: &str) -> Result<String> {
         let catalog = self.read();
-        let mut context = self.optimizer(&catalog)?;
-        Ok(planned(sql, &catalog, &mut context, &self.session())?.to_string())
+        let context = self.optimizer(&catalog)?;
+        Ok(planned(sql, &catalog, &context, &self.session())?.to_string())
     }
 
     /// Runs one statement, which may change the database.
@@ -694,13 +692,12 @@ impl Shared {
     ) -> Result<QueryResult> {
         let seams = self.seams(sql)?;
         let mut catalog = self.write();
-        let mut context = self.optimizer(&catalog)?;
+        let context = self.optimizer(&catalog)?;
         let session = self.session();
         let (bound, bind_ns) =
             timed(|| rudb_bind::bind_statement_with(ast, &catalog, parameters, &session))?;
         match bound {
             Bound::Query(mut plan) => {
-                measure_files(&plan, &mut context);
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let budget = self.budget();
                 let under =
@@ -709,7 +706,6 @@ impl Shared {
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
-                measure_files(&plan, &mut context);
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
@@ -818,55 +814,6 @@ impl Shared {
     }
 }
 
-/// Tells the optimizer how large the Parquet files a bound plan reads are.
-///
-/// The half of the statistics that cannot be gathered before the statement is parsed. A catalog can
-/// be measured at any time because the tables are already there, and a file cannot, because the
-/// query is what says which files it reads. So this runs between binding and optimizing, and it is
-/// here rather than in `rudb_opt` because reading a footer is opening a file and the optimizer
-/// opens nothing.
-///
-/// Every node rather than every node the root reaches, which reads a footer for a table function
-/// the binder built and then left behind. There is no such node today and the walk is simpler this
-/// way, and a wasted footer read is two small reads rather than a wrong answer.
-///
-/// A file it cannot count is left out of the statistics, so the estimate for that scan stays
-/// unknown and the passes that need one skip it. That is the behaviour they already have for a
-/// table nobody measured.
-fn measure_files(plan: &rudb_plan::Plan, context: &mut rudb_opt::pass::Context) {
-    let patterns: Vec<String> =
-        (0..plan.node_count()).filter_map(|at| parquet_path(plan, at as u32)).collect();
-    for pattern in patterns {
-        if let Some(rows) = rudb_functions::parquet_rows(&pattern) {
-            context.measure_file(&pattern, rows);
-        }
-    }
-}
-
-/// The path a node reads Parquet from, for a node that is a `read_parquet` of one written out path.
-///
-/// `None` for everything else, which includes a call over a list of paths. One string is the key
-/// `rudb_opt::estimate` stores a count under, and a list is not one string, so a list is left
-/// unmeasured rather than measured under a key that could not be looked up again.
-fn parquet_path(plan: &rudb_plan::Plan, node: u32) -> Option<String> {
-    let rudb_plan::Node::TableFunction { function, args, .. } = *plan.node(node) else {
-        return None;
-    };
-    if plan.string(function) != "read_parquet" {
-        return None;
-    }
-    let [path] = plan.expr_list(args) else {
-        return None;
-    };
-    let rudb_plan::Expr::Constant(value) = *plan.expr(*path) else {
-        return None;
-    };
-    match plan.value(value) {
-        Value::Varchar(pattern) => Some(pattern.clone()),
-        _ => None,
-    }
-}
-
 /// A query bound and then optimized, which is the plan that runs.
 ///
 /// What [`Database::plan`] dumps, and it optimizes rather than stopping at the bound plan because a
@@ -876,11 +823,10 @@ fn parquet_path(plan: &rudb_plan::Plan, node: u32) -> Option<String> {
 fn planned(
     sql: &str,
     catalog: &Catalog,
-    context: &mut rudb_opt::pass::Context,
+    context: &rudb_opt::pass::Context,
     session: &Session,
 ) -> Result<rudb_plan::Plan> {
     let mut plan = rudb_bind::bind_sql_with(sql, catalog, session)?;
-    measure_files(&plan, context);
     rudb_opt::optimize_with(&mut plan, context)?;
     Ok(plan)
 }
