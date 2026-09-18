@@ -598,3 +598,219 @@ fn distinct_inside_a_value_window_is_refused_the_way_the_pin_refuses_it() {
         "{error}"
     );
 }
+
+#[test]
+fn fill_reads_the_line_between_the_values_on_either_side_of_a_gap() {
+    // The gapped table has its values at k 1, 4 and 6, so the three gaps are read off two different
+    // lines and the answers land on the tens because the keys are evenly spaced. Nothing here reads
+    // the frame: the second and third queries ask for a frame of one row and for the whole
+    // partition with the row itself dropped, and both answer the same column as the first.
+    let line = ints(&[Some(10), Some(20), Some(30), Some(40), Some(50), Some(60)]);
+    assert_eq!(gapped_answer("fill(v) OVER (ORDER BY k)"), line);
+    assert_eq!(
+        gapped_answer("fill(v) OVER (ORDER BY k ROWS BETWEEN CURRENT ROW AND CURRENT ROW)"),
+        line
+    );
+    assert_eq!(
+        gapped_answer(
+            "fill(v) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING \
+             EXCLUDE CURRENT ROW)"
+        ),
+        line
+    );
+}
+
+/// The window column of a query over a table built here, ordered so the rows arrive known.
+fn filled(rows: &str, over: &str) -> Vec<Value> {
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("CREATE TABLE f(k INTEGER, v INTEGER)").expect("creates the table");
+    connection.execute(&format!("INSERT INTO f VALUES {rows}")).expect("inserts the rows");
+    let sql = format!("SELECT fill(v) OVER ({over}) FROM f ORDER BY k");
+    column(&database, &sql, 0)
+}
+
+#[test]
+fn a_gap_past_either_end_carries_the_line_on_rather_than_the_value() {
+    // The part of `fill` that surprises people. A gap before the first value borrows the first two
+    // values and a gap after the last borrows the last two, so both ends keep going at the slope
+    // the values had rather than flattening out. The keys are uneven here on purpose, because a
+    // slope read off the sort key and a slope read off the row count agree on evenly spaced keys
+    // and nowhere else: 10 and 20 are two rows before the 100 and sixty of the key away from it.
+    assert_eq!(
+        filled("(10,NULL),(20,NULL),(30,100),(31,102),(90,NULL)", "ORDER BY k"),
+        ints(&[Some(60), Some(80), Some(100), Some(102), Some(220)])
+    );
+}
+
+#[test]
+fn one_value_is_carried_everywhere_and_none_leaves_the_column_alone() {
+    // With one value there is no line to read, so it is repeated, and this is the one case where
+    // `fill` does flatten out. With no values there is nothing to repeat either.
+    assert_eq!(filled("(1,NULL),(2,5),(3,NULL)", "ORDER BY k"), ints(&[Some(5); 3]));
+    assert_eq!(filled("(1,NULL),(2,NULL)", "ORDER BY k"), ints(&[None, None]));
+}
+
+#[test]
+fn a_gap_between_two_values_the_same_distance_apart_answers_the_earlier_one() {
+    // Two keys in the same place have no line between them, so the slope is zero and the answer is
+    // whichever value came first. The last row asks for the line at a key that is not on it at all
+    // and gets the same answer for the same reason.
+    assert_eq!(
+        filled("(1,10),(1,NULL),(1,30),(2,NULL)", "ORDER BY k"),
+        ints(&[Some(10), Some(10), Some(30), Some(10)])
+    );
+}
+
+#[test]
+fn a_partition_is_filled_on_its_own_and_nothing_is_read_across_the_line() {
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("CREATE TABLE g(p INTEGER, k INTEGER, v INTEGER)").expect("creates it");
+    connection
+        .execute("INSERT INTO g VALUES (1,1,5),(1,2,NULL),(1,3,15),(2,1,NULL),(2,2,8),(2,3,NULL)")
+        .expect("inserts six rows");
+    let sql = "SELECT fill(v) OVER (PARTITION BY p ORDER BY k) FROM g ORDER BY p, k";
+    assert_eq!(
+        column(&database, sql, 0),
+        ints(&[Some(5), Some(10), Some(15), Some(8), Some(8), Some(8)])
+    );
+}
+
+#[test]
+fn fill_answers_in_the_type_it_was_given_and_the_arithmetic_happens_where_that_type_stores_it() {
+    // Four types and four different number lines under them. A DECIMAL interpolates on its unscaled
+    // integer so the scale cancels out of the slope, a DATE on its day count, a TIMESTAMP on its
+    // microseconds, and a DOUBLE on itself. Every one of these was read off the pin.
+    let database = Database::new();
+    let connection = database.connect();
+    connection
+        .execute("CREATE TABLE m(k INTEGER, a DECIMAL(10,2), b DATE, c TIMESTAMP, d DOUBLE)")
+        .expect("creates the table");
+    connection
+        .execute(
+            "INSERT INTO m VALUES (1,10.00,DATE '2020-01-01',TIMESTAMP '2020-01-01 00:00:00',1.0), \
+             (2,NULL,NULL,NULL,NULL),(4,25.50,DATE '2020-01-11',TIMESTAMP '2020-01-01 00:00:09',2.0)",
+        )
+        .expect("inserts three rows");
+    let over = "OVER (ORDER BY k)";
+    let sql = format!(
+        "SELECT fill(a) {over}, fill(b) {over}, fill(c) {over}, fill(d) {over} FROM m ORDER BY k"
+    );
+    let gap: Vec<Value> = {
+        let connection = database.connect();
+        let result = connection.query(&sql).expect("the query runs");
+        result.rows().nth(1).expect("a second row").to_vec()
+    };
+    assert_eq!(
+        gap,
+        vec![
+            // 1000 and 2550 a third of the way apart is 1516 and a bit, truncated toward zero.
+            Value::Decimal { unscaled: 1516, width: 10, scale: 2 },
+            // Day 18262 and day 18272 a third apart is day 18265, which is the fourth of January.
+            Value::Date(18265),
+            // Nine seconds a third of the way through is three, counted in microseconds from the
+            // epoch and not from the first value, which is where the arithmetic happens.
+            Value::Timestamp(1_577_836_803_000_000),
+            // The last digit is the point. Upstream weighs the two ends against each other rather
+            // than walking the distance from the first, and the two write different doubles.
+            Value::Double(1.333_333_333_333_333_5),
+        ]
+    );
+}
+
+#[test]
+fn a_value_the_type_cannot_hold_is_null_rather_than_an_error() {
+    // Upstream answers null here too. The line through 120 and 127 reaches 134 at the third row and
+    // a TINYINT stops at 127, so there is nothing to put in the column and nothing is put there.
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("CREATE TABLE o(k INTEGER, v TINYINT)").expect("creates the table");
+    connection.execute("INSERT INTO o VALUES (1,120),(2,127),(3,NULL)").expect("inserts them");
+    let sql = "SELECT fill(v) OVER (ORDER BY k) FROM o ORDER BY k";
+    assert_eq!(
+        column(&database, sql, 0),
+        vec![Value::TinyInt(120), Value::TinyInt(127), Value::Null]
+    );
+}
+
+#[test]
+fn a_key_that_is_not_a_number_takes_no_part_and_leaves_its_own_row_where_it_was() {
+    // A null key sorts to one end of the partition and an infinity to the other, so the rows that
+    // can be filled are one stretch in the middle. A row outside it keeps whatever it already had,
+    // which for the null key here is a null, and it is not an anchor for anybody else either.
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("CREATE TABLE s(k DOUBLE, v INTEGER)").expect("creates the table");
+    connection.execute("INSERT INTO s VALUES (1,10),(NULL,NULL),(3,NULL),(2,20)").expect("rows");
+    let sql = "SELECT fill(v) OVER (ORDER BY k) FROM s ORDER BY k";
+    assert_eq!(column(&database, sql, 0), ints(&[Some(10), Some(20), Some(30), None]));
+}
+
+#[test]
+fn a_value_that_is_not_a_number_is_kept_and_is_not_an_anchor_for_anybody_else() {
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("CREATE TABLE q(k INTEGER, v DOUBLE)").expect("creates the table");
+    connection
+        .execute("INSERT INTO q VALUES (1,'nan'::DOUBLE),(2,NULL),(3,1.0),(4,NULL),(5,3.0)")
+        .expect("inserts five rows");
+    let sql = "SELECT fill(v) OVER (ORDER BY k) FROM q ORDER BY k";
+    let answered = column(&database, sql, 0);
+    assert!(matches!(answered[0], Value::Double(held) if held.is_nan()), "{:?}", answered[0]);
+    // The second row has no value before it, so it borrows the two after it and reads the line
+    // backwards to reach a key the values never got to.
+    assert_eq!(
+        answered[1..],
+        [Value::Double(0.0), Value::Double(1.0), Value::Double(2.0), Value::Double(3.0)]
+    );
+}
+
+#[test]
+fn the_line_past_the_end_runs_in_the_direction_the_sort_key_gives_it() {
+    // The one place this deliberately answers something the pinned binary does not. Upstream
+    // extrapolates by putting the smaller of the two values first and negating the distance with
+    // it, comparing the values rather than the keys they are ordered by, so its line runs backwards
+    // for any column that falls as the key rises and for every descending `ORDER BY`. On the first
+    // of these it says 0 and -10 where the line through 30 at key 2 and 20 at key 3 says 10 and 0,
+    // and on the second it says 30 and 20 where the line through the two known rows says 30 and 40.
+    // Both of its answers are wrong and neither is pinned by anything in its own corpus, which has
+    // no descending order in it and no falling column to extrapolate from.
+    assert_eq!(
+        filled("(1,30),(2,20),(3,NULL),(4,NULL)", "ORDER BY k"),
+        ints(&[Some(30), Some(20), Some(10), Some(0)])
+    );
+    assert_eq!(
+        filled("(1,10),(2,20),(3,NULL),(4,NULL),(5,NULL)", "ORDER BY k DESC"),
+        ints(&[Some(10), Some(20), Some(30), Some(40), Some(50)])
+    );
+    // Where the values rise under an ascending order the two agree, which is every case upstream's
+    // own tests cover.
+    assert_eq!(
+        filled("(1,NULL),(2,NULL),(3,20),(4,30)", "ORDER BY k"),
+        ints(&[Some(0), Some(10), Some(20), Some(30)])
+    );
+}
+
+#[test]
+fn a_decimal_that_would_not_fit_its_own_width_is_null_rather_than_too_wide() {
+    // The second place this deliberately answers something the pinned binary does not. Upstream
+    // checks the container a DECIMAL is stored in and never checks the declared width, so the line
+    // through 1 and 999 reaching 1997 at the third row comes out of it as a four digit
+    // DECIMAL(3,0), and reading it back or casting it wider gives 1997 again. Null is what upstream
+    // itself answers as soon as the number is wide enough to miss the container too, so this
+    // answers null at the width instead of waiting for the container.
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("CREATE TABLE w(k INTEGER, v DECIMAL(3,0))").expect("creates the table");
+    connection.execute("INSERT INTO w VALUES (1,1),(2,999),(3,NULL)").expect("inserts them");
+    let sql = "SELECT fill(v) OVER (ORDER BY k) FROM w ORDER BY k";
+    assert_eq!(
+        column(&database, sql, 0),
+        vec![
+            Value::Decimal { unscaled: 1, width: 3, scale: 0 },
+            Value::Decimal { unscaled: 999, width: 3, scale: 0 },
+            Value::Null,
+        ]
+    );
+}
