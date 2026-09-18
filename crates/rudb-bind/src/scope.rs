@@ -206,6 +206,12 @@ impl Scope {
         self.columns.remove(position);
     }
 
+    /// Drops everything from `position` on, which is what a semi or an anti join does to the right
+    /// side once its condition has been bound.
+    pub(crate) fn truncate(&mut self, position: usize) {
+        self.columns.truncate(position);
+    }
+
     /// Where a column of that name sits, if exactly one does.
     pub(crate) fn position_of(&self, table: Option<&str>, name: &str) -> Option<usize> {
         let mut found = None;
