@@ -2,11 +2,20 @@
 //!
 //! Two ways of finding the rows one row matches, and one set of rules about what to do with them.
 //!
-//! A condition that is an equality between a column of one side and a column of the other is
-//! answered by looking the value up. The gathered side goes into a hash table once and each driving
-//! row reads one entry out of it, so the work is the two sides added rather than multiplied. That
-//! is the asymptotic half of `spec/07-execution.md` section 7.4 and it is where every join in a
+//! A condition that is an equality with one side's columns on its left and the other side's on its
+//! right is answered by looking the value up. The gathered side goes into a hash table once and each
+//! driving row reads one entry out of it, so the work is the two sides added rather than multiplied.
+//! That is the asymptotic half of `spec/07-execution.md` section 7.4 and it is where every join in a
 //! query past the simplest one ends up.
+//!
+//! What goes into the table is the value of an expression rather than the contents of a column. The
+//! binder writes `p.k::INTEGER = b.k` as a cast around one operand, and a join key that had to be a
+//! bare column would look at that cast, fail to recognise it, and hand the whole join to the nested
+//! loop. Joining a million rows to a hundred thousand that way is ten to the eleventh pairs, which
+//! is hours, so the difference between reading a column and evaluating an expression over it is the
+//! difference between a query that answers and a query that does not. The keys are evaluated a chunk
+//! at a time on both sides, through the same vectorized evaluator the nested loop uses, so an
+//! expression key costs one pass over a side and not one call per row.
 //!
 //! Anything else is a nested loop: the condition is evaluated over the driving row paired with a
 //! whole chunk of the gathered side, which keeps the evaluator on its batch interface and makes the
@@ -74,7 +83,7 @@ use rudb_common::{
 };
 use rudb_kernels::{Connective, combine, is_true};
 use rudb_pipeline::{Progress, Sink, Stream};
-use rudb_plan::{CompareOp, Expr, ExprRef, JoinKind, Plan, Slice};
+use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Plan, Slice};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
@@ -237,13 +246,26 @@ impl<'a> Join<'a> {
         };
         let index = match &equalities {
             Some(equalities) => Some(index(
+                equalities.gathered(self.plan, &self.right_schema, self.time_zone),
                 right_rows,
-                &equalities.right,
-                &equalities.null_is_a_value,
                 &self.cancel,
                 &mut scratch,
             )?),
             None => None,
+        };
+        // The driving side's keys up front rather than one at a time inside the loop, because the
+        // evaluator works on a chunk and the loop below works on a row. What it costs is one key per
+        // driving row held while the join runs, which is the price of keeping the loop's shape, and
+        // it is charged. The stream next door does not pay it: it has the driving chunk in hand and
+        // reads the keys straight out of the vectors.
+        let left_keys = match &equalities {
+            Some(equalities) => keys(
+                equalities.driving(self.plan, &self.left_schema, self.time_zone),
+                left_rows,
+                &self.cancel,
+                &mut scratch,
+            )?,
+            None => Vec::new(),
         };
         // Nothing evaluates a condition over the gathered side when the index answers it, and these
         // chunks are a second copy of a side that is already held whole.
@@ -254,7 +276,7 @@ impl<'a> Join<'a> {
         let mut matched = vec![false; right_rows.len()];
         scratch.grow(u64::try_from(right_rows.len()).unwrap_or(u64::MAX))?;
         let mut out: Vec<Vec<Value>> = Vec::new();
-        for left_row in left_rows {
+        for (position, left_row) in left_rows.iter().enumerate() {
             // Once per left row, in the same place and for the same reason as the reservation at
             // the bottom of the loop. What a query can run past its clock by is one pass over the
             // right side, which is the smallest unit this loop has that is not the inner one.
@@ -272,11 +294,9 @@ impl<'a> Join<'a> {
                 continue;
             }
             let scanned;
-            let hits: &[usize] = match (&equalities, &index) {
-                (Some(equalities), Some(index)) => {
-                    hits(index, left_row, &equalities.left, &equalities.null_is_a_value)
-                }
-                _ => {
+            let hits: &[usize] = match &index {
+                Some(index) => hits(index, left_keys[position].as_ref()),
+                None => {
                     scanned = self.matching(left_row, &left_types, &right_chunks)?;
                     &scanned
                 }
@@ -576,9 +596,14 @@ impl Stream for CrossProduct {
 /// question of the whole gathered side per driving row, and a `POSITIONAL` one is not a lookup at
 /// all. [`streamed`] is the list.
 #[derive(Debug)]
-pub(crate) struct Probe {
+pub(crate) struct Probe<'a> {
+    plan: &'a Plan,
     kind: JoinKind,
     equalities: Equalities,
+    /// What a driving row looks like, which is what the driving key expressions resolve against.
+    left_schema: Schema,
+    /// What a gathered row looks like, which is what the gathered key expressions resolve against.
+    right_schema: Schema,
     /// How wide a driving row is, which is how far to rotate a swapped one.
     left_width: usize,
     /// How wide a gathered row is, which is how much padding an unmatched driving row takes.
@@ -602,6 +627,8 @@ pub(crate) struct Probe {
     /// the gather holds that reservation until the pipeline that depends on it is done, so charging
     /// them a second time on the way into this operator would count one copy twice.
     held: Mutex<Reservation>,
+    /// The parsed zone used by casts in the key expressions.
+    time_zone: SessionTimeZone,
 }
 
 /// The gathered side and the table that finds rows in it.
@@ -616,6 +643,13 @@ struct Built {
 pub(crate) struct Probing {
     /// The driving chunk being walked, held while there is any of it left to answer.
     left: Option<Chunk>,
+    /// That chunk's key columns, evaluated once when the chunk arrived.
+    ///
+    /// Empty when there is nothing to look up, which is a gathered side with no keyed rows in it.
+    /// Every lookup misses then, so evaluating the driving side's key expressions would be work
+    /// thrown away, and a key expression that raises on a row nothing could have matched would be
+    /// raising where the nested loop this replaces never evaluated anything at all.
+    keys: Vec<Vector>,
     row: usize,
     /// How many of the current row's matches have already come out.
     ///
@@ -636,14 +670,14 @@ pub(crate) fn streamed(kind: JoinKind) -> bool {
     )
 }
 
-impl Probe {
+impl<'a> Probe<'a> {
     /// The probe for this join, or nothing when this is not a join a lookup answers.
     ///
     /// `left` is the schema of the side whose rows arrive here and `right` is the side the pipeline
     /// before this one gathered, with `kind` stated in those terms, all exactly as [`Join::new`]
     /// takes them.
     pub(crate) fn new(
-        plan: &Plan,
+        plan: &'a Plan,
         left: &Schema,
         right: &Gathered<'_>,
         kind: JoinKind,
@@ -664,8 +698,11 @@ impl Probe {
             _ => Schema::concat(left, right_schema),
         };
         Some(Self {
+            plan,
             kind,
             equalities,
+            left_schema: left.clone(),
+            right_schema: right_schema.clone(),
             left_width: left.width(),
             right_width: right_schema.width(),
             types: schema.types(),
@@ -675,7 +712,15 @@ impl Probe {
             gathered: right.rows.clone(),
             built: OnceLock::new(),
             held: Mutex::new(memory.reservation()),
+            time_zone: SessionTimeZone::default(),
         })
+    }
+
+    /// Applies the session semantics to the key expressions.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.time_zone = session.session_time_zone();
+        self
     }
 
     /// What this operator produces, which is both sides' columns unless the kind throws one away.
@@ -695,9 +740,8 @@ impl Probe {
                 let rows = self.gathered.take()?;
                 let mut held = self.held.lock().map_err(poisoned)?;
                 let index = index(
+                    self.equalities.gathered(self.plan, &self.right_schema, self.time_zone),
                     &rows,
-                    &self.equalities.right,
-                    &self.equalities.null_is_a_value,
                     &self.cancel,
                     &mut held,
                 )?;
@@ -707,23 +751,39 @@ impl Probe {
     }
 }
 
-impl Stream for Probe {
+impl Stream for Probe<'_> {
     type Local = Probing;
 
     fn local(&self) -> Probing {
-        Probing { left: None, row: 0, hit: 0 }
+        Probing { left: None, keys: Vec::new(), row: 0, hit: 0 }
     }
 
     fn push(&self, chunk: &mut Chunk, local: &mut Probing) -> Result<Progress> {
         let built = self.built()?;
         let left = match local.left.take() {
             // Being asked again, so the chunk holds whatever was downstream of it and the driving
-            // rows are the ones this instance kept.
+            // rows are the ones this instance kept. Their keys are kept beside them, because
+            // evaluating them again would be the same answer at the same price.
             Some(left) => left,
             None => {
                 local.row = 0;
                 local.hit = 0;
-                chunk.clone()
+                let left = chunk.clone();
+                // Once per driving chunk rather than once per driving row, which is what keeps the
+                // evaluator on its batch interface here as well. Nothing at all against an empty
+                // table, for the reason [`Probing::keys`] gives.
+                local.keys = if built.index.is_empty() {
+                    Vec::new()
+                } else {
+                    evaluate_all_in_time_zone(
+                        self.plan,
+                        &self.equalities.left,
+                        &self.left_schema,
+                        &left,
+                        self.time_zone,
+                    )?
+                };
+                left
             }
         };
         let mut out: Vec<Vec<Value>> = Vec::new();
@@ -732,8 +792,12 @@ impl Stream for Probe {
             // place in this operator that runs long once the table is built.
             self.cancel.check()?;
             let row: Vec<Value> = left.row(local.row).collect();
-            let found =
-                hits(&built.index, &row, &self.equalities.left, &self.equalities.null_is_a_value);
+            let key = if local.keys.is_empty() {
+                None
+            } else {
+                key_at(&local.keys, local.row, &self.equalities.null_is_a_value)
+            };
+            let found = hits(&built.index, key.as_ref());
             match self.kind {
                 JoinKind::Semi => {
                     if !found.is_empty() {
@@ -800,17 +864,17 @@ fn too_many_rows() -> Error {
     )
 }
 
-/// The columns a join's equalities line up, by position on each side.
+/// The expressions a join's equalities line up, one pair per equality.
 ///
 /// Two lists rather than a list of pairs because each of them is read whole: one builds the key of
 /// a gathered row and the other builds the key of a driving row, and they are in the same order so
 /// that the two keys are the same key.
 #[derive(Debug)]
 struct Equalities {
-    /// Positions in a row of the driving side.
-    left: Vec<usize>,
-    /// Positions in a row of the gathered side, in the order the driving side's are in.
-    right: Vec<usize>,
+    /// Key expressions over a row of the driving side.
+    left: Vec<ExprRef>,
+    /// Key expressions over a row of the gathered side, in the order the driving side's are in.
+    right: Vec<ExprRef>,
     /// Whether a null in this column is a value to match on, one entry per column above.
     ///
     /// True where the condition was `IS NOT DISTINCT FROM`, which two nulls answer true, and false
@@ -821,20 +885,141 @@ struct Equalities {
     null_is_a_value: Vec<bool>,
 }
 
-/// The columns a join's conditions line up, when every one of them lines two columns up.
+impl Equalities {
+    /// What it takes to read the driving side's keys out of its rows.
+    fn driving<'a>(
+        &'a self,
+        plan: &'a Plan,
+        schema: &'a Schema,
+        time_zone: SessionTimeZone,
+    ) -> Keying<'a> {
+        Keying { plan, exprs: &self.left, schema, nulls: &self.null_is_a_value, time_zone }
+    }
+
+    /// The same for the gathered side, which is the half that goes into the table.
+    fn gathered<'a>(
+        &'a self,
+        plan: &'a Plan,
+        schema: &'a Schema,
+        time_zone: SessionTimeZone,
+    ) -> Keying<'a> {
+        Keying { plan, exprs: &self.right, schema, nulls: &self.null_is_a_value, time_zone }
+    }
+}
+
+/// One side's half of the equalities, with everything it takes to evaluate them.
 ///
-/// This is the question that decides whether the nested loop runs at all. An equality between a
-/// column of one side and a column of the other is answerable by looking the value up, and a
-/// condition that is anything else is not, so a join whose conditions are all equalities is a join
-/// that never has to compare a pair to find out whether it is a pair. It is also the question
+/// The two halves are the same shape and are read by the same code, and a function that took the
+/// five of them apart would be a function whose arguments could be given in the wrong order. Built
+/// by [`Equalities::driving`] and [`Equalities::gathered`], which is where the choice of half is
+/// made and the only place it can be made wrongly.
+#[derive(Debug, Clone, Copy)]
+struct Keying<'a> {
+    plan: &'a Plan,
+    /// The key expressions over a row of this side, one per equality.
+    exprs: &'a [ExprRef],
+    /// What a row of this side looks like, which is what those expressions resolve against.
+    schema: &'a Schema,
+    /// Whether a null in each key column is a value to match on. See [`Equalities::null_is_a_value`].
+    nulls: &'a [bool],
+    /// The parsed zone the casts in those expressions read.
+    time_zone: SessionTimeZone,
+}
+
+/// Which side of a join an expression reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Driving,
+    Gathered,
+}
+
+/// The side every column of `expr` comes from, or nothing when it is not exactly one side.
+///
+/// Both sides is nothing, because an expression over both is a comparison in disguise and there is
+/// no value to put in a table for it. Neither side is nothing too: an expression over no columns at
+/// all is a constant, and `1 = 1` beside a real equality is a filter the optimizer should have
+/// folded rather than a key that lines two sides up. A column in neither schema is a plan this
+/// operator cannot resolve, and guessing a side for it is how a join answers with the wrong rows.
+fn side_of(plan: &Plan, expr: ExprRef, driving: &Schema, gathered: &Schema) -> Option<Side> {
+    let mut side = None;
+    let mut mixed = false;
+    columns(plan, expr, &mut |binding| {
+        let found = if driving.position_of(binding).is_some() {
+            Some(Side::Driving)
+        } else if gathered.position_of(binding).is_some() {
+            Some(Side::Gathered)
+        } else {
+            None
+        };
+        match (side, found) {
+            (_, None) => mixed = true,
+            (None, Some(one)) => side = Some(one),
+            (Some(held), Some(one)) => mixed |= held != one,
+        }
+    });
+    if mixed { None } else { side }
+}
+
+/// Calls `found` for every column `expr` reads.
+///
+/// The same walk `rudb_opt`'s `walk::columns` does, written again here because that one is private
+/// to the optimizer and this crate does not depend on it. Total over [`Expr`] on purpose rather than
+/// with a catch-all arm: a variant added later that holds expressions has to be added here too, and
+/// a match that compiles while quietly missing one would make a join key out of an expression whose
+/// columns nobody looked at.
+fn columns(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ColumnBinding)) {
+    match *plan.expr(expr) {
+        Expr::Column(binding) => found(binding),
+        Expr::Constant(_) => {}
+        Expr::Cast { input, .. } => columns(plan, input, found),
+        Expr::Compare { left, right, .. } => {
+            columns(plan, left, found);
+            columns(plan, right, found);
+        }
+        Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
+            for &child in plan.expr_list(children) {
+                columns(plan, child, found);
+            }
+        }
+        Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
+            for &arg in plan.expr_list(args) {
+                columns(plan, arg, found);
+            }
+            if let Some(inner) = filter {
+                columns(plan, inner, found);
+            }
+        }
+        Expr::Case { arms, otherwise } => {
+            for arm in plan.arm_list(arms) {
+                columns(plan, arm.when, found);
+                columns(plan, arm.then, found);
+            }
+            if let Some(inner) = otherwise {
+                columns(plan, inner, found);
+            }
+        }
+    }
+}
+
+/// The expressions a join's conditions line up, when every one of them lines two sides up.
+///
+/// This is the question that decides whether the nested loop runs at all. An equality whose two
+/// operands read opposite sides is answerable by looking the value up, and a condition that is
+/// anything else is not, so a join whose conditions are all such equalities is a join that never has
+/// to compare a pair to find out whether it is a pair. It is also the question
 /// `crates/rudb-exec/src/build.rs` asks to decide which of the two operators here to build, which is
 /// why it is a function of the plan rather than a method on either of them.
 ///
-/// All of them or none of them, for now. A join with an equality and something else could still use
-/// the equality to find candidates and evaluate the rest over those, and that is the shape this
-/// wants next. What it takes is building a chunk of the candidate rows to evaluate over, which is a
-/// second copy of part of a side, and doing it before the plain case is measured would be adding the
-/// complicated half first.
+/// An operand is an expression and not a column. `ON p.k::INTEGER = b.k` binds to a cast around one
+/// operand and `ON upper(a.name) = b.name` to a call, and both of those are a value per row that a
+/// table can be keyed on exactly as a column is. What matters is not the shape of the operand but
+/// where its columns come from, which is what [`side_of`] answers.
+///
+/// All of the conditions or none of them, for now. A join with an equality and something else could
+/// still use the equality to find candidates and evaluate the rest over those, and that is the shape
+/// this wants next. What it takes is building a chunk of the candidate rows to evaluate over, which
+/// is a second copy of part of a side, and doing it before the plain case is measured would be
+/// adding the complicated half first.
 ///
 /// `=` and `IS NOT DISTINCT FROM`, which are the same lookup with opposite null rules. The table
 /// already holds a row under a key that may contain a null, because [`crate::key::Key`] compares
@@ -856,33 +1041,72 @@ fn equalities(
         else {
             return None;
         };
-        // The two sides of the equality have to be the same type, because what answers it is a hash
-        // table and a hash table has one bucket for one value. The binder puts a cast in where the
-        // types differ, and a cast is not a column, so this is a check rather than a conversion: an
-        // equality that needed one has already failed the match below.
+        // The two operands have to agree on a type, because what answers the equality is a hash
+        // table and a hash table has one bucket for one value. Where they did not agree the binder
+        // has already put a cast in, and that cast is part of the key expression rather than
+        // something that stops the lookup, so this is the check that the binder did its half.
         if plan.expr_type(left) != plan.expr_type(right) || !plan.expr_type(left).is_keyed() {
             return None;
         }
-        let (&Expr::Column(one), &Expr::Column(other)) = (plan.expr(left), plan.expr(right)) else {
-            return None;
-        };
-        let across = match (
-            left_schema.position_of(one).zip(right_schema.position_of(other)),
-            left_schema.position_of(other).zip(right_schema.position_of(one)),
+        match (
+            side_of(plan, left, left_schema, right_schema),
+            side_of(plan, right, left_schema, right_schema),
         ) {
-            (Some(across), _) | (None, Some(across)) => across,
-            // Both columns on one side, which is a predicate that should have been pushed into that
-            // side and is not this operator's to be clever about.
-            (None, None) => return None,
-        };
-        found.left.push(across.0);
-        found.right.push(across.1);
+            (Some(Side::Driving), Some(Side::Gathered)) => {
+                found.left.push(left);
+                found.right.push(right);
+            }
+            (Some(Side::Gathered), Some(Side::Driving)) => {
+                found.left.push(right);
+                found.right.push(left);
+            }
+            // Both operands over one side, which is a predicate that should have been pushed into
+            // that side and is not this operator's to be clever about, or an operand over both
+            // sides or over neither, which no table can be keyed on.
+            _ => return None,
+        }
         found.null_is_a_value.push(op == CompareOp::NotDistinctFrom);
     }
     Some(found)
 }
 
-/// The gathered side's rows, by the values the equalities read out of them.
+/// Evaluates key expressions over rows, a chunk at a time, calling `each` once per row.
+///
+/// Rows go back into chunks so that the key columns are produced by the same vectorized evaluator
+/// the nested loop's conditions go through. The alternative is an interpreter that walks one
+/// expression over one row, which is a second evaluator that has to agree with the first about
+/// every cast and every overflow, and two evaluators that are meant to agree is the kind of pair
+/// that eventually does not.
+///
+/// The chunk built here is a copy of one [`VECTOR_SIZE`] batch of a side and is dropped before the
+/// next one is built, so what it costs at any moment is bounded by the vector size rather than by
+/// the side. That is why it is not charged: the budget is about what an operator holds, and this
+/// holds two thousand rows for as long as it takes to read a key out of them.
+fn each_key(
+    keying: Keying<'_>,
+    rows: &[Vec<Value>],
+    cancel: &Cancel,
+    mut each: impl FnMut(usize, Option<Key>) -> Result<()>,
+) -> Result<()> {
+    let Keying { plan, exprs, schema, nulls, time_zone } = keying;
+    let types = schema.types();
+    let mut base = 0;
+    for batch in rows.chunks(VECTOR_SIZE) {
+        // Once per batch rather than once per row. A build over a side nobody bounded is the one
+        // part of this operator that can run long without producing anything, and a check every two
+        // thousand rows is the same granularity the rest of the operator uses.
+        cancel.check()?;
+        let chunk = rows::pack(&types, batch)?;
+        let columns = evaluate_all_in_time_zone(plan, exprs, schema, &chunk, time_zone)?;
+        for row in 0..batch.len() {
+            each(base + row, key_at(&columns, row, nulls))?;
+        }
+        base += batch.len();
+    }
+    Ok(())
+}
+
+/// The gathered side's rows, by the values the key expressions produce from them.
 ///
 /// A row whose key holds a null in a column the join compares with `=` is left out rather than
 /// stored under a null key. `NULL = NULL` is null and not true, so such a row matches nothing, and
@@ -895,29 +1119,48 @@ fn equalities(
 /// that order too, which is why this is a faster way to the same answer rather than the same answer
 /// in a different order.
 fn index(
+    keying: Keying<'_>,
     rows: &[Vec<Value>],
-    at: &[usize],
-    nulls: &[bool],
     cancel: &Cancel,
     scratch: &mut Reservation,
 ) -> Result<RowMap<Vec<usize>>> {
     let mut index: RowMap<Vec<usize>> = RowMap::default();
     scratch.grow(rows::buckets(rows.len()))?;
-    for (position, row) in rows.iter().enumerate() {
-        let Some(key) = key(row, at, nulls) else { continue };
+    each_key(keying, rows, cancel, |position, key| {
+        let Some(key) = key else { return Ok(()) };
         // The key's own values and the position stored beside it. The list an entry holds grows by
         // one `usize` per row and the vector behind it doubles, so this charges the row it is about
         // rather than trying to say when a doubling happened.
-        scratch.grow(rows::footprint(&key) + 8)?;
-        index.entry(Key(key)).or_default().push(position);
-        // Once per gathered row, which is the same granularity the probe checks at. A build over a
-        // side nobody bounded is the one part of this operator that can run long without producing
-        // anything.
-        if position % 1024 == 0 {
-            cancel.check()?;
-        }
-    }
+        scratch.grow(rows::footprint(&key.0) + 8)?;
+        index.entry(key).or_default().push(position);
+        Ok(())
+    })?;
     Ok(index)
+}
+
+/// Every row's key, in the order the rows are in, with nothing where the key holds a rejected null.
+///
+/// What the sink needs and the stream does not. [`Probe`] reads a driving chunk's keys out of the
+/// vectors they were evaluated into and throws them away with the chunk, while [`Join`] walks
+/// driving rows it gathered earlier and has no chunk to read them out of, so it keeps them.
+fn keys(
+    keying: Keying<'_>,
+    rows: &[Vec<Value>],
+    cancel: &Cancel,
+    scratch: &mut Reservation,
+) -> Result<Vec<Option<Key>>> {
+    let mut built = Vec::with_capacity(rows.len());
+    scratch.grow(
+        u64::try_from(rows.len().saturating_mul(size_of::<Option<Key>>())).unwrap_or(u64::MAX),
+    )?;
+    each_key(keying, rows, cancel, |_, key| {
+        if let Some(key) = &key {
+            scratch.grow(rows::footprint(&key.0))?;
+        }
+        built.push(key);
+        Ok(())
+    })?;
+    Ok(built)
 }
 
 /// The gathered rows one driving row matches, by position in the gathered side.
@@ -925,34 +1168,26 @@ fn index(
 /// Nothing for a driving row whose key holds a null in a column compared with `=`, which matches
 /// nothing for the same reason a null on the other side was never stored. A row with no match is a
 /// row the join kind decides about rather than one that is dropped here.
-fn hits<'i>(
-    index: &'i RowMap<Vec<usize>>,
-    row: &[Value],
-    at: &[usize],
-    nulls: &[bool],
-) -> &'i [usize] {
-    match key(row, at, nulls) {
-        None => &[],
-        Some(key) => index.get(&Key(key)).map_or(&[], Vec::as_slice),
-    }
+fn hits<'i>(index: &'i RowMap<Vec<usize>>, key: Option<&Key>) -> &'i [usize] {
+    key.and_then(|key| index.get(key)).map_or(&[], Vec::as_slice)
 }
 
-/// The values at `at`, or nothing when one of them is a null the join's comparison rejects.
+/// One row's key, read out of the evaluated key columns, or nothing when a null is rejected there.
 ///
 /// Nothing rather than a key holding a null, because the caller's two uses of that answer are the
 /// same one: a null on either side of `=` makes the comparison null, so the row takes part in no
 /// pair and there is nothing to look up or to store. `IS NOT DISTINCT FROM` says the opposite about
 /// the same value, and `nulls` is which of the two each column was written with.
-fn key(row: &[Value], at: &[usize], nulls: &[bool]) -> Option<Vec<Value>> {
-    let mut key = Vec::with_capacity(at.len());
-    for (&column, &kept) in at.iter().zip(nulls) {
-        let value = &row[column];
+fn key_at(columns: &[Vector], row: usize, nulls: &[bool]) -> Option<Key> {
+    let mut key = Vec::with_capacity(columns.len());
+    for (column, &kept) in columns.iter().zip(nulls) {
+        let value = column.value_at(row);
         if !kept && matches!(value, Value::Null) {
             return None;
         }
-        key.push(value.clone());
+        key.push(value);
     }
-    Some(key)
+    Some(Key(key))
 }
 
 /// Both rows, left then right.
@@ -1015,10 +1250,13 @@ fn widen(left_row: &[Value], left_types: &[LogicalType], right: &Chunk) -> Resul
 #[cfg(test)]
 mod tests {
     use rudb_common::{Cancel, Field, LogicalType, Memory, Value};
-    use rudb_plan::{ColumnBinding, JoinKind, Plan, Slice};
+    use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Plan, Slice};
     use rudb_vector::{Data, Vector};
 
-    use super::{Buffered, Chunk, CrossProduct, Gathered, Join, Progress, Schema, Sink, Stream};
+    use super::{
+        Buffered, Chunk, CrossProduct, Gathered, Join, Probe, Progress, Schema, Side, Sink, Stream,
+        equalities, side_of,
+    };
     use crate::gather::{Gather, Keep, Rows};
 
     fn chunk(values: &[i32]) -> Chunk {
@@ -1027,8 +1265,50 @@ mod tests {
         Chunk::new(vec![column]).expect("one column is one length")
     }
 
+    fn wide_chunk(values: &[i64]) -> Chunk {
+        let column = Vector::flat(LogicalType::BigInt, Data::Int64(values.to_vec().into()))
+            .expect("big integers are an i64 layout");
+        Chunk::new(vec![column]).expect("one column is one length")
+    }
+
     fn schema(name: &str, table: u32) -> Schema {
         Schema::numbered(vec![Field::new(name, LogicalType::Integer)], table)
+    }
+
+    fn typed_schema(name: &str, table: u32, ty: LogicalType) -> Schema {
+        Schema::numbered(vec![Field::new(name, ty)], table)
+    }
+
+    /// A reference to the only column of the side numbered `table`.
+    fn column(plan: &mut Plan, table: u32, ty: LogicalType) -> ExprRef {
+        plan.add_expr(Expr::Column(ColumnBinding::new(table, 0)), ty)
+    }
+
+    /// `left = right`, which is the one condition shape a lookup answers.
+    fn equal(plan: &mut Plan, left: ExprRef, right: ExprRef) -> ExprRef {
+        plan.add_expr(Expr::Compare { op: CompareOp::Equal, left, right }, LogicalType::Boolean)
+    }
+
+    /// A driving side of `INTEGER` and a gathered side of `BIGINT`, which is what makes a cast.
+    fn sides() -> (Schema, Schema) {
+        (typed_schema("a", 0, LogicalType::Integer), typed_schema("b", 1, LogicalType::BigInt))
+    }
+
+    /// Every output chunk of one probe over one driving chunk, in the order it produced them.
+    fn probed(probe: &Probe<'_>, driving: &Chunk, width: usize) -> Vec<Vec<Value>> {
+        let mut local = probe.local();
+        let mut chunk = driving.clone();
+        let mut out = Vec::new();
+        loop {
+            let progress = probe.push(&mut chunk, &mut local).expect("a chunk");
+            out.extend((0..chunk.len()).map(|row| {
+                (0..width).map(|column| chunk.value_at(row, column)).collect::<Vec<Value>>()
+            }));
+            if progress != Progress::Again {
+                return out;
+            }
+            chunk = Chunk::empty(&[]);
+        }
     }
 
     /// The right side of a join, run to the end the way the pipeline before this one would.
@@ -1264,5 +1544,128 @@ mod tests {
         let mut chunk = chunk(&[1, 2]);
         assert_eq!(cross.push(&mut chunk, &mut local).expect("no rows"), Progress::More);
         assert!(chunk.is_empty());
+    }
+
+    #[test]
+    fn an_equality_between_two_columns_of_opposite_sides_is_a_key() {
+        let mut plan = Plan::new();
+        let (left, right) = (schema("a", 0), schema("b", 1));
+        let one = column(&mut plan, 0, LogicalType::Integer);
+        let other = column(&mut plan, 1, LogicalType::Integer);
+        let condition = equal(&mut plan, one, other);
+
+        let found = equalities(&plan, &[condition], &left, &right).expect("a key");
+
+        assert_eq!(found.left, [one]);
+        assert_eq!(found.right, [other]);
+        assert_eq!(found.null_is_a_value, [false]);
+    }
+
+    /// The shape the binder actually produces for a join between columns of different widths.
+    ///
+    /// Before the key was an expression this join fell to the nested loop, which on the sizes
+    /// `optimizer/table_filters.test` uses is ten to the eleventh pairs and hours of work for an
+    /// answer the table gives in a second.
+    #[test]
+    fn a_cast_around_one_operand_is_still_a_key() {
+        let mut plan = Plan::new();
+        let (left, right) = sides();
+        let narrow = column(&mut plan, 0, LogicalType::Integer);
+        let widened =
+            plan.add_expr(Expr::Cast { input: narrow, try_cast: false }, LogicalType::BigInt);
+        let other = column(&mut plan, 1, LogicalType::BigInt);
+        let condition = equal(&mut plan, widened, other);
+
+        let found = equalities(&plan, &[condition], &left, &right).expect("a key");
+
+        assert_eq!(found.left, [widened]);
+        assert_eq!(found.right, [other]);
+    }
+
+    /// Which operand the query wrote first says nothing about which side it reads.
+    #[test]
+    fn the_gathered_side_written_first_is_lined_back_up() {
+        let mut plan = Plan::new();
+        let (left, right) = (schema("a", 0), schema("b", 1));
+        let driving = column(&mut plan, 0, LogicalType::Integer);
+        let gathered = column(&mut plan, 1, LogicalType::Integer);
+        let condition = equal(&mut plan, gathered, driving);
+
+        let found = equalities(&plan, &[condition], &left, &right).expect("a key");
+
+        assert_eq!(found.left, [driving]);
+        assert_eq!(found.right, [gathered]);
+    }
+
+    /// A predicate over one side that the optimizer left on the join rather than pushing down.
+    #[test]
+    fn an_equality_whose_operands_read_one_side_is_not_a_key() {
+        let mut plan = Plan::new();
+        let (left, right) = (schema("a", 0), schema("b", 1));
+        let one = column(&mut plan, 0, LogicalType::Integer);
+        let condition = equal(&mut plan, one, one);
+
+        assert!(equalities(&plan, &[condition], &left, &right).is_none());
+    }
+
+    #[test]
+    fn an_equality_between_two_constants_is_not_a_key() {
+        let mut plan = Plan::new();
+        let (left, right) = (schema("a", 0), schema("b", 1));
+        let one = plan.add_constant(Value::Integer(1));
+        let condition = equal(&mut plan, one, one);
+
+        assert!(equalities(&plan, &[condition], &left, &right).is_none());
+    }
+
+    /// An operand over both sides is a comparison in disguise and there is no value to key on.
+    #[test]
+    fn an_operand_that_reads_both_sides_is_not_one_sides_key() {
+        let mut plan = Plan::new();
+        let (left, right) = (schema("a", 0), schema("b", 1));
+        let one = column(&mut plan, 0, LogicalType::Integer);
+        let other = column(&mut plan, 1, LogicalType::Integer);
+        let name = plan.intern("+");
+        let args = plan.add_expr_list(&[one, other]);
+        let sum = plan.add_expr(Expr::Function { name, args }, LogicalType::Integer);
+
+        assert_eq!(side_of(&plan, one, &left, &right), Some(Side::Driving));
+        assert_eq!(side_of(&plan, other, &left, &right), Some(Side::Gathered));
+        assert_eq!(side_of(&plan, sum, &left, &right), None);
+    }
+
+    /// The whole of it, from a plan the binder could have produced to the rows that come out.
+    #[test]
+    fn a_probe_answers_a_join_whose_key_is_a_cast() {
+        let mut plan = Plan::new();
+        let (left, right) = sides();
+        let narrow = column(&mut plan, 0, LogicalType::Integer);
+        let widened =
+            plan.add_expr(Expr::Cast { input: narrow, try_cast: false }, LogicalType::BigInt);
+        let other = column(&mut plan, 1, LogicalType::BigInt);
+        let condition = equal(&mut plan, widened, other);
+        let conditions = plan.add_expr_list(&[condition]);
+
+        let memory = Memory::unlimited();
+        let (gather, rows) = Gather::new(&memory);
+        let mut local = gather.local();
+        gather.sink(&wide_chunk(&[2, 3, 4]), &mut local).expect("the gathered rows");
+        gather.combine(local).expect("the one instance");
+        gather.finalize().expect("nothing to do");
+        let probe = Probe::new(
+            &plan,
+            &left,
+            &Gathered { schema: &right, rows, marker: None, swapped: false },
+            JoinKind::Inner,
+            conditions,
+            &Cancel::new(),
+            &memory,
+        )
+        .expect("a lookup answers an inner join on one equality");
+
+        assert_eq!(
+            probed(&probe, &chunk(&[1, 2, 3]), 2),
+            [vec![Value::Integer(2), Value::BigInt(2)], vec![Value::Integer(3), Value::BigInt(3)]]
+        );
     }
 }
