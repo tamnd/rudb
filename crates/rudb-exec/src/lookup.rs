@@ -256,14 +256,18 @@ impl Lookup {
     ///
     /// `into` is the caller's buffer so that a driving row does not cost an allocation, and it is
     /// cleared here rather than by the caller.
-    pub(crate) fn matches(&self, slot: usize, into: &mut Vec<usize>) {
+    ///
+    /// Row numbers rather than indices, because what the caller does with them is hand them to
+    /// [`Build::gather`](crate::side::Build::gather), and a gather takes a run of `u32`. The chain
+    /// is a run of `u32` already, so this is a copy rather than a widening.
+    pub(crate) fn matches(&self, slot: usize, into: &mut Vec<u32>) {
         into.clear();
         if slot == MISS {
             return;
         }
         let mut at = self.head[slot];
         while at != NONE {
-            into.push(at as usize);
+            into.push(at);
             at = self.next[at as usize];
         }
     }
@@ -339,7 +343,7 @@ mod tests {
     }
 
     /// What one driving row of the same shape finds, in the order it finds it.
-    fn found(lookup: &Lookup, values: &[Option<i32>]) -> Vec<Vec<usize>> {
+    fn found(lookup: &Lookup, values: &[Option<i32>]) -> Vec<Vec<u32>> {
         let mut scratch = Scratch::default();
         let mut slots = Vec::new();
         lookup.slots(&[column(values)], values.len(), &[false], &mut scratch, &mut slots);
@@ -390,7 +394,7 @@ mod tests {
         let mut slots = Vec::new();
         lookup.slots(&[column(&[Some(1)])], 1, &[false], &mut scratch, &mut slots);
         lookup.matches(slots[0], &mut chain);
-        let wanted: Vec<usize> = (0..500).filter(|row| row % 3 == 1).collect();
+        let wanted: Vec<u32> = (0..500).filter(|row| row % 3 == 1).collect();
         assert_eq!(chain, wanted);
     }
 
