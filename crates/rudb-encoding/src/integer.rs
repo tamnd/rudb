@@ -1000,7 +1000,7 @@ mod tests {
         // The base is the smallest value and not zero, so a column that does not start on a
         // multiple of its own step still has one.
         assert_eq!(stride_of(&[7i64, 17, 37]), Some(10));
-        assert_eq!(stride_of(&[10i64, 20, 25]), None);
+        assert_eq!(stride_of(&[10i64, 20, 23]), None);
         // Every value the same is `Constant`'s case and this declines it rather than dividing by a
         // stride of zero.
         assert_eq!(stride_of(&[5i64; 100]), None);
@@ -1086,8 +1086,12 @@ mod tests {
     fn a_low_cardinality_column_becomes_a_dictionary() {
         // Values that are far apart so that packing them directly is 30 bits each, and only 40 of
         // them so that the codes are 6 bits each. The dictionary has to win by a factor of five.
+        //
+        // Drawn at random rather than laid out at a fixed interval, because a fixed interval is a
+        // stride and STRIDE writes the same codes without a dictionary to point them at.
         let mut random = Random::new();
-        let dictionary: Vec<i64> = (0..40).map(|index| 1_000_000_000 + index * 7919).collect();
+        let dictionary: Vec<i64> =
+            (0..40).map(|_| 1_000_000_000 + (random.next() % (1 << 30)) as i64).collect();
         let values: Vec<i64> =
             (0..100_000).map(|_| dictionary[(random.next() % 40) as usize]).collect();
         let bytes = round_trip(&values);
