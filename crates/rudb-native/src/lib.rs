@@ -57,6 +57,13 @@ const FREQUENCY_CANDIDATES: usize = 32_768;
 const FREQUENCY_ENTRIES: usize = 512;
 const FREQUENCY_BUILD_RANK: usize = 10;
 const FREQUENCY_ORDINALS: usize = 65_536;
+/// The fewest values a worker is given a run of when a dictionary's order is sorted in parallel.
+///
+/// Below this the threads and the merges cost more than the sort they replaced. Most string columns
+/// have a dictionary of a few thousand values and take microseconds either way, and the one this is
+/// here for has seventeen million.
+const PARALLEL_RANK_RUN: usize = 64 * 1024;
+
 /// The most threads the two per column passes at the end of a commit are spread over.
 ///
 /// A table like `hits` has ninety numeric columns, so on a machine with more cores than this the
@@ -482,18 +489,80 @@ impl GlobalDictionary {
     /// The heads are kept rather than thrown away once the sort is over, because a reader searching
     /// this order wants exactly the same comparison and for exactly the same reason. Eight bytes an
     /// entry of file is what buys a binary search that reads no values at all in the ordinary case.
-    fn ranked(&self) -> Vec<(u64, u32)> {
+    /// The sorted order, built on as many threads as it is given.
+    ///
+    /// This is the one expensive thing left in committing a file that is not bytes going to disk.
+    /// The comparison looks cheap, an integer against an integer, and on the column this exists for
+    /// it never is: `head` is the first eight bytes of the value, every URL in `hits` begins with
+    /// the same seven characters, so there are about two hundred and fifty distinct heads across
+    /// seventeen million values and nearly every comparison falls through to a byte compare. That
+    /// byte compare is two reads at unrelated places in a payload of gigabytes, which is a cache
+    /// miss each, and a sort that is waiting on memory is exactly the sort that more threads help.
+    ///
+    /// Each worker takes a contiguous run of the codes, reads the heads for it and sorts it, and
+    /// then the runs are merged pairwise a round at a time with the merges in a round running
+    /// alongside each other. The last round is one merge of the whole thing and is what bounds this
+    /// from below, and a merge is a linear walk of two sorted runs rather than a sort.
+    fn ranked_with(&self, workers: usize) -> Result<Vec<(u64, u32)>> {
         let count = self.offsets.len() - 1;
-        let mut ranked = (0..count)
-            .map(|code| {
-                let code = code as u32;
-                (head(self.bytes(code).unwrap_or_default()), code)
-            })
-            .collect::<Vec<_>>();
-        ranked.sort_unstable_by(|left, right| {
+        let compare = |left: &(u64, u32), right: &(u64, u32)| {
             left.0.cmp(&right.0).then_with(|| self.bytes(left.1).cmp(&self.bytes(right.1)))
-        });
-        ranked
+        };
+        let run_of = |first: usize, last: usize| {
+            let mut run = (first..last)
+                .map(|code| {
+                    let code = code as u32;
+                    (head(self.bytes(code).unwrap_or_default()), code)
+                })
+                .collect::<Vec<_>>();
+            run.sort_unstable_by(&compare);
+            run
+        };
+        let workers = workers.min(count.div_ceil(PARALLEL_RANK_RUN)).max(1);
+        if workers <= 1 {
+            return Ok(run_of(0, count));
+        }
+        let width = count.div_ceil(workers);
+        let mut runs = std::thread::scope(|scope| {
+            (0..workers)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        run_of((worker * width).min(count), ((worker + 1) * width).min(count))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| Error::internal("a dictionary sort worker panicked"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        while runs.len() > 1 {
+            let mut taken = std::mem::take(&mut runs).into_iter();
+            let mut pairs = Vec::new();
+            while let Some(left) = taken.next() {
+                pairs.push((left, taken.next()));
+            }
+            runs = std::thread::scope(|scope| {
+                pairs
+                    .into_iter()
+                    .map(|(left, right)| {
+                        scope.spawn(move || match right {
+                            Some(right) => merge_ranked(&left, &right, &compare),
+                            None => left,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| Error::internal("a dictionary merge worker panicked"))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+        }
+        Ok(runs.pop().unwrap_or_default())
     }
 
     fn observe(&mut self, code: u32, null: bool) -> Result<()> {
@@ -3876,52 +3945,47 @@ fn head(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(word)
 }
 
+/// Two sorted runs of the order walked into one.
+///
+/// Ties keep the left run's entries first, which is what makes the whole sort behave as if one
+/// thread had done it: the runs are contiguous ranges of the codes in ascending order, so left
+/// before right is the same order a single `sort_unstable_by` leaves equal values in.
+fn merge_ranked(
+    left: &[(u64, u32)],
+    right: &[(u64, u32)],
+    compare: &impl Fn(&(u64, u32), &(u64, u32)) -> Ordering,
+) -> Vec<(u64, u32)> {
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    let (mut at, mut with) = (0, 0);
+    while at < left.len() && with < right.len() {
+        if compare(&right[with], &left[at]) == Ordering::Less {
+            out.push(right[with]);
+            with += 1;
+        } else {
+            out.push(left[at]);
+            at += 1;
+        }
+    }
+    out.extend_from_slice(&left[at..]);
+    out.extend_from_slice(&right[with..]);
+    out
+}
+
 /// The sorted order of every global dictionary, one entry per column and empty where there is no
 /// dictionary.
 ///
-/// One column's sort has nothing to do with another's, and a table like `hits` has fifteen string
-/// columns, so this runs across threads the way the numeric synopses above do. It is the only part
-/// of committing a file that is more than bookkeeping, and doing it serially would show up as a
-/// pause at the end of a load that thirty two threads had been busy with until then.
+/// The columns go one at a time and each sort takes the whole machine, rather than the columns
+/// going alongside each other and each sort taking one thread. They are not the same trade when one
+/// column is most of the work: `hits` has fifteen string columns and three of them carry billions
+/// of bytes each, so a column at a time bounds this by the total divided by the threads instead of
+/// by the largest column. It is the only part of committing a file that is more than bookkeeping.
 fn rankings(dictionaries: &[Option<GlobalDictionary>]) -> Result<Vec<Vec<(u64, u32)>>> {
-    let present =
-        dictionaries.iter().enumerate().filter(|(_, held)| held.is_some()).map(|(at, _)| at);
-    let present = present.collect::<Vec<_>>();
+    let workers =
+        std::thread::available_parallelism().map_or(1, usize::from).min(MAX_FREQUENCY_WORKERS);
     let mut orders = vec![Vec::new(); dictionaries.len()];
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(MAX_FREQUENCY_WORKERS)
-        .min(present.len());
-    if workers <= 1 {
-        for at in present {
-            if let Some(dictionary) = &dictionaries[at] {
-                orders[at] = dictionary.ranked();
-            }
-        }
-        return Ok(orders);
-    }
-    let width = present.len().div_ceil(workers);
-    let pieces = std::thread::scope(|scope| {
-        present
-            .chunks(width)
-            .map(|columns| {
-                scope.spawn(|| {
-                    columns
-                        .iter()
-                        .filter_map(|&at| dictionaries[at].as_ref().map(|held| (at, held.ranked())))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| {
-                handle.join().map_err(|_| Error::internal("a dictionary sort worker panicked"))
-            })
-            .collect::<Result<Vec<_>>>()
-    })?;
-    for piece in pieces {
-        for (at, order) in piece {
-            orders[at] = order;
+    for (at, held) in dictionaries.iter().enumerate() {
+        if let Some(dictionary) = held {
+            orders[at] = dictionary.ranked_with(workers)?;
         }
     }
     Ok(orders)
@@ -4291,6 +4355,41 @@ mod tests {
     use rudb_common::bounds::Op;
 
     use super::*;
+
+    /// The parallel sort of a dictionary's order answers what one thread would have answered.
+    ///
+    /// The shape that matters is the one the change exists for: values that share a long prefix, so
+    /// that the head is the same for nearly all of them and the comparison falls through to the
+    /// bytes. A run of workers is walked rather than one, because the merge rounds only pair off
+    /// evenly when the run count is a power of two and the odd one out being carried through a
+    /// round is its own case.
+    #[test]
+    fn a_dictionary_order_built_on_many_threads_matches_one_thread() {
+        for count in [0_usize, 1, 2, 3, 1000, 70_000, 131_073] {
+            let mut dictionary = GlobalDictionary::new();
+            for at in 0..count {
+                // Deliberately not in order, and deliberately sharing the first eight bytes with
+                // everything else, which is what `hits` URLs do.
+                let scattered = (at as u64).wrapping_mul(2_654_435_761) % count.max(1) as u64;
+                dictionary
+                    .insert(&format!("http://example.test/{scattered:012}/{at}"))
+                    .expect("a value");
+            }
+            let one = dictionary.ranked_with(1).expect("one thread");
+            assert_eq!(one.len(), count);
+            for many in [2_usize, 3, 8, 32] {
+                let ranked = dictionary.ranked_with(many).expect("many threads");
+                assert_eq!(ranked, one, "{count} values over {many} workers");
+            }
+            // And the order really is the byte order, which the comparison above cannot check.
+            for pair in one.windows(2) {
+                assert!(
+                    dictionary.bytes(pair[0].1) <= dictionary.bytes(pair[1].1),
+                    "{count} values are not in byte order"
+                );
+            }
+        }
+    }
 
     #[test]
     fn checksum_matches_fixed_vectors() {
