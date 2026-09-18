@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
@@ -244,12 +244,23 @@ pub(crate) struct Scan<'a> {
     /// A morsel that is a whole stripe fixes it at the source. Each worker owns the page it reads,
     /// nobody loses a race, and sixteen workers put sixteen quarter megabyte reads in flight.
     stripes: Vec<Range<usize>>,
-    /// The handout over `stripes`, used instead of `chunks` when `whole` is set.
-    runs: Handout,
-    /// Whether a morsel is a whole stripe. See [`Source::morsels`], which is where it is decided
-    /// and is the one moment the scan knows how many workers it will face.
-    whole: AtomicBool,
+    /// The runs of parts a morsel covers, used instead of `chunks` once it is there.
+    ///
+    /// Empty until [`Source::morsels`] fills it, which is the one moment the scan knows how many
+    /// workers it will face and so the one moment it can decide how finely to cut.
+    spread: OnceLock<Spread>,
     skipped: AtomicUsize,
+}
+
+/// How a native scan cuts its parts into morsels.
+///
+/// A run is a range of part numbers and a morsel covers one run. The ranges are built out of the
+/// parts the zone maps leave alive, so a run holds work rather than holding whatever happened to sit
+/// next to it, and the handout beside them is what hands one run to each worker that asks.
+#[derive(Debug)]
+struct Spread {
+    runs: Vec<Range<usize>>,
+    handout: Handout,
 }
 
 impl<'a> Scan<'a> {
@@ -301,7 +312,6 @@ impl<'a> Scan<'a> {
                 next.saturating_add(i64::try_from(table.rows().chunk_len(at)?).unwrap_or(i64::MAX));
         }
         let stripes = table.rows().stripe_parts();
-        let runs = Handout::new(stripes.len());
         Ok(Self {
             table,
             columns,
@@ -310,10 +320,63 @@ impl<'a> Scan<'a> {
             schema,
             chunks,
             stripes,
-            runs,
-            whole: AtomicBool::new(false),
+            spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
         })
+    }
+
+    /// The parts the statistics leave alive, by stripe, and how many rows they hold between them.
+    ///
+    /// This is the pruning the scan used to do while reading, asked before any worker is started, and
+    /// it buys two things the read time version could not give. The instance count can be taken from
+    /// the rows that are really coming rather than from the size of the table. And the work can be
+    /// divided by where it is, which matters because a selective predicate on a file written in key
+    /// order leaves its surviving parts next to each other: on ClickBench 39 the filter keeps about
+    /// ninety of nine hundred and seventy four parts and they sit inside two stripes, so a morsel per
+    /// stripe left fourteen of sixteen workers with nothing to do and the query was faster on one
+    /// thread than on the whole machine.
+    ///
+    /// It asks in two passes because the two kinds of statistic cost very different amounts. The
+    /// stripe bounds are in the directory and already in memory, so the first pass is sixteen
+    /// comparisons and no reading at all. The sieves are a page per stripe off the disk, and that is
+    /// the pass this skips whenever the bounds have already spread the work over enough stripes to
+    /// keep every worker busy, because there the sieves would buy a better instance count at the
+    /// price of doing serially what the workers were about to do at the same time. ClickBench 19 is
+    /// the query that pays it: an equality on an identifier, where no stripe bound rules anything out
+    /// and the sieves rule out all but nine parts, and doing them here made it half as fast.
+    fn living(&self, threads: usize) -> (Vec<Vec<usize>>, usize) {
+        let (mut live, rows) = self.bounded();
+        let working = live.iter().filter(|parts| !parts.is_empty()).count();
+        if self.probes.is_empty() || !worth_sifting(working, threads, rows) {
+            return (live, rows);
+        }
+        let mut sifted = 0;
+        for parts in &mut live {
+            parts.retain(|&at| !self.table.rows().skips(at, &self.probes));
+            for &at in parts.iter() {
+                sifted += self.table.rows().chunk_len(at).unwrap_or(0);
+            }
+        }
+        (live, sifted)
+    }
+
+    /// The first of those two passes, the one that reads nothing.
+    fn bounded(&self) -> (Vec<Vec<usize>>, usize) {
+        let mut rows = 0;
+        let mut live = Vec::with_capacity(self.stripes.len());
+        for (stripe, parts) in self.stripes.iter().enumerate() {
+            if !self.probes.is_empty() && self.table.rows().stripe_skips(stripe, &self.probes) {
+                live.push(Vec::new());
+                continue;
+            }
+            let mut kept = Vec::with_capacity(parts.len());
+            for at in parts.clone() {
+                rows += self.table.rows().chunk_len(at).unwrap_or(0);
+                kept.push(at);
+            }
+            live.push(kept);
+        }
+        (live, rows)
     }
 
     /// What this scan produces.
@@ -322,13 +385,52 @@ impl<'a> Scan<'a> {
     }
 }
 
+/// Whether reading the sieves before the workers start is worth what it costs.
+///
+/// `working` is how many stripes the bounds left with anything in them and `rows` is what those hold.
+/// The sieves would say which parts of those stripes really matter, which gives a truer instance
+/// count and lets the work be cut where it is, and they cost a page read and a decode per stripe on
+/// the one thread that is asking. That trade only pays when the bounds have left the work piled into
+/// fewer stripes than there are workers to want it, because that is the case where handing out a
+/// stripe apiece leaves most of the machine idle. When the work is already spread the workers find it
+/// themselves, at the same time, each reading the sieves of the stripe it is in.
+fn worth_sifting(working: usize, threads: usize, rows: usize) -> bool {
+    working < threads.min(native_instances(rows))
+}
+
+/// The live parts cut into the runs a morsel covers.
+///
+/// A stripe is the unit by default, because sixty four parts under one page is the read the disk
+/// wants and a worker that owns the whole stripe owns the page. That only divides the work when
+/// enough stripes have work in them, so a stripe is cut further when they do not, into as many runs
+/// as it takes to give every worker a couple. The cost of cutting is that two workers can end up
+/// inside one stripe and read the same page, and it is paid only when the alternative is a worker
+/// with no page at all.
+fn runs_of(live: &[Vec<usize>], instances: usize) -> Vec<Range<usize>> {
+    let working = live.iter().filter(|parts| !parts.is_empty()).count();
+    let cuts =
+        if working >= instances { 1 } else { instances.saturating_mul(2).div_ceil(working.max(1)) };
+    let mut runs = Vec::with_capacity(working.saturating_mul(cuts));
+    for parts in live {
+        if parts.is_empty() {
+            continue;
+        }
+        let per = parts.len().div_ceil(cuts).max(1);
+        for piece in parts.chunks(per) {
+            let (first, last) = (piece[0], piece[piece.len() - 1]);
+            runs.push(first..last + 1);
+        }
+    }
+    runs
+}
+
 impl Source for Scan<'_> {
     fn morsel(&self) -> Option<Morsel> {
-        if !self.whole.load(Ordering::Relaxed) {
+        let Some(spread) = self.spread.get() else {
             return self.chunks.take();
-        }
-        let index = self.runs.number()?;
-        let run = self.stripes.get(usize::try_from(index).unwrap_or(usize::MAX))?;
+        };
+        let index = spread.handout.number()?;
+        let run = spread.runs.get(usize::try_from(index).unwrap_or(usize::MAX))?;
         let start = u64::try_from(run.start).unwrap_or(u64::MAX);
         let end = u64::try_from(run.end).unwrap_or(u64::MAX);
         Some(Morsel::new(index, start, end))
@@ -339,10 +441,15 @@ impl Source for Scan<'_> {
         if !self.table.rows().is_native() {
             return Some(chunks);
         }
+        let (live, rows) = self.living(threads);
         // An instance is not free, so a scan asks for as many as the rows behind it can pay for
         // rather than for every worker the machine has. What one costs is a thread, and what it
-        // buys is a share of the work, and `native_instances` is where those two are weighed.
-        let useful = native_instances(self.table.rows().len());
+        // buys is a share of the work, and `native_instances` is where those two are weighed. The
+        // rows it is handed are the ones the zone maps leave rather than the ones the table holds,
+        // because a query that reads a fifteenth of a file is a query the size of a fifteenth of a
+        // file and asking for a worker per stripe of the whole of it is asking for fifteen threads
+        // that start, find their stripe ruled out and stop.
+        let useful = native_instances(rows);
         let instances = chunks.min(threads).min(useful);
         // A stripe per worker only divides the work when there are at least as many stripes as
         // workers. Below that it would leave workers with nothing, and the duplicate reads it
@@ -361,7 +468,8 @@ impl Source for Scan<'_> {
             // each worker has moved on to as well as the one it is in is what stops a straggler
             // reading its own page again, and it costs a page per worker per column.
             self.table.rows().keep_stripes(instances.saturating_mul(2));
-            self.whole.store(true, Ordering::Relaxed);
+            let runs = runs_of(&live, instances);
+            let _ = self.spread.set(Spread { handout: Handout::new(runs.len()), runs });
         }
         Some(instances)
     }
@@ -1501,8 +1609,8 @@ mod tests {
     use rudb_vector::Chunk;
 
     use super::{
-        AtomicBool, Bound, FileScan, Handout, Op, Probe, RUN, Scan, Schema, Series, VECTOR_SIZE,
-        cut_rows, native_instances, next_piece, parts,
+        Bound, FileScan, Handout, OnceLock, Op, Probe, RUN, Scan, Schema, Series, VECTOR_SIZE,
+        cut_rows, native_instances, next_piece, parts, runs_of, worth_sifting,
     };
 
     /// Every morsel a row group of `rows` rows is cut into, by asking for them the way `cut` does.
@@ -1702,6 +1810,79 @@ mod tests {
         std::fs::remove_file(path).expect("remove scratch file");
     }
 
+    /// A scan of a native table with bounds tests on its only column, the way a filter compiles one.
+    fn pruned_scan(table: &Table, tests: Vec<(usize, Op, Bound)>) -> Scan<'_> {
+        let plan = Plan::parse("Get memory.main.items AS items #0 [id::INTEGER]")
+            .expect("the plan text round trips");
+        let Node::Get { index, columns, .. } = *plan.node(plan.root()) else {
+            panic!("the plan is a get");
+        };
+        Scan::new(&plan, table, index, columns, tests).expect("the column is there")
+    }
+
+    /// A predicate that leaves one stripe of two still divides the work between two workers.
+    ///
+    /// Two things are being checked and the second is the one that matters. The instance count comes
+    /// from the rows the zone maps leave rather than from the rows the table holds, so a scan that
+    /// will read half a file asks for what half a file pays for. And the stripe that has work in it
+    /// is cut up, because a morsel per stripe would have given one worker everything and the other
+    /// nothing, which is how ClickBench 39 came to be faster on one thread than on sixteen.
+    #[test]
+    fn a_native_scan_divides_the_stripe_that_survives_pruning() {
+        let (table, path) = native("pruned", 128, 400);
+        assert_eq!(table.rows().stripe_parts().len(), 2, "two full stripes of sixty four parts");
+        let scan = pruned_scan(&table, vec![(0, Op::GreaterOrEqual, Bound::Int(25_600))]);
+
+        assert_eq!(scan.morsels(2), Some(2), "the surviving half pays for two instances");
+        let taken = taken(&scan);
+
+        assert!(taken.len() > 2, "the one stripe with work is cut up, not handed out whole");
+        assert!(
+            taken.iter().all(|(run, _)| run.start >= 64),
+            "no morsel covers the ruled out stripe"
+        );
+        assert_eq!(taken.iter().map(|(_, rows)| rows).sum::<usize>(), 64 * 400);
+        std::fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// The rule that decides whether to read the sieves before starting anybody.
+    ///
+    /// The case in the middle is ClickBench 19, an equality on an identifier over the whole file. No
+    /// stripe bound rules anything out there, so all sixteen stripes come out of the first pass with
+    /// work in them and there is nothing left for a better instance count to fix. Reading the sieves
+    /// anyway would find that only nine parts matter, on one thread, while sixteen workers that were
+    /// about to find the same thing at the same time waited for it, and that cost the query a third
+    /// of its time.
+    #[test]
+    fn the_sieves_are_read_early_only_when_the_bounds_have_left_the_work_in_a_heap() {
+        assert!(worth_sifting(2, 32, 1_000_000), "two stripes of work and a machine to fill");
+        assert!(!worth_sifting(16, 32, 1_000_000), "sixteen is as many instances as the rows buy");
+        assert!(!worth_sifting(1, 1, 1_000_000), "one worker has nowhere to spread it anyway");
+        assert!(!worth_sifting(1, 32, 1_000), "a thousand rows pay for one worker either way");
+    }
+
+    /// The cutting rule on its own. Enough stripes with work and a stripe stays one morsel.
+    #[test]
+    fn a_stripe_that_has_company_stays_one_run() {
+        let live = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]];
+
+        assert_eq!(runs_of(&live, 3), [0..4, 4..8, 8..12]);
+        assert_eq!(runs_of(&live, 1), [0..4, 4..8, 8..12], "one worker is still one run a stripe");
+    }
+
+    /// And the other half of it. One stripe holding all the work is cut into runs of its live parts,
+    /// and the parts the zone maps ruled out are not in any of them except where they sit between
+    /// two that survived, which a morsel walks past without reading.
+    #[test]
+    fn a_stripe_that_holds_all_the_work_is_cut_up() {
+        let live = vec![vec![1, 3, 5, 7], Vec::new()];
+
+        let runs = runs_of(&live, 2);
+
+        assert_eq!(runs, [1..2, 3..4, 5..6, 7..8], "a run apiece, two workers, four to go round");
+        assert!(runs.iter().all(|run| run.start >= 1 && run.end <= 8));
+    }
+
     /// A scan of the `rudb-parquet` fixture, which is 4096 rows in two row groups.
     ///
     /// Built from a plan written as text, the way every other operator test in this crate builds
@@ -1855,8 +2036,7 @@ mod tests {
             schema: Schema::numbered(fields, 0),
             chunks: Handout::new(table.rows().chunk_count()),
             stripes: Vec::new(),
-            runs: Handout::new(0),
-            whole: AtomicBool::new(false),
+            spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
         }
     }
