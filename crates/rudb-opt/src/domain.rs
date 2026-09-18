@@ -26,11 +26,9 @@
 //! that carries it, and the answer for that row would be a missing row rather than whatever the
 //! subquery says about NULL.
 //!
-//! Not every operator has a rule here. A set operation has an answer, which is that the domain is
-//! pushed into every branch and the branches then have to agree on where the domain columns sit,
-//! and that is not written yet. A right or full join is refused because a row of the side that is
-//! not there carries no domain value, and the join back would then look for an outer row whose key
-//! is NULL.
+//! Not every operator has a rule here. A right or full join is refused because a row of the side
+//! that is not there carries no domain value, and the join back would then look for an outer row
+//! whose key is NULL.
 //! Everything with no rule leaves the dependent join in place and the query is refused, which is the
 //! honest end rather than a plan that answers a different question.
 
@@ -261,6 +259,25 @@ fn push(
             let below = push(plan, input, domain, index, keys, outer)?;
             limited(plan, below, Some(order), Some(count), offset, keys)
         }
+        Node::SetOp { left, right, kind, all, index: at_index } => {
+            let width = walk::outputs(plan, left)?.len();
+            if width != walk::outputs(plan, right)?.len() {
+                return None;
+            }
+            let one = branch(plan, left, domain, index, keys, outer)?;
+            let other = branch(plan, right, domain, index, keys, outer)?;
+            let node =
+                plan.add_node(Node::SetOp { left: one, right: other, kind, all, index: at_index });
+            let carried = (0..keys.len())
+                .map(|position| {
+                    ColumnBinding::new(
+                        at_index,
+                        u32::try_from(width + position).expect("branch width"),
+                    )
+                })
+                .collect();
+            Some(Pushed { node, keys: carried, moved: HashMap::new() })
+        }
         Node::Values { index: at_index, columns, rows } => {
             values(plan, at_index, columns, rows, domain, index, keys)
         }
@@ -310,9 +327,10 @@ fn window(
     keys: &[Key],
 ) -> Option<Pushed> {
     let map = mapping(keys, &below);
-    // The domain columns come first so that what the query wrote still breaks ties inside a value
-    // rather than the other way round, which would put rows of different outer rows in one
-    // partition whenever they agreed on the written columns.
+    // The domain columns go in front of what the query wrote. Which rows share a partition does not
+    // depend on the order, since a partition is a set of columns and not a sort, so this is the
+    // same choice the sort rule makes for the reason the sort rule makes it: the operator sorts by
+    // this list, and leading with the domain keeps one outer row's rows together.
     let mut divided = Vec::new();
     for (key, &binding) in keys.iter().zip(&below.keys) {
         let ty = plan.expr_type(key.expr).clone();
@@ -353,6 +371,55 @@ fn window(
         expressions,
     });
     Some(Pushed { node, keys: below.keys, moved: below.moved })
+}
+
+/// One side of a set operation, with the domain pushed into it and its output put back in order.
+///
+/// A set operation matches its two sides by position, so the domain columns have to come out of
+/// both sides in the same places. They do not arrive that way. Where they sit depends on what the
+/// side is made of: a projection puts them on the end, the cross product at the bottom of the walk
+/// puts them in front, and an aggregate moves the columns that were already there. So each side
+/// gets a projection written over it that says where everything is, which is the side's own columns
+/// in the order it had them and then the domain columns behind them. Both sides come out the same
+/// width with the domain in the same places, and the operation above can go back to matching by
+/// position.
+///
+/// Nothing is added to the operation itself. The domain columns are part of the row now, so two
+/// rows that came from different outer rows are two rows, which is what makes `UNION` deduplicate
+/// inside one outer row rather than across all of them, and the same for what `EXCEPT` subtracts
+/// and what `INTERSECT` keeps.
+fn branch(
+    plan: &mut Plan,
+    at: NodeRef,
+    domain: NodeRef,
+    index: u32,
+    keys: &[Key],
+    outer: &TableSet,
+) -> Option<NodeRef> {
+    let before = walk::outputs(plan, at)?;
+    let below = push(plan, at, domain, index, keys, outer)?;
+    let span = plan.expr_span(keys.first()?.expr);
+
+    let mut projected = Vec::new();
+    let mut named = Vec::new();
+    for (position, (binding, ty)) in before.into_iter().enumerate() {
+        // An aggregate below is the one that moves a column, because adding the domain to its
+        // grouping shifts its aggregates along its output. Everything else leaves a binding where
+        // it was, so the map is empty and the lookup costs nothing.
+        let moved = below.moved.get(&binding).copied().unwrap_or(binding);
+        projected.push(plan.add_expr_at(Expr::Column(moved), ty, span));
+        named.push(plan.intern(&format!("__branch_{position}")));
+    }
+    for (position, (key, &binding)) in keys.iter().zip(&below.keys).enumerate() {
+        let ty = plan.expr_type(key.expr).clone();
+        projected.push(plan.add_expr_at(Expr::Column(binding), ty, span));
+        named.push(plan.intern(&format!("__domain_{position}")));
+    }
+
+    let exprs = plan.add_expr_list(&projected);
+    let names = plan.add_name_list(&named);
+    let at_index = walk::fresh_index(plan);
+    Some(plan.add_node(Node::Project { input: below.node, index: at_index, exprs, names }))
 }
 
 /// A limit or a top N inside a correlated subquery, which is a limit per outer row.
@@ -1097,5 +1164,64 @@ mod tests {
         );
         assert!(after.contains("CASE WHEN (#3.0::INTEGER = 0::INTEGER)"), "{after}");
         assert!(after.contains("ELSE \"+\"(#2.0::INTEGER, 1::INTEGER)::INTEGER"), "{after}");
+    }
+
+    /// A set operation on the right of a dependent join, with whatever is written as its right side.
+    ///
+    /// Two sides means the shared fixture cannot build it, since that one puts the filter under the
+    /// last line it was given and a set operation has two last lines.
+    fn correlated_set(kind: &str, right: &str) -> Plan {
+        let text = format!(
+            "DependentJoin SINGLE on=[]\n  Get memory.main.outer AS o #0 [k::INTEGER]\n  SetOp {kind} #4\n    Project #2 [#1.1::INTEGER AS value]\n      Filter (#1.0::INTEGER = #0.0::INTEGER)::BOOLEAN\n        Get memory.main.inner AS i #1 [k::INTEGER, value::INTEGER]\n{right}"
+        );
+        Plan::parse(&text).expect("a correlated set operation")
+    }
+
+    /// A right side that asks nothing about the outer row, which is the common way to write one.
+    const PLAIN: &str = "    Project #3 [#5.1::INTEGER AS value]\n      Get memory.main.other AS u #5 [k::INTEGER, value::INTEGER]\n";
+
+    /// A right side correlated the same way the left one is.
+    const ALSO: &str = "    Project #3 [#5.1::INTEGER AS value]\n      Filter (#5.0::INTEGER = #0.0::INTEGER)::BOOLEAN\n        Get memory.main.other AS u #5 [k::INTEGER, value::INTEGER]\n";
+
+    #[test]
+    fn a_union_inside_the_subquery_carries_the_domain_out_of_both_sides() {
+        let mut plan = correlated_set("UNION ALL", PLAIN);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("SetOp UNION ALL"), "{after}");
+        // Once per side. A set operation matches its sides by position, so a domain column coming
+        // out of one side and not the other is two sides of different widths and an invalid plan.
+        assert_eq!(after.matches("AS __branch_0, ").count(), 2, "{after}");
+        // The side that asks nothing about the outer row is crossed with the domain, which is where
+        // its copy of the column comes from.
+        assert!(after.contains("CrossProduct"), "{after}");
+    }
+
+    #[test]
+    fn an_except_inside_the_subquery_subtracts_inside_one_outer_row() {
+        let mut plan = correlated_set("EXCEPT DISTINCT", ALSO);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("SetOp EXCEPT DISTINCT"), "{after}");
+        // Nothing is added to the operation itself. The domain column is part of the row, so a row
+        // of one outer row and a row of another are two rows and neither subtracts the other.
+        assert_eq!(after.matches("AS __branch_0, ").count(), 2, "{after}");
+    }
+
+    #[test]
+    fn the_columns_a_side_had_stay_in_front_of_the_domain_columns() {
+        let mut plan = correlated_set("INTERSECT DISTINCT", PLAIN);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        // One column each side had and the domain column behind it, in both sides, which is what
+        // lets the operation above go back to matching by position.
+        assert_eq!(after.matches("AS __branch_0, #").count(), 2, "{after}");
+        assert!(after.contains("SetOp INTERSECT DISTINCT"), "{after}");
     }
 }
