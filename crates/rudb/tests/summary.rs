@@ -9,7 +9,10 @@
 //! empty string, so the dictionary of a nullable column can hold an empty string that no row of it
 //! has, and a file that counted its codes or read the first of them in sorted order would report one
 //! distinct value too many and an empty string as the minimum. That is not a rounding error, it is a
-//! wrong answer to `COUNT(DISTINCT)`, and it is why a column with a null in it is left alone.
+//! wrong answer to `COUNT(DISTINCT)`. The count is now settled by the writer, which knows how many
+//! codes a row of the column actually holds, so a null no longer stops it. The minimum is still
+//! stopped by it, because which entry of the sorted order is the first one a row holds is not
+//! something the directory says.
 //!
 //! The numbers come from somewhere else. Each stripe writes down the two ends of each column and
 //! the total of it when the column is integers, so a whole table `MIN`, `MAX`, `SUM` and `AVG` is
@@ -115,13 +118,22 @@ fn the_extremes_of_a_string_column_are_the_two_ends_of_the_order_beside_its_valu
 }
 
 #[test]
-fn a_column_with_a_null_in_it_is_counted_the_ordinary_way() {
+fn a_column_with_a_null_in_it_is_counted_out_of_the_file_as_well() {
     let pair = Pair::new(
         "nulls",
         "SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE 'v' || (i % 13) END AS s FROM range(5000) r(i)",
     );
-    // Thirteen values, and the empty string the nulls were written as is not one of them.
+    // Thirteen values, and the empty string the nulls were written as is not one of them. The
+    // dictionary has fourteen entries here and the file says thirteen, because the writer counted
+    // the rows that hold each code and the empty string's code is held by none of them.
     assert_eq!(pair.agree("SELECT COUNT(DISTINCT s) FROM t"), Value::BigInt(13));
+    assert!(pair.summarised("SELECT COUNT(DISTINCT s) FROM t"), "the rows were grouped anyway");
+    // Counting the groups is a different number, because the nulls are a group of their own and are
+    // not a distinct value. Fourteen groups over thirteen values.
+    assert_eq!(
+        pair.agree("SELECT COUNT(*) FROM (SELECT s FROM t GROUP BY s) g"),
+        Value::BigInt(14)
+    );
     // The extremes are a different matter. They do not come from the dictionary here, they come
     // from the stripe ranges, and those were walked a row at a time with the nulls skipped, so the
     // empty string the nulls were written as never got near them.
@@ -131,6 +143,28 @@ fn a_column_with_a_null_in_it_is_counted_the_ordinary_way() {
     // exactly rather than as a bound that is allowed to be wide.
     assert_eq!(pair.agree("SELECT COUNT(s) FROM t"), Value::BigInt(4545));
     assert!(pair.summarised("SELECT COUNT(s) FROM t"), "the rows were read anyway");
+}
+
+#[test]
+fn a_column_holding_both_nulls_and_empty_strings_counts_the_empty_string_once() {
+    // The case the null placeholder makes awkward. Rows divisible by eleven are null and rows
+    // divisible by seven are a real empty string, so the empty string is a value of this column and
+    // has to be counted, and the two of them share a dictionary entry. Fourteen distinct values.
+    let pair = Pair::new(
+        "sharednull",
+        "SELECT CASE WHEN i % 11 = 0 THEN NULL WHEN i % 7 = 0 THEN '' \
+         ELSE 'v' || (i % 13) END AS s FROM range(5000) r(i)",
+    );
+    assert_eq!(pair.agree("SELECT COUNT(DISTINCT s) FROM t"), Value::BigInt(14));
+    assert!(pair.summarised("SELECT COUNT(DISTINCT s) FROM t"), "the rows were grouped anyway");
+}
+
+#[test]
+fn a_column_that_is_nothing_but_nulls_has_no_distinct_values_at_all() {
+    let pair =
+        Pair::new("allnullstrings", "SELECT CAST(NULL AS VARCHAR) AS s FROM range(500) r(i)");
+    assert_eq!(pair.agree("SELECT COUNT(DISTINCT s) FROM t"), Value::BigInt(0));
+    assert!(pair.summarised("SELECT COUNT(DISTINCT s) FROM t"), "the rows were grouped anyway");
 }
 
 #[test]
