@@ -282,9 +282,16 @@ fn write_pipelines(shape: &Shape, measured: Option<&Document>, out: &mut String)
 fn write_totals(measured: &Document, out: &mut String) {
     let timing = &measured.timing;
     let _ = writeln!(out, "\nTotals");
+    // Planning gets its own figure rather than being folded into the build, because the build is
+    // one walk over a finished plan and the planning is every pass that decided what the plan was.
+    // A query whose optimizer costs more than its execution is a query the optimizer made worse,
+    // and this line is where that is visible without anybody going looking for it.
+    let planning =
+        timing.parse_ns.saturating_add(timing.bind_ns).saturating_add(timing.optimize_ns);
     let _ = writeln!(
         out,
-        "  {} building the tree, {} running it, {} in all",
+        "  {} planning, {} building the tree, {} running it, {} in all",
+        duration(planning),
         duration(timing.physical_ns),
         duration(timing.execute_ns),
         duration(timing.total_ns)

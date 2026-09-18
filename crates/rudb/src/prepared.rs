@@ -106,7 +106,9 @@ impl Prepared {
     /// Checks the values against the statement and runs it.
     fn run(&self, parameters: Parameters) -> Result<QueryResult> {
         let result = self.check(&parameters).and_then(|()| {
-            self.shared.execute_ast(&self.ast, &self.sql, &parameters, &self.shared.token())
+            // Zero for the parse, because this statement was parsed once at `PREPARE` and the
+            // whole point of it is that this execution did not parse anything.
+            self.shared.execute_ast(&self.ast, &self.sql, &parameters, &self.shared.token(), 0)
         });
         result.map_err(|error| self.shared.process_error(error))
     }

@@ -387,8 +387,11 @@ pub struct Timing {
     pub physical_ns: u64,
     /// Running it.
     pub execute_ns: u64,
-    /// The whole call, which is more than the sum of the parts because the parts do not cover
-    /// everything between them.
+    /// The whole call, which is the five phases above added up.
+    ///
+    /// It used to be `physical_ns` plus `execute_ns`, because nothing above the executor was on a
+    /// clock, so a query that spent most of itself in the optimizer reported most of itself as
+    /// nothing at all.
     pub total_ns: u64,
 }
 
