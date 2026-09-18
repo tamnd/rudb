@@ -2442,6 +2442,11 @@ fn merged_range(ranges: impl Iterator<Item = Range>) -> Range {
     merged
 }
 
+/// One stripe's membership index: the code count and then the codes as ascending deltas.
+///
+/// The codes have to be sorted and distinct already, which is what [`unique_codes`] and
+/// [`merged_codes`] hand over. Anything else decodes as different codes, so neither of those two is
+/// a step a caller can skip.
 fn encode_membership(unique: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(unique.len().saturating_mul(2).saturating_add(5));
     put_varint(&mut out, u32::try_from(unique.len()).unwrap_or(u32::MAX));
@@ -3416,10 +3421,20 @@ mod tests {
 
     #[test]
     fn membership_delta_stream_is_sorted_exact_and_bounded() {
-        let encoded = encode_membership(&[900, 4, 4, 72, 9, u32::MAX]);
+        let unique = unique_codes(&[900, 4, 4, 72, 9, u32::MAX]);
+        assert_eq!(unique, [4, 9, 72, 900, u32::MAX]);
+        let encoded = encode_membership(&unique);
         assert_eq!(
             decode_membership(&encoded).expect("valid membership"),
             [4, 9, 72, 900, u32::MAX]
+        );
+        // A stripe's index is the union of its parts', so a code in two of them is in it once and
+        // the result is still one ascending run of deltas.
+        let merged = merged_codes(vec![vec![4, 900], vec![9, 900, u32::MAX], vec![72]]);
+        assert_eq!(merged, [4, 9, 72, 900, u32::MAX]);
+        assert_eq!(
+            decode_membership(&encode_membership(&merged)).expect("valid membership"),
+            unique
         );
         assert!(decode_membership(&[1, 0x80]).is_err(), "a truncated varint is invalid");
         assert!(
