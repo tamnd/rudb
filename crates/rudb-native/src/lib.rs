@@ -4805,7 +4805,10 @@ mod tests {
             Writer::create(&path, "hits", vec![Field::required("id", LogicalType::BigInt)])
                 .expect("new file");
         let parts = STRIPE_PARTS + 3;
-        let per_part = 8;
+        // Big enough that the filter is worth its bytes. A part of eight numbers packs to under a
+        // hundred bytes and the smallest filter there is is sixty nine, so a filter over a part
+        // that small costs about as much to read as the rows do and is no longer written.
+        let per_part = 128;
         for part in 0..parts {
             let held: Vec<Value> = (0..per_part)
                 .map(|row| Value::BigInt(scattered((part * per_part + row) as i64)))
@@ -4823,7 +4826,7 @@ mod tests {
             op: Op::Equal,
             value: Bound::Int(i128::from(scattered(value))),
         };
-        for wanted in [0_i64, 9, (parts * per_part - 1) as i64] {
+        for wanted in [0_i64, (per_part + 1) as i64, (parts * per_part - 1) as i64] {
             let tests = [probe(wanted)];
             let kept: Vec<usize> = (0..parts).filter(|&part| !reader.skips(part, &tests)).collect();
             let home = wanted as usize / per_part;
@@ -4846,9 +4849,9 @@ mod tests {
     /// Both columns hold values spread over the whole of `BIGINT`, so neither gets a bitmap and both
     /// reach the filter. They differ in what the part costs to read. `spread` is a thousand distinct
     /// numbers and packs to eight kilobytes, so a filter of about thirteen hundred bytes is a good
-    /// trade. `repeated` is the same thousand rows over four numbers and encodes to a few hundred
-    /// bytes, but the filter is sized for the rows rather than the values it turns out to hold, so it
-    /// comes out larger than the data. Reading it to decide whether to read the part spends more than
+    /// trade. `repeated` is the same thousand rows over four numbers in runs and encodes to
+    /// almost nothing, but the filter is sized for the rows rather than the values it turns out to
+    /// hold, so it comes out larger than the data. Reading it to decide whether to read the part spends more than
     /// the part, every time, and that is the case this drops.
     #[test]
     fn a_sieve_larger_than_the_part_it_indexes_is_not_written() {
@@ -4865,7 +4868,7 @@ mod tests {
             let spread: Vec<Value> =
                 (0..per_part).map(|row| Value::BigInt(scattered(base + row as i64))).collect();
             let repeated: Vec<Value> =
-                (0..per_part).map(|row| Value::BigInt(scattered((row % 4) as i64))).collect();
+                (0..per_part).map(|row| Value::BigInt(scattered((row / 256) as i64))).collect();
             let chunk = Chunk::new(vec![
                 Vector::from_values(LogicalType::BigInt, &spread).expect("numbers"),
                 Vector::from_values(LogicalType::BigInt, &repeated).expect("numbers"),
@@ -4916,7 +4919,8 @@ mod tests {
         let mut writer =
             Writer::create(&path, "hits", vec![Field::required("id", LogicalType::BigInt)])
                 .expect("new file");
-        let held: Vec<Value> = (0..8).map(|row| Value::BigInt(scattered(row))).collect();
+        let rows = 128;
+        let held: Vec<Value> = (0..rows).map(|row| Value::BigInt(scattered(row))).collect();
         let chunk =
             Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &held).expect("numbers")])
                 .expect("one column");
@@ -4934,7 +4938,10 @@ mod tests {
         let absent =
             [Probe { column: 0, op: Op::Equal, value: Bound::Int(i128::from(scattered(99))) }];
         assert!(!reader.skips(0, &absent), "a sieve that cannot be read skips nothing");
-        assert_eq!(reader.read(0, &[0]).expect("the rows are untouched").len(), 8);
+        assert_eq!(
+            reader.read(0, &[0]).expect("the rows are untouched").len(),
+            usize::try_from(rows).expect("a small count")
+        );
         fs::remove_file(path).expect("remove scratch file");
     }
 
