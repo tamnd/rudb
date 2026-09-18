@@ -327,8 +327,11 @@ mod tests {
         round_trip(&input);
         let tokens = tokens_of(&input);
         assert!(
-            tokens.offsets.iter().zip(&tokens.lengths).any(|(offset, length)| *offset > 1
-                && *offset < *length),
+            tokens
+                .offsets
+                .iter()
+                .zip(&tokens.lengths)
+                .any(|(offset, length)| *offset > 1 && *offset < *length),
             "no partly overlapping copy emitted"
         );
     }
