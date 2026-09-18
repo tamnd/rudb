@@ -253,7 +253,12 @@ impl BigIntDistinctPartition {
 #[derive(Debug)]
 struct EncodedCountExchange {
     dictionary: Arc<Vector>,
-    keys: usize,
+    /// The types of the keys ahead of the string one, which the emit puts the values back into.
+    ///
+    /// A record holds every one of them as eight bytes whatever their columns were, because one
+    /// width is what lets a radix partition be one type. These are what the width came from and
+    /// what it goes back to.
+    leading: Vec<LogicalType>,
     partitions: Vec<Mutex<EncodedCountPartition>>,
     held: Mutex<Vec<Reservation>>,
 }
@@ -705,6 +710,12 @@ impl<'a> Aggregate<'a> {
             && self.plan.expr_type(self.keys[1]) == &LogicalType::Integer
     }
 
+    /// Whether the encoded count radix exchange can own this aggregate.
+    ///
+    /// The keys are one or two signed integers followed by a string. Any width of signed integer
+    /// will do, not just `BIGINT`, because the record holds them all as eight bytes and the emit
+    /// puts them back in the type the query asked for. That is what lets `GROUP BY SearchEngineID,
+    /// SearchPhrase` reach this: the column is a `SMALLINT` and nothing about it needs eight bytes.
     fn encoded_top_count(&self) -> bool {
         if !self.count_only
             || self.top_counts.is_none()
@@ -712,18 +723,10 @@ impl<'a> Aggregate<'a> {
         {
             return false;
         }
-        match self.keys.as_slice() {
-            [first, second] => {
-                self.plan.expr_type(*first) == &LogicalType::BigInt
-                    && self.plan.expr_type(*second) == &LogicalType::Varchar
-            }
-            [first, second, third] => {
-                self.plan.expr_type(*first) == &LogicalType::BigInt
-                    && self.plan.expr_type(*second) == &LogicalType::BigInt
-                    && self.plan.expr_type(*third) == &LogicalType::Varchar
-            }
-            _ => false,
-        }
+        let Some((last, leading)) = self.keys.split_last() else { return false };
+        (1..=2).contains(&leading.len())
+            && self.plan.expr_type(*last) == &LogicalType::Varchar
+            && leading.iter().all(|&key| signed_key(self.plan.expr_type(key)))
     }
 
     /// Whether the grouped distinct radix exchange can own this aggregate.
@@ -840,7 +843,10 @@ impl<'a> Aggregate<'a> {
         let state = self.encoded_count.get_or_init(|| {
             dictionary.as_ref().map(|(_, dictionary)| EncodedCountExchange {
                 dictionary: Arc::clone(dictionary),
-                keys: rows.keys.len(),
+                leading: self.keys[..self.keys.len() - 1]
+                    .iter()
+                    .map(|&key| self.plan.expr_type(key).clone())
+                    .collect(),
                 partitions: (0..RADIX_PARTITIONS)
                     .map(|_| Mutex::new(EncodedCountPartition::default()))
                     .collect(),
@@ -858,7 +864,7 @@ impl<'a> Aggregate<'a> {
                 "an encoded count exchange received two string code spaces",
             ));
         }
-        if state.keys != rows.keys.len() {
+        if state.leading.len() + 1 != rows.keys.len() {
             return Err(Error::internal("an encoded count exchange changed key width"));
         }
         let before = partitions.iter().map(EncodedCountPartition::footprint).sum::<usize>();
@@ -3660,7 +3666,7 @@ fn finish_encoded_count(
             return;
         };
         let done = partition.lock().map_err(poisoned).and_then(|mut rows| {
-            encoded_count_partition(&mut rows, &encoded.dictionary, encoded.keys, bound, memory)
+            encoded_count_partition(&mut rows, &encoded.dictionary, &encoded.leading, bound, memory)
         });
         if let Ok(mut slot) = slots[at].lock() {
             *slot = Some(done);
@@ -3671,10 +3677,11 @@ fn finish_encoded_count(
 fn encoded_count_partition(
     partition: &mut EncodedCountPartition,
     dictionary: &Vector,
-    keys: usize,
+    leading: &[LogicalType],
     bound: usize,
     memory: &Memory,
 ) -> Result<Part> {
+    let keys = leading.len() + 1;
     if !(2..=3).contains(&keys) {
         return Err(Error::internal("an encoded count partition has an unsupported key width"));
     }
@@ -3743,7 +3750,7 @@ fn encoded_count_partition(
         let key = partition.rows[slot];
         let valid = if all_valid { EncodedCountRecord::ALL } else { partition.validity[slot] };
         let first = if valid & EncodedCountRecord::FIRST != 0 {
-            Value::BigInt(key.first)
+            signed_value(&leading[0], key.first)?
         } else {
             Value::Null
         };
@@ -3756,7 +3763,7 @@ fn encoded_count_partition(
         row.push(first);
         if keys == 3 {
             row.push(if valid & EncodedCountRecord::SECOND != 0 {
-                Value::BigInt(key.second)
+                signed_value(&leading[1], key.second)?
             } else {
                 Value::Null
             });
@@ -3766,11 +3773,9 @@ fn encoded_count_partition(
         output.push(row);
     }
     let mut held = memory.reservation();
-    let types = if keys == 2 {
-        vec![LogicalType::BigInt, LogicalType::Varchar, LogicalType::BigInt]
-    } else {
-        vec![LogicalType::BigInt, LogicalType::BigInt, LogicalType::Varchar, LogicalType::BigInt]
-    };
+    let mut types = leading.to_vec();
+    types.push(LogicalType::Varchar);
+    types.push(LogicalType::BigInt);
     let chunks = rows::chunks(&types, &output, &mut held)?;
     timing.stop(0);
     Ok(Part { chunks, held })
@@ -4161,6 +4166,39 @@ impl Aggregate<'_> {
         }
         Ok(part)
     }
+}
+
+/// Whether a group key is a signed integer a fixed width radix record can hold.
+///
+/// The exchanges that take one widen it to eight bytes and narrow it back at the emit, so the width
+/// of the column does not matter and only the signedness and the integerness do. `DATE` and
+/// `TIMESTAMP` have a signed representation too and are deliberately not here, because putting one
+/// back together is more than a narrowing and nothing asks for it yet.
+fn signed_key(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer | LogicalType::BigInt
+    )
+}
+
+/// One signed integer key put back into the type the query asked for.
+///
+/// The narrowing cannot lose anything, because the value came out of a column of this type in the
+/// first place and was only widened to give every key one width. It is checked rather than assumed
+/// because the thing that would break it is a record reaching the wrong emit, and a wrong answer is
+/// a worse way to find that out than an error is.
+fn signed_value(ty: &LogicalType, value: i64) -> Result<Value> {
+    match ty {
+        LogicalType::TinyInt => i8::try_from(value).map(Value::TinyInt).map_err(|_| too_wide(ty)),
+        LogicalType::SmallInt => i16::try_from(value).map(Value::SmallInt).map_err(|_| too_wide(ty)),
+        LogicalType::Integer => i32::try_from(value).map(Value::Integer).map_err(|_| too_wide(ty)),
+        LogicalType::BigInt => Ok(Value::BigInt(value)),
+        _ => Err(Error::internal(format!("{ty} is not a signed integer group key"))),
+    }
+}
+
+fn too_wide(ty: &LogicalType) -> Error {
+    Error::internal(format!("a radix group key does not fit back into {ty}"))
 }
 
 /// Charges a table for what folding groups into it grew, which is the same three sums every time.
