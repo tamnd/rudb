@@ -47,7 +47,7 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 17;
+const FORMAT: u32 = 18;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -1407,7 +1407,20 @@ type SieveSlot = OnceLock<Arc<Vec<Option<Sieve>>>>;
 #[derive(Debug)]
 struct NativeText {
     file: Arc<File>,
-    offsets: Vec<u32>,
+    /// How many values the dictionary holds.
+    values: usize,
+    /// Where each value ends inside its payload block, packed at `offset_bits` in runs of
+    /// [`TEXT_OFFSET_RUN`].
+    ///
+    /// Ends rather than starts, because then a block of 1,024 values is 1,024 numbers rather than
+    /// 1,025: the start of a value is the end of the one before it, and the first value of a block
+    /// starts at zero by construction. Relative to the block rather than to the payload, because a
+    /// reader decodes a whole block and slices it, so an offset into the payload is a number it
+    /// would have to subtract a base from anyway.
+    offsets: Vec<u8>,
+    /// Bits one offset is packed at, which is what the largest block of this column spans and is the
+    /// same for every block of it.
+    offset_bits: usize,
     /// How many entries the sorted order has, which is the value count.
     ranks: usize,
     /// Where the sorted order starts in the file. It is read a block at a time and only when
@@ -1455,6 +1468,18 @@ struct NativeText {
 /// 2.3 to 4.5. Going up to 4,096 buys two to six percent more and makes a block as much as 1.5 MB.
 /// Going down to 512 gives up five to nine percent.
 const TEXT_PAYLOAD_VALUES: usize = 1024;
+
+/// How many offsets go in one packed run.
+///
+/// A payload block holds 1,024 values and `bitpack::pack_tail` takes fewer than 1,024 at a time,
+/// since a whole unit of that many belongs in the transposed layout instead. So the offsets of a
+/// block go in two runs. Five hundred and twelve values at any width is a whole number of bytes, so
+/// a run starts where a multiply says it does and nothing is padded.
+const TEXT_OFFSET_RUN: usize = 512;
+
+/// Bytes at the front of a global dictionary index: the value count, the values a payload block
+/// holds, the block count and the bits an offset is packed at.
+const DICTIONARY_HEADER: usize = 16;
 
 /// How many entries of a dictionary's sorted order sit in one block that is read and checked as a
 /// unit.
@@ -1510,8 +1535,8 @@ impl NativeText {
                     return Err(invalid("global dictionary payload checksum differs"));
                 }
                 let first = block * TEXT_PAYLOAD_VALUES;
-                let last = (first + TEXT_PAYLOAD_VALUES).min(self.offsets.len() - 1);
-                let want = (self.offsets[last] - self.offsets[first]) as usize;
+                let last = (first + TEXT_PAYLOAD_VALUES).min(self.values);
+                let want = self.end_within(last - 1)? as usize;
                 let values = string::decode_flat(&stored)?;
                 if values.len() != last - first {
                     return Err(invalid("global dictionary block holds the wrong value count"));
@@ -1525,6 +1550,34 @@ impl NativeText {
             .as_ref()
             .map_err(Clone::clone)?;
         Ok(Some(bytes.as_slice()))
+    }
+
+    /// Where the value at `index` ends inside its payload block.
+    fn end_within(&self, index: usize) -> Result<u32> {
+        let run = index / TEXT_OFFSET_RUN;
+        let bytes = self
+            .offsets
+            .get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)
+            .ok_or_else(|| invalid("global dictionary offsets are short"))?;
+        let end = bitpack::tail_at(bytes, self.offset_bits, index % TEXT_OFFSET_RUN)
+            .map_err(|_| invalid("global dictionary offsets are short"))?;
+        u32::try_from(end).map_err(|_| invalid("global dictionary offset is past the payload"))
+    }
+
+    /// Where the value at `index` starts inside its payload block, which is where the value before
+    /// it ended unless it is the first of the block.
+    fn start_within(&self, index: usize) -> Result<u32> {
+        if index % TEXT_PAYLOAD_VALUES == 0 { Ok(0) } else { self.end_within(index - 1) }
+    }
+
+    /// Where the value at `index` starts and ends inside its payload block.
+    fn span_within(&self, index: usize) -> Result<(u32, u32)> {
+        let end = self.end_within(index)?;
+        let start = self.start_within(index)?;
+        if start > end {
+            return Err(invalid("global dictionary value ends before it starts"));
+        }
+        Ok((start, end))
     }
 
     /// The block of the sorted order that holds `rank`, and where in it that rank sits.
@@ -1597,6 +1650,45 @@ fn rank_heads(block: &[u8]) -> Result<(u64, usize, &[u8])> {
     Ok((base, width, &block[RANK_BLOCK_HEADER..]))
 }
 
+/// Bits one offset of a dictionary takes, which is what its widest payload block spans.
+///
+/// One width for the whole column rather than one a block. A block is 1,024 values of the same
+/// column, so the blocks of a column are within a factor of two of each other on every ClickBench
+/// string column, and a width a block would save a fraction of a bit and cost a byte a block plus
+/// the arithmetic that finds where a block starts.
+fn offset_width(offsets: &[u32]) -> usize {
+    let values = offsets.len() - 1;
+    let mut span = 0;
+    for first in (0..values).step_by(TEXT_PAYLOAD_VALUES) {
+        let last = (first + TEXT_PAYLOAD_VALUES).min(values);
+        span = span.max(offsets[last] - offsets[first]);
+    }
+    (u32::BITS - span.leading_zeros()) as usize
+}
+
+/// How many bytes `values` offsets take at `bits`, which is what the reader has to know before it
+/// has read any of them.
+fn offset_bytes(values: usize, bits: usize) -> usize {
+    let full = values / TEXT_OFFSET_RUN;
+    let rest = values % TEXT_OFFSET_RUN;
+    full * TEXT_OFFSET_RUN / 8 * bits + bitpack::tail_len(rest, bits)
+}
+
+/// The end of every value within its payload block, packed a run at a time.
+fn encode_offsets(offsets: &[u32], bits: usize, out: &mut Vec<u8>) -> Result<()> {
+    let values = offsets.len() - 1;
+    let mut run = Vec::with_capacity(TEXT_OFFSET_RUN);
+    for first in (0..values).step_by(TEXT_OFFSET_RUN) {
+        let last = (first + TEXT_OFFSET_RUN).min(values);
+        let base = offsets[first / TEXT_PAYLOAD_VALUES * TEXT_PAYLOAD_VALUES];
+        run.clear();
+        run.extend((first..last).map(|value| u64::from(offsets[value + 1] - base)));
+        bitpack::pack_tail(&run, bits, out)
+            .map_err(|_| invalid("global dictionary offsets do not pack"))?;
+    }
+    Ok(())
+}
+
 /// How many bits a code of a dictionary of `values` entries takes.
 fn code_width(values: usize) -> usize {
     match u64::try_from(values).unwrap_or(u64::MAX) {
@@ -1607,31 +1699,29 @@ fn code_width(values: usize) -> usize {
 
 impl TextSource for NativeText {
     fn len(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
+        self.values
     }
 
     fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
-        let (Some(&start), Some(&end)) = (self.offsets.get(index), self.offsets.get(index + 1))
-        else {
+        if index >= self.values {
             return Ok(None);
-        };
+        }
+        let (start, end) = self.span_within(index)?;
         if start == end {
             return Ok(Some(&[]));
         }
         // A block holds a fixed number of values rather than a fixed number of bytes, so the value
-        // is in one block and the only arithmetic is where in it.
+        // is in one block and the offsets already say where in it.
         let block = index / TEXT_PAYLOAD_VALUES;
         let Some(bytes) = self.payload_block(block)? else { return Ok(None) };
-        let base = self.offsets[block * TEXT_PAYLOAD_VALUES];
-        let within = (start - base) as usize;
-        Ok(bytes.get(within..within + (end - start) as usize))
+        Ok(bytes.get(start as usize..end as usize))
     }
 
     fn bytes_len_at(&self, index: usize) -> Result<Option<usize>> {
-        let (Some(&start), Some(&end)) = (self.offsets.get(index), self.offsets.get(index + 1))
-        else {
+        if index >= self.values {
             return Ok(None);
-        };
+        }
+        let (start, end) = self.span_within(index)?;
         Ok(Some((end - start) as usize))
     }
 
@@ -1701,7 +1791,7 @@ impl TextSource for NativeText {
     }
 
     fn footprint(&self) -> usize {
-        self.offsets.capacity() * size_of::<u32>()
+        self.offsets.capacity()
             + self
                 .code_ranks
                 .get()
@@ -4020,7 +4110,10 @@ fn encode_global_dictionary(
     }
     let (ranks, rank_ends) = encode_ranks(order, code_width(values))?;
     let rank_blocks = values.div_ceil(TEXT_RANK_BLOCK);
-    let mut index = Vec::with_capacity(12 + (values + 1) * 4 + (blocks + rank_blocks) * 16);
+    let offset_bits = offset_width(&dictionary.offsets);
+    let mut index = Vec::with_capacity(
+        DICTIONARY_HEADER + offset_bytes(values, offset_bits) + (blocks + rank_blocks) * 16,
+    );
     put_u32(
         &mut index,
         u32::try_from(values).map_err(|_| invalid("global dictionary has too many values"))?,
@@ -4030,9 +4123,8 @@ fn encode_global_dictionary(
         &mut index,
         u32::try_from(blocks).map_err(|_| invalid("global dictionary has too many blocks"))?,
     );
-    for offset in dictionary.offsets {
-        put_u32(&mut index, offset);
-    }
+    put_u32(&mut index, offset_bits as u32);
+    encode_offsets(&dictionary.offsets, offset_bits, &mut index)?;
     // Where each block ends, so a reader can find one. The stored blocks are shorter than the
     // decoded ones and by a different amount each, so this is the one thing the offsets above no
     // longer say.
@@ -4242,22 +4334,24 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
     if ty != &LogicalType::Varchar {
         return Err(invalid("global dictionary belongs to a non-string column"));
     }
-    let mut header = [0; 12];
+    let mut header = [0; DICTIONARY_HEADER];
     read_at(&file, page.offset, &mut header)?;
     let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
     let per_block = u32::from_le_bytes(header[4..8].try_into().expect("four bytes")) as usize;
     let blocks = u32::from_le_bytes(header[8..12].try_into().expect("four bytes")) as usize;
+    let offset_bits = u32::from_le_bytes(header[12..16].try_into().expect("four bytes")) as usize;
     if per_block != TEXT_PAYLOAD_VALUES {
         return Err(invalid("global dictionary block width differs"));
     }
     if blocks != count.div_ceil(TEXT_PAYLOAD_VALUES) {
         return Err(invalid("global dictionary block count differs from its value count"));
     }
-    let offset_len = (count + 1)
-        .checked_mul(4)
-        .ok_or_else(|| invalid("global dictionary offset count overflow"))?;
+    if offset_bits > u32::BITS as usize {
+        return Err(invalid("global dictionary packs offsets past a payload"));
+    }
+    let offset_len = offset_bytes(count, offset_bits);
     // The sorted order is kept out of the index on purpose. The index is read and checksummed in
-    // full the moment the column is first touched, and the order is two thirds the size of the
+    // full the moment the column is first touched, and the order is half again the size of the
     // offsets, so putting it there would make every query that reads a string column pay for a
     // search that most of them never make.
     let ranks = count;
@@ -4268,7 +4362,7 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
         .checked_add(rank_blocks)
         .and_then(|words| words.checked_mul(16))
         .ok_or_else(|| invalid("global dictionary block count overflow"))?;
-    let index_len = 12usize
+    let index_len = DICTIONARY_HEADER
         .checked_add(offset_len)
         .and_then(|len| len.checked_add(hash_len))
         .ok_or_else(|| invalid("global dictionary header overflow"))?;
@@ -4276,16 +4370,13 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
         return Err(invalid("global dictionary offset index exceeds its page"));
     }
     let mut index = vec![0; index_len];
-    index[..12].copy_from_slice(&header);
-    read_at(&file, page.offset + 12, &mut index[12..])?;
+    index[..DICTIONARY_HEADER].copy_from_slice(&header);
+    read_at(&file, page.offset + DICTIONARY_HEADER as u64, &mut index[DICTIONARY_HEADER..])?;
     if checksum(&index) != page.hash {
         return Err(invalid("global dictionary index checksum differs"));
     }
-    let offsets = index[12..12 + offset_len]
-        .chunks_exact(4)
-        .map(|part| u32::from_le_bytes(part.try_into().expect("four bytes")))
-        .collect::<Vec<_>>();
-    let mut words = index[12 + offset_len..]
+    let offsets = index[DICTIONARY_HEADER..DICTIONARY_HEADER + offset_len].to_vec();
+    let mut words = index[DICTIONARY_HEADER + offset_len..]
         .chunks_exact(8)
         .map(|part| u64::from_le_bytes(part.try_into().expect("eight bytes")))
         .collect::<Vec<_>>();
@@ -4314,14 +4405,13 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
     {
         return Err(invalid("global dictionary blocks do not bound the payload"));
     }
-    if offsets.first() != Some(&0) || offsets.windows(2).any(|pair| pair[0] > pair[1]) {
-        return Err(invalid("global dictionary offsets do not bound the payload"));
-    }
     Vector::external_text(
         LogicalType::Varchar,
         Arc::new(NativeText {
             file,
+            values: count,
             offsets,
+            offset_bits,
             ranks,
             rank_at: page.offset + index_len as u64,
             rank_ends,
@@ -4663,19 +4753,27 @@ mod tests {
     /// The tests below damage a byte of the order or of the payload, so they need to know where each
     /// one starts, and working it out here rather than writing a number down means adding something
     /// to the index does not quietly turn one of them into a test that damages the index instead.
-    fn dictionary_index_len(header: &[u8; 12]) -> u64 {
+    fn dictionary_index_len(header: &[u8; DICTIONARY_HEADER]) -> u64 {
         let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
         let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
+        let bits = u32::from_le_bytes(header[12..16].try_into().expect("four bytes")) as usize;
         let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
-        12 + (count + 1) * 4 + (blocks + rank_blocks) * 16
+        DICTIONARY_HEADER as u64
+            + offset_bytes(count as usize, bits) as u64
+            + (blocks + rank_blocks) * 16
     }
 
     /// How long the sorted order is, which is where its last block ends.
-    fn last_rank_end(file: &File, offset: u64, header: &[u8; 12]) -> u64 {
+    fn last_rank_end(file: &File, offset: u64, header: &[u8; DICTIONARY_HEADER]) -> u64 {
         let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
         let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
+        let bits = u32::from_le_bytes(header[12..16].try_into().expect("four bytes")) as usize;
         let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
-        let at = offset + 12 + (count + 1) * 4 + blocks * 16 + (rank_blocks - 1) * 8;
+        let at = offset
+            + DICTIONARY_HEADER as u64
+            + offset_bytes(count as usize, bits) as u64
+            + blocks * 16
+            + (rank_blocks - 1) * 8;
         let mut end = [0; 8];
         read_at(file, at, &mut end).expect("the last rank block end");
         u64::from_le_bytes(end)
@@ -5514,7 +5612,7 @@ mod tests {
         let dictionary = reader.table.dictionaries[1].expect("string dictionary page");
         // Read the count out of the page rather than writing it here, so that adding something
         // else to the index does not silently turn this into a test that damages the index.
-        let mut header = [0; 12];
+        let mut header = [0; DICTIONARY_HEADER];
         read_at(&reader.file, dictionary.offset, &mut header).expect("dictionary header");
         let index_len = dictionary_index_len(&header);
         let rank_len = last_rank_end(&reader.file, dictionary.offset, &header);
@@ -5578,6 +5676,53 @@ mod tests {
         let chunk = reader.read(parts - 1, &[0]).expect("the code page remains valid");
         let error = chunk.validate_external().expect_err("the damage must reach the caller");
         assert!(error.message().contains("payload checksum differs"), "{error}");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Values of different lengths read back where the offsets say they do.
+    ///
+    /// The offsets are packed at one width for the column, they are relative to the payload block a
+    /// value lands in, and they go in runs of half a block, so there are two boundaries where the
+    /// arithmetic could be off by one and neither shows up on values that are all the same length.
+    /// This writes 5,000 values whose lengths cycle through a wide range and reads every one back,
+    /// so the first value of a block, the last value of a run and the last value of a block are all
+    /// covered several times over. An empty value is in the cycle because a zero length span is the
+    /// case the reader short circuits.
+    #[test]
+    fn values_of_different_lengths_read_back_out_of_packed_offsets() {
+        let path = path("dictionary-offsets");
+        let value = |row: usize| {
+            if row % 511 == 3 { String::new() } else { "x".repeat(row % 97) + &format!("{row:05}") }
+        };
+        let rows = 5_000;
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        let values = (0..rows).map(|row| Value::Varchar(value(row))).collect::<Vec<_>>();
+        for part in values.chunks(1_000) {
+            let chunk =
+                Chunk::new(vec![Vector::from_values(LogicalType::Varchar, part).expect("strings")])
+                    .expect("matching rows");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        assert!(
+            rows > TEXT_PAYLOAD_VALUES * 4,
+            "the dictionary has to be several blocks for this to be testing anything"
+        );
+        for part in 0..rows / 1_000 {
+            let chunk = reader.read(part, &[0]).expect("a part");
+            for row in 0..1_000 {
+                let row = part * 1_000 + row;
+                assert_eq!(
+                    chunk.value_at(row % 1_000, 0),
+                    Value::Varchar(value(row)),
+                    "value {row}"
+                );
+            }
+        }
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -5660,7 +5805,7 @@ mod tests {
 
         let reader = Reader::open(&path).expect("valid directory");
         let page = reader.table.dictionaries[1].expect("string dictionary page");
-        let mut header = [0; 12];
+        let mut header = [0; DICTIONARY_HEADER];
         read_at(&reader.file, page.offset, &mut header).expect("dictionary header");
         let index_len = dictionary_index_len(&header);
         let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
