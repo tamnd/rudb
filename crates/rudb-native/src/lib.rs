@@ -30,7 +30,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
@@ -499,6 +499,14 @@ impl GlobalDictionary {
 #[derive(Debug)]
 pub struct Writer {
     file: File,
+    /// Where the next write goes, counted here rather than asked of the file.
+    ///
+    /// The file's own cursor is not ours. Building the numeric frequencies reads pages back through
+    /// [`read_at`], and a positional read is only positional about where it reads from: `pread`
+    /// leaves the cursor alone, and the call Windows has for it moves the cursor to the end of what
+    /// it read. A writer that asked the file where it was would then write the directory over a
+    /// page it had already written, which is what it did.
+    at: u64,
     table: Table,
     generation: u64,
     /// The first and the last source position in every stripe, in the order the stripes were
@@ -552,14 +560,15 @@ impl Writer {
         for field in &fields {
             type_tag(&field.ty)?;
         }
-        let mut file =
+        let file =
             OpenOptions::new().write(true).read(true).create_new(true).open(path).map_err(io)?;
         let mut header = [0; HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&FORMAT.to_le_bytes());
-        file.write_all(&header).map_err(io)?;
+        write_at(&file, 0, &header)?;
         Ok(Self {
             file,
+            at: HEADER,
             dictionaries: fields
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
@@ -577,6 +586,19 @@ impl Writer {
             next_order: 0,
             pending: Vec::with_capacity(STRIPE_PARTS),
         })
+    }
+
+    /// Appends bytes at the end of the file and moves the writer's own offset past them.
+    ///
+    /// Every write in here goes through this, so that [`Writer::at`] is the only answer to where
+    /// anything is and the file's cursor is never consulted for it.
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        write_at(&self.file, self.at, bytes)?;
+        self.at = self
+            .at
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| invalid("native file length overflow"))?;
+        Ok(())
     }
 
     /// Writes one chunk as independently readable column pages.
@@ -659,18 +681,21 @@ impl Writer {
             return Ok(());
         }
         let width = self.table.fields.len();
-        let parts = self.pending.len();
+        // Held here rather than read off the writer, because writing a page needs the writer and
+        // the borrow checker is right that those are two different uses of it.
+        let mut held = std::mem::take(&mut self.pending);
+        let parts = held.len();
         let mut pages = Vec::with_capacity(width);
         let mut memberships = vec![None; width];
         let mut ranges = Vec::with_capacity(width);
         let mut index = Vec::with_capacity(width.saturating_mul(index_section(parts)?));
         for column in 0..width {
-            let offset = self.file.stream_position().map_err(io)?;
+            let offset = self.at;
             let section = index.len();
             let mut length = 0_usize;
-            for pending in &self.pending {
+            for pending in &held {
                 let bytes = &pending.pages[column];
-                self.file.write_all(bytes).map_err(io)?;
+                write_at(&self.file, self.at + length as u64, bytes)?;
                 put_u32(
                     &mut index,
                     u32::try_from(bytes.len()).map_err(|_| invalid("part length overflow"))?,
@@ -685,28 +710,29 @@ impl Writer {
             if length > MAX_PAGE {
                 return Err(invalid("column page exceeds the configured bound"));
             }
+            self.at = self
+                .at
+                .checked_add(length as u64)
+                .ok_or_else(|| invalid("native file length overflow"))?;
             pages.push(Span {
                 offset,
                 length: u32::try_from(length).map_err(|_| invalid("page length overflow"))?,
             });
             ranges.push(merged_range(
-                self.pending
-                    .iter()
-                    .map(|pending| pending.zone.column(column).cloned().unwrap_or_default()),
+                held.iter().map(|pending| pending.zone.column(column).cloned().unwrap_or_default()),
             ));
         }
         for (column, membership) in memberships.iter_mut().enumerate() {
-            if self.pending.iter().all(|pending| pending.codes[column].is_none()) {
+            if held.iter().all(|pending| pending.codes[column].is_none()) {
                 continue;
             }
-            let lists = self
-                .pending
+            let lists = held
                 .iter()
                 .map(|pending| pending.codes[column].clone().unwrap_or_default())
                 .collect::<Vec<_>>();
             let bytes = encode_membership(&merged_codes(lists));
-            let offset = self.file.stream_position().map_err(io)?;
-            self.file.write_all(&bytes).map_err(io)?;
+            let offset = self.at;
+            self.put(&bytes)?;
             *membership = Some(Page {
                 offset,
                 length: u32::try_from(bytes.len())
@@ -716,12 +742,12 @@ impl Writer {
         }
         let mut sieves = vec![None; width];
         for (column, page) in sieves.iter_mut().enumerate() {
-            if self.pending.iter().all(|pending| pending.sieves[column].is_none()) {
+            if held.iter().all(|pending| pending.sieves[column].is_none()) {
                 continue;
             }
-            let bytes = encode_sieves(self.pending.iter().map(|pending| &pending.sieves[column]))?;
-            let offset = self.file.stream_position().map_err(io)?;
-            self.file.write_all(&bytes).map_err(io)?;
+            let bytes = encode_sieves(held.iter().map(|pending| &pending.sieves[column]))?;
+            let offset = self.at;
+            self.put(&bytes)?;
             *page = Some(Page {
                 offset,
                 length: u32::try_from(bytes.len())
@@ -729,8 +755,8 @@ impl Writer {
                 hash: checksum(&bytes),
             });
         }
-        let offset = self.file.stream_position().map_err(io)?;
-        self.file.write_all(&index).map_err(io)?;
+        let offset = self.at;
+        self.put(&index)?;
         let index = Span {
             offset,
             length: u32::try_from(index.len())
@@ -739,7 +765,7 @@ impl Writer {
         let mut rows = 0_usize;
         let mut lengths = Vec::with_capacity(parts);
         let mut span = None;
-        for pending in self.pending.drain(..) {
+        for pending in held.drain(..) {
             rows = rows.checked_add(pending.rows).ok_or_else(|| invalid("row count overflow"))?;
             lengths
                 .push(u32::try_from(pending.rows).map_err(|_| invalid("part row count overflow"))?);
@@ -757,6 +783,8 @@ impl Writer {
             sieves,
             zone: Zone::from_ranges(ranges),
         });
+        // Back where it came from, empty, so the next stripe buffers into the same allocation.
+        self.pending = held;
         Ok(())
     }
 
@@ -984,10 +1012,10 @@ impl Writer {
             let Some(dictionary) = dictionary else { continue };
             self.table.frequencies[index] = Some(code_frequency(&dictionary));
             let encoded = encode_global_dictionary(dictionary, &order)?;
-            let offset = self.file.stream_position().map_err(io)?;
-            self.file.write_all(&encoded.index).map_err(io)?;
-            self.file.write_all(&encoded.ranks).map_err(io)?;
-            self.file.write_all(&encoded.payload).map_err(io)?;
+            let offset = self.at;
+            self.put(&encoded.index)?;
+            self.put(&encoded.ranks)?;
+            self.put(&encoded.payload)?;
             let length = encoded
                 .index
                 .len()
@@ -1005,8 +1033,8 @@ impl Writer {
         if directory.len() > MAX_DIRECTORY {
             return Err(invalid("directory exceeds the configured bound"));
         }
-        let offset = self.file.stream_position().map_err(io)?;
-        self.file.write_all(&directory).map_err(io)?;
+        let offset = self.at;
+        self.put(&directory)?;
         self.file.sync_all().map_err(io)?;
         let slot = Slot {
             offset,
@@ -1015,8 +1043,9 @@ impl Writer {
             generation: self.generation,
             hash: checksum(&directory),
         };
-        self.file.seek(SeekFrom::Start(16)).map_err(io)?;
-        self.file.write_all(&slot.bytes()).map_err(io)?;
+        // The one write that is not an append, and the last one. It goes back over the slot in the
+        // header, so it names its offset rather than going through `put`, and `at` does not move.
+        write_at(&self.file, 16, &slot.bytes())?;
         self.file.sync_all().map_err(io)?;
         Ok(self.table)
     }
@@ -1433,7 +1462,13 @@ fn read_index(file: &File, stripe: &Stripe, column: usize) -> Result<Vec<PartSpa
     let entries = section - size_of::<u64>();
     let stored = u64::from_le_bytes(bytes[entries..].try_into().expect("eight bytes"));
     if checksum(&bytes[..entries]) != stored {
-        return Err(invalid("index page section checksum differs"));
+        // With where it was read from, because the two ways this fires look identical from the
+        // message alone: a file somebody damaged, and a file we wrote to the wrong offset.
+        return Err(invalid(&format!(
+            "index page section checksum differs, column {column} of {parts} parts at {offset}, \
+             wanted {stored:016x} and got {:016x}",
+            checksum(&bytes[..entries]),
+        )));
     }
     let mut spans = Vec::with_capacity(parts);
     let mut start = 0_usize;
@@ -2118,7 +2153,16 @@ impl Reader {
                 }
             };
             if checksum(bytes) != span.hash {
-                return Err(invalid("column page checksum differs"));
+                return Err(invalid(&format!(
+                    "column page checksum differs, column {column} part {} at {}+{} of {} bytes, \
+                     wanted {:016x} and got {:016x}",
+                    place.part,
+                    page.offset,
+                    span.start,
+                    span.length,
+                    span.hash,
+                    checksum(bytes),
+                )));
             }
             let dictionary = self.dictionary(column)?;
             picked.push(decode(&field.ty, rows, bytes, dictionary)?);
@@ -2195,6 +2239,57 @@ fn text_at_rank(dictionary: &Vector, rank: usize) -> Result<Value> {
     Ok(Value::Varchar(text.into()))
 }
 
+/// Writes one span of a file at an offset, without depending on where the cursor is.
+///
+/// The writer owns an offset of its own and passes it in here, so that nothing it writes depends on
+/// a cursor that a read is entitled to move. Both of these can come back short and both loop.
+#[cfg(unix)]
+fn write_at(file: &File, mut offset: u64, mut bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !bytes.is_empty() {
+        let written = file.write_at(bytes, offset).map_err(io)?;
+        if written == 0 {
+            return Err(invalid("a write to the native file wrote nothing"));
+        }
+        offset += written as u64;
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+/// The same write, on the call Windows spells differently.
+#[cfg(windows)]
+fn write_at(file: &File, mut offset: u64, mut bytes: &[u8]) -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !bytes.is_empty() {
+        let written = file.seek_write(bytes, offset).map_err(io)?;
+        if written == 0 {
+            return Err(invalid("a write to the native file wrote nothing"));
+        }
+        offset += written as u64;
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+/// Somewhere that is neither, where the cursor is all there is.
+#[cfg(not(any(unix, windows)))]
+fn write_at(file: &File, offset: u64, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut file = file.try_clone().map_err(io)?;
+    file.seek(SeekFrom::Start(offset)).map_err(io)?;
+    file.write_all(bytes).map_err(io)
+}
+
+/// Reads one span of a file at an offset, without moving a cursor anybody else can see.
+///
+/// Every reader of a table shares one [`File`] behind an [`Arc`], and a grouped aggregate reads its
+/// pages from several threads at once, so this has to be positional. Seeking and then reading is
+/// two calls with a gap in the middle, and in that gap another thread's seek lands and the read
+/// comes back with somebody else's bytes.
+///
+/// Both of these can come back short, so both loop. A read of zero bytes before the span is filled
+/// means the file stops earlier than the directory said it does.
 #[cfg(unix)]
 fn read_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
     use std::os::unix::fs::FileExt;
@@ -2209,7 +2304,30 @@ fn read_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// The same read, on the call Windows spells differently.
+///
+/// `seek_read` is one `ReadFile` carrying the offset with it, so two of them cannot interleave the
+/// way a seek and a read can. It does leave the shared cursor somewhere afterwards, which is why
+/// nothing in this file may read that cursor.
+#[cfg(windows)]
+fn read_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !bytes.is_empty() {
+        let read = file.seek_read(bytes, offset).map_err(io)?;
+        if read == 0 {
+            return Err(invalid("column page ends before its declared length"));
+        }
+        offset += read as u64;
+        bytes = &mut bytes[read..];
+    }
+    Ok(())
+}
+
+/// Somewhere that is neither, where the cursor is all there is.
+///
+/// This one does race, and there is no way to write it so it does not. Nothing we build for runs
+/// here, so it exists to keep the crate compiling rather than to be correct under threads.
+#[cfg(not(any(unix, windows)))]
 fn read_at(file: &File, offset: u64, bytes: &mut [u8]) -> Result<()> {
     let mut file = file.try_clone().map_err(io)?;
     file.seek(SeekFrom::Start(offset)).map_err(io)?;
@@ -3614,6 +3732,88 @@ mod tests {
     fn path(label: &str) -> PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("time advances").as_nanos();
         std::env::temp_dir().join(format!("rudb-native-{label}-{}-{stamp}.rdb", std::process::id()))
+    }
+
+    /// A read names the offset it wants, so a cursor somebody else moved cannot reach it.
+    #[test]
+    fn a_read_at_an_offset_ignores_where_another_thread_left_the_cursor() {
+        const SPANS: usize = 64;
+        const SPAN: usize = 512;
+        let path = path("positional");
+        let content: Vec<u8> =
+            (0..SPANS).flat_map(|span| std::iter::repeat_n(span as u8, SPAN)).collect();
+        fs::write(&path, &content).expect("the file is written");
+        let file = Arc::new(File::open(&path).expect("the file opens"));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let file = Arc::clone(&file);
+                scope.spawn(move || {
+                    for _ in 0..64 {
+                        for span in 0..SPANS {
+                            let mut bytes = [0_u8; SPAN];
+                            read_at(&file, (span * SPAN) as u64, &mut bytes)
+                                .expect("the span reads");
+                            assert!(
+                                bytes.iter().all(|byte| *byte == span as u8),
+                                "span {span} came back as {}",
+                                bytes[0],
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        let mut past = [0_u8; SPAN];
+        let end = (SPANS * SPAN) as u64;
+        let error = read_at(&file, end, &mut past).expect_err("a read past the end is refused");
+        assert!(error.message().contains("ends before its declared length"), "{error}");
+        drop(file);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The writer records where it put a page and puts it there, whatever the cursor is doing.
+    ///
+    /// The cursor is moved between the steps that record an offset, which is what reading the pages
+    /// back to build the frequencies does on a platform with no `pread`. Without the fix the
+    /// directory lands on top of a page and the file fails to reopen.
+    #[test]
+    fn a_writer_puts_a_page_where_it_said_it_did_wherever_the_cursor_has_got_to() {
+        let path = path("cursor");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("id", LogicalType::Integer),
+                Field::new("text", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        writer.append(&sample()).expect("first part");
+        writer.file.seek(SeekFrom::Start(0)).expect("the cursor goes back to the header");
+        writer.append(&sample()).expect("second part");
+        writer.file.seek(SeekFrom::Start(1)).expect("and somewhere useless again");
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("reopen from disk");
+        assert_eq!(reader.table().rows(), 6);
+        let ids = reader.read(0, &[0]).expect("the integer page reads back");
+        assert_eq!(ids.value_at(0, 0), Value::Integer(4));
+        assert_eq!(ids.value_at(2, 0), Value::Integer(-2));
+        let text = reader.read(1, &[1]).expect("the text page reads back");
+        assert_eq!(text.value_at(1, 0), Value::Null);
+        assert_eq!(text.value_at(2, 0), Value::Varchar("long text after a slash".into()));
+        // Nothing the directory points at may run past the end of the file, which is the shape the
+        // failure took: a page recorded at an offset the directory had already been written over.
+        let end = reader.table().stripes().iter().flat_map(|stripe| {
+            stripe
+                .pages
+                .iter()
+                .map(|page| page.offset + u64::from(page.length))
+                .chain(std::iter::once(stripe.index.offset + u64::from(stripe.index.length)))
+        });
+        let last = end.fold(HEADER, u64::max);
+        let directory = fs::metadata(&path).expect("the file is there").len();
+        assert!(last <= directory, "a page runs to {last} in a file of {directory} bytes");
+        fs::remove_file(path).expect("remove scratch file");
     }
 
     fn sample() -> Chunk {
