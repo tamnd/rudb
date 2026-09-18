@@ -58,16 +58,18 @@
 //! will run as more than one instance, and how many morsels the source says it has, which is what
 //! keeps a query over one chunk on one thread.
 //!
-//! [`Pool`] is the thread budget, and it belongs to the database rather than to the query, because
-//! two queries on a sixteen core machine should use sixteen threads between them. It lends a number
-//! rather than running closures, for the reason its own documentation gives.
+//! [`Pool`] is the thread budget and the threads themselves, and it belongs to the database rather
+//! than to the query, because two queries on a sixteen core machine should use sixteen threads
+//! between them. Its workers park between queries rather than being started per pipeline, and the
+//! one `unsafe` block in this crate is what lets a parked thread run work that borrows a plan. Its
+//! own documentation has the invariant that makes that sound.
 //!
 //! What this crate knows about waiting is that an operator can report [`Progress::Blocked`] for
 //! exactly four reasons, which is what makes the wait for graph finite and a deadlock a bug report
 //! with the cycle in it rather than a hang. Nothing reports one yet, so neither driver parks and
 //! both report it instead.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod compact;
 mod dynamic;

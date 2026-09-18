@@ -123,7 +123,7 @@ impl<'a> Query<'a> {
             let degree = lease.degree();
             let spent = {
                 let _running = driver.running();
-                run_parallel(pipeline, cancel, degree)?
+                run_parallel(pipeline, cancel, &lease)?
             };
             driver.ran(degree, spent);
             self.worker_cpu_ns.fetch_add(spent, Ordering::Relaxed);
