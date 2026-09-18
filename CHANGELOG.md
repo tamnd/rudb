@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.33
+
+A patch release that gives a global dictionary its sorted order, so a filter on a string column resolves the literal to a code by binary search instead of comparing values. **The storage format version moves from 8 to 9.** A version 9 reader still opens a version 7 or version 8 file, and a version 8 reader cannot open a version 9 one.
+
+- A global dictionary is written with its values in sorted order, one entry per distinct value giving the code and the first eight bytes of that value as an integer that sorts the way the bytes sort. Codes themselves stay in first appearance order, because the writer streams stripes and because a stripe's codes being consecutive is what frame of reference compression wants.
+- A text comparison against a literal searches that order rather than deciding per value. After the search the filter is one integer against one integer, and a literal the dictionary does not hold is decided for a whole chunk without reading the codes.
+- The order sits outside the part of a dictionary page a reader checksums on first touch, in blocks of five hundred and twelve entries with a checksum each, read only when something searches. A query that never compares a string column against a literal never reads any of it.
+- A probe compares the stored first eight bytes and only reads a value when two entries agree on them, so a search of a half million value dictionary reads one value rather than nineteen scattered blocks of the file.
+- `TextSource` gains `ranks`, `compare_rank` and `code_at_rank` in place of the flat order it briefly had, so a format decides what a probe costs and the search itself stays in the kernels crate.
+- All 43 ClickBench queries at one million rows total 397.9ms against 406.9ms, with fifteen queries between 0.65x and 0.92x and none slower. A full load costs 3.0 percent more time and the file is 3.61 percent larger.
+- The full gate passes on Rust 1.85. No DuckDB bug was found in this work.
+
 ## 0.3.32
 
 A patch release that runs window functions, answers the seven ranking names, and reads dictionary columns as dictionaries in two more places. The storage format version is unchanged.
