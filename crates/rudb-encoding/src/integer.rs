@@ -356,10 +356,13 @@ fn encode_as(
         }
         Kind::Packed => encode_packed(values, &mut out)?,
         Kind::Delta => {
-            let Some(deltas) = deltas(values) else {
+            // An empty chunk has no first value to hang the differences off, and a caller naming
+            // this kind outright does not go past `candidates`, which is where that used to be
+            // ruled out.
+            let (Some(first), Some(deltas)) = (values.first(), deltas(values)) else {
                 return Ok(None);
             };
-            put_i64(&mut out, values[0]);
+            put_i64(&mut out, *first);
             out.extend_from_slice(&encode_at(&deltas, depth + 1, chooser)?);
         }
         Kind::Rle => {
