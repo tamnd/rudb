@@ -31,10 +31,17 @@
 //!
 //! A bound is allowed to be wider than the truth. It rules out a chunk that cannot hold a matching
 //! row, so a range that covers more than the chunk really holds costs a chunk that is read and
-//! yields nothing, and never costs a row. That is what makes the compressed forms cheap here: a
-//! dictionary column's bounds come from its dictionary and not from its codes, a bit packed
-//! column's come from the base and the ceiling it was packed against, and a run encoded column's
-//! come from its run values. None of those walk the rows at all.
+//! yields nothing, and never costs a row. That is what makes a compressed form cheap here: a
+//! dictionary column's bounds can come from its dictionary and not from its codes, a bit packed
+//! column's from the base and the ceiling it was packed against, and a run encoded column's from
+//! its run values, and none of those walks the rows at all.
+//!
+//! Cheap is not the only thing wanted from them any more. A bound that is allowed to be wide cannot
+//! answer a `MIN` and cannot be added up, and a stored table that answers those out of its directory
+//! is worth more than the load time it costs, so the three compressed forms are now read through
+//! their codes, their packing and their runs rather than over their values. Each range says which of
+//! the two it is in `exact`, so a form nobody has taught this about still skips chunks correctly and
+//! simply does not answer the rest.
 //!
 //! # What it costs to build
 //!
@@ -42,9 +49,11 @@
 //! about 60 milliseconds on a load of 0.93 seconds, so a table with a full set of zone maps costs
 //! 1.02 seconds to build against DuckDB's 1.18 for the same `CREATE TABLE AS SELECT`.
 //!
-//! Getting it to 60 milliseconds took two rounds. The first cost 260, which is where the comments on
-//! `extremes` and on `narrower` come from: one was a `Bound` allocated per value instead of a
-//! compare in the column's own type, and the other was a shared dictionary rescanned once per chunk.
+//! Getting it to 60 milliseconds took two rounds. The first cost 260, and the comment on `extremes`
+//! is where half of that went: a `Bound` allocated per value instead of a compare in the column's
+//! own type. The other half was a shared dictionary rescanned once per chunk, which is `hits` and
+//! its `SearchPhrase` column, whose dictionary is far larger than a chunk. Reading the codes costs
+//! the rows instead, which is what happens now for every dictionary rather than only for that one.
 //!
 //! That cost is real and it belongs in the load time rather than hidden behind it, because a table
 //! built once and queried forty three times and a table built once and queried once want different
@@ -53,7 +62,7 @@
 
 use rudb_common::Value;
 use rudb_common::bounds::{Bound, Op, excluded};
-use rudb_vector::{Chunk, Data, Form, Vector};
+use rudb_vector::{Chunk, Data, Form, Packed, Vector};
 
 #[cfg(doc)]
 use crate::MemoryTable;
@@ -83,7 +92,8 @@ pub struct Range {
     ///
     /// A bound that is too wide is fine for skipping a chunk and useless for answering a `MIN`, so
     /// this is the difference between the two. It is set only where the walk actually looked at
-    /// every row, which is the flat layouts and the two forms that hold one value.
+    /// every row, which is every form here except the ones whose values hold something this cannot
+    /// total or compare, and those fall back to the bound.
     pub exact: bool,
     /// The sum of the non-null values when they are integers, and `None` otherwise.
     ///
@@ -155,91 +165,287 @@ impl Zone {
     }
 }
 
+/// What one look at a column found.
+///
+/// The four answers are made together because they come from the same walk. Which walk that is
+/// depends on the form the column arrived in, and the difference between a walk over the rows and a
+/// read of a summary somebody else wrote is exactly what `exact` records.
+#[derive(Default)]
+struct Walked {
+    low: Option<Bound>,
+    high: Option<Bound>,
+    exact: bool,
+    sum: Option<i128>,
+}
+
+impl Walked {
+    /// The two ends and nothing else, which is a string column: they are the rows, and strings do
+    /// not add up.
+    fn ends((low, high): (Option<Bound>, Option<Bound>)) -> Self {
+        Self { low, high, exact: true, sum: None }
+    }
+
+    /// Two integer ends and a total, from a walk that saw every row.
+    fn totalled(low: Option<i128>, high: Option<i128>, sum: i128) -> Self {
+        Self { low: low.map(Bound::Int), high: high.map(Bound::Int), exact: true, sum: Some(sum) }
+    }
+}
+
 /// The range of one vector, in whatever form it arrived in.
 fn range(vector: &Vector) -> Range {
     let nulls = vector.len() - vector.validity().count_valid(vector.len());
-    let (low, high) = match vector.form() {
-        // One value, which is both ends of the range.
-        Form::Constant => match vector.constant_value().and_then(Bound::of_value) {
-            Some(only) => (Some(only.clone()), Some(only)),
-            None => (None, None),
-        },
-        // A start and a step, so the two ends are the first and the last, whichever way it runs.
+    let walked = walk(vector);
+    Range { low: walked.low, high: walked.high, nulls, exact: walked.exact, sum: walked.sum }
+}
+
+/// One pass over one column, one arm per form.
+fn walk(vector: &Vector) -> Walked {
+    match vector.form() {
+        // One value, which is both ends, and a total that is it times the rows that are not null.
+        // That is the whole column with no loop at all.
+        Form::Constant => constant(vector),
+        // A start and a step, so the two ends are the first and the last, whichever way it runs. A
+        // null row inside one has no value of its own, so the ends would then cover a row the column
+        // does not hold, and that is the one case here that is a bound rather than the column.
         Form::Sequence => match vector.sequence_parts() {
-            Some((start, step)) => ends(start, step, vector.len()),
-            None => (None, None),
+            Some((start, step)) => {
+                let (low, high) = ends(start, step, vector.len());
+                let exact = !vector.validity().has_nulls(vector.len());
+                Walked { low, high, exact, sum: None }
+            }
+            None => Walked::default(),
         },
-        // The range the column was packed against, which is at least as wide as the column.
         Form::BitPacked => match vector.packed_parts() {
-            Some(packed) => (Some(Bound::Int(packed.base())), Some(Bound::Int(packed.ceiling()))),
-            None => (None, None),
+            Some(packed) => unpacked(vector, &packed),
+            None => Walked::default(),
         },
-        // The distinct values, which are a superset of the values the codes point at.
         Form::Dictionary => match vector.dictionary_parts() {
-            Some((_, values)) => narrower(vector, values),
-            None => (None, None),
+            Some((codes, values)) => coded(vector, codes, values),
+            None => Walked::default(),
         },
-        // Same, for the value of each run.
         Form::Rle => match vector.run_parts() {
-            Some((_, values)) => narrower(vector, values),
-            None => (None, None),
+            Some((stops, values)) => runs(vector, stops, values),
+            None => Walked::default(),
         },
         Form::Flat => match vector.data() {
-            Some(data) => flat(vector, data),
-            None => (None, None),
+            Some(data) => {
+                let (low, high) = flat(vector, data);
+                let (exact, sum) = summed(vector, data);
+                Walked { low, high, exact, sum }
+            }
+            None => Walked::default(),
         },
         // Strings that are not flat. Walked as bytes rather than as values, because a `Value` per
         // row of a `URL` column is a heap allocation per row and this runs over every column of
         // every chunk of a load.
-        Form::StringView | Form::Fsst => text(vector),
+        Form::StringView | Form::Fsst => Walked::ends(text(vector)),
         // A form added since this was written. Saying nothing about it keeps its rows, which is the
         // answer that is wrong slowly rather than wrong.
-        _ => (None, None),
-    };
-    let (exact, sum) = counted(vector);
-    Range { low, high, nulls, exact, sum }
+        _ => Walked::default(),
+    }
 }
 
-/// Whether the two ends above are exact, and the sum of the values behind them.
-///
-/// Both answers come from the same place, which is whether this walked the rows or read a summary
-/// somebody else wrote. A bit packed column's ends come from the range it was packed against and a
-/// dictionary column's come from its dictionary, and neither of those is the column, so neither can
-/// say what the smallest value in it is or what they add up to.
-fn counted(vector: &Vector) -> (bool, Option<i128>) {
-    match vector.form() {
-        // One value repeated, so the ends are that value and the sum is it times the rows that are
-        // not null. That is the whole column with no loop at all.
-        Form::Constant => match vector.constant_value() {
-            // Every row is null, so there are no ends to get wrong and nothing to add up, and a
-            // total of nothing is zero rather than unknown.
-            Some(Value::Null) => (true, Some(0)),
-            Some(value) => match Bound::of_value(value) {
-                Some(Bound::Int(only)) => {
-                    let rows = vector.validity().count_valid(vector.len()) as i128;
-                    (true, only.checked_mul(rows))
+/// One value repeated, which is both ends of itself.
+fn constant(vector: &Vector) -> Walked {
+    match vector.constant_value() {
+        // Every row is null, so there are no ends to get wrong and nothing to add up, and a total
+        // of nothing is zero rather than unknown.
+        Some(Value::Null) => Walked { exact: true, sum: Some(0), ..Walked::default() },
+        Some(value) => match Bound::of_value(value) {
+            Some(Bound::Int(only)) => {
+                let rows = vector.validity().count_valid(vector.len()) as i128;
+                Walked {
+                    low: Some(Bound::Int(only)),
+                    high: Some(Bound::Int(only)),
+                    exact: true,
+                    // Dropped rather than wrapped, which leaves exact ends and no total, and that is
+                    // a true thing to say.
+                    sum: only.checked_mul(rows),
                 }
-                // A float, including a NaN, which is the second reason on `Range::exact`.
-                Some(Bound::Real(_)) => (false, None),
-                // A constant that is not a number still has exact ends. It is the same one value.
-                _ => (true, None),
+            }
+            // A float, including a NaN, which is the second reason on `Range::exact`.
+            Some(Bound::Real(real)) => Walked {
+                low: Some(Bound::Real(real)),
+                high: Some(Bound::Real(real)),
+                exact: false,
+                sum: None,
             },
-            None => (false, None),
+            // A constant that is not a number still has exact ends. It is the same one value.
+            Some(other) => Walked::ends((Some(other.clone()), Some(other))),
+            None => Walked::default(),
         },
-        // The first and the last, and neither of them was guessed. A null row inside a sequence has
-        // no value of its own, so the ends would then cover a row the column does not hold.
-        Form::Sequence => {
-            let walked = vector.sequence_parts().is_some();
-            (walked && !vector.validity().has_nulls(vector.len()), None)
-        }
-        Form::Flat => match vector.data() {
-            Some(data) => summed(vector, data),
-            None => (false, None),
-        },
-        // A string walked as bytes is walked a row at a time, so those ends are the column's.
-        Form::StringView | Form::Fsst => (true, None),
-        _ => (false, None),
+        None => Walked::default(),
     }
+}
+
+/// A bit packed column, unpacked a row at a time.
+///
+/// The range it was packed against is at least as wide as the column and often much wider, because
+/// a width is a power of two number of bits and a column that fits in nine bits is packed in nine
+/// bits whatever its largest value is. Unpacking costs a shift and a mask per row, so the ends this
+/// gets are the column's and the total comes with them.
+fn unpacked(vector: &Vector, packed: &Packed<'_>) -> Walked {
+    let base = packed.base();
+    let mut low: Option<i128> = None;
+    let mut high: Option<i128> = None;
+    let mut total = 0_i128;
+    let nullable = vector.validity().has_nulls(vector.len());
+    for row in 0..vector.len() {
+        if nullable && vector.is_null_at(row) {
+            continue;
+        }
+        let value = base + i128::from(packed.code(row));
+        widen(value, &mut low, &mut high);
+        total += value;
+    }
+    Walked::totalled(low, high, total)
+}
+
+/// A dictionary column, read through its codes rather than over its values.
+///
+/// The values are a superset of what the rows hold, so reading them is cheap and answers a skip.
+/// It cannot answer a `MIN`, because a value no row points at is still in there, and it cannot
+/// answer a `SUM` at all. Going through the codes costs a gather per row and answers both.
+///
+/// Only for numbers. A string column gets nothing out of being exact here and pays the same price
+/// for it, which is why [`stringy`] still picks whichever of the rows and the values is shorter.
+fn coded(vector: &Vector, codes: &[u32], values: &Vector) -> Walked {
+    if strings(values) {
+        return stringy(vector, values);
+    }
+    let Some(data) = values.data() else { return wider(values) };
+    // A code pointing at a null is a row whose value this would have to invent, so the walk stops
+    // and the superset answers instead. Fewer codes than rows is the same thing said differently,
+    // and a walk that stopped short of the rows would report a total that is missing some of them.
+    if values.validity().has_nulls(values.len()) || codes.len() < vector.len() {
+        return wider(values);
+    }
+    /// One layout, gathered through the codes.
+    macro_rules! gather {
+        ($values:expr) => {{
+            let held: &[_] = $values;
+            let mut low: Option<i128> = None;
+            let mut high: Option<i128> = None;
+            let mut total = 0_i128;
+            // The vector's own validity rather than `is_null_at`, which would follow the code into
+            // the values on every row. The two say the same thing here because the values were just
+            // checked for nulls, and this one is a bit read instead of a second indirection.
+            let validity = vector.validity();
+            let nullable = validity.has_nulls(vector.len());
+            for (row, &code) in codes[..vector.len()].iter().enumerate() {
+                if nullable && !validity.is_valid(row) {
+                    continue;
+                }
+                let Some(&value) = held.get(code as usize) else { return wider(values) };
+                let value = i128::from(value);
+                widen(value, &mut low, &mut high);
+                total += value;
+            }
+            Walked::totalled(low, high, total)
+        }};
+    }
+    match data {
+        Data::Bool(held) => gather!(held),
+        Data::Int8(held) => gather!(held),
+        Data::Int16(held) => gather!(held),
+        Data::Int32(held) => gather!(held),
+        Data::Int64(held) => gather!(held),
+        Data::UInt8(held) => gather!(held),
+        Data::UInt16(held) => gather!(held),
+        Data::UInt32(held) => gather!(held),
+        Data::UInt64(held) => gather!(held),
+        // The widths that cannot be totalled and the floats that must not be, both covered by the
+        // reasons on `Range::sum`. The superset still skips chunks for them.
+        _ => wider(values),
+    }
+}
+
+/// A run encoded column, read a run at a time.
+///
+/// The one form here where the exact answer is cheaper than the rows rather than the same price: a
+/// run contributes its value once to the ends and its value times its length to the total, so a
+/// thousand rows of one value cost one multiply.
+fn runs(vector: &Vector, stops: &[u32], values: &Vector) -> Walked {
+    if strings(values) {
+        return stringy(vector, values);
+    }
+    let Some(data) = values.data() else { return wider(values) };
+    // A null inside a run belongs to one row and the run's value belongs to the rest, and this walks
+    // runs rather than rows, so it cannot tell which. The superset answers instead. So does a set of
+    // runs that stops before the last row, because the rows past it would be left out of the total.
+    if values.validity().has_nulls(values.len()) || vector.validity().has_nulls(vector.len()) {
+        return wider(values);
+    }
+    if stops.last().copied() != u32::try_from(vector.len()).ok() {
+        return wider(values);
+    }
+    /// One layout, weighted by how long each run is.
+    macro_rules! weigh {
+        ($values:expr) => {{
+            let held: &[_] = $values;
+            let mut low: Option<i128> = None;
+            let mut high: Option<i128> = None;
+            let mut total = 0_i128;
+            let mut previous = 0_u32;
+            for (run, &stop) in stops.iter().enumerate() {
+                let Some(&value) = held.get(run) else { return wider(values) };
+                let Some(length) = stop.checked_sub(previous).filter(|&rows| rows > 0) else {
+                    continue;
+                };
+                previous = stop;
+                let value = i128::from(value);
+                widen(value, &mut low, &mut high);
+                total += value * i128::from(length);
+            }
+            Walked::totalled(low, high, total)
+        }};
+    }
+    match data {
+        Data::Bool(held) => weigh!(held),
+        Data::Int8(held) => weigh!(held),
+        Data::Int16(held) => weigh!(held),
+        Data::Int32(held) => weigh!(held),
+        Data::Int64(held) => weigh!(held),
+        Data::UInt8(held) => weigh!(held),
+        Data::UInt16(held) => weigh!(held),
+        Data::UInt32(held) => weigh!(held),
+        Data::UInt64(held) => weigh!(held),
+        _ => wider(values),
+    }
+}
+
+/// The bounds of a column of strings that keeps its values somewhere else.
+///
+/// Exactness is worth paying for on a number and is worth nothing on a string. A whole table `MIN`
+/// on a string column comes off the sorted dictionary the file writes rather than off these ends,
+/// and strings do not add up, so all an exact end buys here is a slightly better chunk skip. So this
+/// keeps the trade the column had before: walk the rows when there are fewer of them than there are
+/// values, and scan the values otherwise.
+///
+/// The values being the longer side is not a strange case. One dictionary is shared by every chunk
+/// of a column, so scanning it per chunk does the same work once per chunk. On `hits` at a million
+/// rows that is `SearchPhrase`, whose dictionary is far larger than a chunk: 90 milliseconds of the
+/// load went on that one column, against 10 for `URL`, which is plain and several times its size.
+fn stringy(vector: &Vector, values: &Vector) -> Walked {
+    if values.len() > vector.len() {
+        return Walked::ends(text(vector));
+    }
+    wider(values)
+}
+
+/// Whether a set of values is text, which is walked by [`text`] rather than gathered.
+fn strings(values: &Vector) -> bool {
+    values.text_parts().is_some() || matches!(values.data(), Some(Data::Varlen(_)))
+}
+
+/// The bounds a column that points somewhere else falls back to, which are its values.
+///
+/// A superset of what the rows hold, so it skips a chunk correctly and answers nothing exactly.
+/// This is where a layout the walks above do not understand ends up, and it is cheap: the values
+/// are usually far fewer than the rows, and scanning them once is the whole cost.
+fn wider(values: &Vector) -> Walked {
+    let inner = range(values);
+    Walked { low: inner.low, high: inner.high, exact: false, sum: None }
 }
 
 /// The sum of a flat column, one typed loop per physical layout, and whether it was walked at all.
@@ -288,29 +494,6 @@ fn summed(vector: &Vector, data: &Data) -> (bool, Option<i128>) {
         Data::Varlen(_) => (true, None),
         Data::Interval(_) | Data::Empty | _ => (false, None),
     }
-}
-
-/// The range of a column that points somewhere else, from whichever end is cheaper to walk.
-///
-/// Scanning the values instead of the rows is what makes a dictionary and a run encoded column
-/// nearly free here, because the values are a superset of what the rows hold and a superset is a
-/// bound that is still correct.
-///
-/// It stops being cheap when the values outnumber the rows, which happens because one dictionary is
-/// shared by every chunk of a column. Scanning it per chunk then does the same work once per chunk.
-/// On `hits` at a million rows that was `SearchPhrase`, whose dictionary is far larger than a chunk:
-/// 90 milliseconds of the load went on that one column, against 10 for `URL`, which is plain and
-/// several times its size. Walking the rows through the codes gives the exact range for the cost of
-/// the rows, so that is what happens when there are fewer of them.
-fn narrower(vector: &Vector, values: &Vector) -> (Option<Bound>, Option<Bound>) {
-    // Only for strings, because `text` is the one row walk here that borrows rather than allocating.
-    // A numeric dictionary this size is not a shape any reader in this engine produces.
-    let strings = matches!(values.data(), Some(Data::Varlen(_))) || values.text_parts().is_some();
-    if strings && values.len() > vector.len() {
-        return text(vector);
-    }
-    let inner = range(values);
-    (inner.low, inner.high)
 }
 
 /// The two ends of a sequence of `len` values starting at `start`.
@@ -531,20 +714,70 @@ mod tests {
         assert!(zone.skips(&probes));
     }
 
-    /// A dictionary is not walked, so its bounds cover values no row holds. That is allowed, and
-    /// this pins it, because the alternative reading is that the bounds are wrong.
+    /// A dictionary holds values no row points at, so its own two ends are wider than the column.
+    /// Reading the codes is what closes that gap, and the gap is the whole point: the wider bounds
+    /// would keep a chunk this one skips, and could not have answered a `MIN` at all.
     #[test]
-    fn a_dictionary_takes_its_bounds_from_its_values_and_not_from_its_codes() {
+    fn a_dictionary_takes_its_bounds_from_its_codes_and_not_from_its_values() {
         let values = vec![Value::Integer(1), Value::Integer(50), Value::Integer(99)];
         let inner = Vector::from_values(LogicalType::Integer, &values).expect("a dictionary");
         let vector = Vector::dictionary(vec![1, 1, 1], inner).expect("a coded column");
         let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
         let range = zone.column(0).expect("one column");
-        assert_eq!(range.low, Some(Bound::Int(1)), "every row is 50, and the bound is wider");
-        assert_eq!(range.high, Some(Bound::Int(99)));
-        // Wider bounds keep chunks they could have skipped. They never skip one they should keep.
+        assert_eq!(range.low, Some(Bound::Int(50)), "every row is 50, and 1 and 99 are not rows");
+        assert_eq!(range.high, Some(Bound::Int(50)));
+        assert!(range.exact);
+        assert_eq!(range.sum, Some(150));
         let probes = vec![Probe { column: 0, op: Op::Equal, value: Bound::Int(1) }];
+        assert!(zone.skips(&probes), "a value in the dictionary that no row holds");
+    }
+
+    /// A dictionary of something this cannot add up or compare in its own type falls back to the
+    /// values, which is the bound it always was, and says it is a bound.
+    #[test]
+    fn a_dictionary_of_floats_falls_back_to_the_bounds_its_values_give() {
+        let values = vec![Value::Double(1.0), Value::Double(50.0), Value::Double(99.0)];
+        let inner = Vector::from_values(LogicalType::Double, &values).expect("a dictionary");
+        let vector = Vector::dictionary(vec![1, 1, 1], inner).expect("a coded column");
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        let range = zone.column(0).expect("one column");
+        assert_eq!(range.low, Some(Bound::Real(1.0)), "every row is 50, and the bound is wider");
+        assert!(!range.exact);
+        assert_eq!(range.sum, None);
+        // Wider bounds keep chunks they could have skipped. They never skip one they should keep.
+        let probes = vec![Probe { column: 0, op: Op::Equal, value: Bound::Real(1.0) }];
         assert!(!zone.skips(&probes));
+    }
+
+    /// A packed width is a whole number of bits, so the range a column was packed against covers
+    /// values it does not hold. Unpacking costs a shift and a mask per row and closes that too.
+    #[test]
+    fn a_bit_packed_column_is_unpacked_rather_than_read_off_its_packing() {
+        // Four rows of four bits each, holding 3, 1, 2 and 1, over a base of 10.
+        let words = vec![0x1213_u64];
+        let vector =
+            Vector::packed(LogicalType::Integer, words, 4, 10, 4).expect("a packed column");
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        let range = zone.column(0).expect("one column");
+        assert_eq!(range.low, Some(Bound::Int(11)), "not the base of 10");
+        assert_eq!(range.high, Some(Bound::Int(13)), "not the ceiling of 25");
+        assert!(range.exact);
+        assert_eq!(range.sum, Some(47));
+    }
+
+    /// A run is worth one multiply rather than one add per row, which is the one form here where
+    /// the exact answer is cheaper than the rows rather than the same price.
+    #[test]
+    fn a_run_encoded_column_is_weighed_by_how_long_each_run_is() {
+        let values = vec![Value::Integer(7), Value::Integer(2)];
+        let inner = Vector::from_values(LogicalType::Integer, &values).expect("the run values");
+        let vector = Vector::runs(vec![3, 5], inner).expect("three sevens and two twos");
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        let range = zone.column(0).expect("one column");
+        assert_eq!(range.low, Some(Bound::Int(2)));
+        assert_eq!(range.high, Some(Bound::Int(7)));
+        assert!(range.exact);
+        assert_eq!(range.sum, Some(25), "three sevens and two twos");
     }
 
     #[test]
@@ -607,19 +840,6 @@ mod tests {
         let range = only(LogicalType::Integer, &values);
         assert!(range.exact);
         assert_eq!(range.sum, Some(16), "the null added nothing");
-    }
-
-    /// The bounds of a dictionary are allowed to be wider than its rows, which is fine for skipping
-    /// a chunk and wrong for answering a `MIN`. This is the flag that tells the two apart.
-    #[test]
-    fn a_dictionary_does_not_claim_its_wider_bounds_are_the_column() {
-        let values = vec![Value::Integer(1), Value::Integer(50), Value::Integer(99)];
-        let inner = Vector::from_values(LogicalType::Integer, &values).expect("a dictionary");
-        let vector = Vector::dictionary(vec![1, 1, 1], inner).expect("a coded column");
-        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
-        let range = zone.column(0).expect("one column");
-        assert!(!range.exact, "the bounds came from the values and not from the rows");
-        assert_eq!(range.sum, None);
     }
 
     /// A float total computed here and a float total computed by the operator can differ in the
