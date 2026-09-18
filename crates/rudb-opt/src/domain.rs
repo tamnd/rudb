@@ -26,9 +26,9 @@
 //! that carries it, and the answer for that row would be a missing row rather than whatever the
 //! subquery says about NULL.
 //!
-//! Not every operator has a rule here. A right or full join is refused because a row of the side
-//! that is not there carries no domain value, and the join back would then look for an outer row
-//! whose key is NULL.
+//! Not every operator has a rule here. A full join is refused because it preserves both of its
+//! sides, so neither copy of the domain is filled in on every row it produces and the value the
+//! join back needs is a column neither side has.
 //! Everything with no rule leaves the dependent join in place and the query is refused, which is the
 //! honest end rather than a plan that answers a different question.
 
@@ -285,13 +285,13 @@ fn push(
             let empty = plan.add_expr_list(&[]);
             sides(plan, left, right, JoinKind::Inner, empty, domain, index, keys, outer)
         }
-        // Inner and left and nothing else. A row of the right side of a right join that matched
-        // nothing on the left carries no domain value, so the join back would ask for an outer row
-        // whose key is NULL and the row would be lost or attached to the wrong one.
+        // A full join is the one with no answer here. Both of its sides are preserved, so neither
+        // copy of the domain is filled in on every row it produces, and the value the join back
+        // needs is a column neither side has.
         Node::Join {
             left,
             right,
-            kind: kind @ (JoinKind::Inner | JoinKind::Left),
+            kind: kind @ (JoinKind::Inner | JoinKind::Left | JoinKind::Right),
             conditions,
             ..
         } => sides(plan, left, right, kind, conditions, domain, index, keys, outer),
@@ -842,7 +842,21 @@ fn empty_answer(plan: &Plan, call: ExprRef) -> Option<Value> {
     matches!(plan.string(name), "count" | "count_star").then_some(Value::BigInt(0))
 }
 
-/// Pushes the domain into whichever side of a two input operator is the correlated one.
+/// Pushes the domain into whichever sides of a two input operator have to carry it.
+///
+/// Two things decide that, and they are not the same thing. A side that reads the outer row has to
+/// carry the domain because that is what its references are rewritten to read. A side the join
+/// preserves has to carry the domain because a row the join keeps has to say which outer row it
+/// belongs to, and a preserved row that matched nothing is told nothing by the side it did not
+/// match. A left join preserves its left side and a right join preserves its right side.
+///
+/// So a right join whose left side is the correlated one still pushes the domain into the right
+/// side, even though nothing in there asks about the outer row, because that is the side whose rows
+/// all survive. Crossing an uncorrelated side with the domain is what `push` already does when it
+/// reaches a subtree that asks nothing, so there is no new case for it here.
+///
+/// A full join preserves both sides and is not handled, since neither copy of the domain is filled
+/// in on every row it produces and the answer is a column neither side has.
 #[allow(clippy::too_many_arguments)]
 fn sides(
     plan: &mut Plan,
@@ -857,53 +871,62 @@ fn sides(
 ) -> Option<Pushed> {
     let left_reads = correlated(plan, left, outer);
     let right_reads = correlated(plan, right, outer);
-    if left_reads && right_reads {
-        let first = push(plan, left, domain, index, keys, outer)?;
-        let second = push(plan, right, domain, index, keys, outer)?;
-        let mut moved = first.moved.clone();
-        moved.extend(second.moved.clone());
-        let map = mapping(keys, &first);
-        let held = plan.expr_list(conditions).to_vec();
-        let mut all: Vec<ExprRef> = held.into_iter().map(|expr| remap(plan, expr, &map)).collect();
+    let keeps_right = kind == JoinKind::Right;
+    let carry_right = right_reads || keeps_right;
+    // Nothing forces the domain on to either side of an inner join whose condition is the only
+    // thing that reads the outer row, and it has to be somewhere, so it goes on the left.
+    let carry_left = left_reads || kind == JoinKind::Left || !carry_right;
+
+    let first = if carry_left { Some(push(plan, left, domain, index, keys, outer)?) } else { None };
+    let second =
+        if carry_right { Some(push(plan, right, domain, index, keys, outer)?) } else { None };
+
+    let mut moved = HashMap::new();
+    for side in [first.as_ref(), second.as_ref()].into_iter().flatten() {
+        moved.extend(side.moved.clone());
+    }
+
+    // The condition reads the left copy of the domain when there is one, and it does not matter
+    // which it reads, because the two are equated below when both are there.
+    let carrier = first.as_ref().or(second.as_ref())?;
+    let mut map = moved.clone();
+    for (key, &binding) in keys.iter().zip(&carrier.keys) {
+        map.insert(key.binding, binding);
+    }
+    let held = plan.expr_list(conditions).to_vec();
+    let mut all: Vec<ExprRef> = held.into_iter().map(|expr| remap(plan, expr, &map)).collect();
+
+    if let (Some(one), Some(other)) = (&first, &second) {
         // The two copies of the domain have to be the same row of it, or a value from one side
         // would meet every value from the other.
-        for (key, (&here, &there)) in keys.iter().zip(first.keys.iter().zip(&second.keys)) {
+        for (key, (&here, &there)) in keys.iter().zip(one.keys.iter().zip(&other.keys)) {
             let ty = plan.expr_type(key.expr).clone();
             let span = plan.expr_span(key.expr);
-            let one = plan.add_expr_at(Expr::Column(here), ty.clone(), span);
-            let other = plan.add_expr_at(Expr::Column(there), ty, span);
+            let mine = plan.add_expr_at(Expr::Column(here), ty.clone(), span);
+            let yours = plan.add_expr_at(Expr::Column(there), ty, span);
             all.push(plan.add_expr_at(
-                Expr::Compare { op: CompareOp::NotDistinctFrom, left: one, right: other },
+                Expr::Compare { op: CompareOp::NotDistinctFrom, left: mine, right: yours },
                 LogicalType::Boolean,
                 span,
             ));
         }
-        let conditions = plan.add_expr_list(&all);
-        let node = plan.add_node(Node::Join {
-            left: first.node,
-            right: second.node,
-            kind,
-            conditions,
-            build: BuildSide::default(),
-        });
-        return Some(Pushed { node, keys: first.keys, moved });
     }
-    // A left join whose correlated side is the right one is the case with no answer here, for the
-    // reason the caller gives. Everything else carries the domain on the left, including the case
-    // where neither side reads the outer row and the condition is what does.
-    if right_reads && kind != JoinKind::Inner {
-        return None;
-    }
-    let (correlated_side, other) = if right_reads { (right, left) } else { (left, right) };
-    let below = push(plan, correlated_side, domain, index, keys, outer)?;
-    let map = mapping(keys, &below);
-    let held = plan.expr_list(conditions).to_vec();
-    let rewritten: Vec<ExprRef> = held.into_iter().map(|expr| remap(plan, expr, &map)).collect();
-    let conditions = plan.add_expr_list(&rewritten);
-    let (left, right) = if right_reads { (other, below.node) } else { (below.node, other) };
-    let node =
-        plan.add_node(Node::Join { left, right, kind, conditions, build: BuildSide::default() });
-    Some(Pushed { node, keys: below.keys, moved: below.moved })
+
+    let conditions = plan.add_expr_list(&all);
+    let node = plan.add_node(Node::Join {
+        left: first.as_ref().map_or(left, |one| one.node),
+        right: second.as_ref().map_or(right, |other| other.node),
+        kind,
+        conditions,
+        build: BuildSide::default(),
+    });
+
+    // Which copy of the domain is filled in on every row the join produces. A right join pads its
+    // left side, so the left copy is NULL on the rows that matched nothing and the right copy is
+    // the one to carry up. Everything else here preserves its left side or neither side, and the
+    // left copy is filled in on both of those.
+    let carried = if keeps_right { second.as_ref()?.keys.clone() } else { carrier.keys.clone() };
+    Some(Pushed { node, keys: carried, moved })
 }
 
 /// What an operator has to rewrite its own expressions with, given what its input did.
@@ -1223,5 +1246,77 @@ mod tests {
         // lets the operation above go back to matching by position.
         assert_eq!(after.matches("AS __branch_0, #").count(), 2, "{after}");
         assert!(after.contains("SetOp INTERSECT DISTINCT"), "{after}");
+    }
+
+    /// A join on the right of a dependent join, with the two sides written out.
+    ///
+    /// Which side reads the outer row is what these tests vary, so neither side comes from the
+    /// shared fixture and both are given.
+    fn correlated_join(kind: &str, left: &str, right: &str) -> Plan {
+        let text = format!(
+            "DependentJoin SINGLE on=[]\n  Get memory.main.outer AS o #0 [k::INTEGER]\n  Join {kind} on=[(#1.0::INTEGER = #5.0::INTEGER)::BOOLEAN]\n{left}{right}"
+        );
+        Plan::parse(&text).expect("a correlated join")
+    }
+
+    /// A side that reads the outer row, written at the depth a join's child sits at.
+    const READS: &str = "    Filter (#1.0::INTEGER = #0.0::INTEGER)::BOOLEAN\n      Get memory.main.inner AS i #1 [k::INTEGER, value::INTEGER]\n";
+
+    /// A side that asks nothing about the outer row.
+    const QUIET: &str = "    Get memory.main.other AS u #5 [k::INTEGER, value::INTEGER]\n";
+
+    #[test]
+    fn a_right_join_puts_the_domain_on_the_side_it_preserves() {
+        let mut plan = correlated_join("RIGHT", READS, QUIET);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("Join RIGHT"), "{after}");
+        // The quiet side asks nothing about the outer row and is crossed with the domain anyway,
+        // because it is the side whose rows all survive and they have to say which outer row they
+        // belong to. Two crosses is one per side.
+        assert_eq!(after.matches("CrossProduct").count(), 2, "{after}");
+        // One equality inside the join to line the two copies of the domain up, and one above it to
+        // join back to the outer rows.
+        assert_eq!(after.matches("IS NOT DISTINCT FROM").count(), 2, "{after}");
+    }
+
+    #[test]
+    fn a_right_join_whose_correlated_side_is_the_one_it_preserves_needs_only_that_side() {
+        let mut plan = correlated_join("RIGHT", QUIET, READS);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("Join RIGHT"), "{after}");
+        // The preserved side is the correlated one, so it carries the domain already and the other
+        // side is left alone. One cross, and no second copy of the domain to line up with.
+        assert_eq!(after.matches("CrossProduct").count(), 1, "{after}");
+        assert_eq!(after.matches("IS NOT DISTINCT FROM").count(), 1, "{after}");
+    }
+
+    #[test]
+    fn a_left_join_whose_correlated_side_is_the_right_one_carries_the_domain_on_both() {
+        let mut plan = correlated_join("LEFT", QUIET, READS);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        // This was refused before, and it is the mirror of the case above. The side the join
+        // preserves is the quiet one, so that is the side that has to be given the domain.
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("Join LEFT"), "{after}");
+        assert_eq!(after.matches("CrossProduct").count(), 2, "{after}");
+        assert_eq!(after.matches("IS NOT DISTINCT FROM").count(), 2, "{after}");
+    }
+
+    #[test]
+    fn a_full_join_inside_the_subquery_is_refused() {
+        let mut plan = correlated_join("FULL", READS, QUIET);
+        unnest::lower(&mut plan).expect("unnesting runs");
+        let after = plan.to_string();
+        // Both sides are preserved, so neither copy of the domain is filled in on every row, and
+        // the value the join back needs is a column neither side has.
+        assert!(after.contains("DependentJoin"), "{after}");
     }
 }
