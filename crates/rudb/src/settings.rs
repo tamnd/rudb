@@ -242,16 +242,13 @@ impl Settings {
                 .set(name, text.trim());
         }
         if is_rule(name) {
-            // `RESET stats.presize` puts the rule back on, which is where a fresh database has it.
-            let enabled = match value {
-                None => true,
-                Some(value) => switch_of(value)?,
+            // `RESET stats.presize` puts the rule back where a fresh database has it, which is on
+            // for the statistics rules and off for the graph sections.
+            let mut rules = self.rules.write().unwrap_or_else(|held| held.into_inner());
+            return match value {
+                None => rules.reset_named(name),
+                Some(value) => rules.set_named(name, switch_of(value)?),
             };
-            return self
-                .rules
-                .write()
-                .unwrap_or_else(|held| held.into_inner())
-                .set_named(name, enabled);
         }
         if !Self::NAMES.iter().any(|known| known.eq_ignore_ascii_case(name)) {
             return Err(Error::catalog(rudb_functions::unknown_setting(name)));

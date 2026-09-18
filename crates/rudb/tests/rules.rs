@@ -54,7 +54,9 @@ fn the_ablation_changes_no_answer() {
     let database = database();
     for sql in QUERIES {
         let expected = rows(&database, sql);
-        for switch in ["SET statistics = 'off'", "SET graph_sections = 'off'"] {
+        // The graph sections go the other way round because they start off, so the run that has to
+        // match is the one with them on.
+        for switch in ["SET statistics = 'off'", "SET graph_sections = 'on'"] {
             database.execute(switch).expect("the switch is a setting");
             assert_eq!(rows(&database, sql), expected, "{switch} changed {sql}");
         }
@@ -114,10 +116,12 @@ fn the_two_masters_answer_to_the_names_the_specification_uses() {
     database.execute("SET statistics = 'on'").expect("and back");
     assert_eq!(setting("stats.all"), "true");
 
-    database.execute("SET graph_sections = 'off'").expect("the graph spelling");
+    // The graph sections start off, which is what #760 asks for, so this one is set on and reset.
     assert_eq!(setting("graph.sections"), "false");
-    database.execute("RESET graph_sections").expect("and back");
+    database.execute("SET graph_sections = 'on'").expect("the graph spelling");
     assert_eq!(setting("graph.sections"), "true");
+    database.execute("RESET graph_sections").expect("and back off");
+    assert_eq!(setting("graph.sections"), "false");
 }
 
 #[test]

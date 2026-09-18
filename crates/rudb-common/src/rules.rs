@@ -14,6 +14,12 @@
 //! 9.2, where every query takes the hash join, the nested loop and the ordinary scan. Both runs must
 //! produce identical answers, and that comparison runs on every commit rather than at a milestone.
 //!
+//! The two masters do not start in the same place. `statistics` starts on, because a better estimate
+//! of a number the planner already needed is not a new behaviour and nobody should have to ask for
+//! it. `graph_sections` starts off, which is what tamnd/rudb#760 asks for, because a stored section
+//! and a new operator are a new behaviour, and a new behaviour earns its default by measuring better
+//! rather than by being written.
+//!
 //! # Why these are not in `Settings::NAMES`
 //!
 //! The same reason the seam settings are not, which `crates/rudb/src/settings.rs` states: a name in
@@ -38,8 +44,10 @@ use crate::{Error, Result};
 
 /// One switch.
 ///
-/// Every variant is on by default, so a fresh database behaves as it did before any of this
-/// existed and an ablation is something a run asks for rather than something it inherits.
+/// Every statistics variant is on by default, so a fresh database behaves as it did before any of
+/// this existed and an ablation is something a run asks for rather than something it inherits.
+/// [`Rule::GraphSections`] is the exception and starts off, because it is a stored structure and a
+/// new path through the executor rather than a better answer to a question already being asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rule {
     /// Every statistics consumer. Off means every question answers `Stat::Unknown`.
@@ -108,6 +116,14 @@ impl Rule {
         }
     }
 
+    /// Whether a fresh database has this rule on.
+    ///
+    /// Everything does except [`Rule::GraphSections`], and the reason is in the module docs.
+    #[must_use]
+    pub const fn starts_on(self) -> bool {
+        !matches!(self, Self::GraphSections)
+    }
+
     /// The rule a settings key names, in any of its spellings.
     #[must_use]
     pub fn from_name(key: &str) -> Option<Self> {
@@ -169,10 +185,25 @@ impl Default for Rules {
 }
 
 impl Rules {
-    /// Everything on, which is what a fresh database has.
+    /// What a fresh database has, which is every statistics rule on and the graph sections off.
+    ///
+    /// The statistics rules are on because their whole point is that they change no answer, so a
+    /// database that had to be told to use them would be a database where nobody used them. The
+    /// graph sections are off because they are a stored structure that nothing writes yet and a new
+    /// path through the executor when they arrive, and a new path is worth having on by default only
+    /// once the measurement says it is better. G3 in tamnd/rudb#763 is where that is decided.
     #[must_use]
     pub const fn new() -> Self {
-        Self(u16::MAX)
+        let mut bits = 0;
+        let mut index = 0;
+        while index < Rule::ALL.len() {
+            let rule = Rule::ALL[index];
+            if rule.starts_on() {
+                bits |= bit(rule);
+            }
+            index += 1;
+        }
+        Self(bits)
     }
 
     /// Whether this rule may fire, which is its own switch and its master's.
@@ -209,13 +240,23 @@ impl Rules {
     /// [`ErrorCode::Catalog`](crate::ErrorCode::Catalog) when nothing is called that, with the list
     /// of rules in the message.
     pub fn set_named(&mut self, key: &str, enabled: bool) -> Result<()> {
-        let Some(rule) = Rule::from_name(key) else {
-            return Err(Error::catalog(format!(
-                "no rule called {key}, the rules are {}",
-                rule_names()
-            )));
-        };
+        let Some(rule) = Rule::from_name(key) else { return Err(no_such_rule(key)) };
         self.set(rule, enabled);
+        Ok(())
+    }
+
+    /// Puts one rule back where a fresh database has it, which is what `RESET` means.
+    ///
+    /// Not the same as setting it on, because [`Rule::GraphSections`] starts off and a reset that
+    /// turned it on would be a reset that left the database somewhere it has never been.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::Catalog`](crate::ErrorCode::Catalog) when nothing is called that, with the list
+    /// of rules in the message.
+    pub fn reset_named(&mut self, key: &str) -> Result<()> {
+        let Some(rule) = Rule::from_name(key) else { return Err(no_such_rule(key)) };
+        self.set(rule, rule.starts_on());
         Ok(())
     }
 
@@ -236,7 +277,11 @@ impl Rules {
     /// The rules that are not where a fresh database left them, which is what a run records when it
     /// says what it measured.
     pub fn changed(self) -> impl Iterator<Item = (&'static str, bool)> {
-        self.states().filter(|(_, enabled)| !enabled)
+        let fresh = Self::new();
+        Rule::ALL
+            .into_iter()
+            .filter(move |&rule| self.is_set(rule) != fresh.is_set(rule))
+            .map(move |rule| (rule.name(), self.is_set(rule)))
     }
 }
 
@@ -244,17 +289,34 @@ const fn bit(rule: Rule) -> u16 {
     1 << (rule as u16)
 }
 
+fn no_such_rule(key: &str) -> Error {
+    Error::catalog(format!("no rule called {key}, the rules are {}", rule_names()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn everything_is_on_to_begin_with() {
+    fn every_statistics_rule_starts_on_and_the_graph_sections_start_off() {
         let rules = Rules::new();
         for rule in Rule::ALL {
-            assert!(rules.enabled(rule), "{} should start on", rule.name());
+            if rule == Rule::GraphSections {
+                assert!(!rules.enabled(rule), "the graph sections should start off");
+            } else {
+                assert!(rules.enabled(rule), "{} should start on", rule.name());
+            }
         }
+        // A fresh database has nothing to report, off switch included.
         assert_eq!(rules.changed().count(), 0);
+    }
+
+    #[test]
+    fn turning_the_graph_sections_on_is_a_change_worth_reporting() {
+        let mut rules = Rules::new();
+        rules.set(Rule::GraphSections, true);
+        assert!(rules.enabled(Rule::GraphSections));
+        assert_eq!(rules.changed().collect::<Vec<_>>(), vec![("graph.sections", true)]);
     }
 
     #[test]
@@ -263,7 +325,9 @@ mod tests {
         rules.set(Rule::StatsAll, false);
         assert!(!rules.enabled(Rule::Presize));
         assert!(!rules.enabled(Rule::NarrowArithmetic));
-        // The graph sections are their own layer and their own ablation.
+        // The graph sections are their own layer and their own ablation, so the statistics master
+        // does not reach them either way.
+        rules.set(Rule::GraphSections, true);
         assert!(rules.enabled(Rule::GraphSections));
         // The switch underneath is still where the session left it, which is what it reads back as.
         assert!(rules.is_set(Rule::Presize));
