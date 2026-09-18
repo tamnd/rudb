@@ -74,6 +74,20 @@
 //! query does not finish in five minutes. With it in the scan of orders the one condition left is an
 //! equality, the join is a lookup, and the query answers in 3.9 seconds.
 //!
+//! # What a disjunction implies
+//!
+//! An `OR` is one predicate and does not split, because a row failing one branch may still be a row
+//! the query wants. But a row satisfying `(A AND X) OR (A AND Y)` satisfies `A` whichever branch it
+//! took, so `A` may be stated beside it, and stating it separately is the point: `A` on its own is
+//! something this pass can push into a side or turn into a join condition, where the disjunction it
+//! came out of reads both sides and does neither. The disjunction stays where it was, since dropping
+//! the branches it still tells apart would be a different query. `shared` is that rule.
+//!
+//! TPC-H q19 is the query that needs it: a cross product of lineitem and part under a single `OR` of
+//! three branches, with `p_partkey = l_partkey` in all three and two predicates over lineitem alone
+//! in all three as well. Without this the equality is buried where nothing can see it and six million
+//! rows against two hundred thousand do not finish. With it the query answers in 3.0 seconds.
+//!
 //! # A cross product that is a join
 //!
 //! A cross product under a filter that equates a column of one side with a column of the other is an
@@ -764,8 +778,9 @@ fn never(plan: &Plan, predicate: ExprRef) -> bool {
 
 /// Adds every conjunct of `predicate` to `into`.
 ///
-/// Only `AND`. An `OR` is one predicate however it is written, since a row that fails one side of it
-/// may still be a row the query wants.
+/// Only `AND` splits a predicate into parts that each stand on their own. An `OR` is one predicate
+/// however it is written, since a row that fails one side of it may still be a row the query wants,
+/// but it is not silent either: see `shared`.
 fn split(plan: &Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
     if let Expr::Conjunction { op: ConjunctionOp::And, children } = *plan.expr(predicate) {
         for &child in plan.expr_list(children) {
@@ -773,6 +788,54 @@ fn split(plan: &Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
         }
     } else {
         into.push(predicate);
+        shared(plan, predicate, into);
+    }
+}
+
+/// Adds the conjuncts every branch of a disjunction has to `into`, beside the disjunction itself.
+///
+/// A row satisfying `(A AND X) OR (A AND Y)` satisfies `A`, whichever branch it took. So `A` may be
+/// stated separately, and stating it separately is the whole point: `A` on its own is a predicate
+/// this pass can push into a side or turn into a join condition, where the disjunction it came out
+/// of reads both sides and does neither. The disjunction stays where it was, because dropping the
+/// branches it still distinguishes would be a different query. This is a predicate the query already
+/// implies, added so that something else can use it, and it costs one more evaluation per row.
+///
+/// TPC-H q19 is the query that needs it. It is a cross product of lineitem and part under a single
+/// `OR` of three branches, and `p_partkey = l_partkey` is in all three, along with two predicates
+/// over lineitem alone. Without this the equality is buried inside the disjunction where nothing can
+/// see it, the cross product stays a cross product, and six million rows against two hundred thousand
+/// does not finish. With it the equality becomes the join condition and the two lineitem predicates
+/// go into the scan.
+///
+/// A volatile branch is left alone. `(random() < 0.5 AND X) OR (random() < 0.5 AND Y)` has two calls
+/// that are allowed to disagree, so neither branch promises anything about a third call made on its
+/// own, and `same` compares how an expression is written rather than what it will answer.
+fn shared(plan: &Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
+    let Expr::Conjunction { op: ConjunctionOp::Or, children } = *plan.expr(predicate) else {
+        return;
+    };
+    let Some((&first, rest)) = plan.expr_list(children).split_first() else {
+        return;
+    };
+    let mut common = Vec::new();
+    split(plan, first, &mut common);
+    common.retain(|&part| !walk::volatile(plan, part));
+    for &branch in rest {
+        if common.is_empty() {
+            return;
+        }
+        let mut here = Vec::new();
+        split(plan, branch, &mut here);
+        common.retain(|&part| here.iter().any(|&other| walk::same(plan, part, other)));
+    }
+    // A conjunct the list already states is not added twice. The pass reads a join's conditions back
+    // through `split` on every visit, so without this a disjunction in a condition list would grow a
+    // fresh copy of what it implies each time anything looked at it.
+    for part in common {
+        if !into.iter().any(|&other| walk::same(plan, part, other)) {
+            into.push(part);
+        }
     }
 }
 
@@ -1420,6 +1483,59 @@ Filter (#0.1::INTEGER < #1.1::INTEGER)::BOOLEAN
 Join INNER on=[(#0.0::INTEGER < #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER < #1.1::INTEGER)::BOOLEAN]
   Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
   Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_conjunct_every_branch_of_a_disjunction_has_is_stated_beside_it() {
+        // TPC-H q19 in miniature. The disjunction reads both sides and does nothing for the plan.
+        // The equality it implies is what turns the cross product into a join, and the disjunction
+        // stays because it still tells the two branches apart.
+        let before = "\
+Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_conjunct_only_one_branch_of_a_disjunction_has_is_not_stated() {
+        // `b = 1` holds of the rows the first branch lets through and says nothing about the rows the
+        // second one does, so the query does not imply it and neither does this pass.
+        let before = "\
+Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN OR (#0.1::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), before);
+    }
+
+    #[test]
+    fn a_shared_conjunct_over_one_side_of_a_disjunction_goes_into_that_side() {
+        // The other half of what q19 needs. Two of the three predicates common to its branches read
+        // lineitem alone, and this is the rewrite that gets them to the scan.
+        let before = "\
+Filter (((#0.1::INTEGER = 7::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.1::INTEGER = 7::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Filter (((#0.1::INTEGER = 7::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.1::INTEGER = 7::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Filter (#0.1::INTEGER = 7::INTEGER)::BOOLEAN
+      Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
 ";
         assert_eq!(pushed(before), after);
     }
