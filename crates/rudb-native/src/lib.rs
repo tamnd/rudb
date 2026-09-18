@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::bounds::{Bound, Op};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_encoding::{chooser, integer, string};
 use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
@@ -46,7 +47,7 @@ use rudb_vector::{Buffer, Chunk, Data, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 12;
+const FORMAT: u32 = 13;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -2767,6 +2768,78 @@ fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
     Ok(())
 }
 
+/// Which cascades are worth trying on a run of dictionary codes.
+///
+/// The exhaustive chooser encodes every candidate at every level of a cascade three deep and keeps
+/// the smallest, which on a part of 1024 codes is around a hundred full encodes to decide something
+/// three candidates were always going to win. It is the right default for a crate that does not
+/// know what it is looking at. Here we do know. Codes are counted from zero in the order the values
+/// were first seen, so a part of them is one value, or a narrow band, or a few long runs, and those
+/// are constant, frame of reference and run length. Nothing else has ever come first on this data.
+///
+/// A dictionary of dictionary codes is the one candidate that can never pay, because the codes are
+/// already the dictionary, and it is also the most expensive one to try. Below the top level the
+/// streams are an RLE's run values and run lengths, which are integers in their own right with no
+/// runs left in them, so only the two flat candidates go down there.
+///
+/// This is size given up for time on purpose, and the ablation is this chooser against
+/// [`chooser::EXHAUSTIVE`] on the same file.
+#[derive(Debug)]
+struct Codes;
+
+impl chooser::Chooser for Codes {
+    fn name(&self) -> &'static str {
+        "codes"
+    }
+
+    fn narrow_strings(
+        &self,
+        _values: &[&[u8]],
+        offered: &[string::Kind],
+        _depth: u8,
+    ) -> Vec<string::Kind> {
+        // Never reached, because nothing here encodes strings through the cascade. The trait asks
+        // for it and the honest answer to a question we have no opinion on is the whole list.
+        offered.to_vec()
+    }
+
+    fn narrow_integers(
+        &self,
+        _values: &[i64],
+        offered: &[integer::Kind],
+        depth: u8,
+    ) -> Vec<integer::Kind> {
+        let keep: &[integer::Kind] = if depth == 0 {
+            &[integer::Kind::Constant, integer::Kind::Packed, integer::Kind::Rle]
+        } else {
+            &[integer::Kind::Constant, integer::Kind::Packed]
+        };
+        let narrowed: Vec<integer::Kind> =
+            offered.iter().copied().filter(|kind| keep.contains(kind)).collect();
+        // The contract is a non empty subset, and a chunk that offers none of the three is a chunk
+        // this has no opinion about rather than one that cannot be written.
+        if narrowed.is_empty() { offered.to_vec() } else { narrowed }
+    }
+}
+
+/// A part's dictionary codes through the integer cascade, or `None` when the cascade did not pay.
+///
+/// Until now this stream was a `u32` a row with nothing asked of it, and on ClickBench that was
+/// 400,185,326 bytes for every one of the 28 varchar columns, the same count for `URL` as for a
+/// column holding the empty string in nearly every row. Codes are dense integers counted from zero
+/// and a part holds 1024 of them, which is the shape frame of reference is best at, and a column
+/// with one value everywhere comes back a constant costing nothing per row rather than four bytes.
+///
+/// The result is taken only when it is smaller than the plain form. A cascade is allowed to come
+/// out larger on a part whose codes are genuinely wide, `URL` has about sixty million distinct
+/// values, and there is no reason to pay for the decode when it does.
+fn encoded_codes(codes: &[u32]) -> Result<Option<Vec<u8>>> {
+    let wide: Vec<i64> = codes.iter().map(|code| i64::from(*code)).collect();
+    let coded = integer::encode_with(&wide, &Codes)?;
+    let plain = codes.len().saturating_mul(size_of::<u32>());
+    Ok((coded.len() < plain).then_some(coded))
+}
+
 fn encode(
     vector: &Vector,
     global: Option<&mut GlobalDictionary>,
@@ -2798,7 +2871,13 @@ fn encode(
         None
     };
     let packed = packed_vector.as_ref().and_then(Vector::packed_parts);
-    out.push(if global_codes.is_some() {
+    let coded = match global_codes.as_deref() {
+        Some(codes) => encoded_codes(codes)?,
+        None => None,
+    };
+    out.push(if coded.is_some() {
+        4
+    } else if global_codes.is_some() {
         3
     } else if dictionary.is_some() {
         1
@@ -2824,6 +2903,10 @@ fn encode(
             }
             out.push(bits);
         }
+    }
+    if let Some(coded) = coded {
+        out.extend_from_slice(&coded);
+        return Ok((out, membership));
     }
     if let Some(codes) = global_codes {
         for code in codes {
@@ -3454,18 +3537,29 @@ fn decode(
         let dictionary = Vector::flat(LogicalType::Varchar, Data::Varlen(strings))?;
         return Ok(Vector::dictionary(codes, dictionary)?.with_validity(validity));
     }
-    if codec == 3 {
+    if codec == 3 || codec == 4 {
         let dictionary = global.ok_or_else(|| invalid("global code page has no dictionary"))?;
-        let mut codes = Vec::with_capacity(rows);
-        let mut highest = None;
-        for _ in 0..rows {
-            let code = cur.u32()?;
-            highest = Some(highest.map_or(code, |old: u32| old.max(code)));
-            codes.push(code);
-        }
-        if cur.at != bytes.len() {
-            return Err(invalid("global code page has trailing bytes"));
-        }
+        let codes = if codec == 4 {
+            // The cascade holds the whole tail of the page and says how long it is itself, so the
+            // check that nothing is left over is the one the decoder already makes.
+            let wide = integer::decode(&bytes[cur.at..])?;
+            if wide.len() != rows {
+                return Err(invalid("encoded code page holds the wrong number of rows"));
+            }
+            wide.into_iter()
+                .map(|code| u32::try_from(code).map_err(|_| invalid("code is not a code")))
+                .collect::<Result<Vec<u32>>>()?
+        } else {
+            let mut codes = Vec::with_capacity(rows);
+            for _ in 0..rows {
+                codes.push(cur.u32()?);
+            }
+            if cur.at != bytes.len() {
+                return Err(invalid("global code page has trailing bytes"));
+            }
+            codes
+        };
+        let highest = codes.iter().copied().max();
         return Ok(Vector::stable_dictionary_validated(codes, dictionary, highest)?
             .with_validity(validity));
     }
@@ -4421,5 +4515,50 @@ mod tests {
 
         let decoded = decode_directory(&directory, file_size).expect("large lazy dictionary");
         assert_eq!(decoded.dictionaries[0].expect("dictionary").length, dictionary.length);
+    }
+
+    #[test]
+    fn a_column_with_one_value_everywhere_costs_almost_nothing_a_row() {
+        let path = path("constant-codes");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        let empty = vec![Value::Varchar(String::new()); 1024];
+        for _ in 0..4 {
+            let column = Vector::from_values(LogicalType::Varchar, &empty).expect("strings");
+            writer.append(&Chunk::new(vec![column]).expect("one column")).expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let pages = reader.layout().columns.first().expect("one column").pages;
+        // This column used to cost four bytes a row, 16,384 of them, the same as a column of four
+        // thousand distinct URLs would. The cascade calls each part a constant, so what is left is
+        // a tag, a count and the value, and the row count stops being what drives the number.
+        assert!(pages < 256, "{pages} bytes of pages for 4,096 rows of one value");
+        let read = reader.read(3, &[0]).expect("the last part back");
+        assert_eq!(read.value_at(0, 0), Value::Varchar(String::new()));
+        assert_eq!(read.value_at(1023, 0), Value::Varchar(String::new()));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn a_code_stream_the_cascade_cannot_shrink_is_left_alone() {
+        // A shift register rather than a run, because an arithmetic run is the one wide shape the
+        // cascade does shrink. This is what a column with tens of millions of distinct values hands
+        // over: full width codes with no order to them.
+        let mut state: u32 = 0x9e37_79b9;
+        let spread: Vec<u32> = (0..1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state
+            })
+            .collect();
+        assert_eq!(encoded_codes(&spread).expect("no failure"), None);
+        let near: Vec<u32> = (0..1024).collect();
+        let coded = encoded_codes(&near).expect("no failure").expect("counting up is packable");
+        assert!(coded.len() < near.len() * 4, "{} bytes for a run of 1,024", coded.len());
     }
 }
