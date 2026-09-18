@@ -4190,7 +4190,9 @@ fn signed_key(ty: &LogicalType) -> bool {
 fn signed_value(ty: &LogicalType, value: i64) -> Result<Value> {
     match ty {
         LogicalType::TinyInt => i8::try_from(value).map(Value::TinyInt).map_err(|_| too_wide(ty)),
-        LogicalType::SmallInt => i16::try_from(value).map(Value::SmallInt).map_err(|_| too_wide(ty)),
+        LogicalType::SmallInt => {
+            i16::try_from(value).map(Value::SmallInt).map_err(|_| too_wide(ty))
+        }
         LogicalType::Integer => i32::try_from(value).map(Value::Integer).map_err(|_| too_wide(ty)),
         LogicalType::BigInt => Ok(Value::BigInt(value)),
         _ => Err(Error::internal(format!("{ty} is not a signed integer group key"))),
@@ -5015,9 +5017,15 @@ mod tests {
         partition.push(row(1, 2, 0), EncodedCountRecord::ALL);
         partition.push(row(1, 2, 1), EncodedCountRecord::ALL);
         partition.push(row(0, 2, 0), EncodedCountRecord::SECOND | EncodedCountRecord::THIRD);
-        let part =
-            encoded_count_partition(&mut partition, &dictionary, 3, 10, &Memory::unlimited())
-                .expect("the encoded partition");
+        let leading = [LogicalType::BigInt, LogicalType::BigInt];
+        let part = encoded_count_partition(
+            &mut partition,
+            &dictionary,
+            &leading,
+            10,
+            &Memory::unlimited(),
+        )
+        .expect("the encoded partition");
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for chunk in part.chunks {
             for row in 0..chunk.len() {
@@ -5046,7 +5054,7 @@ mod tests {
     }
 
     #[test]
-    fn a_two_key_encoded_count_omits_the_unused_integer() {
+    fn a_two_key_encoded_count_omits_the_unused_integer_and_narrows_the_one_it_keeps() {
         let dictionary = Vector::from_values(
             LogicalType::Varchar,
             &[Value::Varchar("one".into()), Value::Varchar("two".into())],
@@ -5058,9 +5066,17 @@ mod tests {
         partition.push(row(1, 0), EncodedCountRecord::ALL);
         partition.push(row(1, 1), EncodedCountRecord::ALL);
         partition.push(row(0, 0), EncodedCountRecord::SECOND | EncodedCountRecord::THIRD);
-        let part =
-            encoded_count_partition(&mut partition, &dictionary, 2, 10, &Memory::unlimited())
-                .expect("the encoded partition");
+        // A `SMALLINT` leading key, which is q14's shape. The record held it as eight bytes and the
+        // emit has to hand it back two bytes wide or the answer has the wrong column type in it.
+        let leading = [LogicalType::SmallInt];
+        let part = encoded_count_partition(
+            &mut partition,
+            &dictionary,
+            &leading,
+            10,
+            &Memory::unlimited(),
+        )
+        .expect("the encoded partition");
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for chunk in part.chunks {
             for row in 0..chunk.len() {
@@ -5069,8 +5085,8 @@ mod tests {
         }
         rows.sort_by_key(|row| format!("{row:?}"));
         let mut expected = vec![
-            vec![Value::BigInt(1), Value::Varchar("one".into()), Value::BigInt(2)],
-            vec![Value::BigInt(1), Value::Varchar("two".into()), Value::BigInt(1)],
+            vec![Value::SmallInt(1), Value::Varchar("one".into()), Value::BigInt(2)],
+            vec![Value::SmallInt(1), Value::Varchar("two".into()), Value::BigInt(1)],
             vec![Value::Null, Value::Varchar("one".into()), Value::BigInt(1)],
         ];
         expected.sort_by_key(|row| format!("{row:?}"));
