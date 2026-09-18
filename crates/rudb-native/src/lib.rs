@@ -47,7 +47,7 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 18;
+const FORMAT: u32 = 19;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -293,6 +293,16 @@ pub struct Table {
     rows: usize,
     dictionaries: Vec<Option<Page>>,
     frequencies: Vec<Option<FrequencySummary>>,
+    /// How many distinct values each column holds, for the columns that know.
+    ///
+    /// A dictionary entry is made the first time a value is seen and nothing ever removes one, so
+    /// the size of the dictionary is the number of distinct values in the column. That is the whole
+    /// story for a column with no null in it, and the wrong number by one for a column with a null
+    /// in it, because a null row is written as the code for the empty string and makes an entry the
+    /// dictionary would not otherwise have. The writer knows which case it is, since it counts the
+    /// non-null rows that use each code while it builds the frequency summary, and the reader cannot
+    /// work it out from the dictionary alone. So the writer settles it here.
+    distincts: Vec<Option<u64>>,
 }
 
 impl Table {
@@ -630,6 +640,7 @@ impl Writer {
             table: Table {
                 name: name.into(),
                 dictionaries: vec![None; fields.len()],
+                distincts: vec![None; fields.len()],
                 fields,
                 stripes: Vec::new(),
                 rows: 0,
@@ -1213,6 +1224,11 @@ impl Writer {
         let orders = rankings(&dictionaries)?;
         for (index, (dictionary, order)) in dictionaries.into_iter().zip(orders).enumerate() {
             let Some(dictionary) = dictionary else { continue };
+            // A code nothing counted is a code no non-null row of this column holds, which is the
+            // empty string a null was written as and nothing else, because a code is only ever made
+            // by a row asking for one.
+            self.table.distincts[index] =
+                Some(dictionary.counts.iter().filter(|count| **count != 0).count() as u64);
             self.table.frequencies[index] = Some(code_frequency(&dictionary));
             let encoded = encode_global_dictionary(dictionary, &order)?;
             let offset = self.at;
@@ -2257,21 +2273,26 @@ impl Reader {
     /// to, and the alternative is a hash table with a row per distinct value built from a pass over
     /// every row.
     ///
+    /// A null in the column used to make this `None` and no longer does. A null row is written as
+    /// the code for the empty string, so a nullable column's dictionary can hold an empty string
+    /// that no row of it actually has, and the dictionary on its own does not say which case it is.
+    /// The writer does know, because it counts the non-null rows that use each code on its way to
+    /// the frequency summary, so it records how many codes any row holds and the directory carries
+    /// that number. This reads it rather than the size of the dictionary, which also means the
+    /// dictionary page is not opened to answer.
+    ///
     /// `None` for a column the file has no dictionary for, which is every column that is not a
-    /// string, and `None` for a column with a null in it. A sketch would answer the first
-    /// approximately and SQL asked for the exact number. The second is the placeholder: a null row
-    /// is written as the code for the empty string, so a nullable column's dictionary may hold an
-    /// empty string that no row of it actually has, and nothing persisted today tells the two cases
-    /// apart.
+    /// string. A sketch would answer that approximately and SQL asked for the exact number.
     ///
     /// # Errors
     ///
-    /// If the column is outside the schema, or the dictionary page does not read.
+    /// If the column is outside the schema.
     pub fn distinct_values(&self, column: usize) -> Result<Option<u64>> {
-        if self.null_count(column)? > 0 {
-            return Ok(None);
-        }
-        Ok(self.dictionary(column)?.map(|dictionary| dictionary.len() as u64))
+        self.table
+            .distincts
+            .get(column)
+            .copied()
+            .ok_or_else(|| invalid("distinct column index out of range"))
     }
 
     /// How many rows of one column are null, added up over the stripes.
@@ -2933,6 +2954,15 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             }
         }
     }
+    for distinct in &table.distincts {
+        match distinct {
+            None => out.push(0),
+            Some(count) => {
+                out.push(1);
+                put_u64(&mut out, *count);
+            }
+        }
+    }
     put_u64(&mut out, u64::try_from(table.rows).map_err(|_| invalid("row count overflow"))?);
     put_u32(&mut out, u32::try_from(table.stripes.len()).map_err(|_| invalid("too many stripes"))?);
     for stripe in &table.stripes {
@@ -3144,6 +3174,14 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             _ => return Err(invalid("dictionary page tag differs")),
         });
     }
+    let mut distincts = Vec::with_capacity(width);
+    for _ in 0..width {
+        distincts.push(match cur.u8()? {
+            0 => None,
+            1 => Some(cur.u64()?),
+            _ => return Err(invalid("distinct count tag differs")),
+        });
+    }
     let rows = usize::try_from(cur.u64()?).map_err(|_| invalid("row count does not fit"))?;
     let count = cur.u32()? as usize;
     let mut stripes = Vec::with_capacity(count);
@@ -3353,7 +3391,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     if cur.at != bytes.len() {
         return Err(invalid("directory has trailing bytes"));
     }
-    Ok(Table { name, fields, stripes, rows, dictionaries, frequencies })
+    Ok(Table { name, fields, stripes, rows, dictionaries, distincts, frequencies })
 }
 
 fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
@@ -5946,6 +5984,7 @@ mod tests {
             stripes: Vec::new(),
             rows: 0,
             dictionaries: vec![Some(dictionary)],
+            distincts: vec![None],
             frequencies: vec![None],
         };
         let directory = encode_directory(&table).expect("directory");
