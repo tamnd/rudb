@@ -488,6 +488,24 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
         let _ = rank;
         Err(Error::internal("a text source without a sorted order was asked for a rank"))
     }
+    /// The rank of every value, in position order, when the source can hand the whole map over.
+    ///
+    /// This is [`code_at_rank`](Self::code_at_rank) turned round, and it is a separate method
+    /// because the two are wanted by opposite kinds of reader. A search wants one code out of a
+    /// rank and probes a handful of times, so it reads the order a block at a time and leaves the
+    /// rest alone. A min or a max over a grouped column wants a rank out of a code once per row,
+    /// and a walk of the order per row costs far more than reading the order once and turning it
+    /// round. What that buys is a comparison of two integers where the alternative is a fetch of
+    /// two strings out of a payload the size of the column.
+    ///
+    /// The slice is indexed by position and is as long as [`len`](Self::len), so a caller holding a
+    /// dictionary code indexes it directly.
+    ///
+    /// `None` from a source with no order, and from one with an order it would rather not invert.
+    /// Nothing depends on this for correctness, only for speed.
+    fn code_ranks(&self) -> Option<&[u32]> {
+        None
+    }
     /// Whether another source presents the same values.
     fn equal(&self, other: &dyn TextSource) -> bool {
         self.len() == other.len()
@@ -1887,6 +1905,15 @@ impl Vector {
         match &self.body {
             Body::ExternalText { source } => source.code_at_rank(rank),
             _ => Err(Error::internal("a vector without a sorted order was asked for a rank")),
+        }
+    }
+
+    /// The rank of every value, indexed by position. See [`TextSource::code_ranks`].
+    #[must_use]
+    pub fn code_ranks(&self) -> Option<&[u32]> {
+        match &self.body {
+            Body::ExternalText { source } => source.code_ranks(),
+            _ => None,
         }
     }
 
