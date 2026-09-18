@@ -457,7 +457,10 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
     /// this for correctness, only for speed.
     ///
     /// A source that answers with `Some` promises the slice is a permutation of `0..len` and that
-    /// `bytes_at(order[rank])` is nondecreasing in `rank`.
+    /// `bytes_at(order[rank])` is strictly increasing in `rank`. Strictly, which is to say the
+    /// values are distinct, because what reads this searches it, and a search of a run of equal
+    /// values finds one of them rather than all of them. A source that holds the same value twice
+    /// must answer `None` here even though it could sort itself perfectly well.
     fn sorted_order(&self) -> Option<&[u32]> {
         None
     }

@@ -30,6 +30,19 @@
 //! somewhere that is built per query node, so the question cannot change under it, and the
 //! dictionary is checked by pointer on every chunk so a second dictionary is declined rather than
 //! answered from the first one's memo.
+//!
+//! # When the dictionary is sorted, do not peel at all
+//!
+//! A peel still has to read every distinct value once, and for `Referer` on `hits` that is four
+//! hundred thousand reads out of the file before the memo has anything in it. A dictionary that
+//! comes with its sorted order can do better than that for the one question that matters most,
+//! which is whether a value equals a literal, because the answer is a binary search: about
+//! nineteen reads for the whole query rather than four hundred thousand, and after it the filter
+//! is an integer compare against one code with no memo to consult.
+//!
+//! [`Lookup`] is that search, memoized the same way and for the same reason. It only answers
+//! equality. A `LIKE`, a regular expression or any other scalar function still needs the peel, and
+//! always will, because no ordering of the values tells you which of them match a pattern.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -87,6 +100,80 @@ impl Peel {
         }
         Some(answers.run(dictionary, codes, len, map, decide))
     }
+}
+
+/// Where one literal sits in a dictionary that came with its sorted order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Found {
+    /// The dictionary holds the literal under this code, so a row matches exactly when its code is
+    /// this one.
+    At(u32),
+    /// The dictionary does not hold the literal at all, so no row of this column matches it. This
+    /// is the case a whole scan can sometimes be skipped on, and it costs the same search to find.
+    Absent,
+}
+
+/// The result of searching one dictionary for one literal, kept for the life of a query node.
+#[derive(Debug, Default)]
+pub(crate) struct Lookup {
+    memo: OnceLock<Searched>,
+}
+
+#[derive(Debug)]
+struct Searched {
+    /// The dictionary this was searched in, recognised by pointer the way [`Peel`] does it.
+    dictionary: Arc<Vector>,
+    found: Found,
+}
+
+impl Lookup {
+    /// Where `wanted` sits in `column`'s dictionary, searched once and remembered.
+    ///
+    /// `None` means there is nothing to search and the caller should do what it did before: the
+    /// column is not a dictionary that shares its values, or the values did not arrive with a
+    /// sorted order, or this was built against a different dictionary.
+    ///
+    /// A failed read is returned rather than remembered, so a caller that retries gets the error
+    /// again rather than a wrong answer cached from a half finished search.
+    pub(crate) fn find(&self, column: &Vector, wanted: &[u8]) -> Option<Result<Found>> {
+        let (_, dictionary) = column.shared_dictionary_parts()?;
+        if let Some(memo) = self.memo.get() {
+            return Arc::ptr_eq(&memo.dictionary, dictionary).then_some(Ok(memo.found));
+        }
+        let order = dictionary.sorted_order()?;
+        let found = match search(dictionary, order, wanted) {
+            Ok(Some(found)) => found,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+        // Two threads that get here at once do the same search and set the same answer, and the
+        // one that loses the race drops its own copy of it. Both return what they found.
+        let _ = self.memo.set(Searched { dictionary: Arc::clone(dictionary), found });
+        Some(Ok(found))
+    }
+}
+
+/// The code of `wanted` in a dictionary, by binary search over its sorted order.
+///
+/// `Ok(None)` declines, which happens when the order names an entry that has no bytes to compare.
+/// Nothing in the format writes one, so this is the impossible case rather than the rare one, and
+/// declining leaves the caller on the path it would have taken anyway.
+fn search(dictionary: &Vector, order: &[u32], wanted: &[u8]) -> Result<Option<Found>> {
+    let mut low = 0;
+    let mut high = order.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let code = *order
+            .get(middle)
+            .ok_or_else(|| Error::internal("a dictionary order is shorter than it said"))?;
+        let Some(bytes) = dictionary.try_bytes_at(code as usize)? else { return Ok(None) };
+        match bytes.cmp(wanted) {
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+            std::cmp::Ordering::Equal => return Ok(Some(Found::At(code))),
+        }
+    }
+    Ok(Some(Found::Absent))
 }
 
 impl Answers {
@@ -206,5 +293,128 @@ mod tests {
     fn a_column_that_is_not_a_shared_dictionary_has_nothing_to_peel() {
         let flat = letters(&["apple", "pear"]);
         assert!(Peel::default().answer(&flat, 2, |slot| slot, holds).is_none());
+    }
+
+    /// Stands in for the values of a native column, which are reachable one at a time out of the
+    /// file and which arrive with the sorted order the writer worked out. Counting the reads is
+    /// the point, because the whole claim is that a search does a few of them and a peel does one
+    /// for every distinct value.
+    #[derive(Debug)]
+    struct Filed {
+        values: Vec<Vec<u8>>,
+        order: Vec<u32>,
+        reads: AtomicUsize,
+    }
+
+    impl Filed {
+        /// `values` in the order the writer handed out codes, which is not sorted order.
+        fn new(values: &[&str]) -> Self {
+            let values: Vec<Vec<u8>> = values.iter().map(|text| text.as_bytes().to_vec()).collect();
+            let mut order = (0..values.len() as u32).collect::<Vec<_>>();
+            order.sort_by(|&left, &right| values[left as usize].cmp(&values[right as usize]));
+            Self { values, order, reads: AtomicUsize::new(0) }
+        }
+    }
+
+    impl rudb_vector::TextSource for Filed {
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.values.get(index).map(Vec::as_slice))
+        }
+
+        fn footprint(&self) -> usize {
+            self.values.iter().map(Vec::len).sum()
+        }
+
+        fn sorted_order(&self) -> Option<&[u32]> {
+            Some(&self.order)
+        }
+    }
+
+    /// A dictionary of `count` values named after their position, with codes handed out in an
+    /// order that is nothing like sorted order, plus the source so a test can count its reads.
+    fn filed(count: usize) -> (Vector, Arc<Filed>) {
+        let spellings =
+            (0..count).map(|at| format!("value-{:04}", (at * 7919) % count)).collect::<Vec<_>>();
+        let source =
+            Arc::new(Filed::new(&spellings.iter().map(String::as_str).collect::<Vec<_>>()));
+        let values = Vector::external_text(LogicalType::Varchar, Arc::clone(&source) as Arc<_>)
+            .expect("a filed vector");
+        (values, source)
+    }
+
+    #[test]
+    fn a_literal_is_found_in_a_sorted_dictionary_without_reading_every_value() {
+        let (values, source) = filed(1024);
+        let column = Vector::stable_dictionary(vec![3, 900, 3], Arc::new(values)).expect("codes");
+        let found = Lookup::default()
+            .find(&column, b"value-0700")
+            .expect("a sorted dictionary can be searched")
+            .expect("the search reads");
+        let Found::At(code) = found else { panic!("the dictionary holds it") };
+        assert_eq!(source.values[code as usize], b"value-0700");
+        let reads = source.reads.load(Ordering::Relaxed);
+        assert!(reads <= 11, "a search of 1024 values read {reads} of them");
+    }
+
+    #[test]
+    fn a_literal_the_dictionary_does_not_hold_is_answered_absent() {
+        let (values, _) = filed(64);
+        let column = Vector::stable_dictionary(vec![0], Arc::new(values)).expect("codes");
+        let found = Lookup::default().find(&column, b"nothing").expect("searchable").expect("read");
+        assert_eq!(found, Found::Absent);
+    }
+
+    /// The empty string is the literal ten ClickBench queries filter on, and it is the one value
+    /// most likely to sit at rank zero, so it is worth naming as its own case.
+    #[test]
+    fn the_empty_string_is_found_like_any_other_value() {
+        let source = Arc::new(Filed::new(&["pear", "", "apple"]));
+        let values = Vector::external_text(LogicalType::Varchar, source).expect("a filed vector");
+        let column = Vector::stable_dictionary(vec![0, 1, 2], Arc::new(values)).expect("codes");
+        assert_eq!(
+            Lookup::default().find(&column, b"").expect("searchable").expect("read"),
+            Found::At(1)
+        );
+    }
+
+    #[test]
+    fn a_second_chunk_over_the_same_dictionary_searches_nothing() {
+        let (values, source) = filed(256);
+        let values = Arc::new(values);
+        let first = Vector::stable_dictionary(vec![0, 1], Arc::clone(&values)).expect("codes");
+        let second = Vector::stable_dictionary(vec![2], Arc::clone(&values)).expect("codes");
+        let lookup = Lookup::default();
+        let found = lookup.find(&first, b"value-0100").expect("searchable").expect("read");
+        let reads = source.reads.load(Ordering::Relaxed);
+        assert!(reads > 0, "the first chunk did the search");
+        assert_eq!(lookup.find(&second, b"value-0100").expect("searchable").expect("read"), found);
+        assert_eq!(source.reads.load(Ordering::Relaxed), reads, "the second chunk read nothing");
+    }
+
+    /// Whatever a dictionary knows about itself, a second one is a different question, and
+    /// answering it from the first one's search would be wrong rather than slow.
+    #[test]
+    fn a_search_is_not_reused_across_two_dictionaries() {
+        let lookup = Lookup::default();
+        let (first, _) = filed(8);
+        let (second, _) = filed(8);
+        let first = Vector::stable_dictionary(vec![0], Arc::new(first)).expect("codes");
+        let second = Vector::stable_dictionary(vec![0], Arc::new(second)).expect("codes");
+        assert!(lookup.find(&first, b"value-0000").is_some());
+        assert!(lookup.find(&second, b"value-0000").is_none());
+    }
+
+    /// A dictionary built in memory does not know its own order, and the caller has to be left on
+    /// the path it would have taken, which is the peel.
+    #[test]
+    fn a_dictionary_with_no_order_is_declined() {
+        let values = Arc::new(letters(&["apple", "pear"]));
+        let column = Vector::stable_dictionary(vec![0, 1], values).expect("codes");
+        assert!(Lookup::default().find(&column, b"apple").is_none());
     }
 }
