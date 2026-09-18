@@ -1240,6 +1240,87 @@ impl Reader {
         }))
     }
 
+    /// How many distinct values one column holds, counting a null as no value.
+    ///
+    /// A string column of this format is written against one dictionary that covers the whole table.
+    /// A code is handed out the first time a value is seen and nothing ever removes one, so the
+    /// number of codes is the number of distinct values exactly rather than an estimate. That makes
+    /// `COUNT(DISTINCT column)` over a whole table a question the directory already knows the answer
+    /// to, and the alternative is a hash table with a row per distinct value built from a pass over
+    /// every row.
+    ///
+    /// `None` for a column the file has no dictionary for, which is every column that is not a
+    /// string, and `None` for a column with a null in it. A sketch would answer the first
+    /// approximately and SQL asked for the exact number. The second is the placeholder: a null row
+    /// is written as the code for the empty string, so a nullable column's dictionary may hold an
+    /// empty string that no row of it actually has, and nothing persisted today tells the two cases
+    /// apart.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema, or the dictionary page does not read.
+    pub fn distinct_values(&self, column: usize) -> Result<Option<u64>> {
+        if self.null_count(column)? > 0 {
+            return Ok(None);
+        }
+        Ok(self.dictionary(column)?.map(|dictionary| dictionary.len() as u64))
+    }
+
+    /// How many rows of one column are null, added up over the stripes.
+    ///
+    /// Every stripe records this exactly when it is written, because a null count is not a bound
+    /// that is allowed to be wide the way a minimum and a maximum are: a filter that reads one too
+    /// many is slow and a `COUNT` that reads one too many is wrong. Adding up a few hundred numbers
+    /// already in memory is what makes `COUNT(column)` over a whole table free.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema.
+    pub fn null_count(&self, column: usize) -> Result<u64> {
+        if column >= self.table.fields.len() {
+            return Err(invalid("null count column index out of range"));
+        }
+        let mut nulls = 0_u64;
+        for stripe in &self.table.stripes {
+            let range = stripe
+                .zone
+                .column(column)
+                .ok_or_else(|| invalid("stripe zone is narrower than the schema"))?;
+            nulls = nulls
+                .checked_add(range.nulls as u64)
+                .ok_or_else(|| invalid("null count overflow"))?;
+        }
+        Ok(nulls)
+    }
+
+    /// The smallest and the largest value of one string column, from the order beside its values.
+    ///
+    /// The dictionary holds exactly the values the column holds, so the first and the last of them
+    /// in sorted order are the column's minimum and maximum. Two reads of a rank block settle what
+    /// otherwise walks a million rows.
+    ///
+    /// `None` when the column is not a string, when the file was written before version 9 and so has
+    /// no order, when the column has no values at all, or when it has a null in it, which is the
+    /// placeholder again: the empty string a null is written as would sort ahead of every real
+    /// value and be reported as the minimum.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema, or a rank names a code the dictionary does not have.
+    pub fn text_extremes(&self, column: usize) -> Result<Option<(Value, Value)>> {
+        if self.null_count(column)? > 0 {
+            return Ok(None);
+        }
+        let Some(dictionary) = self.dictionary(column)? else { return Ok(None) };
+        let Some(ranks) = dictionary.ranks() else { return Ok(None) };
+        if ranks == 0 {
+            return Ok(None);
+        }
+        let low = text_at_rank(&dictionary, 0)?;
+        let high = text_at_rank(&dictionary, ranks - 1)?;
+        Ok(Some((low, high)))
+    }
+
     fn dictionary(&self, column: usize) -> Result<Option<Arc<Vector>>> {
         let Some(page) = self.table.dictionaries[column] else { return Ok(None) };
         if let Some(dictionary) = self.dictionaries[column].get() {
@@ -1383,6 +1464,15 @@ impl Reader {
     pub fn skips(&self, stripe: usize, probes: &[Probe]) -> bool {
         self.table.stripes.get(stripe).is_some_and(|stripe| stripe.zone.skips(probes))
     }
+}
+
+/// The value sitting at one position of a dictionary's sorted order.
+fn text_at_rank(dictionary: &Vector, rank: usize) -> Result<Value> {
+    let code = dictionary.code_at_rank(rank)? as usize;
+    let text = dictionary
+        .try_text_at(code)?
+        .ok_or_else(|| invalid("global dictionary order names a code it does not have"))?;
+    Ok(Value::Varchar(text.into()))
 }
 
 #[cfg(unix)]
