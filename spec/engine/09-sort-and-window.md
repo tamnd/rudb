@@ -78,6 +78,8 @@ A sliding aggregate for a fixed-size frame, adding the entering row and removing
 
 A segment tree for the general frame, which is the paper's contribution: build a balanced tree of partial aggregates over the partition, and any frame is then answered by combining a logarithmic number of nodes. This handles `MIN` and `MAX` over sliding frames, `RANGE` frames whose bounds are data-dependent, and everything else that the first two cannot. It costs a linear build and it is the fallback rather than the default.
 
+Finding the frame is a separate question from aggregating over it, and `RANGE` is the unit where finding it costs something. A `RANGE` distance is a distance in the values the query ordered by rather than a count of rows, so the end of the frame is wherever the key reaches `key + offset` or `key - offset`, and which arithmetic that is depends on the type of the key and on whether the sort runs up or down. The addition is an ordinary function call resolved once when the operator is built, which is why a distance over a string key is refused with the same words as any other missing overload, and the place it names is found by binary search over the partition, which is already sorted by that one key. A row whose key is null gets its peer group instead, because there is no distance from a null to anything.
+
 The `combine` function from document 07 is exactly what a segment tree node needs, which is another reason it was specified there rather than being invented here.
 
 Document 01 recorded that Polars' streaming engine falls back to a non-streaming path for window functions, which is the honest admission that this operator is hard to stream. rudb does not stream it either at this layer, and says so.

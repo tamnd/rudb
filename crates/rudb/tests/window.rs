@@ -45,6 +45,13 @@ fn totals(values: &[i128]) -> Vec<Value> {
     values.iter().map(|&held| Value::HugeInt(held)).collect()
 }
 
+/// A window column whose last row is null, which is what the row with no key gets from a distance.
+fn ending_null(values: &[i128]) -> Vec<Value> {
+    let mut answers = totals(values);
+    answers.push(Value::Null);
+    answers
+}
+
 fn counts(values: &[i64]) -> Vec<Value> {
     values.iter().map(|&held| Value::BigInt(held)).collect()
 }
@@ -348,16 +355,131 @@ fn a_frame_distance_that_is_null_is_refused_and_one_that_is_negative_is_not() {
 }
 
 #[test]
-fn a_range_frame_with_a_distance_says_it_is_not_done_rather_than_guessing() {
-    // The one gap left, and it is a distance measured from the current row's order key rather than
-    // from its position, so answering it is arithmetic over whatever type that key has. Saying so
-    // is better than answering it as though it were a `ROWS` frame, which is what it is not.
+fn a_range_distance_is_measured_in_the_key_and_not_in_the_rows() {
+    // The tie on 2 is what separates this from `ROWS`. Both rows that hold 2 see the same frame,
+    // because the frame is the values between 1 and 3 and not the row before and the row itself.
+    assert_eq!(
+        answered("sum(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)"),
+        ending_null(&[1, 5, 5, 7, 7])
+    );
+    assert_eq!(
+        answered("sum(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING)"),
+        ending_null(&[5, 8, 8, 11, 7])
+    );
+    assert_eq!(
+        answered("count(*) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING)"),
+        counts(&[3, 4, 4, 4, 2, 1])
+    );
+}
+
+#[test]
+fn a_range_distance_runs_the_way_the_sort_key_runs() {
+    // Under `DESC` the rows before the current one hold larger keys, so `1 PRECEDING` adds where it
+    // would have subtracted. A frame that reaches the same distance either way is the query that
+    // notices, because it answers the same under both orders and would not if the sign were fixed.
+    let both = ending_null(&[5, 8, 8, 11, 7]);
+    assert_eq!(
+        answered("sum(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING)"),
+        both
+    );
+    assert_eq!(
+        answered("sum(i) OVER (ORDER BY i DESC RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING)"),
+        both
+    );
+    // Where the nulls are sorted to is a separate question from which direction the key runs, and
+    // moving them to the front moves no frame, because no frame ever reaches them.
+    assert_eq!(
+        answered("sum(i) OVER (ORDER BY i NULLS FIRST RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING)"),
+        both
+    );
+}
+
+#[test]
+fn a_null_key_gets_its_peer_group_because_there_is_no_distance_from_a_null() {
+    // The null row is alone in its peer group here, so a frame around it holds one row and a `sum`
+    // over that row is null. The count is what shows it is one row and not none and not all six.
+    assert_eq!(
+        answered("count(*) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING)"),
+        counts(&[3, 4, 4, 4, 2, 1])
+    );
+    // An end that is not a distance is answered the way it always was, so a frame with one of each
+    // reaches from the start of the partition to the null row's own peer group.
+    assert_eq!(
+        answered("sum(i) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING)"),
+        totals(&[5, 8, 8, 12, 12, 12])
+    );
+}
+
+#[test]
+fn a_range_frame_that_covers_nothing_is_null_and_one_that_covers_a_gap_skips_it() {
+    // `2 PRECEDING AND 1 PRECEDING` is the rows strictly before the current key by one or two, and
+    // the first row of the partition has none of them.
+    assert_eq!(
+        answered("sum(i) OVER (ORDER BY i RANGE BETWEEN 2 PRECEDING AND 1 PRECEDING)"),
+        vec![
+            Value::Null,
+            Value::HugeInt(1),
+            Value::HugeInt(1),
+            Value::HugeInt(5),
+            Value::HugeInt(7),
+            Value::Null
+        ]
+    );
+    // A start after the end covers nothing anywhere, which is null and not an error.
+    assert_eq!(
+        answered("sum(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND 2 PRECEDING)"),
+        vec![Value::Null; 6]
+    );
+}
+
+#[test]
+fn a_range_distance_is_arithmetic_so_it_takes_the_type_the_key_takes() {
+    // A fractional distance over an integer key does the subtraction in decimal, which reaches the
+    // same rows here and would not if the distance were rounded to a row count first.
+    assert_eq!(
+        answered("sum(i) OVER (ORDER BY i RANGE BETWEEN 1.5 PRECEDING AND 1.5 FOLLOWING)"),
+        ending_null(&[5, 8, 8, 11, 7])
+    );
+    // An interval over a timestamp is the same resolution reaching a different overload, and it is
+    // the case that shows the distance is not a number of rows at all.
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("CREATE TABLE s(a TIMESTAMP, v INTEGER)").expect("creates the table");
+    connection
+        .execute(
+            "INSERT INTO s VALUES ('2020-01-01 00:00:00',1),('2020-01-01 00:00:30',2), \
+             ('2020-01-01 00:01:00',4),('2020-01-01 00:02:00',8)",
+        )
+        .expect("inserts four rows");
+    let sql = "SELECT sum(v) OVER (ORDER BY a RANGE BETWEEN INTERVAL 1 MINUTE PRECEDING \
+               AND CURRENT ROW) FROM s ORDER BY a";
+    assert_eq!(column(&database, sql, 0), totals(&[1, 3, 7, 12]));
+}
+
+#[test]
+fn a_range_distance_that_cannot_be_measured_says_so_where_the_arithmetic_says_so() {
+    // Three separate refusals that look alike. A null distance has no frame, a negative one has a
+    // frame that runs backwards, and a key that cannot be added to has no arithmetic at all.
     let database = built();
     let connection = database.connect();
     let error = connection
-        .query("SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t")
-        .expect_err("that frame is not answered yet");
-    assert!(error.message().contains("RANGE frame with an offset"), "{error}");
+        .query(
+            "SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN NULL PRECEDING AND CURRENT ROW) FROM t",
+        )
+        .expect_err("a null distance is not a distance");
+    assert_eq!(error.message(), "Window RANGE expressions cannot be NULL");
+    let error = connection
+        .query("SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t")
+        .expect_err("a negative RANGE distance is refused where a negative ROWS one is not");
+    assert_eq!(error.message(), "Invalid RANGE PRECEDING value");
+    let error = connection
+        .query("SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN CURRENT ROW AND -1 FOLLOWING) FROM t")
+        .expect_err("the other end is refused in its own words");
+    assert_eq!(error.message(), "Invalid RANGE FOLLOWING value");
+    let error = connection
+        .query("SELECT sum(i) OVER (ORDER BY j RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t")
+        .expect_err("there is nothing to subtract one from a string with");
+    assert!(error.message().contains("No function matches"), "{error}");
 }
 
 #[test]
