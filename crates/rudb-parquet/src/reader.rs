@@ -582,6 +582,20 @@ impl Reader {
             .collect()
     }
 
+    /// How many rows the whole file holds, as its footer states.
+    ///
+    /// The file's count and not this reader's, so a reader that [`Reader::split`] has narrowed to
+    /// one row group still answers for all of them. The caller is the planner, which wants to know
+    /// how large the input is before anything has been split, and a footer is counted rather than
+    /// sampled, so this is exact.
+    ///
+    /// Negative is impossible in a file anybody wrote and is taken as zero rather than as an error,
+    /// because a row count is not what a corrupt file should be reported through.
+    #[must_use]
+    pub fn rows(&self) -> u64 {
+        u64::try_from(self.metadata.rows).unwrap_or(0)
+    }
+
     /// How many bytes of column data have been read.
     ///
     /// The footer is not counted. It is read once whatever the query is, and what a projection test
