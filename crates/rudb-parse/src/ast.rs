@@ -119,6 +119,12 @@ pub struct Setting {
     /// An expression rather than text. `SET memory_limit = '1GB'` writes a string and `SET threads
     /// = 4` writes a number, and what a setting does with either is the setting's business.
     pub value: ExprRef,
+    /// Whether the statement was written as a bare `PRAGMA name`.
+    ///
+    /// `PRAGMA disable_optimizer` is a `SET` with the name and the value both folded into one word,
+    /// and which word means what is the catalog's business rather than the parser's, so it arrives
+    /// here as a name with no value and this flag to say that no value is not a `RESET`.
+    pub pragma: bool,
 }
 
 /// Which copy of a setting a statement means.

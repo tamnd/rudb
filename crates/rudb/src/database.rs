@@ -676,6 +676,10 @@ impl Shared {
                     sql,
                 )
             }
+            Bound::Setting(setting) if setting.pragma => {
+                self.inner.settings.toggle(&setting.name)?;
+                Ok(QueryResult::empty())
+            }
             Bound::Setting(setting) => {
                 let value = setting.value.as_ref();
                 self.inner.settings.apply(

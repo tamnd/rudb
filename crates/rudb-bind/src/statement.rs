@@ -74,6 +74,8 @@ pub struct Setting {
     pub scope: ast::Scope,
     /// The value, or `None` for a `RESET`.
     pub value: Option<Value>,
+    /// Whether the statement was written as a bare `PRAGMA name`, which carries its value in it.
+    pub pragma: bool,
 }
 
 /// A bound `CREATE TABLE`.
@@ -402,7 +404,7 @@ fn setting(
         };
         Some(binder.plan().value(value).clone())
     };
-    Ok(Bound::Setting(Setting { name, scope: written.scope, value }))
+    Ok(Bound::Setting(Setting { name, scope: written.scope, value, pragma: written.pragma }))
 }
 
 fn insert(
