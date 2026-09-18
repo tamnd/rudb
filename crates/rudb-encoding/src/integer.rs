@@ -1,7 +1,7 @@
 //! The single column integer encodings and the cascade over them.
 //!
 //! `spec/06-compression.md` section 6.2 lists the encoding set and section 6.3 says the ratios are
-//! in the cascade rather than in any one encoding. This module is both: the six candidate shapes
+//! in the cascade rather than in any one encoding. This module is both: the seven candidate shapes
 //! for an integer column, each of which encodes its own output by calling back into the chooser, so
 //! that RLE over a dictionary over a bit packed code array is a thing that happens by construction
 //! rather than a case somebody wrote out.
@@ -75,6 +75,9 @@ pub enum Kind {
     Dict = 4,
     /// One dominant value with an exception list of positions and values.
     Sparse = 5,
+    /// A base and a common step, with the number of steps to each value encoded as a chunk in its
+    /// own right.
+    Strided = 6,
 }
 
 impl Kind {
@@ -90,6 +93,7 @@ impl Kind {
             3 => Ok(Self::Rle),
             4 => Ok(Self::Dict),
             5 => Ok(Self::Sparse),
+            6 => Ok(Self::Strided),
             other => Err(Error::internal(format!("unknown encoding tag {other}"))),
         }
     }
@@ -104,6 +108,7 @@ impl Kind {
             Self::Rle => "RLE",
             Self::Dict => "DICT",
             Self::Sparse => "SPARSE",
+            Self::Strided => "STRIDE",
         }
     }
 }
@@ -284,6 +289,9 @@ fn candidates(values: &[i64], depth: u8) -> Vec<Kind> {
         Some((_, count)) if count * 10 >= values.len() * 8 => kinds.push(Kind::Sparse),
         _ => {}
     }
+    if stride_of(values).is_some() {
+        kinds.push(Kind::Strided);
+    }
     kinds
 }
 
@@ -355,6 +363,27 @@ fn encode_as(
             );
             out.extend_from_slice(&encode_at(&positions, depth + 1, chooser)?);
             out.extend_from_slice(&encode_at(&exceptions, depth + 1, chooser)?);
+        }
+        Kind::Strided => {
+            let (Some(base), Some(stride)) = (values.iter().min().copied(), stride_of(values))
+            else {
+                return Ok(None);
+            };
+            let mut steps = Vec::with_capacity(values.len());
+            for value in values {
+                let step = offset_from(*value, base) / stride;
+                // A step count the recursion cannot hold. An offset is at most 65 bits because both
+                // ends came from an `i64`, and only a stride of one leaves it that wide, which is a
+                // stride this never offers. Refused rather than wrapped, because a candidate that
+                // does not apply is one the chooser skips.
+                let Ok(step) = i64::try_from(step) else {
+                    return Ok(None);
+                };
+                steps.push(step);
+            }
+            put_i64(&mut out, base);
+            put_u64(&mut out, stride);
+            out.extend_from_slice(&encode_at(&steps, depth + 1, chooser)?);
         }
     }
     Ok(Some(out))
@@ -560,6 +589,19 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
             }
             Ok(values)
         }
+        Kind::Strided => {
+            let base = reader.i64()?;
+            let stride = reader.u64()?;
+            let steps = decode_chunk(reader, scratch)?;
+            check_count(steps.len(), count)?;
+            let mut values = Vec::with_capacity(count);
+            for step in steps {
+                let step = u64::try_from(step)
+                    .map_err(|_| Error::internal("a negative number of strides"))?;
+                values.push(value_from(step.wrapping_mul(stride), base));
+            }
+            Ok(values)
+        }
     }
 }
 
@@ -619,7 +661,59 @@ fn describe_chunk(reader: &mut Reader<'_>) -> Result<String> {
             let exceptions = describe_chunk(reader)?;
             format!("SPARSE({positions}, {exceptions})")
         }
+        Kind::Strided => {
+            reader.i64()?;
+            let stride = reader.u64()?;
+            format!("STRIDE[{stride}]({})", describe_chunk(reader)?)
+        }
     })
+}
+
+/// The step every value of the chunk is a whole number of, or `None` when there is not one worth
+/// having.
+///
+/// This is the greatest common divisor of every value's distance from the smallest one. A timestamp
+/// column loaded from a source that recorded whole seconds holds microseconds that are all multiples
+/// of a million, and without this the frame of reference pays twenty bits a value to write down the
+/// twenty zero bits at the bottom of every one of them.
+///
+/// The walk stops the moment the divisor reaches one, which is what makes this affordable to ask on
+/// every chunk. Two values that share no factor are enough to answer, and on a column of arbitrary
+/// numbers that is almost always the first pair.
+fn stride_of(values: &[i64]) -> Option<u64> {
+    let base = values.iter().min().copied()?;
+    let mut divisor = 0u64;
+    for value in values {
+        divisor = gcd(divisor, offset_from(*value, base));
+        if divisor == 1 {
+            return None;
+        }
+    }
+    // Zero is every value being the base, which `Constant` already holds for nothing, and one is
+    // the frame of reference on its own with two extra words of header.
+    (divisor > 1).then_some(divisor)
+}
+
+/// Binary GCD, which is the one without a division in it.
+fn gcd(mut left: u64, mut right: u64) -> u64 {
+    if left == 0 {
+        return right;
+    }
+    if right == 0 {
+        return left;
+    }
+    let shift = (left | right).trailing_zeros();
+    left >>= left.trailing_zeros();
+    loop {
+        right >>= right.trailing_zeros();
+        if left > right {
+            std::mem::swap(&mut left, &mut right);
+        }
+        right -= left;
+        if right == 0 {
+            return left << shift;
+        }
+    }
 }
 
 /// The distance from the frame of reference base, which is always representable in a `u64` because
@@ -873,6 +967,64 @@ mod tests {
             }
             assert_eq!(smallest.as_deref(), Some(chosen.as_slice()), "{}", values.len());
         }
+    }
+
+    #[test]
+    fn a_column_of_whole_seconds_in_microseconds_pays_nothing_for_the_zeroes() {
+        // What three ClickBench columns are. `epoch_ms(EventTime * 1000)` on a source that recorded
+        // whole seconds gives microseconds with twenty zero bits under every value, and a frame of
+        // reference over a part that spans a working day needs 36 bits to write them down.
+        let mut random = Random::new();
+        let day = 1_374_000_000_000_000i64;
+        let values: Vec<i64> =
+            (0..100_000).map(|_| day + (random.next() % 68_400) as i64 * 1_000_000).collect();
+        let bytes = round_trip(&values);
+        assert_eq!(kind_of(&bytes), Kind::Strided);
+        assert!(describe(&bytes).unwrap().starts_with("STRIDE[1000000]"), "{:?}", describe(&bytes));
+        // 17 bits a value for the range of seconds, against the 36 the microseconds need.
+        let strided = 100_000 * 17 / 8;
+        assert!(bytes.len() < strided + 2000, "{} bytes for {strided} of payload", bytes.len());
+
+        let plain = encode_only(Kind::Packed, &values).unwrap().expect("packing always applies");
+        assert!(
+            bytes.len() * 2 < plain.len(),
+            "{} strided against {} packed",
+            bytes.len(),
+            plain.len()
+        );
+    }
+
+    #[test]
+    fn a_stride_is_the_common_factor_of_the_distances_from_the_smallest_value() {
+        assert_eq!(stride_of(&[10i64, 20, 40]), Some(10));
+        // The base is the smallest value and not zero, so a column that does not start on a
+        // multiple of its own step still has one.
+        assert_eq!(stride_of(&[7i64, 17, 37]), Some(10));
+        assert_eq!(stride_of(&[10i64, 20, 25]), None);
+        // Every value the same is `Constant`'s case and this declines it rather than dividing by a
+        // stride of zero.
+        assert_eq!(stride_of(&[5i64; 100]), None);
+        assert_eq!(stride_of(&[]), None);
+        // The two ends of the type, where the distance needs 65 bits and only a `u64` holds it.
+        assert_eq!(stride_of(&[i64::MIN, i64::MAX]), Some(u64::MAX));
+    }
+
+    #[test]
+    fn a_stride_across_the_whole_of_the_type_round_trips() {
+        // The distance is 65 bits, so the step count is one and the offset it comes back as is a
+        // number no `i64` holds. This is the arithmetic the encoder has to do in `u64`.
+        for values in [vec![i64::MIN, i64::MAX], vec![i64::MIN, 0, i64::MAX]] {
+            let bytes = round_trip(&values);
+            assert_eq!(decode(&bytes).unwrap(), values);
+        }
+    }
+
+    #[test]
+    fn a_column_with_no_common_factor_is_not_offered_a_stride() {
+        let mut random = Random::new();
+        let values: Vec<i64> = (0..2000).map(|_| (random.next() % 1_000_000) as i64).collect();
+        assert!(!offered(&values).contains(&Kind::Strided));
+        assert!(encode_only(Kind::Strided, &values).unwrap().is_none());
     }
 
     #[test]
