@@ -72,7 +72,7 @@ use crate::fetch::{Fetch, TableFetch};
 use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
-use crate::join::{CrossProduct, Gathered, Join};
+use crate::join::{CrossProduct, Gathered, Join, Probe};
 use crate::keywords::keywords;
 use crate::query::Query;
 use crate::register::registries;
@@ -1408,6 +1408,28 @@ impl<'a> Building<'a, '_> {
                 self.close(held, gathering, Arc::new(Watched::new(gather, kept)));
                 let mut left = self.node(driving)?;
                 let side = Gathered { schema: &held_schema, rows: gathered, marker, swapped };
+                // A lookup answers this join and the kind decides about a driving row from that
+                // row's own matches, so nothing has to be held and the driving side streams
+                // through. That is one less copy of a side, an answer that is never collected, and
+                // a pipeline no longer pinned to one thread by a sink that refuses to run twice.
+                //
+                // The plan's shape does not know about this and counts a pipeline here that the
+                // built query then fuses away, the same way it would if a cross product were a join
+                // node. Nothing runs wrong because of it: what the driver waits on is `after` on
+                // the segment, which is set right below, and the shape is only where the numbers on
+                // the counters come from. What it costs is that a profile divides the time between
+                // two pipeline ids that are really one, and what it would take to fix is teaching
+                // `rudb_plan` the same question this line asks, in a second place, where the two
+                // could disagree and the disagreement would be a wrong plan rather than a coarse
+                // profile.
+                if let Some(probe) =
+                    Probe::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)
+                {
+                    let schema = probe.schema().clone();
+                    let counters = self.watch(reference, id, pipeline, "Probe", None);
+                    left.after.push(gathering);
+                    return Ok(left.then(Arc::new(Watched::new(probe, counters)), schema));
+                }
                 let (join, out) =
                     Join::new(plan, &left.schema, side, kind, conditions, self.cancel, memory);
                 let join = join.in_session(self.session);
