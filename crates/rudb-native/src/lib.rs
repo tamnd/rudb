@@ -892,6 +892,9 @@ pub struct Reader {
     /// How many whole stripe pages have been read, which is what the sharing above is judged on. A
     /// scan of a column should read each of its stripes once however many workers it has.
     pages: Arc<AtomicUsize>,
+    /// How many index sections have been read. A scan of a column should read each of its stripes
+    /// once here too, and the test that says so is the only thing keeping it that way.
+    indexes: Arc<AtomicUsize>,
 }
 
 /// Where one table wide part number lands.
@@ -927,10 +930,17 @@ struct CachedColumn {
 /// The second list is what keeps a scan from reading the same page once per worker. It is a list
 /// and not a set because it holds at most one stripe per worker on the column and is walked far
 /// less often than a hash of it would be built.
+///
+/// The third is every index this reader has ever read for the column, one slot per stripe, and it
+/// is never evicted. An index is a few hundred bytes and a page is a quarter of a megabyte, so the
+/// two do not belong under the same budget. Riding in the page cache meant a worker that came back
+/// to a stripe after its page had been evicted read the index again with it, which on the full
+/// ClickBench file was about thirteen hundred reads out of a hundred and fourteen thousand.
 #[derive(Debug, Default)]
 struct Cached {
     pages: Vec<CachedColumn>,
     loading: Vec<usize>,
+    index: Vec<Option<Arc<Vec<PartSpan>>>>,
 }
 
 /// Stripes of one column a reader keeps the bytes of.
@@ -1277,7 +1287,14 @@ fn part_bytes(page: &[u8], span: PartSpan) -> Result<&[u8]> {
 }
 
 /// Puts one stripe of one column in the cache, dropping the stripe that has been there longest.
+///
+/// The index goes in its own slot and stays. Only the page is under the budget.
 fn remember(cached: &mut Cached, held: &CachedColumn) {
+    if let Some(slot) = cached.index.get_mut(held.stripe) {
+        if slot.is_none() {
+            *slot = Some(Arc::clone(&held.index));
+        }
+    }
     match cached.pages.iter().position(|page| page.stripe == held.stripe) {
         // An index only read and a page read can both be in flight over the same stripe, and
         // letting the first land on top of the second would throw away a page somebody read.
@@ -1338,8 +1355,15 @@ impl Reader {
         let table = decode_directory(&bytes, size)?;
         let places = places(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
-        let cache =
-            (0..table.fields.len()).map(|_| Mutex::new(Cached::default())).collect::<Vec<_>>();
+        let stripes = table.stripes.len();
+        let cache = (0..table.fields.len())
+            .map(|_| {
+                Mutex::new(Cached {
+                    index: (0..stripes).map(|_| None).collect(),
+                    ..Cached::default()
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(Self {
             file: Arc::new(file),
             table: Arc::new(table),
@@ -1347,6 +1371,7 @@ impl Reader {
             places: Arc::new(places),
             cache: Arc::new(cache),
             pages: Arc::new(AtomicUsize::new(0)),
+            indexes: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1748,12 +1773,16 @@ impl Reader {
                 return Ok(found);
             }
         }
+        let known = cached.index.get(at).and_then(Clone::clone);
         if cached.loading.contains(&at) {
             drop(cached);
             if let Some(found) = found {
                 return Ok(found);
             }
-            let held = self.page_of(stripe, column, at, false)?;
+            // The index is almost always already here, because somebody read this stripe to get
+            // into the loading list in the first place, so this branch usually costs no read at
+            // all and the part read below it is the only one the losing worker pays for.
+            let held = self.page_of(stripe, column, at, false, known)?;
             let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
             remember(&mut cached, &held);
             return Ok(held);
@@ -1761,7 +1790,7 @@ impl Reader {
         cached.loading.push(at);
         drop(cached);
 
-        let read = self.page_of(stripe, column, at, whole);
+        let read = self.page_of(stripe, column, at, whole, known);
 
         // The stripe leaves the loading list and its page enters the cache under one lock. Doing
         // them separately would leave a moment where another worker sees neither and reads the
@@ -1776,14 +1805,25 @@ impl Reader {
     }
 
     /// Reads one stripe's index for a column, and its page when the caller wants all of it.
+    ///
+    /// `known` is the index when the reader has already read it, which after the first worker
+    /// through a stripe it always has, because [`remember`] keeps every index for the life of the
+    /// reader. Without that a scan reads the index again on every part that misses the page cache.
     fn page_of(
         &self,
         stripe: &Stripe,
         column: usize,
         at: usize,
         whole: bool,
+        known: Option<Arc<Vec<PartSpan>>>,
     ) -> Result<CachedColumn> {
-        let index = Arc::new(read_index(&self.file, stripe, column)?);
+        let index = match known {
+            Some(index) => index,
+            None => {
+                self.indexes.fetch_add(1, Atomic::Relaxed);
+                Arc::new(read_index(&self.file, stripe, column)?)
+            }
+        };
         let page = if whole {
             self.pages.fetch_add(1, Atomic::Relaxed);
             let span = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
@@ -3382,6 +3422,49 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
+    /// A scan reads a stripe's index once for the whole scan, not once per part that misses.
+    ///
+    /// The page cache holds four stripes and an index used to ride inside it, so a table with more
+    /// stripes than that read the index again every time a stripe came back around. The index is a
+    /// few hundred bytes and the page is a quarter of a megabyte, which is why they are now under
+    /// different budgets. This is the test that keeps them there, since the saving is small enough
+    /// that nothing in a benchmark would notice it going away again.
+    #[test]
+    fn an_index_is_read_once_per_stripe_however_often_the_page_is_evicted() {
+        let path = path("index-cache");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        let parts = STRIPE_PARTS * (CACHED_STRIPES_PER_COLUMN + 2);
+        for part in 0..parts {
+            let id = part as i32;
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Integer, &[Value::Integer(id)]).expect("integers"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let stripes = reader.table().stripes().len();
+        assert!(stripes > CACHED_STRIPES_PER_COLUMN, "the page cache has to be too small for this");
+        // Twice over, so that the second pass finds every page evicted and every index kept.
+        for _ in 0..2 {
+            for part in 0..parts {
+                let chunk = reader.read(part, &[0]).expect("a part");
+                assert_eq!(chunk.value_at(0, 0), Value::Integer(part as i32));
+            }
+        }
+        assert_eq!(reader.indexes.load(Atomic::Relaxed), stripes, "one index read per stripe");
+        assert!(
+            reader.pages.load(Atomic::Relaxed) > stripes,
+            "the pages are the ones that get read again, which is what makes the index count mean \
+             something"
+        );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
     /// A damaged index page is caught before anything decodes a part out of it.
     ///
     /// The index is the one structure a reader trusts to find bytes with, so it carries a checksum
@@ -3558,7 +3641,8 @@ mod tests {
     #[test]
     fn a_dictionary_over_one_extent_checks_every_block_of_it() {
         let path = path("dictionary-extents");
-        let value = |row: usize| format!("{row:07} a value long enough to be worth a payload block");
+        let value =
+            |row: usize| format!("{row:07} a value long enough to be worth a payload block");
         let parts = 30;
         let per_part = 1000;
         let mut writer =
@@ -3568,10 +3652,10 @@ mod tests {
             let values = (0..per_part)
                 .map(|row| Value::Varchar(value(part * per_part + row)))
                 .collect::<Vec<_>>();
-            let chunk =
-                Chunk::new(vec![Vector::from_values(LogicalType::Varchar, &values)
-                    .expect("strings")])
-                .expect("matching rows");
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Varchar, &values).expect("strings"),
+            ])
+            .expect("matching rows");
             writer.append(&chunk).expect("a part");
         }
         writer.finish().expect("commit");
