@@ -35,6 +35,15 @@
 //! what the pass produces is a superset of the rows that really win. That is the point: it is a
 //! filter and not the decision, and every row it keeps is compared again properly.
 //!
+//! The batched path gets the same pass, one step behind. It does not hold its candidates in order,
+//! so it only knows its worst one just after a trim, and that key is what it rejects against until
+//! the next trim. It stays a true bound in between, because the running only improves: once the
+//! bound of candidates are all at least as good as that key, nothing worse than it can finish
+//! inside the bound. This matters more here than it does above, not less. A row this path keeps
+//! costs a `Vec` for its key and a `Vec` for the whole row with a `Value` per column, so on
+//! ClickBench's four `LIMIT 10 OFFSET 1000` queries, which come out of a group by with a `URL` in
+//! the key, building those for every row was most of what the operator did.
+//!
 //! Three things make it step aside and look at every row instead. A worst candidate whose first key
 //! is null, because then what beats it depends on where the query puts nulls and the comparison
 //! kernel answers null rather than true. A `NULLS FIRST` ordering over a column that has nulls, for
@@ -109,6 +118,16 @@ pub(crate) struct Running {
     failure: Option<Error>,
     /// The morsel this instance is reading and how many of its rows have arrived.
     place: Place,
+    /// The key of the worst candidate this instance has room for, once it has the bound of them.
+    ///
+    /// `None` until the first trim fills the running, and set at every trim after that. Only the
+    /// batched path keeps it, since the sorted path reads the same key straight out of `kept`, which
+    /// it holds in order at all times.
+    ///
+    /// It stays true between trims because the running only improves. Once the bound of candidates
+    /// are all at least as good as this key, a row worse than it cannot finish inside the bound, and
+    /// neither can one that ties it, because everything it ties arrived first.
+    cut: Option<Vec<Value>>,
 }
 
 impl TopN {
@@ -165,6 +184,7 @@ impl Sink for TopN {
             charged: self.memory.reservation(),
             failure: None,
             place: Place::default(),
+            cut: None,
         }
     }
 
@@ -216,23 +236,41 @@ impl Sink for TopN {
             recharge(&local.kept, &mut local.charged)?;
             return Ok(Progress::More);
         }
+        // The same question the sorted path asks, asked once the running is full rather than on
+        // every chunk from the start, because this path only knows its worst candidate after a trim.
+        // Without it a `LIMIT 10 OFFSET 1000` builds a `Vec<Value>` for the key and another for
+        // every column of every row that reaches it, however hopeless the row is, and on a wide row
+        // with a string in it that is most of what the operator does.
+        let narrowed = local
+            .cut
+            .as_ref()
+            .and_then(|cut| worth_looking_at(&self.keys, &keys, cut, chunk.len()));
         let mut taken = 0;
-        // row at a time: the key still has the same Value layout the sort holds, and 2i (#63)
-        // replaces it with one normalized comparable byte string per row.
-        for row in 0..chunk.len() {
-            let key: Vec<Value> =
-                keys.iter().map(|column| column.try_value_at(row)).collect::<Result<_>>()?;
-            let values: Vec<Value> = (0..chunk.width())
-                .map(|column| chunk.try_value_at(row, column))
-                .collect::<Result<_>>()?;
-            taken += rows::footprint(&key) + rows::footprint(&values);
-            local.kept.push((key, values, local.place.of(row)));
+        match narrowed {
+            // row at a time: the rows the pass kept are the ones that can still win, and each of
+            // them has to be read out of the columns rather than counted.
+            Some(rows) => {
+                for row in rows.iter() {
+                    let arrival = local.place.of(row);
+                    taken += hold(&keys, chunk, row, arrival, &mut local.kept)?;
+                }
+            }
+            // row at a time: the key still has the same Value layout the sort holds, and 2i (#63)
+            // replaces it with one normalized comparable byte string per row.
+            None => {
+                for row in 0..chunk.len() {
+                    let arrival = local.place.of(row);
+                    taken += hold(&keys, chunk, row, arrival, &mut local.kept)?;
+                }
+            }
         }
         local.place.past(chunk.len());
         local.charged.grow(taken)?;
         if local.kept.len() > self.bound.saturating_mul(2) {
             trim(&self.keys, &mut local.kept, self.bound, &mut local.failure);
             recharge(&local.kept, &mut local.charged)?;
+            local.cut = (local.kept.len() == self.bound && self.bound > 0)
+                .then(|| local.kept[self.bound - 1].0.clone());
         }
         Ok(Progress::More)
     }
@@ -278,6 +316,27 @@ fn poisoned<T>(_: T) -> Error {
 fn trim(keys: &[SortKey], kept: &mut Vec<Sortable>, bound: usize, failure: &mut Option<Error>) {
     kept.sort_by(|left, right| settled(keys, left, right, failure));
     kept.truncate(bound);
+}
+
+/// Reads one row out of the columns and puts it among the candidates, unordered.
+///
+/// What the batched path does with a row it has decided to keep, and the reason it costs what it
+/// costs: a `Vec` for the key, a `Vec` for the row, and a `Value` per column of each, which for a
+/// string column is a `String`. The answer is what those two together are charged.
+fn hold(
+    keys: &[Vector],
+    chunk: &Chunk,
+    row: usize,
+    arrival: crate::sort::Arrival,
+    kept: &mut Vec<Sortable>,
+) -> Result<u64> {
+    let key: Vec<Value> =
+        keys.iter().map(|column| column.try_value_at(row)).collect::<Result<_>>()?;
+    let values: Vec<Value> =
+        (0..chunk.width()).map(|column| chunk.try_value_at(row, column)).collect::<Result<_>>()?;
+    let taken = rows::footprint(&key) + rows::footprint(&values);
+    kept.push((key, values, arrival));
+    Ok(taken)
 }
 
 /// Keeps one row when its key belongs in the ordered prefix.
