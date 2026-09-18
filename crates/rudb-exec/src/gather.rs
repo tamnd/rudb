@@ -144,6 +144,11 @@ pub(crate) fn take(chunk: &Chunk, local: &mut Gathering) -> Result<()> {
 /// them again would be a copy of the whole side for nothing. Same edge, same shape, different thing
 /// kept.
 ///
+/// A join takes this one too, for a reason that is nearly the opposite and comes out the same. It
+/// reads its gathered side by position rather than in order, once to build its table and then once
+/// per match, so what it wants is columns it can gather out of. Rows would be an allocation apiece
+/// on the way in and a transpose back into columns on the way out. See [`Build`](crate::side::Build).
+///
 /// What it fills is a [`Buffered`], because that is already the source that reads finished chunks
 /// back out and there is no reason for a second one.
 #[derive(Debug)]
@@ -185,7 +190,8 @@ impl Sink for Keep {
     }
 
     /// Not yet, for the reason the gather above gives. A cross product replays these chunks in the
-    /// order they were kept, so the order they were kept in is part of the answer.
+    /// order they were kept, so the order they were kept in is part of the answer, and a join
+    /// produces a key's matches in the order its side holds them for the same reason.
     fn parallel(&self) -> bool {
         false
     }
