@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
     Arm, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
-    NodeRef, Plan, Slice, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
+    NodeRef, Plan, Slice, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
 use crate::tables::{TableSet, produced};
@@ -278,6 +278,9 @@ fn push(
         }
         Node::Values { index: at_index, columns, rows } => {
             values(plan, at_index, columns, rows, domain, index, keys)
+        }
+        Node::TableFunction { index: at_index, function, args, options, settings, columns } => {
+            lateral(plan, at_index, function, args, options, settings, columns, domain, index, keys)
         }
         Node::CrossProduct { left, right } => {
             let empty = plan.add_expr_list(&[]);
@@ -655,6 +658,60 @@ fn values(
     let exprs = plan.add_expr_list(&projected);
     let names = plan.add_name_list(&names);
     let node = plan.add_node(Node::Project { input, index: at_index, exprs, names });
+    Some(Pushed { node, keys: carried, moved: HashMap::new() })
+}
+
+/// A table function whose arguments read the outer row, which is what `FROM o, range(o.n)` is.
+///
+/// This is the one operator the push cannot go under. A table function's arguments are what produce
+/// its rows rather than something read over rows that already exist, so there is no input below it
+/// for the domain to be crossed into, and unlike a `VALUES` there is no projection over the domain
+/// that says the same thing either, because how many rows a call makes depends on what the arguments
+/// come to.
+///
+/// So the domain becomes the input and the node becomes a [`Node::LateralFunction`], which is the
+/// same call made once per row of what is underneath it. That is one call per distinct value of the
+/// correlated columns, which is what every other rule here also gives, and not one call per outer
+/// row.
+///
+/// The domain columns come out of it unmoved. A `LateralFunction` appends the function's columns to
+/// the row it was given rather than replacing it, the way a window does, so the domain columns are
+/// still where the domain put them and `keys` goes back out reading the domain straight.
+#[allow(clippy::too_many_arguments)]
+fn lateral(
+    plan: &mut Plan,
+    at_index: u32,
+    function: StrRef,
+    args: Slice,
+    options: Slice,
+    settings: Slice,
+    columns: Slice,
+    domain: NodeRef,
+    index: u32,
+    keys: &[Key],
+) -> Option<Pushed> {
+    // The outer references read the domain straight rather than something a lower operator carried,
+    // because there is no lower operator. Nothing else is moved for the same reason.
+    let mut map = HashMap::new();
+    for (position, key) in keys.iter().enumerate() {
+        let at = u32::try_from(position).expect("key count");
+        map.insert(key.binding, ColumnBinding::new(index, at));
+    }
+    let held = plan.expr_list(args).to_vec();
+    let rewritten: Vec<ExprRef> = held.into_iter().map(|expr| remap(plan, expr, &map)).collect();
+    let args = plan.add_expr_list(&rewritten);
+    let node = plan.add_node(Node::LateralFunction {
+        input: domain,
+        index: at_index,
+        function,
+        args,
+        options,
+        settings,
+        columns,
+    });
+    let carried = (0..keys.len())
+        .map(|position| ColumnBinding::new(index, u32::try_from(position).expect("key count")))
+        .collect();
     Some(Pushed { node, keys: carried, moved: HashMap::new() })
 }
 

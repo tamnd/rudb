@@ -98,8 +98,8 @@ pub enum Node {
     ///
     /// The arguments are expressions rather than numbers, because `range(2 + 3)` is a legal call
     /// and folding it here would mean the plan could not be printed back as what was written. They
-    /// cannot refer to a column: a table function that sees the row on its left is `LATERAL`, which
-    /// is a different node and is not here yet.
+    /// cannot refer to a column: a table function that sees the row on its left is `LATERAL`, and
+    /// that is [`Node::LateralFunction`].
     ///
     /// A separate node from [`Node::Values`] even though `range(3)` and `VALUES (0), (1), (2)`
     /// produce the same rows, because the one that produces three million rows should be three
@@ -124,6 +124,38 @@ pub enum Node {
         /// decide what the columns are and the columns are settled there.
         settings: Slice,
         /// The produced columns with their types, into the field pool.
+        columns: Slice,
+    },
+    /// A table function evaluated once per row of its input, which is what `LATERAL` means.
+    ///
+    /// `FROM t, range(t.n)` is this. A table function's arguments are what produce its rows rather
+    /// than something read over rows that already exist, so there is nothing underneath one for a
+    /// domain to be pushed into and nothing the rules in the unnesting pass can rewrite it into.
+    /// This is the operator those rules stop at: the domain goes in on the left, the arguments read
+    /// it, and the call is made once per row of it.
+    ///
+    /// The output is the input's columns followed by the function's, which is a cross product whose
+    /// right side is allowed to change per left row. That is what lets the join putting the rows
+    /// back beside their outer row sit above this and read the domain columns where it reads them
+    /// everywhere else.
+    ///
+    /// Only the series family reaches here. A reader takes a file name, the binder settles the
+    /// columns by opening the file, and a name that is not a constant is refused there, so a
+    /// correlated `read_csv` never gets this far.
+    LateralFunction {
+        /// The rows the call is made against, one call per row.
+        input: NodeRef,
+        /// The table index that this call's columns bind against.
+        index: u32,
+        /// Which function, as its own canonical name.
+        function: StrRef,
+        /// The arguments, into the expression list pool, read against a row of `input`.
+        args: Slice,
+        /// The names of the named parameters the call was written with, into the name pool.
+        options: Slice,
+        /// What each of those names was given, into the expression list pool and the same length.
+        settings: Slice,
+        /// The produced columns with their types, into the field pool, not counting the input's.
         columns: Slice,
     },
     /// A predicate over the input, keeping the rows where it is true.
@@ -380,6 +412,7 @@ impl Node {
             Self::Dummy => "Dummy",
             Self::Values { .. } => "Values",
             Self::TableFunction { .. } => "TableFunction",
+            Self::LateralFunction { .. } => "LateralFunction",
             Self::Filter { .. } => "Filter",
             Self::Project { .. } => "Project",
             Self::Aggregate { .. } => "Aggregate",
@@ -421,7 +454,8 @@ impl Node {
             | Self::TopN { input, .. }
             | Self::Fetch { input, .. }
             | Self::TableFetch { input, .. }
-            | Self::Distinct { input, .. } => [Some(input), None],
+            | Self::Distinct { input, .. }
+            | Self::LateralFunction { input, .. } => [Some(input), None],
             Self::Join { left, right, .. }
             | Self::DependentJoin { left, right, .. }
             | Self::CrossProduct { left, right }
@@ -443,6 +477,7 @@ impl Node {
             Self::Get { index, .. }
             | Self::Values { index, .. }
             | Self::TableFunction { index, .. }
+            | Self::LateralFunction { index, .. }
             | Self::Project { index, .. }
             | Self::Fetch { index, .. }
             | Self::TableFetch { index, .. }
@@ -620,6 +655,15 @@ mod tests {
                 settings: Slice::EMPTY,
                 columns: Slice::EMPTY,
             },
+            Node::LateralFunction {
+                input: 0,
+                index: 0,
+                function: 0,
+                args: Slice::EMPTY,
+                options: Slice::EMPTY,
+                settings: Slice::EMPTY,
+                columns: Slice::EMPTY,
+            },
             Node::Filter { input: 0, predicate: 0 },
             Node::Project { input: 0, index: 0, exprs: Slice::EMPTY, names: Slice::EMPTY },
             Node::Aggregate { input: 0, index: 0, groups: Slice::EMPTY, aggregates: Slice::EMPTY },
@@ -683,6 +727,7 @@ mod tests {
                 Node::Get { .. }
                     | Node::Values { .. }
                     | Node::TableFunction { .. }
+                    | Node::LateralFunction { .. }
                     | Node::Project { .. }
                     | Node::Aggregate { .. }
                     | Node::SetOp { .. }

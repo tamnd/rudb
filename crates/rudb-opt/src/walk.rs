@@ -89,6 +89,7 @@ pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
             *definition = children[0];
             *body = children[1];
         }
+        Node::LateralFunction { input, .. } => *input = children[0],
         Node::Get { .. }
         | Node::Dummy
         | Node::Values { .. }
@@ -135,6 +136,18 @@ pub(crate) fn outputs(plan: &Plan, at: NodeRef) -> Option<Vec<(ColumnBinding, Lo
         Node::Window { input, index, expressions, .. } => {
             let mut found = outputs(plan, input)?;
             found.extend(listed(plan, index, 0, expressions));
+            Some(found)
+        }
+        // A lateral call appends the function's columns to the row it was called for, the way a
+        // cross product appends the right side's, so its input's bindings are still what they were.
+        Node::LateralFunction { input, index, columns, .. } => {
+            let mut found = outputs(plan, input)?;
+            found.extend(
+                plan.field_list(columns)
+                    .iter()
+                    .enumerate()
+                    .map(|(position, field)| (binding(index, position), field.ty.clone())),
+            );
             Some(found)
         }
         Node::Filter { input, .. }
@@ -378,7 +391,8 @@ pub(crate) fn node_columns(
                 each(plan, row, found);
             }
         }
-        Node::TableFunction { args, settings, .. } => {
+        Node::TableFunction { args, settings, .. }
+        | Node::LateralFunction { args, settings, .. } => {
             each(plan, args, found);
             each(plan, settings, found);
         }

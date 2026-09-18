@@ -1366,14 +1366,15 @@ impl<'a> Binder<'a> {
                 }
             }
         }
-        // A table function's arguments are evaluated to produce the rows rather than over rows that
-        // already exist, so there is nothing underneath it for the domain to be pushed into and no
-        // projection over the domain that would say the same thing, the way there is for a VALUES.
-        // Answering it wants an operator that evaluates a source once per value and there is none.
-        // Said here rather than left to the executor, so the message names what was written.
-        if !here.is_empty() && matches!(ast.source(source), ast::Source::Function { .. }) {
-            return Err(Error::not_implemented("a table function reading a LATERAL column"));
-        }
+        // A table function is allowed to read the left the same as anything else here. There is
+        // nothing underneath one for the domain to be pushed into, since its arguments are what
+        // produce its rows, so the unnesting pass turns it into a `LateralFunction` and the call is
+        // made once per domain value. That is `domain.rs`.
+        //
+        // Nothing has to be turned down here for the functions that would not survive it. The only
+        // table functions taking an argument that is not a name are the series family, which is the
+        // family that operator answers, and a name that is not a constant is refused where the
+        // columns are settled, because settling them means opening the file or reading the catalog.
         Ok((node, scope, here))
     }
 

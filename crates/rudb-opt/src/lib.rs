@@ -272,6 +272,9 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         Node::Window { input, expressions, .. } => {
             output_columns(plan, input) + plan.expr_list(expressions).len()
         }
+        Node::LateralFunction { input, columns, .. } => {
+            output_columns(plan, input) + plan.field_list(columns).len()
+        }
         Node::Dummy => 0,
         Node::Filter { input, .. }
         | Node::Sort { input, .. }

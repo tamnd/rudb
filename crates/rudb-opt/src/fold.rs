@@ -155,10 +155,12 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
                 }
             }
         }
-        Node::TableFunction { args, .. } => {
+        Node::TableFunction { args, .. } | Node::LateralFunction { args, .. } => {
             if let Some(rewritten) = expr_list(plan, args, done) {
                 match plan.node_mut(node) {
-                    Node::TableFunction { args, .. } => *args = rewritten,
+                    Node::TableFunction { args, .. } | Node::LateralFunction { args, .. } => {
+                        *args = rewritten;
+                    }
                     _ => unreachable!("the node was a table function a moment ago"),
                 }
             }
