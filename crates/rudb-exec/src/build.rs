@@ -1443,6 +1443,7 @@ impl<'a> Building<'a, '_> {
                 if let Some(probe) =
                     Probe::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)
                 {
+                    let probe = probe.in_session(self.session);
                     let schema = probe.schema().clone();
                     let counters = self.watch(reference, id, pipeline, "Probe", None);
                     left.after.push(gathering);
