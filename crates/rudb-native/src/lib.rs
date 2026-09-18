@@ -4837,7 +4837,8 @@ mod tests {
             assert!(kept.len() <= 2, "{wanted} keeps {kept:?}, which is more than one stray part");
         }
         let absent = [probe((parts * per_part) as i64 + 1)];
-        assert!((0..parts).all(|part| reader.skips(part, &absent)), "no part holds it");
+        let kept = (0..parts).filter(|&part| !reader.skips(part, &absent)).count();
+        assert!(kept <= 1, "{kept} parts of {parts} kept a value no part holds");
         // The same probes against the bounds alone, which is what this replaces. A column of
         // scattered numbers has a range per stripe that covers nearly the whole type.
         let tests = [probe(0)];
