@@ -73,6 +73,21 @@ fn invalid(message: &str) -> Error {
     Error::invalid_input(format!("invalid rudb native file: {message}"))
 }
 
+/// Adds a sequence of byte counts without an overflow the caller has to think about.
+fn sum(counts: impl Iterator<Item = u64>) -> u64 {
+    counts.fold(0, u64::saturating_add)
+}
+
+/// One column's span out of a per column list, or zero when the list is shorter than the column.
+fn span_bytes(spans: &[Span], at: usize) -> u64 {
+    spans.get(at).map_or(0, |span| u64::from(span.length))
+}
+
+/// One column's page out of a per column list, or zero when that column has no page at all.
+fn page_bytes(pages: &[Option<Page>], at: usize) -> u64 {
+    pages.get(at).and_then(Option::as_ref).map_or(0, Page::bytes)
+}
+
 fn checksum(bytes: &[u8]) -> u64 {
     const P1: u64 = 11_400_714_785_074_694_791;
     const P2: u64 = 14_029_467_366_897_019_727;
@@ -165,6 +180,13 @@ struct Page {
     offset: u64,
     length: u32,
     hash: u64,
+}
+
+impl Page {
+    /// How much of the file this page takes, for [`Reader::layout`].
+    fn bytes(&self) -> u64 {
+        u64::from(self.length)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -279,6 +301,87 @@ impl Table {
     #[must_use]
     pub fn stripes(&self) -> &[Stripe] {
         &self.stripes
+    }
+}
+
+/// Where one column's bytes went, taken from the directory rather than by reading pages.
+#[derive(Debug, Clone)]
+pub struct ColumnLayout {
+    /// The column's name, so a report does not have to carry the field list beside this.
+    pub name: String,
+    /// The type, spelled the way the catalog spells it.
+    pub kind: String,
+    /// Every stripe's page of this column added up, which is the encoded data itself.
+    pub pages: u64,
+    /// Every stripe's exact code membership page for this column.
+    pub memberships: u64,
+    /// Every stripe's membership sieve page for this column.
+    pub sieves: u64,
+    /// The table wide dictionary of this column, if it has one.
+    pub dictionary: u64,
+}
+
+impl ColumnLayout {
+    /// Everything this column costs, which is what the file would lose if the column went.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.pages
+            .saturating_add(self.memberships)
+            .saturating_add(self.sieves)
+            .saturating_add(self.dictionary)
+    }
+}
+
+/// Where a whole file's bytes went.
+///
+/// Every number here comes out of the committed directory, so taking it costs one directory read
+/// however large the file is. That is the point: a 45 GB table has to be able to say where it went
+/// without being read, or nobody will ask.
+///
+/// The parts that are not a column are kept apart rather than shared out over the columns. The
+/// stripe index page holds a section per column and could be split, and the directory and the
+/// header cannot be, so splitting one of the three and not the others would read as if the columns
+/// accounted for everything. They do not, and the gap is the thing worth looking at.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    /// The size of the file on disk.
+    pub file: u64,
+    /// Committed rows.
+    pub rows: usize,
+    /// Committed stripes.
+    pub stripes: usize,
+    /// Committed parts, which is how many chunks a scan reads.
+    pub parts: usize,
+    /// One entry per column, in the table's column order.
+    pub columns: Vec<ColumnLayout>,
+    /// Every stripe's index page, which carries a length and a checksum for every part of every
+    /// column and is charged per stripe rather than per column.
+    pub indexes: u64,
+    /// The committed directory itself, the one that was read to build this.
+    pub directory: u64,
+    /// The fixed header, which holds the magic, the format and the two directory slots.
+    pub header: u64,
+}
+
+impl Layout {
+    /// Everything the columns cost together.
+    #[must_use]
+    pub fn columns_total(&self) -> u64 {
+        self.columns.iter().map(ColumnLayout::total).fold(0, u64::saturating_add)
+    }
+
+    /// What the file holds that this does not account for.
+    ///
+    /// A committed file is written once and never rewritten in place, so an earlier directory and
+    /// the pages of an earlier snapshot are still in it. That is the honest place for them: they
+    /// are bytes on disk that no column owns.
+    #[must_use]
+    pub fn unaccounted(&self) -> u64 {
+        self.file
+            .saturating_sub(self.columns_total())
+            .saturating_sub(self.indexes)
+            .saturating_sub(self.directory)
+            .saturating_sub(self.header)
     }
 }
 
@@ -941,6 +1044,10 @@ pub struct Reader {
     /// How many stripes of one column the page cache keeps. See [`CACHED_STRIPES_PER_COLUMN`] for
     /// what sets it and [`Reader::keep_stripes`] for who raises it.
     kept: Arc<AtomicUsize>,
+    /// The file's size when it was opened, for [`Reader::layout`].
+    size: u64,
+    /// The committed directory's size, for [`Reader::layout`].
+    directory: u64,
 }
 
 /// Where one table wide part number lands.
@@ -1422,7 +1529,8 @@ impl Reader {
                 selected = Some((slot, bytes));
             }
         }
-        let (_, bytes) = selected.ok_or_else(|| invalid("no committed directory slot is valid"))?;
+        let (slot, bytes) =
+            selected.ok_or_else(|| invalid("no committed directory slot is valid"))?;
         let table = decode_directory(&bytes, size)?;
         let places = places(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
@@ -1449,7 +1557,42 @@ impl Reader {
             pages: Arc::new(AtomicUsize::new(0)),
             indexes: Arc::new(AtomicUsize::new(0)),
             kept: Arc::new(AtomicUsize::new(CACHED_STRIPES_PER_COLUMN)),
+            size,
+            directory: u64::from(slot.length),
         })
+    }
+
+    /// Where the file's bytes went, from the directory alone.
+    ///
+    /// No page is read, so this costs the same on a 45 GB table as on an empty one. See [`Layout`]
+    /// for what is charged where and for why the three things that are not columns stay separate.
+    #[must_use]
+    pub fn layout(&self) -> Layout {
+        let table = &self.table;
+        let stripes = table.stripes.as_slice();
+        let columns = table
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(at, field)| ColumnLayout {
+                name: field.name.clone(),
+                kind: field.ty.to_string(),
+                pages: sum(stripes.iter().map(|stripe| span_bytes(&stripe.pages, at))),
+                memberships: sum(stripes.iter().map(|stripe| page_bytes(&stripe.memberships, at))),
+                sieves: sum(stripes.iter().map(|stripe| page_bytes(&stripe.sieves, at))),
+                dictionary: page_bytes(&table.dictionaries, at),
+            })
+            .collect();
+        Layout {
+            file: self.size,
+            rows: table.rows,
+            stripes: stripes.len(),
+            parts: self.places.len(),
+            columns,
+            indexes: sum(stripes.iter().map(|stripe| u64::from(stripe.index.length))),
+            directory: self.directory,
+            header: HEADER,
+        }
     }
 
     /// How many parts the table has, which is how many chunks a scan of it reads.
