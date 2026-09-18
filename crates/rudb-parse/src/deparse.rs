@@ -604,13 +604,15 @@ fn call(ast: &Ast, name: Slice, args: Slice, distinct: bool) -> String {
     let written = parts(ast, name);
     let list = ast.expr_list(args);
     // `count(*)` is a different function from `count`, and the star is how it is spelled rather than
-    // an argument it takes, so it prints under the name it really has.
-    if list.len() == 1
-        && matches!(ast.expr(list[0]), Expr::Star { qualifier, replacements }
-            if qualifier.is_empty() && replacements.is_empty())
-        && written.eq_ignore_ascii_case("count")
-    {
-        return "count_star()".to_string();
+    // an argument it takes, so it prints under the name it really has. `count()` with nothing in it
+    // is the third spelling of the same function and prints under that name too.
+    if written.eq_ignore_ascii_case("count") {
+        let starred = list.len() == 1
+            && matches!(ast.expr(list[0]), Expr::Star { qualifier, replacements }
+                if qualifier.is_empty() && replacements.is_empty());
+        if starred || list.is_empty() {
+            return "count_star()".to_string();
+        }
     }
     let word = if distinct { "DISTINCT " } else { "" };
     format!("{}({word}{})", operator(ast, name, &written), exprs(ast, args))
@@ -1143,6 +1145,7 @@ mod tests {
     #[test]
     fn a_star_count_is_a_function_of_its_own_and_a_list_is_a_call() {
         assert_eq!(body("SELECT count(*) FROM t"), "SELECT count_star() FROM t");
+        assert_eq!(body("SELECT count() FROM t"), "SELECT count_star() FROM t");
         assert_eq!(body("SELECT count(DISTINCT x) FROM t"), "SELECT count(DISTINCT x) FROM t");
         assert_eq!(body("SELECT [1, 2, 3]"), "SELECT list_value(1, 2, 3)");
         assert_eq!(body("SELECT []"), "SELECT list_value()");

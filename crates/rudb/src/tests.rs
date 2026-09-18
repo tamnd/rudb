@@ -148,6 +148,18 @@ fn count_star_and_count_of_a_column_disagree_about_nulls() {
     assert_eq!(rows(&db, "SELECT count(s) FROM t"), vec![vec![Value::BigInt(3)]]);
 }
 
+/// `count()` with nothing in it is the third spelling of `count(*)`. It counts rows, it is named
+/// after the function it really is, and it works wherever the other two do.
+#[test]
+fn count_with_no_arguments_counts_rows_the_way_a_star_does() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT count() FROM t"), vec![vec![Value::BigInt(4)]]);
+    assert_eq!(rows(&db, "SELECT COUNT() FROM t"), vec![vec![Value::BigInt(4)]]);
+    assert_eq!(db.query("SELECT count() FROM t").unwrap().names(), ["count_star()"]);
+    assert_eq!(rows(&db, "SELECT count() OVER () FROM t LIMIT 1"), vec![vec![Value::BigInt(4)]]);
+    assert_eq!(db.query("SELECT count() OVER () FROM t").unwrap().names(), ["count() OVER ()"]);
+}
+
 #[test]
 fn a_group_by_produces_one_row_per_distinct_value() {
     let db = database();
