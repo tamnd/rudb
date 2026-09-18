@@ -3065,6 +3065,95 @@ fn a_pragma_with_an_equals_sign_sets_the_setting_a_plain_set_would() {
     assert_eq!(rows(&db, "SELECT current_setting('threads')"), vec![vec![Value::BigInt(4)]]);
 }
 
+/// The three `show` pragmas, which answer what is here rather than what a query returns.
+#[test]
+fn the_show_pragmas_list_the_tables_the_databases_and_both_with_the_columns() {
+    let db = database();
+    db.execute("CREATE VIEW v AS SELECT 1 AS a").expect("a view");
+    // Tables and views together and sorted by name, because an unqualified name reaches both and
+    // the pin does not say which kind a name is here.
+    assert_eq!(
+        rows(&db, "PRAGMA show_tables"),
+        vec![vec![text("empty")], vec![text("t")], vec![text("v")]]
+    );
+    assert_eq!(rows(&db, "PRAGMA show_databases"), vec![vec![text("memory")]]);
+    let names = |values: Vec<&str>| Value::List {
+        element: LogicalType::Varchar,
+        values: values.into_iter().map(text).collect(),
+    };
+    assert_eq!(
+        rows(&db, "PRAGMA show_tables_expanded"),
+        vec![
+            vec![
+                text("memory"),
+                text("main"),
+                text("empty"),
+                names(vec!["x"]),
+                names(vec!["INTEGER"]),
+                Value::Boolean(false),
+            ],
+            vec![
+                text("memory"),
+                text("main"),
+                text("t"),
+                names(vec!["x", "s"]),
+                names(vec!["INTEGER", "VARCHAR"]),
+                Value::Boolean(false),
+            ],
+            vec![
+                text("memory"),
+                text("main"),
+                text("v"),
+                names(vec!["a"]),
+                names(vec!["INTEGER"]),
+                Value::Boolean(false),
+            ],
+        ]
+    );
+}
+
+/// `SHOW TABLES` and the rest of the special forms are the three pragmas written another way.
+#[test]
+fn the_show_statement_answers_the_pragma_of_the_same_name() {
+    let db = database();
+    for (statement, pragma) in [
+        ("SHOW TABLES", "PRAGMA show_tables"),
+        ("SHOW tables", "PRAGMA show_tables"),
+        ("DESCRIBE TABLES", "PRAGMA show_tables"),
+        ("SHOW DATABASES", "PRAGMA show_databases"),
+        ("DESCRIBE DATABASES", "PRAGMA show_databases"),
+        ("SHOW ALL", "PRAGMA show_tables_expanded"),
+        ("SHOW ALL TABLES", "PRAGMA show_tables_expanded"),
+        ("DESCRIBE ALL", "PRAGMA show_tables_expanded"),
+    ] {
+        assert_eq!(rows(&db, statement), rows(&db, pragma), "{statement}");
+    }
+    // A table of that name does not get it back, because the pin reads the word before the name
+    // reaches the catalog, and a qualified name is not the special form at all.
+    db.execute("CREATE TABLE tables(a INTEGER)").expect("a table named tables");
+    assert_eq!(rows(&db, "SHOW TABLES"), rows(&db, "PRAGMA show_tables"));
+    assert_eq!(rows(&db, "DESCRIBE TABLES"), rows(&db, "PRAGMA show_tables"));
+    assert_eq!(rows(&db, "DESCRIBE main.tables"), rows(&db, "DESCRIBE SELECT * FROM tables"));
+}
+
+/// A pragma only name written where a table goes is a name that is not there.
+#[test]
+fn a_name_that_exists_only_after_the_word_pragma_is_not_a_table_function() {
+    let db = database();
+    for name in ["pragma_show_tables", "pragma_show_databases", "pragma_show_tables_expanded"] {
+        assert_eq!(
+            failure(&db, &format!("SELECT * FROM {name}()")),
+            format!("Table Function with name {name} does not exist!")
+        );
+    }
+    // The other spelling of the same name works, so the two halves really are separate.
+    assert!(!rows(&db, "PRAGMA show_tables").is_empty());
+    // And these take no arguments, which is said about the pragma and not about the rewrite.
+    let message = failure(&db, "PRAGMA show_tables(1)");
+    assert!(message.contains("'show_tables(INTEGER)'"), "{message}");
+    assert!(message.ends_with("\tPRAGMA \"show_tables\"\n"), "{message}");
+}
+
 /// What a pragma says when it is not one, and when it is one and was called wrongly.
 #[test]
 fn a_pragma_that_is_wrong_is_complained_about_in_the_spelling_it_was_written_in() {

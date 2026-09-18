@@ -116,6 +116,41 @@ pub fn view_fields() -> Vec<Field> {
     ]
 }
 
+/// The one column `PRAGMA show_tables` returns.
+///
+/// Named `name` and nothing else, because the statement answers what is in reach of an unqualified
+/// name and a client that wants to know where each one lives asks `PRAGMA show_tables_expanded`.
+#[must_use]
+pub fn show_table_fields() -> Vec<Field> {
+    vec![Field::new("name", LogicalType::Varchar)]
+}
+
+/// The one column `PRAGMA show_databases` returns.
+///
+/// `database_name` rather than `name`, which is the spelling `duckdb_databases()` uses as well, and
+/// it differs from the column `PRAGMA show_tables` returns for no reason either of them states.
+#[must_use]
+pub fn show_database_fields() -> Vec<Field> {
+    vec![Field::new("database_name", LogicalType::Varchar)]
+}
+
+/// The six columns `PRAGMA show_tables_expanded` returns.
+///
+/// The column names and the column types are two `VARCHAR[]` down one row rather than a row each,
+/// which makes this the one catalog table that answers a table's shape without a join. `temporary`
+/// is the last column and it is the only one that is not a name.
+#[must_use]
+pub fn show_expanded_fields() -> Vec<Field> {
+    vec![
+        Field::new("database", LogicalType::Varchar),
+        Field::new("schema", LogicalType::Varchar),
+        Field::new("name", LogicalType::Varchar),
+        Field::new("column_names", LogicalType::list(LogicalType::Varchar)),
+        Field::new("column_types", LogicalType::list(LogicalType::Varchar)),
+        Field::new("temporary", LogicalType::Boolean),
+    ]
+}
+
 /// The columns `duckdb_columns()` returns, in the pin's order.
 #[must_use]
 pub fn column_fields() -> Vec<Field> {
