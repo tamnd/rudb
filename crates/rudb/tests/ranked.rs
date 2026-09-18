@@ -135,11 +135,20 @@ fn a_grouped_extreme_beside_the_other_aggregates_leaves_them_alone() {
 
 #[test]
 fn an_ungrouped_extreme_over_the_whole_column_is_the_one_the_bytes_give() {
-    // The one here that does not go through the ranks. An aggregate with no grouping folds a whole
-    // vector into one accumulator and reduces before it ever looks at a state, so it keeps the path
-    // it had, and this is the test that says so by still agreeing with memory.
+    // The one here that reaches none of this. An extreme over a whole stored column is answered out
+    // of the directory with no scan at all, which is a different use of the same sorted order, and
+    // this is the test that says the two agree about what that order means.
     let pair = Pair::new("whole", &ordered(20_000, 97), 4);
     pair.agree("SELECT MIN(s), MAX(s) FROM t");
+}
+
+#[test]
+fn an_ungrouped_extreme_over_a_filtered_column_is_the_one_the_bytes_give() {
+    // Ungrouped but scanned, because a filter takes the directory answer away and leaves a fold of
+    // one vector at a time into a single accumulator. That fold finds the winning row first and
+    // reads one value at the end, so the ranks decide the row and never decide the answer directly.
+    let pair = Pair::new("wholefiltered", &ordered(20_000, 97), 4);
+    pair.agree("SELECT MIN(s), MAX(s) FROM t WHERE s > '1500000' AND s < '1900000'");
 }
 
 #[test]

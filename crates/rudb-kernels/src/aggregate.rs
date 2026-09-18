@@ -1431,6 +1431,9 @@ fn extreme_bytes(
     if !matches!(values.logical_type(), LogicalType::Varchar | LogicalType::Blob) {
         return None;
     }
+    if let Some(ranks) = values.code_ranks() {
+        return extreme_ranked(ranks, codes, nulls, least);
+    }
     let mut winner: Option<(usize, u32)> = None;
     let mut best: Vec<u8> = Vec::new();
     // row at a time: a dictionary in a file answers one code at a time and there is no run to read.
@@ -1455,6 +1458,40 @@ fn extreme_bytes(
             best.clear();
             best.extend_from_slice(candidate);
             winner = Some((row, code));
+        }
+    }
+    Some(winner.map(|(row, _)| row))
+}
+
+/// The row that wins an extreme, out of the sorted order the file wrote beside the dictionary.
+///
+/// This is [`extreme_bytes`] over a dictionary that knows which of any two of its values is smaller,
+/// and then no value is read at all. The loop above reads one out of the payload for every row whose
+/// code is not the code already winning, which on a column like `Referer` is nearly every row,
+/// because eight hundred thousand rows there hold four hundred thousand distinct values and a repeat
+/// almost never lands next to the thing it repeats. Here a row costs a load out of a map four bytes
+/// wide per distinct value and a comparison of two integers.
+///
+/// A tie keeps the earlier row, which is what the byte loop does, and two rows tie here exactly when
+/// they hold the same value, so the row the caller goes on to read is the same row either way.
+///
+/// `None` declines, for a code with no rank against it, and the caller falls back.
+fn extreme_ranked(
+    ranks: &[u32],
+    codes: &[u32],
+    nulls: &Validity,
+    least: bool,
+) -> Option<Option<usize>> {
+    let mut winner: Option<(usize, u32)> = None;
+    // row at a time: a code is a number out of the data, so which value it lands on is not known
+    // for any row until that row has been read.
+    for (row, &code) in codes.iter().enumerate() {
+        if !nulls.is_valid(row) {
+            continue;
+        }
+        let &rank = ranks.get(code as usize)?;
+        if winner.is_none_or(|(_, held)| if least { rank < held } else { rank > held }) {
+            winner = Some((row, rank));
         }
     }
     Some(winner.map(|(row, _)| row))
