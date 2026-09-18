@@ -848,7 +848,30 @@ fn the_name_inside_an_over_has_to_be_one_that_can_be_a_window() {
         failure("SELECT nosuchwindow(counter) OVER () FROM hits"),
         "Aggregate Function with name nosuchwindow does not exist!"
     );
-    assert_eq!(failure("SELECT row_number() OVER () FROM hits"), "row_number as a window function");
+    assert_eq!(failure("SELECT lead(counter) OVER () FROM hits"), "lead as a window function");
+}
+
+#[test]
+fn a_ranking_window_binds_to_a_window_operator_and_the_name_says_what_it_reads() {
+    // The ranking windows go through the same table the aggregates do, so what is worth checking
+    // here is that they reach the operator at all and come back with the type the pin gives them.
+    let counted = plan("SELECT row_number() OVER (ORDER BY counter) FROM hits");
+    assert!(counted.contains("expressions=[row_number()::BIGINT]"), "{counted}");
+    let divided = plan("SELECT percent_rank() OVER (ORDER BY counter) FROM hits");
+    assert!(divided.contains("expressions=[percent_rank()::DOUBLE]"), "{divided}");
+    let cut = plan("SELECT ntile(4) OVER (ORDER BY counter) FROM hits");
+    assert!(cut.contains("expressions=[ntile(CAST(4::INTEGER)::BIGINT)::BIGINT]"), "{cut}");
+}
+
+#[test]
+fn a_ranking_window_is_only_a_window_and_says_so_where_it_cannot_be_one() {
+    // Upstream's two sentences. A name that is only ever a window is not a function call on its
+    // own, and a DISTINCT in front of one has nothing to collapse because the call reads no values.
+    assert_eq!(failure("SELECT row_number() FROM hits"), "Window functions are not supported here");
+    assert_eq!(
+        failure("SELECT row_number(DISTINCT) OVER () FROM hits"),
+        "DISTINCT is not implemented for the window function \"\"row_number\"\""
+    );
 }
 
 #[test]

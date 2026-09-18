@@ -244,6 +244,109 @@ fn a_window_in_an_order_by_decides_the_order_without_appearing_in_the_answer() {
     );
 }
 
+fn doubles(values: &[f64]) -> Vec<Value> {
+    values.iter().map(|&held| Value::Double(held)).collect()
+}
+
+#[test]
+fn the_three_rankings_that_count_differ_only_on_the_rows_that_tie() {
+    // Which is the whole reason there are three of them. Row number separates the tied rows, rank
+    // gives both of them the first one's position and then leaves a gap, and dense rank numbers the
+    // groups so it never leaves one.
+    assert_eq!(answered("row_number() OVER (ORDER BY i)"), counts(&[1, 2, 3, 4, 5, 6]));
+    assert_eq!(answered("rank() OVER (ORDER BY i)"), counts(&[1, 2, 2, 4, 5, 6]));
+    assert_eq!(answered("dense_rank() OVER (ORDER BY i)"), counts(&[1, 2, 2, 3, 4, 5]));
+    // Upstream's other spelling of the same function, which it reports as an alias.
+    assert_eq!(answered("rank_dense() OVER (ORDER BY i)"), counts(&[1, 2, 2, 3, 4, 5]));
+}
+
+#[test]
+fn the_two_rankings_that_divide_run_from_zero_to_one_and_from_above_zero_to_one() {
+    assert_eq!(
+        answered("percent_rank() OVER (ORDER BY i)"),
+        doubles(&[0.0, 0.2, 0.2, 0.6, 0.8, 1.0])
+    );
+    assert_eq!(
+        answered("cume_dist() OVER (ORDER BY i)"),
+        doubles(&[1.0 / 6.0, 0.5, 0.5, 4.0 / 6.0, 5.0 / 6.0, 1.0])
+    );
+}
+
+#[test]
+fn a_ranking_with_no_order_sees_one_peer_group_and_answers_accordingly() {
+    // Every row is a peer of every other, so rank is one everywhere and cume_dist is one everywhere,
+    // while row_number still separates them because separating them is all it does.
+    assert_eq!(answered("row_number() OVER ()"), counts(&[1, 2, 3, 4, 5, 6]));
+    assert_eq!(answered("rank() OVER ()"), counts(&[1, 1, 1, 1, 1, 1]));
+    assert_eq!(answered("percent_rank() OVER ()"), doubles(&[0.0; 6]));
+    assert_eq!(answered("cume_dist() OVER ()"), doubles(&[1.0; 6]));
+}
+
+#[test]
+fn a_ranking_ignores_the_frame_that_was_written_around_it() {
+    // A rank is about the partition and a frame is about a row's neighbourhood, so naming one does
+    // not change the other. These two columns are the same as the two without the frame above.
+    let frame = "ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW";
+    assert_eq!(answered(&format!("rank() OVER ({frame})")), counts(&[1, 2, 2, 4, 5, 6]));
+    assert_eq!(answered(&format!("row_number() OVER ({frame})")), counts(&[1, 2, 3, 4, 5, 6]));
+}
+
+#[test]
+fn ntile_cuts_the_partition_into_buckets_and_the_bigger_ones_come_first() {
+    // Six rows in four buckets are two, two, one and one. The remainder goes to the front, which is
+    // the arrangement the standard asks for and the one the pin produces.
+    assert_eq!(answered("ntile(2) OVER (ORDER BY i)"), counts(&[1, 1, 1, 2, 2, 2]));
+    assert_eq!(answered("ntile(4) OVER (ORDER BY i)"), counts(&[1, 1, 2, 2, 3, 4]));
+    // Each partition is cut on its own, so the three rows of the second one become two and one.
+    let database = built();
+    let sql = "SELECT ntile(2) OVER (PARTITION BY j ORDER BY i) FROM t ORDER BY j, i";
+    assert_eq!(column(&database, sql, 0), counts(&[1, 1, 2, 1, 1, 2]));
+}
+
+#[test]
+fn the_bucket_count_is_read_off_the_row_so_it_can_be_a_column() {
+    // Upstream reads it per row rather than once for the partition, and a null there is a null
+    // answer rather than a failure, which is the one place this family produces one.
+    assert_eq!(
+        answered("ntile(i) OVER (ORDER BY i)"),
+        vec![
+            Value::BigInt(1),
+            Value::BigInt(1),
+            Value::BigInt(1),
+            Value::BigInt(2),
+            Value::BigInt(3),
+            Value::Null,
+        ]
+    );
+}
+
+#[test]
+fn a_bucket_count_that_is_not_a_count_at_all_is_refused_in_upstreams_words() {
+    let database = built();
+    let connection = database.connect();
+    let error = connection
+        .query("SELECT ntile(0) OVER (ORDER BY i) FROM t")
+        .expect_err("zero buckets is not a cut of anything");
+    assert!(error.message().contains("Argument for ntile must be greater than zero"), "{error}");
+}
+
+#[test]
+fn a_frame_distance_that_is_null_is_refused_and_one_that_is_negative_is_not() {
+    // Two rules that look alike and are not. A null distance has no frame at all and upstream says
+    // so, and a negative one has a frame that runs the other way, which usually covers nothing and
+    // is an answer of null rather than an error.
+    let database = built();
+    let connection = database.connect();
+    let error = connection
+        .query("SELECT sum(i) OVER (ORDER BY i ROWS BETWEEN NULL PRECEDING AND CURRENT ROW) FROM t")
+        .expect_err("a null distance is not a distance");
+    assert!(error.message().contains("cannot be NULL"), "{error}");
+    assert_eq!(
+        answered("sum(i) OVER (ORDER BY i ROWS BETWEEN -1 PRECEDING AND CURRENT ROW)"),
+        vec![Value::Null; 6]
+    );
+}
+
 #[test]
 fn a_range_frame_with_a_distance_says_it_is_not_done_rather_than_guessing() {
     // The one gap left, and it is a distance measured from the current row's order key rather than

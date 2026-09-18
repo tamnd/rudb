@@ -141,6 +141,7 @@ fn scalar(row: FunctionRow) -> FunctionEntry {
         function_type: match row.kind {
             FunctionKind::Scalar => "scalar",
             FunctionKind::Aggregate => "aggregate",
+            FunctionKind::Window => "window",
         },
         alias_of: row.alias_of,
         return_type: Some(row.returns),

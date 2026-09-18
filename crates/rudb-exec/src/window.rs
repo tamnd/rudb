@@ -52,11 +52,54 @@ use crate::rows;
 use crate::schema::Schema;
 use crate::sort::{Arrival, Place, compare};
 
+/// What a call reads to answer, which is one of two entirely different things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reads {
+    /// The rows the frame covers, through an accumulator. Every aggregate.
+    Frame,
+    /// Where the row sits in its partition. The ranking windows, which have no arguments to read
+    /// and no frame to read them over, and which answer the same whatever frame was written.
+    Position(Ranking),
+}
+
+/// The ranking windows, which count rather than aggregate.
+///
+/// Peer groups decide all of them. `row_number` is the only one that separates tied rows, `rank`
+/// gives every row of a group the position of the group's first row, and `dense_rank` gives it the
+/// number of the group. The two that divide are built out of those, and `ntile` is the one that
+/// reads an argument, which is how many buckets to cut the partition into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ranking {
+    RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+}
+
+impl Ranking {
+    /// The ranking a name stands for, or `None` for a name that is an aggregate.
+    fn of(name: &str) -> Option<Self> {
+        Some(match name {
+            "row_number" => Self::RowNumber,
+            "rank" => Self::Rank,
+            "dense_rank" | "rank_dense" => Self::DenseRank,
+            "percent_rank" => Self::PercentRank,
+            "cume_dist" => Self::CumeDist,
+            "ntile" => Self::Ntile,
+            _ => return None,
+        })
+    }
+}
+
 /// One window call, resolved against the input.
 #[derive(Debug)]
 struct Call {
     /// The resolved function name, which the accumulator is built from.
     name: String,
+    /// Whether it reads the frame or the row's position.
+    reads: Reads,
     /// What the call returns, which is also the type of the column it produces.
     returns: LogicalType,
     /// Where this call's arguments start among the gathered values.
@@ -188,8 +231,10 @@ impl Window {
                 gathered.push(predicate);
                 gathered.len() - 1
             });
+            let written = plan.string(*name);
             calls.push(Call {
-                name: plan.string(*name).to_string(),
+                reads: Ranking::of(written).map_or(Reads::Frame, Reads::Position),
+                name: written.to_string(),
                 returns: plan.expr_type(expr).clone(),
                 args_at,
                 args: arguments.len(),
@@ -473,33 +518,28 @@ impl Window {
         back: bool,
         after: bool,
     ) -> Result<usize> {
-        let offset = self.distance_at(rows, at, column)?;
+        let offset = self.distance_at(rows, at, column, back)?;
+        // A distance written as `1 PRECEDING` runs backwards and one written as `-1 PRECEDING` runs
+        // forwards again, which upstream accepts rather than refusing. The frame it leaves usually
+        // covers nothing, since a start after the end is an empty frame, and that is an answer of
+        // null and not an error.
+        let signed = if back { offset.saturating_neg() } else { offset };
+        let landed = |from: usize| -> Option<usize> {
+            let from = i64::try_from(from).unwrap_or(i64::MAX);
+            usize::try_from(from.saturating_add(signed)).ok()
+        };
         Ok(match self.frame.unit {
             WindowUnit::Rows => {
-                let landed = if back {
-                    match at.checked_sub(offset) {
-                        Some(landed) => landed,
-                        // Everything that far back is before the partition. As a start that clamps
-                        // to the first row and as an end it leaves the frame covering nothing,
-                        // which is what the caller's `max` over the start turns a zero into.
-                        None => return Ok(0),
-                    }
-                } else {
-                    at.saturating_add(offset)
-                };
+                // Everything that far back is before the partition. As a start that clamps to the
+                // first row and as an end it leaves the frame covering nothing, which is what the
+                // caller's `max` over the start turns a zero into.
+                let Some(landed) = landed(at) else { return Ok(0) };
                 if after { landed.saturating_add(1) } else { landed }
             }
             // A `GROUPS` distance counts peer groups, so it lands on a group and the frame takes
             // that whole group rather than one row of it.
             _ => {
-                let group = if back {
-                    match peers[at].checked_sub(offset) {
-                        Some(group) => group,
-                        None => return Ok(0),
-                    }
-                } else {
-                    peers[at].saturating_add(offset)
-                };
+                let Some(group) = landed(peers[at]) else { return Ok(0) };
                 if after {
                     peers.iter().rposition(|&held| held <= group).map_or(0, |end| end + 1)
                 } else {
@@ -513,19 +553,29 @@ impl Window {
     ///
     /// Read per row and not once, because DuckDB accepts a column there. `ROWS BETWEEN j PRECEDING
     /// AND CURRENT ROW` gives every row a frame of its own size.
-    fn distance_at(&self, rows: &[Windowed], at: usize, column: Option<usize>) -> Result<usize> {
+    fn distance_at(
+        &self,
+        rows: &[Windowed],
+        at: usize,
+        column: Option<usize>,
+        back: bool,
+    ) -> Result<i64> {
         let column =
             column.ok_or_else(|| Error::internal("a frame distance the window did not gather"))?;
         let value = &rows[at].0[column];
-        if value.is_null() {
-            return Err(Error::binder("Invalid Input Error: Window frame offset cannot be NULL"));
-        }
-        let Some(offset) = value.as_i64() else {
-            return Err(Error::binder("Invalid Input Error: Window frame offset must be a number"));
+        let named = || {
+            let unit = match self.frame.unit {
+                WindowUnit::Rows => "ROWS",
+                WindowUnit::Range => "RANGE",
+                WindowUnit::Groups => "GROUPS",
+            };
+            let end = if back { "PRECEDING" } else { "FOLLOWING" };
+            format!("Window {unit} {end} expression")
         };
-        usize::try_from(offset).map_err(|_| {
-            Error::binder("Invalid Input Error: Window frame offset must not be negative")
-        })
+        if value.is_null() {
+            return Err(Error::invalid_input(format!("{} cannot be NULL", named())));
+        }
+        value.as_i64().ok_or_else(|| Error::invalid_input(format!("{} must be a number", named())))
     }
 
     /// One call's value over the rows the frame covers.
@@ -537,6 +587,9 @@ impl Window {
         at: usize,
         frame: std::ops::Range<usize>,
     ) -> Result<Value> {
+        if let Reads::Position(ranking) = call.reads {
+            return ranked(ranking, call, rows, peers, at);
+        }
         let mut accumulator = Accumulator::new(&call.name, &call.returns)?;
         let mut seen: Vec<Vec<Value>> = Vec::new();
         for row in frame {
@@ -574,6 +627,75 @@ impl Window {
             WindowExclude::Ties => peers[row] == peers[at] && row != at,
         }
     }
+}
+
+/// One ranking window's value for one row.
+///
+/// The frame is not consulted and that is the rule rather than a shortcut here. Upstream answers
+/// `rank() OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)` with the same column as
+/// `rank() OVER (ORDER BY i)`, because a rank is about the partition and a frame is about a row's
+/// neighbourhood, and the standard says a window that names one of these ignores the other.
+fn ranked(
+    ranking: Ranking,
+    call: &Call,
+    rows: &[Windowed],
+    peers: &[usize],
+    at: usize,
+) -> Result<Value> {
+    let total = rows.len();
+    let first = first_of(peers, peers[at]);
+    let last = last_of(peers, peers[at]);
+    let count = |held: usize| {
+        i64::try_from(held).map_err(|_| Error::internal("a partition longer than a BIGINT"))
+    };
+    Ok(match ranking {
+        Ranking::RowNumber => Value::BigInt(count(at + 1)?),
+        // Every row of a peer group gets the position of the group's first row, so a group of two
+        // is followed by a gap and `1, 2, 2, 4` is a rank column and not a mistake.
+        Ranking::Rank => Value::BigInt(count(first + 1)?),
+        Ranking::DenseRank => Value::BigInt(count(peers[at] + 1)?),
+        // The rank of the row over the rank of the last row, which is why it starts at zero and
+        // reaches one. A partition of one row has nothing to divide by and upstream answers zero
+        // there rather than a division by zero or a null.
+        Ranking::PercentRank => {
+            Value::Double(if total <= 1 { 0.0 } else { first as f64 / (total - 1) as f64 })
+        }
+        // How much of the partition is at or before this row, counting the whole peer group, so it
+        // ends at one on every partition and starts above zero.
+        Ranking::CumeDist => Value::Double((last + 1) as f64 / total as f64),
+        Ranking::Ntile => ntile(call, rows, at, total)?,
+    })
+}
+
+/// Which bucket of `buckets` the row at `at` falls in, numbered from one.
+///
+/// The buckets are as equal as they can be and the remainder goes to the front, which is upstream's
+/// arrangement and the standard's: six rows in four buckets are two, two, one and one, and never
+/// one, one, two and two. The count is read off the current row rather than once for the partition
+/// because upstream reads it per row, so `ntile(i)` gives each row a cut of its own.
+fn ntile(call: &Call, rows: &[Windowed], at: usize, total: usize) -> Result<Value> {
+    let written = &rows[at].0[call.args_at];
+    if written.is_null() {
+        return Ok(Value::Null);
+    }
+    let buckets = written
+        .as_i64()
+        .ok_or_else(|| Error::invalid_input("Argument for ntile must be a number"))?;
+    if buckets <= 0 {
+        return Err(Error::invalid_input("Argument for ntile must be greater than zero"));
+    }
+    let buckets = usize::try_from(buckets).unwrap_or(total).min(total.max(1));
+    let each = total / buckets;
+    let wide = total % buckets;
+    // The first `wide` buckets hold one row more than the rest. A row inside that stretch divides
+    // by the wider size and a row past it starts counting again from where the stretch ended.
+    let bucket = if at < wide * (each + 1) {
+        at / (each + 1)
+    } else {
+        wide + (at - wide * (each + 1)) / each.max(1)
+    };
+    let bucket = i64::try_from(bucket + 1).map_err(|_| Error::internal("too many buckets"))?;
+    Ok(Value::BigInt(bucket))
 }
 
 /// The first row of the peer group numbered `group`.
