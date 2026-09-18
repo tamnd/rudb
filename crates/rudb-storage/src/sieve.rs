@@ -90,6 +90,13 @@ const SALTS: [u64; LANES] =
 /// The starting state of the value hash, which is part of the format for the same reason.
 const SEED: u64 = 0xcbf2_9ce4_8422_2325;
 
+/// Bits the distinct counter spends, which is 256 bytes on the stack.
+///
+/// Linear counting stays accurate while the bitmap is under half full, and a chunk of a thousand
+/// rows over 2048 bits is 39 percent full at worst. It has to be a power of two, since the bit one
+/// hash names is taken off the top of it with a shift.
+const COUNTER_BITS: usize = 2048;
+
 /// The tag byte an encoded [`Dense`] starts with.
 const DENSE_TAG: u8 = 0;
 
@@ -117,6 +124,15 @@ pub struct Dense {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked {
     words: Vec<u64>,
+}
+
+/// How many distinct values a stretch holds, to the precision sizing a filter needs.
+///
+/// Small enough to live on the stack and be built once a chunk, because that is how often this is
+/// asked and an allocation a chunk a column would be more than the whole of what it saves.
+#[derive(Debug)]
+struct Counter {
+    words: [u64; COUNTER_BITS / 64],
 }
 
 impl Sieve {
@@ -156,13 +172,12 @@ impl Sieve {
         // fifty bytes. Nothing cheaper than the values themselves answers this: a flat vector knows
         // its length and nothing else, and the encoder that does count them runs after this.
         //
-        // So the hashes are taken first, sorted and deduplicated, and the filter is sized from what
-        // is left and filled from it. The pass over the vector is the one `fill` would have made, and
-        // the sort is the price, which is a thousand integers already in a buffer.
-        let mut hashes = hashes(vector)?;
-        hashes.sort_unstable();
-        hashes.dedup();
-        let mut filter = blocked(hashes.len(), budget)?;
+        // So the hashes are taken first and counted on the way past, and the filter is sized from
+        // the count and filled from the hashes. The walk is the one `fill` would have made, and the
+        // count is eleven bits of each hash into a bitmap on the stack, so the whole of what this
+        // costs over sizing by the rows is a shift and an or a row.
+        let (hashes, distinct) = hashes(vector)?;
+        let mut filter = blocked(distinct, budget)?;
         for hash in &hashes {
             filter.add(*hash);
         }
@@ -336,6 +351,41 @@ impl Dense {
     }
 }
 
+impl Counter {
+    /// A counter that has seen nothing.
+    fn new() -> Self {
+        Self { words: [0; COUNTER_BITS / 64] }
+    }
+
+    /// Records one hash.
+    #[inline]
+    fn saw(&mut self, hash: u64) {
+        let bit = (hash >> (64 - COUNTER_BITS.trailing_zeros())) as usize;
+        self.words[bit / 64] |= 1 << (bit % 64);
+    }
+
+    /// About how many distinct hashes it was given.
+    ///
+    /// Linear counting. A bitmap of `m` bits given `n` distinct hashes has `m(1 - e^(-n/m))` of them
+    /// set on average, so the count back out is `-m ln(1 - set/m)`. It is good to about a percent
+    /// while the bitmap is under half full, which for 2048 bits is up to a thousand values, and a
+    /// chunk holds a thousand rows.
+    ///
+    /// A full bitmap has no answer, since every `n` past a point sets every bit, so that returns the
+    /// largest count it can still tell apart and lets the caller's own bound take over.
+    fn distinct(&self) -> usize {
+        let set: u32 = self.words.iter().map(|word| word.count_ones()).sum();
+        let bits = COUNTER_BITS as f64;
+        let clear = bits - f64::from(set);
+        if clear < 1.0 {
+            return COUNTER_BITS;
+        }
+        let estimate = -bits * (clear / bits).ln();
+        // A hash the bitmap saw at all is one value, so the floor is one rather than zero.
+        (estimate.round() as usize).max(1)
+    }
+}
+
 impl Blocked {
     /// Whether every bit `hash` names is set, which is what a Bloom filter can say.
     fn holds(&self, hash: u64) -> bool {
@@ -429,15 +479,22 @@ fn blocked(values: usize, budget: usize) -> Option<Blocked> {
     Some(Blocked { words: vec![0; blocks.checked_mul(BLOCK_WORDS)?] })
 }
 
-/// The hash of every value the stretch holds, or `None` when a row cannot be read.
+/// The hash of every value the stretch holds and about how many of them are distinct, or `None` when
+/// a row cannot be read.
 ///
-/// The same three readers as [`fill`] in the same order and for the same reasons, and the same
-/// answer to a row none of them can read. It exists beside `fill` rather than inside it because a
-/// blocked filter has to know how many distinct values it is sizing for before there is anywhere to
-/// put them, and a second pass over the column to find out would cost more than the bytes it saves.
-fn hashes(vector: &Vector) -> Option<Vec<u64>> {
+/// The same three readers as [`fill`] in the same order and for the same reasons, and the same answer
+/// to a row none of them can read. It exists beside `fill` rather than inside it because a blocked
+/// filter has to know how many values it is sizing for before there is anywhere to put them, and a
+/// second walk of the column to find out would cost more than the bytes it saves.
+///
+/// The count is a [`Counter`], which is approximate and does not need to be anything else. A filter
+/// is sized in whole blocks of fifty one values, so a count a percent out is the same filter, and a
+/// count that is out by more than that gives a filter a little large or a little leaky rather than a
+/// wrong answer.
+fn hashes(vector: &Vector) -> Option<(Vec<u64>, usize)> {
     let nullable = vector.validity().has_nulls(vector.len());
     let mut hashes = Vec::with_capacity(vector.len());
+    let mut counter = Counter::new();
     // row at a time: the third reader has no vectorised form, and a row it cannot read is a sieve
     // that has to be abandoned rather than a row that can be left out.
     for row in 0..vector.len() {
@@ -445,20 +502,33 @@ fn hashes(vector: &Vector) -> Option<Vec<u64>> {
             continue;
         }
         if let Some(number) = vector.signed_at(row) {
-            hashes.push(hash_int(number));
+            let hash = hash_int(number);
+            counter.saw(hash);
+            hashes.push(hash);
             continue;
         }
         if let Some(bytes) = vector.bytes_at(row) {
-            hashes.push(hash_bytes(bytes));
+            let hash = hash_bytes(bytes);
+            counter.saw(hash);
+            hashes.push(hash);
             continue;
         }
         match Bound::of_value(&vector.value_at(row)) {
-            Some(Bound::Int(number)) => hashes.push(hash_int(number)),
-            Some(Bound::Bytes(bytes)) => hashes.push(hash_bytes(&bytes)),
+            Some(Bound::Int(number)) => {
+                let hash = hash_int(number);
+                counter.saw(hash);
+                hashes.push(hash);
+            }
+            Some(Bound::Bytes(bytes)) => {
+                let hash = hash_bytes(&bytes);
+                counter.saw(hash);
+                hashes.push(hash);
+            }
             Some(Bound::Real(_)) | None => return None,
         }
     }
-    Some(hashes)
+    let distinct = counter.distinct().min(hashes.len());
+    Some((hashes, distinct))
 }
 
 /// Puts every value of `vector` into `sieve`, answering whether it could read all of them.
@@ -698,6 +768,30 @@ mod tests {
         assert_eq!(blocked.words.len(), BLOCK_WORDS, "two values fit in one block");
         assert!(!sieve.excludes(&int(1 << 40)));
         assert!(!sieve.excludes(&int(1 << 41)));
+    }
+
+    /// The counter is close enough over the whole range a chunk can hand it.
+    ///
+    /// Linear counting over 2048 bits has a standard error under two percent up to a thousand
+    /// distinct values, so ten percent is loose enough never to flake and tight enough to catch the
+    /// estimator being wrong rather than noisy. Every value is given three times, since a counter
+    /// that answered the rows rather than the values would pass none of these.
+    #[test]
+    fn the_distinct_counter_is_within_a_few_percent_of_the_truth() {
+        for distinct in [1_usize, 7, 40, 200, 512, 1024] {
+            let mut counter = Counter::new();
+            for value in 0..distinct {
+                for _ in 0..3 {
+                    counter.saw(hash_int(i128::try_from(value).expect("small") * 982_451_653));
+                }
+            }
+            let counted = counter.distinct();
+            let slack = (distinct / 10).max(2);
+            assert!(
+                counted.abs_diff(distinct) <= slack,
+                "{distinct} distinct values counted as {counted}"
+            );
+        }
     }
 
     /// A flat column is sized by its values too, which is the case the dictionary one hides.
