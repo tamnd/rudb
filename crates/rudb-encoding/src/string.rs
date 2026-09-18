@@ -232,7 +232,12 @@ impl Flat {
 
     /// Every value in order.
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
-        (0..self.len()).map(|index| self.get(index).expect("in range"))
+        let mut at = 0;
+        self.ends.iter().map(move |end| {
+            let value = self.bytes.get(at..*end).unwrap_or_default();
+            at = *end;
+            value
+        })
     }
 
     /// The buffer on its own, for a caller that wanted the bytes rather than the values.
@@ -623,8 +628,8 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
             // The shared prefix is copied out of the buffer being written into, so a value never
             // has to exist anywhere but where it belongs.
             let mut flat = Flat::with_capacity(count, suffixes.bytes.len());
-            for index in 0..count {
-                let shared = usize::try_from(prefixes[index])
+            for (index, prefix) in prefixes.iter().enumerate() {
+                let shared = usize::try_from(*prefix)
                     .map_err(|_| Error::internal("a negative shared prefix length"))?;
                 let (from, previous) = if index == 0 {
                     (0, 0)
