@@ -163,6 +163,10 @@ pub(crate) struct Aggregate<'a> {
     having_count: Option<(usize, i64)>,
     /// The most groups an unordered limit above this operator can observe.
     max_groups: Option<usize>,
+    /// The groups a pushed down limit keeps, agreed once and used by every instance.
+    agreed: Mutex<Option<Agreed>>,
+    /// Whether [`Agreed::keys`] is filled in, so the fold can ask without taking the lock.
+    settled: AtomicBool,
     memory: Memory,
     /// The chunks the passes have finished, and what they are charged.
     built: Mutex<Built>,
@@ -603,6 +607,8 @@ impl<'a> Aggregate<'a> {
             top_counts: None,
             having_count: None,
             max_groups: None,
+            agreed: Mutex::new(None),
+            settled: AtomicBool::new(false),
             by_vector,
             groups,
             calls,
@@ -1749,6 +1755,112 @@ impl<'a> Aggregate<'a> {
         Ok(())
     }
 
+    /// Agree with the other instances on which groups a pushed down limit keeps.
+    ///
+    /// Two steps and they have to happen in this order. First this chunk's keys go into the agreed
+    /// set, until there are as many as the limit. Then, if the set is full, it goes into this
+    /// instance's own table, which from that moment holds the limit's worth of groups and opens no
+    /// more.
+    ///
+    /// The order is what makes it sound. Coming out of the first step either the set is full, and the
+    /// second step puts all of it here so this chunk is folded against the agreed groups, or it is not
+    /// full, and then every key of this chunk is in it, so a group the fold opens for this chunk is a
+    /// group every other instance will keep too. There is no chunk in between the two where an
+    /// instance can open a group that nobody else has.
+    fn agree(
+        &self,
+        rows: &Rows,
+        limit: usize,
+        into: &mut Building,
+        installed: &mut bool,
+    ) -> Result<()> {
+        if !self.settled.load(Ordering::Acquire) {
+            self.collect(rows, limit)?;
+        }
+        if *installed || !self.settled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let keys = {
+            let held = self.agreed.lock().map_err(poisoned)?;
+            let agreed = held
+                .as_ref()
+                .ok_or_else(|| Error::internal("a limited aggregate settled on nothing"))?;
+            let keys = agreed
+                .keys
+                .as_ref()
+                .ok_or_else(|| Error::internal("a limited aggregate settled without keys"))?;
+            Arc::clone(keys)
+        };
+        self.install(&keys, into)?;
+        *installed = true;
+        Ok(())
+    }
+
+    /// This chunk's keys into the agreed set, and the set sealed once it is as large as the limit.
+    ///
+    /// Under one lock, so this is the serial part of a limited aggregate. It lasts as long as it
+    /// takes to see the limit's worth of distinct keys, which for a `LIMIT 10` over a million rows is
+    /// the first chunk and nothing after it.
+    fn collect(&self, rows: &Rows, limit: usize) -> Result<()> {
+        let mut held = self.agreed.lock().map_err(poisoned)?;
+        let agreed = match held.as_mut() {
+            Some(agreed) => agreed,
+            None => {
+                let types: Vec<LogicalType> =
+                    rows.keys.iter().map(|column| column.logical_type().clone()).collect();
+                held.insert(Agreed { table: Table::new(&types), hashes: Vec::new(), keys: None })
+            }
+        };
+        if agreed.keys.is_some() {
+            return Ok(());
+        }
+        crate::table::hash(&rows.keys, rows.rows, &mut agreed.hashes);
+        // row at a time: a key that is not in the set starts a group in it, which changes what the
+        // key after would have found, and the set is at most the limit long so there is no run to
+        // batch.
+        for row in 0..rows.rows {
+            if agreed.table.len() >= limit {
+                break;
+            }
+            let hash = agreed.hashes[row];
+            if let Probe::Vacant(bucket) = agreed.table.probe(hash, &rows.keys, row) {
+                agreed.table.insert(bucket, hash, &rows.keys, row)?;
+            }
+        }
+        if agreed.table.len() < limit {
+            return Ok(());
+        }
+        let mut keys = Vec::with_capacity(rows.keys.len());
+        for (at, column) in rows.keys.iter().enumerate() {
+            keys.push(agreed.table.column(at, column.logical_type(), 0..agreed.table.len())?);
+        }
+        agreed.keys = Some(Arc::new(keys));
+        self.settled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// The agreed keys into one instance's table, as the groups it is allowed to keep.
+    ///
+    /// A group that is already there stays where it is, because this instance has been counting into
+    /// it and its slot is the order it was first seen in.
+    fn install(&self, keys: &[Vector], into: &mut Building) -> Result<()> {
+        let rows = keys.first().map_or(0, Vector::len);
+        let Building { table, states, counts, compact, seen, groups, hashes, .. } = into;
+        crate::table::hash(keys, rows, hashes);
+        // row at a time: same as the set above, and there are at most a limit's worth of them.
+        for (row, &hash) in hashes.iter().enumerate().take(rows) {
+            if let Probe::Vacant(bucket) = table.probe(hash, keys, row) {
+                table.insert(bucket, hash, keys, row)?;
+                *groups = table.len();
+                self.fresh(states, counts, compact)?;
+                if self.sets {
+                    self.fresh_seen(seen);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether an instance holding this table should hand it to the partitions and stop keeping one.
     ///
     /// Four things have to hold. There has to be more than one instance, because sharing a table
@@ -2366,6 +2478,22 @@ impl Rows {
     }
 }
 
+/// The groups a pushed down limit keeps, shared by every instance of the aggregate.
+///
+/// An unordered limit over a grouping may keep any groups it likes, as long as the rows of the ones
+/// it keeps are all counted. On one thread that is the first ones seen. On several it has to be the
+/// same ones for everybody, or an instance drops rows of a group another instance is counting and
+/// the count comes back short. This is the set they all use.
+#[derive(Debug)]
+struct Agreed {
+    /// The keys seen so far, in the order they were first seen, while there are fewer than the limit.
+    table: Table,
+    /// Scratch for the probe, kept so a chunk of a thousand rows asks the allocator for nothing.
+    hashes: Vec<u64>,
+    /// The keys once there are as many of them as the limit, ready for an instance to install.
+    keys: Option<Arc<Vec<Vector>>>,
+}
+
 /// The scratch one pipeline instance keeps between chunks, and its table when it has one of its own.
 #[derive(Debug)]
 pub(crate) struct Partitioned {
@@ -2391,6 +2519,12 @@ pub(crate) struct Partitioned {
     /// table has grown enough to be worth sharing, and from then on this is `None` and the chunks go
     /// straight into the partitions.
     single: Option<Building>,
+    /// Whether the agreed keys of a pushed down limit are already in this instance's table.
+    ///
+    /// They go in once and they never come out, so after that the table holds as many groups as the
+    /// limit and the fold opens no more. Before that it is this instance's own keys in there, every
+    /// one of which is in the agreed set because it was put there on the way past.
+    installed: bool,
     expressions: Scratch,
     spreading: Spreading,
     /// One table per partition, belonging to this instance and to nobody else.
@@ -2839,26 +2973,38 @@ impl Sink for Aggregate<'_> {
             dense_nulls: 0,
             dense_memory: self.memory.reservation(),
             single: Some(self.start()),
+            installed: false,
             expressions: self.inputs.scratch(),
             spreading: Spreading::new(),
             own: (0..RADIX_PARTITIONS).map(|_| None).collect(),
         }
     }
 
-    /// Refused for a limit pushed down into the grouping, and for nothing else.
+    /// Refused for a limit pushed down into an aggregate with no groups, and for nothing else.
     ///
-    /// A pushed down limit is worse than a refusal, because it would answer. `max_groups` stops the
-    /// table opening groups once an unordered limit above cannot observe another, and every
-    /// instance would stop at its own tenth group while the rows of the groups it dropped kept
-    /// arriving, so `count(*)` would come back short. That is #474's trick, which is worth keeping,
-    /// and the price of keeping it is that the aggregate under it runs on one thread.
+    /// A pushed down limit used to be refused outright. `max_groups` stops the table opening groups
+    /// once an unordered limit above cannot observe another, and every instance would stop at its
+    /// own tenth group while the rows of the groups it dropped kept arriving, so `count(*)` came back
+    /// short. That is #474's trick, which is worth keeping, and the price of keeping it was that the
+    /// aggregate under it ran on one thread.
+    ///
+    /// It no longer is. [`Aggregate::agree`] settles the groups between the instances before any of
+    /// them can open one of its own, so they all stop at the same tenth group and a row that one of
+    /// them drops is a row all of them drop. What is refused here is a limit over an aggregate with
+    /// no group expressions, where there is one slot, no key to agree on and nothing to divide.
+    ///
+    /// A grouped count over one column is refused as well, because that is the shape the dense count
+    /// takes when the column turns out to carry a stable dictionary, and the dense count answers a
+    /// partition at a time in whatever order the partitions finish. Nothing above it usually cares,
+    /// because a group by over a dictionary is on its way to a sort. Under a raw limit it would
+    /// decide which ten rows come out, and that is not a thing to leave to a race.
     ///
     /// Spilling used to be refused here too, because a key could be in one instance's table and in
     /// another instance's spill file at once. Partitioning answers that: a partition's file only
     /// ever holds keys belonging to that partition, so the key is either finished in the partition
     /// or absent from it, which is the invariant spilling rested on all along.
     fn parallel(&self) -> bool {
-        self.max_groups.is_none()
+        self.max_groups.is_none() || (!self.alone && !(self.count_only && self.keys.len() == 1))
     }
 
     /// One chunk, either into this instance's own table or split across the shared partitions.
@@ -2893,6 +3039,7 @@ impl Sink for Aggregate<'_> {
             dense_nulls,
             dense_memory,
             single,
+            installed,
             expressions,
             spreading,
             own,
@@ -3024,6 +3171,11 @@ impl Sink for Aggregate<'_> {
         if let Some(table) = single {
             if let Some(error) = table.failure.take() {
                 return Err(error);
+            }
+            if let Some(limit) = self.max_groups {
+                if !self.alone {
+                    self.agree(&rows, limit, table, installed)?;
+                }
             }
             let timing = stage::Timing::start(Stage::Fold);
             let folded = self.fold(&rows, table, None);
@@ -4510,6 +4662,62 @@ mod tests {
             [
                 vec![Value::Integer(1), Value::BigInt(2)],
                 vec![Value::Integer(2), Value::BigInt(3)],
+                vec![Value::Integer(3), Value::BigInt(1)],
+            ]
+        );
+    }
+
+    /// What used to make a pushed down limit refuse a second instance.
+    ///
+    /// Two instances, a limit of two, and the rows arranged so that each of them would fill its own
+    /// table with different groups if they were left to choose. The left sees 1 and 2 first and the
+    /// right sees 3 and 4 first, and group 1 has a row on both sides. Whichever two groups come out,
+    /// their counts have to be the whole count of those groups and not one instance's share of it.
+    #[test]
+    fn two_instances_under_a_limit_keep_the_same_groups() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, out) = aggregate(&plan);
+        let aggregate = aggregate.limit_groups(2);
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        aggregate.sink(&chunk(&[1, 2, 1, 2]), &mut left).expect("the left rows");
+        aggregate.sink(&chunk(&[3, 4, 1, 2]), &mut right).expect("the right rows");
+        aggregate.combine(left).expect("the left instance");
+        aggregate.combine(right).expect("the right instance");
+        aggregate.finalize().expect("the answer");
+
+        let mut rows = answer(&out);
+        rows.sort_by_key(|row| format!("{:?}", row[0]));
+        assert_eq!(
+            rows,
+            [vec![Value::Integer(1), Value::BigInt(3)], vec![Value::Integer(2), Value::BigInt(3)],]
+        );
+    }
+
+    /// The other side of it, where the input never has as many groups as the limit asks for.
+    ///
+    /// Nothing is ever settled, so nothing is ever dropped, and the two instances simply open their
+    /// own keys and merge. Every group has to come out with its whole count.
+    #[test]
+    fn two_instances_under_a_limit_nothing_reaches_keep_every_group() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, out) = aggregate(&plan);
+        let aggregate = aggregate.limit_groups(10);
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        aggregate.sink(&chunk(&[1, 2]), &mut left).expect("the left rows");
+        aggregate.sink(&chunk(&[2, 3]), &mut right).expect("the right rows");
+        aggregate.combine(left).expect("the left instance");
+        aggregate.combine(right).expect("the right instance");
+        aggregate.finalize().expect("the answer");
+
+        let mut rows = answer(&out);
+        rows.sort_by_key(|row| format!("{:?}", row[0]));
+        assert_eq!(
+            rows,
+            [
+                vec![Value::Integer(1), Value::BigInt(1)],
+                vec![Value::Integer(2), Value::BigInt(2)],
                 vec![Value::Integer(3), Value::BigInt(1)],
             ]
         );
