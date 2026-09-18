@@ -502,6 +502,41 @@ pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>>
 /// The bytes a single tail value can span, which is a shift of at most seven plus a width of at
 /// most sixty four, so seventy one bits and therefore nine bytes, rounded up to the load that
 /// covers it.
+/// One value of a run written by [`pack_tail`], read where it lies.
+///
+/// [`unpack_tail`] decodes the whole run, which is what a scan wants and what nearly every caller
+/// here is. A binary search is the other kind of caller: it wants one value out of the middle of a
+/// block, it makes about as many probes as the block has bits, and decoding the block to answer one
+/// of them would cost more than reading the value it was avoiding.
+///
+/// # Errors
+///
+/// If `width` exceeds 64, or if the value would run past the end of `input`.
+pub fn tail_at(input: &[u8], width: usize, index: usize) -> Result<u64> {
+    if width > 64 {
+        return Err(Error::internal(format!("a width of {width} is past what a u64 holds")));
+    }
+    if width == 0 {
+        return Ok(0);
+    }
+    let start = index * width;
+    let end = start + width;
+    if end.div_ceil(8) > input.len() {
+        return Err(Error::internal(format!(
+            "value {index} at {width} bits ends past the {} bytes there are",
+            input.len()
+        )));
+    }
+    // The value spans at most nine bytes, which is a whole `u64` straddling a byte boundary, so one
+    // window covers it wherever it starts.
+    let first = start / 8;
+    let last = (end - 1) / 8;
+    let mut window = [0u8; WINDOW];
+    window[..=last - first].copy_from_slice(&input[first..=last]);
+    let word = u128::from_le_bytes(window);
+    Ok(((word >> (start % 8)) & u128::from(low_mask(width))) as u64)
+}
+
 const WINDOW: usize = 16;
 
 fn check_tail(count: usize, width: usize) -> Result<()> {
@@ -751,6 +786,31 @@ mod tests {
                     "{count} at {width}"
                 );
             }
+        }
+    }
+
+    /// Reading one value where it lies agrees with decoding the whole run.
+    ///
+    /// Every width and every position, since the point of it is the arithmetic that finds the bytes
+    /// a value straddles, and that is what is off by one.
+    ///
+    /// A value that runs off the buffer is an error. The buffer stops on a byte boundary and a value
+    /// does not, so an index a little past the count can still lie inside the padding of the last
+    /// byte and that reads rather than complains. It is the caller that knows how many values it
+    /// wrote, the same way it does for `unpack_tail`.
+    #[test]
+    fn one_value_of_a_tail_reads_the_same_as_the_whole_of_it() {
+        let mut random = Random::new();
+        for width in 0..=64usize {
+            let count = 37;
+            let values: Vec<u64> = (0..count).map(|_| random.next() & low_mask(width)).collect();
+            let mut bytes = Vec::new();
+            pack_tail(&values, width, &mut bytes).unwrap();
+            for (index, value) in values.iter().enumerate() {
+                assert_eq!(tail_at(&bytes, width, index).unwrap(), *value, "{index} at {width}");
+            }
+            let Some(fits) = (bytes.len() * 8).checked_div(width) else { continue };
+            assert!(tail_at(&bytes, width, fits + 1).is_err(), "past the end at {width}");
         }
     }
 

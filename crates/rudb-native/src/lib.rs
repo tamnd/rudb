@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::bounds::{Bound, Op};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_encoding::{chooser, integer, string};
+use rudb_encoding::{bitpack, chooser, integer, string};
 use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
@@ -47,7 +47,7 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 16;
+const FORMAT: u32 = 17;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -1414,8 +1414,15 @@ struct NativeText {
     /// something searches it, so a query that never compares this column against a literal never
     /// touches it at all.
     rank_at: u64,
+    /// Where each block of the sorted order ends, as a byte offset from `rank_at`. A block is packed
+    /// at whatever width its own heads need, so unlike the entries it replaced its length is not
+    /// arithmetic on the block number.
+    rank_ends: Vec<u64>,
     rank_hashes: Vec<u64>,
     rank_blocks: Vec<OnceLock<Result<Vec<u8>>>>,
+    /// Bits one code is packed at, which is what the value count needs and is the same for every
+    /// block of the column.
+    code_bits: usize,
     /// The sorted order turned round, built the first time a reader asks for it.
     ///
     /// Four bytes per value against the four the offsets already hold, so a column that has this is
@@ -1452,16 +1459,29 @@ const TEXT_PAYLOAD_VALUES: usize = 1024;
 /// How many entries of a dictionary's sorted order sit in one block that is read and checked as a
 /// unit.
 ///
-/// Five hundred and twelve entries is six kilobytes, which is a page and a half. A binary search
-/// over half a million entries makes nineteen probes, and the first ten land in ten different
-/// blocks while the last nine land in the one block that holds the answer, so the whole search
-/// reads about sixty six kilobytes of a two megabyte order. A smaller block would save a little on
-/// the early probes and cost a checksum list four times as long. A larger one would read more than
-/// it uses on every probe.
+/// Five hundred and twelve entries is between two and three kilobytes on the ClickBench string
+/// columns, which is well under a page. A binary search over half a million entries makes nineteen
+/// probes, and the first ten land in ten different blocks while the last nine land in the one block
+/// that holds the answer, so the whole search reads about thirty kilobytes of a megabyte of order. A
+/// smaller block would save a little on the early probes, cost a checksum and an end list four times
+/// as long, and give the heads less to share a base with. A larger one would read more than it uses
+/// on every probe.
 const TEXT_RANK_BLOCK: usize = 512;
 
-/// Bytes one entry of the sorted order takes: eight for the head and four for the code.
-const RANK_ENTRY: usize = size_of::<u64>() + size_of::<u32>();
+/// Bytes at the front of a rank block, which is the base of its heads and the width they are packed
+/// at.
+///
+/// An entry used to be twelve bytes flat, eight for the head and four for the code, and on the five
+/// ClickBench columns that have a dictionary worth the name that was 744 MB of a 12.2 GB file. Both
+/// halves of it are nearly empty. The heads are the first eight bytes of the values in sorted order,
+/// so a block of five hundred and twelve of them spans a tiny slice of the column, and on a column of
+/// URLs they are all `http://w` and the block holds one distinct head. The codes are positions in a
+/// dictionary of eighteen million, which is twenty five bits and not thirty two.
+///
+/// So a block now writes the smallest head in it, the bits the largest is above that, and the heads
+/// and the codes packed at the width each needs. A block where every head agrees costs nine bytes
+/// and the codes.
+const RANK_BLOCK_HEADER: usize = size_of::<u64>() + 1;
 
 impl NativeText {
     /// One block of the payload, read and decoded the first time anything asks for a value in it.
@@ -1520,10 +1540,11 @@ impl NativeText {
             .ok_or_else(|| invalid("global dictionary rank is past the order"))?;
         let block = slot
             .get_or_init(|| {
-                let first = rank / TEXT_RANK_BLOCK * TEXT_RANK_BLOCK;
-                let len = TEXT_RANK_BLOCK.min(self.ranks - first) * RANK_ENTRY;
-                let mut bytes = vec![0; len];
-                read_at(&self.file, self.rank_at + (first * RANK_ENTRY) as u64, &mut bytes)?;
+                let which = rank / TEXT_RANK_BLOCK;
+                let start = if which == 0 { 0 } else { self.rank_ends[which - 1] };
+                let end = self.rank_ends[which];
+                let mut bytes = vec![0; (end - start) as usize];
+                read_at(&self.file, self.rank_at + start, &mut bytes)?;
                 if checksum(&bytes)
                     != *self
                         .rank_hashes
@@ -1542,11 +1563,45 @@ impl NativeText {
     /// The first eight bytes of the value at `rank`, as the integer a comparison reads.
     fn head_at(&self, rank: usize) -> Result<u64> {
         let (block, within) = self.rank_parts(rank)?;
-        let at = within * size_of::<u64>();
-        let bytes = block
-            .get(at..at + size_of::<u64>())
-            .ok_or_else(|| invalid("global dictionary rank block is short of heads"))?;
-        Ok(u64::from_le_bytes(bytes.try_into().expect("eight bytes")))
+        let (base, width, packed) = rank_heads(block)?;
+        let above = bitpack::tail_at(packed, width, within)
+            .map_err(|_| invalid("global dictionary rank block is short of heads"))?;
+        Ok(base.wrapping_add(above))
+    }
+
+    /// The packed codes of one rank block, which follow the heads on the next byte boundary.
+    fn rank_codes<'block>(&self, block: &'block [u8], count: usize) -> Result<&'block [u8]> {
+        let (_, width, packed) = rank_heads(block)?;
+        packed
+            .get(bitpack::tail_len(count, width)..)
+            .ok_or_else(|| invalid("global dictionary rank block is short of codes"))
+    }
+
+    /// How many entries the block holding `rank` has, which is a full block except at the end.
+    fn rank_block_len(&self, rank: usize) -> usize {
+        let first = rank / TEXT_RANK_BLOCK * TEXT_RANK_BLOCK;
+        TEXT_RANK_BLOCK.min(self.ranks - first)
+    }
+}
+
+/// The base, the width and the packed bytes of one rank block's heads.
+fn rank_heads(block: &[u8]) -> Result<(u64, usize, &[u8])> {
+    let header = block
+        .get(..RANK_BLOCK_HEADER)
+        .ok_or_else(|| invalid("global dictionary rank block is short"))?;
+    let base = u64::from_le_bytes(header[..8].try_into().expect("eight bytes"));
+    let width = header[8] as usize;
+    if width > 64 {
+        return Err(invalid("global dictionary rank block packs heads past a word"));
+    }
+    Ok((base, width, &block[RANK_BLOCK_HEADER..]))
+}
+
+/// How many bits a code of a dictionary of `values` entries takes.
+fn code_width(values: usize) -> usize {
+    match u64::try_from(values).unwrap_or(u64::MAX) {
+        0 | 1 => 0,
+        last => (u64::BITS - (last - 1).leading_zeros()) as usize,
     }
 }
 
@@ -1601,12 +1656,11 @@ impl TextSource for NativeText {
 
     fn code_at_rank(&self, rank: usize) -> Result<u32> {
         let (block, within) = self.rank_parts(rank)?;
-        let heads = block.len() / RANK_ENTRY * size_of::<u64>();
-        let at = heads + within * size_of::<u32>();
-        let bytes = block
-            .get(at..at + size_of::<u32>())
-            .ok_or_else(|| invalid("global dictionary rank block is short of codes"))?;
-        let code = u32::from_le_bytes(bytes.try_into().expect("four bytes"));
+        let codes = self.rank_codes(block, self.rank_block_len(rank))?;
+        let code = bitpack::tail_at(codes, self.code_bits, within)
+            .map_err(|_| invalid("global dictionary rank block is short of codes"))?;
+        let code = u32::try_from(code)
+            .map_err(|_| invalid("global dictionary order names a code it does not have"))?;
         if code as usize >= self.len() {
             return Err(invalid("global dictionary order names a code it does not have"));
         }
@@ -1627,10 +1681,14 @@ impl TextSource for NativeText {
                 // for the bounds check, the division and the lock on every one of them.
                 for first in (0..self.ranks).step_by(TEXT_RANK_BLOCK) {
                     let (block, _) = self.rank_parts(first).ok()?;
-                    let heads = block.len() / RANK_ENTRY * size_of::<u64>();
-                    let codes = block.get(heads..)?;
-                    for (within, entry) in codes.chunks_exact(size_of::<u32>()).enumerate() {
-                        let code = u32::from_le_bytes(entry.try_into().ok()?) as usize;
+                    let count = self.rank_block_len(first);
+                    let codes = self.rank_codes(block, count).ok()?;
+                    for (within, code) in bitpack::unpack_tail(codes, self.code_bits, count)
+                        .ok()?
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let code = usize::try_from(code).ok()?;
                         *ranks.get_mut(code)? = u32::try_from(first + within).ok()?;
                     }
                 }
@@ -1650,6 +1708,7 @@ impl TextSource for NativeText {
                 .and_then(Option::as_ref)
                 .map_or(0, |ranks| ranks.capacity() * size_of::<u32>())
             + self.rank_hashes.capacity() * size_of::<u64>()
+            + self.rank_ends.capacity() * size_of::<u64>()
             + self.rank_blocks.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
             + self
                 .rank_blocks
@@ -3959,9 +4018,9 @@ fn encode_global_dictionary(
     if payload.len() != blocks {
         return Err(invalid("global dictionary payload is not the blocks it says it is"));
     }
-    let ranks = encode_ranks(order);
+    let (ranks, rank_ends) = encode_ranks(order, code_width(values))?;
     let rank_blocks = values.div_ceil(TEXT_RANK_BLOCK);
-    let mut index = Vec::with_capacity(12 + (values + 1) * 4 + (blocks * 2 + rank_blocks) * 8);
+    let mut index = Vec::with_capacity(12 + (values + 1) * 4 + (blocks + rank_blocks) * 16);
     put_u32(
         &mut index,
         u32::try_from(values).map_err(|_| invalid("global dictionary has too many values"))?,
@@ -3987,8 +4046,19 @@ fn encode_global_dictionary(
     for block in &payload {
         put_u64(&mut index, checksum(block));
     }
-    for block in ranks.chunks(TEXT_RANK_BLOCK * RANK_ENTRY) {
-        put_u64(&mut index, checksum(block));
+    // The same two lists for the sorted order. A rank block is packed at whatever width its own
+    // heads need, so where one ends is no longer arithmetic on the block number.
+    if rank_ends.len() != rank_blocks {
+        return Err(invalid("global dictionary order is not the blocks it says it is"));
+    }
+    for end in &rank_ends {
+        put_u64(&mut index, *end);
+    }
+    let mut at = 0_usize;
+    for end in &rank_ends {
+        let end = usize::try_from(*end).map_err(|_| invalid("global dictionary order overflow"))?;
+        put_u64(&mut index, checksum(&ranks[at..end]));
+        at = end;
     }
     Ok(EncodedDictionary { index, ranks, payload })
 }
@@ -4140,17 +4210,32 @@ fn settle_shape<'a>(
 /// asks for a head at every probe and for a code about once a search. Keeping the heads together
 /// means a probe touches eight bytes of a block rather than twelve spread over it, and the last few
 /// probes of a search, which are the ones that land in the same block, touch the same cache line.
-fn encode_ranks(order: &[(u64, u32)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(order.len() * RANK_ENTRY);
+fn encode_ranks(order: &[(u64, u32)], code_bits: usize) -> Result<(Vec<u8>, Vec<u64>)> {
+    let mut out = Vec::with_capacity(order.len() * 4);
+    let mut ends = Vec::with_capacity(order.len().div_ceil(TEXT_RANK_BLOCK));
+    let mut heads = Vec::with_capacity(TEXT_RANK_BLOCK);
+    let mut codes = Vec::with_capacity(TEXT_RANK_BLOCK);
     for block in order.chunks(TEXT_RANK_BLOCK) {
-        for &(head, _) in block {
-            put_u64(&mut out, head);
+        // The order is sorted by value and a head is a prefix of a value, so the heads of a block
+        // rise, the smallest is the first and the largest is the last.
+        let base = block.first().map_or(0, |&(head, _)| head);
+        let span = block.last().map_or(0, |&(head, _)| head.wrapping_sub(base));
+        let width = (u64::BITS - span.leading_zeros()) as usize;
+        heads.clear();
+        codes.clear();
+        for &(head, code) in block {
+            heads.push(head.wrapping_sub(base));
+            codes.push(u64::from(code));
         }
-        for &(_, code) in block {
-            put_u32(&mut out, code);
-        }
+        put_u64(&mut out, base);
+        out.push(width as u8);
+        bitpack::pack_tail(&heads, width, &mut out)
+            .map_err(|_| invalid("global dictionary heads do not pack"))?;
+        bitpack::pack_tail(&codes, code_bits, &mut out)
+            .map_err(|_| invalid("global dictionary codes do not pack"))?;
+        ends.push(out.len() as u64);
     }
-    out
+    Ok((out, ends))
 }
 
 fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Result<Vector> {
@@ -4177,23 +4262,17 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
     // search that most of them never make.
     let ranks = count;
     let rank_blocks = ranks.div_ceil(TEXT_RANK_BLOCK);
-    let rank_len =
-        ranks.checked_mul(RANK_ENTRY).ok_or_else(|| invalid("global dictionary rank overflow"))?;
-    // Two words a block, one for where it ends in the file and one for its checksum, then one a
-    // rank block.
+    // Two words a payload block, one for where it ends in the file and one for its checksum, and the
+    // same two a rank block.
     let hash_len = blocks
-        .checked_mul(2)
-        .and_then(|words| words.checked_add(rank_blocks))
-        .and_then(|words| words.checked_mul(8))
+        .checked_add(rank_blocks)
+        .and_then(|words| words.checked_mul(16))
         .ok_or_else(|| invalid("global dictionary block count overflow"))?;
     let index_len = 12usize
         .checked_add(offset_len)
         .and_then(|len| len.checked_add(hash_len))
         .ok_or_else(|| invalid("global dictionary header overflow"))?;
-    let body_len = index_len
-        .checked_add(rank_len)
-        .ok_or_else(|| invalid("global dictionary header overflow"))?;
-    if body_len > page.length as usize {
+    if index_len > page.length as usize {
         return Err(invalid("global dictionary offset index exceeds its page"));
     }
     let mut index = vec![0; index_len];
@@ -4211,8 +4290,22 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
         .map(|part| u64::from_le_bytes(part.try_into().expect("eight bytes")))
         .collect::<Vec<_>>();
     let mut hashes = words.split_off(blocks);
-    let rank_hashes = hashes.split_off(blocks);
+    let mut rank_ends = hashes.split_off(blocks);
+    let rank_hashes = rank_ends.split_off(rank_blocks);
     let ends = words;
+    // A rank block packs its heads at whatever width its own values need, so its length is no longer
+    // arithmetic on the block number and the reader has to be told where each one ends.
+    if rank_ends.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(invalid("global dictionary order blocks do not rise"));
+    }
+    let rank_len = usize::try_from(rank_ends.last().copied().unwrap_or_default())
+        .map_err(|_| invalid("global dictionary rank overflow"))?;
+    let body_len = index_len
+        .checked_add(rank_len)
+        .ok_or_else(|| invalid("global dictionary header overflow"))?;
+    if body_len > page.length as usize {
+        return Err(invalid("global dictionary order exceeds its page"));
+    }
     // What the offsets bound is the decoded payload, and what the page holds is the stored one, so
     // the last block end is the only thing that ties the index to the length of the page.
     let stored_len = page.length as usize - body_len;
@@ -4231,8 +4324,10 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
             offsets,
             ranks,
             rank_at: page.offset + index_len as u64,
+            rank_ends,
             rank_hashes,
             rank_blocks: (0..rank_blocks).map(|_| OnceLock::new()).collect(),
+            code_bits: code_width(count),
             code_ranks: OnceLock::new(),
             payload: page.offset + body_len as u64,
             ends,
@@ -4561,6 +4656,29 @@ mod tests {
         let directory = fs::metadata(&path).expect("the file is there").len();
         assert!(last <= directory, "a page runs to {last} in a file of {directory} bytes");
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// How long a global dictionary index is, read out of the page's own header.
+    ///
+    /// The tests below damage a byte of the order or of the payload, so they need to know where each
+    /// one starts, and working it out here rather than writing a number down means adding something
+    /// to the index does not quietly turn one of them into a test that damages the index instead.
+    fn dictionary_index_len(header: &[u8; 12]) -> u64 {
+        let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
+        let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
+        let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
+        12 + (count + 1) * 4 + (blocks + rank_blocks) * 16
+    }
+
+    /// How long the sorted order is, which is where its last block ends.
+    fn last_rank_end(file: &File, offset: u64, header: &[u8; 12]) -> u64 {
+        let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
+        let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
+        let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
+        let at = offset + 12 + (count + 1) * 4 + blocks * 16 + (rank_blocks - 1) * 8;
+        let mut end = [0; 8];
+        read_at(file, at, &mut end).expect("the last rank block end");
+        u64::from_le_bytes(end)
     }
 
     fn sample() -> Chunk {
@@ -5398,13 +5516,10 @@ mod tests {
         // else to the index does not silently turn this into a test that damages the index.
         let mut header = [0; 12];
         read_at(&reader.file, dictionary.offset, &mut header).expect("dictionary header");
-        let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
-        let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
-        let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
-        let index_len =
-            12 + (count + 1) * 4 + (blocks * 2 + rank_blocks) * 8 + count * RANK_ENTRY as u64;
+        let index_len = dictionary_index_len(&header);
+        let rank_len = last_rank_end(&reader.file, dictionary.offset, &header);
         let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
-        file.seek(SeekFrom::Start(dictionary.offset + index_len))
+        file.seek(SeekFrom::Start(dictionary.offset + index_len + rank_len))
             .expect("inside dictionary payload");
         file.write_all(&[255]).expect("damage dictionary payload");
 
@@ -5547,10 +5662,7 @@ mod tests {
         let page = reader.table.dictionaries[1].expect("string dictionary page");
         let mut header = [0; 12];
         read_at(&reader.file, page.offset, &mut header).expect("dictionary header");
-        let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
-        let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
-        let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
-        let index_len = 12 + (count + 1) * 4 + (blocks * 2 + rank_blocks) * 8;
+        let index_len = dictionary_index_len(&header);
         let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
         file.seek(SeekFrom::Start(page.offset + index_len)).expect("the first head");
         file.write_all(&[255]).expect("damage the order");
