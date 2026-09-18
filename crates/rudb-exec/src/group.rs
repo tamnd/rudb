@@ -1175,7 +1175,7 @@ impl<'a> Aggregate<'a> {
                     hashes.clear();
                     hashes.extend_from_slice(prehashed);
                 }
-                None => crate::table::hash(keys, *length, hashes),
+                None => crate::table::hash(keys, *length, hashes, crate::table::Across::OneInput),
             }
         }
         // The probe, and nothing else. What comes out of it is one slot per row, which is what the
@@ -1863,7 +1863,12 @@ impl<'a> Aggregate<'a> {
         if agreed.keys.is_some() {
             return Ok(());
         }
-        crate::table::hash(&rows.keys, rows.rows, &mut agreed.hashes);
+        crate::table::hash(
+            &rows.keys,
+            rows.rows,
+            &mut agreed.hashes,
+            crate::table::Across::OneInput,
+        );
         // row at a time: a key that is not in the set starts a group in it, which changes what the
         // key after would have found, and the set is at most the limit long so there is no run to
         // batch.
@@ -1895,7 +1900,7 @@ impl<'a> Aggregate<'a> {
     fn install(&self, keys: &[Vector], into: &mut Building) -> Result<()> {
         let rows = keys.first().map_or(0, Vector::len);
         let Building { table, states, counts, compact, seen, groups, hashes, .. } = into;
-        crate::table::hash(keys, rows, hashes);
+        crate::table::hash(keys, rows, hashes, crate::table::Across::OneInput);
         // row at a time: same as the set above, and there are at most a limit's worth of them.
         for (row, &hash) in hashes.iter().enumerate().take(rows) {
             if let Probe::Vacant(bucket) = table.probe(hash, keys, row) {
@@ -2173,7 +2178,7 @@ impl<'a> Aggregate<'a> {
     /// column of the batch and it happens before any lock is taken by either caller.
     fn split(&self, rows: &Rows, spreading: &mut Spreading) -> Result<Vec<Option<Rows>>> {
         let Spreading { hashes, picks, keyed, spin, .. } = spreading;
-        crate::table::hash(&rows.keys, rows.rows, hashes);
+        crate::table::hash(&rows.keys, rows.rows, hashes, crate::table::Across::OneInput);
         for pick in picks.iter_mut() {
             pick.clear();
         }
