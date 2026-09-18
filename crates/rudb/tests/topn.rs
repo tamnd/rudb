@@ -139,6 +139,44 @@ fn either_side_of_the_sorted_bound() {
     agree("a ASC NULLS LAST, b DESC NULLS LAST", 200, 0);
 }
 
+/// The batched path rejecting a chunk against the worst candidate it had at its last trim, which is
+/// the same filter the sorted path runs and is a step behind rather than exact.
+///
+/// The bounds here are all above 64 and small enough against a 4096 row file that the running is
+/// trimmed several times, which is what puts a bound in the hand of the pass at all. The three cases
+/// are the three the sorted path has: a key with no nulls, a first key almost every row ties, and a
+/// key that is an expression.
+#[test]
+fn the_batched_path_rejects_a_chunk_against_its_last_trim() {
+    agree("t ASC NULLS LAST", 100, 0);
+    agree("t DESC NULLS LAST", 100, 0);
+    agree("a ASC NULLS LAST, b ASC NULLS LAST", 100, 0);
+    agree("b % 7 ASC NULLS LAST, t ASC NULLS LAST", 128, 0);
+}
+
+/// The same two awkward cases the sorted path has, at a bound that takes the batched path instead.
+///
+/// Nulls asked for first arriving after the running has filled with values, and values arriving
+/// after it has filled with nulls. Both of them are where a filter that asks which rows are below a
+/// value gets null back rather than true, and both have to make the pass step aside.
+#[test]
+fn the_batched_path_steps_aside_for_the_same_nulls_the_sorted_one_does() {
+    agree("s ASC NULLS FIRST", 100, 0);
+    agree("s ASC NULLS LAST", 100, 0);
+    agree("s DESC NULLS FIRST", 100, 0);
+    same(&placed("file_row_number > 2000", "ASC NULLS FIRST", 100));
+    same(&placed("file_row_number BETWEEN 6 AND 2000", "ASC NULLS LAST", 100));
+}
+
+/// An offset at a bound that takes the batched path, which is the shape four of the ClickBench
+/// queries have and the reason the filter was put on this path.
+#[test]
+fn the_batched_path_with_an_offset_under_the_bound() {
+    agree("t ASC NULLS LAST", 10, 1000);
+    agree("a DESC NULLS LAST, b ASC NULLS LAST", 10, 200);
+    agree("s ASC NULLS FIRST", 10, 100);
+}
+
 /// A limit that asks for more than the file has, so the prefix never fills and the filter never has
 /// a bound to compare against.
 #[test]
