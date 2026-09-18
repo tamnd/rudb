@@ -63,6 +63,33 @@ impl Source for Counting {
     }
 }
 
+/// A source that remembers what it was told, so a test can say it was told at all.
+///
+/// Counting the calls as well as the number, because being asked twice and being asked once are
+/// different things to a source that cuts its work when it answers.
+#[derive(Debug, Default)]
+struct Asked {
+    told: AtomicUsize,
+    calls: AtomicUsize,
+}
+
+impl Source for Asked {
+    fn morsels(&self, threads: usize) -> Option<usize> {
+        self.told.store(threads, Ordering::Relaxed);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Some(64)
+    }
+
+    fn morsel(&self) -> Option<Morsel> {
+        None
+    }
+
+    fn read(&self, _morsel: &mut Morsel, out: &mut Chunk) -> rudb_common::Result<Progress> {
+        *out = Chunk::empty(&[LogicalType::BigInt]);
+        Ok(Progress::Done)
+    }
+}
+
 /// Keeps rows whose value is even, by rebuilding the chunk. F0 is allowed to be slow.
 #[derive(Debug)]
 struct Evens;
@@ -782,6 +809,41 @@ fn the_degree_of_a_pipeline_is_the_smaller_of_the_ceiling_and_the_work() {
     assert_eq!(built.degree(4), 4, "ten morsels is more than enough for four threads");
     assert_eq!(built.degree(32), 10, "and not enough for thirty two");
     assert_eq!(built.degree(1), 1);
+}
+
+#[test]
+fn a_source_is_told_how_many_workers_are_coming_even_when_the_answer_is_one() {
+    // Asking is how a source is told, not only how it is counted, so the one worker case has to
+    // reach it. A scan cuts a morsel per stripe when it is asked and a morsel per part when it is
+    // not, and the second kind is one it cannot walk ruled out parts inside of, which made a
+    // single threaded point lookup pay for every part it had already proved held nothing.
+    let source = Arc::new(Asked::default());
+    let built = pipeline(Arc::clone(&source) as Arc<dyn Source>, Arc::new(Total::default()));
+
+    assert_eq!(built.degree(1), 1, "one worker, however much work the source says it has");
+    assert_eq!(source.calls.load(Ordering::Relaxed), 1, "and it was asked rather than assumed");
+    assert_eq!(
+        source.told.load(Ordering::Relaxed),
+        1,
+        "and told the one rather than something else"
+    );
+}
+
+#[test]
+fn a_source_under_an_operator_that_refuses_instances_is_told_one_rather_than_the_ceiling() {
+    // The pipeline is going to run on one thread whatever the pool would lend, so telling the
+    // source the ceiling would have it cut for workers that are never coming.
+    let source = Arc::new(Asked::default());
+    let built = Pipeline::new(
+        PipelineId(0),
+        Arc::clone(&source) as Arc<dyn Source>,
+        Arc::new(Total::default()) as Arc<dyn DynSink>,
+    )
+    .then(Arc::new(OnlyOnce) as Arc<dyn DynStream>);
+
+    assert!(!built.parallel());
+    assert_eq!(built.degree(32), 1);
+    assert_eq!(source.told.load(Ordering::Relaxed), 1);
 }
 
 #[test]
