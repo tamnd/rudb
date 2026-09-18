@@ -6,12 +6,19 @@
 //! has to print something next to each operator. Both of those want the same function and neither
 //! of them wants a search.
 //!
-//! Everything here is a guess and the type says so. [`rows`] returns `None` rather than a default,
-//! because a caller that has to decide between two sides can only do that when it has two numbers,
-//! and a made up number that looks like a measurement is how an optimizer talks itself into the
-//! wrong plan. The one rule the whole module follows is that a node whose input is unknown is
-//! unknown: uncertainty travels up rather than being rounded away at the first operator that has a
-//! formula.
+//! Almost everything here is a guess and the type says so. [`rows`] returns `None` rather than a
+//! default, because a caller that has to decide between two sides can only do that when it has two
+//! numbers, and a made up number that looks like a measurement is how an optimizer talks itself
+//! into the wrong plan. The one rule the whole module follows is that a node whose input is unknown
+//! is unknown: uncertainty travels up rather than being rounded away at the first operator that has
+//! a formula.
+//!
+//! [`rows_stat`] is the same walk with the class kept, and it is the one that says which numbers
+//! are not guesses. A scan is the catalog's count and is exact, a cross product of two counted
+//! sides is arithmetic on counted numbers and is exact, a `LIMIT` over an unknown input is a real
+//! ceiling, and everything above the first filter, group by or equijoin is an estimate from a
+//! constant. Both functions walk the same tree and the numbers they give back are the same numbers,
+//! so a caller that only compares two sides can go on using [`rows`] and ignore all of this.
 //!
 //! The constants are the textbook ones, which is to say they are DuckDB's, which is to say they
 //! are Selinger's. They are wrong for any particular query and they are wrong in a direction that
@@ -28,7 +35,8 @@
 
 use std::collections::BTreeMap;
 
-use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
+use rudb_common::stat::{Class, Source, Stat};
+use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind};
 
 use crate::walk;
 
@@ -92,35 +100,73 @@ impl Statistics {
     }
 }
 
+/// The class of a number that came out of one of the constants above.
+///
+/// [`Source::Constant`] and not [`Source::Propagation`], because the guess is the constant and the
+/// propagation only carried it. The point of printing the source in `EXPLAIN` is to find the place
+/// where nobody had a number, and this is that place.
+const GUESSED: Class = Class::Estimated { source: Source::Constant };
+
+/// The class of a number that is a proven ceiling with nothing under it.
+///
+/// A `LIMIT 10` over an unknown input produces somewhere between no rows and ten, so the value is
+/// certain from above and the relative error can be the whole of it, which is a bound of one. That
+/// is the weakest certificate there is and it is still worth telling apart from a guess: a guess
+/// can be exceeded and this cannot.
+const CEILING: Class = Class::Certified { bound: 1.0 };
+
 /// How many rows this node is guessed to produce, where a guess can be made at all.
 ///
 /// `None` means nothing downstream of here should pretend to know, which is the answer for a scan
 /// of a table nobody measured, for every table function, and for anything above either of those.
+///
+/// The same answer as [`rows_stat`] with the class dropped. Callers that only have to compare two
+/// numbers want this one; the class matters to `EXPLAIN` and to the histogram.
+#[must_use]
+pub fn rows(plan: &Plan, node: NodeRef, stats: &Statistics) -> Option<u64> {
+    rows_stat(plan, node, stats).value().copied()
+}
+
+/// How many rows this node produces, and how much of that is knowledge.
+///
+/// `Unknown` means nothing downstream of here should pretend to know, which is the answer for a
+/// scan of a table nobody measured, for every table function, and for anything above either of
+/// those. A `Known` carries the class of `spec/stats/04-in-memory.md` section 4.1, and the classes
+/// combine up the tree the way that document's section 4.7 asks: a number derived from an exact one
+/// and a guess is a guess, and the degradation is never rounded away.
 ///
 /// This walks the subtree once per call and does not cache. A caller that wants the whole plan
 /// annotated will walk it top down and ask for each node, which is quadratic in the depth, and a
 /// plan deep enough for that to matter is a plan with other problems. The cache goes in when join
 /// ordering arrives and asks the same question about the same subtree a thousand times.
 #[must_use]
-pub fn rows(plan: &Plan, node: NodeRef, stats: &Statistics) -> Option<u64> {
-    let of = |child: NodeRef| rows(plan, child, stats);
+pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
+    let of = |child: NodeRef| rows_stat(plan, child, stats);
     match *plan.node(node) {
         // One row with no columns, which is what a `SELECT` with no `FROM` is bound against.
-        Node::Dummy => Some(1),
+        Node::Dummy => Stat::exact(1),
+        // The catalog counted these rather than estimating them, so the count is the count. That
+        // is the one exact number a plan starts from today and it is why the histogram does not
+        // read all unknown: a scan knows, and everything above it stops knowing.
         Node::Get { catalog, schema, table, .. } => {
-            stats.rows_in(plan.string(catalog), plan.string(schema), plan.string(table))
+            match stats.rows_in(plan.string(catalog), plan.string(schema), plan.string(table)) {
+                Some(rows) => Stat::exact(rows),
+                None => Stat::Unknown,
+            }
         }
         // Counted rather than guessed. A literal row list is the one place in a plan where the
         // number of rows is written down.
-        Node::Values { rows: list, .. } => u64::try_from(plan.row_list(list).len()).ok(),
+        Node::Values { rows: list, .. } => {
+            u64::try_from(plan.row_list(list).len()).map_or(Stat::Unknown, Stat::exact)
+        }
         // A table function is an open door. `read_parquet` could answer this from the footer and
         // one day should, but the answer would have to come from the reader rather than from here,
         // and a function nobody taught this about would still be unknown. Guessing on behalf of all
         // of them is the failure mode this module exists to avoid.
-        Node::TableFunction { .. } => None,
+        Node::TableFunction { .. } => Stat::Unknown,
         Node::Filter { input, predicate } => {
             let kept = KEPT_BY_A_CONDITION.powi(conjuncts(plan, predicate));
-            of(input).map(|n| scale(n, kept).max(1))
+            guess(of(input), kept)
         }
         // A projection changes the width and not the height, and a sort changes neither.
         // A fetch reads a column of each row it is handed, so it is as tall as its input too.
@@ -134,45 +180,76 @@ pub fn rows(plan: &Plan, node: NodeRef, stats: &Statistics) -> Option<u64> {
             // much as over a billion, which is the one case here that is a fact rather than a
             // guess. `empty_result_pullup` stops at this node for the same reason.
             if plan.expr_list(groups).is_empty() {
-                return Some(1);
+                return Stat::exact(1);
             }
-            of(input).map(|n| scale(n, KEPT_BY_A_GROUP_BY).max(1))
+            guess(of(input), KEPT_BY_A_GROUP_BY)
         }
         // The same shape as a group by on those columns, because that is what it is.
-        Node::Distinct { input, .. } => of(input).map(|n| scale(n, KEPT_BY_A_GROUP_BY).max(1)),
+        Node::Distinct { input, .. } => guess(of(input), KEPT_BY_A_GROUP_BY),
         Node::Limit { input, count, offset } => {
             let input = of(input);
             match count {
-                // `OFFSET` with no `LIMIT` takes rows away and cannot add any.
+                // `OFFSET` with no `LIMIT` takes rows away and cannot add any, and taking a known
+                // number of rows off a counted one leaves a counted one.
                 None => input.map(|n| n.saturating_sub(offset)),
                 // A limit is a ceiling even when the input is unknown, which is the one place in
                 // this module where an unknown input still gives an answer. It is an upper bound
                 // rather than an estimate, and for the callers here that is the useful direction:
                 // a side that cannot produce more than ten rows is the small side whatever feeds
-                // it.
-                Some(count) => Some(input.map_or(count, |n| n.saturating_sub(offset).min(count))),
+                // it. An input that was counted keeps its class, because the smaller of two known
+                // numbers is known.
+                Some(count) => match input {
+                    Stat::Unknown => Stat::Known { value: count, class: CEILING },
+                    known => known.map(|n| n.saturating_sub(offset).min(count)),
+                },
             }
         }
-        Node::TopN { input, count, offset, .. } => {
-            Some(of(input).map_or(count, |n| n.saturating_sub(offset).min(count)))
-        }
+        Node::TopN { input, count, offset, .. } => match of(input) {
+            Stat::Unknown => Stat::Known { value: count, class: CEILING },
+            known => known.map(|n| n.saturating_sub(offset).min(count)),
+        },
         Node::Join { left, right, kind, conditions } => {
             join(of(left), of(right), kind, plan.expr_list(conditions).len())
         }
         // The right cardinality is a function of each left row until decorrelation, so treating it
         // as one independently measured input would be a made-up estimate.
-        Node::DependentJoin { .. } => None,
-        Node::CrossProduct { left, right } => match (of(left), of(right)) {
-            (Some(left), Some(right)) => Some(left.saturating_mul(right)),
-            _ => None,
-        },
+        Node::DependentJoin { .. } => Stat::Unknown,
+        // Two counted sides multiply to a counted answer. Nothing is guessed here at all.
+        Node::CrossProduct { left, right } => of(left).zip(of(right), u64::saturating_mul),
         // Every set operation is bounded above by both sides together, and `UNION ALL` reaches it.
         // The deduplicating ones and `EXCEPT` are somewhere below it and nothing here knows where,
-        // so the bound is what they get.
-        Node::SetOp { left, right, .. } => match (of(left), of(right)) {
-            (Some(left), Some(right)) => Some(left.saturating_add(right)),
-            _ => None,
-        },
+        // so the bound is what they get, and the bound is what their class says they got.
+        Node::SetOp { left, right, kind, all, .. } => {
+            let total = of(left).zip(of(right), u64::saturating_add);
+            match (kind, all) {
+                // `UNION ALL` emits both sides and reaches the bound, so two counted sides give a
+                // counted answer.
+                (SetOpKind::Union, true) => total,
+                _ => ceiling(total),
+            }
+        }
+    }
+}
+
+/// One of the constant guesses applied to a child's count.
+///
+/// `Unknown` in, `Unknown` out, which is the rule the whole module follows. Otherwise the child's
+/// class combines with [`GUESSED`], so an exact scan under a filter is an estimate and stays one all
+/// the way up.
+fn guess(input: Stat<u64>, kept: f64) -> Stat<u64> {
+    match input {
+        Stat::Unknown => Stat::Unknown,
+        Stat::Known { value, class } => {
+            Stat::Known { value: scale(value, kept).max(1), class: class.combine(GUESSED) }
+        }
+    }
+}
+
+/// The same number, said as a ceiling rather than as a count.
+fn ceiling(stat: Stat<u64>) -> Stat<u64> {
+    match stat {
+        Stat::Unknown => Stat::Unknown,
+        Stat::Known { value, class } => Stat::Known { value, class: class.combine(CEILING) },
     }
 }
 
@@ -203,24 +280,29 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> i32 {
 }
 
 /// The join kinds, each of which is a different question.
-fn join(left: Option<u64>, right: Option<u64>, kind: JoinKind, conditions: usize) -> Option<u64> {
+fn join(left: Stat<u64>, right: Stat<u64>, kind: JoinKind, conditions: usize) -> Stat<u64> {
     match kind {
         // Left rows, filtered by whether a match exists. Never more than the left side, and the
         // right side's size does not enter into it.
-        JoinKind::Semi => left.map(|n| scale(n, KEPT_BY_A_CONDITION).max(1)),
-        JoinKind::Anti => left.map(|n| scale(n, 1.0 - KEPT_BY_A_CONDITION).max(1)),
-        // At most one right row each, by definition.
+        JoinKind::Semi => guess(left, KEPT_BY_A_CONDITION),
+        JoinKind::Anti => guess(left, 1.0 - KEPT_BY_A_CONDITION),
+        // At most one right row each, by definition, which makes this a fact about the node rather
+        // than a guess about the data.
         JoinKind::Single | JoinKind::Mark => left,
-        // The nth with the nth, so the shorter side decides.
-        JoinKind::Positional => match (left, right) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            _ => None,
-        },
+        // The nth with the nth, so the shorter side decides, and it decides exactly.
+        JoinKind::Positional => left.zip(right, u64::min),
         _ => {
-            let (Some(left), Some(right)) = (left, right) else { return None };
+            let (
+                Stat::Known { value: left, class: left_class },
+                Stat::Known { value: right, class: right_class },
+            ) = (left, right)
+            else {
+                return Stat::Unknown;
+            };
+            let both = left_class.combine(right_class);
             // A join with no condition is a cross product wearing a different node.
             if conditions == 0 {
-                return Some(left.saturating_mul(right));
+                return Stat::Known { value: left.saturating_mul(right), class: both };
             }
             // The containment assumption: every row of the smaller side finds a match, so an
             // equijoin produces about as many rows as its larger side. It is the standard guess and
@@ -228,14 +310,19 @@ fn join(left: Option<u64>, right: Option<u64>, kind: JoinKind, conditions: usize
             // writes and none of the joins that hurt. A many to many join on a low cardinality
             // column produces far more than this, and finding that out needs distinct counts.
             let matched = left.max(right);
-            Some(match kind {
+            let value = match kind {
                 // An outer join emits every row of the preserved side whether it matched or not,
                 // so the estimate cannot fall below that side.
                 JoinKind::Left => matched.max(left),
                 JoinKind::Right => matched.max(right),
                 JoinKind::Full => matched.max(left).max(right),
                 _ => matched,
-            })
+            };
+            // The containment assumption is the guess, so this is one however exact both sides
+            // were. Two counted tables joined on a column nobody has a distinct count for is the
+            // single most common way a plan goes wrong, and a class saying exact here would hide
+            // exactly that.
+            Stat::Known { value, class: both.combine(GUESSED) }
         }
     }
 }
@@ -254,25 +341,43 @@ fn scale(rows: u64, by: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use rudb_common::stat::{Class, Source, Stat};
     use rudb_plan::Plan;
 
-    use super::{Statistics, rows};
+    use super::{Statistics, rows, rows_stat};
 
     /// A one column scan of the named table, which is what most of these sit on.
     fn scan(table: &str, index: u32) -> String {
         format!("Get memory.main.{table} AS {table} #{index} [a::INTEGER]\n")
     }
 
-    /// The estimate for the root of a plan written as text, against the given table sizes.
-    fn estimate(text: &str, tables: &[(&str, u64)]) -> Option<u64> {
+    /// The tables named here, sized as given, and nothing else measured.
+    fn statistics(tables: &[(&str, u64)]) -> Statistics {
         let mut stats = Statistics::new();
         for (table, count) in tables {
             stats.record("memory", "main", table, *count);
         }
+        stats
+    }
+
+    /// The estimate for the root of a plan written as text, against the given table sizes.
+    fn estimate(text: &str, tables: &[(&str, u64)]) -> Option<u64> {
+        let stats = statistics(tables);
         let plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         rows(&plan, plan.root(), &stats)
     }
+
+    /// The same estimate with the class still attached.
+    fn stat(text: &str, tables: &[(&str, u64)]) -> Stat<u64> {
+        let stats = statistics(tables);
+        let plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        rows_stat(&plan, plan.root(), &stats)
+    }
+
+    /// The guess this module has always made, spelled out.
+    const GUESSED: Class = Class::Estimated { source: Source::Constant };
 
     #[test]
     fn a_scan_is_what_the_catalog_said_and_nothing_when_nobody_said() {
@@ -416,6 +521,67 @@ mod tests {
     fn a_union_all_is_both_sides_and_so_is_the_bound_on_the_rest_of_them() {
         let text = format!("SetOp UNION ALL #2\n  {}  {}", scan("a", 0), scan("b", 1));
         assert_eq!(estimate(&text, &[("a", 30), ("b", 12)]), Some(42));
+    }
+
+    #[test]
+    fn a_count_that_came_from_the_catalog_says_it_is_exact() {
+        // The one number in here that was counted rather than guessed, and the only reason the
+        // histogram does not read all unknown at this point in the series.
+        assert_eq!(stat(&scan("t", 0), &[("t", 5000)]).class(), Some(Class::Exact));
+        assert_eq!(stat(&scan("t", 0), &[]).class(), None);
+    }
+
+    #[test]
+    fn one_guess_anywhere_under_a_node_makes_the_node_a_guess() {
+        // Exact combined with a guess is the guess. A filter over a counted table is not a counted
+        // number any more, and reading the class back as exact is what would make somebody fold a
+        // constant on it later.
+        let text = format!("Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n  {}", scan("t", 0));
+        assert_eq!(stat(&text, &[("t", 1000)]).class(), Some(GUESSED));
+        // And the guess stays the same guess however many of them stack up, since they all come
+        // from the same constant.
+        let twice = format!(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n  Filter (#0.0::INTEGER > \
+             1::INTEGER)::BOOLEAN\n    {}",
+            scan("t", 0)
+        );
+        assert_eq!(stat(&twice, &[("t", 1000)]).class(), Some(GUESSED));
+    }
+
+    #[test]
+    fn an_ungrouped_aggregate_is_exact_because_one_row_is_a_fact() {
+        let text = format!("Aggregate #1 groups=[] aggregates=[]\n  {}", scan("t", 0));
+        assert_eq!(stat(&text, &[]).class(), Some(Class::Exact));
+    }
+
+    #[test]
+    fn a_limit_over_an_unmeasured_input_is_certified_rather_than_estimated() {
+        // Ten is not a guess about what the scan produces, it is the most this node can emit, so a
+        // caller asking whether the number can be exceeded gets the right answer.
+        let text = format!("Limit 10 offset 0\n  {}", scan("t", 0));
+        assert_eq!(stat(&text, &[]).class(), Some(Class::Certified { bound: 1.0 }));
+        // Over a counted input the count wins and the answer is a fact again.
+        assert_eq!(stat(&text, &[("t", 3)]).class(), Some(Class::Exact));
+    }
+
+    #[test]
+    fn a_join_with_no_condition_is_a_product_and_the_product_is_exact() {
+        // Every row against every row is arithmetic rather than an assumption. The equijoin next to
+        // it is the assumption, and the two should not read the same.
+        let product = format!("Join INNER on=[]\n  {}  {}", scan("a", 0), scan("b", 1));
+        assert_eq!(stat(&product, &[("a", 1000), ("b", 1000)]).class(), Some(Class::Exact));
+        let equi = format!(
+            "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n  {}  {}",
+            scan("a", 0),
+            scan("b", 1)
+        );
+        assert_eq!(stat(&equi, &[("a", 1000), ("b", 1000)]).class(), Some(GUESSED));
+    }
+
+    #[test]
+    fn a_table_function_is_unknown_and_stays_unknown_over_it() {
+        let text = "TableFunction range args=[] #0 [a::BIGINT]\n";
+        assert_eq!(stat(text, &[]), Stat::Unknown);
     }
 
     #[test]

@@ -27,11 +27,20 @@
 //! badly and a default constant that nobody noticed produce the same wrong row count and want
 //! different fixes.
 //!
-//! # Nothing consumes this yet
+//! # What the histogram reads today
 //!
-//! Every producer in the tree still answers `Unknown`, which makes [`Classes`] read all unknown and
-//! makes the ablation of `spec/stats/09-measurement.md` section 9.3 trivially pass. That is G0's
-//! honest zero and it is the number the rest of the series moves.
+//! The one producer wired up is the optimizer's row count estimator, and the [`Classes`] histogram
+//! it fills is the G0 baseline that the rest of the series moves. It does not read all `Unknown`.
+//! A base table scan gets its count from the catalog and is [`Class::Exact`], a `LIMIT` over an
+//! input nobody counted is [`Class::Certified`] because the limit is a real ceiling, a table
+//! function or a dependent join is `Unknown`, and everything above the first filter, group by or
+//! join is [`Class::Estimated`] from [`Source::Constant`], which is the literal selectivity guess
+//! the estimator has always used. So the honest zero is the share of decisions resting on a
+//! constant rather than a hundred percent unknown, and that share is what the series drives down.
+//!
+//! Nothing reads the class back yet. It is written into `EXPLAIN` and into the metrics document so
+//! that the ablation of `spec/stats/09-measurement.md` section 9.3 has a number to compare against,
+//! and no plan choice turns on it until a later milestone puts real statistics behind it.
 
 use std::fmt;
 

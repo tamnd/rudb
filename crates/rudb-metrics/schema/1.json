@@ -43,6 +43,12 @@
     "bytes_read_back": 0,
     "io_requests": 1180
   },
+  "estimates": {
+    "exact": 1,
+    "certified": 1,
+    "estimated": 1,
+    "unknown": 0
+  },
   "strategies": [
     {
       "seam": "hash.table",
@@ -96,6 +102,7 @@
       "rows_in": 0,
       "rows_out": 99997497,
       "estimated_rows": 99997497,
+      "estimate_class": "exact",
       "wall_ns": 620000000,
       "cpu_ns": 4800000000,
       "bytes_read": 1420000000,
@@ -140,6 +147,7 @@
       "rows_in": 99997497,
       "rows_out": 41983110,
       "estimated_rows": 2400000,
+      "estimate_class": "estimated from constant",
       "wall_ns": 360000000,
       "cpu_ns": 2800000000,
       "bytes_read": 0,
@@ -170,7 +178,8 @@
       "detail": null,
       "rows_in": 41983110,
       "rows_out": 10,
-      "estimated_rows": null,
+      "estimated_rows": 10,
+      "estimate_class": "certified to 100.00%",
       "wall_ns": 343000000,
       "cpu_ns": 2280000000,
       "bytes_read": 0,
