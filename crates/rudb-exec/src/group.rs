@@ -1927,7 +1927,26 @@ impl<'a> Aggregate<'a> {
         !self.alone
             && self.max_groups.is_none()
             && self.started.load(Ordering::Relaxed) > 1
-            && (table.groups >= PARTITION_FROM || crowded(&self.memory))
+            && (table.groups >= self.partition_from() || crowded(&self.memory))
+    }
+
+    /// How large a table has to be before splitting it is worth doing.
+    ///
+    /// [`PARTITION_FROM`] ordinarily, and more than that when a count descending TopN above has
+    /// pushed its bound down here. That bound is applied when a table is finished, and after a split
+    /// there are sixteen tables to finish rather than one, so it is applied sixteen times and lets
+    /// through sixteen times as many rows. It only stops letting through more than it should once
+    /// each partition would still hold more groups than the bound, which is what this asks for.
+    ///
+    /// ClickBench 39 is the query that showed it. It groups five columns down to 5445 groups under a
+    /// bound of 1010, so one table gives the pipeline above 1010 rows and sixteen give it all 5445,
+    /// and those rows carry two wide URLs apiece through a project and a top n that run on one
+    /// thread. Partitioning made the aggregate itself scale and handed the difference straight back.
+    fn partition_from(&self) -> usize {
+        match self.top_counts {
+            Some(bound) => PARTITION_FROM.max(bound.saturating_mul(self.merged.len())),
+            None => PARTITION_FROM,
+        }
     }
 
     /// Turns partitioning on for every instance, and puts whatever was already combined where it
@@ -4904,6 +4923,41 @@ mod tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, values);
+    }
+
+    /// The same five thousand groups, under a pushed down bound, stay in one table.
+    ///
+    /// The bound is applied when a table is finished, so sixteen partitions apply it sixteen times
+    /// and let through sixteen times as many rows as one table would. With five thousand groups
+    /// spread over sixteen partitions not one of them reaches a bound of a thousand, so the bound
+    /// stops doing anything at all and the pipeline above gets every group instead of a thousand of
+    /// them. Splitting is only worth it once a partition would still hold more groups than the bound,
+    /// and that is what the threshold asks, so this table stays whole and the bound bites.
+    #[test]
+    fn an_aggregate_under_a_pushed_down_bound_keeps_its_table_in_one_piece() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, out) = aggregate(&plan);
+        let aggregate = aggregate.top_counts(1_000);
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        let values: Vec<i32> = (0..5_000).collect();
+        for part in values.chunks(1_024) {
+            aggregate.sink(&chunk(part), &mut left).expect("a chunk of groups");
+            aggregate.sink(&chunk(part), &mut right).expect("the same groups again");
+        }
+        aggregate.combine(left).expect("the first instance");
+        aggregate.combine(right).expect("the second instance");
+        assert!(
+            !aggregate.built.lock().expect("readable").partitioning,
+            "sixteen partitions of three hundred groups would let the bound through untouched"
+        );
+        aggregate.finalize().expect("the answer");
+
+        assert_eq!(
+            answer(&out).len(),
+            1_000,
+            "the bound is applied once and not once per partition"
+        );
     }
 
     /// An ungrouped aggregate has no key to probe, so the merge is the accumulators on their own and
