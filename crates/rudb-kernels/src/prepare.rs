@@ -30,6 +30,7 @@
 use rudb_common::{LogicalType, Value};
 use rudb_vector::Vector;
 
+use crate::peel::Peel;
 use crate::regexp;
 use crate::scalar;
 use crate::shape::single;
@@ -111,10 +112,15 @@ impl Recipe {
 /// It matters least where a chunk is full and most where it is not. A second conjunct handed the
 /// eleven rows the first one kept pays the same setup as one handed two thousand, so on a selective
 /// filter the setup was a real part of the call rather than a rounding error on it.
+///
+/// It is also where the memo lives for a comparison against a dictionary, which is the other thing
+/// that only works if it is built once for the query. The `peel` module has what that is and why
+/// it belongs to one comparison node rather than to the kernel.
 #[derive(Debug)]
 pub struct Held {
     value: Value,
     single: Vector,
+    peel: Peel,
 }
 
 impl Held {
@@ -124,7 +130,7 @@ impl Held {
     /// chunk and fall through to the row at a time path if it has to.
     #[must_use]
     pub fn of(ty: &LogicalType, value: &Value) -> Option<Self> {
-        Some(Self { value: value.clone(), single: single(ty, value)? })
+        Some(Self { value: value.clone(), single: single(ty, value)?, peel: Peel::default() })
     }
 
     /// Whether this was built for the side a kernel is about to read.
@@ -140,6 +146,20 @@ impl Held {
     /// The one row column.
     pub(crate) fn single(&self) -> &Vector {
         &self.single
+    }
+
+    /// The literal's bytes, when it is text, so a kernel can check it is the one it is comparing
+    /// against without building a value per chunk to check with.
+    pub(crate) fn text(&self) -> Option<&[u8]> {
+        match &self.value {
+            Value::Varchar(text) => Some(text.as_bytes()),
+            _ => None,
+        }
+    }
+
+    /// The memo for this comparison node.
+    pub(crate) fn peel(&self) -> &Peel {
+        &self.peel
     }
 }
 

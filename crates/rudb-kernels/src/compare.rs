@@ -176,7 +176,7 @@ pub fn compare_prepared(
         return boolean(vec![false; len], Validity::AllInvalid, len);
     }
 
-    if let Some(answers) = external_text_literal(op, left, right, len, identity)? {
+    if let Some(answers) = external_text_literal(op, left, right, len, identity, held)? {
         let validity = left_valid.and(&right_valid, len);
         return boolean(blank_the_nulls(answers, &validity), validity, len);
     }
@@ -270,7 +270,7 @@ pub fn refine_prepared(
 
     let rows = kept.indices();
     let map = |slot: usize| rows[slot] as usize;
-    if let Some(answers) = external_text_literal(op, left, right, kept.len(), map)? {
+    if let Some(answers) = external_text_literal(op, left, right, kept.len(), map, held)? {
         return Ok(narrowed(&answers, rows, |slot| {
             let row = rows[slot] as usize;
             left_valid.is_valid(row) && right_valid.is_valid(row)
@@ -308,12 +308,18 @@ pub fn refine_prepared(
 }
 
 /// Equality between storage-backed text and a literal, without constructing row values.
+///
+/// Where the column is a dictionary that shares its values and the caller brought the literal it
+/// was built with, this decides once per distinct value instead of once per row. See
+/// the `peel` module. Everything else reads the column a row at a time, which is still better
+/// than the general path because it never builds a value.
 fn external_text_literal<M>(
     op: Comparison,
     left: &Vector,
     right: &Vector,
     len: usize,
     map: M,
+    held: Option<&Held>,
 ) -> Result<Option<Vec<bool>>>
 where
     M: Fn(usize) -> usize + Copy,
@@ -334,6 +340,28 @@ where
         _ => return Ok(None),
     };
     let same = if swapped { op.swapped() } else { op } == Comparison::Equal;
+    // The literal has to be the one the memo was filled against, which it is when the caller took
+    // both from the same comparison node. A caller that gets it wrong is slow rather than wrong,
+    // which is the rule the rest of `Held` keeps.
+    if let Some(held) = held.filter(|held| held.text() == Some(literal)) {
+        let decide = |dictionary: &Vector, code: usize| -> Result<bool> {
+            let found = if literal.is_empty() {
+                dictionary.try_bytes_len_at(code)?.is_some_and(|length| length == 0)
+            } else {
+                dictionary.try_bytes_at(code)?.is_some_and(|bytes| bytes == literal)
+            };
+            Ok(found)
+        };
+        if let Some(answers) = held.peel().answer(column, len, map, decide) {
+            let mut answers = answers?;
+            if !same {
+                for answer in &mut answers {
+                    *answer = !*answer;
+                }
+            }
+            return Ok(Some(answers));
+        }
+    }
     let mut answers = Vec::with_capacity(len);
     for slot in 0..len {
         let row = map(slot);
@@ -1869,6 +1897,43 @@ mod tests {
             let over_flat = refine(op, &flat, &constant, &kept).expect("refines");
             let over_shared = refine(op, &shared, &constant, &kept).expect("refines");
             assert_eq!(over_shared.indices(), over_flat.indices(), "{op:?}");
+        }
+    }
+
+    /// The peeled path and the row at a time oracle on the same rows, on both spellings and on
+    /// both entry points. A dictionary that shares its values is what a native scan hands over, so
+    /// this is the shape every `WHERE URL <> ''` in ClickBench arrives in.
+    #[test]
+    fn a_comparison_peeled_over_a_shared_dictionary_answers_what_the_oracle_answers() {
+        let words = ["", "one", "two", "", "three"];
+        let values: Vec<Value> = words.iter().map(|text| Value::Varchar((*text).into())).collect();
+        let values = std::sync::Arc::new(
+            Vector::from_values(LogicalType::Varchar, &values).expect("a vector of text"),
+        );
+        let codes = vec![0, 1, 3, 2, 0, 4, 1, 0];
+        let column = Vector::stable_dictionary(codes.clone(), values).expect("codes are in range");
+        for literal in ["", "one"] {
+            for op in [Comparison::Equal, Comparison::NotEqual] {
+                let value = Value::Varchar(literal.to_owned());
+                let held = Held::of(&LogicalType::Varchar, &value).expect("text has a column");
+                let right = Vector::constant(LogicalType::Varchar, value.clone(), column.len());
+                let wanted = oracle(op, &column, &right);
+                let got = compare_prepared(op, &column, &right, Some(&held))
+                    .expect("the peeled path answers");
+                assert_eq!(got, wanted, "{literal:?} under {op:?}");
+                // A fresh memo for the selection, since the one above belongs to that call's node.
+                let held = Held::of(&LogicalType::Varchar, &value).expect("text has a column");
+                let kept = Selection::from_predicate(column.len(), |row| row % 3 != 1);
+                let refined = refine_prepared(op, &column, &right, &kept, Some(&held))
+                    .expect("the peeled path narrows");
+                let wanted: Vec<u32> = kept
+                    .indices()
+                    .iter()
+                    .copied()
+                    .filter(|&row| is_true(&wanted.value_at(row as usize)))
+                    .collect();
+                assert_eq!(refined.indices(), wanted, "{literal:?} under {op:?}, narrowed");
+            }
         }
     }
 }
