@@ -79,6 +79,7 @@ use rudb_vector::{
 use crate::fallback::{self, Kernel};
 use crate::logic::is_true;
 use crate::number::{approximate, integral};
+use crate::peel::Found;
 use crate::prepare::Held;
 use crate::shape::{first, identity, nulls_of, single};
 
@@ -344,6 +345,11 @@ where
     // both from the same comparison node. A caller that gets it wrong is slow rather than wrong,
     // which is the rule the rest of `Held` keeps.
     if let Some(held) = held.filter(|held| held.text() == Some(literal)) {
+        // A dictionary that came with its sorted order answers this without reading any value more
+        // than the search does, so try that before filling a memo one value at a time.
+        if let Some(found) = held.lookup().find(column, literal) {
+            return Ok(Some(against_code(column, found?, len, map, same)?));
+        }
         let decide = |dictionary: &Vector, code: usize| -> Result<bool> {
             let found = if literal.is_empty() {
                 dictionary.try_bytes_len_at(code)?.is_some_and(|length| length == 0)
@@ -373,6 +379,38 @@ where
         answers.push(equal == same);
     }
     Ok(Some(answers))
+}
+
+/// Every row's answer once the literal has been resolved to a code, or to nothing.
+///
+/// This is the whole point of storing a dictionary's sorted order. The comparison is a `u32`
+/// against a `u32` and it never touches the payload, so a filter on a text column costs what a
+/// filter on an integer column costs. A literal the dictionary does not hold is decided for the
+/// whole chunk without looking at the codes at all, because a code that is in the dictionary cannot
+/// be the one that is not.
+fn against_code<M>(
+    column: &Vector,
+    found: Found,
+    len: usize,
+    map: M,
+    same: bool,
+) -> Result<Vec<bool>>
+where
+    M: Fn(usize) -> usize,
+{
+    let Found::At(wanted) = found else { return Ok(vec![!same; len]) };
+    let (codes, _) = column
+        .shared_dictionary_parts()
+        .ok_or_else(|| Error::internal("a resolved literal lost the codes it was resolved for"))?;
+    let mut answers = Vec::with_capacity(len);
+    // row at a time: the comparison is the loop. Nothing here reads a value or allocates.
+    for slot in 0..len {
+        let code = *codes
+            .get(map(slot))
+            .ok_or_else(|| Error::internal("a compared row is past the end of its codes"))?;
+        answers.push((code == wanted) == same);
+    }
+    Ok(answers)
 }
 
 /// The positions of `rows` whose answer is true and whose row is live, without a branch per row.
@@ -1912,19 +1950,83 @@ mod tests {
         );
         let codes = vec![0, 1, 3, 2, 0, 4, 1, 0];
         let column = Vector::stable_dictionary(codes.clone(), values).expect("codes are in range");
-        for literal in ["", "one"] {
+        same_as_the_oracle(&column);
+    }
+
+    /// Values a storage reader would hand over, which answer one at a time and which know the
+    /// order the writer sorted them into.
+    #[derive(Debug)]
+    struct Filed {
+        values: Vec<Vec<u8>>,
+        order: Vec<u32>,
+    }
+
+    impl rudb_vector::TextSource for Filed {
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
+            Ok(self.values.get(index).map(Vec::as_slice))
+        }
+
+        fn footprint(&self) -> usize {
+            self.values.iter().map(Vec::len).sum()
+        }
+
+        fn ranks(&self) -> Option<usize> {
+            Some(self.order.len())
+        }
+
+        fn compare_rank(&self, rank: usize, wanted: &[u8]) -> Result<Ordering> {
+            // Plain bytes rather than the head the native format compares first, because what this
+            // test is about is the answer the comparison gives and not how few reads it took.
+            Ok(self.values[self.order[rank] as usize].as_slice().cmp(wanted))
+        }
+
+        fn code_at_rank(&self, rank: usize) -> Result<u32> {
+            Ok(self.order[rank])
+        }
+    }
+
+    /// The same comparison over a dictionary whose values came out of a file with their order, so
+    /// the literal is resolved to a code by search rather than compared against every value.
+    #[test]
+    fn a_comparison_against_a_sorted_dictionary_answers_what_the_oracle_answers() {
+        // Distinct, which is what a source promises by answering with an order at all, and which
+        // a global dictionary is by construction.
+        let words = ["", "one", "two", "four", "three"];
+        let values: Vec<Vec<u8>> = words.iter().map(|text| text.as_bytes().to_vec()).collect();
+        let mut order = (0..values.len() as u32).collect::<Vec<_>>();
+        order.sort_by(|&left, &right| values[left as usize].cmp(&values[right as usize]));
+        let values = Vector::external_text(
+            LogicalType::Varchar,
+            std::sync::Arc::new(Filed { values, order }),
+        )
+        .expect("a filed vector");
+        let codes = vec![0, 1, 3, 2, 0, 4, 1, 0];
+        let column = Vector::stable_dictionary(codes, std::sync::Arc::new(values))
+            .expect("codes are in range");
+        same_as_the_oracle(&column);
+    }
+
+    /// Every equality and inequality against a handful of literals, whole and narrowed, checked
+    /// against the row at a time path. `missing` is in here because a dictionary that does not
+    /// hold the literal is decided for the whole chunk and that is its own arm of the code.
+    fn same_as_the_oracle(column: &Vector) {
+        for literal in ["", "one", "missing"] {
             for op in [Comparison::Equal, Comparison::NotEqual] {
                 let value = Value::Varchar(literal.to_owned());
                 let held = Held::of(&LogicalType::Varchar, &value).expect("text has a column");
                 let right = Vector::constant(LogicalType::Varchar, value.clone(), column.len());
-                let wanted = oracle(op, &column, &right);
-                let got = compare_prepared(op, &column, &right, Some(&held))
+                let wanted = oracle(op, column, &right);
+                let got = compare_prepared(op, column, &right, Some(&held))
                     .expect("the peeled path answers");
                 assert_eq!(got, wanted, "{literal:?} under {op:?}");
                 // A fresh memo for the selection, since the one above belongs to that call's node.
                 let held = Held::of(&LogicalType::Varchar, &value).expect("text has a column");
                 let kept = Selection::from_predicate(column.len(), |row| row % 3 != 1);
-                let refined = refine_prepared(op, &column, &right, &kept, Some(&held))
+                let refined = refine_prepared(op, column, &right, &kept, Some(&held))
                     .expect("the peeled path narrows");
                 let wanted: Vec<u32> = kept
                     .indices()

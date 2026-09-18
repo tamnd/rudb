@@ -38,6 +38,7 @@
 //! child per member plus a tag saying which member each row is in.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use rudb_common::{Cause, Error, Field, LogicalType, Result, Value, slow};
@@ -442,6 +443,51 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
     }
     /// Resident bytes retained by this source.
     fn footprint(&self) -> usize;
+    /// How many ranks this source's sorted value order has, when it has one.
+    ///
+    /// A rank is a position in the values sorted by their bytes, so rank zero is the smallest value
+    /// and rank `ranks() - 1` is the largest. A storage format that keeps a dictionary for a whole
+    /// column can afford to sort the distinct values once when it writes the file, and what that
+    /// buys is a binary search where a reader that only knows the values are distinct has to ask
+    /// every one of them whether it matches.
+    ///
+    /// `None` means the source does not know its order, which is the honest answer for anything
+    /// built in memory and for a file written before its format stored one. Nothing is allowed to
+    /// depend on this for correctness, only for speed.
+    ///
+    /// A source that answers with `Some` promises the ranks cover every value it has, and that
+    /// [`compare_rank`](Self::compare_rank) is consistent with an ordering in which the values are
+    /// strictly increasing. Strictly, which is to say the values are distinct, because what reads
+    /// this searches it, and a search of a run of equal values finds one of them rather than all of
+    /// them. A source that holds the same value twice must answer `None` here even though it could
+    /// sort itself perfectly well.
+    fn ranks(&self) -> Option<usize> {
+        None
+    }
+    /// How the value at `rank` compares against `wanted`.
+    ///
+    /// This is a method rather than a slice of positions the caller indexes because the answer is
+    /// the only thing a search wants, and a source that knows that can answer most probes without
+    /// reading a value at all. A file that stores the first few bytes of each value in rank order
+    /// settles every probe from those bytes except the ones where two values start the same way,
+    /// and the payload stays untouched. A caller handed positions instead would have to read a
+    /// value per probe, which for a dictionary of half a million entries spread over thirty
+    /// megabytes is a fresh block of the file every time.
+    ///
+    /// Only called for a rank below [`ranks`](Self::ranks), so the default is the error a source
+    /// that has no order should never be asked to produce.
+    fn compare_rank(&self, rank: usize, wanted: &[u8]) -> Result<Ordering> {
+        let _ = (rank, wanted);
+        Err(Error::internal("a text source without a sorted order was asked to compare a rank"))
+    }
+    /// The position of the value at `rank`, which is what a search returns once it has found one.
+    ///
+    /// Called about once per search rather than once per probe, so unlike
+    /// [`compare_rank`](Self::compare_rank) it is free to be the expensive one.
+    fn code_at_rank(&self, rank: usize) -> Result<u32> {
+        let _ = rank;
+        Err(Error::internal("a text source without a sorted order was asked for a rank"))
+    }
     /// Whether another source presents the same values.
     fn equal(&self, other: &dyn TextSource) -> bool {
         self.len() == other.len()
@@ -1810,6 +1856,37 @@ impl Vector {
             },
             Body::ExternalText { source } => source.bytes_len_at(index),
             _ => Ok(self.bytes_at(index).map(<[u8]>::len)),
+        }
+    }
+
+    /// How many ranks this vector's values have in sorted order, when whatever holds them knows.
+    ///
+    /// See [`TextSource::ranks`] for what a rank is and what a source promises by answering with
+    /// one. Only a vector whose values come from storage can answer, because only storage is in a
+    /// position to have sorted them once and written the answer down.
+    #[must_use]
+    pub fn ranks(&self) -> Option<usize> {
+        match &self.body {
+            Body::ExternalText { source } => source.ranks(),
+            _ => None,
+        }
+    }
+
+    /// How the value at `rank` compares against `wanted`. See [`TextSource::compare_rank`].
+    pub fn compare_rank(&self, rank: usize, wanted: &[u8]) -> Result<Ordering> {
+        match &self.body {
+            Body::ExternalText { source } => source.compare_rank(rank, wanted),
+            _ => {
+                Err(Error::internal("a vector without a sorted order was asked to compare a rank"))
+            }
+        }
+    }
+
+    /// The position of the value at `rank`. See [`TextSource::code_at_rank`].
+    pub fn code_at_rank(&self, rank: usize) -> Result<u32> {
+        match &self.body {
+            Body::ExternalText { source } => source.code_at_rank(rank),
+            _ => Err(Error::internal("a vector without a sorted order was asked for a rank")),
         }
     }
 
