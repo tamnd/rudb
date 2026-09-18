@@ -36,6 +36,7 @@ Closes when `rudb-compat levels` stops saying that nothing has been measured, an
 - [ ] `duckdb_extensions`, `duckdb_optimizers`
 - [ ] `information_schema` and the `pragma_*` function family
 - [x] `current_setting()`, and settings readable as values
+- [x] The whole settings registry, the pin's hundred and ninety two names with their types, scopes, alias pairs and defaults, each taken, kept and read back through `SET`, `RESET`, `current_setting()` and `duckdb_settings()`
 - [ ] Session context: `now()`, `current_date`, `current_timestamp`, `current_schema`, `current_user`
 - [ ] Session time zone, and the one argument `age`
 - [ ] The semantics bundle, holding the nineteen meaning changing settings, consumed by the binder and read by nothing below it

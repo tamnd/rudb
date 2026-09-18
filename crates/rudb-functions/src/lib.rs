@@ -33,7 +33,8 @@ pub use functioncatalog::{
 };
 pub use rudb_csv::Given;
 pub use settingcatalog::{
-    GLOBAL, SETTINGS, SettingEntry, setting_fields, setting_named, unknown_setting,
+    Behaviour, GLOBAL, LOCAL, SETTINGS, SettingEntry, setting_fields, setting_named,
+    unknown_setting,
 };
 pub use signature::{
     FunctionKind, FunctionRow, Resolved, function_rows, kind_of, part_type, resolve,

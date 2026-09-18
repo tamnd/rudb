@@ -2576,7 +2576,6 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
     // A name nobody has is the same sentence `SET` gives for it, which is one sentence in one place.
     let unknown = failure(&db, "SELECT current_setting('nope')");
     assert!(unknown.starts_with("unrecognized configuration parameter \"nope\""), "{unknown}");
-    assert!(unknown.contains("\"disabled_optimizers\""), "{unknown}");
     assert_eq!(unknown, db.execute("SET nope = 1").unwrap_err().message());
     // The wrong number of arguments is the ordinary arity error with the one overload under it.
     assert_eq!(
@@ -2591,8 +2590,9 @@ fn a_setting_that_is_not_a_constant_or_not_a_setting_is_refused_the_pins_way() {
 fn the_settings_table_answers_the_question_a_client_asks_it() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());
-    // Twenty two rows for twenty settings, because the pin gives an alias a row of its own.
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(22)]]);
+    // The pin's hundred and ninety two rows for a hundred and eighty five settings, because seven
+    // of them have a second spelling and the pin gives each spelling a row of its own.
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_settings()"), vec![vec![Value::BigInt(192)]]);
     // The description is the pin's sentence word for word, since a client comparing them would
     // otherwise see a difference that is not one.
     assert_eq!(
@@ -2609,6 +2609,41 @@ fn the_settings_table_answers_the_question_a_client_asks_it() {
     // The seams are not settings, which is decided in the settings module and checked here because
     // this is the table a reader would find them in if the decision ever changed by accident.
     assert!(rows(&db, "SELECT name FROM duckdb_settings() WHERE name LIKE 'seam%'").is_empty());
+    // Every row has a value, including the hundred and sixty nine rudb does not read, because a
+    // client reading this table to find out what an engine is set to should not find a hole.
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM duckdb_settings() WHERE value IS NULL"),
+        vec![vec![Value::BigInt(0)]]
+    );
+}
+
+/// A setting rudb takes and does not read still answers `SET`, `RESET`, `current_setting()` and the
+/// settings table, because a script that turns a knob in its preamble wanted to keep going and not
+/// to be told the engine has never heard the name.
+#[test]
+fn a_setting_the_engine_does_not_read_still_answers_every_way_of_asking() {
+    let db = database();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    let value = "SELECT value FROM duckdb_settings() WHERE name = 'enable_http_metadata_cache'";
+    assert_eq!(rows(&db, value), vec![vec![text("false")]]);
+    db.execute("SET enable_http_metadata_cache = true").expect("a knob takes a value");
+    assert_eq!(rows(&db, value), vec![vec![text("true")]]);
+    assert_eq!(
+        rows(&db, "SELECT current_setting('enable_http_metadata_cache')"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    db.execute("RESET enable_http_metadata_cache").expect("a knob resets");
+    assert_eq!(rows(&db, value), vec![vec![text("false")]]);
+    // A number setting reads back as its own type, which is what `typeof` on the pin says too.
+    db.execute("SET partitioned_write_max_open_files = 42").expect("a number knob");
+    assert_eq!(
+        rows(&db, "SELECT current_setting('partitioned_write_max_open_files')"),
+        vec![vec![Value::UBigInt(42)]]
+    );
+    // And a setting that would change what a query returns is the other half of the rule.
+    let error = db.execute("SET preserve_insertion_order = false").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Not implemented Error");
+    db.execute("SET preserve_insertion_order = true").expect("the value it already behaves as");
 }
 
 #[test]
@@ -4791,12 +4826,15 @@ fn a_hint_naming_a_seam_nobody_has_fails_the_query_rather_than_being_ignored() {
 }
 
 #[test]
-fn a_name_that_is_not_a_setting_says_which_ones_there_are() {
+fn a_name_that_is_not_a_setting_says_so_and_offers_the_nearest_ones() {
     let db = Database::new();
     let error = db.execute("SET bogus = 1").unwrap_err();
     assert_eq!(error.code().duckdb_name(), "Catalog Error");
-    assert!(error.message().contains("\"bogus\""), "{error}");
+    assert_eq!(error.message(), "unrecognized configuration parameter \"bogus\"");
+    // A near miss gets the name it missed, and not the other hundred and ninety one.
+    let error = db.execute("SET thread = 1").unwrap_err();
     assert!(error.message().contains("\"threads\""), "{error}");
+    assert!(!error.message().contains("\"memory_limit\""), "{error}");
 }
 
 #[test]
