@@ -7,12 +7,21 @@
 //! counted, because deduplicating is the expensive half and a lopsided grouping column otherwise
 //! hands the whole of the biggest group to one thread.
 //!
-//! So the rows go both ways. Each instance buffers a numeric record partitioned by the group hash
-//! and a pair record partitioned by the pair hash, and at the end the pairs are deduplicated by
+//! So the rows go both ways. Each instance folds the numeric side into a table of its own and
+//! buffers a pair record partitioned by the pair hash, and at the end the pairs are deduplicated by
 //! [`crate::pairs`] and the survivors are counted into the group tables the numeric side already
 //! built. A surviving pair carries its group hash, and the split it comes back in is picked by the
 //! top bits of that hash, which is the same arithmetic that picked the group's owner, so the split
 //! and the owner are the same number and no group has to be looked for anywhere else.
+//!
+//! The numeric side is two phases and not one. An instance folds into its own table for as long as
+//! that table stays small, and only once it holds more groups than [`LOCAL_GROUPS`] does the
+//! instance go back to writing a record per row and partitioning them by the group hash. A local
+//! table is worth having exactly when there are many more rows than groups, which is when folding
+//! collapses a run of rows into one state before anything is shared, and it stops being worth having
+//! when the table no longer sits in cache. Both phases end in the same owners and the fold is
+//! associative, so an instance that changes its mind halfway leaves half its rows in each and the
+//! answer does not notice.
 //!
 //! What this replaces is a set of every distinct pair held inside each owner. That set was probed
 //! once a row and rehashed as it grew, and on the million row ClickBench file the two functions it
@@ -35,13 +44,42 @@ use crate::signed::SignedReader;
 const EMPTY: u32 = u32::MAX;
 const FLUSH_ROWS: usize = 32_768;
 
+/// How many groups an instance folds into a table of its own before it starts partitioning instead.
+///
+/// A [`State`] is sixty four bytes and a bucket is four, so a table at this size is about a third of
+/// a megabyte and probes out of the level two cache of the core running it. Past that the probe
+/// starts missing, and a table that misses is no cheaper than the owner's table it was put in front
+/// of while still costing a merge at the end.
+const LOCAL_GROUPS: usize = 4_096;
+
 #[derive(Debug)]
 pub(crate) struct Exchange {
-    owners: Vec<Mutex<Owner>>,
+    owners: Vec<Mutex<Table>>,
     /// The pairs behind the distinct count, partitioned on the pair and not on the group.
     pairs: Vec<Mutex<Held>>,
     next_start: AtomicUsize,
     held: Mutex<Vec<Reservation>>,
+}
+
+/// What identifies a group, kept apart from what is accumulated for it.
+///
+/// A probe compares this and reads nothing else, so a table of a few thousand groups walks twelve
+/// bytes a slot rather than the sixty four a [`State`] takes, and the whole of what a probe touches
+/// stays in cache for several times as many groups as it otherwise would.
+#[derive(Debug, Clone, Copy)]
+struct Key {
+    group: i32,
+    /// Carried rather than recomputed, because the scatter that made the record already has it and
+    /// growing the table would otherwise hash every group it holds again.
+    hash: u32,
+    valid: bool,
+}
+
+impl Key {
+    #[inline]
+    fn same(self, other: Self) -> bool {
+        self.group == other.group && self.valid == other.valid
+    }
 }
 
 /// One row's numeric part, on its way to the owner of its group.
@@ -65,6 +103,10 @@ impl Record {
     fn has(self, flag: u8) -> bool {
         self.valid & flag != 0
     }
+
+    fn key(self) -> Key {
+        Key { group: self.group, hash: self.group_hash, valid: self.has(Self::GROUP) }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -82,6 +124,12 @@ impl Partition {
 pub(crate) struct Local {
     used: bool,
     buffered: usize,
+    /// This instance's own group table, which every numeric row folds into until there are too many
+    /// groups for it to be worth keeping.
+    table: Table,
+    /// Set once [`Self::table`] has outgrown [`LOCAL_GROUPS`], after which rows are partitioned and
+    /// folded by the owners as they always were.
+    spread: bool,
     partitions: Vec<Partition>,
     pairs: Vec<Run>,
     memory: Reservation,
@@ -92,6 +140,8 @@ impl Local {
         Self {
             used: false,
             buffered: 0,
+            table: Table::new(memory),
+            spread: false,
             partitions: (0..PARTITIONS).map(|_| Partition::default()).collect(),
             pairs: (0..PARTITIONS).map(|_| Run::default()).collect(),
             memory: memory.reservation(),
@@ -106,6 +156,17 @@ impl Local {
         self.partitions.iter().map(Partition::footprint).sum::<usize>()
             + self.pairs.iter().map(Run::footprint).sum::<usize>()
     }
+
+    /// Takes one row's numeric part, either into this instance's table or into a partition.
+    #[inline]
+    fn numeric(&mut self, row: Record, shift: u32) -> Result<()> {
+        if self.spread {
+            self.partitions[(row.group_hash >> shift) as usize].rows.push(row);
+            Ok(())
+        } else {
+            self.table.add_row(row)
+        }
+    }
 }
 
 impl Exchange {
@@ -118,7 +179,7 @@ impl Exchange {
     ) -> Result<()> {
         let [group, sum, mean, user] = inputs;
         let exchange = slot.get_or_init(|| Self {
-            owners: (0..PARTITIONS).map(|_| Mutex::new(Owner::new(memory))).collect(),
+            owners: (0..PARTITIONS).map(|_| Mutex::new(Table::new(memory))).collect(),
             pairs: (0..PARTITIONS).map(|_| Mutex::new(Held::default())).collect(),
             next_start: AtomicUsize::new(0),
             held: Mutex::new(Vec::new()),
@@ -135,13 +196,16 @@ impl Exchange {
             for row in 0..rows {
                 let key = group.at(row) as i32;
                 let hash = group_hash(key, true);
-                local.partitions[(hash >> shift) as usize].rows.push(Record {
-                    group: key,
-                    group_hash: hash,
-                    sum: sum.at(row) as i16,
-                    mean: mean.at(row) as i16,
-                    valid: Record::GROUP | Record::SUM | Record::MEAN,
-                });
+                local.numeric(
+                    Record {
+                        group: key,
+                        group_hash: hash,
+                        sum: sum.at(row) as i16,
+                        mean: mean.at(row) as i16,
+                        valid: Record::GROUP | Record::SUM | Record::MEAN,
+                    },
+                    shift,
+                )?;
                 scatter(&mut local.pairs, shift, key, true, user.at(row) as i64);
             }
         } else {
@@ -175,13 +239,7 @@ impl Exchange {
                     .map_err(|_| Error::internal("a SMALLINT average value is out of range"))?
                 };
                 let hash = group_hash(key, valid & Record::GROUP != 0);
-                local.partitions[(hash >> shift) as usize].rows.push(Record {
-                    group: key,
-                    group_hash: hash,
-                    sum,
-                    mean,
-                    valid,
-                });
+                local.numeric(Record { group: key, group_hash: hash, sum, mean, valid }, shift)?;
                 // A null value counts towards nothing, so it never becomes a pair. The row still
                 // counts towards the numeric aggregates above, which is why this is the only part of
                 // it that is skipped.
@@ -193,6 +251,9 @@ impl Exchange {
                     scatter(&mut local.pairs, shift, key, valid & Record::GROUP != 0, user);
                 }
             }
+        }
+        if !local.spread && local.table.len() > LOCAL_GROUPS {
+            local.spread = true;
         }
         local.memory.grow(width(local.footprint().saturating_sub(before)))?;
         timing.stop(0);
@@ -230,13 +291,44 @@ impl Exchange {
         Ok(())
     }
 
-    /// Hands one instance's work over, the numeric records by fold and the pairs by move.
+    /// Folds one instance's own table into the owners, each group into the owner its hash picks.
+    ///
+    /// The groups are bucketed by owner before any lock is taken, so an owner is locked once for
+    /// however many of this instance's groups belong to it rather than once a group. An instance
+    /// that saw a thousand groups would otherwise take and drop a thousand locks to hand over a
+    /// thousand states.
+    fn absorb(&self, table: &mut Table) -> Result<()> {
+        if table.is_empty() {
+            return Ok(());
+        }
+        let timing = stage::Timing::start(Stage::Fold);
+        let shift = pairs::shift();
+        let mut by_owner: Vec<Vec<usize>> = (0..PARTITIONS).map(|_| Vec::new()).collect();
+        for (slot, key) in table.keys.iter().enumerate() {
+            by_owner[(key.hash >> shift) as usize].push(slot);
+        }
+        for (at, slots) in by_owner.into_iter().enumerate() {
+            if slots.is_empty() {
+                continue;
+            }
+            let mut owner = self.owners[at].lock().map_err(poisoned)?;
+            for slot in slots {
+                owner.fold(table.keys[slot], &table.states[slot])?;
+            }
+        }
+        table.release();
+        timing.stop(0);
+        Ok(())
+    }
+
+    /// Hands one instance's work over, the numeric states by fold and the pairs by move.
     ///
     /// The pairs are not flushed along the way the numeric records are. There is nothing to fold
     /// them into until every instance has finished, so flushing them early would only copy them into
     /// a shared vector under a lock, where handing the run over at the end is a move.
     pub(crate) fn combine(&self, mut local: Local) -> Result<()> {
         self.flush(&mut local)?;
+        self.absorb(&mut local.table)?;
         for (at, run) in local.pairs.iter_mut().enumerate() {
             if !run.rows.is_empty() {
                 let run = std::mem::take(run);
@@ -286,10 +378,9 @@ impl Exchange {
     }
 }
 
+/// What is accumulated for one group, with nothing in it that says which group that is.
 #[derive(Debug, Default)]
 struct State {
-    group: i32,
-    group_valid: bool,
     count: i64,
     sum: i128,
     sum_seen: bool,
@@ -298,43 +389,152 @@ struct State {
     distinct: i64,
 }
 
+/// An open addressed table of groups, used both by an instance for itself and by an owner.
+///
+/// The two uses are the same code because the second phase has to accept whatever the first phase
+/// folded, and a state that came from a whole instance and a state that came from one row differ
+/// only in what is in them.
 #[derive(Debug)]
-struct Owner {
+struct Table {
     buckets: Vec<u32>,
+    /// How many groups this table takes before it is grown, which is half the buckets. Held rather
+    /// than worked out, because the alternative is a multiply and a compare on every probe.
+    limit: usize,
+    keys: Vec<Key>,
     states: Vec<State>,
     memory: Reservation,
 }
 
-impl Owner {
+impl Table {
     fn new(memory: &Memory) -> Self {
-        Self { buckets: Vec::new(), states: Vec::new(), memory: memory.reservation() }
+        Self {
+            buckets: Vec::new(),
+            limit: 0,
+            keys: Vec::new(),
+            states: Vec::new(),
+            memory: memory.reservation(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The slot of one group, opened if this table has not seen it before.
+    #[inline]
+    fn slot(&mut self, key: Key) -> Result<usize> {
+        if self.keys.len() >= self.limit {
+            self.grow()?;
+        }
+        let mask = self.buckets.len() - 1;
+        let mut at = key.hash as usize & mask;
+        loop {
+            let found = self.buckets[at];
+            if found == EMPTY {
+                return self.open(at, key);
+            }
+            let found = found as usize;
+            if self.keys[found].same(key) {
+                return Ok(found);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// Puts a group this table has not seen into the bucket the probe stopped on.
+    ///
+    /// Out of line from [`Self::slot`] because it runs once a group where the probe runs once a row,
+    /// and the reservation it takes has no business being on the path a hit takes.
+    #[cold]
+    fn open(&mut self, at: usize, key: Key) -> Result<usize> {
+        let slot = self.keys.len();
+        self.buckets[at] = u32::try_from(slot)
+            .map_err(|_| Error::out_of_memory("too many mixed aggregate groups"))?;
+        if self.states.len() == self.states.capacity() {
+            let old = self.states.capacity();
+            let new = old.max(16) * 2;
+            self.memory.grow(width((new - old) * (size_of::<State>() + size_of::<Key>())))?;
+            self.states.reserve_exact(new - old);
+            self.keys.reserve_exact(new - old);
+        }
+        self.keys.push(key);
+        self.states.push(State::default());
+        Ok(slot)
+    }
+
+    /// One row's numeric part folded into its group.
+    fn add_row(&mut self, row: Record) -> Result<()> {
+        let slot = self.slot(row.key())?;
+        let state = &mut self.states[slot];
+        state.count = state
+            .count
+            .checked_add(1)
+            .ok_or_else(|| Error::out_of_range("a mixed COUNT overflowed BIGINT"))?;
+        if row.has(Record::SUM) {
+            state.sum = state
+                .sum
+                .checked_add(i128::from(row.sum))
+                .ok_or_else(|| Error::out_of_range("a mixed SUM overflowed HUGEINT"))?;
+            state.sum_seen = true;
+        }
+        if row.has(Record::MEAN) {
+            state.mean = state
+                .mean
+                .checked_add(i128::from(row.mean))
+                .ok_or_else(|| Error::out_of_range("a mixed AVG total overflowed HUGEINT"))?;
+            state.mean_count = state
+                .mean_count
+                .checked_add(1)
+                .ok_or_else(|| Error::out_of_range("a mixed AVG count overflowed BIGINT"))?;
+        }
+        Ok(())
     }
 
     fn add_all(&mut self, rows: &mut Vec<Record>) -> Result<()> {
         for row in rows.drain(..) {
-            let slot = self.group(row.group, row.group_hash, row.has(Record::GROUP))?;
-            let state = &mut self.states[slot];
-            state.count = state
-                .count
-                .checked_add(1)
-                .ok_or_else(|| Error::out_of_range("a mixed COUNT overflowed BIGINT"))?;
-            if row.has(Record::SUM) {
-                state.sum = state
-                    .sum
-                    .checked_add(i128::from(row.sum))
-                    .ok_or_else(|| Error::out_of_range("a mixed SUM overflowed HUGEINT"))?;
-                state.sum_seen = true;
-            }
-            if row.has(Record::MEAN) {
-                state.mean = state
-                    .mean
-                    .checked_add(i128::from(row.mean))
-                    .ok_or_else(|| Error::out_of_range("a mixed AVG total overflowed HUGEINT"))?;
-                state.mean_count = state
-                    .mean_count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::out_of_range("a mixed AVG count overflowed BIGINT"))?;
-            }
+            self.add_row(row)?;
+        }
+        Ok(())
+    }
+
+    /// Adds one whole state to whatever this table already holds for that group.
+    ///
+    /// What makes the two phases agree. An instance adds up whatever share of a group it happened to
+    /// see and the owner adds the shares, which is the same answer because every part of a state
+    /// here is a sum and a sum does not care how it was bracketed.
+    fn fold(&mut self, key: Key, add: &State) -> Result<()> {
+        let slot = self.slot(key)?;
+        let state = &mut self.states[slot];
+        state.count = state
+            .count
+            .checked_add(add.count)
+            .ok_or_else(|| Error::out_of_range("a mixed COUNT overflowed BIGINT"))?;
+        if add.sum_seen {
+            state.sum = state
+                .sum
+                .checked_add(add.sum)
+                .ok_or_else(|| Error::out_of_range("a mixed SUM overflowed HUGEINT"))?;
+            state.sum_seen = true;
+        }
+        if add.mean_count != 0 {
+            state.mean = state
+                .mean
+                .checked_add(add.mean)
+                .ok_or_else(|| Error::out_of_range("a mixed AVG total overflowed HUGEINT"))?;
+            state.mean_count = state
+                .mean_count
+                .checked_add(add.mean_count)
+                .ok_or_else(|| Error::out_of_range("a mixed AVG count overflowed BIGINT"))?;
+        }
+        if add.distinct != 0 {
+            state.distinct = state
+                .distinct
+                .checked_add(add.distinct)
+                .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
         }
         Ok(())
     }
@@ -348,7 +548,8 @@ impl Owner {
         let timing = stage::Timing::start(Stage::Fold);
         for part in counted {
             for pair in &part.splits[split] {
-                let slot = self.group(pair.group, pair.group_hash, pair.valid)?;
+                let key = Key { group: pair.group, hash: pair.group_hash, valid: pair.valid };
+                let slot = self.slot(key)?;
                 let state = &mut self.states[slot];
                 state.distinct = state
                     .distinct
@@ -360,53 +561,32 @@ impl Owner {
         Ok(())
     }
 
-    fn group(&mut self, group: i32, hash: u32, valid: bool) -> Result<usize> {
-        if self.buckets.is_empty() || (self.states.len() + 1) * 2 > self.buckets.len() {
-            self.grow_groups()?;
-        }
-        if self.states.len() == self.states.capacity() {
-            let old = self.states.capacity();
-            let new = old.max(16) * 2;
-            self.memory.grow(width((new - old) * size_of::<State>()))?;
-            self.states.reserve_exact(new - old);
-        }
-        let mask = self.buckets.len() - 1;
-        let mut at = hash as usize & mask;
-        loop {
-            let slot = self.buckets[at];
-            if slot == EMPTY {
-                let slot = self.states.len();
-                self.buckets[at] = u32::try_from(slot)
-                    .map_err(|_| Error::out_of_memory("too many mixed aggregate groups"))?;
-                self.states.push(State { group, group_valid: valid, ..State::default() });
-                return Ok(slot);
-            }
-            let slot = slot as usize;
-            let held = &self.states[slot];
-            if held.group == group && held.group_valid == valid {
-                return Ok(slot);
-            }
-            at = (at + 1) & mask;
-        }
-    }
-
-    fn grow_groups(&mut self) -> Result<()> {
+    fn grow(&mut self) -> Result<()> {
         let old = self.buckets.len();
         let new = old.max(32) * 2;
         self.memory.grow(width(new * size_of::<u32>()))?;
         let mut grown = vec![EMPTY; new];
         let mask = new - 1;
-        for (slot, state) in self.states.iter().enumerate() {
-            let hash = group_hash(state.group, state.group_valid);
-            let mut at = hash as usize & mask;
+        for (slot, key) in self.keys.iter().enumerate() {
+            let mut at = key.hash as usize & mask;
             while grown[at] != EMPTY {
                 at = (at + 1) & mask;
             }
             grown[at] = slot as u32;
         }
         self.buckets = grown;
+        self.limit = new / 2;
         self.memory.shrink(width(old * size_of::<u32>()));
         Ok(())
+    }
+
+    /// Gives back everything this table holds, for a local one that has handed its states over.
+    fn release(&mut self) {
+        self.buckets = Vec::new();
+        self.limit = 0;
+        self.keys = Vec::new();
+        self.states = Vec::new();
+        self.memory.release();
     }
 
     fn finish(&mut self, bound: usize, memory: &Memory) -> Result<Output> {
@@ -422,8 +602,9 @@ impl Owner {
         }
         let mut output = Vec::with_capacity(best.len());
         for slot in best {
+            let key = self.keys[slot];
             let state = &self.states[slot];
-            let group = if state.group_valid { Value::Integer(state.group) } else { Value::Null };
+            let group = if key.valid { Value::Integer(key.group) } else { Value::Null };
             output.push(vec![
                 group,
                 Accumulator::exact_sum(state.sum, state.sum_seen, &LogicalType::HugeInt)
@@ -434,11 +615,7 @@ impl Owner {
                 Value::BigInt(state.distinct),
             ]);
         }
-        self.buckets.clear();
-        self.buckets.shrink_to_fit();
-        self.states.clear();
-        self.states.shrink_to_fit();
-        self.memory.release();
+        self.release();
         let mut held = memory.reservation();
         let chunks = rows::chunks(
             &[
@@ -478,7 +655,7 @@ mod tests {
 
     use crate::pairs::{Held, PARTITIONS, Run, distinct_pairs, group_hash, scatter, shift};
 
-    use super::{Owner, Record, SignedReader};
+    use super::{Key, LOCAL_GROUPS, Local, Record, SignedReader, State, Table};
 
     #[test]
     fn signed_reader_agrees_with_offset_packed_vectors() {
@@ -499,13 +676,6 @@ mod tests {
         // The same five rows go both ways, as numeric records here and as pairs below, which is what
         // the operator does with them. One split and one owner, because an owner in a real query
         // only ever sees the split its own groups came back in.
-        let row = |group, sum, mean, valid| Record {
-            group,
-            group_hash: group_hash(group, valid & Record::GROUP != 0),
-            sum,
-            mean,
-            valid,
-        };
         let all = Record::GROUP | Record::SUM | Record::MEAN;
         let mut input = vec![
             row(3, 2, 4, all),
@@ -515,7 +685,7 @@ mod tests {
             row(0, 5, 2, Record::SUM | Record::MEAN),
         ];
         let memory = Memory::unlimited();
-        let mut owner = Owner::new(&memory);
+        let mut owner = Table::new(&memory);
         owner.add_all(&mut input).expect("rows enter one owner");
 
         let mut runs: Vec<Run> = (0..PARTITIONS).map(|_| Run::default()).collect();
@@ -530,41 +700,74 @@ mod tests {
         let counted = vec![distinct_pairs(&mut pairs, 1, &memory).expect("a pair partition")];
         owner.count_distinct(&counted, 0).expect("the pairs count into the groups");
 
-        let output = owner.finish(10, &memory).expect("a mixed radix owner");
-        let mut rows = Vec::new();
-        for chunk in output.chunks {
-            for row in 0..chunk.len() {
-                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+        assert_eq!(emitted(&mut owner, &memory), expected());
+        assert_eq!(size_of::<Record>(), 16);
+    }
+
+    /// The same rows folded locally first come out the same as the rows folded straight in.
+    ///
+    /// The point of the two phases. An instance adds up whatever share of a group it saw before
+    /// anything is shared, and the owner adds the shares, so the same five rows split across two
+    /// instances have to give what one owner reading all five gives. The distinct side is left out
+    /// here because it never goes through a local table at all, and the test above covers it.
+    #[test]
+    fn folding_locally_and_then_into_an_owner_gives_what_folding_straight_in_gives() {
+        let all = Record::GROUP | Record::SUM | Record::MEAN;
+        let rows = [
+            row(3, 2, 4, all),
+            row(3, 3, 6, all),
+            row(3, 0, 0, Record::GROUP),
+            row(4, 7, 8, all),
+            row(0, 5, 2, Record::SUM | Record::MEAN),
+        ];
+        let memory = Memory::unlimited();
+        let mut straight = Table::new(&memory);
+        straight.add_all(&mut rows.to_vec()).expect("rows enter one owner");
+
+        // Two instances that between them saw the same five rows, each folding its own share.
+        let mut owner = Table::new(&memory);
+        for share in rows.chunks(2) {
+            let mut instance = Table::new(&memory);
+            instance.add_all(&mut share.to_vec()).expect("rows enter one instance");
+            for (slot, key) in instance.keys.iter().enumerate() {
+                owner.fold(*key, &instance.states[slot]).expect("a state enters its owner");
             }
         }
-        rows.sort_by_key(|row: &Vec<Value>| format!("{:?}", row[0]));
+        assert_eq!(emitted(&mut owner, &memory), emitted(&mut straight, &memory));
+    }
+
+    /// An instance stops keeping a table of its own once the table is too big to be worth it.
+    ///
+    /// Without this a grouping column with a million distinct values would build a million entry
+    /// table per instance in front of the owners, which is every cost of the table and none of the
+    /// collapsing it is there for.
+    #[test]
+    fn an_instance_gives_up_its_own_table_once_it_holds_too_many_groups() {
+        let memory = Memory::unlimited();
+        let mut local = Local::new(&memory);
+        let shift = shift();
+        for group in 0..i32::try_from(LOCAL_GROUPS).expect("a small bound") {
+            local
+                .numeric(row(group, 1, 1, Record::GROUP | Record::SUM | Record::MEAN), shift)
+                .expect("a row");
+        }
+        assert_eq!(local.table.len(), LOCAL_GROUPS, "every group so far is its own");
+        assert!(!local.spread, "the table is still inside the bound");
+        assert!(local.partitions.iter().all(|part| part.rows.is_empty()), "nothing partitioned");
+
+        local.spread = local.table.len() > LOCAL_GROUPS;
+        assert!(!local.spread, "the bound is inclusive");
+        local.numeric(row(-1, 1, 1, Record::GROUP), shift).expect("one more group");
+        local.spread = local.table.len() > LOCAL_GROUPS;
+        assert!(local.spread, "one group past the bound is one too many");
+
+        local.numeric(row(-2, 1, 1, Record::GROUP), shift).expect("a partitioned row");
+        assert_eq!(local.table.len(), LOCAL_GROUPS + 1, "the table stopped where it was");
         assert_eq!(
-            rows,
-            [
-                vec![
-                    Value::Integer(3),
-                    Value::HugeInt(5),
-                    Value::BigInt(3),
-                    Value::Double(5.0),
-                    Value::BigInt(2),
-                ],
-                vec![
-                    Value::Integer(4),
-                    Value::HugeInt(7),
-                    Value::BigInt(1),
-                    Value::Double(8.0),
-                    Value::BigInt(1),
-                ],
-                vec![
-                    Value::Null,
-                    Value::HugeInt(5),
-                    Value::BigInt(1),
-                    Value::Double(2.0),
-                    Value::BigInt(1),
-                ],
-            ]
+            local.partitions.iter().map(|part| part.rows.len()).sum::<usize>(),
+            1,
+            "and the row after it was partitioned instead"
         );
-        assert_eq!(size_of::<Record>(), 16);
     }
 
     #[test]
@@ -578,5 +781,56 @@ mod tests {
                 assert_eq!(crate::pairs::split_of(hash, 16), (hash >> shift()) as usize);
             }
         }
+        assert_eq!(size_of::<Key>(), 12);
+        assert_eq!(size_of::<State>(), 64);
+    }
+
+    fn row(group: i32, sum: i16, mean: i16, valid: u8) -> Record {
+        Record {
+            group,
+            group_hash: group_hash(group, valid & Record::GROUP != 0),
+            sum,
+            mean,
+            valid,
+        }
+    }
+
+    /// One table's rows, sorted so that the order the groups were opened in does not show.
+    fn emitted(table: &mut Table, memory: &Memory) -> Vec<Vec<Value>> {
+        let output = table.finish(10, memory).expect("a mixed radix owner");
+        let mut rows = Vec::new();
+        for chunk in output.chunks {
+            for row in 0..chunk.len() {
+                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+            }
+        }
+        rows.sort_by_key(|row: &Vec<Value>| format!("{:?}", row[0]));
+        rows
+    }
+
+    fn expected() -> Vec<Vec<Value>> {
+        vec![
+            vec![
+                Value::Integer(3),
+                Value::HugeInt(5),
+                Value::BigInt(3),
+                Value::Double(5.0),
+                Value::BigInt(2),
+            ],
+            vec![
+                Value::Integer(4),
+                Value::HugeInt(7),
+                Value::BigInt(1),
+                Value::Double(8.0),
+                Value::BigInt(1),
+            ],
+            vec![
+                Value::Null,
+                Value::HugeInt(5),
+                Value::BigInt(1),
+                Value::Double(2.0),
+                Value::BigInt(1),
+            ],
+        ]
     }
 }
