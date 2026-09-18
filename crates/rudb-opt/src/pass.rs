@@ -194,6 +194,15 @@ impl Context {
 /// Not every node in the arena. A rewrite that replaced a node leaves the old one behind, and a
 /// pass that walked the arena would go on rewriting nodes that nothing runs, which costs time on
 /// every later pass and can report an error about a plan nobody asked about.
+///
+/// Parents before children is the whole point for [`crate::columns`], which narrows a node to what
+/// everything above it reads and so needs everything above it to have been read first. A plan is a
+/// graph and not a tree, because a rewrite that wants a subtree twice points at it twice rather than
+/// copying it, and breadth first order does not give that: a node two parents reach at different
+/// depths comes out after the nearer one and before the further one. Sorting does give it. A node's
+/// children are behind it, which [`Plan::validate`] enforces and says so with the node number, so
+/// walking the reachable nodes from the largest reference down visits every parent of a node before
+/// the node itself however many parents it has.
 pub(crate) fn top_down(plan: &Plan) -> Vec<NodeRef> {
     let mut found = Vec::new();
     let mut pending = VecDeque::from([plan.root()]);
@@ -204,6 +213,7 @@ pub(crate) fn top_down(plan: &Plan) -> Vec<NodeRef> {
         found.push(node);
         pending.extend(plan.node(node).children().into_iter().flatten());
     }
+    found.sort_unstable_by(|left, right| right.cmp(left));
     found
 }
 
