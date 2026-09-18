@@ -6,6 +6,19 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.32
+
+A patch release that runs window functions, answers the seven ranking names, and reads dictionary columns as dictionaries in two more places. The storage format version is unchanged.
+
+- Window queries run. The operator sorts by the partition keys and then the order keys, walks each partition once, and evaluates each call against the frame the plan wrote, so `ROWS`, `GROUPS`, the default `RANGE` frame and all four `EXCLUDE` forms answer. A `RANGE` frame with an offset is still refused by name, because the distance there is measured on the order key rather than on the position.
+- The seven ranking names answer: `row_number`, `rank`, `dense_rank` with its `rank_dense` alias, `percent_rank`, `cume_dist` and `ntile`. They read the peer groups rather than the frame, so a frame written around one of them is ignored, which is what the reference binary does.
+- `duckdb_functions()` reports a fourth kind, `window`, for the names that can only ever be written inside an `OVER`. Writing one anywhere else is refused, and so is `DISTINCT` inside one, both in the reference binary's words.
+- A frame distance that is negative is accepted and answers null instead of being refused, and one that is NULL is refused as an invalid input rather than as a binder error, which is how the reference binary reports both.
+- A minimum or a maximum over a dictionary column is decided on the dictionary bytes rather than on a value per row.
+- A text comparison against a dictionary column is decided once per distinct value rather than once per row.
+- The compatibility corpus gained a window file with 37 records, all of them measured against the pinned binary.
+- The full gate passes on Rust 1.85. No DuckDB bug was found in this work.
+
 ## 0.3.31
 
 A patch release that binds window functions, carries `OVER` through the parser, and makes native integer storage and page buffer costs explicit. The storage format version is unchanged.
