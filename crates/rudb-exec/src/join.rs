@@ -860,7 +860,7 @@ fn equalities(
         // table and a hash table has one bucket for one value. The binder puts a cast in where the
         // types differ, and a cast is not a column, so this is a check rather than a conversion: an
         // equality that needed one has already failed the match below.
-        if plan.expr_type(left) != plan.expr_type(right) || !looked_up(plan.expr_type(left)) {
+        if plan.expr_type(left) != plan.expr_type(right) || !plan.expr_type(left).is_keyed() {
             return None;
         }
         let (&Expr::Column(one), &Expr::Column(other)) = (plan.expr(left), plan.expr(right)) else {
@@ -953,24 +953,6 @@ fn key(row: &[Value], at: &[usize], nulls: &[bool]) -> Option<Vec<Value>> {
         key.push(value.clone());
     }
     Some(key)
-}
-
-/// Whether two values of this type are equal exactly when they are the same key.
-///
-/// The scalar types are, which is what the hash table needs, and the nested ones are not asked.
-/// A list containing a null compares to another list by SQL's rules and not by its bytes, so a
-/// table that treated two such lists as one key would answer a join with rows `=` says nothing
-/// about. There is no query behind allowing them and there is a wrong answer behind guessing.
-fn looked_up(of: &LogicalType) -> bool {
-    !matches!(
-        of,
-        LogicalType::List(_)
-            | LogicalType::Array(_, _)
-            | LogicalType::Struct(_)
-            | LogicalType::Map(_, _)
-            | LogicalType::Union(_)
-            | LogicalType::Null
-    )
 }
 
 /// Both rows, left then right.
