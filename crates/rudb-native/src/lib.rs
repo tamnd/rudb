@@ -36,8 +36,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rudb_common::bounds::Bound;
+use rudb_common::bounds::{Bound, Op};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
@@ -45,7 +46,7 @@ use rudb_vector::{Buffer, Chunk, Data, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 11;
+const FORMAT: u32 = 12;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -56,6 +57,13 @@ const FREQUENCY_ENTRIES: usize = 512;
 const FREQUENCY_BUILD_RANK: usize = 10;
 const FREQUENCY_ORDINALS: usize = 65_536;
 const MAX_FREQUENCY_WORKERS: usize = 16;
+
+/// The most bytes one column of one part may spend on a membership sieve.
+///
+/// A part is a thousand rows, so a filter sized for every one of them being distinct is about
+/// thirteen hundred bytes and this never binds in practice. It is here so that a part that somehow
+/// arrives much wider than a vector cannot put an unbounded index in the file.
+const SIEVE_BUDGET: usize = 8 * 1024;
 
 fn io(error: std::io::Error) -> Error {
     Error::io(error.to_string())
@@ -217,6 +225,9 @@ pub struct Stripe {
     index: Span,
     pages: Vec<Span>,
     memberships: Vec<Option<Page>>,
+    /// One page per column holding the membership sieve of every part of the stripe, for the
+    /// columns that have one. A column whose parts all declined a sieve has no page at all.
+    sieves: Vec<Option<Page>>,
     zone: Zone,
 }
 
@@ -402,6 +413,7 @@ struct PendingPart {
     pages: Vec<Vec<u8>>,
     codes: Vec<Option<Vec<u32>>>,
     zone: Zone,
+    sieves: Vec<Option<Sieve>>,
 }
 
 /// Parts in one stripe.
@@ -514,13 +526,24 @@ impl Writer {
         if self.pending.last().is_some_and(|last| last.order > order) {
             self.flush_pending()?;
         }
-        self.pending.push(PendingPart {
-            order,
-            rows: chunk.len(),
-            pages,
-            codes,
-            zone: Zone::of(chunk),
-        });
+        // The zone is built first because the sieve reads the range it produced rather than walking
+        // the column a second time to find out how wide it is.
+        let zone = Zone::of(chunk);
+        let mut sieves = Vec::with_capacity(chunk.width());
+        for (index, column) in chunk.columns().iter().enumerate() {
+            let range =
+                zone.column(index).ok_or_else(|| invalid("a zone is narrower than its chunk"))?;
+            // A column with a global dictionary already has an exact membership index per stripe,
+            // so an approximate one beside it would cost a hash of every string in the table to
+            // answer a question that is already answered. What it would buy is the finer grain, a
+            // part rather than a stripe, and that is worth coming back for on its own.
+            if self.dictionaries[index].is_some() {
+                sieves.push(None);
+                continue;
+            }
+            sieves.push(Sieve::of(column, range, SIEVE_BUDGET));
+        }
+        self.pending.push(PendingPart { order, rows: chunk.len(), pages, codes, zone, sieves });
         if self.pending.len() == STRIPE_PARTS {
             self.flush_pending()?;
         }
@@ -588,6 +611,21 @@ impl Writer {
                 hash: checksum(&bytes),
             });
         }
+        let mut sieves = vec![None; width];
+        for (column, page) in sieves.iter_mut().enumerate() {
+            if self.pending.iter().all(|pending| pending.sieves[column].is_none()) {
+                continue;
+            }
+            let bytes = encode_sieves(self.pending.iter().map(|pending| &pending.sieves[column]))?;
+            let offset = self.file.stream_position().map_err(io)?;
+            self.file.write_all(&bytes).map_err(io)?;
+            *page = Some(Page {
+                offset,
+                length: u32::try_from(bytes.len())
+                    .map_err(|_| invalid("sieve page length overflow"))?,
+                hash: checksum(&bytes),
+            });
+        }
         let offset = self.file.stream_position().map_err(io)?;
         self.file.write_all(&index).map_err(io)?;
         let index = Span {
@@ -613,6 +651,7 @@ impl Writer {
             index,
             pages,
             memberships,
+            sieves,
             zone: Zone::from_ranges(ranges),
         });
         Ok(())
@@ -886,6 +925,10 @@ pub struct Reader {
     file: Arc<File>,
     table: Arc<Table>,
     dictionaries: Arc<Vec<OnceLock<Arc<Vector>>>>,
+    /// The membership sieves of one stripe of one column, by column and then by stripe, read the
+    /// first time a probe asks about them. A query filters on one or two columns and never looks at
+    /// the rest, so reading these at open would be the whole index for the sake of a fraction of it.
+    sieves: Arc<Vec<Vec<SieveSlot>>>,
     /// Which stripe and which part of it every part of the table is, by table wide part number.
     places: Arc<Vec<Place>>,
     cache: Arc<Vec<Mutex<Cached>>>,
@@ -950,6 +993,9 @@ struct Cached {
 /// order so that is a small number. It multiplies by the page size, which is a quarter of a
 /// megabyte for a four byte column, and by the number of columns a query touches.
 const CACHED_STRIPES_PER_COLUMN: usize = 4;
+
+/// The sieves of one stripe of one column, once somebody has asked for them.
+type SieveSlot = OnceLock<Arc<Vec<Option<Sieve>>>>;
 
 type CrossingCache = OnceLock<Box<[OnceLock<Result<Vec<u8>>>]>>;
 
@@ -1364,10 +1410,14 @@ impl Reader {
                 })
             })
             .collect::<Vec<_>>();
+        let sieves = (0..table.fields.len())
+            .map(|_| table.stripes.iter().map(|_| OnceLock::new()).collect())
+            .collect();
         Ok(Self {
             file: Arc::new(file),
             table: Arc::new(table),
             dictionaries: Arc::new(dictionaries),
+            sieves: Arc::new(sieves),
             places: Arc::new(places),
             cache: Arc::new(cache),
             pages: Arc::new(AtomicUsize::new(0)),
@@ -1878,13 +1928,63 @@ impl Reader {
         Chunk::with_rows(picked, rows)
     }
 
-    /// Whether persisted bounds prove that the stripe holding a part cannot match the predicates.
+    /// Whether persisted statistics prove that a part cannot match the predicates.
     ///
-    /// The bounds are per stripe, so every part of a stripe gets the same answer. A scan that skips
-    /// one part of a stripe this way skips all of them.
+    /// Two of them. The bounds are per stripe, so every part of a stripe gets the same answer from
+    /// those and a scan that skips one part that way skips all sixty four. The sieves are per part
+    /// and answer equality, which is the test bounds are worst at: a column of identifiers has every
+    /// stripe covering nearly the whole of its type, so the bounds keep every part of it and the
+    /// sieve keeps the ones that really hold the value.
+    ///
+    /// The bounds go first because they are already in memory and the sieves are a read.
     #[must_use]
     pub fn skips(&self, part: usize, probes: &[Probe]) -> bool {
-        self.stripe_of(part).is_ok_and(|stripe| stripe.zone.skips(probes))
+        let Some(place) = self.places.get(part).copied() else { return false };
+        let Some(stripe) = self.table.stripes.get(place.stripe as usize) else { return false };
+        if stripe.zone.skips(probes) {
+            return true;
+        }
+        probes.iter().any(|probe| self.sifted(place, probe))
+    }
+
+    /// Whether the sieve of one part rules out one probe.
+    ///
+    /// Only equality. An ordered comparison is what the bounds are for and a sieve says nothing
+    /// about it, and a read that cannot answer keeps the part, which is the answer a caller with no
+    /// sieve gets anyway.
+    fn sifted(&self, place: Place, probe: &Probe) -> bool {
+        if probe.op != Op::Equal {
+            return false;
+        }
+        match self.stripe_sieves(place.stripe as usize, probe.column) {
+            Some(sieves) => sieves
+                .get(place.part as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|sieve| sieve.excludes(&probe.value)),
+            None => false,
+        }
+    }
+
+    /// The sieves of one stripe of one column, read once and kept.
+    ///
+    /// `None` when the column has no sieves in that stripe, when the page is damaged, and when the
+    /// bytes are not a page this version can read. A sieve is an index over data that is still there
+    /// and a caller that cannot read one reads the rows, so this is the one place in the file where
+    /// a bad checksum is a slow query rather than an error.
+    fn stripe_sieves(&self, stripe: usize, column: usize) -> Option<&[Option<Sieve>]> {
+        let slot = self.sieves.get(column)?.get(stripe)?;
+        if let Some(held) = slot.get() {
+            return Some(held);
+        }
+        let page = self.table.stripes.get(stripe)?.sieves.get(column).copied().flatten()?;
+        let mut bytes = vec![0; page.length as usize];
+        read_at(&self.file, page.offset, &mut bytes).ok()?;
+        if checksum(&bytes) != page.hash {
+            return None;
+        }
+        let sieves = Arc::new(decode_sieves(&bytes).ok()?);
+        let _ = slot.set(sieves);
+        slot.get().map(|held| held.as_slice())
     }
 }
 
@@ -2051,6 +2151,17 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             put_u64(&mut out, page.offset);
             put_u32(&mut out, page.length);
             put_u64(&mut out, page.hash);
+        }
+        for sieve in &stripe.sieves {
+            match sieve {
+                None => out.push(0),
+                Some(page) => {
+                    out.push(1);
+                    put_u64(&mut out, page.offset);
+                    put_u32(&mut out, page.length);
+                    put_u64(&mut out, page.hash);
+                }
+            }
         }
         for range in stripe.zone.columns() {
             put_bound(&mut out, range.low.as_ref())?;
@@ -2289,6 +2400,23 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             }
             memberships[column] = Some(page);
         }
+        let mut sieves = vec![None; width];
+        for sieve in sieves.iter_mut().take(width) {
+            match cur.u8()? {
+                0 => continue,
+                1 => {}
+                _ => return Err(invalid("a sieve page has an unknown tag")),
+            }
+            let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+            let end = page
+                .offset
+                .checked_add(u64::from(page.length))
+                .ok_or_else(|| invalid("sieve page offset overflow"))?;
+            if page.offset < HEADER || end > size || page.length as usize > MAX_PAGE {
+                return Err(invalid("sieve page range is outside the file"));
+            }
+            *sieve = Some(page);
+        }
         let mut ranges = Vec::with_capacity(width);
         for _ in 0..width {
             let low = cur.bound()?;
@@ -2313,6 +2441,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             index,
             pages,
             memberships,
+            sieves,
             zone: Zone::from_ranges(ranges),
         });
     }
@@ -2686,6 +2815,68 @@ fn merged_range(ranges: impl Iterator<Item = Range>) -> Range {
         };
     }
     merged
+}
+
+/// One stripe's sieves for one column: the part count, a length for each part, then their bytes.
+///
+/// One page for the whole stripe rather than one per part, because a part's sieve is a few hundred
+/// bytes and sixty four of those are sixty four directory entries and sixty four reads for something
+/// a scan walks straight through. A part with no sieve writes a length of zero and costs four bytes.
+fn encode_sieves<'a>(sieves: impl Iterator<Item = &'a Option<Sieve>>) -> Result<Vec<u8>> {
+    let held: Vec<&Option<Sieve>> = sieves.collect();
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(held.len()).map_err(|_| invalid("too many parts in a stripe"))?,
+    );
+    for sieve in &held {
+        let length = sieve.as_ref().map_or(0, Sieve::len);
+        put_u32(&mut out, u32::try_from(length).map_err(|_| invalid("sieve length overflow"))?);
+    }
+    // flatten: a part with no sieve wrote a length of zero above and contributes no bytes here.
+    for sieve in held.into_iter().flatten() {
+        out.extend_from_slice(&sieve.to_bytes());
+    }
+    Ok(out)
+}
+
+/// The sieves one encoded page holds, one entry per part of the stripe.
+///
+/// A part whose bytes are not a sieve this version understands comes back as `None`, which is a part
+/// that gets read. That is how a file written by a later version of the sieve stays readable rather
+/// than being a corrupt page.
+fn decode_sieves(bytes: &[u8]) -> Result<Vec<Option<Sieve>>> {
+    let parts = u32::from_le_bytes(
+        bytes
+            .get(..4)
+            .ok_or_else(|| invalid("sieve page is truncated"))?
+            .try_into()
+            .map_err(|_| invalid("sieve page is truncated"))?,
+    ) as usize;
+    let mut lengths = Vec::with_capacity(parts);
+    for part in 0..parts {
+        let at = 4 + part * 4;
+        let field = bytes.get(at..at + 4).ok_or_else(|| invalid("sieve page is truncated"))?;
+        lengths.push(u32::from_le_bytes(
+            field.try_into().map_err(|_| invalid("sieve page is truncated"))?,
+        ) as usize);
+    }
+    let mut at = 4 + parts * 4;
+    let mut out = Vec::with_capacity(parts);
+    for length in lengths {
+        if length == 0 {
+            out.push(None);
+            continue;
+        }
+        let end = at.checked_add(length).ok_or_else(|| invalid("sieve page is truncated"))?;
+        let field = bytes.get(at..end).ok_or_else(|| invalid("sieve page is truncated"))?;
+        out.push(Sieve::from_bytes(field));
+        at = end;
+    }
+    if at != bytes.len() {
+        return Err(invalid("sieve page has trailing bytes"));
+    }
+    Ok(out)
 }
 
 /// One stripe's membership index: the code count and then the codes as ascending deltas.
@@ -3368,6 +3559,92 @@ mod tests {
         let above = [Probe { column: 0, op: Op::Greater, value: Bound::Int(100) }];
         assert!(reader.skips(0, &above), "the first stripe stops at 63");
         assert!(!reader.skips(STRIPE_PARTS * 2, &above), "the third stripe reaches 130");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A scattered value in the column that decides `WHERE UserID = ?`.
+    fn scattered(n: i64) -> i64 {
+        n.wrapping_mul(-7_046_029_254_386_353_131)
+    }
+
+    /// A part whose sieve does not hold the constant is skipped, and a range would skip none of them.
+    ///
+    /// This is ClickBench query 19 in miniature. The values are spread over the whole of `BIGINT`, so
+    /// every stripe's bounds cover nearly all of it and rule out nothing, and the part that really
+    /// holds the value is the only one a scan has to read.
+    #[test]
+    fn a_part_is_skipped_when_its_sieve_does_not_hold_the_constant() {
+        let path = path("sieve-skip");
+        let mut writer =
+            Writer::create(&path, "hits", vec![Field::required("id", LogicalType::BigInt)])
+                .expect("new file");
+        let parts = STRIPE_PARTS + 3;
+        let per_part = 8;
+        for part in 0..parts {
+            let held: Vec<Value> = (0..per_part)
+                .map(|row| Value::BigInt(scattered((part * per_part + row) as i64)))
+                .collect();
+            let chunk =
+                Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &held).expect("numbers")])
+                    .expect("one column");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let probe = |value: i64| Probe {
+            column: 0,
+            op: Op::Equal,
+            value: Bound::Int(i128::from(scattered(value))),
+        };
+        for wanted in [0_i64, 9, (parts * per_part - 1) as i64] {
+            let tests = [probe(wanted)];
+            let kept: Vec<usize> = (0..parts).filter(|&part| !reader.skips(part, &tests)).collect();
+            let home = wanted as usize / per_part;
+            assert_eq!(kept, vec![home], "only the part holding {wanted} is read");
+        }
+        let absent = [probe((parts * per_part) as i64 + 1)];
+        assert!((0..parts).all(|part| reader.skips(part, &absent)), "no part holds it");
+        // The same probes against the bounds alone, which is what this replaces. A column of
+        // scattered numbers has a range per stripe that covers nearly the whole type.
+        let tests = [probe(0)];
+        assert!(
+            reader.table().stripes().iter().all(|stripe| !stripe.zone.skips(&tests)),
+            "the bounds rule out no stripe at all"
+        );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A damaged sieve page is a part that gets read, not a query that fails.
+    ///
+    /// A sieve is an index over rows that are still there and still correct, so losing one costs
+    /// time and costs no answers. That is the opposite of the membership index beside it, which is
+    /// the only thing standing between a string page and a wrong answer.
+    #[test]
+    fn a_damaged_sieve_page_is_read_through_rather_than_refused() {
+        let path = path("sieve-damaged");
+        let mut writer =
+            Writer::create(&path, "hits", vec![Field::required("id", LogicalType::BigInt)])
+                .expect("new file");
+        let held: Vec<Value> = (0..8).map(|row| Value::BigInt(scattered(row))).collect();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &held).expect("numbers")])
+                .expect("one column");
+        writer.append(&chunk).expect("one part");
+        writer.finish().expect("commit");
+
+        let page =
+            Reader::open(&path).expect("reopen").table.stripes[0].sieves[0].expect("a sieve page");
+        let mut file = OpenOptions::new().write(true).open(&path).expect("open the sieve page");
+        file.seek(SeekFrom::Start(page.offset + u64::from(page.length) - 1)).expect("seek");
+        file.write_all(&[0xff]).expect("damage one byte");
+        drop(file);
+
+        let reader = Reader::open(&path).expect("reopen the damaged file");
+        let absent =
+            [Probe { column: 0, op: Op::Equal, value: Bound::Int(i128::from(scattered(99))) }];
+        assert!(!reader.skips(0, &absent), "a sieve that cannot be read skips nothing");
+        assert_eq!(reader.read(0, &[0]).expect("the rows are untouched").len(), 8);
         fs::remove_file(path).expect("remove scratch file");
     }
 
