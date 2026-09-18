@@ -5290,9 +5290,11 @@ mod tests {
                 state
             })
             .collect();
-        assert_eq!(encoded_codes(&spread).expect("no failure"), None);
+        assert_eq!(encoded_codes(&spread, &mut Shape::default()).expect("no failure"), None);
         let near: Vec<u32> = (0..1024).collect();
-        let coded = encoded_codes(&near).expect("no failure").expect("counting up is packable");
+        let coded = encoded_codes(&near, &mut Shape::default())
+            .expect("no failure")
+            .expect("counting up is packable");
         assert!(coded.len() < near.len() * 4, "{} bytes for a run of 1,024", coded.len());
     }
 
