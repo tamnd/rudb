@@ -31,7 +31,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -3058,7 +3058,7 @@ fn cascaded(
     let plain = values.len().saturating_mul(width);
     let best = match packed {
         // The tag, the base, the word count and the words, which is what the codec 2 branch writes.
-        Some(packed) => plain.min(21 + std::mem::size_of_val(packed.words())),
+        Some(packed) => plain.min(21 + size_of_val(packed.words())),
         None => plain,
     };
     let out = integer::encode_with(&values, &Fixed)?;
