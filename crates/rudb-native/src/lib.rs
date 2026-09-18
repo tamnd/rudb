@@ -786,9 +786,8 @@ impl Writer {
             // know that. The necessary half needs two numbers that are both in hand here.
             let sieve = match dictionary {
                 Some(_) => None,
-                None => {
-                    Sieve::of(column, &range, SIEVE_BUDGET).filter(|sieve| sieve.len() < bytes.len())
-                }
+                None => Sieve::of(column, &range, SIEVE_BUDGET)
+                    .filter(|sieve| sieve.len() < bytes.len()),
             };
             stripe.pages.push(bytes);
             stripe.codes.push(unique);
@@ -4881,7 +4880,10 @@ mod tests {
         let spread = &layout.columns[0];
         let repeated = &layout.columns[1];
         assert!(spread.sieves > 0, "a column whose parts are worth a filter keeps one");
-        assert_eq!(repeated.sieves, 0, "a column whose filter costs more than its parts keeps none");
+        assert_eq!(
+            repeated.sieves, 0,
+            "a column whose filter costs more than its parts keeps none"
+        );
         // Per part this is the rule itself, so it holds over the column as well: a part without a
         // sieve adds to one side of this and to nothing on the other.
         for column in &layout.columns {
