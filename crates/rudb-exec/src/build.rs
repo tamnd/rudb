@@ -682,10 +682,12 @@ fn known_rows(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Option<u6
         return Ok(filter.rows());
     }
     let Some((table, _, column)) = grouped_column(plan, catalog, node)? else { return Ok(None) };
-    // A grouping puts every null in a group of its own and a distinct count does not count it, so
-    // the two would differ on a column with a null in it. They cannot differ here, because a file
-    // only answers this for a column it knows has none.
-    table.rows().distinct_values(column)
+    let Some(distinct) = table.rows().distinct_values(column)? else { return Ok(None) };
+    // A grouping puts every null in a group of its own and a distinct count does not count it, so a
+    // column with a null in it has one group more than it has distinct values. Both numbers are
+    // exact, so adding them is exact too, and a file that answers the second answers the first.
+    let Some(nulls) = table.rows().null_count(column)? else { return Ok(None) };
+    Ok(Some(distinct.saturating_add(u64::from(nulls > 0))))
 }
 
 /// Every aggregate of a whole table aggregation, answered from the directory of a native file.
