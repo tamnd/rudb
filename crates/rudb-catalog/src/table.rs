@@ -52,6 +52,35 @@ impl Rows {
         }
     }
 
+    /// How many distinct non-null values one column holds, when the rows are stored somewhere that
+    /// already knows.
+    ///
+    /// A table still being built in memory answers `None`, which means whoever asked has to count
+    /// the rows the ordinary way.
+    pub fn distinct_values(&self, column: usize) -> Result<Option<u64>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Native(reader) => reader.distinct_values(column),
+        }
+    }
+
+    /// How many rows of one column are null, when the rows are stored somewhere that already knows.
+    pub fn null_count(&self, column: usize) -> Result<Option<u64>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Native(reader) => reader.null_count(column).map(Some),
+        }
+    }
+
+    /// The smallest and the largest value of one string column, when the rows are stored somewhere
+    /// that already knows.
+    pub fn text_extremes(&self, column: usize) -> Result<Option<(Value, Value)>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Native(reader) => reader.text_extremes(column),
+        }
+    }
+
     /// Sparse numeric frequency candidate rows from a committed native snapshot.
     pub fn frequency_occurrences(&self, column: usize) -> Result<Option<FrequencyOccurrences>> {
         match self {
