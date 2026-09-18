@@ -159,8 +159,8 @@ pub fn encode_with_kind(values: &[i64], chooser: &dyn Chooser) -> Result<(Vec<u8
 /// looking again.
 ///
 /// The saving over [`encode_with`] is not only the candidates that are not encoded. It is also
-/// [`candidates`], which sorts a copy of the chunk to find out how many distinct values are in it,
-/// and which this never calls.
+/// the filter that decides which candidates apply at all, which sorts a copy of the chunk to find
+/// out how many distinct values are in it, and which this never calls.
 ///
 /// # Errors
 ///
