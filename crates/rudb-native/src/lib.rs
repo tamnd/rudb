@@ -4891,6 +4891,17 @@ mod tests {
     }
 
     #[test]
+    fn a_cascade_value_too_wide_for_its_column_is_refused_rather_than_cut() {
+        // What a damaged page looks like from here: the cascade decoded, so the bytes are not
+        // truncated, but the values do not belong to the column the directory says they do.
+        let over = vec![i64::from(i32::MAX) + 1];
+        let error = narrowed(&LogicalType::Integer, over).expect_err("a page that disagrees");
+        assert!(format!("{error}").contains("not of its type"), "{error}");
+        assert!(narrowed(&LogicalType::BigInt, vec![i64::MIN]).is_ok(), "bigint holds all of i64");
+        assert!(narrowed(&LogicalType::Varchar, vec![0]).is_err(), "strings are not integers");
+    }
+
+    #[test]
     fn a_code_stream_the_cascade_cannot_shrink_is_left_alone() {
         // A shift register rather than a run, because an arithmetic run is the one wide shape the
         // cascade does shrink. This is what a column with tens of millions of distinct values hands
