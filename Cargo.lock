@@ -443,6 +443,7 @@ name = "rudb-native"
 version = "0.3.36"
 dependencies = [
  "rudb-common",
+ "rudb-encoding",
  "rudb-storage",
  "rudb-vector",
 ]
