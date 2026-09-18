@@ -953,6 +953,27 @@ impl Stored {
     }
 }
 
+/// How many inputs the hashes being taken have to agree across.
+///
+/// A stable dictionary promises one code space, so two rows of it hold the same value exactly when
+/// they hold the same code, and hashing the code instead of the value it points at is a pass over a
+/// run of `u32` instead of a pass over the strings. The promise covers one column of one table and
+/// nothing wider. A group by reads one input, so it can take that.
+///
+/// A join reads two. The same string arrives on the build side under one dictionary and on the
+/// probe side under another, with a different code in each, and hashing the codes puts the two
+/// halves of a pair in different buckets. The comparison would still say they are equal, because
+/// [`Column::holds`] compares the bytes when the dictionaries are not the same one, but a probe
+/// that never reaches the right bucket never asks it. The join would simply produce nothing, which
+/// is the worst shape a bug like this comes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Across {
+    /// One input, so a stable dictionary's codes stand in for the values they point at.
+    OneInput,
+    /// Two inputs, so every column is hashed by the value itself.
+    TwoInputs,
+}
+
 /// Hashes a chunk of key columns into one word per row.
 ///
 /// This is the column at a time half of #237. The type of a column is matched on once per column
@@ -960,11 +981,12 @@ impl Stored {
 /// a run of `i32` with a multiply and a rotate in it.
 ///
 /// `hashes` is the caller's buffer, kept between chunks so that this does not go to the allocator
-/// once per chunk either.
-pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>) {
+/// once per chunk either. `across` is how many inputs these hashes have to agree with, which is the
+/// one thing the caller knows and this cannot work out for itself.
+pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>, across: Across) {
     hashes.clear();
     hashes.resize(rows, 0);
-    if let [column] = keys {
+    if let ([column], Across::OneInput) = (keys, across) {
         if let Some((codes, _)) = column.stable_dictionary_parts() {
             let validity = column.validity();
             for (row, state) in hashes.iter_mut().enumerate() {
@@ -975,7 +997,7 @@ pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>) {
         }
     }
     for column in keys {
-        fold(column, rows, hashes);
+        fold(column, rows, hashes, across);
     }
     for state in hashes.iter_mut() {
         *state = spread(*state);
@@ -990,14 +1012,16 @@ pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>) {
 /// types, are missing on purpose: they fall through to the general path in every form, so there is
 /// nothing for them to disagree with. An interval is hashed as the one length its three counts add
 /// up to, which is what makes a day and twenty four hours one group.
-fn fold(column: &Vector, rows: usize, hashes: &mut [u64]) {
+fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
     let validity = column.validity();
-    if let Some((codes, _)) = column.stable_dictionary_parts() {
-        for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-            let one = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
-            *state = mix(*state, one);
+    if across == Across::OneInput {
+        if let Some((codes, _)) = column.stable_dictionary_parts() {
+            for (row, state) in hashes.iter_mut().enumerate().take(rows) {
+                let one = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
+                *state = mix(*state, one);
+            }
+            return;
         }
-        return;
     }
     if let Some(packed) = column.packed_parts() {
         for (row, state) in hashes.iter_mut().enumerate().take(rows) {
@@ -1153,7 +1177,7 @@ mod tests {
     /// The hash of one column of values, in whatever form the vector is in.
     fn hashed(column: &Vector) -> Vec<u64> {
         let mut hashes = Vec::new();
-        hash(std::slice::from_ref(column), column.len(), &mut hashes);
+        hash(std::slice::from_ref(column), column.len(), &mut hashes, Across::OneInput);
         hashes
     }
 
@@ -1208,7 +1232,7 @@ mod tests {
     fn one_at_a_time(keys: &[Vector], rows: usize, types: &[LogicalType]) -> (Table, Vec<usize>) {
         let mut table = Table::new(types);
         let mut hashes = Vec::new();
-        hash(keys, rows, &mut hashes);
+        hash(keys, rows, &mut hashes, Across::OneInput);
         let mut slots = Vec::new();
         for (row, &hash) in hashes.iter().enumerate() {
             slots.push(match table.probe(hash, keys, row) {
@@ -1230,7 +1254,7 @@ mod tests {
     ) -> (Table, Vec<usize>) {
         let mut table = Table::new(types);
         let mut hashes = Vec::new();
-        hash(keys, rows, &mut hashes);
+        hash(keys, rows, &mut hashes, Across::OneInput);
         let mut slots = vec![usize::MAX; rows];
         let mut walk = Walk::default();
         let mut from = 0;
@@ -1362,8 +1386,8 @@ mod tests {
         let twos = flat(LogicalType::Integer, &[Value::Integer(2)]);
         let mut forwards = Vec::new();
         let mut backwards = Vec::new();
-        hash(&[ones.clone(), twos.clone()], 1, &mut forwards);
-        hash(&[twos, ones], 1, &mut backwards);
+        hash(&[ones.clone(), twos.clone()], 1, &mut forwards, Across::OneInput);
+        hash(&[twos, ones], 1, &mut backwards, Across::OneInput);
         assert_ne!(forwards, backwards);
     }
 
@@ -1379,7 +1403,7 @@ mod tests {
             flat(LogicalType::Integer, &[Value::Integer(1), Value::Integer(1), Value::Integer(1)]);
         let keys = [names, numbers];
         let mut hashes = Vec::new();
-        hash(&keys, 3, &mut hashes);
+        hash(&keys, 3, &mut hashes, Across::OneInput);
 
         let mut table = Table::new(&[LogicalType::Varchar, LogicalType::Integer]);
         let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
@@ -1427,7 +1451,7 @@ mod tests {
             let names = Vector::constant(LogicalType::Varchar, Value::Varchar(text.into()), 2);
             let keys = [names];
             let mut hashes = Vec::new();
-            hash(&keys, 2, &mut hashes);
+            hash(&keys, 2, &mut hashes, Across::OneInput);
 
             let mut table = Table::new(&[LogicalType::Varchar]);
             let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
@@ -1450,8 +1474,8 @@ mod tests {
         let grace = Vector::constant(LogicalType::Varchar, Value::Varchar("grace".into()), 1);
         let mut first = Vec::new();
         let mut second = Vec::new();
-        hash(std::slice::from_ref(&ada), 1, &mut first);
-        hash(std::slice::from_ref(&grace), 1, &mut second);
+        hash(std::slice::from_ref(&ada), 1, &mut first, Across::OneInput);
+        hash(std::slice::from_ref(&grace), 1, &mut second, Across::OneInput);
 
         let mut table = Table::new(&[LogicalType::Varchar]);
         let keys = [ada];
@@ -1498,7 +1522,7 @@ mod tests {
         let column = flat(LogicalType::BigInt, &values);
         let keys = [column];
         let mut hashes = Vec::new();
-        hash(&keys, values.len(), &mut hashes);
+        hash(&keys, values.len(), &mut hashes, Across::OneInput);
 
         let mut table = Table::new(&[LogicalType::BigInt]);
         for (row, &one) in hashes.iter().enumerate() {
@@ -1577,7 +1601,7 @@ mod tests {
         let values: Vec<Value> = (0..1000).map(Value::BigInt).collect();
         let keys = [flat(LogicalType::BigInt, &values)];
         let mut hashes = Vec::new();
-        hash(&keys, values.len(), &mut hashes);
+        hash(&keys, values.len(), &mut hashes, Across::OneInput);
         let mut table = Table::new(&[LogicalType::BigInt]);
         for (row, &hash) in hashes.iter().enumerate() {
             let Probe::Vacant(bucket) = table.probe(hash, &keys, row) else {
@@ -1600,7 +1624,7 @@ mod tests {
         let column = flat(LogicalType::Varchar, &[Value::Varchar(long.clone())]);
         let keys = [column];
         let mut hashes = Vec::new();
-        hash(&keys, 1, &mut hashes);
+        hash(&keys, 1, &mut hashes, Across::OneInput);
         let mut table = Table::new(&[LogicalType::Varchar]);
         assert_eq!(table.owned(), 0);
         let Probe::Vacant(bucket) = table.probe(hashes[0], &keys, 0) else {
