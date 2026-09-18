@@ -45,7 +45,7 @@ use rudb_vector::{Buffer, Chunk, Data, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 10;
+const FORMAT: u32 = 11;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -1524,6 +1524,89 @@ impl Reader {
         Ok(Some((low, high)))
     }
 
+    /// The smallest and the largest value of one column, when every stripe wrote exact ends.
+    ///
+    /// A stripe's ends are allowed to be wider than the truth, because a bound that rules out a
+    /// chunk that could not match is still correct when it rules out nothing. That is what makes
+    /// them cheap to write for a bit packed or a dictionary column, and it is also what stops them
+    /// answering a `MIN`. So each stripe says which of the two it wrote, and this answers only when
+    /// all of them walked their rows.
+    ///
+    /// `None` for a column with no ends, for an empty table, and for a column any stripe of which
+    /// guessed. Nulls need no special case, because the ends skip them the same way `MIN` does.
+    ///
+    /// One case is given up on that did not have to be. A stripe merges the ends of its sixty four
+    /// parts, and a part with no ends at all erases the merged ones, because a part whose rows are
+    /// not covered by the stripe's ends is a stripe that would skip rows it should keep. A part of
+    /// nothing but nulls has no rows to cover and so did not need to erase anything, but the merge
+    /// cannot tell that part from a part whose layout it could not read. So a column with a chunk
+    /// of nothing but nulls in the middle of it goes and reads the rows. That is slow and right,
+    /// and the fix is a row count per part rather than anything here.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema.
+    pub fn exact_extremes(&self, column: usize) -> Result<Option<(Bound, Bound)>> {
+        if column >= self.table.fields.len() {
+            return Err(invalid("extremes column index out of range"));
+        }
+        let mut low: Option<Bound> = None;
+        let mut high: Option<Bound> = None;
+        for stripe in &self.table.stripes {
+            let range = stripe
+                .zone
+                .column(column)
+                .ok_or_else(|| invalid("stripe zone is narrower than the schema"))?;
+            if !range.exact {
+                return Ok(None);
+            }
+            // A stripe of nothing but nulls has no ends and says nothing about the column's, which
+            // is why this skips it rather than giving up on the whole column. A stripe that has
+            // rows and still has no end is a layout whose values this cannot see, and skipping that
+            // one would answer with an end taken from the other stripes, so it gives up instead.
+            let (Some(small), Some(large)) = (range.low.as_ref(), range.high.as_ref()) else {
+                if stripe.rows > range.nulls {
+                    return Ok(None);
+                }
+                continue;
+            };
+            low = Some(low.map_or_else(|| small.clone(), |held| held.smaller(small.clone())));
+            high = Some(high.map_or_else(|| large.clone(), |held| held.larger(large.clone())));
+        }
+        Ok(low.zip(high))
+    }
+
+    /// The sum of one integer column and how many rows went into it, when every stripe wrote one.
+    ///
+    /// The count beside the sum is the non-null rows, because that is what a `SUM` adds up and what
+    /// an `AVG` divides by, and a caller that had to work it out from the row count and the null
+    /// count would be doing the same walk twice.
+    ///
+    /// `None` for anything that is not an integer column, for a file written by something that did
+    /// not record it, and when adding the stripes together would overflow.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema.
+    pub fn exact_sum(&self, column: usize) -> Result<Option<(i128, u64)>> {
+        if column >= self.table.fields.len() {
+            return Err(invalid("sum column index out of range"));
+        }
+        let mut total = 0_i128;
+        let mut rows = 0_u64;
+        for stripe in &self.table.stripes {
+            let range = stripe
+                .zone
+                .column(column)
+                .ok_or_else(|| invalid("stripe zone is narrower than the schema"))?;
+            let Some(part) = range.sum else { return Ok(None) };
+            let Some(sum) = total.checked_add(part) else { return Ok(None) };
+            total = sum;
+            rows = rows.saturating_add(stripe.rows as u64 - range.nulls as u64);
+        }
+        Ok(Some((total, rows)))
+    }
+
     fn dictionary(&self, column: usize) -> Result<Option<Arc<Vector>>> {
         let Some(page) = self.table.dictionaries[column] else { return Ok(None) };
         if let Some(dictionary) = self.dictionaries[column].get() {
@@ -1902,6 +1985,14 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
                 &mut out,
                 u32::try_from(range.nulls).map_err(|_| invalid("null count overflow"))?,
             );
+            out.push(u8::from(range.exact));
+            match range.sum {
+                None => out.push(0),
+                Some(total) => {
+                    out.push(1);
+                    out.extend_from_slice(&total.to_le_bytes());
+                }
+            }
         }
     }
     out.extend_from_slice(FREQUENCIES);
@@ -2132,7 +2223,15 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             if nulls > stripe_rows {
                 return Err(invalid("null count exceeds stripe rows"));
             }
-            ranges.push(Range { low, high, nulls });
+            let exact = cur.u8()? != 0;
+            let sum = match cur.u8()? {
+                0 => None,
+                1 => Some(i128::from_le_bytes(
+                    cur.take(16)?.try_into().map_err(|_| invalid("a stripe sum is truncated"))?,
+                )),
+                _ => return Err(invalid("a stripe sum has an unknown tag")),
+            };
+            ranges.push(Range { low, high, nulls, exact, sum });
         }
         stripes.push(Stripe {
             rows: stripe_rows,
@@ -2488,6 +2587,15 @@ fn merged_range(ranges: impl Iterator<Item = Range>) -> Range {
     let mut first = true;
     for range in ranges {
         merged.nulls = merged.nulls.saturating_add(range.nulls);
+        // Both of these have to survive every part, so one part that could not say anything makes
+        // the stripe unable to say it either. A sum is dropped on overflow rather than wrapped,
+        // which leaves the stripe with exact ends and no total, which is a true thing to say.
+        merged.sum = match (merged.sum.take(), range.sum) {
+            (Some(held), Some(next)) if !first => held.checked_add(next),
+            (_, next) if first => next,
+            _ => None,
+        };
+        merged.exact = if first { range.exact } else { merged.exact && range.exact };
         if first {
             merged.low = range.low;
             merged.high = range.high;
