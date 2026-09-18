@@ -107,11 +107,16 @@ impl<'a> Pipeline<'a> {
     /// That last bound is the floor F4 asks for, arrived at by counting rather than by estimating.
     /// A scan of one stored chunk is one morsel and stays on one thread whatever the machine has,
     /// and a Parquet file of nine row groups uses nine threads and not the sixteen it was offered.
+    /// The source is asked however few workers are coming for it, including when that is one. What
+    /// it answers is a count, but asking is also how it is told what is about to happen, and a
+    /// source that cuts its work differently for one worker than for eight cannot do that if the
+    /// one worker case never reaches it. A scan of a stored table cuts a morsel per stripe rather
+    /// than a morsel per part, and a morsel per part is one a scan cannot walk ruled out parts
+    /// inside of, so a single threaded selective query used to pay for every part it had already
+    /// proved held nothing.
     #[must_use]
     pub fn degree(&self, ceiling: usize) -> usize {
-        if ceiling <= 1 || !self.parallel() {
-            return 1;
-        }
+        let ceiling = if self.parallel() { ceiling.max(1) } else { 1 };
         match self.source.morsels(ceiling) {
             Some(work) => work.clamp(1, ceiling),
             None => ceiling,
