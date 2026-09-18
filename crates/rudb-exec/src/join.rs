@@ -95,7 +95,8 @@ use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 use crate::buffer::Buffered;
 use crate::expr::evaluate_all_in_time_zone;
 use crate::gather::{self, Gathering, Rows};
-use crate::key::{Key, RowMap};
+
+use crate::lookup::{Lookup, MISS, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 
@@ -251,7 +252,7 @@ impl<'a> Join<'a> {
             equalities(self.plan, &self.conditions, &self.left_schema, &self.right_schema)
         };
         let index = match &equalities {
-            Some(equalities) => Some(index(
+            Some(equalities) => Some(lookup(
                 equalities.gathered(self.plan, &self.right_schema, self.time_zone),
                 right_rows,
                 &self.cancel,
@@ -259,19 +260,20 @@ impl<'a> Join<'a> {
             )?),
             None => None,
         };
-        // The driving side's keys up front rather than one at a time inside the loop, because the
-        // evaluator works on a chunk and the loop below works on a row. What it costs is one key per
-        // driving row held while the join runs, which is the price of keeping the loop's shape, and
-        // it is charged. The stream next door does not pay it: it has the driving chunk in hand and
-        // reads the keys straight out of the vectors.
-        let left_keys = match &equalities {
-            Some(equalities) => keys(
+        // The driving side looked up up front rather than one row at a time inside the loop,
+        // because the lookup works on a chunk and the loop below works on a row. What it costs is
+        // one `usize` per driving row held while the join runs, which is the price of keeping the
+        // loop's shape, and it is charged. The stream next door does not pay even that: it has the
+        // driving chunk in hand and looks it up as it arrives.
+        let left_slots = match (&equalities, &index) {
+            (Some(equalities), Some(index)) => found(
                 equalities.driving(self.plan, &self.left_schema, self.time_zone),
+                index,
                 left_rows,
                 &self.cancel,
                 &mut scratch,
             )?,
-            None => Vec::new(),
+            _ => Vec::new(),
         };
         let residual = equalities.as_ref().map(|equalities| Residual {
             plan: self.plan,
@@ -294,6 +296,8 @@ impl<'a> Join<'a> {
         // Reused across driving rows, so that a join with a residual allocates once rather than
         // once per row it looks up.
         let mut kept: Vec<usize> = Vec::new();
+        // The same, for the chain the lookup answers a driving row with.
+        let mut chain: Vec<usize> = Vec::new();
         for (position, left_row) in left_rows.iter().enumerate() {
             // Once per left row, in the same place and for the same reason as the reservation at
             // the bottom of the loop. What a query can run past its clock by is one pass over the
@@ -314,8 +318,8 @@ impl<'a> Join<'a> {
             let scanned;
             let hits: &[usize] = match (&index, &residual) {
                 (Some(index), Some(residual)) => {
-                    let found = hits(index, left_keys[position].as_ref());
-                    residual.keep(left_row, right_rows, found, &mut kept)?
+                    index.matches(left_slots[position], &mut chain);
+                    residual.keep(left_row, right_rows, &chain, &mut kept)?
                 }
                 _ => {
                     scanned = self.matching(left_row, &left_types, &right_chunks)?;
@@ -663,7 +667,7 @@ pub(crate) struct Probe<'a> {
 #[derive(Debug)]
 struct Built {
     rows: Vec<Vec<Value>>,
-    index: RowMap<Vec<usize>>,
+    index: Lookup,
 }
 
 /// Where one instance of a probe is in the driving chunk it was given.
@@ -678,6 +682,15 @@ pub(crate) struct Probing {
     /// thrown away, and a key expression that raises on a row nothing could have matched would be
     /// raising where the nested loop this replaces never evaluated anything at all.
     keys: Vec<Vector>,
+    /// That chunk's slot per driving row, looked up once when the chunk arrived.
+    ///
+    /// Once per chunk rather than once per row because the probe is a batch at a time. See
+    /// [`Lookup::slots`], which is the whole argument.
+    slots: Vec<usize>,
+    /// The buffers that lookup walks the chunk with, held here so that a chunk costs no allocation.
+    scratch: Scratch,
+    /// The gathered rows the current driving row matches, refilled per row from its chain.
+    chain: Vec<usize>,
     row: usize,
     /// How many of the current row's matches have already come out.
     ///
@@ -782,7 +795,7 @@ impl<'a> Probe<'a> {
             .get_or_init(|| {
                 let rows = self.gathered.take()?;
                 let mut held = self.held.lock().map_err(poisoned)?;
-                let index = index(
+                let index = lookup(
                     self.equalities.gathered(self.plan, &self.right_schema, self.time_zone),
                     &rows,
                     &self.cancel,
@@ -798,7 +811,15 @@ impl Stream for Probe<'_> {
     type Local = Probing;
 
     fn local(&self) -> Probing {
-        Probing { left: None, keys: Vec::new(), row: 0, hit: 0 }
+        Probing {
+            left: None,
+            keys: Vec::new(),
+            slots: Vec::new(),
+            scratch: Scratch::default(),
+            chain: Vec::new(),
+            row: 0,
+            hit: 0,
+        }
     }
 
     fn push(&self, chunk: &mut Chunk, local: &mut Probing) -> Result<Progress> {
@@ -826,6 +847,19 @@ impl Stream for Probe<'_> {
                         self.time_zone,
                     )?
                 };
+                // The lookup for the whole chunk at once, which is the hash in one pass per key
+                // column and the probe a batch of rows at a time. Doing it here rather than in the
+                // row loop below is what keeps the driving side on its batch interface.
+                local.slots.clear();
+                if !local.keys.is_empty() {
+                    built.index.slots(
+                        &local.keys,
+                        left.len(),
+                        &self.equalities.null_is_a_value,
+                        &mut local.scratch,
+                        &mut local.slots,
+                    );
+                }
                 left
             }
         };
@@ -839,13 +873,12 @@ impl Stream for Probe<'_> {
             // place in this operator that runs long once the table is built.
             self.cancel.check()?;
             let row: Vec<Value> = left.row(local.row).collect();
-            let key = if local.keys.is_empty() {
-                None
-            } else {
-                key_at(&local.keys, local.row, &self.equalities.null_is_a_value)
-            };
-            let found = hits(&built.index, key.as_ref());
-            let found = self.residual().keep(&row, &built.rows, found, &mut kept)?;
+            // The chain the lookup above left for this row, which is one walk of a run of `u32`
+            // rather than a hash and a map lookup.
+            built
+                .index
+                .matches(local.slots.get(local.row).copied().unwrap_or(MISS), &mut local.chain);
+            let found = self.residual().keep(&row, &built.rows, &local.chain, &mut kept)?;
             match self.kind {
                 JoinKind::Semi => {
                     if !found.is_empty() {
@@ -1205,26 +1238,32 @@ fn equalities(
     (!found.left.is_empty()).then_some(found)
 }
 
-/// Evaluates key expressions over rows, a chunk at a time, calling `each` once per row.
+/// The gathered side's rows, in a table that finds them by the values the key expressions produce.
 ///
-/// Rows go back into chunks so that the key columns are produced by the same vectorized evaluator
-/// the nested loop's conditions go through. The alternative is an interpreter that walks one
-/// expression over one row, which is a second evaluator that has to agree with the first about
-/// every cast and every overflow, and two evaluators that are meant to agree is the kind of pair
-/// that eventually does not.
+/// A batch at a time, and every part of what a batch costs is a pass over a column rather than a
+/// walk over a row: the key expressions are evaluated through the vectorized evaluator the rest of
+/// this file uses, the hash is one pass per key column with the column's type matched on once, and
+/// the probe walks the rows of a batch together so the cache misses on a table larger than the
+/// cache are outstanding at the same time. What this replaced built a `Vec<Value>` per gathered row
+/// and hashed it a tagged value at a time. See [`Lookup`] for the rest of the argument.
 ///
-/// The chunk built here is a copy of one [`VECTOR_SIZE`] batch of a side and is dropped before the
-/// next one is built, so what it costs at any moment is bounded by the vector size rather than by
-/// the side. That is why it is not charged: the budget is about what an operator holds, and this
-/// holds two thousand rows for as long as it takes to read a key out of them.
-fn each_key(
+/// The chunk built per batch is a copy of one [`VECTOR_SIZE`] batch of a side and is dropped before
+/// the next one, so what it costs at any moment is bounded by the vector size rather than by the
+/// side. That is why it is not charged: the budget is about what an operator holds, and this holds
+/// two thousand rows for as long as it takes to read a key out of them. What is charged is the
+/// table, after each batch and by the difference, so a build that is going to be too large says so
+/// while it is building rather than at the last row.
+fn lookup(
     keying: Keying<'_>,
     rows: &[Vec<Value>],
     cancel: &Cancel,
-    mut each: impl FnMut(usize, Option<Key>) -> Result<()>,
-) -> Result<()> {
+    scratch: &mut Reservation,
+) -> Result<Lookup> {
     let Keying { plan, exprs, schema, nulls, time_zone } = keying;
     let types = schema.types();
+    let mut lookup = Lookup::new(rows.len())?;
+    let mut charged = lookup.footprint();
+    scratch.grow(charged)?;
     let mut base = 0;
     for batch in rows.chunks(VECTOR_SIZE) {
         // Once per batch rather than once per row. A build over a side nobody bounded is the one
@@ -1233,96 +1272,58 @@ fn each_key(
         cancel.check()?;
         let chunk = rows::pack(&types, batch)?;
         let columns = evaluate_all_in_time_zone(plan, exprs, schema, &chunk, time_zone)?;
-        for row in 0..batch.len() {
-            each(base + row, key_at(&columns, row, nulls))?;
-        }
+        lookup.add(&columns, batch.len(), base, nulls)?;
+        let want = lookup.footprint();
+        scratch.grow(want.saturating_sub(charged))?;
+        charged = want;
         base += batch.len();
     }
-    Ok(())
+    lookup.seal();
+    scratch.shrink(charged.saturating_sub(lookup.footprint()));
+    Ok(lookup)
 }
 
-/// The gathered side's rows, by the values the key expressions produce from them.
+/// Every driving row's slot in the table, in the order the rows are in, [`MISS`] where it has none.
 ///
-/// A row whose key holds a null in a column the join compares with `=` is left out rather than
-/// stored under a null key. `NULL = NULL` is null and not true, so such a row matches nothing, and
-/// leaving it out is what says so. A column the join compares with `IS NOT DISTINCT FROM` is the
-/// other rule and the null is stored, which the key encoding has always been able to hold, since it
-/// is the encoding grouping uses and grouping puts every null in the same group.
+/// What the sink needs and the stream does not. [`Probe`] has a driving chunk in hand and looks it
+/// up as it arrives, while [`Join`] walks driving rows it gathered earlier and has no chunk to read
+/// them out of, so it does the lookup for the whole side first and keeps the answer.
 ///
-/// The positions come out of one pass in order, so each entry's list is ascending and the rows a
-/// probe finds arrive in the order the gathered side holds them. The nested loop produced them in
-/// that order too, which is why this is a faster way to the same answer rather than the same answer
-/// in a different order.
-fn index(
+/// One `usize` per driving row rather than the row's key, which is what this used to keep. A key was
+/// a `Vec<Value>` per row, so a nested loop join over a million driving rows on a two column key
+/// held two million tagged values and asked the allocator for a million vectors to put them in, all
+/// of it to be thrown away at the end. The slot is what the loop actually reads.
+///
+/// Rows go back into chunks so that the key columns are produced by the same vectorized evaluator
+/// the nested loop's conditions go through. The alternative is an interpreter that walks one
+/// expression over one row, which is a second evaluator that has to agree with the first about
+/// every cast and every overflow, and two evaluators that are meant to agree is the kind of pair
+/// that eventually does not.
+fn found(
     keying: Keying<'_>,
+    index: &Lookup,
     rows: &[Vec<Value>],
     cancel: &Cancel,
     scratch: &mut Reservation,
-) -> Result<RowMap<Vec<usize>>> {
-    let mut index: RowMap<Vec<usize>> = RowMap::default();
-    scratch.grow(rows::buckets(rows.len()))?;
-    each_key(keying, rows, cancel, |position, key| {
-        let Some(key) = key else { return Ok(()) };
-        // The key's own values and the position stored beside it. The list an entry holds grows by
-        // one `usize` per row and the vector behind it doubles, so this charges the row it is about
-        // rather than trying to say when a doubling happened.
-        scratch.grow(rows::footprint(&key.0) + 8)?;
-        index.entry(key).or_default().push(position);
-        Ok(())
-    })?;
-    Ok(index)
-}
-
-/// Every row's key, in the order the rows are in, with nothing where the key holds a rejected null.
-///
-/// What the sink needs and the stream does not. [`Probe`] reads a driving chunk's keys out of the
-/// vectors they were evaluated into and throws them away with the chunk, while [`Join`] walks
-/// driving rows it gathered earlier and has no chunk to read them out of, so it keeps them.
-fn keys(
-    keying: Keying<'_>,
-    rows: &[Vec<Value>],
-    cancel: &Cancel,
-    scratch: &mut Reservation,
-) -> Result<Vec<Option<Key>>> {
+) -> Result<Vec<usize>> {
+    let Keying { plan, exprs, schema, nulls, time_zone } = keying;
+    let types = schema.types();
     let mut built = Vec::with_capacity(rows.len());
-    scratch.grow(
-        u64::try_from(rows.len().saturating_mul(size_of::<Option<Key>>())).unwrap_or(u64::MAX),
-    )?;
-    each_key(keying, rows, cancel, |_, key| {
-        if let Some(key) = &key {
-            scratch.grow(rows::footprint(&key.0))?;
-        }
-        built.push(key);
-        Ok(())
-    })?;
-    Ok(built)
-}
-
-/// The gathered rows one driving row matches, by position in the gathered side.
-///
-/// Nothing for a driving row whose key holds a null in a column compared with `=`, which matches
-/// nothing for the same reason a null on the other side was never stored. A row with no match is a
-/// row the join kind decides about rather than one that is dropped here.
-fn hits<'i>(index: &'i RowMap<Vec<usize>>, key: Option<&Key>) -> &'i [usize] {
-    key.and_then(|key| index.get(key)).map_or(&[], Vec::as_slice)
-}
-
-/// One row's key, read out of the evaluated key columns, or nothing when a null is rejected there.
-///
-/// Nothing rather than a key holding a null, because the caller's two uses of that answer are the
-/// same one: a null on either side of `=` makes the comparison null, so the row takes part in no
-/// pair and there is nothing to look up or to store. `IS NOT DISTINCT FROM` says the opposite about
-/// the same value, and `nulls` is which of the two each column was written with.
-fn key_at(columns: &[Vector], row: usize, nulls: &[bool]) -> Option<Key> {
-    let mut key = Vec::with_capacity(columns.len());
-    for (column, &kept) in columns.iter().zip(nulls) {
-        let value = column.value_at(row);
-        if !kept && matches!(value, Value::Null) {
-            return None;
-        }
-        key.push(value);
+    scratch
+        .grow(u64::try_from(rows.len().saturating_mul(size_of::<usize>())).unwrap_or(u64::MAX))?;
+    let mut probing = Scratch::default();
+    let mut slots = Vec::new();
+    for batch in rows.chunks(VECTOR_SIZE) {
+        // Once per batch rather than once per row. A lookup over a side nobody bounded is one of the
+        // two parts of this operator that can run long without producing anything, and a check every
+        // two thousand rows is the same granularity the rest of the operator uses.
+        cancel.check()?;
+        let chunk = rows::pack(&types, batch)?;
+        let columns = evaluate_all_in_time_zone(plan, exprs, schema, &chunk, time_zone)?;
+        index.slots(&columns, batch.len(), nulls, &mut probing, &mut slots);
+        built.extend_from_slice(&slots);
     }
-    Some(Key(key))
+    Ok(built)
 }
 
 /// Both rows, left then right.

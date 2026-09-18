@@ -93,6 +93,7 @@ mod join;
 mod key;
 mod keywords;
 mod lateral;
+mod lookup;
 mod metadata;
 mod ordering;
 mod pairs;
