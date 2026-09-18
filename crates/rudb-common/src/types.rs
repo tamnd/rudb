@@ -395,6 +395,24 @@ impl LogicalType {
         )
     }
 
+    /// Whether two values of this type are equal exactly when they are the same key.
+    ///
+    /// The question a hash table asks before it is used to answer an equality. A hash table has one
+    /// bucket per value, so it can only answer `=` for a type where being the same bytes and being
+    /// equal are the same thing. The scalar types are like that. A list containing a null is not: it
+    /// compares to another list by SQL's rules rather than by its bytes, so a table that treated two
+    /// such lists as one key would answer a join with rows `=` says nothing about. `NULL` is not
+    /// either, for the same reason one step further along.
+    ///
+    /// Asked in two places, which is why it lives here rather than in one of them. The join operator
+    /// asks it to decide whether to build a table or to compare every pair, and the optimizer asks it
+    /// before it moves a predicate onto a join, because a predicate that costs the join its table
+    /// costs more than it saves.
+    #[must_use]
+    pub fn is_keyed(&self) -> bool {
+        !self.is_nested() && !matches!(self, Self::Null)
+    }
+
     /// The type both of these can be cast to without losing a value, if there is one.
     ///
     /// This is DuckDB's `MaxLogicalType` and it is where the type of `a + b` starts, and it is the

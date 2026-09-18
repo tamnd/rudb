@@ -274,7 +274,8 @@ Filter ((#0.0::INTEGER = #0.1::INTEGER)::BOOLEAN AND (#0.0::INTEGER > 5::INTEGER
     fn an_equality_over_a_cross_product_sends_the_predicate_into_both_sides() {
         // The one that matters. Neither half of this reaches `b` without the other: the equality is
         // over both sides so it cannot move, and the comparison is over `a` so it has nothing to say
-        // about `b` until the equality says it.
+        // about `b` until the equality says it. The equality is then what turns the cross product
+        // into a join, which is `filter`'s rule and happens in the same visit.
         let before = "\
 Filter ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.0::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN
   CrossProduct
@@ -282,12 +283,11 @@ Filter ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.0::INTEGER > 5::INTEGER
     Get memory.main.t AS b #1 [a::INTEGER]
 ";
         let after = "\
-Filter (#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN
-  CrossProduct
-    Filter (#0.0::INTEGER > 5::INTEGER)::BOOLEAN
-      Get memory.main.t AS a #0 [a::INTEGER]
-    Filter (#1.0::INTEGER > 5::INTEGER)::BOOLEAN
-      Get memory.main.t AS b #1 [a::INTEGER]
+Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
+  Filter (#0.0::INTEGER > 5::INTEGER)::BOOLEAN
+    Get memory.main.t AS a #0 [a::INTEGER]
+  Filter (#1.0::INTEGER > 5::INTEGER)::BOOLEAN
+    Get memory.main.t AS b #1 [a::INTEGER]
 ";
         assert_eq!(pushed(before), after);
     }
