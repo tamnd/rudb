@@ -1092,6 +1092,45 @@ mod tests {
         assert_eq!(again, bytes);
     }
 
+    /// A caller naming a kind can name one the search would never have picked, and until there was
+    /// a way to name one no encoder was ever asked to run on input it was not the smallest for. So
+    /// every kind is run over every shape here, including the ones it is plainly wrong for, and the
+    /// only thing asked of it is that what comes back is what went in.
+    #[test]
+    fn every_kind_that_applies_decodes_to_what_it_was_given() {
+        let shapes: Vec<Vec<i64>> = vec![
+            Vec::new(),
+            vec![5; 1024],
+            vec![i64::MIN, i64::MAX, 0, -1],
+            (0..1024).map(|at| at * 7).collect(),
+            (0..1024).map(|at| at % 17).collect(),
+            (0..1024).map(|at| if at % 100 == 0 { at } else { 3 }).collect(),
+            (0..1024).map(|at| -at * 1_000_003).collect(),
+            (0..1024_i64)
+                .map(|at| {
+                    at.wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407)
+                })
+                .collect(),
+        ];
+        let kinds =
+            [Kind::Constant, Kind::Packed, Kind::Delta, Kind::Rle, Kind::Dict, Kind::Sparse];
+        for values in &shapes {
+            for kind in kinds {
+                let Some(bytes) = encode_only_with(kind, values, &EXHAUSTIVE).unwrap() else {
+                    continue;
+                };
+                assert_eq!(
+                    &decode(&bytes).unwrap(),
+                    values,
+                    "{} over {} values",
+                    kind.name(),
+                    values.len()
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_kind_that_does_not_apply_encodes_nothing() {
         // Nothing is constant about this, and the caller that asked is the one holding an answer
