@@ -36,7 +36,7 @@
 
 use std::cmp::Ordering;
 
-use crate::Value;
+use crate::{LogicalType, Value};
 
 /// The comparison a bounds test applies.
 ///
@@ -113,6 +113,43 @@ impl Bound {
             Value::Double(number) => Self::Real(*number),
             Value::Varchar(text) => Self::Bytes(text.as_bytes().to_vec()),
             Value::Blob(bytes) => Self::Bytes(bytes.clone()),
+            _ => return None,
+        })
+    }
+
+    /// The value this bound stands for in a column of type `ty`, and `None` when it cannot be one.
+    ///
+    /// The inverse of [`Bound::of_value`], and it needs the type because the bound does not carry
+    /// one: every integer width widens into `Int`, so going back is a question about the column
+    /// rather than about the number. A number that does not fit the type answers `None`, which is
+    /// what a caller that got a bound from somewhere other than this column should get.
+    #[must_use]
+    pub fn into_value(&self, ty: &LogicalType) -> Option<Value> {
+        /// Narrows a widened integer back into the type it came from.
+        macro_rules! fit {
+            ($number:expr, $variant:ident) => {
+                Some(Value::$variant((*$number).try_into().ok()?))
+            };
+        }
+        Some(match (self, ty) {
+            (Self::Int(number), LogicalType::Boolean) => Value::Boolean(*number != 0),
+            (Self::Int(number), LogicalType::TinyInt) => return fit!(number, TinyInt),
+            (Self::Int(number), LogicalType::SmallInt) => return fit!(number, SmallInt),
+            (Self::Int(number), LogicalType::Integer) => return fit!(number, Integer),
+            (Self::Int(number), LogicalType::BigInt) => return fit!(number, BigInt),
+            (Self::Int(number), LogicalType::HugeInt) => Value::HugeInt(*number),
+            (Self::Int(number), LogicalType::UTinyInt) => return fit!(number, UTinyInt),
+            (Self::Int(number), LogicalType::USmallInt) => return fit!(number, USmallInt),
+            (Self::Int(number), LogicalType::UInteger) => return fit!(number, UInteger),
+            (Self::Int(number), LogicalType::UBigInt) => return fit!(number, UBigInt),
+            (Self::Int(number), LogicalType::UHugeInt) => return fit!(number, UHugeInt),
+            (Self::Int(number), LogicalType::Date) => return fit!(number, Date),
+            (Self::Real(number), LogicalType::Float) => Value::Float(*number as f32),
+            (Self::Real(number), LogicalType::Double) => Value::Double(*number),
+            (Self::Bytes(bytes), LogicalType::Varchar) => {
+                Value::Varchar(String::from_utf8(bytes.clone()).ok()?)
+            }
+            (Self::Bytes(bytes), LogicalType::Blob) => Value::Blob(bytes.clone()),
             _ => return None,
         })
     }

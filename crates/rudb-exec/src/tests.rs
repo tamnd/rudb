@@ -972,7 +972,7 @@ fn the_functions_table_declares_a_promoted_argument_with_the_type_variable() {
 }
 
 #[test]
-fn the_settings_table_is_twenty_two_rows_for_twenty_settings_and_has_no_value_without_a_session() {
+fn the_settings_table_is_the_pins_rows_and_has_no_value_without_a_session() {
     // Built through `run`, which goes through `build` and so has no database behind it. There is
     // nothing to read a value out of there, so both value columns come back null, and that is the
     // answer rather than a default: this crate does not know what memory limit the process was
@@ -986,36 +986,20 @@ fn the_settings_table_is_twenty_two_rows_for_twenty_settings_and_has_no_value_wi
             other => panic!("a setting name, not {other:?}"),
         })
         .collect();
-    assert_eq!(
-        names,
-        [
-            "TimeZone",
-            "allow_parser_override_extension",
-            "current_dialect",
-            "default_null_order",
-            "default_order",
-            "dialect_compatibility_mode",
-            "disable_timestamptz_casts",
-            "disabled_optimizers",
-            "errors_as_json",
-            "ieee_floating_point_ops",
-            "integer_division",
-            "max_memory",
-            "memory_limit",
-            "null_on_division_by_zero",
-            "order_by_non_integer_literal",
-            "preserve_identifier_case",
-            "regex_match_operator_semantics",
-            "scalar_subquery_error_on_multiple_rows",
-            "show_behavior",
-            "threads",
-            "warnings_as_errors",
-            "worker_threads"
-        ]
-    );
+    // A hundred and ninety two, which is the pin's count, and in the pin's order.
+    assert_eq!(names.len(), 192);
+    assert_eq!(&names[..3], ["Calendar", "TimeZone", "__delta_only_variant_encoding_enabled"]);
+    assert_eq!(names.last().expect("a last row"), "zstd_min_string_length");
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+    // Fifteen of them are per connection on the pin, and this table reports the scope the pin
+    // reports whether or not two connections here could ever differ.
+    let local = rows.iter().filter(|row| row[2] == text("LOCAL")).count();
+    assert_eq!(local, 15);
     for row in &rows {
         assert_eq!(row[1], Value::Null, "{:?}", row[0]);
-        assert_eq!(row[2], text("GLOBAL"), "{:?}", row[0]);
+        assert!(row[2] == text("GLOBAL") || row[2] == text("LOCAL"), "{:?}", row[0]);
         assert_eq!(row[3], Value::Null, "{:?}", row[0]);
     }
 }

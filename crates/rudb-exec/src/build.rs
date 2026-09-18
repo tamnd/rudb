@@ -47,6 +47,7 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, QualifiedName, Table};
 use rudb_common::{Cancel, Error, Field, Memory, Result, Session, Value};
 use rudb_functions::TableFunction;
+use rudb_kernels::Accumulator;
 use rudb_metrics::{Counters, Driver, Report};
 use rudb_parquet::{Bound, Op};
 use rudb_pipeline::{
@@ -554,9 +555,14 @@ fn known_rows(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Option<u6
 /// `None` the moment one of them cannot be, because a query that reads the rows for one aggregate
 /// may as well read them for all of them. What is answerable here is deliberately small and exact.
 /// A count is a number the file wrote down, a distinct count is the size of a dictionary that holds
-/// every distinct value once, and the extremes of a string column are the two ends of the order
-/// written beside that dictionary. None of these is a sketch and none of them is a bound that is
-/// allowed to be wide, so none of them can be off by one.
+/// every distinct value once, the extremes of a string column are the two ends of the order written
+/// beside that dictionary, and the extremes and the total of an integer column are the stripe
+/// ranges added up. None of these is a sketch and none of them is a bound that is allowed to be
+/// wide, so none of them can be off by one.
+///
+/// The one thing this does not do is decide differently from the operators. A sum and an average
+/// finish through the state a grouped aggregation would have built, so the rounding, the overflow
+/// and the answer for a column with no rows in it are the operator's rather than a second opinion.
 fn native_summary(
     plan: &Plan,
     catalog: &Catalog,
@@ -611,10 +617,26 @@ fn native_summary(
                 values.push(count(table.rows().len() as u64 - nulls)?);
             }
             "min" | "max" => {
-                let Some((low, high)) = table.rows().text_extremes(column)? else {
+                let Some(value) = extreme(table, column, call == "min")? else { return Ok(None) };
+                values.push(value);
+            }
+            // Adding a column up is adding its stripe totals up, and dividing that by the rows that
+            // went into it is the average. Both finish through the same state the operator would
+            // have built, so a file that answers this cannot answer it differently.
+            "sum" | "avg" => {
+                let Some(field) = table.columns().get(column) else { return Ok(None) };
+                if !field.ty.is_integer() {
                     return Ok(None);
+                }
+                let Some((total, rows)) = table.rows().exact_sum(column)? else { return Ok(None) };
+                let returns = plan.expr_type(aggregate);
+                let state = if call == "sum" {
+                    Accumulator::exact_sum(total, rows > 0, returns)
+                } else {
+                    let Ok(seen) = i64::try_from(rows) else { return Ok(None) };
+                    Accumulator::exact_avg(total, seen, returns)
                 };
-                values.push(if call == "min" { low } else { high });
+                values.push(state.finish()?);
             }
             _ => return Ok(None),
         }
@@ -637,6 +659,21 @@ fn summary_schema(plan: &Plan, index: u32, aggregates: Slice) -> Result<Schema> 
         fields.push(Field::new(plan.string(name).to_string(), plan.expr_type(reference).clone()));
     }
     Ok(Schema::numbered(fields, index))
+}
+
+/// One end of a stored column, from the two places a file keeps one.
+///
+/// The dictionary is asked first, because a string column keeps its values in sorted order and the
+/// two ends of that order are the answer with nothing to walk and nothing to convert. Everything
+/// else comes from the stripe ranges, which are only an answer when every stripe wrote ends it had
+/// really looked at rather than ends it was allowed to widen.
+fn extreme(table: &Table, column: usize, smallest: bool) -> Result<Option<Value>> {
+    if let Some((low, high)) = table.rows().text_extremes(column)? {
+        return Ok(Some(if smallest { low } else { high }));
+    }
+    let Some((low, high)) = table.rows().exact_extremes(column)? else { return Ok(None) };
+    let Some(field) = table.columns().get(column) else { return Ok(None) };
+    Ok(if smallest { low } else { high }.into_value(&field.ty))
 }
 
 /// A row count as the BIGINT every count aggregate produces.

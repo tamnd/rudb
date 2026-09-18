@@ -51,6 +51,7 @@
 //! answers, and the only way to have that conversation is with both numbers in front of you.
 //! [`MemoryTable::stats_ns`] is what a load reports it spent here.
 
+use rudb_common::Value;
 use rudb_common::bounds::{Bound, Op, excluded};
 use rudb_vector::{Chunk, Data, Form, Vector};
 
@@ -77,6 +78,21 @@ pub struct Range {
     pub high: Option<Bound>,
     /// How many rows are null, which is what an `IS NULL` would be answered against.
     pub nulls: usize,
+    /// Whether `low` and `high` are the values the rows really hold rather than bounds that are
+    /// allowed to be wider.
+    ///
+    /// A bound that is too wide is fine for skipping a chunk and useless for answering a `MIN`, so
+    /// this is the difference between the two. It is set only where the walk actually looked at
+    /// every row, which is the flat layouts and the two forms that hold one value.
+    pub exact: bool,
+    /// The sum of the non-null values when they are integers, and `None` otherwise.
+    ///
+    /// Only integers, for two reasons that are both about answering the same thing twice. A float
+    /// sum depends on the order it was added in, so one computed here at load and one computed at
+    /// query time over the same rows can differ in the last bits, and a stored answer that is nearly
+    /// the answer is worse than no stored answer. And a float column can hold a NaN, which makes
+    /// every comparison undecidable, so the extremes beside this would not be extremes either.
+    pub sum: Option<i128>,
 }
 
 impl Range {
@@ -180,7 +196,98 @@ fn range(vector: &Vector) -> Range {
         // answer that is wrong slowly rather than wrong.
         _ => (None, None),
     };
-    Range { low, high, nulls }
+    let (exact, sum) = counted(vector);
+    Range { low, high, nulls, exact, sum }
+}
+
+/// Whether the two ends above are exact, and the sum of the values behind them.
+///
+/// Both answers come from the same place, which is whether this walked the rows or read a summary
+/// somebody else wrote. A bit packed column's ends come from the range it was packed against and a
+/// dictionary column's come from its dictionary, and neither of those is the column, so neither can
+/// say what the smallest value in it is or what they add up to.
+fn counted(vector: &Vector) -> (bool, Option<i128>) {
+    match vector.form() {
+        // One value repeated, so the ends are that value and the sum is it times the rows that are
+        // not null. That is the whole column with no loop at all.
+        Form::Constant => match vector.constant_value() {
+            // Every row is null, so there are no ends to get wrong and nothing to add up, and a
+            // total of nothing is zero rather than unknown.
+            Some(Value::Null) => (true, Some(0)),
+            Some(value) => match Bound::of_value(value) {
+                Some(Bound::Int(only)) => {
+                    let rows = vector.validity().count_valid(vector.len()) as i128;
+                    (true, only.checked_mul(rows))
+                }
+                // A float, including a NaN, which is the second reason on `Range::exact`.
+                Some(Bound::Real(_)) => (false, None),
+                // A constant that is not a number still has exact ends. It is the same one value.
+                _ => (true, None),
+            },
+            None => (false, None),
+        },
+        // The first and the last, and neither of them was guessed. A null row inside a sequence has
+        // no value of its own, so the ends would then cover a row the column does not hold.
+        Form::Sequence => {
+            let walked = vector.sequence_parts().is_some();
+            (walked && !vector.validity().has_nulls(vector.len()), None)
+        }
+        Form::Flat => match vector.data() {
+            Some(data) => summed(vector, data),
+            None => (false, None),
+        },
+        // A string walked as bytes is walked a row at a time, so those ends are the column's.
+        Form::StringView | Form::Fsst => (true, None),
+        _ => (false, None),
+    }
+}
+
+/// The sum of a flat column, one typed loop per physical layout, and whether it was walked at all.
+///
+/// The accumulator is an `i128` for every width, so a million `BIGINT` rows cannot overflow it and
+/// nothing has to be checked per value. Adding the stripes together afterwards is checked, because
+/// that is where enough rows to matter could finally pile up.
+fn summed(vector: &Vector, data: &Data) -> (bool, Option<i128>) {
+    /// One layout, summed in the widest integer there is.
+    macro_rules! add {
+        ($values:expr) => {{
+            let held: &[_] = $values;
+            let mut total = 0_i128;
+            if vector.validity().has_nulls(vector.len()) {
+                for (index, &value) in held.iter().enumerate() {
+                    if !vector.is_null_at(index) {
+                        total += i128::from(value);
+                    }
+                }
+            } else {
+                for &value in held {
+                    total += i128::from(value);
+                }
+            }
+            (true, Some(total))
+        }};
+    }
+    match data {
+        Data::Bool(values) => add!(values),
+        Data::Int8(values) => add!(values),
+        Data::Int16(values) => add!(values),
+        Data::Int32(values) => add!(values),
+        Data::Int64(values) => add!(values),
+        Data::UInt8(values) => add!(values),
+        Data::UInt16(values) => add!(values),
+        Data::UInt32(values) => add!(values),
+        Data::UInt64(values) => add!(values),
+        // Exact ends, and no sum. A hundred and twenty eight bit column can overflow the widest
+        // accumulator there is, which is the first reason on `Range::sum`.
+        Data::Int128(_) | Data::UInt128(_) => (true, None),
+        // Neither. A NaN is left out of the ends above, because a NaN at one of them rules nothing
+        // out, and a column that holds one then has ends that are not its rows. The sum is the
+        // other reason on `Range::sum`.
+        Data::Float32(_) | Data::Float64(_) => (false, None),
+        // Strings, walked a row at a time by `text` above.
+        Data::Varlen(_) => (true, None),
+        Data::Interval(_) | Data::Empty | _ => (false, None),
+    }
 }
 
 /// The range of a column that points somewhere else, from whichever end is cheaper to walk.
@@ -477,5 +584,69 @@ mod tests {
         let range = zone.column(0).expect("one column");
         assert_eq!(range.low, Some(Bound::Int(85)), "it counts down");
         assert_eq!(range.high, Some(Bound::Int(100)));
+    }
+
+    /// The range of one column of `values`, typed as `ty`.
+    fn only(ty: LogicalType, values: &[Value]) -> super::Range {
+        let vector = Vector::from_values(ty, values).expect("a column");
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        zone.column(0).expect("one column").clone()
+    }
+
+    #[test]
+    fn a_walked_column_says_so_and_says_what_it_adds_up_to() {
+        let values = vec![Value::Integer(7), Value::Integer(2), Value::Integer(9)];
+        let range = only(LogicalType::Integer, &values);
+        assert!(range.exact, "the rows were walked one at a time");
+        assert_eq!(range.sum, Some(18));
+    }
+
+    #[test]
+    fn a_null_row_is_left_out_of_the_total_the_way_it_is_left_out_of_the_ends() {
+        let values = vec![Value::Integer(7), Value::Null, Value::Integer(9)];
+        let range = only(LogicalType::Integer, &values);
+        assert!(range.exact);
+        assert_eq!(range.sum, Some(16), "the null added nothing");
+    }
+
+    /// The bounds of a dictionary are allowed to be wider than its rows, which is fine for skipping
+    /// a chunk and wrong for answering a `MIN`. This is the flag that tells the two apart.
+    #[test]
+    fn a_dictionary_does_not_claim_its_wider_bounds_are_the_column() {
+        let values = vec![Value::Integer(1), Value::Integer(50), Value::Integer(99)];
+        let inner = Vector::from_values(LogicalType::Integer, &values).expect("a dictionary");
+        let vector = Vector::dictionary(vec![1, 1, 1], inner).expect("a coded column");
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        let range = zone.column(0).expect("one column");
+        assert!(!range.exact, "the bounds came from the values and not from the rows");
+        assert_eq!(range.sum, None);
+    }
+
+    /// A float total computed here and a float total computed by the operator can differ in the
+    /// last bits, because addition in this domain depends on the order, and a NaN is left out of
+    /// the ends above while `MAX` would have to answer with it. So neither is claimed.
+    #[test]
+    fn a_float_column_reports_neither_an_exact_end_nor_a_total() {
+        let values = vec![Value::Double(2.5), Value::Double(9.0), Value::Double(1.0)];
+        let range = only(LogicalType::Double, &values);
+        assert!(!range.exact);
+        assert_eq!(range.sum, None);
+        assert_eq!(range.low, Some(Bound::Real(1.0)), "it is still a bound worth skipping on");
+    }
+
+    #[test]
+    fn a_constant_column_adds_up_to_itself_times_the_rows_that_are_not_null() {
+        let vector = Vector::constant(LogicalType::Integer, Value::Integer(62), 100);
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        let range = zone.column(0).expect("one column");
+        assert!(range.exact);
+        assert_eq!(range.sum, Some(6200));
+    }
+
+    #[test]
+    fn a_column_of_nothing_but_nulls_adds_up_to_zero_rather_than_to_nothing_known() {
+        let range = only(LogicalType::BigInt, &[Value::Null, Value::Null]);
+        assert!(range.exact, "there is no end here to be wrong about");
+        assert_eq!(range.sum, Some(0));
     }
 }
