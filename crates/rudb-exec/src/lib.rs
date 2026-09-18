@@ -101,6 +101,7 @@ mod rows;
 mod schema;
 mod setop;
 mod settingnames;
+mod signed;
 mod sort;
 mod source;
 mod spill;
