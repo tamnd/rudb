@@ -94,6 +94,7 @@ mod key;
 mod keywords;
 mod metadata;
 mod ordering;
+mod pairs;
 mod prepared;
 mod query;
 mod register;
