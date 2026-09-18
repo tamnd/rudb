@@ -342,6 +342,7 @@ dependencies = [
  "rudb-jit",
  "rudb-kernels",
  "rudb-metrics",
+ "rudb-native",
  "rudb-opt",
  "rudb-parquet",
  "rudb-parse",
