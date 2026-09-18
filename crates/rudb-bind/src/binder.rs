@@ -153,6 +153,19 @@ struct WindowParts {
     frame: WindowFrame,
 }
 
+/// A materialised `WITH` definition that has been bound and can be read by name.
+#[derive(Debug)]
+struct Materialized {
+    /// Which written definition this is, as an index into `Ast::ctes`.
+    written: u32,
+    /// The number the plan uses to pair a read with what it reads.
+    cte: u32,
+    /// The name it was written with, which is the table name a read is reachable through.
+    name: String,
+    /// What it produces, in order, under the declared names when a column list was written.
+    fields: Vec<Field>,
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingSubquery {
     pub(crate) node: NodeRef,
@@ -193,6 +206,14 @@ pub(crate) struct Binder<'a> {
     pub(crate) clause: &'static str,
     /// The views whose bodies are open on the stack, which is what catches a cycle.
     expanding: Vec<String>,
+    /// The materialised `WITH` definitions whose bodies are being bound, innermost last.
+    ///
+    /// A stack rather than a map from what was written, because a plain `WITH` is put into every
+    /// place it is named, so a materialised one written inside a plain one is bound once per use
+    /// and each of those is a materialisation of its own with a number of its own.
+    materialized: Vec<Materialized>,
+    /// How many materialisations have been numbered, which is where the next number comes from.
+    next_cte: u32,
     /// When this statement started, read once and kept, which is what `now()` folds to.
     started: Option<i64>,
 }
@@ -221,6 +242,8 @@ impl<'a> Binder<'a> {
             correlations: Vec::new(),
             clause: "SELECT clause",
             expanding: Vec::new(),
+            materialized: Vec::new(),
+            next_cte: 0,
             started: None,
         }
     }
@@ -320,19 +343,89 @@ impl<'a> Binder<'a> {
 
     fn bind_query_inner(&mut self, ast: &Ast, query: ast::QueryRef) -> Result<(NodeRef, Scope)> {
         let written = ast.query(query);
+        if written.ctes.is_empty() {
+            return self.bind_body(ast, &written);
+        }
+        // The names a query introduces are gone again once it is bound, and they go whether the
+        // binding worked or not, which is why the stack is cut back here rather than at the end of
+        // the call that pushed onto it.
+        let depth = self.materialized.len();
+        let result = self.bind_materialized(ast, &written);
+        self.materialized.truncate(depth);
+        result
+    }
+
+    /// A query with materialised `WITH` definitions in front of it.
+    ///
+    /// The definitions are bound first and in the order they were written, so that a later one can
+    /// read an earlier one, and then the body. The wrapping runs backwards so that the first
+    /// definition ends up outermost, which is the order they have to be filled in.
+    fn bind_materialized(&mut self, ast: &Ast, written: &ast::Query) -> Result<(NodeRef, Scope)> {
+        let depth = self.materialized.len();
+        let held = ast.cte_list(written.ctes).to_vec();
+        let mut definitions = Vec::with_capacity(held.len());
+        for &index in &held {
+            definitions.push(self.bind_definition(ast, index)?);
+        }
+        let (mut node, scope) = self.bind_body(ast, written)?;
+        for (at, definition) in definitions.into_iter().enumerate().rev() {
+            let entry = &self.materialized[depth + at];
+            let cte = entry.cte;
+            let name = entry.name.clone();
+            let fields = entry.fields.clone();
+            let name = self.plan.intern(&name);
+            let columns = self.plan.add_fields(&fields);
+            node =
+                self.add_node(Node::MaterializedCte { definition, body: node, name, cte, columns });
+        }
+        Ok((node, scope))
+    }
+
+    /// Binds one materialised `WITH` definition and makes its name readable from there on.
+    ///
+    /// The definition is projected onto exactly the columns a read of it sees, under the names the
+    /// column list declared when there was one. That projection is not decoration: what is held is
+    /// what a read gets back, so the held rows have to be the rows of the definition's own select
+    /// list and nothing it happened to carry along underneath.
+    ///
+    /// A column list with more names in it than the definition has columns is not an error here,
+    /// which is the pinned build's rule and is written out on [`Scope::rename_prefix`].
+    fn bind_definition(&mut self, ast: &Ast, index: u32) -> Result<NodeRef> {
+        let held = ast.cte(index);
+        let name = ast.string(held.name).to_string();
+        let (node, mut scope) = self.bind_query(ast, held.query)?;
+        if !held.columns.is_empty() {
+            let names: Vec<&str> = ast.name(held.columns).collect();
+            scope.rename_prefix(&names);
+        }
+        let table = self.fresh_index();
+        let mut exprs = Vec::with_capacity(scope.len());
+        let mut names = Vec::with_capacity(scope.len());
+        for column in &scope.columns {
+            exprs.push(self.plan.add_expr(Expr::Column(column.binding), column.ty.clone()));
+            names.push(self.plan.intern(&column.name));
+        }
+        let exprs = self.plan.add_expr_list(&exprs);
+        let names = self.plan.add_name_list(&names);
+        let node = self.add_node(Node::Project { input: node, index: table, exprs, names });
+        let cte = self.next_cte;
+        self.next_cte += 1;
+        self.materialized.push(Materialized { written: index, cte, name, fields: scope.fields() });
+        Ok(node)
+    }
+
+    fn bind_body(&mut self, ast: &Ast, written: &ast::Query) -> Result<(NodeRef, Scope)> {
         match written.body {
-            ast::QueryBody::Select(select) => self.bind_select(ast, select, &written),
+            ast::QueryBody::Select(select) => self.bind_select(ast, select, written),
             ast::QueryBody::SetOp { op, quantifier, by_name, left, right } => {
                 if by_name {
                     return Err(Error::not_implemented("UNION BY NAME"));
                 }
-                self.bind_set_op(ast, &written, op, quantifier, left, right)
+                self.bind_set_op(ast, written, op, quantifier, left, right)
             }
-            ast::QueryBody::Values(rows) => self.bind_values(ast, &written, rows),
-            ast::QueryBody::Describe(inner) => self.bind_describe(ast, &written, inner),
-            ast::QueryBody::Show { name, relation } => {
-                self.bind_show(ast, &written, name, relation)
-            }
+            ast::QueryBody::Values(rows) => self.bind_values(ast, written, rows),
+            ast::QueryBody::Describe(inner) => self.bind_describe(ast, written, inner),
+            ast::QueryBody::Show { name, relation } => self.bind_show(ast, written, name, relation),
         }
     }
 
@@ -1202,10 +1295,55 @@ impl<'a> Binder<'a> {
                 }
                 Ok((node, scope))
             }
+            ast::Source::Cte { cte, alias, columns } => {
+                self.bind_cte_scan(ast, cte, alias, columns)
+            }
             ast::Source::Join { left, right, kind, natural, on, using } => {
                 self.bind_join(ast, left, right, kind, natural, on, using)
             }
         }
+    }
+
+    /// A read of a materialised `WITH`, which is a leaf the same way a table scan is.
+    ///
+    /// Which definition it reads was settled by the parser, so there is no name to look up here and
+    /// no shadowing left to think about. What is looked up is the materialisation that definition
+    /// turned into, and the search runs backwards because the same definition is bound again for
+    /// each use of a plain `WITH` it sits inside, and a read means the innermost of those.
+    fn bind_cte_scan(
+        &mut self,
+        ast: &Ast,
+        written: u32,
+        alias: ast::StrRef,
+        columns: ast::Slice,
+    ) -> Result<(NodeRef, Scope)> {
+        let Some(held) = self.materialized.iter().rev().find(|held| held.written == written) else {
+            let name = ast.string(ast.cte(written).name);
+            return Err(Error::binder(format!("Table with name {name} does not exist!")));
+        };
+        let cte = held.cte;
+        let fields = held.fields.clone();
+        let text = held.name.clone();
+        let label = if alias == NONE { text.clone() } else { ast.string(alias).to_string() };
+        let name = self.plan.intern(&text);
+        let index = self.fresh_index();
+        let mut scope = Scope::empty();
+        for (at, field) in fields.iter().enumerate() {
+            scope.push(Visible {
+                table: label.clone(),
+                name: field.name.clone(),
+                binding: ColumnBinding::new(index, at as u32),
+                ty: field.ty.clone(),
+                not_null: field.not_null,
+            });
+        }
+        if !columns.is_empty() {
+            let names: Vec<&str> = ast.name(columns).collect();
+            scope.rename(&names, &label)?;
+        }
+        let columns = self.plan.add_fields(&fields);
+        let node = self.add_node(Node::CteScan { index, cte, name, columns });
+        Ok((node, scope))
     }
 
     fn bind_table(

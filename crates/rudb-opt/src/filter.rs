@@ -365,11 +365,34 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             filter(plan, above, pending)
         }
 
+        // A predicate here is written against what the body produces, so it goes into the body the
+        // way it would go through a sort. Nothing goes into the definition: a predicate that holds
+        // at one read of a materialisation does not hold at another, and the rows are held once for
+        // all of them. Pushing one in takes the check that every read is filtered the same way,
+        // which is what upstream calls `cte_filter_pusher` and is not written here.
+        Node::MaterializedCte { definition, body, name, cte, columns } => {
+            let rebuilt_definition = node(plan, definition, Vec::new(), tables);
+            let rebuilt_body = node(plan, body, pending, tables);
+            if rebuilt_definition == definition && rebuilt_body == body {
+                at
+            } else {
+                plan.add_node(Node::MaterializedCte {
+                    definition: rebuilt_definition,
+                    body: rebuilt_body,
+                    name,
+                    cte,
+                    columns,
+                })
+            }
+        }
+
         // The bottom. A scan takes a predicate into its own filter list in E2 and cannot yet, so
         // what reaches here becomes a filter sitting directly on the scan.
-        Node::Get { .. } | Node::Values { .. } | Node::TableFunction { .. } | Node::Dummy => {
-            filter(plan, at, pending)
-        }
+        Node::Get { .. }
+        | Node::Values { .. }
+        | Node::TableFunction { .. }
+        | Node::Dummy
+        | Node::CteScan { .. } => filter(plan, at, pending),
     }
 }
 

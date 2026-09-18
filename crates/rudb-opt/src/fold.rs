@@ -140,7 +140,9 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
         | Node::Limit { .. }
         | Node::TableFetch { .. }
         | Node::SetOp { .. }
-        | Node::CrossProduct { .. } => {}
+        | Node::CrossProduct { .. }
+        | Node::MaterializedCte { .. }
+        | Node::CteScan { .. } => {}
         Node::Values { rows, .. } => {
             let held = plan.row_list(rows).to_vec();
             let rewritten: Vec<Slice> =

@@ -35,8 +35,9 @@
 //! whatever pointed at the limit now finds the projection, and no node is added.
 //!
 //! Trading the contents of a slot is only safe when nothing else is looking at it. The binder builds
-//! a tree, since there are no common table expressions yet and a view is bound again at each
-//! reference rather than shared, so this does not come up today. It is checked anyway rather than
+//! a tree: a view is bound again at each reference rather than shared, and a materialised `WITH` is
+//! one definition with a read of its own at each place it is named rather than one subtree pointed
+//! at twice, so this does not come up today. It is checked anyway rather than
 //! assumed, because the first plan with a shared subtree in it would otherwise get a wrong answer
 //! rather than a worse one.
 

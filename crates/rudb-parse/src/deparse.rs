@@ -98,7 +98,8 @@ pub fn create_view(ast: &Ast, index: CreateViewRef) -> String {
 #[must_use]
 pub fn query(ast: &Ast, index: QueryRef) -> String {
     let held = ast.query(index);
-    let mut out = match held.body {
+    let mut out = with(ast, held.ctes);
+    out += &match held.body {
         QueryBody::Select(select) => selection(ast, select),
         QueryBody::SetOp { op, quantifier, by_name, left, right } => {
             setop(ast, op, quantifier, by_name, left, right)
@@ -130,6 +131,35 @@ pub fn query(ast: &Ast, index: QueryRef) -> String {
         out += &format!(" OFFSET {}", expr(ast, held.offset));
     }
     out
+}
+
+/// The materialised `WITH` definitions in front of a query, or nothing when there are none.
+///
+/// The last bracket is not followed by a space, which is upstream's spacing and was measured: a
+/// view defined with one comes back as `WITH c AS MATERIALIZED (SELECT 1 AS x)SELECT * FROM c`. A
+/// column list is written with a space in front of it for the same reason.
+fn with(ast: &Ast, ctes: Slice) -> String {
+    if ctes.is_empty() {
+        return String::new();
+    }
+    let written: Vec<String> = ast
+        .cte_list(ctes)
+        .iter()
+        .map(|&index| {
+            let held = ast.cte(index);
+            let columns = if held.columns.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", names(ast, held.columns))
+            };
+            format!(
+                "{}{columns} AS MATERIALIZED ({})",
+                quoted(ast.string(held.name)),
+                query(ast, held.query)
+            )
+        })
+        .collect();
+    format!("WITH {}", written.join(", "))
 }
 
 /// A set operation, with the spacing bug upstream has in it.
@@ -227,6 +257,11 @@ fn order(ast: &Ast, item: &OrderItem) -> String {
 fn source(ast: &Ast, index: SourceRef) -> String {
     match ast.source(index) {
         Source::Table { name, alias, columns } => label(ast, parts(ast, name), alias, columns),
+        // The name it was written with, since the definition is somewhere else in the tree and a
+        // reference to it is a name where a table goes.
+        Source::Cte { cte, alias, columns } => {
+            label(ast, quoted(ast.string(ast.cte(cte).name)), alias, columns)
+        }
         Source::Subquery { query: inner, alias, columns } => {
             label(ast, format!("({})", query(ast, inner)), alias, columns)
         }

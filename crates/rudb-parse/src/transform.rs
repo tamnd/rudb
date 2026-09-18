@@ -22,10 +22,10 @@ use std::collections::HashMap;
 use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 
 use crate::ast::{
-    Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, CreateView, Distinct, DropTable, Expr, ExprRef,
-    Insert, JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef,
-    Scope, Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement, StrRef, Target,
-    UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
+    Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, CreateView, Cte, Distinct, DropTable, Expr,
+    ExprRef, Insert, JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody,
+    QueryRef, Scope, Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement,
+    StrRef, Target, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -108,10 +108,12 @@ struct Transform<'a> {
     current_span: Span,
     /// Non-recursive CTEs visible while their containing query is transformed.
     ///
-    /// A reference becomes an ordinary subquery source here. That is the inlined shape the binder
-    /// already understands, and keeping it at this boundary avoids teaching every later name
-    /// resolver about a second kind of relation.
-    ctes: Vec<(StrRef, QueryRef, Slice)>,
+    /// A plain reference becomes an ordinary subquery source here. That is the inlined shape the
+    /// binder already understands, and keeping it at this boundary avoids teaching every later name
+    /// resolver about a second kind of relation. A materialised one cannot be inlined, because the
+    /// point of it is that it runs once, so it stays a definition and its references stay
+    /// references. Both kinds are in one list because shadowing does not care which kind a name is.
+    ctes: Vec<(StrRef, Held, Slice)>,
     /// Windows named by a `WINDOW` clause, with whether the definition wrote a frame.
     ///
     /// Scoped the way the CTE list is scoped, and for the same reason. A subquery written inside a
@@ -119,6 +121,15 @@ struct Transform<'a> {
     /// `SELECT (SELECT sum(j) OVER w FROM s) FROM t WINDOW w AS (ORDER BY j)` resolves `w` on the
     /// reference binary and comes back out of the catalog with it inlined.
     named_windows: Vec<(StrRef, WindowRef, bool)>,
+}
+
+/// What a `WITH` name stands for.
+#[derive(Debug, Clone, Copy)]
+enum Held {
+    /// A plain or `NOT MATERIALIZED` one, put into every place it is named.
+    Inline(QueryRef),
+    /// A `MATERIALIZED` one, which is an index into `Ast::ctes`.
+    Once(u32),
 }
 
 impl<'a> Transform<'a> {
@@ -288,6 +299,13 @@ impl<'a> Transform<'a> {
         let start = self.ast.parts.len() as u32;
         self.ast.parts.extend(items);
         Slice { start, len: self.ast.parts.len() as u32 - start }
+    }
+
+    /// Turn a vector of materialised `WITH` indexes into a slice of the list pool.
+    fn cte_slice(&mut self, items: Vec<u32>) -> Slice {
+        let start = self.ast.cte_lists.len() as u32;
+        self.ast.cte_lists.extend(items);
+        Slice { start, len: self.ast.cte_lists.len() as u32 - start }
     }
 
     /// Turn a vector of column definitions into a slice of the column arena.
@@ -916,6 +934,7 @@ impl<'a> Transform<'a> {
 
     fn query_inner(&mut self, node: u32) -> Result<QueryRef> {
         let mark = self.ctes.len();
+        let mut once = Vec::new();
         let with = self.find(node, "WithClause");
         if with != NONE {
             if self.find(with, "Recursive") != NONE {
@@ -925,12 +944,23 @@ impl<'a> Transform<'a> {
                 if self.name(statement) != "WithStatement" {
                     continue;
                 }
+                // `MATERIALIZED` says the definition runs once and every reference reads the rows
+                // it produced, and `NOT MATERIALIZED` and the plain form say the query goes into
+                // each place the name is used. That is the choice recorded here rather than left
+                // to the optimizer, because the pinned build records it in the same place: its
+                // `EXPLAIN` for a plain `WITH` used twice is two copies of the definition and its
+                // `EXPLAIN` for a materialised one is a CTE node with two scans of it.
+                //
+                // The pin has one more rule that rudb does not, and it is written down here rather
+                // than implemented because nothing can reach it yet. A plain definition holding a
+                // volatile call is held anyway: `WITH c AS (SELECT random() AS r) SELECT a.r, b.r
+                // FROM c a, c b` gives the same number twice on the pin and plans as a CTE node,
+                // where the same query over `SELECT 1 AS n` is inlined twice. rudb inlines either
+                // one, which is the same answer until there is a volatile function to call, and
+                // the function table has no `random`, no `nextval` and no `now` in it yet.
                 let materialized = self.find(statement, "Materialized");
-                if materialized != NONE
-                    && !self.text(materialized).eq_ignore_ascii_case("NOT MATERIALIZED")
-                {
-                    return self.unsupported(materialized);
-                }
+                let materialized = materialized != NONE
+                    && !self.text(materialized).eq_ignore_ascii_case("NOT MATERIALIZED");
                 let name = self.identifier(self.first(statement));
                 let list = self.find(statement, "InsertColumnList");
                 let columns = if list == NONE {
@@ -948,7 +978,14 @@ impl<'a> Transform<'a> {
                     return self.unsupported(body);
                 }
                 let query = self.query(self.first(select))?;
-                self.ctes.push((name, query, columns));
+                if materialized {
+                    let index = self.ast.ctes.len() as u32;
+                    self.ast.ctes.push(Cte { name, query, columns });
+                    once.push(index);
+                    self.ctes.push((name, Held::Once(index), columns));
+                } else {
+                    self.ctes.push((name, Held::Inline(query), columns));
+                }
             }
         }
         let chain = self.find(node, "SelectSetOpChain");
@@ -959,6 +996,10 @@ impl<'a> Transform<'a> {
         let modifiers = self.find(node, "ResultModifiers");
         if modifiers != NONE {
             self.result_modifiers(query, modifiers)?;
+        }
+        if !once.is_empty() {
+            let slice = self.cte_slice(once);
+            self.ast.queries[query as usize].ctes = slice;
         }
         self.ctes.truncate(mark);
         Ok(query)
@@ -1521,14 +1562,28 @@ impl<'a> Transform<'a> {
                 let (alias, columns) = self.table_alias(self.find(inner, "TableAlias"));
                 if name.len == 1 {
                     let part = self.ast.parts[name.start as usize];
-                    if let Some(&(_, query, declared)) =
+                    if let Some(&(_, held, declared)) =
                         self.ctes.iter().rev().find(|&&(cte, _, _)| {
                             self.ast.string(cte).eq_ignore_ascii_case(self.ast.string(part))
                         })
                     {
-                        let alias = if alias == NONE { part } else { alias };
-                        let columns = if columns.is_empty() { declared } else { columns };
-                        return Ok(self.push_source(Source::Subquery { query, alias, columns }));
+                        match held {
+                            Held::Inline(query) => {
+                                let alias = if alias == NONE { part } else { alias };
+                                let columns = if columns.is_empty() { declared } else { columns };
+                                return Ok(self.push_source(Source::Subquery {
+                                    query,
+                                    alias,
+                                    columns,
+                                }));
+                            }
+                            // The alias is left as it was written, which for a bare name is
+                            // nothing at all, because the definition already has the name and a
+                            // reference that invented one would print itself as `c AS c`.
+                            Held::Once(cte) => {
+                                return Ok(self.push_source(Source::Cte { cte, alias, columns }));
+                            }
+                        }
                     }
                 }
                 Ok(self.push_source(Source::Table { name, alias, columns }))
@@ -3427,6 +3482,9 @@ mod tests {
             Source::Subquery { query, alias: query_alias, .. } => {
                 format!("({}){}", show_query(ast, query), alias(query_alias))
             }
+            Source::Cte { cte, alias: cte_alias, .. } => {
+                format!("{}{}", ast.string(ast.cte(cte).name), alias(cte_alias))
+            }
             Source::Values { rows, alias: values_alias, .. } => {
                 format!("{}{}", show_rows(ast, rows), alias(values_alias))
             }
@@ -3472,7 +3530,18 @@ mod tests {
         let list = |slice: Slice| {
             ast.expr_list(slice).iter().map(|&item| show(ast, item)).collect::<Vec<_>>().join(", ")
         };
-        let mut out = match query.body {
+        let mut out = String::new();
+        for &index in ast.cte_list(query.ctes) {
+            let cte = ast.cte(index);
+            let columns = ast.name(cte.columns).collect::<Vec<_>>().join(", ");
+            let columns = if columns.is_empty() { columns } else { format!("({columns})") };
+            out += &format!(
+                "WITH {}{columns} AS MATERIALIZED ({}) ",
+                ast.string(cte.name),
+                show_query(ast, cte.query)
+            );
+        }
+        out += &match query.body {
             QueryBody::SetOp { op, quantifier, by_name, left, right } => {
                 let by_name = if by_name { " BY NAME" } else { "" };
                 format!(
@@ -3980,13 +4049,47 @@ mod tests {
             round("WITH t(x) AS NOT MATERIALIZED (SELECT 1) SELECT x FROM t"),
             "SELECT x FROM (SELECT 1) AS t"
         );
-        for query in [
-            "WITH RECURSIVE t(x) AS (SELECT 1) SELECT x FROM t",
-            "WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT x FROM t",
-        ] {
-            let error = parse_ast(query).expect_err("the unsupported CTE shape is refused");
-            assert!(error.to_string().starts_with("Not implemented Error"), "{query}: {error}");
-        }
+        let query = "WITH RECURSIVE t(x) AS (SELECT 1) SELECT x FROM t";
+        let error = parse_ast(query).expect_err("the unsupported CTE shape is refused");
+        assert!(error.to_string().starts_with("Not implemented Error"), "{query}: {error}");
+    }
+
+    /// A materialised one keeps its definition, because putting it in two places runs it twice.
+    #[test]
+    fn a_materialized_cte_stays_a_definition_and_its_references_stay_references() {
+        assert_eq!(
+            round("WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT x FROM t"),
+            "WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT x FROM t"
+        );
+        assert_eq!(
+            round("WITH t(y) AS MATERIALIZED (SELECT 1) SELECT y FROM t"),
+            "WITH t(y) AS MATERIALIZED (SELECT 1) SELECT y FROM t"
+        );
+        // Two references are two sources naming one definition, which is the whole point of the
+        // word: the inlined form above would be two copies of the query.
+        assert_eq!(
+            round("WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT * FROM t a, t b"),
+            "WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT * FROM t AS a, t AS b"
+        );
+        // The inner name shadows the outer one, which is decided here and nowhere later.
+        assert_eq!(
+            round(
+                "WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT (WITH t AS (SELECT 2 AS x) \
+                 SELECT x FROM t) AS inner"
+            ),
+            "WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT (SELECT x FROM (SELECT 2 AS x) AS t) \
+             AS inner"
+        );
+        // A definition may read one written before it, and it is the definition that is read
+        // rather than a second copy of the query behind it.
+        assert_eq!(
+            round(
+                "WITH a AS MATERIALIZED (SELECT 1 AS x), b AS MATERIALIZED (SELECT x + 1 AS y \
+                 FROM a) SELECT y FROM b"
+            ),
+            "WITH a AS MATERIALIZED (SELECT 1 AS x) WITH b AS MATERIALIZED (SELECT (x Add 1) \
+             AS y FROM a) SELECT y FROM b"
+        );
     }
 
     /// `DESCRIBE` is a query body, and the two spellings that name something become a star over it.
