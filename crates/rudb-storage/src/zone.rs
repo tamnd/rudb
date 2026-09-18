@@ -106,6 +106,12 @@ pub struct Range {
 }
 
 impl Range {
+    /// The range of one column, which is one pass over it.
+    #[must_use]
+    pub fn of(vector: &Vector) -> Self {
+        range(vector)
+    }
+
     /// Whether this range says no row of the chunk can pass `probe`.
     #[must_use]
     pub fn excludes(&self, op: Op, value: &Bound) -> bool {
@@ -192,6 +198,10 @@ impl Walked {
 }
 
 /// The range of one vector, in whatever form it arrived in.
+///
+/// Public through [`Range::of`] because a writer that encodes a stripe one column at a time across
+/// threads needs the range of the column it was handed, and building a whole [`Zone`] to read one
+/// entry out of it would walk every other column on that thread as well.
 fn range(vector: &Vector) -> Range {
     let nulls = vector.len() - vector.validity().count_valid(vector.len());
     let walked = walk(vector);
