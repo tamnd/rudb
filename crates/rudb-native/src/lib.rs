@@ -563,9 +563,11 @@ impl Writer {
                 offset,
                 length: u32::try_from(length).map_err(|_| invalid("page length overflow"))?,
             });
-            ranges.push(merged_range(self.pending.iter().map(|pending| {
-                pending.zone.column(column).cloned().unwrap_or_default()
-            })));
+            ranges.push(merged_range(
+                self.pending
+                    .iter()
+                    .map(|pending| pending.zone.column(column).cloned().unwrap_or_default()),
+            ));
         }
         for (column, membership) in memberships.iter_mut().enumerate() {
             if self.pending.iter().all(|pending| pending.codes[column].is_none()) {
@@ -590,19 +592,19 @@ impl Writer {
         self.file.write_all(&index).map_err(io)?;
         let index = Span {
             offset,
-            length: u32::try_from(index.len()).map_err(|_| invalid("index page length overflow"))?,
+            length: u32::try_from(index.len())
+                .map_err(|_| invalid("index page length overflow"))?,
         };
         let mut rows = 0_usize;
         let mut lengths = Vec::with_capacity(parts);
         let mut span = None;
         for pending in self.pending.drain(..) {
             rows = rows.checked_add(pending.rows).ok_or_else(|| invalid("row count overflow"))?;
-            lengths.push(
-                u32::try_from(pending.rows).map_err(|_| invalid("part row count overflow"))?,
+            lengths
+                .push(u32::try_from(pending.rows).map_err(|_| invalid("part row count overflow"))?);
+            span = Some(
+                span.map_or((pending.order, pending.order), |(first, _)| (first, pending.order)),
             );
-            span = Some(span.map_or((pending.order, pending.order), |(first, _)| {
-                (first, pending.order)
-            }));
         }
         self.order.push(span.ok_or_else(|| invalid("a stripe was flushed with no parts"))?);
         self.table.stripes.push(Stripe {
@@ -1209,8 +1211,7 @@ fn read_index(file: &File, stripe: &Stripe, column: usize) -> Result<Vec<PartSpa
     let mut start = 0_usize;
     for part in 0..parts {
         let at = part * INDEX_ENTRY;
-        let length =
-            u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes")) as usize;
+        let length = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes")) as usize;
         let hash = u64::from_le_bytes(bytes[at + 4..at + 12].try_into().expect("eight bytes"));
         spans.push(PartSpan { start, length, hash });
         start = start.checked_add(length).ok_or_else(|| invalid("column page length overflow"))?;
@@ -1578,8 +1579,7 @@ impl Reader {
     /// can both read it, and the second one to finish finds the first one's copy and drops its own,
     /// which costs one duplicated read and never costs a worker a wait.
     fn held(&self, at: usize, stripe: &Stripe, column: usize, whole: bool) -> Result<CachedColumn> {
-        let cache =
-            self.cache.get(column).ok_or_else(|| invalid("column index out of range"))?;
+        let cache = self.cache.get(column).ok_or_else(|| invalid("column index out of range"))?;
         let found = {
             let held = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
             held.iter().find(|held| held.stripe == at).cloned()
@@ -1615,11 +1615,8 @@ impl Reader {
     fn read_impl(&self, at: usize, columns: &[usize], whole: bool) -> Result<Chunk> {
         let place = *self.places.get(at).ok_or_else(|| invalid("part index out of range"))?;
         let index = place.stripe as usize;
-        let stripe = self
-            .table
-            .stripes
-            .get(index)
-            .ok_or_else(|| invalid("stripe index out of range"))?;
+        let stripe =
+            self.table.stripes.get(index).ok_or_else(|| invalid("stripe index out of range"))?;
         let rows = place.rows as usize;
         let mut picked = Vec::with_capacity(columns.len());
         for &column in columns {
