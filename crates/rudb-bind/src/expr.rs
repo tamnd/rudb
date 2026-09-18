@@ -228,15 +228,23 @@ impl Binder<'_> {
             return Ok(self.add_expr(Expr::Column(found.binding), found.ty.clone()));
         }
         let mut found = None;
-        for outer in self.outer_scopes.iter().rev() {
+        for (at, outer) in self.outer_scopes.iter().enumerate().rev() {
             if let Some(visible) = outer.resolve_optional(&parts)? {
-                found = Some((visible.binding, visible.ty.clone()));
+                found = Some((at, visible.binding, visible.ty.clone()));
                 break;
             }
         }
-        let Some((binding, ty)) = found else {
+        let Some((at, binding, ty)) = found else {
             return scope.resolve(&parts).map(|_| unreachable!());
         };
+        // A LATERAL entry may not aggregate over what its left neighbour gave it. There is one row
+        // of the left per evaluation of the entry, so `sum(o.k)` would be a sum of one value and
+        // whoever wrote it meant something else. The pinned build refuses it in these words and a
+        // correlated column read anywhere else in the entry, including under its own aggregate's
+        // filter or inside a window, is fine.
+        if self.in_aggregate && self.lateral_scopes.contains(&at) {
+            return Err(Error::binder("LATERAL join cannot contain aggregates!"));
+        }
         if let Some(correlations) = self.correlations.last_mut() {
             if !correlations.contains(&binding) {
                 correlations.push(binding);

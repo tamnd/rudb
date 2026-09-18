@@ -201,6 +201,13 @@ pub(crate) struct Binder<'a> {
     /// Uncorrelated scalar queries waiting to be joined into the select block that uses them.
     pub(crate) scalar_subqueries: Vec<PendingSubquery>,
     pub(crate) outer_scopes: Vec<Scope>,
+    /// Which of the outer scopes are a FROM entry's left neighbours rather than an enclosing query.
+    ///
+    /// The two are resolved the same way and refused differently. An aggregate may read a column of
+    /// the query it is written in and may not read one a LATERAL brought in from the left, so the
+    /// check needs to know which scope the name came out of. Each entry is a position in
+    /// `outer_scopes`.
+    pub(crate) lateral_scopes: Vec<usize>,
     pub(crate) correlations: Vec<Vec<ColumnBinding>>,
     /// Where we are, for an error message that says which clause the writer should look at.
     pub(crate) clause: &'static str,
@@ -239,6 +246,7 @@ impl<'a> Binder<'a> {
             in_window: false,
             scalar_subqueries: Vec::new(),
             outer_scopes: Vec::new(),
+            lateral_scopes: Vec::new(),
             correlations: Vec::new(),
             clause: "SELECT clause",
             expanding: Vec::new(),
@@ -1254,11 +1262,68 @@ impl<'a> Binder<'a> {
         };
         let (mut node, mut scope) = self.bind_source(ast, *first)?;
         for source in rest {
-            let (right, right_scope) = self.bind_source(ast, *source)?;
-            node = self.add_node(Node::CrossProduct { left: node, right });
+            let (right, right_scope, correlations) = self.bind_lateral(ast, *source, &scope)?;
+            node = if correlations.is_empty() {
+                self.add_node(Node::CrossProduct { left: node, right })
+            } else {
+                let conditions = self.plan.add_expr_list(&[]);
+                self.add_node(Node::DependentJoin {
+                    left: node,
+                    right,
+                    kind: JoinKind::Inner,
+                    conditions,
+                })
+            };
             scope = scope.concat(right_scope);
         }
         Ok((node, scope))
+    }
+
+    /// Binds one FROM entry with everything written to its left already visible.
+    ///
+    /// That is what LATERAL means, and it is what a comma separated FROM does here whether the word
+    /// was written or not, because the pinned build resolves `FROM o, (SELECT o.k + 1)` without it.
+    /// The keyword therefore changes nothing and is accepted rather than acted on.
+    ///
+    /// The columns of the left that the entry read come back with it, and an entry that read none
+    /// is an ordinary product. The rest are somebody else's: a name that resolved past the left
+    /// neighbours belongs to an enclosing query, so it is handed up to whichever frame is waiting
+    /// for it rather than counted here, or the subquery this FROM sits in would lose track of its
+    /// own correlation.
+    fn bind_lateral(
+        &mut self,
+        ast: &Ast,
+        source: ast::SourceRef,
+        left: &Scope,
+    ) -> Result<(NodeRef, Scope, Vec<ColumnBinding>)> {
+        self.lateral_scopes.push(self.outer_scopes.len());
+        self.outer_scopes.push(left.clone());
+        self.correlations.push(Vec::new());
+        let bound = self.bind_source(ast, source);
+        let read = self.correlations.pop().expect("correlation frame");
+        self.outer_scopes.pop();
+        self.lateral_scopes.pop();
+        let (node, scope) = bound?;
+
+        let mut here = Vec::new();
+        for binding in read {
+            if left.columns.iter().any(|column| column.binding == binding) {
+                here.push(binding);
+            } else if let Some(enclosing) = self.correlations.last_mut() {
+                if !enclosing.contains(&binding) {
+                    enclosing.push(binding);
+                }
+            }
+        }
+        // A table function's arguments are evaluated to produce the rows rather than over rows that
+        // already exist, so there is nothing underneath it for the domain to be pushed into and no
+        // projection over the domain that would say the same thing, the way there is for a VALUES.
+        // Answering it wants an operator that evaluates a source once per value and there is none.
+        // Said here rather than left to the executor, so the message names what was written.
+        if !here.is_empty() && matches!(ast.source(source), ast::Source::Function { .. }) {
+            return Err(Error::not_implemented("a table function reading a LATERAL column"));
+        }
+        Ok((node, scope, here))
     }
 
     fn bind_source(&mut self, ast: &Ast, source: ast::SourceRef) -> Result<(NodeRef, Scope)> {
@@ -2007,7 +2072,17 @@ impl<'a> Binder<'a> {
         using: ast::Slice,
     ) -> Result<(NodeRef, Scope)> {
         let (left_node, left_scope) = self.bind_source(ast, left)?;
-        let (right_node, right_scope) = self.bind_source(ast, right)?;
+        let (right_node, right_scope, correlated) = self.bind_lateral(ast, right, &left_scope)?;
+        // A row of the right side exists only for the left row it was evaluated against, so a kind
+        // that has to produce right rows with no left row has nothing to produce them from. The
+        // pinned build says this and names only the two kinds that work.
+        if !correlated.is_empty()
+            && !matches!(kind, ast::JoinKind::Inner | ast::JoinKind::Cross | ast::JoinKind::Left)
+        {
+            return Err(Error::binder(
+                "The combining JOIN type must be INNER or LEFT for a LATERAL reference",
+            ));
+        }
         let split = left_scope.len();
         let mut scope = left_scope.concat(right_scope);
 
@@ -2084,14 +2159,16 @@ impl<'a> Binder<'a> {
             conditions.push(self.as_boolean(predicate, "JOIN")?);
         }
 
-        if kind == ast::JoinKind::Cross {
-            if !conditions.is_empty() {
-                return Err(Error::binder("a CROSS JOIN cannot have a condition"));
-            }
-            let node = self.add_node(Node::CrossProduct { left: left_node, right: right_node });
-            return Ok((node, scope));
+        if kind == ast::JoinKind::Cross && !conditions.is_empty() {
+            return Err(Error::binder("a CROSS JOIN cannot have a condition"));
         }
-        if conditions.is_empty() && kind == ast::JoinKind::Inner {
+        // A product is the join with nothing to join on, and it is not one when the right side has
+        // to be evaluated per left row, because then there is a dependency to lower even though
+        // there is no condition to test.
+        if correlated.is_empty()
+            && conditions.is_empty()
+            && matches!(kind, ast::JoinKind::Cross | ast::JoinKind::Inner)
+        {
             let node = self.add_node(Node::CrossProduct { left: left_node, right: right_node });
             return Ok((node, scope));
         }
@@ -2105,13 +2182,22 @@ impl<'a> Binder<'a> {
             ast::JoinKind::Positional => JoinKind::Positional,
         };
         let conditions = self.plan.add_expr_list(&conditions);
-        let node = self.add_node(Node::Join {
-            left: left_node,
-            right: right_node,
-            kind,
-            conditions,
-            build: BuildSide::default(),
-        });
+        let node = if correlated.is_empty() {
+            self.add_node(Node::Join {
+                left: left_node,
+                right: right_node,
+                kind,
+                conditions,
+                build: BuildSide::default(),
+            })
+        } else {
+            self.add_node(Node::DependentJoin {
+                left: left_node,
+                right: right_node,
+                kind,
+                conditions,
+            })
+        };
         Ok((node, scope))
     }
 

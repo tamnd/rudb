@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 
-use rudb_common::{LogicalType, Value};
+use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
     Arm, BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice,
     SortKey,
@@ -252,6 +252,9 @@ fn push(
             let node = plan.add_node(Node::Sort { input: below.node, keys: order });
             Some(Pushed { node, keys: below.keys, moved: below.moved })
         }
+        Node::Values { index: at_index, columns, rows } => {
+            values(plan, at_index, columns, rows, domain, index, keys)
+        }
         Node::CrossProduct { left, right } => {
             let empty = plan.add_expr_list(&[]);
             sides(plan, left, right, JoinKind::Inner, empty, domain, index, keys, outer)
@@ -268,6 +271,112 @@ fn push(
         } => sides(plan, left, right, kind, conditions, domain, index, keys, outer),
         _ => None,
     }
+}
+
+/// A `VALUES` whose rows read the outer row, which is what `LATERAL (VALUES (o.k * 3))` is.
+///
+/// There is nothing underneath a `VALUES` for the domain to be pushed into, so here the domain
+/// becomes the input rather than something crossed with one. Each domain value produces the rows the
+/// literal wrote, with the outer references inside them reading the domain columns instead of the
+/// outer row. One row is that and nothing else, a projection over the domain.
+///
+/// More than one row needs a way to say which of them an output row is, because a projection
+/// produces one row per input row and this has to produce several. The domain is crossed with a
+/// `VALUES` of the row numbers, which is a literal relation of n rows that reads nothing, and then
+/// each output column is a `CASE` over the number picking that row's expression for it. That is n
+/// rows per domain value written with the operators there are, rather than an operator that
+/// evaluates a source once per row, which is the thing this whole module exists to avoid.
+fn values(
+    plan: &mut Plan,
+    at_index: u32,
+    columns: Slice,
+    rows: Slice,
+    domain: NodeRef,
+    index: u32,
+    keys: &[Key],
+) -> Option<Pushed> {
+    let held: Vec<Vec<ExprRef>> =
+        plan.row_list(rows).to_vec().into_iter().map(|row| plan.expr_list(row).to_vec()).collect();
+    let fields = plan.field_list(columns).to_vec();
+    if held.is_empty() {
+        return None;
+    }
+    let span = plan.expr_span(keys.first()?.expr);
+    // The outer references read the domain straight rather than something a lower operator carried,
+    // because there is no lower operator. Nothing else is moved for the same reason.
+    let mut map = HashMap::new();
+    for (position, key) in keys.iter().enumerate() {
+        let at = u32::try_from(position).expect("key count");
+        map.insert(key.binding, ColumnBinding::new(index, at));
+    }
+
+    let (input, chosen) = if held.len() == 1 {
+        let row = held.into_iter().next().expect("one row");
+        (domain, row.into_iter().map(|expr| remap(plan, expr, &map)).collect::<Vec<_>>())
+    } else {
+        let counter = LogicalType::Integer;
+        // The numbers themselves, made once. The literal relation below is built out of them and
+        // the condition each output column asks is a comparison against one of them.
+        let count = i32::try_from(held.len()).ok()?;
+        let numbers: Vec<ExprRef> = (0..count)
+            .map(|at| {
+                let value = plan.add_value(Value::Integer(at));
+                plan.add_expr_at(Expr::Constant(value), counter.clone(), span)
+            })
+            .collect();
+        let numbered: Vec<Slice> =
+            numbers.iter().map(|&expr| plan.add_expr_list(&[expr])).collect();
+        let counted = plan.add_rows(&numbered);
+        let field = Field { name: "__row".to_string(), ty: counter.clone(), not_null: true };
+        let named = plan.add_fields(&[field]);
+        let table = walk::fresh_index(plan);
+        let source = plan.add_node(Node::Values { index: table, columns: named, rows: counted });
+        let input = plan.add_node(Node::CrossProduct { left: domain, right: source });
+        let which = plan.add_expr_at(Expr::Column(ColumnBinding::new(table, 0)), counter, span);
+        let mut chosen = Vec::new();
+        for (column, field) in fields.iter().enumerate() {
+            let (last, rest) = held.split_last().expect("more than one row");
+            let mut arms = Vec::new();
+            for (at, written) in rest.iter().enumerate() {
+                let when = plan.add_expr_at(
+                    Expr::Compare { op: CompareOp::Equal, left: which, right: numbers[at] },
+                    LogicalType::Boolean,
+                    span,
+                );
+                let then = remap(plan, written[column], &map);
+                arms.push(Arm { when, then });
+            }
+            // The last row is the `ELSE` rather than an arm of its own. The number is one of the n
+            // by construction, so the condition that would test for it is known true wherever the
+            // others are false and writing it would only give the folder something to remove.
+            let otherwise = remap(plan, last[column], &map);
+            let arms = plan.add_arms(&arms);
+            chosen.push(plan.add_expr_at(
+                Expr::Case { arms, otherwise: Some(otherwise) },
+                field.ty.clone(),
+                span,
+            ));
+        }
+        (input, chosen)
+    };
+
+    // The domain columns are added to the output for the same reason every other rule here adds
+    // them, which is that the join putting these rows back beside their outer row is above this.
+    let mut projected = chosen;
+    let mut names: Vec<_> = fields.iter().map(|field| plan.intern(&field.name)).collect();
+    let width = projected.len();
+    let mut carried = Vec::new();
+    for (position, key) in keys.iter().enumerate() {
+        let ty = plan.expr_type(key.expr).clone();
+        let at = u32::try_from(position).expect("key count");
+        projected.push(plan.add_expr_at(Expr::Column(ColumnBinding::new(index, at)), ty, span));
+        names.push(plan.intern(&format!("__domain_{position}")));
+        carried.push(ColumnBinding::new(at_index, u32::try_from(width + position).expect("width")));
+    }
+    let exprs = plan.add_expr_list(&projected);
+    let names = plan.add_name_list(&names);
+    let node = plan.add_node(Node::Project { input, index: at_index, exprs, names });
+    Some(Pushed { node, keys: carried, moved: HashMap::new() })
 }
 
 /// Groups by the domain columns as well, and puts back the groups the domain has and the input does
@@ -657,5 +766,48 @@ mod tests {
         // make it one limit over the whole inner side, and answering a different query is worse
         // than saying no.
         assert!(after.contains("DependentJoin"), "{after}");
+    }
+
+    /// A `VALUES` on the right of a dependent join, which is what `LATERAL (VALUES ...)` binds to.
+    ///
+    /// Nothing under it and no inner table, so it does not fit the shape `correlated` builds.
+    fn correlated_values(rows: &str) -> Plan {
+        let text = format!(
+            "DependentJoin INNER on=[]\n  Get memory.main.outer AS o #0 [k::INTEGER]\n  Values #1 [col0::INTEGER] rows=[{rows}]\n"
+        );
+        Plan::parse(&text).expect("a correlated plan")
+    }
+
+    #[test]
+    fn one_values_row_reading_the_outer_row_becomes_a_projection_over_the_domain() {
+        let mut plan = correlated_values("[\"*\"(#0.0::INTEGER, 3::INTEGER)::INTEGER]");
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        // The domain is the input rather than something crossed with one, because there is nothing
+        // under a VALUES for it to be pushed into, and one row needs nothing to choose between.
+        assert!(!after.contains("CrossProduct"), "{after}");
+        assert!(!after.contains("CASE WHEN"), "{after}");
+        assert!(after.contains("__domain_0"), "{after}");
+    }
+
+    #[test]
+    fn several_values_rows_are_chosen_between_by_a_row_number() {
+        let mut plan = correlated_values(
+            "[\"*\"(#0.0::INTEGER, 3::INTEGER)::INTEGER], [\"+\"(#0.0::INTEGER, 1::INTEGER)::INTEGER]",
+        );
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        // Two rows per domain value, so the domain is crossed with a literal relation of the row
+        // numbers and each output column asks which row it is. The last row is the ELSE.
+        assert!(
+            after.contains("Values #3 [__row::INTEGER] rows=[[0::INTEGER], [1::INTEGER]]"),
+            "{after}"
+        );
+        assert!(after.contains("CASE WHEN (#3.0::INTEGER = 0::INTEGER)"), "{after}");
+        assert!(after.contains("ELSE \"+\"(#2.0::INTEGER, 1::INTEGER)::INTEGER"), "{after}");
     }
 }

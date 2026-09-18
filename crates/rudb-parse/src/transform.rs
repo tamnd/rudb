@@ -1588,10 +1588,11 @@ impl<'a> Transform<'a> {
                 }
                 Ok(self.push_source(Source::Table { name, alias, columns }))
             }
+            // `LATERAL` is read and dropped. A FROM entry here already sees the entries written to
+            // its left, which is what the word asks for, so writing it changes nothing and the
+            // pinned build resolves the same query with and without it.
             "TableSubquery" => {
-                if self.find(inner, "TableAliasColon") != NONE
-                    || self.find(inner, "Lateral") != NONE
-                {
+                if self.find(inner, "TableAliasColon") != NONE {
                     return self.unsupported(inner);
                 }
                 // `SubqueryReference <- Parens(SelectStatementInternal)`.
@@ -1602,11 +1603,12 @@ impl<'a> Transform<'a> {
             }
             // `TableFunction <- TableFunctionLateralOpt / TableFunctionAliasColon`, and
             // `TableFunctionLateralOpt <- Lateral? QualifiedTableFunction TableFunctionArguments
-            // WithOrdinality? TableAlias?`. The colon form and `LATERAL` are their own work, and
-            // `WITH ORDINALITY` adds a column, so all three are turned away rather than dropped.
+            // WithOrdinality? TableAlias?`. The colon form is its own work and `WITH ORDINALITY`
+            // adds a column, so both are turned away rather than dropped. `LATERAL` is read and
+            // dropped, for the reason given above `TableSubquery`.
             "TableFunction" => {
                 let form = self.first(inner);
-                for name in ["TableAliasColon", "Lateral", "WithOrdinality", "SampleClause"] {
+                for name in ["TableAliasColon", "WithOrdinality", "SampleClause"] {
                     let clause = self.find(form, name);
                     if clause != NONE {
                         return self.unsupported(clause);
@@ -4756,15 +4758,18 @@ mod tests {
         // The grammar allows a call with no arguments here and the transformer keeps it, because
         // whether a particular function takes none is the binder's question and not this one's.
         assert_eq!(round("SELECT * FROM some_function()"), "SELECT * FROM some_function()");
+        // `LATERAL` is read and dropped, because a FROM entry here already sees the entries written
+        // to its left and the word asks for nothing more.
+        assert_eq!(round("SELECT * FROM LATERAL range(3)"), "SELECT * FROM range(3)");
+        assert_eq!(
+            round("SELECT * FROM t, LATERAL (SELECT t.x) AS v"),
+            "SELECT * FROM t, (SELECT t.x) AS v"
+        );
     }
 
     #[test]
     fn the_forms_of_a_table_function_this_does_not_cover_are_turned_away_by_name() {
-        for query in [
-            "SELECT * FROM range(3) WITH ORDINALITY",
-            "SELECT * FROM LATERAL range(3)",
-            "SELECT * FROM t: range(3)",
-        ] {
+        for query in ["SELECT * FROM range(3) WITH ORDINALITY", "SELECT * FROM t: range(3)"] {
             let error = parse_ast(query).unwrap_err().to_string();
             assert!(error.contains("grammar rule"), "{query} failed with {error}");
         }
