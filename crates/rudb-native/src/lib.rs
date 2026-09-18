@@ -1397,8 +1397,6 @@ struct NativeText {
     /// and that reader was going to read the payload of this column once per row otherwise.
     code_ranks: OnceLock<Option<Vec<u32>>>,
     payload: u64,
-    /// How many bytes the payload holds once it is decoded, which is what the offsets index into.
-    payload_len: usize,
     /// Where each block of the payload ends in the file, as a byte offset from `payload`. The
     /// blocks are stored back to back, so a block starts where the one before it ended.
     ends: Vec<u64>,
@@ -4171,9 +4169,8 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
     let mut hashes = words.split_off(blocks);
     let rank_hashes = hashes.split_off(blocks);
     let ends = words;
-    // The offsets say how long the payload is once it is decoded. The last block end says how much
-    // of the file it takes as stored, and those are two different numbers now.
-    let payload_len = offsets.last().copied().unwrap_or_default() as usize;
+    // What the offsets bound is the decoded payload, and what the page holds is the stored one, so
+    // the last block end is the only thing that ties the index to the length of the page.
     let stored_len = page.length as usize - body_len;
     if ends.last().copied().unwrap_or_default() as usize != stored_len
         || ends.windows(2).any(|pair| pair[0] > pair[1])
@@ -4194,7 +4191,6 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
             rank_blocks: (0..rank_blocks).map(|_| OnceLock::new()).collect(),
             code_ranks: OnceLock::new(),
             payload: page.offset + body_len as u64,
-            payload_len,
             ends,
             hashes,
             blocks: (0..blocks).map(|_| OnceLock::new()).collect(),
