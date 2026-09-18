@@ -47,6 +47,6 @@ pub use session::{
 };
 pub use slow::{Cause, Tally};
 pub use stage::{Spent, Stage};
-pub use stat::{Class, Classes, Source, Stat};
+pub use stat::{Class, Classes, Direction, Provenance, Stat, Use};
 pub use types::{Field, LogicalType, MAX_DECIMAL_WIDTH, PhysicalType};
 pub use value::{Value, civil_from_days, days_from_civil, interval_micros};

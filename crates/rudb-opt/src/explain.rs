@@ -162,6 +162,7 @@ pub fn record_estimates(plan: &Plan, statistics: &Statistics, document: &mut Doc
         if let Some(estimate) = estimated.get(operator.id as usize) {
             operator.estimated_rows = estimate.value().copied();
             operator.estimate_class = estimate.class();
+            operator.estimate_provenance = estimate.provenance();
             document.estimates.record(estimate);
         }
     }
@@ -189,17 +190,21 @@ fn printed(
 /// The row count and its class, as the bracket on a plan line reads.
 ///
 /// The tilde is on the guesses and nothing else. A count that was counted is printed without one
-/// because it is not approximately anything, and the word after the number says where it came from,
-/// which is the question somebody asks when a plan went wrong. `spec/stats/04-in-memory.md` section
-/// 4.1 asks for the source to be printed for exactly that reason: a bad plan is diagnosed by asking
-/// which number was wrong and who produced it, and `estimated from constant` is the answer that says
-/// nobody had a number here at all.
+/// because it is not approximately anything, and the words after the number say what kind of
+/// knowledge it is and where it came from, which is the question somebody asks when a plan went
+/// wrong. `spec/stats/04-in-memory.md` section 4.1 asks for both to be printed for exactly that
+/// reason: a bad plan is diagnosed by asking which number was wrong and who produced it, and
+/// `estimated from default` is the answer that says nobody had a number here at all.
+///
+/// The provenance is printed next to an exact number too, per `spec/stats/02-the-catalogue.md`
+/// section 2.1.1. An exact count out of the catalog and an exact join cardinality out of a link
+/// header are different kinds of exact and a reader has to be able to tell them apart.
 fn estimate(stat: Stat<u64>) -> String {
     match stat {
         Stat::Unknown => "rows unknown".to_owned(),
-        Stat::Known { value, class } => match class {
-            Class::Estimated { .. } => format!("~{value} rows {class}"),
-            class => format!("{value} rows {class}"),
+        Stat::Known { value, class, provenance } => match class {
+            Class::Estimated => format!("~{value} rows {class} from {provenance}"),
+            class => format!("{value} rows {class} from {provenance}"),
         },
     }
 }
@@ -441,9 +446,9 @@ mod tests {
         assert_eq!(
             tree(&out).join("\n"),
             concat!(
-                "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN  [~200 rows estimated from constant] \
+                "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN  [~200 rows estimated from default] \
                  [pipeline 0] [reference]\n",
-                "  Get memory.main.t AS t #0 [a::INTEGER]  [1000 rows exact] [pipeline 0] \
+                "  Get memory.main.t AS t #0 [a::INTEGER]  [1000 rows exact from row count] [pipeline 0] \
                  [reference]",
             )
         );
@@ -516,9 +521,15 @@ mod tests {
         );
         let lines = tree(&out);
         assert_eq!(lines.len(), 3, "{out}");
-        assert!(lines[0].contains("[~5000 rows estimated from constant]"), "{out}");
-        assert!(lines[1].contains("small") && lines[1].contains("[10 rows exact]"), "{out}");
-        assert!(lines[2].contains("big") && lines[2].contains("[5000 rows exact]"), "{out}");
+        assert!(lines[0].contains("[~5000 rows estimated from default]"), "{out}");
+        assert!(
+            lines[1].contains("small") && lines[1].contains("[10 rows exact from row count]"),
+            "{out}"
+        );
+        assert!(
+            lines[2].contains("big") && lines[2].contains("[5000 rows exact from row count]"),
+            "{out}"
+        );
         // Indented by depth, so the shape of the tree survives being flattened into lines.
         assert!(lines[1].starts_with("  Get"), "{out}");
     }
