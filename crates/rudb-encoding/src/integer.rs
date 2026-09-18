@@ -310,10 +310,13 @@ fn encode_as(
         }
         Kind::Packed => encode_packed(values, &mut out)?,
         Kind::Delta => {
-            let Some(deltas) = deltas(values) else {
+            // An empty chunk has no first value to hang the differences off. The search never asks
+            // for one because `candidates` rules it out, but `encode_only` goes straight past that
+            // and used to index into the chunk anyway.
+            let (Some(first), Some(deltas)) = (values.first(), deltas(values)) else {
                 return Ok(None);
             };
-            put_i64(&mut out, values[0]);
+            put_i64(&mut out, *first);
             out.extend_from_slice(&encode_at(&deltas, depth + 1, chooser)?);
         }
         Kind::Rle => {
@@ -1075,6 +1078,45 @@ mod tests {
         for kind in applicable {
             let bytes = encode_only(kind, &values).unwrap().unwrap();
             assert_eq!(decode(&bytes).unwrap(), values, "{}", kind.name());
+        }
+    }
+
+    /// The test above only asks the kinds `candidates` offered, so between them the two cover the
+    /// encoders on input the search would give them and nothing else. `encode_only` does not go
+    /// through `candidates` at all, so every one of its callers can hand an encoder a shape the
+    /// filter would have refused, and the empty chunk is the shape that used to panic.
+    #[test]
+    fn every_kind_that_applies_decodes_to_what_it_was_given() {
+        let shapes: Vec<Vec<i64>> = vec![
+            Vec::new(),
+            vec![5; 1024],
+            vec![i64::MIN, i64::MAX, 0, -1],
+            (0..1024).map(|at| at * 7).collect(),
+            (0..1024).map(|at| at % 17).collect(),
+            (0..1024).map(|at| if at % 100 == 0 { at } else { 3 }).collect(),
+            (0..1024).map(|at| -at * 1_000_003).collect(),
+            (0..1024_i64)
+                .map(|at| {
+                    at.wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407)
+                })
+                .collect(),
+        ];
+        let kinds =
+            [Kind::Constant, Kind::Packed, Kind::Delta, Kind::Rle, Kind::Dict, Kind::Sparse];
+        for values in &shapes {
+            for kind in kinds {
+                let Some(bytes) = encode_only(kind, values).unwrap() else {
+                    continue;
+                };
+                assert_eq!(
+                    &decode(&bytes).unwrap(),
+                    values,
+                    "{} over {} values",
+                    kind.name(),
+                    values.len()
+                );
+            }
         }
     }
 
