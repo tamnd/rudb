@@ -52,6 +52,8 @@
 //! aggregate this is, and the match on which layout the column is in. All three of those are decided
 //! once per vector here and none of them per row.
 
+use std::sync::Arc;
+
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::{Data, Form, Validity, Vector};
 
@@ -174,7 +176,75 @@ enum State {
     // Box the one state whose scalar representation is much wider than every numeric aggregate.
     // Most ClickBench groups contain count/sum/avg states and should not each pay for a 64-byte
     // Value they never hold. Min and max allocate only after they see their first non-null value.
-    Extreme { held: Option<Box<Value>>, least: bool },
+    Extreme { held: Option<Box<Extremum>>, least: bool },
+}
+
+/// What a min or a max is holding.
+#[derive(Debug, Clone)]
+enum Extremum {
+    /// A value copied out of the column it came from.
+    Held(Value),
+    /// A position in a dictionary that knows its sorted order, kept in place of the value there.
+    ///
+    /// A grouped min over a column of strings does a comparison per row, and comparing two strings
+    /// means fetching both out of a payload the size of the column. A dictionary that sorted its
+    /// values when it was written already knows which of any two of them is smaller, so the
+    /// comparison becomes two integers and a string is fetched once for the group that answers with
+    /// it rather than once for every row that fails to.
+    ///
+    /// The dictionary is held rather than borrowed, and that is what makes the `Arc::ptr_eq` in
+    /// [`Extremum::offer`] a sound way to ask whether two of these rank against each other. Two
+    /// dictionaries number their values differently, so a rank from one means nothing to the other,
+    /// and keeping this one alive is what stops a second from turning up at the same address and
+    /// being taken for it.
+    Ranked { dictionary: Arc<Vector>, code: u32, rank: u32 },
+}
+
+impl Extremum {
+    /// The value this holds, read out of the dictionary when that is where it still is.
+    fn value(&self) -> Result<Value> {
+        match self {
+            Self::Held(value) => Ok(value.clone()),
+            Self::Ranked { dictionary, code, .. } => dictionary.try_value_at(*code as usize),
+        }
+    }
+
+    /// Replaces a rank with the value it stands for, so that something without ranks can compare.
+    fn settle(&mut self) -> Result<&mut Value> {
+        if let Self::Ranked { .. } = self {
+            let value = self.value()?;
+            *self = Self::Held(value);
+        }
+        match self {
+            Self::Held(value) => Ok(value),
+            Self::Ranked { .. } => {
+                Err(Error::internal("a settled extreme kept its rank".to_string()))
+            }
+        }
+    }
+
+    /// Offers one dictionary row, and keeps it when it beats what is already here.
+    ///
+    /// The whole point of the fast path is the first arm: same dictionary, so one integer compare
+    /// and, on a win, two stores. Anything else settles into a value and compares the long way,
+    /// which is what a mix of dictionaries or a mix of forms in one aggregate costs.
+    fn offer(&mut self, dictionary: &Arc<Vector>, code: u32, rank: u32, least: bool) -> Result<()> {
+        if let Self::Ranked { dictionary: mine, code: held_code, rank: held_rank } = self {
+            if Arc::ptr_eq(mine, dictionary) {
+                if if least { rank < *held_rank } else { rank > *held_rank } {
+                    *held_code = code;
+                    *held_rank = rank;
+                }
+                return Ok(());
+            }
+        }
+        let candidate = dictionary.try_value_at(code as usize)?;
+        let ordering = order(&candidate, self.settle()?)?;
+        if if least { ordering.is_lt() } else { ordering.is_gt() } {
+            *self = Self::Held(candidate);
+        }
+        Ok(())
+    }
 }
 
 impl Accumulator {
@@ -330,12 +400,12 @@ impl Accumulator {
                 let replace = match held {
                     None => true,
                     Some(current) => {
-                        let ordering = order(value, current)?;
+                        let ordering = order(value, current.settle()?)?;
                         if *least { ordering.is_lt() } else { ordering.is_gt() }
                     }
                 };
                 if replace {
-                    *held = Some(Box::new(value.clone()));
+                    *held = Some(Box::new(Extremum::Held(value.clone())));
                 }
             }
         }
@@ -475,12 +545,12 @@ impl Accumulator {
                 let replace = match held {
                     None => true,
                     Some(current) => {
-                        let ordering = order(&candidate, current)?;
+                        let ordering = order(&candidate, current.settle()?)?;
                         if least { ordering.is_lt() } else { ordering.is_gt() }
                     }
                 };
                 if replace {
-                    *held = Some(Box::new(candidate));
+                    *held = Some(Box::new(Extremum::Held(candidate)));
                 }
             }
             (State::Extreme { .. }, Contribution::Extreme(None)) => {}
@@ -561,15 +631,25 @@ impl Accumulator {
                 if least == same =>
             {
                 if let Some(candidate) = candidate {
-                    let replace = match held {
-                        None => true,
-                        Some(current) => {
-                            let ordering = order(candidate, current)?;
-                            if *least { ordering.is_lt() } else { ordering.is_gt() }
+                    match (held.as_deref_mut(), candidate.as_ref()) {
+                        (None, _) => *held = Some(candidate.clone()),
+                        // Two workers over one column hold ranks out of the one dictionary, so the
+                        // merge that brings their tables together compares integers too.
+                        (
+                            Some(Extremum::Ranked { dictionary, rank, .. }),
+                            Extremum::Ranked { dictionary: theirs, rank: other, .. },
+                        ) if Arc::ptr_eq(dictionary, theirs) => {
+                            if if *least { other < rank } else { other > rank } {
+                                *held = Some(candidate.clone());
+                            }
                         }
-                    };
-                    if replace {
-                        *held = Some(candidate.clone());
+                        (Some(current), _) => {
+                            let value = candidate.value()?;
+                            let ordering = order(&value, current.settle()?)?;
+                            if if *least { ordering.is_lt() } else { ordering.is_gt() } {
+                                *held = Some(candidate.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -647,7 +727,7 @@ impl Accumulator {
                 };
                 Ok(Value::Decimal { unscaled: *total, width, scale: *scale })
             }
-            State::Extreme { held, .. } => Ok(held.as_deref().cloned().unwrap_or(Value::Null)),
+            State::Extreme { held, .. } => held.as_deref().map_or(Ok(Value::Null), Extremum::value),
         }
     }
 
@@ -703,6 +783,11 @@ pub fn update_scattered(
         )));
     };
     let kind = first.kind();
+    // Which way a min or a max runs, taken before the loops below borrow the states they update.
+    let extreme = match first.state {
+        State::Extreme { least, .. } => Some(least),
+        _ => None,
+    };
     let into = Where { slots, stride, offset };
     // `count(*)` reads nothing, so it never asks for the argument it does not have.
     if kind == Kind::CountStar {
@@ -729,7 +814,12 @@ pub fn update_scattered(
     if matches!(nulls, Validity::AllInvalid) {
         return Ok(());
     }
-    if matches!(first.state, State::Extreme { .. })
+    if let Some(least) = extreme {
+        if ranked_extremes(states, into, input, rows, &nulls, least)? {
+            return Ok(());
+        }
+    }
+    if extreme.is_some()
         && input.logical_type() == &LogicalType::Varchar
         && matches!(input.form(), Form::Flat | Form::Dictionary | Form::StringView | Form::Rle)
     {
@@ -754,7 +844,7 @@ pub fn update_scattered(
             };
             match held {
                 Some(current) => {
-                    let Value::Varchar(previous) = current.as_mut() else {
+                    let Value::Varchar(previous) = current.settle()? else {
                         return Err(Error::internal(
                             "a varchar extreme held another type".to_string(),
                         ));
@@ -771,11 +861,20 @@ pub fn update_scattered(
                         previous.push_str(utf8(bytes)?);
                     }
                 }
-                None => *held = Some(Box::new(Value::Varchar(utf8(bytes)?.to_owned()))),
+                None => {
+                    let text = Value::Varchar(utf8(bytes)?.to_owned());
+                    *held = Some(Box::new(Extremum::Held(text)));
+                }
             }
         }
         return Ok(());
     }
+    let Some(first) = states.get(offset) else {
+        return Err(Error::internal(format!(
+            "an aggregate at {offset} of {} accumulators",
+            states.len()
+        )));
+    };
     let feed = feed_of(first, input.logical_type());
     if let Some(feed) = feed {
         if spread(states, into, input, rows, &nulls, feed)? {
@@ -792,6 +891,58 @@ pub fn update_scattered(
         states[index].update(std::slice::from_ref(&value))?;
     }
     Ok(())
+}
+
+/// A grouped min or max over a dictionary that sorted its values when it was written.
+///
+/// The win is that no string is read. Each row turns into the rank of its code, which is one load
+/// out of a map four bytes wide per distinct value, and a group keeps the rank it has rather than
+/// the text, so a column whose payload is sixty six megabytes over four hundred thousand values is
+/// never touched until the groups are finished. Against the byte comparison below it, on ClickBench
+/// query 28 over the million row file, this is the difference between a fetch out of a dictionary
+/// block per row for eight hundred thousand rows and one fetch per group for ninety five thousand
+/// groups.
+///
+/// `false` when the input is not a dictionary, or is one that does not know its order, and the
+/// caller then takes whichever of the slower paths fits. Nothing here decides an answer differently
+/// from those, only more cheaply: a rank order is the byte order of the values by the promise
+/// [`rudb_vector::TextSource::ranks`] makes.
+fn ranked_extremes(
+    states: &mut [Accumulator],
+    into: Where<'_>,
+    input: &Vector,
+    rows: usize,
+    nulls: &Validity,
+    least: bool,
+) -> Result<bool> {
+    let Some((codes, dictionary)) = input.shared_dictionary_parts() else { return Ok(false) };
+    let Some(ranks) = dictionary.code_ranks() else { return Ok(false) };
+    if codes.len() < rows {
+        return Ok(false);
+    }
+    // row at a time: a scatter is per row by definition, since two adjacent rows are usually two
+    // different groups and there is nothing to reduce before it.
+    for (row, &code) in codes.iter().enumerate().take(rows) {
+        if !nulls.is_valid(row) {
+            continue;
+        }
+        let Some(index) = into.index(row) else { continue };
+        // Giving up here leaves the rows already offered in the groups that took them, and that is
+        // harmless: offering a row to a min twice reaches the same min as offering it once, so the
+        // path the caller falls back to reads the whole vector again and lands in the same place.
+        let Some(&rank) = ranks.get(code as usize) else { return Ok(false) };
+        let State::Extreme { held, .. } = &mut states[index].state else {
+            return Err(Error::internal("a ranked extreme into another state".to_string()));
+        };
+        match held {
+            Some(current) => current.offer(dictionary, code, rank, least)?,
+            None => {
+                let kept = Extremum::Ranked { dictionary: dictionary.clone(), code, rank };
+                *held = Some(Box::new(kept));
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// The text a row holds, checked once for the row that is going to be kept.
@@ -1075,6 +1226,7 @@ fn extreme_into<M: Fn(usize) -> usize>(
                         let replace = match held {
                             None => true,
                             Some(current) => {
+                                let current: &Value = current.settle()?;
                                 let mark = integral(current).ok_or_else(|| not_narrow(current))?;
                                 if least { number < mark } else { number > mark }
                             }
@@ -1083,7 +1235,8 @@ fn extreme_into<M: Fn(usize) -> usize>(
                         // arrives sorted is once and for a column that arrives shuffled is about
                         // the harmonic number of the rows in the group.
                         if replace {
-                            *held = Some(Box::new(run.input.try_value_at(row)?));
+                            let value = run.input.try_value_at(row)?;
+                            *held = Some(Box::new(Extremum::Held(value)));
                         }
                     }
                 })+
@@ -2260,8 +2413,7 @@ mod tests {
     /// row. It is decided on the bytes, and the bytes can be asked for a code at a time.
     #[test]
     fn an_extreme_over_a_dictionary_that_keeps_its_bytes_in_a_file_is_decided_on_the_bytes() {
-        let source =
-            std::sync::Arc::new(Filed(vec![b"pear".to_vec(), b"apple".to_vec(), b"plum".to_vec()]));
+        let source = Arc::new(Filed(vec![b"pear".to_vec(), b"apple".to_vec(), b"plum".to_vec()]));
         let values = Vector::external_text(LogicalType::Varchar, source).expect("three values");
         let coded = Vector::dictionary(vec![0, 2, 1, 2, 0], values).expect("codes are in range");
         let batch = std::slice::from_ref(&coded);
