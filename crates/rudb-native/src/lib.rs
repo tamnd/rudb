@@ -1211,6 +1211,39 @@ pub struct Reader {
     size: u64,
     /// The committed directory's size, for [`Reader::layout`].
     directory: u64,
+    /// What opening the file cost, which is a number rather than a claim.
+    opening: Opening,
+}
+
+/// What [`Reader::open`] read before it returned.
+///
+/// `spec/stats/04-in-memory.md` section 4.2 says opening a table reads the header and the directory
+/// and nothing else, and once that document's statistics are in the file the tempting change is to
+/// load a column summary or two on the way past, because they are small and the next query will
+/// want them. A hundred milliseconds of that is a hundred milliseconds nobody asked for, and an
+/// embedded database is opened by processes that are about to run one trivial query.
+///
+/// So the claim gets a number. Both of these are fixed by the schema and the stripe count and are
+/// independent of how many rows the file holds, and the test that says so is what stops the
+/// tempting change from landing quietly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Opening {
+    /// How many times the file was read. The header, then each directory slot that looked valid
+    /// enough to check, so three at the most.
+    pub reads: u32,
+    /// How many bytes those reads asked for.
+    pub bytes: u64,
+}
+
+/// What a reader has read, while it was being opened and since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Reads {
+    /// What opening cost, before any query had been planned.
+    pub opening: Opening,
+    /// Whole stripe pages read since.
+    pub pages: usize,
+    /// Index sections read since.
+    pub indexes: usize,
 }
 
 /// Where one table wide part number lands.
@@ -1663,6 +1696,7 @@ impl Reader {
         }
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header).map_err(io)?;
+        let mut opening = Opening { reads: 1, bytes: HEADER };
         let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
         // The two halves are worth telling apart. A wrong magic is a file that was never ours and
         // the answer is to look at the path. A wrong version is our own file from another build,
@@ -1690,6 +1724,8 @@ impl Reader {
             let mut bytes = vec![0; slot.length as usize];
             file.seek(SeekFrom::Start(slot.offset)).map_err(io)?;
             file.read_exact(&mut bytes).map_err(io)?;
+            opening.reads += 1;
+            opening.bytes += u64::from(slot.length);
             if checksum(&bytes) == slot.hash
                 && selected
                     .as_ref()
@@ -1728,7 +1764,23 @@ impl Reader {
             kept: Arc::new(AtomicUsize::new(CACHED_STRIPES_PER_COLUMN)),
             size,
             directory: u64::from(slot.length),
+            opening,
         })
+    }
+
+    /// What this reader has read so far, and what opening it cost.
+    ///
+    /// Public because the claim of `spec/stats/04-in-memory.md` section 4.2 is about this number
+    /// and a claim nobody can check is a comment. A caller that wants to know whether opening a
+    /// file touched the data asks here, and gets an answer that does not depend on what the page
+    /// cache happened to hold.
+    #[must_use]
+    pub fn reads(&self) -> Reads {
+        Reads {
+            opening: self.opening,
+            pages: self.pages.load(Atomic::Relaxed),
+            indexes: self.indexes.load(Atomic::Relaxed),
+        }
     }
 
     /// Where the file's bytes went, from the directory alone.
@@ -4469,6 +4521,116 @@ mod tests {
             }
         });
         assert_eq!(reader.pages.load(Atomic::Relaxed), 1, "one stripe, one page read, whoever won");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Opening a file reads the header and the directory, and nothing that depends on the rows.
+    ///
+    /// `spec/stats/04-in-memory.md` section 4.2. There are no statistics in the file yet, so this
+    /// holds today by not having anything to load, and that is exactly why it is worth pinning now.
+    /// The change that breaks it is the reasonable looking one: summaries are a few hundred bytes,
+    /// the next query will want them, so read them on the way past. A process that opened the
+    /// database to run one trivial query pays for all of it and gets nothing.
+    ///
+    /// Two files of the same shape and a thousand times the rows in one of them, opened, and the
+    /// two openings cost the same. The stripe count is held equal so that the directory is the same
+    /// size in both, which leaves the rows as the only thing that changed. Anything read out of the
+    /// data would show up here.
+    #[test]
+    fn opening_costs_the_same_over_a_thousand_times_the_rows() {
+        let opened = |label: &str, rows_per_part: i32| {
+            let path = path(label);
+            let mut writer =
+                Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                    .expect("new file");
+            for part in 0..STRIPE_PARTS * 3 {
+                // Scrambled rather than sequential, so that the fat file is actually fatter. A run
+                // of consecutive integers encodes to almost nothing and would leave the two files
+                // the same size, which would make this test pass for the wrong reason.
+                let values = (0..rows_per_part)
+                    .map(|row| {
+                        Value::Integer((part as i32 * rows_per_part + row).wrapping_mul(2_654_435))
+                    })
+                    .collect::<Vec<_>>();
+                let chunk = Chunk::new(vec![
+                    Vector::from_values(LogicalType::Integer, &values).expect("integers"),
+                ])
+                .expect("matching rows");
+                writer.append(&chunk).expect("one part");
+            }
+            writer.finish().expect("commit");
+            let reader = Reader::open(&path).expect("reopen from disk");
+            let size = fs::metadata(&path).expect("the file is there").len();
+            let out = (reader.reads(), reader.table().stripes().len(), size);
+            fs::remove_file(path).expect("remove scratch file");
+            out
+        };
+
+        let (thin, thin_stripes, thin_size) = opened("open-thin", 1);
+        let (fat, fat_stripes, fat_size) = opened("open-fat", 1000);
+        assert_eq!(
+            thin_stripes, fat_stripes,
+            "the same stripe count is what makes this a fair ask"
+        );
+        assert!(
+            fat_size > thin_size * 50,
+            "the fat file has to actually be larger, and it is {fat_size} against {thin_size}"
+        );
+
+        assert_eq!(thin.opening.reads, fat.opening.reads, "the same reads either way");
+        assert_eq!(thin.pages, 0, "opening read a page");
+        assert_eq!(fat.pages, 0, "opening read a page");
+        assert_eq!(thin.indexes, 0, "opening read an index");
+        assert_eq!(fat.indexes, 0, "opening read an index");
+        // Not exactly equal, because a directory holds offsets and a larger file has larger ones,
+        // and a handful of bytes of varint is not somebody loading statistics. A factor is.
+        assert!(
+            fat.opening.bytes < thin.opening.bytes * 2,
+            "opening the thin file read {} bytes and the fat one read {}",
+            thin.opening.bytes,
+            fat.opening.bytes
+        );
+    }
+
+    /// The reads a file costs to open are fixed by its shape and not by what ran before.
+    ///
+    /// `spec/stats/04-in-memory.md` section 4.3, which is the rule that keeps a plan reproducible:
+    /// the plan is a function of the data, the generation and the settings, and never of what
+    /// happened to be in cache. Opening the same file twice in the same process has to cost the
+    /// same, because a second open that read less would be an open that was about to plan
+    /// differently.
+    #[test]
+    fn two_opens_of_one_file_cost_the_same_and_the_second_is_not_cheaper() {
+        let path = path("open-twice");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        for part in 0..STRIPE_PARTS * 3 {
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Integer, &[Value::Integer(part as i32)])
+                    .expect("integers"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let first = Reader::open(&path).expect("open");
+        // A whole scan in between, so the operating system's page cache is as warm as it gets and
+        // anything that consulted it would show up in the second open.
+        for part in 0..first.parts() {
+            first.read(part, &[0]).expect("a part");
+        }
+        assert!(first.reads().pages > 0, "the scan has to have read something");
+        let second = Reader::open(&path).expect("open again");
+
+        assert_eq!(first.reads().opening, second.reads().opening);
+        assert_eq!(
+            second.reads().pages,
+            0,
+            "the second open read a page off the back of the first"
+        );
+        assert_eq!(second.reads().indexes, 0, "the second open read an index it inherited");
         fs::remove_file(path).expect("remove scratch file");
     }
 
