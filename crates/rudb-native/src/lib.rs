@@ -579,7 +579,7 @@ fn weight(ty: &LogicalType) -> usize {
 /// digit megabytes at a hundred million rows, and it puts a four byte column's page at a quarter of
 /// a megabyte, which is the size a sequential read wants. Larger stripes buy a smaller directory
 /// and cost a sparse fetch, which has to read a page index before it can reach one part.
-const STRIPE_PARTS: usize = 64;
+pub const STRIPE_PARTS: usize = 64;
 
 /// Bytes one part takes in a stripe's index page: four for the length, eight for the checksum.
 const INDEX_ENTRY: usize = size_of::<u32>() + size_of::<u64>();
@@ -672,6 +672,55 @@ impl Writer {
         if chunk.is_empty() {
             return Ok(());
         }
+        self.admit(chunk)?;
+        if self.pending.last().is_some_and(|last| last.order > order) {
+            self.flush_pending()?;
+        }
+        // Cloned rather than encoded, and a clone of a chunk that owns its buffers is a copy of
+        // them. Sixty four parts of a hundred and five columns is tens of megabytes held for the
+        // length of a stripe and a few seconds of memory traffic over a whole ClickBench load,
+        // against the hundreds of seconds of encode this is what lets off one thread.
+        self.pending.push(PendingChunk { order, chunk: chunk.clone() });
+        if self.pending.len() == STRIPE_PARTS {
+            self.flush_pending()?;
+        }
+        Ok(())
+    }
+
+    /// Writes a run of chunks as one stripe of its own.
+    ///
+    /// [`Self::append_at`] decides where a stripe ends by watching the orders go past, which works
+    /// when one caller hands over every chunk in source order and does not when several do. A
+    /// writer being fed by more than one pipeline instance sees the orders interleave, and a stripe
+    /// that ends every time two of them cross is a stripe of one or two parts.
+    ///
+    /// So the grouping moves to the caller. Whoever is buffering hands over a run it already knows
+    /// is contiguous and in order, and gets a stripe holding exactly that run. The orders still
+    /// have to come out in source order once the stripes are sorted, which [`Self::finish`] checks,
+    /// so the runs from different callers may interleave with each other but may not overlap.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::append`], and if the run is longer than [`STRIPE_PARTS`].
+    pub fn append_stripe(&mut self, parts: Vec<((u64, u64), Chunk)>) -> Result<()> {
+        if parts.len() > STRIPE_PARTS {
+            return Err(invalid("a stripe was handed more parts than it holds"));
+        }
+        // Whatever an earlier caller left behind is its own stripe rather than the front of this
+        // one, because the two runs are from different places in the source and a stripe is a run.
+        self.flush_pending()?;
+        for (order, chunk) in parts {
+            if chunk.is_empty() {
+                continue;
+            }
+            self.admit(&chunk)?;
+            self.pending.push(PendingChunk { order, chunk });
+        }
+        self.flush_pending()
+    }
+
+    /// Checks a chunk against the declared table and counts its rows in.
+    fn admit(&mut self, chunk: &Chunk) -> Result<()> {
         if chunk.width() != self.table.fields.len() {
             return Err(invalid("chunk width differs from table schema"));
         }
@@ -685,17 +734,6 @@ impl Writer {
             .rows
             .checked_add(chunk.len())
             .ok_or_else(|| invalid("row count overflow"))?;
-        if self.pending.last().is_some_and(|last| last.order > order) {
-            self.flush_pending()?;
-        }
-        // Cloned rather than encoded, and a clone of a chunk that owns its buffers is a copy of
-        // them. Sixty four parts of a hundred and five columns is tens of megabytes held for the
-        // length of a stripe and a few seconds of memory traffic over a whole ClickBench load,
-        // against the hundreds of seconds of encode this is what lets off one thread.
-        self.pending.push(PendingChunk { order, chunk: chunk.clone() });
-        if self.pending.len() == STRIPE_PARTS {
-            self.flush_pending()?;
-        }
         Ok(())
     }
 
@@ -4404,6 +4442,90 @@ mod tests {
         assert!(strings.contains(&(Value::Null, 2)));
         assert!(strings.contains(&(Value::Varchar("alpha".into()), 2)));
         assert!(strings.contains(&(Value::Varchar("long text after a slash".into()), 2)));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Two pipeline instances handing over whole runs, which is what makes the native sink safe to
+    /// instance.
+    ///
+    /// The runs arrive in the order the instances finished reading them rather than in source
+    /// order, and the second one to finish is the one that read the earlier rows. Each run is still
+    /// a stripe of its own and the table still reads back in source order, which is the whole of
+    /// what the writer promises about ordering.
+    #[test]
+    fn runs_handed_over_out_of_order_still_read_back_in_source_order() {
+        let path = path("interleaved-runs");
+        let mut writer =
+            Writer::create(&path, "interleaved", vec![Field::new("v", LogicalType::BigInt)])
+                .expect("new file");
+        for morsel in [2_u64, 0, 3, 1] {
+            let parts = (0..4_u64)
+                .map(|chunk| {
+                    let first = i64::try_from(morsel * 32 + chunk * 8).expect("small");
+                    let values =
+                        (0..8_i64).map(|row| Value::BigInt(first + row)).collect::<Vec<_>>();
+                    let column =
+                        Vector::from_values(LogicalType::BigInt, &values).expect("a column");
+                    ((morsel, chunk), Chunk::new(vec![column]).expect("one column"))
+                })
+                .collect::<Vec<_>>();
+            writer.append_stripe(parts).expect("a stripe");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        assert_eq!(reader.table().stripes().len(), 4, "a run is a stripe of its own");
+        assert_eq!(reader.table().rows(), 128);
+        for part in 0..16_usize {
+            let read = reader.read(part, &[0]).expect("a part back");
+            for row in 0..8_usize {
+                let want = i64::try_from(part * 8 + row).expect("small");
+                assert_eq!(read.value_at(row, 0), Value::BigInt(want), "part {part} row {row}");
+            }
+        }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Runs from different callers may interleave and may not overlap, and the commit is what
+    /// catches an overlap.
+    #[test]
+    fn runs_that_overlap_each_other_are_refused_at_commit() {
+        let path = path("overlapping-runs");
+        let mut writer =
+            Writer::create(&path, "overlapping", vec![Field::new("v", LogicalType::BigInt)])
+                .expect("new file");
+        let one = |order: (u64, u64)| {
+            let column = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)])
+                .expect("a column");
+            (order, Chunk::new(vec![column]).expect("one column"))
+        };
+        // The second run sits inside the first rather than after it, which is a thing no instance
+        // holding its own contiguous run can produce and a thing the file cannot represent.
+        writer.append_stripe(vec![one((0, 0)), one((0, 2))]).expect("a stripe");
+        writer.append_stripe(vec![one((0, 1))]).expect("a stripe");
+        let error = writer.finish().expect_err("the runs overlap");
+        assert!(error.message().contains("source order"), "{error}");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A stripe holds [`STRIPE_PARTS`] parts, so a run longer than that is a caller bug rather than
+    /// something to split, and the writer says so at the door instead of quietly cutting it in two.
+    #[test]
+    fn a_run_longer_than_a_stripe_is_refused() {
+        let path = path("overlong-run");
+        let mut writer =
+            Writer::create(&path, "overlong", vec![Field::new("v", LogicalType::BigInt)])
+                .expect("new file");
+        let parts = (0..=STRIPE_PARTS)
+            .map(|at| {
+                let column = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)])
+                    .expect("a column");
+                let chunk = Chunk::new(vec![column]).expect("one column");
+                ((0, u64::try_from(at).expect("small")), chunk)
+            })
+            .collect::<Vec<_>>();
+        let error = writer.append_stripe(parts).expect_err("one part too many");
+        assert!(error.message().contains("more parts than it holds"), "{error}");
         fs::remove_file(path).expect("remove scratch file");
     }
 
