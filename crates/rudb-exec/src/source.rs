@@ -24,11 +24,12 @@ use rudb_parquet::{Bound, Op, Reader, Test, skips};
 use rudb_pipeline::{Morsel, Progress, Source};
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_storage::Probe;
-use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, Data, Selection, VECTOR_SIZE, Vector};
 
 use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
 use crate::schema::Schema;
 use crate::sideways::Sideways;
+use crate::table::{Across, hash};
 
 /// One morsel per position, handed to whoever asks first.
 ///
@@ -267,6 +268,45 @@ pub(crate) struct Scan<'a> {
     /// workers it will face and so the one moment it can decide how finely to cut.
     spread: OnceLock<Spread>,
     skipped: AtomicUsize,
+    /// Whether the runtime filter has been earning the hash it costs.
+    paying: Paying,
+}
+
+/// How many rows go through the runtime filter before it has to justify itself.
+const WARMUP: usize = 1 << 16;
+
+/// Whether the runtime filter is worth the hash it costs, counted as the scan goes.
+///
+/// A filter that turns most rows away pays for itself many times over: the row it drops is a row the
+/// join above does not look up, and a lookup into a build side too large for the cache is several
+/// times what the filter charges. A filter that turns none away is a hash and a cache line per row
+/// spent on nothing. Which of the two a join has is not something either side knows before the rows
+/// go past, so the scan applies the filter, counts what it kept, and stops applying it once enough
+/// rows have gone by to say it is not paying.
+///
+/// Giving up is final. Once the scan stops counting the numbers stop moving, so a filter that failed
+/// its warmup is never asked again, and the rest of the table goes past at the speed it would have
+/// had if the join had never armed anything.
+#[derive(Debug, Default)]
+struct Paying {
+    seen: AtomicUsize,
+    kept: AtomicUsize,
+}
+
+impl Paying {
+    /// Whether the filter has earned another chunk.
+    fn worth(&self) -> bool {
+        let seen = self.seen.load(Ordering::Relaxed);
+        // Under the warmup there is nothing to go on, and a filter is given the benefit of it.
+        seen < WARMUP
+            || self.kept.load(Ordering::Relaxed).saturating_mul(4) < seen.saturating_mul(3)
+    }
+
+    /// Records what one chunk put through the filter and what came out.
+    fn saw(&self, rows: usize, kept: usize) {
+        self.seen.fetch_add(rows, Ordering::Relaxed);
+        self.kept.fetch_add(kept, Ordering::Relaxed);
+    }
 }
 
 /// Moves tests from the projection's numbering onto the table's.
@@ -349,7 +389,45 @@ impl<'a> Scan<'a> {
             stripes,
             spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
+            paying: Paying::default(),
         })
+    }
+
+    /// Drops the rows of one chunk that a join above this scan cannot hold a match for.
+    ///
+    /// The range above rules out whole chunks and this rules out rows inside the ones that are left,
+    /// which is the tier that still says something about a column whose values are spread over their
+    /// whole domain. One hash of one column and one cache line touched per row, against a filter
+    /// small enough to stay in the cache while a fact table goes past it.
+    ///
+    /// The column is read out of the chunk this scan has just produced rather than out of the table,
+    /// so the position is the projection's and the rows are whatever the chunk holds, including the
+    /// row numbers a scan makes up. Nothing to do at all for a scan with no join above it, which is
+    /// two loads and a branch per chunk, and nothing to do either once [`Paying`] has decided the
+    /// filter is not turning enough rows away to be worth hashing for.
+    ///
+    /// # Errors
+    ///
+    /// Whatever narrowing the chunk to the rows that survived raises.
+    fn sift(&self, chunk: &mut Chunk) -> Result<()> {
+        let Some((at, filter)) = self.sideways.as_ref().and_then(|s| s.sifting(self.index)) else {
+            return Ok(());
+        };
+        if !self.paying.worth() {
+            return Ok(());
+        }
+        let Ok(column) = chunk.column(at) else { return Ok(()) };
+        let rows = chunk.len();
+        let mut hashes = Vec::new();
+        hash(std::slice::from_ref(column), rows, &mut hashes, Across::TwoInputs);
+        let kept = Selection::from_predicate(rows, |row| filter.holds(hashes[row]));
+        self.paying.saw(rows, kept.len());
+        if kept.len() == rows {
+            return Ok(());
+        }
+        let whole = std::mem::replace(chunk, Chunk::empty(&[]));
+        *chunk = whole.select(&kept)?;
+        Ok(())
     }
 
     /// Every test this scan has, which is the plan's and whatever a join above it worked out.
@@ -546,6 +624,7 @@ impl Source for Scan<'_> {
         let read = self.table.rows().read(at, &projected)?;
         if self.columns.iter().all(Option::is_some) {
             *out = read;
+            self.sift(out)?;
             return Ok(more(morsel));
         }
         let mut held = Vec::with_capacity(self.columns.len());
@@ -559,6 +638,7 @@ impl Source for Scan<'_> {
             }
         }
         *out = Chunk::with_rows(held, read.len())?;
+        self.sift(out)?;
         Ok(more(morsel))
     }
 }
@@ -1650,12 +1730,15 @@ mod tests {
     use rudb_functions::TableFunction;
     use rudb_pipeline::{Progress, Source};
     use rudb_plan::{ColumnBinding, Node, Plan};
-    use rudb_vector::Chunk;
+    use rudb_storage::Blocked;
+    use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Bound, FileScan, Handout, OnceLock, Op, Probe, RUN, Scan, Schema, Series, Sideways,
-        VECTOR_SIZE, cut_rows, native_instances, next_piece, parts, runs_of, worth_sifting,
+        Across, Bound, FileScan, Handout, OnceLock, Op, Paying, Probe, RUN, Scan, Schema, Series,
+        Sideways, VECTOR_SIZE, WARMUP, cut_rows, hash, native_instances, next_piece, parts,
+        runs_of, worth_sifting,
     };
+    use crate::sideways::Found;
 
     /// Every morsel a row group of `rows` rows is cut into, by asking for them the way `cut` does.
     fn cutting(rows: usize, target: usize) -> Vec<std::ops::Range<usize>> {
@@ -1771,7 +1854,7 @@ mod tests {
             let values: Vec<Value> =
                 (0..rows).map(|row| Value::Integer((part * rows + row) as i32)).collect();
             let chunk = Chunk::new(vec![
-                rudb_vector::Vector::from_values(LogicalType::Integer, &values).expect("integers"),
+                Vector::from_values(LogicalType::Integer, &values).expect("integers"),
             ])
             .expect("matching rows");
             writer.append(&chunk).expect("one part");
@@ -2085,6 +2168,7 @@ mod tests {
             stripes: Vec::new(),
             spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
+            paying: Paying::default(),
         }
     }
 
@@ -2134,12 +2218,76 @@ mod tests {
         let table = counted(VECTOR_SIZE * 5);
         let sideways = Sideways::new();
         sideways.about(ColumnBinding::new(0, 0));
-        sideways.found(Some((Bound::Int(5_000), Bound::Int(5_100))));
+        sideways.found(Found::of(Some((Bound::Int(5_000), Bound::Int(5_100))), None));
         let mut scan = scanning(&table, Vec::new());
         scan.sideways = Some(sideways);
 
         assert_eq!(counted_rows(&scan), VECTOR_SIZE, "one chunk's worth");
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
+    }
+
+    /// A filter over three keys, hashed the way the build side of a join hashes the column it is
+    /// keyed on.
+    fn holding(values: &[i32]) -> Blocked {
+        let mut filter = Blocked::sized(values.len(), 1 << 20).expect("a filter over three keys");
+        let column = Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into()))
+            .expect("integers are an i32 layout");
+        let mut hashes = Vec::new();
+        hash(std::slice::from_ref(&column), values.len(), &mut hashes, Across::TwoInputs);
+        for word in hashes {
+            filter.add(word);
+        }
+        filter
+    }
+
+    /// The row tier. The range keeps the chunk the three keys fall in and the filter throws away
+    /// every row of it that is not one of them.
+    #[test]
+    fn a_scan_drops_the_rows_a_joins_build_side_cannot_match() {
+        let table = counted(VECTOR_SIZE * 3);
+        let sideways = Sideways::new();
+        sideways.about(ColumnBinding::new(0, 0));
+        sideways.found(Found::of(
+            Some((Bound::Int(2_100), Bound::Int(2_300))),
+            Some(holding(&[2_100, 2_200, 2_300])),
+        ));
+        let mut scan = scanning(&table, Vec::new());
+        scan.sideways = Some(sideways);
+
+        assert_eq!(counted_rows(&scan), 3, "the three rows the build side holds a key for");
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 2, "and two chunks were never read");
+    }
+
+    /// A filter that keeps nearly every row it sees is dropped once the warmup is over, and one
+    /// that turns rows away is kept however long the scan runs.
+    #[test]
+    fn a_runtime_filter_that_turns_nothing_away_is_given_up_on() {
+        let idle = Paying::default();
+        let busy = Paying::default();
+        for _ in 0..(WARMUP / VECTOR_SIZE) {
+            assert!(idle.worth(), "nothing is decided under the warmup");
+            idle.saw(VECTOR_SIZE, VECTOR_SIZE);
+            busy.saw(VECTOR_SIZE, VECTOR_SIZE / 16);
+        }
+
+        assert!(!idle.worth(), "a filter that kept every row is not worth hashing for");
+        assert!(busy.worth(), "one that kept a sixteenth of them is");
+
+        // Giving up is final, so the rows that go past afterwards are never counted and the answer
+        // cannot drift back.
+        assert!(!idle.worth());
+    }
+
+    /// The line itself, which is a quarter of the rows dropped.
+    #[test]
+    fn a_filter_is_worth_hashing_for_once_it_drops_a_quarter_of_the_rows() {
+        for (kept, worth) in [(0, true), (740, true), (749, true), (750, false), (1_000, false)] {
+            let paying = Paying::default();
+            for _ in 0..(WARMUP / 1_000 + 1) {
+                paying.saw(1_000, kept);
+            }
+            assert_eq!(paying.worth(), worth, "{kept} of every thousand rows kept");
+        }
     }
 
     /// A join that never armed one, and a build side with no rows, both leave the scan reading

@@ -316,18 +316,44 @@ impl Dense {
 }
 
 impl Blocked {
+    /// An empty filter sized for `values` entries, inside `budget` bytes.
+    ///
+    /// `None` when `budget` leaves under four bits an entry, which is a filter that keeps nearly
+    /// everything it is asked about and so is bytes spent to answer nothing.
+    ///
+    /// This is here for a caller outside the file format: a hash join builds one of these over its
+    /// build side's keys while the query runs and hands it to the scan under its other side. Such a
+    /// filter is never written down, so it is free to hash its values however the operator filling
+    /// it already hashes them, which is why this and the two below speak in hashes rather than in
+    /// values. A filter built one way and probed the other answers nonsense, so one caller has to
+    /// own both ends of it, and every caller here does.
+    #[must_use]
+    pub fn sized(values: usize, budget: usize) -> Option<Self> {
+        blocked(values, budget)
+    }
+
     /// Whether every bit `hash` names is set, which is what a Bloom filter can say.
-    fn holds(&self, hash: u64) -> bool {
+    ///
+    /// One sided in the direction the rest of this file is: `false` says no entry hashed to this,
+    /// and `true` says one may have.
+    #[must_use]
+    pub fn holds(&self, hash: u64) -> bool {
         let block = self.block(hash);
         lanes(hash).iter().all(|&bit| self.words[block + bit / 64] & (1 << (bit % 64)) != 0)
     }
 
     /// Sets every bit `hash` names.
-    fn add(&mut self, hash: u64) {
+    pub fn add(&mut self, hash: u64) {
         let block = self.block(hash);
         for bit in lanes(hash) {
             self.words[block + bit / 64] |= 1 << (bit % 64);
         }
+    }
+
+    /// How many bytes of bits this holds.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        self.words.len() * 8
     }
 
     /// Where the block for `hash` starts, as an index into the words.
@@ -399,7 +425,9 @@ fn dense(range: &Range) -> Option<Dense> {
 fn blocked(values: usize, budget: usize) -> Option<Blocked> {
     let wanted = values.checked_mul(BITS_PER_VALUE)?.div_ceil(BLOCK_BITS).max(1);
     let blocks = wanted.min(budget / (BLOCK_WORDS * 8));
-    if blocks.checked_mul(BLOCK_BITS)? < values.checked_mul(LEAN_BITS_PER_VALUE)? {
+    // No block at all is a budget under one cache line, which is nowhere to put a bit rather than
+    // a filter that keeps everything, so it is refused even where there are no values to hold.
+    if blocks == 0 || blocks.checked_mul(BLOCK_BITS)? < values.checked_mul(LEAN_BITS_PER_VALUE)? {
         return None;
     }
     Some(Blocked { words: vec![0; blocks.checked_mul(BLOCK_WORDS)?] })

@@ -14,5 +14,5 @@ pub mod sieve;
 pub mod zone;
 
 pub use memory::MemoryTable;
-pub use sieve::Sieve;
+pub use sieve::{Blocked, Sieve};
 pub use zone::{Probe, Range, Zone};
