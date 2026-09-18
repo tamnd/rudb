@@ -96,12 +96,12 @@ impl Rows {
                 .chunk(at)
                 .ok_or_else(|| Error::internal("row ordinal names a missing chunk"))?
                 .len(),
-            Self::Native(reader) => reader
-                .table()
-                .stripes()
-                .get(at)
-                .ok_or_else(|| Error::internal("row ordinal names a missing stripe"))?
-                .rows(),
+            Self::Native(reader) => {
+                if at >= reader.parts() {
+                    return Err(Error::internal("row ordinal names a missing part"));
+                }
+                reader.part_rows(at)
+            }
         })
     }
 
@@ -153,12 +153,12 @@ impl Rows {
         Chunk::with_rows(vectors, ordinals.len())
     }
 
-    /// Reads a native row fetch across all requested stripes and columns in one worker fan-out.
+    /// Reads a native row fetch across all requested parts and columns in one worker fan-out.
     ///
-    /// Ordinary scans already parallelize by stripe in the pipeline above the reader. A late fetch
-    /// is deliberately one pipeline instance and commonly asks for all hundred ClickBench columns
-    /// from rows in several stripes. Keeping the workers alive across those stripes avoids a
-    /// scoped thread launch and join for every winning stripe.
+    /// Ordinary scans already parallelize by part in the pipeline above the reader. A late fetch is
+    /// deliberately one pipeline instance and commonly asks for all hundred ClickBench columns from
+    /// rows in several parts. Keeping the workers alive across those parts avoids a scoped thread
+    /// launch and join for every winning part.
     fn native_rows_at(
         reader: &NativeReader,
         types: &[LogicalType],
@@ -168,37 +168,52 @@ impl Rows {
         if columns.is_empty() {
             return Chunk::with_rows(Vec::new(), ordinals.len());
         }
-        let mut ends = Vec::with_capacity(reader.table().stripes().len());
+        let mut ends = Vec::with_capacity(reader.parts());
         let mut end = 0_usize;
-        for stripe in reader.table().stripes() {
-            end = end.saturating_add(stripe.rows());
+        for part in 0..reader.parts() {
+            end = end.saturating_add(reader.part_rows(part));
             ends.push(end);
         }
         let mut locations = Vec::with_capacity(ordinals.len());
         for &ordinal in ordinals {
             let ordinal = usize::try_from(ordinal)
                 .map_err(|_| Error::internal("row ordinal does not fit this platform"))?;
-            let stripe = ends.partition_point(|&end| end <= ordinal);
-            if stripe == ends.len() {
+            let part = ends.partition_point(|&end| end <= ordinal);
+            if part == ends.len() {
                 return Err(Error::internal("row ordinal is past the table"));
             }
-            let start = stripe.checked_sub(1).map_or(0, |before| ends[before]);
-            locations.push((stripe, ordinal - start));
+            let start = part.checked_sub(1).map_or(0, |before| ends[before]);
+            locations.push((part, ordinal - start));
         }
+        // A fetch that reaches most of the table is cheaper read a whole stripe page at a time,
+        // because the winners in one stripe then cost one read rather than one read a part. A fetch
+        // that reaches a handful of rows is not, because a page is sixty four parts wide and it
+        // would be reading all of them to use one. An eighth of the parts is where the bytes a page
+        // read wastes stop being worth the calls it saves.
+        let mut distinct = 0_usize;
+        for (at, location) in locations.iter().enumerate() {
+            if at == 0 || locations[at - 1].0 != location.0 {
+                distinct += 1;
+            }
+        }
+        let dense = distinct.saturating_mul(8) >= reader.parts();
         const MIN_COLUMNS_PER_WORKER: usize = 16;
         const MAX_WORKERS: usize = 8;
         let workers = columns.len().div_ceil(MIN_COLUMNS_PER_WORKER).min(MAX_WORKERS);
         if workers <= 1 {
-            let vectors = Self::read_native_columns(reader, columns, types, &locations)?;
+            let vectors = Self::read_native_columns(reader, columns, types, &locations, dense)?;
             return Chunk::with_rows(vectors, ordinals.len());
         }
         let width = columns.len().div_ceil(workers);
+        let locations = &locations;
         let pieces = std::thread::scope(|scope| {
             let handles = columns
                 .chunks(width)
                 .zip(types.chunks(width))
                 .map(|(columns, types)| {
-                    scope.spawn(|| Self::read_native_columns(reader, columns, types, &locations))
+                    scope.spawn(move || {
+                        Self::read_native_columns(reader, columns, types, locations, dense)
+                    })
                 })
                 .collect::<Vec<_>>();
             handles
@@ -222,16 +237,21 @@ impl Rows {
         columns: &[usize],
         types: &[LogicalType],
         locations: &[(usize, usize)],
+        dense: bool,
     ) -> Result<Vec<Vector>> {
         let mut values = vec![Vec::with_capacity(locations.len()); columns.len()];
         let mut from = 0;
         while from < locations.len() {
-            let stripe = locations[from].0;
+            let part = locations[from].0;
             let mut upto = from + 1;
-            while upto < locations.len() && locations[upto].0 == stripe {
+            while upto < locations.len() && locations[upto].0 == part {
                 upto += 1;
             }
-            let held = reader.read_sparse(stripe, columns)?;
+            let held = if dense {
+                reader.read(part, columns)?
+            } else {
+                reader.read_sparse(part, columns)?
+            };
             for &(_, row) in &locations[from..upto] {
                 for (at, values) in values.iter_mut().enumerate() {
                     values.push(held.value_at(row, at));
@@ -278,12 +298,12 @@ impl Rows {
         matches!(self, Self::Native(_))
     }
 
-    /// Number of independently readable chunks or stripes.
+    /// Number of independently readable chunks or parts.
     #[must_use]
     pub fn chunk_count(&self) -> usize {
         match self {
             Self::Memory(rows) => rows.chunk_count(),
-            Self::Native(reader) => reader.table().stripes().len(),
+            Self::Native(reader) => reader.parts(),
         }
     }
 
