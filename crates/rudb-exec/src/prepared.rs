@@ -828,9 +828,19 @@ impl Prepared {
             if pending.is_empty() {
                 break;
             }
-            let narrowed = narrow(chunk, &pending)?;
+            // `pending` starts as every row in order and only ever shrinks, so the same length is
+            // the same rows in the same order and there is nothing to cut. That is the whole of the
+            // first arm of a one armed `CASE`, which is the shape of the ClickBench query this was
+            // measured on, and cutting it was a copy of every column in the chunk for nothing.
+            let cut;
+            let narrowed = if pending.len() == chunk.len() {
+                chunk
+            } else {
+                cut = narrow(chunk, &pending)?;
+                &cut
+            };
             let mut scratch = arm.when.scratch();
-            let flags = arm.when.evaluate_one(&narrowed, &mut scratch)?;
+            let flags = arm.when.evaluate_one(narrowed, &mut scratch)?;
             let mut taken = Vec::new();
             let mut claimed = Vec::new();
             let mut still = Vec::new();
@@ -846,7 +856,7 @@ impl Prepared {
                 }
             }
             if !taken.is_empty() {
-                let matched = narrow(&narrowed, &taken)?;
+                let matched = narrow(narrowed, &taken)?;
                 let mut scratch = arm.then.scratch();
                 let results = arm.then.evaluate_one(&matched, &mut scratch)?;
                 built.place(&placed(&claimed)?, results)?;
@@ -855,9 +865,15 @@ impl Prepared {
         }
         if let Some(otherwise) = otherwise {
             if !pending.is_empty() {
-                let narrowed = narrow(chunk, &pending)?;
+                let cut;
+                let narrowed = if pending.len() == chunk.len() {
+                    chunk
+                } else {
+                    cut = narrow(chunk, &pending)?;
+                    &cut
+                };
                 let mut scratch = otherwise.scratch();
-                let results = otherwise.evaluate_one(&narrowed, &mut scratch)?;
+                let results = otherwise.evaluate_one(narrowed, &mut scratch)?;
                 built.place(&placed(&pending)?, results)?;
             }
         }
@@ -1296,6 +1312,81 @@ mod tests {
     fn a_case_agrees() {
         agrees(
             "CASE WHEN (#0.0::INTEGER > 1::INTEGER)::BOOLEAN THEN 10::INTEGER \
+             ELSE 20::INTEGER END::INTEGER AS a",
+        );
+    }
+
+    /// A second arm, which is the first one that sees a cut chunk rather than the whole one.
+    ///
+    /// The first arm of any `CASE` runs over every row, so it takes the path that does not cut at
+    /// all, and a `CASE` of one arm never exercises the other one. Two arms and an `ELSE` puts a
+    /// different set of rows in front of each of the three.
+    ///
+    /// That this is the only test here reaching the cut was checked rather than assumed, by gating a
+    /// panic on it and rerunning the seven. This one failed and the other six did not.
+    #[test]
+    fn a_case_of_two_arms_agrees() {
+        agrees(
+            "CASE WHEN (#0.0::INTEGER > 2::INTEGER)::BOOLEAN THEN 10::INTEGER \
+             WHEN (#0.0::INTEGER > 1::INTEGER)::BOOLEAN THEN 20::INTEGER \
+             ELSE 30::INTEGER END::INTEGER AS a",
+        );
+    }
+
+    /// No `ELSE`, so the rows no arm claims are null rather than anything.
+    ///
+    /// The case a run of data with a hole in it gets wrong: a null still occupies a position, and an
+    /// assembly that skipped it would put every value after it one row early.
+    #[test]
+    fn a_case_with_no_else_agrees() {
+        agrees(
+            "CASE WHEN (#0.0::INTEGER > 2::INTEGER)::BOOLEAN THEN 10::INTEGER \
+             END::INTEGER AS a",
+        );
+    }
+
+    /// An arm no row takes, so it contributes nothing to the answer and must not shift it.
+    #[test]
+    fn a_case_whose_arm_claims_nothing_agrees() {
+        agrees(
+            "CASE WHEN (#0.0::INTEGER > 99::INTEGER)::BOOLEAN THEN 10::INTEGER \
+             ELSE 20::INTEGER END::INTEGER AS a",
+        );
+    }
+
+    /// Strings, which is the case that used to allocate one of them per row and drop it afterwards.
+    ///
+    /// The arm reads a column and the `ELSE` is a constant, which is the shape of the ClickBench
+    /// query this path was rewritten for: the arm arrives as views over an arena and the `ELSE` as
+    /// one value repeated, and the two have to be laid end to end into a single arena.
+    #[test]
+    fn a_case_over_strings_agrees() {
+        agrees(
+            "CASE WHEN (#0.0::INTEGER > 1::INTEGER)::BOOLEAN THEN #0.1::VARCHAR \
+             ELSE ''::VARCHAR END::VARCHAR AS a",
+        );
+    }
+
+    /// A null inside an arm, which is a different thing from a row no arm claimed.
+    ///
+    /// Both come out null and they reach the validity mask by different routes, so a mask built for
+    /// one of them and not the other reads correct on whichever test only has the other in it.
+    #[test]
+    fn a_case_whose_arm_answers_null_agrees() {
+        agrees(
+            "CASE WHEN (#0.0::INTEGER > 1::INTEGER)::BOOLEAN THEN #0.1::VARCHAR \
+             ELSE NULL::VARCHAR END::VARCHAR AS a",
+        );
+    }
+
+    /// A `WHEN` over a column that is null on some rows, which is neither true nor false there.
+    ///
+    /// A three valued `WHEN` is what decides whether a row goes to the arm or falls through, and
+    /// treating unknown as true would claim a row the `ELSE` should have had.
+    #[test]
+    fn a_case_whose_test_is_null_on_some_rows_agrees() {
+        agrees(
+            "CASE WHEN (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN THEN 10::INTEGER \
              ELSE 20::INTEGER END::INTEGER AS a",
         );
     }

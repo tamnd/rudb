@@ -111,14 +111,18 @@ impl Assembly {
             }
         }
         if let Some(values) = &mut self.values {
+            // row at a time: the nested fallback named on the field above. A `LIST`, a `STRUCT` and
+            // a `MAP` are a child vector and a run of entries rather than a run of values, so there
+            // is no buffer to lay one after another and no typed copy to do the interleave with.
             for (slot, &row) in positions.iter().enumerate() {
                 values[row as usize] = piece.value_at(slot);
             }
             return Ok(());
         }
-        // Flat is the one form the copy loop below reads, and flattening is itself a typed loop per
-        // layout rather than a walk through values, so a constant, a dictionary or a packed run of
-        // codes is written out once here rather than read a row at a time later.
+        // flatten: the copy loop that does the interleave reads a run of data, and a piece can
+        // arrive constant, dictionary encoded or bit packed. Flattening is itself a typed loop per
+        // layout, so writing the piece out once here is what stops it being read a value at a time
+        // later, and a piece that is already flat is not copied at all.
         let flat = piece.flatten()?;
         let Some(from) = flat.data() else {
             return Err(Error::internal("a flattened vector with no run of data in it"));
@@ -253,8 +257,7 @@ mod tests {
             .expect("a vector");
         let odds = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1), Value::BigInt(3)])
             .expect("a vector");
-        let built =
-            agrees(&LogicalType::BigInt, 4, &[(vec![0, 2], evens), (vec![1, 3], odds)]);
+        let built = agrees(&LogicalType::BigInt, 4, &[(vec![0, 2], evens), (vec![1, 3], odds)]);
         assert_eq!(
             values(&built),
             vec![Value::BigInt(0), Value::BigInt(1), Value::BigInt(2), Value::BigInt(3)]
@@ -265,7 +268,8 @@ mod tests {
     fn a_row_no_piece_claims_is_null() {
         // Which is what a `CASE` with no `ELSE` leaves behind, and the case where a run of data with
         // a hole in it would put every value after the hole at the wrong index.
-        let piece = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(7)]).expect("a vector");
+        let piece =
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(7)]).expect("a vector");
         let built = agrees(&LogicalType::BigInt, 3, &[(vec![1], piece)]);
         assert_eq!(values(&built), vec![Value::Null, Value::BigInt(7), Value::Null]);
     }
@@ -304,7 +308,10 @@ mod tests {
         .expect("a vector");
         let built = agrees(&LogicalType::Varchar, 3, &[(vec![0, 2], left), (vec![1], right)]);
         assert_eq!(built.value_at(0), Value::Varchar("a short one".into()));
-        assert_eq!(built.value_at(1), Value::Varchar("a string that is far too long to live inline in a view".into()));
+        assert_eq!(
+            built.value_at(1),
+            Value::Varchar("a string that is far too long to live inline in a view".into())
+        );
         assert_eq!(built.value_at(2), Value::Varchar("another".into()));
     }
 
@@ -315,8 +322,7 @@ mod tests {
         let arm = Vector::from_values(LogicalType::Varchar, &[Value::Varchar("kept".into())])
             .expect("a vector");
         let otherwise = Vector::constant(LogicalType::Varchar, Value::Varchar("".into()), 3);
-        let built =
-            agrees(&LogicalType::Varchar, 4, &[(vec![2], arm), (vec![0, 1, 3], otherwise)]);
+        let built = agrees(&LogicalType::Varchar, 4, &[(vec![2], arm), (vec![0, 1, 3], otherwise)]);
         assert_eq!(built.value_at(0), Value::Varchar("".into()));
         assert_eq!(built.value_at(2), Value::Varchar("kept".into()));
     }
@@ -325,24 +331,35 @@ mod tests {
     fn a_dictionary_piece_is_walked_to_its_values() {
         // A scanned string column arrives as codes over a shared dictionary, so this is the form the
         // `THEN Referer` arm of the ClickBench query actually hands over.
-        let dictionary =
-            Vector::from_values(LogicalType::Varchar, &[Value::Varchar("one".into()), Value::Varchar("two".into())])
-                .expect("a dictionary");
+        let dictionary = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("one".into()), Value::Varchar("two".into())],
+        )
+        .expect("a dictionary");
         let piece = Vector::dictionary(vec![1, 0, 1], dictionary).expect("a dictionary vector");
         let built = agrees(&LogicalType::Varchar, 3, &[(vec![0, 1, 2], piece)]);
-        assert_eq!(values(&built), vec![Value::Varchar("two".into()), Value::Varchar("one".into()), Value::Varchar("two".into())]);
+        assert_eq!(
+            values(&built),
+            vec![
+                Value::Varchar("two".into()),
+                Value::Varchar("one".into()),
+                Value::Varchar("two".into())
+            ]
+        );
     }
 
     #[test]
     fn a_piece_placed_at_the_wrong_number_of_positions_is_an_error() {
-        let piece = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)]).expect("a vector");
+        let piece =
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)]).expect("a vector");
         let mut assembly = Assembly::new(LogicalType::BigInt, 4).expect("an assembly");
         assert!(assembly.place(&[0, 1], &piece).is_err(), "two positions for one row");
     }
 
     #[test]
     fn a_position_past_the_end_is_an_error_rather_than_a_lost_row() {
-        let piece = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)]).expect("a vector");
+        let piece =
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)]).expect("a vector");
         let mut assembly = Assembly::new(LogicalType::BigInt, 2).expect("an assembly");
         assert!(assembly.place(&[9], &piece).is_err(), "a row past the end of the assembly");
     }
@@ -351,7 +368,8 @@ mod tests {
     fn a_piece_of_the_wrong_layout_is_an_error_rather_than_a_wrong_answer() {
         // Two runs of data that cannot be laid end to end, which is a bug in whoever built the
         // pieces and has to say so rather than silently keep the first one.
-        let piece = Vector::from_values(LogicalType::Varchar, &[Value::Varchar("x".into())]).expect("text");
+        let piece =
+            Vector::from_values(LogicalType::Varchar, &[Value::Varchar("x".into())]).expect("text");
         let mut assembly = Assembly::new(LogicalType::BigInt, 1).expect("an assembly");
         assert!(assembly.place(&[0], &piece).is_err(), "text laid after integers");
     }
@@ -373,7 +391,10 @@ mod tests {
             (LogicalType::UBigInt, vec![Value::UBigInt(17), Value::UBigInt(18)]),
             (LogicalType::Float, vec![Value::Float(1.5), Value::Float(-2.5)]),
             (LogicalType::Double, vec![Value::Double(3.5), Value::Double(-4.5)]),
-            (LogicalType::Varchar, vec![Value::Varchar("first".into()), Value::Varchar("second".into())]),
+            (
+                LogicalType::Varchar,
+                vec![Value::Varchar("first".into()), Value::Varchar("second".into())],
+            ),
             (LogicalType::Date, vec![Value::Date(19), Value::Date(20)]),
         ];
         for (ty, pair) in cases {
