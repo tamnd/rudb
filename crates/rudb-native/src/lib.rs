@@ -1331,6 +1331,13 @@ struct NativeText {
     rank_at: u64,
     rank_hashes: Vec<u64>,
     rank_blocks: Vec<OnceLock<Result<Vec<u8>>>>,
+    /// The sorted order turned round, built the first time a reader asks for it.
+    ///
+    /// Four bytes per value against the four the offsets already hold, so a column that has this is
+    /// carrying half again what it carried before rather than something of a new order. It is built
+    /// only when something asks, which is a grouped min or max over this column and nothing else,
+    /// and that reader was going to read the payload of this column once per row otherwise.
+    code_ranks: OnceLock<Option<Vec<u32>>>,
     payload: u64,
     payload_len: usize,
     hashes: Vec<u64>,
@@ -1552,8 +1559,42 @@ impl TextSource for NativeText {
         Ok(code)
     }
 
+    fn code_ranks(&self) -> Option<&[u32]> {
+        // The order is a permutation of the positions, so inverting it needs every position to be
+        // named exactly once. Anything else and the slice would have holes, and a caller indexing
+        // it by a code would read a rank that belongs to nothing.
+        if self.ranks == 0 || self.ranks != self.len() {
+            return None;
+        }
+        self.code_ranks
+            .get_or_init(|| {
+                let mut ranks = vec![u32::MAX; self.ranks];
+                // A block at a time rather than a rank at a time, because reading it per rank pays
+                // for the bounds check, the division and the lock on every one of them.
+                for first in (0..self.ranks).step_by(TEXT_RANK_BLOCK) {
+                    let (block, _) = self.rank_parts(first).ok()?;
+                    let heads = block.len() / RANK_ENTRY * size_of::<u64>();
+                    let codes = block.get(heads..)?;
+                    for (within, entry) in codes.chunks_exact(size_of::<u32>()).enumerate() {
+                        let code = u32::from_le_bytes(entry.try_into().ok()?) as usize;
+                        *ranks.get_mut(code)? = u32::try_from(first + within).ok()?;
+                    }
+                }
+                if ranks.contains(&u32::MAX) {
+                    return None;
+                }
+                Some(ranks)
+            })
+            .as_deref()
+    }
+
     fn footprint(&self) -> usize {
         self.offsets.capacity() * size_of::<u32>()
+            + self
+                .code_ranks
+                .get()
+                .and_then(Option::as_ref)
+                .map_or(0, |ranks| ranks.capacity() * size_of::<u32>())
             + self.rank_hashes.capacity() * size_of::<u64>()
             + self.rank_blocks.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
             + self
@@ -3956,6 +3997,7 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
             rank_at: page.offset + index_len as u64,
             rank_hashes,
             rank_blocks: (0..rank_blocks).map(|_| OnceLock::new()).collect(),
+            code_ranks: OnceLock::new(),
             payload: page.offset + body_len as u64,
             payload_len,
             hashes,
