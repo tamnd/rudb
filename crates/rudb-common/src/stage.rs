@@ -54,6 +54,12 @@ pub enum Stage {
     Dictionary,
     /// Cutting pages to the chunk boundary and putting the columns side by side.
     Assemble,
+    /// Getting the room an operator is about to fill, which is the allocation and the zeroing.
+    ///
+    /// Separate from the stage that fills it because the two have different fixes. A fold that is
+    /// slow wants a better probe and a reserve that is slow wants a buffer that is kept rather than
+    /// made again, and a number that adds them together says neither.
+    Reserve,
     /// Folding a chunk of rows into a hash table, which is the probe and the accumulator update.
     Fold,
     /// Splitting a table across the radix partitions, or folding rows straight into them.
@@ -65,7 +71,7 @@ pub enum Stage {
 }
 
 /// How many stages there are, which is how wide a [`Spent`] is.
-const STAGES: usize = 9;
+const STAGES: usize = 10;
 
 impl Stage {
     /// Every stage, in the order the work goes through them.
@@ -75,6 +81,7 @@ impl Stage {
         Self::Decode,
         Self::Dictionary,
         Self::Assemble,
+        Self::Reserve,
         Self::Fold,
         Self::Scatter,
         Self::Merge,
@@ -90,6 +97,7 @@ impl Stage {
             Self::Decode => "decode",
             Self::Dictionary => "dictionary",
             Self::Assemble => "assemble",
+            Self::Reserve => "reserve",
             Self::Fold => "fold",
             Self::Scatter => "scatter",
             Self::Merge => "merge",
@@ -106,10 +114,11 @@ impl Stage {
             Self::Decode => 2,
             Self::Dictionary => 3,
             Self::Assemble => 4,
-            Self::Fold => 5,
-            Self::Scatter => 6,
-            Self::Merge => 7,
-            Self::Emit => 8,
+            Self::Reserve => 5,
+            Self::Fold => 6,
+            Self::Scatter => 7,
+            Self::Merge => 8,
+            Self::Emit => 9,
         }
     }
 }
