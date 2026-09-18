@@ -31,7 +31,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -43,11 +43,11 @@ use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
-use rudb_vector::{Buffer, Chunk, Data, TextSource, Vector};
+use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 13;
+const FORMAT: u32 = 14;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -2940,6 +2940,131 @@ impl chooser::Chooser for Codes {
     }
 }
 
+/// Which cascades are worth trying on a part of plain integers.
+///
+/// Wider than [`Codes`] because the values are not codes and carry whatever shape the column has.
+/// A timestamp column climbs, so delta is the one that matters and is the reason this exists at
+/// all: three timestamp columns in ClickBench were coming out at exactly eight bytes a row with
+/// nothing asked of them. A column that is one value with a handful of exceptions is sparse. What
+/// is still left out is the dictionary, for the same reason as in [`Codes`]: it is the most
+/// expensive candidate to try and this file already puts the columns that want one through a
+/// dictionary of their own before they ever reach here.
+#[derive(Debug)]
+struct Fixed;
+
+impl chooser::Chooser for Fixed {
+    fn name(&self) -> &'static str {
+        "fixed"
+    }
+
+    fn narrow_strings(
+        &self,
+        _values: &[&[u8]],
+        offered: &[string::Kind],
+        _depth: u8,
+    ) -> Vec<string::Kind> {
+        offered.to_vec()
+    }
+
+    fn narrow_integers(
+        &self,
+        _values: &[i64],
+        offered: &[integer::Kind],
+        depth: u8,
+    ) -> Vec<integer::Kind> {
+        let keep: &[integer::Kind] = if depth == 0 {
+            &[
+                integer::Kind::Constant,
+                integer::Kind::Packed,
+                integer::Kind::Delta,
+                integer::Kind::Rle,
+                integer::Kind::Sparse,
+            ]
+        } else {
+            &[integer::Kind::Constant, integer::Kind::Packed, integer::Kind::Delta]
+        };
+        let narrowed: Vec<integer::Kind> =
+            offered.iter().copied().filter(|kind| keep.contains(kind)).collect();
+        if narrowed.is_empty() { offered.to_vec() } else { narrowed }
+    }
+}
+
+/// Every value of an integer part as an `i64`, or `None` for a part this cannot widen without
+/// losing one.
+///
+/// `UBIGINT` is the only integer type left out, because half its range does not fit and a page that
+/// silently wrapped would be worse than a page that stays plain. Booleans and strings are not
+/// integers and have their own ways of being small.
+fn widened(data: &Data) -> Option<Vec<i64>> {
+    match data {
+        Data::Int8(values) => Some(values.iter().map(|value| i64::from(*value)).collect()),
+        Data::UInt8(values) => Some(values.iter().map(|value| i64::from(*value)).collect()),
+        Data::Int16(values) => Some(values.iter().map(|value| i64::from(*value)).collect()),
+        Data::UInt16(values) => Some(values.iter().map(|value| i64::from(*value)).collect()),
+        Data::Int32(values) => Some(values.iter().map(|value| i64::from(*value)).collect()),
+        Data::UInt32(values) => Some(values.iter().map(|value| i64::from(*value)).collect()),
+        Data::Int64(values) => Some(values.to_vec()),
+        _ => None,
+    }
+}
+
+/// The same values back in the width the column is declared at.
+///
+/// A value that does not fit is a page that disagrees with the directory about what the column is,
+/// which is a damaged file rather than a caller error, so it is refused rather than truncated.
+fn narrowed(ty: &LogicalType, values: Vec<i64>) -> Result<Data> {
+    fn fit<T: TryFrom<i64>>(values: &[i64]) -> Result<Vec<T>> {
+        values
+            .iter()
+            .map(|value| T::try_from(*value).map_err(|_| invalid("page value is not of its type")))
+            .collect()
+    }
+    Ok(match ty {
+        LogicalType::TinyInt => Data::Int8(fit::<i8>(&values)?.into()),
+        LogicalType::UTinyInt => Data::UInt8(fit::<u8>(&values)?.into()),
+        LogicalType::SmallInt => Data::Int16(fit::<i16>(&values)?.into()),
+        LogicalType::USmallInt => Data::UInt16(fit::<u16>(&values)?.into()),
+        LogicalType::Integer | LogicalType::Date => Data::Int32(fit::<i32>(&values)?.into()),
+        LogicalType::UInteger => Data::UInt32(fit::<u32>(&values)?.into()),
+        LogicalType::BigInt | LogicalType::Timestamp => Data::Int64(values.into()),
+        _ => return Err(invalid("cascade codec belongs to a page that is not integers")),
+    })
+}
+
+/// How many bytes a part of this type costs written out plainly, which is what the cascade has to
+/// beat before it is worth the decode.
+fn plain_width(ty: &LogicalType) -> Option<usize> {
+    Some(match ty {
+        LogicalType::TinyInt | LogicalType::UTinyInt => 1,
+        LogicalType::SmallInt | LogicalType::USmallInt => 2,
+        LogicalType::Integer | LogicalType::UInteger | LogicalType::Date => 4,
+        LogicalType::BigInt | LogicalType::Timestamp => 8,
+        _ => return None,
+    })
+}
+
+/// A part's plain integers through the cascade, or `None` when nothing it offers is worth it.
+///
+/// What it has to beat is whatever the page would otherwise have cost, which is the bit packed form
+/// where there is one and the plain width where there is not. Both are cheaper to decode than a
+/// cascade, so a tie goes to them.
+fn cascaded(
+    flat: &Vector,
+    ty: &LogicalType,
+    packed: Option<&Packed<'_>>,
+) -> Result<Option<Vec<u8>>> {
+    let (Some(width), Some(data)) = (plain_width(ty), flat.data()) else { return Ok(None) };
+    let Some(values) = widened(data) else { return Ok(None) };
+    let plain = values.len().saturating_mul(width);
+    let best = match packed {
+        // The tag, the base, the word count and the words, which is what the codec 2 branch writes.
+        Some(packed) => plain.min(21 + size_of_val(packed.words())),
+        None => plain,
+    };
+    let out = integer::encode_with(&values, &Fixed)?;
+    Ok((out.len() < best).then_some(out))
+}
+
 /// A part's dictionary codes through the integer cascade, or `None` when the cascade did not pay.
 ///
 /// Until now this stream was a `u32` a row with nothing asked of it, and on ClickBench that was
@@ -2993,8 +3118,18 @@ fn encode(
         Some(codes) => encoded_codes(codes)?,
         None => None,
     };
+    // Only where nothing else has claimed the page, which is the plain integer case. A packed part
+    // is still on the table because the cascade has to beat it too: the bit pack takes a part only
+    // when it halves it, so a column that shrinks by a third was coming out whole.
+    let cascade = if dictionary.is_none() && global_codes.is_none() {
+        cascaded(&flat, ty, packed.as_ref())?
+    } else {
+        None
+    };
     out.push(if coded.is_some() {
         4
+    } else if cascade.is_some() {
+        5
     } else if global_codes.is_some() {
         3
     } else if dictionary.is_some() {
@@ -3024,6 +3159,10 @@ fn encode(
     }
     if let Some(coded) = coded {
         out.extend_from_slice(&coded);
+        return Ok((out, membership));
+    }
+    if let Some(cascade) = cascade {
+        out.extend_from_slice(&cascade);
         return Ok((out, membership));
     }
     if let Some(codes) = global_codes {
@@ -3680,6 +3819,15 @@ fn decode(
         let highest = codes.iter().copied().max();
         return Ok(Vector::stable_dictionary_validated(codes, dictionary, highest)?
             .with_validity(validity));
+    }
+    if codec == 5 {
+        // The cascade holds the whole tail of the page and says how long it is itself.
+        let values = integer::decode(&bytes[cur.at..])?;
+        if values.len() != rows {
+            return Err(invalid("cascade page holds the wrong number of rows"));
+        }
+        let data = narrowed(ty, values)?;
+        return Ok(Vector::flat(ty.clone(), data)?.with_validity(validity));
     }
     if codec == 2 {
         let width = u32::from(cur.u8()?);
@@ -4740,6 +4888,17 @@ mod tests {
         assert_eq!(read.value_at(0, 0), Value::Varchar(String::new()));
         assert_eq!(read.value_at(1023, 0), Value::Varchar(String::new()));
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn a_cascade_value_too_wide_for_its_column_is_refused_rather_than_cut() {
+        // What a damaged page looks like from here: the cascade decoded, so the bytes are not
+        // truncated, but the values do not belong to the column the directory says they do.
+        let over = vec![i64::from(i32::MAX) + 1];
+        let error = narrowed(&LogicalType::Integer, over).expect_err("a page that disagrees");
+        assert!(format!("{error}").contains("not of its type"), "{error}");
+        assert!(narrowed(&LogicalType::BigInt, vec![i64::MIN]).is_ok(), "bigint holds all of i64");
+        assert!(narrowed(&LogicalType::Varchar, vec![0]).is_err(), "strings are not integers");
     }
 
     #[test]
