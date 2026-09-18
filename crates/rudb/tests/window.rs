@@ -705,6 +705,62 @@ fn a_default_of_another_type_is_cast_to_the_columns_and_one_that_will_not_cast_s
 }
 
 #[test]
+fn a_filter_decides_which_rows_of_the_frame_the_window_reads() {
+    // The frame is worked out first and the predicate is applied to what is in it, so a filter
+    // never moves the frame and never changes which row is the current one. The third of these is
+    // the one that says so: the running count climbs only where the predicate holds, and the rows
+    // where it does not hold are still in the frame and still carry the count so far.
+    assert_eq!(answered("sum(i) FILTER (WHERE i > 1) OVER ()"), totals(&[11, 11, 11, 11, 11, 11]));
+    assert_eq!(
+        answered("sum(i) FILTER (WHERE i > 2) OVER (PARTITION BY j ORDER BY i)"),
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::HugeInt(3),
+            Value::HugeInt(7),
+            Value::HugeInt(7)
+        ]
+    );
+    assert_eq!(
+        answered(
+            "count(*) FILTER (WHERE i > 2) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+        ),
+        counts(&[0, 0, 0, 1, 2, 2])
+    );
+    assert_eq!(
+        answered(
+            "sum(i) FILTER (WHERE j = 'a') OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"
+        ),
+        vec![
+            Value::HugeInt(1),
+            Value::HugeInt(3),
+            Value::HugeInt(4),
+            Value::HugeInt(2),
+            Value::Null,
+            Value::Null
+        ]
+    );
+}
+
+#[test]
+fn a_filter_on_a_ranking_window_is_refused_the_way_the_pin_refuses_it() {
+    // Doubled quotes again, and for the reason DISTINCT is refused on the same calls. A ranking
+    // window reads no values, so a predicate over the values has nothing to keep or drop.
+    let database = built();
+    let connection = database.connect();
+    let error = connection
+        .query("SELECT row_number() FILTER (WHERE i > 1) OVER (ORDER BY i) FROM t")
+        .expect_err("a filtered ranking window is refused");
+    assert!(
+        error
+            .message()
+            .contains("FILTER is not implemented for the window function \"\"row_number\"\""),
+        "{error}"
+    );
+}
+
+#[test]
 fn distinct_inside_a_value_window_is_refused_the_way_the_pin_refuses_it() {
     // Doubled quotes and all. There is nothing for a DISTINCT to collapse when the call picks one
     // row rather than folding several, and upstream says so rather than ignoring it.

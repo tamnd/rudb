@@ -2058,7 +2058,7 @@ impl<'a> Transform<'a> {
                                 .push(Expr::Literal { kind: LiteralKind::String, text: literal });
                             let name = self.function_name("struct_extract");
                             let args = self.expr_slice(vec![expr, key]);
-                            self.push(Expr::Function { name, args, distinct: false })
+                            self.push(Expr::Function { name, args, distinct: false, filter: NONE })
                         }
                         // `DotMethodOperator <- '.' MethodExpression`, where `x.f(a)` is `f(x, a)`.
                         "DotMethodOperator" => {
@@ -2078,7 +2078,7 @@ impl<'a> Transform<'a> {
                                 }
                             }
                             let args = self.expr_slice(args);
-                            self.push(Expr::Function { name, args, distinct: false })
+                            self.push(Expr::Function { name, args, distinct: false, filter: NONE })
                         }
                         _ => return self.unsupported(dot),
                     }
@@ -2133,7 +2133,7 @@ impl<'a> Transform<'a> {
             let index = self.expr(begin)?;
             let name = self.function_name("array_extract");
             let args = self.expr_slice(vec![target, index]);
-            return Ok(self.push(Expr::Function { name, args, distinct: false }));
+            return Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }));
         }
         let first = if begin == NONE { self.literal_number("1") } else { self.expr(begin)? };
         // `EndSliceBound <- ':' EndSliceValue?` and `EndSliceValue <- Expression / EndSliceMinus`,
@@ -2156,7 +2156,7 @@ impl<'a> Transform<'a> {
         }
         let name = self.function_name("array_slice");
         let args = self.expr_slice(args);
-        Ok(self.push(Expr::Function { name, args, distinct: false }))
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
     /// A number literal the transformer writes rather than reads, for a bound a range left out.
@@ -2221,12 +2221,24 @@ impl<'a> Transform<'a> {
     /// `FunctionExpression <- FunctionIdentifier FunctionExpressionArguments WithinGroupClause?
     /// FilterClause? ExportClause? OverClause?`.
     fn function(&mut self, node: u32) -> Result<ExprRef> {
-        for name in ["WithinGroupClause", "FilterClause", "ExportClause"] {
+        for name in ["WithinGroupClause", "ExportClause"] {
             let clause = self.find(node, name);
             if clause != NONE {
                 return self.unsupported(clause);
             }
         }
+        // `FilterClauseContents <- 'WHERE'? Expression`, so the word is optional and the predicate
+        // is the last thing under it either way. Whether the call is allowed to carry one at all is
+        // the binder's question, because it is a question about what the name resolves to.
+        let clause = self.find(node, "FilterClause");
+        let written =
+            if clause == NONE { NONE } else { self.descendant(clause, "FilterClauseContents") };
+        let filter = if written == NONE {
+            NONE
+        } else {
+            let predicate = self.kids(written).last().unwrap_or(NONE);
+            self.expr(predicate)?
+        };
         let over = self.find(node, "OverClause");
         let name = self.name_parts(self.first(node));
         // `FunctionExpressionArguments <- Parens(FunctionExpressionArgumentList)` and
@@ -2260,7 +2272,14 @@ impl<'a> Transform<'a> {
         if over != NONE {
             let args = self.expr_slice(args);
             let spec = self.over(over)?;
-            return Ok(self.push(Expr::Window { name, args, distinct, ignore_nulls, spec }));
+            return Ok(self.push(Expr::Window {
+                name,
+                args,
+                distinct,
+                filter,
+                ignore_nulls,
+                spec,
+            }));
         }
         // `IFNULL` is an ordinary call in the grammar and is not one by the time DuckDB's parser is
         // done with it: `ifnull(NULL, 3)` comes back named `COALESCE(NULL, 3)` there, and so does
@@ -2273,10 +2292,10 @@ impl<'a> Transform<'a> {
             }
             let args = self.expr_slice(args);
             let name = self.function_name("coalesce");
-            return Ok(self.push(Expr::Function { name, args, distinct }));
+            return Ok(self.push(Expr::Function { name, args, distinct, filter }));
         }
         let args = self.expr_slice(args);
-        Ok(self.push(Expr::Function { name, args, distinct }))
+        Ok(self.push(Expr::Function { name, args, distinct, filter }))
     }
 
     // Windows.
@@ -2510,7 +2529,7 @@ impl<'a> Transform<'a> {
         }
         let args = self.expr_slice(args);
         let name = self.function_name("coalesce");
-        Ok(self.push(Expr::Function { name, args, distinct: false }))
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
     /// `NullIfExpression <- 'NULLIF' Parens(NullIfArguments)` and
@@ -2533,7 +2552,7 @@ impl<'a> Transform<'a> {
         }
         let args = self.expr_slice(args);
         let name = self.function_name("nullif");
-        Ok(self.push(Expr::Function { name, args, distinct: false }))
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
     /// `SubstringExpression <- 'SUBSTRING' Parens(SubstringArguments)` and
@@ -2572,7 +2591,7 @@ impl<'a> Transform<'a> {
         }
         let args = self.expr_slice(args);
         let name = self.function_name("substring");
-        Ok(self.push(Expr::Function { name, args, distinct: false }))
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
     /// `PositionExpression <- 'POSITION' Parens(PositionArguments)` and
@@ -2590,7 +2609,7 @@ impl<'a> Transform<'a> {
         let haystack = self.expr(self.nth(arguments, 1))?;
         let args = self.expr_slice(vec![haystack, needle]);
         let name = self.function_name("position");
-        Ok(self.push(Expr::Function { name, args, distinct: false }))
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
     /// `TrimExpression <- 'TRIM' Parens(TrimArguments)` and
@@ -2627,7 +2646,7 @@ impl<'a> Transform<'a> {
         }
         let args = self.expr_slice(args);
         let name = self.function_name(name);
-        Ok(self.push(Expr::Function { name, args, distinct: false }))
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
     /// `OverlayExpression <- 'OVERLAY' Parens(OverlayArguments)` and
@@ -2652,7 +2671,7 @@ impl<'a> Transform<'a> {
         }
         let args = self.expr_slice(args);
         let name = self.function_name("overlay");
-        Ok(self.push(Expr::Function { name, args, distinct: false }))
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
     /// A number literal the query did not write, for the one place a lowering has to supply one.
@@ -2692,7 +2711,7 @@ impl<'a> Transform<'a> {
         let operand = self.expr(self.nth(arguments, 1))?;
         let name = self.function_name("date_part");
         let args = self.expr_slice(vec![part, operand]);
-        Ok(self.push(Expr::Function { name, args, distinct: false }))
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
     /// `FunctionArgument <- NamedFunctionArgument / PositionalFunctionArgument`.
@@ -2815,13 +2834,13 @@ impl<'a> Transform<'a> {
         if let Some(width) = width {
             let name = self.function_name("trunc");
             let args = self.expr_slice(vec![count]);
-            let whole = self.push(Expr::Function { name, args, distinct: false });
+            let whole = self.push(Expr::Function { name, args, distinct: false, filter: NONE });
             let ty = self.intern(width);
             count = self.push(Expr::Cast { operand: whole, ty, try_cast: false });
         }
         let name = self.function_name(function);
         let args = self.expr_slice(vec![count]);
-        Ok(self.push(Expr::Function { name, args, distinct: false }))
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
     /// `CaseExpression <- 'CASE' Expression? CaseWhenThen+ CaseElse? 'END'`.
@@ -3263,6 +3282,10 @@ mod tests {
         if expr == NONE {
             return "-".to_string();
         }
+        /// The `FILTER` on a call, which is nothing at all when there is none.
+        fn shown_filter(ast: &Ast, filter: ExprRef) -> String {
+            if filter == NONE { String::new() } else { format!(" FILTER [{}]", show(ast, filter)) }
+        }
         let list = |slice: Slice| {
             ast.expr_list(slice).iter().map(|&item| show(ast, item)).collect::<Vec<_>>().join(", ")
         };
@@ -3300,12 +3323,14 @@ mod tests {
                 };
                 format!("({} {op} {})", show(ast, left), show(ast, right))
             }
-            Expr::Function { name, args, distinct } => {
+            Expr::Function { name, args, distinct, filter } => {
                 let distinct = if distinct { "DISTINCT " } else { "" };
-                format!("{}({distinct}{})", ast.name_text(name), list(args))
+                let filter = shown_filter(ast, filter);
+                format!("{}({distinct}{}){filter}", ast.name_text(name), list(args))
             }
-            Expr::Window { name, args, distinct, ignore_nulls, spec } => {
+            Expr::Window { name, args, distinct, filter, ignore_nulls, spec } => {
                 let distinct = if distinct { "DISTINCT " } else { "" };
+                let filter = shown_filter(ast, filter);
                 let nulls = if ignore_nulls { " IGNORE NULLS" } else { "" };
                 let held = ast.window(spec);
                 let order = ast
@@ -3322,7 +3347,7 @@ mod tests {
                     other => format!("{other:?}"),
                 };
                 format!(
-                    "{}({distinct}{}{nulls}) OVER [{}] [{order}] [{:?} {} {} {:?}]",
+                    "{}({distinct}{}{nulls}){filter} OVER [{}] [{order}] [{:?} {} {} {:?}]",
                     ast.name_text(name),
                     list(args),
                     list(held.partition),
@@ -4456,6 +4481,30 @@ mod tests {
         assert_eq!(round("SELECT count(DISTINCT x)"), "SELECT count(DISTINCT x)");
         assert_eq!(round("SELECT count(ALL x)"), "SELECT count(x)");
         assert_eq!(round("SELECT main.count(x)"), "SELECT main.count(x)");
+    }
+
+    #[test]
+    fn a_call_keeps_the_filter_it_was_written_with_and_the_word_where_is_optional() {
+        // `FilterClauseContents <- 'WHERE'? Expression`, so both spellings parse and both land on
+        // the same predicate. Which names are allowed to carry one is not a question the parser
+        // can answer, so it keeps one wherever it was written and lets the binder refuse it.
+        assert_eq!(round("SELECT sum(x) FILTER (WHERE y > 1)"), "SELECT sum(x) FILTER [(y Gt 1)]");
+        assert_eq!(round("SELECT sum(x) FILTER (y > 1)"), "SELECT sum(x) FILTER [(y Gt 1)]");
+        assert_eq!(round("SELECT count(*) FILTER (WHERE b)"), "SELECT count(*) FILTER [b]");
+        assert_eq!(
+            round("SELECT sum(DISTINCT x) FILTER (WHERE b)"),
+            "SELECT sum(DISTINCT x) FILTER [b]"
+        );
+        assert_eq!(round("SELECT abs(x) FILTER (WHERE b)"), "SELECT abs(x) FILTER [b]");
+    }
+
+    /// The `FILTER` goes before the `OVER`, which is a rule of the grammar and not of the binder.
+    #[test]
+    fn a_window_call_carries_its_filter_in_front_of_its_over() {
+        assert_eq!(
+            round("SELECT sum(x) FILTER (WHERE b) OVER ()"),
+            "SELECT sum(x) FILTER [b] OVER [] [] [Range UnboundedPreceding CurrentRow NoOthers]"
+        );
     }
 
     #[test]

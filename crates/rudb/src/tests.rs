@@ -160,6 +160,58 @@ fn count_with_no_arguments_counts_rows_the_way_a_star_does() {
     assert_eq!(db.query("SELECT count() OVER () FROM t").unwrap().names(), ["count() OVER ()"]);
 }
 
+/// A `FILTER` picks which rows one aggregate reads, which is not the same as picking which rows
+/// the query has. Every answer here was read off the pinned binary.
+#[test]
+fn a_filter_narrows_one_aggregate_and_leaves_the_rest_of_the_query_alone() {
+    let db = scripted(&[
+        "CREATE TABLE f (k INTEGER, v INTEGER)",
+        "INSERT INTO f VALUES (1, 1), (1, 2), (1, NULL), (2, 3), (2, 4), (2, NULL)",
+    ]);
+    assert_eq!(
+        rows(&db, "SELECT sum(v) FILTER (WHERE v > 1) FROM f"),
+        vec![vec![Value::HugeInt(9)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FILTER (WHERE v > 1) FROM f"),
+        vec![vec![Value::BigInt(3)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(v) FILTER (WHERE v IS NULL) FROM f"),
+        vec![vec![Value::BigInt(0)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FILTER (WHERE v IS NULL) FROM f"),
+        vec![vec![Value::BigInt(2)]]
+    );
+    // Two aggregates over the same rows, one of them filtered, which is what the feature is for.
+    assert_eq!(
+        rows(&db, "SELECT count(*) FILTER (WHERE v > 1), count(*) FROM f"),
+        vec![vec![Value::BigInt(3), Value::BigInt(6)]]
+    );
+    // A group where the predicate holds for nothing still has its row, with the empty answer each
+    // aggregate gives over no rows at all.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k, count(*) FILTER (WHERE v > 2), sum(v) FILTER (WHERE v > 2) \
+             FROM f GROUP BY k ORDER BY k"
+        ),
+        vec![
+            vec![integer(1), Value::BigInt(0), Value::Null],
+            vec![integer(2), Value::BigInt(2), Value::HugeInt(7)],
+        ]
+    );
+    assert_eq!(rows(&db, "SELECT sum(v) FILTER (WHERE false) FROM f"), vec![vec![Value::Null]]);
+    assert_eq!(
+        rows(&db, "SELECT sum(DISTINCT v) FILTER (WHERE v > 1) FROM f"),
+        vec![vec![Value::HugeInt(9)]]
+    );
+    // The predicate is cast to BOOLEAN the way a `WHERE` is, so an integer column is a predicate
+    // on whether the integer is not zero and the null row drops out of it.
+    assert_eq!(rows(&db, "SELECT sum(v) FILTER (WHERE v) FROM f"), vec![vec![Value::HugeInt(10)]]);
+}
+
 #[test]
 fn a_group_by_produces_one_row_per_distinct_value() {
     let db = database();
