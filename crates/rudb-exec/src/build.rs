@@ -1421,11 +1421,15 @@ impl<'a> Building<'a, '_> {
                 let gathering = self.shape.pipeline(held);
                 let held = self.node(held)?;
                 let held_schema = held.schema.clone();
-                let (gather, gathered) = Gather::new(memory);
-                let kept = self.watch(reference, gather_id, gathering, "Gather", None);
-                self.close(held, gathering, Arc::new(Watched::new(gather, kept)));
+                // The chunks as chunks rather than a row per row. A join reads this side by
+                // position, to build its table and then once per match, so taking it apart into a
+                // `Vec<Value>` per row here would be an allocation per row for a layout the join
+                // then has to transpose back into columns. See `crate::side::Build`.
+                let (gather, gathered) = Keep::new(memory);
+                let watched = self.watch(reference, gather_id, gathering, "Gather", None);
+                self.close(held, gathering, Arc::new(Watched::new(gather, watched)));
                 let mut left = self.node(driving)?;
-                let side = Gathered { schema: &held_schema, rows: gathered, marker, swapped };
+                let side = Gathered { schema: &held_schema, chunks: gathered, marker, swapped };
                 // A lookup answers this join and the kind decides about a driving row from that
                 // row's own matches, so nothing has to be held and the driving side streams
                 // through. That is one less copy of a side, an answer that is never collected, and

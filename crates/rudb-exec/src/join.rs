@@ -60,8 +60,8 @@
 //! # Two pipelines and an edge
 //!
 //! A join is two inputs, and two inputs is two pipelines with a dependency between them. One side
-//! ends in a [`Gather`](crate::gather::Gather), which keeps its rows and does nothing else, and the
-//! other ends here. The order is not a choice: no row of the second side can be answered until every
+//! ends in a [`Keep`](crate::gather::Keep), which holds on to its chunks as the chunks they are and
+//! does nothing else, and the other ends here. The order is not a choice: no row of the second side can be answered until every
 //! row of the first it might match has been seen, and that is the edge the scheduler will read off
 //! the plan. It is the edge the lookup above builds on too: the gathered side is the side the table
 //! is built from, and the table can be built because that pipeline has finished.
@@ -94,11 +94,11 @@ use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
 use crate::expr::evaluate_all_in_time_zone;
-use crate::gather::{self, Gathering, Rows};
-
+use crate::gather::{self, Gathering};
 use crate::lookup::{Lookup, MISS, Scratch};
 use crate::rows;
 use crate::schema::Schema;
+use crate::side::{Build, PAD};
 
 /// A join with a condition.
 #[derive(Debug)]
@@ -127,7 +127,7 @@ pub(crate) struct Join<'a> {
     /// rows and thirty thousand right ones runs for a minute with nothing looking at the token.
     cancel: Cancel,
     /// The right side, filled by the pipeline this one depends on.
-    right: Rows,
+    right: Buffered,
     /// The left side, as every instance gathered it.
     left: Mutex<Vec<Vec<Value>>>,
     /// What the left side is charged, given back once the finished chunks are charged instead.
@@ -147,8 +147,13 @@ pub(crate) struct Join<'a> {
 pub(crate) struct Gathered<'s> {
     /// What that side's rows look like.
     pub(crate) schema: &'s Schema,
-    /// The rows, readable once the pipeline that filled them has finished.
-    pub(crate) rows: Rows,
+    /// The chunks, readable once the pipeline that filled them has finished.
+    ///
+    /// Chunks rather than rows. This side is going to be read by position, once to build the table
+    /// and then once per match, and taking it apart into a `Vec<Value>` per row on the way in would
+    /// be an allocation per row for a layout that then has to be transposed back into columns
+    /// anyway. See [`Build`], which is where they are laid end to end.
+    pub(crate) chunks: Buffered,
     /// The marker's position for a mark join, when it is not the final column.
     pub(crate) marker: Option<usize>,
     /// Whether this is the plan's left input rather than its right one.
@@ -206,7 +211,7 @@ impl<'a> Join<'a> {
             swapped,
             memory: memory.clone(),
             cancel: cancel.clone(),
-            right: right.rows,
+            right: right.chunks,
             left: Mutex::new(Vec::new()),
             charged: Mutex::new(Vec::new()),
             held: Mutex::new(memory.reservation()),
@@ -229,19 +234,23 @@ impl<'a> Join<'a> {
     }
 
     /// The joined rows, before they are turned back into chunks.
-    fn joined(
-        &self,
-        left_rows: &[Vec<Value>],
-        right_rows: &[Vec<Value>],
-    ) -> Result<Vec<Vec<Value>>> {
+    fn joined(&self, left_rows: &[Vec<Value>], right_chunks: &[Chunk]) -> Result<Vec<Vec<Value>>> {
         // The rows being paired up, charged apart from the chunks that come out, because a nested
         // loop join holds all of it at once and gives back everything but the output when it is
         // done.
         let mut scratch = self.memory.reservation();
         let left_types = self.left_schema.types();
         let right_types = self.right_schema.types();
+        // The gathered side as columns, which is what a match is read out of. The kinds on this
+        // operator still pair rows up one at a time, so what they take out of it is a row, but the
+        // side itself is held the way the stream next door holds it and the residual reads it by
+        // gathering. See [`Build`] and #880 for the rest of the way.
+        let right = Build::new(&right_types, right_chunks)?;
+        scratch.grow(right.footprint())?;
+        let right_rows = right.rows();
         if self.kind == JoinKind::Positional {
-            return Ok(positional(left_rows, right_rows, left_types.len(), right_types.len()));
+            let rows: Vec<Vec<Value>> = (0..right_rows).map(|at| right.row(at as u32)).collect();
+            return Ok(positional(left_rows, &rows, left_types.len(), right_types.len()));
         }
         // A mark join asks a question about the whole of the gathered side rather than collecting
         // the rows that match, and its answer distinguishes no match from a match nobody could
@@ -254,7 +263,7 @@ impl<'a> Join<'a> {
         let index = match &equalities {
             Some(equalities) => Some(lookup(
                 equalities.gathered(self.plan, &self.right_schema, self.time_zone),
-                right_rows,
+                right_chunks,
                 &self.cancel,
                 &mut scratch,
             )?),
@@ -280,24 +289,23 @@ impl<'a> Join<'a> {
             exprs: &equalities.residual,
             combined: &self.combined,
             left_types: &left_types,
-            right_types: &right_types,
             time_zone: self.time_zone,
         });
         // Nothing evaluates a condition over the whole gathered side when the index narrows it
-        // first, and these chunks are a second copy of a side that is already held whole. What the
-        // residual evaluates over is a chunk of the candidates, built one driving row at a time.
-        let right_chunks = match index {
-            Some(_) => Vec::new(),
-            None => rows::chunks(&right_types, right_rows, &mut scratch)?,
+        // first. What the residual evaluates over is a chunk of the candidates, gathered one
+        // driving row at a time.
+        let scanned_over: &[Chunk] = match index {
+            Some(_) => &[],
+            None => right_chunks,
         };
-        let mut matched = vec![false; right_rows.len()];
-        scratch.grow(u64::try_from(right_rows.len()).unwrap_or(u64::MAX))?;
+        let mut matched = vec![false; right_rows];
+        scratch.grow(u64::try_from(right_rows).unwrap_or(u64::MAX))?;
         let mut out: Vec<Vec<Value>> = Vec::new();
         // Reused across driving rows, so that a join with a residual allocates once rather than
         // once per row it looks up.
-        let mut kept: Vec<usize> = Vec::new();
+        let mut kept: Vec<u32> = Vec::new();
         // The same, for the chain the lookup answers a driving row with.
-        let mut chain: Vec<usize> = Vec::new();
+        let mut chain: Vec<u32> = Vec::new();
         for (position, left_row) in left_rows.iter().enumerate() {
             // Once per left row, in the same place and for the same reason as the reservation at
             // the bottom of the loop. What a query can run past its clock by is one pass over the
@@ -305,7 +313,7 @@ impl<'a> Join<'a> {
             self.cancel.check()?;
             let before = out.len();
             if self.kind == JoinKind::Mark {
-                let marker = self.marker(left_row, &left_types, &right_chunks)?;
+                let marker = self.marker(left_row, &left_types, scanned_over)?;
                 let mut row = pad_right(left_row, right_types.len());
                 let Some(position) = self.marker else {
                     return Err(Error::internal("a mark join has no marker column"));
@@ -316,18 +324,18 @@ impl<'a> Join<'a> {
                 continue;
             }
             let scanned;
-            let hits: &[usize] = match (&index, &residual) {
+            let hits: &[u32] = match (&index, &residual) {
                 (Some(index), Some(residual)) => {
                     index.matches(left_slots[position], &mut chain);
-                    residual.keep(left_row, right_rows, &chain, &mut kept)?
+                    residual.keep(left_row, &right, &chain, &mut kept)?
                 }
                 _ => {
-                    scanned = self.matching(left_row, &left_types, &right_chunks)?;
+                    scanned = self.matching(left_row, &left_types, scanned_over)?;
                     &scanned
                 }
             };
             for &hit in hits {
-                matched[hit] = true;
+                matched[hit as usize] = true;
             }
             match self.kind {
                 JoinKind::Mark => unreachable!("mark joins leave before collecting hits"),
@@ -346,7 +354,7 @@ impl<'a> Join<'a> {
                         return Err(too_many_rows());
                     }
                     match hits.first() {
-                        Some(&hit) => out.push(pair(left_row, &right_rows[hit])),
+                        Some(&hit) => out.push(pair(left_row, &right.row(hit))),
                         None => out.push(pad_right(left_row, right_types.len())),
                     }
                 }
@@ -355,7 +363,7 @@ impl<'a> Join<'a> {
                 }
                 _ => {
                     for &hit in hits {
-                        out.push(pair(left_row, &right_rows[hit]));
+                        out.push(pair(left_row, &right.row(hit)));
                     }
                 }
             }
@@ -369,7 +377,7 @@ impl<'a> Join<'a> {
         if matches!(self.kind, JoinKind::Right | JoinKind::Full) {
             for (at, seen) in matched.iter().enumerate() {
                 if !seen {
-                    out.push(pad_left(left_types.len(), &right_rows[at]));
+                    out.push(pad_left(left_types.len(), &right.row(at as u32)));
                 }
             }
         }
@@ -386,11 +394,11 @@ impl<'a> Join<'a> {
         left_row: &[Value],
         left_types: &[LogicalType],
         right_chunks: &[Chunk],
-    ) -> Result<Vec<usize>> {
+    ) -> Result<Vec<u32>> {
         let mut hits = Vec::new();
-        let mut base = 0;
+        let mut base: u32 = 0;
         for chunk in right_chunks {
-            let rows = chunk.len();
+            let rows = u32::try_from(chunk.len()).unwrap_or(PAD);
             if self.conditions.is_empty() {
                 hits.extend(base..base + rows);
             } else {
@@ -407,7 +415,7 @@ impl<'a> Join<'a> {
                 // answer still gets. The flags are already a vector here, so what this wants is the
                 // selection that 2c (#57) threads.
                 for row in 0..rows {
-                    if is_true(&merged.value_at(row)) {
+                    if is_true(&merged.value_at(row as usize)) {
                         hits.push(base + row);
                     }
                 }
@@ -479,8 +487,8 @@ impl Sink for Join<'_> {
 
     fn finalize(&self) -> Result<()> {
         let left_rows = std::mem::take(&mut *self.left.lock().map_err(poisoned)?);
-        let right_rows = self.right.take()?;
-        let mut out = self.joined(&left_rows, &right_rows)?;
+        let right_chunks = held(&self.right)?;
+        let mut out = self.joined(&left_rows, &right_chunks)?;
         if self.swapped {
             // Back into the plan's order. Every row here is this operator's left half followed by
             // its right half, and the plan asked for the other way round, so one rotation by the
@@ -495,7 +503,7 @@ impl Sink for Join<'_> {
         // Both sides go before the answer is built, because the answer is as large as both of them
         // together and holding three copies is what the budget exists to stop.
         drop(left_rows);
-        drop(right_rows);
+        drop(right_chunks);
         let mut held = self.held.lock().map_err(poisoned)?;
         let chunks = rows::chunks(&self.schema.types(), &out, &mut held)?;
         self.out.fill(chunks)?;
@@ -636,11 +644,9 @@ pub(crate) struct Probe<'a> {
     combined: Schema,
     left_types: Vec<LogicalType>,
     right_types: Vec<LogicalType>,
-    /// How wide a driving row is, which is how far to rotate a swapped one.
+    /// How many columns of the answer are the driving side's, which is how far to rotate a swapped
+    /// one.
     left_width: usize,
-    /// How wide a gathered row is, which is how much padding an unmatched driving row takes.
-    right_width: usize,
-    types: Vec<LogicalType>,
     schema: Schema,
     /// Whether this operator's left side is the plan's right one. See [`Join::swapped`].
     swapped: bool,
@@ -650,7 +656,7 @@ pub(crate) struct Probe<'a> {
     /// wrapper checking between chunks would not look at the token while it ran.
     cancel: Cancel,
     /// The gathered side, filled by the pipeline this one depends on.
-    gathered: Rows,
+    gathered: Buffered,
     /// The rows and the table over them, built by whichever instance asks first.
     built: OnceLock<Result<Arc<Built>>>,
     /// What the table is charged, held for as long as it is readable.
@@ -666,7 +672,7 @@ pub(crate) struct Probe<'a> {
 /// The gathered side and the table that finds rows in it.
 #[derive(Debug)]
 struct Built {
-    rows: Vec<Vec<Value>>,
+    rows: Build,
     index: Lookup,
 }
 
@@ -690,7 +696,17 @@ pub(crate) struct Probing {
     /// The buffers that lookup walks the chunk with, held here so that a chunk costs no allocation.
     scratch: Scratch,
     /// The gathered rows the current driving row matches, refilled per row from its chain.
-    chain: Vec<usize>,
+    chain: Vec<u32>,
+    /// The ones of those a residual condition kept, when there is a residual condition.
+    kept: Vec<u32>,
+    /// Which driving row each output row reads from, one entry per output row.
+    ///
+    /// This and the one below it are the answer. A pair is two numbers, so the row loop writes two
+    /// numbers, and the columns are gathered at those positions once the loop is done. See
+    /// [`Build`], which is the whole argument.
+    left_at: Vec<u32>,
+    /// Which gathered row each output row reads from, [`PAD`] for a row that matched nothing.
+    right_at: Vec<u32>,
     row: usize,
     /// How many of the current row's matches have already come out.
     ///
@@ -748,12 +764,10 @@ impl<'a> Probe<'a> {
             left_types: left.types(),
             right_types: right_schema.types(),
             left_width: left.width(),
-            right_width: right_schema.width(),
-            types: schema.types(),
             schema,
             swapped,
             cancel: cancel.clone(),
-            gathered: right.rows.clone(),
+            gathered: right.chunks.clone(),
             built: OnceLock::new(),
             held: Mutex::new(memory.reservation()),
             time_zone: SessionTimeZone::default(),
@@ -779,7 +793,6 @@ impl<'a> Probe<'a> {
             exprs: &self.equalities.residual,
             combined: &self.combined,
             left_types: &self.left_types,
-            right_types: &self.right_types,
             time_zone: self.time_zone,
         }
     }
@@ -793,14 +806,20 @@ impl<'a> Probe<'a> {
     fn built(&self) -> Result<Arc<Built>> {
         self.built
             .get_or_init(|| {
-                let rows = self.gathered.take()?;
-                let mut held = self.held.lock().map_err(poisoned)?;
+                let chunks = held(&self.gathered)?;
+                let mut charged = self.held.lock().map_err(poisoned)?;
                 let index = lookup(
                     self.equalities.gathered(self.plan, &self.right_schema, self.time_zone),
-                    &rows,
+                    &chunks,
                     &self.cancel,
-                    &mut held,
+                    &mut charged,
                 )?;
+                // The chunks laid end to end, which is a copy of the side and is charged as one.
+                // The chunks themselves are not charged again here: the keep that made them holds
+                // that reservation for as long as this operator can read them, and charging the
+                // same bytes twice would be a limit half the size it says it is.
+                let rows = Build::new(&self.right_types, &chunks)?;
+                charged.grow(rows.footprint())?;
                 Ok(Arc::new(Built { rows, index }))
             })
             .clone()
@@ -817,6 +836,9 @@ impl Stream for Probe<'_> {
             slots: Vec::new(),
             scratch: Scratch::default(),
             chain: Vec::new(),
+            kept: Vec::new(),
+            left_at: Vec::new(),
+            right_at: Vec::new(),
             row: 0,
             hit: 0,
         }
@@ -863,52 +885,60 @@ impl Stream for Probe<'_> {
                 left
             }
         };
-        let mut out: Vec<Vec<Value>> = Vec::new();
-        // Once per call rather than once per driving row. A driving row whose key has more matches
-        // than fit in a chunk is filtered again on the call that resumes it, which is the same work
-        // for the same answer and is what keeps the instance state down to where the row got to.
-        let mut kept: Vec<usize> = Vec::new();
-        while local.row < left.len() && out.len() < VECTOR_SIZE {
+        let residual = self.residual();
+        // The two halves of the answer, one entry per output row. Nothing is built here but a pair
+        // of numbers per pair of rows, and the columns are gathered at those numbers below.
+        local.left_at.clear();
+        local.right_at.clear();
+        while local.row < left.len() && local.left_at.len() < VECTOR_SIZE {
             // Once per driving row, the same granularity the nested loop checks at, and the only
             // place in this operator that runs long once the table is built.
             self.cancel.check()?;
-            let row: Vec<Value> = left.row(local.row).collect();
             // The chain the lookup above left for this row, which is one walk of a run of `u32`
             // rather than a hash and a map lookup.
-            built
-                .index
-                .matches(local.slots.get(local.row).copied().unwrap_or(MISS), &mut local.chain);
-            let found = self.residual().keep(&row, &built.rows, &local.chain, &mut kept)?;
+            let slot = local.slots.get(local.row).copied().unwrap_or(MISS);
+            built.index.matches(slot, &mut local.chain);
+            // The driving row as values only when there is a conjunct left to evaluate on it, which
+            // is what makes an ordinary equi join cost no boxed row at all. A residual still gets
+            // one per driving row, because the pairs it evaluates over are one row repeated across
+            // its candidates and a constant vector is built out of a value.
+            let found: &[u32] = if residual.exprs.is_empty() {
+                &local.chain
+            } else {
+                let values: Vec<Value> = left.row(local.row).collect();
+                residual.keep(&values, &built.rows, &local.chain, &mut local.kept)?
+            };
+            let at = u32::try_from(local.row).map_err(|_| too_many_rows())?;
             match self.kind {
                 JoinKind::Semi => {
                     if !found.is_empty() {
-                        out.push(row);
+                        local.left_at.push(at);
                     }
                 }
                 JoinKind::Anti => {
                     if found.is_empty() {
-                        out.push(row);
+                        local.left_at.push(at);
                     }
                 }
                 JoinKind::Single => {
                     if found.len() > 1 {
                         return Err(too_many_rows());
                     }
-                    match found.first() {
-                        Some(&hit) => out.push(pair(&row, &built.rows[hit])),
-                        None => out.push(pad_right(&row, self.right_width)),
-                    }
+                    local.left_at.push(at);
+                    local.right_at.push(found.first().copied().unwrap_or(PAD));
                 }
                 JoinKind::Left if found.is_empty() => {
-                    out.push(pad_right(&row, self.right_width));
+                    local.left_at.push(at);
+                    local.right_at.push(PAD);
                 }
                 // An inner join with no match produces nothing, which is this arm with an empty
                 // list, and the rest of it is one output row per match.
                 _ => {
-                    let room = VECTOR_SIZE - out.len();
+                    let room = VECTOR_SIZE - local.left_at.len();
                     let end = (local.hit + room).min(found.len());
                     for &hit in &found[local.hit..end] {
-                        out.push(pair(&row, &built.rows[hit]));
+                        local.left_at.push(at);
+                        local.right_at.push(hit);
                     }
                     if end < found.len() {
                         // A key with more matches than fit in a chunk. The row stays where it is and
@@ -921,14 +951,23 @@ impl Stream for Probe<'_> {
             }
             local.row += 1;
         }
-        if self.swapped {
-            // Back into the plan's order, for the reason [`Sink::finalize`] gives below. On the rows
-            // rather than the chunk because the rows are owned here and the chunk is not built yet.
-            for row in &mut out {
-                row.rotate_left(self.left_width);
-            }
+        let mut columns: Vec<Vector> = left
+            .columns()
+            .iter()
+            .map(|column| column.gather(&local.left_at))
+            .collect::<Result<Vec<_>>>()?;
+        // A semi or an anti join answers with the driving row alone, so there is no gathered half
+        // to put beside it and no positions were written for one.
+        if !matches!(self.kind, JoinKind::Semi | JoinKind::Anti) {
+            columns.extend(built.rows.gather(&local.right_at)?);
         }
-        *chunk = rows::pack(&self.types, &out)?;
+        if self.swapped {
+            // Back into the plan's order, for the reason [`Sink::finalize`] gives below. One
+            // rotation of the column list rather than a rotation per row, which is what holding the
+            // answer as columns buys here as well.
+            columns.rotate_left(self.left_width);
+        }
+        *chunk = Chunk::with_rows(columns, local.left_at.len())?;
         if local.row < left.len() {
             local.left = Some(left);
             return Ok(Progress::Again);
@@ -1029,8 +1068,6 @@ struct Residual<'a> {
     combined: &'a Schema,
     /// What a driving row looks like, for repeating one across the candidates.
     left_types: &'a [LogicalType],
-    /// What a gathered row looks like, for packing candidates back into a chunk.
-    right_types: &'a [LogicalType],
     time_zone: SessionTimeZone,
 }
 
@@ -1043,7 +1080,9 @@ impl Residual<'_> {
     /// The pairs are built a vector at a time and evaluated the way the nested loop evaluates them,
     /// through one chunk of the candidates with the driving row repeated across it as constants. A
     /// key with more candidates than fit in a vector is several passes rather than one oversized
-    /// chunk, which is the same rule the rest of this file follows.
+    /// chunk, which is the same rule the rest of this file follows. The chunk of candidates is one
+    /// gather per column out of the gathered side, which is the same kernel the answer is built
+    /// with and the reason this does not box a row either.
     ///
     /// One difference from the loop this replaces, and it is the right way round: a conjunct that
     /// raises is now only evaluated on pairs the equality already accepted, so a join that used to
@@ -1052,19 +1091,16 @@ impl Residual<'_> {
     fn keep<'h>(
         &self,
         left_row: &[Value],
-        rows: &[Vec<Value>],
-        hits: &'h [usize],
-        into: &'h mut Vec<usize>,
-    ) -> Result<&'h [usize]> {
+        rows: &Build,
+        hits: &'h [u32],
+        into: &'h mut Vec<u32>,
+    ) -> Result<&'h [u32]> {
         if self.exprs.is_empty() || hits.is_empty() {
             return Ok(hits);
         }
         into.clear();
-        let mut candidates: Vec<Vec<Value>> = Vec::new();
         for batch in hits.chunks(VECTOR_SIZE) {
-            candidates.clear();
-            candidates.extend(batch.iter().map(|&hit| rows[hit].clone()));
-            let chunk = rows::pack(self.right_types, &candidates)?;
+            let chunk = rows.chunk(batch)?;
             let combined = widen(left_row, self.left_types, &chunk)?;
             let flags = evaluate_all_in_time_zone(
                 self.plan,
@@ -1240,47 +1276,65 @@ fn equalities(
 
 /// The gathered side's rows, in a table that finds them by the values the key expressions produce.
 ///
-/// A batch at a time, and every part of what a batch costs is a pass over a column rather than a
+/// A chunk at a time, and every part of what a chunk costs is a pass over a column rather than a
 /// walk over a row: the key expressions are evaluated through the vectorized evaluator the rest of
 /// this file uses, the hash is one pass per key column with the column's type matched on once, and
-/// the probe walks the rows of a batch together so the cache misses on a table larger than the
+/// the probe walks the rows of a chunk together so the cache misses on a table larger than the
 /// cache are outstanding at the same time. What this replaced built a `Vec<Value>` per gathered row
 /// and hashed it a tagged value at a time. See [`Lookup`] for the rest of the argument.
 ///
-/// The chunk built per batch is a copy of one [`VECTOR_SIZE`] batch of a side and is dropped before
-/// the next one, so what it costs at any moment is bounded by the vector size rather than by the
-/// side. That is why it is not charged: the budget is about what an operator holds, and this holds
-/// two thousand rows for as long as it takes to read a key out of them. What is charged is the
-/// table, after each batch and by the difference, so a build that is going to be too large says so
-/// while it is building rather than at the last row.
+/// The chunks are the chunks the pipeline on the other side of the dependency edge produced, held
+/// as they were given, so nothing is packed or unpacked here at all. What is charged is the table,
+/// after each chunk and by the difference, so a build that is going to be too large says so while
+/// it is building rather than at the last row.
 fn lookup(
     keying: Keying<'_>,
-    rows: &[Vec<Value>],
+    chunks: &[Chunk],
     cancel: &Cancel,
     scratch: &mut Reservation,
 ) -> Result<Lookup> {
     let Keying { plan, exprs, schema, nulls, time_zone } = keying;
-    let types = schema.types();
-    let mut lookup = Lookup::new(rows.len())?;
+    let rows: usize = chunks.iter().map(Chunk::len).sum();
+    let mut lookup = Lookup::new(rows)?;
     let mut charged = lookup.footprint();
     scratch.grow(charged)?;
     let mut base = 0;
-    for batch in rows.chunks(VECTOR_SIZE) {
-        // Once per batch rather than once per row. A build over a side nobody bounded is the one
+    for chunk in chunks {
+        // Once per chunk rather than once per row. A build over a side nobody bounded is the one
         // part of this operator that can run long without producing anything, and a check every two
         // thousand rows is the same granularity the rest of the operator uses.
         cancel.check()?;
-        let chunk = rows::pack(&types, batch)?;
-        let columns = evaluate_all_in_time_zone(plan, exprs, schema, &chunk, time_zone)?;
-        lookup.add(&columns, batch.len(), base, nulls)?;
+        let columns = evaluate_all_in_time_zone(plan, exprs, schema, chunk, time_zone)?;
+        lookup.add(&columns, chunk.len(), base, nulls)?;
         let want = lookup.footprint();
         scratch.grow(want.saturating_sub(charged))?;
         charged = want;
-        base += batch.len();
+        base += chunk.len();
     }
     lookup.seal();
     scratch.shrink(charged.saturating_sub(lookup.footprint()));
     Ok(lookup)
+}
+
+/// Everything a pipeline breaker put in a buffer, as one list.
+///
+/// A join reads its gathered side by position and reads it more than once, so it wants the whole
+/// list rather than the shared cursor a pipeline hands out. [`Buffered::reader`] is the handle with
+/// a cursor of its own and this is the only thing the join asks of it.
+///
+/// # Errors
+///
+/// [`ErrorCode::Internal`](rudb_common::ErrorCode::Internal) if a thread panicked while holding the
+/// list, or if a chunk that was counted is not there.
+fn held(chunks: &Buffered) -> Result<Vec<Chunk>> {
+    let reader = chunks.reader();
+    (0..reader.len()?)
+        .map(|at| {
+            reader.at(at)?.ok_or_else(|| {
+                Error::internal("a join was given fewer gathered chunks than it was told about")
+            })
+        })
+        .collect()
 }
 
 /// Every driving row's slot in the table, in the order the rows are in, [`MISS`] where it has none.
@@ -1393,7 +1447,7 @@ mod tests {
         Buffered, Chunk, CrossProduct, Gathered, Join, Probe, Progress, Schema, Side, Sink, Stream,
         equalities, side_of,
     };
-    use crate::gather::{Gather, Keep, Rows};
+    use crate::gather::Keep;
 
     fn chunk(values: &[i32]) -> Chunk {
         let column = Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into()))
@@ -1477,15 +1531,15 @@ mod tests {
     }
 
     /// The right side of a join, run to the end the way the pipeline before this one would.
-    fn gathered(memory: &Memory, values: &[i32]) -> (Gather, Rows) {
-        let (gather, rows) = Gather::new(memory);
-        let mut local = gather.local();
+    fn gathered(memory: &Memory, values: &[i32]) -> (Keep, Buffered) {
+        let (keep, chunks) = Keep::new(memory);
+        let mut local = keep.local();
         if !values.is_empty() {
-            gather.sink(&chunk(values), &mut local).expect("the right rows");
+            keep.sink(&chunk(values), &mut local).expect("the right rows");
         }
-        gather.combine(local).expect("the one instance");
-        gather.finalize().expect("nothing to do");
-        (gather, rows)
+        keep.combine(local).expect("the one instance");
+        keep.finalize().expect("the chunks");
+        (keep, chunks)
     }
 
     /// The one left chunk through the sink, and the answer out of the other end.
@@ -1513,7 +1567,7 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("a", 0),
-            Gathered { schema: &schema("b", 1), rows: right, marker: None, swapped: false },
+            Gathered { schema: &schema("b", 1), chunks: right, marker: None, swapped: false },
             JoinKind::Inner,
             Slice::EMPTY,
             &Cancel::new(),
@@ -1547,7 +1601,12 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("b", 1),
-            Gathered { schema: &schema("a", 0), rows: gathered_side, marker: None, swapped: true },
+            Gathered {
+                schema: &schema("a", 0),
+                chunks: gathered_side,
+                marker: None,
+                swapped: true,
+            },
             JoinKind::Inner,
             Slice::EMPTY,
             &Cancel::new(),
@@ -1582,7 +1641,12 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("b", 1),
-            Gathered { schema: &schema("a", 0), rows: gathered_side, marker: None, swapped: true },
+            Gathered {
+                schema: &schema("a", 0),
+                chunks: gathered_side,
+                marker: None,
+                swapped: true,
+            },
             JoinKind::Right,
             Slice::EMPTY,
             &Cancel::new(),
@@ -1609,7 +1673,7 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("a", 0),
-            Gathered { schema: &schema("b", 1), rows: right, marker: None, swapped: false },
+            Gathered { schema: &schema("b", 1), chunks: right, marker: None, swapped: false },
             JoinKind::Anti,
             Slice::EMPTY,
             &Cancel::new(),
@@ -1631,7 +1695,7 @@ mod tests {
         let (join, out) = Join::new(
             &plan,
             &schema("a", 0),
-            Gathered { schema: &schema("b", 1), rows: right, marker: None, swapped: false },
+            Gathered { schema: &schema("b", 1), chunks: right, marker: None, swapped: false },
             JoinKind::Positional,
             Slice::EMPTY,
             &Cancel::new(),
@@ -1855,17 +1919,15 @@ mod tests {
         let conditions = plan.add_expr_list(&[key, beside]);
 
         let memory = Memory::unlimited();
-        let (gather, rows) = Gather::new(&memory);
-        let mut local = gather.local();
-        gather
-            .sink(&pair_chunk(&[(2, 5), (2, 50), (3, 5)]), &mut local)
-            .expect("the gathered rows");
-        gather.combine(local).expect("the one instance");
-        gather.finalize().expect("nothing to do");
+        let (keep, rows) = Keep::new(&memory);
+        let mut local = keep.local();
+        keep.sink(&pair_chunk(&[(2, 5), (2, 50), (3, 5)]), &mut local).expect("the gathered rows");
+        keep.combine(local).expect("the one instance");
+        keep.finalize().expect("the chunks");
         let probe = Probe::new(
             &plan,
             &left,
-            &Gathered { schema: &right, rows, marker: None, swapped: false },
+            &Gathered { schema: &right, chunks: rows, marker: None, swapped: false },
             JoinKind::Inner,
             conditions,
             &Cancel::new(),
@@ -1902,15 +1964,15 @@ mod tests {
         let conditions = plan.add_expr_list(&[key, beside]);
 
         let memory = Memory::unlimited();
-        let (gather, rows) = Gather::new(&memory);
-        let mut local = gather.local();
-        gather.sink(&pair_chunk(&[(2, 50)]), &mut local).expect("the gathered rows");
-        gather.combine(local).expect("the one instance");
-        gather.finalize().expect("nothing to do");
+        let (keep, rows) = Keep::new(&memory);
+        let mut local = keep.local();
+        keep.sink(&pair_chunk(&[(2, 50)]), &mut local).expect("the gathered rows");
+        keep.combine(local).expect("the one instance");
+        keep.finalize().expect("the chunks");
         let probe = Probe::new(
             &plan,
             &left,
-            &Gathered { schema: &right, rows, marker: None, swapped: false },
+            &Gathered { schema: &right, chunks: rows, marker: None, swapped: false },
             JoinKind::Left,
             conditions,
             &Cancel::new(),
@@ -1945,15 +2007,15 @@ mod tests {
         let conditions = plan.add_expr_list(&[key, beside]);
 
         let memory = Memory::unlimited();
-        let (gather, gathered) = Gather::new(&memory);
-        let mut local = gather.local();
-        gather.sink(&pair_chunk(&[(2, 50), (4, 1)]), &mut local).expect("the gathered rows");
-        gather.combine(local).expect("the one instance");
-        gather.finalize().expect("nothing to do");
+        let (keep, gathered) = Keep::new(&memory);
+        let mut local = keep.local();
+        keep.sink(&pair_chunk(&[(2, 50), (4, 1)]), &mut local).expect("the gathered rows");
+        keep.combine(local).expect("the one instance");
+        keep.finalize().expect("the chunks");
         let (join, out) = Join::new(
             &plan,
             &left,
-            Gathered { schema: &right, rows: gathered, marker: None, swapped: false },
+            Gathered { schema: &right, chunks: gathered, marker: None, swapped: false },
             JoinKind::Full,
             conditions,
             &Cancel::new(),
@@ -1988,15 +2050,15 @@ mod tests {
         let conditions = plan.add_expr_list(&[condition]);
 
         let memory = Memory::unlimited();
-        let (gather, rows) = Gather::new(&memory);
-        let mut local = gather.local();
-        gather.sink(&wide_chunk(&[2, 3, 4]), &mut local).expect("the gathered rows");
-        gather.combine(local).expect("the one instance");
-        gather.finalize().expect("nothing to do");
+        let (keep, rows) = Keep::new(&memory);
+        let mut local = keep.local();
+        keep.sink(&wide_chunk(&[2, 3, 4]), &mut local).expect("the gathered rows");
+        keep.combine(local).expect("the one instance");
+        keep.finalize().expect("the chunks");
         let probe = Probe::new(
             &plan,
             &left,
-            &Gathered { schema: &right, rows, marker: None, swapped: false },
+            &Gathered { schema: &right, chunks: rows, marker: None, swapped: false },
             JoinKind::Inner,
             conditions,
             &Cancel::new(),

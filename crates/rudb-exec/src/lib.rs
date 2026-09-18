@@ -48,10 +48,12 @@
 //! several threads is the driver rather than the operators.
 //!
 //! An operator with two inputs is two pipelines with an edge between them, and the set operation
-//! and the join are both built that way. The side that has to finish first ends in a
-//! `gather::Gather`, which holds its rows and does nothing else, and the side that uses it reads
-//! them through a handle. That edge is the one [`Query::run`] takes its order from, and for the join
-//! it is where the hash table goes when #62 replaces the nested loop.
+//! and the join are both built that way. The side that has to finish first ends in a `gather` sink,
+//! which holds what it is given and does nothing else, and the side that uses it reads through a
+//! handle. A set operation walks that side a row at a time and takes a `gather::Gather`, which holds
+//! rows. A join reads it by position and takes a `gather::Keep`, which holds the chunks as chunks.
+//! That edge is the one [`Query::run`] takes its order from, and for the join it is where the hash
+//! table goes.
 //!
 //! The cross product sits on that edge too, and it is the operator that made `rudb-pipeline` grow a
 //! [`Progress::Again`](rudb_pipeline::Progress::Again). One of its input chunks becomes as many
@@ -104,6 +106,7 @@ mod rows;
 mod schema;
 mod setop;
 mod settingnames;
+mod side;
 mod signed;
 mod sort;
 mod source;
