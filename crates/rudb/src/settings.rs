@@ -21,6 +21,13 @@
 //! list twenty eight names the binary has never heard of. They go through the same [`Settings::apply`]
 //! anyway, because a second door into the settings is a second place for a scope rule to be wrong.
 //!
+//! The rule switches of `rudb_common::rules` are the other exception and they work the same way.
+//! `SET stats.presize = false` turns off one optimization so that its worth can be measured on its
+//! own, and `SET statistics = off` turns off all of them at once, which is the ablation
+//! `spec/stats/09-measurement.md` section 9.3 runs on every commit. `SET graph_sections = off` is
+//! the same idea for the stored graph sections. None of the ten is a DuckDB setting either, so none
+//! of them is in the settings catalog and `duckdb_settings()` does not list them.
+//!
 //! Every setting the engine reads is global, which is the scope DuckDB gives it, and for those
 //! `SET LOCAL` is refused with the sentence the binary prints and `SET SESSION` with the one it
 //! prints for a global setting, which is a different sentence and says which of the two the writer
@@ -38,7 +45,8 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 use rudb_common::{
-    DefaultNullOrder, Error, IdentifierCase, Memory, Result, Session, ShowBehavior, Value, human,
+    DefaultNullOrder, Error, IdentifierCase, Memory, Result, Rules, Session, ShowBehavior, Value,
+    human, looks_like_rule, rule_names,
 };
 use rudb_functions::{Behaviour, LOCAL, SETTINGS, SettingEntry};
 use rudb_parse::ast::Scope;
@@ -109,6 +117,14 @@ pub(crate) struct Settings {
     /// `spec/17-milestones.md`: the process flag sets them by running a `SET` at startup, and a
     /// per query hint is this with the query's own pins laid over a copy.
     seams: RwLock<rudb_seam::Settings>,
+    /// Which optimization rules may fire, as `SET stats.<name>` and `SET graph.sections` have left
+    /// them.
+    ///
+    /// The same exception the seams are, for the same reason, and `rudb_common::rules` says why the
+    /// names are not in the settings catalog. Every statistics rule starts on, so a database that
+    /// never mentions one of these behaves as it did before any of them existed, and the graph
+    /// sections start off because they are a new path rather than a better estimate.
+    rules: RwLock<Rules>,
 }
 
 impl Settings {
@@ -142,6 +158,7 @@ impl Settings {
             warnings_as_errors: RwLock::new(false),
             carried: RwLock::new(BTreeMap::new()),
             seams: RwLock::new(rudb_seam::Settings::new()),
+            rules: RwLock::new(Rules::new()),
         }
     }
 
@@ -157,6 +174,14 @@ impl Settings {
     /// none of them, so the copy is a copy of nothing much.
     pub(crate) fn seams(&self) -> rudb_seam::Settings {
         self.seams.read().unwrap_or_else(|held| held.into_inner()).clone()
+    }
+
+    /// The rules as the statements have left them.
+    ///
+    /// A copy for the same reason the seams are copied: a statement reads them once and a reference
+    /// would be a lock held for the length of the query. This one is two bytes.
+    pub(crate) fn rules(&self) -> Rules {
+        *self.rules.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The configuration as the statements have left it.
@@ -214,6 +239,15 @@ impl Settings {
                 .write()
                 .unwrap_or_else(|held| held.into_inner())
                 .set(name, text.trim());
+        }
+        if is_rule(name) {
+            // `RESET stats.presize` puts the rule back where a fresh database has it, which is on
+            // for the statistics rules and off for the graph sections.
+            let mut rules = self.rules.write().unwrap_or_else(|held| held.into_inner());
+            return match value {
+                None => rules.reset_named(name),
+                Some(value) => rules.set_named(name, switch_of(value)?),
+            };
         }
         let Some(entry) = rudb_functions::setting_named(canonical(name)) else {
             return Err(Error::catalog(rudb_functions::unknown_setting(name)));
@@ -503,6 +537,11 @@ impl Settings {
                 Error::catalog(format!("no seam called {name}, see rudb_strategies() for the list"))
             });
         }
+        if is_rule(name) {
+            return self.rules().named(name).map(|enabled| enabled.to_string()).ok_or_else(|| {
+                Error::catalog(format!("no rule called {name}, the rules are {}", rule_names()))
+            });
+        }
         let Some(entry) = rudb_functions::setting_named(canonical(name)) else {
             return Err(Error::catalog(rudb_functions::unknown_setting(name)));
         };
@@ -677,6 +716,7 @@ impl Settings {
             _ => ShowBehavior::Auto,
         });
         session.set_warnings_as_errors(warnings_as_errors);
+        session.set_rules(self.rules());
         for entry in SETTINGS {
             if entry.behaviour != Behaviour::Honoured {
                 session.set(entry.name, self.carried(entry));
@@ -765,6 +805,31 @@ fn is_seam(name: &str) -> bool {
         return false;
     }
     name.starts_with(SEAM_PREFIX) || rudb_seam::seam_named(name).is_some()
+}
+
+/// Whether this name is one of the rule switches rather than a setting DuckDB has.
+///
+/// The same shape as [`is_seam`] and for the same reason. A DuckDB setting wins, so the day one of
+/// its names collides with a rule of ours the compatible answer is the one that is given.
+fn is_rule(name: &str) -> bool {
+    if rudb_functions::setting_named(name).is_some() {
+        return false;
+    }
+    looks_like_rule(name)
+}
+
+/// A rule switch as the boolean it sets.
+///
+/// `off` and `on` on top of what [`boolean_of`] takes, because that is how the specification
+/// documents write these two switches and somebody reading them should be able to type what they
+/// say. A rule setting is the only place those two words mean anything, so they are handled here
+/// rather than in the cast every other boolean setting goes through.
+fn switch_of(value: &Value) -> Result<bool> {
+    match value {
+        Value::Varchar(text) if text.eq_ignore_ascii_case("off") => Ok(false),
+        Value::Varchar(text) if text.eq_ignore_ascii_case("on") => Ok(true),
+        other => boolean_of(other),
+    }
 }
 
 /// A value as the text a setting reads.

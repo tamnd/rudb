@@ -17,6 +17,8 @@ use std::collections::BTreeMap;
 use chrono::{Offset, TimeZone as _, Utc};
 use chrono_tz::Tz;
 
+use crate::Rules;
+
 /// The settings a session has, by name.
 ///
 /// Every setting the engine has, not only the ones somebody changed. A reader of this is answering
@@ -27,6 +29,7 @@ pub struct Session {
     values: BTreeMap<String, String>,
     time_zone: Tz,
     semantics: Semantics,
+    rules: Rules,
 }
 
 /// The meaning-changing session choices consumed while a query is bound.
@@ -211,7 +214,12 @@ impl SessionTimeZone {
 
 impl Default for Session {
     fn default() -> Self {
-        Self { values: BTreeMap::new(), time_zone: chrono_tz::UTC, semantics: Semantics::default() }
+        Self {
+            values: BTreeMap::new(),
+            time_zone: chrono_tz::UTC,
+            semantics: Semantics::default(),
+            rules: Rules::new(),
+        }
     }
 }
 
@@ -313,6 +321,21 @@ impl Session {
     #[must_use]
     pub fn semantics(&self) -> Semantics {
         self.semantics
+    }
+
+    /// Records which optimization rules the session has turned off.
+    pub fn set_rules(&mut self, rules: Rules) {
+        self.rules = rules;
+    }
+
+    /// Which optimization rules may fire for this statement.
+    ///
+    /// Read by whatever is about to apply one, which is why it rides on the session rather than
+    /// being reached for through the database: the rank that sets it and the ranks that obey it
+    /// cannot see each other.
+    #[must_use]
+    pub fn rules(&self) -> Rules {
+        self.rules
     }
 
     /// Whether the bundled time-zone database knows this name.
