@@ -44,11 +44,12 @@
 
 use std::fmt::Write as _;
 
+use rudb_common::stat::{Class, Stat};
 use rudb_metrics::{Document, Operator};
 use rudb_plan::{Node, NodeRef, OperatorRef, PipelineRef, Plan, Shape, seams_of};
 use rudb_seam::{Registries, SeamId, Settings};
 
-use crate::estimate::{Statistics, rows};
+use crate::estimate::{Statistics, rows_stat};
 
 /// What `EXPLAIN` needs to know about the seams to print the last section.
 ///
@@ -137,23 +138,31 @@ pub fn analyzed(
     printed(plan, statistics, seams, Some(measured))
 }
 
-/// Writes the estimated row count of every node onto the operator row that node became.
+/// Writes the estimated row count of every node onto the operator row that node became, and the
+/// histogram of how much the planner knew onto the document.
 ///
 /// Done here because the estimate is here and the mapping from a node to an operator is in
 /// `rudb-plan`, and neither of those is something the crate that runs a query should be working out
 /// for itself. An estimate an order of magnitude away from what happened is how a bad plan explains
 /// itself, and `rudb_metrics::warnings` cannot say so over a document where the estimate is missing.
+///
+/// The histogram counts one decision per operator and not per node, for the same reason the row
+/// counts go on operators: a node the physical plan folded away is not a decision anybody acted on,
+/// and counting it would move the number with a plan rewrite that changed nothing about what was
+/// known.
 pub fn record_estimates(plan: &Plan, statistics: &Statistics, document: &mut Document) {
     let shape = Shape::of(plan);
-    let mut estimated = vec![None; shape.operators() as usize];
+    let mut estimated = vec![Stat::Unknown; shape.operators() as usize];
     for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
         if let Some(id) = shape.operator_of(node) {
-            estimated[id as usize] = rows(plan, node, statistics);
+            estimated[id as usize] = rows_stat(plan, node, statistics);
         }
     }
     for operator in &mut document.operators {
         if let Some(estimate) = estimated.get(operator.id as usize) {
-            operator.estimated_rows = *estimate;
+            operator.estimated_rows = estimate.value().copied();
+            operator.estimate_class = estimate.class();
+            document.estimates.record(estimate);
         }
     }
 }
@@ -177,6 +186,24 @@ fn printed(
     out
 }
 
+/// The row count and its class, as the bracket on a plan line reads.
+///
+/// The tilde is on the guesses and nothing else. A count that was counted is printed without one
+/// because it is not approximately anything, and the word after the number says where it came from,
+/// which is the question somebody asks when a plan went wrong. `spec/stats/04-in-memory.md` section
+/// 4.1 asks for the source to be printed for exactly that reason: a bad plan is diagnosed by asking
+/// which number was wrong and who produced it, and `estimated from constant` is the answer that says
+/// nobody had a number here at all.
+fn estimate(stat: Stat<u64>) -> String {
+    match stat {
+        Stat::Unknown => "rows unknown".to_owned(),
+        Stat::Known { value, class } => match class {
+            Class::Estimated { .. } => format!("~{value} rows {class}"),
+            class => format!("{value} rows {class}"),
+        },
+    }
+}
+
 /// Everything a line of the tree is written from, which is the same for every line.
 ///
 /// The walk down the tree changes the node and the depth and nothing else, so the rest is carried
@@ -193,10 +220,7 @@ struct Printing<'a> {
 impl Printing<'_> {
     fn write_node(self, node: NodeRef, depth: usize, out: &mut String) {
         let printed = self.plan.operator(node);
-        let estimate = match rows(self.plan, node, self.statistics) {
-            Some(count) => format!("~{count} rows"),
-            None => "rows unknown".to_owned(),
-        };
+        let estimate = estimate(rows_stat(self.plan, node, self.statistics));
         let pipeline = self.shape.pipeline(node);
         let marker =
             if self.seams.all_reference(self.plan.node(node)) { " [reference]" } else { "" };
@@ -378,10 +402,11 @@ fn children(node: &Node) -> Vec<NodeRef> {
 
 #[cfg(test)]
 mod tests {
+    use rudb_metrics::{Document, Operator};
     use rudb_plan::Plan;
     use rudb_seam::{Registries, Settings};
 
-    use super::{Seams, explain, explain_with};
+    use super::{Seams, Shape, explain, explain_with, record_estimates};
     use crate::estimate::Statistics;
 
     fn parsed(text: &str) -> Plan {
@@ -410,11 +435,16 @@ mod tests {
             ),
             &[("t", 1000)],
         );
+        // The scan says exact because the catalog counted those rows, and the filter above it says
+        // estimated because the fifth it took off them is a constant somebody picked. A reader
+        // deciding whether to trust the number wants to be told which of the two it is.
         assert_eq!(
             tree(&out).join("\n"),
             concat!(
-                "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN  [~200 rows] [pipeline 0] [reference]\n",
-                "  Get memory.main.t AS t #0 [a::INTEGER]  [~1000 rows] [pipeline 0] [reference]",
+                "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN  [~200 rows estimated from constant] \
+                 [pipeline 0] [reference]\n",
+                "  Get memory.main.t AS t #0 [a::INTEGER]  [1000 rows exact] [pipeline 0] \
+                 [reference]",
             )
         );
     }
@@ -425,6 +455,53 @@ mod tests {
         // reader this wording exists for.
         let out = printed("Get memory.main.t AS t #0 [a::INTEGER]\n", &[]);
         assert!(tree(&out)[0].contains("[rows unknown]"), "{out}");
+    }
+
+    #[test]
+    fn the_document_gets_one_class_per_operator_and_the_number_that_goes_with_it() {
+        let plan = parsed(concat!(
+            "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER]\n",
+        ));
+        let mut statistics = Statistics::new();
+        statistics.record("memory", "main", "t", 1000);
+        let mut document = Document::new("select");
+        let shape = Shape::of(&plan);
+        for id in 0..shape.operators() {
+            document.operators.push(Operator::new(id, 0, "operator"));
+        }
+        record_estimates(&plan, &statistics, &mut document);
+
+        // Two operators, so two decisions, and the histogram is a count of decisions rather than
+        // of nodes or of rows.
+        assert_eq!(document.estimates.total(), 2);
+        assert_eq!(document.estimates.exact(), 1);
+        assert_eq!(document.estimates.estimated(), 1);
+        assert_eq!(document.estimates.unknown(), 0);
+        // And the class on a row always agrees with the number on the same row, so a reader never
+        // sees a class over a missing estimate or an estimate with no class on it.
+        for operator in &document.operators {
+            assert_eq!(operator.estimated_rows.is_some(), operator.estimate_class.is_some());
+        }
+    }
+
+    #[test]
+    fn an_operator_nobody_estimated_is_counted_as_nobody_knowing_rather_than_left_out() {
+        // The share the series moves is a share of every decision, so a decision made with nothing
+        // has to be in the denominator. Dropping it would make a planner that knows less look
+        // better than one that knows more.
+        let plan = parsed("TableFunction range args=[] #0 [a::BIGINT]\n");
+        let mut document = Document::new("select");
+        let shape = Shape::of(&plan);
+        for id in 0..shape.operators() {
+            document.operators.push(Operator::new(id, 0, "operator"));
+        }
+        record_estimates(&plan, &Statistics::new(), &mut document);
+
+        assert_eq!(document.estimates.unknown(), document.estimates.total());
+        assert!(document.estimates.total() > 0);
+        assert_eq!(document.operators[0].estimated_rows, None);
+        assert_eq!(document.operators[0].estimate_class, None);
     }
 
     #[test]
@@ -439,9 +516,9 @@ mod tests {
         );
         let lines = tree(&out);
         assert_eq!(lines.len(), 3, "{out}");
-        assert!(lines[0].contains("[~5000 rows]"), "{out}");
-        assert!(lines[1].contains("small") && lines[1].contains("[~10 rows]"), "{out}");
-        assert!(lines[2].contains("big") && lines[2].contains("[~5000 rows]"), "{out}");
+        assert!(lines[0].contains("[~5000 rows estimated from constant]"), "{out}");
+        assert!(lines[1].contains("small") && lines[1].contains("[10 rows exact]"), "{out}");
+        assert!(lines[2].contains("big") && lines[2].contains("[5000 rows exact]"), "{out}");
         // Indented by depth, so the shape of the tree survives being flattened into lines.
         assert!(lines[1].starts_with("  Get"), "{out}");
     }
