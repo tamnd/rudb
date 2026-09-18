@@ -5282,7 +5282,7 @@ mod tests {
         let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
         let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
         let index_len =
-            12 + (count + 1) * 4 + (blocks + rank_blocks) * 8 + count * RANK_ENTRY as u64;
+            12 + (count + 1) * 4 + (blocks * 2 + rank_blocks) * 8 + count * RANK_ENTRY as u64;
         let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
         file.seek(SeekFrom::Start(dictionary.offset + index_len))
             .expect("inside dictionary payload");
@@ -5372,7 +5372,7 @@ mod tests {
         let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
         let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
         let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
-        let index_len = 12 + (count + 1) * 4 + (blocks + rank_blocks) * 8;
+        let index_len = 12 + (count + 1) * 4 + (blocks * 2 + rank_blocks) * 8;
         let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
         file.seek(SeekFrom::Start(page.offset + index_len)).expect("the first head");
         file.write_all(&[255]).expect("damage the order");
