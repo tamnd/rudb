@@ -37,8 +37,9 @@
 use rudb_catalog::{Catalog, Database, Schema, Table};
 use rudb_common::{LogicalType, Result, Value};
 use rudb_functions::{
-    DUCKDB, canonical, column_fields, database_fields, numeric_facts, schema_fields, table_fields,
-    type_oid, view_fields,
+    DUCKDB, canonical, column_fields, database_fields, numeric_facts, schema_fields,
+    show_database_fields, show_expanded_fields, show_table_fields, table_fields, type_oid,
+    view_fields,
 };
 use rudb_parse::quoted;
 use rudb_plan::{Plan, Slice};
@@ -293,6 +294,143 @@ fn column_row(
         Value::Boolean(false),
         Value::Null,
     ]
+}
+
+/// The name of everything an unqualified name can reach, which is what `PRAGMA show_tables` is.
+///
+/// Sorted by name, and views sit among the tables rather than after them, which is the pin's answer
+/// and the only sensible one for a list whose whole purpose is to say what a name will find.
+///
+/// The search path is the default schema of the default database, plus `temp` on the pin. rudb has
+/// neither `CREATE SCHEMA` nor a temporary table yet, so the path is one schema and this walks it
+/// directly. The day either lands this is the function that has to grow a real search path rather
+/// than a lookup of one name.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn showtables(
+    catalog: &Catalog,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let mut names = Vec::new();
+    for database in catalog.databases() {
+        if !database.name().eq_ignore_ascii_case(catalog.default_catalog()) {
+            continue;
+        }
+        for schema in database.schemas() {
+            if !schema.name().eq_ignore_ascii_case(catalog.default_schema()) {
+                continue;
+            }
+            names.extend(schema.tables().iter().map(|table| table.name().table.clone()));
+            names.extend(schema.views().iter().map(|view| view.name().table.clone()));
+        }
+    }
+    names.sort();
+    let rows: Vec<Vec<Value>> = names.iter().map(|name| vec![text(name)]).collect();
+    Metadata::new("pragma_show_tables", &show_table_fields(), &rows, plan, index, columns)
+}
+
+/// The name of everything that is attached, which is what `PRAGMA show_databases` is.
+///
+/// The databases the engine owns are left out, because the pin leaves its own out too and the
+/// question the statement asks is which databases a client can write a name into.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn showdatabases(
+    catalog: &Catalog,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let mut names: Vec<&str> = catalog
+        .databases()
+        .iter()
+        .filter(|database| !database.internal())
+        .map(Database::name)
+        .collect();
+    names.sort_unstable();
+    let rows: Vec<Vec<Value>> = names.iter().map(|name| vec![text(name)]).collect();
+    Metadata::new("pragma_show_databases", &show_database_fields(), &rows, plan, index, columns)
+}
+
+/// Every table and view anywhere with its columns beside it, which is `PRAGMA show_tables_expanded`.
+///
+/// Sorted by database, then schema, then name, and the engine's own databases are left out the way
+/// `PRAGMA show_databases` leaves them out. The two list columns are the one place in these tables
+/// where a table's shape is reported without a join, and the types are written the way the type
+/// prints rather than the way it was declared.
+///
+/// `temporary` is false on every row, because `CREATE TEMPORARY TABLE` is not a statement rudb takes
+/// yet and the pin only puts true there for an entry in its `temp` database. The day that statement
+/// lands this column is read off the database the entry is in rather than being a constant.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn showtablesexpanded(
+    catalog: &Catalog,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let mut rows = Vec::new();
+    for database in catalog.databases() {
+        if database.internal() {
+            continue;
+        }
+        for schema in database.schemas() {
+            for table in schema.tables() {
+                rows.push(expanded_row(database, schema, &table.name().table, table.columns()));
+            }
+            for view in schema.views() {
+                rows.push(expanded_row(database, schema, &view.name().table, &view.columns()));
+            }
+        }
+    }
+    // On the three name columns, which are the three the pin orders by. They are varchars on every
+    // row, so the key is those three strings and nothing in it can be null.
+    rows.sort_by_key(|row| {
+        let at = |index: usize| match &row[index] {
+            Value::Varchar(name) => name.clone(),
+            _ => String::new(),
+        };
+        (at(0), at(1), at(2))
+    });
+    Metadata::new(
+        "pragma_show_tables_expanded",
+        &show_expanded_fields(),
+        &rows,
+        plan,
+        index,
+        columns,
+    )
+}
+
+/// One row of `PRAGMA show_tables_expanded`, for a table or for a view.
+fn expanded_row(
+    database: &Database,
+    schema: &Schema,
+    name: &str,
+    columns: &[rudb_common::Field],
+) -> Vec<Value> {
+    vec![
+        text(database.name()),
+        text(schema.name()),
+        text(name),
+        names_of(columns.iter().map(|field| field.name.clone())),
+        names_of(columns.iter().map(|field| field.ty.to_string())),
+        Value::Boolean(false),
+    ]
+}
+
+/// A `VARCHAR[]` of whatever was handed in, which is how both list columns are built.
+fn names_of(values: impl Iterator<Item = String>) -> Value {
+    Value::List { element: LogicalType::Varchar, values: values.map(Value::Varchar).collect() }
 }
 
 /// Every base table in the catalog with the database and schema it is in.

@@ -256,7 +256,10 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::PragmaVersion
         | TableFunction::PragmaPlatform
         | TableFunction::PragmaUserAgent
-        | TableFunction::PragmaDatabaseSize => vec![0],
+        | TableFunction::PragmaDatabaseSize
+        | TableFunction::PragmaShowTables
+        | TableFunction::PragmaShowDatabases
+        | TableFunction::PragmaShowTablesExpanded => vec![0],
     }
 }
 

@@ -23,8 +23,8 @@ pub mod table;
 pub mod typecatalog;
 
 pub use entrycatalog::{
-    DUCKDB, canonical, column_fields, database_fields, numeric_facts, schema_fields, table_fields,
-    view_fields,
+    DUCKDB, canonical, column_fields, database_fields, numeric_facts, schema_fields,
+    show_database_fields, show_expanded_fields, show_table_fields, table_fields, view_fields,
 };
 pub use file::{
     csv_fields, csv_given, files, is_file, is_pattern, open_csv, open_parquet, parquet_fields,
