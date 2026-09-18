@@ -4490,9 +4490,18 @@ mod tests {
 
     #[test]
     fn a_code_stream_the_cascade_cannot_shrink_is_left_alone() {
-        // Spread far enough apart that nothing narrower than the full width holds them, which is
-        // the shape a column with tens of millions of distinct values hands over.
-        let spread: Vec<u32> = (0..1024).map(|row| row * 4_000_000).collect();
+        // A shift register rather than a run, because an arithmetic run is the one wide shape the
+        // cascade does shrink. This is what a column with tens of millions of distinct values hands
+        // over: full width codes with no order to them.
+        let mut state: u32 = 0x9e37_79b9;
+        let spread: Vec<u32> = (0..1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state
+            })
+            .collect();
         assert_eq!(encoded_codes(&spread).expect("no failure"), None);
         let near: Vec<u32> = (0..1024).collect();
         let coded = encoded_codes(&near).expect("no failure").expect("counting up is packable");
