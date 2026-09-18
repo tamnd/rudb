@@ -3919,8 +3919,7 @@ fn encode_global_dictionary(
     }
     let ranks = encode_ranks(order);
     let rank_blocks = values.div_ceil(TEXT_RANK_BLOCK);
-    let mut index =
-        Vec::with_capacity(12 + (values + 1) * 4 + (blocks * 2 + rank_blocks) * 8);
+    let mut index = Vec::with_capacity(12 + (values + 1) * 4 + (blocks * 2 + rank_blocks) * 8);
     put_u32(
         &mut index,
         u32::try_from(values).map_err(|_| invalid("global dictionary has too many values"))?,
