@@ -106,15 +106,31 @@ pub(crate) fn chunks(
 ) -> Result<Vec<Chunk>> {
     let mut built = Vec::new();
     for batch in rows.chunks(VECTOR_SIZE) {
-        let mut columns = Vec::with_capacity(types.len());
-        for (position, ty) in types.iter().enumerate() {
-            let down: Vec<Value> =
-                batch.iter().map(|row| row.get(position).cloned().unwrap_or(Value::Null)).collect();
-            columns.push(Vector::from_values(ty.clone(), &down)?);
-        }
-        let chunk = Chunk::with_rows(columns, batch.len())?;
+        let chunk = pack(types, batch)?;
         held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
         built.push(chunk);
     }
     Ok(built)
+}
+
+/// One chunk out of rows that already fit in one.
+///
+/// Nothing is charged here, which is the difference from [`chunks`] above and is why it is separate.
+/// An operator that hands a chunk downstream as soon as it has built it is not holding a second copy
+/// of anything, so there is nothing for it to be charged for, and a reservation dropped at the end
+/// of the call that built the chunk would be a charge that stopped being true while the chunk was
+/// still being read.
+///
+/// # Errors
+///
+/// If a value does not belong in the column it was placed in, or if a row is not as wide as the type
+/// list.
+pub(crate) fn pack(types: &[LogicalType], rows: &[Vec<Value>]) -> Result<Chunk> {
+    let mut columns = Vec::with_capacity(types.len());
+    for (position, ty) in types.iter().enumerate() {
+        let down: Vec<Value> =
+            rows.iter().map(|row| row.get(position).cloned().unwrap_or(Value::Null)).collect();
+        columns.push(Vector::from_values(ty.clone(), &down)?);
+    }
+    Chunk::with_rows(columns, rows.len())
 }
