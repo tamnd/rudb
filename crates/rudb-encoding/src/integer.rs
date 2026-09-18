@@ -40,6 +40,12 @@
 //! the first 1024 rows of a sorted column look constant. Building that first would mean the numbers
 //! this milestone produces are the sampler's numbers rather than the format's, and there would be
 //! no way to tell how much the sampler is leaving behind.
+//!
+//! There is a second way to spend less on the search and it is not a chooser at all. A writer laying
+//! down a column writes one chunk after another out of the same column, and [`encode_with_kind`]
+//! hands back what the search settled on so that [`encode_only_with`] can put the next chunk
+//! straight through it. That is the sample being the chunk before rather than a slice of this one,
+//! and it costs nothing when it is right and one search when it is wrong.
 
 use rudb_common::{Error, Result};
 
@@ -129,6 +135,42 @@ pub fn encode(values: &[i64]) -> Result<Vec<u8>> {
 /// As [`encode`].
 pub fn encode_with(values: &[i64], chooser: &dyn Chooser) -> Result<Vec<u8>> {
     encode_at(values, 0, chooser)
+}
+
+/// [`encode_with`] and the kind it settled on at the top of the cascade.
+///
+/// The bytes carry the kind in their first byte and a caller could read it back off them, but a
+/// tag is a number in a format rather than a `Kind`, and turning one into the other is this
+/// module's business. What the kind is for is the next chunk of the same column: a writer that has
+/// just searched every candidate over a thousand values knows something about the thousand after
+/// them, and [`encode_only_with`] is how it spends that.
+///
+/// # Errors
+///
+/// As [`encode`].
+pub fn encode_with_kind(values: &[i64], chooser: &dyn Chooser) -> Result<(Vec<u8>, Kind)> {
+    best_at(values, 0, chooser)
+}
+
+/// One named candidate over a whole chunk, with `chooser` deciding the levels below it.
+///
+/// `None` when the kind does not apply, which is the answer a caller reusing an earlier chunk's
+/// kind has to be ready for: a column whose shape changes hands back nothing here and has to go
+/// looking again.
+///
+/// The saving over [`encode_with`] is not only the candidates that are not encoded. It is also
+/// [`candidates`], which sorts a copy of the chunk to find out how many distinct values are in it,
+/// and which this never calls.
+///
+/// # Errors
+///
+/// As [`encode`].
+pub fn encode_only_with(
+    kind: Kind,
+    values: &[i64],
+    chooser: &dyn Chooser,
+) -> Result<Option<Vec<u8>>> {
+    encode_as(kind, values, 0, chooser)
 }
 
 /// Decodes a chunk written by [`encode`].
@@ -235,14 +277,18 @@ pub fn describe(bytes: &[u8]) -> Result<String> {
 }
 
 fn encode_at(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u8>> {
+    best_at(values, depth, chooser).map(|(bytes, _)| bytes)
+}
+
+fn best_at(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Result<(Vec<u8>, Kind)> {
     let offered = candidates(values, depth);
-    let mut best: Option<Vec<u8>> = None;
+    let mut best: Option<(Vec<u8>, Kind)> = None;
     for kind in chooser.narrow_integers(values, &offered, depth) {
         let Some(bytes) = encode_as(kind, values, depth, chooser)? else {
             continue;
         };
-        if best.as_ref().is_none_or(|current| bytes.len() < current.len()) {
-            best = Some(bytes);
+        if best.as_ref().is_none_or(|(current, _)| bytes.len() < current.len()) {
+            best = Some((bytes, kind));
         }
     }
     // `Packed` applies to every input including the empty one, so the chooser always has at least
@@ -1034,6 +1080,24 @@ mod tests {
         assert!(sizes.iter().any(|(kind, _)| *kind == Kind::Dict));
         assert!(sizes.iter().any(|(kind, _)| *kind == Kind::Packed));
         assert!(sizes.iter().all(|(_, size)| *size > 0));
+    }
+
+    #[test]
+    fn the_kind_that_came_back_is_the_one_that_encodes_the_same_bytes_again() {
+        let values: Vec<i64> = (0..5000).map(|index| index % 17).collect();
+        let (bytes, kind) = encode_with_kind(&values, &EXHAUSTIVE).unwrap();
+        assert_eq!(bytes, encode(&values).unwrap());
+        assert_eq!(bytes.first().copied(), Some(kind.tag()));
+        let again = encode_only_with(kind, &values, &EXHAUSTIVE).unwrap().unwrap();
+        assert_eq!(again, bytes);
+    }
+
+    #[test]
+    fn a_kind_that_does_not_apply_encodes_nothing() {
+        // Nothing is constant about this, and the caller that asked is the one holding an answer
+        // from the chunk before.
+        let values: Vec<i64> = (0..1024).map(|index| index * 31).collect();
+        assert!(encode_only_with(Kind::Constant, &values, &EXHAUSTIVE).unwrap().is_none());
     }
 
     #[test]

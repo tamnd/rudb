@@ -717,9 +717,11 @@ impl Writer {
             sieves: Vec::with_capacity(held.len()),
             ranges: Vec::with_capacity(held.len()),
         };
+        // One column of one stripe, which is the run of parts the cascade's choice carries over.
+        let mut shape = Shape::default();
         for pending in held {
             let column = pending.chunk.column(index)?;
-            let (bytes, unique) = encode(column, dictionary.as_deref_mut())?;
+            let (bytes, unique) = encode(column, dictionary.as_deref_mut(), &mut shape)?;
             if bytes.len() > MAX_PAGE {
                 return Err(invalid("column page exceeds the configured bound"));
             }
@@ -3237,6 +3239,7 @@ fn cascaded(
     flat: &Vector,
     ty: &LogicalType,
     packed: Option<&Packed<'_>>,
+    shape: &mut Shape,
 ) -> Result<Option<Vec<u8>>> {
     let (Some(width), Some(data)) = (plain_width(ty), flat.data()) else { return Ok(None) };
     let Some(values) = widened(data) else { return Ok(None) };
@@ -3246,8 +3249,84 @@ fn cascaded(
         Some(packed) => plain.min(21 + size_of_val(packed.words())),
         None => plain,
     };
-    let out = integer::encode_with(&values, &Fixed)?;
-    Ok((out.len() < best).then_some(out))
+    shape.cascade(&values, best, &Fixed)
+}
+
+/// What the cascade chose for the part before this one, which is what the part after it tries
+/// first.
+///
+/// The search is the expensive half of the encoder and it is repeated in full on every part of
+/// every column. On ClickBench that is 97,669 parts of 105 columns, and the answer is the same
+/// nearly every time, because a part is a thousand consecutive rows of one column and what suits a
+/// thousand rows of a column suits the thousand after them. Measured on gamingpc, the search is 420
+/// of the 920 processor seconds the encode spends over a whole load.
+///
+/// So the first part of a stripe is searched and the rest are told. The kind that won is kept here
+/// and offered to the next part, which then encodes that one candidate and nothing else. What it
+/// also skips is the filter that decides which candidates apply, and that is the larger half of the
+/// saving, because the filter sorts a copy of the part to count its distinct values.
+///
+/// A kind that does not apply to the next part hands back nothing, and a kind that applies but no
+/// longer pays for itself is thrown out, and in both cases the search runs again and the answer it
+/// gives is kept instead. That is also what the part that starts a stripe does, so a column that
+/// changes shape partway through pays one search to notice rather than carrying a wrong answer to
+/// the end of the file.
+///
+/// A search that finds nothing worth writing is remembered too. A column of high entropy integers
+/// has no cascade and searching every part of it to be told so again is the same waste from the
+/// other side, so that answer carries to the end of the stripe as well.
+///
+/// Nothing here can produce bytes that will not decode. A named kind still has to apply and still
+/// encodes the whole part, so the worst a stale answer can do is cost a few bytes against what the
+/// search would have found, and the size it is measured against is the plain form either way.
+#[derive(Debug, Default)]
+enum Shape {
+    /// Nothing decided yet, which is the first part of every column of every stripe.
+    #[default]
+    Unknown,
+    /// The kind that won on the part before, and paid for its own decode doing it.
+    Kind(integer::Kind),
+    /// The search ran on the part before and nothing it offered was smaller than the plain form.
+    Plain,
+}
+
+impl Shape {
+    /// The part through the cascade, or `None` when nothing the cascade can do is smaller than the
+    /// `best` bytes the plain forms of the same part come to.
+    fn cascade(
+        &mut self,
+        values: &[i64],
+        best: usize,
+        chooser: &dyn chooser::Chooser,
+    ) -> Result<Option<Vec<u8>>> {
+        // A part of one repeated value is worth naming whatever the part before it was, because
+        // `Constant` is thirteen bytes against the twenty one a zero width bit pack costs and the
+        // check is one pass with no allocation in it.
+        let constant = values.first().is_some_and(|first| values.iter().all(|value| value == first));
+        let guess = match (constant, &self) {
+            (true, _) => Some(integer::Kind::Constant),
+            (false, Self::Kind(kind)) => Some(*kind),
+            (false, _) => None,
+        };
+        if let Some(kind) = guess {
+            if let Some(bytes) = integer::encode_only_with(kind, values, chooser)? {
+                if bytes.len() < best {
+                    *self = Self::Kind(kind);
+                    return Ok(Some(bytes));
+                }
+            }
+        }
+        if matches!(self, Self::Plain) && !constant {
+            return Ok(None);
+        }
+        let (bytes, chosen) = integer::encode_with_kind(values, chooser)?;
+        if bytes.len() < best {
+            *self = Self::Kind(chosen);
+            return Ok(Some(bytes));
+        }
+        *self = Self::Plain;
+        Ok(None)
+    }
 }
 
 /// A part's dictionary codes through the integer cascade, or `None` when the cascade did not pay.
@@ -3261,16 +3340,16 @@ fn cascaded(
 /// The result is taken only when it is smaller than the plain form. A cascade is allowed to come
 /// out larger on a part whose codes are genuinely wide, `URL` has about sixty million distinct
 /// values, and there is no reason to pay for the decode when it does.
-fn encoded_codes(codes: &[u32]) -> Result<Option<Vec<u8>>> {
+fn encoded_codes(codes: &[u32], shape: &mut Shape) -> Result<Option<Vec<u8>>> {
     let wide: Vec<i64> = codes.iter().map(|code| i64::from(*code)).collect();
-    let coded = integer::encode_with(&wide, &Codes)?;
     let plain = codes.len().saturating_mul(size_of::<u32>());
-    Ok((coded.len() < plain).then_some(coded))
+    shape.cascade(&wide, plain, &Codes)
 }
 
 fn encode(
     vector: &Vector,
     global: Option<&mut GlobalDictionary>,
+    shape: &mut Shape,
 ) -> Result<(Vec<u8>, Option<Vec<u32>>)> {
     let ty = vector.logical_type();
     // flatten: the file writer needs a uniform scalar page and does it once per loaded chunk.
@@ -3300,14 +3379,14 @@ fn encode(
     };
     let packed = packed_vector.as_ref().and_then(Vector::packed_parts);
     let coded = match global_codes.as_deref() {
-        Some(codes) => encoded_codes(codes)?,
+        Some(codes) => encoded_codes(codes, shape)?,
         None => None,
     };
     // Only where nothing else has claimed the page, which is the plain integer case. A packed part
     // is still on the table because the cascade has to beat it too: the bit pack takes a part only
     // when it halves it, so a column that shrinks by a third was coming out whole.
     let cascade = if dictionary.is_none() && global_codes.is_none() {
-        cascaded(&flat, ty, packed.as_ref())?
+        cascaded(&flat, ty, packed.as_ref(), shape)?
     } else {
         None
     };
@@ -5214,6 +5293,65 @@ mod tests {
         let near: Vec<u32> = (0..1024).collect();
         let coded = encoded_codes(&near).expect("no failure").expect("counting up is packable");
         assert!(coded.len() < near.len() * 4, "{} bytes for a run of 1,024", coded.len());
+    }
+
+    /// A remembered kind is a guess about the next part and the encoder has to survive it being
+    /// wrong, which is the whole of what makes it safe to guess at all.
+    #[test]
+    fn a_kind_that_no_longer_fits_sends_the_part_back_to_the_search() {
+        let plain = 1024 * size_of::<i64>();
+        let mut shape = Shape::default();
+        let climbing = (0..1024_i64).map(|at| at * 7).collect::<Vec<_>>();
+        let first = shape.cascade(&climbing, plain, &Fixed).expect("a chunk").expect("worth it");
+        assert_eq!(integer::decode(&first).expect("the climb decodes"), climbing);
+        assert!(matches!(shape, Shape::Kind(_)), "the climb settled on nothing");
+        // Whatever the climb settled on does not apply to a part of one value, and the part still
+        // comes back whole.
+        let flat = vec![9_i64; 1024];
+        let second = shape.cascade(&flat, plain, &Fixed).expect("a chunk").expect("worth it");
+        assert_eq!(integer::decode(&second).expect("the flat run decodes"), flat);
+        assert!(matches!(shape, Shape::Kind(integer::Kind::Constant)));
+        // Nothing beats one byte, so this is the search running and finding nothing worth writing.
+        assert!(shape.cascade(&climbing, 1, &Fixed).expect("a chunk").is_none());
+        assert!(matches!(shape, Shape::Plain), "nothing paid and nothing was noted");
+        // And that answer carries, which is the bargain: the part after it is not searched either.
+        assert!(shape.cascade(&climbing, plain, &Fixed).expect("a chunk").is_none());
+        let mut fresh = Shape::default();
+        assert!(fresh.cascade(&climbing, plain, &Fixed).expect("a chunk").is_some());
+    }
+
+    /// The parts of one column are encoded as whatever the part before them was, so a column that
+    /// changes shape partway through is the case where that is the wrong answer. What it must not
+    /// be is a wrong value.
+    #[test]
+    fn a_column_that_changes_shape_reads_back_whole() {
+        fn value(part: usize, row: usize) -> i64 {
+            let at = i64::try_from(part * 64 + row).expect("small");
+            if part < 40 { 7 } else { at * 1_000_003 }
+        }
+        let path = path("changing-shape");
+        let mut writer = Writer::create(&path, "changing", vec![Field::new("v", LogicalType::BigInt)])
+            .expect("new file");
+        for part in 0..70_usize {
+            let values =
+                (0..64_usize).map(|row| Value::BigInt(value(part, row))).collect::<Vec<_>>();
+            let column = Vector::from_values(LogicalType::BigInt, &values).expect("a column");
+            writer.append(&Chunk::new(vec![column]).expect("one column")).expect("a part");
+        }
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("valid directory");
+        assert_eq!(reader.table().rows(), 70 * 64);
+        for part in 0..70_usize {
+            let read = reader.read(part, &[0]).expect("a part back");
+            for row in 0..64_usize {
+                assert_eq!(
+                    read.value_at(row, 0),
+                    Value::BigInt(value(part, row)),
+                    "part {part} row {row}"
+                );
+            }
+        }
+        fs::remove_file(path).expect("remove scratch file");
     }
 
     /// The columns of a stripe are encoded on whichever thread got to them, so the one thing that
