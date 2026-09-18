@@ -306,9 +306,12 @@ fn unpacked(vector: &Vector, packed: &Packed<'_>) -> Walked {
 /// The values are a superset of what the rows hold, so reading them is cheap and answers a skip.
 /// It cannot answer a `MIN`, because a value no row points at is still in there, and it cannot
 /// answer a `SUM` at all. Going through the codes costs a gather per row and answers both.
+///
+/// Only for numbers. A string column gets nothing out of being exact here and pays the same price
+/// for it, which is why [`stringy`] still picks whichever of the rows and the values is shorter.
 fn coded(vector: &Vector, codes: &[u32], values: &Vector) -> Walked {
     if strings(values) {
-        return Walked::ends(text(vector));
+        return stringy(vector, values);
     }
     let Some(data) = values.data() else { return wider(values) };
     // A code pointing at a null is a row whose value this would have to invent, so the walk stops
@@ -324,9 +327,13 @@ fn coded(vector: &Vector, codes: &[u32], values: &Vector) -> Walked {
             let mut low: Option<i128> = None;
             let mut high: Option<i128> = None;
             let mut total = 0_i128;
-            let nullable = vector.validity().has_nulls(vector.len());
-            for (row, &code) in codes.iter().take(vector.len()).enumerate() {
-                if nullable && vector.is_null_at(row) {
+            // The vector's own validity rather than `is_null_at`, which would follow the code into
+            // the values on every row. The two say the same thing here because the values were just
+            // checked for nulls, and this one is a bit read instead of a second indirection.
+            let validity = vector.validity();
+            let nullable = validity.has_nulls(vector.len());
+            for (row, &code) in codes[..vector.len()].iter().enumerate() {
+                if nullable && !validity.is_valid(row) {
                     continue;
                 }
                 let Some(&value) = held.get(code as usize) else { return wider(values) };
@@ -360,7 +367,7 @@ fn coded(vector: &Vector, codes: &[u32], values: &Vector) -> Walked {
 /// thousand rows of one value cost one multiply.
 fn runs(vector: &Vector, stops: &[u32], values: &Vector) -> Walked {
     if strings(values) {
-        return Walked::ends(text(vector));
+        return stringy(vector, values);
     }
     let Some(data) = values.data() else { return wider(values) };
     // A null inside a run belongs to one row and the run's value belongs to the rest, and this walks
@@ -405,6 +412,25 @@ fn runs(vector: &Vector, stops: &[u32], values: &Vector) -> Walked {
         Data::UInt64(held) => weigh!(held),
         _ => wider(values),
     }
+}
+
+/// The bounds of a column of strings that keeps its values somewhere else.
+///
+/// Exactness is worth paying for on a number and is worth nothing on a string. A whole table `MIN`
+/// on a string column comes off the sorted dictionary the file writes rather than off these ends,
+/// and strings do not add up, so all an exact end buys here is a slightly better chunk skip. So this
+/// keeps the trade the column had before: walk the rows when there are fewer of them than there are
+/// values, and scan the values otherwise.
+///
+/// The values being the longer side is not a strange case. One dictionary is shared by every chunk
+/// of a column, so scanning it per chunk does the same work once per chunk. On `hits` at a million
+/// rows that is `SearchPhrase`, whose dictionary is far larger than a chunk: 90 milliseconds of the
+/// load went on that one column, against 10 for `URL`, which is plain and several times its size.
+fn stringy(vector: &Vector, values: &Vector) -> Walked {
+    if values.len() > vector.len() {
+        return Walked::ends(text(vector));
+    }
+    wider(values)
 }
 
 /// Whether a set of values is text, which is walked by [`text`] rather than gathered.
