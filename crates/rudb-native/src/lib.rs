@@ -59,6 +59,14 @@ const FREQUENCY_BUILD_RANK: usize = 10;
 const FREQUENCY_ORDINALS: usize = 65_536;
 const MAX_FREQUENCY_WORKERS: usize = 16;
 
+/// The most threads one stripe's encode is spread over.
+///
+/// Higher than the frequency cap because this is the load itself rather than a pass at the end of
+/// it, and the work is one column of sixty four parts, which is large enough that a thread that
+/// takes one is not a thread that was started for nothing. A machine with more cores than this has
+/// the rest of them on the Parquet read, which is still one thread and is the other half of #808.
+const MAX_ENCODE_WORKERS: usize = 32;
+
 /// The most bytes one column of one part may spend on a membership sieve.
 ///
 /// A part is a thousand rows, so a filter sized for every one of them being distinct is about
@@ -515,17 +523,54 @@ pub struct Writer {
     order: Vec<((u64, u64), (u64, u64))>,
     next_order: u64,
     dictionaries: Vec<Option<GlobalDictionary>>,
-    pending: Vec<PendingPart>,
+    pending: Vec<PendingChunk>,
 }
 
+/// A chunk that has arrived and is waiting for the rest of its stripe.
+///
+/// The rows are kept rather than the pages they encode to, which is the whole of #808's first half.
+/// Encoding on arrival put every column of every part on the thread that called `append_at`, and
+/// that thread is the only one the load has. Encoding at the flush instead means a stripe's worth
+/// of work is on the table at once, and a stripe splits by column into a hundred and five pieces
+/// that share nothing.
 #[derive(Debug)]
-struct PendingPart {
+struct PendingChunk {
     order: (u64, u64),
-    rows: usize,
+    chunk: Chunk,
+}
+
+/// One column's share of a stripe, which is what one encode worker produces.
+///
+/// Indexed by part, so a stripe is a column of these and the write loop reads down one of them.
+/// That is also the order the loop wanted: `flush_pending` walks a column at a time and lays its
+/// parts next to each other, and it used to reach across a row of parts to do it.
+#[derive(Debug)]
+struct ColumnStripe {
     pages: Vec<Vec<u8>>,
     codes: Vec<Option<Vec<u32>>>,
-    zone: Zone,
     sieves: Vec<Option<Sieve>>,
+    ranges: Vec<Range>,
+}
+
+/// Roughly what encoding a column of this type costs, for ordering the encode queue.
+///
+/// Only the order matters and only roughly. A string column hashes and copies every value into a
+/// dictionary and is in a different class from everything else, and among the fixed widths the wide
+/// ones carry more bytes through the cascade than the narrow ones. Anything finer than that would
+/// be a cost model, and the queue already absorbs a wrong guess: it only has to avoid finishing on
+/// a column nobody else can help with.
+fn weight(ty: &LogicalType) -> usize {
+    match ty {
+        LogicalType::Varchar | LogicalType::Blob => 64,
+        LogicalType::BigInt
+        | LogicalType::UBigInt
+        | LogicalType::Timestamp
+        | LogicalType::Double
+        | LogicalType::Decimal { .. } => 8,
+        LogicalType::Integer | LogicalType::UInteger | LogicalType::Date | LogicalType::Float => 4,
+        LogicalType::SmallInt | LogicalType::USmallInt => 2,
+        _ => 1,
+    }
 }
 
 /// Parts in one stripe.
@@ -630,19 +675,10 @@ impl Writer {
         if chunk.width() != self.table.fields.len() {
             return Err(invalid("chunk width differs from table schema"));
         }
-        let mut pages = Vec::with_capacity(chunk.width());
-        let mut codes = Vec::with_capacity(chunk.width());
         for (index, field) in self.table.fields.iter().enumerate() {
-            let column = chunk.column(index)?;
-            if column.logical_type() != &field.ty {
+            if chunk.column(index)?.logical_type() != &field.ty {
                 return Err(invalid("chunk type differs from table schema"));
             }
-            let (bytes, unique) = encode(column, self.dictionaries[index].as_mut())?;
-            if bytes.len() > MAX_PAGE {
-                return Err(invalid("column page exceeds the configured bound"));
-            }
-            pages.push(bytes);
-            codes.push(unique);
         }
         self.table.rows = self
             .table
@@ -652,28 +688,128 @@ impl Writer {
         if self.pending.last().is_some_and(|last| last.order > order) {
             self.flush_pending()?;
         }
-        // The zone is built first because the sieve reads the range it produced rather than walking
-        // the column a second time to find out how wide it is.
-        let zone = Zone::of(chunk);
-        let mut sieves = Vec::with_capacity(chunk.width());
-        for (index, column) in chunk.columns().iter().enumerate() {
-            let range =
-                zone.column(index).ok_or_else(|| invalid("a zone is narrower than its chunk"))?;
-            // A column with a global dictionary already has an exact membership index per stripe,
-            // so an approximate one beside it would cost a hash of every string in the table to
-            // answer a question that is already answered. What it would buy is the finer grain, a
-            // part rather than a stripe, and that is worth coming back for on its own.
-            if self.dictionaries[index].is_some() {
-                sieves.push(None);
-                continue;
-            }
-            sieves.push(Sieve::of(column, range, SIEVE_BUDGET));
-        }
-        self.pending.push(PendingPart { order, rows: chunk.len(), pages, codes, zone, sieves });
+        // Cloned rather than encoded, and a clone of a chunk that owns its buffers is a copy of
+        // them. Sixty four parts of a hundred and five columns is tens of megabytes held for the
+        // length of a stripe and a few seconds of memory traffic over a whole ClickBench load,
+        // against the hundreds of seconds of encode this is what lets off one thread.
+        self.pending.push(PendingChunk { order, chunk: chunk.clone() });
         if self.pending.len() == STRIPE_PARTS {
             self.flush_pending()?;
         }
         Ok(())
+    }
+
+    /// Encodes one column's parts of a stripe, with the column's dictionary to itself.
+    ///
+    /// Nothing here is shared with another column. The dictionary belongs to this one, the sieve
+    /// reads only this one, and the page bytes go in a vector of this one's own. That is why the
+    /// fan out below can hand a whole column to a thread and take a plain `&mut` on the dictionary
+    /// rather than making it something several threads can grow at once, which is the harder half
+    /// of #808 and is still open.
+    fn encode_column(
+        index: usize,
+        held: &[PendingChunk],
+        mut dictionary: Option<&mut GlobalDictionary>,
+    ) -> Result<ColumnStripe> {
+        let mut stripe = ColumnStripe {
+            pages: Vec::with_capacity(held.len()),
+            codes: Vec::with_capacity(held.len()),
+            sieves: Vec::with_capacity(held.len()),
+            ranges: Vec::with_capacity(held.len()),
+        };
+        for pending in held {
+            let column = pending.chunk.column(index)?;
+            let (bytes, unique) = encode(column, dictionary.as_deref_mut())?;
+            if bytes.len() > MAX_PAGE {
+                return Err(invalid("column page exceeds the configured bound"));
+            }
+            // The range is built first because the sieve reads it rather than walking the column a
+            // second time to find out how wide it is.
+            let range = Range::of(column);
+            // A column with a global dictionary already has an exact membership index per stripe,
+            // so an approximate one beside it would cost a hash of every string in the table to
+            // answer a question that is already answered. What it would buy is the finer grain, a
+            // part rather than a stripe, and that is worth coming back for on its own.
+            let sieve = match dictionary {
+                Some(_) => None,
+                None => Sieve::of(column, &range, SIEVE_BUDGET),
+            };
+            stripe.pages.push(bytes);
+            stripe.codes.push(unique);
+            stripe.sieves.push(sieve);
+            stripe.ranges.push(range);
+        }
+        Ok(stripe)
+    }
+
+    /// Encodes a whole stripe, one column to a worker.
+    ///
+    /// The columns are handed out through a queue rather than dealt in equal piles, because they
+    /// are nothing like equal: `URL` on ClickBench is a global dictionary of sixty one million
+    /// strings and `IsMobile` is a byte. A pile that happened to hold the four large string columns
+    /// would be the whole stripe and the other workers would be waiting on it. The queue is sorted
+    /// so the expensive ones are taken first, which is the classic answer to a last job that runs
+    /// longer than everything after it.
+    fn encode_columns(&mut self, held: &[PendingChunk]) -> Result<Vec<ColumnStripe>> {
+        let width = self.table.fields.len();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_ENCODE_WORKERS)
+            .min(width);
+        if workers <= 1 || held.len() <= 1 {
+            return self
+                .dictionaries
+                .iter_mut()
+                .enumerate()
+                .map(|(index, dictionary)| Self::encode_column(index, held, dictionary.as_mut()))
+                .collect();
+        }
+        // The dictionaries are moved out and back rather than borrowed, because a worker that takes
+        // the next column off a queue cannot be holding a borrow of the vector the queue came from.
+        let mut jobs: Vec<(usize, Option<GlobalDictionary>)> =
+            std::mem::take(&mut self.dictionaries).into_iter().enumerate().collect();
+        // Popped from the back, so the expensive columns go last in the vector.
+        jobs.sort_by_key(|(index, _)| weight(&self.table.fields[*index].ty));
+        let queue = Mutex::new(jobs);
+        let pieces = std::thread::scope(|scope| {
+            (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let taken = queue
+                                .lock()
+                                .map_err(|_| Error::internal("a native encode worker panicked"))?
+                                .pop();
+                            let Some((index, mut dictionary)) = taken else { break };
+                            let encoded = Self::encode_column(index, held, dictionary.as_mut())?;
+                            mine.push((index, dictionary, encoded));
+                        }
+                        Ok(mine)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| Error::internal("a native encode worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let mut dictionaries: Vec<Option<GlobalDictionary>> = (0..width).map(|_| None).collect();
+        let mut encoded: Vec<Option<ColumnStripe>> = (0..width).map(|_| None).collect();
+        for piece in pieces {
+            for (index, dictionary, stripe) in piece {
+                dictionaries[index] = dictionary;
+                encoded[index] = Some(stripe);
+            }
+        }
+        self.dictionaries = dictionaries;
+        encoded
+            .into_iter()
+            .map(|stripe| stripe.ok_or_else(|| Error::internal("a column was never encoded")))
+            .collect()
     }
 
     /// Writes the buffered parts as one stripe, each column's parts contiguous on disk.
@@ -686,16 +822,16 @@ impl Writer {
         // the borrow checker is right that those are two different uses of it.
         let mut held = std::mem::take(&mut self.pending);
         let parts = held.len();
+        let encoded = self.encode_columns(&held)?;
         let mut pages = Vec::with_capacity(width);
         let mut memberships = vec![None; width];
         let mut ranges = Vec::with_capacity(width);
         let mut index = Vec::with_capacity(width.saturating_mul(index_section(parts)?));
-        for column in 0..width {
+        for stripe in &encoded {
             let offset = self.at;
             let section = index.len();
             let mut length = 0_usize;
-            for pending in &held {
-                let bytes = &pending.pages[column];
+            for bytes in &stripe.pages {
                 write_at(&self.file, self.at + length as u64, bytes)?;
                 put_u32(
                     &mut index,
@@ -719,17 +855,16 @@ impl Writer {
                 offset,
                 length: u32::try_from(length).map_err(|_| invalid("page length overflow"))?,
             });
-            ranges.push(merged_range(
-                held.iter().map(|pending| pending.zone.column(column).cloned().unwrap_or_default()),
-            ));
+            ranges.push(merged_range(stripe.ranges.iter().cloned()));
         }
-        for (column, membership) in memberships.iter_mut().enumerate() {
-            if held.iter().all(|pending| pending.codes[column].is_none()) {
+        for (membership, stripe) in memberships.iter_mut().zip(&encoded) {
+            if stripe.codes.iter().all(Option::is_none) {
                 continue;
             }
-            let lists = held
+            let lists = stripe
+                .codes
                 .iter()
-                .map(|pending| pending.codes[column].clone().unwrap_or_default())
+                .map(|codes| codes.clone().unwrap_or_default())
                 .collect::<Vec<_>>();
             let bytes = encode_membership(&merged_codes(lists));
             let offset = self.at;
@@ -742,11 +877,11 @@ impl Writer {
             });
         }
         let mut sieves = vec![None; width];
-        for (column, page) in sieves.iter_mut().enumerate() {
-            if held.iter().all(|pending| pending.sieves[column].is_none()) {
+        for (page, stripe) in sieves.iter_mut().zip(&encoded) {
+            if stripe.sieves.iter().all(Option::is_none) {
                 continue;
             }
-            let bytes = encode_sieves(held.iter().map(|pending| &pending.sieves[column]))?;
+            let bytes = encode_sieves(stripe.sieves.iter())?;
             let offset = self.at;
             self.put(&bytes)?;
             *page = Some(Page {
@@ -767,9 +902,9 @@ impl Writer {
         let mut lengths = Vec::with_capacity(parts);
         let mut span = None;
         for pending in held.drain(..) {
-            rows = rows.checked_add(pending.rows).ok_or_else(|| invalid("row count overflow"))?;
-            lengths
-                .push(u32::try_from(pending.rows).map_err(|_| invalid("part row count overflow"))?);
+            let part = pending.chunk.len();
+            rows = rows.checked_add(part).ok_or_else(|| invalid("row count overflow"))?;
+            lengths.push(u32::try_from(part).map_err(|_| invalid("part row count overflow"))?);
             span = Some(
                 span.map_or((pending.order, pending.order), |(first, _)| (first, pending.order)),
             );
@@ -4919,5 +5054,67 @@ mod tests {
         let near: Vec<u32> = (0..1024).collect();
         let coded = encoded_codes(&near).expect("no failure").expect("counting up is packable");
         assert!(coded.len() < near.len() * 4, "{} bytes for a run of 1,024", coded.len());
+    }
+
+    /// The columns of a stripe are encoded on whichever thread got to them, so the one thing that
+    /// must not depend on which thread that was is the file. Two writes of the same rows are
+    /// compared byte for byte rather than value for value, because a dictionary that two columns
+    /// somehow shared would still read back correctly and would hand out its codes in the order the
+    /// threads happened to run in, which is exactly what this is here to catch.
+    #[test]
+    fn two_writes_of_the_same_rows_give_the_same_bytes() {
+        fn written(path: &PathBuf) {
+            let fields = (0..40)
+                .map(|column| {
+                    let ty =
+                        if column % 4 == 0 { LogicalType::Varchar } else { LogicalType::BigInt };
+                    Field::new(format!("c{column}"), ty)
+                })
+                .collect::<Vec<_>>();
+            let mut writer = Writer::create(path, "wide", fields).expect("new file");
+            for part in 0..70_u64 {
+                let columns = (0..40)
+                    .map(|column| {
+                        let values = (0..64_u64)
+                            .map(|row| {
+                                let seed = part.wrapping_mul(31).wrapping_add(row);
+                                if column % 4 == 0 {
+                                    Value::Varchar(format!("v{}", seed % 17))
+                                } else {
+                                    Value::BigInt(i64::try_from(seed % 97).expect("small"))
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let ty = if column % 4 == 0 {
+                            LogicalType::Varchar
+                        } else {
+                            LogicalType::BigInt
+                        };
+                        Vector::from_values(ty, &values).expect("a column")
+                    })
+                    .collect::<Vec<_>>();
+                writer.append(&Chunk::new(columns).expect("forty columns")).expect("a part");
+            }
+            writer.finish().expect("commit");
+        }
+
+        let first = path("repeatable-one");
+        let second = path("repeatable-two");
+        written(&first);
+        written(&second);
+        let left = fs::read(&first).expect("the first file");
+        let right = fs::read(&second).expect("the second file");
+        assert_eq!(left.len(), right.len(), "two writes of the same rows differ in length");
+        assert!(left == right, "two writes of the same rows differ in their bytes");
+
+        // And the rows are still there, since a pair of identically wrong files would pass the
+        // comparison above on its own.
+        let reader = Reader::open(&first).expect("valid directory");
+        assert_eq!(reader.table().rows(), 70 * 64);
+        let read = reader.read(0, &[0, 1]).expect("the first part back");
+        assert_eq!(read.value_at(0, 0), Value::Varchar("v0".to_owned()));
+        assert_eq!(read.value_at(0, 1), Value::BigInt(0));
+        fs::remove_file(first).expect("remove scratch file");
+        fs::remove_file(second).expect("remove scratch file");
     }
 }
