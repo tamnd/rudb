@@ -457,6 +457,12 @@ impl Binder<'_> {
             }
             return self.bind_aggregate(ast, "count_star", &[], false, scope);
         }
+        // `count()` with nothing in it is upstream's other spelling of `count(*)`. It counts rows
+        // the same way and it is not an arity mistake, which is what the signature table would
+        // otherwise say about a `count` given no arguments.
+        if rudb_catalog::same_name(&written, "count") && arguments.is_empty() {
+            return self.bind_aggregate(ast, "count_star", &[], false, scope);
+        }
         if kind_of(&written) == Some(FunctionKind::Aggregate) {
             return self.bind_aggregate(ast, &written, &arguments, distinct, scope);
         }
@@ -1048,7 +1054,11 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                 .expr_list(args)
                 .iter()
                 .any(|&arg| matches!(ast.expr(arg), ast::Expr::Star { .. }));
-            if starred && rudb_catalog::same_name(written, "count") {
+            // `count()` with nothing in it is named after the function it really is, the same way
+            // `count(*)` is, and it is the one spelling of the three that does not survive as
+            // written.
+            let empty = ast.expr_list(args).is_empty();
+            if (starred || empty) && rudb_catalog::same_name(written, "count") {
                 return "count_star()".to_string();
             }
             // The name goes to lower case, which is the one place a spelling from the query is not

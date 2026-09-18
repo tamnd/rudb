@@ -755,6 +755,17 @@ fn a_star_inside_a_window_is_count_star_and_nothing_else_takes_one() {
     assert_eq!(failure("SELECT sum(*) OVER () FROM hits"), "* is not allowed in sum()");
 }
 
+/// `count()` written with nothing in it is the same function as `count(*)`, inside an `OVER` and
+/// out of one. Every other aggregate given no arguments is still an arity mistake and says so.
+#[test]
+fn count_with_no_arguments_is_the_same_function_as_count_with_a_star() {
+    let printed = plan("SELECT count() FROM hits");
+    assert!(printed.contains("aggregates=[count_star()::BIGINT]"), "{printed}");
+    let windowed = plan("SELECT count() OVER () FROM hits");
+    assert!(windowed.contains("expressions=[count_star()::BIGINT]"), "{windowed}");
+    assert!(failure("SELECT sum() FROM hits").starts_with("No function matches"));
+}
+
 #[test]
 fn the_window_runs_after_the_grouping_and_after_the_having() {
     // Measured on the pinned binary rather than reasoned about. The window totals one group here,

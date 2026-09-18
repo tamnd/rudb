@@ -2072,6 +2072,10 @@ impl<'a> Binder<'a> {
                 return Err(Error::binder(format!("* is not allowed in {name}()")));
             }
             ("count_star", &[])
+        } else if same_name(name, "count") && args.is_empty() {
+            // `count()` with nothing in it is upstream's other spelling of `count(*)`. It counts
+            // rows the same way and it is not an arity mistake.
+            ("count_star", &[])
         } else {
             (name, args)
         };
