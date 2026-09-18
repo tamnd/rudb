@@ -958,11 +958,34 @@ struct NativeText {
     payload: u64,
     payload_len: usize,
     hashes: Vec<u64>,
-    payload_blocks: Vec<OnceLock<Result<Vec<u8>>>>,
+    /// The payload, read and kept an extent at a time. See [`TEXT_PAYLOAD_EXTENT`].
+    payload_extents: Vec<OnceLock<Result<Vec<u8>>>>,
     crossing: Vec<CrossingCache>,
 }
 
 const TEXT_PAYLOAD_BLOCK: usize = 64 * 1024;
+
+/// How many blocks are read, allocated and waited on as one.
+///
+/// The block is what a checksum covers and it is written into the file, so it cannot move without
+/// the format moving. What a reader does with it can. A scan of a string column ends up wanting
+/// every block, because the codes a part holds are spread over the whole dictionary, and reading
+/// them one at a time made a hundred million row `LIKE` spend more than half its time in the kernel
+/// rather than in the predicate: a pread and a `Vec` per sixty four kilobytes, over a dictionary
+/// that is more than a gigabyte, is twenty thousand of each. Under a poor man's profile of ClickBench
+/// query 21, 58 percent of the samples were in a syscall, 18 percent were in `mprotect` with the
+/// allocator growing the heap by sixty four kilobytes at a time, and 20 percent were threads parked
+/// on a `OnceLock` somebody else was filling.
+///
+/// Eight blocks is half a megabyte, which is one read, one allocation the allocator takes straight
+/// from `mmap` rather than off the heap, and one wait. The cost is paid by a query that wants a few
+/// values rather than a column of them, which now reads half a megabyte to get at sixty four
+/// kilobytes, and that is what picks the number. Over the queries that go each way, with the scan
+/// being ClickBench query 21 and the few value read being query 34, which takes its answer out of
+/// the frequency page and then looks ten codes up: four blocks is 1.318s and 0.075s, eight is 1.168s
+/// and 0.084s, sixteen is 1.205s and 0.116s. The scan stops improving after eight and the lookup
+/// keeps getting worse.
+const TEXT_PAYLOAD_EXTENT: usize = 8;
 const TEXT_CROSSING_BLOCK: usize = 1024;
 
 /// How many entries of a dictionary's sorted order sit in one block that is read and checked as a
@@ -981,31 +1004,42 @@ const RANK_ENTRY: usize = size_of::<u64>() + size_of::<u32>();
 
 impl NativeText {
     fn payload_block(&self, block: usize) -> Result<Option<&[u8]>> {
-        let Some(slot) = self.payload_blocks.get(block) else { return Ok(None) };
-        slot.get_or_init(|| {
-            let start = block
-                .checked_mul(TEXT_PAYLOAD_BLOCK)
-                .ok_or_else(|| invalid("global dictionary block offset overflow"))?;
-            let len = TEXT_PAYLOAD_BLOCK.min(
-                self.payload_len
-                    .checked_sub(start)
-                    .ok_or_else(|| invalid("global dictionary block starts past payload"))?,
-            );
-            let mut bytes = vec![0; len];
-            read_at(&self.file, self.payload + start as u64, &mut bytes)?;
-            if checksum(&bytes)
-                != *self
-                    .hashes
-                    .get(block)
-                    .ok_or_else(|| invalid("global dictionary block has no checksum"))?
-            {
-                return Err(invalid("global dictionary payload checksum differs"));
-            }
-            Ok(bytes)
-        })
-        .as_ref()
-        .map(|bytes| Some(bytes.as_slice()))
-        .map_err(Clone::clone)
+        if block >= self.hashes.len() {
+            return Ok(None);
+        }
+        let extent = block / TEXT_PAYLOAD_EXTENT;
+        let Some(slot) = self.payload_extents.get(extent) else { return Ok(None) };
+        let bytes = slot
+            .get_or_init(|| {
+                let start = extent
+                    .checked_mul(TEXT_PAYLOAD_EXTENT * TEXT_PAYLOAD_BLOCK)
+                    .ok_or_else(|| invalid("global dictionary block offset overflow"))?;
+                let len = (TEXT_PAYLOAD_EXTENT * TEXT_PAYLOAD_BLOCK).min(
+                    self.payload_len
+                        .checked_sub(start)
+                        .ok_or_else(|| invalid("global dictionary block starts past payload"))?,
+                );
+                let mut bytes = vec![0; len];
+                read_at(&self.file, self.payload + start as u64, &mut bytes)?;
+                // The checksums are per block and stay per block, because they are in the file. The
+                // extent is only how much of the file one read and one allocation cover.
+                for (within, piece) in bytes.chunks(TEXT_PAYLOAD_BLOCK).enumerate() {
+                    if checksum(piece)
+                        != *self
+                            .hashes
+                            .get(extent * TEXT_PAYLOAD_EXTENT + within)
+                            .ok_or_else(|| invalid("global dictionary block has no checksum"))?
+                    {
+                        return Err(invalid("global dictionary payload checksum differs"));
+                    }
+                }
+                Ok(bytes)
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let within = (block % TEXT_PAYLOAD_EXTENT) * TEXT_PAYLOAD_BLOCK;
+        let end = (within + TEXT_PAYLOAD_BLOCK).min(bytes.len());
+        Ok(bytes.get(within..end))
     }
 
     /// The block of the sorted order that holds `rank`, and where in it that rank sits.
@@ -1153,10 +1187,10 @@ impl TextSource for NativeText {
                 .filter_map(|result| result.as_ref().ok())
                 .map(Vec::capacity)
                 .sum::<usize>()
-            + self.payload_blocks.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
+            + self.payload_extents.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
             + self.hashes.capacity() * size_of::<u64>()
             + self
-                .payload_blocks
+                .payload_extents
                 .iter()
                 .filter_map(OnceLock::get)
                 .filter_map(|result| result.as_ref().ok())
@@ -2912,8 +2946,9 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
     {
         return Err(invalid("global dictionary offsets do not bound the payload"));
     }
-    let payload_blocks =
-        (0..payload_len.div_ceil(TEXT_PAYLOAD_BLOCK)).map(|_| OnceLock::new()).collect();
+    let payload_extents = (0..payload_len.div_ceil(TEXT_PAYLOAD_BLOCK * TEXT_PAYLOAD_EXTENT))
+        .map(|_| OnceLock::new())
+        .collect();
     let crossing = (0..count.div_ceil(TEXT_CROSSING_BLOCK)).map(|_| OnceLock::new()).collect();
     Vector::external_text(
         LogicalType::Varchar,
@@ -2927,7 +2962,7 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
             payload: page.offset + body_len as u64,
             payload_len,
             hashes,
-            payload_blocks,
+            payload_extents,
             crossing,
         }),
     )
@@ -3510,6 +3545,56 @@ mod tests {
         let chunk = reader.read(0, &[1]).expect("code page and dictionary index remain valid");
         let error =
             chunk.validate_external().expect_err("payload corruption must reach the caller");
+        assert!(error.message().contains("payload checksum differs"), "{error}");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A payload that spans more than one extent still reads and checks every block of it.
+    ///
+    /// The test above has a dictionary of three values, so it says nothing about the grouping a
+    /// reader does over the blocks the checksums are written for. This one is over a megabyte,
+    /// which is more than one extent, and it reads a value out of the first extent and a value out
+    /// of the last and then damages the last and asks for it again.
+    #[test]
+    fn a_dictionary_over_one_extent_checks_every_block_of_it() {
+        let path = path("dictionary-extents");
+        let value = |row: usize| format!("{row:07} a value long enough to be worth a payload block");
+        let parts = 30;
+        let per_part = 1000;
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in 0..parts {
+            let values = (0..per_part)
+                .map(|row| Value::Varchar(value(part * per_part + row)))
+                .collect::<Vec<_>>();
+            let chunk =
+                Chunk::new(vec![Vector::from_values(LogicalType::Varchar, &values)
+                    .expect("strings")])
+                .expect("matching rows");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let dictionary = reader.table.dictionaries[0].expect("string dictionary page");
+        assert!(
+            dictionary.length as usize > TEXT_PAYLOAD_BLOCK * TEXT_PAYLOAD_EXTENT,
+            "the dictionary has to be over one extent for this to be testing anything"
+        );
+        for part in [0, parts - 1] {
+            let chunk = reader.read(part, &[0]).expect("a part");
+            chunk.validate_external().expect("every payload block checks out");
+            assert_eq!(chunk.value_at(0, 0), Value::Varchar(value(part * per_part)));
+        }
+
+        let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
+        file.seek(SeekFrom::Start(dictionary.offset + u64::from(dictionary.length) - 4))
+            .expect("the last bytes of the page are payload");
+        file.write_all(&[255]).expect("damage the last payload block");
+        let reader = Reader::open(&path).expect("the directory and the index are untouched");
+        let chunk = reader.read(parts - 1, &[0]).expect("the code page remains valid");
+        let error = chunk.validate_external().expect_err("the damage must reach the caller");
         assert!(error.message().contains("payload checksum differs"), "{error}");
         fs::remove_file(path).expect("remove scratch file");
     }
