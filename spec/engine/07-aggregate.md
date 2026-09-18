@@ -85,7 +85,7 @@ DuckDB does the first two and they turn a query over a hundred million rows into
 
 ## 7.8 The rest of the surface
 
-`FILTER (WHERE ...)` on an aggregate is a selection passed to `update`, which the interface in section 7.3 already takes, so it costs nothing extra.
+`FILTER (WHERE ...)` on an aggregate is a selection passed to `update`, which the interface in section 7.3 already takes, so it costs nothing extra. The predicate is one more input to the call, bound in the scope the arguments are bound in and cast to `BOOLEAN` the way a `WHERE` is, so `FILTER (WHERE i)` over an integer column asks whether the integer is not zero. It is a selection over the rows the call reads and not over the rows the query has, which is what lets a filtered count and an unfiltered one sit in the same target list and disagree, and it is why a group where the predicate holds for nothing still has its row with the answer each aggregate gives over no rows at all. Three calls cannot carry one and all three are refused with the words upstream refuses them with: a scalar function, because it does not read several rows and so none of `DISTINCT`, `FILTER` and `ORDER BY` mean anything on one, an aggregate written inside the predicate, and a window written inside an aggregate's predicate.
 
 Ordered aggregates, meaning `string_agg(x ORDER BY y)` and the ordered set functions, need the input sorted per group, which needs the sort from document 09, so they are scheduled after it.
 

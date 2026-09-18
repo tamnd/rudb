@@ -12,8 +12,8 @@
 
 use rudb_common::{Error, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Value};
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
-use rudb_parse::Ast;
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
+use rudb_parse::{Ast, NONE};
 use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef};
 
 use crate::binder::{Binder, PendingSubquery, WindowCall};
@@ -54,13 +54,20 @@ impl Binder<'_> {
             ast::Expr::Literal { kind, text } => self.bind_literal(ast, kind, text),
             ast::Expr::Unary { op, operand } => self.bind_unary(ast, op, operand, scope),
             ast::Expr::Binary { op, left, right } => self.bind_binary(ast, op, left, right, scope),
-            ast::Expr::Function { name, args, distinct } => {
-                self.bind_call(ast, name, args, distinct, scope)
+            ast::Expr::Function { name, args, distinct, filter } => {
+                self.bind_call(ast, name, args, distinct, filter, scope)
             }
-            ast::Expr::Window { name, args, distinct, ignore_nulls, spec } => {
+            ast::Expr::Window { name, args, distinct, filter, ignore_nulls, spec } => {
                 let written = ast.name(name).last().unwrap_or_default().to_string();
                 let args = ast.expr_list(args).to_vec();
-                let call = WindowCall { name: &written, args: &args, distinct, ignore_nulls, spec };
+                let call = WindowCall {
+                    name: &written,
+                    args: &args,
+                    distinct,
+                    filter,
+                    ignore_nulls,
+                    spec,
+                };
                 self.bind_window(ast, &call, scope)
             }
             ast::Expr::Cast { operand, ty, try_cast } => {
@@ -159,6 +166,7 @@ impl Binder<'_> {
     ) -> Result<(rudb_plan::NodeRef, Scope, Vec<rudb_plan::ColumnBinding>)> {
         let outer_aggregation = self.aggregation.take();
         let outer_in_aggregate = std::mem::replace(&mut self.in_aggregate, false);
+        let outer_in_filter = std::mem::replace(&mut self.in_filter, false);
         let outer_subqueries = std::mem::take(&mut self.scalar_subqueries);
         let outer_clause = std::mem::replace(&mut self.clause, "SELECT clause");
 
@@ -170,6 +178,7 @@ impl Binder<'_> {
         let nested_subqueries = std::mem::take(&mut self.scalar_subqueries);
         self.aggregation = outer_aggregation;
         self.in_aggregate = outer_in_aggregate;
+        self.in_filter = outer_in_filter;
         self.scalar_subqueries = outer_subqueries;
         self.clause = outer_clause;
 
@@ -438,6 +447,7 @@ impl Binder<'_> {
         name: ast::Slice,
         args: ast::Slice,
         distinct: bool,
+        filter: ast::ExprRef,
         scope: &Scope,
     ) -> Result<ExprRef> {
         let written = ast.name(name).last().unwrap_or_default().to_string();
@@ -455,16 +465,16 @@ impl Binder<'_> {
             if !rudb_catalog::same_name(&written, "count") || arguments.len() != 1 {
                 return Err(Error::binder(format!("* is not allowed in {written}()")));
             }
-            return self.bind_aggregate(ast, "count_star", &[], false, scope);
+            return self.bind_aggregate(ast, "count_star", &[], false, filter, scope);
         }
         // `count()` with nothing in it is upstream's other spelling of `count(*)`. It counts rows
         // the same way and it is not an arity mistake, which is what the signature table would
         // otherwise say about a `count` given no arguments.
         if rudb_catalog::same_name(&written, "count") && arguments.is_empty() {
-            return self.bind_aggregate(ast, "count_star", &[], false, scope);
+            return self.bind_aggregate(ast, "count_star", &[], false, filter, scope);
         }
         if kind_of(&written) == Some(FunctionKind::Aggregate) {
-            return self.bind_aggregate(ast, &written, &arguments, distinct, scope);
+            return self.bind_aggregate(ast, &written, &arguments, distinct, filter, scope);
         }
         // A ranking window with no `OVER` after it. Upstream says this and not that the name is
         // missing, because the name is there and it is the place it was written that is wrong:
@@ -472,9 +482,13 @@ impl Binder<'_> {
         if kind_of(&written) == Some(FunctionKind::Window) {
             return Err(Error::binder("Window functions are not supported here"));
         }
-        if distinct {
-            return Err(Error::binder(format!(
-                "DISTINCT is not applicable to the scalar function {written}"
+        // Upstream's sentence, which names all three modifiers whichever one was written, and which
+        // it reaches only once the name has resolved: `nosuch(DISTINCT x)` is a catalog error there
+        // and not this, so a name this does not know falls through and gets the catalog's answer.
+        if (distinct || filter != NONE) && kind_of(&written) == Some(FunctionKind::Scalar) {
+            return Err(Error::invalid_input(format!(
+                "Function \"{written}\" is a Scalar Function. \"DISTINCT\", \"FILTER\", and \
+                 \"ORDER BY\" are only applicable to window and aggregate functions."
             )));
         }
         let mut bound = Vec::with_capacity(arguments.len());
@@ -531,11 +545,8 @@ impl Binder<'_> {
     ) -> Result<ExprRef> {
         // A simple CASE is bound as the searched one it means. The operand is bound once and the
         // resulting expression is shared by every arm, so the arms do not each re-evaluate it.
-        let subject = if operand == rudb_parse::NONE {
-            None
-        } else {
-            Some(self.bind_expr(ast, operand, scope)?)
-        };
+        let subject =
+            if operand == NONE { None } else { Some(self.bind_expr(ast, operand, scope)?) };
         let written = ast.arm_list(arms).to_vec();
         let mut bound = Vec::with_capacity(written.len());
         let mut result = LogicalType::Null;
@@ -549,7 +560,7 @@ impl Binder<'_> {
             result = meet(&result, self.plan().expr_type(then))?;
             bound.push(Arm { when, then });
         }
-        let fallback = if otherwise == rudb_parse::NONE {
+        let fallback = if otherwise == NONE {
             None
         } else {
             let bound = self.bind_expr(ast, otherwise, scope)?;
@@ -910,7 +921,7 @@ fn meet(left: &LogicalType, right: &LogicalType) -> Result<LogicalType> {
 /// This decides whether a select block aggregates at all, which has to be known before the target
 /// list is bound because the answer changes what every column reference in it means.
 pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
-    if expr == rudb_parse::NONE {
+    if expr == NONE {
         return false;
     }
     match ast.expr(expr) {
@@ -974,6 +985,20 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
 /// Per #251.
 fn quoted(text: &str) -> String {
     rudb_parse::quoted(text)
+}
+
+/// The `FILTER` part of a generated name, which is empty when the call was written without one.
+///
+/// It is part of the name for the same reason `DISTINCT` is. `sum(i)` and the same sum under a
+/// predicate are two different answers, so a heading that called them the same thing would be
+/// naming one of them wrongly. The word `WHERE` is printed whether or not it was written, because
+/// that is what upstream prints.
+fn named_filter(ast: &Ast, filter: ast::ExprRef, semantics: Semantics) -> String {
+    if filter == NONE {
+        String::new()
+    } else {
+        format!(" FILTER (WHERE {})", describe(ast, filter, semantics))
+    }
 }
 
 /// The name a target gets when the query did not give it one.
@@ -1063,7 +1088,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                 _ => format!("({left} {} {right})", name_spelling(ast, op)),
             }
         }
-        ast::Expr::Function { name, args, distinct } => {
+        ast::Expr::Function { name, args, distinct, filter } => {
             let written = ast.name(name).last().unwrap_or_default();
             let starred = ast
                 .expr_list(args)
@@ -1074,7 +1099,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             // written.
             let empty = ast.expr_list(args).is_empty();
             if (starred || empty) && rudb_catalog::same_name(written, "count") {
-                return "count_star()".to_string();
+                return format!("count_star(){}", named_filter(ast, filter, semantics));
             }
             // The name goes to lower case, which is the one place a spelling from the query is not
             // kept. DuckDB's parser folds a function name as it reads it and the name it prints
@@ -1097,7 +1122,11 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             let word = if distinct { "DISTINCT " } else { "" };
             let arguments: Vec<String> =
                 ast.expr_list(args).iter().map(|&arg| describe(ast, arg, semantics)).collect();
-            format!("{name}({word}{})", arguments.join(", "))
+            format!(
+                "{name}({word}{}){}",
+                arguments.join(", "),
+                named_filter(ast, filter, semantics)
+            )
         }
         ast::Expr::Cast { operand, ty, try_cast } => {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
@@ -1112,7 +1141,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         ast::Expr::Case { operand, arms, otherwise } => {
             let mut text = "CASE ".to_string();
             for arm in ast.arm_list(arms) {
-                let when = if operand == rudb_parse::NONE {
+                let when = if operand == NONE {
                     describe(ast, arm.when, semantics)
                 } else {
                     format!(
@@ -1126,7 +1155,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                     describe(ast, arm.then, semantics)
                 ));
             }
-            let fallback = if otherwise == rudb_parse::NONE {
+            let fallback = if otherwise == NONE {
                 "NULL".to_string()
             } else {
                 describe(ast, otherwise, semantics)

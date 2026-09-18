@@ -939,6 +939,93 @@ fn a_ranking_window_binds_to_a_window_operator_and_the_name_says_what_it_reads()
 }
 
 #[test]
+fn a_filter_is_a_condition_over_the_rows_and_reaches_the_call_as_one_more_input() {
+    // The predicate is cast to BOOLEAN the way a WHERE is, and it lands on the call rather than on
+    // the scan, because it decides which rows this one aggregate reads and not which rows the
+    // query has.
+    let summed = plan("SELECT sum(counter) FILTER (WHERE counter > 1) FROM hits");
+    assert!(
+        summed.contains(
+            "aggregates=[sum(#0.2::INTEGER FILTER (#0.2::INTEGER > 1::INTEGER)::BOOLEAN)::HUGEINT]"
+        ),
+        "{summed}"
+    );
+    let counted = plan("SELECT count(*) FILTER (WHERE counter > 1) FROM hits");
+    assert!(
+        counted.contains(
+            "aggregates=[count_star(FILTER (#0.2::INTEGER > 1::INTEGER)::BOOLEAN)::BIGINT]"
+        ),
+        "{counted}"
+    );
+    let cast = plan("SELECT sum(counter) FILTER (WHERE counter) FROM hits");
+    assert!(cast.contains("FILTER CAST(#0.2::INTEGER)::BOOLEAN)"), "{cast}");
+    let windowed = plan("SELECT sum(counter) FILTER (WHERE counter > 1) OVER () FROM hits");
+    assert!(
+        windowed.contains(
+            "expressions=[sum(#0.2::INTEGER FILTER (#0.2::INTEGER > 1::INTEGER)::BOOLEAN)::HUGEINT"
+        ),
+        "{windowed}"
+    );
+}
+
+#[test]
+fn a_filter_is_refused_where_there_is_nothing_for_it_to_keep_or_drop() {
+    // Upstream's three sentences. A scalar function is not a call that reads several rows, so none
+    // of the three modifiers mean anything on one, and the one sentence names all three whichever
+    // one was written. A ranking window reads no values at all, so a predicate over the values has
+    // nothing to work on, and that one is refused with the doubled quotes DISTINCT is refused with.
+    assert_eq!(
+        failure("SELECT abs(counter) FILTER (WHERE counter > 1) FROM hits"),
+        "Function \"abs\" is a Scalar Function. \"DISTINCT\", \"FILTER\", and \"ORDER BY\" are \
+         only applicable to window and aggregate functions."
+    );
+    assert_eq!(
+        failure("SELECT abs(DISTINCT counter) FROM hits"),
+        "Function \"abs\" is a Scalar Function. \"DISTINCT\", \"FILTER\", and \"ORDER BY\" are \
+         only applicable to window and aggregate functions."
+    );
+    assert_eq!(
+        failure("SELECT row_number() FILTER (WHERE counter > 1) OVER () FROM hits"),
+        "FILTER is not implemented for the window function \"\"row_number\"\""
+    );
+    assert_eq!(
+        failure("SELECT lag(counter) FILTER (WHERE counter > 1) OVER (ORDER BY counter) FROM hits"),
+        "FILTER is not implemented for the window function \"\"lag\"\""
+    );
+    // A name nobody has is still a name nobody has. The sentence above comes after the catalog has
+    // been asked and not before it, so the answer here is the catalog's and not that one.
+    assert!(
+        failure("SELECT nosuch(counter) FILTER (WHERE counter > 1) FROM hits")
+            .contains("nosuch does not exist"),
+        "an unknown name should reach the catalog first"
+    );
+}
+
+#[test]
+fn what_a_filter_may_contain_depends_on_what_the_call_it_hangs_off_is() {
+    // An aggregate's filter is bound as if it were inside the call, so an aggregate in it is
+    // refused on its own terms and a window in it is refused the way a window inside an aggregate
+    // is. A window's filter is bound inside the window instead, so a window in it is a nested
+    // window while an aggregate in it is an ordinary aggregate over the same rows.
+    assert_eq!(
+        failure("SELECT sum(counter) FILTER (WHERE sum(counter) > 1) FROM hits"),
+        "aggregate functions are not allowed in FILTER"
+    );
+    assert_eq!(
+        failure("SELECT sum(counter) FILTER (WHERE row_number() OVER () > 1) FROM hits"),
+        "aggregate function calls cannot contain window function calls"
+    );
+    assert_eq!(
+        failure("SELECT sum(counter) FILTER (WHERE row_number() OVER () > 1) OVER () FROM hits"),
+        "window function calls cannot be nested"
+    );
+    let inner = plan(
+        "SELECT sum(counter) FILTER (WHERE sum(counter) > 1) OVER () FROM hits GROUP BY counter",
+    );
+    assert!(inner.contains("Window"), "{inner}");
+}
+
+#[test]
 fn a_ranking_window_is_only_a_window_and_says_so_where_it_cannot_be_one() {
     // Upstream's two sentences. A name that is only ever a window is not a function call on its
     // own, and a DISTINCT in front of one has nothing to collapse because the call reads no values.

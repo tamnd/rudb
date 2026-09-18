@@ -679,6 +679,10 @@ pub enum Expr {
         args: Slice,
         /// Whether the call said `DISTINCT`.
         distinct: bool,
+        /// The `FILTER (WHERE ...)` predicate, or `NONE`. Kept on every call and not only on the
+        /// ones that can carry it, because which names can carry it is a question about the
+        /// function catalog and the parser does not have one.
+        filter: ExprRef,
     },
     /// A function call with an `OVER` on the end of it.
     ///
@@ -694,6 +698,9 @@ pub enum Expr {
         args: Slice,
         /// Whether the call said `DISTINCT`.
         distinct: bool,
+        /// The `FILTER (WHERE ...)` predicate, or `NONE`. It is written before the `OVER` and not
+        /// after it, which is a rule of the grammar rather than of the binder.
+        filter: ExprRef,
         /// Whether the call said `IGNORE NULLS`. `RESPECT NULLS` is the default and is not kept,
         /// because the reference binary drops it: a view written with it comes back without it.
         ignore_nulls: bool,
