@@ -80,6 +80,7 @@ use crate::strategies::strategies;
 use crate::stream::{Filter, Limit, Project};
 use crate::topn::TopN;
 use crate::typenames::typenames;
+use crate::window::{Window, Written};
 
 /// Builds the pipelines for a plan's root, for a query nothing will stop.
 ///
@@ -1054,8 +1055,16 @@ impl<'a> Building<'a, '_> {
                     "a dependent join reached execution before subquery unnesting",
                 ));
             }
-            Node::Window { .. } => {
-                return Err(Error::not_implemented("window execution"));
+            Node::Window { input, index, partition, order, frame, expressions } => {
+                let below = self.node(input)?;
+                let written = Written { index, partition, order, frame, expressions };
+                let (window, out) = Window::new(plan, &below.schema, &written, memory)?;
+                let window = window.in_session(self.session);
+                let schema = window.schema().clone();
+                let counters = self.watch(reference, id, pipeline, "Window", None);
+                let reading = Arc::clone(&counters);
+                self.close(below, pipeline, Arc::new(Watched::new(window, counters)));
+                Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
         };
         Ok(segment)
