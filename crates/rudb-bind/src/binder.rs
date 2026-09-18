@@ -172,6 +172,12 @@ pub(crate) struct PendingSubquery {
     pub(crate) kind: JoinKind,
     pub(crate) conditions: Vec<ExprRef>,
     pub(crate) dependent: bool,
+    /// The table index this query's join adds to the rows it is joined into.
+    ///
+    /// Kept so that a `HAVING` which reads one of these can say which columns came from a query
+    /// joined above the grouping rather than from the table underneath it. Those columns are not
+    /// the table's and the grouping rule has nothing to say about them.
+    pub(crate) index: u32,
 }
 
 /// The state one binding run carries.
@@ -200,6 +206,12 @@ pub(crate) struct Binder<'a> {
     pub(crate) in_window: bool,
     /// Uncorrelated scalar queries waiting to be joined into the select block that uses them.
     pub(crate) scalar_subqueries: Vec<PendingSubquery>,
+    /// Table indices of the queries this block will join in above its grouping, not below it.
+    ///
+    /// Only ever set while a `HAVING` is being rewritten over the aggregate. A column from one of
+    /// these is not a column of the grouped table, so the rule about grouping every column does not
+    /// reach it, and the join that produces it goes on top of the `Aggregate` rather than under it.
+    pub(crate) joined_above: Vec<u32>,
     pub(crate) outer_scopes: Vec<Scope>,
     pub(crate) correlations: Vec<Vec<ColumnBinding>>,
     /// Where we are, for an error message that says which clause the writer should look at.
@@ -238,6 +250,7 @@ impl<'a> Binder<'a> {
             windows: Vec::new(),
             in_window: false,
             scalar_subqueries: Vec::new(),
+            joined_above: Vec::new(),
             outer_scopes: Vec::new(),
             correlations: Vec::new(),
             clause: "SELECT clause",
@@ -305,7 +318,8 @@ impl<'a> Binder<'a> {
     fn attach_scalar_subqueries(&mut self, mut input: NodeRef) -> NodeRef {
         let subqueries = std::mem::take(&mut self.scalar_subqueries);
         for pending in subqueries {
-            let PendingSubquery { node: mut right, kind, conditions, dependent } = pending;
+            let PendingSubquery { node: mut right, kind, conditions, dependent, index: _ } =
+                pending;
             if kind == JoinKind::Single && !self.semantics.scalar_subquery_error_on_multiple_rows()
             {
                 right = self.add_node(Node::Limit { input: right, count: Some(1), offset: 0 });
@@ -770,10 +784,42 @@ impl<'a> Binder<'a> {
         let visible = exprs.len();
 
         let mut having = None;
+        // The queries a `HAVING` wrote, which are joined in above the grouping rather than below
+        // it. TPC-H q11 is the case: `HAVING sum(ps_supplycost * ps_availqty) > (SELECT sum(...))`
+        // compares one group's total against a total over the whole table, and the second total is
+        // one row that has nothing to do with the groups. Joined underneath the grouping it would
+        // be a column of every input row and the grouping rule would ask for it in the GROUP BY,
+        // which is the complaint this used to make.
+        let mut above = Vec::new();
         if written.having != NONE {
             self.clause = "HAVING clause";
+            let before = self.scalar_subqueries.len();
             let predicate = self.bind_expr(ast, written.having, &input)?;
+            // A correlated one still goes underneath, because what it correlates to is a column of
+            // the rows going into the grouping and there is nothing above the grouping to read.
+            for pending in self.scalar_subqueries.split_off(before) {
+                if pending.dependent {
+                    self.scalar_subqueries.push(pending);
+                } else {
+                    above.push(pending);
+                }
+            }
+            self.joined_above = above.iter().map(|pending| pending.index).collect();
             let predicate = self.over_aggregate(predicate, &input)?;
+            // A mark join carries its comparison rather than the predicate carrying it, and that
+            // comparison is written over the outer rows, so it needs the same rewrite.
+            let mut rewritten = Vec::with_capacity(above.len());
+            for mut pending in above {
+                let conditions = std::mem::take(&mut pending.conditions);
+                let mut over = Vec::with_capacity(conditions.len());
+                for condition in conditions {
+                    over.push(self.over_aggregate(condition, &input)?);
+                }
+                pending.conditions = over;
+                rewritten.push(pending);
+            }
+            above = rewritten;
+            self.joined_above.clear();
             having = Some(self.as_boolean(predicate, "HAVING")?);
         }
 
@@ -810,6 +856,11 @@ impl<'a> Binder<'a> {
             let groups = self.plan.add_expr_list(&aggregation.groups);
             let aggregates = self.plan.add_expr_list(&aggregation.aggregates);
             node = self.add_node(Node::Aggregate { input: node, index, groups, aggregates });
+        }
+        if !above.is_empty() {
+            debug_assert!(self.scalar_subqueries.is_empty(), "a query is waiting to be joined");
+            self.scalar_subqueries = above;
+            node = self.attach_scalar_subqueries(node);
         }
         if let Some(predicate) = having {
             node = self.add_node(Node::Filter { input: node, predicate });
@@ -2462,6 +2513,11 @@ impl<'a> Binder<'a> {
             // `SELECT sum(count(i)) OVER () FROM t GROUP BY j` binds and `sum(i) OVER ()` over the
             // same block does not.
             Expr::Column(binding) if self.is_window_output(binding) => Ok(expr),
+            // The same argument for a query joined in above the grouping. `HAVING sum(x) > (SELECT
+            // ...)` reads one row out of a query that has nothing to do with the groups, and the
+            // join that produces it sits on top of the `Aggregate`, so what it produces is not one
+            // of the grouped table's columns either.
+            Expr::Column(binding) if self.joined_above.contains(&binding.table) => Ok(expr),
             Expr::Column(binding) => {
                 let name =
                     scope.columns.iter().find(|column| column.binding == binding).map_or_else(

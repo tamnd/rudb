@@ -216,6 +216,23 @@ fn having_filters_above_the_aggregate_and_where_filters_below_it() {
     assert!(filter_above < aggregate && aggregate < filter_below, "{text}");
 }
 
+/// A `HAVING` that compares a group against a total over the whole table, which is TPC-H q11.
+///
+/// The query it reads is one row and has nothing to do with the groups, so its join goes on top of
+/// the aggregate. Underneath it the column would be on every input row and the grouping rule would
+/// ask for it in the GROUP BY, which is what this used to say.
+#[test]
+fn a_having_can_compare_a_group_against_a_query_of_its_own() {
+    let text = plan(
+        "SELECT url, count(*) FROM hits GROUP BY url HAVING count(*) > (SELECT count(*) / 100 \
+         FROM hits)",
+    );
+    let filter = text.find("Filter").expect("the HAVING filter");
+    let join = text.find("Join").expect("the join that brings the total in");
+    let aggregate = text.find("Aggregate").expect("the aggregate");
+    assert!(filter < join && join < aggregate, "{text}");
+}
+
 #[test]
 fn an_aggregate_in_a_where_clause_says_where_it_cannot_go() {
     let message = failure("SELECT url FROM hits WHERE count(*) > 1");
