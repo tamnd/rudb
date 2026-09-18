@@ -10,6 +10,12 @@
 //! has, and a file that counted its codes or read the first of them in sorted order would report one
 //! distinct value too many and an empty string as the minimum. That is not a rounding error, it is a
 //! wrong answer to `COUNT(DISTINCT)`, and it is why a column with a null in it is left alone.
+//!
+//! The numbers come from somewhere else. Each stripe writes down the two ends of each column and
+//! the total of it when the column is integers, so a whole table `MIN`, `MAX`, `SUM` and `AVG` is
+//! the stripes put together. Floats and decimals are left out on purpose, and the test for that is
+//! in `rudb-storage` rather than here, because the format does not store either type yet and a
+//! test that cannot create the table is a test that proves nothing.
 
 use rudb::Database;
 use rudb_common::Value;
@@ -105,8 +111,11 @@ fn a_column_with_a_null_in_it_is_counted_the_ordinary_way() {
     );
     // Thirteen values, and the empty string the nulls were written as is not one of them.
     assert_eq!(pair.agree("SELECT COUNT(DISTINCT s) FROM t"), Value::BigInt(13));
+    // The extremes are a different matter. They do not come from the dictionary here, they come
+    // from the stripe ranges, and those were walked a row at a time with the nulls skipped, so the
+    // empty string the nulls were written as never got near them.
     assert_eq!(pair.agree("SELECT MIN(s) FROM t"), Value::Varchar("v0".to_owned()));
-    assert!(!pair.summarised("SELECT MIN(s) FROM t"), "a nullable column was answered from a file");
+    assert!(pair.summarised("SELECT MIN(s) FROM t"), "the rows were read anyway");
     // The count of the column is still the file's business, because a null count is written down
     // exactly rather than as a bound that is allowed to be wide.
     assert_eq!(pair.agree("SELECT COUNT(s) FROM t"), Value::BigInt(4545));
@@ -126,12 +135,41 @@ fn a_filter_or_a_grouping_sends_the_query_back_to_the_rows() {
 }
 
 #[test]
-fn a_numeric_column_has_no_dictionary_and_is_left_alone() {
+fn a_numeric_column_has_no_dictionary_so_its_distinct_values_are_still_counted() {
     let pair = Pair::new("numeric", "SELECT i % 7 AS n FROM range(5000) r(i)");
     assert_eq!(pair.agree("SELECT COUNT(DISTINCT n) FROM t"), Value::BigInt(7));
     assert!(!pair.summarised("SELECT COUNT(DISTINCT n) FROM t"), "a numeric column was summarised");
+}
+
+#[test]
+fn the_ends_and_the_total_of_an_integer_column_are_its_stripe_ranges_added_up() {
+    let pair = Pair::new("integers", "SELECT i % 7 AS n FROM range(5000) r(i)");
     assert_eq!(pair.agree("SELECT MIN(n) FROM t"), Value::BigInt(0));
-    assert!(!pair.summarised("SELECT MIN(n) FROM t"), "a numeric column was summarised");
+    assert_eq!(pair.agree("SELECT MAX(n) FROM t"), Value::BigInt(6));
+    assert_eq!(pair.agree("SELECT SUM(n) FROM t"), Value::HugeInt(14995));
+    assert_eq!(pair.agree("SELECT AVG(n) FROM t"), Value::Double(2.999));
+    assert!(pair.summarised("SELECT MIN(n), MAX(n), SUM(n), AVG(n) FROM t"), "the rows were read");
+}
+
+#[test]
+fn an_integer_column_with_nulls_in_it_is_still_answered_because_the_null_count_is_exact() {
+    let pair = Pair::new(
+        "nullints",
+        "SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i % 7 END AS n FROM range(5000) r(i)",
+    );
+    assert_eq!(pair.agree("SELECT MIN(n) FROM t"), Value::BigInt(0));
+    assert_eq!(pair.agree("SELECT COUNT(n) FROM t"), Value::BigInt(4545));
+    pair.agree("SELECT SUM(n) FROM t");
+    pair.agree("SELECT AVG(n) FROM t");
+    assert!(pair.summarised("SELECT SUM(n), AVG(n) FROM t"), "the rows were read anyway");
+}
+
+#[test]
+fn an_integer_column_that_is_all_nulls_answers_what_an_aggregate_over_nothing_answers() {
+    let pair = Pair::new("allnull", "SELECT CAST(NULL AS BIGINT) AS n FROM range(5000) r(i)");
+    assert_eq!(pair.agree("SELECT SUM(n) FROM t"), Value::Null);
+    assert_eq!(pair.agree("SELECT AVG(n) FROM t"), Value::Null);
+    assert!(pair.summarised("SELECT SUM(n), AVG(n) FROM t"), "the rows were read anyway");
 }
 
 #[test]
