@@ -791,9 +791,7 @@ impl Writer {
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| Error::internal("a native encode worker panicked"))?
+                    handle.join().map_err(|_| Error::internal("a native encode worker panicked"))?
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
