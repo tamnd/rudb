@@ -178,12 +178,83 @@ fn an_in_test_against_a_distinct_subquery_answers_the_matching_keys() {
 }
 
 #[test]
-fn a_limit_inside_a_correlated_subquery_is_refused() {
+fn a_limit_inside_a_correlated_subquery_is_one_row_per_outer_row() {
     let database = database();
-    // No rule for it. A limit inside the subquery is per outer row and pushing the domain under it
-    // would make it one limit over the whole inner side, which is a different query.
-    let sql = "SELECT k, (SELECT count(*) FROM (SELECT w FROM i WHERE i.k = o.k LIMIT 1) AS x) AS c \
-               FROM o";
-    let error = database.query(sql).expect_err("no rule for a limit").to_string();
-    assert!(error.contains("dependent join"), "{error}");
+    // The one that says the limit did not become a limit over the whole inner side. Key 1 has two
+    // matches and key 2 has one, and both answer one.
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT count(*) FROM (SELECT w FROM i WHERE i.k = o.k LIMIT 1) AS x) AS c \
+             FROM o ORDER BY k"
+        ),
+        counts(&[1, 1, 0, 0])
+    );
+}
+
+#[test]
+fn a_top_n_inside_a_correlated_subquery_sorts_the_matches_of_each_outer_row() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT w FROM i WHERE i.k = o.k ORDER BY w DESC LIMIT 1) AS c \
+             FROM o ORDER BY k"
+        ),
+        [Value::Integer(200), Value::Integer(300), Value::Null, Value::Null]
+    );
+}
+
+#[test]
+fn an_offset_inside_a_correlated_subquery_skips_rows_of_that_outer_row_only() {
+    let database = database();
+    // Key 2 has one match, so skipping one leaves it nothing. If the offset were counted over the
+    // whole inner side it would have an answer here, which is how this test fails.
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT w FROM i WHERE i.k = o.k ORDER BY w LIMIT 1 OFFSET 1) AS c \
+             FROM o ORDER BY k"
+        ),
+        [Value::Integer(200), Value::Null, Value::Null, Value::Null]
+    );
+}
+
+#[test]
+fn an_offset_with_no_limit_keeps_everything_after_it() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT sum(w) FROM (SELECT w FROM i WHERE i.k = o.k ORDER BY w OFFSET 1) \
+             AS x) AS c FROM o ORDER BY k"
+        ),
+        [Value::HugeInt(200), Value::Null, Value::Null, Value::Null]
+    );
+}
+
+#[test]
+fn an_offset_past_the_end_answers_nothing_for_every_outer_row() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT w FROM i WHERE i.k = o.k ORDER BY w LIMIT 1 OFFSET 5) AS c \
+             FROM o ORDER BY k"
+        ),
+        [Value::Null, Value::Null, Value::Null, Value::Null]
+    );
+}
+
+#[test]
+fn a_lateral_entry_with_a_limit_answers_that_many_rows_per_left_row() {
+    let database = database();
+    assert_eq!(
+        keys(
+            &database,
+            "SELECT o.k, v.w FROM o, LATERAL (SELECT w FROM i WHERE i.k = o.k ORDER BY w LIMIT 2) \
+             AS v ORDER BY o.k, v.w"
+        ),
+        [Value::Integer(1), Value::Integer(1), Value::Integer(2)]
+    );
 }
