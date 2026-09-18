@@ -336,11 +336,12 @@ impl Source for Scan<'_> {
 
 /// How many instances of a scan over a stored table are worth running.
 ///
-/// An instance costs a thread, and on this machine a scoped thread is about sixteen microseconds to
-/// start and join, paid on the thread that starts it before it does any work of its own. Sixteen
-/// instances is a quarter of a millisecond spent before the first row is read. That is nothing on a
-/// query that was going to take thirty milliseconds and it is most of a query that was going to
-/// take one, which is the whole of the tension this function sits in.
+/// An instance costs a worker, and a worker costs a lock, a push and a notify now that the pool
+/// parks its threads rather than starting one per pipeline per run. It used to cost a thread
+/// creation, about sixteen microseconds, and a sixteen way scan spent a quarter of a millisecond
+/// before it read a row. What is left is the share of the work the instance takes, which is the
+/// tension this function sits in: dividing a small table further buys less than the coordination
+/// costs, whatever the coordination is.
 ///
 /// Two slopes, and the larger wins. The first grows to eight and is what a small table uses, where
 /// there are not many rows to divide and dividing them further buys less than the threads cost. The
@@ -358,10 +359,18 @@ impl Source for Scan<'_> {
 /// The old shape of this capped small tables at four and only grew past six hundred thousand rows,
 /// on a measurement that said sixteen instances made the million row suite 16.6 percent slower.
 /// That is no longer true of this engine and it is worth saying why rather than quietly changing
-/// the constant: the per instance cost that measurement was paying has come down, and what is left
-/// is the thread, so the cap moved with it. It should be measured again when the thread stops being
-/// created per pipeline per run, because that is the last fixed cost in here and removing it would
-/// take both slopes up again.
+/// the constant: the per instance cost that measurement was paying has come down, so the cap moved
+/// with it.
+///
+/// That comment used to end by saying these should be measured again once the thread stopped being
+/// created per pipeline per run, because that was the last fixed cost in here and removing it would
+/// take both slopes up. The thread is gone and the measurement was done, and the answer was no. On
+/// the million row sample, halving both divisors is 196.3 ms against 199.8, and quartering them is
+/// 196.5. On the hundred thousand row sample, halving them is 35.3 ms against 35.5 and quartering
+/// them is 38.2. So dividing further is worth about a percent at a million rows and costs eight
+/// percent at a hundred thousand, and the numbers stay where they are. What that says is that the
+/// scan is no longer what limits how much of this machine a query uses, and the next thing to look
+/// at is the operators above it.
 fn native_instances(rows: usize) -> usize {
     let small = rows.div_ceil(25_000).min(8);
     let large = rows.div_ceil(62_500);
