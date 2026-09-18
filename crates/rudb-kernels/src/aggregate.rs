@@ -733,35 +733,45 @@ pub fn update_scattered(
         && input.logical_type() == &LogicalType::Varchar
         && matches!(input.form(), Form::Flat | Form::Dictionary | Form::StringView | Form::Rle)
     {
+        // Bytes rather than text, because the comparison below is a comparison of bytes and asking
+        // for a `&str` would check that every row of the column is UTF-8 on the way past. That check
+        // is the whole column read again: on `SELECT MIN(Referer) ... GROUP BY` over the million row
+        // ClickBench sample it was 210 million instructions, a tenth of the query, to produce a
+        // `&str` that was turned straight back into the bytes it came from. It is paid where it
+        // means something instead, which is the row that becomes a group's answer.
+        //
         // row at a time: each input belongs to one group; only a new extreme owns its text.
         for row in 0..rows {
             if !nulls.is_valid(row) {
                 continue;
             }
             let Some(index) = into.index(row) else { continue };
-            let text = input.try_text_at(row)?.ok_or_else(|| {
+            let bytes = input.try_bytes_at(row)?.ok_or_else(|| {
                 Error::internal("a valid varchar row had no borrowed text".to_string())
             })?;
             let State::Extreme { held, least } = &mut states[index].state else {
                 return Err(Error::internal("a string extreme into another state".to_string()));
             };
-            let replace = match held {
-                None => true,
+            match held {
                 Some(current) => {
-                    let Value::Varchar(previous) = current.as_ref() else {
+                    let Value::Varchar(previous) = current.as_mut() else {
                         return Err(Error::internal(
                             "a varchar extreme held another type".to_string(),
                         ));
                     };
-                    if *least {
-                        text.as_bytes() < previous.as_bytes()
+                    let better = if *least {
+                        bytes < previous.as_bytes()
                     } else {
-                        text.as_bytes() > previous.as_bytes()
+                        bytes > previous.as_bytes()
+                    };
+                    if better {
+                        // Written over the string the group already holds rather than into a new
+                        // one, because a group is made once and its answer is replaced many times.
+                        previous.clear();
+                        previous.push_str(utf8(bytes)?);
                     }
                 }
-            };
-            if replace {
-                *held = Some(Box::new(Value::Varchar(text.to_owned())));
+                None => *held = Some(Box::new(Value::Varchar(utf8(bytes)?.to_owned()))),
             }
         }
         return Ok(());
@@ -782,6 +792,15 @@ pub fn update_scattered(
         states[index].update(std::slice::from_ref(&value))?;
     }
     Ok(())
+}
+
+/// The text a row holds, checked once for the row that is going to be kept.
+///
+/// The same message [`Vector::try_text_at`] gives, because it is the same failure and a caller
+/// cannot tell which of the two read the column.
+fn utf8(bytes: &[u8]) -> Result<&str> {
+    std::str::from_utf8(bytes)
+        .map_err(|error| Error::conversion(format!("invalid UTF-8 in VARCHAR: {error}")))
 }
 
 /// Which accumulator a row belongs to.
