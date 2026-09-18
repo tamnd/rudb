@@ -20,18 +20,22 @@
 //! [`Query::run`](https://docs.rs/rudb-exec) still takes them one at a time and the dependency edges
 //! are what would decide which may overlap.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rudb_common::{Cancel, Error, Result};
 use rudb_metrics::Span;
 
 use crate::pipeline::Pipeline;
+use crate::pool::Lease;
 use crate::serial::{Stop, instance, run_serial};
 
-/// Run a pipeline on `degree` threads and combine what they produced.
+/// Run a pipeline on the threads the lease covers and combine what they produced.
 ///
-/// The caller's thread is one of them, so `degree` of one is exactly the serial driver and is
-/// handed to it rather than being a special case in here.
+/// The caller's thread is one of them, so a lease of one is exactly the serial driver and is handed
+/// to it rather than being a special case in here. The rest are workers the pool already has parked,
+/// and [`Lease::scatter`] is what wakes them and what makes sure this does not return until they
+/// have all put down the pipeline they borrowed.
 ///
 /// Returns the CPU nanoseconds burned on the threads that were not the caller's. The clock this
 /// engine reads for CPU time is per thread, which is the right clock for attributing work to an
@@ -42,11 +46,10 @@ use crate::serial::{Stop, instance, run_serial};
 ///
 /// # Errors
 ///
-/// The first error any instance reported. The rest are dropped rather than collected, because a
-/// query answers with one error and the useful one is the one that happened first. An instance that
-/// fails asks the others to stop, so a second error is usually the same failure seen from another
-/// thread.
-pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, degree: usize) -> Result<u64> {
+/// The first error any instance reported. The rest are dropped, because a query answers with one
+/// error and the useful one is the one that happened first.
+pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>) -> Result<u64> {
+    let degree = lease.degree();
     if degree <= 1 {
         run_serial(pipeline, cancel)?;
         return Ok(0);
@@ -55,41 +58,43 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, degree: usize) -> 
     let stop = Stop::default();
     let failed = AtomicBool::new(false);
     let spent = AtomicU64::new(0);
-    let mut done: Vec<Result<()>> = Vec::with_capacity(degree);
+    let failure = Mutex::new(None);
 
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(degree - 1);
-        for _ in 1..degree {
-            handles.push(scope.spawn(|| {
-                let measured = Span::start();
-                let ran = one(pipeline, cancel, &stop, &failed);
-                let (_, cpu) = measured.stop();
-                spent.fetch_add(cpu, Ordering::Relaxed);
-                ran
-            }));
-        }
-        // The thread that asked runs an instance too, rather than waiting on the ones it started.
-        // A degree of two that keeps one thread idle is not a degree of two.
-        done.push(one(pipeline, cancel, &stop, &failed));
-        for handle in handles {
-            done.push(handle.join().unwrap_or_else(|_| Err(panicked())));
-        }
-    });
-
-    let mut failure = None;
-    for finished in done {
-        if let Err(error) = finished {
-            if failure.is_none() {
-                failure = Some(error);
-            }
-        }
+    // What a borrowed worker runs. It is the caller's own instance with a clock around it, because
+    // the CPU clock this engine reads is per thread and the caller cannot see a worker's.
+    let task = || {
+        let measured = Span::start();
+        let ran = one(pipeline, cancel, &stop, &failed);
+        let (_, cpu) = measured.stop();
+        spent.fetch_add(cpu, Ordering::Relaxed);
+        keep(&failure, ran);
+    };
+    let (mine, panicked) = lease.scatter(&task, || one(pipeline, cancel, &stop, &failed));
+    keep(&failure, mine);
+    if panicked {
+        keep(&failure, Err(panicked_thread()));
     }
-    if let Some(error) = failure {
+
+    if let Some(error) = failure.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
         return Err(error);
     }
 
     pipeline.sink().finalize_state()?;
     Ok(spent.load(Ordering::Relaxed))
+}
+
+/// Keeps the first error and drops the rest.
+///
+/// A query answers with one error and the useful one is the one that happened first. An instance
+/// that fails asks the others to stop, so a second error is usually the same failure seen from
+/// another thread.
+fn keep(failure: &Mutex<Option<Error>>, ran: Result<()>) {
+    if let Err(error) = ran {
+        let mut held = failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.is_none() {
+            *held = Some(error);
+        }
+    }
 }
 
 /// One instance, with its own local state, asking the others to stop if it fails.
@@ -139,6 +144,6 @@ fn one(pipeline: &Pipeline<'_>, cancel: &Cancel, stop: &Stop, failed: &AtomicBoo
 /// A panic in an operator is a bug in this engine rather than anything a query can cause, and the
 /// thread it happened on has already printed it. What is left to do is fail the query rather than
 /// let the other instances combine into a state that is missing whatever that one was holding.
-fn panicked() -> Error {
+fn panicked_thread() -> Error {
     Error::internal("a thread running part of this query panicked")
 }

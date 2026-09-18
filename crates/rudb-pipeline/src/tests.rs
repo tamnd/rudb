@@ -707,6 +707,28 @@ impl Stream for Breaks {
     }
 }
 
+/// A stream that panics on a thread that is not the caller's, which is the hang this pool could be.
+#[derive(Debug)]
+struct Panics {
+    caller: std::thread::ThreadId,
+}
+
+impl Stream for Panics {
+    type Local = ();
+
+    /// Panics on a worker and not on the thread that asked, which is what makes this test decide
+    /// something rather than race. Every instance builds its local state before it reads a row, so
+    /// a worker that exists has been here, whereas a worker might never reach `push` if the calling
+    /// thread got through all the morsels first.
+    fn local(&self) {
+        assert_eq!(std::thread::current().id(), self.caller, "a worker built a local state");
+    }
+
+    fn push(&self, _chunk: &mut Chunk, (): &mut ()) -> rudb_common::Result<Progress> {
+        Ok(Progress::More)
+    }
+}
+
 /// A stream that will not run as a second instance, which is what a `LIMIT` says.
 #[derive(Debug)]
 struct OnlyOnce;
@@ -787,7 +809,7 @@ fn the_parallel_driver_answers_what_the_serial_one_answers() {
         Arc::new(Counting::new(values.clone(), 100, 32)) as Arc<dyn Source>,
         Arc::clone(&sink),
     );
-    run_parallel(&built, &Cancel::new(), 8).expect("it runs");
+    run_parallel(&built, &Cancel::new(), &Pool::new(8).lease(8)).expect("it runs");
 
     assert_eq!(*sink.global.lock().unwrap(), expected);
     assert_eq!(sink.combines.load(Ordering::Relaxed), 8, "one combine per instance");
@@ -800,7 +822,7 @@ fn every_morsel_is_read_once_however_many_threads_read_them() {
     let sink = Arc::new(Total::default());
     let built = pipeline(Arc::clone(&source) as Arc<dyn Source>, Arc::clone(&sink));
 
-    run_parallel(&built, &Cancel::new(), 8).expect("it runs");
+    run_parallel(&built, &Cancel::new(), &Pool::new(8).lease(8)).expect("it runs");
 
     assert_eq!(source.reads.load(Ordering::Relaxed), 100, "a hundred morsels of one chunk each");
 }
@@ -813,7 +835,7 @@ fn a_degree_of_one_is_the_serial_driver() {
         Arc::clone(&sink),
     );
 
-    let spent = run_parallel(&built, &Cancel::new(), 1).expect("it runs");
+    let spent = run_parallel(&built, &Cancel::new(), &Pool::new(1).lease(1)).expect("it runs");
 
     assert_eq!(*sink.global.lock().unwrap(), 55);
     assert_eq!(sink.combines.load(Ordering::Relaxed), 1);
@@ -828,7 +850,7 @@ fn the_parallel_driver_reports_what_its_workers_burned() {
         Arc::clone(&sink),
     );
 
-    let spent = run_parallel(&built, &Cancel::new(), 4).expect("it runs");
+    let spent = run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4)).expect("it runs");
 
     if thread_cpu_ns().is_some() {
         assert!(
@@ -848,8 +870,48 @@ fn an_instance_that_fails_stops_the_others_and_the_query_says_why() {
     )
     .then(Arc::new(Breaks) as Arc<dyn DynStream>);
 
-    let error = run_parallel(&built, &Cancel::new(), 4).unwrap_err();
+    let error = run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4)).unwrap_err();
 
     assert_eq!(error.message(), "this operator always gives up");
+    assert_eq!(sink.finalizes.load(Ordering::Relaxed), 0, "a failed pipeline has no answer");
+}
+
+#[test]
+fn the_pool_starts_its_workers_once_and_keeps_them_for_the_next_query() {
+    let pool = Pool::new(4);
+    assert_eq!(pool.workers(), 0, "a pool that has run nothing has started nothing");
+
+    for _ in 0..3 {
+        let sink = Arc::new(Total::default());
+        let built = pipeline(
+            Arc::new(Counting::new((1..=10_000).collect(), 100, 32)) as Arc<dyn Source>,
+            Arc::clone(&sink),
+        );
+        run_parallel(&built, &Cancel::new(), &pool.lease(4)).expect("it runs");
+        assert_eq!(*sink.global.lock().unwrap(), 50_005_000);
+    }
+
+    assert_eq!(pool.workers(), 3, "three runs of four threads borrowed the same three workers");
+}
+
+#[test]
+fn a_worker_that_panics_fails_the_query_rather_than_leaving_it_waiting() {
+    // The panic is printed by the thread it happens on, and this test means to cause one, so the
+    // hook is taken off for the duration rather than letting it write a backtrace to a passing run.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let sink = Arc::new(Total::default());
+    let built = Pipeline::new(
+        PipelineId(0),
+        Arc::new(Counting::new((1..=10_000).collect(), 10, 10)) as Arc<dyn Source>,
+        Arc::clone(&sink) as Arc<dyn DynSink>,
+    )
+    .then(Arc::new(Panics { caller: std::thread::current().id() }) as Arc<dyn DynStream>);
+
+    let error = run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4)).unwrap_err();
+
+    std::panic::set_hook(hook);
+    assert_eq!(error.message(), "a thread running part of this query panicked");
     assert_eq!(sink.finalizes.load(Ordering::Relaxed), 0, "a failed pipeline has no answer");
 }
