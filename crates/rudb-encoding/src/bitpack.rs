@@ -463,27 +463,38 @@ pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>>
     }
     let mask = u128::from(low_mask(width));
     let mut values = Vec::with_capacity(count);
-    // The last few values run out of window, because the buffer ends on the byte holding the top
-    // bits of the last one rather than sixteen bytes later, so they are read through a padded copy.
-    // Everything before them is read straight out of the input.
-    let whole = if input.len() >= WINDOW {
-        (((input.len() - WINDOW) * 8) / width + 1).min(count)
-    } else {
-        0
-    };
+    let read = |window: u128, bit: usize| ((window >> bit) & mask) as u64;
+    // A buffer shorter than a window is one load for the whole call, because everything it holds is
+    // inside it. Short arrays are most of what a cascade stores, so this is the common case by
+    // count of calls even though it is the rare one by count of values.
+    if input.len() < WINDOW {
+        let mut window = [0u8; WINDOW];
+        window[..input.len()].copy_from_slice(input);
+        let word = u128::from_le_bytes(window);
+        for index in 0..count {
+            values.push(read(word, index * width));
+        }
+        return Ok(values);
+    }
+    // Otherwise a value is read where it lies, until the window would run off the end.
+    let whole = (((input.len() - WINDOW) * 8) / width + 1).min(count);
     for index in 0..whole {
         let bit = index * width;
         let mut window = [0u8; WINDOW];
         window.copy_from_slice(&input[bit / 8..bit / 8 + WINDOW]);
-        values.push(((u128::from_le_bytes(window) >> (bit % 8)) & mask) as u64);
+        values.push(read(u128::from_le_bytes(window), bit % 8));
     }
-    for index in whole..count {
-        let bit = index * width;
-        let at = bit / 8;
+    if whole < count {
+        // Every value left over begins past the sixteenth byte from the end, by the definition of
+        // `whole` just above, and the buffer stops on the byte holding the top bits of the last
+        // one. So all of them lie inside the final window and one load serves the lot.
+        let base = input.len() - WINDOW;
         let mut window = [0u8; WINDOW];
-        let take = input.len().min(at + WINDOW) - at;
-        window[..take].copy_from_slice(&input[at..at + take]);
-        values.push(((u128::from_le_bytes(window) >> (bit % 8)) & mask) as u64);
+        window.copy_from_slice(&input[base..]);
+        let word = u128::from_le_bytes(window);
+        for index in whole..count {
+            values.push(read(word, index * width - base * 8));
+        }
     }
     Ok(values)
 }
