@@ -1886,13 +1886,56 @@ impl Reader {
         if boundary <= summary.omitted_max {
             return Ok(None);
         }
-        let dictionary =
-            if field.ty == LogicalType::Varchar { self.dictionary(column)? } else { None };
-        let mut out = Vec::with_capacity(summary.entries.len());
-        for entry in &summary.entries {
+        self.decode_frequencies(column, &field.ty, &summary.entries).map(Some)
+    }
+
+    /// Every value of one column with the number of rows holding it, when the synopsis is complete.
+    ///
+    /// The heavy hitter pass keeps a bounded set of candidates and decrements them all when it runs
+    /// out of room, so what it usually ends with is the leading values and a bound on everything it
+    /// dropped. `omitted_max` of zero says that never happened: no candidate was ever decremented and
+    /// the entries did not overflow the stored budget, so the list is every distinct value of the
+    /// column with an exact count, and a null counts as a value of its own rather than being skipped.
+    ///
+    /// That makes a whole class of question answerable without reading a row. How many rows hold a
+    /// value, how many do not, and what a `GROUP BY` of that column with a count over it produces are
+    /// all in here. It is only ever true of a column with few enough distinct values, which is the
+    /// case worth having, because that is exactly the column a grouping or an equality filter would
+    /// otherwise walk every row to answer.
+    ///
+    /// `None` when the column has no synopsis, or has one that dropped anything.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema or a stored value does not fit its declared type.
+    pub fn exact_frequencies(&self, column: usize) -> Result<Option<Vec<(Value, u64)>>> {
+        let field = self
+            .table
+            .fields
+            .get(column)
+            .ok_or_else(|| invalid("frequency column index out of range"))?;
+        let Some(summary) = self.table.frequencies.get(column).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        if summary.omitted_max > 0 {
+            return Ok(None);
+        }
+        self.decode_frequencies(column, &field.ty, &summary.entries).map(Some)
+    }
+
+    /// Turns stored frequency entries into values of the column's own type.
+    fn decode_frequencies(
+        &self,
+        column: usize,
+        ty: &LogicalType,
+        entries: &[FrequencyEntry],
+    ) -> Result<Vec<(Value, u64)>> {
+        let dictionary = if *ty == LogicalType::Varchar { self.dictionary(column)? } else { None };
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
             let value = match entry.value {
                 FrequencyValue::Null => Value::Null,
-                FrequencyValue::Integer(value) => match field.ty {
+                FrequencyValue::Integer(value) => match *ty {
                     LogicalType::TinyInt => Value::TinyInt(
                         i8::try_from(value)
                             .map_err(|_| invalid("frequency TINYINT is out of range"))?,
@@ -1942,7 +1985,7 @@ impl Reader {
             };
             out.push((value, entry.count));
         }
-        Ok(Some(out))
+        Ok(out)
     }
 
     /// Sparse rows belonging to the bounded numeric frequency candidate set.

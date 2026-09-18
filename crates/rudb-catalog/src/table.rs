@@ -53,6 +53,17 @@ impl Rows {
         }
     }
 
+    /// Every value of one column with its exact row count, when the persisted synopsis is complete.
+    ///
+    /// Only ever an answer for a column with few enough distinct values that the synopsis never had
+    /// to drop one. In-memory tables have no persisted synopsis and return `None`.
+    pub fn exact_frequencies(&self, column: usize) -> Result<Option<Vec<(Value, u64)>>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Native(reader) => reader.exact_frequencies(column),
+        }
+    }
+
     /// How many distinct non-null values one column holds, when the rows are stored somewhere that
     /// already knows.
     ///
