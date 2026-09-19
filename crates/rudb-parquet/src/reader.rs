@@ -83,6 +83,7 @@ use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 use crate::chunk::Pages;
 use crate::metadata::{Metadata, SchemaColumn};
 use crate::page::Body;
+use crate::prune::Footer;
 
 type PickedColumns = Vec<(usize, usize, Vec<Value>)>;
 
@@ -390,6 +391,16 @@ impl Reader {
     #[must_use]
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
+    }
+
+    /// The zone maps of this file, to outlive the reader that read them.
+    ///
+    /// The planner wants the bounds after the file is closed, and the footer is behind an `Arc`
+    /// already because splitting a reader shares it, so handing one out costs a refcount and copies
+    /// nothing. Nobody can mutate it, since [`Reader`] never does either.
+    #[must_use]
+    pub fn zones(&self) -> Footer {
+        Footer::new(Arc::clone(&self.metadata))
     }
 
     /// Another reader over the same file, reading only the row groups in `groups`.

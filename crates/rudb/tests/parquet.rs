@@ -84,6 +84,11 @@ fn a_filter_over_a_file_is_a_guess_that_says_it_is_one() {
     // A fifth of a counted number rather than an unknown over an unknown. The value is the
     // constant's and is wrong for this predicate, and the point is that it now exists and admits
     // where it came from.
+    //
+    // The zone maps do not change this one, which is the point of how they are applied. They are a
+    // ceiling over the guess rather than a replacement for it, this file is one row group that
+    // `a < 10` does not rule out, so the ceiling is the whole 4096 and the guess is already under
+    // it. A file the bounds do rule groups out of is what `zoned.rs` covers.
     let text = explained(&format!("EXPLAIN SELECT a FROM {} WHERE a < 10", fixture()));
     assert!(text.contains("[~819 rows estimated from default]"), "{text}");
 }

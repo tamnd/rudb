@@ -24,7 +24,9 @@
 //! [`Columns::Parquet`]: crate::table::Columns::Parquet
 
 use std::path::Path;
+use std::sync::Arc;
 
+use rudb_common::bounds::Zones;
 use rudb_common::{Error, Field, Provenance, Result, Stat, Value};
 use rudb_csv::{Given, Reader as CsvReader};
 use rudb_io::glob::has_magic;
@@ -150,11 +152,11 @@ fn open_file(path: &str) -> Result<Box<dyn File>> {
 
 /// What the footers of the Parquet files behind one call said about them.
 ///
-/// Three answers out of the one read. A Parquet footer states the schema, the row count and
+/// Four answers out of the one read. A Parquet footer states the schema, the row count and
 /// whatever statistics the writer kept in the same few kilobytes at the end of the file, so a
-/// binder that has read one has read all of it, and splitting them into three functions would mean
-/// three ways to open the same file.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// binder that has read one has read all of it, and splitting them into four functions would mean
+/// four ways to open the same file.
+#[derive(Debug, Clone, Default)]
 pub struct Footers {
     /// The columns the call produces, which are the first file's.
     pub fields: Vec<Field>,
@@ -162,6 +164,13 @@ pub struct Footers {
     pub rows: Stat<u64>,
     /// How many distinct values each column holds, by name, for the columns that were stated.
     pub distincts: Vec<(String, u64)>,
+    /// The minimum and the maximum of every column of every row group, where anything can answer.
+    ///
+    /// Behind a trait object and not a table of numbers, because the file this matters most on has
+    /// a hundred and five columns in eight thousand row groups and the bounds of it are already
+    /// parsed and already in memory on the side that read them. What the planner wants out of them
+    /// is one number, so the question travels to the bounds rather than the bounds to the question.
+    pub zones: Option<Arc<dyn Zones>>,
 }
 
 /// The columns a `read_parquet` of `paths` produces, how many rows all of them hold, and how many
@@ -198,6 +207,15 @@ pub struct Footers {
 /// full. The alternative is the first file's count multiplied by the number of files, which is a
 /// sample wearing the word exact, and the files of a partitioned export are not the same size.
 ///
+/// The bounds stop at one file, where the rest of this does not. A test names a column by its
+/// position in the file's schema, and two files are two schemas as far as this knows: the first
+/// file's word is taken for the columns and a later one that disagrees is cast to it, so the same
+/// position can be a different column in the second file. Ruling out a row group by comparing the
+/// wrong column's bounds drops rows the query wanted, which is a wrong answer and not a slow one,
+/// and the way to fix it is to map each file's schema onto the first file's rather than to assume
+/// they line up. Until something asks for that, a call over more than one file answers `None` here
+/// and the estimate falls back to what it did before.
+///
 /// # Errors
 ///
 /// Everything [`open_parquet`] reports about the first file.
@@ -205,6 +223,7 @@ pub fn parquet_footers(paths: &[String]) -> Result<Footers> {
     let first = paths.first().map_or("", String::as_str);
     let reader = open_parquet(first)?;
     let fields = reader.fields();
+    let zones = (paths.len() == 1).then(|| Arc::new(reader.zones()) as Arc<dyn Zones>);
     let mut largest: Vec<(String, Option<u64>)> =
         reader.metadata().schema.iter().map(|column| (column.name.clone(), Some(0))).collect();
     largest_distincts(&reader, &mut largest);
@@ -212,14 +231,25 @@ pub fn parquet_footers(paths: &[String]) -> Result<Footers> {
         let Some(rows) = rows else {
             // Nothing is capped and nothing is claimed. A count that covers some of the files is
             // worse than no count, and a total that did not add up says the set of files is not
-            // what this read them as.
-            return Footers { fields: fields.clone(), rows: Stat::Unknown, distincts: Vec::new() };
+            // what this read them as. The bounds are unaffected, since they never covered more
+            // than the first file and the first file is the one that opened.
+            return Footers {
+                fields: fields.clone(),
+                rows: Stat::Unknown,
+                distincts: Vec::new(),
+                zones: zones.clone(),
+            };
         };
         let distincts = largest
             .into_iter()
             .filter_map(|(name, count)| count.map(|count| (name, count.min(rows))))
             .collect();
-        Footers { fields: fields.clone(), rows: Stat::exact(rows, Provenance::RowCount), distincts }
+        Footers {
+            fields: fields.clone(),
+            rows: Stat::exact(rows, Provenance::RowCount),
+            distincts,
+            zones: zones.clone(),
+        }
     };
     let Some(mut total) = reader.rows() else { return Ok(counted(None, largest)) };
     for path in paths.iter().skip(1) {

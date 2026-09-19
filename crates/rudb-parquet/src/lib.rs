@@ -49,5 +49,5 @@ pub use metadata::{
     ColumnChunk, Encoding, Metadata, Physical, Region, RowGroup, SchemaColumn, Stats,
 };
 pub use page::{Body, DataV1, DataV2, Dictionary, Header};
-pub use prune::{Bound, Op, Test, skips};
+pub use prune::{Bound, Footer, Op, Test, skips};
 pub use reader::{Reader, read};
