@@ -175,6 +175,8 @@ impl Document {
                     });
                     out.count("wall_ns", pipeline.wall_ns);
                     out.count("cpu_ns", pipeline.cpu_ns);
+                    out.count("slowest_ns", pipeline.slowest_ns);
+                    out.count("finalize_ns", pipeline.finalize_ns);
                     out.key("blocked_ns");
                     out.object(|out| {
                         out.count("io", pipeline.blocked.io_ns);
@@ -486,6 +488,19 @@ pub struct Pipeline {
     pub wall_ns: u64,
     /// CPU time across its instances.
     pub cpu_ns: u64,
+    /// The wall of the longest single instance, which is the one the rest waited for.
+    ///
+    /// What sits between this and `wall_ns` is what starting and joining the threads cost. What
+    /// sits between this and `cpu_ns` divided by `instances` is how unevenly the work was split.
+    /// Both of those used to be one unnamed number that had to be got at by subtracting the
+    /// operators from the pipeline, and on ClickBench 39 that number is more than half the query.
+    pub slowest_ns: u64,
+    /// The wall of the sink's finalize, which runs once on one thread after every instance is done.
+    ///
+    /// A grouped aggregate does most of its work here and starts its own threads to do it. This is
+    /// the wall of the whole thing, undivided, which is the number that matters when the question
+    /// is what the query waited for.
+    pub finalize_ns: u64,
     /// Where the waiting went.
     pub blocked: Blocked,
 }
@@ -500,6 +515,8 @@ impl Pipeline {
             depends_on: Vec::new(),
             wall_ns: 0,
             cpu_ns: 0,
+            slowest_ns: 0,
+            finalize_ns: 0,
             blocked: Blocked::default(),
         }
     }
@@ -726,12 +743,15 @@ mod tests {
         scan.instances = 8;
         scan.wall_ns = 980_000_000;
         scan.cpu_ns = 7_600_000_000;
+        scan.slowest_ns = 940_000_000;
+        scan.finalize_ns = 31_000_000;
         scan.blocked.io_ns = 120_000_000;
         scan.blocked.downstream_ns = 3_000_000;
         let mut top = Pipeline::new(1);
         top.depends_on.push(0);
         top.wall_ns = 343_000_000;
         top.cpu_ns = 2_280_000_000;
+        top.slowest_ns = 343_000_000;
         metrics.pipelines.extend([scan, top]);
 
         let mut read = Operator::new(3, 0, "Scan");

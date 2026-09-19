@@ -75,6 +75,10 @@ pub struct Driver {
     instances: AtomicU32,
     wall_ns: AtomicU64,
     cpu_ns: AtomicU64,
+    /// The longest single instance, which is what the pipeline waited for. See [`Driver::waited`].
+    slowest_ns: AtomicU64,
+    /// The sink's finalize, which is one thread whatever it does inside. See [`Driver::waited`].
+    finalize_ns: AtomicU64,
     charged: Arc<Charged>,
 }
 
@@ -86,6 +90,8 @@ impl Driver {
             instances: AtomicU32::new(0),
             wall_ns: AtomicU64::new(0),
             cpu_ns: AtomicU64::new(0),
+            slowest_ns: AtomicU64::new(0),
+            finalize_ns: AtomicU64::new(0),
             charged,
         }
     }
@@ -123,6 +129,29 @@ impl Driver {
     pub fn ran(&self, instances: usize, worker_cpu_ns: u64) {
         self.instances.fetch_add(u32::try_from(instances).unwrap_or(u32::MAX), Ordering::Relaxed);
         self.cpu_ns.fetch_add(worker_cpu_ns, Ordering::Relaxed);
+    }
+
+    /// Records the longest single instance and the finalize that ran once after all of them.
+    ///
+    /// These two are what turns the gap between a pipeline's wall clock and the work inside it from
+    /// a subtraction into a reading. The wall above the slowest instance is what starting and
+    /// joining the threads cost. The gap between the slowest instance and the average one is the
+    /// imbalance. And the finalize is a thread on its own whatever it does inside, which for a
+    /// grouped aggregate is most of the query and used to be charged to the operator and then
+    /// divided by the instance count, so it read as a sixteenth of what it was.
+    ///
+    /// The slowest is a maximum across runs rather than a sum, because a pipeline drained twice
+    /// waited for the slower of the two and not for both. The finalize adds, because there were two
+    /// of them and both happened.
+    pub fn waited(&self, slowest_ns: u64, finalize_ns: u64) {
+        self.slowest_ns.fetch_max(slowest_ns, Ordering::Relaxed);
+        self.finalize_ns.fetch_add(finalize_ns, Ordering::Relaxed);
+    }
+
+    /// The longest single instance and the total finalize this driver has been told about.
+    #[must_use]
+    pub fn waits(&self) -> (u64, u64) {
+        (self.slowest_ns.load(Ordering::Relaxed), self.finalize_ns.load(Ordering::Relaxed))
     }
 
     /// How many instances of this pipeline have run.
