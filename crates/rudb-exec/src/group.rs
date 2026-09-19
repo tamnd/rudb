@@ -322,8 +322,46 @@ fn widest_run(lengths: impl Iterator<Item = usize>) -> Option<usize> {
     lengths.enumerate().max_by_key(|&(_, rows)| rows).map(|(at, _)| at)
 }
 
+/// How many of a bucket's bits hold the slot its group sits at, the rest being the tag.
+///
+/// Twenty four, which is sixteen million groups in one radix partition and two hundred and sixty
+/// eight million across the sixteen. A partition that outgrows it says so rather than wrapping, and
+/// the ClickBench file would have to be two hundred times larger before one did.
+const SLOT_BITS: u32 = 24;
+
+/// The part of a bucket that is the slot.
+const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
+
 /// The bucket value that says a slot in a radix partition's open addressed table is free.
-const EMPTY_SLOT: u32 = u32::MAX;
+///
+/// Every slot bit set and no tag bits, so a free bucket is a single comparison against the slot
+/// half and never has to be told apart from a real entry that happens to share its tag.
+const EMPTY_SLOT: u32 = SLOT_MASK;
+
+/// The eight bits of a group's hash that its bucket carries beside the slot.
+///
+/// This is what makes the probe one random read instead of two. Without it a bucket says only where
+/// its group is, so the only way to find out whether it is the right group is to read the group,
+/// and the array of groups is megabytes and read in an order the hash chose. With it, two hundred
+/// and fifty five mismatches in two hundred and fifty six are rejected inside the bucket array,
+/// which is a quarter the size and which the probe has already touched. It is free in memory
+/// because the slot never needed more than twenty four of the thirty two bits it was given.
+///
+/// The eight bits above the ones the bucket index uses, because a tag cut from bits the index
+/// already used would be the same for every bucket in a chain and would reject nothing. A partition
+/// cannot hold more buckets than [`SLOT_BITS`] allows slots, so those eight are always above it.
+/// One of the two records hashes to a `u32` and the other to a `u64`, and both are widened here so
+/// that the tag is the same bits of whichever it is.
+const fn slot_tag(hash: u64) -> u32 {
+    (((hash >> SLOT_BITS) as u32) & 0xff) << SLOT_BITS
+}
+
+/// A bucket for a group at this slot with this hash, or an error when the partition is too large.
+fn bucket_for(slot: usize, hash: u64, what: &'static str) -> Result<u32> {
+    let slot = u32::try_from(slot).ok().filter(|&slot| slot < SLOT_MASK);
+    let slot = slot.ok_or_else(|| Error::out_of_memory(what))?;
+    Ok(slot_tag(hash) | slot)
+}
 
 #[derive(Debug, Clone, Copy)]
 struct EncodedCountRecord {
@@ -3805,22 +3843,27 @@ fn encoded_slot(
 ) -> std::result::Result<usize, usize> {
     let mask = buckets.len() - 1;
     let all_valid = groups.validity.is_empty();
+    let tag = slot_tag(u64::from(row.hash));
     let mut at = row.hash as usize & mask;
     loop {
-        let slot = buckets[at];
+        let bucket = buckets[at];
+        let slot = bucket & SLOT_MASK;
         if slot == EMPTY_SLOT {
             return Err(at);
         }
-        let slot = slot as usize;
-        let held = groups.rows[slot];
-        let held_valid = if all_valid { EncodedCountRecord::ALL } else { groups.validity[slot] };
-        if held.hash == row.hash
-            && held.first == row.first
-            && held.second == row.second
-            && held.third == row.third
-            && held_valid == valid
-        {
-            return Ok(slot);
+        if bucket == tag | slot {
+            let slot = slot as usize;
+            let held = groups.rows[slot];
+            let held_valid =
+                if all_valid { EncodedCountRecord::ALL } else { groups.validity[slot] };
+            if held.hash == row.hash
+                && held.first == row.first
+                && held.second == row.second
+                && held.third == row.third
+                && held_valid == valid
+            {
+                return Ok(slot);
+            }
         }
         at = (at + 1) & mask;
     }
@@ -3865,8 +3908,11 @@ fn encoded_count_partition(
             Ok(slot) => slot,
             Err(bucket) => {
                 let slot = counts.len();
-                buckets[bucket] = u32::try_from(slot)
-                    .map_err(|_| Error::out_of_memory("an encoded radix partition is too large"))?;
+                buckets[bucket] = bucket_for(
+                    slot,
+                    u64::from(row.hash),
+                    "an encoded radix partition is too large",
+                )?;
                 partition.rows[slot] = row;
                 if !all_valid {
                     partition.validity[slot] = valid;
@@ -3895,9 +3941,11 @@ fn encoded_count_partition(
                 Ok(slot) => slot,
                 Err(bucket) => {
                     let slot = counts.len();
-                    buckets[bucket] = u32::try_from(slot).map_err(|_| {
-                        Error::out_of_memory("an encoded radix partition is too large")
-                    })?;
+                    buckets[bucket] = bucket_for(
+                        slot,
+                        u64::from(row.hash),
+                        "an encoded radix partition is too large",
+                    )?;
                     partition.push(row, valid);
                     counts.push(0);
                     slot
@@ -4068,18 +4116,25 @@ fn fixed_slot(
     const KEYS: u8 = FixedRecord::FIRST | FixedRecord::SECOND;
     let mask = buckets.len() - 1;
     let all_valid = groups.validity.is_empty();
-    let mut at = fixed_hash(row, valid) as usize & mask;
+    let hash = fixed_hash(row, valid);
+    let tag = slot_tag(hash);
+    let mut at = hash as usize & mask;
     loop {
-        let slot = buckets[at];
+        let bucket = buckets[at];
+        let slot = bucket & SLOT_MASK;
         if slot == EMPTY_SLOT {
             return Err(at);
         }
-        let slot = slot as usize;
-        let held = groups.rows[slot];
-        let held_valid = if all_valid { FixedRecord::ALL } else { groups.validity[slot] };
-        if held.first == row.first && held.second == row.second && held_valid & KEYS == valid & KEYS
-        {
-            return Ok(slot);
+        if bucket == tag | slot {
+            let slot = slot as usize;
+            let held = groups.rows[slot];
+            let held_valid = if all_valid { FixedRecord::ALL } else { groups.validity[slot] };
+            if held.first == row.first
+                && held.second == row.second
+                && held_valid & KEYS == valid & KEYS
+            {
+                return Ok(slot);
+            }
         }
         at = (at + 1) & mask;
     }
@@ -4117,8 +4172,11 @@ fn fixed_partition(
             Ok(slot) => slot,
             Err(bucket) => {
                 let slot = states.len();
-                buckets[bucket] = u32::try_from(slot)
-                    .map_err(|_| Error::out_of_memory("a fixed radix partition is too large"))?;
+                buckets[bucket] = bucket_for(
+                    slot,
+                    fixed_hash(row, valid),
+                    "a fixed radix partition is too large",
+                )?;
                 partition.rows[slot] = row;
                 if !all_valid {
                     partition.validity[slot] = valid;
@@ -4149,9 +4207,11 @@ fn fixed_partition(
                 Ok(slot) => slot,
                 Err(bucket) => {
                     let slot = states.len();
-                    buckets[bucket] = u32::try_from(slot).map_err(|_| {
-                        Error::out_of_memory("a fixed radix partition is too large")
-                    })?;
+                    buckets[bucket] = bucket_for(
+                        slot,
+                        fixed_hash(row, valid),
+                        "a fixed radix partition is too large",
+                    )?;
                     partition.push(row, valid);
                     states.push(CompactNumeric::default());
                     slot
