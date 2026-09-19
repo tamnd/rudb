@@ -767,6 +767,31 @@ fn the_watching_wrapper_passes_the_preparing_on() {
     assert!(counters.snapshot().wall_ns > 0, "and the time it took is charged to the operator");
 }
 
+/// Filling the CPU column of an operator's row costs a system call on either side of every call, so
+/// the shim only does it for an operator that was built asking for the column. Wall time is not
+/// optional and does not cost one, which is why both of these are timed and only one is charged.
+#[test]
+fn only_an_operator_that_asked_for_a_cpu_column_is_timed_on_the_thread_clock() {
+    let quiet = Arc::new(Counters::new(0, 0, "Quiet"));
+    let charging = Arc::new(Counters::new(1, 0, "Charging").charging_cpu(true));
+    for counters in [&quiet, &charging] {
+        let source = Arc::new(Watched::new(
+            Counting::new((1..=200_000).collect(), 1_000, 1_000),
+            Arc::clone(counters),
+        ));
+        let sink = Arc::new(Total::default());
+        let built = pipeline(source as Arc<dyn Source>, sink);
+        run_serial(&built, &Cancel::new()).expect("the pipeline runs");
+    }
+
+    let unasked = quiet.snapshot();
+    assert!(unasked.wall_ns > 0, "two hundred thousand rows take longer than nothing");
+    assert_eq!(unasked.cpu_ns, 0, "nobody asked this one for a CPU number");
+    if thread_cpu_ns().is_some() {
+        assert!(charging.snapshot().cpu_ns > 0, "and this one asked, on the same rows");
+    }
+}
+
 /// A stream that gives up on the compact form of every chunk it is handed, and says so.
 ///
 /// This is what the real ones look like from the shim's point of view: it does not know what a

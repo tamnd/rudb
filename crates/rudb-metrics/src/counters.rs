@@ -25,6 +25,12 @@ pub struct Counters {
     detail: Option<String>,
     estimated_rows: Option<u64>,
     implementations: Vec<Implementation>,
+    /// Whether the shim around this operator reads the thread clock as well as the wall clock.
+    ///
+    /// Off unless somebody asked for the numbers, because the thread clock is a system call and the
+    /// shim reads it twice per chunk. See [`Span`](crate::Span) for what that came to. Not an atomic
+    /// because it is decided when the operator is built and read on every thread afterwards.
+    charges_cpu: bool,
     rows_in: AtomicU64,
     rows_out: AtomicU64,
     wall_ns: AtomicU64,
@@ -58,6 +64,7 @@ impl Counters {
             detail: None,
             estimated_rows: None,
             implementations: Vec::new(),
+            charges_cpu: false,
             rows_in: AtomicU64::new(0),
             rows_out: AtomicU64::new(0),
             wall_ns: AtomicU64::new(0),
@@ -85,6 +92,24 @@ impl Counters {
     pub fn estimated(mut self, rows: u64) -> Self {
         self.estimated_rows = Some(rows);
         self
+    }
+
+    /// Says this operator's row wants a CPU column, so the shim around it reads the thread clock.
+    ///
+    /// Whoever builds the operator decides, because that is the one place that can see whether the
+    /// statement is an `EXPLAIN ANALYZE` or ran under `enable_profiling`. Everything else gets the
+    /// wall clock alone, and a wall clock per operator plus a thread clock per pipeline is enough to
+    /// find a slow operator without paying a system call per chunk to do it.
+    #[must_use]
+    pub fn charging_cpu(mut self, charges: bool) -> Self {
+        self.charges_cpu = charges;
+        self
+    }
+
+    /// Whether the shim should read the thread clock around this operator.
+    #[must_use]
+    pub fn charges_cpu(&self) -> bool {
+        self.charges_cpu
     }
 
     /// What the operator picked at one of the seams it sits on.

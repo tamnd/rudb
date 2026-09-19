@@ -79,9 +79,21 @@ pub fn thread_cpu_ns() -> Option<u64> {
 
 /// One measured call, from the moment it started.
 ///
-/// Both clocks are read when this is made and again when it is stopped, which is twice per operator
-/// per chunk. That is the granularity rule: a clock read is a seam crossing and a seam crossing
-/// happens once per chunk and never once per row.
+/// A span reads the wall clock when it is made and again when it is stopped. Whether it also reads
+/// the thread clock is the caller's decision, and the two cost very different amounts.
+///
+/// The wall clock is `CLOCK_MONOTONIC`, which Linux answers out of the vDSO without entering the
+/// kernel, so it is about twenty nanoseconds and can be read around anything that handles a chunk.
+/// `CLOCK_THREAD_CPUTIME_ID` has no vDSO entry on any Linux this runs on, so every reading of it is
+/// a real system call: several hundred nanoseconds, and on a chunk of a thousand rows that is more
+/// than the work inside the call it is measuring. Four of them per chunk, which is what a source and
+/// a sink together came to, made a count over twenty million rows fourteen times slower than the
+/// same count with the thread clock left alone.
+///
+/// So [`Span::start`] is for the spans taken once per statement, once per pipeline and once per
+/// worker, where a system call is nothing, and [`Span::wall`] is for the one taken per operator per
+/// chunk. What the per operator span gives up is the CPU column of one operator's row, which is why
+/// `EXPLAIN ANALYZE` and `enable_profiling` turn it back on for the statement that asked.
 #[derive(Debug)]
 pub struct Span {
     wall: Instant,
@@ -89,23 +101,44 @@ pub struct Span {
 }
 
 impl Span {
-    /// Starts timing.
+    /// Starts timing, on both clocks.
     #[must_use]
     pub fn start() -> Self {
         Self { wall: Instant::now(), cpu: thread_cpu_ns() }
     }
 
+    /// Starts timing on the wall clock alone, which is the cheap one.
+    ///
+    /// The CPU time such a span reports is zero, and zero is what an operator that did not charge
+    /// itself any should say.
+    #[must_use]
+    pub fn wall() -> Self {
+        Self { wall: Instant::now(), cpu: None }
+    }
+
+    /// Starts timing, reading the thread clock only if `cpu` says to.
+    ///
+    /// Here rather than at the call site because the call site is a hot one and the branch reads
+    /// better as a name than as an `if` around two constructors.
+    #[must_use]
+    pub fn charging(cpu: bool) -> Self {
+        if cpu { Self::start() } else { Self::wall() }
+    }
+
     /// Stops timing, and reports the wall nanoseconds and the CPU nanoseconds it took.
     ///
-    /// The CPU number is zero on a platform with no thread clock. A document whose operators
-    /// account for none of its CPU time says so in its warnings, which is the honest outcome and is
-    /// better than a wall time reported twice under two names.
+    /// The CPU number is zero on a platform with no thread clock, and zero for a span that was not
+    /// reading that clock. A document whose operators account for none of its CPU time says so in
+    /// its warnings, which is the honest outcome and is better than a wall time reported twice under
+    /// two names.
     #[must_use]
     pub fn stop(self) -> (u64, u64) {
         let wall = u64::try_from(self.wall.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let cpu = match (self.cpu, thread_cpu_ns()) {
-            (Some(started), Some(ended)) => ended.saturating_sub(started),
-            _ => 0,
+        // The thread clock is only read here when it was read at the start, because reading it is a
+        // system call and a span that is not reporting CPU time must not pay for one.
+        let cpu = match self.cpu {
+            Some(started) => thread_cpu_ns().map_or(0, |ended| ended.saturating_sub(started)),
+            None => 0,
         };
         (wall, cpu)
     }
@@ -132,6 +165,37 @@ mod tests {
         assert!(counted > 0, "the loop has to be kept");
         let (wall, cpu) = span.stop();
         assert!(wall > 0, "two million multiplications take longer than nothing");
+        if thread_cpu_ns().is_some() {
+            assert!(cpu > 0, "work on this thread costs this thread CPU time");
+        }
+    }
+
+    /// A wall only span still times the work and reports no CPU at all, which is what lets the
+    /// per chunk span skip the system call.
+    #[test]
+    fn a_wall_only_span_reports_the_time_and_no_cpu() {
+        for span in [Span::wall(), Span::charging(false)] {
+            let mut counted: u64 = 0;
+            for at in 0..2_000_000u64 {
+                counted = counted.wrapping_add(at * at);
+            }
+            assert!(counted > 0, "the loop has to be kept");
+            let (wall, cpu) = span.stop();
+            assert!(wall > 0, "two million multiplications take longer than nothing");
+            assert_eq!(cpu, 0, "a span that never read the thread clock has nothing to report");
+        }
+    }
+
+    /// And one asked to charge does, so the two constructors are not the same one twice.
+    #[test]
+    fn a_charging_span_reads_the_thread_clock() {
+        let span = Span::charging(true);
+        let mut counted: u64 = 0;
+        for at in 0..2_000_000u64 {
+            counted = counted.wrapping_add(at * at);
+        }
+        assert!(counted > 0, "the loop has to be kept");
+        let (_, cpu) = span.stop();
         if thread_cpu_ns().is_some() {
             assert!(cpu > 0, "work on this thread costs this thread CPU time");
         }

@@ -6,8 +6,17 @@
 //! is measured the day it is written by somebody who never read this file.
 //!
 //! It measures per call, which is per chunk, which is the granularity rule. Two clock readings
-//! around a call that handles two thousand rows is not a measurement anybody can feel. Two clock
+//! around a call that handles a thousand rows is not a measurement anybody can feel. Two clock
 //! readings per row would be the measurement rather than the thing measured.
+//!
+//! That holds for the wall clock, which Linux answers out of the vDSO without entering the kernel.
+//! It does not hold for the thread CPU clock, which is a real system call every time and costs more
+//! per chunk than a chunk of a thousand rows costs to produce: a count over twenty million rows was
+//! fourteen times slower with it than without. So the thread clock is read here only when the
+//! operator was built saying its row wants a CPU column, which is what `EXPLAIN ANALYZE` and
+//! `enable_profiling` arrange. Every query still gets wall time per operator, and CPU time per
+//! pipeline and per worker, because those spans are taken once per pipeline rather than once per
+//! chunk.
 //!
 //! It also reads the slow path counter on either side of the call, and the difference is what that
 //! operator gave up on inside that chunk. That is the whole reason the counter is per thread: a
@@ -66,7 +75,7 @@ impl<S: Source> Source for Watched<S> {
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
-        let measure = Measure::start();
+        let measure = Measure::start(&self.counters);
         let progress = self.inner.read(morsel, out);
         measure.stop(&self.counters);
         // A failed read still cost the time it took, which is why the time is recorded above
@@ -91,7 +100,7 @@ impl<S: Stream> Stream for Watched<S> {
 
     /// Counted against this operator the way its pushes are, because it is its work.
     fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
-        let measure = Measure::start();
+        let measure = Measure::start(&self.counters);
         let prepared = self.inner.prepare(threads);
         measure.stop(&self.counters);
         prepared
@@ -102,7 +111,7 @@ impl<S: Stream> Stream for Watched<S> {
         // and the rows it produced after it. A filter that keeps a tenth of its input is the
         // difference between those two numbers and nothing else records it.
         let taken = rows(chunk);
-        let measure = Measure::start();
+        let measure = Measure::start(&self.counters);
         let progress = self.inner.push(chunk, local);
         measure.stop(&self.counters);
         if progress.is_ok() {
@@ -128,7 +137,7 @@ impl<K: Sink> Sink for Watched<K> {
     /// a lock that turns out to be contended is exactly the sort of thing this wrapper exists to
     /// show rather than leave somebody to guess at.
     fn at(&self, morsel: &Morsel, local: &mut Self::Local) -> Result<()> {
-        let measure = Measure::start();
+        let measure = Measure::start(&self.counters);
         let noted = self.inner.at(morsel, local);
         measure.stop(&self.counters);
         noted
@@ -136,7 +145,7 @@ impl<K: Sink> Sink for Watched<K> {
 
     fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress> {
         let taken = rows(chunk);
-        let measure = Measure::start();
+        let measure = Measure::start(&self.counters);
         let progress = self.inner.sink(chunk, local);
         measure.stop(&self.counters);
         if progress.is_ok() {
@@ -148,7 +157,7 @@ impl<K: Sink> Sink for Watched<K> {
     /// Measured, because merging one thread's state into the global one is work and on an aggregate
     /// it is a lot of it.
     fn combine(&self, local: Self::Local) -> Result<()> {
-        let measure = Measure::start();
+        let measure = Measure::start(&self.counters);
         let combined = self.inner.combine(local);
         measure.stop(&self.counters);
         combined
@@ -162,7 +171,7 @@ impl<K: Sink> Sink for Watched<K> {
     /// finished state, and that source is measured in its own right, so counting them in both
     /// places would put the same rows in the document twice.
     fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
-        let measure = Measure::start();
+        let measure = Measure::start(&self.counters);
         let finished = self.inner.finalize(threads);
         measure.stop(&self.counters);
         finished
@@ -182,10 +191,15 @@ struct Measure {
 
 impl Measure {
     /// Reads both, with the clock last so that as little as possible sits between it and the call.
-    fn start() -> Self {
+    ///
+    /// The clock is the wall clock unless `counters` says this operator's row wants a CPU column.
+    /// Reading the thread clock is a system call and this runs twice per operator per chunk, so on a
+    /// chunk of a thousand rows it costs more than the call it is timing. See
+    /// [`Span`](rudb_metrics::Span).
+    fn start(counters: &Counters) -> Self {
         let before = slow::here();
         let reading = stage::here();
-        Self { span: Span::start(), before, reading }
+        Self { span: Span::charging(counters.charges_cpu()), before, reading }
     }
 
     /// Reads both again and charges the difference to the operator.
