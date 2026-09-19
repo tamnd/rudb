@@ -721,20 +721,31 @@ fn onto(
     (fit.into_iter().chain(unfit).collect(), Vec::new())
 }
 
-/// Whether the join operator will answer this whole condition list with a hash table.
+/// Whether the join operator will answer this condition list with a hash table.
 ///
-/// Every condition has to be one a lookup answers, and there has to be at least one, since a join
-/// with nothing to check pairs every row with every row and has no key to build a table on. This is
-/// `rudb_exec`'s `equalities` asked of a finished plan rather than of one being rewritten, and it is
-/// what `crate::sides` needs, because which side a join would rather gather is the opposite question
-/// for a hash table than for a nested loop.
+/// One condition a lookup answers is enough, which is what `rudb_exec`'s `equalities` asks and so
+/// is what this has to ask. A join written `ON p.k = b.k AND p.g <> b.g` builds its table on the
+/// equality and evaluates the rest on the handful of candidates the equality found, so it is a
+/// hash join with a residual rather than a nested loop. This used to require every condition, and
+/// the cost of that was not a missed rewrite but the wrong one: `crate::sides` asks this to decide
+/// which side to gather, the answer is the opposite for the two operators, and a join the executor
+/// answers with a table was being handed the side a nested loop would want, which is the larger
+/// one. TPC-H q21's two `EXISTS` joins are written exactly that way and both of them were
+/// gathering the whole of `lineitem` to be probed by seventy five thousand rows.
+///
+/// There still has to be one, since a join with nothing to check pairs every row with every row
+/// and has no key to build a table on.
+///
+/// This is deliberately stricter than the executor in the other direction: a key that is an
+/// expression rather than a bare column is a table the executor builds and this says no to, so the
+/// answer is the side the binder chose rather than a side chosen wrongly.
 pub(crate) fn lookup(
     plan: &Plan,
     tables: &mut Tables,
     conditions: &[ExprRef],
     below: &(TableSet, TableSet),
 ) -> bool {
-    !conditions.is_empty() && conditions.iter().all(|&part| answered(plan, tables, part, below))
+    conditions.iter().any(|&part| answered(plan, tables, part, below))
 }
 
 /// Which of the predicates over a cross product become the conditions of an inner join, and which

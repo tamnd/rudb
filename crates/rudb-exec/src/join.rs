@@ -1074,6 +1074,15 @@ impl<'a> Probe<'a> {
         if !matches!(self.kind, JoinKind::Inner | JoinKind::Semi) {
             return None;
         }
+        self.keyed_sideways()
+    }
+
+    /// The same, without the question about the kind.
+    ///
+    /// [`Marking`] answers that question differently and everything else about the key is the
+    /// same, so the two refusals that are about the equality live here and the one that is about
+    /// what the join does with a driving row lives with each operator.
+    fn keyed_sideways(&self) -> Option<(ExprRef, ColumnBinding)> {
         let at = self.equalities.null_is_a_value.iter().position(|&stored| !stored)?;
         let Expr::Column(binding) = *self.plan.expr(*self.equalities.left.get(at)?) else {
             return None;
@@ -1378,6 +1387,280 @@ impl Stream for Probe<'_> {
         }
         Ok(Progress::More)
     }
+}
+
+/// A semi or an anti join that gathered the side whose rows it produces.
+///
+/// Every other operator here gathers one side and produces rows as the other one streams past. A
+/// semi join produces its subject side's rows, so [`Probe`] has to gather the other side, and when
+/// the other side is the larger of the two that is the wrong way round. TPC-H q21 is the case that
+/// asked for this: its `EXISTS` becomes a semi join whose subject is about seventy five thousand
+/// rows and whose other side is the whole six million row `lineitem`, and gathering six million
+/// rows to answer seventy five thousand questions is a table thirty times larger than it needs to
+/// be, built out of a copy of a side thirty times larger than the answer.
+///
+/// So this one turns the join around. The subject side is gathered, the other side streams, and a
+/// driving row that finds a match sets a bit against the gathered row it matched rather than
+/// producing anything. When the driving side is finished, the gathered rows whose bit is set are
+/// the semi join's answer and the ones whose bit is clear are the anti join's. It is the same
+/// table, the same lookup and the same residual as [`Probe`], which is why it holds one and calls
+/// into it rather than spelling any of that a second time. What differs is only what is done with
+/// the matches.
+///
+/// # Why this is a sink
+///
+/// Because nothing can be said about a gathered row until the last driving row has been through.
+/// A bit that is clear now may be set by a driving row that has not arrived, so the answer is not
+/// known until the pipeline ends, and an operator whose answer is only known then is a
+/// [`Sink`]. That is the same argument [`streamed`] gives for `RIGHT` and `FULL`.
+///
+/// What it costs is that the answer is materialised instead of streaming on, and what it saves is
+/// gathering the larger side. `rudb_opt`'s `sides` pass only turns a join around when it estimates
+/// the subject to be the smaller of the two, so the copy that is made is the smaller one and the
+/// copy that is avoided is the larger one.
+///
+/// The bits themselves are per instance and merged in [`Sink::combine`], so the driving side runs
+/// on the whole lease and no two threads write the same word. A bitmap over the gathered side is
+/// one bit per gathered row however many driving rows there are, which is what makes merging
+/// cheap: a semi join over six million driving rows merges the same eight kilobytes per instance
+/// as one over six.
+#[derive(Debug)]
+pub(crate) struct Marking<'a> {
+    /// The table, the equalities, the residual and the gathered rows, all of them already written.
+    probe: Probe<'a>,
+    /// What this operator produces, which is the gathered side and nothing beside it.
+    schema: Schema,
+    /// One bit per gathered row, set where some driving row matched it.
+    marked: Mutex<Vec<u64>>,
+    /// What the answer is charged, held for as long as it is readable.
+    held: Mutex<Reservation>,
+    out: Buffered,
+}
+
+/// One instance's share of a marking join.
+#[derive(Debug)]
+pub(crate) struct Marks {
+    /// The driving chunk's key columns, evaluated once when the chunk arrived.
+    keys: Vec<Vector>,
+    /// The driving chunk's slot per row, looked up once when the chunk arrived.
+    slots: Vec<usize>,
+    /// The buffers the lookup walks a chunk with, held here so that a chunk costs no allocation.
+    scratch: Scratch,
+    /// The gathered rows the current driving row matches, refilled per row from its chain.
+    chain: Vec<u32>,
+    /// The candidates a residual condition kept, when there is a residual condition.
+    cand: Candidates,
+    /// This instance's bits, one per gathered row, merged into the operator's in `combine`.
+    ///
+    /// Empty until the first chunk, because how many bits there are is how many rows the gathered
+    /// side has and [`Sink::local`] cannot fail and so cannot read the table.
+    bits: Vec<u64>,
+}
+
+impl<'a> Marking<'a> {
+    /// The marking join for this join, or nothing when this is not one a lookup answers.
+    ///
+    /// `left` is the schema of the side whose rows arrive here and `right` is the side the
+    /// pipeline before this one gathered, exactly as [`Probe::new`] takes them. Unlike there,
+    /// `kind` is the plan's own: turning a semi join around does not make it another kind, it
+    /// makes it the same kind answered from the other end, which is why no new
+    /// [`JoinKind`] had to be invented for this.
+    pub(crate) fn new(
+        plan: &'a Plan,
+        left: &Schema,
+        right: &Gathered<'_>,
+        kind: JoinKind,
+        conditions: Slice,
+        cancel: &Cancel,
+        memory: &Memory,
+    ) -> Option<(Self, Buffered)> {
+        if !matches!(kind, JoinKind::Semi | JoinKind::Anti) || !right.swapped {
+            return None;
+        }
+        let probe = Probe::new(plan, left, right, kind, conditions, cancel, memory)?;
+        let out = Buffered::new();
+        let marking = Self {
+            probe,
+            schema: right.schema.clone(),
+            marked: Mutex::new(Vec::new()),
+            held: Mutex::new(memory.reservation()),
+            out: out.clone(),
+        };
+        Some((marking, out))
+    }
+
+    /// Applies the session semantics to the key expressions.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.probe = self.probe.in_session(session);
+        self
+    }
+
+    /// What this operator produces, which is the gathered side's columns and nothing else.
+    ///
+    /// The gathered side is the plan's left input here, because that is what turning the join
+    /// around means, and a semi or an anti join produces the plan's left input's columns. So there
+    /// is no column order to put back and [`Probe::swapped`] has nothing to do in this operator.
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// The key this join can hand to the scan under its driving side.
+    ///
+    /// Both kinds, where [`Probe::sideways`] takes only the two that drop a driving row with no
+    /// match. The rule there is about what a driving row with no match produces and here a driving
+    /// row produces nothing at all: all it can do is set a bit, and a row whose key is outside the
+    /// gathered side's range sets no bit whether it is read or not. So an anti join is on the list
+    /// here, and it is the one that wants it most, since the side it drives is the larger one by
+    /// construction.
+    pub(crate) fn sideways(&self) -> Option<(ExprRef, ColumnBinding)> {
+        self.probe.keyed_sideways()
+    }
+}
+
+impl Sink for Marking<'_> {
+    type Local = Marks;
+
+    fn local(&self) -> Marks {
+        Marks {
+            keys: Vec::new(),
+            slots: Vec::new(),
+            scratch: Scratch::default(),
+            chain: Vec::new(),
+            cand: Candidates::default(),
+            bits: Vec::new(),
+        }
+    }
+
+    /// Builds the table here, where the whole lease is free, rather than inside an instance.
+    ///
+    /// The same reason [`Stream::prepare`] gives. The table is smaller than a probe's by the
+    /// argument in this operator's documentation, but one thread building it while the rest of the
+    /// lease sleeps on a lock is the same shape of waste whatever its size.
+    fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
+        self.probe.built_with(threads)?;
+        Ok(())
+    }
+
+    fn sink(&self, chunk: &Chunk, local: &mut Marks) -> Result<Progress> {
+        let built = self.probe.built()?;
+        let rows = built.rows.rows();
+        if rows == 0 || chunk.is_empty() {
+            return Ok(Progress::More);
+        }
+        if local.bits.is_empty() {
+            local.bits = vec![0; rows.div_ceil(u64::BITS as usize)];
+        }
+        // Once per driving chunk rather than once per driving row, which is what keeps the driving
+        // side on its batch interface. Nothing at all against an empty table, for the reason
+        // [`Probing::keys`] gives: every lookup misses, so the keys would be evaluated to be
+        // thrown away and a key expression that raises would raise where no pair existed.
+        local.keys = if built.index.is_empty() {
+            Vec::new()
+        } else {
+            evaluate_all_in_time_zone(
+                self.probe.plan,
+                &self.probe.equalities.left,
+                &self.probe.left_schema,
+                chunk,
+                self.probe.time_zone,
+            )?
+        };
+        local.slots.clear();
+        if !local.keys.is_empty() {
+            built.index.slots(
+                &local.keys,
+                chunk.len(),
+                &self.probe.equalities.null_is_a_value,
+                &mut local.scratch,
+                &mut local.slots,
+            );
+        }
+        // What a residual answered about the chunk before this one says nothing about this one,
+        // and the row numbers it is held under would be read as if it did.
+        local.cand.forget();
+        let residual = self.probe.residual();
+        let Marks { slots, chain, cand, bits, .. } = local;
+        // No check in here. It is one chain walk per row over a driving chunk of at most
+        // [`VECTOR_SIZE`] rows, and the wrapper checks between chunks.
+        for row in 0..chunk.len() {
+            let found: &[u32] = if residual.exprs.is_empty() {
+                let slot = slots.get(row).copied().unwrap_or(MISS);
+                built.index.matches(slot, chain);
+                chain
+            } else {
+                if !cand.holds(row) {
+                    cand.from = row;
+                    cand.fill(&residual, chunk, &built, slots)?;
+                }
+                cand.of(row)
+            };
+            for &at in found {
+                let at = at as usize;
+                if let Some(word) = bits.get_mut(at / u64::BITS as usize) {
+                    *word |= 1 << (at % u64::BITS as usize);
+                }
+            }
+        }
+        Ok(Progress::More)
+    }
+
+    fn combine(&self, local: Marks) -> Result<()> {
+        if local.bits.is_empty() {
+            return Ok(());
+        }
+        let mut marked = self.marked.lock().map_err(poisoned)?;
+        if marked.is_empty() {
+            *marked = local.bits;
+            return Ok(());
+        }
+        for (word, one) in marked.iter_mut().zip(local.bits) {
+            *word |= one;
+        }
+        Ok(())
+    }
+
+    /// The gathered rows the bits chose, in the order the gathered side holds them.
+    ///
+    /// A chunk at a time and gathered at positions, which is [`Build::gather`] doing exactly what
+    /// it does for a probe. The order does not depend on which instance marked which row, which is
+    /// the promise [`Sink::parallel`] asks for.
+    fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
+        let built = self.probe.built_with(threads)?;
+        let marked = std::mem::take(&mut *self.marked.lock().map_err(poisoned)?);
+        // A semi join keeps the rows something matched and an anti join keeps the rest. That one
+        // comparison is the whole difference between the two kinds here.
+        let wanted = self.probe.kind == JoinKind::Semi;
+        let mut chunks = Vec::new();
+        let mut at: Vec<u32> = Vec::with_capacity(VECTOR_SIZE);
+        let mut charged = self.held.lock().map_err(poisoned)?;
+        for row in 0..built.rows.rows() {
+            let bit = marked
+                .get(row / u64::BITS as usize)
+                .is_some_and(|word| word >> (row % u64::BITS as usize) & 1 == 1);
+            if bit != wanted {
+                continue;
+            }
+            at.push(u32::try_from(row).map_err(|_| unaddressable())?);
+            if at.len() == VECTOR_SIZE {
+                let chunk = built.rows.chunk(&at)?;
+                charged.grow(chunk.footprint() as u64)?;
+                chunks.push(chunk);
+                at.clear();
+            }
+        }
+        if !at.is_empty() {
+            let chunk = built.rows.chunk(&at)?;
+            charged.grow(chunk.footprint() as u64)?;
+            chunks.push(chunk);
+        }
+        self.out.fill(chunks)
+    }
+}
+
+/// What a join says when its gathered side holds more rows than a position can name.
+fn unaddressable() -> Error {
+    Error::internal("a join gathered more rows than it can address")
 }
 
 /// What a scalar subquery says when it turns out not to be scalar.
@@ -1935,8 +2218,8 @@ mod tests {
     use rudb_vector::{Data, Validity, Vector};
 
     use super::{
-        Buffered, Chunk, CrossProduct, Gathered, Join, Probe, Progress, Schema, Side, Sink, Stream,
-        equalities, side_of,
+        Buffered, Chunk, CrossProduct, Gathered, Join, Marking, Probe, Progress, Schema, Side,
+        Sink, Stream, equalities, side_of,
     };
     use crate::gather::Keep;
 
@@ -2845,5 +3128,244 @@ mod tests {
             probed(&probe, &chunk(&[1, 2, 3]), 2),
             [vec![Value::Integer(2), Value::BigInt(2)], vec![Value::Integer(3), Value::BigInt(3)]]
         );
+    }
+
+    /// The subject side of a turned around join, gathered the way the pipeline before it would.
+    fn subject(rows: &[Option<i32>], memory: &Memory) -> Buffered {
+        let (keep, kept) = Keep::new(memory);
+        let mut local = keep.local();
+        if !rows.is_empty() {
+            keep.sink(&some_chunk(rows), &mut local).expect("the gathered rows");
+        }
+        keep.combine(local).expect("the one instance");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
+        kept
+    }
+
+    /// Every row a marking join answers with, given the subject it gathered and what drives it.
+    ///
+    /// `driving` is a chunk per instance rather than a chunk per call, so a test that hands over
+    /// two of them is a test of two instances marking the same side and their bits being merged.
+    /// `kind` is the plan's own, because turning a join around does not make it another kind.
+    fn marking(
+        kind: JoinKind,
+        subject_rows: &[Option<i32>],
+        driving: &[&[Option<i32>]],
+    ) -> Vec<Value> {
+        let mut plan = Plan::new();
+        // The driving side is this operator's left and the gathered subject is its right, which is
+        // what `swapped` says: the subject is the plan's left input.
+        let (left, right) = (schema("b", 1), schema("a", 0));
+        let conditions = {
+            let one = column(&mut plan, 1, LogicalType::Integer);
+            let other = column(&mut plan, 0, LogicalType::Integer);
+            let key = equal(&mut plan, one, other);
+            plan.add_expr_list(&[key])
+        };
+        let memory = Memory::unlimited();
+        let kept = subject(subject_rows, &memory);
+        let (mark, out) = Marking::new(
+            &plan,
+            &left,
+            &Gathered { schema: &right, chunks: kept, marker: None, swapped: true },
+            kind,
+            conditions,
+            &Cancel::new(),
+            &memory,
+        )
+        .expect("one equality is enough to mark on");
+        for rows in driving {
+            let mut local = mark.local();
+            mark.sink(&some_chunk(rows), &mut local).expect("a driving chunk");
+            mark.combine(local).expect("one instance");
+        }
+        mark.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
+        answered_rows(&out)
+    }
+
+    /// The one column of every chunk a sink left in its buffer.
+    fn answered_rows(out: &Buffered) -> Vec<Value> {
+        let reader = out.reader();
+        let mut rows = Vec::new();
+        for at in 0..reader.len().expect("the chunks") {
+            let chunk = reader.at(at).expect("the chunk").expect("a chunk that was counted");
+            rows.extend((0..chunk.len()).map(|row| chunk.value_at(row, 0)));
+        }
+        rows
+    }
+
+    /// The point of the operator. A semi join produces the rows of the side it gathered, in the
+    /// order that side holds them, and the side it gathered is the subject.
+    #[test]
+    fn a_marking_semi_join_answers_with_the_gathered_rows_something_matched() {
+        assert_eq!(
+            marking(JoinKind::Semi, &[Some(1), Some(2), Some(3)], &[&[Some(3), Some(1)]]),
+            [Value::Integer(1), Value::Integer(3)]
+        );
+    }
+
+    /// The other half of the same bitmap, which is the whole difference between the two kinds.
+    #[test]
+    fn a_marking_anti_join_answers_with_the_gathered_rows_nothing_matched() {
+        assert_eq!(
+            marking(JoinKind::Anti, &[Some(1), Some(2), Some(3)], &[&[Some(3), Some(1)]]),
+            [Value::Integer(2)]
+        );
+    }
+
+    /// A subject row matched by many driving rows is still one row of the answer. That is what a
+    /// semi join means and it is what a bit rather than a counter gives for free.
+    #[test]
+    fn a_marking_semi_join_answers_a_subject_row_once_however_often_it_matched() {
+        assert_eq!(
+            marking(JoinKind::Semi, &[Some(1), Some(2)], &[&[Some(2), Some(2), Some(2)]]),
+            [Value::Integer(2)]
+        );
+    }
+
+    /// Two instances, each with its own bits, merged in `combine`. A subject row is in the answer
+    /// when either of them marked it, which is what makes the driving side safe to run in
+    /// parallel.
+    #[test]
+    fn a_marking_join_puts_the_bits_of_two_instances_together() {
+        assert_eq!(
+            marking(JoinKind::Semi, &[Some(1), Some(2), Some(3)], &[&[Some(1)], &[Some(3)]]),
+            [Value::Integer(1), Value::Integer(3)]
+        );
+    }
+
+    /// Nothing drives it at all, which is the case the bitmap is never sized for. A semi join over
+    /// an empty other side keeps nothing and an anti join over one keeps everything.
+    #[test]
+    fn a_marking_join_over_a_driving_side_with_no_rows_marks_nothing() {
+        assert_eq!(marking(JoinKind::Semi, &[Some(1), Some(2)], &[]), []);
+        assert_eq!(
+            marking(JoinKind::Anti, &[Some(1), Some(2)], &[]),
+            [Value::Integer(1), Value::Integer(2)]
+        );
+    }
+
+    /// The null rule, from the other end. Under `=` a null key matches nothing, so a subject row
+    /// whose key is null is never marked however the other side is written, and it is the anti
+    /// join that keeps it.
+    #[test]
+    fn a_marking_join_never_marks_a_subject_row_whose_key_is_null() {
+        assert_eq!(
+            marking(JoinKind::Semi, &[Some(1), None], &[&[Some(1), None]]),
+            [Value::Integer(1)]
+        );
+        assert_eq!(marking(JoinKind::Anti, &[Some(1), None], &[&[Some(1), None]]), [Value::Null]);
+    }
+
+    /// A subject with no rows in it answers nothing whichever kind asks, and the table it builds
+    /// is the empty one every driving row misses in.
+    #[test]
+    fn a_marking_join_over_an_empty_subject_answers_nothing() {
+        assert_eq!(marking(JoinKind::Semi, &[], &[&[Some(1)]]), []);
+        assert_eq!(marking(JoinKind::Anti, &[], &[&[Some(1)]]), []);
+    }
+
+    /// The condition the lookup did not answer, evaluated on the candidates the equality found and
+    /// read back a driving row at a time. TPC-H q21's two turned around joins are written this
+    /// way, `ON l.orderkey = o.orderkey AND l.suppkey <> o.suppkey`, so the residual is not a
+    /// corner of this operator but the case it was written for.
+    #[test]
+    fn a_marking_join_marks_only_what_the_residual_kept() {
+        let mut plan = Plan::new();
+        let (left, right) = (pair_schema(1), pair_schema(0));
+        let conditions = {
+            let one = column_at(&mut plan, 1, 0, LogicalType::Integer);
+            let other = column_at(&mut plan, 0, 0, LogicalType::Integer);
+            let key = equal(&mut plan, one, other);
+            let driving_g = column_at(&mut plan, 1, 1, LogicalType::Integer);
+            let subject_g = column_at(&mut plan, 0, 1, LogicalType::Integer);
+            let over = greater(&mut plan, driving_g, subject_g);
+            plan.add_expr_list(&[key, over])
+        };
+        let memory = Memory::unlimited();
+        let (keep, kept) = Keep::new(&memory);
+        let mut local = keep.local();
+        // Two subject rows on the same key, told apart only by the column the residual reads.
+        keep.sink(&pair_chunk(&[(7, 1), (7, 9), (8, 1)]), &mut local).expect("the gathered rows");
+        keep.combine(local).expect("the one instance");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
+        let (mark, out) = Marking::new(
+            &plan,
+            &left,
+            &Gathered { schema: &right, chunks: kept, marker: None, swapped: true },
+            JoinKind::Semi,
+            conditions,
+            &Cancel::new(),
+            &memory,
+        )
+        .expect("an equality beside a residual is still a lookup");
+        let mut instance = mark.local();
+        // Key 7 finds both subject rows and the residual keeps the one whose `g` is under 5. Key
+        // 8 finds the third and the residual throws it away.
+        mark.sink(&pair_chunk(&[(7, 5), (8, 0)]), &mut instance).expect("a driving chunk");
+        mark.combine(instance).expect("the one instance");
+        mark.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
+
+        assert_eq!(answered_rows(&out), [Value::Integer(7)]);
+    }
+
+    /// An anti join is on the list a semi join is on, which [`Probe::sideways`] is not. A driving
+    /// row here can only set a bit, and one whose key no gathered row holds sets none whether the
+    /// scan reads it or not, so the scan may as well not read it.
+    #[test]
+    fn a_marking_join_offers_its_key_to_the_scan_under_either_kind() {
+        for kind in [JoinKind::Semi, JoinKind::Anti] {
+            let mut plan = Plan::new();
+            let (left, right) = (schema("b", 1), schema("a", 0));
+            let conditions = {
+                let one = column(&mut plan, 1, LogicalType::Integer);
+                let other = column(&mut plan, 0, LogicalType::Integer);
+                let key = equal(&mut plan, one, other);
+                plan.add_expr_list(&[key])
+            };
+            let memory = Memory::unlimited();
+            let kept = subject(&[Some(1)], &memory);
+            let (mark, _out) = Marking::new(
+                &plan,
+                &left,
+                &Gathered { schema: &right, chunks: kept, marker: None, swapped: true },
+                kind,
+                conditions,
+                &Cancel::new(),
+                &memory,
+            )
+            .expect("one equality is enough to mark on");
+            assert!(mark.sideways().is_some(), "a {} join has a key to offer", kind.keyword());
+        }
+    }
+
+    /// The operator refuses the join it was not written for rather than answering it wrongly.
+    /// Nothing in the executor asks it to, because only `sides` turns a join around and it turns
+    /// around no other kind, but the refusal is what makes that a fact about one pass rather than
+    /// a thing two places have to agree on.
+    #[test]
+    fn a_marking_join_refuses_a_kind_it_does_not_answer() {
+        let mut plan = Plan::new();
+        let (left, right) = (schema("b", 1), schema("a", 0));
+        let conditions = {
+            let one = column(&mut plan, 1, LogicalType::Integer);
+            let other = column(&mut plan, 0, LogicalType::Integer);
+            let key = equal(&mut plan, one, other);
+            plan.add_expr_list(&[key])
+        };
+        let memory = Memory::unlimited();
+        for kind in [JoinKind::Inner, JoinKind::Left, JoinKind::Single, JoinKind::Mark] {
+            let kept = subject(&[Some(1)], &memory);
+            let made = Marking::new(
+                &plan,
+                &left,
+                &Gathered { schema: &right, chunks: kept, marker: None, swapped: true },
+                kind,
+                conditions,
+                &Cancel::new(),
+                &memory,
+            );
+            assert!(made.is_none(), "a {} join is not a marking join", kind.keyword());
+        }
     }
 }

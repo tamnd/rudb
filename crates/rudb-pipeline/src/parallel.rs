@@ -121,6 +121,10 @@ pub fn run_parallel(
     for stream in pipeline.streams() {
         stream.prepare_once(lease)?;
     }
+    // The sink too, for the same reason. A join that gathered the side it produces marks rather
+    // than pairs, so it ends its pipeline instead of sitting in the middle of one, and its table
+    // is shared by every instance exactly as a probe's is.
+    pipeline.sink().prepare_once(lease)?;
 
     let stop = Stop::default();
     let failed = AtomicBool::new(false);
