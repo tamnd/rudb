@@ -371,26 +371,26 @@ impl Exchange {
         if !nulled {
             match group_nulls {
                 None => {
-                    for row in 0..rows {
-                        scatter(&mut local.partitions, shift, reader.at(row), true, held_user[row]);
+                    for (row, &user) in held_user.iter().enumerate() {
+                        scatter(&mut local.partitions, shift, reader.at(row), true, user);
                     }
                 }
                 Some(nulls) => {
-                    for row in 0..rows {
+                    for (row, &user) in held_user.iter().enumerate() {
                         let valid = !nulls.is_null_at(row);
                         let group = if valid { reader.at(row) } else { 0 };
-                        scatter(&mut local.partitions, shift, group, valid, held_user[row]);
+                        scatter(&mut local.partitions, shift, group, valid, user);
                     }
                 }
             }
         } else {
-            for row in 0..rows {
+            for (row, &held) in held_user.iter().enumerate() {
                 if user.is_null_at(row) {
                     continue;
                 }
                 let valid = group_nulls.is_none_or(|nulls| !nulls.is_null_at(row));
                 let group = if valid { reader.at(row) } else { 0 };
-                scatter(&mut local.partitions, shift, group, valid, held_user[row]);
+                scatter(&mut local.partitions, shift, group, valid, held);
             }
         }
         let after = local.partitions.iter().map(Run::footprint).sum::<usize>();

@@ -1,90 +1,29 @@
-//! Reading a signed integer column where it lies rather than a row at a time.
+//! Reading a signed integer column as a block rather than a row at a time.
 //!
 //! Asking a [`Vector`] for one row costs a match on the layout, a widen to 128 bits and, at the
 //! caller, a checked narrowing back. On a column of a million rows that is paid a million times for
-//! a layout that does not change between rows. Picking the layout once and then reading the run of
-//! words, or the packed bits, where the values actually lie costs none of that.
+//! a layout that does not change between rows. Reading the whole run up front costs one call and
+//! leaves the loop above it indexing a flat slice.
 //!
 //! This is the same lift #237 did for the group hash, #539 for the key comparison and #804 for the
 //! `COUNT(DISTINCT BIGINT)` scatter. It lives here rather than in one of the aggregate modules
-//! because two of them want it and a third is likely to, and a second copy would be free to drift
-//! on which layouts it recognises.
+//! because three of them want it, and a second copy would be free to drift on which layouts it
+//! recognises.
 
 use rudb_common::{Error, Result};
-use rudb_vector::{Data, Packed, Vector};
-
-/// One signed column, with the layout decided once instead of once a row.
-///
-/// [`Self::Other`] is the fallback for a layout with no run to read, and it is the row at a time
-/// path the rest of this exists to avoid.
-pub(crate) enum SignedReader<'a> {
-    Int16(&'a [i16]),
-    Int32(&'a [i32]),
-    Int64(&'a [i64]),
-    Packed(Packed<'a>),
-    Other(&'a Vector),
-}
-
-impl<'a> SignedReader<'a> {
-    /// The cheapest reader the vector's layout allows.
-    pub(crate) fn new(vector: &'a Vector) -> Self {
-        match vector.data() {
-            Some(Data::Int16(values)) => Self::Int16(values.as_slice()),
-            Some(Data::Int32(values)) => Self::Int32(values.as_slice()),
-            Some(Data::Int64(values)) => Self::Int64(values.as_slice()),
-            _ => match vector.packed_parts() {
-                Some(packed) => Self::Packed(packed),
-                None => Self::Other(vector),
-            },
-        }
-    }
-
-    /// The value at one row, widened.
-    ///
-    /// # Panics
-    ///
-    /// Panics on the fallback path when the vector has no signed representation for the row, which
-    /// callers rule out by only reaching here for a column the binder typed as a signed integer.
-    pub(crate) fn at(&self, row: usize) -> i128 {
-        match self {
-            Self::Int16(values) => i128::from(values[row]),
-            Self::Int32(values) => i128::from(values[row]),
-            Self::Int64(values) => i128::from(values[row]),
-            Self::Packed(packed) => {
-                let words = packed.words();
-                let width = packed.width();
-                let bit = (packed.offset() + row) * width as usize;
-                let word = bit / u64::BITS as usize;
-                let shift = (bit % u64::BITS as usize) as u32;
-                let mask = u64::MAX >> (u64::BITS - width);
-                let low = words.get(word).copied().unwrap_or(0) >> shift;
-                let taken = u64::BITS - shift;
-                let code = if taken >= width {
-                    low & mask
-                } else {
-                    let high = words.get(word + 1).copied().unwrap_or(0) << taken;
-                    (low | high) & mask
-                };
-                packed.base() + i128::from(code)
-            }
-            Self::Other(vector) => {
-                vector.signed_at(row).expect("the typed aggregate input is a signed value")
-            }
-        }
-    }
-}
+use rudb_vector::Vector;
 
 /// One signed column read into a flat run of 64 bit values, once per chunk rather than once per row.
 ///
-/// [`SignedReader`] picks the layout once and then still walks the column a row at a time, which
-/// costs a match on the reader, a bounds check and a widen to 128 bits that the caller then narrows
-/// back. Reading the whole run up front costs one call and leaves the loop above it indexing a flat
-/// slice. Callgrind put the row at a time form at 13% of ClickBench 9 and 11% of ClickBench 8.
+/// What this replaces is a reader that picked the layout once and then still walked the column a
+/// row at a time, which cost a match on the reader, a bounds check and a widen to 128 bits that the
+/// caller narrowed straight back. Callgrind put that at 13% of ClickBench 9 and 11% of ClickBench 8.
 ///
 /// `Vector::signed_block` copies a flat `BIGINT` run and sign extends a narrower one, both of which
-/// the compiler widens into a handful of instructions per lane. The forms it will not hand over, a
-/// dictionary and a run among them, are filled here a row at a time, so no caller has to know which
-/// kind of column it was given.
+/// the compiler widens into a handful of instructions per lane, and it walks a packed run or a
+/// sequence with the arithmetic those need. The forms it will not hand over, a dictionary and a run
+/// among them, are filled here a row at a time, so no caller has to know which kind of column it was
+/// given.
 ///
 /// Nulls are the same question asked once. A column with none in it costs the loop above nothing,
 /// and a column with some is asked row by row the way it always was, because a null is read out of
@@ -148,7 +87,7 @@ mod tests {
     use rudb_common::{LogicalType, Value};
     use rudb_vector::Vector;
 
-    use super::{SignedBlock, SignedReader};
+    use super::SignedBlock;
 
     /// The layout the vector hands over as a block and the layout it refuses have to come back the
     /// same, because the caller above this cannot tell them apart and indexes both the same way.
@@ -182,19 +121,21 @@ mod tests {
         assert!(block.cut(4).is_err(), "more rows than the chunk held");
     }
 
-    /// A packed column with an offset, which is the layout [`SignedReader`] exists for and the one
-    /// whose bit arithmetic it writes out by hand rather than borrowing from the vector.
+    /// A packed column that starts partway through its own words, which is what a chunk cut out of a
+    /// stored page looks like and the one shape whose arithmetic is easy to get off by a row.
     #[test]
-    fn a_reader_agrees_with_the_vector_on_an_offset_packed_column() {
+    fn a_block_agrees_with_the_vector_on_an_offset_packed_column() {
         let values: Vec<Value> =
             (0..256).map(|row| Value::Integer((row * 37 % 127) - 30)).collect();
         let flat = Vector::from_values(LogicalType::Integer, &values).expect("an integer vector");
         let packed = flat.bit_packed().expect("the vector packs");
         assert!(packed.packed_parts().is_some());
         let cut = packed.slice(3, 200).expect("an offset packed vector");
-        let reader = SignedReader::new(&cut);
-        for row in 0..cut.len() {
-            assert_eq!(reader.at(row), cut.signed_at(row).expect("a signed value"));
+        let mut block = SignedBlock::default();
+        block.read(cut.len(), &cut).expect("a packed column is read as a block");
+        let held = block.cut(cut.len()).expect("every row of it");
+        for (row, &value) in held.iter().enumerate() {
+            assert_eq!(i128::from(value), cut.signed_at(row).expect("a signed value"));
         }
     }
 }
