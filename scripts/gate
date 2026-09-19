@@ -89,5 +89,11 @@ case "$changed" in
 esac
 
 # Non-interactive ssh does not read the profile that puts cargo on the path, so it goes on here.
+#
+# Incremental compilation is off because nothing here can use it. Every run rsyncs a tree in and the
+# files it changed are the ones the incremental cache would have to throw away anyway, and what the
+# cache does instead is grow. Two runs have failed on a full disk because of it, one with a bus error
+# out of the linker and one with a plain out of space, and 5.6G of the 23G under one gate tree on
+# server2 was incremental state that had never saved anybody a second.
 # shellcheck disable=SC2029
-ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; export RUDB_CI_BASE='$base'; export RUDB_CI_CHANGED='$changed'; cd ~/$remote && cargo xtask ci $*"
+ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; export CARGO_INCREMENTAL=0; export RUDB_CI_BASE='$base'; export RUDB_CI_CHANGED='$changed'; cd ~/$remote && cargo xtask ci $*"
