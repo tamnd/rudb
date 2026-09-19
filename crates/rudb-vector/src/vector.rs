@@ -270,6 +270,31 @@ impl Data {
         crate::for_each_layout!(signed, widened)
     }
 
+    /// The first `len` signed integers, widened to `i64`, appended to `out`.
+    ///
+    /// The bulk form of [`Self::signed_at`]. Four of the five signed layouts, because the fifth is
+    /// 128 bits wide and does not fit what this hands back. `Int64` is a copy of the run and the
+    /// three narrower ones are a sign extension the compiler turns into one instruction per lane.
+    ///
+    /// `false`, leaving `out` as it found it, for the wide layout, for a run shorter than `len` and
+    /// for every layout that is not a signed integer.
+    #[must_use]
+    pub fn signed_block(&self, len: usize, out: &mut Vec<i64>) -> bool {
+        match self {
+            Self::Int8(v) => widen(v.as_slice(), len, out),
+            Self::Int16(v) => widen(v.as_slice(), len, out),
+            Self::Int32(v) => widen(v.as_slice(), len, out),
+            Self::Int64(v) => match v.as_slice().get(..len) {
+                Some(run) => {
+                    out.extend_from_slice(run);
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
     /// An unsigned integer at `index`, widened.
     #[must_use]
     pub fn unsigned_at(&self, index: usize) -> Option<u128> {
@@ -2100,6 +2125,90 @@ impl Vector {
         }
     }
 
+    /// Every signed value in order, widened to `i64`, written into `out`.
+    ///
+    /// The bulk form of [`Self::signed_at`], for a caller that is going to read the whole vector
+    /// anyway. A group by on two integer columns called `signed_at` once per column per row, and
+    /// every one of those matched on the body, called into the data and matched again on the
+    /// layout, which is about sixty five instructions to read a number that was already sitting in
+    /// a slice. It was a fifth of ClickBench 32 on its own.
+    ///
+    /// A null writes whatever the body holds under it, which is the zero a flat column keeps behind
+    /// its mask. Nulls are a separate question and the caller asks it separately, from
+    /// [`Self::none_null`] once for the vector when that answers and a row at a time when it does
+    /// not.
+    ///
+    /// `false`, with `out` left empty, for a vector this cannot hand over as a block: `HUGEINT` and
+    /// the wide decimals, whose values do not fit an `i64`, the string and nested forms, the
+    /// compressed form, and the dictionary and run forms, which are a gather rather than a copy and
+    /// are left until something wants them. A caller that gets `false` reads the vector the way it
+    /// read it before, with [`Self::signed_at`].
+    #[must_use]
+    pub fn signed_block(&self, out: &mut Vec<i64>) -> bool {
+        out.clear();
+        match &self.body {
+            Body::Flat(data) => data.signed_block(self.len, out),
+            Body::Constant(value) => {
+                let held = match value.as_ref() {
+                    Value::TinyInt(x) => i64::from(*x),
+                    Value::SmallInt(x) => i64::from(*x),
+                    Value::Integer(x) | Value::Date(x) => i64::from(*x),
+                    Value::BigInt(x) | Value::Time(x) | Value::Timestamp(x) => *x,
+                    _ => return false,
+                };
+                out.resize(self.len, held);
+                true
+            }
+            // The same arithmetic [`Self::signed_at`] does on a sequence, once per row rather than
+            // once per call, and it wraps where that one wraps.
+            Body::Sequence { start, step } => {
+                out.extend(
+                    (0..self.len).map(|index| start.wrapping_add(step.wrapping_mul(index as i64))),
+                );
+                true
+            }
+            Body::Packed { words, width, base, offset } => match i64::try_from(*base) {
+                Ok(base) => {
+                    out.extend((0..self.len).map(|index| {
+                        base.wrapping_add(code_at(
+                            words,
+                            (*offset + index) * *width as usize,
+                            *width,
+                        ) as i64)
+                    }));
+                    true
+                }
+                Err(_) => false,
+            },
+            Body::Dictionary { .. }
+            | Body::Runs { .. }
+            | Body::Coded { .. }
+            | Body::Views { .. }
+            | Body::ExternalText { .. }
+            | Body::Nested { .. }
+            | Body::Fields { .. } => false,
+        }
+    }
+
+    /// Whether the vector holds no nulls at all, asked once rather than a row at a time.
+    ///
+    /// The bulk form of [`Self::is_null_at`], and it answers the same question that one does, so a
+    /// dictionary and a run are read through to the values behind them where those two keep their
+    /// nulls. A dictionary that holds a null no code points at answers `false` here and `false` at
+    /// every row, which is the safe direction and is the only place the two can differ.
+    ///
+    /// A caller that gets `false` goes back to asking a row at a time.
+    #[must_use]
+    pub fn none_null(&self) -> bool {
+        if self.validity.has_nulls(self.len) {
+            return false;
+        }
+        match &self.body {
+            Body::Dictionary { values, .. } | Body::Runs { values, .. } => values.none_null(),
+            _ => true,
+        }
+    }
+
     /// Every value in order, as single values.
     pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
         (0..self.len).map(|index| self.value_at(index))
@@ -2661,6 +2770,20 @@ impl Coded<'_> {
         let mut out = Vec::with_capacity(bytes.len());
         self.table.compress(bytes, &mut out);
         out
+    }
+}
+
+/// The first `len` of a run of some narrower signed width, sign extended into `out`.
+///
+/// Written once and called from the three narrow arms of [`Data::signed_block`], so that the sign
+/// extension is one loop the compiler can widen rather than three written out by hand.
+fn widen<T: Copy + Into<i64>>(run: &[T], len: usize, out: &mut Vec<i64>) -> bool {
+    match run.get(..len) {
+        Some(run) => {
+            out.extend(run.iter().map(|&x| x.into()));
+            true
+        }
+        None => false,
     }
 }
 
@@ -4301,6 +4424,76 @@ mod tests {
         assert_eq!(text.signed_at(0), None, "a string is not a number");
         let double = Vector::flat(LogicalType::Double, Data::Float64(vec![1.5].into())).unwrap();
         assert_eq!(double.signed_at(0), None, "a double is not a signed integer");
+    }
+
+    /// The block form has to agree with the row at a time form on every position of every shape it
+    /// answers for, because a caller picks one of the two and a group by that read two different
+    /// numbers for one row would put that row in two groups.
+    #[test]
+    fn a_block_of_signed_integers_holds_what_the_row_at_a_time_accessor_hands_back() {
+        let mut out = Vec::new();
+        let shapes = [
+            integers(&[7, -3, 0, 2]),
+            Vector::flat(LogicalType::Integer, Data::Int32(vec![5, -6, 7].into())).unwrap(),
+            Vector::flat(LogicalType::SmallInt, Data::Int16(vec![1, -2].into())).unwrap(),
+            Vector::flat(LogicalType::TinyInt, Data::Int8(vec![-128, 127].into())).unwrap(),
+            Vector::constant(LogicalType::BigInt, Value::BigInt(11), 3),
+            Vector::sequence(100, 5, 4),
+            integers(&[1, 2, 3, 1]).bit_packed().unwrap(),
+        ];
+        for column in &shapes {
+            assert!(column.signed_block(&mut out), "{:?} hands over a block", column.form());
+            assert_eq!(out.len(), column.len(), "{:?} filled the whole chunk", column.form());
+            for (index, &held) in out.iter().enumerate() {
+                assert_eq!(
+                    Some(i128::from(held)),
+                    column.signed_at(index),
+                    "{:?} at {index}",
+                    column.form()
+                );
+            }
+        }
+    }
+
+    /// What the block form will not answer for, where the caller reads the vector a row at a time
+    /// instead. A null is not one of them: it writes whatever sits under it and the caller reads the
+    /// null from the column.
+    #[test]
+    fn a_block_is_refused_for_the_shapes_it_would_have_to_gather_or_widen() {
+        let mut out = Vec::new();
+        let flat = integers(&[7, -3, 0, 2]);
+        assert!(!Vector::dictionary(vec![1, 0], flat.clone()).unwrap().signed_block(&mut out));
+        assert!(!Vector::runs(vec![2, 5], integers(&[4, 9])).unwrap().signed_block(&mut out));
+        let wide = Vector::flat(LogicalType::HugeInt, Data::Int128(vec![1, 2].into())).unwrap();
+        assert!(!wide.signed_block(&mut out), "a hugeint does not fit sixty four bits");
+        let double = Vector::flat(LogicalType::Double, Data::Float64(vec![1.5].into())).unwrap();
+        assert!(!double.signed_block(&mut out), "a double is not a signed integer");
+        assert!(out.is_empty(), "a refusal leaves the buffer empty");
+
+        let nulls =
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(4), Value::Null]).unwrap();
+        assert!(nulls.signed_block(&mut out), "a flat column with nulls still hands over");
+        assert_eq!(out[0], 4);
+    }
+
+    /// Asked once for a chunk, and it has to agree with `is_null_at` asked for every row of it.
+    #[test]
+    fn a_vector_says_whether_it_holds_any_null_at_all() {
+        let flat = integers(&[7, -3, 0, 2]);
+        assert!(flat.none_null());
+        let nulls =
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(4), Value::Null]).unwrap();
+        assert!(!nulls.none_null());
+        assert!(Vector::dictionary(vec![1, 0], flat.clone()).unwrap().none_null());
+        // The null is in the dictionary rather than in the mask, which is the case the row at a time
+        // form reads through for and the reason this one does too.
+        let holed = Vector::dictionary(vec![0, 0], nulls.clone()).unwrap();
+        assert!(!holed.none_null(), "a dictionary is read through to its values");
+        assert!(!holed.is_null_at(0), "and no code points at the null it holds");
+        assert!(Vector::runs(vec![2, 5], integers(&[4, 9])).unwrap().none_null());
+        assert!(!Vector::runs(vec![1, 2], nulls).unwrap().none_null());
+        assert!(Vector::constant(LogicalType::BigInt, Value::BigInt(11), 3).none_null());
+        assert!(!Vector::constant(LogicalType::BigInt, Value::Null, 3).none_null());
     }
 
     /// The integer of a value, for comparing `signed_at` against `value_at` position by position.
