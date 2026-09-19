@@ -137,10 +137,27 @@ fn explain_analyze_runs_the_query_and_prints_what_each_operator_actually_did() {
         let estimated = line.contains(" rows exact from row count]")
             || line.contains(" rows estimated from default]");
         assert!(estimated, "a line with no estimate on it: {line}");
-        assert!(line.contains(" rows, "), "a line with no measurement on it: {line}");
+        // The filter is the exception, and it says why rather than going quiet. Its comparison
+        // happens inside the scan a level down, so the rows and the time are counted there and once.
+        let moved = line.contains("[applied by the scan below]");
+        assert!(line.contains(" rows, ") || moved, "a line with no measurement on it: {line}");
     }
     assert!(text.contains("[994 rows, "), "{text}");
-    assert!(text.contains("[1000 rows, "), "{text}");
+    assert!(text.contains("[applied by the scan below]"), "{text}");
+}
+
+/// A filter that stayed where it was still reports what it did.
+///
+/// `a % 2 = 0` is not a column against a constant, so no scan can apply it and the operator is
+/// built. The scan hands up every row it read and the filter throws half of them away, which is the
+/// two numbers this output is for.
+#[test]
+fn explain_analyze_measures_a_filter_that_no_scan_could_take() {
+    let database = with_rows(1000);
+    let text = explained(&database, "EXPLAIN ANALYZE SELECT a FROM t WHERE a % 2 = 0");
+    assert!(!text.contains("[applied by the scan below]"), "{text}");
+    assert!(text.contains("[1000 rows, "), "the scan read all of them: {text}");
+    assert!(text.contains("[500 rows, "), "the filter kept half: {text}");
 }
 
 #[test]

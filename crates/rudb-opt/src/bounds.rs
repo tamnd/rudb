@@ -51,6 +51,46 @@ pub fn of(plan: &Plan, input: rudb_plan::NodeRef, predicate: ExprRef) -> Vec<Tes
     tests
 }
 
+/// The same tests, but only when they are the whole of the predicate.
+///
+/// [`of`] drops the conjuncts it cannot read, which is right for pruning: a test that is missing
+/// costs a chunk that gets read and never costs a row. It is the wrong answer for a scan that means
+/// to apply the filter rather than only prune with it, because there the conjuncts that were dropped
+/// are the rows that were not thrown away. So this answers `Some` only when every conjunct came
+/// through, and the caller that gets `None` leaves the filter where it was.
+///
+/// Empty is `None` too. A predicate that reads as no tests at all is one this says nothing about,
+/// and a scan handed nothing to apply would be a filter deleted rather than moved.
+#[must_use]
+pub fn all_of(plan: &Plan, input: rudb_plan::NodeRef, predicate: ExprRef) -> Option<Vec<Test>> {
+    let index = scanned(plan, input)?;
+    let mut tests = Vec::new();
+    let whole = every_conjunct(plan, predicate, index, &mut tests);
+    (whole && !tests.is_empty()).then_some(tests)
+}
+
+/// The tests a stored table directly below this filter applies itself, when it applies all of them.
+///
+/// Asked of the filter node rather than of a predicate and an input, because two callers ask it and
+/// neither of them should be deciding it. The builder asks so it can move the filter into the scan
+/// and build no operator for it. `EXPLAIN` asks so the filter's line can say that its work happened
+/// below it, since a node with no operator has nothing to report and a line that says nothing reads
+/// like a measurement that went missing.
+///
+/// The condition written twice is the condition that drifts, and the way that failure shows is output
+/// claiming the work moved when it did not, or the other way about. So it is written here.
+///
+/// Only [`Node::Get`]. A `read_parquet` wants the same thing and reads its rows through a different
+/// loop, so it is its own piece of work rather than a second arm here.
+#[must_use]
+pub fn into_scan(plan: &Plan, filter: rudb_plan::NodeRef) -> Option<Vec<Test>> {
+    let Node::Filter { input, predicate } = *plan.node(filter) else { return None };
+    if !matches!(*plan.node(input), Node::Get { .. }) {
+        return None;
+    }
+    all_of(plan, input, predicate)
+}
+
 /// The table index of a scan, or `None` for a node that has no bounds to ask about.
 #[must_use]
 pub fn scanned(plan: &Plan, node: rudb_plan::NodeRef) -> Option<u32> {
@@ -80,6 +120,32 @@ fn conjuncts(plan: &Plan, predicate: ExprRef, index: u32, out: &mut Vec<Test>) {
             }
         }
         _ => {}
+    }
+}
+
+/// [`conjuncts`] again, answering whether it read all of them rather than only collecting the ones
+/// it could.
+///
+/// Written beside the other walk rather than as one walk with a flag because the two want opposite
+/// things from an `OR`. The collecting walk steps over it, since a conjunct under an `OR` says
+/// nothing about the row when it is false. This one has to call it unreadable, since a predicate with
+/// an `OR` in it is a predicate the tests do not add up to.
+fn every_conjunct(plan: &Plan, predicate: ExprRef, index: u32, out: &mut Vec<Test>) -> bool {
+    match *plan.expr(predicate) {
+        // Stops at the first conjunct it cannot read, which leaves `out` holding the ones before it
+        // and is why the caller throws the whole list away rather than using it on a `false`. Half a
+        // predicate in there is not a smaller filter, it is the wrong one.
+        Expr::Conjunction { op: ConjunctionOp::And, children } => {
+            plan.expr_list(children).iter().all(|child| every_conjunct(plan, *child, index, out))
+        }
+        Expr::Compare { op, left, right } => match comparison(plan, op, left, right, index) {
+            Some(test) => {
+                out.push(test);
+                true
+            }
+            None => false,
+        },
+        _ => false,
     }
 }
 

@@ -61,7 +61,7 @@
 //! [`MemoryTable::stats_ns`] is what a load reports it spent here.
 
 use rudb_common::Value;
-use rudb_common::bounds::{Bound, Op, excluded};
+use rudb_common::bounds::{Bound, Op, certain, excluded};
 use rudb_vector::{Chunk, Data, Form, Packed, Vector};
 
 #[cfg(doc)]
@@ -117,6 +117,17 @@ impl Range {
     pub fn excludes(&self, op: Op, value: &Bound) -> bool {
         excluded(op, value, self.low.as_ref(), self.high.as_ref())
     }
+
+    /// Whether this range says every row of the chunk passes `probe`.
+    ///
+    /// A chunk with a null in the column is never certain whatever the two ends say, because a
+    /// comparison against null is null and a filter keeps the rows where its predicate is true. That
+    /// is the one thing this adds to [`certain`], and it is the reason the question is asked here
+    /// rather than of the two bounds on their own: the null count sits beside them and nowhere else.
+    #[must_use]
+    pub fn certain(&self, op: Op, value: &Bound) -> bool {
+        self.nulls == 0 && certain(op, value, self.low.as_ref(), self.high.as_ref())
+    }
 }
 
 /// The ranges of every column of one chunk.
@@ -167,6 +178,25 @@ impl Zone {
             self.columns
                 .get(probe.column)
                 .is_some_and(|range| range.excludes(probe.op, &probe.value))
+        })
+    }
+
+    /// Whether these probes, taken together, keep every row of the chunk.
+    ///
+    /// The mirror of [`Self::skips`], and the quantifier turns over with it. One probe ruling the
+    /// chunk out rules it out, so that one is `any`. Every probe has to pass every row for the
+    /// filter to keep every row, so this one is `all`, and a probe naming a column this does not
+    /// describe says nothing here too, which now means the chunk is not certain and gets compared.
+    ///
+    /// No probes at all is `true` by the shape of `all`, and that is the right answer for the wrong
+    /// reason: a filter with nothing in it does keep every row. Callers do not reach it, because a
+    /// scan with no probes has no comparison to skip in the first place.
+    #[must_use]
+    pub fn certain(&self, probes: &[Probe]) -> bool {
+        probes.iter().all(|probe| {
+            self.columns
+                .get(probe.column)
+                .is_some_and(|range| range.certain(probe.op, &probe.value))
         })
     }
 }
@@ -647,6 +677,51 @@ mod tests {
         let inside = vec![Probe { column: 0, op: Op::Equal, value: Bound::Int(10) }];
         assert!(zone.skips(&outside));
         assert!(!zone.skips(&inside));
+    }
+
+    #[test]
+    fn a_probe_the_whole_range_passes_is_certain_and_one_it_straddles_is_not() {
+        let zone = Zone::of(&chunk(&[10, 20]));
+        let whole = vec![Probe { column: 0, op: Op::GreaterOrEqual, value: Bound::Int(10) }];
+        let part = vec![Probe { column: 0, op: Op::GreaterOrEqual, value: Bound::Int(15) }];
+        assert!(zone.certain(&whole));
+        assert!(!zone.certain(&part));
+        // And neither of them skips it, which is the point: the three answers are different
+        // answers and the middle one used to be the same as the last.
+        assert!(!zone.skips(&whole));
+        assert!(!zone.skips(&part));
+    }
+
+    /// The quantifier turns over between the two questions, which is the thing to get wrong.
+    #[test]
+    fn every_probe_has_to_pass_for_the_chunk_to_be_certain() {
+        let zone = Zone::of(&chunk(&[10, 20]));
+        let probes = vec![
+            Probe { column: 0, op: Op::GreaterOrEqual, value: Bound::Int(10) },
+            Probe { column: 0, op: Op::Less, value: Bound::Int(15) },
+        ];
+        assert!(!zone.certain(&probes), "the second probe throws rows away");
+        assert!(!zone.skips(&probes), "and neither probe rules the chunk out");
+    }
+
+    /// A comparison against null is null and a filter keeps what is true, so one null is enough.
+    #[test]
+    fn a_null_in_the_column_makes_the_chunk_uncertain_whatever_the_ends_say() {
+        let held = [Some(10), None, Some(20)]
+            .map(|value| value.map_or(Value::Null, Value::Integer))
+            .to_vec();
+        let vector = Vector::from_values(LogicalType::Integer, &held).expect("a column");
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        let whole = vec![Probe { column: 0, op: Op::GreaterOrEqual, value: Bound::Int(10) }];
+        assert_eq!(zone.column(0).expect("one column").nulls, 1);
+        assert!(!zone.certain(&whole));
+    }
+
+    #[test]
+    fn a_probe_on_a_column_the_zone_does_not_describe_is_not_certain() {
+        let zone = Zone::of(&chunk(&[10, 20]));
+        let probes = vec![Probe { column: 7, op: Op::GreaterOrEqual, value: Bound::Int(0) }];
+        assert!(!zone.certain(&probes));
     }
 
     /// The conjunction, which is where a query like ClickBench 37 gets its selectivity: four tests

@@ -265,10 +265,21 @@ impl Printing<'_> {
         let pipeline = self.shape.pipeline(node);
         let marker =
             if self.seams.all_reference(self.plan.node(node)) { " [reference]" } else { "" };
-        let actual = self
-            .measured
-            .map(|measured| actually(measured, self.shape.operator(node)))
-            .unwrap_or_default();
+        // A filter the scan below applies is a node with no operator, so there is nothing to look up
+        // and nothing went wrong. It says where its work went instead, and the rows and the time are
+        // on the scan's line one level down, counted once.
+        //
+        // Only under `ANALYZE`, because this is what stands in place of a measurement. A plan printed
+        // without one has no column here at all, and a note about where work happens in a run that
+        // did not happen would be answering a question nobody asked.
+        let moved = self.measured.is_some() && crate::bounds::into_scan(self.plan, node).is_some();
+        let actual = if moved {
+            "  [applied by the scan below]".to_owned()
+        } else {
+            self.measured
+                .map(|measured| actually(measured, self.shape.operator(node)))
+                .unwrap_or_default()
+        };
         // The estimate goes after the operator rather than in a column of its own, because the tree
         // is indented and a column would have to be wider than the deepest line to line up.
         let _ = writeln!(

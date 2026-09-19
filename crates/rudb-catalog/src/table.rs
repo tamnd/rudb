@@ -379,6 +379,18 @@ impl Rows {
         }
     }
 
+    /// Whether statistics prove every row of this chunk matches.
+    ///
+    /// The other side of [`Self::skips`], and what a scan holding the filter itself asks before it
+    /// runs one. A chunk this answers `true` for is handed up as it was read.
+    #[must_use]
+    pub fn certain(&self, at: usize, probes: &[Probe]) -> bool {
+        match self {
+            Self::Memory(rows) => rows.certain(at, probes),
+            Self::Native(reader) => reader.certain(at, probes),
+        }
+    }
+
     /// Whether the bounds of a whole stripe prove that none of it can match.
     ///
     /// Always false for an in memory table, which has no stripes and so has nothing to say at that

@@ -5395,12 +5395,18 @@ fn operator<'a>(metrics: &'a rudb_metrics::Document, kind: &str) -> &'a rudb_met
         .unwrap_or_else(|| panic!("a {kind} in {:?}", metrics.operators))
 }
 
+/// The three operators of a small query and what each of them reported.
+///
+/// The predicate is written `x + 0 > 1` rather than `x > 1` so that a filter operator exists to
+/// report anything at all. A comparison of a column against a constant is applied by the scan
+/// itself now, and this test is about the metrics document rather than about where the comparison
+/// runs, so it asks for the shape it means to measure.
 #[test]
 fn a_query_reports_what_every_operator_in_it_did() {
     let db = database();
-    let result = db.query("SELECT x FROM t WHERE x > 1").unwrap();
+    let result = db.query("SELECT x FROM t WHERE x + 0 > 1").unwrap();
     let metrics = result.metrics().expect("a query that ran has metrics");
-    assert_eq!(metrics.query.sql, "SELECT x FROM t WHERE x > 1");
+    assert_eq!(metrics.query.sql, "SELECT x FROM t WHERE x + 0 > 1");
     let scan = operator(metrics, "Scan");
     let filter = operator(metrics, "Filter");
     assert_eq!(scan.detail.as_deref(), Some("t"), "a scan says what it read");
@@ -5426,7 +5432,7 @@ fn an_operator_that_was_pinned_off_the_reference_stops_being_marked_as_one() {
     // so the filter's row has to say so and every other row has to be unaffected.
     let db = database();
     db.execute("SET seam_chunk_compaction = 'learned-gain'").unwrap();
-    let result = db.query("SELECT x FROM t WHERE x > 1").unwrap();
+    let result = db.query("SELECT x FROM t WHERE x + 0 > 1").unwrap();
     let metrics = result.metrics().expect("a query that ran has metrics");
     let filter = operator(metrics, "Filter");
     assert!(!filter.reference_impl, "{:?}", filter.implementations);
@@ -5437,13 +5443,34 @@ fn an_operator_that_was_pinned_off_the_reference_stops_being_marked_as_one() {
 #[test]
 fn every_operator_has_its_own_id_and_a_parent_is_numbered_before_its_children() {
     let db = database();
-    let result = db.query("SELECT count(*) FROM t WHERE x > 1").unwrap();
+    let result = db.query("SELECT count(*) FROM t WHERE x + 0 > 1").unwrap();
     let metrics = result.metrics().expect("a query that ran has metrics");
     let ids: Vec<u32> = metrics.operators.iter().map(|operator| operator.id).collect();
     assert_eq!(ids, (0..u32::try_from(ids.len()).unwrap()).collect::<Vec<_>>());
     let scan = operator(metrics, "Scan");
     let filter = operator(metrics, "Filter");
     assert!(filter.id < scan.id, "the filter is above the scan, so it is numbered first");
+}
+
+/// A filter the scan applied itself has no row in the document, and leaves its number unused.
+///
+/// The numbering comes from the plan and the plan still has the filter node in it, so the operators
+/// that were built keep the numbers the plan gave them and the one that was not built leaves a gap.
+/// Rising and unique is what the numbers promise, not consecutive, and a reader that wants the node
+/// behind an id finds it whether or not its neighbour was built.
+#[test]
+fn a_filter_the_scan_applied_has_no_operator_and_leaves_its_number_unused() {
+    let db = database();
+    let result = db.query("SELECT count(*) FROM t WHERE x > 1").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    assert!(
+        !metrics.operators.iter().any(|operator| operator.kind == "Filter"),
+        "{:?}",
+        metrics.operators
+    );
+    let ids: Vec<u32> = metrics.operators.iter().map(|operator| operator.id).collect();
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "the ids still rise: {ids:?}");
+    assert_eq!(operator(metrics, "Scan").rows_out, 2, "the scan produced the rows that passed");
 }
 
 #[test]
