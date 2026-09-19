@@ -2572,7 +2572,7 @@ fn uncorrelated_exists_is_a_single_joined_marker() {
 }
 
 #[test]
-fn correlated_exists_groups_keys_before_its_single_join() {
+fn correlated_exists_ends_up_a_semi_join_against_the_relation() {
     let db = database();
     let exists = "SELECT k FROM (VALUES (1), (2), (3), (NULL)) o(k) WHERE EXISTS (SELECT 1 FROM (VALUES (1), (1), (3), (NULL)) i(k) WHERE i.k = o.k) ORDER BY k";
     assert_eq!(rows(&db, exists), vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
@@ -2583,9 +2583,13 @@ fn correlated_exists_groups_keys_before_its_single_join() {
         ),
         vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]
     );
+    // The keys go through a grouping and a single join on the way here, because that is what the
+    // correlated key binds to, and `delim` collapses both of them once the plan is far enough
+    // along to see that the grouping is only there to stop the join matching twice.
     let plan = db.plan(exists).expect("the correlated existence query plans");
-    assert!(plan.contains("Join SINGLE"), "{plan}");
-    assert!(plan.contains("Aggregate"), "{plan}");
+    assert!(plan.contains("Join SEMI"), "{plan}");
+    assert!(!plan.contains("Join SINGLE"), "{plan}");
+    assert!(!plan.contains("Aggregate"), "{plan}");
     assert!(!plan.contains("DependentJoin"), "{plan}");
     assert!(!plan.contains("Limit 1"), "{plan}");
 }

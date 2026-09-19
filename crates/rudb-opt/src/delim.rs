@@ -43,6 +43,29 @@
 //! domain row would have been handed to, with the same null in it, so the answer it gets is the one
 //! it was getting before.
 //!
+//! # The same test with no domain in it
+//!
+//! Not every correlated existence test gets a domain. When the correlated column is compared for
+//! equality against a column of the subquery's own relation, the values the outer query could ask
+//! about are the values that relation holds, so the binder groups the relation itself rather than
+//! inventing a domain to group. TPC-H q4 is that shape. `EXISTS (SELECT * FROM lineitem WHERE
+//! l_orderkey = o_orderkey AND l_commitdate < l_receiptdate)` binds to the distinct order keys of
+//! the filtered lineitem, a marker beside each of them, and the single join putting the marker back
+//! beside the order it belongs to.
+//!
+//! The grouping is then the only thing between the single join and the subquery's relation, and it
+//! is there to stop the join matching an outer row twice. A semi join stops at the first match, so
+//! once the join is a semi join the grouping has nothing left to do and goes with the rest of it.
+//! At SF1 that grouping reads 3,793,296 lineitem rows and produces 1,375,365 order keys, which is
+//! most of what q4 costs, and q22 pays the same for the distinct customer keys of orders.
+//!
+//! The one thing the grouping was doing besides the duplicates is raising the error a single join
+//! raises when it matches twice, so the collapse only happens where that error could not have
+//! fired. That means one equality per grouped column, each naming a different one, which is the
+//! condition under which a grouped relation holds at most one matching row per outer row. A
+//! condition that leaves a grouped column unjoined is refused on those grounds, and so is one that
+//! is not an equality at all.
+//!
 //! # What it refuses
 //!
 //! A marker that is not a constant, or a constant that is null. The filter tests the marker against
@@ -101,7 +124,7 @@ impl Pass for Deliminator {
 /// Collapses every decorrelated existence test in `plan` into a semi or an anti join.
 pub fn remove(plan: &mut Plan) {
     for node in top_down(plan) {
-        let Some(found) = matched(plan, node) else {
+        let Some(found) = matched(plan, node).or_else(|| flattened(plan, node)) else {
             continue;
         };
         let held = plan.expr_list(found.conditions).to_vec();
@@ -213,6 +236,71 @@ fn matched(plan: &Plan, node: NodeRef) -> Option<Found> {
     Some(Found { left, right: inner, conditions: correlated, kind, moved })
 }
 
+/// Reads the same shape with no domain in it out of the filter at `node`.
+///
+/// The steps are [`matched`]'s down to the grouping, and then they stop: what is under the grouping
+/// is the subquery's own relation rather than a join back to a domain, so there is no domain to
+/// take out and the grouping is the whole of what goes. Which outer column each carried column
+/// stands for is read off the group expressions instead of off a domain's keys, and it is one step
+/// rather than two because the conditions name the marker projection's columns and the group
+/// expressions name the relation's.
+fn flattened(plan: &Plan, node: NodeRef) -> Option<Found> {
+    let Node::Filter { input, predicate } = *plan.node(node) else {
+        return None;
+    };
+    let (kind, tested) = asked(plan, predicate)?;
+    let Node::Join { left, right, kind: JoinKind::Single, conditions, .. } = *plan.node(input)
+    else {
+        return None;
+    };
+    let Node::Project { input: distinct, index: marker, exprs, .. } = *plan.node(right) else {
+        return None;
+    };
+    if tested != ColumnBinding::new(marker, 0) {
+        return None;
+    }
+    let projected = plan.expr_list(exprs).to_vec();
+    let (&flag, carried) = projected.split_first()?;
+    let Expr::Constant(value) = *plan.expr(flag) else {
+        return None;
+    };
+    if matches!(plan.value(value), Value::Null) {
+        return None;
+    }
+
+    let Node::Aggregate { input: answers, index: distinct_index, groups, aggregates } =
+        *plan.node(distinct)
+    else {
+        return None;
+    };
+    if !plan.expr_list(aggregates).is_empty() || !columns(plan, carried, distinct_index) {
+        return None;
+    }
+    let grouped = plan.expr_list(groups).to_vec();
+    if grouped.len() != carried.len() {
+        return None;
+    }
+
+    let mut moved = HashMap::new();
+    for (position, &group) in grouped.iter().enumerate() {
+        let Expr::Column(binding) = *plan.expr(group) else {
+            return None;
+        };
+        moved.insert(ColumnBinding::new(marker, at(position + 1)?), binding);
+    }
+    if !covers(plan, conditions, marker, carried.len())
+        || reads(plan, answers, &produced(plan, left))
+    {
+        return None;
+    }
+    if read_above(plan, marker, node, input)
+        || read_beside(plan, distinct_index, [node, input, right])
+    {
+        return None;
+    }
+    Some(Found { left, right: answers, conditions, kind, moved })
+}
+
 /// Which join a filter over a marker is asking for, and the marker it reads.
 ///
 /// A bare test that the marker is not null is the existence test itself and is a semi join. The
@@ -294,6 +382,73 @@ fn lines_up(plan: &Plan, conditions: Slice, marker: u32, keyed: &[ColumnBinding]
         seen[position] = true;
     }
     seen.into_iter().all(|found| found)
+}
+
+/// Whether the join back is one equality per carried column, each naming a different one.
+///
+/// This is what says the grouping under the marker projection can go. A grouped relation holds one
+/// row per combination of the grouped columns, so an outer row that fixes every one of them by an
+/// equality has at most one row to match and the grouping was never stopping the join matching
+/// twice. Leave a grouped column unjoined and it was, and taking the grouping away would turn a
+/// query that raised an error into one that answers.
+///
+/// Either spelling of equality counts. The join back is written null safe where a domain was
+/// involved, because the domain carries a row for a null key, and plain where the values came from
+/// the subquery's own relation, and both of them match one row of a grouped relation at most.
+fn covers(plan: &Plan, conditions: Slice, marker: u32, carried: usize) -> bool {
+    let held = plan.expr_list(conditions);
+    if held.len() != carried {
+        return false;
+    }
+    let mut seen = vec![false; carried];
+    for &condition in held {
+        let Expr::Compare { op: CompareOp::Equal | CompareOp::NotDistinctFrom, left, right } =
+            *plan.expr(condition)
+        else {
+            return false;
+        };
+        let Expr::Column(here) = *plan.expr(left) else {
+            return false;
+        };
+        let Expr::Column(there) = *plan.expr(right) else {
+            return false;
+        };
+        // One side reads the marker projection and the other reads the outer row. Both sides
+        // reading it is a condition the outer row has no part in, and neither side reading it is a
+        // condition on some grouped column this cannot see.
+        let named = match (here.table == marker, there.table == marker) {
+            (true, false) => here,
+            (false, true) => there,
+            _ => return false,
+        };
+        if named.column == 0 {
+            return false;
+        }
+        let Ok(position) = usize::try_from(named.column - 1) else {
+            return false;
+        };
+        if position >= carried || seen[position] {
+            return false;
+        }
+        seen[position] = true;
+    }
+    seen.into_iter().all(|found| found)
+}
+
+/// Whether anything but the nodes in `going` reads a column of the grouping at `distinct`.
+///
+/// The marker projection reads it and is one of the three, along with the filter and the join,
+/// because all three of them are what the collapse writes over. Anything else that reads it would
+/// be left naming a table that the plan no longer produces.
+fn read_beside(plan: &Plan, distinct: u32, going: [NodeRef; 3]) -> bool {
+    let mut found = false;
+    for at in top_down(plan) {
+        if going.contains(&at) {
+            continue;
+        }
+        walk::node_columns(plan, at, &mut |_, binding| found |= binding.table == distinct);
+    }
+    found
 }
 
 /// Whether anything in the subtree under `at` reads a column of a table in `outer`.
@@ -473,6 +628,121 @@ mod tests {
             "        Join SEMI on=[(#1.0::BIGINT = #3.0::BIGINT)::BOOLEAN]\n",
             "          Aggregate #3 groups=[#0.0::BIGINT, #0.1::BIGINT] aggregates=[]\n",
             "            Get memory.main.t AS t #0 [a::BIGINT, b::BIGINT]\n",
+            "          Get memory.main.u AS u #1 [k::BIGINT]\n",
+        );
+        assert_eq!(removed(text), text);
+    }
+
+    /// The shape decorrelation leaves an `EXISTS` in when the correlated column was already a
+    /// column of the subquery's own relation, so there is no domain and only the grouping.
+    fn grouped(head: &str) -> String {
+        format!(
+            concat!(
+                "Filter {head}\n",
+                "  Join SINGLE on=[(#5.1::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
+                "    Get memory.main.t AS t #0 [a::BIGINT, b::BIGINT]\n",
+                "    Project #5 [TRUE::BOOLEAN AS exists, #4.0::BIGINT AS __correlated_1]\n",
+                "      Aggregate #4 groups=[#1.0::BIGINT] aggregates=[]\n",
+                "        Get memory.main.u AS u #1 [k::BIGINT]\n",
+            ),
+            head = head
+        )
+    }
+
+    #[test]
+    fn an_existence_test_over_a_grouping_becomes_a_semi_join_against_the_relation() {
+        assert_eq!(
+            removed(&grouped(TESTED)),
+            concat!(
+                "Join SEMI on=[(#1.0::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
+                "  Get memory.main.t AS t #0 [a::BIGINT, b::BIGINT]\n",
+                "  Get memory.main.u AS u #1 [k::BIGINT]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn the_same_grouping_with_not_in_front_of_the_test_becomes_an_anti_join() {
+        assert_eq!(
+            removed(&grouped(&format!("not({TESTED})::BOOLEAN"))),
+            concat!(
+                "Join ANTI on=[(#1.0::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
+                "  Get memory.main.t AS t #0 [a::BIGINT, b::BIGINT]\n",
+                "  Get memory.main.u AS u #1 [k::BIGINT]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_grouping_with_a_real_aggregate_in_it_is_left_alone() {
+        // A `HAVING` inside the subquery, which produces rows the relation underneath does not.
+        let text = concat!(
+            "Filter (#5.0::BOOLEAN IS DISTINCT FROM NULL::BOOLEAN)::BOOLEAN\n",
+            "  Join SINGLE on=[(#5.1::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.t AS t #0 [a::BIGINT, b::BIGINT]\n",
+            "    Project #5 [TRUE::BOOLEAN AS exists, #4.0::BIGINT AS __correlated_1]\n",
+            "      Aggregate #4 groups=[#1.0::BIGINT] aggregates=[count_star()::BIGINT]\n",
+            "        Get memory.main.u AS u #1 [k::BIGINT]\n",
+        );
+        assert_eq!(removed(text), text);
+    }
+
+    #[test]
+    fn a_grouping_on_an_expression_is_left_alone() {
+        // The relation holds no column of that shape, so there is nothing for the conditions to
+        // read once the grouping producing it has gone.
+        let text = concat!(
+            "Filter (#5.0::BOOLEAN IS DISTINCT FROM NULL::BOOLEAN)::BOOLEAN\n",
+            "  Join SINGLE on=[(#5.1::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.t AS t #0 [a::BIGINT, b::BIGINT]\n",
+            "    Project #5 [TRUE::BOOLEAN AS exists, #4.0::BIGINT AS __correlated_1]\n",
+            "      Aggregate #4 groups=[abs(#1.0::BIGINT)::BIGINT] aggregates=[]\n",
+            "        Get memory.main.u AS u #1 [k::BIGINT]\n",
+        );
+        assert_eq!(removed(text), text);
+    }
+
+    #[test]
+    fn a_join_back_that_is_not_an_equality_is_left_alone() {
+        // The grouping keeps one row per key and the outer row wants every key above its own, so
+        // the single join raises its error here and taking the grouping away would hide it.
+        let text = concat!(
+            "Filter (#5.0::BOOLEAN IS DISTINCT FROM NULL::BOOLEAN)::BOOLEAN\n",
+            "  Join SINGLE on=[(#5.1::BIGINT > #0.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.t AS t #0 [a::BIGINT, b::BIGINT]\n",
+            "    Project #5 [TRUE::BOOLEAN AS exists, #4.0::BIGINT AS __correlated_1]\n",
+            "      Aggregate #4 groups=[#1.0::BIGINT] aggregates=[]\n",
+            "        Get memory.main.u AS u #1 [k::BIGINT]\n",
+        );
+        assert_eq!(removed(text), text);
+    }
+
+    #[test]
+    fn a_grouped_column_the_join_back_does_not_name_is_left_alone() {
+        // Two conditions on the first of the two grouped columns and none on the second, which is
+        // the same miscount the domain shape refuses and for the same reason.
+        let text = concat!(
+            "Filter (#5.0::BOOLEAN IS DISTINCT FROM NULL::BOOLEAN)::BOOLEAN\n",
+            "  Join SINGLE on=[(#5.1::BIGINT = #0.0::BIGINT)::BOOLEAN, \
+             (#5.1::BIGINT = #0.1::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.t AS t #0 [a::BIGINT, b::BIGINT]\n",
+            "    Project #5 [TRUE::BOOLEAN AS exists, #4.0::BIGINT AS __correlated_1, \
+             #4.1::BIGINT AS __correlated_2]\n",
+            "      Aggregate #4 groups=[#1.0::BIGINT, #1.1::BIGINT] aggregates=[]\n",
+            "        Get memory.main.u AS u #1 [k::BIGINT, j::BIGINT]\n",
+        );
+        assert_eq!(removed(text), text);
+    }
+
+    #[test]
+    fn a_grouped_column_read_above_the_filter_stops_the_collapse() {
+        let text = concat!(
+            "Project #6 [#5.1::BIGINT AS k]\n",
+            "  Filter (#5.0::BOOLEAN IS DISTINCT FROM NULL::BOOLEAN)::BOOLEAN\n",
+            "    Join SINGLE on=[(#5.1::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
+            "      Get memory.main.t AS t #0 [a::BIGINT, b::BIGINT]\n",
+            "      Project #5 [TRUE::BOOLEAN AS exists, #4.0::BIGINT AS __correlated_1]\n",
+            "        Aggregate #4 groups=[#1.0::BIGINT] aggregates=[]\n",
             "          Get memory.main.u AS u #1 [k::BIGINT]\n",
         );
         assert_eq!(removed(text), text);
