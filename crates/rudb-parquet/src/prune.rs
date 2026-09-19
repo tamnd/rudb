@@ -46,7 +46,7 @@
 use std::sync::Arc;
 
 use rudb_common::LogicalType;
-use rudb_common::bounds::Zones;
+use rudb_common::bounds::{Spread, Zones, kept};
 
 use crate::metadata::{ColumnChunk, Metadata, Physical, RowGroup, SchemaColumn};
 
@@ -101,6 +101,66 @@ impl Zones for Footer {
         }
         Some(total)
     }
+
+    fn spread(&self, tests: &[Test]) -> Option<Spread> {
+        let mut passing = 0.0_f64;
+        let mut whole = 0.0_f64;
+        let mut read = 0;
+        for group in &self.metadata.row_groups {
+            let rows = rows(group.rows);
+            let spread = fraction(tests, group, &self.metadata.schema);
+            whole += rows;
+            passing += rows * spread.fraction;
+            // The most any one group could read, rather than a sum or a count of the groups. A
+            // writer is free to state statistics for a column in one group and not in the next, and
+            // the caller is charging its constant for the tests nobody answered, so the question is
+            // whether anybody answered this one anywhere.
+            read = read.max(spread.read);
+        }
+        (read > 0 && whole > 0.0)
+            .then(|| Spread { fraction: (passing / whole).clamp(0.0, 1.0), read })
+    }
+}
+
+/// The fraction of one group these tests are expected to keep, and how many of them said so.
+///
+/// Tests on one column are intersected and not multiplied, which [`kept`] does and this feeds. Tests
+/// on different columns are multiplied, which assumes the columns are independent of each other and
+/// is the same assumption the estimator makes everywhere else.
+///
+/// A group this cannot read at all keeps a fraction of one rather than being left out of the sum.
+/// Leaving it out would divide by the groups that were read and report their fraction as the whole
+/// file's, which is a number about part of a file wearing the name of all of it.
+fn fraction(tests: &[Test], group: &RowGroup, schema: &[SchemaColumn]) -> Spread {
+    let mut spread = Spread { fraction: 1.0, read: 0 };
+    for (position, test) in tests.iter().enumerate() {
+        // Once per column and not once per test, because `kept` is given every test on the column
+        // and answers for all of them together. The first mention of a column is the one that asks.
+        if tests[..position].iter().any(|earlier| earlier.column == test.column) {
+            continue;
+        }
+        let Some(column) = schema.get(test.column) else { continue };
+        let Some(chunk) = group.columns.iter().find(|chunk| chunk.column == test.column) else {
+            continue;
+        };
+        let Some(stats) = chunk.stats.as_ref() else { continue };
+        let Some(low) = stats.min.as_deref().and_then(|bytes| read_bound(bytes, column)) else {
+            continue;
+        };
+        let Some(high) = stats.max.as_deref().and_then(|bytes| read_bound(bytes, column)) else {
+            continue;
+        };
+        let Some(kept) = kept(tests, test.column, &low, &high) else { continue };
+        spread.fraction *= kept.fraction;
+        spread.read += kept.read;
+    }
+    spread
+}
+
+/// A group's row count as a weight, floored at zero for a count that does not read as one.
+#[expect(clippy::cast_precision_loss, reason = "a row count is a weight here and not an identity")]
+fn rows(count: i64) -> f64 {
+    if count > 0 { count as f64 } else { 0.0 }
 }
 
 /// Whether the bounds say no row of this group can satisfy every one of these tests.
@@ -123,8 +183,8 @@ pub fn skips(tests: &[Test], group: &RowGroup, schema: &[SchemaColumn]) -> bool 
 /// Whether one test rules out one column chunk.
 fn rules_out(test: &Test, chunk: &ColumnChunk, column: &SchemaColumn) -> bool {
     let Some(stats) = chunk.stats.as_ref() else { return false };
-    let low = stats.min.as_deref().and_then(|bytes| read(bytes, column));
-    let high = stats.max.as_deref().and_then(|bytes| read(bytes, column));
+    let low = stats.min.as_deref().and_then(|bytes| read_bound(bytes, column));
+    let high = stats.max.as_deref().and_then(|bytes| read_bound(bytes, column));
     rudb_common::bounds::excluded(test.op, &test.value, low.as_ref(), high.as_ref())
 }
 
@@ -139,7 +199,7 @@ fn rules_out(test: &Test, chunk: &ColumnChunk, column: &SchemaColumn) -> bool {
 /// integer in a signed physical one and says the bound is ordered as unsigned. Reading a `UINTEGER`
 /// above two billion as an `i32` gives a negative number, and a skip decided on that is a row group
 /// dropped from an answer, so the unsigned types read through the unsigned word of the same width.
-fn read(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
+fn read_bound(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
     let unsigned = matches!(
         column.ty,
         LogicalType::UTinyInt
@@ -363,5 +423,73 @@ mod tests {
         // Zero rows is a fact about the file and the estimator is right to take it as one. The
         // `None` this returns is reserved for a count that did not read as a row count.
         assert_eq!(footer(Vec::new()).surviving(&test(Op::Equal, 1)), Some(0));
+    }
+
+    /// The fraction `spread` answers for these tests, which is what every test below asks about.
+    fn spread(footer: &Footer, tests: &[Test]) -> Option<f64> {
+        footer.spread(tests).map(|spread| spread.fraction)
+    }
+
+    #[test]
+    fn the_spread_is_interpolated_inside_every_group_and_weighted_by_its_rows() {
+        // Three groups of a hundred rows each running 1 to 10, 20 to 30 and 40 to 50. `x < 25`
+        // keeps all of the first, the five values 20 to 24 out of the eleven in the second, and
+        // none of the third, which is a hundred plus forty five point four rows out of three
+        // hundred. The ceiling for the same filter is two hundred, because a group that holds
+        // anything at all survives whole, and that gap is the whole point of having both.
+        let footer = footer(vec![
+            group(Some(1), Some(10)),
+            group(Some(20), Some(30)),
+            group(Some(40), Some(50)),
+        ]);
+        let fraction = spread(&footer, &test(Op::Less, 25)).expect("every group was read");
+        assert!((fraction - (100.0 + 500.0 / 11.0) / 300.0).abs() < 1e-9, "{fraction}");
+        assert_eq!(footer.surviving(&test(Op::Less, 25)), Some(200));
+    }
+
+    #[test]
+    fn a_group_the_bounds_rule_out_contributes_nothing_to_the_spread() {
+        let footer = footer(vec![group(Some(1), Some(10)), group(Some(20), Some(30))]);
+        assert_eq!(spread(&footer, &test(Op::Greater, 1000)), Some(0.0));
+        assert_eq!(spread(&footer, &test(Op::Less, 1000)), Some(1.0));
+    }
+
+    #[test]
+    fn a_group_that_cannot_be_interpolated_is_carried_whole_rather_than_left_out() {
+        // Leaving it out would divide by the groups that were read and report their fraction as
+        // the file's, which is a number about part of the file wearing the name of the whole of it.
+        // Here the second group is half the rows and says nothing, so the answer cannot go below a
+        // half however narrow the filter on the first group is.
+        let mut unwritten = group(Some(1), Some(10));
+        unwritten.columns[0].stats = None;
+        let footer = footer(vec![group(Some(20), Some(30)), unwritten]);
+        assert_eq!(spread(&footer, &test(Op::Greater, 1000)), Some(0.5));
+        // And the test still counts as read, because one group answered it. Charging the caller's
+        // constant for a condition that was answered would apply two guesses to one condition.
+        assert_eq!(footer.spread(&test(Op::Greater, 1000)).map(|spread| spread.read), Some(1));
+    }
+
+    #[test]
+    fn a_test_no_group_can_interpolate_is_nothing_rather_than_the_whole_file() {
+        // The caller's signal to fall back to its constant. Answering one here would say the filter
+        // keeps everything, which is a claim about the data made out of having read none of it.
+        assert_eq!(spread(&footer(Vec::new()), &test(Op::Less, 5)), None, "no group to read");
+        let read = footer(vec![group(Some(1), Some(10)), group(Some(20), Some(30))]);
+        assert_eq!(spread(&read, &test(Op::Equal, 5)), None, "a range cannot divide by a value");
+        assert_eq!(spread(&read, &[]), None);
+        assert!(spread(&read, &test(Op::Less, 5)).is_some(), "a range it can read comes back");
+    }
+
+    #[test]
+    fn two_tests_on_one_column_name_the_interval_between_them() {
+        // `x >= 22 AND x < 25` names the three values 22, 23 and 24 of the eleven in the group.
+        // Multiplying two fractions would give nine elevenths times five elevenths, which is a
+        // wider interval than the one asked for and is the error this shape used to have.
+        let footer = footer(vec![group(Some(20), Some(30))]);
+        let mut both = test(Op::GreaterOrEqual, 22);
+        both.extend(test(Op::Less, 25));
+        let fraction = spread(&footer, &both).expect("both were read");
+        assert!((fraction - 3.0 / 11.0).abs() < 1e-9, "{fraction}");
+        assert_eq!(footer.spread(&both).map(|spread| spread.read), Some(2));
     }
 }

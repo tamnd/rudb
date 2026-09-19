@@ -1311,6 +1311,13 @@ mod tests {
         fn surviving(&self, _tests: &[rudb_common::bounds::Test]) -> Option<u64> {
             Some(42)
         }
+
+        fn spread(
+            &self,
+            tests: &[rudb_common::bounds::Test],
+        ) -> Option<rudb_common::bounds::Spread> {
+            Some(rudb_common::bounds::Spread { fraction: 0.5, read: tests.len() })
+        }
     }
 
     #[test]
