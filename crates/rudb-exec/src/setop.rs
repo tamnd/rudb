@@ -21,7 +21,7 @@
 use std::sync::Mutex;
 
 use rudb_common::{Error, Memory, Reservation, Result, Value};
-use rudb_pipeline::{Progress, Sink};
+use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::SetOpKind;
 use rudb_vector::Chunk;
 
@@ -108,7 +108,7 @@ impl Sink for SetOp {
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         // Both sides at once, which is what every arm below needs, and the counting tables on top
         // of them. The tables are not charged separately, because a count per distinct row is
         // bounded by the rows that are already charged and charging it twice would refuse a query

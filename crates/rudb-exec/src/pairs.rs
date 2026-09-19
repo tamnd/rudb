@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rudb_common::{Error, Memory, Reservation, Result, Spent, Stage, stage};
 
+use rudb_pipeline::Lease;
+
 use crate::key::{mix, spread};
 
 /// How many radix partitions the pairs are spread over.
@@ -125,14 +127,20 @@ pub(crate) fn shift() -> u32 {
     u32::BITS - PARTITIONS.ilog2()
 }
 
-/// Runs `count` pieces of work across `degree` threads and hands back what they made, in order.
+/// Runs `count` pieces of work across the lease's threads and hands back what they made, in order.
 ///
 /// The pieces are taken off one counter rather than dealt out in advance, because they are not the
 /// same size and a thread that draws a cheap one should pick up the next piece instead of finishing
 /// early. The calling thread takes a share too.
 ///
 /// `what` only ever reaches an error message, and reads as "nothing <what> 3".
+///
+/// # Errors
+///
+/// Whatever `run` reported for the first piece that failed, in piece order rather than in the order
+/// the threads finished, so that the same input reports the same error.
 pub(crate) fn in_parallel<T: Send>(
+    threads: &Lease<'_>,
     count: usize,
     degree: usize,
     what: &str,
@@ -152,34 +160,60 @@ pub(crate) fn in_parallel<T: Send>(
             }
         }
     };
-    std::thread::scope(|scope| {
-        let degree = degree.min(count);
-        let mut handles = Vec::with_capacity(degree - 1);
-        for _ in 1..degree {
-            handles.push(scope.spawn(|| {
-                step();
-                stage::here()
-            }));
+    together(threads, degree.min(count), &step)?;
+    let mut out = Vec::with_capacity(count);
+    for (at, slot) in slots.iter().enumerate() {
+        out.push(
+            slot.lock()
+                .map_err(poisoned)?
+                .take()
+                .unwrap_or_else(|| Err(Error::internal(format!("nothing {what} {at}"))))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Run `work` on the lease's threads and on this one, and collect what the borrowed ones measured.
+///
+/// Every finishing path an aggregate has looks the same from far enough away. There is a counter, a
+/// slot per partition, and a function that takes whichever partition is next until there are none
+/// left, so the only thing that differs between them is that function. What they also share is the
+/// two things that are easy to get wrong: a borrowed thread's stage clock has to come back as a
+/// difference rather than as a whole reading, because a pool worker carries what the queries before
+/// this one spent, and a thread that panicked has to fail the query rather than leave a partition
+/// looking like it was never reached.
+///
+/// What a caller gives up by using the lease is a finish wider than the lease. A pipeline's lease
+/// is sized by the morsels its source has, so a scan of one morsel leases one thread and finishes
+/// its aggregate on one thread even when the machine has thirty two and the aggregate has a hundred
+/// thousand groups. That is the right answer for a session that asked for one thread and a
+/// pessimistic one for a small table with a large group by, and the fix when it matters is for the
+/// lease to be sized by the whole pipeline rather than by its source. On ClickBench it does not
+/// come up, because a native scan of a hundred thousand rows already has five morsels.
+///
+/// # Errors
+///
+/// When a borrowed thread panicked, which is a bug in this engine rather than anything a query can
+/// ask for.
+pub(crate) fn together(threads: &Lease<'_>, degree: usize, work: &(dyn Fn() + Sync)) -> Result<()> {
+    let theirs = Mutex::new(Spent::none());
+    let task = || {
+        let before = stage::here();
+        work();
+        let mine = stage::here().since(before);
+        if let Ok(mut held) = theirs.lock() {
+            held.add(mine);
         }
-        step();
-        let mut theirs = Spent::none();
-        for handle in handles {
-            let spent =
-                handle.join().map_err(|_| Error::internal("a radix pair worker panicked"))?;
-            theirs.add(spent);
-        }
-        stage::gained(theirs);
-        let mut out = Vec::with_capacity(count);
-        for (at, slot) in slots.iter().enumerate() {
-            out.push(
-                slot.lock()
-                    .map_err(poisoned)?
-                    .take()
-                    .unwrap_or_else(|| Err(Error::internal(format!("nothing {what} {at}"))))?,
-            );
-        }
-        Ok::<_, Error>(out)
-    })
+    };
+    // The thread that asked takes partitions too rather than waiting on the ones it woke, for the
+    // reason the parallel driver gives for doing the same. Its own reading needs no difference and
+    // no adding, because it is already the clock the instrumentation shim reads.
+    let (_, panicked) = threads.scatter_at_most(degree, &task, work);
+    stage::gained(theirs.into_inner().map_err(poisoned)?);
+    if panicked {
+        return Err(Error::internal("a thread finishing an aggregate panicked"));
+    }
+    Ok(())
 }
 
 /// What one pair partition found, split by group hash so the count can take one split each.

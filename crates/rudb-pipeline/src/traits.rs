@@ -6,6 +6,7 @@ use rudb_common::Result;
 use rudb_vector::Chunk;
 
 use crate::morsel::Morsel;
+use crate::pool::Lease;
 use crate::progress::Progress;
 
 /// Produces chunks. One instance, many concurrent readers.
@@ -196,5 +197,5 @@ pub trait Sink: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Whatever finishing the state reports.
-    fn finalize(&self) -> Result<()>;
+    fn finalize(&self, threads: &Lease<'_>) -> Result<()>;
 }

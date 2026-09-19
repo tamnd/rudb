@@ -17,6 +17,7 @@ use rudb_common::{Error, Result};
 use rudb_vector::Chunk;
 
 use crate::morsel::Morsel;
+use crate::pool::Lease;
 use crate::progress::Progress;
 use crate::traits::{Sink, Stream};
 
@@ -129,7 +130,7 @@ pub trait DynSink: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Whatever the typed operator reports.
-    fn finalize_state(&self) -> Result<()>;
+    fn finalize_state(&self, threads: &Lease<'_>) -> Result<()>;
 }
 
 impl<S: Sink> DynSink for S {
@@ -153,7 +154,7 @@ impl<S: Sink> DynSink for S {
         self.combine(local.downcast::<S::Local>()?)
     }
 
-    fn finalize_state(&self) -> Result<()> {
-        self.finalize()
+    fn finalize_state(&self, threads: &Lease<'_>) -> Result<()> {
+        self.finalize(threads)
     }
 }

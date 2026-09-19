@@ -40,7 +40,7 @@ use std::sync::Mutex;
 use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_functions::resolve;
 use rudb_kernels::Accumulator;
-use rudb_pipeline::{Progress, Sink};
+use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{
     ColumnBinding, Expr, ExprRef, Plan, Slice, SortKey, WindowBound, WindowExclude, WindowFrame,
     WindowUnit,
@@ -496,7 +496,7 @@ impl Sink for Window {
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         let mut gathered = std::mem::take(&mut *self.rows.lock().map_err(poisoned)?);
         let keys = self.sorting.len();
         let mut failure: Option<Error> = None;

@@ -33,6 +33,7 @@ use std::sync::{Mutex, OnceLock, TryLockError};
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Stage, Value, stage};
 use rudb_kernels::Accumulator;
+use rudb_pipeline::Lease;
 use rudb_vector::{Chunk, Vector};
 
 use crate::pairs::{
@@ -345,23 +346,34 @@ impl Exchange {
     /// query is small enough to finish on one thread. There is no choice here: the split a group
     /// comes back in has to be the owner that already holds its numeric state, and there are
     /// [`PARTITIONS`] of those whatever the query looks like.
-    pub(crate) fn finish(&self, bound: usize, memory: &Memory) -> Result<Vec<Chunk>> {
+    pub(crate) fn finish(
+        &self,
+        threads: &Lease<'_>,
+        bound: usize,
+        memory: &Memory,
+    ) -> Result<Vec<Chunk>> {
         let input = self
             .pairs
             .iter()
             .map(|partition| partition.lock().map(|held| held.rows()).map_err(poisoned))
             .sum::<Result<usize>>()?;
-        let degree = input.div_ceil(16_384).clamp(1, PARTITIONS);
-        let counted =
-            in_parallel(PARTITIONS, degree, "deduplicated the pairs of radix partition", |at| {
+        let degree = input.div_ceil(16_384).clamp(1, PARTITIONS).min(threads.degree());
+        let counted = in_parallel(
+            threads,
+            PARTITIONS,
+            degree,
+            "deduplicated the pairs of radix partition",
+            |at| {
                 let mut partition = self.pairs[at].lock().map_err(poisoned)?;
                 distinct_pairs(&mut partition, PARTITIONS, memory)
+            },
+        )?;
+        let outputs =
+            in_parallel(threads, PARTITIONS, degree, "finished mixed radix partition", |at| {
+                let mut owner = self.owners[at].lock().map_err(poisoned)?;
+                owner.count_distinct(&counted, at)?;
+                owner.finish(bound, memory)
             })?;
-        let outputs = in_parallel(PARTITIONS, degree, "finished mixed radix partition", |at| {
-            let mut owner = self.owners[at].lock().map_err(poisoned)?;
-            owner.count_distinct(&counted, at)?;
-            owner.finish(bound, memory)
-        })?;
         // The distinct pairs are read for the last time by the pass above, so the room they took goes
         // back here rather than at the end of the query.
         for part in counted {

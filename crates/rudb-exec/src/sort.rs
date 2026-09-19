@@ -37,7 +37,7 @@ use std::cmp::Ordering;
 use std::sync::Mutex;
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
-use rudb_pipeline::{Progress, Sink};
+use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::Chunk;
 
@@ -195,7 +195,7 @@ impl Sink for Sort {
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         let mut sortable = std::mem::take(&mut *self.rows.lock().map_err(poisoned)?);
         let mut failure: Option<Error> = None;
         sortable.sort_by(|left, right| settled(&self.keys, left, right, &mut failure));
