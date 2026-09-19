@@ -3837,6 +3837,7 @@ fn encoded_count_partition(
     if !(2..=3).contains(&keys) {
         return Err(Error::internal("an encoded count partition has an unsupported key width"));
     }
+    let reserving = stage::Timing::start(Stage::Reserve);
     let (mut partition, total) = runs.seed();
     let capacity = total.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
@@ -3851,6 +3852,7 @@ fn encoded_count_partition(
     // The table grows by one group per record the other runs hold that this one has not seen, and
     // reserving for all of them up front is one allocation instead of a doubling walk under a fold.
     partition.rows.reserve(room);
+    reserving.stop(0);
     let timing = stage::Timing::start(Stage::Fold);
     // The run this took as the table, compacted in place: the group for a record always lands at a
     // slot at or behind where the record was read from, so nothing unread is ever written over.
@@ -3881,8 +3883,10 @@ fn encoded_count_partition(
     if !all_valid {
         partition.validity.truncate(counts.len());
     }
+    timing.stop(0);
     // Every other instance's run, folded into that table and given back one run at a time rather
     // than all at the end, so the records this has finished with stop costing anything.
+    let timing = stage::Timing::start(Stage::Merge);
     for run in std::mem::take(&mut runs.runs) {
         let all_valid = run.validity.is_empty();
         for (source, &row) in run.rows.iter().enumerate() {
@@ -4088,6 +4092,7 @@ fn fixed_partition(
     calls: &[Call],
     memory: &Memory,
 ) -> Result<Part> {
+    let reserving = stage::Timing::start(Stage::Reserve);
     let (mut partition, total) = runs.seed();
     let capacity = total.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
@@ -4101,6 +4106,7 @@ fn fixed_partition(
     let mut states: Vec<CompactNumeric> = Vec::with_capacity(total);
     let mut overflow = HashMap::new();
     partition.rows.reserve(room);
+    reserving.stop(0);
     let timing = stage::Timing::start(Stage::Fold);
     let seeded = partition.rows.len();
     let all_valid = partition.validity.is_empty();
@@ -4132,6 +4138,9 @@ fn fixed_partition(
     if !all_valid {
         partition.validity.truncate(states.len());
     }
+    timing.stop(0);
+    // Every other instance's run, folded into that table, which is the merge half of the close.
+    let timing = stage::Timing::start(Stage::Merge);
     for run in std::mem::take(&mut runs.runs) {
         let all_valid = run.validity.is_empty();
         for (source, &row) in run.rows.iter().enumerate() {
