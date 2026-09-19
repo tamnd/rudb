@@ -155,7 +155,8 @@ pub(crate) struct Aggregate<'a> {
     radix_distinct_count: bool,
     /// Emit at most this many groups from each radix partition when the parent orders by count
     /// descending. The ordinary TopN still makes the final global choice.
-    top_counts: Option<usize>,
+    /// How many groups a count descending TopN above can observe, and which call it ranks by.
+    top_counts: Option<(usize, usize)>,
     /// Emit only groups whose COUNT(*) call at this index reaches the inclusive bound.
     ///
     /// The Filter remains above the aggregate and checks the predicate again. This only avoids
@@ -719,14 +720,31 @@ impl<'a> Aggregate<'a> {
     }
 
     /// Keeps only the groups that can still reach a count-descending TopN above this aggregate.
+    ///
+    /// The counting shapes answer the count from their own state and not from an accumulator, so
+    /// which call it is does not reach them and they keep passing zero. An aggregate holding one
+    /// accumulator per call needs the call the TopN sorts on, and takes this only for a plain
+    /// `COUNT(*)`, which is the one whose running value a group is certain to be holding.
+    ///
+    /// Dropping the groups that cannot be reached is worth more here than on the counting shapes,
+    /// because everything else in the row is built per group at the end: a `MIN` over a string
+    /// column fetches a value out of the dictionary for each group, and a million of those thrown
+    /// away by a `LIMIT 10` above is a read of most of the column for nothing.
     #[must_use]
-    pub(crate) fn top_counts(mut self, bound: usize) -> Self {
+    pub(crate) fn top_counts(mut self, bound: usize, call: usize) -> Self {
         if self.count_only
             || self.compact_numeric
             || self.distinct_count
             || self.mixed_numeric_distinct
         {
-            self.top_counts = Some(bound);
+            self.top_counts = Some((bound, 0));
+        } else if self.calls.get(call).is_some_and(|call| {
+            call.name == "count_star"
+                && call.args.is_empty()
+                && !call.distinct
+                && call.filter.is_none()
+        }) {
+            self.top_counts = Some((bound, call));
         }
         self
     }
@@ -1517,10 +1535,10 @@ impl<'a> Aggregate<'a> {
             states[slot * calls + call].counted().expect("a selected COUNT call has a COUNT state")
         };
         let selected = match (self.top_counts, self.having_count) {
-            (Some(bound), _) => {
+            (Some((bound, ranks)), _) => {
                 let mut best = Vec::with_capacity(bound.min(groups));
                 for slot in 0..groups {
-                    let at = best.partition_point(|&kept| count(kept, 0) >= count(slot, 0));
+                    let at = best.partition_point(|&kept| count(kept, ranks) >= count(slot, ranks));
                     if at < bound {
                         best.insert(at, slot);
                         best.truncate(bound);
@@ -2077,7 +2095,7 @@ impl<'a> Aggregate<'a> {
     /// thread. Partitioning made the aggregate itself scale and handed the difference straight back.
     fn partition_from(&self) -> usize {
         match self.top_counts {
-            Some(bound) => PARTITION_FROM.max(bound.saturating_mul(self.merged.len())),
+            Some((bound, _)) => PARTITION_FROM.max(bound.saturating_mul(self.merged.len())),
             None => PARTITION_FROM,
         }
     }
@@ -3639,7 +3657,7 @@ impl Sink for Aggregate<'_> {
         if let Some(mixed) = self.mixed.get() {
             let chunks = mixed.finish(
                 threads,
-                self.top_counts.expect("a mixed exchange has a TopN bound"),
+                self.top_counts.expect("a mixed exchange has a TopN bound").0,
                 &self.memory,
             )?;
             return self.out.fill(chunks);
@@ -3647,7 +3665,7 @@ impl Sink for Aggregate<'_> {
         if let Some(Some(distinct)) = self.grouped_distinct.get() {
             let chunks = distinct.finish(
                 threads,
-                self.top_counts.expect("a grouped distinct exchange has a TopN bound"),
+                self.top_counts.expect("a grouped distinct exchange has a TopN bound").0,
                 &self.memory,
             )?;
             return self.out.fill(chunks);
@@ -3667,7 +3685,7 @@ impl Sink for Aggregate<'_> {
                 })
                 .sum::<Result<usize>>()?;
             let degree = degree_for(input, threads);
-            let bound = self.top_counts.expect("an encoded exchange has a TopN bound");
+            let bound = self.top_counts.expect("an encoded exchange has a TopN bound").0;
             together(threads, degree, &|| {
                 finish_encoded_count(&next, &slots, encoded, bound, &self.memory);
             })?;
@@ -3724,7 +3742,7 @@ impl Sink for Aggregate<'_> {
             return self.out.fill(chunks);
         }
         if let Some(fixed) = self.fixed.get() {
-            let bound = self.top_counts.expect("a fixed exchange has a TopN bound");
+            let bound = self.top_counts.expect("a fixed exchange has a TopN bound").0;
             let next = AtomicUsize::new(0);
             let slots: Vec<Mutex<Option<Result<Part>>>> =
                 (0..RADIX_PARTITIONS).map(|_| Mutex::new(None)).collect();
@@ -5237,7 +5255,7 @@ mod tests {
     fn an_aggregate_under_a_pushed_down_bound_keeps_its_table_in_one_piece() {
         let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
         let (aggregate, out) = aggregate(&plan);
-        let aggregate = aggregate.top_counts(1_000);
+        let aggregate = aggregate.top_counts(1_000, 0);
         let mut left = aggregate.local();
         let mut right = aggregate.local();
         let values: Vec<i32> = (0..5_000).collect();
@@ -5545,7 +5563,7 @@ mod tests {
         let (aggregate, out) =
             Aggregate::new(&plan, &schema, 1, groups, aggregates, &Memory::unlimited())
                 .expect("a count aggregate");
-        let aggregate = aggregate.top_counts(10);
+        let aggregate = aggregate.top_counts(10, 0);
         let users = Vector::from_values(
             LogicalType::BigInt,
             &[Value::BigInt(7), Value::BigInt(7), Value::BigInt(8)],
@@ -5615,7 +5633,7 @@ mod tests {
         let (aggregate, out) =
             Aggregate::new(&plan, &schema, 1, groups, aggregates, &Memory::unlimited())
                 .expect("a count aggregate");
-        let aggregate = aggregate.top_counts(10);
+        let aggregate = aggregate.top_counts(10, 0);
         let input = Chunk::new(vec![users, phrases]).expect("two aligned columns");
         let mut local = aggregate.local();
         aggregate.sink(&input, &mut local).expect("the chunk");

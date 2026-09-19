@@ -209,7 +209,8 @@ struct BuildUnder<'a> {
 #[derive(Clone, Copy, Default)]
 struct AggregateBound {
     max_groups: Option<usize>,
-    top_counts: Option<usize>,
+    /// How many groups a count descending TopN above can observe, and which call it ranks them by.
+    top_counts: Option<(usize, usize)>,
     having_count: Option<(usize, i64)>,
 }
 
@@ -282,13 +283,16 @@ fn ordered(plan: &Plan, node: NodeRef) -> bool {
     }
 }
 
-/// The aggregate under a TopN whose only key is a COUNT result descending.
+/// The aggregate under a TopN whose only key is a COUNT result descending, and which call that is.
 ///
 /// Keeping the local prefix from every radix partition is sufficient for the global prefix: a
 /// group excluded behind `k` groups in its own partition cannot enter the first `k` overall. The
 /// regular TopN remains in the plan and settles the small union, so this only reduces aggregate
 /// output and does not replace ordering semantics.
-fn count_top_aggregate(plan: &Plan, input: NodeRef, keys: Slice) -> Option<NodeRef> {
+///
+/// The call index comes back because an aggregate that is not one of the counting shapes holds one
+/// accumulator per call, and the one to rank the groups by is whichever of them the TopN sorts on.
+fn count_top_aggregate(plan: &Plan, input: NodeRef, keys: Slice) -> Option<(NodeRef, usize)> {
     let [key] = plan.sort_key_list(keys) else { return None };
     if !key.descending {
         return None;
@@ -327,7 +331,7 @@ fn count_top_aggregate(plan: &Plan, input: NodeRef, keys: Slice) -> Option<NodeR
         && plan.expr_list(args).len() == 1
         && distinct
         && filter.is_none();
-    (count_star || distinct_count).then_some(aggregate)
+    (count_star || distinct_count).then_some((aggregate, call))
 }
 
 /// A direct aggregate under `input` and the COUNT(*) call constrained by a simple lower bound.
@@ -889,8 +893,9 @@ struct Building<'a, 'b> {
     /// that drops rows under a `LIMIT` changes which rows reach the limit. [`Builder::node`] clears
     /// it for every node that is not a scan, a filter or a projection.
     sideways: Option<Arc<Sideways<'a>>>,
-    /// Aggregates whose parent TopN orders by COUNT descending, and its count plus offset.
-    top_counts: Vec<(NodeRef, usize)>,
+    /// Aggregates whose parent TopN orders by COUNT descending, its count plus offset, and which
+    /// call of the aggregate that count is.
+    top_counts: Vec<(NodeRef, usize, usize)>,
     /// The materialisations whose bodies are being walked, innermost last.
     held: Vec<Held>,
 }
@@ -1018,7 +1023,7 @@ impl<'a> Building<'a, '_> {
             None => aggregate,
         };
         let aggregate = match bound.top_counts {
-            Some(bound) => aggregate.top_counts(bound),
+            Some((bound, call)) => aggregate.top_counts(bound, call),
             None => aggregate,
         };
         let aggregate = match bound.having_count {
@@ -1029,7 +1034,7 @@ impl<'a> Building<'a, '_> {
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
         if bound.max_groups.is_none() && bound.having_count.is_none() {
-            let top = bound.top_counts;
+            let top = bound.top_counts.map(|(bound, _)| bound);
             if let Some(frequencies) =
                 native_frequencies(self.plan, self.catalog, input, groups, aggregates, top)?
             {
@@ -1289,10 +1294,9 @@ impl<'a> Building<'a, '_> {
                 below.then(Arc::new(Watched::new(project, counters)), schema)
             }
             Node::Aggregate { input, index, groups, aggregates } => {
-                let top_counts = self
-                    .top_counts
-                    .iter()
-                    .find_map(|&(aggregate, bound)| (aggregate == reference).then_some(bound));
+                let top_counts = self.top_counts.iter().find_map(|&(aggregate, bound, call)| {
+                    (aggregate == reference).then_some((bound, call))
+                });
                 self.aggregate(
                     reference,
                     input,
@@ -1340,10 +1344,10 @@ impl<'a> Building<'a, '_> {
                 below.then(Arc::new(Watched::new(limit, counters)), schema)
             }
             Node::TopN { input, keys, count, offset } => {
-                if let Some(aggregate) = count_top_aggregate(plan, input, keys) {
+                if let Some((aggregate, call)) = count_top_aggregate(plan, input, keys) {
                     let bound = count.saturating_add(offset);
                     if let Ok(bound) = usize::try_from(bound) {
-                        self.top_counts.push((aggregate, bound));
+                        self.top_counts.push((aggregate, bound, call));
                     }
                 }
                 let below = self.node(input)?;
@@ -1589,8 +1593,9 @@ mod tests {
         let Node::TopN { input, keys, .. } = *plan.node(plan.root()) else {
             panic!("the root is a TopN")
         };
-        let aggregate = count_top_aggregate(&plan, input, keys).expect("the grouped count");
+        let (aggregate, call) = count_top_aggregate(&plan, input, keys).expect("the grouped count");
         assert!(matches!(plan.node(aggregate), Node::Aggregate { .. }));
+        assert_eq!(call, 0, "the count is the only call");
     }
 
     #[test]
@@ -1606,8 +1611,9 @@ mod tests {
         let Node::TopN { input, keys, .. } = *plan.node(plan.root()) else {
             panic!("the root is a TopN")
         };
-        let aggregate = count_top_aggregate(&plan, input, keys).expect("the grouped count");
+        let (aggregate, call) = count_top_aggregate(&plan, input, keys).expect("the grouped count");
         assert!(matches!(plan.node(aggregate), Node::Aggregate { .. }));
+        assert_eq!(call, 0, "the count is the only call");
     }
 
     #[test]
@@ -1631,8 +1637,10 @@ mod tests {
         let Node::TopN { input, keys, .. } = *plan.node(plan.root()) else {
             panic!("the root is a TopN")
         };
-        let aggregate = count_top_aggregate(&plan, input, keys).expect("the distinct count");
+        let (aggregate, call) =
+            count_top_aggregate(&plan, input, keys).expect("the distinct count");
         assert!(matches!(plan.node(aggregate), Node::Aggregate { .. }));
+        assert_eq!(call, 0, "the distinct count is the only call");
     }
 
     #[test]
@@ -1647,8 +1655,9 @@ mod tests {
         let Node::TopN { input, keys, .. } = *plan.node(plan.root()) else {
             panic!("the root is a TopN")
         };
-        let aggregate = count_top_aggregate(&plan, input, keys).expect("the grouped count");
+        let (aggregate, call) = count_top_aggregate(&plan, input, keys).expect("the grouped count");
         assert!(matches!(plan.node(aggregate), Node::Aggregate { .. }));
+        assert_eq!(call, 1, "the count is the second of the four calls");
     }
 
     #[test]
