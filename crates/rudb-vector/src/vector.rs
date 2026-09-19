@@ -460,6 +460,36 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
     fn bytes_len_at(&self, index: usize) -> Result<Option<usize>> {
         Ok(self.bytes_at(index)?.map(<[u8]>::len))
     }
+    /// Hands `body` the values from `first` up to at most `limit`, and answers where it stopped.
+    ///
+    /// The point of it is what it does not do, which is keep what it read.
+    /// [`bytes_at`](Self::bytes_at) hands back a borrow, so a source that decodes a block to answer
+    /// it has to hold that block for as long as the source lives, and a reader that walks the whole
+    /// source therefore ends up holding the whole thing decoded. On the ClickBench `URL` dictionary
+    /// that is 4.2 GB resident to answer one `LIKE`, and none of it is read twice.
+    ///
+    /// A caller that means to walk a stretch of values once calls this instead and gets the bytes
+    /// on loan for the length of the call. The source decides how much it hands over at a time,
+    /// which for a blocked payload is the rest of the block it had to decode anyway, and answers
+    /// with one past the last value it visited so the caller can come back for the next stretch.
+    /// The answer is always above `first` where `first` is a value this source has, so a loop on it
+    /// finishes.
+    ///
+    /// The default hands over one value through `bytes_at` and is correct for every source. It is
+    /// also pointless for a source that keeps everything anyway, which is every source built in
+    /// memory, and that is the right default for exactly that reason.
+    fn sweep(
+        &self,
+        first: usize,
+        limit: usize,
+        body: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<usize> {
+        if first >= limit.min(self.len()) {
+            return Ok(first);
+        }
+        body(first, self.bytes_at(first)?.unwrap_or_default())?;
+        Ok(first + 1)
+    }
     /// Resident bytes retained by this source.
     fn footprint(&self) -> usize;
     /// How many ranks this source's sorted value order has, when it has one.
@@ -1875,6 +1905,40 @@ impl Vector {
             | Body::Nested { .. }
             | Body::Fields { .. } => Ok(None),
         }
+    }
+
+    /// Walks the values from `first` up to at most `limit`, without keeping what it read.
+    ///
+    /// [`TextSource::sweep`] is what this is for and what the doc on it explains. Everything else
+    /// here is the honest fallback: a vector that is not reading text out of a file has its values
+    /// already, so there is nothing to avoid keeping, and it hands over one value and lets the
+    /// caller come back. The answer is one past the last value visited either way, so the loop that
+    /// calls this is the same loop whichever form it got.
+    ///
+    /// Nulls go the slow way. A source that reads a file holds no validity of its own, so the
+    /// vector's own mask is the only thing that knows, and rather than teach the sweep about it the
+    /// one form that can have both hands over a value at a time through the reader that checks.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading a value raises, and whatever `body` raises.
+    pub fn sweep_text(
+        &self,
+        first: usize,
+        limit: usize,
+        body: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<usize> {
+        let limit = limit.min(self.len);
+        if first >= limit {
+            return Ok(first);
+        }
+        if let Body::ExternalText { source } = &self.body {
+            if matches!(self.validity, Validity::AllValid) {
+                return source.sweep(first, limit, body);
+            }
+        }
+        body(first, self.try_bytes_at(first)?.unwrap_or_default())?;
+        Ok(first + 1)
     }
 
     /// Variable length byte count at `index`, preserving storage failures.

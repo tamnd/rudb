@@ -1373,16 +1373,45 @@ impl StableLike {
     }
 
     /// Decides every value of the group holding `code`, which reads one payload block in order.
+    ///
+    /// The walk goes through [`Vector::sweep_text`] rather than reading a value at a time, and that
+    /// is the whole reason the group exists. A dictionary that reads out of a file decodes a block
+    /// to answer for any value in it, and the reader that answers one value at a time has to keep
+    /// every block it decoded, so a walk of the whole dictionary ends up holding the whole
+    /// dictionary decoded: 4.2 GB for ClickBench `URL`, none of it read twice. A sweep hands the
+    /// block over for the length of the call and drops it, so what is left behind is the two bits a
+    /// value written here.
+    ///
+    /// The answers go into a buffer and are written a word at a time at the end rather than as they
+    /// are decided, because a sweep may hand over less than a group at a time and the buffer is 256
+    /// bytes. Nothing reads a bit before it is written, since a thread that finds the value
+    /// undecided walks it itself.
+    ///
+    /// Two threads landing on the same group now decode the same block twice where one used to
+    /// decode it and the other wait on the lock behind it. That is the trade and it is a good one:
+    /// a scan hands each thread its own parts and the dictionary has seventeen thousand blocks, so
+    /// the collision is rare, and what it costs when it happens is one block decoded twice rather
+    /// than every block kept for the length of the query.
     fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
         let first = code / LIKE_GROUP * LIKE_GROUP;
         let last = (first + LIKE_GROUP).min(self.dictionary.len());
-        for start in (first..last).step_by(MEMO_VALUES) {
-            let mut bits = 0_u64;
-            for step in 0..(last - start).min(MEMO_VALUES) {
-                let held = like.holds_vector(&self.dictionary, start + step, characters)?;
-                bits |= (1 | u64::from(held) << 1) << (step * 2);
+        let mut bits = [0_u64; LIKE_GROUP / MEMO_VALUES];
+        let mut at = first;
+        while at < last {
+            let stopped =
+                self.dictionary.sweep_text(at, last, &mut |index: usize, text: &[u8]| {
+                    let held = like.holds_loan(text, characters)?;
+                    let (word, shift) = Self::slot(index - first);
+                    bits[word] |= (1 | u64::from(held) << 1) << shift;
+                    Ok(())
+                })?;
+            if stopped <= at {
+                return Err(Error::internal("a dictionary sweep did not move"));
             }
-            self.word(start / MEMO_VALUES)?.fetch_or(bits, Ordering::Release);
+            at = stopped;
+        }
+        for (step, word) in bits.iter().take((last - first).div_ceil(MEMO_VALUES)).enumerate() {
+            self.word(first / MEMO_VALUES + step)?.fetch_or(*word, Ordering::Release);
         }
         Ok(())
     }
@@ -1452,6 +1481,23 @@ impl Like {
             return Ok(self.compiled.holds_bytes(text) != self.negated);
         }
         let text = vector.try_text_at(position)?.unwrap_or_default();
+        let folded = if self.fold_case { Some(text.to_lowercase()) } else { None };
+        let text = folded.as_deref().unwrap_or(text);
+        Ok(self.compiled.holds(text, characters) != self.negated)
+    }
+
+    /// The same answer for a value already in hand rather than one to be read out of a vector.
+    ///
+    /// What a sweep hands over is bytes on loan, so this is [`Self::holds_vector`] with the read
+    /// taken out of it, including the reason the two halves are there: a pattern that neither folds
+    /// case nor needs characters never looks at whether the bytes are UTF-8, and the two that do
+    /// raise the same conversion error reading a value out of a vector raises.
+    fn holds_loan(&self, text: &[u8], characters: &mut Vec<char>) -> Result<bool> {
+        if !self.fold_case && !matches!(self.compiled, Pattern::General(_)) {
+            return Ok(self.compiled.holds_bytes(text) != self.negated);
+        }
+        let text = std::str::from_utf8(text)
+            .map_err(|error| Error::conversion(format!("invalid UTF-8 in VARCHAR: {error}")))?;
         let folded = if self.fold_case { Some(text.to_lowercase()) } else { None };
         let text = folded.as_deref().unwrap_or(text);
         Ok(self.compiled.holds(text, characters) != self.negated)

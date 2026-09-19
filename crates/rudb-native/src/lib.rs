@@ -1533,39 +1533,42 @@ impl NativeText {
     /// shorter than the decoded one and by a different amount in every block.
     fn payload_block(&self, block: usize) -> Result<Option<&[u8]>> {
         let Some(slot) = self.blocks.get(block) else { return Ok(None) };
-        let bytes = slot
-            .get_or_init(|| {
-                let start = if block == 0 { 0 } else { self.ends[block - 1] };
-                let end = self.ends[block];
-                let len = end
-                    .checked_sub(start)
-                    .ok_or_else(|| invalid("global dictionary block ends before it starts"))?;
-                let mut stored = vec![
-                    0;
-                    usize::try_from(len).map_err(|_| invalid(
-                        "global dictionary block does not fit in memory"
-                    ))?
-                ];
-                read_at(&self.file, self.payload + start, &mut stored)?;
-                if checksum(&stored) != self.hashes[block] {
-                    return Err(invalid("global dictionary payload checksum differs"));
-                }
-                let first = block * TEXT_PAYLOAD_VALUES;
-                let last = (first + TEXT_PAYLOAD_VALUES).min(self.values);
-                let want = self.end_within(last - 1)? as usize;
-                let values = string::decode_flat(&stored)?;
-                if values.len() != last - first {
-                    return Err(invalid("global dictionary block holds the wrong value count"));
-                }
-                let bytes = values.into_bytes();
-                if bytes.len() != want {
-                    return Err(invalid("global dictionary block decodes to the wrong length"));
-                }
-                Ok(bytes)
-            })
-            .as_ref()
-            .map_err(Clone::clone)?;
+        let bytes = slot.get_or_init(|| self.decode_block(block)).as_ref().map_err(Clone::clone)?;
         Ok(Some(bytes.as_slice()))
+    }
+
+    /// Reads and decodes one block of the payload, without deciding who keeps it.
+    ///
+    /// [`Self::payload_block`] keeps it forever, which is what a point read wants and what a walk
+    /// of the whole dictionary must not do. Both call this and they differ in nothing else.
+    fn decode_block(&self, block: usize) -> Result<Vec<u8>> {
+        let start = if block == 0 { 0 } else { self.ends[block - 1] };
+        let end = self.ends[block];
+        let len = end
+            .checked_sub(start)
+            .ok_or_else(|| invalid("global dictionary block ends before it starts"))?;
+        let mut stored = vec![
+            0;
+            usize::try_from(len).map_err(|_| invalid(
+                "global dictionary block does not fit in memory"
+            ))?
+        ];
+        read_at(&self.file, self.payload + start, &mut stored)?;
+        if checksum(&stored) != self.hashes[block] {
+            return Err(invalid("global dictionary payload checksum differs"));
+        }
+        let first = block * TEXT_PAYLOAD_VALUES;
+        let last = (first + TEXT_PAYLOAD_VALUES).min(self.values);
+        let want = self.end_within(last - 1)? as usize;
+        let values = string::decode_flat(&stored)?;
+        if values.len() != last - first {
+            return Err(invalid("global dictionary block holds the wrong value count"));
+        }
+        let bytes = values.into_bytes();
+        if bytes.len() != want {
+            return Err(invalid("global dictionary block decodes to the wrong length"));
+        }
+        Ok(bytes)
     }
 
     /// Where the value at `index` ends inside its payload block.
@@ -1739,6 +1742,47 @@ impl TextSource for NativeText {
         }
         let (start, end) = self.span_within(index)?;
         Ok(Some((end - start) as usize))
+    }
+
+    /// The rest of the block holding `first`, decoded into a buffer that dies with the call.
+    ///
+    /// A block is the unit this format decodes, so a walk that wants every value is going to
+    /// decode every block whatever it does. What it does not have to do is keep them, and
+    /// [`Self::payload_block`] keeps every block it is asked for, so the reader that walks the
+    /// whole dictionary through `bytes_at` ends up holding the whole dictionary decoded. On
+    /// ClickBench `URL` that is 4.2 GB resident to answer one `LIKE`, and nothing reads a byte of
+    /// it twice.
+    ///
+    /// A block already in hand is used where it is there, since decoding it again to avoid keeping
+    /// what is already kept would be the wrong trade in both directions.
+    fn sweep(
+        &self,
+        first: usize,
+        limit: usize,
+        body: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<usize> {
+        let limit = limit.min(self.values);
+        if first >= limit {
+            return Ok(first);
+        }
+        let block = first / TEXT_PAYLOAD_VALUES;
+        let last = ((block + 1) * TEXT_PAYLOAD_VALUES).min(limit);
+        let decoded;
+        let bytes: &[u8] = match self.blocks.get(block).and_then(OnceLock::get) {
+            Some(Ok(kept)) => kept,
+            _ => {
+                decoded = self.decode_block(block)?;
+                &decoded
+            }
+        };
+        for index in first..last {
+            let (start, end) = self.span_within(index)?;
+            let value = bytes
+                .get(start as usize..end as usize)
+                .ok_or_else(|| invalid("global dictionary value is past its block"))?;
+            body(index, value)?;
+        }
+        Ok(last)
     }
 
     fn ranks(&self) -> Option<usize> {
@@ -5942,6 +5986,70 @@ mod tests {
                 );
             }
         }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A sweep of the dictionary reads every value and keeps none of the blocks it read.
+    ///
+    /// The point of the sweep is the resident size rather than the answer, so both are checked
+    /// here. The values come back through `try_bytes_at` afterwards rather than before, because
+    /// asking that first would decode every block and leave the footprint check with nothing to
+    /// say. The last assertion is the other half of it: a point read still keeps what it decoded,
+    /// which is what a query that reads a handful of values wants and is why the sweep is a second
+    /// way in rather than a change to the first.
+    #[test]
+    fn a_dictionary_sweep_reads_every_value_and_keeps_no_block() {
+        let path = path("dictionary-sweep");
+        // Two thousand five hundred distinct values is two whole payload blocks and a part of a
+        // third, so the sweep has to be called more than once and the last call has to stop short.
+        let spellings = (0..2_500)
+            .map(|index| Value::Varchar(format!("value {index:08} {}", "x".repeat(index % 40))))
+            .collect::<Vec<_>>();
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        // A chunk is a part and a part is at most 1,024 rows, so the values go in three of them.
+        // The dictionary is table wide and does not care where a value was written.
+        for part in spellings.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("stripe written");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        assert_eq!(dictionary.len(), spellings.len(), "every value is distinct");
+
+        let resting = dictionary.footprint();
+        let mut swept: Vec<Vec<u8>> = Vec::new();
+        let mut at = 0;
+        let mut calls = 0;
+        while at < dictionary.len() {
+            let stopped = dictionary
+                .sweep_text(at, dictionary.len(), &mut |index: usize, text: &[u8]| {
+                    assert_eq!(index, swept.len(), "a sweep hands its values over in order");
+                    swept.push(text.to_vec());
+                    Ok(())
+                })
+                .expect("a sweep reads");
+            assert!(stopped > at, "a sweep moves");
+            at = stopped;
+            calls += 1;
+        }
+        assert_eq!(calls, 3, "a sweep hands over one block at a time");
+        assert_eq!(dictionary.footprint(), resting, "a sweep keeps no block it decoded");
+
+        let read = (0..dictionary.len())
+            .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(swept, read, "a sweep answers what a point read answers");
+        assert!(dictionary.footprint() > resting, "a point read keeps the block it decoded");
         fs::remove_file(path).expect("remove scratch file");
     }
 
