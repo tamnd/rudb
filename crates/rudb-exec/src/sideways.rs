@@ -54,12 +54,24 @@
 //!
 //! Anything this cannot arm is a query that runs exactly as it did before, because a scan handed
 //! nothing asks nothing and reads everything.
+//!
+//! # The column the join names is not the column the scan produces
+//!
+//! A projection binds its output against a table index of its own, so the driving column a join
+//! knows about is `#1.0` where the scan under it produces `#0.0`, and a scan asked about a binding
+//! into some other table answers nothing. That is one node between the two and it is there in every
+//! plan that projects, which is every plan over a view and every plan pushdown has been through, so
+//! taking the join's binding as it stands is a runtime filter that is built, handed over and never
+//! read. [`beneath`] is the walk that turns the one into the other, down the same two nodes the
+//! builder allows and through nothing else, and a projection that computes its column rather than
+//! passing one through ends the walk with nothing, because a fact about a value says nothing about
+//! what an expression over it produces.
 
 use std::sync::{Arc, OnceLock};
 
 use rudb_common::bounds::{Bound, Op};
 use rudb_common::{Result, SessionTimeZone};
-use rudb_plan::{ColumnBinding, ExprRef, Plan};
+use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan};
 use rudb_storage::{Blocked, Range};
 use rudb_vector::{Chunk, Vector};
 
@@ -203,6 +215,41 @@ impl<'a> Sideways<'a> {
     }
 }
 
+/// The same column as `binding`, named the way the scan at the bottom of `node` names it.
+///
+/// The join knows its driving column as the projection above the scan binds it, and the scan knows
+/// its own columns, so somebody has to walk between the two. This does, down the two nodes
+/// [`crate::build`] lets a runtime filter through, and it is the same walk for the same reason: a
+/// filter keeps rows and renames nothing, so the binding goes through it untouched, and a projection
+/// rebinds, so the binding becomes whatever the expression in that position is.
+///
+/// `None` unless the walk ends at a scan of the table the binding is about by then. A projection
+/// whose column at that position is an expression rather than a column ends it, because a set of
+/// values says nothing about what an expression over them produces, and so does a node the builder
+/// would have refused anyway, which is here as well so that the two cannot drift apart.
+pub(crate) fn beneath(plan: &Plan, node: NodeRef, binding: ColumnBinding) -> Option<ColumnBinding> {
+    let mut at = node;
+    let mut binding = binding;
+    loop {
+        match *plan.node(at) {
+            Node::Get { index, .. } | Node::TableFunction { index, .. } => {
+                return (binding.table == index).then_some(binding);
+            }
+            Node::Filter { input, .. } => at = input,
+            Node::Project { input, index, exprs, .. } => {
+                if binding.table == index {
+                    let exprs = plan.expr_list(exprs);
+                    let at = exprs.get(binding.column as usize)?;
+                    let Expr::Column(inner) = *plan.expr(*at) else { return None };
+                    binding = inner;
+                }
+                at = input;
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// What the build side holds, read off the chunks it was gathered into.
 ///
 /// One pass over one column of the smaller side of the join, at the moment that side is complete.
@@ -303,7 +350,7 @@ mod tests {
     use rudb_storage::Blocked;
     use rudb_vector::{Chunk, Vector};
 
-    use super::{Across, Extremes, Found, Keyed, Schema, Sideways, found, hash};
+    use super::{Across, Extremes, Found, Keyed, Schema, Sideways, beneath, found, hash};
 
     fn column(values: &[Option<i32>]) -> Vector {
         let values: Vec<Value> =
@@ -465,5 +512,81 @@ mod tests {
 
         assert_eq!(found.range, None);
         assert_eq!(through(&found.filter.expect("a filter of no keys"), &[Some(1)]), [false]);
+    }
+
+    /// A driving side written as plan text, which is how every other operator test in this crate
+    /// builds one.
+    fn driving(text: &str) -> Plan {
+        Plan::parse(text).expect("the plan text round trips")
+    }
+
+    /// The case that is in every plan over a view: the join names the projection's column and the
+    /// scan under it names its own, and without the walk between them the filter is built, handed
+    /// over and read by nobody.
+    #[test]
+    fn a_projection_between_the_join_and_the_scan_renames_the_column_the_filter_is_about() {
+        let plan = driving(
+            "Project #1 [#0.1::INTEGER AS k]\n  \
+             TableFunction read_parquet args=['f'::VARCHAR] #0 [a::INTEGER, k::INTEGER]",
+        );
+
+        assert_eq!(
+            beneath(&plan, plan.root(), ColumnBinding::new(1, 0)),
+            Some(ColumnBinding::new(0, 1)),
+            "the scan's own name for the projection's column"
+        );
+    }
+
+    /// A filter keeps rows and renames nothing, so the binding goes through it as it stands, and
+    /// this is the shape a join over a filtered fact table drives with.
+    #[test]
+    fn a_filter_between_the_two_leaves_the_binding_alone() {
+        let plan = driving(
+            "Project #1 [#0.0::INTEGER AS k]\n  \
+             Filter (#0.0::INTEGER > 3::INTEGER)::BOOLEAN\n    \
+             TableFunction read_parquet args=['f'::VARCHAR] #0 [k::INTEGER]",
+        );
+
+        assert_eq!(
+            beneath(&plan, plan.root(), ColumnBinding::new(1, 0)),
+            Some(ColumnBinding::new(0, 0))
+        );
+    }
+
+    /// A projection that computes its column ends the walk, because a set of values says nothing
+    /// about what an expression over them produces, and a scan dropping rows on that would be rows
+    /// missing from the answer.
+    #[test]
+    fn a_computed_column_is_not_a_column_the_filter_can_be_about() {
+        let plan = driving(
+            "Project #1 [(#0.0::INTEGER > 3::INTEGER)::BOOLEAN AS k]\n  \
+             TableFunction read_parquet args=['f'::VARCHAR] #0 [k::INTEGER]",
+        );
+
+        assert_eq!(beneath(&plan, plan.root(), ColumnBinding::new(1, 0)), None);
+    }
+
+    /// And the walk has to end at the scan the binding is about by then, so a driving side with a
+    /// node in the way, or one about another table's column, arms nothing.
+    #[test]
+    fn a_walk_that_does_not_reach_the_scan_it_is_about_arms_nothing() {
+        let plan = driving(
+            "Limit 5 offset 0\n  \
+             TableFunction read_parquet args=['f'::VARCHAR] #0 [k::INTEGER]",
+        );
+
+        assert_eq!(
+            beneath(&plan, plan.root(), ColumnBinding::new(0, 0)),
+            None,
+            "a node in the way"
+        );
+
+        let plan = driving("TableFunction read_parquet args=['f'::VARCHAR] #0 [k::INTEGER]");
+
+        assert_eq!(
+            beneath(&plan, plan.root(), ColumnBinding::new(3, 0)),
+            None,
+            "another table's column"
+        );
     }
 }
