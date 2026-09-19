@@ -255,19 +255,57 @@ impl Table {
         slots: &mut [usize],
         walk: &mut Walk,
     ) {
+        self.probe_at(hashes, keys, Rows::Run(from, upto), &mut slots[from..upto], walk);
+        // Back from a place in the batch to a row, because a run of rows is what this caller asked
+        // about and a row is what it wants to hear about.
+        for place in &mut walk.pending {
+            *place += from;
+        }
+    }
+
+    /// The same, for a list of rows rather than a run of them.
+    ///
+    /// `slots` is as long as `rows` and is written by place rather than by row, and the places
+    /// [`Walk::pending`] hands back index `rows` the same way. A join builds its table in
+    /// partitions and the rows of a partition are scattered through the side, so what one thread
+    /// probes with is a list.
+    pub(crate) fn probe_these(
+        &self,
+        hashes: &[u64],
+        keys: &[Vector],
+        rows: &[usize],
+        slots: &mut [usize],
+        walk: &mut Walk,
+    ) {
+        self.probe_at(hashes, keys, Rows::These(rows), slots, walk);
+    }
+
+    /// The batched probe itself, answering by place in the batch.
+    fn probe_at(
+        &self,
+        hashes: &[u64],
+        keys: &[Vector],
+        rows: Rows<'_>,
+        slots: &mut [usize],
+        walk: &mut Walk,
+    ) {
         let mask = self.buckets.len() - 1;
         walk.pending.clear();
         if self.buckets.len() <= HOT {
-            for row in from..upto {
+            for (out, found) in slots.iter_mut().enumerate().take(rows.len()) {
+                let row = rows.at(out);
                 match self.probe(hashes[row], keys, row) {
-                    Probe::Found(slot) => slots[row] = slot,
-                    Probe::Vacant(_) => walk.pending.push(row),
+                    Probe::Found(slot) => *found = slot,
+                    Probe::Vacant(_) => walk.pending.push(out),
                 }
             }
             return;
         }
         walk.here.clear();
-        walk.here.extend((from..upto).map(|row| Step { row, at: (hashes[row] as usize) & mask }));
+        walk.here.extend((0..rows.len()).map(|out| {
+            let row = rows.at(out);
+            Step { row, out, at: (hashes[row] as usize) & mask }
+        }));
         while !walk.here.is_empty() {
             // The bucket of every row still walking, which is the only pass that goes to memory
             // ahead of the keys.
@@ -293,17 +331,18 @@ impl Table {
             for ((step, &bucket), &same) in walk.here.iter().zip(&walk.seen).zip(&walk.same) {
                 let slot = slot_of(bucket);
                 if slot == EMPTY {
-                    walk.pending.push(step.row);
+                    walk.pending.push(step.out);
                 } else if same {
-                    slots[step.row] = slot as usize;
+                    slots[step.out] = slot as usize;
                 } else {
-                    walk.next.push(Step { row: step.row, at: (step.at + 1) & mask });
+                    walk.next.push(Step { row: step.row, out: step.out, at: (step.at + 1) & mask });
                 }
             }
             std::mem::swap(&mut walk.here, &mut walk.next);
         }
         // In row order, because the slot a group is given is the order the answer comes out in, and
-        // the passes above reach a vacancy in whatever order the walks happen to end.
+        // the passes above reach a vacancy in whatever order the walks happen to end. The places
+        // sort into row order too, because a batch is given in row order either way it is given.
         walk.pending.sort_unstable();
     }
 
@@ -424,8 +463,42 @@ impl Table {
 struct Step {
     /// Its row in the chunk, which is where its hash and its key are.
     row: usize,
+    /// Where its answer goes, which is its place in the batch rather than its row.
+    ///
+    /// The two are the same number for a run of rows and are not for a list of them. A join builds
+    /// its table in partitions and a partition's rows are scattered through the side, so the batch
+    /// it hands over is a list and the answers come back packed.
+    out: usize,
     /// The bucket its walk is looking at now.
     at: usize,
+}
+
+/// Which rows of a chunk a probe is being asked about.
+#[derive(Debug, Clone, Copy)]
+enum Rows<'a> {
+    /// Every row from the first up to the last, which is what a group by asks.
+    Run(usize, usize),
+    /// These and no others, in the order they are given, which is what one partition of a join's
+    /// build asks.
+    These(&'a [usize]),
+}
+
+impl Rows<'_> {
+    /// How many rows are in the batch.
+    fn len(&self) -> usize {
+        match *self {
+            Rows::Run(from, upto) => upto - from,
+            Rows::These(rows) => rows.len(),
+        }
+    }
+
+    /// The row in the `index`th place of the batch.
+    fn at(&self, index: usize) -> usize {
+        match *self {
+            Rows::Run(from, _) => from + index,
+            Rows::These(rows) => rows[index],
+        }
+    }
 }
 
 /// The buffers [`Table::probe_run`] walks a batch with.
