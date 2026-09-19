@@ -195,9 +195,28 @@ impl Call {
         for value in rest {
             match value {
                 Value::Varchar(held) => spelling = held,
-                // A group index that is not a number the machine can hold is one no pattern has, so
-                // it reads as the empty string rather than as an error, which is what DuckDB
-                // answers for a group index past the end of the pattern.
+                // A null group index is not a number and keeps the null path it already had.
+                Value::Null => {}
+                // DuckDB takes zero to nine and refuses everything else with this sentence, per
+                // #496. It refuses it while binding and this cannot, for the reason `hoist` gives
+                // a few lines up: preparing a query here does not raise what running it would
+                // raise, so the sentence comes out of the first chunk that reaches the call, which
+                // is where an option letter that is not one already comes out of. A query that
+                // reaches no rows at all therefore still answers where upstream errors.
+                //
+                // A group inside zero to nine that the pattern does not have is the empty string
+                // and not an error, which is why nothing here counts the pattern's groups.
+                other if name == "regexp_extract" => {
+                    let held = integral(other)
+                        .and_then(|held| usize::try_from(held).ok())
+                        .filter(|&held| held <= 9);
+                    let Some(held) = held else {
+                        return Err(Error::invalid_input("Group index must be between 0 and 9!"));
+                    };
+                    group = held;
+                }
+                // The other three take an option string and no group index, so a number here is
+                // one upstream refuses while binding and this reads the way it always did.
                 other => {
                     group = integral(other)
                         .and_then(|held| usize::try_from(held).ok())
@@ -320,18 +339,30 @@ mod tests {
         assert_eq!(host("http://www./a"), "www.");
     }
 
-    /// The bug this is here for: a group index that does not fit a `usize` is read as
-    /// `usize::MAX`, which means a group no pattern has, and the doubling on the way to the slot
-    /// overflowed. `SELECT regexp_extract('a', 'a', -1)` panicked the process while the optimizer
-    /// folded the call, before a row existed. It answers the empty string now, the same as any
-    /// other group the pattern does not have. Refusing it the way DuckDB does is #496.
+    /// The bug this started as: a group index that does not fit a `usize` was read as `usize::MAX`,
+    /// which means a group no pattern has, and the doubling on the way to the slot overflowed.
+    /// `SELECT regexp_extract('a', 'a', -1)` panicked the process while the optimizer folded the
+    /// call, before a row existed.
+    ///
+    /// It is refused now, which is #496 and what DuckDB does. A group inside zero to nine that the
+    /// pattern does not have is still the empty string, because that is what DuckDB answers for it.
     #[test]
-    fn a_group_index_that_is_not_a_group_extracts_nothing() {
+    fn a_group_index_outside_zero_to_nine_is_refused() {
+        let called = |group: Value| {
+            let args = [Value::Varchar("a".into()), Value::Varchar("a".into()), group];
+            value("regexp_extract", &args)
+        };
+        for outside in [Value::BigInt(-1), Value::BigInt(10), Value::BigInt(i64::MAX)] {
+            let message = called(outside.clone()).expect_err("outside the range").to_string();
+            assert!(
+                message.contains("Group index must be between 0 and 9!"),
+                "{outside:?} said {message}"
+            );
+        }
         let empty = Value::Varchar(String::new());
-        let args = [Value::Varchar("a".into()), Value::Varchar("a".into()), Value::BigInt(-1)];
-        assert_eq!(value("regexp_extract", &args).expect("no panic"), empty);
-        let past = [Value::Varchar("a".into()), Value::Varchar("a".into()), Value::BigInt(7)];
-        assert_eq!(value("regexp_extract", &past).expect("no panic"), empty);
+        assert_eq!(called(Value::BigInt(7)).expect("inside the range"), empty);
+        assert_eq!(called(Value::BigInt(9)).expect("inside the range"), empty);
+        assert_eq!(called(Value::BigInt(0)).expect("inside the range"), Value::Varchar("a".into()));
     }
 
     #[test]
