@@ -181,6 +181,38 @@ fn search(dictionary: &Vector, ranks: usize, wanted: &[u8]) -> Result<Found> {
     Ok(Found::Absent)
 }
 
+/// How many of a dictionary's values sort before `wanted`, and whether one of them is `wanted`.
+///
+/// [`search`] answers where a literal is and this answers where it would go, which is what an
+/// inequality needs and an equality does not. The two could be one function returning both, and they
+/// are not because the loops differ in the one line that matters: a search stops the moment it lands
+/// on the literal and this one carries on past it to the first rank holding it, so that the count it
+/// returns is a boundary rather than wherever the halving happened to touch down. The values are
+/// distinct, which [`crate::TextSource::ranks`] promises, so there is exactly one such rank and the
+/// flag says whether the search met it.
+///
+/// What the count is for: with `below` values under the literal and `equal` saying whether the
+/// literal itself is in there, a value of rank `r` is under the literal exactly when `r < below` and
+/// under or equal to it exactly when `r < below + equal`. Those two boundaries answer all four
+/// inequalities between them, and neither of them reads a value.
+pub(crate) fn below(dictionary: &Vector, ranks: usize, wanted: &[u8]) -> Result<(usize, bool)> {
+    let mut low = 0;
+    let mut high = ranks;
+    let mut equal = false;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match dictionary.compare_rank(middle, wanted)? {
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+            std::cmp::Ordering::Equal => {
+                equal = true;
+                high = middle;
+            }
+        }
+    }
+    Ok((low, equal))
+}
+
 impl Answers {
     fn run<M, D>(
         &self,

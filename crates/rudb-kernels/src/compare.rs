@@ -79,7 +79,7 @@ use rudb_vector::{
 use crate::fallback::{self, Kernel};
 use crate::logic::is_true;
 use crate::number::{approximate, integral};
-use crate::peel::Found;
+use crate::peel::{self, Found};
 use crate::prepare::Held;
 use crate::shape::{first, identity, nulls_of, single};
 
@@ -413,6 +413,9 @@ where
         }
         return Ok(Some(answers));
     }
+    if let Some(answers) = by_rank(op, column, literal, len, map)? {
+        return Ok(Some(answers));
+    }
     let mut answers = Vec::with_capacity(len);
     for slot in 0..len {
         let row = map(slot);
@@ -424,6 +427,62 @@ where
             None => Ordering::Equal,
         };
         answers.push(op.holds(order));
+    }
+    Ok(Some(answers))
+}
+
+/// An inequality against a literal answered out of the dictionary's sorted order, or `None` when
+/// there is no order to answer it from.
+///
+/// The equality path has resolved a literal to a code and compared integers since the sorted order
+/// was written, and this is the same trick for the other four comparisons. One binary search puts the
+/// literal at a rank boundary, the inverse of the order turns each row's code into its rank, and then
+/// the whole comparison is one `usize` against another. No value is read and no bytes are compared.
+///
+/// The caller this was written for is the top N. `ORDER BY <varchar> LIMIT 10` asks every chunk
+/// whether any row in it can still beat the tenth best candidate, which is a comparison of the key
+/// column against a literal that changes as the query runs, so there is nothing to memoize and the
+/// row loop is the whole of the operator. On ClickBench 25, which is that query over `SearchPhrase`,
+/// the top N was 0.377 of the 0.791 milliseconds the pipeline's operators spent per instance, against
+/// 0.097 for the same query ordered by a timestamp. The gap was the byte compare.
+///
+/// The filter gets it too, for `WHERE <varchar> < 'literal'` and for both halves of a `BETWEEN`.
+///
+/// Two things have to be true and the source decides both. It has to know its own order, and it has
+/// to be willing to hand the order back inverted, which is a `u32` per value it builds once and keeps.
+/// A source that would rather not answers `None` to one of them and the byte loop below runs instead,
+/// which is what every in memory column does today.
+fn by_rank<M>(
+    op: Comparison,
+    column: &Vector,
+    literal: &[u8],
+    len: usize,
+    map: M,
+) -> Result<Option<Vec<bool>>>
+where
+    M: Fn(usize) -> usize,
+{
+    let Some((codes, dictionary)) = column.shared_dictionary_parts() else { return Ok(None) };
+    let Some(ranks) = dictionary.ranks() else { return Ok(None) };
+    let Some(order) = dictionary.code_ranks() else { return Ok(None) };
+    let (below, equal) = peel::below(dictionary, ranks, literal)?;
+    // The two boundaries `peel::below` describes, picked by which side of the literal the comparison
+    // wants and whether the literal itself counts as being on that side.
+    let cut = match op {
+        Comparison::Less | Comparison::GreaterOrEqual => below,
+        _ => below + usize::from(equal),
+    };
+    let under = matches!(op, Comparison::Less | Comparison::LessOrEqual);
+    let mut answers = Vec::with_capacity(len);
+    // row at a time: the comparison is the loop, and a row of it is two loads and an integer compare.
+    for slot in 0..len {
+        let code = *codes
+            .get(map(slot))
+            .ok_or_else(|| Error::internal("a ranked row is past the end of its codes"))?;
+        let rank = *order
+            .get(code as usize)
+            .ok_or_else(|| Error::internal("a ranked code is past the end of its dictionary"))?;
+        answers.push(((rank as usize) < cut) == under);
     }
     Ok(Some(answers))
 }
@@ -2201,6 +2260,8 @@ mod tests {
     struct Filed {
         values: Vec<Vec<u8>>,
         order: Vec<u32>,
+        /// [`Self::order`] turned round, built on the first ask the way a reader's is.
+        ranked: std::sync::OnceLock<Option<Vec<u32>>>,
     }
 
     impl rudb_vector::TextSource for Filed {
@@ -2229,6 +2290,18 @@ mod tests {
         fn code_at_rank(&self, rank: usize) -> Result<u32> {
             Ok(self.order[rank])
         }
+
+        fn code_ranks(&self) -> Option<&[u32]> {
+            self.ranked
+                .get_or_init(|| {
+                    let mut ranks = vec![0; self.order.len()];
+                    for (rank, &code) in self.order.iter().enumerate() {
+                        ranks[code as usize] = rank as u32;
+                    }
+                    Some(ranks)
+                })
+                .as_deref()
+        }
     }
 
     /// The same comparison over a dictionary whose values came out of a file with their order, so
@@ -2243,7 +2316,7 @@ mod tests {
         order.sort_by(|&left, &right| values[left as usize].cmp(&values[right as usize]));
         let values = Vector::external_text(
             LogicalType::Varchar,
-            std::sync::Arc::new(Filed { values, order }),
+            std::sync::Arc::new(Filed { values, order, ranked: std::sync::OnceLock::new() }),
         )
         .expect("a filed vector");
         let codes = vec![0, 1, 3, 2, 0, 4, 1, 0];
@@ -2256,8 +2329,15 @@ mod tests {
     /// against the row at a time path. `missing` is in here because a dictionary that does not
     /// hold the literal is decided for the whole chunk and that is its own arm of the code.
     fn same_as_the_oracle(column: &Vector) {
-        for literal in ["", "one", "missing"] {
-            for op in [Comparison::Equal, Comparison::NotEqual] {
+        for literal in ["", "one", "missing", "zzz"] {
+            for op in [
+                Comparison::Equal,
+                Comparison::NotEqual,
+                Comparison::Less,
+                Comparison::LessOrEqual,
+                Comparison::Greater,
+                Comparison::GreaterOrEqual,
+            ] {
                 let value = Value::Varchar(literal.to_owned());
                 let held = Held::of(&LogicalType::Varchar, &value).expect("text has a column");
                 let right = Vector::constant(LogicalType::Varchar, value.clone(), column.len());
