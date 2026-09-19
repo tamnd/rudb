@@ -1304,11 +1304,14 @@ const LIKE_GROUP: usize = 1024;
 /// the same query written as a prefix, both cost what `%google%` costs to the hundredth of a
 /// second.
 ///
-/// So the answer is a bit a value and whether it has been decided is another, which is 2.3 MB each
-/// for `URL` against the eighteen a byte a value took, and the memo decides a whole group at a time
-/// rather than a value at a time. Deciding a group is a walk over 1,024 consecutive dictionary
-/// values, which is one payload block read in the order it decodes to rather than a scatter across
-/// a gigabyte of them.
+/// So the memo is two bits a value, one saying the value has been decided and one holding what was
+/// decided, which is 4.6 MB for `URL` against the eighteen a byte a value took. Both bits live in
+/// the same word of thirty two values, so the row loop reads one word and reads it once, and a
+/// reader that sees the decided bit is looking at the answer that was written with it.
+///
+/// The memo also decides a whole group at a time rather than a value at a time. Deciding a group is
+/// a walk over 1,024 consecutive dictionary values, which is one payload block read in the order it
+/// decodes to rather than a scatter across a gigabyte of them.
 ///
 /// A group is only worth deciding whole where the chunk asking is a scan rather than what a
 /// selective filter left behind. A chunk of ten rows that happen to point at ten distant values has
@@ -1320,61 +1323,63 @@ const LIKE_GROUP: usize = 1024;
 /// Two threads can decide the same value or the same group at the same time. They walk the same
 /// values with the same pattern and reach the same answer, so the race is benign: the group write
 /// and the single value write agree wherever they overlap, and neither can clear a bit the other
-/// set. The decided bit is written last with a release and read with an acquire, which is what
-/// makes the answer visible to a thread that skips the walk.
+/// set. A decision is one `fetch_or` carrying both bits, released by the thread that made it and
+/// acquired by the thread that skips the walk because of it.
 #[derive(Debug)]
 struct StableLike {
     dictionary: Arc<Vector>,
-    /// One bit a value, set where the value matches, meaningful once its decided bit is set.
-    answers: Vec<AtomicU64>,
-    /// One bit a value, set once that value's answer is written.
-    decided: Vec<AtomicU64>,
+    /// Two bits a value, the low one of the pair saying the value was decided and the high one
+    /// saying it matched, packed thirty two values to the word.
+    state: Vec<AtomicU64>,
 }
 
+/// How many dictionary values one word of the memo holds, at two bits each.
+const MEMO_VALUES: usize = 32;
+
 impl StableLike {
-    /// Whether `code` has been decided already.
-    fn is_decided(&self, code: usize) -> bool {
-        self.decided
-            .get(code / 64)
-            .is_some_and(|word| word.load(Ordering::Acquire) >> (code % 64) & 1 == 1)
+    /// The word `code` lives in and how far into it the pair of bits sits.
+    fn slot(code: usize) -> (usize, usize) {
+        (code / MEMO_VALUES, code % MEMO_VALUES * 2)
+    }
+
+    /// Whether `code` matches, or `None` where nothing has decided it yet.
+    ///
+    /// One load for both bits, which is the whole point of packing them together: this runs once a
+    /// row over a memo too big to stay in the last level cache, so a second array would be a second
+    /// miss for a question the first one already answered.
+    fn peek(&self, code: usize) -> Option<bool> {
+        let (index, shift) = Self::slot(code);
+        let word = self.state.get(index)?.load(Ordering::Acquire);
+        ((word >> shift) & 1 == 1).then(|| (word >> (shift + 1)) & 1 == 1)
     }
 
     /// Decides one value, which is what a chunk too small to be a scan asks for.
     fn decide_one(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
-        if like.holds_vector(&self.dictionary, code, characters)? {
-            self.word(&self.answers, code)?.fetch_or(1 << (code % 64), Ordering::Relaxed);
-        }
-        self.word(&self.decided, code)?.fetch_or(1 << (code % 64), Ordering::Release);
+        let held = like.holds_vector(&self.dictionary, code, characters)?;
+        let (index, shift) = Self::slot(code);
+        self.word(index)?.fetch_or((1 | u64::from(held) << 1) << shift, Ordering::Release);
         Ok(())
     }
 
     /// Decides every value of the group holding `code`, which reads one payload block in order.
     fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
-        let group = code / LIKE_GROUP;
-        let first = group * LIKE_GROUP;
+        let first = code / LIKE_GROUP * LIKE_GROUP;
         let last = (first + LIKE_GROUP).min(self.dictionary.len());
-        for word in (first..last).step_by(64) {
+        for start in (first..last).step_by(MEMO_VALUES) {
             let mut bits = 0_u64;
-            for bit in 0..(last - word).min(64) {
-                if like.holds_vector(&self.dictionary, word + bit, characters)? {
-                    bits |= 1 << bit;
-                }
+            for step in 0..(last - start).min(MEMO_VALUES) {
+                let held = like.holds_vector(&self.dictionary, start + step, characters)?;
+                bits |= (1 | u64::from(held) << 1) << (step * 2);
             }
-            self.word(&self.answers, word)?.fetch_or(bits, Ordering::Relaxed);
-            let all = if last - word >= 64 { u64::MAX } else { (1 << (last - word)) - 1 };
-            self.word(&self.decided, word)?.fetch_or(all, Ordering::Release);
+            self.word(start / MEMO_VALUES)?.fetch_or(bits, Ordering::Release);
         }
         Ok(())
     }
 
-    /// Whether `code` matches, which is only asked once it has been decided.
-    fn answer(&self, code: usize) -> Result<bool> {
-        Ok(self.word(&self.answers, code)?.load(Ordering::Relaxed) >> (code % 64) & 1 == 1)
-    }
-
-    /// The word of `bits` that `code` lives in.
-    fn word<'memo>(&self, bits: &'memo [AtomicU64], code: usize) -> Result<&'memo AtomicU64> {
-        bits.get(code / 64)
+    /// The word of the memo at `index`.
+    fn word(&self, index: usize) -> Result<&AtomicU64> {
+        self.state
+            .get(index)
             .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))
     }
 }
@@ -1490,11 +1495,10 @@ fn like_stable(
     returns: &LogicalType,
 ) -> Result<Option<Vector>> {
     let cache = like.stable.get_or_init(|| {
-        let words = dictionary.len().div_ceil(64);
+        let words = dictionary.len().div_ceil(MEMO_VALUES);
         StableLike {
             dictionary: Arc::clone(dictionary),
-            answers: (0..words).map(|_| AtomicU64::new(0)).collect(),
-            decided: (0..words).map(|_| AtomicU64::new(0)).collect(),
+            state: (0..words).map(|_| AtomicU64::new(0)).collect(),
         }
     });
     if !Arc::ptr_eq(&cache.dictionary, dictionary) {
@@ -1505,14 +1509,19 @@ fn like_stable(
     let mut characters = Vec::new();
     let validity = over_valid(rows, base, |index| {
         let code = codes[index] as usize;
-        if !cache.is_decided(code) {
-            if bulk {
-                cache.decide_group(code, like, &mut characters)?;
-            } else {
-                cache.decide_one(code, like, &mut characters)?;
+        out[index] = match cache.peek(code) {
+            Some(held) => held,
+            None => {
+                if bulk {
+                    cache.decide_group(code, like, &mut characters)?;
+                } else {
+                    cache.decide_one(code, like, &mut characters)?;
+                }
+                cache
+                    .peek(code)
+                    .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?
             }
-        }
-        out[index] = cache.answer(code)?;
+        };
         Ok(())
     })?;
     finish(returns, Data::Bool(out.into()), validity)
