@@ -331,42 +331,16 @@ pub(crate) fn columns(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ColumnB
 /// A pass that has to write one of those columns down somewhere else needs its type and its span,
 /// and the plan records both per expression rather than per binding, so the binding on its own is
 /// not enough to build a second reference to the same column with.
+///
+/// The walk itself is [`Plan::read_columns`], because the binder asks the same question about a
+/// subquery it is deciding where to attach and there should be one match arm per `Expr` variant
+/// rather than two.
 pub(crate) fn columns_at(
     plan: &Plan,
     expr: ExprRef,
     found: &mut impl FnMut(ExprRef, ColumnBinding),
 ) {
-    match *plan.expr(expr) {
-        Expr::Column(binding) => found(expr, binding),
-        Expr::Constant(_) => {}
-        Expr::Cast { input, .. } => columns_at(plan, input, found),
-        Expr::Compare { left, right, .. } => {
-            columns_at(plan, left, found);
-            columns_at(plan, right, found);
-        }
-        Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
-            for &child in plan.expr_list(children) {
-                columns_at(plan, child, found);
-            }
-        }
-        Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
-            for &arg in plan.expr_list(args) {
-                columns_at(plan, arg, found);
-            }
-            if let Some(inner) = filter {
-                columns_at(plan, inner, found);
-            }
-        }
-        Expr::Case { arms, otherwise } => {
-            for arm in plan.arm_list(arms) {
-                columns_at(plan, arm.when, found);
-                columns_at(plan, arm.then, found);
-            }
-            if let Some(inner) = otherwise {
-                columns_at(plan, inner, found);
-            }
-        }
-    }
+    plan.read_columns(expr, found);
 }
 
 /// Calls `found` for every column one node reads, not counting the nodes under it.

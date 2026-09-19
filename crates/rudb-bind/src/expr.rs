@@ -122,6 +122,7 @@ impl Binder<'_> {
             kind: rudb_plan::JoinKind::Single,
             conditions: Vec::new(),
             dependent: !correlations.is_empty(),
+            reads: correlations,
             index: column.binding.table,
         });
         Ok(expr)
@@ -151,6 +152,7 @@ impl Binder<'_> {
             kind: rudb_plan::JoinKind::Single,
             conditions: Vec::new(),
             dependent: !correlations.is_empty(),
+            reads: correlations,
             index,
         });
         self.against_null(
@@ -707,6 +709,7 @@ impl Binder<'_> {
             kind: rudb_plan::JoinKind::Mark,
             conditions: vec![condition],
             dependent: !correlations.is_empty(),
+            reads: correlations,
             index: projected,
         });
         if negate { self.call("not", vec![marker]) } else { Ok(marker) }
