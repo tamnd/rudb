@@ -262,16 +262,24 @@ fn unary(name: &str, arg: &Vector, returns: &LogicalType, rows: usize) -> Result
         && arg.data().is_none()
     {
         let mut out = vec![0_i64; rows];
-        let validity = over_valid(rows, base, |index| {
-            let bytes = arg.try_bytes_at(index)?.unwrap_or_default();
-            let size = if name == "strlen" {
-                bytes.len()
-            } else {
-                bytes.iter().filter(|byte| (**byte as i8) >= -0x40).count()
-            };
-            out[index] = i64::try_from(size).unwrap_or(i64::MAX);
-            Ok(())
-        })?;
+        // `strlen` counts bytes and a source that keeps its values end to end knows how many a value
+        // has without reading any of them, because the two offsets that say where the value starts
+        // and stops are what it would read the value through anyway. `length` counts characters and
+        // has to look, since how many bytes a character took is in the bytes.
+        let validity = if name == "strlen" {
+            over_valid(rows, base, |index| {
+                let size = arg.try_bytes_len_at(index)?.unwrap_or_default();
+                out[index] = i64::try_from(size).unwrap_or(i64::MAX);
+                Ok(())
+            })?
+        } else {
+            over_valid(rows, base, |index| {
+                let bytes = arg.try_bytes_at(index)?.unwrap_or_default();
+                let size = bytes.iter().filter(|byte| (**byte as i8) >= -0x40).count();
+                out[index] = i64::try_from(size).unwrap_or(i64::MAX);
+                Ok(())
+            })?
+        };
         return finish(returns, Data::Int64(out.into()), validity);
     }
     match arg.form() {
