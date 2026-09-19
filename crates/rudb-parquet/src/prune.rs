@@ -45,8 +45,9 @@
 
 use std::sync::Arc;
 
-use rudb_common::LogicalType;
-use rudb_common::bounds::{MICROS, Spread, Zones, kept};
+use rudb_common::bounds::{End, MICROS, Spread, Zones, kept};
+use rudb_common::stat::Provenance;
+use rudb_common::{LogicalType, Stat};
 
 use crate::metadata::{ColumnChunk, Metadata, Physical, RowGroup, SchemaColumn};
 
@@ -119,6 +120,47 @@ impl Zones for Footer {
         }
         (read > 0 && whole > 0.0)
             .then(|| Spread { fraction: (passing / whole).clamp(0.0, 1.0), read })
+    }
+
+    fn extreme(&self, column: usize, end: End) -> Stat<Bound> {
+        let Some(schema) = self.metadata.schema.get(column) else { return Stat::Unknown };
+        let mut folded: Option<Bound> = None;
+        for group in &self.metadata.row_groups {
+            let Some(chunk) = group.columns.iter().find(|chunk| chunk.column == column) else {
+                return Stat::Unknown;
+            };
+            let Some(stats) = chunk.stats.as_ref() else { return Stat::Unknown };
+            let Some(bytes) = stats.bound(end) else {
+                // No bound, which is what a chunk of nothing but nulls looks like. `MIN` and `MAX`
+                // skip nulls, so a chunk holding only them has nothing to contribute and the rest
+                // of the file still answers. A chunk that did not say why it has no bound could be
+                // holding anything, so it gives up the answer.
+                if stats.nulls == Some(chunk.values) {
+                    continue;
+                }
+                return Stat::Unknown;
+            };
+            if !stats.exact(end, chunk.physical) {
+                return Stat::Unknown;
+            }
+            let Some(bound) = read_bound(bytes, schema) else { return Stat::Unknown };
+            // A float bound is not read as an answer even when the writer called it exact. The
+            // format keeps NaN out of the bounds and this engine sorts NaN above every number, so
+            // the largest value of a column holding one is a NaN the footer never mentions.
+            if matches!(bound, Bound::Real(_)) {
+                return Stat::Unknown;
+            }
+            folded = match folded {
+                None => Some(bound),
+                Some(so_far) => match end.further(&so_far, &bound) {
+                    Some(further) => Some(further),
+                    // Two bounds of one column that do not order against each other, which is a
+                    // decimal too wide to restate at the other's scale. Nothing to fold them with.
+                    None => return Stat::Unknown,
+                },
+            };
+        }
+        folded.map_or(Stat::Unknown, |value| Stat::exact(value, Provenance::ZoneMap))
     }
 }
 
@@ -315,6 +357,8 @@ mod tests {
                     distinct: None,
                     min: low.map(|number| number.to_le_bytes().to_vec()),
                     max: high.map(|number| number.to_le_bytes().to_vec()),
+                    min_exact: None,
+                    max_exact: None,
                 }),
                 column_index: None,
                 offset_index: None,
@@ -557,6 +601,8 @@ mod tests {
             distinct: None,
             min: Some(low.to_le_bytes().to_vec()),
             max: Some(high.to_le_bytes().to_vec()),
+            min_exact: None,
+            max_exact: None,
         });
         (schema, group)
     }

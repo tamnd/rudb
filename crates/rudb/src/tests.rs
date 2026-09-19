@@ -5155,7 +5155,7 @@ fn a_pass_duckdb_has_and_rudb_has_not_built_is_taken_and_does_nothing() {
     // absence changes no answer.
     let db = Database::new();
     let folded = db.plan("SELECT 1 + 2").unwrap();
-    for name in ["deliminator", "join_filter_pushdown", "statistics_propagation"] {
+    for name in ["compressed_materialization", "join_filter_pushdown", "reorder_filter"] {
         db.execute(&format!("SET disabled_optimizers = '{name}'")).expect(name);
         assert_eq!(db.setting("disabled_optimizers").unwrap(), name);
         assert_eq!(db.plan("SELECT 1 + 2").unwrap(), folded, "{name} turned something off");

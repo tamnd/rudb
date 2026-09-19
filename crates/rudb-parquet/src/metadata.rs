@@ -20,6 +20,7 @@
 
 use std::fmt::Write as _;
 
+use rudb_common::bounds::End;
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_compress::Codec;
 use rudb_io::File;
@@ -186,6 +187,51 @@ pub struct Stats {
     pub min: Option<Vec<u8>>,
     /// The largest value, in the column's plain encoding.
     pub max: Option<Vec<u8>>,
+    /// Whether [`Stats::min`] is the smallest value itself, where the writer said either way.
+    ///
+    /// A writer is allowed to shorten a long string bound as long as it moves it outward, so a
+    /// shortened minimum is no larger than the smallest value and a shortened maximum is no smaller
+    /// than the largest. That keeps every skip this makes correct, because a wider range rules out
+    /// no more than a narrow one does, and it is exactly what stops the bound from being an answer:
+    /// `MIN(url)` off a shortened minimum is a string that is not in the column.
+    ///
+    /// `None` is the ordinary state and means the writer said nothing, which most of them do. See
+    /// [`Stats::exact`] for what is made of that, which is not the same as assuming the worst.
+    pub min_exact: Option<bool>,
+    /// Whether [`Stats::max`] is the largest value itself, where the writer said either way.
+    pub max_exact: Option<bool>,
+}
+
+impl Stats {
+    /// Whether the bound on `end` is the value itself rather than one the writer moved outward.
+    ///
+    /// The writer's word where there is one. Where there is not, it comes from the physical type:
+    /// shortening is defined for byte strings and for nothing else, because a number has no prefix
+    /// to keep and a writer that dropped half of an `INT64` would not have a bound at all. So the
+    /// fixed width types are exact by construction and the two byte array types are not exact
+    /// unless somebody said so.
+    ///
+    /// That is not caution for its own sake. The ClickBench file states neither flag on any of its
+    /// twenty three thousand column chunks, and its dates and its integers are still answers under
+    /// this rule while its strings are not. A file DuckDB wrote states `true` on all of them and
+    /// its strings are answers too.
+    #[must_use]
+    pub fn exact(&self, end: End, physical: Physical) -> bool {
+        let stated = match end {
+            End::Low => self.min_exact,
+            End::High => self.max_exact,
+        };
+        stated.unwrap_or(!matches!(physical, Physical::ByteArray | Physical::FixedLenByteArray))
+    }
+
+    /// The bytes of the bound on `end`, whatever the writer wrote there.
+    #[must_use]
+    pub fn bound(&self, end: End) -> Option<&[u8]> {
+        match end {
+            End::Low => self.min.as_deref(),
+            End::High => self.max.as_deref(),
+        }
+    }
 }
 
 /// One column of one row group: where its bytes are and what is in them.
@@ -909,6 +955,8 @@ pub(crate) fn read_stats(reader: &mut Reader<'_>) -> Result<Stats> {
             4 => stats.distinct = Some(reader.read_int()?),
             5 => stats.max = Some(reader.read_binary()?.to_vec()),
             6 => stats.min = Some(reader.read_binary()?.to_vec()),
+            7 => stats.max_exact = Some(reader.read_bool(field.kind, false)?),
+            8 => stats.min_exact = Some(reader.read_bool(field.kind, false)?),
             _ => reader.skip(field.kind)?,
         }
     }

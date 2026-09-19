@@ -919,7 +919,7 @@ fn scale(rows: u64, by: f64) -> u64 {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rudb_common::bounds::{Op, Spread, Test, Zones};
+    use rudb_common::bounds::{Bound, End, Op, Spread, Test, Zones};
     use rudb_common::stat::{Class, Direction, Provenance, Stat};
     use rudb_plan::Plan;
 
@@ -1621,6 +1621,10 @@ mod tests {
         fn spread(&self, tests: &[Test]) -> Option<Spread> {
             self.asked.lock().expect("no test panics while holding this").extend_from_slice(tests);
             self.spread.map(|fraction| Spread { fraction, read: tests.len() })
+        }
+
+        fn extreme(&self, _column: usize, _end: End) -> Stat<Bound> {
+            Stat::Unknown
         }
     }
 

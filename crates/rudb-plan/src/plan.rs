@@ -1365,6 +1365,14 @@ mod tests {
         ) -> Option<rudb_common::bounds::Spread> {
             Some(rudb_common::bounds::Spread { fraction: 0.5, read: tests.len() })
         }
+
+        fn extreme(
+            &self,
+            _column: usize,
+            _end: rudb_common::bounds::End,
+        ) -> Stat<rudb_common::bounds::Bound> {
+            Stat::Unknown
+        }
     }
 
     #[test]
