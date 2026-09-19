@@ -17,6 +17,7 @@ The goal has not changed. rudb is meant to be ten times faster than DuckDB and t
 9. [`09-the-measured-work-list.md`](09-the-measured-work-list.md) is the work sorted by measured cost rather than by plan order.
 10. [`10-what-the-encoder-costs.md`](10-what-the-encoder-costs.md) is `cargo xtask encode`, the per candidate split of the encoder's seconds, and its thread scaling.
 11. [`11-how-duckdb-reads-parquet.md`](11-how-duckdb-reads-parquet.md) is `cargo xtask parquet`, both engines over the same file, the two root causes it separates, and the six item work list that follows.
+12. [`12-the-chunk-and-the-page.md`](12-the-chunk-and-the-page.md) is what a chunk costs before it holds any data, why the in memory table cannot hand one out without copying it, and the four changes that follow from those two numbers.
 
 [`../storage-v2/`](../storage-v2/) is the format these notes keep arriving at, designed from the queries rather than from the file, with the size target worked out against the real `hits.parquet` instead of assumed.
 
