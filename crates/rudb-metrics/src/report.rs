@@ -220,9 +220,9 @@ mod tests {
     fn a_pipeline_with_a_driver_reports_what_the_driver_charged() {
         let report = Report::new();
         let driver = report.driving(0);
-        let scan = report.watch(Counters::new(0, 0, "Scan"));
-        scan.spent(400, 380);
         let whole = driver.running().stop();
+        let scan = report.watch(Counters::new(0, 0, "Scan"));
+        scan.spent(whole.0 + 1, whole.1 + 1);
         let mut document = Document::new("select * from t");
         report.fill(&mut document);
         assert_eq!(document.pipelines.len(), 1);
@@ -232,7 +232,7 @@ mod tests {
         );
         assert_ne!(
             document.pipelines[0].wall_ns, document.operators[0].wall_ns,
-            "and it is not the sum of the operators, which is what it would have been before"
+            "and it is not the sum of the operators, which is a nanosecond more on purpose and is what it would have been before"
         );
     }
 
