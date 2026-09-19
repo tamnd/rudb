@@ -583,15 +583,17 @@ fn follow(
                 let catalog = plan.string(catalog);
                 let schema = plan.string(schema);
                 let table = plan.string(table);
-                return stats
-                    .distinct_in(catalog, schema, table, name)
-                    .or_else(|| rows.then(|| stats.rows_in(catalog, schema, table)).flatten());
+                if let Some(distinct) = stats.distinct_in(catalog, schema, table, name) {
+                    return Some(distinct);
+                }
+                return if rows { stats.rows_in(catalog, schema, table) } else { None };
             }
             Node::TableFunction { index, columns, .. } if index == binding.table => {
                 let name = &plan.field_list(columns).get(position)?.name;
-                return plan
-                    .distinct_measured(index, name)
-                    .or_else(|| rows.then(|| plan.measured(index).decide().copied()).flatten());
+                if let Some(distinct) = plan.distinct_measured(index, name) {
+                    return Some(distinct);
+                }
+                return if rows { plan.measured(index).decide().copied() } else { None };
             }
             Node::Project { index, exprs, .. } if index == binding.table => {
                 let &carried = plan.expr_list(exprs).get(position)?;
@@ -822,9 +824,7 @@ mod tests {
 
     /// A filter of the given predicate over a two column scan of `t`.
     fn filtered(predicate: &str) -> String {
-        format!(
-            "Filter {predicate}\n  Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n"
-        )
+        format!("Filter {predicate}\n  Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n")
     }
 
     /// A join of two one column scans on their one column, which is what the counted tests sit on.
