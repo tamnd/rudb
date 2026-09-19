@@ -258,3 +258,48 @@ fn a_lateral_entry_with_a_limit_answers_that_many_rows_per_left_row() {
         [Value::Integer(1), Value::Integer(1), Value::Integer(2)]
     );
 }
+
+/// A select list that reads the outer row, over a filter that also reads it with an equality.
+///
+/// The rule in `unnest.rs` that turns a correlated filter into an ordinary join has to stand aside
+/// here, because the projection it would move to the right side of that join reads a column of the
+/// left side. It used to fire anyway and the query came back as an internal error about a column
+/// not being in a schema, which is #993. The general rule answers it.
+#[test]
+fn a_select_list_that_reads_the_outer_row_is_answered() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT o.k FROM i WHERE i.k = o.k AND i.w = 100) AS c FROM o ORDER BY k"
+        ),
+        [Value::Integer(1), Value::Null, Value::Null, Value::Null]
+    );
+}
+
+/// The same with the outer column inside an expression rather than on its own.
+#[test]
+fn a_select_list_expression_over_both_rows_is_answered() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT o.k + i.w FROM i WHERE i.k = o.k AND i.w = 100) AS c \
+             FROM o ORDER BY k"
+        ),
+        [Value::Integer(101), Value::Null, Value::Null, Value::Null]
+    );
+}
+
+/// The same over a column the correlation does not read, so the outer row is used twice over.
+#[test]
+fn a_select_list_that_reads_a_second_outer_column_is_answered() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT o.t FROM i WHERE i.k = o.k AND i.w = 300) AS c FROM o ORDER BY k"
+        ),
+        [Value::Null, Value::Varchar("b".into()), Value::Null, Value::Null]
+    );
+}
