@@ -905,6 +905,24 @@ struct Held {
     filling: PipelineRef,
 }
 
+/// Whether this statement asked for a CPU column on every operator's row.
+///
+/// It is off by default and that is a performance decision rather than a policy one. The number
+/// comes from `CLOCK_THREAD_CPUTIME_ID`, which has no vDSO entry on Linux, so reading it is a real
+/// system call, and the shim reads it twice per operator per chunk. On chunks of a thousand rows
+/// that came to more than the operators themselves: a count over twenty million rows was fourteen
+/// times slower with the reading than without it. Wall time per operator stays on, because the wall
+/// clock does come out of the vDSO, and CPU time per pipeline and per worker stays on because those
+/// spans are taken once per pipeline rather than once per chunk.
+///
+/// The two ways to ask are `EXPLAIN ANALYZE`, which sets this for its own run, and
+/// `PRAGMA enable_profiling`, which sets it for every statement after it until
+/// `PRAGMA disable_profiling`. The second writes the sentinel the settings layer uses for a null
+/// back, which is why the value is compared against it rather than merely being present.
+fn profiling(session: &Session) -> bool {
+    session.get("enable_profiling").is_some_and(|format| format != rudb_functions::UNSET)
+}
+
 impl<'a> Building<'a, '_> {
     /// The id of the operator holding the side of this node that has to finish first.
     ///
@@ -942,6 +960,10 @@ impl<'a> Building<'a, '_> {
     /// because there is one implementation of it and that one is the obvious correct one. The
     /// marker comes off by itself on the day a seam under it has something else registered and
     /// chosen, with nothing to remember to change here.
+    ///
+    /// This is also where the shim around the operator is told whether to read the thread clock, for
+    /// the reason [`profiling`] gives. It is decided here because this is the one place that can see
+    /// the session the statement is running under, and once per operator rather than once per chunk.
     fn watch(
         &self,
         node: NodeRef,
@@ -950,7 +972,7 @@ impl<'a> Building<'a, '_> {
         kind: &str,
         detail: Option<&str>,
     ) -> Arc<Counters> {
-        let mut counters = Counters::new(id, pipeline, kind);
+        let mut counters = Counters::new(id, pipeline, kind).charging_cpu(profiling(self.session));
         if let Some(detail) = detail {
             counters = counters.detailed(detail);
         }

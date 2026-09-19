@@ -69,7 +69,9 @@ Twenty-seven seams. Each row of that table is a place where somebody can read a 
 
 > **A seam is crossed once per chunk, never once per row.**
 
-This is the rule that makes the cost of modularity bounded, and it is the rule that most modular engines get wrong. A `trait` whose method takes one value is an indirect call in a hot loop and costs an order of magnitude. A `trait` whose method takes a chunk is an indirect call every 122,880 rows and costs nothing measurable.
+This is the rule that makes the cost of modularity bounded, and it is the rule that most modular engines get wrong. A `trait` whose method takes one value is an indirect call in a hot loop and costs an order of magnitude. A `trait` whose method takes a chunk is an indirect call every 1,024 rows and costs nothing measurable.
+
+That number used to read 122,880 here, which is the morsel a scan hands out and not the chunk an operator is called with. The chunk is 1,024 rows, so a seam is crossed a hundred and twenty times more often than this rule was written believing, and the difference matters as soon as something more expensive than an indirect call sits at the door. An indirect call is a few nanoseconds and is still nothing next to a thousand rows of work. A system call is several hundred and is not: the per-operator CPU clock was one, twice per operator per chunk, and it made a `count(*)` over twenty million rows fourteen times slower than the same count without it. [`14-metrics.md`](14-metrics.md) section 2 has that measurement and what was done about it. The rule stands as written. What comes with it is that anything put at a seam has to be an indirect call and a branch rather than a kernel entry, and a per-chunk cost has to be read against 1,024 rows.
 
 Concretely, every seam trait's methods take one of: a whole chunk, a whole column, a whole morsel, a whole partition, or a configuration decision made at plan time. None of them take a row, a value, or a single key.
 
