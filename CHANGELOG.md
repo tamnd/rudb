@@ -6,6 +6,14 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.58
+
+A patch release of two pull requests, one in the optimizer and one in the join. The storage format version is unchanged at 9 and the native directory format is unchanged at 19.
+
+A range filter used to be worth a fifth of the rows, which is the constant every condition nobody can read gets. The Parquet footer already says the smallest and the largest value of the column in each row group, so where the constant falls inside that stretch is a much better guess than a fifth, and `Zones` now answers that as a second question beside the one that proves a group holds nothing. The first is a ceiling and is never wrong, the second is a guess that can be wrong in either direction, so a caller caps with one and multiplies with the other.
+
+A mark join is answered by a lookup now rather than by the row major operator. It had been on the list of kinds a lookup cannot answer, because its answer is about the whole gathered side rather than about one driving row, and the one fact it needs about that side is whether the side holds a null key. That turns a miss from false into null, and the gathered side is finished before the first driving row arrives, so it is settled once while the table is built and read as a flag after that. TPC-H q16 is the only query in the suite with a mark join in it and it was both the worst query against DuckDB and the least parallel one. Its join goes from 92.7ms to 2.7ms and the query from 144.3ms to 33.5ms.
+
 ## 0.3.57
 
 A patch release of one pull request in the join, which takes the last serial part of a hash join and spreads it over every thread the query already has. The storage format version is unchanged at 9 and the native directory format is unchanged at 19.
