@@ -805,6 +805,28 @@ mod tests {
         rows(&plan, plan.root(), &stats)
     }
 
+    /// The same estimate with the class and the provenance still attached.
+    fn counted_stat(
+        text: &str,
+        tables: &[(&str, u64)],
+        columns: &[(&str, &str, u64)],
+    ) -> Stat<u64> {
+        let mut stats = statistics(tables);
+        for (table, column, distinct) in columns {
+            stats.record_distinct("memory", "main", table, column, *distinct);
+        }
+        let plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        rows_stat(&plan, plan.root(), &stats)
+    }
+
+    /// A filter of the given predicate over a two column scan of `t`.
+    fn filtered(predicate: &str) -> String {
+        format!(
+            "Filter {predicate}\n  Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n"
+        )
+    }
+
     /// A join of two one column scans on their one column, which is what the counted tests sit on.
     fn joined(left: &str, right: &str) -> String {
         format!(
@@ -1250,6 +1272,123 @@ mod tests {
         let tables = &[("l", 1_000), ("r", 1_000)];
         let counts = &[("l", "a", 0), ("r", "a", 0)];
         assert_eq!(counted(&text, tables, counts), Some(1_000));
+    }
+
+    #[test]
+    fn an_equality_against_a_constant_keeps_one_value_out_of_the_count() {
+        // TPC-H o_clerk written small. A fifth of three hundred thousand orders is sixty thousand
+        // and the answer is fifteen hundred, which is the error this rule exists to remove.
+        let text = filtered("(#0.0::INTEGER = 3::INTEGER)::BOOLEAN");
+        let tables = &[("t", 300_000)];
+        assert_eq!(counted(&text, tables, &[]), Some(60_000));
+        assert_eq!(counted(&text, tables, &[("t", "a", 200)]), Some(1_500));
+    }
+
+    #[test]
+    fn a_count_that_says_more_rows_than_the_constant_did_is_still_the_count() {
+        // Three values is a third, which is above the fifth the constant guessed. The rule is to
+        // use the number where there is one rather than to make the answer smaller, and this is
+        // the direction the constant was wrong in for o_orderstatus.
+        let text = filtered("(#0.0::INTEGER = 3::INTEGER)::BOOLEAN");
+        assert_eq!(counted(&text, &[("t", 900_000)], &[("t", "a", 3)]), Some(300_000));
+    }
+
+    #[test]
+    fn two_counted_equalities_divide_by_both_counts() {
+        // The independence assumption, which is the same one the constant made when it multiplied
+        // two fifths together, with the counts standing in for the fifths.
+        let text = filtered(
+            "((#0.0::INTEGER = 3::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 4::INTEGER)::BOOLEAN)::BOOLEAN",
+        );
+        let tables = &[("t", 200_000)];
+        let counts = &[("t", "a", 25), ("t", "b", 40)];
+        assert_eq!(counted(&text, tables, counts), Some(200));
+    }
+
+    #[test]
+    fn a_column_nobody_counted_keeps_the_constant_rather_than_becoming_one_row() {
+        // One over the rows is one row, so a fallback to the row count here would call every
+        // equality on an uncounted column a single row lookup. The count on the other column is
+        // still read, so one uncounted condition does not throw away the one next to it.
+        let text = filtered(
+            "((#0.0::INTEGER = 3::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 4::INTEGER)::BOOLEAN)::BOOLEAN",
+        );
+        let tables = &[("t", 1_000_000)];
+        assert_eq!(counted(&text, tables, &[]), Some(40_000));
+        assert_eq!(counted(&text, tables, &[("t", "a", 50)]), Some(4_000));
+    }
+
+    #[test]
+    fn only_an_equality_against_a_constant_reads_the_count() {
+        // A range is about order rather than about one value, and two columns comparing to each
+        // other pick a value neither count describes. Both keep the constant with the count sitting
+        // right there unread.
+        let tables = &[("t", 1_000_000)];
+        let counts = &[("t", "a", 50), ("t", "b", 50)];
+        let above = filtered("(#0.0::INTEGER > 3::INTEGER)::BOOLEAN");
+        assert_eq!(counted(&above, tables, counts), Some(200_000));
+        let other = filtered("(#0.0::INTEGER <> 3::INTEGER)::BOOLEAN");
+        assert_eq!(counted(&other, tables, counts), Some(200_000));
+        let columns = filtered("(#0.0::INTEGER = #0.1::INTEGER)::BOOLEAN");
+        assert_eq!(counted(&columns, tables, counts), Some(200_000));
+    }
+
+    #[test]
+    fn an_equality_reads_the_count_whichever_side_the_constant_is_on() {
+        let text = filtered("(3::INTEGER = #0.0::INTEGER)::BOOLEAN");
+        assert_eq!(counted(&text, &[("t", 100_000)], &[("t", "a", 50)]), Some(2_000));
+    }
+
+    #[test]
+    fn a_projection_carries_a_count_up_to_a_filter_as_well() {
+        // The same walk the join arithmetic makes, which matters here because every query written
+        // against a view puts a projection between the filter and the scan that counted.
+        let text = concat!(
+            "Filter (#1.0::INTEGER = 3::INTEGER)::BOOLEAN\n",
+            "  Project #1 [#0.0::INTEGER AS a]\n",
+            "    Get memory.main.t AS t #0 [a::INTEGER]\n"
+        );
+        assert_eq!(counted(text, &[("t", 100_000)], &[("t", "a", 50)]), Some(2_000));
+    }
+
+    #[test]
+    fn a_count_bigger_than_the_table_still_leaves_a_row() {
+        // The floor the whole module has always had. A plan that believes a subtree produces no
+        // rows is a plan that stops reading it, and a stale count is not a proof of anything.
+        let text = filtered("(#0.0::INTEGER = 3::INTEGER)::BOOLEAN");
+        assert_eq!(counted(&text, &[("t", 10)], &[("t", "a", 1_000_000)]), Some(1));
+    }
+
+    #[test]
+    fn where_a_filter_got_its_fraction_from_is_printed() {
+        // Three answers, so that somebody reading EXPLAIN and chasing a bad estimate can tell
+        // which of the three this was without reading the predicate back.
+        let tables = &[("t", 1_000_000)];
+        let one = filtered("(#0.0::INTEGER = 3::INTEGER)::BOOLEAN");
+        assert_eq!(
+            counted_stat(&one, tables, &[("t", "a", 50)]).provenance(),
+            Some(Provenance::Sketch)
+        );
+        assert_eq!(counted_stat(&one, tables, &[]).provenance(), Some(Provenance::Default));
+        let both = filtered(
+            "((#0.0::INTEGER = 3::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 4::INTEGER)::BOOLEAN)::BOOLEAN",
+        );
+        assert_eq!(
+            counted_stat(&both, tables, &[("t", "a", 50)]).provenance(),
+            Some(Provenance::Propagation)
+        );
+    }
+
+    #[test]
+    fn a_counted_filter_is_still_a_guess() {
+        // The count is a fact about the column and the fraction taken from it is not a fact about
+        // the query. It assumes the values are spread evenly and that the filter is independent of
+        // whatever happened underneath, which is the assumption that fails first.
+        let text = filtered("(#0.0::INTEGER = 3::INTEGER)::BOOLEAN");
+        let stat = counted_stat(&text, &[("t", 1_000_000)], &[("t", "a", 50)]);
+        assert_eq!(stat.decide(), Some(&20_000));
+        assert_eq!(stat.enable(), None);
+        assert_eq!(stat.answer(), None);
     }
 
     /// A store of two columns, `a` then `b`, answering with a count fixed when it is built.
