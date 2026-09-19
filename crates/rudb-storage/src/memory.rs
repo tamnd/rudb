@@ -351,9 +351,7 @@ mod tests {
         assert_eq!(table.null_count(0).expect("the only column"), wanted);
         // A string column that never had a null still answers, with zero.
         let mut words = MemoryTable::new(vec![LogicalType::Varchar]);
-        words
-            .append_rows(&[vec![Value::Varchar("a".to_string())]])
-            .expect("one string");
+        words.append_rows(&[vec![Value::Varchar("a".to_string())]]).expect("one string");
         assert_eq!(words.null_count(0).expect("the only column"), 0);
     }
 

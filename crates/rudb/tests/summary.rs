@@ -402,7 +402,8 @@ fn a_table_in_memory_answers_out_of_its_zone_maps_without_reading_its_rows() {
 
 #[test]
 fn a_table_in_memory_reads_its_rows_for_what_a_zone_map_does_not_hold() {
-    let pair = Pair::new("memrows", "SELECT i % 7 AS n, 'v' || (i % 13) AS s FROM range(5000) r(i)");
+    let pair =
+        Pair::new("memrows", "SELECT i % 7 AS n, 'v' || (i % 13) AS s FROM range(5000) r(i)");
     // A distinct count needs every value once and a zone map holds two of them, so this is the case
     // the file answers and memory does not. Both still say seven.
     assert!(!pair.in_memory("SELECT COUNT(DISTINCT n) FROM t"), "a zone map counted the values");
