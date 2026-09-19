@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Fifteen passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
+//! Seventeen passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
 //! the start of it. Column pruning came first, because it is the pass whose absence is measured in
 //! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -20,6 +20,7 @@ mod domain;
 pub mod empty;
 pub mod estimate;
 pub mod explain;
+pub mod extremes;
 pub mod filter;
 pub mod fold;
 pub mod late;
@@ -121,7 +122,7 @@ pub const RANK: u8 = 11;
 /// on the next run instead, which is the fixed sequence not settling. Before the rest, because the
 /// subtree it removes is a subtree they would otherwise walk, and because the operators it leaves
 /// next to each other are the pairs limit pushdown and top N are looking for.
-pub static PASSES: [&(dyn Pass + Sync); 16] = [
+pub static PASSES: [&(dyn Pass + Sync); 17] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -132,6 +133,7 @@ pub static PASSES: [&(dyn Pass + Sync); 16] = [
     &semi::DistinctToSemi,
     &semi::SemiPushdown,
     &empty::EmptyResultPullup,
+    &extremes::StatisticsPropagation,
     &cte::UnusedMaterialization,
     &columns::UnusedColumns,
     &limit::LimitPushdown,
@@ -143,12 +145,12 @@ pub static PASSES: [&(dyn Pass + Sync); 16] = [
 /// Every name `SET disabled_optimizers` accepts, which is every name DuckDB accepts.
 ///
 /// `SELECT name FROM duckdb_optimizers()` on the pinned binary, sorted, all forty four of them.
-/// Twelve of them name a pass [`PASSES`] holds, and every name here is one rudb takes without
+/// Thirteen of them name a pass [`PASSES`] holds, and every name here is one rudb takes without
 /// complaint, because turning off a pass that does not exist is a thing that has already happened.
 ///
-/// Accepting the other thirty two is the whole point. Forty five files in the upstream corpus run a
+/// Accepting the other thirty one is the whole point. Forty five files in the upstream corpus run a
 /// `SET disabled_optimizers`, and most of them name a pass rudb has not written,
-/// `statistics_propagation` and `compressed_materialization` and the rest. Refusing those makes the
+/// `compressed_materialization` and `join_elimination` and the rest. Refusing those makes the
 /// `SET` fail, and a failed `SET` in a sqllogictest file ends the file, so every record after it
 /// goes unasked over a pass whose absence changes no answer.
 ///
