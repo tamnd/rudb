@@ -439,7 +439,7 @@ fn encode_packed(values: &[i64], out: &mut Vec<u8>) -> Result<()> {
 /// It is threaded through the recursion rather than made per call because a chunk is a cascade. A
 /// dictionary of deltas is three nested decodes, and each of them would otherwise make its own.
 ///
-/// All three start empty and are grown on the first unit that needs them, to their largest size
+/// Both start empty and are grown on the first unit that needs them, to their largest size
 /// rather than to the size that unit wants, so that every unit after the first finds them the right
 /// length already and nothing is zeroed or resized again.
 ///
@@ -457,8 +457,6 @@ struct Decoding {
     packed: Vec<u64>,
     /// One unit of unpacked offsets, before the base is added back.
     unit: Vec<u64>,
-    /// What the unpack transposes through.
-    transposed: bitpack::Scratch<u64>,
 }
 
 thread_local! {
@@ -483,7 +481,7 @@ fn with_decoding<T>(run: impl FnOnce(&mut Decoding) -> T) -> T {
 impl Decoding {
     /// Buffers that have not made room for anything yet.
     const fn new() -> Self {
-        Self { packed: Vec::new(), unit: Vec::new(), transposed: bitpack::Scratch::new() }
+        Self { packed: Vec::new(), unit: Vec::new() }
     }
 
     /// Makes room for one unit. A no op every time after the first.
@@ -512,12 +510,7 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
                     for word in &mut scratch.packed[..words] {
                         *word = reader.u64()?;
                     }
-                    bitpack::unpack_with(
-                        &scratch.packed[..words],
-                        width,
-                        &mut scratch.unit,
-                        &mut scratch.transposed,
-                    )?;
+                    bitpack::unpack(&scratch.packed[..words], width, &mut scratch.unit)?;
                     values.extend(scratch.unit.iter().map(|offset| value_from(*offset, base)));
                 } else {
                     let bytes = reader.bytes(bitpack::tail_len(wanted, width))?;

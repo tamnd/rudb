@@ -281,7 +281,7 @@ pub fn unpack_transposed<T: Packable>(input: &[T], width: usize, output: &mut [T
     Ok(())
 }
 
-/// The buffer [`pack_with`] and [`unpack_with`] transpose through, kept so it can be reused.
+/// The buffer [`pack_with`] transposes through, kept so it can be reused.
 ///
 /// Going between row order and the transposed layout needs somewhere to put the other order, and
 /// that somewhere is [`VALUES`] values, which is 8 KB for a `u64`. Allocating it per call is not the
@@ -290,7 +290,8 @@ pub fn unpack_transposed<T: Packable>(input: &[T], width: usize, output: &mut [T
 /// once per 1024 rows, and it showed up as the largest single item in a ClickBench profile, larger
 /// than the unpacking it was making room for.
 ///
-/// So a caller that unpacks more than one unit should make one of these and pass it in.
+/// So a caller that packs more than one unit should make one of these and pass it in. The unpacking
+/// side does not need one at all any more: see [`unpack`].
 ///
 /// It starts empty and grows on the first unit that needs it, because a caller holds one for a whole
 /// decode and most chunks are not bit packed at all. Making the buffer in the constructor was tried
@@ -351,30 +352,73 @@ pub fn pack_with<T: Packable>(
     pack_transposed(&scratch.transposed, width, output)
 }
 
-/// Unpacks into row order. The inverse of [`pack`], and see its note about who should call it.
+/// Unpacks into row order. The inverse of [`pack`].
+///
+/// This is what every scan of a packed integer column goes through, so it is written as one pass
+/// rather than as [`unpack_transposed`] followed by [`untranspose`]. Those two are still here and
+/// still the definition of the layout, and the test below checks this agrees with them at every
+/// width, but running them in sequence costs three things this does not. A 1024 value buffer to
+/// hold the middle, a second read of all of it, and a scatter: `untranspose` walks its input in
+/// order and writes all over its output, which is a store that misses and a loop no compiler will
+/// turn into wider instructions.
+///
+/// The fused form works because a row has the same bit schedule in every lane. That is the whole
+/// point of the layout. Row `r` of every lane takes bits `r * width` to `(r + 1) * width` of that
+/// lane's stream, so which word to read and how far to shift it are decided once for the row, and
+/// what is left for the lanes is a load, a shift, an or, a mask and a store with no branch and no
+/// carry from the lane before. The lanes of a row are next to each other in both the packed words
+/// and the output, so that inner loop reads and writes straight lines. Where a row lands in the
+/// output is the permutation `untranspose` was applying, and since the lane index is the low part
+/// of it, it comes out as a base address for the row and costs nothing.
 ///
 /// # Errors
 ///
 /// As [`unpack_transposed`].
 pub fn unpack<T: Packable>(input: &[T], width: usize, output: &mut [T]) -> Result<()> {
-    unpack_with(input, width, output, &mut Scratch::new())
-}
-
-/// As [`unpack`], through a buffer the caller keeps rather than one allocated per call.
-///
-/// # Errors
-///
-/// As [`unpack_transposed`].
-pub fn unpack_with<T: Packable>(
-    input: &[T],
-    width: usize,
-    output: &mut [T],
-    scratch: &mut Scratch<T>,
-) -> Result<()> {
+    check_width::<T>(width)?;
     check_vector_len(output.len(), "output")?;
-    scratch.ready();
-    unpack_transposed(input, width, &mut scratch.transposed)?;
-    untranspose(&scratch.transposed, output)
+    if input.len() != packed_len::<T>(width) {
+        return Err(Error::internal(format!(
+            "a {width} bit packed vector is {} words, not {}",
+            packed_len::<T>(width),
+            input.len()
+        )));
+    }
+    if width == 0 {
+        output.fill(T::from_u64(0));
+        return Ok(());
+    }
+
+    let mask = low_mask(width);
+    let lanes = T::LANES;
+    let group_size = T::WIDTH / 8;
+    for row in 0..T::WIDTH {
+        let bit = row * width;
+        let word = bit / T::WIDTH;
+        let shift = bit % T::WIDTH;
+        // The same arithmetic as `source_index` with the lane left off, because the lane is the low
+        // part of it and the lanes of a row are consecutive from here.
+        let base = ((row % group_size) * 8 + ORDER[row / group_size]) * lanes;
+        let low = &input[word * lanes..(word + 1) * lanes];
+        let into = &mut output[base..base + lanes];
+        if shift + width <= T::WIDTH {
+            for lane in 0..lanes {
+                into[lane] = T::from_u64((low[lane].to_u64() >> shift) & mask);
+            }
+        } else {
+            // The value straddles two words, so `shift` is above zero, the carry in from the word
+            // above is a left shift by less than the word width, and neither shift can overflow.
+            // There is a word above to read: a value that straddles into word `word + 1` is one the
+            // packer wrote there, and it wrote `width` words a lane.
+            let carried = T::WIDTH - shift;
+            let high = &input[(word + 1) * lanes..(word + 2) * lanes];
+            for lane in 0..lanes {
+                let value = (low[lane].to_u64() >> shift) | (high[lane].to_u64() << carried);
+                into[lane] = T::from_u64(value & mask);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// How many bytes [`pack_tail`] writes for `count` values at `width` bits.
@@ -630,23 +674,56 @@ mod tests {
 
     #[test]
     fn a_reused_scratch_gives_what_a_fresh_one_gives() {
-        // The buffer a unit transposes through is now handed in so it is not zeroed per call, which
-        // is only sound if every element of it is written every time. If some were not, a narrow
-        // unit following a wide one would read whatever the wide one left behind, so the widths here
-        // go up and down rather than in order and each answer is checked against the same unit
-        // unpacked through a buffer nothing has touched.
+        // The buffer a unit transposes through is handed in so it is not zeroed per call, which is
+        // only sound if every element of it is written every time. If some were not, a narrow unit
+        // following a wide one would read whatever the wide one left behind, so the widths here go
+        // up and down rather than in order and each answer is checked against the same unit packed
+        // through a buffer nothing has touched.
         let mut scratch = Scratch::<u64>::new();
         for width in [64, 1, 33, 7, 64, 0, 17, 60, 3] {
             let values = sample::<u64>(width);
-            let mut packed = vec![0u64; packed_len::<u64>(width)];
-            pack_with(&values, width, &mut packed, &mut scratch).unwrap();
-            let mut reused = vec![0u64; VALUES];
-            unpack_with(&packed, width, &mut reused, &mut scratch).unwrap();
-            let mut fresh = vec![0u64; VALUES];
-            unpack(&packed, width, &mut fresh).unwrap();
+            let mut reused = vec![0u64; packed_len::<u64>(width)];
+            pack_with(&values, width, &mut reused, &mut scratch).unwrap();
+            let mut fresh = vec![0u64; packed_len::<u64>(width)];
+            pack(&values, width, &mut fresh).unwrap();
             assert_eq!(reused, fresh, "at {width} bits after a wider unit");
-            assert_eq!(reused, values, "at {width} bits");
+            let mut back = vec![0u64; VALUES];
+            unpack(&reused, width, &mut back).unwrap();
+            assert_eq!(back, values, "at {width} bits");
         }
+    }
+
+    #[test]
+    fn the_one_pass_unpack_gives_what_the_two_passes_give() {
+        // `unpack` is the fused form of `unpack_transposed` followed by `untranspose`, and those two
+        // are the definition of the layout. So this checks the fast one against the slow one at
+        // every width of every type rather than against a remembered answer, which is the check that
+        // would catch the fused one getting a shift or a row base wrong at one width out of sixty
+        // five.
+        fn agree<T: Packable>() {
+            for width in 0..=T::WIDTH {
+                let values = sample::<T>(width);
+                let mut transposed = vec![T::from_u64(0); VALUES];
+                transpose(&values, &mut transposed).unwrap();
+                let mut packed = vec![T::from_u64(0); packed_len::<T>(width)];
+                pack_transposed(&transposed, width, &mut packed).unwrap();
+
+                let mut middle = vec![T::from_u64(0); VALUES];
+                unpack_transposed(&packed, width, &mut middle).unwrap();
+                let mut slow = vec![T::from_u64(0); VALUES];
+                untranspose(&middle, &mut slow).unwrap();
+
+                let mut fast = vec![T::from_u64(0); VALUES];
+                unpack(&packed, width, &mut fast).unwrap();
+
+                assert_eq!(fast, slow, "{} bit type at {width} bits", T::WIDTH);
+                assert_eq!(fast, values, "{} bit type at {width} bits round trip", T::WIDTH);
+            }
+        }
+        agree::<u8>();
+        agree::<u16>();
+        agree::<u32>();
+        agree::<u64>();
     }
 
     #[test]
