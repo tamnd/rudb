@@ -358,9 +358,6 @@ fn push(
             let empty = plan.add_expr_list(&[]);
             sides(plan, left, right, JoinKind::Inner, empty, domain, index, keys, outer)
         }
-        // A semi, anti or mark join is what is left out. Those produce one side's rows and not both
-        // sides put end to end, so there is no second half to push the domain into and no place in
-        // the output for it to come back out of.
         Node::Join {
             left,
             right,
@@ -368,6 +365,19 @@ fn push(
             conditions,
             ..
         } => sides(plan, left, right, kind, conditions, domain, index, keys, outer),
+        // A positional join and a single join are what is left out. A positional join pairs the nth
+        // row of one side with the nth row of the other, and crossing either side with the domain
+        // changes what the nth row is. A single join is left out for a reason that is not about the
+        // domain at all: the rule that builds one for an `EXISTS` in a join condition writes a plan
+        // whose left side reads a column of its right side, and pushing a domain through that turns
+        // a query that was refused into a query that fails in the executor. That is #913.
+        Node::Join {
+            left,
+            right,
+            kind: kind @ (JoinKind::Semi | JoinKind::Anti | JoinKind::Mark),
+            conditions,
+            ..
+        } => filtering(plan, left, right, kind, conditions, domain, index, keys, outer),
         _ => None,
     }
 }
@@ -1072,6 +1082,94 @@ fn sides(
     Some(Pushed { node, keys: carried, moved })
 }
 
+/// Pushes the domain into a join whose left input is the subject rather than a side.
+///
+/// A semi, anti or mark join answers a question about each left row, which is whether the right side
+/// has a match for it. The left rows come out, or a column about them does, and the right side's
+/// rows are only ever consulted. That is what makes this a different rule from [`sides`] rather than
+/// another case in it.
+///
+/// The left input always carries the domain here, and not because anything in it reads the outer
+/// row. Every row this join produces is a left row, so the domain has to be in the left input for
+/// there to be a domain column in the output at all, and the join back to the outer rows above has
+/// nothing to read otherwise.
+///
+/// The right input carries one only when something in it reads the outer row. What that buys is the
+/// part that makes the rule correct rather than merely typed: a left row now says which outer row it
+/// belongs to, so the question asked about it has to be asked against the right rows belonging to the
+/// same outer row and not against all of them at once. The domain equality goes into the join
+/// condition, and from there the match, the lack of one and the mark's third answer are all decided
+/// per outer row the way the dependent join decided them.
+///
+/// The two copies of the domain have to be told apart for that equality to say anything, so the
+/// right input gets a second one bound against an index of its own. That is the same [`twin`] the
+/// full join rule uses and for the same reason, which is that a comparison between a column and
+/// itself is not a comparison.
+#[allow(clippy::too_many_arguments)]
+fn filtering(
+    plan: &mut Plan,
+    left: NodeRef,
+    right: NodeRef,
+    kind: JoinKind,
+    conditions: Slice,
+    domain: NodeRef,
+    index: u32,
+    keys: &[Key],
+    outer: &TableSet,
+) -> Option<Pushed> {
+    let first = push(plan, left, domain, index, keys, outer)?;
+    let second = if correlated(plan, right, outer) {
+        let (other_domain, other_index) = twin(plan, domain)?;
+        Some(push(plan, right, other_domain, other_index, keys, outer)?)
+    } else {
+        None
+    };
+
+    let mut map = first.moved.clone();
+    if let Some(other) = &second {
+        map.extend(other.moved.clone());
+    }
+    for (key, &binding) in keys.iter().zip(&first.keys) {
+        map.insert(key.binding, binding);
+    }
+    let held = plan.expr_list(conditions).to_vec();
+    let mut all: Vec<ExprRef> = held.into_iter().map(|expr| remap(plan, expr, &map)).collect();
+
+    if let Some(other) = &second {
+        for (key, (&here, &there)) in keys.iter().zip(first.keys.iter().zip(&other.keys)) {
+            let ty = plan.expr_type(key.expr).clone();
+            let span = plan.expr_span(key.expr);
+            let mine = plan.add_expr_at(Expr::Column(here), ty.clone(), span);
+            let yours = plan.add_expr_at(Expr::Column(there), ty, span);
+            all.push(plan.add_expr_at(
+                Expr::Compare { op: CompareOp::NotDistinctFrom, left: mine, right: yours },
+                LogicalType::Boolean,
+                span,
+            ));
+        }
+    }
+
+    let conditions = plan.add_expr_list(&all);
+    let node = plan.add_node(Node::Join {
+        left: first.node,
+        right: second.as_ref().map_or(right, |other| other.node),
+        kind,
+        conditions,
+        build: BuildSide::default(),
+    });
+
+    // A semi and an anti join produce the left side's columns and nothing else, so a binding the
+    // right side moved is not reachable above and reporting it would point whatever read it at a
+    // column that is not there. A mark join produces both sides, so both halves are reported.
+    let mut moved = first.moved;
+    if kind == JoinKind::Mark {
+        if let Some(other) = second {
+            moved.extend(other.moved);
+        }
+    }
+    Some(Pushed { node, keys: first.keys, moved })
+}
+
 /// A second copy of the domain, bound against an index of its own.
 ///
 /// The domain is one node that every side of the push shares, so two sides that both carry it carry
@@ -1579,6 +1677,77 @@ mod tests {
         let otherwise = case.split("ELSE ").nth(1).expect("an ELSE");
         let column = |text: &str| text.split_whitespace().next().expect("a column").to_owned();
         assert_ne!(column(then), column(otherwise), "{after}");
+    }
+
+    #[test]
+    fn a_semi_join_carries_the_domain_on_the_side_whose_rows_come_out() {
+        let mut plan = correlated_join("SEMI", READS, QUIET);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("Join SEMI"), "{after}");
+        // Only the left side. A semi join produces the left rows, the right side is consulted and
+        // thrown away, and nothing in the right side asks about the outer row here.
+        assert_eq!(after.matches("CrossProduct").count(), 1, "{after}");
+        assert_eq!(after.matches("IS NOT DISTINCT FROM").count(), 1, "{after}");
+    }
+
+    #[test]
+    fn a_semi_join_whose_correlated_side_is_the_right_one_carries_the_domain_on_both() {
+        let mut plan = correlated_join("SEMI", QUIET, READS);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("Join SEMI"), "{after}");
+        // The left side carries one because its rows are the answer, and the right side carries one
+        // because it is the side asking the question and it has to ask it about the same outer row.
+        assert_eq!(after.matches("CrossProduct").count(), 2, "{after}");
+        // Two copies of the domain, and they have to be two columns rather than one shared node, or
+        // the equality between them says nothing and a left row meets every right row.
+        assert_eq!(after.matches("groups=[#0.0::INTEGER] aggregates=[]").count(), 2, "{after}");
+        // One equality inside the join to line the two copies up, and one above it to join back.
+        assert_eq!(after.matches("IS NOT DISTINCT FROM").count(), 2, "{after}");
+    }
+
+    #[test]
+    fn an_anti_join_is_the_semi_case_with_the_sense_flipped() {
+        let mut plan = correlated_join("ANTI", QUIET, READS);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("Join ANTI"), "{after}");
+        assert_eq!(after.matches("CrossProduct").count(), 2, "{after}");
+        assert_eq!(after.matches("IS NOT DISTINCT FROM").count(), 2, "{after}");
+    }
+
+    #[test]
+    fn a_mark_join_decides_its_third_answer_per_domain_value() {
+        let mut plan = correlated_join("MARK", QUIET, READS);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("Join MARK"), "{after}");
+        // The domain equality is inside the join rather than above it, which is the whole point.
+        // A mark join answers true, false or unknown for each left row, and the row it answers for
+        // is now a domain value and a left row together, so the right rows it is allowed to match
+        // are the ones carrying the same domain value.
+        assert_eq!(after.matches("CrossProduct").count(), 2, "{after}");
+        assert_eq!(after.matches("IS NOT DISTINCT FROM").count(), 2, "{after}");
+    }
+
+    #[test]
+    fn a_single_join_is_still_refused() {
+        let mut plan = correlated_join("SINGLE", READS, QUIET);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        let after = plan.to_string();
+        // Not because of anything about the domain. The rule that writes a single join for an
+        // `EXISTS` in a join condition writes a plan whose left side reads a column of its right
+        // side, and pushing a domain through it turns a refusal into a failure. That is #913.
+        assert!(after.contains("DependentJoin"), "{after}");
     }
 
     #[test]
