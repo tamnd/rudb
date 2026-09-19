@@ -33,6 +33,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::mem::{size_of, size_of_val};
 use std::path::Path;
+use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -2915,20 +2916,44 @@ impl Reader {
 
     /// Whether persisted statistics prove that every row of a part matches the predicates.
     ///
-    /// Only the bounds, and only the stripe's. The sieves say nothing here, because a sieve that
-    /// holds a value is a sieve that may be holding somebody else's hash, so it can rule a part out
-    /// and can never wave one through.
+    /// Only the bounds. The sieves say nothing here, because a sieve that holds a value is a sieve
+    /// that may be holding somebody else's hash, so it can rule a part out and can never wave one
+    /// through.
     ///
-    /// The stripe's bounds are wider than the part's and its null count covers sixty four parts
-    /// rather than one, and both of those are the safe direction. A stretch where everything passes
-    /// contains no narrower stretch where something fails, and a stripe with no nulls in it has no
-    /// nulls in any of its parts. So this answers `false` for parts it could have waved through if
-    /// the directory recorded bounds that finely, which costs a comparison and never costs rows.
+    /// The stripe first and the part after it, the same two steps and in the same order as
+    /// [`Self::skips`]. The stripe's bounds are in memory already and its null count covers sixty
+    /// four parts rather than one, so a stripe that answers is an answer for nothing, and the part's
+    /// own bounds are only read for the probes it could not settle. Both directions are safe: a
+    /// stretch where everything passes contains no narrower stretch where something fails, and a
+    /// stripe with no nulls has no nulls in any of its parts.
+    ///
+    /// A string end a part recorded is cut down to its first few bytes, so a part's stretch can be
+    /// wider than its rows really are as well. That is the same safe direction for the same reason,
+    /// and it is why this asks the two ends rather than anything `exact` says.
     #[must_use]
     pub fn certain(&self, part: usize, probes: &[Probe]) -> bool {
         let Some(place) = self.places.get(part).copied() else { return false };
         let Some(stripe) = self.table.stripes.get(place.stripe as usize) else { return false };
-        stripe.zone.certain(probes)
+        if stripe.zone.certain(probes) {
+            return true;
+        }
+        probes
+            .iter()
+            .all(|probe| stripe.zone.certain(slice::from_ref(probe)) || self.inside(place, probe))
+    }
+
+    /// Whether one part's own two ends prove that every row of it passes `probe`.
+    ///
+    /// The mirror of [`Self::outside`], reading the same page. `false` for a part whose stripe wrote
+    /// no range page, which is a stripe of one part, because there the stripe's own bounds are the
+    /// part's and the caller has already asked them.
+    fn inside(&self, place: Place, probe: &Probe) -> bool {
+        match self.stripe_part_ranges(place.stripe as usize, probe.column) {
+            Some(ranges) => ranges
+                .get(place.part as usize)
+                .is_some_and(|range| range.certain(probe.op, &probe.value)),
+            None => false,
+        }
     }
 
     /// Whether the bounds of one stripe prove that none of its parts can match the predicates.
@@ -5606,6 +5631,40 @@ mod tests {
         assert_eq!(kept, vec![0, 1, 2], "only the three parts that start under three thousand");
         // The same question asked of the stripe alone, which is what this replaces.
         assert!(!reader.stripe_skips(0, &under), "the stripe reaches from zero and keeps itself");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// The other half of the same page. A part whose own bounds put every row of it inside the
+    /// filter is waved through, so the comparison never runs on it, where the stripe's bounds reach
+    /// across every part and can prove nothing.
+    #[test]
+    fn a_part_is_waved_through_when_its_own_bounds_pass_a_comparison_the_stripe_cannot() {
+        let path = path("part-range-certain");
+        let mut writer =
+            Writer::create(&path, "hits", vec![Field::required("at", LogicalType::BigInt)])
+                .expect("new file");
+        let parts = STRIPE_PARTS + 3;
+        let per_part = 128;
+        for part in 0..parts {
+            let held: Vec<Value> = (0..per_part)
+                .map(|row| {
+                    Value::BigInt((part * 1_000) as i64 + (scattered(row as i64).rem_euclid(900)))
+                })
+                .collect();
+            let chunk =
+                Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &held).expect("numbers")])
+                    .expect("one column");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let under = [Probe { column: 0, op: Op::Less, value: Bound::Int(3_000) }];
+        let waved: Vec<usize> = (0..parts).filter(|&part| reader.certain(part, &under)).collect();
+        assert_eq!(waved, vec![0, 1, 2], "the three parts that end under three thousand");
+        // The first stripe reaches from zero to past sixty thousand, so it straddles three thousand
+        // and settles nothing either way. The three yeses above are the parts' own ends talking.
+        assert!(!reader.stripe_skips(0, &under), "the stripe straddles the comparison");
         fs::remove_file(path).expect("remove scratch file");
     }
 
