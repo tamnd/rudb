@@ -28,7 +28,7 @@ use rudb_metrics::Span;
 
 use crate::pipeline::Pipeline;
 use crate::pool::Lease;
-use crate::serial::{Stop, instance, run_serial};
+use crate::serial::{Stop, drain, instance, run_serial};
 
 /// What a parallel run cost that the thread which started it cannot see for itself.
 ///
@@ -170,6 +170,10 @@ pub fn run_parallel(
     if let Some(error) = failure.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
         return Err(error);
     }
+
+    // After every instance and before the finish. What an operator owes at the end is a fact about
+    // all of them put together, which is why no instance could have said it on its way out.
+    drain(pipeline, cancel)?;
 
     let measured = Span::start();
     let finalized = pipeline.sink().finalize_state(lease);

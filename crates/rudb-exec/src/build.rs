@@ -72,7 +72,7 @@ use crate::fetch::{Fetch, TableFetch};
 use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
-use crate::join::{CrossProduct, Gathered, Join, Marking, Probe};
+use crate::join::{CrossProduct, Gathered, Join, Marking, Padding, Probe};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
 use crate::query::Query;
@@ -1542,6 +1542,22 @@ impl<'a> Building<'a, '_> {
                     self.close(left, pipeline, Arc::new(Watched::new(mark, counters)));
                     let reader = Arc::new(Watched::new(out, reading));
                     return Ok(Segment::reading(reader, schema, pipeline));
+                }
+                // An outer join that gathered the side it keeps. It streams the pairs like any
+                // probe and owes a padded row for every gathered row nothing matched, which it
+                // hands over once the driving side is finished. See `crate::join::Padding`.
+                if let Some(pad) =
+                    Padding::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)
+                {
+                    let pad = pad.in_session(self.session);
+                    arm(pad.sideways());
+                    let schema = pad.schema().clone();
+                    // Named for what it does rather than for the kind, because the kind on the
+                    // plan line above it already says which outer join this is and what a reader
+                    // of a profile wants to know here is which of the two operators ran.
+                    let counters = self.watch(reference, id, pipeline, "Pad", None);
+                    left.after.push(gathering);
+                    return Ok(left.then(Arc::new(Watched::new(pad, counters)), schema));
                 }
                 if let Some(probe) =
                     Probe::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)

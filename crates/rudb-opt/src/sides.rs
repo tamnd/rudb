@@ -76,26 +76,31 @@
 //! A join whose two sides estimate the same. There is nothing to choose between them and choosing
 //! anyway would make the flag depend on which comparison operator was written down.
 //!
-//! # An outer join has a side it cannot gather
+//! # An outer join used to have a side it could not gather
 //!
 //! An `OUTER` join keeps the rows of one side whether or not anything matched them, and which of
-//! them matched nothing is not known until the last row of the other side has been through. So the
-//! lookup cannot answer it while gathering that side: it decides about a driving row from that
-//! row's own matches, which is what lets it answer as it goes, and a row of the gathered side that
-//! nothing has matched yet may still be matched by a driving row that has not arrived.
-//! `crates/rudb-exec/src/join.rs::streamed` is that list and `RIGHT` and `FULL` are not on it.
+//! them matched nothing is not known until the last row of the other side has been through. The
+//! lookup decides about a driving row from that row's own matches, which is what lets it answer as
+//! it goes, so `crates/rudb-exec/src/join.rs::streamed` leaves `RIGHT` and `FULL` off its list and
+//! the kept side used to be forced to stream. Gathering it instead meant the nested loop and its
+//! boxed row per pair, which on `customer LEFT JOIN orders` at SF1 was 0.392 s against 0.079 for
+//! the same join gathering the other side.
 //!
-//! Gathering the kept side of a `LEFT` join is the same thing as running a `RIGHT` join, because
-//! that is what [`rudb_plan::JoinKind::mirrored`] says swapping the inputs means. So the size rule
-//! on its own can take a join the lookup would have answered and hand it to the nested loop, which
-//! builds a boxed row per pair, and on `customer LEFT JOIN orders` at SF1 it did: the estimate has
-//! the kept side smaller, the pass gathered it, and counting the pairs took 0.392 s against 0.079 s
-//! for the same join gathering the other side. TPC-H q13 is that join and it went 0.854 s to 0.460.
+//! What that argument leaves out is that only part of such a join's answer has to wait. The pairs
+//! are known as each driving row arrives, exactly as they are for an inner join. What is not known
+//! until the end is the padded row owed to a gathered row nothing matched, and there are at most
+//! as many of those as the gathered side has rows.
+//! `crates/rudb-exec/src/join.rs::Padding` produces the first half as a stream and hands the
+//! second half over once the driving side is finished, so the kept side can be gathered after all.
 //!
-//! So a kind that keeps a side does not get a choice when the join is a lookup. The side to gather
-//! is the other one, whichever is bigger, because the alternative is not a smaller hash table, it
-//! is no hash table. A `FULL` join keeps both sides and no lookup answers it either way, so it is
-//! left to the size rule with the rest of the nested loops.
+//! Which matters because forcing the kept side to stream forces the pipeline's degree to be
+//! whatever the kept side is worth. TPC-H q13 keeps the 150,000 row `customer` and joins it to the
+//! 1.5 million row `orders`, so the 1.5 million probes ran at the degree 150,000 rows buy, which
+//! on a ten thread machine is two of them, while the machine's other eight sat idle. DuckDB
+//! answers the same query as a right outer join for the same reason.
+//!
+//! So an outer join is back on the size rule with everything else. When no lookup answers it the
+//! nested loop runs and wants the larger side, which is what the size rule already says.
 
 use rudb_plan::{BuildSide, JoinKind, Node, Plan};
 
@@ -149,29 +154,6 @@ fn prefers(left: u64, right: u64, lookup: bool) -> Option<BuildSide> {
     }
 }
 
-/// The side a lookup has no choice about, for a kind that keeps one side's rows whatever matches.
-///
-/// The kept side cannot be the gathered one, because a gathered row that nothing has matched yet
-/// may still be matched, so the operator cannot say anything about it until the driving side is
-/// finished, and the lookup answers a driving row as it arrives. Gathering it instead hands the
-/// join to the nested loop, which is the argument in the module documentation and the measurement
-/// there. Size does not come into it: the choice is between a hash table on the other side and no
-/// hash table at all.
-///
-/// `None` for a nested loop, which runs the same way whichever side it holds, and for the kinds
-/// that keep neither side or both.
-#[must_use]
-fn forced(kind: JoinKind, lookup: bool) -> Option<BuildSide> {
-    if !lookup {
-        return None;
-    }
-    match kind {
-        JoinKind::Left => Some(BuildSide::Right),
-        JoinKind::Right => Some(BuildSide::Left),
-        _ => None,
-    }
-}
-
 /// Writes the chosen side onto every join in `plan` that has one.
 ///
 /// In place rather than by rebuilding, because this changes no node's shape and no node's children.
@@ -201,19 +183,13 @@ fn choose(plan: &mut Plan, stats: &Facts) {
         if turned && !lookup {
             continue;
         }
-        let wanted = match forced(kind, lookup) {
-            Some(side) => side,
-            None => {
-                let (Some(left), Some(right)) =
-                    (estimate::rows(plan, left, stats), estimate::rows(plan, right, stats))
-                else {
-                    continue;
-                };
-                let Some(side) = prefers(left, right, lookup) else {
-                    continue;
-                };
-                side
-            }
+        let (Some(left), Some(right)) =
+            (estimate::rows(plan, left, stats), estimate::rows(plan, right, stats))
+        else {
+            continue;
+        };
+        let Some(wanted) = prefers(left, right, lookup) else {
+            continue;
         };
         if let Node::Join { build, .. } = plan.node_mut(node) {
             *build = wanted;
@@ -225,7 +201,7 @@ fn choose(plan: &mut Plan, stats: &Facts) {
 mod tests {
     use rudb_plan::{BuildSide, JoinKind, Node, Plan};
 
-    use super::{BuildSideProbeSide, forced, prefers};
+    use super::{BuildSideProbeSide, prefers};
     use crate::estimate::Facts;
     use crate::pass::{Context, Pass};
 
@@ -334,38 +310,25 @@ mod tests {
         assert_eq!(chosen("FULL", 400_000, 4), BuildSide::Left);
     }
 
+    /// The side a `LEFT` join keeps is gatherable now, so the size rule decides it like any other.
+    /// Four rows against four hundred thousand is gathered whichever input the four are, and the
+    /// executor runs the second of those as `crates/rudb-exec/src/join.rs::Padding`.
     #[test]
-    fn a_left_join_on_a_key_gathers_the_other_side_however_small_the_side_it_keeps_is() {
-        // Four rows against four hundred thousand, and the four are the side the join keeps. The
-        // size rule wants them gathered and cannot have them: gathering them is running a `RIGHT`
-        // join, no lookup answers one, and the join would go to the nested loop instead.
-        assert_eq!(keyed("LEFT", 4, 400_000), BuildSide::Right);
+    fn a_left_join_on_a_key_gathers_whichever_side_is_smaller() {
+        assert_eq!(keyed("LEFT", 4, 400_000), BuildSide::Left);
         assert_eq!(keyed("LEFT", 400_000, 4), BuildSide::Right);
     }
 
     #[test]
     fn a_right_join_on_a_key_is_the_same_rule_the_other_way_round() {
-        assert_eq!(keyed("RIGHT", 400_000, 4), BuildSide::Left);
+        assert_eq!(keyed("RIGHT", 400_000, 4), BuildSide::Right);
         assert_eq!(keyed("RIGHT", 4, 400_000), BuildSide::Left);
     }
 
-    /// A `FULL` join keeps both sides, so no lookup answers it whichever side is gathered and there
-    /// is nothing to protect. It goes back to the size rule with the other nested loops.
     #[test]
     fn a_full_join_on_a_key_still_gathers_the_smaller_side() {
         assert_eq!(keyed("FULL", 4, 400_000), BuildSide::Left);
         assert_eq!(keyed("FULL", 400_000, 4), BuildSide::Right);
-    }
-
-    #[test]
-    fn the_side_an_outer_join_cannot_gather_is_the_side_it_keeps() {
-        assert_eq!(forced(JoinKind::Left, true), Some(BuildSide::Right));
-        assert_eq!(forced(JoinKind::Right, true), Some(BuildSide::Left));
-        assert_eq!(forced(JoinKind::Full, true), None);
-        assert_eq!(forced(JoinKind::Inner, true), None);
-        // A nested loop runs the same way whichever side it holds, so there is nothing forced.
-        assert_eq!(forced(JoinKind::Left, false), None);
-        assert_eq!(forced(JoinKind::Right, false), None);
     }
 
     /// A semi join produces its left input's rows. There is no join that produces its right

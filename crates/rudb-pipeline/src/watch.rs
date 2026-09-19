@@ -106,6 +106,28 @@ impl<S: Stream> Stream for Watched<S> {
         prepared
     }
 
+    fn drains(&self) -> bool {
+        self.inner.drains()
+    }
+
+    /// Measured, and the rows counted, because a drain is chunks this operator produced and the
+    /// document would otherwise show an operator that made fewer rows than it handed on.
+    ///
+    /// The clock covers the callback as well as the operator, which charges this operator for
+    /// whatever sits below it. There is nowhere better to put that time: the operators below are
+    /// measured by their own shims when the callback reaches them, so what is left here is theirs
+    /// counted twice rather than a gap, and the alternative is a clock started and stopped around
+    /// every chunk of a drain that is one chunk long on almost every query.
+    fn drain(&self, out: &mut dyn FnMut(&mut Chunk) -> Result<Progress>) -> Result<()> {
+        let measure = Measure::start(&self.counters);
+        let drained = self.inner.drain(&mut |chunk| {
+            self.counters.made(rows(chunk));
+            out(chunk)
+        });
+        measure.stop(&self.counters);
+        drained
+    }
+
     fn push(&self, chunk: &mut Chunk, local: &mut Self::Local) -> Result<Progress> {
         // A stream transforms in place, so the rows it was given have to be counted before the call
         // and the rows it produced after it. A filter that keeps a tenth of its input is the
