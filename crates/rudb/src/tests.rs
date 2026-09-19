@@ -2591,7 +2591,7 @@ fn correlated_exists_groups_keys_before_its_single_join() {
 }
 
 #[test]
-fn correlated_exists_uses_an_outer_domain_for_inequalities() {
+fn correlated_exists_with_an_inequality_ends_up_a_semi_join() {
     let db = database();
     let sql = "SELECT k FROM (VALUES (1), (2), (4)) o(k) WHERE EXISTS (SELECT 1 FROM (VALUES (1), (3)) i(x) WHERE i.x < o.k) ORDER BY k";
     assert_eq!(rows(&db, sql), vec![vec![Value::Integer(2)], vec![Value::Integer(4)]]);
@@ -2610,11 +2610,12 @@ fn correlated_exists_uses_an_outer_domain_for_inequalities() {
         vec![vec![Value::Boolean(true)]]
     );
     let plan = db.plan(sql).expect("the correlated inequality existence query plans");
-    // Semi rather than inner, because the distinct over the domain above it asks which of the
-    // domain's values had a match and not which pairs matched.
-    assert!(plan.contains("Join SEMI"), "{plan}");
-    assert!(plan.contains("Join SINGLE"), "{plan}");
-    assert!(plan.contains("IS NOT DISTINCT FROM"), "{plan}");
+    // An inequality still decorrelates through a domain of the outer keys, and the deliminator
+    // then takes the domain back out, because the outer side of the join back is the relation the
+    // domain was standing in for. What is left is the two sides joined on the inequality itself.
+    assert!(plan.contains("Join SEMI on=[(#1.0::INTEGER < #0.0::INTEGER)::BOOLEAN]"), "{plan}");
+    assert!(!plan.contains("Join SINGLE"), "{plan}");
+    assert!(!plan.contains("Aggregate"), "{plan}");
     assert!(!plan.contains("DependentJoin"), "{plan}");
 }
 

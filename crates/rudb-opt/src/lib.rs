@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Thirteen passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
+//! Fifteen passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
 //! the start of it. Column pruning came first, because it is the pass whose absence is measured in
 //! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -12,6 +12,7 @@
 
 pub mod columns;
 pub mod cte;
+pub mod delim;
 pub mod dependent;
 pub mod distinct;
 mod domain;
@@ -68,6 +69,13 @@ pub const RANK: u8 = 11;
 /// empty result pullup, column pruning and late materialisation all walk the join tree and all of
 /// them should walk the tree that is going to run.
 ///
+/// The deliminator is between filter pushdown and join ordering, and both halves of that matter.
+/// After pushdown, because the shape it reads is a filter over the marker of one single join and
+/// before pushdown that test is one conjunct of the query's whole `WHERE`, sitting above however
+/// many other joins the `FROM` list turned into. Before join ordering, because what it leaves
+/// behind is a semi join where there was a join back to a domain, and the pass that decides which
+/// order to build a region in should be reading the joins that are going to run.
+///
 /// Empty result pullup is after filter pushdown, because pushdown is what moves an unsatisfiable
 /// predicate down to the scan it should stop and what drops the conjuncts that were always true, so
 /// the pass that looks for a predicate nothing can satisfy should look after that has happened. It
@@ -112,11 +120,12 @@ pub const RANK: u8 = 11;
 /// on the next run instead, which is the fixed sequence not settling. Before the rest, because the
 /// subtree it removes is a subtree they would otherwise walk, and because the operators it leaves
 /// next to each other are the pairs limit pushdown and top N are looking for.
-pub static PASSES: [&(dyn Pass + Sync); 14] = [
+pub static PASSES: [&(dyn Pass + Sync); 15] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
     &filter::FilterPushdown,
+    &delim::Deliminator,
     &order::JoinOrder,
     &semi::MarkToSemi,
     &semi::DistinctToSemi,
@@ -132,11 +141,11 @@ pub static PASSES: [&(dyn Pass + Sync); 14] = [
 /// Every name `SET disabled_optimizers` accepts, which is every name DuckDB accepts.
 ///
 /// `SELECT name FROM duckdb_optimizers()` on the pinned binary, sorted, all forty four of them.
-/// Eleven of them name a pass [`PASSES`] holds, and every name here is one rudb takes without
+/// Twelve of them name a pass [`PASSES`] holds, and every name here is one rudb takes without
 /// complaint, because turning off a pass that does not exist is a thing that has already happened.
 ///
-/// Accepting the other thirty three is the whole point. Forty five files in the upstream corpus run
-/// a `SET disabled_optimizers`, and most of them name a pass rudb has not written, `deliminator` and
+/// Accepting the other thirty two is the whole point. Forty five files in the upstream corpus run a
+/// `SET disabled_optimizers`, and most of them name a pass rudb has not written,
 /// `statistics_propagation` and `compressed_materialization` and the rest. Refusing those makes the
 /// `SET` fail, and a failed `SET` in a sqllogictest file ends the file, so every record after it
 /// goes unasked over a pass whose absence changes no answer.
