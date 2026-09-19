@@ -69,6 +69,7 @@ fn report(path: &str, layout: &Layout, all: bool) {
     let pages = total(layout, |column| column.pages);
     let memberships = total(layout, |column| column.memberships);
     let sieves = total(layout, |column| column.sieves);
+    let part_ranges = total(layout, |column| column.part_ranges);
     let dictionaries = total(layout, |column| column.dictionary);
     println!("  {:>16}  {:>6}  {:>8}  what", "bytes", "share", "per row");
     for (bytes, what) in [
@@ -76,6 +77,7 @@ fn report(path: &str, layout: &Layout, all: bool) {
         (dictionaries, "table wide dictionaries"),
         (memberships, "exact code membership pages"),
         (sieves, "membership sieve pages"),
+        (part_ranges, "per part range pages"),
         (layout.indexes, "stripe index pages, per part lengths and checksums"),
         (layout.directory, "the committed directory"),
         (layout.header, "the header"),

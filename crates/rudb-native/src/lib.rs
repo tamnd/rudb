@@ -47,7 +47,7 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 20;
+const FORMAT: u32 = 21;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -81,6 +81,16 @@ const MAX_ENCODE_WORKERS: usize = 32;
 /// rule in `encode_column` that a sieve may not be as large as the part it indexes, which is a cap
 /// per column rather than one number for the whole file.
 const SIEVE_BUDGET: usize = 8 * 1024;
+
+/// The most bytes one end of a per part range may spend on a string.
+///
+/// A bound is allowed to be wider than the truth and never narrower, so a long string is cut down to
+/// this many bytes for the low end and cut down and then stepped up for the high end. The reason for
+/// a cap at all is that there are nine hundred and seventy four parts of a hundred and five columns
+/// in a million rows of ClickBench and `URL` runs to hundreds of bytes, so keeping every end whole
+/// would put more in the directory than the skipping is worth. Twenty four bytes is past the point
+/// where two URLs of the same site still look alike.
+const PART_BOUND_BYTES: usize = 24;
 
 fn io(error: std::io::Error) -> Error {
     Error::io(error.to_string())
@@ -267,6 +277,17 @@ pub struct Stripe {
     /// One page per column holding the membership sieve of every part of the stripe, for the
     /// columns that have one. A column whose parts all declined a sieve has no page at all.
     sieves: Vec<Option<Page>>,
+    /// One page per column holding the two ends and the null count of every part of the stripe.
+    ///
+    /// The stripe's own `zone` below covers sixty four times as many rows, and on a column that is
+    /// not the one the rows are ordered by that is the difference between skipping half the file and
+    /// skipping all but three percent of it. On ClickBench 24 the cutoff the answer settles at
+    /// leaves eight stripes of sixteen alive and thirty parts of nine hundred and seventy four.
+    ///
+    /// A page per column rather than one page for the stripe, so that a query that compares one
+    /// column reads the ends of that column and not of the hundred and four beside it. Read lazily
+    /// for the same reason, like the sieves.
+    part_ranges: Vec<Option<Page>>,
     zone: Zone,
 }
 
@@ -344,6 +365,8 @@ pub struct ColumnLayout {
     pub memberships: u64,
     /// Every stripe's membership sieve page for this column.
     pub sieves: u64,
+    /// Every stripe's per part range page for this column.
+    pub part_ranges: u64,
     /// The table wide dictionary of this column, if it has one.
     pub dictionary: u64,
 }
@@ -355,6 +378,7 @@ impl ColumnLayout {
         self.pages
             .saturating_add(self.memberships)
             .saturating_add(self.sieves)
+            .saturating_add(self.part_ranges)
             .saturating_add(self.dictionary)
     }
 }
@@ -955,6 +979,28 @@ impl Writer {
                 hash: checksum(&bytes),
             });
         }
+        // A stripe of one part has the same rows in it as that part, so its own bounds are already
+        // the part's and a page here would say what the directory says. Everywhere else the page is
+        // written unless it comes to more than the column it indexes, which is the rule the sieves
+        // go by and for the same reason: a reader reads this to decide whether to read the column,
+        // so a page larger than the column has spent more than the read it is avoiding.
+        let mut part_ranges = vec![None; width];
+        if parts > 1 {
+            for ((page, stripe), span) in part_ranges.iter_mut().zip(&encoded).zip(&pages) {
+                let bytes = encode_part_ranges(&stripe.ranges)?;
+                if bytes.len() >= span.length as usize {
+                    continue;
+                }
+                let offset = self.at;
+                self.put(&bytes)?;
+                *page = Some(Page {
+                    offset,
+                    length: u32::try_from(bytes.len())
+                        .map_err(|_| invalid("part range page length overflow"))?,
+                    hash: checksum(&bytes),
+                });
+            }
+        }
         let offset = self.at;
         self.put(&index)?;
         let index = Span {
@@ -981,6 +1027,7 @@ impl Writer {
             pages,
             memberships,
             sieves,
+            part_ranges,
             zone: Zone::from_ranges(ranges),
         });
         // Back where it came from, empty, so the next stripe buffers into the same allocation.
@@ -1295,6 +1342,9 @@ pub struct Reader {
     /// first time a probe asks about them. A query filters on one or two columns and never looks at
     /// the rest, so reading these at open would be the whole index for the sake of a fraction of it.
     sieves: Arc<Vec<Vec<SieveSlot>>>,
+    /// The per part ranges of one stripe of one column, by column and then by stripe, read the
+    /// first time something compares that column and kept after that.
+    part_ranges: Arc<Vec<Vec<RangeSlot>>>,
     /// Which stripe and which part of it every part of the table is, by table wide part number.
     places: Arc<Vec<Place>>,
     cache: Arc<Vec<Mutex<Cached>>>,
@@ -1419,6 +1469,8 @@ const CACHED_STRIPES_PER_COLUMN: usize = 4;
 
 /// The sieves of one stripe of one column, once somebody has asked for them.
 type SieveSlot = OnceLock<Arc<Vec<Option<Sieve>>>>;
+
+type RangeSlot = OnceLock<Arc<Vec<Range>>>;
 
 #[derive(Debug)]
 struct NativeText {
@@ -2124,7 +2176,10 @@ impl Reader {
                 })
             })
             .collect::<Vec<_>>();
-        let sieves = (0..table.fields.len())
+        let sieves: Vec<Vec<SieveSlot>> = (0..table.fields.len())
+            .map(|_| table.stripes.iter().map(|_| OnceLock::new()).collect())
+            .collect();
+        let part_ranges: Vec<Vec<RangeSlot>> = (0..table.fields.len())
             .map(|_| table.stripes.iter().map(|_| OnceLock::new()).collect())
             .collect();
         Ok(Self {
@@ -2134,6 +2189,7 @@ impl Reader {
             loading: Arc::new((0..table_fields).map(|_| Mutex::new(())).collect()),
             opened: Arc::new(AtomicUsize::new(0)),
             sieves: Arc::new(sieves),
+            part_ranges: Arc::new(part_ranges),
             places: Arc::new(places),
             cache: Arc::new(cache),
             pages: Arc::new(AtomicUsize::new(0)),
@@ -2179,6 +2235,7 @@ impl Reader {
                 pages: sum(stripes.iter().map(|stripe| span_bytes(&stripe.pages, at))),
                 memberships: sum(stripes.iter().map(|stripe| page_bytes(&stripe.memberships, at))),
                 sieves: sum(stripes.iter().map(|stripe| page_bytes(&stripe.sieves, at))),
+                part_ranges: sum(stripes.iter().map(|stripe| page_bytes(&stripe.part_ranges, at))),
                 dictionary: page_bytes(&table.dictionaries, at),
             })
             .collect();
@@ -2798,13 +2855,19 @@ impl Reader {
 
     /// Whether persisted statistics prove that a part cannot match the predicates.
     ///
-    /// Two of them. The bounds are per stripe, so every part of a stripe gets the same answer from
-    /// those and a scan that skips one part that way skips all sixty four. The sieves are per part
-    /// and answer equality, which is the test bounds are worst at: a column of identifiers has every
-    /// stripe covering nearly the whole of its type, so the bounds keep every part of it and the
-    /// sieve keeps the ones that really hold the value.
+    /// Three of them, asked cheapest first.
     ///
-    /// The bounds go first because they are already in memory and the sieves are a read.
+    /// The stripe's bounds are in memory already, so they are free, and they are also the coarsest:
+    /// every part of a stripe gets the same answer and a scan that skips one part that way skips all
+    /// sixty four. Then the part's own bounds, which are a read of one page per column per stripe
+    /// and are sixty four times finer. Then the sieves, which are per part and answer equality, the
+    /// test bounds are worst at: a column of identifiers has every stripe and nearly every part
+    /// covering the whole of its type, so bounds keep them all and the sieve keeps the ones that
+    /// really hold the value.
+    ///
+    /// The middle one is what an ordered comparison on a column the rows are not sorted by needs. On
+    /// ClickBench 24 the stripe bounds leave eight stripes of sixteen alive, which is half the file,
+    /// and the part bounds leave thirty parts of nine hundred and seventy four.
     #[must_use]
     pub fn skips(&self, part: usize, probes: &[Probe]) -> bool {
         let Some(place) = self.places.get(part).copied() else { return false };
@@ -2812,7 +2875,42 @@ impl Reader {
         if stripe.zone.skips(probes) {
             return true;
         }
-        probes.iter().any(|probe| self.sifted(place, probe))
+        probes.iter().any(|probe| self.outside(place, probe) || self.sifted(place, probe))
+    }
+
+    /// Whether the bounds of one part rule out one probe.
+    ///
+    /// The part's own two ends, which are narrower than the stripe's and cost a page read the first
+    /// time this is asked about a column. A column with no page here answers `false`, which is the
+    /// answer a caller got before there were any.
+    fn outside(&self, place: Place, probe: &Probe) -> bool {
+        match self.stripe_part_ranges(place.stripe as usize, probe.column) {
+            Some(ranges) => ranges
+                .get(place.part as usize)
+                .is_some_and(|range| range.excludes(probe.op, &probe.value)),
+            None => false,
+        }
+    }
+
+    /// The per part ranges of one stripe of one column, read once and kept.
+    ///
+    /// `None` when the column has no page in that stripe and when the page is damaged, on the same
+    /// reasoning as the sieves: this is an index over data that is still there, so a caller that
+    /// cannot read one reads the rows and gets the right answer slowly.
+    fn stripe_part_ranges(&self, stripe: usize, column: usize) -> Option<&[Range]> {
+        let slot = self.part_ranges.get(column)?.get(stripe)?;
+        if let Some(held) = slot.get() {
+            return Some(held);
+        }
+        let page = self.table.stripes.get(stripe)?.part_ranges.get(column).copied().flatten()?;
+        let mut bytes = vec![0; page.length as usize];
+        read_at(&self.file, page.offset, &mut bytes).ok()?;
+        if checksum(&bytes) != page.hash {
+            return None;
+        }
+        let ranges = Arc::new(decode_part_ranges(&bytes).ok()?);
+        let _ = slot.set(ranges);
+        slot.get().map(|held| held.as_slice())
     }
 
     /// Whether persisted statistics prove that every row of a part matches the predicates.
@@ -3147,6 +3245,17 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
                 }
             }
         }
+        for held in &stripe.part_ranges {
+            match held {
+                None => out.push(0),
+                Some(page) => {
+                    out.push(1);
+                    put_u64(&mut out, page.offset);
+                    put_u32(&mut out, page.length);
+                    put_u64(&mut out, page.hash);
+                }
+            }
+        }
         for range in stripe.zone.columns() {
             put_bound(&mut out, range.low.as_ref())?;
             put_bound(&mut out, range.high.as_ref())?;
@@ -3414,6 +3523,23 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             }
             *sieve = Some(page);
         }
+        let mut part_ranges = vec![None; width];
+        for held in part_ranges.iter_mut().take(width) {
+            match cur.u8()? {
+                0 => continue,
+                1 => {}
+                _ => return Err(invalid("a part range page has an unknown tag")),
+            }
+            let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+            let end = page
+                .offset
+                .checked_add(u64::from(page.length))
+                .ok_or_else(|| invalid("part range page offset overflow"))?;
+            if page.offset < HEADER || end > size || page.length as usize > MAX_PAGE {
+                return Err(invalid("part range page range is outside the file"));
+            }
+            *held = Some(page);
+        }
         let mut ranges = Vec::with_capacity(width);
         for column in 0..width {
             let low = cur.bound()?;
@@ -3447,6 +3573,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             pages,
             memberships,
             sieves,
+            part_ranges,
             zone: Zone::from_ranges(ranges),
         });
     }
@@ -4142,6 +4269,67 @@ fn merged_range(ranges: impl Iterator<Item = Range>) -> Range {
 /// One page for the whole stripe rather than one per part, because a part's sieve is a few hundred
 /// bytes and sixty four of those are sixty four directory entries and sixty four reads for something
 /// a scan walks straight through. A part with no sieve writes a length of zero and costs four bytes.
+/// `bound` cut down to [`PART_BOUND_BYTES`], still a bound of the side it was.
+///
+/// A prefix of a string sorts at or before the string, so cutting one down leaves a low end that is
+/// still a low end. A high end has to go the other way, so the cut prefix is stepped up at the last
+/// byte that can carry it, and a prefix of nothing but `0xFF` has no such byte and gives up the
+/// bound rather than claiming one that is too small. Anything that is not a string is already a
+/// fixed width and is left alone.
+fn shortened(bound: Option<Bound>, high: bool) -> Option<Bound> {
+    match bound {
+        Some(Bound::Bytes(mut value)) if value.len() > PART_BOUND_BYTES => {
+            value.truncate(PART_BOUND_BYTES);
+            if !high {
+                return Some(Bound::Bytes(value));
+            }
+            while let Some(last) = value.pop() {
+                if last < u8::MAX {
+                    value.push(last + 1);
+                    return Some(Bound::Bytes(value));
+                }
+            }
+            None
+        }
+        other => other,
+    }
+}
+
+/// The ranges of one column's parts of one stripe, as a page.
+///
+/// The two ends and the null count, and not `exact` or the total. Those two answer a `MIN` or a
+/// `SUM` out of the directory, and the directory already answers those per stripe, where the same
+/// number costs sixty times less to keep. What a part range is for is skipping the part, and
+/// skipping needs the ends. So a range read back from here says it is not exact, which is true of a
+/// string end that was cut down anyway.
+fn encode_part_ranges(ranges: &[Range]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(ranges.len()).map_err(|_| invalid("too many parts in a stripe"))?,
+    );
+    for range in ranges {
+        put_bound(&mut out, shortened(range.low.clone(), false).as_ref())?;
+        put_bound(&mut out, shortened(range.high.clone(), true).as_ref())?;
+        put_u32(&mut out, u32::try_from(range.nulls).map_err(|_| invalid("null count overflow"))?);
+    }
+    Ok(out)
+}
+
+/// The ranges one encoded page holds, one entry per part of the stripe.
+fn decode_part_ranges(bytes: &[u8]) -> Result<Vec<Range>> {
+    let mut cur = Cursor { bytes, at: 0 };
+    let parts = cur.u32()? as usize;
+    let mut out = Vec::new();
+    for _ in 0..parts {
+        let low = cur.bound()?;
+        let high = cur.bound()?;
+        let nulls = cur.u32()? as usize;
+        out.push(Range { low, high, nulls, exact: false, sum: None });
+    }
+    Ok(out)
+}
+
 fn encode_sieves<'a>(sieves: impl Iterator<Item = &'a Option<Sieve>>) -> Result<Vec<u8>> {
     let held: Vec<&Option<Sieve>> = sieves.collect();
     let mut out = Vec::new();
@@ -5381,6 +5569,97 @@ mod tests {
             "the bounds rule out no stripe at all"
         );
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A part whose own bounds rule out an ordered comparison is skipped where the stripe's keep it.
+    ///
+    /// This is the shape of ClickBench 24. Each part covers a narrow stretch of the column and the
+    /// stripe covers all sixty four of them at once, so a comparison that lands inside the stripe
+    /// rules out none of it and rules out all but a few parts.
+    #[test]
+    fn a_part_is_skipped_when_its_own_bounds_rule_out_a_comparison_the_stripe_keeps() {
+        let path = path("part-range-skip");
+        let mut writer =
+            Writer::create(&path, "hits", vec![Field::required("at", LogicalType::BigInt)])
+                .expect("new file");
+        let parts = STRIPE_PARTS + 3;
+        let per_part = 128;
+        for part in 0..parts {
+            // Scattered inside the part's own band rather than a run, because a run of
+            // consecutive numbers encodes to a stride of a few bytes and then the page of ranges
+            // costs more than reading the column it indexes, which is the case the writer declines.
+            let held: Vec<Value> = (0..per_part)
+                .map(|row| {
+                    Value::BigInt((part * 1_000) as i64 + (scattered(row as i64).rem_euclid(900)))
+                })
+                .collect();
+            let chunk =
+                Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &held).expect("numbers")])
+                    .expect("one column");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let under = [Probe { column: 0, op: Op::Less, value: Bound::Int(3_000) }];
+        let kept: Vec<usize> = (0..parts).filter(|&part| !reader.skips(part, &under)).collect();
+        assert_eq!(kept, vec![0, 1, 2], "only the three parts that start under three thousand");
+        // The same question asked of the stripe alone, which is what this replaces.
+        assert!(!reader.stripe_skips(0, &under), "the stripe reaches from zero and keeps itself");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// The page is worth its bytes on a column with parts to tell apart and is not written on one
+    /// that has a single part, where the stripe bounds already are the part's.
+    #[test]
+    fn a_stripe_of_one_part_writes_no_range_page_and_a_stripe_of_many_does() {
+        for (parts, wanted) in [(1_usize, false), (STRIPE_PARTS, true)] {
+            let path = path("part-range-page");
+            let mut writer =
+                Writer::create(&path, "hits", vec![Field::required("at", LogicalType::BigInt)])
+                    .expect("new file");
+            for part in 0..parts {
+                let held: Vec<Value> = (0..128)
+                    .map(|row| {
+                        Value::BigInt((part * 1_000) as i64 + scattered(row as i64).rem_euclid(900))
+                    })
+                    .collect();
+                let chunk = Chunk::new(vec![
+                    Vector::from_values(LogicalType::BigInt, &held).expect("numbers"),
+                ])
+                .expect("one column");
+                writer.append(&chunk).expect("one part");
+            }
+            writer.finish().expect("commit");
+            let reader = Reader::open(&path).expect("reopen from disk");
+            let bytes = reader.layout().columns[0].part_ranges;
+            assert_eq!(bytes > 0, wanted, "{parts} parts wrote {bytes} bytes of ranges");
+            fs::remove_file(path).expect("remove scratch file");
+        }
+    }
+
+    /// A cut down string end is still an end on the side it was, which is the only thing that keeps
+    /// a shortened bound from turning a skip into a wrong answer.
+    #[test]
+    fn a_string_end_that_is_cut_down_still_covers_the_value_it_came_from() {
+        let long = vec![b'a'; PART_BOUND_BYTES * 2];
+        let low = shortened(Some(Bound::Bytes(long.clone())), false).expect("a low end");
+        let high = shortened(Some(Bound::Bytes(long.clone())), true).expect("a high end");
+        let Bound::Bytes(low) = low else { panic!("a string stays a string") };
+        let Bound::Bytes(high) = high else { panic!("a string stays a string") };
+        assert!(low.len() <= PART_BOUND_BYTES && high.len() <= PART_BOUND_BYTES);
+        assert!(low.as_slice() <= long.as_slice(), "the low end is at or under the value");
+        assert!(high.as_slice() >= long.as_slice(), "the high end is at or over the value");
+    }
+
+    /// A string of nothing but the largest byte has no prefix that can be stepped up, so the high
+    /// end is given up rather than claimed too small. No end keeps the part, which is always safe.
+    #[test]
+    fn a_string_end_with_no_room_to_step_up_gives_up_the_bound() {
+        let long = vec![u8::MAX; PART_BOUND_BYTES * 2];
+        assert_eq!(shortened(Some(Bound::Bytes(long.clone())), true), None);
+        let low = shortened(Some(Bound::Bytes(long)), false).expect("a low end is still a prefix");
+        assert_eq!(low, Bound::Bytes(vec![u8::MAX; PART_BOUND_BYTES]));
     }
 
     /// A sieve bigger than the part it indexes is not written, and one smaller than it still is.
