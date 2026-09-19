@@ -40,7 +40,7 @@ use crate::pairs::{
     self, Counted, Held, PARTITIONS, Run, distinct_pairs, group_hash, in_parallel, scatter,
 };
 use crate::rows;
-use crate::signed::SignedReader;
+use crate::signed::SignedBlock;
 
 const EMPTY: u32 = u32::MAX;
 const FLUSH_ROWS: usize = 32_768;
@@ -134,6 +134,9 @@ pub(crate) struct Local {
     partitions: Vec<Partition>,
     pairs: Vec<Run>,
     memory: Reservation,
+    /// The group key, the SUM argument, the AVG argument and the distinct argument of one chunk,
+    /// read as blocks rather than a row at a time. See [`SignedBlock`].
+    blocks: [SignedBlock; 4],
 }
 
 impl Local {
@@ -146,6 +149,7 @@ impl Local {
             partitions: (0..PARTITIONS).map(|_| Partition::default()).collect(),
             pairs: (0..PARTITIONS).map(|_| Run::default()).collect(),
             memory: memory.reservation(),
+            blocks: Default::default(),
         }
     }
 
@@ -178,7 +182,6 @@ impl Exchange {
         rows: usize,
         local: &mut Local,
     ) -> Result<()> {
-        let [group, sum, mean, user] = inputs;
         let exchange = slot.get_or_init(|| Self {
             owners: (0..PARTITIONS).map(|_| Mutex::new(Table::new(memory))).collect(),
             pairs: (0..PARTITIONS).map(|_| Mutex::new(Held::default())).collect(),
@@ -188,71 +191,12 @@ impl Exchange {
         let timing = stage::Timing::start(Stage::Scatter);
         let before = local.footprint();
         let shift = pairs::shift();
-        let all_valid = inputs.iter().all(|column| !column.validity().has_nulls(rows));
-        if all_valid {
-            let group = SignedReader::new(group);
-            let sum = SignedReader::new(sum);
-            let mean = SignedReader::new(mean);
-            let user = SignedReader::new(user);
-            for row in 0..rows {
-                let key = group.at(row) as i32;
-                let hash = group_hash(key, true);
-                local.numeric(
-                    Record {
-                        group: key,
-                        group_hash: hash,
-                        sum: sum.at(row) as i16,
-                        mean: mean.at(row) as i16,
-                        valid: Record::GROUP | Record::SUM | Record::MEAN,
-                    },
-                    shift,
-                )?;
-                scatter(&mut local.pairs, shift, key, true, user.at(row) as i64);
-            }
-        } else {
-            for row in 0..rows {
-                let mut valid = 0_u8;
-                let key = if group.is_null_at(row) {
-                    0
-                } else {
-                    valid |= Record::GROUP;
-                    i32::try_from(group.signed_at(row).ok_or_else(|| {
-                        Error::internal("an INTEGER group has no signed representation")
-                    })?)
-                    .map_err(|_| Error::internal("an INTEGER group is out of range"))?
-                };
-                let sum = if sum.is_null_at(row) {
-                    0
-                } else {
-                    valid |= Record::SUM;
-                    i16::try_from(sum.signed_at(row).ok_or_else(|| {
-                        Error::internal("a SMALLINT sum value has no signed representation")
-                    })?)
-                    .map_err(|_| Error::internal("a SMALLINT sum value is out of range"))?
-                };
-                let mean = if mean.is_null_at(row) {
-                    0
-                } else {
-                    valid |= Record::MEAN;
-                    i16::try_from(mean.signed_at(row).ok_or_else(|| {
-                        Error::internal("a SMALLINT average value has no signed representation")
-                    })?)
-                    .map_err(|_| Error::internal("a SMALLINT average value is out of range"))?
-                };
-                let hash = group_hash(key, valid & Record::GROUP != 0);
-                local.numeric(Record { group: key, group_hash: hash, sum, mean, valid }, shift)?;
-                // A null value counts towards nothing, so it never becomes a pair. The row still
-                // counts towards the numeric aggregates above, which is why this is the only part of
-                // it that is skipped.
-                if !user.is_null_at(row) {
-                    let user = i64::try_from(user.signed_at(row).ok_or_else(|| {
-                        Error::internal("a distinct BIGINT value has no signed representation")
-                    })?)
-                    .map_err(|_| Error::internal("a distinct BIGINT value is out of range"))?;
-                    scatter(&mut local.pairs, shift, key, valid & Record::GROUP != 0, user);
-                }
-            }
-        }
+        // The buffers come out of the instance for the length of the loop, because filling them
+        // borrows it and folding a row into it borrows it again.
+        let mut blocks = std::mem::take(&mut local.blocks);
+        let outcome = Self::scatter_blocks(&mut blocks, inputs, rows, shift, local);
+        local.blocks = blocks;
+        outcome?;
         if !local.spread && local.table.len() > LOCAL_GROUPS {
             local.spread = true;
         }
@@ -262,6 +206,88 @@ impl Exchange {
         local.used = true;
         if local.buffered >= FLUSH_ROWS {
             exchange.flush(local)?;
+        }
+        Ok(())
+    }
+
+    /// The four columns of one chunk read as blocks and then folded a row at a time.
+    ///
+    /// Split out of [`Self::buffer`] only so that the buffers can be lent out while the instance is
+    /// borrowed for the fold. See [`SignedBlock`] for why they are worth lending.
+    ///
+    /// The two loops are the same fold twice, once for a chunk with no null in any of the four
+    /// columns and once for a chunk with one somewhere. The first is what ClickBench 9 runs and it
+    /// reads four flat slices and asks nothing else. The second asks each column about each row, as
+    /// it always did, but only for the columns that actually hold a null.
+    fn scatter_blocks(
+        blocks: &mut [SignedBlock; 4],
+        inputs: [&Vector; 4],
+        rows: usize,
+        shift: u32,
+        local: &mut Local,
+    ) -> Result<()> {
+        let [group, sum, mean, user] = inputs;
+        for (held, column) in blocks.iter_mut().zip(inputs) {
+            held.read(rows, column)?;
+        }
+        let [held_group, held_sum, held_mean, held_user] = &*blocks;
+        let (null_group, null_sum, null_mean, null_user) =
+            (held_group.nulled(), held_sum.nulled(), held_mean.nulled(), held_user.nulled());
+        let (held_group, held_sum, held_mean, held_user) = (
+            held_group.cut(rows)?,
+            held_sum.cut(rows)?,
+            held_mean.cut(rows)?,
+            held_user.cut(rows)?,
+        );
+        if !(null_group || null_sum || null_mean || null_user) {
+            for row in 0..rows {
+                let key = held_group[row] as i32;
+                let hash = group_hash(key, true);
+                local.numeric(
+                    Record {
+                        group: key,
+                        group_hash: hash,
+                        sum: held_sum[row] as i16,
+                        mean: held_mean[row] as i16,
+                        valid: Record::GROUP | Record::SUM | Record::MEAN,
+                    },
+                    shift,
+                )?;
+                scatter(&mut local.pairs, shift, key, true, held_user[row]);
+            }
+            return Ok(());
+        }
+        for row in 0..rows {
+            let mut valid = 0_u8;
+            let key = if null_group && group.is_null_at(row) {
+                0
+            } else {
+                valid |= Record::GROUP;
+                i32::try_from(held_group[row])
+                    .map_err(|_| Error::internal("an INTEGER group is out of range"))?
+            };
+            let sum = if null_sum && sum.is_null_at(row) {
+                0
+            } else {
+                valid |= Record::SUM;
+                i16::try_from(held_sum[row])
+                    .map_err(|_| Error::internal("a SMALLINT sum value is out of range"))?
+            };
+            let mean = if null_mean && mean.is_null_at(row) {
+                0
+            } else {
+                valid |= Record::MEAN;
+                i16::try_from(held_mean[row])
+                    .map_err(|_| Error::internal("a SMALLINT average value is out of range"))?
+            };
+            let hash = group_hash(key, valid & Record::GROUP != 0);
+            local.numeric(Record { group: key, group_hash: hash, sum, mean, valid }, shift)?;
+            // A null value counts towards nothing, so it never becomes a pair. The row still counts
+            // towards the numeric aggregates above, which is why this is the only part of it that is
+            // skipped.
+            if !(null_user && user.is_null_at(row)) {
+                scatter(&mut local.pairs, shift, key, valid & Record::GROUP != 0, held_user[row]);
+            }
         }
         Ok(())
     }
@@ -667,21 +693,7 @@ mod tests {
 
     use crate::pairs::{Held, PARTITIONS, Run, distinct_pairs, group_hash, scatter, shift};
 
-    use super::{Key, LOCAL_GROUPS, Local, Record, SignedReader, State, Table};
-
-    #[test]
-    fn signed_reader_agrees_with_offset_packed_vectors() {
-        let values: Vec<Value> =
-            (0..256).map(|row| Value::Integer((row * 37 % 127) - 30)).collect();
-        let flat = Vector::from_values(LogicalType::Integer, &values).expect("an integer vector");
-        let packed = flat.bit_packed().expect("the vector packs");
-        assert!(packed.packed_parts().is_some());
-        let cut = packed.slice(3, 200).expect("an offset packed vector");
-        let reader = SignedReader::new(&cut);
-        for row in 0..cut.len() {
-            assert_eq!(reader.at(row), cut.signed_at(row).expect("a signed value"));
-        }
-    }
+    use super::{Key, LOCAL_GROUPS, Local, Record, State, Table};
 
     #[test]
     fn one_owner_combines_numeric_and_distinct_states() {
