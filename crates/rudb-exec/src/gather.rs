@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 
 use rudb_common::{Error, Memory, Reservation, Result, Value};
-use rudb_pipeline::{Progress, Sink};
+use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_vector::Chunk;
 
 use crate::buffer::Buffered;
@@ -105,7 +105,7 @@ impl Sink for Gather {
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         Ok(())
     }
 }
@@ -246,7 +246,7 @@ impl Sink for Keep<'_> {
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         let chunks = std::mem::take(&mut *self.chunks.lock().map_err(poisoned)?);
         // Before the chunks are handed on, because handing them on is what lets the pipeline that
         // depends on this one start, and the scan in that pipeline reads the filter as it starts.
@@ -295,7 +295,7 @@ mod tests {
         gather.sink(&chunk(&[1, 2]), &mut local).expect("two rows");
         gather.sink(&chunk(&[3]), &mut local).expect("one more");
         gather.combine(local).expect("the one instance");
-        gather.finalize().expect("nothing to do");
+        gather.finalize(&rudb_pipeline::Lease::alone()).expect("nothing to do");
 
         assert_eq!(
             first(&rows.take().expect("readable")),
@@ -346,7 +346,7 @@ mod tests {
         keep.sink(&Chunk::empty(&[LogicalType::Integer]), &mut local).expect("no rows");
         keep.sink(&chunk(&[3]), &mut local).expect("one row");
         keep.combine(local).expect("the one instance");
-        keep.finalize().expect("the chunks");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
 
         assert_eq!(out.len().expect("readable"), 2);
         assert_eq!(out.at(0).expect("readable").expect("the first").len(), 2);

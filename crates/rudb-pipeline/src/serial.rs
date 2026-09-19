@@ -12,6 +12,7 @@ use rudb_common::{Cancel, Error, Result};
 use rudb_vector::Chunk;
 
 use crate::pipeline::{Locals, Pipeline};
+use crate::pool::Lease;
 use crate::progress::{Blocked, Progress};
 
 /// Set when an instance has had everything it wants, so that the others stop taking morsels.
@@ -50,7 +51,7 @@ pub fn run_serial(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
     let mut locals = pipeline.locals();
     instance(pipeline, cancel, &stop, &mut locals)?;
     pipeline.sink().combine_state(locals.sink)?;
-    pipeline.sink().finalize_state()
+    pipeline.sink().finalize_state(&Lease::alone())
 }
 
 /// One instance of a pipeline, reading morsels until there are none left or somebody says stop.

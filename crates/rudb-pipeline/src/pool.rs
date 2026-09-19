@@ -44,8 +44,11 @@
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
+
+/// The pool behind [`Lease::alone`], which never lends anything and never starts a thread.
+static SOLO: OnceLock<Pool> = OnceLock::new();
 
 /// The thread budget of one database, and the threads themselves.
 #[derive(Debug)]
@@ -334,6 +337,20 @@ pub struct Lease<'a> {
 }
 
 impl Lease<'_> {
+    /// A lease of the calling thread and nothing else, for a caller that has no pool to ask.
+    ///
+    /// Everything that finishes a pipeline now takes a lease, because a sink that wants threads
+    /// should use the ones the driver already borrowed rather than starting its own. The serial
+    /// driver has no lease to pass on and neither does a test that builds a pipeline by hand, and
+    /// both of them mean the same thing by it, which is this.
+    ///
+    /// It costs nothing. The pool behind it is made once for the process and a pool starts no
+    /// threads until something asks for one, and this one is built to lend none.
+    #[must_use]
+    pub fn alone() -> Lease<'static> {
+        SOLO.get_or_init(|| Pool::new(1)).lease(1)
+    }
+
     /// How many instances may run at once, counting the thread that asked.
     #[must_use]
     pub fn degree(&self) -> usize {
@@ -351,7 +368,25 @@ impl Lease<'_> {
     /// reported rather than resumed: it is a bug in this engine, the thread it happened on has
     /// already printed it, and what is left to do is fail the query.
     pub fn scatter<R>(&self, task: &(dyn Fn() + Sync), body: impl FnOnce() -> R) -> (R, bool) {
-        if self.extra == 0 {
+        self.scatter_at_most(self.degree(), task, body)
+    }
+
+    /// [`Lease::scatter`] over no more than `most` threads, counting the caller's own.
+    ///
+    /// A lease is sized for the pipeline and the work inside it is not always that wide. A hash
+    /// aggregate finishes a fixed number of partitions and a seventeenth thread handed one of
+    /// sixteen has nothing to do but be woken and joined, which is a lock and a notify spent to
+    /// find out there is no work. So the caller that knows how many pieces it has says so.
+    ///
+    /// Asking for more than the lease covers is not an error and gets the lease.
+    pub fn scatter_at_most<R>(
+        &self,
+        most: usize,
+        task: &(dyn Fn() + Sync),
+        body: impl FnOnce() -> R,
+    ) -> (R, bool) {
+        let extra = self.extra.min(most.saturating_sub(1));
+        if extra == 0 {
             return (body(), false);
         }
         let borrowed: *const (dyn Fn() + Sync + '_) = task;
@@ -367,11 +402,11 @@ impl Lease<'_> {
         };
         let batch = Arc::new(Batch {
             task: erased,
-            left: Mutex::new(self.extra),
+            left: Mutex::new(extra),
             done: Condvar::new(),
             panicked: AtomicBool::new(false),
         });
-        self.pool.enqueue(&batch, self.extra);
+        self.pool.enqueue(&batch, extra);
         let value = {
             let _joined = Joined { batch: &batch };
             body()

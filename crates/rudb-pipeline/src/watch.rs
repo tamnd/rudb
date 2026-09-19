@@ -27,6 +27,7 @@ use rudb_metrics::{Counters, Span};
 use rudb_vector::Chunk;
 
 use crate::morsel::Morsel;
+use crate::pool::Lease;
 use crate::progress::Progress;
 use crate::traits::{Sink, Source, Stream};
 
@@ -152,9 +153,9 @@ impl<K: Sink> Sink for Watched<K> {
     /// The rows a sink produced are not counted here. They come out of whatever source reads its
     /// finished state, and that source is measured in its own right, so counting them in both
     /// places would put the same rows in the document twice.
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
         let measure = Measure::start();
-        let finished = self.inner.finalize();
+        let finished = self.inner.finalize(threads);
         measure.stop(&self.counters);
         finished
     }
