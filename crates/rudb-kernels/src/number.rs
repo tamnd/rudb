@@ -71,6 +71,17 @@ pub(crate) fn digits(unscaled: i128) -> u8 {
     count
 }
 
+/// The largest magnitude a decimal of this width does not hold, which is ten to the width.
+///
+/// [`digits`] answers the same question by counting, and counting costs a division per digit. A
+/// value fits a width exactly when its magnitude is below ten to that width, so a caller with one
+/// width and many values computes this once and compares, rather than dividing a number down to
+/// nothing once per row. Both are capped at 38 by [`LogicalType::decimal`], and ten to the
+/// thirty eighth is inside an `i128`, so this is the same answer the counting gives.
+pub(crate) fn beyond(width: u8) -> u128 {
+    pow10(width).unsigned_abs()
+}
+
 /// The same number written at a different scale, rounding half away from zero on the way down.
 pub(crate) fn rescale(unscaled: i128, from: u8, to: u8) -> Option<i128> {
     if to >= from {
@@ -110,6 +121,23 @@ mod tests {
         assert_eq!(digits(9), 1);
         assert_eq!(digits(10), 2);
         assert_eq!(digits(-1234), 4);
+    }
+
+    /// The comparison the run at a time path makes and the count the row at a time path makes have
+    /// to be the same question, so this asks both of them about every width and both sides of every
+    /// boundary between one width and the next.
+    #[test]
+    fn a_value_is_below_ten_to_the_width_exactly_when_it_has_no_more_digits_than_that() {
+        for width in 1..=38u8 {
+            let limit = beyond(width);
+            for unscaled in [0, 1, -1, pow10(width) - 1, pow10(width), -pow10(width)] {
+                assert_eq!(
+                    unscaled.unsigned_abs() < limit,
+                    digits(unscaled) <= width,
+                    "{unscaled} against a width of {width}"
+                );
+            }
+        }
     }
 
     #[test]
