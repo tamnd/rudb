@@ -71,6 +71,7 @@
       "wall_ns": 980000000,
       "cpu_ns": 7600000000,
       "slowest_ns": 940000000,
+      "slowest_cpu_ns": 912000000,
       "finalize_ns": 31000000,
       "blocked_ns": {
         "io": 120000000,
@@ -88,6 +89,7 @@
       "wall_ns": 343000000,
       "cpu_ns": 2280000000,
       "slowest_ns": 343000000,
+      "slowest_cpu_ns": 180000000,
       "finalize_ns": 0,
       "blocked_ns": {
         "io": 0,

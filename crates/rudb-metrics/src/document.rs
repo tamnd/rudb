@@ -176,6 +176,7 @@ impl Document {
                     out.count("wall_ns", pipeline.wall_ns);
                     out.count("cpu_ns", pipeline.cpu_ns);
                     out.count("slowest_ns", pipeline.slowest_ns);
+                    out.count("slowest_cpu_ns", pipeline.slowest_cpu_ns);
                     out.count("finalize_ns", pipeline.finalize_ns);
                     out.key("blocked_ns");
                     out.object(|out| {
@@ -495,6 +496,12 @@ pub struct Pipeline {
     /// Both of those used to be one unnamed number that had to be got at by subtracting the
     /// operators from the pipeline, and on ClickBench 39 that number is more than half the query.
     pub slowest_ns: u64,
+    /// The CPU of that same instance, which says whether it was working or waiting.
+    ///
+    /// An instance twice as long as the average either had twice the work or spent half its time
+    /// waiting for a lock, and the two want opposite fixes. Near `slowest_ns` is work and far below
+    /// it is waiting.
+    pub slowest_cpu_ns: u64,
     /// The wall of the sink's finalize, which runs once on one thread after every instance is done.
     ///
     /// A grouped aggregate does most of its work here and starts its own threads to do it. This is
@@ -516,6 +523,7 @@ impl Pipeline {
             wall_ns: 0,
             cpu_ns: 0,
             slowest_ns: 0,
+            slowest_cpu_ns: 0,
             finalize_ns: 0,
             blocked: Blocked::default(),
         }
@@ -744,6 +752,7 @@ mod tests {
         scan.wall_ns = 980_000_000;
         scan.cpu_ns = 7_600_000_000;
         scan.slowest_ns = 940_000_000;
+        scan.slowest_cpu_ns = 912_000_000;
         scan.finalize_ns = 31_000_000;
         scan.blocked.io_ns = 120_000_000;
         scan.blocked.downstream_ns = 3_000_000;
@@ -752,6 +761,7 @@ mod tests {
         top.wall_ns = 343_000_000;
         top.cpu_ns = 2_280_000_000;
         top.slowest_ns = 343_000_000;
+        top.slowest_cpu_ns = 180_000_000;
         metrics.pipelines.extend([scan, top]);
 
         let mut read = Operator::new(3, 0, "Scan");
