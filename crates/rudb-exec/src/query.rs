@@ -112,6 +112,12 @@ impl<'a> Query<'a> {
     /// nine threads and whose sort uses one holds nine for as long as the scan and one after that,
     /// and the threads it is not using are there for whatever else the database is running.
     ///
+    /// How many threads it borrows and how many instances it runs are two numbers. The instances
+    /// are what the source has work for. The borrow is the wider of that and what the sink says it
+    /// can finish on, because the finish happens on the same threads with every instance already
+    /// joined, and a hash aggregate merging a million groups is not the same width as the scan that
+    /// fed it.
+    ///
     /// # Errors
     ///
     /// Whatever any operator reports, or [`ErrorCode::Interrupt`](rudb_common::ErrorCode::Interrupt)
@@ -119,11 +125,11 @@ impl<'a> Query<'a> {
     /// here holds a token of its own except the join, whose nested loop can outlive a chunk.
     pub fn run(&self, cancel: &Cancel, pool: &Pool) -> Result<()> {
         for (pipeline, driver) in self.pipelines.iter().zip(&self.drivers) {
-            let lease = pool.lease(pipeline.degree(pool.threads()));
-            let degree = lease.degree();
+            let lease = pool.lease(pipeline.lease_degree(pool.threads()));
+            let degree = pipeline.degree(pool.threads()).min(lease.degree());
             let spread = {
                 let _running = driver.running();
-                run_parallel(pipeline, cancel, &lease)?
+                run_parallel(pipeline, cancel, &lease, degree)?
             };
             driver.ran(degree, spread.worker_cpu_ns);
             driver.waited(spread.slowest_ns, spread.slowest_cpu_ns, spread.finalize_ns);

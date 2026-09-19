@@ -247,6 +247,38 @@ impl Sink for Total {
     }
 }
 
+/// A sink that finishes wider than the source that feeds it, and writes down what it was given.
+#[derive(Debug, Default)]
+struct WideFinish {
+    combines: AtomicUsize,
+    /// How many threads the lease handed to `finalize` covered.
+    finished_on: AtomicUsize,
+}
+
+impl Sink for WideFinish {
+    type Local = ();
+
+    fn local(&self) {}
+
+    fn finalize_degree(&self, ceiling: usize) -> usize {
+        ceiling
+    }
+
+    fn sink(&self, _chunk: &Chunk, (): &mut ()) -> rudb_common::Result<Progress> {
+        Ok(Progress::More)
+    }
+
+    fn combine(&self, (): ()) -> rudb_common::Result<()> {
+        self.combines.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn finalize(&self, threads: &crate::Lease<'_>) -> rudb_common::Result<()> {
+        self.finished_on.store(threads.degree(), Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 /// A source that says it is waiting for a read it never issued.
 #[derive(Debug)]
 struct AlwaysBlocked;
@@ -261,7 +293,7 @@ impl Source for AlwaysBlocked {
     }
 }
 
-fn pipeline(source: Arc<dyn Source>, sink: Arc<Total>) -> Pipeline<'static> {
+fn pipeline<S: DynSink + 'static>(source: Arc<dyn Source>, sink: Arc<S>) -> Pipeline<'static> {
     Pipeline::new(PipelineId(0), source, sink as Arc<dyn DynSink>)
 }
 
@@ -725,7 +757,8 @@ fn the_parallel_driver_prepares_once_for_all_its_instances_and_offers_them_all()
     )
     .then(Arc::new(Prepares(Arc::clone(&ready))) as Arc<dyn DynStream>);
 
-    run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4)).expect("the pipeline runs");
+    run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4), usize::MAX)
+        .expect("the pipeline runs");
 
     assert_eq!(
         ready.prepared.load(Ordering::Relaxed),
@@ -1040,11 +1073,45 @@ fn the_parallel_driver_answers_what_the_serial_one_answers() {
         Arc::new(Counting::new(values.clone(), 100, 32)) as Arc<dyn Source>,
         Arc::clone(&sink),
     );
-    run_parallel(&built, &Cancel::new(), &Pool::new(8).lease(8)).expect("it runs");
+    run_parallel(&built, &Cancel::new(), &Pool::new(8).lease(8), usize::MAX).expect("it runs");
 
     assert_eq!(*sink.global.lock().unwrap(), expected);
     assert_eq!(sink.combines.load(Ordering::Relaxed), 8, "one combine per instance");
     assert_eq!(sink.finalizes.load(Ordering::Relaxed), 1, "and one finalize for all of them");
+}
+
+#[test]
+fn a_sink_that_finishes_wider_than_its_source_gets_the_threads_without_the_instances() {
+    // Three morsels and a sink that says it can finish on everything. The borrow is what the sink
+    // asked for and the instance count is still what the source has work for, which is the whole
+    // point: an aggregate merging a million groups is not the same width as the scan that fed it,
+    // and running an instance per borrowed thread instead would start eight readers for three
+    // morsels.
+    let sink = Arc::new(WideFinish::default());
+    let built = pipeline(
+        Arc::new(Counting::new((1..=30).collect(), 10, 3)) as Arc<dyn Source>,
+        Arc::clone(&sink),
+    );
+
+    assert_eq!(built.degree(8), 3, "three morsels are three instances");
+    assert_eq!(built.lease_degree(8), 8, "and the sink asked for the rest");
+
+    let pool = Pool::new(8);
+    let lease = pool.lease(built.lease_degree(8));
+    run_parallel(&built, &Cancel::new(), &lease, built.degree(8)).expect("it runs");
+
+    assert_eq!(sink.combines.load(Ordering::Relaxed), 3, "one combine per instance and no more");
+    assert_eq!(sink.finished_on.load(Ordering::Relaxed), 8, "the finish saw the whole lease");
+}
+
+#[test]
+fn a_sink_that_says_nothing_about_finishing_leaves_the_lease_to_its_source() {
+    let sink = Arc::new(Total::default());
+    let built = pipeline(
+        Arc::new(Counting::new((1..=30).collect(), 10, 3)) as Arc<dyn Source>,
+        Arc::clone(&sink),
+    );
+    assert_eq!(built.lease_degree(8), built.degree(8), "the default finish is one thread");
 }
 
 #[test]
@@ -1053,7 +1120,7 @@ fn every_morsel_is_read_once_however_many_threads_read_them() {
     let sink = Arc::new(Total::default());
     let built = pipeline(Arc::clone(&source) as Arc<dyn Source>, Arc::clone(&sink));
 
-    run_parallel(&built, &Cancel::new(), &Pool::new(8).lease(8)).expect("it runs");
+    run_parallel(&built, &Cancel::new(), &Pool::new(8).lease(8), usize::MAX).expect("it runs");
 
     assert_eq!(source.reads.load(Ordering::Relaxed), 100, "a hundred morsels of one chunk each");
 }
@@ -1066,7 +1133,8 @@ fn a_degree_of_one_is_the_serial_driver() {
         Arc::clone(&sink),
     );
 
-    let spent = run_parallel(&built, &Cancel::new(), &Pool::new(1).lease(1)).expect("it runs");
+    let spent =
+        run_parallel(&built, &Cancel::new(), &Pool::new(1).lease(1), usize::MAX).expect("it runs");
 
     assert_eq!(*sink.global.lock().unwrap(), 55);
     assert_eq!(sink.combines.load(Ordering::Relaxed), 1);
@@ -1081,7 +1149,8 @@ fn the_parallel_driver_reports_what_its_workers_burned() {
         Arc::clone(&sink),
     );
 
-    let spent = run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4)).expect("it runs");
+    let spent =
+        run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4), usize::MAX).expect("it runs");
 
     if thread_cpu_ns().is_some() {
         assert!(
@@ -1105,7 +1174,8 @@ fn an_instance_that_fails_stops_the_others_and_the_query_says_why() {
     )
     .then(Arc::new(Breaks) as Arc<dyn DynStream>);
 
-    let error = run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4)).unwrap_err();
+    let error =
+        run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4), usize::MAX).unwrap_err();
 
     assert_eq!(error.message(), "this operator always gives up");
     assert_eq!(sink.finalizes.load(Ordering::Relaxed), 0, "a failed pipeline has no answer");
@@ -1122,7 +1192,7 @@ fn the_pool_starts_its_workers_once_and_keeps_them_for_the_next_query() {
             Arc::new(Counting::new((1..=10_000).collect(), 100, 32)) as Arc<dyn Source>,
             Arc::clone(&sink),
         );
-        run_parallel(&built, &Cancel::new(), &pool.lease(4)).expect("it runs");
+        run_parallel(&built, &Cancel::new(), &pool.lease(4), usize::MAX).expect("it runs");
         assert_eq!(*sink.global.lock().unwrap(), 50_005_000);
     }
 
@@ -1144,7 +1214,8 @@ fn a_worker_that_panics_fails_the_query_rather_than_leaving_it_waiting() {
     )
     .then(Arc::new(Panics { caller: std::thread::current().id() }) as Arc<dyn DynStream>);
 
-    let error = run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4)).unwrap_err();
+    let error =
+        run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4), usize::MAX).unwrap_err();
 
     std::panic::set_hook(hook);
     assert_eq!(error.message(), "a thread running part of this query panicked");

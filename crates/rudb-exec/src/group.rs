@@ -514,12 +514,27 @@ struct Partition {
     /// The tables instances kept to themselves, waiting to be merged into one.
     ///
     /// One per instance that folded anything into this partition. They are merged by whichever
-    /// thread closes this partition, which is one thread per partition and so sixteen merges
-    /// running at once rather than one.
+    /// thread closes this partition, which is one thread per partition and so as many merges
+    /// running at once as there are partitions rather than one.
     pending: Vec<Building>,
 }
 
-const RADIX_PARTITIONS: usize = 16;
+/// How many radix partitions the groups are spread over.
+///
+/// This is the ceiling on how many threads can finish an aggregate, because a partition is finished
+/// by one thread and nothing it holds depends on any other partition. It was sixteen, which was
+/// enough while a pipeline borrowed threads for its source and a million row scan cut sixteen
+/// morsels. Now that the borrow is the wider of the source and the sink, sixteen is what stops a
+/// thirty two thread machine from finishing on thirty two threads, and it has to be at least as
+/// large as the thread count for the finish to reach the whole machine.
+///
+/// Sixty four rather than thirty two, so that a machine larger than this one is covered and so that
+/// a thread that draws a heavy partition is one of four a thread has rather than one of one. What
+/// more partitions cost is the scatter: a chunk is split into one set of vectors per partition and
+/// sixty four of them are smaller pieces than sixteen. On `GROUP BY WatchID, ClientIP` over a
+/// million rows, where the groups are nearly one per row and this is the whole query, the merge
+/// halves and the scatter does not move enough to take it back.
+const RADIX_PARTITIONS: usize = 64;
 const DENSE_PARTITIONS: usize = 4;
 
 /// How many groups an instance holds before it stops keeping them to itself.
@@ -3169,6 +3184,23 @@ fn set(slot: &mut Value, column: &Vector, row: usize) -> Result<()> {
 impl Sink for Aggregate<'_> {
     type Local = Partitioned;
 
+    /// A grouped aggregate finishes on every thread the query was given.
+    ///
+    /// Its finish is a merge of radix partitions and nothing a partition holds depends on any other
+    /// partition, so it is as wide as there are partitions to take. That is not the same width as
+    /// the scan underneath it, which is cut by how many rows the file has, and the two used to be
+    /// the same number because a pipeline borrowed threads for its source and then finished on
+    /// those. On a thirty two thread machine `GROUP BY WatchID, ClientIP` over a million rows was
+    /// merging a million groups on the sixteen threads the scan asked for.
+    ///
+    /// Asked for everything rather than for a guess, because this is asked before a row has been
+    /// read and there is nothing here yet to guess from. An ungrouped aggregate is one group made
+    /// when the instance is and has no merge to spread, so it says one and the pipeline borrows
+    /// whatever its source wanted.
+    fn finalize_degree(&self, ceiling: usize) -> usize {
+        if self.groups.is_empty() { 1 } else { ceiling }
+    }
+
     fn local(&self) -> Partitioned {
         self.started.fetch_add(1, Ordering::Relaxed);
         Partitioned {
@@ -4372,12 +4404,18 @@ struct Part {
 /// How many threads to finish `input` rows of radix partitions on.
 ///
 /// Two bounds and both of them matter. There is no point starting a thread for every partition when
-/// there are sixty five thousand rows between all of them, because the wake and the join cost more
+/// there are only a few thousand rows between all of them, because the wake and the join cost more
 /// than the rows do, and that is what the divisor says. And there is no point asking for more
 /// threads than the query was given, which is what the lease says and what this used to ignore: a
 /// session that set the thread count to one still finished an aggregate on sixteen.
+///
+/// The divisor was sixty five thousand, which on a million rows says sixteen threads whatever the
+/// machine has. That was the same number the scan happened to cut morsels at, so nothing showed,
+/// and now that a pipeline can borrow more threads than its source runs instances on it is what
+/// would hold the finish at half the machine. Sixteen thousand is the same argument at the size a
+/// woken thread is actually worth paying for.
 fn degree_for(input: usize, threads: &Lease<'_>) -> usize {
-    input.div_ceil(65_536).clamp(1, RADIX_PARTITIONS).min(threads.degree())
+    input.div_ceil(16_384).clamp(1, RADIX_PARTITIONS).min(threads.degree())
 }
 
 impl Aggregate<'_> {
