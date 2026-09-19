@@ -41,6 +41,7 @@ use crate::pairs::together;
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
+use crate::signed::SignedBlock;
 use crate::spill::{Reader, Spill};
 use crate::table::{Probe, Table, Walk};
 
@@ -905,7 +906,7 @@ impl<'a> Aggregate<'a> {
         // [`FixedBlocks`] for what that was costing.
         blocks.read(rows.rows, [first, second, sum, mean])?;
         let [held_first, held_second, held_sum, held_mean] = blocks.cut(rows.rows)?;
-        let [null_first, null_second, null_sum, null_mean] = blocks.nulled;
+        let [null_first, null_second, null_sum, null_mean] = blocks.nulled();
         for row in 0..rows.rows {
             let mut valid = 0;
             let first_value = if null_first && first.is_null_at(row) {
@@ -2777,19 +2778,15 @@ pub(crate) struct Partitioned {
 /// underneath and matched again on its layout, to read a number that was already sitting in a flat
 /// slice. Callgrind put the two of them together at a third of ClickBench 32.
 ///
-/// So the columns are read as blocks. `Vector::signed_block` copies a flat `BIGINT` run and sign
-/// extends a narrower one, both of which the compiler widens, and the forms it will not hand over
-/// are filled here a row at a time exactly as the loop used to. Nulls are the same question asked
-/// once: a column with none in it costs the loop nothing, and a column with some is asked row by row
-/// the way it always was.
+/// So the columns are read as blocks. [`SignedBlock`] copies a flat run, sign extends a narrower
+/// one and fills the forms the vector will not hand over a row at a time exactly as the loop used
+/// to, and it answers the null question once for the whole column rather than once per row.
 ///
 /// The buffers live for as long as the instance does, so a chunk allocates nothing for this.
 #[derive(Debug, Default)]
 struct FixedBlocks {
     /// The first key, the second key, the SUM argument and the AVG argument, in that order.
-    held: [Vec<i64>; 4],
-    /// Whether each of those columns has a null anywhere in this chunk.
-    nulled: [bool; 4],
+    held: [SignedBlock; 4],
 }
 
 impl FixedBlocks {
@@ -2800,28 +2797,16 @@ impl FixedBlocks {
     /// A column that is not an integer in any form, which is a plan that should not have reached the
     /// fixed width exchange at all.
     fn read(&mut self, rows: usize, columns: [&Vector; 4]) -> Result<()> {
-        for (at, (held, column)) in self.held.iter_mut().zip(columns).enumerate() {
-            self.nulled[at] = !column.none_null();
-            if column.signed_block(held) {
-                continue;
-            }
-            held.clear();
-            held.reserve(rows);
-            // A dictionary or a run, which the vector does not hand over as a block, read the way
-            // every form was read before this. A null writes a zero, as it did, because the loop
-            // reads the null out of the column itself and not out of here.
-            for row in 0..rows {
-                held.push(match column.signed_at(row) {
-                    Some(value) => i64::try_from(value)
-                        .map_err(|_| Error::internal("a fixed column is out of range"))?,
-                    None if column.is_null_at(row) => 0,
-                    None => {
-                        return Err(Error::internal("a fixed column has no signed representation"));
-                    }
-                });
-            }
+        for (held, column) in self.held.iter_mut().zip(columns) {
+            held.read(rows, column)?;
         }
         Ok(())
+    }
+
+    /// Whether each of the four columns has a null anywhere in this chunk.
+    fn nulled(&self) -> [bool; 4] {
+        let [first, second, sum, mean] = &self.held;
+        [first.nulled(), second.nulled(), sum.nulled(), mean.nulled()]
     }
 
     /// The four buffers cut to the length of the chunk, so the loop over them checks no bounds.
@@ -2832,12 +2817,7 @@ impl FixedBlocks {
     /// chunk's.
     fn cut(&self, rows: usize) -> Result<[&[i64]; 4]> {
         let [first, second, sum, mean] = &self.held;
-        let (Some(first), Some(second), Some(sum), Some(mean)) =
-            (first.get(..rows), second.get(..rows), sum.get(..rows), mean.get(..rows))
-        else {
-            return Err(Error::internal("a fixed radix exchange read short of the chunk"));
-        };
-        Ok([first, second, sum, mean])
+        Ok([first.cut(rows)?, second.cut(rows)?, sum.cut(rows)?, mean.cut(rows)?])
     }
 }
 
