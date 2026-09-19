@@ -68,7 +68,7 @@ use std::cmp::Ordering;
 use std::sync::Mutex;
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
-use rudb_kernels::{Comparison, refine};
+use rudb_kernels::{Comparison, compare as compare_vectors, selection};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::{Chunk, Selection, Vector};
@@ -447,7 +447,14 @@ fn worth_looking_at(
         (true, false) => Comparison::GreaterOrEqual,
     };
     let against = Vector::constant(column.logical_type().clone(), bound.clone(), rows);
-    refine(op, column, &against, &Selection::identity(rows)).ok()
+    // The whole chunk is in play here, so this asks the kernel that reads its operands where they
+    // lie rather than the one that reads them through a selection. Handing the threaded kernel an
+    // identity selection would build a `u32` a row to say "all of them", check every one of them is
+    // in range, and then put a load and an indirection in front of each of the comparisons that
+    // loop is otherwise three instructions long. On `ORDER BY EventTime LIMIT 10` over ClickBench
+    // that was more instructions than decoding the column cost.
+    let flags = compare_vectors(op, column, &against).ok()?;
+    Some(selection(&flags, rows))
 }
 
 /// Charges the scratch reservation for what is still held after a trim.
