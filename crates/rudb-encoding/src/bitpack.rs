@@ -522,11 +522,24 @@ pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>>
     }
     // Otherwise a value is read where it lies, until the window would run off the end.
     let whole = (((input.len() - WINDOW) * 8) / width + 1).min(count);
-    for index in 0..whole {
-        let bit = index * width;
-        let mut window = [0u8; WINDOW];
-        window.copy_from_slice(&input[bit / 8..bit / 8 + WINDOW]);
-        values.push(read(u128::from_le_bytes(window), bit % 8));
+    if width <= NARROW {
+        // Half the window, because a value this wide that starts at most seven bits into a byte
+        // ends inside the eight bytes from that byte. The shift and the mask are then one
+        // instruction each where a 128 bit shift is three, and every real width is down here: the
+        // offsets a text block carries are seventeen bits and a dictionary code is fewer.
+        let mask = low_mask(width);
+        for index in 0..whole {
+            let bit = index * width;
+            let word = word_at(input, bit / 8);
+            values.push((word >> (bit % 8)) & mask);
+        }
+    } else {
+        for index in 0..whole {
+            let bit = index * width;
+            let mut window = [0u8; WINDOW];
+            window.copy_from_slice(&input[bit / 8..bit / 8 + WINDOW]);
+            values.push(read(u128::from_le_bytes(window), bit % 8));
+        }
     }
     if whole < count {
         // Every value left over begins past the sixteenth byte from the end, by the definition of
@@ -543,9 +556,6 @@ pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>>
     Ok(values)
 }
 
-/// The bytes a single tail value can span, which is a shift of at most seven plus a width of at
-/// most sixty four, so seventy one bits and therefore nine bytes, rounded up to the load that
-/// covers it.
 /// One value of a run written by [`pack_tail`], read where it lies.
 ///
 /// [`unpack_tail`] decodes the whole run, which is what a scan wants and what nearly every caller
@@ -571,17 +581,39 @@ pub fn tail_at(input: &[u8], width: usize, index: usize) -> Result<u64> {
             input.len()
         )));
     }
-    // The value spans at most nine bytes, which is a whole `u64` straddling a byte boundary, so one
-    // window covers it wherever it starts.
     let first = start / 8;
     let last = (end - 1) / 8;
+    // A value that ends inside the eight bytes it starts in is one load, one shift and one mask.
+    // The window below copies a length the compiler does not know, which is a call to `memcpy`
+    // rather than a load, and this reads one value at a time for every string a text column hands
+    // out. It was fifteen percent of ClickBench 27.
+    if first + 8 <= input.len() && last - first < 8 {
+        return Ok((word_at(input, first) >> (start % 8)) & low_mask(width));
+    }
     let mut window = [0u8; WINDOW];
     window[..=last - first].copy_from_slice(&input[first..=last]);
     let word = u128::from_le_bytes(window);
     Ok(((word >> (start % 8)) & u128::from(low_mask(width))) as u64)
 }
 
+/// The bytes a single tail value can span, which is a shift of at most seven plus a width of at
+/// most sixty four, so seventy one bits and therefore nine bytes, rounded up to the load that
+/// covers it.
 const WINDOW: usize = 16;
+
+/// The widest value that always ends inside the eight bytes it starts in, which is sixty four bits
+/// less the seven a value can begin into its first byte.
+const NARROW: usize = 57;
+
+/// Eight bytes read where they lie, as one load.
+///
+/// The length is a constant the compiler can see, which is what makes it a load. The caller is
+/// responsible for `at + 8` being inside `input`, and the index below says so where it is not.
+#[inline]
+fn word_at(input: &[u8], at: usize) -> u64 {
+    let run: [u8; 8] = input[at..at + 8].try_into().expect("eight bytes");
+    u64::from_le_bytes(run)
+}
 
 fn check_tail(count: usize, width: usize) -> Result<()> {
     if count >= VALUES {

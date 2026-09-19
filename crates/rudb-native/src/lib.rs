@@ -1677,10 +1677,10 @@ impl NativeText {
     /// value, one for the end and one for the start that is the end before it, and on the ClickBench
     /// `URL` dictionary of eighteen million that was most of the half second a `LIKE` over it took.
     ///
-    /// [`bitpack::unpack_tail`] walks the run instead, which makes the window a fixed sixteen bytes
-    /// and so an unaligned load, and reads the bit position off a counter. A run is five hundred and
-    /// twelve values and a block is two of them, so a block of a thousand and twenty four values
-    /// costs two calls here and nothing per value.
+    /// [`bitpack::unpack_tail`] walks the run instead, which makes the window a fixed width and so
+    /// an unaligned load, and reads the bit position off a counter. A run is five hundred and twelve
+    /// values and a block is two of them, so a block of a thousand and twenty four values costs two
+    /// calls here and nothing per value.
     fn ends_within(&self, first: usize, last: usize) -> Result<Vec<u64>> {
         let mut ends = Vec::with_capacity(last.saturating_sub(first));
         let mut at = first;
