@@ -3635,34 +3635,58 @@ fn widened(data: &Data) -> Option<Vec<i64>> {
     }
 }
 
-/// An integer type a cascaded page can be read back into, and the range that fits in it.
+/// An integer type a cascaded page can be read back into, and how to tell whether a value fits.
 ///
 /// This exists so that the check and the conversion can be two loops instead of one. `TryFrom` puts
 /// them together, which is the right shape for one value and the wrong one for a page: a fallible
 /// conversion a value at a time is a branch a value at a time, the branch decides whether the loop
 /// keeps going, and a loop like that is one no compiler will widen.
 trait Narrow: Copy {
-    /// The smallest and the largest `i64` this type holds.
-    const RANGE: (i64, i64);
+    /// How wide this type is, and what to add to a value to put its range at the bottom of a `u64`.
+    ///
+    /// Half the width for a signed type, which is what moves its smallest value to zero, and nothing
+    /// for an unsigned one, whose smallest value is already there.
+    const BIASED: (u32, u64);
 
     /// The value narrowed, which the caller has already shown fits.
     fn narrow(value: i64) -> Self;
 }
 
-/// Says a primitive integer holds the range its own bounds describe and narrows with `as`.
+/// The bits of `value` a `T` cannot hold, and zero when the value fits.
 ///
-/// `as` is a truncation and is the right operation here only because [`fit`] has already compared
-/// against [`Narrow::RANGE`], and it is what makes the second loop a widening store with no branch
-/// in it.
+/// The question is asked this way round because the answers or together. A page fits when every
+/// residue in it is zero, so the loop is an or into an accumulator and the decision is one test
+/// after it, where asking whether each value is between a floor and a ceiling gives an answer that
+/// does not combine and turns into a running minimum and maximum.
+///
+/// Biasing and shifting is what the answer is made of, rather than anything that reads more like the
+/// question, because those are the operations a machine has four of. A 64 bit integer minimum is
+/// AVX-512. So is a 64 bit arithmetic shift right, which is how the sign extension this could be
+/// written as would have to be done. An add and a logical shift right are AVX2 and are on every
+/// machine this runs on, so this is the form that gets four values a cycle instead of one.
+///
+/// Adding the bias moves the type's range to `0..=2^bits`, wrapping, so everything in range shifts
+/// away to nothing and everything outside it leaves something behind. A negative value under an
+/// unsigned type is caught by the same shift, because a negative `i64` read as a `u64` is enormous.
+#[allow(clippy::cast_sign_loss, reason = "a residue is a bit pattern and not a number")]
+fn residue<T: Narrow>(value: i64) -> u64 {
+    let (bits, bias) = T::BIASED;
+    (value as u64).wrapping_add(bias) >> bits
+}
+
+/// Says a primitive integer narrows with `as`, and where the bottom of its range is.
+///
+/// `as` is a truncation and is the right operation here only because [`fit`] has already found every
+/// residue zero, and it is what makes the second loop a narrowing store with no branch in it.
 macro_rules! narrows {
-    ($($ty:ty),*) => {$(
+    ($($ty:ty => $bias:expr),* $(,)?) => {$(
         impl Narrow for $ty {
-            const RANGE: (i64, i64) = (<$ty>::MIN as i64, <$ty>::MAX as i64);
+            const BIASED: (u32, u64) = (<$ty>::BITS, $bias);
 
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
-                reason = "the caller has checked the range this truncates to"
+                reason = "the caller has checked the bits this truncates away"
             )]
             fn narrow(value: i64) -> Self {
                 value as Self
@@ -3671,26 +3695,33 @@ macro_rules! narrows {
     )*};
 }
 
-narrows!(i8, u8, i16, u16, i32, u32);
+narrows! {
+    i8 => 1 << 7,
+    u8 => 0,
+    i16 => 1 << 15,
+    u16 => 0,
+    i32 => 1 << 31,
+    u32 => 0,
+}
 
 /// Narrows a page's values, refusing the page if any of them does not fit.
 ///
-/// The extremes first and the conversion second, rather than a fallible conversion a value at a
-/// time. Both loops here are ones a compiler widens: a running minimum and maximum is two
-/// instructions a lane, and a narrowing store is one. The version this replaces was a `TryFrom` and
-/// a `collect` into a `Result`, which is a compare, a branch and a short circuit a value at a time,
-/// and on ClickBench 39 it was seven percent of the query.
+/// The check first and the conversion second, rather than a fallible conversion a value at a time.
+/// Both loops here are ones a compiler widens: [`residue`] is three instructions a lane and a
+/// narrowing store is one. The version before this was a `TryFrom` and a `collect` into a `Result`,
+/// which is a compare, a branch and a short circuit a value at a time, and on ClickBench 39 it was
+/// seven percent of the query. The version after that kept a running minimum and maximum, which is
+/// the obvious way to ask and needs a 64 bit integer minimum that AVX2 does not have, so it stayed
+/// a value at a time and was still ten percent of the same query.
 ///
-/// An empty page has no extremes and nothing to refuse, which falls out of the fold's starting
-/// values being the wrong way round rather than needing a case of its own.
+/// An empty page has nothing to refuse, which falls out of the accumulator starting at zero rather
+/// than needing a case of its own.
 fn fit<T: Narrow>(values: &[i64]) -> Result<Vec<T>> {
-    let (mut low, mut high) = (i64::MAX, i64::MIN);
+    let mut spilled = 0u64;
     for value in values {
-        low = low.min(*value);
-        high = high.max(*value);
+        spilled |= residue::<T>(*value);
     }
-    let (floor, ceiling) = T::RANGE;
-    if low < floor || high > ceiling {
+    if spilled != 0 {
         return Err(invalid("page value is not of its type"));
     }
     Ok(values.iter().map(|value| T::narrow(*value)).collect())
@@ -6165,11 +6196,13 @@ mod tests {
 
     /// Narrowing a page takes what fits and refuses the page for anything that does not.
     ///
-    /// The edges of the range on both sides and one step past each of them, because checking the
-    /// extremes of a page separately from converting it is only right if the comparison is the one
-    /// `TryFrom` would have made, and off by one there is a file that reads back a different number
-    /// than it was given. The empty page is here because the fold that finds the extremes starts
-    /// with them the wrong way round, and a check written the obvious way would refuse it.
+    /// The edges of the range on both sides and one step past each of them, for every type, because
+    /// checking a page separately from converting it is only right if the check refuses exactly what
+    /// `TryFrom` would have refused, and off by one there is a file that reads back a different
+    /// number than it was given. The check is a bit pattern rather than a comparison, so it is not
+    /// the shape a reader would guess from the bounds, which is why all six are here. The empty page
+    /// is here because a check written the obvious way starts with the extremes the wrong way round
+    /// and refuses it.
     #[test]
     fn narrowing_a_page_takes_what_fits_and_refuses_what_does_not() {
         assert_eq!(fit::<i8>(&[]).expect("an empty page fits anything"), Vec::<i8>::new());
@@ -6177,14 +6210,65 @@ mod tests {
         fit::<i8>(&[128]).expect_err("one past the top does not fit");
         fit::<i8>(&[-129]).expect_err("one past the bottom does not fit");
         assert_eq!(fit::<u8>(&[0, 255]).expect("the edges fit"), vec![0_u8, 255]);
+        fit::<u8>(&[256]).expect_err("one past the top does not fit");
         fit::<u8>(&[-1]).expect_err("a negative does not fit an unsigned page");
+        assert_eq!(
+            fit::<i16>(&[-32_768, 0, 32_767]).expect("the edges fit"),
+            vec![-32_768_i16, 0, 32_767]
+        );
+        fit::<i16>(&[32_768]).expect_err("one past the top does not fit");
+        fit::<i16>(&[-32_769]).expect_err("one past the bottom does not fit");
+        assert_eq!(fit::<u16>(&[0, 65_535]).expect("the edges fit"), vec![0_u16, 65_535]);
+        fit::<u16>(&[65_536]).expect_err("one past the top does not fit");
+        fit::<u16>(&[-1]).expect_err("a negative does not fit an unsigned page");
+        assert_eq!(
+            fit::<i32>(&[i64::from(i32::MIN), 0, i64::from(i32::MAX)]).expect("the edges fit"),
+            vec![i32::MIN, 0, i32::MAX]
+        );
+        fit::<i32>(&[i64::from(i32::MAX) + 1]).expect_err("one past the top does not fit");
+        fit::<i32>(&[i64::from(i32::MIN) - 1]).expect_err("one past the bottom does not fit");
         assert_eq!(
             fit::<u32>(&[0, 4_294_967_295]).expect("the edges fit"),
             vec![0_u32, 4_294_967_295]
         );
         fit::<u32>(&[4_294_967_296]).expect_err("one past the top does not fit");
-        assert_eq!(fit::<i32>(&[i64::from(i32::MIN)]).expect("the edge fits"), vec![i32::MIN]);
-        fit::<i32>(&[i64::from(i32::MIN) - 1]).expect_err("one past the bottom does not fit");
+        fit::<u32>(&[-1]).expect_err("a negative does not fit an unsigned page");
+
+        // One value in a page that fits is still a page that does not, which is the thing an or
+        // into an accumulator could get wrong in a way a page of one value would never show.
+        fit::<i8>(&[0, 1, 2, 128, 3]).expect_err("one bad value spoils the page");
+    }
+
+    /// The residue says yes to exactly what `TryFrom` says yes to.
+    ///
+    /// The edges above are the cases anyone would think to write down. This is the argument that
+    /// there are no others, made by asking both questions about every value either narrow type could
+    /// have an opinion about, and then about the values around the wide edges and the ends of an
+    /// `i64`, which a range that size cannot reach.
+    #[test]
+    fn the_residue_agrees_with_a_checked_conversion_everywhere() {
+        for value in -70_000_i64..70_000 {
+            assert_eq!(fit::<i8>(&[value]).is_ok(), i8::try_from(value).is_ok(), "{value} as i8");
+            assert_eq!(fit::<u8>(&[value]).is_ok(), u8::try_from(value).is_ok(), "{value} as u8");
+            assert_eq!(fit::<i16>(&[value]).is_ok(), i16::try_from(value).is_ok(), "{value} i16");
+            assert_eq!(fit::<u16>(&[value]).is_ok(), u16::try_from(value).is_ok(), "{value} u16");
+        }
+        let wide = [i64::MIN, i64::MIN + 1, i64::from(i32::MIN), 0, i64::from(u32::MAX), i64::MAX];
+        for edge in wide {
+            for step in -2_i64..=2 {
+                let value = edge.saturating_add(step);
+                assert_eq!(
+                    fit::<i32>(&[value]).is_ok(),
+                    i32::try_from(value).is_ok(),
+                    "{value} as i32"
+                );
+                assert_eq!(
+                    fit::<u32>(&[value]).is_ok(),
+                    u32::try_from(value).is_ok(),
+                    "{value} as u32"
+                );
+            }
+        }
     }
 
     /// A dictionary at its budget sweeps without keeping, and still answers what it answered.
