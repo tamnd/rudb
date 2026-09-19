@@ -475,6 +475,18 @@ impl Accumulator {
             return Ok(true);
         }
         let least = self.kind() == Kind::Min;
+        // A min or a max over a dictionary that knows its sorted order is decided on ranks, and
+        // nothing comes out of the payload until the answer is asked for. Without this the extreme
+        // arm below picks a winning row per vector and reads the string at it, which over a hundred
+        // million rows is ninety seven thousand point reads into a payload that keeps every block it
+        // decodes. That is where `MIN(Referer) WHERE Referer <> ''` spent three gigabytes and half a
+        // second, and it only showed up under a filter because without one every vector's winner is
+        // the empty string and every one of those reads lands in the same block.
+        if matches!(self.state, State::Extreme { .. })
+            && ranked_extreme(&mut self.state, input, rows, &nulls, least)?
+        {
+            return Ok(true);
+        }
         let want = match (&self.state, input.logical_type()) {
             (State::Whole { .. }, _) => Want::Whole,
             (State::Real { total, .. }, ty) => {
@@ -934,6 +946,60 @@ fn ranked_extremes(
         let State::Extreme { held, .. } = &mut states[index].state else {
             return Err(Error::internal("a ranked extreme into another state".to_string()));
         };
+        match held {
+            Some(current) => current.offer(dictionary, code, rank, least)?,
+            None => {
+                let kept = Extremum::Ranked { dictionary: dictionary.clone(), code, rank };
+                *held = Some(Box::new(kept));
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// One vector into an ungrouped extreme, out of the sorted order the file wrote beside a dictionary.
+///
+/// This is [`ranked_extremes`] for the case where there is one state rather than a table of them,
+/// and the shape of the loop changes with it: no group to scatter into means the whole vector is
+/// reduced to its winning code first and offered once, so a vector costs one integer compare per row
+/// and one [`Extremum::offer`] rather than one per row.
+///
+/// What it saves is not the compares, it is the reads. The path it replaces reduces the vector to a
+/// winning row and then reads the string at that row to hold it, and a point read into a dictionary
+/// that lives in a file decodes the block its value sits in and keeps it. One of those per vector
+/// over a hundred million rows holds most of the payload by the end. Holding the rank instead reads
+/// nothing until the aggregate is finished, and then reads one value.
+///
+/// `false` when the input is not a dictionary, or is one that does not know its order, or has a code
+/// with no rank against it, and the caller then takes the byte path as before. Nothing is written
+/// into the state until the vector has been walked without declining, so a decline halfway through
+/// leaves the state exactly as it found it.
+fn ranked_extreme(
+    state: &mut State,
+    input: &Vector,
+    rows: usize,
+    nulls: &Validity,
+    least: bool,
+) -> Result<bool> {
+    let Some((codes, dictionary)) = input.shared_dictionary_parts() else { return Ok(false) };
+    let Some(ranks) = dictionary.code_ranks() else { return Ok(false) };
+    let Some(codes) = codes.get(..rows) else { return Ok(false) };
+    let mut winner: Option<(u32, u32)> = None;
+    // row at a time: a code is a number out of the data, so which value it lands on is not known
+    // for any row until that row has been read.
+    for (row, &code) in codes.iter().enumerate() {
+        if !nulls.is_valid(row) {
+            continue;
+        }
+        let Some(&rank) = ranks.get(code as usize) else { return Ok(false) };
+        if winner.is_none_or(|(_, held)| if least { rank < held } else { rank > held }) {
+            winner = Some((code, rank));
+        }
+    }
+    let State::Extreme { held, .. } = state else {
+        return Err(Error::internal("a ranked extreme into another state".to_string()));
+    };
+    if let Some((code, rank)) = winner {
         match held {
             Some(current) => current.offer(dictionary, code, rank, least)?,
             None => {
@@ -2570,6 +2636,110 @@ mod tests {
         assert!(matches!(smallest, Some(Contribution::Extreme(Some(2)))));
         let largest = gather(&coded, 5, &Validity::AllValid, Want::Extreme(false));
         assert!(matches!(largest, Some(Contribution::Extreme(Some(1)))));
+    }
+
+    /// The same thing [`Filed`] is, for a reader that also wrote down the order it sorted the
+    /// values into, and which counts the reads so a test can say how many there were.
+    #[derive(Debug)]
+    struct Sorted {
+        values: Vec<Vec<u8>>,
+        order: Vec<u32>,
+        ranked: std::sync::OnceLock<Option<Vec<u32>>>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Sorted {
+        fn over(words: &[&str]) -> Arc<Self> {
+            let values: Vec<Vec<u8>> = words.iter().map(|word| word.as_bytes().to_vec()).collect();
+            let mut order: Vec<u32> = (0..values.len() as u32).collect();
+            order.sort_by(|&left, &right| values[left as usize].cmp(&values[right as usize]));
+            Arc::new(Self {
+                values,
+                order,
+                ranked: std::sync::OnceLock::new(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl rudb_vector::TextSource for Sorted {
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.values.get(index).map(Vec::as_slice))
+        }
+
+        fn footprint(&self) -> usize {
+            self.values.iter().map(Vec::len).sum()
+        }
+
+        fn ranks(&self) -> Option<usize> {
+            Some(self.order.len())
+        }
+
+        fn compare_rank(&self, rank: usize, wanted: &[u8]) -> Result<std::cmp::Ordering> {
+            Ok(self.values[self.order[rank] as usize].as_slice().cmp(wanted))
+        }
+
+        fn code_at_rank(&self, rank: usize) -> Result<u32> {
+            Ok(self.order[rank])
+        }
+
+        fn code_ranks(&self) -> Option<&[u32]> {
+            self.ranked
+                .get_or_init(|| {
+                    let mut ranks = vec![0; self.order.len()];
+                    for (rank, &code) in self.order.iter().enumerate() {
+                        ranks[code as usize] = rank as u32;
+                    }
+                    Some(ranks)
+                })
+                .as_deref()
+        }
+    }
+
+    /// An ungrouped min over a dictionary that knows its order holds the rank and reads nothing
+    /// until it is finished, which is the whole difference between this and the byte path.
+    ///
+    /// The count is what the test is about. The byte path reduces a vector to its winning row and
+    /// then reads the string there to hold it, so two vectors cost two reads and a hundred thousand
+    /// cost a hundred thousand, each of which decodes a block of a payload and keeps it. One read
+    /// here says the rank travelled instead and the value came out once at the end.
+    #[test]
+    fn an_ungrouped_extreme_over_a_sorted_dictionary_reads_one_value_however_many_vectors_it_saw() {
+        let source = Sorted::over(&["pear", "apple", "plum", "fig"]);
+        // One value vector behind every page, which is what a reader hands over and is what makes
+        // two ranks from two vectors comparable at all.
+        let handed: Arc<dyn rudb_vector::TextSource> = source.clone();
+        let values =
+            Arc::new(Vector::external_text(LogicalType::Varchar, handed).expect("four values"));
+        // row at a time: each of these is its own vector, which is the point of the test.
+        for (name, wanted) in [("min", "apple"), ("max", "plum")] {
+            source.reads.store(0, std::sync::atomic::Ordering::Relaxed);
+            let mut accumulator =
+                Accumulator::new(name, &LogicalType::Varchar).expect("a known one");
+            for codes in [vec![0_u32, 2, 3], vec![1, 0, 2], vec![3, 3, 0]] {
+                let rows = codes.len();
+                let coded = Vector::stable_dictionary(codes, Arc::clone(&values))
+                    .expect("codes are in range");
+                accumulator
+                    .update_run(std::slice::from_ref(&coded), rows)
+                    .expect("folds a vector in");
+            }
+            assert_eq!(
+                accumulator.finish().expect("an extreme"),
+                Value::Varchar(wanted.into()),
+                "the {name} of three vectors"
+            );
+            assert_eq!(source.reads(), 1, "the {name} read the payload once");
+        }
     }
 
     /// The flat sum reads the first `rows` values as one slice rather than one index at a time, so
