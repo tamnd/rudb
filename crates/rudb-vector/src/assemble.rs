@@ -32,6 +32,8 @@
 //! once. [`Assembly::place`] reads a piece and is done with it, so the borrow ends between arms and
 //! nothing has to be cloned to keep it alive.
 
+use std::sync::Arc;
+
 use rudb_common::{Error, LogicalType, Result, Value};
 
 use crate::string::StringView;
@@ -158,9 +160,39 @@ impl Assembly {
         if matches!(self.data, Data::Empty) {
             return Ok(Vector::constant(self.ty, Value::Null, self.rows));
         }
+        let validity = Validity::from_run(&self.live);
+        // A string column is finished by permuting views rather than by copying bytes. Sixteen
+        // bytes a row move and the payload stays in the arena the pieces were appended into, which
+        // is the same trade [`crate::vector::Body::Views`] is for a page. It matters most where the
+        // permutation is the identity and the whole thing is a move, which is every column of a
+        // hash join's gathered side.
+        if let Data::Varlen(column) = self.data {
+            let (laid, arena) = column.into_parts();
+            let arena = Arc::new(arena);
+            if straight(&self.at) {
+                return Ok(Vector::string_views(self.ty, laid, arena)?.with_validity(validity));
+            }
+            let views = self
+                .at
+                .iter()
+                .map(|&index| laid.get(index).copied().unwrap_or_else(StringView::empty))
+                .collect();
+            return Ok(Vector::string_views(self.ty, views, arena)?.with_validity(validity));
+        }
+        // Row `n` reads position `n`, so the copy below would be a copy of the run onto itself. An
+        // assembly whose pieces arrived in order and claimed every row is exactly that, and laying
+        // the chunks of a join's gathered side end to end is exactly that.
+        if straight(&self.at) {
+            return Ok(Vector::flat(self.ty, self.data)?.with_validity(validity));
+        }
         let gathered = copy_of(&self.data, &self.at);
-        Ok(Vector::flat(self.ty, gathered)?.with_validity(Validity::from_run(&self.live)))
+        Ok(Vector::flat(self.ty, gathered)?.with_validity(validity))
     }
+}
+
+/// Whether row `n` reads position `n` for every row, which makes the final gather a copy onto itself.
+fn straight(at: &[usize]) -> bool {
+    at.iter().enumerate().all(|(row, &index)| row == index)
 }
 
 /// Lays a run of data end to end after another, answering how many values it appended.
@@ -218,7 +250,7 @@ fn extend(into: &mut Data, from: &Data) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Chunk;
+    use crate::{Chunk, Form};
 
     /// Every row of a vector, as values, which is what an assembly is checked against.
     fn values(vector: &Vector) -> Vec<Value> {
@@ -313,6 +345,46 @@ mod tests {
             Value::Varchar("a string that is far too long to live inline in a view".into())
         );
         assert_eq!(built.value_at(2), Value::Varchar("another".into()));
+    }
+
+    #[test]
+    fn strings_laid_end_to_end_in_order_come_back_as_views_over_the_arena_they_went_into() {
+        // The shape a hash join's gathered side is: chunk after chunk, each claiming the rows
+        // straight after the last, so the permutation is the identity and nothing needs moving.
+        let first = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("one".into()), Value::Varchar("two".into())],
+        )
+        .expect("a vector");
+        let second = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("a third one long enough to be out of line".into())],
+        )
+        .expect("a vector");
+        let built = agrees(&LogicalType::Varchar, 3, &[(vec![0, 1], first), (vec![2], second)]);
+        assert_eq!(built.form(), Form::StringView, "the bytes stay where they were appended");
+        assert_eq!(
+            built.value_at(2),
+            Value::Varchar("a third one long enough to be out of line".into())
+        );
+    }
+
+    #[test]
+    fn a_string_row_no_piece_claims_is_null_rather_than_empty() {
+        // The hole a `CASE` with no `ELSE` leaves, on the path that permutes views instead of
+        // copying bytes, where an unclaimed row has no view to read and has to come out null.
+        let piece = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("a value long enough to be out of line".into())],
+        )
+        .expect("a vector");
+        let built = agrees(&LogicalType::Varchar, 3, &[(vec![2], piece)]);
+        assert_eq!(built.value_at(0), Value::Null);
+        assert_eq!(built.value_at(1), Value::Null);
+        assert_eq!(
+            built.value_at(2),
+            Value::Varchar("a value long enough to be out of line".into())
+        );
     }
 
     #[test]
