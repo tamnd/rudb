@@ -45,7 +45,7 @@
 use std::fmt::Write as _;
 
 use rudb_common::stat::{Class, Classes, Stat, Use};
-use rudb_metrics::{Document, Operator};
+use rudb_metrics::{Document, Operator, commas};
 use rudb_plan::{Node, NodeRef, OperatorRef, PipelineRef, Plan, Shape, seams_of};
 use rudb_seam::{Registries, SeamId, Settings};
 
@@ -181,6 +181,20 @@ pub fn record_estimates(plan: &Plan, facts: &Facts, document: &mut Document) {
             estimated[id as usize] = rows_stat(plan, node, facts);
         }
     }
+    // A filter the scan below applies is a node with no operator of its own, and the scan's operator
+    // counts what came out of the filter rather than what is in the table. The estimate that belongs
+    // against those rows is the filter's, so it is written over the scan's here. Leaving the scan's
+    // there compares a count of the table against a count of what survived a predicate, which is two
+    // different questions and reads as an exact count that was wrong.
+    for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        let Node::Filter { input, .. } = *plan.node(node) else { continue };
+        if crate::bounds::into_scan(plan, node).is_none() {
+            continue;
+        }
+        if let Some(id) = shape.operator_of(input) {
+            estimated[id as usize] = rows_stat(plan, node, facts);
+        }
+    }
     for operator in &mut document.operators {
         if let Some(estimate) = estimated.get(operator.id as usize) {
             operator.estimated_rows = estimate.value().copied();
@@ -202,11 +216,11 @@ fn printed(
     let shape = Shape::of(plan);
     let printing = Printing { plan, facts, shape: &shape, seams, measured, statistics };
     let mut out = String::new();
-    printing.write_node(plan.root(), 0, &mut out);
+    printing.write_node(plan.root(), 0, false, &mut out);
     write_pipelines(&shape, measured, &mut out);
     write_seams(seams, &mut out);
     if statistics == Statistics::Asked {
-        write_statistics(reads(plan, facts, &shape), &mut out);
+        write_statistics(reads(plan, facts, &shape), measured, &mut out);
     }
     if let Some(measured) = measured {
         write_totals(measured, &mut out);
@@ -259,7 +273,13 @@ struct Printing<'a> {
 }
 
 impl Printing<'_> {
-    fn write_node(self, node: NodeRef, depth: usize, out: &mut String) {
+    /// One line for this node and one for each below it.
+    ///
+    /// `filtered` says the node above this one is a filter the scan applies itself, which is true of
+    /// exactly one node in a plan that has one and says that the rows counted on this line are the
+    /// rows that came out of that filter. Carried down rather than looked up, because the node above
+    /// is the one that knows and a node cannot see its parent.
+    fn write_node(self, node: NodeRef, depth: usize, filtered: bool, out: &mut String) {
         let printed = self.plan.operator(node);
         let estimate = estimate(rows_stat(self.plan, node, self.facts), self.statistics);
         let pipeline = self.shape.pipeline(node);
@@ -277,7 +297,7 @@ impl Printing<'_> {
             "  [applied by the scan below]".to_owned()
         } else {
             self.measured
-                .map(|measured| actually(measured, self.shape.operator(node)))
+                .map(|measured| actually(measured, self.shape.operator(node), filtered))
                 .unwrap_or_default()
         };
         // The estimate goes after the operator rather than in a column of its own, because the tree
@@ -298,19 +318,23 @@ impl Printing<'_> {
                     "{:indent$}{} of the side that finishes first{}",
                     "",
                     operator.kind,
-                    actually(measured, gathered),
+                    actually(measured, gathered, false),
                     indent = (depth + 1) * 2
                 );
             }
         }
         for child in children(self.plan.node(node)) {
-            self.write_node(child, depth + 1, out);
+            self.write_node(child, depth + 1, moved, out);
         }
     }
 }
 
 /// What one operator did, as it goes on the end of its line.
-fn actually(measured: &Document, id: OperatorRef) -> String {
+///
+/// `filtered` puts the filter back into the sentence for a scan that applied one. The rows on such a
+/// line are the rows that came out of the filter above it, and a count that is smaller than the
+/// exact count on the same line reads as a wrong count until it says which of the two it is.
+fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
     let Some(operator) = row(measured, id) else {
         return "  [not measured]".to_owned();
     };
@@ -324,7 +348,8 @@ fn actually(measured: &Document, id: OperatorRef) -> String {
             format!(", {} fell back, most of it {}", operator.fallbacks.total(), cause.name())
         }
     };
-    format!("  [{} rows, {}{memory}{slow}]", operator.rows_out, duration(operator.wall_ns))
+    let after = if filtered { " after the filter above" } else { "" };
+    format!("  [{} rows{after}, {}{memory}{slow}]", operator.rows_out, duration(operator.wall_ns))
 }
 
 /// The operator row with this id.
@@ -416,7 +441,13 @@ fn reads(plan: &Plan, facts: &Facts, shape: &Shape) -> Reads {
 /// zeroes. The uses that did not happen are named instead of being left out, because the line
 /// saying nothing was read to enable is the reassuring half of this section and a reader cannot get
 /// it from an absence.
-fn write_statistics(reads: Reads, out: &mut String) {
+///
+/// Under `ANALYZE` the same section then says how far each class turned out to be from the rows the
+/// run produced, which is the other half of the measurement and the only half that can tell a good
+/// source from a bad one. The class histogram says how much of the plan rested on knowledge and the
+/// q-error says whether that knowledge was right, and `spec/stats/09-measurement.md` section 9.5
+/// asks for both because either on its own can look fine while the other is a disaster.
+fn write_statistics(reads: Reads, measured: Option<&Document>, out: &mut String) {
     let _ = writeln!(out, "\nStatistics");
     let mut silent = Vec::new();
     for use_ in [Use::Answer, Use::Enable, Use::Decide] {
@@ -434,6 +465,41 @@ fn write_statistics(reads: Reads, out: &mut String) {
     }
     if !silent.is_empty() {
         let _ = writeln!(out, "  nothing was read {}", among(&silent, "or"));
+    }
+    write_q_errors(measured, out);
+}
+
+/// How far the cardinalities were from the rows, by class, which only a run can say.
+///
+/// Nothing at all without a run, rather than a row of zeroes, because a plan that was printed and
+/// not executed has no truth to be measured against and a section of empty buckets would read as if
+/// it did and every estimate was perfect.
+///
+/// A class with nothing in it is left out for the same reason the buckets are. The exact line is the
+/// one to read first, and it wants reading in one direction. An operator that produced more rows
+/// than an exact count said exist is a number that claimed to have been counted and was not, and the
+/// warnings below say that again in stronger words. An operator that produced fewer is usually
+/// execution doing its job: a limit stopped the pipeline, the scan applied a filter itself, or a
+/// hash join handed the scan under its driving side the key filter of the side that finished first,
+/// which on TPC-H q12 takes the scan of `orders` from a million and a half rows to forty four
+/// thousand. Both land in the same bucket here, so an exact line that is not all at one is a
+/// question to go and answer rather than an answer.
+fn write_q_errors(measured: Option<&Document>, out: &mut String) {
+    let Some(measured) = measured else { return };
+    let errors = measured.q_errors();
+    if errors.total() == 0 {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "  q-error against the rows the run produced, {} measured",
+        commas(errors.total())
+    );
+    for (class, spread) in errors.named() {
+        if spread.total() == 0 {
+            continue;
+        }
+        let _ = writeln!(out, "    {class} {}: {spread}", commas(spread.total()));
     }
 }
 
@@ -545,6 +611,7 @@ fn children(node: &Node) -> Vec<NodeRef> {
 
 #[cfg(test)]
 mod tests {
+    use rudb_common::stat::Class;
     use rudb_metrics::{Document, Operator};
     use rudb_plan::Plan;
     use rudb_seam::{Registries, Settings};
@@ -670,8 +737,10 @@ mod tests {
 
     #[test]
     fn the_document_gets_one_class_per_operator_and_the_number_that_goes_with_it() {
+        // Not equal rather than greater than, so the scan cannot take the filter and the two nodes
+        // stay two operators. The test below is the other case.
         let plan = parsed(concat!(
-            "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n",
+            "Filter (#0.0::INTEGER <> 1::INTEGER)::BOOLEAN\n",
             "  Get memory.main.t AS t #0 [a::INTEGER]\n",
         ));
         let mut facts = Facts::new();
@@ -694,6 +763,28 @@ mod tests {
         for operator in &document.operators {
             assert_eq!(operator.estimated_rows.is_some(), operator.estimate_class.is_some());
         }
+    }
+
+    #[test]
+    fn a_filter_the_scan_applies_is_the_estimate_on_the_scans_row() {
+        // The builder makes no operator for a filter a scan can apply, so the scan's row counts the
+        // rows that came out of the filter. The estimate against those rows is the filter's, and the
+        // table's exact count belongs to a question nobody asked here. Writing the count there
+        // instead compares the size of the table with the size of what survived a predicate, and
+        // every one of those comparisons reads as the catalog having counted wrong.
+        let plan = parsed(concat!(
+            "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER]\n",
+        ));
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "t", 1000);
+        let mut document = Document::new("select");
+        let shape = Shape::of(&plan);
+        let scan = shape.operator_of(1).expect("the scan is an operator");
+        document.operators.push(Operator::new(scan, 0, "Scan"));
+        record_estimates(&plan, &facts, &mut document);
+        assert_eq!(document.operators[0].estimated_rows, Some(200));
+        assert_eq!(document.operators[0].estimate_class, Some(Class::Estimated));
     }
 
     #[test]
