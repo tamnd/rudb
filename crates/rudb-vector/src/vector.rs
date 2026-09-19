@@ -2832,24 +2832,36 @@ pub(crate) const NOWHERE: usize = usize::MAX;
 ///
 /// The caller has already checked that `end` is inside the vector, and a body whose data is shorter
 /// than its vector claims is a bug elsewhere, so a short run is clamped rather than reported.
+///
+/// A fixed width run over a buffer that is a window into a page does not copy anything, because
+/// [`Buffer::slice`] moves the offset instead. That is the case a scan over stored memory is in, and
+/// it is why the flat body is no longer the one form of a vector whose cut costs an allocation.
 fn run_of(data: &Data, at: usize, end: usize) -> Data {
     macro_rules! run {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match data {
                 Data::Empty => Data::Empty,
                 $(Data::$variant(values) => {
-                    let values = values.as_slice();
-                    let from = at.min(values.len());
-                    let to = end.max(from).min(values.len());
-                    let mut out = Buffer::with_capacity(end - at);
-                    out.extend_from_slice(&values[from..to]);
-                    // A body shorter than the rows asked for pads with the zero every layout uses
-                    // for a null, which is the answer `copy_of` gives for a position past the end.
-                    // row at a time: never runs on a vector whose data matches its length.
-                    for _ in to..end {
-                        out.push($zero);
+                    let held = values.len();
+                    let from = at.min(held);
+                    let to = end.max(from).min(held);
+                    if to == end {
+                        // The whole run is there, so this is a window on a shared page and a copy on
+                        // an owned one, decided inside the buffer rather than here.
+                        Data::$variant(values.slice(from, end - from))
+                    } else {
+                        let values = values.as_slice();
+                        let mut out = Buffer::with_capacity(end - at);
+                        out.extend_from_slice(&values[from..to]);
+                        // A body shorter than the rows asked for pads with the zero every layout
+                        // uses for a null, which is the answer `copy_of` gives for a position past
+                        // the end.
+                        // row at a time: never runs on a vector whose data matches its length.
+                        for _ in to..end {
+                            out.push($zero);
+                        }
+                        Data::$variant(out)
                     }
-                    Data::$variant(out)
                 })+
                 // A view says where its bytes are, so a run of rows is not a run of bytes and this
                 // is the one layout whose cut is still a loop. The total is known before any of it
@@ -3871,6 +3883,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The flat body used to be the one form of a vector whose cut cost an allocation and a copy,
+    /// and it is not any more when its buffer is a run inside a page. Asserted on the address,
+    /// because the values are the same either way and the address is the whole claim.
+    #[test]
+    fn cutting_a_flat_body_over_a_page_does_not_copy_it() {
+        let page = Arc::new((0i64..64).collect::<Vec<_>>());
+        let address = page.as_ptr() as usize;
+        let data = Data::Int64(Buffer::from_arc(Arc::clone(&page)));
+        let vector = Vector::flat(LogicalType::BigInt, data).unwrap();
+        let cut = vector.slice(16, 8).unwrap();
+        assert_eq!(cut.form(), Form::Flat);
+        assert_eq!(cut.len(), 8);
+        let Some(Data::Int64(run)) = cut.data() else {
+            panic!("the layout changed under the test")
+        };
+        assert!(run.is_shared(), "the cut copied the run out of the page");
+        assert_eq!(run.as_slice().as_ptr() as usize, address + 16 * 8);
+        assert_eq!(run.as_slice(), &(16i64..24).collect::<Vec<_>>()[..]);
+        assert_eq!(cut.value_at(0), Value::BigInt(16));
+        // And the same cut of an owned run says the same thing, by copying it.
+        let owned = Vector::flat(LogicalType::BigInt, Data::Int64((0i64..64).collect())).unwrap();
+        let copied = owned.slice(16, 8).unwrap();
+        let Some(Data::Int64(run)) = copied.data() else {
+            panic!("the layout changed under the test")
+        };
+        assert!(!run.is_shared());
+        assert_eq!(run.as_slice(), &(16i64..24).collect::<Vec<_>>()[..]);
     }
 
     #[test]
