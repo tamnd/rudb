@@ -29,14 +29,25 @@
 //! `NaN` has no minimum, so no test against it rules anything out, and the `None` from the ordering
 //! carries that through without a case of its own.
 //!
-//! Times and timestamps are a gap rather than a decision. A [`Value::Timestamp`] is microseconds and
-//! a file is free to store the same column in milliseconds or nanoseconds, so comparing the two
-//! would rule out stretches holding rows the query wants. Closing that means carrying the unit
-//! alongside the bound, which is a change to make when a benchmark asks for it.
+//! # Two numbers of the same thing
+//!
+//! A decimal, a time and a timestamp are all an integer with a power of ten under it, and the two
+//! sides of a comparison are free to disagree about which power. A `DECIMAL(15, 2)` column stores
+//! 12.34 as 1234 and the same constant written `12.340` arrives as 12340. A [`Value::Timestamp`] is
+//! microseconds and a file is free to store the column in milliseconds or nanoseconds. Comparing
+//! either pair as the integers they are would rule out stretches holding rows the query wants, which
+//! is a wrong answer.
+//!
+//! So [`Bound::Scaled`] carries the power alongside the integer and the comparison restates the
+//! coarser of the two before it looks at them. Restating upwards is exact, and where it does not fit
+//! an `i128` the comparison answers nothing rather than guessing, which keeps the stretch.
 
 use std::cmp::Ordering;
 
 use crate::{LogicalType, Value};
+
+/// The scale a microsecond count sits at, which is what every time and timestamp constant is.
+pub const MICROS: u8 = 6;
 
 /// The comparison a bounds test applies.
 ///
@@ -77,7 +88,7 @@ impl Op {
 
 /// A constant, in a domain that can be ordered against a stored bound.
 ///
-/// Three domains and not one per type, because a bound written for a `SMALLINT` has to compare with
+/// Four domains and not one per type, because a bound written for a `SMALLINT` has to compare with
 /// a constant the parser read as an `INTEGER`, and widening both to the same domain is what makes
 /// that one comparison instead of a table of them.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,8 +97,35 @@ pub enum Bound {
     Int(i128),
     /// `FLOAT` and `DOUBLE`.
     Real(f64),
+    /// `DECIMAL`, `TIME` and `TIMESTAMP`, as an integer and the power of ten under it.
+    ///
+    /// Apart from [`Bound::Int`] because the two sides of one comparison can disagree about the
+    /// power, which the module doc goes into. A decimal's scale is its own, and a time or a
+    /// timestamp is a count of seconds at whichever of 0, 3, 6 or 9 its unit is.
+    Scaled {
+        /// The integer, so 12.34 at scale 2 is 1234 and a microsecond timestamp is at scale 6.
+        unscaled: i128,
+        /// How many powers of ten sit under it.
+        scale: u8,
+    },
     /// `VARCHAR` and `BLOB`, ordered as bytes.
     Bytes(Vec<u8>),
+}
+
+/// `unscaled` at `scale` restated at `into`, exactly or not at all.
+///
+/// Upwards is a multiplication that either fits an `i128` or does not. Downwards is only exact when
+/// the digits being dropped are zeroes, and a bound that has to round is no bound: rounding a
+/// minimum up or a maximum down would rule out a stretch holding rows the query wants.
+#[must_use]
+fn restated(unscaled: i128, scale: u8, into: u8) -> Option<i128> {
+    let ten = |steps: u8| 10_i128.checked_pow(u32::from(steps));
+    if into >= scale {
+        unscaled.checked_mul(ten(into - scale)?)
+    } else {
+        let factor = ten(scale - into)?;
+        (unscaled % factor == 0).then_some(unscaled / factor)
+    }
 }
 
 impl Bound {
@@ -111,6 +149,17 @@ impl Bound {
             Value::Date(days) => Self::Int(i128::from(*days)),
             Value::Float(number) => Self::Real(f64::from(*number)),
             Value::Double(number) => Self::Real(*number),
+            Value::Decimal { unscaled, scale, .. } => {
+                Self::Scaled { unscaled: *unscaled, scale: *scale }
+            }
+            // A constant of any of these four is microseconds, whatever unit the column it is being
+            // compared against is stored in, so the scale is the same six every time.
+            Value::Time(micros)
+            | Value::TimeTz(micros)
+            | Value::Timestamp(micros)
+            | Value::TimestampTz(micros) => {
+                Self::Scaled { unscaled: i128::from(*micros), scale: MICROS }
+            }
             Value::Varchar(text) => Self::Bytes(text.as_bytes().to_vec()),
             Value::Blob(bytes) => Self::Bytes(bytes.clone()),
             _ => return None,
@@ -146,6 +195,25 @@ impl Bound {
             (Self::Int(number), LogicalType::Date) => return fit!(number, Date),
             (Self::Real(number), LogicalType::Float) => Value::Float(*number as f32),
             (Self::Real(number), LogicalType::Double) => Value::Double(*number),
+            (Self::Scaled { unscaled, scale }, LogicalType::Decimal { width, scale: want }) => {
+                Value::Decimal {
+                    unscaled: restated(*unscaled, *scale, *want)?,
+                    width: *width,
+                    scale: *want,
+                }
+            }
+            (Self::Scaled { unscaled, scale }, LogicalType::Time) => {
+                return fit!(&restated(*unscaled, *scale, MICROS)?, Time);
+            }
+            (Self::Scaled { unscaled, scale }, LogicalType::TimeTz) => {
+                return fit!(&restated(*unscaled, *scale, MICROS)?, TimeTz);
+            }
+            (Self::Scaled { unscaled, scale }, LogicalType::Timestamp) => {
+                return fit!(&restated(*unscaled, *scale, MICROS)?, Timestamp);
+            }
+            (Self::Scaled { unscaled, scale }, LogicalType::TimestampTz) => {
+                return fit!(&restated(*unscaled, *scale, MICROS)?, TimestampTz);
+            }
             (Self::Bytes(bytes), LogicalType::Varchar) => {
                 Value::Varchar(String::from_utf8(bytes.clone()).ok()?)
             }
@@ -161,6 +229,15 @@ impl Bound {
             (Self::Int(left), Self::Int(right)) => Some(left.cmp(right)),
             (Self::Real(left), Self::Real(right)) => left.partial_cmp(right),
             (Self::Bytes(left), Self::Bytes(right)) => Some(left.as_slice().cmp(right)),
+            (
+                Self::Scaled { unscaled: left, scale: from },
+                Self::Scaled { unscaled: right, scale: to },
+            ) => {
+                // Both restated at the finer of the two, which is upwards for at least one of them
+                // and is the direction that keeps every digit either of them had.
+                let scale = (*from).max(*to);
+                Some(restated(*left, *from, scale)?.cmp(&restated(*right, *to, scale)?))
+            }
             _ => None,
         }
     }
@@ -331,12 +408,42 @@ fn holds(bound: Option<&Bound>, value: &Bound, wanted: &[Ordering]) -> bool {
 /// The integers are counted and the reals are measured, which is the difference between six values
 /// in 10 to 15 and a sixth of the distance from 10 to 15. Dates are integers here and are counted,
 /// which is what makes a range of days come out right on a small table rather than only on a large
-/// one.
+/// one. A decimal, a time and a timestamp are counted too, once every number in the question has
+/// been restated at one scale, because a `DECIMAL(15, 2)` column runs over hundredths and those are
+/// as countable as days are.
 #[must_use]
 pub fn kept(tests: &[Test], column: usize, low: &Bound, high: &Bound) -> Option<Spread> {
+    let ours = || tests.iter().filter(|test| test.column == column);
     match (low, high) {
-        (&Bound::Int(low), &Bound::Int(high)) => counted(tests, column, low, high),
+        (&Bound::Int(low), &Bound::Int(high)) => {
+            let clips = ours().filter_map(|test| match test.value {
+                Bound::Int(value) => Some((test.op, value)),
+                _ => None,
+            });
+            counted(clips, low, high)
+        }
         (&Bound::Real(low), &Bound::Real(high)) => measured(tests, column, low, high),
+        (
+            &Bound::Scaled { unscaled: low, scale: lower },
+            &Bound::Scaled { unscaled: high, scale: upper },
+        ) => {
+            // The finest scale anything in the question is written at, so that every number in it
+            // restates upwards and none of them loses a digit on the way. The step of the counting
+            // is one at that scale, which is the column's own step where the constants are no finer
+            // than the column, and a fraction of it where one of them is. Either way it is the same
+            // step above and below the line and the ratio is what comes out.
+            let scale = ours().fold(lower.max(upper), |scale, test| match test.value {
+                Bound::Scaled { scale: theirs, .. } => scale.max(theirs),
+                _ => scale,
+            });
+            let clips = ours().filter_map(|test| match test.value {
+                Bound::Scaled { unscaled, scale: theirs } => {
+                    Some((test.op, restated(unscaled, theirs, scale)?))
+                }
+                _ => None,
+            });
+            counted(clips, restated(low, lower, scale)?, restated(high, upper, scale)?)
+        }
         _ => None,
     }
 }
@@ -356,24 +463,28 @@ pub struct Spread {
 
 /// [`kept`] over a dense stretch of integers, where the answer is a count of values.
 ///
-/// The stretch starts as the whole of `low` to `high` and each test clips one end of it. `x < v`
+/// The stretch starts as the whole of `low` to `high` and each clip narrows one end of it. `x < v`
 /// clips the top to `v - 1` and `x >= v` clips the bottom to `v`, and the fraction at the end is the
 /// integers left over the integers there were. An interval clipped past itself is a zero rather than
 /// a negative number.
 ///
 /// A stretch of one value falls out of this without a case of its own, because `high - low + 1` is
 /// one rather than zero and there is nothing to divide by that is not there.
+///
+/// The clips arrive as an iterator rather than as the tests themselves, because the two domains that
+/// end up here disagree about how a test becomes a number and agree about everything after that. An
+/// integer is already one and a scaled value has to be restated first, and a clip that could not be
+/// made is simply not in the iterator.
 #[expect(clippy::cast_precision_loss, reason = "a span past two to the fifty third is not a span")]
-fn counted(tests: &[Test], column: usize, low: i128, high: i128) -> Option<Spread> {
+fn counted(clips: impl Iterator<Item = (Op, i128)>, low: i128, high: i128) -> Option<Spread> {
     let whole = high.checked_sub(low)?.checked_add(1)?;
     if whole <= 0 {
         return None;
     }
     let (mut first, mut last) = (low, high);
     let mut read = 0;
-    for test in tests.iter().filter(|test| test.column == column) {
-        let &Bound::Int(value) = &test.value else { continue };
-        match test.op {
+    for (op, value) in clips {
+        match op {
             Op::Less => last = last.min(value.saturating_sub(1)),
             Op::LessOrEqual => last = last.min(value),
             Op::Greater => first = first.max(value.saturating_add(1)),
@@ -421,8 +532,10 @@ fn measured(tests: &[Test], column: usize, low: f64, high: f64) -> Option<Spread
 
 #[cfg(test)]
 mod tests {
-    use super::{Bound, Op, Test, excluded, kept};
-    use crate::Value;
+    use std::cmp::Ordering;
+
+    use super::{Bound, MICROS, Op, Test, excluded, kept};
+    use crate::{LogicalType, Value};
 
     /// The range 10 to 20, which every test here asks about.
     fn range() -> (Bound, Bound) {
@@ -495,13 +608,13 @@ mod tests {
         assert_eq!(Bound::of_value(&Value::Integer(7)), Some(Bound::Int(7)));
     }
 
-    /// The gap the module doc documents, pinned so that closing it is a test that changes rather
-    /// than a behaviour that quietly appears. A timestamp constant is microseconds and a file's
-    /// statistics are at whatever unit the file chose, so no test is made from one at all.
+    /// A timestamp constant is microseconds and a file's statistics are at whatever unit the file
+    /// chose, which is why these carry the scale rather than being widened into [`Bound::Int`]. A
+    /// date does not, because a day is a day in every file that states one.
     #[test]
-    fn a_timestamp_constant_makes_no_bound() {
-        assert_eq!(Bound::of_value(&Value::Timestamp(1)), None);
-        assert_eq!(Bound::of_value(&Value::Time(1)), None);
+    fn a_temporal_constant_carries_the_unit_it_is_counted_in() {
+        assert_eq!(Bound::of_value(&Value::Timestamp(1)), Some(scaled(1, MICROS)));
+        assert_eq!(Bound::of_value(&Value::Time(1)), Some(scaled(1, MICROS)));
         assert_eq!(Bound::of_value(&Value::Date(1)), Some(Bound::Int(1)));
     }
 
@@ -642,6 +755,115 @@ mod tests {
         let nan = Bound::Real(f64::NAN);
         let tests = vec![Test { column: 0, op: Op::Less, value: Bound::Real(1.0) }];
         assert_eq!(kept(&tests, 0, &nan, &nan), None);
+    }
+
+    /// A decimal at a stated scale, which is what the footer and the parser each hand over.
+    fn scaled(unscaled: i128, scale: u8) -> Bound {
+        Bound::Scaled { unscaled, scale }
+    }
+
+    #[test]
+    fn two_scales_of_one_number_are_one_number() {
+        // 12.34 written at two scales and at three, which is the same quantity and has to order as
+        // one. Comparing the integers as they are would put 12340 above 1235 and rule out a stretch
+        // holding the rows the query asked for.
+        assert_eq!(scaled(1234, 2).order(&scaled(12_340, 3)), Some(Ordering::Equal));
+        assert_eq!(scaled(1234, 2).order(&scaled(12_350, 3)), Some(Ordering::Less));
+        assert_eq!(scaled(1235, 2).order(&scaled(12_340, 3)), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn a_decimal_constant_rules_out_a_stretch_the_same_way_an_integer_does() {
+        // `l_discount BETWEEN 0.05 AND 0.07` against a group running from 0.00 to 0.04, with the
+        // constants at a finer scale than the column to make the restating do something.
+        let (low, high) = (scaled(0, 2), scaled(4, 2));
+        assert!(excluded(Op::GreaterOrEqual, &scaled(50, 3), Some(&low), Some(&high)));
+        assert!(!excluded(Op::LessOrEqual, &scaled(70, 3), Some(&low), Some(&high)));
+        // And the edge, where the constant is the maximum itself rather than past it.
+        assert!(!excluded(Op::GreaterOrEqual, &scaled(40, 3), Some(&low), Some(&high)));
+    }
+
+    #[test]
+    fn a_decimal_range_is_counted_over_the_steps_the_scale_gives_it() {
+        // 0.00 to 0.10 at scale 2 is eleven hundredths. `x <= 0.07` keeps eight of them, which is
+        // the same counting a range of integers gets and is why this shares that code.
+        let (low, high) = (scaled(0, 2), scaled(10, 2));
+        let tests = vec![Test { column: 0, op: Op::LessOrEqual, value: scaled(7, 2) }];
+        let spread = kept(&tests, 0, &low, &high).expect("a decimal range interpolates");
+        assert!((spread.fraction - 8.0 / 11.0).abs() < 1e-12, "{spread:?}");
+        assert_eq!(spread.read, 1);
+    }
+
+    #[test]
+    fn a_constant_finer_than_the_column_is_counted_at_its_own_scale() {
+        // The same stretch and a constant at scale 3, where the step is a thousandth rather than a
+        // hundredth. 0.000 to 0.100 is 101 thousandths and `x <= 0.075` keeps 76 of them, which is
+        // the fraction the finer grid gives and is within a step of the coarser one.
+        let (low, high) = (scaled(0, 2), scaled(10, 2));
+        let tests = vec![Test { column: 0, op: Op::LessOrEqual, value: scaled(75, 3) }];
+        let spread = kept(&tests, 0, &low, &high).expect("a finer constant interpolates");
+        assert!((spread.fraction - 76.0 / 101.0).abs() < 1e-12, "{spread:?}");
+    }
+
+    #[test]
+    fn a_timestamp_in_one_unit_compares_with_a_constant_in_another() {
+        // A file storing milliseconds against the microseconds every constant arrives as. The
+        // stretch is one second and the constant is half a second into it, so half of it survives.
+        let (low, high) = (scaled(1_000, 3), scaled(2_000, 3));
+        let tests = vec![Test { column: 0, op: Op::Less, value: scaled(1_500_000, MICROS) }];
+        let spread = kept(&tests, 0, &low, &high).expect("a timestamp range interpolates");
+        assert!((spread.fraction - 0.5).abs() < 1e-3, "{spread:?}");
+        assert!(excluded(Op::Less, &scaled(1_000_000, MICROS), Some(&low), Some(&high)));
+    }
+
+    #[test]
+    fn a_number_too_wide_to_restate_answers_nothing_rather_than_wrapping() {
+        // Restating a scale 0 maximum at scale 30 does not fit an `i128`, and the comparison that
+        // needs it says nothing, which keeps the stretch. Wrapping would rule out a stretch that
+        // holds the rows.
+        let huge = scaled(i128::MAX / 2, 0);
+        assert_eq!(huge.order(&scaled(1, 30)), None);
+        assert!(!excluded(Op::Less, &scaled(1, 30), Some(&huge), Some(&huge)));
+    }
+
+    #[test]
+    fn a_scaled_bound_orders_against_nothing_from_another_domain() {
+        assert_eq!(scaled(1234, 2).order(&Bound::Int(12)), None);
+        assert_eq!(Bound::Real(12.34).order(&scaled(1234, 2)), None);
+        assert_eq!(kept(&one(Op::Less, 15), 0, &scaled(0, 2), &scaled(100, 2)), None);
+    }
+
+    #[test]
+    fn a_decimal_value_becomes_a_bound_and_comes_back_at_the_columns_scale() {
+        let value = Value::Decimal { unscaled: 1234, width: 18, scale: 2 };
+        let bound = Bound::of_value(&value).expect("a decimal has a bound");
+        assert_eq!(bound, scaled(1234, 2));
+        // Back out at a finer scale, which is exact, and at a coarser one, which is only exact when
+        // the digits going away are zeroes.
+        let finer = LogicalType::Decimal { width: 18, scale: 3 };
+        assert_eq!(
+            bound.into_value(&finer),
+            Some(Value::Decimal { unscaled: 12_340, width: 18, scale: 3 })
+        );
+        let coarser = LogicalType::Decimal { width: 18, scale: 1 };
+        assert_eq!(bound.into_value(&coarser), None, "12.34 is not a number of tenths");
+        assert_eq!(
+            scaled(1230, 2).into_value(&coarser),
+            Some(Value::Decimal { unscaled: 123, width: 18, scale: 1 })
+        );
+    }
+
+    #[test]
+    fn a_timestamp_value_becomes_a_bound_in_microseconds_and_comes_back() {
+        let value = Value::Timestamp(1_700_000_000_000_000);
+        let bound = Bound::of_value(&value).expect("a timestamp has a bound");
+        assert_eq!(bound, scaled(1_700_000_000_000_000, MICROS));
+        assert_eq!(bound.into_value(&LogicalType::Timestamp), Some(value));
+        // A file's milliseconds restate upwards into the microseconds the value type is.
+        assert_eq!(
+            scaled(1_700_000_000_000, 3).into_value(&LogicalType::Timestamp),
+            Some(Value::Timestamp(1_700_000_000_000_000))
+        );
     }
 
     #[test]

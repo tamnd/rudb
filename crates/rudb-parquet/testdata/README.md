@@ -140,3 +140,20 @@ COPY (
 Eight groups is not an accident. The estimator holds its guess under the rows in the groups the bounds leave, and the guess for one condition is a fifth of the file, so a ceiling only bites when fewer than a fifth of the groups survive. Four groups of 4096 would never reach that and would test nothing.
 
 DuckDB reads it as n=16384, sum(k)=134209536, sum(g)=786036, and answers 100 rows for `k < 100`, 8192 for `k >= 8192`, 169 for `g = 5` and none for `k > 999999`. `g` is `i % 97`, so every row group holds every value of it and no filter on `g` rules a group out, which is the control.
+
+## scaled.parquet
+
+Written by DuckDB, Snappy, eight row groups of 1024 rows. `sorted.parquet` is the same idea for a column of integers and this is it for the three types that are an integer with a power of ten under it, which are the ones the two sides of a comparison can disagree about the scale of.
+
+```sql
+COPY (
+  SELECT (i / 100.0)::DECIMAL(15,2) AS d,
+         ('2020-01-01 00:00:00'::TIMESTAMP + (i * INTERVAL 1 MINUTE)) AS t,
+         (('2020-01-01 00:00:00'::TIMESTAMP + (i * INTERVAL 1 MINUTE)))::TIMESTAMP_MS AS ms
+  FROM range(8192) tbl(i)
+) TO 'scaled.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1024, COMPRESSION snappy);
+```
+
+All three columns ascend, so a filter on any of them rules groups out and the groups that survive are narrow enough to interpolate inside. `d` is stored as an `INT64` of hundredths, which is what makes reading its bounds as plain integers wrong: the footer's 7 is 0.07. `t` and `ms` are the same instants in two units, microseconds and milliseconds, which is what makes reading a timestamp's bounds without the unit wrong the same way.
+
+DuckDB reads it as n=8192 with `d` from 0.00 to 81.91 and `t` from 2020-01-01 00:00:00 to 2020-01-06 16:31:00, and answers 1000 rows for `d < 10.00`, 3192 for `d >= 50.00`, 1001 for `d BETWEEN 20.00 AND 30.00`, none for `d > 999.00`, 1440 for `t < '2020-01-02 00:00:00'` and 2432 for `t >= '2020-01-05 00:00:00'`.
