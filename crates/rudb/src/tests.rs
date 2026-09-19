@@ -2610,7 +2610,9 @@ fn correlated_exists_uses_an_outer_domain_for_inequalities() {
         vec![vec![Value::Boolean(true)]]
     );
     let plan = db.plan(sql).expect("the correlated inequality existence query plans");
-    assert!(plan.contains("Join INNER"), "{plan}");
+    // Semi rather than inner, because the distinct over the domain above it asks which of the
+    // domain's values had a match and not which pairs matched.
+    assert!(plan.contains("Join SEMI"), "{plan}");
     assert!(plan.contains("Join SINGLE"), "{plan}");
     assert!(plan.contains("IS NOT DISTINCT FROM"), "{plan}");
     assert!(!plan.contains("DependentJoin"), "{plan}");

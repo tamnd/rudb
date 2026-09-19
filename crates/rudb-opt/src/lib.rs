@@ -112,13 +112,14 @@ pub const RANK: u8 = 11;
 /// on the next run instead, which is the fixed sequence not settling. Before the rest, because the
 /// subtree it removes is a subtree they would otherwise walk, and because the operators it leaves
 /// next to each other are the pairs limit pushdown and top N are looking for.
-pub static PASSES: [&(dyn Pass + Sync); 13] = [
+pub static PASSES: [&(dyn Pass + Sync); 14] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
     &filter::FilterPushdown,
     &order::JoinOrder,
     &semi::MarkToSemi,
+    &semi::DistinctToSemi,
     &empty::EmptyResultPullup,
     &cte::UnusedMaterialization,
     &columns::UnusedColumns,
