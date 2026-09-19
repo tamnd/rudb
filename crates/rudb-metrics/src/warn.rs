@@ -9,9 +9,10 @@
 //! number below it partial. Then what it did that costs time, then what it got wrong, then what it
 //! cannot account for.
 
-use rudb_common::human;
+use rudb_common::{Class, human};
 
 use crate::document::{Document, Outcome};
+use crate::qerror::{contradicted, q_error, word};
 use crate::{commas, duration};
 
 /// How far an estimate can be out before it is worth saying so.
@@ -51,6 +52,7 @@ impl Document {
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         self.ending(&mut warnings);
+        self.contradictions(&mut warnings);
         self.spills(&mut warnings);
         self.references(&mut warnings);
         self.fallbacks(&mut warnings);
@@ -143,25 +145,62 @@ impl Document {
         warnings.push(format!("{} calls took the row at a time path{blamed}", commas(total)));
     }
 
+    /// A number the run produced more rows than is not a bad estimate, it is a bug, and it is
+    /// reported however small the disagreement is.
+    ///
+    /// The threshold below belongs to guesses. A guess that is out by nine is a guess and a guess
+    /// that is out by eleven is a guess, so a line is only worth printing past an order of
+    /// magnitude. An exact count a run produced one more row than is something that claimed to have
+    /// counted and did not, and P0's third exit criterion says such a thing stops the milestone
+    /// rather than being filed with the estimates. A certificate is the same failure with a range
+    /// instead of a point.
+    ///
+    /// Only that direction, for the reason `crate::qerror::contradicted` sets out: a plan's row
+    /// count is a ceiling on what execution produces rather than a prediction of it, and three
+    /// ordinary things in this engine take a scan below it.
+    ///
+    /// This is the only rule here that says what it found is a defect rather than a cost, which is
+    /// why it goes above the ones about time. Somebody reading this list wants to know that a number
+    /// in their plan was false before they read how long the plan took.
+    fn contradictions(&self, warnings: &mut Vec<String>) {
+        for operator in &self.operators {
+            let Some((estimated, produced)) = contradicted(operator) else { continue };
+            let from = match operator.estimate_provenance {
+                Some(provenance) => format!(" from {provenance}"),
+                None => String::new(),
+            };
+            warnings.push(format!(
+                "{} was {} at {} rows{from} and produced {}, which the run contradicts, so this is a wrong answer bug rather than a bad estimate",
+                operator.named(),
+                said(operator.estimate_class),
+                commas(estimated),
+                commas(produced)
+            ));
+        }
+    }
+
     /// An estimate an order of magnitude out is how a bad plan explains itself.
+    ///
+    /// The class is on the line because the same ratio means two different things depending on it.
+    /// `estimated` says the guess was bad and the work is to find a better source for it.
+    /// `certified` says the truth was inside the certificate and a long way from the value, which is
+    /// a bound that is true and too loose to plan with. The two want different work and the number
+    /// on its own does not tell them apart.
     fn estimates(&self, warnings: &mut Vec<String>) {
         for operator in &self.operators {
             let Some(estimated) = operator.estimated_rows else { continue };
-            let (high, low) = if estimated > operator.rows_out {
-                (u128::from(estimated), u128::from(operator.rows_out))
-            } else {
-                (u128::from(operator.rows_out), u128::from(estimated))
-            };
-            // A zero on either side is an estimate of nothing or a result of nothing, and dividing
-            // by it says infinity when what it means is that one of the two is a special case. One
-            // row is the floor, which makes the ratio the size of the other side.
-            let low = low.max(1);
+            // The ones the run contradicted are already reported above, in stronger words.
+            if contradicted(operator).is_some() {
+                continue;
+            }
+            let (high, low) = q_error(estimated, operator.rows_out);
             if high / low < Q_ERROR {
                 continue;
             }
             warnings.push(format!(
-                "{} was estimated at {} rows and produced {} (q-error {})",
+                "{} was {} at {} rows and produced {} (q-error {})",
                 operator.named(),
+                said(operator.estimate_class),
                 commas(estimated),
                 commas(operator.rows_out),
                 ratio(high, low)
@@ -257,6 +296,18 @@ impl Document {
     }
 }
 
+/// How a sentence says what kind of number it is about.
+///
+/// The q-error module's `word` is the noun a bucket is labelled with and this is the verb a sentence
+/// needs, which are the same for two of the three classes and not for the third: a bucket of exact
+/// numbers is labelled exact, and a number that is exact was counted.
+fn said(class: Option<Class>) -> &'static str {
+    match class {
+        Some(Class::Exact) => "counted",
+        other => word(other),
+    }
+}
+
 /// One number over another, to one decimal place.
 ///
 /// Integer arithmetic because a q-error of 17.5 is a label rather than a measurement, and because
@@ -269,7 +320,7 @@ fn ratio(high: u128, low: u128) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::{Cause, Tally};
+    use rudb_common::{Cause, Class, Direction, Provenance, Tally};
 
     use crate::document::{Document, Implementation, Operator, Outcome, Pipeline};
 
@@ -376,9 +427,11 @@ mod tests {
         let mut metrics = document();
         let mut close = Operator::new(0, 0, "Filter");
         close.estimated_rows = Some(1000);
+        close.estimate_class = Some(Class::Estimated);
         close.rows_out = 4000;
         let mut wrong = Operator::new(1, 0, "HashAggregate");
         wrong.estimated_rows = Some(2_400_000);
+        wrong.estimate_class = Some(Class::Estimated);
         wrong.rows_out = 41_983_110;
         metrics.operators.extend([close, wrong]);
         assert_eq!(
@@ -390,10 +443,74 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_count_the_run_went_past_is_a_wrong_answer_bug_and_not_a_bad_estimate() {
+        // One row over. The q-error is one point zero zero zero zero zero two and no threshold
+        // anywhere would fire on it, which is the point: the size of the disagreement does not
+        // matter because something said it had counted and there was a row it had not counted.
+        let mut metrics = document();
+        let mut scan = Operator::new(0, 0, "Scan");
+        scan.estimated_rows = Some(6_001_215);
+        scan.estimate_class = Some(Class::Exact);
+        scan.estimate_provenance = Some(Provenance::RowCount);
+        scan.rows_out = 6_001_216;
+        metrics.operators.push(scan);
+        assert_eq!(
+            metrics.warnings(),
+            vec![
+                "operator 0 (Scan) was counted at 6,001,215 rows from row count and produced 6,001,216, which the run contradicts, so this is a wrong answer bug rather than a bad estimate"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_certificate_the_run_falls_outside_of_is_the_same_failure_with_a_range() {
+        let mut metrics = document();
+        let mut limit = Operator::new(0, 0, "Limit");
+        limit.estimated_rows = Some(10);
+        limit.estimate_class = Some(Class::Certified { bound: 1.0, direction: Direction::AtMost });
+        limit.estimate_provenance = Some(Provenance::Default);
+        limit.rows_out = 11;
+        metrics.operators.push(limit);
+        assert_eq!(
+            metrics.warnings(),
+            vec![
+                "operator 0 (Limit) was certified at 10 rows from default and produced 11, which the run contradicts, so this is a wrong answer bug rather than a bad estimate"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_count_the_run_came_up_short_of_is_execution_working_rather_than_a_bug() {
+        // The scan really does hold a thousand rows and the limit above it stopped the pipeline at
+        // five, so the count was right and the operator stopped early. A limit is the easiest of the
+        // three to write down here and the other two matter more in practice: a filter the scan
+        // applies itself, and the key filter a hash join hands the scan under its driving side.
+        // The q-error line still reports it, because two hundred to one is worth seeing even when
+        // the reason for it is good.
+        let mut metrics = document();
+        let mut scan = Operator::new(0, 0, "Scan");
+        scan.estimated_rows = Some(1000);
+        scan.estimate_class = Some(Class::Exact);
+        scan.estimate_provenance = Some(Provenance::RowCount);
+        scan.rows_out = 5;
+        let mut limit = Operator::new(1, 0, "Limit");
+        limit.estimated_rows = Some(5);
+        limit.estimate_class = Some(Class::Exact);
+        limit.rows_out = 5;
+        metrics.operators.extend([scan, limit]);
+        assert!(
+            !metrics.warnings().iter().any(|line| line.contains("contradicts")),
+            "{:?}",
+            metrics.warnings()
+        );
+    }
+
+    #[test]
     fn an_estimate_against_no_rows_does_not_divide_by_zero() {
         let mut metrics = document();
         let mut empty = Operator::new(0, 0, "Filter");
         empty.estimated_rows = Some(50);
+        empty.estimate_class = Some(Class::Estimated);
         empty.rows_out = 0;
         metrics.operators.push(empty);
         assert_eq!(

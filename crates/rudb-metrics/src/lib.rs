@@ -34,10 +34,10 @@
 //! and reproducibility is the whole reason the seams exist.
 //!
 //! Warnings are generated rather than written. Anything the engine knows it did badly, which is a
-//! spill, a reference implementation, a row at a time path, an estimate off by an order of
-//! magnitude, time spent blocked or CPU that no operator accounts for, becomes a line in
-//! [`Document::warnings`] from the numbers themselves. Nothing calls a warn function, so nothing
-//! can forget to. The warnings list is what somebody reads first.
+//! spill, a reference implementation, a row at a time path, a number the run contradicts, an
+//! estimate off by an order of magnitude, time spent blocked or CPU that no operator accounts for,
+//! becomes a line in [`Document::warnings`] from the numbers themselves. Nothing calls a warn
+//! function, so nothing can forget to. The warnings list is what somebody reads first.
 //!
 //! # What fills it in
 //!
@@ -81,6 +81,7 @@ mod counters;
 mod document;
 mod driver;
 mod json;
+mod qerror;
 mod report;
 mod warn;
 
@@ -91,6 +92,7 @@ pub use document::{
     Resource, Settings, Strategy, Timing,
 };
 pub use driver::{Driver, Running};
+pub use qerror::{QErrors, Spread, q_error, tenths, word};
 pub use report::Report;
 
 /// The version of the document this crate writes.
