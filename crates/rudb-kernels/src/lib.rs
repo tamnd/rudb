@@ -75,7 +75,7 @@ mod shape;
 mod subscript;
 mod text;
 
-pub use aggregate::{Accumulator, NOWHERE, update_scattered};
+pub use aggregate::{Accumulator, NOWHERE, settle_extremes, update_scattered};
 pub use cast::{cast, cast_in_time_zone, cast_value};
 pub use compare::{
     Comparison, compare, compare_prepared, compare_values, order, order_with_nulls, refine,
