@@ -14,17 +14,13 @@ readme.workspace = true
 
 [dependencies]
 rudb-common.workspace = true
-rudb-vector.workspace = true
-rudb-kernels.workspace = true
 rudb-metrics.workspace = true
 rudb-seam.workspace = true
 rudb-plan.workspace = true
+rudb-bind.workspace = true
 rudb-catalog.workspace = true
 rudb-functions.workspace = true
 rudb-storage.workspace = true
-
-[dev-dependencies]
-rudb-bind.workspace = true
 
 [lints]
 workspace = true

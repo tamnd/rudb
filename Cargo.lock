@@ -244,8 +244,10 @@ dependencies = [
  "rudb-catalog",
  "rudb-common",
  "rudb-functions",
+ "rudb-kernels",
  "rudb-parse",
  "rudb-plan",
+ "rudb-vector",
 ]
 
 [[package]]
@@ -456,12 +458,10 @@ dependencies = [
  "rudb-catalog",
  "rudb-common",
  "rudb-functions",
- "rudb-kernels",
  "rudb-metrics",
  "rudb-plan",
  "rudb-seam",
  "rudb-storage",
- "rudb-vector",
 ]
 
 [[package]]
