@@ -576,22 +576,11 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
             Ok(flat)
         }
         Kind::Fsst => {
-            let (table, used) = SymbolTable::deserialize(reader.rest())?;
-            reader.skip(used)?;
-            let lengths = decode_lengths(reader, count)?;
-            // The compressed total is what the buffer has to hold and it is also the only sane
-            // guess at the decompressed one, so it is checked before it is believed.
-            let compressed_len = sum_of(&lengths)?;
-            if compressed_len > reader.remaining() {
-                return Err(Error::internal(format!(
-                    "a compressed chunk says it holds {compressed_len} bytes and has {}",
-                    reader.remaining()
-                )));
-            }
-            let mut flat = Flat::with_capacity(count, compressed_len);
-            for length in lengths {
-                let compressed = reader.bytes(length)?;
-                table.decompress(compressed, &mut flat.bytes)?;
+            let runs = read_compressed(reader, count)?;
+            let mut flat = Flat::with_capacity(count, runs.payload.len());
+            let mut at = 0;
+            for index in 0..count {
+                runs.run_into(index, &mut at, &mut flat.bytes)?;
                 flat.ends.push(flat.bytes.len());
             }
             Ok(flat)
@@ -651,7 +640,6 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
             let sizes = decode_integers(reader)?;
             let lengths = decode_integers(reader)?;
             let offsets = decode_integers(reader)?;
-            let literals = decode_chunk(reader)?;
             if sizes.len() != count {
                 return Err(Error::internal(format!(
                     "a matched chunk says it holds {count} values and has {} lengths",
@@ -671,7 +659,7 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
             // The copies point back into the bytes already replayed, which is the buffer the values
             // are going into, so the replay is the decode and there is nothing to cut up after it.
             let mut flat = Flat::with_capacity(count, total);
-            lz::rebuild_into(&literals, &lengths, &offsets, &mut flat.bytes)?;
+            replay_literals(reader, &lengths, &offsets, &mut flat.bytes)?;
             if flat.bytes.len() != total {
                 return Err(Error::internal(format!(
                     "a matched chunk rebuilt {} bytes where its lengths add up to {total}",
@@ -686,6 +674,106 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
             Ok(flat)
         }
     }
+}
+
+/// A compressed chunk's symbol table and its runs, left where the file put them.
+///
+/// Reading a compressed chunk into this rather than straight into a buffer is what lets a run be
+/// decompressed where the run belongs. The payload is one slice, the run boundaries come from the
+/// length array, and so asking for a run is a decompress of a subslice and nothing else.
+struct Compressed<'a> {
+    /// The table the runs were compressed against.
+    table: SymbolTable,
+    /// How many compressed bytes each run holds, in order.
+    lengths: Vec<usize>,
+    /// Every run's compressed bytes, end to end.
+    payload: &'a [u8],
+}
+
+impl Compressed<'_> {
+    /// Decompresses run `index` onto the end of `out`, with `at` saying where the run starts.
+    ///
+    /// The caller carries the offset because the runs are asked for in order, and adding a length
+    /// per run is cheaper than the prefix sum the alternative wants.
+    ///
+    /// # Errors
+    ///
+    /// If there is no such run, if it runs off the end of the payload, or if it does not decompress.
+    fn run_into(&self, index: usize, at: &mut usize, out: &mut Vec<u8>) -> Result<()> {
+        let length = *self
+            .lengths
+            .get(index)
+            .ok_or_else(|| Error::internal(format!("run {index} is not in the chunk")))?;
+        let end = at
+            .checked_add(length)
+            .ok_or_else(|| Error::internal("a compressed chunk longer than memory"))?;
+        let run = self
+            .payload
+            .get(*at..end)
+            .ok_or_else(|| Error::internal("a compressed run is past the end of its chunk"))?;
+        *at = end;
+        self.table.decompress(run, out)
+    }
+}
+
+/// Reads a compressed chunk's table, run lengths and payload without decompressing any of it.
+///
+/// The tag and the count have already been read.
+///
+/// # Errors
+///
+/// If the table does not deserialize, if the length array is not `count` long, or if the lengths
+/// add up to more than the chunk has left.
+fn read_compressed<'a>(reader: &mut Reader<'a>, count: usize) -> Result<Compressed<'a>> {
+    let (table, used) = SymbolTable::deserialize(reader.rest())?;
+    reader.skip(used)?;
+    let lengths = decode_lengths(reader, count)?;
+    // The compressed total is what the payload holds and it is also the only sane guess at the
+    // decompressed one, so it is checked before it is believed.
+    let compressed_len = sum_of(&lengths)?;
+    if compressed_len > reader.remaining() {
+        return Err(Error::internal(format!(
+            "a compressed chunk says it holds {compressed_len} bytes and has {}",
+            reader.remaining()
+        )));
+    }
+    let payload = reader.bytes(compressed_len)?;
+    Ok(Compressed { table, lengths, payload })
+}
+
+/// Replays a matched chunk's tokens, reading the literal runs out of the nested chunk holding them.
+///
+/// The nested chunk is decoded into a buffer and copied out of, the way anything nested is, unless
+/// it is compressed. On the ClickBench `URL` column it always is, and there a block of a thousand
+/// values holds about eight thousand seven hundred literal runs, so that buffer is the whole
+/// block's bytes and copying the runs out of it writes every one of them a second time.
+/// Decompressing a run straight to where it belongs skips the buffer, the length array that would
+/// cut it up, and that second pass over the bytes.
+///
+/// # Errors
+///
+/// Whatever reading the literals or replaying the tokens reports.
+fn replay_literals(
+    reader: &mut Reader<'_>,
+    lengths: &[i64],
+    offsets: &[i64],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if reader.rest().first() == Some(&Kind::Fsst.tag()) {
+        reader.u8()?;
+        let runs = reader.u32()? as usize;
+        let compressed = read_compressed(reader, runs)?;
+        let mut at = 0;
+        return lz::replay(
+            runs,
+            |index, into| compressed.run_into(index, &mut at, into),
+            lengths,
+            offsets,
+            out,
+        );
+    }
+    let literals = decode_chunk(reader)?;
+    lz::rebuild_into(&literals, lengths, offsets, out)
 }
 
 fn describe_chunk(reader: &mut Reader<'_>) -> Result<String> {
@@ -1086,6 +1174,20 @@ mod tests {
 
     fn raw_size(values: &[Vec<u8>]) -> usize {
         values.iter().map(Vec::len).sum::<usize>() + values.len() * 4
+    }
+
+    #[test]
+    fn a_matched_chunk_replays_literals_whether_or_not_they_are_compressed() {
+        // The literals of a matched chunk are a chunk of their own, and when that chunk is
+        // compressed the replay decompresses each run straight into the output instead of into a
+        // buffer it then copies out of. Both columns here are checked value for value by
+        // round_trip, so what is left is to show that one of them takes the fused path and the
+        // other takes the one that decodes the literals first, and that the two agree.
+        let compressed = describe(&round_trip(&keyed(urls(20_000)))).unwrap();
+        assert!(compressed.starts_with("LZ(") && compressed.contains(", FSST["), "{compressed}");
+
+        let buffered = describe(&round_trip(&keyed(urls(300)))).unwrap();
+        assert!(buffered.starts_with("LZ(") && buffered.contains(", PLAIN("), "{buffered}");
     }
 
     #[test]
