@@ -52,12 +52,7 @@ impl Build {
     /// columns, and a join against an empty side still has to produce the right number of null
     /// columns for the driving rows a `LEFT` join keeps.
     ///
-    /// A column at a time is also a thread at a time. One column's assembly reads one column of
-    /// each chunk and writes one vector, and two of them share nothing, so the lease the calling
-    /// pipeline already holds gets a column each. What that does not get is more threads than the
-    /// side has columns, which is the limit worth naming: splitting a column across threads would
-    /// mean an arena per piece and then a join of the arenas, and the copy that would cost is the
-    /// one #947 took out.
+    /// A column at a time is also a thread at a time. See [`laid_out`], which is where that is.
     ///
     /// # Errors
     ///
@@ -74,20 +69,7 @@ impl Build {
                 "a join cannot gather {rows} rows, which is more than a position can name"
             )));
         }
-        let one = |index: usize| -> Result<Vector> {
-            let mut assembly = Assembly::new(types[index].clone(), rows)?;
-            let mut at: Vec<u32> = Vec::new();
-            let mut base: u32 = 0;
-            for chunk in chunks {
-                let len = u32::try_from(chunk.len()).unwrap_or(PAD);
-                at.clear();
-                at.extend(base..base + len);
-                assembly.place(&at, chunk.column(index)?)?;
-                base += len;
-            }
-            assembly.finish()
-        };
-        let columns = in_parallel(threads, types.len(), threads.degree(), "gathered column", one)?;
+        let columns = laid_out(types, chunks, threads)?;
         Ok(Self { columns, rows })
     }
 
@@ -129,6 +111,44 @@ impl Build {
     pub(crate) fn row(&self, at: u32) -> Vec<Value> {
         self.columns.iter().map(|column| column.value_at(at as usize)).collect()
     }
+}
+
+/// A list of chunks laid end to end, one vector per column, a column per thread.
+///
+/// Both of this operator's two runs over the gathered side want it: the pairs the join answers with
+/// are gathered out of it, and the table that finds the pairs is built over the key columns in the
+/// same shape. A partition of that build reads rows from anywhere in the side, so the keys have to
+/// be one run rather than a list of chunks before it can start.
+///
+/// A column at a time is also a thread at a time. One column's assembly reads one column of each
+/// chunk and writes one vector, and two of them share nothing, so the lease the calling pipeline
+/// already holds gets a column each. What that does not get is more threads than there are columns,
+/// which is the limit worth naming: splitting a column across threads would mean an arena per piece
+/// and then a join of the arenas, and the copy that would cost is the one #947 took out.
+///
+/// # Errors
+///
+/// Whatever the assembly says when a column is of a type it has no layout for.
+pub(crate) fn laid_out(
+    types: &[LogicalType],
+    chunks: &[Chunk],
+    threads: &Lease<'_>,
+) -> Result<Vec<Vector>> {
+    let rows: usize = chunks.iter().map(Chunk::len).sum();
+    let one = |index: usize| -> Result<Vector> {
+        let mut assembly = Assembly::new(types[index].clone(), rows)?;
+        let mut at: Vec<u32> = Vec::new();
+        let mut base: u32 = 0;
+        for chunk in chunks {
+            let len = u32::try_from(chunk.len()).unwrap_or(PAD);
+            at.clear();
+            at.extend(base..base + len);
+            assembly.place(&at, chunk.column(index)?)?;
+            base += len;
+        }
+        assembly.finish()
+    };
+    in_parallel(threads, types.len(), threads.degree(), "gathered column", one)
 }
 
 #[cfg(test)]

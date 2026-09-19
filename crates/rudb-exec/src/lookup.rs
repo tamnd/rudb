@@ -20,6 +20,17 @@
 //! different order, and makes a failing test a diff rather than an investigation. A chain that is
 //! pushed onto at the front comes out backwards, so the build keeps a tail per slot and appends.
 //!
+//! # Partitions
+//!
+//! One table cannot be filled from several threads, because two rows of one key have to reach
+//! their chain in the order they arrived. A side split by the top bits of its hash is several
+//! tables that share nothing, because a key lands in exactly one of them, and that is how this is
+//! built on more than one thread. See [`Lookup::build`]. The split is on the top bits and the
+//! bucket inside a partition is the bottom ones, so the two never say the same thing, and the
+//! order a chain comes out in does not change: a partition reads the side from the first row to
+//! the last, so its chains are in the order the side holds them whatever the other partitions are
+//! doing beside it.
+//!
 //! # Nulls
 //!
 //! `NULL = NULL` is null and not true, so a row whose key holds a null in a column the join
@@ -28,13 +39,25 @@
 //! value and its nulls are stored and compared, which the table already does, because a group by
 //! puts every null in one group and that is the same question.
 
-use rudb_common::{Error, LogicalType, Result};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use rudb_common::{Cancel, Error, LogicalType, Result};
+use rudb_pipeline::Lease;
 use rudb_vector::{Form, Vector};
 
-use crate::table::{Across, BATCH, Probe, Table, Walk};
+use crate::pairs::in_parallel;
+use crate::table::{BATCH, Probe, Table, Walk};
 
 /// The end of a chain, and the row a slot with nothing in it points at.
 const NONE: u32 = u32::MAX;
+
+/// Below this many rows a side is built on one thread.
+///
+/// Partitioning costs a pass over the hashes per partition and a table per partition, and on a side
+/// of a few thousand rows that is more than the build. The number is where the two meet on the
+/// shapes in TPC-H rather than anything deeper: q21's two large joins are millions of rows and
+/// every join against `nation` or `region` is tens.
+const SPLIT: usize = 64 * 1024;
 
 /// What a probe of a row whose key is not in the table leaves behind.
 ///
@@ -42,51 +65,103 @@ const NONE: u32 = u32::MAX;
 /// survive being written into the same run.
 pub(crate) const MISS: usize = usize::MAX;
 
+/// One partition of the table, built by one thread and probed by whoever lands in it.
+#[derive(Debug)]
+struct Part {
+    /// One slot per distinct key of this partition.
+    table: Table,
+    /// What this partition's slots are numbered from once the partitions are laid end to end, so
+    /// that a slot handed out by a probe names a key of the whole side rather than of a partition.
+    base: usize,
+}
+
 /// The gathered side's rows, by the values the key expressions produce from them.
 #[derive(Debug, Default)]
 pub(crate) struct Lookup {
-    /// One slot per distinct key. Built on the first batch, because that is where the types of the
-    /// key columns are, and left empty by a gathered side with no rows in it at all.
-    table: Option<Table>,
-    /// The first gathered row of each distinct key, by slot.
+    /// The partitions, by the top bits of the hash. Empty for a side with nothing keyed in it.
+    parts: Vec<Part>,
+    /// How many of the hash's top bits name the partition. Zero when there is only one.
+    bits: u32,
+    /// The first gathered row of each distinct key, by slot, partitions laid end to end.
     head: Vec<u32>,
-    /// The last one, by slot, which is what lets a row be appended rather than pushed on the front.
-    /// Dropped by [`Self::seal`] when the build is over, because a probe never reads it.
-    tail: Vec<u32>,
     /// The next gathered row with the same key, by gathered row, [`NONE`] at the end of a chain.
-    next: Vec<u32>,
+    ///
+    /// Atomic because the partitions write it at the same time, and free because they never write
+    /// the same entry: a row belongs to the partition its hash names and to no other.
+    next: Vec<AtomicU32>,
     /// How many gathered rows are in the table, which is not how many went past it: a row whose key
     /// holds a rejected null is neither stored nor counted.
     kept: usize,
-    /// The hash per row of the batch being added, kept between batches.
-    hashes: Vec<u64>,
-    /// The slot per row of the batch being added, same.
-    slots: Vec<usize>,
-    /// Whether each row of the batch has a key at all, same.
-    keyed: Vec<bool>,
-    /// The buffers a batched probe walks with.
-    walk: Walk,
 }
 
 impl Lookup {
-    /// An empty table over a gathered side of `rows` rows.
+    /// The table over a gathered side whose key columns are `keys`, built on the threads in hand.
     ///
-    /// The row count is taken up front because the chain is indexed by gathered row and is
-    /// allocated once rather than grown, and because it is where the one limit on this gets
-    /// checked.
+    /// The keys are one run per column rather than a list of chunks, because a partition's rows are
+    /// scattered through the side and a thread building one has to reach any of them. See
+    /// [`laid_out`](crate::side::laid_out), which is what lays them out.
+    ///
+    /// # What a partition is for
+    ///
+    /// Every instance of the pipeline this table belongs to probes it, and until #952 whichever
+    /// instance reached it first built the whole thing while the others slept. #952 moved the build
+    /// out in front of the instances so that the threads are free during it, and this is what
+    /// spends them. Two rows of one key have to reach their chain in the order they arrived, so one
+    /// table cannot be filled from several threads, but a side split by the top bits of its hash is
+    /// several tables that share nothing: a key lands in exactly one of them, so no two threads
+    /// ever look at one bucket, one stored key or one chain.
+    ///
+    /// The top bits rather than the bottom ones because the bottom ones are the bucket number
+    /// inside a partition's own table. Partitioning on those would leave every row of a partition
+    /// agreeing on the low bits of its bucket, which is one bucket in `parts` used and the rest
+    /// empty.
+    ///
+    /// A partition finds its rows by reading the whole run of hashes and keeping the ones that are
+    /// its own. That is a pass per partition over eight bytes a row, which sounds like the wrong
+    /// shape and is not: it is sequential, it prefetches, and it is nothing next to the probe and
+    /// the insert it saves, which walk a table too large for any cache.
     ///
     /// # Errors
     ///
     /// [`rudb_common::ErrorCode::OutOfMemory`] past [`NONE`] gathered rows, which is the row a
-    /// chain uses to say it has ended.
-    pub(crate) fn new(rows: usize) -> Result<Self> {
+    /// chain uses to say it has ended, and whatever storing a key raises. Cancellation is checked a
+    /// batch at a time inside each partition.
+    pub(crate) fn build(
+        keys: &[Vector],
+        rows: usize,
+        nulls: &[bool],
+        threads: &Lease<'_>,
+        cancel: &Cancel,
+    ) -> Result<Self> {
         if rows >= NONE as usize {
-            return Err(Error::out_of_memory(format!(
-                "a hash join cannot gather more than {} rows on one side",
-                NONE - 1
-            )));
+            return Err(too_many_rows());
         }
-        Ok(Self { next: vec![NONE; rows], ..Self::default() })
+        if rows == 0 || keys.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut hashes = Vec::new();
+        crate::table::hash(keys, rows, &mut hashes, crate::table::Across::TwoInputs);
+        let mut keyed = Vec::new();
+        which_are_keyed(keys, rows, nulls, &mut keyed);
+
+        let bits = split_into(rows, threads.degree());
+        let count = 1usize << bits;
+        let next: Vec<AtomicU32> = (0..rows).map(|_| AtomicU32::new(NONE)).collect();
+        let types: Vec<LogicalType> = keys.iter().map(|key| key.logical_type().clone()).collect();
+        let one = |part: usize| -> Result<(Table, Vec<u32>, usize)> {
+            fill(part, bits, &types, keys, &hashes, &keyed, &next, cancel)
+        };
+        let filled = in_parallel(threads, count, threads.degree(), "join table partition", one)?;
+
+        let mut parts = Vec::with_capacity(count);
+        let mut head = Vec::new();
+        let mut kept = 0;
+        for (table, mine, held) in filled {
+            parts.push(Part { base: head.len(), table });
+            head.extend(mine);
+            kept += held;
+        }
+        Ok(Self { parts, bits, head, next, kept })
     }
 
     /// Whether there is anything at all to look up.
@@ -101,112 +176,11 @@ impl Lookup {
 
     /// What this has taken from the allocator, capacity rather than length throughout.
     pub(crate) fn footprint(&self) -> u64 {
-        let table = self.table.as_ref().map_or(0, |table| table.footprint() + table.owned());
+        let tables: u64 =
+            self.parts.iter().map(|part| part.table.footprint() + part.table.owned()).sum();
         let chain =
-            (self.head.capacity() + self.tail.capacity() + self.next.capacity()) * size_of::<u32>();
-        let batch = self.hashes.capacity() * size_of::<u64>()
-            + self.slots.capacity() * size_of::<usize>()
-            + self.keyed.capacity();
-        table + u64::try_from(chain + batch).unwrap_or(u64::MAX)
-    }
-
-    /// Adds one batch of the gathered side, whose keys are `keys` and whose first row is `base`.
-    ///
-    /// A batch rather than a row for the reason the whole file exists. The hash is one pass per key
-    /// column with the type matched on once, the probe walks [`BATCH`] rows together so that the
-    /// misses on a table larger than the cache are all outstanding at once, and the comparison that
-    /// settles a bucket is one pass per column as well.
-    ///
-    /// `nulls` says, per key column, whether a null in it is a value to be stored rather than a row
-    /// to be left out. See the module docs.
-    ///
-    /// # Errors
-    ///
-    /// [`rudb_common::ErrorCode::OutOfMemory`] when there are more distinct keys than the table can
-    /// hold, and whatever building a stored key raises.
-    pub(crate) fn add(
-        &mut self,
-        keys: &[Vector],
-        rows: usize,
-        base: usize,
-        nulls: &[bool],
-    ) -> Result<()> {
-        if rows == 0 {
-            return Ok(());
-        }
-        let Self { table, head, tail, next, kept, hashes, slots, keyed, walk } = self;
-        let table = table.get_or_insert_with(|| {
-            let types: Vec<LogicalType> =
-                keys.iter().map(|key| key.logical_type().clone()).collect();
-            Table::new(&types)
-        });
-        // Two inputs, always. This side's dictionary and the driving side's are two dictionaries
-        // even when the two sides are two scans of one table, so the codes cannot stand in for the
-        // values. [`Across`] has the argument.
-        crate::table::hash(keys, rows, hashes, Across::TwoInputs);
-        which_are_keyed(keys, rows, nulls, keyed);
-        slots.clear();
-        slots.resize(rows, MISS);
-        let mut from = 0;
-        while from < rows {
-            let upto = (from + BATCH).min(rows);
-            table.probe_run(hashes, keys, from, upto, slots, walk);
-            // The rows the batch could not settle, in row order, which is the order they have to go
-            // in: two rows of one batch can be the first two rows of one key, and the second only
-            // finds the first if the first went in before it was asked.
-            for &row in walk.pending() {
-                if !keyed[row] {
-                    continue;
-                }
-                match table.probe(hashes[row], keys, row) {
-                    Probe::Found(slot) => slots[row] = slot,
-                    Probe::Vacant(bucket) => {
-                        let slot = table.insert(bucket, hashes[row], keys, row)?;
-                        debug_assert_eq!(
-                            slot,
-                            head.len(),
-                            "a slot is the number of keys before it"
-                        );
-                        head.push(NONE);
-                        tail.push(NONE);
-                        slots[row] = slot;
-                    }
-                }
-            }
-            // In row order and after the whole batch has a slot, because the batched pass fills the
-            // rows that were already keys and the loop above fills the rest, and a chain that was
-            // appended to in that order would hold a key's rows in neither the order they arrived
-            // in nor any other one.
-            for row in from..upto {
-                let slot = slots[row];
-                if slot == MISS || !keyed[row] {
-                    continue;
-                }
-                let at = u32::try_from(base + row).map_err(|_| too_many_rows())?;
-                if tail[slot] == NONE {
-                    head[slot] = at;
-                } else {
-                    next[tail[slot] as usize] = at;
-                }
-                tail[slot] = at;
-                *kept += 1;
-            }
-            from = upto;
-        }
-        Ok(())
-    }
-
-    /// Gives back what only the build needed, now that it is over.
-    ///
-    /// The tail per slot is how a chain is appended to and nothing reads it afterwards, so a join
-    /// over a side with ten million distinct keys holds forty megabytes of it for the length of the
-    /// probe for no reason at all. The batch buffers go the same way and for the same reason.
-    pub(crate) fn seal(&mut self) {
-        self.tail = Vec::new();
-        self.hashes = Vec::new();
-        self.slots = Vec::new();
-        self.keyed = Vec::new();
-        self.walk = Walk::default();
+            self.head.capacity() * size_of::<u32>() + self.next.capacity() * size_of::<AtomicU32>();
+        tables + u64::try_from(chain).unwrap_or(u64::MAX)
     }
 
     /// The slot each driving row's key is in, [`MISS`] where it is in none.
@@ -215,6 +189,10 @@ impl Lookup {
     /// hash is a pass per key column and the probe is a batch at a time, so a chunk of two thousand
     /// rows costs two thousand rows of arithmetic and one set of outstanding cache misses per batch
     /// rather than three dependent misses per row.
+    ///
+    /// With more than one partition the chunk is dealt into them first, because a batch has to be
+    /// probed against one table and a driving row's partition is whatever its hash says. The deal
+    /// is a pass over the hashes and the batches that come out of it are the same size as before.
     ///
     /// The scratch buffers are the caller's because the caller is one instance of the probe and
     /// this table is shared by all of them.
@@ -228,17 +206,27 @@ impl Lookup {
     ) {
         into.clear();
         into.resize(rows, MISS);
-        let Some(table) = self.table.as_ref() else { return };
-        if rows == 0 {
+        if rows == 0 || self.parts.is_empty() {
             return;
         }
-        crate::table::hash(keys, rows, &mut scratch.hashes, Across::TwoInputs);
+        crate::table::hash(keys, rows, &mut scratch.hashes, crate::table::Across::TwoInputs);
         which_are_keyed(keys, rows, nulls, &mut scratch.keyed);
-        let mut from = 0;
-        while from < rows {
-            let upto = (from + BATCH).min(rows);
-            table.probe_run(&scratch.hashes, keys, from, upto, into, &mut scratch.walk);
-            from = upto;
+        if self.parts.len() == 1 {
+            let mut from = 0;
+            while from < rows {
+                let upto = (from + BATCH).min(rows);
+                self.parts[0].table.probe_run(
+                    &scratch.hashes,
+                    keys,
+                    from,
+                    upto,
+                    into,
+                    &mut scratch.walk,
+                );
+                from = upto;
+            }
+        } else {
+            self.deal(keys, rows, scratch, into);
         }
         // A row whose key holds a rejected null matches nothing, and the table was never told about
         // that rule. It would answer with a miss anyway, because no key holding such a null was
@@ -248,6 +236,41 @@ impl Lookup {
         for (row, &keyed) in scratch.keyed.iter().enumerate().take(rows) {
             if !keyed {
                 into[row] = MISS;
+            }
+        }
+    }
+
+    /// The same, for a table in partitions, which has to know which one before it can ask.
+    fn deal(&self, keys: &[Vector], rows: usize, scratch: &mut Scratch, into: &mut [usize]) {
+        scratch.by_part.resize_with(self.parts.len(), Vec::new);
+        for held in &mut scratch.by_part {
+            held.clear();
+        }
+        for row in 0..rows {
+            if scratch.keyed[row] {
+                scratch.by_part[part_of(scratch.hashes[row], self.bits)].push(row);
+            }
+        }
+        for (part, mine) in self.parts.iter().zip(&scratch.by_part) {
+            let mut from = 0;
+            while from < mine.len() {
+                let upto = (from + BATCH).min(mine.len());
+                let batch = &mine[from..upto];
+                scratch.found.clear();
+                scratch.found.resize(batch.len(), MISS);
+                part.table.probe_these(
+                    &scratch.hashes,
+                    keys,
+                    batch,
+                    &mut scratch.found,
+                    &mut scratch.walk,
+                );
+                for (&row, &slot) in batch.iter().zip(&scratch.found) {
+                    if slot != MISS {
+                        into[row] = part.base + slot;
+                    }
+                }
+                from = upto;
             }
         }
     }
@@ -268,9 +291,100 @@ impl Lookup {
         let mut at = self.head[slot];
         while at != NONE {
             into.push(at);
-            at = self.next[at as usize];
+            at = self.next[at as usize].load(Ordering::Relaxed);
         }
     }
+}
+
+/// One partition of the build: the rows whose hash names it, in the order the side holds them.
+///
+/// Everything here belongs to this partition alone except `next`, and the entries of that it writes
+/// are the rows it owns, so nothing it touches is touched by another thread.
+#[allow(clippy::too_many_arguments)]
+fn fill(
+    part: usize,
+    bits: u32,
+    types: &[LogicalType],
+    keys: &[Vector],
+    hashes: &[u64],
+    keyed: &[bool],
+    next: &[AtomicU32],
+    cancel: &Cancel,
+) -> Result<(Table, Vec<u32>, usize)> {
+    let mut mine: Vec<usize> = Vec::new();
+    for (row, &hash) in hashes.iter().enumerate() {
+        if keyed[row] && part_of(hash, bits) == part {
+            mine.push(row);
+        }
+    }
+    let mut table = Table::new(types);
+    let mut head: Vec<u32> = Vec::new();
+    let mut tail: Vec<u32> = Vec::new();
+    let mut found: Vec<usize> = Vec::new();
+    let mut walk = Walk::default();
+    let mut kept = 0;
+    let mut from = 0;
+    while from < mine.len() {
+        // Once per batch rather than once per row. A build over a side nobody bounded is the one
+        // part of this operator that can run long without producing anything.
+        cancel.check()?;
+        let upto = (from + BATCH).min(mine.len());
+        let batch = &mine[from..upto];
+        found.clear();
+        found.resize(batch.len(), MISS);
+        table.probe_these(hashes, keys, batch, &mut found, &mut walk);
+        // The rows the batch could not settle, in row order, which is the order they have to go in:
+        // two rows of one batch can be the first two rows of one key, and the second only finds the
+        // first if the first went in before it was asked.
+        for &place in walk.pending() {
+            let row = batch[place];
+            match table.probe(hashes[row], keys, row) {
+                Probe::Found(slot) => found[place] = slot,
+                Probe::Vacant(bucket) => {
+                    let slot = table.insert(bucket, hashes[row], keys, row)?;
+                    debug_assert_eq!(slot, head.len(), "a slot is the number of keys before it");
+                    head.push(NONE);
+                    tail.push(NONE);
+                    found[place] = slot;
+                }
+            }
+        }
+        // In row order and after the whole batch has a slot, because the batched pass fills the
+        // rows that were already keys and the loop above fills the rest, and a chain that was
+        // appended to in that order would hold a key's rows in neither the order they arrived in
+        // nor any other one.
+        for (&row, &slot) in batch.iter().zip(&found) {
+            let at = u32::try_from(row).map_err(|_| too_many_rows())?;
+            if tail[slot] == NONE {
+                head[slot] = at;
+            } else {
+                next[tail[slot] as usize].store(at, Ordering::Relaxed);
+            }
+            tail[slot] = at;
+            kept += 1;
+        }
+        from = upto;
+    }
+    Ok((table, head, kept))
+}
+
+/// How many of a hash's top bits name a partition, which is none below [`SPLIT`] rows.
+///
+/// A power of two of them, and no more than the threads there are to run them on, because a
+/// partition nobody is free to take is a pass over the hashes that bought nothing.
+fn split_into(rows: usize, threads: usize) -> u32 {
+    if rows < SPLIT || threads <= 1 {
+        return 0;
+    }
+    threads.next_power_of_two().trailing_zeros()
+}
+
+/// Which partition a hash belongs to.
+fn part_of(hash: u64, bits: u32) -> usize {
+    if bits == 0 {
+        return 0;
+    }
+    (hash >> (64 - bits)) as usize
 }
 
 /// The buffers one instance of a probe walks a driving chunk with.
@@ -281,6 +395,10 @@ pub(crate) struct Scratch {
     hashes: Vec<u64>,
     keyed: Vec<bool>,
     walk: Walk,
+    /// The chunk's rows dealt into the partitions they belong to, one list per partition.
+    by_part: Vec<Vec<usize>>,
+    /// What one batch of one of those lists found, by place in the batch.
+    found: Vec<usize>,
 }
 
 /// Which rows have a key at all, which is every row until a rejected null says otherwise.
@@ -332,14 +450,20 @@ fn column(values: &[Option<i32>]) -> Vector {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lookup, MISS, Scratch, column};
+    use rudb_common::Cancel;
+    use rudb_pipeline::{Lease, Pool};
 
-    /// Builds a lookup over one integer key column, one batch, nulls rejected.
+    use super::{Lookup, MISS, SPLIT, Scratch, column, part_of, split_into};
+
+    /// Builds a lookup over one integer key column on one thread, nulls rejected.
     fn built(values: &[Option<i32>]) -> Lookup {
-        let mut lookup = Lookup::new(values.len()).expect("a lookup");
-        lookup.add(&[column(values)], values.len(), 0, &[false]).expect("a build");
-        lookup.seal();
-        lookup
+        built_by(values, &[false], &Lease::alone())
+    }
+
+    /// The same, saying what a null means and how many threads may work on it.
+    fn built_by(values: &[Option<i32>], nulls: &[bool], threads: &Lease<'_>) -> Lookup {
+        Lookup::build(&[column(values)], values.len(), nulls, threads, &Cancel::new())
+            .expect("a build")
     }
 
     /// What one driving row of the same shape finds, in the order it finds it.
@@ -414,10 +538,7 @@ mod tests {
     /// able to hold it because a group by puts every null in one group.
     #[test]
     fn a_null_a_join_calls_a_value_is_stored_and_found() {
-        let values = [Some(1), None, None];
-        let mut lookup = Lookup::new(values.len()).expect("a lookup");
-        lookup.add(&[column(&values)], values.len(), 0, &[true]).expect("a build");
-        lookup.seal();
+        let lookup = built_by(&[Some(1), None, None], &[true], &Lease::alone());
         let mut scratch = Scratch::default();
         let mut slots = Vec::new();
         let driving = [None];
@@ -429,22 +550,63 @@ mod tests {
 
     #[test]
     fn a_gathered_side_with_nothing_keyed_in_it_is_empty() {
-        assert!(Lookup::new(0).expect("a lookup").is_empty());
+        let nothing = Lookup::build(&[], 0, &[false], &Lease::alone(), &Cancel::new())
+            .expect("no columns at all");
+        assert!(nothing.is_empty());
         assert!(built(&[None, None]).is_empty(), "every row's key was a rejected null");
         assert!(!built(&[Some(1)]).is_empty());
     }
 
-    /// The build holds a tail per slot and the probe does not, and a join over ten million distinct
-    /// keys would otherwise carry forty megabytes of it for the length of the probe.
+    /// The split is on the top bits of the hash and the bucket a key lands in is the low bits, so
+    /// a partition's own table has to see the whole spread of buckets. Splitting the other way
+    /// round would leave every row of a partition agreeing on the low bits of its bucket, which is
+    /// one chain per partition and a table that is a list.
     #[test]
-    fn sealing_gives_back_what_only_the_build_needed() {
-        let mut lookup = Lookup::new(4).expect("a lookup");
-        lookup
-            .add(&[column(&[Some(1), Some(2), Some(1), Some(3)])], 4, 0, &[false])
-            .expect("built");
-        let before = lookup.footprint();
-        lookup.seal();
-        assert!(lookup.footprint() < before, "{} is not less than {before}", lookup.footprint());
-        assert_eq!(found(&lookup, &[Some(1)]), vec![vec![0, 2]], "and it still answers");
+    fn a_partition_is_named_by_the_top_bits_and_a_bucket_by_the_low_ones() {
+        assert_eq!(part_of(0, 2), 0);
+        assert_eq!(part_of(u64::MAX, 2), 3);
+        assert_eq!(part_of(1 << 62, 2), 1);
+        assert_eq!(part_of(u64::MAX, 0), 0, "one partition holds everything");
+        assert_eq!(part_of(0xFFFF_FFFF, 2), 0, "the low bits say nothing about which partition");
+    }
+
+    /// A side small enough that the dealing would cost more than the building saves stays on one
+    /// thread, and so does a lease with nothing to spend.
+    #[test]
+    fn a_small_side_is_not_split_at_all() {
+        assert_eq!(split_into(1_000, 8), 0);
+        assert_eq!(split_into(SPLIT - 1, 8), 0);
+        assert_eq!(split_into(SPLIT, 1), 0);
+        assert_eq!(split_into(SPLIT, 8), 3);
+        assert_eq!(split_into(SPLIT, 6), 3, "rounded up to a power of two");
+    }
+
+    /// The one that matters, over enough rows to be split for real. Every key's rows still come out
+    /// in the order the side holds them, which is the thing several threads filling several tables
+    /// could break and the thing a failing join test would show as a reordered diff.
+    #[test]
+    fn a_side_built_in_partitions_answers_the_same_as_one_built_whole() {
+        let values: Vec<Option<i32>> = (0..SPLIT as i32 + 1_000).map(|row| Some(row % 7)).collect();
+        let pool = Pool::new(4);
+        let lookup = built_by(&values, &[false], &pool.lease(4));
+        assert!(lookup.parts.len() > 1, "a side this long is split");
+        let mut scratch = Scratch::default();
+        let mut slots = Vec::new();
+        let driving: Vec<Option<i32>> = (0..9).map(Some).collect();
+        lookup.slots(&[column(&driving)], driving.len(), &[false], &mut scratch, &mut slots);
+        let mut chain = Vec::new();
+        for (key, &slot) in slots.iter().enumerate() {
+            let key = i32::try_from(key).expect("nine of them");
+            let wanted: Vec<u32> = (0..values.len())
+                .filter(|&row| values[row] == Some(key))
+                .map(|row| u32::try_from(row).expect("a side this long"))
+                .collect();
+            if wanted.is_empty() {
+                assert_eq!(slot, MISS, "key {key} is not in the side");
+                continue;
+            }
+            lookup.matches(slot, &mut chain);
+            assert_eq!(chain, wanted, "key {key} came out in the wrong order");
+        }
     }
 }
