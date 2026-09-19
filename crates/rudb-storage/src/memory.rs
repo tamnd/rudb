@@ -138,6 +138,15 @@ impl MemoryTable {
         self.zones.get(index).is_some_and(|zone| zone.skips(probes))
     }
 
+    /// Whether the probes keep every row of chunk `index`.
+    ///
+    /// A chunk with no zone is a chunk that gets compared, for the same reason it is a chunk that
+    /// gets read: saying nothing about a chunk has to mean doing the work on it.
+    #[must_use]
+    pub fn certain(&self, index: usize, probes: &[Probe]) -> bool {
+        self.zones.get(index).is_some_and(|zone| zone.certain(probes))
+    }
+
     /// How many rows of one column are null, added up over the chunks.
     ///
     /// Always an answer, because a zone's null count is the one number in it that never comes from a

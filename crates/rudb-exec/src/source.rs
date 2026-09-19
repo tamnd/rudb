@@ -21,14 +21,18 @@ use rudb_functions::{
 use rudb_kernels::cast;
 use rudb_metrics::Counters;
 use rudb_parquet::{Bound, Op, Reader, Test, skips};
-use rudb_pipeline::{Morsel, Progress, Source};
+use rudb_pipeline::{Compaction, Gauge, Morsel, Progress, Source, narrow};
 use rudb_plan::{ExprRef, Plan, Slice};
+use rudb_seam::{Context, SeamId, Settings};
 use rudb_storage::Probe;
 use rudb_vector::{Chunk, Data, Selection, VECTOR_SIZE, Vector};
 
 use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
+use crate::prepared::{Prepared, Scratch};
+use crate::register::compaction;
 use crate::schema::Schema;
 use crate::sideways::Sideways;
+use crate::stream::later_passes;
 use crate::table::{Across, hash};
 
 /// One morsel per position, handed to whoever asks first.
@@ -262,6 +266,10 @@ pub(crate) struct Scan<'a> {
     /// A morsel that is a whole stripe fixes it at the source. Each worker owns the page it reads,
     /// nobody loses a race, and sixteen workers put sixteen quarter megabyte reads in flight.
     stripes: Vec<Range<usize>>,
+    /// The filter this scan applies to the rows it read, when the builder gave it one.
+    pushed: Option<Pushed>,
+    /// How many chunks the zone maps proved the filter keeps whole, so the comparison never ran.
+    waved: AtomicUsize,
     /// The runs of parts a morsel covers, used instead of `chunks` once it is there.
     ///
     /// Empty until [`Source::morsels`] fills it, which is the one moment the scan knows how many
@@ -323,6 +331,141 @@ fn onto(columns: &[Option<usize>], tests: Vec<(usize, Op, Bound)>) -> Vec<Probe>
         .collect()
 }
 
+/// A filter a builder is handing to a scan to apply, rather than one it means to run above it.
+///
+/// This is what DuckDB calls the table filters of a scan, and the reason to want it is the middle of
+/// the three answers a zone map can give. Pruning uses one end of it: the chunk holds nothing the
+/// filter wants, so it is never read. The other end is the chunk that holds nothing the filter would
+/// throw away, and only an operator that has both the zone and the predicate in front of it can act
+/// on that. A filter above the scan has the predicate and not the zone, so it compares every row of
+/// every chunk whatever the statistics already proved.
+///
+/// It is offered rather than pushed, because only some predicates can go. See
+/// [`rudb_opt::bounds::all_of`]: every conjunct has to read as a comparison of one of this scan's
+/// columns against a constant, and one that does not leaves the whole filter where it was. A residual
+/// split, where the readable conjuncts go down and the rest stay above, would be worth more and needs
+/// the plan rewritten rather than read, which is a pass in `rudb-opt` and not a branch here.
+#[derive(Debug)]
+pub(crate) struct Pushdown {
+    /// The filter node this came from, which is still in the plan and is what the compaction gain
+    /// function counts the passes above.
+    pub(crate) node: rudb_plan::NodeRef,
+    pub(crate) predicate: ExprRef,
+    /// The conjuncts, read as tests, in the numbering of what the scan produces.
+    pub(crate) tests: Vec<(usize, Op, Bound)>,
+}
+
+/// Everything the builder hands a scan that narrows what it reads.
+///
+/// Three things rather than one because they arrive from three places and are used at three moments.
+/// The pruning tests come from the predicate and are asked of a zone before a chunk is read. The
+/// pushed filter is that same predicate again, kept whole, and is applied to the chunks that were
+/// read. The sideways filter comes from a join that has already built its side and is asked while the
+/// scan is running. They are gathered into one argument because a scan takes all three and a
+/// constructor of nine parameters is a constructor nobody reads.
+#[derive(Debug, Default)]
+pub(crate) struct Filters<'a> {
+    /// Tests a zone map can rule a chunk out with, which is as many of the conjuncts as could be
+    /// read. One that is missing costs a chunk that gets read and never costs a row.
+    pub(crate) pruning: Vec<(usize, Op, Bound)>,
+    /// The whole predicate, for the scan to apply, or `None` when a filter above it is applying it.
+    pub(crate) pushed: Option<Pushdown>,
+    /// What a join built and handed back down after the plan was already running.
+    pub(crate) sideways: Option<Arc<Sideways<'a>>>,
+}
+
+/// The filter a scan applies itself, once it has been prepared against the scan's own columns.
+#[derive(Debug)]
+struct Pushed {
+    predicate: Prepared,
+    compaction: &'static dyn Compaction,
+    passes: u32,
+    /// The same conjuncts as probes, or `None` when one of them could not be moved onto the table's
+    /// numbering.
+    ///
+    /// `None` rather than a shorter list, because a list with one conjunct missing from it would
+    /// prove the rows pass a filter that is not the one being applied, and [`Zone::certain`] over an
+    /// empty list is vacuously true. Wrong by omission is the one failure mode worth a type here. It
+    /// costs the comparison on every chunk, which is what the engine did before this existed.
+    ///
+    /// [`Zone::certain`]: rudb_storage::Zone::certain
+    probes: Option<Vec<Probe>>,
+    /// Working space handed back after each chunk rather than made for each one.
+    ///
+    /// A [`Source`] has no per instance state to keep this in, which a [`Stream`] does, so the scan
+    /// keeps a free list and every reader takes one and returns it. That is a lock per chunk that
+    /// really matters, which is every chunk the comparison runs on, and nothing at all on the ones
+    /// the zone waves through. Uncontended it is tens of nanoseconds against a comparison over two
+    /// thousand rows, and the alternative of building the slots per chunk is two allocations of a
+    /// vector per step that a scan does a hundred thousand times.
+    ///
+    /// [`Stream`]: rudb_pipeline::Stream
+    spare: Mutex<Vec<Working>>,
+}
+
+/// One reader's share of what a pushed filter mutates.
+#[derive(Debug)]
+struct Working {
+    scratch: Scratch,
+    gauge: Gauge,
+}
+
+impl Pushed {
+    /// Prepares the offered predicate against what the scan produces.
+    ///
+    /// The same three things [`crate::stream::Filter`] builds, because this is that operator moved
+    /// rather than a second one written: the predicate prepared over the input's types, the
+    /// compaction the session asked for, and how many times the rows it keeps get read again.
+    ///
+    /// # Errors
+    ///
+    /// If the predicate does not resolve against the scan's schema, or if the session has pinned the
+    /// compaction seam to something that cannot run over these columns. Both are what the filter
+    /// above the scan would have raised, at the same moment, for the same reasons.
+    fn new(
+        plan: &Plan,
+        schema: &Schema,
+        columns: &[Option<usize>],
+        pushdown: Pushdown,
+        seams: &Settings,
+        session: &Session,
+    ) -> Result<Self> {
+        let types = schema.types();
+        let context = Context::new(SeamId::ChunkCompaction, seams).with_types(&types);
+        let compaction = compaction().choose(&context)?.strategy();
+        let wanted = pushdown.tests.len();
+        let probes = onto(columns, pushdown.tests);
+        Ok(Self {
+            predicate: Prepared::one(plan, pushdown.predicate, schema)?.in_session(session),
+            compaction,
+            passes: later_passes(plan, pushdown.node),
+            probes: (probes.len() == wanted).then_some(probes),
+            spare: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// One reader's working space, out of the free list or newly made.
+    fn take(&self) -> Working {
+        let waiting = self.spare.lock().ok().and_then(|mut spare| spare.pop());
+        waiting.unwrap_or_else(|| Working {
+            scratch: self.predicate.scratch(),
+            gauge: Gauge::new(self.passes),
+        })
+    }
+
+    /// The working space back, for whichever reader asks next.
+    ///
+    /// A lock this cannot take is a lock somebody panicked holding, and the answer to that is to drop
+    /// the working space rather than to fail the scan: the next reader builds one and the query
+    /// finishes. The gain function loses the counts this instance had gathered, which costs a
+    /// compaction decision made on less evidence and costs no rows.
+    fn give(&self, working: Working) {
+        if let Ok(mut spare) = self.spare.lock() {
+            spare.push(working);
+        }
+    }
+}
+
 /// How a native scan cuts its parts into morsels.
 ///
 /// A run is a range of part numbers and a morsel covers one run. The ranges are built out of the
@@ -346,9 +489,11 @@ impl<'a> Scan<'a> {
         table: &'a Table,
         index: u32,
         projection: Slice,
-        tests: Vec<(usize, Op, Bound)>,
-        sideways: Option<Arc<Sideways<'a>>>,
+        filters: Filters<'a>,
+        seams: &Settings,
+        session: &Session,
     ) -> Result<Self> {
+        let Filters { pruning, pushed: pushdown, sideways } = filters;
         let fields = plan.field_list(projection).to_vec();
         let mut columns = Vec::with_capacity(fields.len());
         for field in &fields {
@@ -365,7 +510,7 @@ impl<'a> Scan<'a> {
             })?;
             columns.push(Some(position));
         }
-        let probes = onto(&columns, tests);
+        let probes = onto(&columns, pruning);
         let schema = Schema::numbered(fields, index);
         let chunks = Handout::new(table.rows().chunk_count());
         let mut next = 0_i64;
@@ -376,6 +521,9 @@ impl<'a> Scan<'a> {
                 next.saturating_add(i64::try_from(table.rows().chunk_len(at)?).unwrap_or(i64::MAX));
         }
         let stripes = table.rows().stripe_parts();
+        let pushed = pushdown
+            .map(|pushdown| Pushed::new(plan, &schema, &columns, pushdown, seams, session))
+            .transpose()?;
         Ok(Self {
             table,
             columns,
@@ -387,10 +535,47 @@ impl<'a> Scan<'a> {
             schema,
             chunks,
             stripes,
+            pushed,
+            waved: AtomicUsize::new(0),
             spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
             paying: Paying::default(),
         })
+    }
+
+    /// Applies the filter the builder handed over, to the chunk numbered `at`.
+    ///
+    /// The three way decision, and the one this whole arrangement exists for. A chunk whose zone
+    /// proves every row passes is handed on as it was read, with no comparison, no selection and no
+    /// narrowing. A chunk the zone cannot decide is compared, which is what a filter above the scan
+    /// would have done to every chunk of the table. The third answer, that the chunk holds nothing at
+    /// all, was settled before this: [`Source::read`] walks past it and never reads it.
+    ///
+    /// On a predicate that keeps most of a clustered column this is most of the chunks. The bounds
+    /// note in `rudb-common` has the case: `l_shipdate <= '1998-09-02'` keeps ninety eight percent of
+    /// TPC-H lineitem, so nearly every chunk of it is one where the comparison was going to keep
+    /// every row and the only thing it produced was the knowledge that it had.
+    ///
+    /// # Errors
+    ///
+    /// Whatever evaluating the predicate or narrowing the chunk reports.
+    fn apply(&self, at: usize, chunk: &mut Chunk) -> Result<()> {
+        let Some(pushed) = self.pushed.as_ref() else { return Ok(()) };
+        let whole =
+            pushed.probes.as_deref().is_some_and(|probes| self.table.rows().certain(at, probes));
+        if whole {
+            self.waved.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        // Taken and given back rather than built here. An empty free list means every other reader
+        // is holding one, which is a reader that has not had a turn yet rather than an error.
+        let mut working = pushed.take();
+        let kept = pushed.predicate.evaluate_filter(chunk, &mut working.scratch)?;
+        if kept.len() != chunk.len() {
+            narrow(pushed.compaction, chunk, &kept, &mut working.gauge)?;
+        }
+        pushed.give(working);
+        Ok(())
     }
 
     /// Drops the rows of one chunk that a join above this scan cannot hold a match for.
@@ -675,6 +860,7 @@ impl Source for Scan<'_> {
         let read = self.table.rows().read(at, &projected)?;
         if self.columns.iter().all(Option::is_some) {
             *out = read;
+            self.apply(at, out)?;
             self.sift(out)?;
             return Ok(more(morsel));
         }
@@ -689,6 +875,7 @@ impl Source for Scan<'_> {
             }
         }
         *out = Chunk::with_rows(held, read.len())?;
+        self.apply(at, out)?;
         self.sift(out)?;
         Ok(more(morsel))
     }
@@ -1840,9 +2027,9 @@ mod tests {
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Across, Bound, FileScan, Handout, OnceLock, Op, Paying, Probe, RUN, Scan, Schema, Series,
-        Sideways, VECTOR_SIZE, WARMUP, cut_rows, hash, native_instances, next_piece, parts,
-        runs_of, worth_sifting,
+        Across, Bound, FileScan, Filters, Handout, OnceLock, Op, Paying, Probe, Pushdown, RUN,
+        Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE, WARMUP, cut_rows, hash,
+        native_instances, next_piece, parts, runs_of, worth_sifting,
     };
     use crate::sideways::Found;
 
@@ -1979,7 +2166,16 @@ mod tests {
         let Node::Get { index, columns, .. } = *plan.node(plan.root()) else {
             panic!("the plan is a get");
         };
-        Scan::new(&plan, table, index, columns, Vec::new(), None).expect("the column is there")
+        Scan::new(
+            &plan,
+            table,
+            index,
+            columns,
+            Filters::default(),
+            &Settings::default(),
+            &Session::default(),
+        )
+        .expect("the column is there")
     }
 
     /// Every morsel the scan hands out, as the parts it covers and the rows that came out of it.
@@ -2050,7 +2246,16 @@ mod tests {
         let Node::Get { index, columns, .. } = *plan.node(plan.root()) else {
             panic!("the plan is a get");
         };
-        Scan::new(&plan, table, index, columns, tests, None).expect("the column is there")
+        Scan::new(
+            &plan,
+            table,
+            index,
+            columns,
+            Filters { pruning: tests, ..Filters::default() },
+            &Settings::default(),
+            &Session::default(),
+        )
+        .expect("the column is there")
     }
 
     /// A predicate that leaves one stripe of two still divides the work between two workers.
@@ -2294,10 +2499,79 @@ mod tests {
             schema: Schema::numbered(fields, 0),
             chunks: Handout::new(table.rows().chunk_count()),
             stripes: Vec::new(),
+            pushed: None,
+            waved: AtomicUsize::new(0),
             spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
             paying: Paying::default(),
         }
+    }
+
+    /// A scan of `counted` applying `predicate` itself, the way the builder hands one over.
+    ///
+    /// The plan is written out and parsed rather than assembled, so the predicate this applies is
+    /// the one a query would really have produced, casts and all.
+    fn applying<'a>(table: &'a Table, predicate: &str) -> (Plan, Scan<'a>) {
+        let plan =
+            Plan::parse(&format!("Filter {predicate}\n  Get memory.main.t AS t #0 [n::INTEGER]"))
+                .expect("the plan text round trips");
+        let Node::Filter { input, predicate } = *plan.node(plan.root()) else {
+            panic!("the plan is a filter");
+        };
+        let Node::Get { index, columns, .. } = *plan.node(input) else {
+            panic!("under a get");
+        };
+        let tests = rudb_opt::bounds::all_of(&plan, input, predicate)
+            .expect("every conjunct reads as a test");
+        let pushdown = Pushdown { node: plan.root(), predicate, tests: tests.clone() };
+        let filters = Filters { pruning: tests, pushed: Some(pushdown), ..Filters::default() };
+        let scan = Scan::new(
+            &plan,
+            table,
+            index,
+            columns,
+            filters,
+            &Settings::default(),
+            &Session::default(),
+        )
+        .expect("the column is there");
+        (plan, scan)
+    }
+
+    /// The middle of the three answers. Every row of the table is at or above zero, so every chunk
+    /// is one the zone waves through and the comparison never runs on any of them.
+    #[test]
+    fn a_filter_the_zone_maps_prove_is_applied_to_no_rows_at_all() {
+        let table = counted(VECTOR_SIZE * 5);
+        let (_plan, scan) = applying(&table, "(#0.0::INTEGER >= 0::INTEGER)::BOOLEAN");
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 5, "every row came through");
+        assert_eq!(scan.waved.load(Ordering::Relaxed), 5, "and no chunk was compared");
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 0, "nor ruled out");
+    }
+
+    /// All three answers in one scan. Five chunks hold 0 to 5119 a thousand and twenty four at a
+    /// time and the filter keeps 2500 up, so the first two are ruled out, the third straddles the
+    /// constant and is compared, and the last two are waved through whole.
+    #[test]
+    fn a_scan_skips_waves_through_and_compares_in_the_one_pass() {
+        let table = counted(VECTOR_SIZE * 5);
+        let (_plan, scan) = applying(&table, "(#0.0::INTEGER >= 2500::INTEGER)::BOOLEAN");
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 5 - 2_500);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 2, "0 to 2047 holds nothing wanted");
+        assert_eq!(scan.waved.load(Ordering::Relaxed), 2, "3072 to 5119 is all of it wanted");
+    }
+
+    /// The filter is really applied and not only decided about.
+    #[test]
+    fn a_chunk_the_zone_cannot_decide_comes_back_narrowed_to_the_rows_that_pass() {
+        let table = counted(VECTOR_SIZE);
+        let (_plan, scan) = applying(&table, "(#0.0::INTEGER < 10::INTEGER)::BOOLEAN");
+
+        assert_eq!(counted_rows(&scan), 10);
+        assert_eq!(scan.waved.load(Ordering::Relaxed), 0);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 0);
     }
 
     /// How many rows the scan produced, over every morsel it hands out.

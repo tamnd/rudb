@@ -2815,6 +2815,24 @@ impl Reader {
         probes.iter().any(|probe| self.sifted(place, probe))
     }
 
+    /// Whether persisted statistics prove that every row of a part matches the predicates.
+    ///
+    /// Only the bounds, and only the stripe's. The sieves say nothing here, because a sieve that
+    /// holds a value is a sieve that may be holding somebody else's hash, so it can rule a part out
+    /// and can never wave one through.
+    ///
+    /// The stripe's bounds are wider than the part's and its null count covers sixty four parts
+    /// rather than one, and both of those are the safe direction. A stretch where everything passes
+    /// contains no narrower stretch where something fails, and a stripe with no nulls in it has no
+    /// nulls in any of its parts. So this answers `false` for parts it could have waved through if
+    /// the directory recorded bounds that finely, which costs a comparison and never costs rows.
+    #[must_use]
+    pub fn certain(&self, part: usize, probes: &[Probe]) -> bool {
+        let Some(place) = self.places.get(part).copied() else { return false };
+        let Some(stripe) = self.table.stripes.get(place.stripe as usize) else { return false };
+        stripe.zone.certain(probes)
+    }
+
     /// Whether the bounds of one stripe prove that none of its parts can match the predicates.
     ///
     /// The cheap half of [`Self::skips`], asked about a whole stripe at once. The bounds live in the

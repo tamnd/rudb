@@ -205,3 +205,26 @@ This is a load time cost being spent rather than a query getting faster, and the
 Queries that have to read rows are unaffected, which is the thing worth checking about a change like this. `count(*) WHERE v >= 10` is 4.32 before and 4.48 after, `sum(v) WHERE v >= 10` is 4.15 and 4.19, `sum(k + v)` is 1.56 and 1.49, `count(*) WHERE k = 7` is 1.54 and 1.45. That is noise in both directions.
 
 The lesson to carry out of this is the one section 10 stated and then did not act on. The wins are in not touching the data, and the cheapest of those are the ones where the engine already computed the fact and never wired it to the question. It is worth going looking for the others.
+
+## 12. What the filter moving into the scan measured
+
+Written on 19 September 2026, after the third item of the list that section 11 ended with. A zone map that can prove a chunk holds nothing the filter wants can also prove a chunk holds nothing the filter would throw away, and only an operator with the zone and the predicate in front of it can act on the second half. So the filter moved. A predicate whose every conjunct reads as a comparison of one of the scan's own columns against a constant is handed to the scan and no filter operator is built above it, and the scan then decides per chunk between skipping the chunk, skipping the comparison, and running it.
+
+These were run on gamingpc rather than server2, so they are not comparable with the numbers above, only with each other. One thread, the same twenty million rows, best of four, nanoseconds per row. The DuckDB column is v2.0.0-dev84237 on the same box with the same threads setting.
+
+| query | filter above the scan | filter in the scan | DuckDB |
+| --- | ---: | ---: | ---: |
+| `count(*) WHERE v >= 10` | 1.58 | 0.25 | 0.40 |
+| `sum(v) WHERE v >= 10` | 1.86 | 0.99 | 1.00 |
+| `sum(k + v)`, no filter | 1.57 | 1.58 | 1.80 |
+| `count(*) WHERE k = 7` | 0.38 | 0.25 | 0.10 |
+
+The first row is the case this exists for. `v` runs with the rows, so every chunk but the first is one where the comparison was going to keep every row and the only thing it produced was the knowledge that it had. Six times, and now faster than DuckDB on the same query.
+
+The second row is the same predicate with the values read. Half the win survives, which is the right amount: what came off is the comparison and the selection vector, and what is left is twenty million eight byte values going past the summing loop whatever anybody proved about them. This is the query section 10 said had 2.1 times in it for any engine by any means.
+
+The third row is the control. No filter, no change, and the number says the scan loop was not touched.
+
+The fourth row is the one to keep looking at. A needle in a scattered column is chunks ruled out rather than chunks waved through, and that part was already here, so the win is only the filter operator that is no longer built and no longer handed anything. DuckDB is still two and a half times faster, and the reason is that it decides this over row groups of 122,880 rows while rudb decides it 19,532 times over chunks of 1,024. That is issues #984 and #480, in that order, and it is the next thing.
+
+One note about the apparatus rather than the engine. `scan.py` grouped its runs by counting positions past the `CREATE TABLE`, which stopped reporting a timing at some point, so every label was one query out. It groups by the query text now. The numbers in section 11 were taken before that happened and a spot check of them holds.
