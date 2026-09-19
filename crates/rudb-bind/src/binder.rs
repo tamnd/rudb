@@ -504,10 +504,8 @@ impl<'a> Binder<'a> {
         match written.body {
             ast::QueryBody::Select(select) => self.bind_select(ast, select, written),
             ast::QueryBody::SetOp { op, quantifier, by_name, left, right } => {
-                if by_name {
-                    return Err(Error::not_implemented("UNION BY NAME"));
-                }
-                self.bind_set_op(ast, written, op, quantifier, left, right)
+                let operator = Operator { op, quantifier, by_name };
+                self.bind_set_op(ast, written, operator, left, right)
             }
             ast::QueryBody::Values(rows) => self.bind_values(ast, written, rows),
             ast::QueryBody::Describe(inner) => self.bind_describe(ast, written, inner),
@@ -728,51 +726,37 @@ impl<'a> Binder<'a> {
         &mut self,
         ast: &Ast,
         query: &ast::Query,
-        op: SetOp,
-        quantifier: Quantifier,
+        operator: Operator,
         left: ast::QueryRef,
         right: ast::QueryRef,
     ) -> Result<(NodeRef, Scope)> {
         let (left_node, left_scope) = self.bind_query(ast, left)?;
         let (right_node, right_scope) = self.bind_query(ast, right)?;
-        if left_scope.len() != right_scope.len() {
-            return Err(Error::binder(format!(
-                "Set operations can only apply to expressions with the same number of result columns, but left side has {} and right side has {}",
-                left_scope.len(),
-                right_scope.len()
-            )));
-        }
-        // Both sides have to hand back one set of types, so each column meets the other side's.
-        let mut types = Vec::with_capacity(left_scope.len());
-        for (left, right) in left_scope.columns.iter().zip(&right_scope.columns) {
-            let common = left.ty.promote(&right.ty).ok_or_else(|| {
-                Error::binder(format!(
-                    "Cannot combine a column of type {} with a column of type {} in a set operation",
-                    left.ty, right.ty
-                ))
-            })?;
-            types.push(common);
-        }
-        let left_node = self.conform(left_node, &left_scope, &types)?;
-        let right_node = self.conform(right_node, &right_scope, &types)?;
+        let merged = if operator.by_name {
+            match_by_name(&left_scope, &right_scope)?
+        } else {
+            match_by_position(&left_scope, &right_scope)?
+        };
+        let left_node = self.conform(left_node, &left_scope, &merged, |column| column.left)?;
+        let right_node = self.conform(right_node, &right_scope, &merged, |column| column.right)?;
         let index = self.fresh_index();
-        let kind = match op {
+        let kind = match operator.op {
             SetOp::Union => SetOpKind::Union,
             SetOp::Except => SetOpKind::Except,
             SetOp::Intersect => SetOpKind::Intersect,
         };
         // UNION alone removes duplicates and UNION ALL keeps them, which is the one place the
         // unwritten quantifier and ALL disagree.
-        let all = quantifier == Quantifier::All;
+        let all = operator.quantifier == Quantifier::All;
         let mut node =
             self.add_node(Node::SetOp { left: left_node, right: right_node, kind, all, index });
         let mut scope = Scope::empty();
-        for (at, (column, ty)) in left_scope.columns.iter().zip(&types).enumerate() {
+        for (at, column) in merged.iter().enumerate() {
             scope.push(Visible {
                 table: String::new(),
                 name: column.name.clone(),
                 binding: ColumnBinding::new(index, at as u32),
-                ty: ty.clone(),
+                ty: column.ty.clone(),
                 // A column of a set operation is nullable whatever the two sides were, because a
                 // column that refuses nulls on one side and takes them on the other takes them.
                 not_null: false,
@@ -790,17 +774,38 @@ impl<'a> Binder<'a> {
         Ok((node, scope))
     }
 
-    /// Projects one side of a set operation so that its columns have the agreed types.
-    fn conform(&mut self, node: NodeRef, scope: &Scope, types: &[LogicalType]) -> Result<NodeRef> {
-        if scope.columns.iter().zip(types).all(|(column, ty)| &column.ty == ty) {
+    /// Projects one side of a set operation onto the columns the operation comes out with.
+    ///
+    /// `pick` says which column of this side each output column is. It answers nothing for a
+    /// column only the other side wrote, which happens under `BY NAME` and which this side fills
+    /// with a null, since that is the row it would have written if it had written the column.
+    fn conform(
+        &mut self,
+        node: NodeRef,
+        scope: &Scope,
+        merged: &[Merged],
+        pick: impl Fn(&Merged) -> Option<usize>,
+    ) -> Result<NodeRef> {
+        let unchanged = merged.len() == scope.len()
+            && merged
+                .iter()
+                .enumerate()
+                .all(|(at, column)| pick(column) == Some(at) && column.ty == scope.columns[at].ty);
+        if unchanged {
             return Ok(node);
         }
         let index = self.fresh_index();
-        let mut exprs = Vec::with_capacity(types.len());
-        let mut names = Vec::with_capacity(types.len());
-        for (column, ty) in scope.columns.iter().zip(types) {
-            let expr = self.plan.add_expr(Expr::Column(column.binding), column.ty.clone());
-            exprs.push(self.checked_cast_to(expr, ty, false)?);
+        let mut exprs = Vec::with_capacity(merged.len());
+        let mut names = Vec::with_capacity(merged.len());
+        for column in merged {
+            let expr = match pick(column) {
+                Some(at) => {
+                    let held = &scope.columns[at];
+                    self.plan.add_expr(Expr::Column(held.binding), held.ty.clone())
+                }
+                None => self.plan.add_constant(Value::Null),
+            };
+            exprs.push(self.checked_cast_to(expr, &column.ty, false)?);
             names.push(self.plan.intern(&column.name));
         }
         let exprs = self.plan.add_expr_list(&exprs);
@@ -3049,6 +3054,111 @@ impl Options {
         options.given = csv_given(&named)?;
         Ok(options)
     }
+}
+
+/// What was written between the two sides of a set operation.
+#[derive(Clone, Copy)]
+struct Operator {
+    /// `UNION`, `EXCEPT` or `INTERSECT`.
+    op: SetOp,
+    /// `ALL`, `DISTINCT`, or neither, which means `DISTINCT` everywhere it is allowed.
+    quantifier: Quantifier,
+    /// Whether `BY NAME` was written, which only `UNION` takes.
+    by_name: bool,
+}
+
+/// One column of the result of a set operation, and where each side keeps it.
+struct Merged {
+    /// The name it comes out under, which is the left side's when both sides wrote it.
+    name: String,
+    /// What it is, after the two sides' types have met.
+    ty: LogicalType,
+    /// Which column of the left side it is, absent when only the right side wrote it.
+    left: Option<usize>,
+    /// Which column of the right side it is, absent when only the left side wrote it.
+    right: Option<usize>,
+}
+
+/// Matches the two sides of an ordinary set operation, which is first column to first column.
+///
+/// The names are the left side's, so `SELECT a FROM t UNION SELECT b FROM u` comes out as `a`.
+fn match_by_position(left: &Scope, right: &Scope) -> Result<Vec<Merged>> {
+    if left.len() != right.len() {
+        return Err(Error::binder(format!(
+            "Set operations can only apply to expressions with the same number of result columns, but left side has {} and right side has {}",
+            left.len(),
+            right.len()
+        )));
+    }
+    let mut merged = Vec::with_capacity(left.len());
+    for (at, (held, other)) in left.columns.iter().zip(&right.columns).enumerate() {
+        merged.push(Merged {
+            name: held.name.clone(),
+            ty: meet(&held.ty, &other.ty)?,
+            left: Some(at),
+            right: Some(at),
+        });
+    }
+    Ok(merged)
+}
+
+/// Matches the two sides of a `UNION BY NAME`, which is by column name and not by position.
+///
+/// The result has the left side's columns in the order the left side wrote them, then the right
+/// side's columns the left side did not write, in the order the right side wrote them. A column
+/// only one side wrote is that side's type and the other side fills it with a null, which is why
+/// nothing here needs the two sides to be the same width. Names match without regard to case, and
+/// the spelling that comes out is the left side's, both of which follow the rest of the engine.
+fn match_by_name(left: &Scope, right: &Scope) -> Result<Vec<Merged>> {
+    named_once(left)?;
+    named_once(right)?;
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    for (at, held) in left.columns.iter().enumerate() {
+        let other = right.columns.iter().position(|column| same_name(&column.name, &held.name));
+        let ty = match other {
+            Some(other) => meet(&held.ty, &right.columns[other].ty)?,
+            None => held.ty.clone(),
+        };
+        merged.push(Merged { name: held.name.clone(), ty, left: Some(at), right: other });
+    }
+    for (at, held) in right.columns.iter().enumerate() {
+        if left.columns.iter().any(|column| same_name(&column.name, &held.name)) {
+            continue;
+        }
+        merged.push(Merged {
+            name: held.name.clone(),
+            ty: held.ty.clone(),
+            left: None,
+            right: Some(at),
+        });
+    }
+    Ok(merged)
+}
+
+/// Refuses a side of a `UNION BY NAME` that wrote one name twice.
+///
+/// Matching by name needs the name to say which column, and a side that wrote `a` twice has no
+/// answer to give. An ordinary union does not care, because there the position says which column.
+/// The doubled quotes around the name are the reference binary's and not a mistake here.
+fn named_once(scope: &Scope) -> Result<()> {
+    for (at, held) in scope.columns.iter().enumerate() {
+        if scope.columns[..at].iter().any(|column| same_name(&column.name, &held.name)) {
+            return Err(Error::binder(format!(
+                "UNION (ALL) BY NAME operation doesn't support duplicate names in the SELECT list - the name \"\"{}\"\" occurs multiple times",
+                held.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The one type a column of a set operation comes out as, given what each side wrote.
+fn meet(left: &LogicalType, right: &LogicalType) -> Result<LogicalType> {
+    left.promote(right).ok_or_else(|| {
+        Error::binder(format!(
+            "Cannot combine a column of type {left} with a column of type {right} in a set operation"
+        ))
+    })
 }
 
 /// DuckDB's complaint about a named parameter that was given a null, which is a different sentence
