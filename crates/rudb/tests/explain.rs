@@ -140,9 +140,11 @@ fn explain_analyze_runs_the_query_and_prints_what_each_operator_actually_did() {
         // The filter is the exception, and it says why rather than going quiet. Its comparison
         // happens inside the scan a level down, so the rows and the time are counted there and once.
         let moved = line.contains("[applied by the scan below]");
-        assert!(line.contains(" rows, ") || moved, "a line with no measurement on it: {line}");
+        assert!(line.contains(" rows") || moved, "a line with no measurement on it: {line}");
     }
-    assert!(text.contains("[994 rows, "), "{text}");
+    // The scan says the rows it counted are the ones that came out of the filter, because the line
+    // above it carries the estimate for them and this line carries the exact count of the table.
+    assert!(text.contains("[994 rows after the filter above, "), "{text}");
     assert!(text.contains("[applied by the scan below]"), "{text}");
 }
 
