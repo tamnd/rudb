@@ -447,6 +447,25 @@ impl<T> Stat<T> {
         }
     }
 
+    /// The value for a use the caller is carrying rather than spelling.
+    ///
+    /// The same three rules, chosen by a [`Use`] in hand instead of by which method got called. A
+    /// consumer that keeps its use in a constant reads through here and `EXPLAIN` prints the same
+    /// constant, so the word a plan says a number was read for and the rule that number went
+    /// through can never drift apart.
+    ///
+    /// `Answer` is the exact only half of it, the same half [`Self::answer`] gives, because a
+    /// certificate needs a proof obligation discharged and there is nothing here to discharge it
+    /// with. A caller that can discharge one calls [`Self::answer_certified`] and says so.
+    #[must_use]
+    pub const fn read(&self, use_: Use) -> Option<&T> {
+        match use_ {
+            Use::Answer => self.answer(),
+            Use::Enable => self.enable(),
+            Use::Decide => self.decide(),
+        }
+    }
+
     /// The value, but only when it is exact.
     ///
     /// The older name for [`Self::enable`], kept because the rule it enforces is stated under this

@@ -609,7 +609,7 @@ impl Shared {
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
                 run(sql, &plan, &catalog, cancel, under)
             }
-            Bound::Explain { mut plan, analyze } => {
+            Bound::Explain { mut plan, analyze, statistics } => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
@@ -620,7 +620,7 @@ impl Shared {
                     &context,
                     seams,
                     &session,
-                    analyze,
+                    Asked { analyze, statistics },
                     sql,
                     Planning { parse_ns, bind_ns, optimize_ns },
                 )
@@ -781,7 +781,7 @@ impl Shared {
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
                 run(sql, &plan, &catalog, cancel, under)
             }
-            Bound::Explain { mut plan, analyze } => {
+            Bound::Explain { mut plan, analyze, statistics } => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
@@ -792,7 +792,7 @@ impl Shared {
                     &context,
                     seams,
                     &session,
-                    analyze,
+                    Asked { analyze, statistics },
                     sql,
                     Planning { parse_ns, bind_ns, optimize_ns },
                 )
@@ -1130,13 +1130,15 @@ fn explaining(
     context: &rudb_opt::pass::Context,
     seams: rudb_opt::explain::Seams<'_>,
     session: &Session,
-    analyze: bool,
+    asked: Asked,
     sql: &str,
     planning: Planning,
 ) -> Result<QueryResult> {
     let facts = context.facts();
-    if !analyze {
-        return explained("logical_plan", &rudb_opt::explain::explain_with(plan, facts, seams));
+    let statistics = asked.statistics();
+    if !asked.analyze {
+        let text = rudb_opt::explain::explain_with(plan, facts, seams, statistics);
+        return explained("logical_plan", &text);
     }
     // `EXPLAIN ANALYZE` is the one place a person reads these numbers with their own eyes rather
     // than through the harness, so the planning that produced the plan being printed has to reach
@@ -1153,8 +1155,31 @@ fn explaining(
         Under::new(budget, facts, seams.settings(), &profiled, Rows::ForACaller).after(planning);
     let result = run(sql, plan, catalog, cancel, under)?;
     let measured = result.metrics().expect("a query that ran reports what it did");
-    let text = rudb_opt::explain::analyzed(plan, facts, seams, measured);
+    let text = rudb_opt::explain::analyzed(plan, facts, seams, measured, statistics);
     explained("analyzed_plan", &text)
+}
+
+/// The two flags an `EXPLAIN` can carry, which are the whole of what the options change.
+///
+/// One argument rather than two, because they arrive together, they are both booleans, and a pair
+/// of bare booleans in a row at a call site is a pair somebody eventually swaps.
+#[derive(Debug, Clone, Copy)]
+struct Asked {
+    /// Run the query as well, and print what happened next to what was expected.
+    analyze: bool,
+    /// Print what the planner knew: the use and the class behind every number in the plan.
+    statistics: bool,
+}
+
+impl Asked {
+    /// The statistics flag, in the words the printer takes it in.
+    fn statistics(self) -> rudb_opt::explain::Statistics {
+        if self.statistics {
+            rudb_opt::explain::Statistics::Asked
+        } else {
+            rudb_opt::explain::Statistics::NotAsked
+        }
+    }
 }
 
 /// One row of two strings, which is the result set `EXPLAIN` hands back.

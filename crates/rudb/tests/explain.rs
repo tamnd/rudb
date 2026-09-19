@@ -205,5 +205,45 @@ fn explaining_something_that_is_not_a_query_is_refused() {
     let create = database.query("EXPLAIN CREATE TABLE u (a INTEGER)").expect_err("refused");
     assert!(create.to_string().contains("CreateStatement"), "{create}");
     let options = database.query("EXPLAIN (FORMAT JSON) SELECT a FROM t").expect_err("refused");
-    assert!(options.to_string().contains("ExplainOptionList"), "{options}");
+    assert!(options.to_string().contains("Unimplemented explain type: format"), "{options}");
+}
+
+#[test]
+fn explain_statistics_says_what_every_number_in_the_plan_was_read_for() {
+    // `spec/stats/05-every-query.md` section 5.1.1 asks `EXPLAIN` to print which use happened, and
+    // this is the whole of that question asked end to end: a use on each line and the classes
+    // counted underneath. Every cardinality the optimizer reads chooses between plans that produce
+    // the same rows, so the answer today is decide on every line, and the section says out loud
+    // that nothing licensed a rewrite off a number.
+    let database = with_rows(1000);
+    let text = explained(&database, "EXPLAIN (STATISTICS) SELECT a FROM t WHERE a > 5");
+    for line in tree(&text) {
+        assert!(line.contains(", read to decide]"), "a line with no use on it: {line}");
+    }
+    assert!(text.contains("\nStatistics\n"), "{text}");
+    assert!(text.contains("read to decide: exact 1, certified 0, estimated"), "{text}");
+    assert!(text.contains("nothing was read to answer or to enable"), "{text}");
+
+    // A plain explain is the plan and nothing else, because the use and the class on every line is
+    // a second sentence per line for a question most readers are not asking.
+    let quiet = explained(&database, "EXPLAIN SELECT a FROM t WHERE a > 5");
+    assert!(!quiet.contains("read to"), "{quiet}");
+    assert!(!quiet.contains("\nStatistics\n"), "{quiet}");
+}
+
+#[test]
+fn the_explain_options_this_answers_reach_the_output_and_can_be_asked_for_together() {
+    let database = with_rows(100);
+    // `ANALYZE` in the option list is the keyword written the other way, so it has to run the query
+    // and come back under the analyzed key rather than the logical one.
+    let analyzed = explained(&database, "EXPLAIN (ANALYZE) SELECT a FROM t");
+    assert!(analyzed.contains("\nTotals\n"), "{analyzed}");
+    // `LOGICAL` names the plan this already prints, so it changes nothing.
+    let logical = explained(&database, "EXPLAIN (LOGICAL) SELECT a FROM t");
+    assert_eq!(tree(&logical), tree(&explained(&database, "EXPLAIN SELECT a FROM t")));
+    // And the two that do something can be asked for at once.
+    let both = explained(&database, "EXPLAIN (ANALYZE, STATISTICS) SELECT a FROM t");
+    assert!(both.contains("\nTotals\n"), "{both}");
+    assert!(both.contains("\nStatistics\n"), "{both}");
+    assert!(both.contains(", read to decide]"), "{both}");
 }
