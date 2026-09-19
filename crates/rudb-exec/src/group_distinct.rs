@@ -1,11 +1,25 @@
 //! Fixed-width radix ownership for grouped `COUNT(DISTINCT BIGINT)` with a TopN parent.
 //!
-//! The group key here is four bytes wide whatever the query said it was. An `INTEGER` key already
-//! is, and a `VARCHAR` key becomes one when the column arrives with a stable dictionary, because
-//! then the code and the string it stands for pick out the same groups and the code is what this
-//! can put in a record. That is the whole of why `GROUP BY SearchPhrase` reaches this at all: the
-//! dictionary is written once for the column and shared by every chunk of it, so grouping on the
-//! code is grouping on the string with none of the payload.
+//! The group key here is four bytes wide whatever the query said it was. A signed integer column
+//! already fits, and a string column fits when it arrives with a stable dictionary, because then
+//! the code and the string it stands for pick out the same groups and the code is what this can put
+//! in a record. That is the whole of why `GROUP BY SearchPhrase` reaches this at all: the dictionary
+//! is written once for the column and shared by every chunk of it, so grouping on the code is
+//! grouping on the string with none of the payload.
+//!
+//! Two columns fit in the same four bytes when their codes are laid out side by side the way digits
+//! are laid out in a number, so the composite is the first column's code times the width of
+//! everything after it plus the rest. Zero is reserved in every column for a null, which is what
+//! makes the composite a group key on its own rather than half of one: a record carries a single
+//! validity bit, and with more than one column that bit could say a key was null but never which of
+//! the keys it was. One column is the case where the bit is enough, and it keeps using it, so
+//! nothing about the queries that reached this before has changed.
+//!
+//! What bounds the composite is that the column widths multiplied together have to fit in four
+//! signed bytes. `GROUP BY MobilePhone, MobilePhoneModel` fits because a `SMALLINT` has sixty five
+//! thousand values and the model dictionary has under a hundred. Two wide columns do not, and an
+//! aggregate whose keys do not fit falls through to the general table the way a string with no
+//! dictionary always has.
 
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,6 +28,7 @@ use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Stage, Value,
 use rudb_pipeline::Lease;
 use rudb_vector::{Chunk, Vector};
 
+use crate::group::signed_value;
 use crate::pairs::{
     self, Counted, Grouped, Held, PARTITIONS, Run, distinct_pairs, in_parallel, scatter,
 };
@@ -22,46 +37,248 @@ use crate::signed::SignedReader;
 
 const EMPTY: u32 = u32::MAX;
 
+/// One group column, and what its code space is made of.
+#[derive(Debug)]
+enum Column {
+    /// A signed integer column, whose code is the value itself.
+    Signed(LogicalType),
+    /// A string column, whose code is the position of its value in a stable dictionary.
+    Dictionary(Arc<Vector>),
+}
+
+impl Column {
+    fn kind(&self) -> LogicalType {
+        match self {
+            Self::Signed(kind) => kind.clone(),
+            Self::Dictionary(_) => LogicalType::Varchar,
+        }
+    }
+
+    /// The lowest code this column can produce, which is what a composite shifts it up by.
+    fn low(&self) -> Option<i64> {
+        match self {
+            Self::Signed(LogicalType::TinyInt) => Some(i64::from(i8::MIN)),
+            Self::Signed(LogicalType::SmallInt) => Some(i64::from(i16::MIN)),
+            Self::Signed(LogicalType::Integer) => Some(i64::from(i32::MIN)),
+            Self::Signed(_) => None,
+            Self::Dictionary(_) => Some(0),
+        }
+    }
+
+    /// How many codes this column has, not counting a null.
+    fn width(&self) -> Option<i64> {
+        match self {
+            Self::Signed(LogicalType::TinyInt) => Some(1 << 8),
+            Self::Signed(LogicalType::SmallInt) => Some(1 << 16),
+            Self::Signed(LogicalType::Integer) => Some(1 << 32),
+            Self::Signed(_) => None,
+            Self::Dictionary(dictionary) => i64::try_from(dictionary.len()).ok(),
+        }
+    }
+
+    /// One code put back into the value it stood for, where the code has had its low taken off.
+    fn value(&self, code: i64) -> Result<Value> {
+        match self {
+            Self::Signed(kind) => signed_value(kind, code),
+            Self::Dictionary(dictionary) => {
+                let at = usize::try_from(code)
+                    .map_err(|_| Error::internal("a group code is not a dictionary position"))?;
+                dictionary.try_value_at(at)
+            }
+        }
+    }
+}
+
+/// Several group columns laid out side by side in one code.
+#[derive(Debug)]
+struct Composite {
+    columns: Vec<Column>,
+    /// What each column's code has taken off it, so that its lowest value lands on zero.
+    lows: Vec<i64>,
+    /// How many codes each column has, counting the zero that stands for a null.
+    spans: Vec<i64>,
+    /// What each column's code is multiplied by, which is the width of everything after it.
+    strides: Vec<i64>,
+}
+
+impl Composite {
+    /// The layout these columns need, or nothing when four signed bytes cannot hold it.
+    fn plan(columns: Vec<Column>) -> Option<Self> {
+        let lows = columns.iter().map(Column::low).collect::<Option<Vec<_>>>()?;
+        let spans = columns
+            .iter()
+            .map(|column| column.width()?.checked_add(1))
+            .collect::<Option<Vec<_>>>()?;
+        let mut strides = vec![1_i64; spans.len()];
+        let mut width = 1_i64;
+        for at in (0..spans.len()).rev() {
+            strides[at] = width;
+            width = width.checked_mul(spans[at])?;
+        }
+        if width > i64::from(i32::MAX) {
+            return None;
+        }
+        Some(Self { columns, lows, spans, strides })
+    }
+
+    /// One composite code taken apart into the values its columns held.
+    fn values(&self, code: i32) -> Result<Vec<Value>> {
+        let code = i64::from(code);
+        let mut out = Vec::with_capacity(self.columns.len());
+        for (at, column) in self.columns.iter().enumerate() {
+            let here = code / self.strides[at] % self.spans[at];
+            out.push(match here {
+                0 => Value::Null,
+                held => column.value(held - 1 + self.lows[at])?,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// How a group key is held in the four bytes a record gives it.
+#[derive(Debug)]
+enum Shape {
+    /// One column held as itself, with the record's validity saying whether the key was null.
+    Alone(Column),
+    /// Several columns composed into one code, with a null taking each column's zero.
+    Many(Composite),
+}
+
+impl Shape {
+    fn plan(keys: &[Key<'_>]) -> Option<Self> {
+        let mut columns = Vec::with_capacity(keys.len());
+        for key in keys {
+            columns.push(match key.codes {
+                Codes::Loose => return None,
+                Codes::Signed => Column::Signed(key.kind.clone()),
+                Codes::Dictionary(_, dictionary) => Column::Dictionary(Arc::clone(dictionary)),
+            });
+        }
+        match columns.len() {
+            0 => None,
+            1 => columns.pop().map(Self::Alone),
+            _ => Composite::plan(columns).map(Self::Many),
+        }
+    }
+
+    fn columns(&self) -> &[Column] {
+        match self {
+            Self::Alone(column) => std::slice::from_ref(column),
+            Self::Many(composite) => &composite.columns,
+        }
+    }
+
+    fn kinds(&self) -> Vec<LogicalType> {
+        self.columns().iter().map(Column::kind).collect()
+    }
+
+    /// One group's code put back into the values its columns held.
+    fn values(&self, group: Grouped) -> Result<Vec<Value>> {
+        match self {
+            Self::Alone(_) if !group.valid => Ok(vec![Value::Null]),
+            Self::Alone(column) => Ok(vec![column.value(i64::from(group.group))?]),
+            Self::Many(composite) => composite.values(group.group),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Exchange {
-    /// The code space the groups are in, and `None` when the key was an integer to begin with.
-    ///
-    /// Held so that the emit can turn a code back into the string it stands for, and so that a
-    /// later chunk arriving in a different code space is caught rather than counted as if the two
-    /// agreed on what a code means.
-    dictionary: Option<Arc<Vector>>,
+    /// The code space the groups are in, held so that the emit can turn a code back into the value
+    /// it stands for, and so that a later chunk arriving in a different code space is caught rather
+    /// than counted as if the two agreed on what a code means.
+    shape: Shape,
     partitions: Vec<Mutex<Held>>,
     held: Mutex<Vec<Reservation>>,
 }
 
-/// What stands in for the group key of one chunk.
+/// What stands in for one group column of one chunk.
 pub(crate) enum Codes<'a> {
-    /// The key is a signed integer, so the vector is read where it lies.
+    /// The column is a signed integer, so the vector is read where it lies.
     Signed,
-    /// The key is a string and its stable dictionary code stands in for it.
+    /// The column is a string and its stable dictionary code stands in for it.
     Dictionary(&'a [u32], &'a Arc<Vector>),
-    /// The key is a string with no stable dictionary, so there is no code to group on.
+    /// The column is a string with no stable dictionary, so there is no code to group on.
     Loose,
 }
 
-/// One chunk's group key, with the layout decided once instead of once a row.
-enum GroupReader<'a> {
+/// One group column of one chunk, as the caller found it.
+pub(crate) struct Key<'a> {
+    pub(crate) vector: &'a Vector,
+    pub(crate) kind: &'a LogicalType,
+    pub(crate) codes: Codes<'a>,
+}
+
+/// One chunk's group column, with the layout decided once instead of once a row.
+enum ColumnReader<'a> {
     Signed(SignedReader<'a>),
     Dictionary(&'a [u32]),
 }
 
+impl ColumnReader<'_> {
+    /// The column's code at one row.
+    ///
+    /// A dictionary code is in range because [`Exchange::buffer`] checks the whole run against the
+    /// dictionary before reading any of it, and a signed value is in range because the shape only
+    /// admits the widths that fit.
+    #[inline]
+    fn at(&self, row: usize) -> i64 {
+        match self {
+            Self::Signed(reader) => reader.at(row) as i64,
+            Self::Dictionary(codes) => i64::from(codes[row]),
+        }
+    }
+}
+
+/// One chunk's whole group key.
+enum GroupReader<'a> {
+    /// The one column, read where it lies.
+    Alone(ColumnReader<'a>),
+    /// The composite of every column, built a column at a time before any row is scattered.
+    ///
+    /// Built up front rather than row by row because a composite has to check that each column's
+    /// code is inside the range the layout gave it, and a column at a time that check is one
+    /// predictable compare in a loop over a single vector. Row by row it would be a loop over the
+    /// columns per row with a branch on each column's layout inside it.
+    Many(Vec<i32>),
+}
+
 impl GroupReader<'_> {
     /// The group key at one row, narrowed to the four bytes a record holds.
-    ///
-    /// A code is in range because [`Exchange::buffer`] checks the whole run against the dictionary
-    /// before reading any of it, and a signed key is in range because the binder typed it `INTEGER`.
     #[inline]
     fn at(&self, row: usize) -> i32 {
         match self {
-            Self::Signed(reader) => reader.at(row) as i32,
-            Self::Dictionary(codes) => codes[row] as i32,
+            Self::Alone(column) => column.at(row) as i32,
+            Self::Many(codes) => codes[row],
         }
     }
+}
+
+/// Lays one column's codes into the composite every row is being built in.
+///
+/// The range check is what keeps a column out of its neighbour's digits. A value that is wider than
+/// the type it was read under would multiply up past its own stride and land on some other pair of
+/// keys, which is a wrong answer rather than a failure, so it is caught here instead.
+fn lay(
+    codes: &mut [i32],
+    reader: &ColumnReader<'_>,
+    nulls: Option<&Vector>,
+    at: usize,
+    composite: &Composite,
+) -> Result<()> {
+    let (low, span, stride) = (composite.lows[at], composite.spans[at], composite.strides[at]);
+    for (row, slot) in codes.iter_mut().enumerate() {
+        let here = match nulls {
+            Some(nulls) if nulls.is_null_at(row) => 0,
+            _ => reader.at(row) - low + 1,
+        };
+        if !(0..span).contains(&here) {
+            return Err(Error::internal("a group key is wider than the type it was read under"));
+        }
+        *slot += (here * stride) as i32;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -94,58 +311,41 @@ impl Exchange {
     /// rows being counted here and the rest being counted there.
     pub(crate) fn buffer(
         slot: &OnceLock<Option<Self>>,
-        group: &Vector,
-        codes: Codes<'_>,
+        keys: &[Key<'_>],
         user: &Vector,
         rows: usize,
         local: &mut Local,
     ) -> Result<bool> {
-        let state = slot.get_or_init(|| match codes {
-            Codes::Loose => None,
-            Codes::Signed => Some(Self::new(None)),
-            Codes::Dictionary(_, dictionary) => Some(Self::new(Some(Arc::clone(dictionary)))),
-        });
+        let state = slot.get_or_init(|| Shape::plan(keys).map(Self::new));
         let Some(state) = state else { return Ok(false) };
-        let reader = match (&state.dictionary, codes) {
-            (None, Codes::Signed) => GroupReader::Signed(SignedReader::new(group)),
-            (Some(held), Codes::Dictionary(codes, dictionary)) if Arc::ptr_eq(held, dictionary) => {
-                // Checked for the whole run here rather than once a row, so that the read below is a
-                // load and nothing else. A row whose key is null has whatever code the dictionary
-                // vector happened to leave there, which is why the null rows are exempt.
-                //
-                // The width is checked against `i32::MAX` and not just against the run because a
-                // record holds four signed bytes. A code above that would narrow to a negative
-                // number and land on some other code's group.
-                let width = dictionary.len();
-                if i32::try_from(width).is_err() {
-                    return Err(Error::internal(
-                        "a stable dictionary has more codes than a group record holds",
-                    ));
-                }
-                let loose = codes[..rows]
-                    .iter()
-                    .enumerate()
-                    .any(|(row, &code)| code as usize >= width && !group.is_null_at(row));
-                if loose {
-                    return Err(Error::internal("a stable dictionary code is out of range"));
-                }
-                GroupReader::Dictionary(codes)
-            }
-            _ => {
-                return Err(Error::internal(
-                    "a grouped distinct exchange received two group code spaces",
-                ));
-            }
+        let reader = state.reader(keys, rows)?;
+        // With one column the record's validity carries the null, so the loop below has to know
+        // where to look for it. With several the null is already inside the code.
+        let group_nulls = match &state.shape {
+            Shape::Alone(_) => nulls_of(keys[0].vector, rows),
+            Shape::Many(_) => None,
         };
         let before = local.partitions.iter().map(Run::footprint).sum::<usize>();
         let shift = pairs::shift();
-        let all_valid = !group.validity().has_nulls(rows) && !user.validity().has_nulls(rows);
-        if all_valid {
-            // Neither column has a null, so the layout is the only thing that changes between rows
-            // and it is picked once here rather than once a row. See `SignedReader`.
-            let user = SignedReader::new(user);
-            for row in 0..rows {
-                scatter(&mut local.partitions, shift, reader.at(row), true, user.at(row) as i64);
+        if !user.validity().has_nulls(rows) {
+            // The distinct argument has no null, so the layout is the only thing that changes
+            // between rows and it is picked once here rather than once a row. See `SignedReader`.
+            let values = SignedReader::new(user);
+            match group_nulls {
+                None => {
+                    for row in 0..rows {
+                        let user = values.at(row) as i64;
+                        scatter(&mut local.partitions, shift, reader.at(row), true, user);
+                    }
+                }
+                Some(nulls) => {
+                    for row in 0..rows {
+                        let valid = !nulls.is_null_at(row);
+                        let group = if valid { reader.at(row) } else { 0 };
+                        let user = values.at(row) as i64;
+                        scatter(&mut local.partitions, shift, group, valid, user);
+                    }
+                }
             }
         } else {
             for row in 0..rows {
@@ -156,7 +356,7 @@ impl Exchange {
                     Error::internal("a distinct BIGINT value has no signed representation")
                 })?)
                 .map_err(|_| Error::internal("a distinct BIGINT value is out of range"))?;
-                let valid = !group.is_null_at(row);
+                let valid = group_nulls.is_none_or(|nulls| !nulls.is_null_at(row));
                 let group = if valid { reader.at(row) } else { 0 };
                 scatter(&mut local.partitions, shift, group, valid, user);
             }
@@ -167,9 +367,35 @@ impl Exchange {
         Ok(true)
     }
 
-    fn new(dictionary: Option<Arc<Vector>>) -> Self {
+    /// One chunk's keys read the way the shape says they are held.
+    fn reader<'a>(&self, keys: &[Key<'a>], rows: usize) -> Result<GroupReader<'a>> {
+        if keys.len() != self.shape.columns().len() {
+            return Err(Error::internal(
+                "a grouped distinct exchange received the wrong key width",
+            ));
+        }
+        let mut readers = Vec::with_capacity(keys.len());
+        for (key, column) in keys.iter().zip(self.shape.columns()) {
+            readers.push(column_reader(key, column, rows)?);
+        }
+        match &self.shape {
+            Shape::Alone(_) => readers
+                .pop()
+                .map(GroupReader::Alone)
+                .ok_or_else(|| Error::internal("a grouped distinct exchange received no key")),
+            Shape::Many(composite) => {
+                let mut codes = vec![0_i32; rows];
+                for (at, (reader, key)) in readers.iter().zip(keys).enumerate() {
+                    lay(&mut codes, reader, nulls_of(key.vector, rows), at, composite)?;
+                }
+                Ok(GroupReader::Many(codes))
+            }
+        }
+    }
+
+    fn new(shape: Shape) -> Self {
         Self {
-            dictionary,
+            shape,
             partitions: (0..PARTITIONS).map(|_| Mutex::new(Held::default())).collect(),
             held: Mutex::new(Vec::new()),
         }
@@ -237,7 +463,7 @@ impl Exchange {
             },
         )?;
         let merged = in_parallel(threads, splits, degree, "counted the groups of split", |at| {
-            count_groups(&counted, at, self.dictionary.as_ref(), bound, memory)
+            count_groups(&counted, at, &self.shape, bound, memory)
         })?;
         // The distinct pairs are read for the last time by the pass above, so the room they took
         // goes back here rather than at the end of the query.
@@ -253,6 +479,46 @@ impl Exchange {
         }
         Ok(chunks)
     }
+}
+
+/// One chunk's column read the way the shape says that column is held.
+fn column_reader<'a>(key: &Key<'a>, column: &Column, rows: usize) -> Result<ColumnReader<'a>> {
+    match (column, &key.codes) {
+        (Column::Signed(_), Codes::Signed) => {
+            Ok(ColumnReader::Signed(SignedReader::new(key.vector)))
+        }
+        (Column::Dictionary(held), Codes::Dictionary(codes, dictionary))
+            if Arc::ptr_eq(held, dictionary) =>
+        {
+            // Checked for the whole run here rather than once a row, so that the read later is a
+            // load and nothing else. A row whose key is null has whatever code the dictionary
+            // vector happened to leave there, which is why the null rows are exempt.
+            //
+            // The width is checked against `i32::MAX` and not just against the run because a
+            // record holds four signed bytes. A code above that would narrow to a negative
+            // number and land on some other code's group.
+            let width = dictionary.len();
+            if i32::try_from(width).is_err() {
+                return Err(Error::internal(
+                    "a stable dictionary has more codes than a group record holds",
+                ));
+            }
+            let loose = codes[..rows]
+                .iter()
+                .enumerate()
+                .any(|(row, &code)| code as usize >= width && !key.vector.is_null_at(row));
+            if loose {
+                return Err(Error::internal("a stable dictionary code is out of range"));
+            }
+            Ok(ColumnReader::Dictionary(codes))
+        }
+        _ => Err(Error::internal("a grouped distinct exchange received two group code spaces")),
+    }
+}
+
+/// A column's validity when the chunk has a null in it, and nothing when it has none.
+fn nulls_of(vector: &Vector, rows: usize) -> Option<&Vector> {
+    vector.validity().has_nulls(rows).then_some(vector)
 }
 
 struct Output {
@@ -271,7 +537,7 @@ struct Output {
 fn count_groups(
     counted: &[Counted],
     split: usize,
-    dictionary: Option<&Arc<Vector>>,
+    shape: &Shape,
     bound: usize,
     memory: &Memory,
 ) -> Result<Output> {
@@ -328,22 +594,16 @@ fn count_groups(
     best.sort_unstable();
     let mut output = Vec::with_capacity(best.len());
     for slot in best {
-        let found = groups[slot];
-        // The code goes back to being the string it stood for here and nowhere earlier, so what is
-        // copied is one string per group that reached the bound rather than one per row.
-        let group = match (found.valid, dictionary) {
-            (false, _) => Value::Null,
-            (true, None) => Value::Integer(found.group),
-            (true, Some(dictionary)) => dictionary.try_value_at(found.group as usize)?,
-        };
-        output.push(vec![group, Value::BigInt(counts[slot])]);
+        // The code goes back to being the values it stood for here and nowhere earlier, so what is
+        // copied is one row per group that reached the bound rather than one per row of input.
+        let mut row = shape.values(groups[slot])?;
+        row.push(Value::BigInt(counts[slot]));
+        output.push(row);
     }
-    let key = match dictionary {
-        Some(_) => LogicalType::Varchar,
-        None => LogicalType::Integer,
-    };
+    let mut kinds = shape.kinds();
+    kinds.push(LogicalType::BigInt);
     let mut held = memory.reservation();
-    let chunks = rows::chunks(&[key, LogicalType::BigInt], &output, &mut held)?;
+    let chunks = rows::chunks(&kinds, &output, &mut held)?;
     timing.stop(0);
     Ok(Output { chunks, held })
 }
@@ -366,7 +626,7 @@ mod tests {
 
     use crate::pairs::{Held, Record, Run, distinct_pairs};
 
-    use super::count_groups;
+    use super::{Column, Composite, Shape, count_groups};
 
     #[test]
     fn one_partition_deduplicates_pairs_and_counts_groups_across_the_runs_it_was_handed() {
@@ -383,7 +643,7 @@ mod tests {
         third.push(row(4, 10, 5), true);
         third.push(row(0, 10, 5), false);
         let mut partition = Held { runs: vec![first, Run::default(), second, third] };
-        let rows = finished(&mut partition, None);
+        let rows = finished(&mut partition, &signed());
         assert_eq!(
             rows,
             [
@@ -404,11 +664,8 @@ mod tests {
         run.push(row(2, 10, 5), true);
         run.push(row(1, 10, 5), true);
         run.push(row(0, 10, 5), false);
-        let words = ["zero", "one", "two"].map(|word| Value::Varchar(word.to_string()));
-        let dictionary =
-            Arc::new(Vector::from_values(LogicalType::Varchar, &words).expect("a dictionary"));
         let mut partition = Held { runs: vec![run] };
-        let rows = finished(&mut partition, Some(&dictionary));
+        let rows = finished(&mut partition, &Shape::Alone(Column::Dictionary(words())));
         // Code 0 is "zero" in the dictionary and the group whose key was null still answers NULL,
         // because what makes a group null is the key's validity and not what its code points at.
         assert_eq!(
@@ -418,6 +675,75 @@ mod tests {
                 vec![Value::Varchar("one".to_string()), Value::BigInt(1)],
                 vec![Value::Varchar("two".to_string()), Value::BigInt(2)],
             ]
+        );
+    }
+
+    #[test]
+    fn two_columns_composed_into_one_code_come_back_out_as_the_pair_they_were() {
+        let shape = two_columns();
+        // A `SMALLINT` beside a three word dictionary, so a column of four codes sits under a column
+        // of sixty five thousand and seven. The codes below are what `GroupReader` would have built.
+        let code = |phone: i64, word: i64| {
+            let Shape::Many(composite) = &shape else { panic!("a composite") };
+            ((phone - i64::from(i16::MIN) + 1) * composite.strides[0] + word + 1) as i32
+        };
+        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        let mut run = Run::default();
+        run.push(row(code(7, 2), 10, 5), true);
+        run.push(row(code(7, 2), 11, 5), true);
+        run.push(row(code(7, 2), 10, 5), true);
+        run.push(row(code(7, 1), 10, 5), true);
+        run.push(row(code(-3, 1), 10, 5), true);
+        let mut partition = Held { runs: vec![run] };
+        assert_eq!(
+            finished(&mut partition, &shape),
+            [
+                vec![Value::SmallInt(-3), Value::Varchar("one".into()), Value::BigInt(1)],
+                vec![Value::SmallInt(7), Value::Varchar("one".into()), Value::BigInt(1)],
+                vec![Value::SmallInt(7), Value::Varchar("two".into()), Value::BigInt(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_null_in_one_column_of_a_composite_is_a_group_of_its_own_per_other_column() {
+        let shape = two_columns();
+        // A null phone beside two different words, which is the case a single validity bit cannot
+        // tell apart and the reserved zero can. A null phone is the zero of the top column, so all
+        // that is left of the composite is the word's own code.
+        let code = |word: i64| (word + 1) as i32;
+        let (first, second) = (code(1), code(2));
+        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        let mut run = Run::default();
+        run.push(row(first, 10, 5), true);
+        run.push(row(second, 10, 5), true);
+        run.push(row(second, 11, 5), true);
+        let mut partition = Held { runs: vec![run] };
+        assert_eq!(
+            finished(&mut partition, &shape),
+            [
+                vec![Value::Null, Value::Varchar("one".into()), Value::BigInt(1)],
+                vec![Value::Null, Value::Varchar("two".into()), Value::BigInt(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn two_wide_columns_do_not_fit_in_a_group_code() {
+        // Four billion values under three, which is over what four signed bytes hold.
+        assert!(
+            Composite::plan(vec![
+                Column::Signed(LogicalType::Integer),
+                Column::Dictionary(words()),
+            ])
+            .is_none()
+        );
+        // A `BIGINT` has no width this can put a bound on at all.
+        assert!(
+            Composite::plan(
+                vec![Column::Signed(LogicalType::BigInt), Column::Dictionary(words()),]
+            )
+            .is_none()
         );
     }
 
@@ -445,7 +771,7 @@ mod tests {
                 distinct_pairs(&mut right, splits, &memory).expect("a pair partition"),
             ];
             assert_eq!(
-                rows_of(&counted, splits, None),
+                rows_of(&counted, splits, &signed()),
                 [
                     vec![Value::Integer(3), Value::BigInt(3)],
                     vec![Value::Integer(4), Value::BigInt(1)],
@@ -457,23 +783,38 @@ mod tests {
     /// How many splits the tests count over, picked to be neither one nor the sixteen a big query gets.
     const SPLITS: usize = 4;
 
+    fn signed() -> Shape {
+        Shape::Alone(Column::Signed(LogicalType::Integer))
+    }
+
+    fn words() -> Arc<Vector> {
+        let words = ["zero", "one", "two"].map(|word| Value::Varchar(word.to_string()));
+        Arc::new(Vector::from_values(LogicalType::Varchar, &words).expect("a dictionary"))
+    }
+
+    fn two_columns() -> Shape {
+        Shape::Many(
+            Composite::plan(vec![
+                Column::Signed(LogicalType::SmallInt),
+                Column::Dictionary(words()),
+            ])
+            .expect("a composite"),
+        )
+    }
+
     /// One partition finished and flattened into rows, sorted so the partition order does not show.
-    fn finished(partition: &mut Held, dictionary: Option<&Arc<Vector>>) -> Vec<Vec<Value>> {
+    fn finished(partition: &mut Held, shape: &Shape) -> Vec<Vec<Value>> {
         let counted = vec![
             distinct_pairs(partition, SPLITS, &Memory::unlimited()).expect("a pair partition"),
         ];
-        rows_of(&counted, SPLITS, dictionary)
+        rows_of(&counted, SPLITS, shape)
     }
 
     /// Every split merged and flattened into rows, sorted so the split order does not show.
-    fn rows_of(
-        counted: &[crate::pairs::Counted],
-        splits: usize,
-        dictionary: Option<&Arc<Vector>>,
-    ) -> Vec<Vec<Value>> {
+    fn rows_of(counted: &[crate::pairs::Counted], splits: usize, shape: &Shape) -> Vec<Vec<Value>> {
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for split in 0..splits {
-            let output = count_groups(counted, split, dictionary, 10, &Memory::unlimited())
+            let output = count_groups(counted, split, shape, 10, &Memory::unlimited())
                 .expect("a grouped distinct split");
             for chunk in output.chunks {
                 for row in 0..chunk.len() {

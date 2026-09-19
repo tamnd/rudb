@@ -811,19 +811,31 @@ impl<'a> Aggregate<'a> {
 
     /// Whether the grouped distinct radix exchange can own this aggregate.
     ///
-    /// A `VARCHAR` key is admitted alongside an `INTEGER` one because a string column that arrives
-    /// with a stable dictionary has a four byte code per row that picks out exactly the groups the
-    /// strings do. Whether it does arrive that way is not known until a chunk turns up, so the type
-    /// is all that is asked here and the exchange decides the rest on its first chunk.
+    /// A `VARCHAR` key is admitted alongside a signed integer one because a string column that
+    /// arrives with a stable dictionary has a four byte code per row that picks out exactly the
+    /// groups the strings do. Whether it does arrive that way is not known until a chunk turns up,
+    /// so the type is all that is asked here and the exchange decides the rest on its first chunk.
+    ///
+    /// Two keys are admitted on the same terms, and whether two of them fit in the four bytes a
+    /// record holds is also left to the first chunk, because the width of a string key is the width
+    /// of its dictionary and nothing here knows that yet. `GROUP BY MobilePhone, MobilePhoneModel`
+    /// is the shape this is for: a `SMALLINT` and a dictionary of under a hundred models fit side
+    /// by side with room to spare, and an aggregate that does not fit falls through to the general
+    /// table.
     fn grouped_distinct_top_count(&self) -> bool {
         self.distinct_count
             && self.top_counts.is_some()
             && self.constants.iter().all(Option::is_none)
-            && self.keys.len() == 1
-            && matches!(
-                self.plan.expr_type(self.keys[0]),
-                LogicalType::Integer | LogicalType::Varchar
-            )
+            && (1..=2).contains(&self.keys.len())
+            && self.keys.iter().all(|&key| {
+                matches!(
+                    self.plan.expr_type(key),
+                    LogicalType::TinyInt
+                        | LogicalType::SmallInt
+                        | LogicalType::Integer
+                        | LogicalType::Varchar
+                )
+            })
     }
 
     fn mixed_top_count(&self) -> bool {
@@ -3253,35 +3265,44 @@ impl Sink for Aggregate<'_> {
             return Ok(Progress::More);
         }
         if self.grouped_distinct_top_count() {
-            let [group] = rows.keys.as_slice() else {
+            if rows.keys.len() != self.keys.len() {
                 return Err(Error::internal(
                     "a grouped distinct exchange received the wrong key width",
                 ));
-            };
+            }
             let Some(user) = rows.arguments.first().and_then(|arguments| arguments.first()) else {
                 return Err(Error::internal("a grouped distinct exchange received no argument"));
             };
-            // What the group is read as, which for a string key is its dictionary code when the
-            // column brought one and nothing at all when it did not. A dictionary that holds a null
-            // is left out: a code would then stand for a null as well as the key's own validity
-            // does, and two ways of being null in one group column is a way to get the count wrong.
-            let codes = if self.plan.expr_type(self.keys[0]) == &LogicalType::Varchar {
-                match group.stable_dictionary_parts() {
-                    Some((codes, dictionary))
-                        if !dictionary.validity().has_nulls(dictionary.len()) =>
-                    {
-                        group_distinct::Codes::Dictionary(codes, dictionary)
-                    }
-                    _ => group_distinct::Codes::Loose,
-                }
-            } else {
-                group_distinct::Codes::Signed
-            };
+            // What each group column is read as, which for a string key is its dictionary code when
+            // the column brought one and nothing at all when it did not. A dictionary that holds a
+            // null is left out: a code would then stand for a null as well as the key's own
+            // validity does, and two ways of being null in one group column is a way to get the
+            // count wrong.
+            let keys: Vec<group_distinct::Key<'_>> = rows
+                .keys
+                .iter()
+                .zip(&self.keys)
+                .map(|(vector, &key)| {
+                    let kind = self.plan.expr_type(key);
+                    let codes = if kind == &LogicalType::Varchar {
+                        match vector.stable_dictionary_parts() {
+                            Some((codes, dictionary))
+                                if !dictionary.validity().has_nulls(dictionary.len()) =>
+                            {
+                                group_distinct::Codes::Dictionary(codes, dictionary)
+                            }
+                            _ => group_distinct::Codes::Loose,
+                        }
+                    } else {
+                        group_distinct::Codes::Signed
+                    };
+                    group_distinct::Key { vector, kind, codes }
+                })
+                .collect();
             let timing = stage::Timing::start(Stage::Scatter);
             let buffered = group_distinct::Exchange::buffer(
                 &self.grouped_distinct,
-                group,
-                codes,
+                &keys,
                 user,
                 rows.rows,
                 grouped_distinct,
@@ -4513,7 +4534,7 @@ fn narrow_key(ty: &LogicalType) -> bool {
 /// first place and was only widened to give every key one width. It is checked rather than assumed
 /// because the thing that would break it is a record reaching the wrong emit, and a wrong answer is
 /// a worse way to find that out than an error is.
-fn signed_value(ty: &LogicalType, value: i64) -> Result<Value> {
+pub(crate) fn signed_value(ty: &LogicalType, value: i64) -> Result<Value> {
     match ty {
         LogicalType::TinyInt => i8::try_from(value).map(Value::TinyInt).map_err(|_| too_wide(ty)),
         LogicalType::SmallInt => {
