@@ -133,6 +133,14 @@ impl<K: Sink> Sink for Watched<K> {
         self.inner.parallel()
     }
 
+    /// Counted against this operator the way its chunks are, because it is its work.
+    fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
+        let measure = Measure::start(&self.counters);
+        let prepared = self.inner.prepare(threads);
+        measure.stop(&self.counters);
+        prepared
+    }
+
     /// Measured like the rest, even though it moves no rows. It takes a lock on the ordered root and
     /// a lock that turns out to be contended is exactly the sort of thing this wrapper exists to
     /// show rather than leave somebody to guess at.
