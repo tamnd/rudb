@@ -103,6 +103,14 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>)
         });
     }
 
+    // Before the instances are handed out rather than from inside one of them, because what asks
+    // for this is a hash join and its table is shared by all of them. Built from inside an
+    // instance it is one thread working and the rest of the lease asleep on a lock, and built here
+    // it is the whole lease. See [`Stream::prepare`].
+    for stream in pipeline.streams() {
+        stream.prepare_once(lease)?;
+    }
+
     let stop = Stop::default();
     let failed = AtomicBool::new(false);
     let spent = AtomicU64::new(0);

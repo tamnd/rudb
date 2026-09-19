@@ -89,6 +89,14 @@ impl<S: Stream> Stream for Watched<S> {
         self.inner.parallel()
     }
 
+    /// Counted against this operator the way its pushes are, because it is its work.
+    fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
+        let measure = Measure::start();
+        let prepared = self.inner.prepare(threads);
+        measure.stop(&self.counters);
+        prepared
+    }
+
     fn push(&self, chunk: &mut Chunk, local: &mut Self::Local) -> Result<Progress> {
         // A stream transforms in place, so the rows it was given have to be counted before the call
         // and the rows it produced after it. A filter that keeps a tenth of its input is the

@@ -27,7 +27,10 @@
 //! padded rows go through the same loop as the matched ones.
 
 use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_pipeline::Lease;
 use rudb_vector::{Assembly, Chunk, Vector};
+
+use crate::pairs::in_parallel;
 
 /// The position that gathers as null, which is what an unmatched driving row is paired with.
 ///
@@ -49,21 +52,31 @@ impl Build {
     /// columns, and a join against an empty side still has to produce the right number of null
     /// columns for the driving rows a `LEFT` join keeps.
     ///
+    /// A column at a time is also a thread at a time. One column's assembly reads one column of
+    /// each chunk and writes one vector, and two of them share nothing, so the lease the calling
+    /// pipeline already holds gets a column each. What that does not get is more threads than the
+    /// side has columns, which is the limit worth naming: splitting a column across threads would
+    /// mean an arena per piece and then a join of the arenas, and the copy that would cost is the
+    /// one #947 took out.
+    ///
     /// # Errors
     ///
     /// [`rudb_common::ErrorCode::OutOfRange`] when the side has more rows than a position can name,
     /// and whatever the assembly says when a column is of a type it has no layout for.
-    pub(crate) fn new(types: &[LogicalType], chunks: &[Chunk]) -> Result<Self> {
+    pub(crate) fn new(
+        types: &[LogicalType],
+        chunks: &[Chunk],
+        threads: &Lease<'_>,
+    ) -> Result<Self> {
         let rows: usize = chunks.iter().map(Chunk::len).sum();
         if rows >= PAD as usize {
             return Err(Error::out_of_range(format!(
                 "a join cannot gather {rows} rows, which is more than a position can name"
             )));
         }
-        let mut columns = Vec::with_capacity(types.len());
-        let mut at: Vec<u32> = Vec::new();
-        for (index, ty) in types.iter().enumerate() {
-            let mut assembly = Assembly::new(ty.clone(), rows)?;
+        let one = |index: usize| -> Result<Vector> {
+            let mut assembly = Assembly::new(types[index].clone(), rows)?;
+            let mut at: Vec<u32> = Vec::new();
             let mut base: u32 = 0;
             for chunk in chunks {
                 let len = u32::try_from(chunk.len()).unwrap_or(PAD);
@@ -72,8 +85,9 @@ impl Build {
                 assembly.place(&at, chunk.column(index)?)?;
                 base += len;
             }
-            columns.push(assembly.finish()?);
-        }
+            assembly.finish()
+        };
+        let columns = in_parallel(threads, types.len(), threads.degree(), "gathered column", one)?;
         Ok(Self { columns, rows })
     }
 
@@ -120,6 +134,7 @@ impl Build {
 #[cfg(test)]
 mod tests {
     use rudb_common::{LogicalType, Value};
+    use rudb_pipeline::Lease;
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{Build, PAD};
@@ -135,14 +150,20 @@ mod tests {
         Chunk::new(vec![numbers, strings]).expect("two columns of the same length")
     }
 
+    /// One thread, because a test is checking what comes out and not how many threads it took.
+    fn alone() -> Lease<'static> {
+        Lease::alone()
+    }
+
     fn types() -> Vec<LogicalType> {
         vec![LogicalType::Integer, LogicalType::Varchar]
     }
 
     #[test]
     fn chunks_laid_end_to_end_read_back_in_the_order_they_were_given() {
-        let side = Build::new(&types(), &[chunk(&[1, 2], &["a", "b"]), chunk(&[3], &["c"])])
-            .expect("two chunks of two columns");
+        let side =
+            Build::new(&types(), &[chunk(&[1, 2], &["a", "b"]), chunk(&[3], &["c"])], &alone())
+                .expect("two chunks of two columns");
         assert_eq!(side.rows(), 3);
         let gathered = side.gather(&[0, 1, 2]).expect("three positions in range");
         assert_eq!(gathered[0].value_at(0), Value::Integer(1));
@@ -153,7 +174,7 @@ mod tests {
 
     #[test]
     fn a_position_may_be_asked_for_more_than_once_and_in_any_order() {
-        let side = Build::new(&types(), &[chunk(&[10, 20], &["x", "y"])])
+        let side = Build::new(&types(), &[chunk(&[10, 20], &["x", "y"])], &alone())
             .expect("one chunk of two columns");
         let gathered = side.gather(&[1, 1, 0]).expect("three positions in range");
         assert_eq!(gathered[0].value_at(0), Value::Integer(20));
@@ -163,7 +184,8 @@ mod tests {
 
     #[test]
     fn the_padding_position_reads_as_null_in_every_column() {
-        let side = Build::new(&types(), &[chunk(&[7], &["z"])]).expect("one chunk of two columns");
+        let side = Build::new(&types(), &[chunk(&[7], &["z"])], &alone())
+            .expect("one chunk of two columns");
         let gathered = side.gather(&[PAD, 0]).expect("a padded position and a real one");
         assert_eq!(gathered[0].value_at(0), Value::Null);
         assert_eq!(gathered[1].value_at(0), Value::Null);
@@ -172,7 +194,7 @@ mod tests {
 
     #[test]
     fn a_side_with_no_chunks_still_has_its_columns_and_every_one_of_them_is_null() {
-        let side = Build::new(&types(), &[]).expect("no chunks at all");
+        let side = Build::new(&types(), &[], &alone()).expect("no chunks at all");
         assert_eq!(side.rows(), 0);
         let gathered = side.gather(&[PAD, PAD]).expect("two padded positions");
         assert_eq!(gathered.len(), 2);
@@ -182,7 +204,8 @@ mod tests {
 
     #[test]
     fn a_row_read_as_values_is_the_row_that_went_in() {
-        let side = Build::new(&types(), &[chunk(&[4, 5], &["p", "q"])]).expect("one chunk");
+        let side =
+            Build::new(&types(), &[chunk(&[4, 5], &["p", "q"])], &alone()).expect("one chunk");
         assert_eq!(side.row(1), vec![Value::Integer(5), Value::Varchar("q".to_string())]);
     }
 }

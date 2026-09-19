@@ -95,6 +95,27 @@ pub trait Stream: Send + Sync + fmt::Debug {
         true
     }
 
+    /// Do whatever this operator needs doing once, before any instance of it runs.
+    ///
+    /// A hash join is why this is here. Its table is built from a side another pipeline gathered,
+    /// it is shared by every instance, and until this existed it was built by whichever instance
+    /// asked for it first, behind a lock the other instances waited on. That is one thread doing
+    /// the work while the other nine sleep, and on TPC-H q9 it was 46 percent of all worker thread
+    /// time spent in `semaphore_wait_trap`. The work itself is perfectly parallel and the threads
+    /// to do it on are the ones this pipeline has already leased, which is what the argument is.
+    ///
+    /// Called once per run of the pipeline, on the thread that is about to hand the instances out,
+    /// so an implementation may assume it is alone and may borrow the lease. An operator with
+    /// nothing to do before it starts leaves this as it is and pays a virtual call per pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the operator reports. A failure here fails the pipeline before any of it has run.
+    fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
+        let _ = threads;
+        Ok(())
+    }
+
     /// Transform `chunk` in place.
     ///
     /// May shrink it through its selection and may replace its columns. May not grow it past the
