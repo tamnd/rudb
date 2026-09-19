@@ -1086,7 +1086,15 @@ impl<'a> Transform<'a> {
             _ => return self.unsupported(kind),
         };
         let quantifier = self.quantifier(self.find(node, "DistinctOrAll"));
-        Ok((op, quantifier, self.find(node, "ByName") != NONE))
+        let by_name = self.find(node, "ByName") != NONE;
+        // `BY NAME` only goes with `UNION`. The grammar takes it after `EXCEPT` as well, since the
+        // two share a clause, so the pairing is checked here and refused the way the pin refuses
+        // it. `INTERSECT BY NAME` never reaches this, because intersection has a clause of its own
+        // with no `ByName` in it, and is a syntax error there just as it is there.
+        if by_name && op == SetOp::Except {
+            return Err(Error::parser("Invalid combination of EXCEPT and BY NAME"));
+        }
+        Ok((op, quantifier, by_name))
     }
 
     /// `DistinctOrAll <- DistinctKeyword / AllKeyword`, absent included.
