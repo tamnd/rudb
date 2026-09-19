@@ -523,15 +523,23 @@ fn scalar_aggregate_domain(
         })
         .collect();
     let domain_conditions = plan.add_expr_list(&domain_conditions);
+    let original_groups = plan.expr_list(groups).to_vec();
+    // The left join is here to keep a row for a domain key no inner row matched, because an
+    // ungrouped aggregate over an empty input is still one row. A subquery that groups is the other
+    // case: an empty input produces no groups at all, so it returns no row and the scalar it was
+    // read for is NULL. Keeping the padded row there invents a group, and since the group
+    // expressions are rewritten to read the domain, a group written on an outer column has the
+    // outer value in it and looks real. A `count(*)` over that invented group answered zero where
+    // the answer is NULL. With a group there is nothing to pad, so the join is an inner one. #1013.
+    let domain_kind = if original_groups.is_empty() { JoinKind::Left } else { JoinKind::Inner };
     let joined = plan.add_node(Node::Join {
         left: domain,
         right: inner_input,
-        kind: JoinKind::Left,
+        kind: domain_kind,
         conditions: domain_conditions,
         build: BuildSide::default(),
     });
 
-    let original_groups = plan.expr_list(groups).to_vec();
     let mut grouped_exprs: Vec<ExprRef> = original_groups
         .iter()
         .map(|&group| {
@@ -646,6 +654,14 @@ fn scalar_count_aggregate(
     else {
         return None;
     };
+    // The padded row this rule creates is the answer to "a scalar count over an empty input is
+    // zero", and that sentence is only true when the subquery has no `GROUP BY`. With one, an empty
+    // input produces no groups at all, so the subquery returns no row and the answer is NULL rather
+    // than zero. Standing aside sends the query to the rules below, which build the same domain
+    // without putting a zero where there is no group. That is #1013.
+    if !plan.expr_list(groups).is_empty() {
+        return None;
+    }
     if !plan.expr_list(aggregates).iter().any(|&call| {
         matches!(*plan.expr(call), Expr::Aggregate { name, .. } if matches!(plan.string(name), "count" | "count_star"))
     }) {
