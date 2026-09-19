@@ -3422,6 +3422,15 @@ impl Sink for Aggregate<'_> {
     /// takes it and merges the pair on its own thread, so the tables come together in a tree. On
     /// ClickBench 11, which groups two columns down to 143 and so never partitions, the pipeline
     /// spent 0.645 of its slowest instance's 2.329 milliseconds off CPU waiting for that queue.
+    ///
+    /// A tree copies more than a queue does. A queue folds each instance's rows into the accumulator
+    /// once, and a tree folds the result of one merge into the next, so a row is carried up as many
+    /// levels as the tree is deep. What pays for that is the depth: a queue is as many merges long as
+    /// there are instances and a tree is the logarithm of that, and the cost of one merge here is
+    /// bounded by the group count rather than by the level, because instances that between them hold
+    /// fewer groups than [`PARTITION_FROM`] hold mostly the same ones. The bound is also why the
+    /// extra copying is small in absolute terms: an aggregate that reaches this line has fewer than
+    /// [`PARTITION_FROM`] groups in total, so there is not much in any of the tables to carry.
     fn combine(&self, local: Partitioned) -> Result<()> {
         let Partitioned {
             mixed,
