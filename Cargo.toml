@@ -6,7 +6,7 @@ members = ["crates/*", "xtask"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.3.52"
+version = "0.3.53"
 edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
@@ -27,39 +27,39 @@ chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 chrono-tz = "0.10.4"
 iana-time-zone = "0.1.65"
 memchr = "2.7.6"
-rudb = { version = "=0.3.52", path = "crates/rudb" }
-rudb-arrow = { version = "=0.3.52", path = "crates/rudb-arrow" }
-rudb-bind = { version = "=0.3.52", path = "crates/rudb-bind" }
-rudb-c-api = { version = "=0.3.52", path = "crates/rudb-c-api" }
-rudb-catalog = { version = "=0.3.52", path = "crates/rudb-catalog" }
-rudb-cli = { version = "=0.3.52", path = "crates/rudb-cli" }
-rudb-common = { version = "=0.3.52", path = "crates/rudb-common" }
-rudb-compress = { version = "=0.3.52", path = "crates/rudb-compress" }
-rudb-csv = { version = "=0.3.52", path = "crates/rudb-csv" }
-rudb-delta = { version = "=0.3.52", path = "crates/rudb-delta" }
-rudb-duckdb-format = { version = "=0.3.52", path = "crates/rudb-duckdb-format" }
-rudb-encoding = { version = "=0.3.52", path = "crates/rudb-encoding" }
-rudb-exec = { version = "=0.3.52", path = "crates/rudb-exec" }
-rudb-extension = { version = "=0.3.52", path = "crates/rudb-extension" }
-rudb-functions = { version = "=0.3.52", path = "crates/rudb-functions" }
-rudb-iceberg = { version = "=0.3.52", path = "crates/rudb-iceberg" }
-rudb-io = { version = "=0.3.52", path = "crates/rudb-io" }
-rudb-ir = { version = "=0.3.52", path = "crates/rudb-ir" }
-rudb-jit = { version = "=0.3.52", path = "crates/rudb-jit" }
-rudb-json = { version = "=0.3.52", path = "crates/rudb-json" }
-rudb-kernels = { version = "=0.3.52", path = "crates/rudb-kernels" }
-rudb-metrics = { version = "=0.3.52", path = "crates/rudb-metrics" }
-rudb-native = { version = "=0.3.52", path = "crates/rudb-native" }
-rudb-opt = { version = "=0.3.52", path = "crates/rudb-opt" }
-rudb-parquet = { version = "=0.3.52", path = "crates/rudb-parquet" }
-rudb-parse = { version = "=0.3.52", path = "crates/rudb-parse" }
-rudb-pipeline = { version = "=0.3.52", path = "crates/rudb-pipeline" }
-rudb-plan = { version = "=0.3.52", path = "crates/rudb-plan" }
-rudb-regex = { version = "=0.3.52", path = "crates/rudb-regex" }
-rudb-seam = { version = "=0.3.52", path = "crates/rudb-seam" }
-rudb-storage = { version = "=0.3.52", path = "crates/rudb-storage" }
-rudb-txn = { version = "=0.3.52", path = "crates/rudb-txn" }
-rudb-vector = { version = "=0.3.52", path = "crates/rudb-vector" }
+rudb = { version = "=0.3.53", path = "crates/rudb" }
+rudb-arrow = { version = "=0.3.53", path = "crates/rudb-arrow" }
+rudb-bind = { version = "=0.3.53", path = "crates/rudb-bind" }
+rudb-c-api = { version = "=0.3.53", path = "crates/rudb-c-api" }
+rudb-catalog = { version = "=0.3.53", path = "crates/rudb-catalog" }
+rudb-cli = { version = "=0.3.53", path = "crates/rudb-cli" }
+rudb-common = { version = "=0.3.53", path = "crates/rudb-common" }
+rudb-compress = { version = "=0.3.53", path = "crates/rudb-compress" }
+rudb-csv = { version = "=0.3.53", path = "crates/rudb-csv" }
+rudb-delta = { version = "=0.3.53", path = "crates/rudb-delta" }
+rudb-duckdb-format = { version = "=0.3.53", path = "crates/rudb-duckdb-format" }
+rudb-encoding = { version = "=0.3.53", path = "crates/rudb-encoding" }
+rudb-exec = { version = "=0.3.53", path = "crates/rudb-exec" }
+rudb-extension = { version = "=0.3.53", path = "crates/rudb-extension" }
+rudb-functions = { version = "=0.3.53", path = "crates/rudb-functions" }
+rudb-iceberg = { version = "=0.3.53", path = "crates/rudb-iceberg" }
+rudb-io = { version = "=0.3.53", path = "crates/rudb-io" }
+rudb-ir = { version = "=0.3.53", path = "crates/rudb-ir" }
+rudb-jit = { version = "=0.3.53", path = "crates/rudb-jit" }
+rudb-json = { version = "=0.3.53", path = "crates/rudb-json" }
+rudb-kernels = { version = "=0.3.53", path = "crates/rudb-kernels" }
+rudb-metrics = { version = "=0.3.53", path = "crates/rudb-metrics" }
+rudb-native = { version = "=0.3.53", path = "crates/rudb-native" }
+rudb-opt = { version = "=0.3.53", path = "crates/rudb-opt" }
+rudb-parquet = { version = "=0.3.53", path = "crates/rudb-parquet" }
+rudb-parse = { version = "=0.3.53", path = "crates/rudb-parse" }
+rudb-pipeline = { version = "=0.3.53", path = "crates/rudb-pipeline" }
+rudb-plan = { version = "=0.3.53", path = "crates/rudb-plan" }
+rudb-regex = { version = "=0.3.53", path = "crates/rudb-regex" }
+rudb-seam = { version = "=0.3.53", path = "crates/rudb-seam" }
+rudb-storage = { version = "=0.3.53", path = "crates/rudb-storage" }
+rudb-txn = { version = "=0.3.53", path = "crates/rudb-txn" }
+rudb-vector = { version = "=0.3.53", path = "crates/rudb-vector" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
