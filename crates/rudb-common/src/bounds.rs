@@ -134,6 +134,46 @@ fn restated(unscaled: i128, scale: u8, into: u8) -> Option<i128> {
     }
 }
 
+/// The power of ten under a column stored as an integer, and `None` for a column that is not one.
+///
+/// A decimal's scale is its own. A time or a timestamp is a count of seconds at the unit its type
+/// names, and the two zoned types are the same count as their unzoned twins, because what makes them
+/// different types is not something a minimum and a maximum can see. A date is not here: its integer
+/// is a count of days and there is no power of ten under it.
+///
+/// This is the contract between a store and the question it gets asked. A store that keeps the
+/// minimum of one of these columns keeps the integer it was given, so the bound it hands over is a
+/// [`Bound::Scaled`] carrying this power and not a [`Bound::Int`] carrying the integer on its own. A
+/// constant of the same type arrives as a `Scaled` too, and [`Bound::order`] restates the coarser of
+/// the two. Hand over an `Int` instead and the two never pair: `order` has no arm for them and
+/// answers `None`, which is the answer that keeps every row, so the whole zone map is read and
+/// ignored.
+#[must_use]
+pub fn scale_of(ty: &LogicalType) -> Option<u8> {
+    Some(match *ty {
+        LogicalType::Decimal { scale, .. } => scale,
+        LogicalType::TimestampS => 0,
+        LogicalType::TimestampMs => 3,
+        LogicalType::Time | LogicalType::TimeTz => MICROS,
+        LogicalType::Timestamp | LogicalType::TimestampTz => MICROS,
+        LogicalType::TimestampNs => 9,
+        _ => return None,
+    })
+}
+
+/// `bound` as a column of `ty` hands it over, which is [`scale_of`] applied to an integer.
+///
+/// A store that walks its own rows gets the integer the column holds and nothing else, so this is
+/// where the type it holds them for is put back. Anything that is already scaled is left alone, and
+/// so is a bound of any other shape, since a byte string and a float carry their own domain.
+#[must_use]
+pub fn scaled_as(bound: Bound, ty: &LogicalType) -> Bound {
+    match (bound, scale_of(ty)) {
+        (Bound::Int(unscaled), Some(scale)) => Bound::Scaled { unscaled, scale },
+        (bound, _) => bound,
+    }
+}
+
 impl Bound {
     /// The bound a value stands for, or `None` for a value no bound compares with.
     ///

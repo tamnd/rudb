@@ -45,7 +45,7 @@
 
 use std::sync::Arc;
 
-use rudb_common::bounds::{End, MICROS, Spread, Zones, kept};
+use rudb_common::bounds::{End, Spread, Zones, kept, scale_of};
 use rudb_common::stat::Provenance;
 use rudb_common::{LogicalType, Stat};
 
@@ -250,7 +250,7 @@ fn read_bound(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
             | LogicalType::UBigInt
             | LogicalType::UHugeInt
     );
-    if let Some(scale) = scale(&column.ty) {
+    if let Some(scale) = scale_of(&column.ty) {
         let unscaled = match column.physical {
             Physical::Int32 => i128::from(i32::from_le_bytes(bytes.try_into().ok()?)),
             Physical::Int64 => i128::from(i64::from_le_bytes(bytes.try_into().ok()?)),
@@ -282,24 +282,6 @@ fn read_bound(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
     }
 }
 
-/// The power of ten under a column stored as an integer, and `None` for a column that is not one.
-///
-/// A decimal's scale is its own. A time or a timestamp is a count of seconds at the unit the file
-/// chose, and the unit is in the type because the schema reader put it there. The two zoned types
-/// are the same count as their unzoned twins, and what makes them different types is not something a
-/// minimum and a maximum can see.
-fn scale(ty: &LogicalType) -> Option<u8> {
-    Some(match *ty {
-        LogicalType::Decimal { scale, .. } => scale,
-        LogicalType::TimestampS => 0,
-        LogicalType::TimestampMs => 3,
-        LogicalType::Time | LogicalType::TimeTz => MICROS,
-        LogicalType::Timestamp | LogicalType::TimestampTz => MICROS,
-        LogicalType::TimestampNs => 9,
-        _ => return None,
-    })
-}
-
 /// A two's complement big endian integer of up to sixteen bytes, which is how a wide decimal is
 /// written.
 ///
@@ -321,9 +303,9 @@ mod tests {
     use std::sync::Arc;
 
     use rudb_common::LogicalType;
-    use rudb_common::bounds::Zones;
+    use rudb_common::bounds::{MICROS, Zones};
 
-    use super::{Bound, Footer, MICROS, Op, Test, read_bound, skips};
+    use super::{Bound, Footer, Op, Test, read_bound, skips};
     use crate::metadata::{
         ColumnChunk, Encoding, Metadata, Physical, RowGroup, SchemaColumn, Stats,
     };
