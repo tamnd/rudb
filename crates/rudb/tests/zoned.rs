@@ -94,12 +94,16 @@ fn a_ceiling_over_the_guess_leaves_the_guess_where_it_was() {
 
 #[test]
 fn a_column_whose_groups_all_look_alike_is_estimated_the_way_it_always_was() {
-    // The control. `g` is the row number modulo ninety seven, so every group runs from 0 to 96 and
-    // no filter on it rules anything out. The ceiling is the whole file and the estimate is the
-    // constant, untouched, which is the path almost every query in the world still takes.
+    // The control for the bounds. `g` is the row number modulo ninety seven, so every group runs
+    // from 0 to 96 and no filter on it rules anything out. The ceiling is the whole file and the
+    // bounds change nothing, which is what this is here to show.
+    //
+    // The number is not the constant any more because the footer counts `g` at ninety seven and an
+    // equality against a constant takes one value out of the count. Sixteen thousand rows over
+    // ninety seven is 168 against a truth of 169, where the constant said 3,276.
     let database = Database::new();
     let line = estimated(&database, "g = 5");
-    assert!(line.contains("[~3276 rows estimated from default]"), "{line}");
+    assert!(line.contains("[~168 rows estimated from sketch]"), "{line}");
     assert_eq!(answered(&database, "g = 5"), 169);
 }
 
