@@ -49,7 +49,7 @@ use rudb_metrics::{Document, Operator};
 use rudb_plan::{Node, NodeRef, OperatorRef, PipelineRef, Plan, Shape, seams_of};
 use rudb_seam::{Registries, SeamId, Settings};
 
-use crate::estimate::{Statistics, rows_stat};
+use crate::estimate::{Facts, rows_stat};
 
 /// What `EXPLAIN` needs to know about the seams to print the last section.
 ///
@@ -101,10 +101,10 @@ impl<'a> Seams<'a> {
 /// The plan section is the same either way. What is missing is the seam section, which is why this
 /// exists for tests and for anything that wants the tree and nothing else.
 #[must_use]
-pub fn explain(plan: &Plan, statistics: &Statistics) -> String {
+pub fn explain(plan: &Plan, facts: &Facts) -> String {
     let settings = Settings::new();
     let registries = Registries::new();
-    explain_with(plan, statistics, Seams::new(&settings, &registries))
+    explain_with(plan, facts, Seams::new(&settings, &registries))
 }
 
 /// The plan as `EXPLAIN` prints it: the tree, then the pipelines, then the seams.
@@ -117,8 +117,8 @@ pub fn explain(plan: &Plan, statistics: &Statistics) -> String {
 /// zero, and the difference between "no rows" and "nobody knows" is the whole of what
 /// [`crate::estimate`] is careful about.
 #[must_use]
-pub fn explain_with(plan: &Plan, statistics: &Statistics, seams: Seams<'_>) -> String {
-    printed(plan, statistics, seams, None)
+pub fn explain_with(plan: &Plan, facts: &Facts, seams: Seams<'_>) -> String {
+    printed(plan, facts, seams, None)
 }
 
 /// The plan as `EXPLAIN ANALYZE` prints it, which is the same three sections with what happened
@@ -129,13 +129,8 @@ pub fn explain_with(plan: &Plan, statistics: &Statistics, seams: Seams<'_>) -> S
 /// counters with, so a document from a different query lines nothing up rather than lining the
 /// wrong things up.
 #[must_use]
-pub fn analyzed(
-    plan: &Plan,
-    statistics: &Statistics,
-    seams: Seams<'_>,
-    measured: &Document,
-) -> String {
-    printed(plan, statistics, seams, Some(measured))
+pub fn analyzed(plan: &Plan, facts: &Facts, seams: Seams<'_>, measured: &Document) -> String {
+    printed(plan, facts, seams, Some(measured))
 }
 
 /// Writes the estimated row count of every node onto the operator row that node became, and the
@@ -150,12 +145,12 @@ pub fn analyzed(
 /// counts go on operators: a node the physical plan folded away is not a decision anybody acted on,
 /// and counting it would move the number with a plan rewrite that changed nothing about what was
 /// known.
-pub fn record_estimates(plan: &Plan, statistics: &Statistics, document: &mut Document) {
+pub fn record_estimates(plan: &Plan, facts: &Facts, document: &mut Document) {
     let shape = Shape::of(plan);
     let mut estimated = vec![Stat::Unknown; shape.operators() as usize];
     for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
         if let Some(id) = shape.operator_of(node) {
-            estimated[id as usize] = rows_stat(plan, node, statistics);
+            estimated[id as usize] = rows_stat(plan, node, facts);
         }
     }
     for operator in &mut document.operators {
@@ -169,14 +164,9 @@ pub fn record_estimates(plan: &Plan, statistics: &Statistics, document: &mut Doc
 }
 
 /// The three sections, with the measured numbers in them if there are any.
-fn printed(
-    plan: &Plan,
-    statistics: &Statistics,
-    seams: Seams<'_>,
-    measured: Option<&Document>,
-) -> String {
+fn printed(plan: &Plan, facts: &Facts, seams: Seams<'_>, measured: Option<&Document>) -> String {
     let shape = Shape::of(plan);
-    let printing = Printing { plan, statistics, shape: &shape, seams, measured };
+    let printing = Printing { plan, facts, shape: &shape, seams, measured };
     let mut out = String::new();
     printing.write_node(plan.root(), 0, &mut out);
     write_pipelines(&shape, measured, &mut out);
@@ -216,7 +206,7 @@ fn estimate(stat: Stat<u64>) -> String {
 #[derive(Clone, Copy)]
 struct Printing<'a> {
     plan: &'a Plan,
-    statistics: &'a Statistics,
+    facts: &'a Facts,
     shape: &'a Shape,
     seams: Seams<'a>,
     measured: Option<&'a Document>,
@@ -225,7 +215,7 @@ struct Printing<'a> {
 impl Printing<'_> {
     fn write_node(self, node: NodeRef, depth: usize, out: &mut String) {
         let printed = self.plan.operator(node);
-        let estimate = estimate(rows_stat(self.plan, node, self.statistics));
+        let estimate = estimate(rows_stat(self.plan, node, self.facts));
         let pipeline = self.shape.pipeline(node);
         let marker =
             if self.seams.all_reference(self.plan.node(node)) { " [reference]" } else { "" };
@@ -412,18 +402,18 @@ mod tests {
     use rudb_seam::{Registries, Settings};
 
     use super::{Seams, Shape, explain, explain_with, record_estimates};
-    use crate::estimate::Statistics;
+    use crate::estimate::Facts;
 
     fn parsed(text: &str) -> Plan {
         Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"))
     }
 
     fn printed(text: &str, tables: &[(&str, u64)]) -> String {
-        let mut statistics = Statistics::new();
+        let mut facts = Facts::new();
         for (table, count) in tables {
-            statistics.record("memory", "main", table, *count);
+            facts.record("memory", "main", table, *count);
         }
-        explain(&parsed(text), &statistics)
+        explain(&parsed(text), &facts)
     }
 
     /// The tree, without the sections under it, which is the part most tests are about.
@@ -468,14 +458,14 @@ mod tests {
             "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n",
             "  Get memory.main.t AS t #0 [a::INTEGER]\n",
         ));
-        let mut statistics = Statistics::new();
-        statistics.record("memory", "main", "t", 1000);
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "t", 1000);
         let mut document = Document::new("select");
         let shape = Shape::of(&plan);
         for id in 0..shape.operators() {
             document.operators.push(Operator::new(id, 0, "operator"));
         }
-        record_estimates(&plan, &statistics, &mut document);
+        record_estimates(&plan, &facts, &mut document);
 
         // Two operators, so two decisions, and the histogram is a count of decisions rather than
         // of nodes or of rows.
@@ -501,7 +491,7 @@ mod tests {
         for id in 0..shape.operators() {
             document.operators.push(Operator::new(id, 0, "operator"));
         }
-        record_estimates(&plan, &Statistics::new(), &mut document);
+        record_estimates(&plan, &Facts::new(), &mut document);
 
         assert_eq!(document.estimates.unknown(), document.estimates.total());
         assert!(document.estimates.total() > 0);
@@ -601,7 +591,7 @@ mod tests {
         let plan = parsed(
             "Sort [#0.0::INTEGER ASC NULLS LAST]\n  Get memory.main.t AS t #0 [a::INTEGER]\n",
         );
-        let out = explain_with(&plan, &Statistics::new(), Seams::new(&settings, &registries));
+        let out = explain_with(&plan, &Facts::new(), Seams::new(&settings, &registries));
         assert!(out.contains("[reference]"), "{out}");
         assert!(!out.contains("sort = "), "{out}");
     }

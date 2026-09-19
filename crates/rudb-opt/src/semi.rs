@@ -50,7 +50,7 @@ use std::collections::VecDeque;
 use rudb_common::Result;
 use rudb_plan::{BuildSide, Expr, JoinKind, Node, NodeRef, Plan, Slice};
 
-use crate::estimate::{self, Statistics};
+use crate::estimate::{self, Facts};
 use crate::pass::{Context, Pass, top_down};
 use crate::tables::{TableSet, Tables, produced};
 use crate::walk;
@@ -189,7 +189,7 @@ impl Pass for SemiPushdown {
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        lower(plan, context.statistics());
+        lower(plan, context.facts());
         Ok(())
     }
 }
@@ -246,14 +246,14 @@ impl Pass for SemiPushdown {
 /// Nothing is rewritten in place. A node is added for the move and the nodes above it are added
 /// again over it, the way join ordering rebuilds a region, so a subtree two parents share is left
 /// alone for the parent that did not ask.
-pub fn lower(plan: &mut Plan, stats: &Statistics) {
+pub fn lower(plan: &mut Plan, stats: &Facts) {
     let mut tables = Tables::new();
     let root = rebuilt(plan, plan.root(), &mut tables, stats);
     plan.set_root(root);
 }
 
 /// Rewrites the plan under `at`, returning `at` itself where nothing under it changed.
-fn rebuilt(plan: &mut Plan, at: NodeRef, tables: &mut Tables, stats: &Statistics) -> NodeRef {
+fn rebuilt(plan: &mut Plan, at: NodeRef, tables: &mut Tables, stats: &Facts) -> NodeRef {
     let children: Vec<NodeRef> = plan.node(at).children().into_iter().flatten().collect();
     let done: Vec<NodeRef> =
         children.iter().map(|&child| rebuilt(plan, child, tables, stats)).collect();
@@ -275,7 +275,7 @@ enum Under {
 }
 
 /// The semi join at `at` moved into one side of the join under it, or nothing where it stays.
-fn moved(plan: &mut Plan, at: NodeRef, tables: &mut Tables, stats: &Statistics) -> Option<NodeRef> {
+fn moved(plan: &mut Plan, at: NodeRef, tables: &mut Tables, stats: &Facts) -> Option<NodeRef> {
     let Node::Join { left, right, kind, conditions, build } = *plan.node(at) else {
         return None;
     };
@@ -325,7 +325,7 @@ fn moved(plan: &mut Plan, at: NodeRef, tables: &mut Tables, stats: &Statistics) 
 /// A cross product does, always. A join does when the side it joins `side` to is at least as big,
 /// which is the reading of the two estimates the doc on [`lower`] argues for, and a side with no
 /// estimate is a side nothing can be read off at all.
-fn expands(plan: &Plan, side: NodeRef, other: NodeRef, under: Under, stats: &Statistics) -> bool {
+fn expands(plan: &Plan, side: NodeRef, other: NodeRef, under: Under, stats: &Facts) -> bool {
     let Under::Join(conditions, _) = under else {
         return true;
     };
@@ -400,7 +400,7 @@ mod tests {
     use rudb_plan::Plan;
 
     use super::{convert, lower, narrow};
-    use crate::estimate::Statistics;
+    use crate::estimate::Facts;
 
     /// What the plan a text prints looks like once the pass has run over it.
     fn converted(text: &str) -> String {
@@ -425,7 +425,7 @@ mod tests {
     /// would be one the optimizer's idempotence check trips over on the first debug build to see a
     /// plan like this.
     fn lowered(text: &str) -> String {
-        let mut counts = Statistics::new();
+        let mut counts = Facts::new();
         for (table, rows) in [("t", 1000), ("u", 10), ("v", 100), ("w", 100_000)] {
             counts.record("memory", "main", table, rows);
         }
