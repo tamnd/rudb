@@ -221,7 +221,12 @@ impl Sieve {
             // Two floats that are equal can have different bits and two that have the same bits can
             // be unequal, so a hash of a float decides nothing about equality between floats. No
             // sieve is built over one either, and this is the other end of that decision.
-            Bound::Real(_) => false,
+            //
+            // A scaled value is refused for a different reason. The integer under it is only the
+            // same integer the sieve was built from when the two are at the same scale, and the
+            // scale is on the column rather than on the sieve, so this cannot tell. Hashing it
+            // anyway would rule out a stretch holding 12.34 because the constant arrived as 12.340.
+            Bound::Real(_) | Bound::Scaled { .. } => false,
         }
     }
 
@@ -552,7 +557,7 @@ fn hashes(vector: &Vector) -> Option<(Vec<u64>, usize)> {
                 counter.saw(hash);
                 hashes.push(hash);
             }
-            Some(Bound::Real(_)) | None => return None,
+            Some(Bound::Real(_) | Bound::Scaled { .. }) | None => return None,
         }
     }
     let distinct = counter.distinct().min(hashes.len());
@@ -596,7 +601,7 @@ fn fill(vector: &Vector, sieve: &mut Sieve) -> bool {
                     return false;
                 }
             }
-            Some(Bound::Real(_)) | None => return false,
+            Some(Bound::Real(_) | Bound::Scaled { .. }) | None => return false,
         }
     }
     true

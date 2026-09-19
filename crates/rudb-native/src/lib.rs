@@ -47,7 +47,7 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 19;
+const FORMAT: u32 = 20;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -3125,6 +3125,11 @@ impl<'a> Cursor<'a> {
                 let length = self.u32()? as usize;
                 Some(Bound::Bytes(self.take(length)?.to_vec()))
             }
+            4 => {
+                let unscaled =
+                    i128::from_le_bytes(self.take(16)?.try_into().expect("sixteen bytes"));
+                Some(Bound::Scaled { unscaled, scale: self.u8()? })
+            }
             _ => return Err(invalid("bound tag differs")),
         })
     }
@@ -3409,6 +3414,11 @@ fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
             out.push(3);
             put_u32(out, u32::try_from(value.len()).map_err(|_| invalid("bound length overflow"))?);
             out.extend_from_slice(value);
+        }
+        Some(Bound::Scaled { unscaled, scale }) => {
+            out.push(4);
+            out.extend_from_slice(&unscaled.to_le_bytes());
+            out.push(*scale);
         }
     }
     Ok(())
