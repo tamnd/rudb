@@ -265,6 +265,19 @@ const CEILING: Class = Class::Certified { bound: 1.0, direction: Direction::AtMo
 /// rule refuses everything but an exact count, and the statistics section says an enable happened.
 pub const CARDINALITY: Use = Use::Decide;
 
+/// What a distinct count in a plan is read for, in the same vocabulary.
+///
+/// [`Use::Decide`] as well, and for a stronger reason than the cardinality has: the two callers are
+/// an equality's selectivity and a join's cardinality, and both of them are working out how many
+/// rows an operator produces so that something can choose a plan. Neither changes what the query
+/// answers. So a certified lower bound is allowed through, which is most of what a Parquet footer
+/// can supply, and the number being a bound rather than a count costs a plan choice at worst.
+///
+/// `COUNT(DISTINCT c)` is the read that would declare [`Use::Answer`] here, and it is not written
+/// yet. When it is, the class rule refuses everything but an exact count, which is a file of one row
+/// group or a native table's dictionary, per `spec/stats/05-every-query.md` section 5.1.
+pub const DISTINCT: Use = Use::Decide;
+
 /// How many rows this node is guessed to produce, where a guess can be made at all.
 ///
 /// `None` means nothing downstream of here should pretend to know, which is the answer for a scan
@@ -297,6 +310,27 @@ pub fn rows(plan: &Plan, node: NodeRef, stats: &Facts) -> Option<u64> {
 /// ordering arrives and asks the same question about the same subtree a thousand times.
 #[must_use]
 pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Facts) -> Stat<u64> {
+    rows_stat_into(plan, node, stats, &mut Vec::new())
+}
+
+/// [`rows_stat`] with the distinct counts read at this node collected into `reads`.
+///
+/// At this node and not under it. The recursion into the children goes through [`rows_stat`], which
+/// throws its own collection away, so a caller that walks every operator of a plan and asks about
+/// each of them ends up with each read counted once rather than once per ancestor. That is the same
+/// rule `EXPLAIN (STATISTICS)` already counts cardinalities by, and it is the only rule under which
+/// the two lines of that section can be read against each other.
+///
+/// The cardinality this returns is not pushed. A cardinality is the caller's own answer, so the
+/// caller records it under [`CARDINALITY`] itself, and only the distinct counts, which are read here
+/// and never surface, need carrying out.
+#[must_use]
+pub fn rows_stat_into(
+    plan: &Plan,
+    node: NodeRef,
+    stats: &Facts,
+    reads: &mut Vec<Stat<u64>>,
+) -> Stat<u64> {
     let of = |child: NodeRef| rows_stat(plan, child, stats);
     match *plan.node(node) {
         // One row with no columns, which is what a `SELECT` with no `FROM` is bound against.
@@ -324,7 +358,7 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Facts) -> Stat<u64> {
         // how many the call gives back for each of them.
         Node::LateralFunction { .. } => Stat::Unknown,
         Node::Filter { input, predicate } => {
-            let (kept, from) = kept(plan, input, predicate, stats);
+            let (kept, from) = kept(plan, input, predicate, stats, reads);
             // The bounds are a ceiling over the guess and not a new thing to guess about. A store
             // that keeps a minimum and a maximum per part can say which parts this filter rules
             // out, and the rows in the parts that survive is a number no answer to this filter can
@@ -396,7 +430,7 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Facts) -> Stat<u64> {
             of(right),
             kind,
             plan.expr_list(conditions).len(),
-            keyspace(plan, conditions, stats),
+            keyspace(plan, conditions, stats, reads),
         ),
         // The right cardinality is a function of each left row until decorrelation, so treating it
         // as one independently measured input would be a made-up estimate.
@@ -518,12 +552,18 @@ fn ceiling(stat: Stat<u64>) -> Stat<u64> {
 /// standard reading and it is why this stays [`GUESSED`]: it assumes the conditions and whatever
 /// happened underneath are independent, which is the assumption every estimator makes and the one
 /// that fails first.
-fn kept(plan: &Plan, input: NodeRef, predicate: ExprRef, stats: &Facts) -> (f64, Provenance) {
+fn kept(
+    plan: &Plan,
+    input: NodeRef,
+    predicate: ExprRef,
+    stats: &Facts,
+    reads: &mut Vec<Stat<u64>>,
+) -> (f64, Provenance) {
     let mut fraction = 1.0;
     let mut counted = 0;
     let mut pending = Vec::new();
     for conjunct in conjuncts(plan, predicate) {
-        match values(plan, conjunct, stats) {
+        match values(plan, conjunct, stats, reads) {
             Some(values) => {
                 fraction /= widened(values);
                 counted += 1;
@@ -544,9 +584,13 @@ fn kept(plan: &Plan, input: NodeRef, predicate: ExprRef, stats: &Facts) -> (f64,
     // A fraction two different suppliers contributed to came from the arithmetic over them rather
     // than from either, which is what `Propagation` is for. A reader chasing a bad estimate wants to
     // know which supplier to go and look at without reading the predicate back.
+    // A distinct count says `Dictionary` and not `Sketch`. There is no sketch in this engine and
+    // there never was: the number came from a native table's dictionary or from what a Parquet
+    // writer counted per row group, and naming a structure that does not exist sends a reader
+    // chasing a bad estimate to look for something nobody has written.
     let from = match (counted, interpolated, guessed) {
         (0, 0, _) => FROM_A_CONSTANT,
-        (_, 0, 0) => Provenance::Sketch,
+        (_, 0, 0) => Provenance::Dictionary,
         (0, _, 0) => Provenance::ZoneMap,
         _ => Provenance::Propagation,
     };
@@ -610,7 +654,12 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> Vec<ExprRef> {
 /// row instead of thirty thousand. The join can fall back because the row count put through its
 /// arithmetic gives the containment assumption back exactly. This has no such identity and has to
 /// refuse.
-fn values(plan: &Plan, conjunct: ExprRef, stats: &Facts) -> Option<u64> {
+fn values(
+    plan: &Plan,
+    conjunct: ExprRef,
+    stats: &Facts,
+    reads: &mut Vec<Stat<u64>>,
+) -> Option<u64> {
     let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(conjunct) else {
         return None;
     };
@@ -619,9 +668,14 @@ fn values(plan: &Plan, conjunct: ExprRef, stats: &Facts) -> Option<u64> {
         (_, &Expr::Column(binding)) if walk::constant(plan, left) => binding,
         _ => return None,
     };
+    // Recorded before it is read, and recorded even when it turns out to be unknown. A read that
+    // found nothing is still a read the planner made, and the section `EXPLAIN (STATISTICS)` prints
+    // is worth far less if the misses are left out of it.
+    let stat = stated(plan, binding, stats);
+    reads.push(stat);
     // A column with no values in it is an empty column or a column of nothing but nulls, and
     // neither is something to divide by.
-    stated(plan, binding, stats).filter(|&values| values > 0)
+    stat.read(DISTINCT).copied().filter(|&values| values > 0)
 }
 
 /// How many rows sit in the parts of `input` that `predicate` cannot rule out.
@@ -679,12 +733,12 @@ fn asked<'a>(
 ///
 /// A column nobody counted falls back to the table's rows. See [`Missing::Rows`] for why, and
 /// [`stated`] for the caller that cannot take that answer.
-fn distinct(plan: &Plan, binding: ColumnBinding, stats: &Facts) -> Option<u64> {
+fn distinct(plan: &Plan, binding: ColumnBinding, stats: &Facts) -> Stat<u64> {
     follow(plan, binding, stats, Missing::Rows, 16)
 }
 
 /// [`distinct`] restricted to columns somebody actually counted.
-fn stated(plan: &Plan, binding: ColumnBinding, stats: &Facts) -> Option<u64> {
+fn stated(plan: &Plan, binding: ColumnBinding, stats: &Facts) -> Stat<u64> {
     follow(plan, binding, stats, Missing::Nothing, 16)
 }
 
@@ -696,6 +750,11 @@ enum Missing {
     /// containment assumption exactly. That is why the join can fall back rather than refusing: a
     /// refusal on one side would throw away a stated count on the other, and that is most of TPC-H,
     /// where the low cardinality column is stated and the key it joins against is not.
+    ///
+    /// It comes back through [`ceiling`] so that the class says which of the two it is. The row
+    /// count itself is exact and the distinct count it stands in for is not, and handing the
+    /// catalog's [`Class::Exact`] straight over would tell a reader the column was counted when
+    /// nobody counted it.
     Rows,
     /// Nothing. For a caller with no such identity, where the row count would come out as a claim
     /// rather than as a fallback.
@@ -724,47 +783,54 @@ fn follow(
     stats: &Facts,
     missing: Missing,
     depth: u32,
-) -> Option<u64> {
-    let depth = depth.checked_sub(1)?;
+) -> Stat<u64> {
+    let Some(depth) = depth.checked_sub(1) else {
+        return Stat::Unknown;
+    };
     let position = binding.column as usize;
     let rows = missing == Missing::Rows;
     for at in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
         match *plan.node(at) {
             Node::Get { catalog, schema, table, index, columns, .. } if index == binding.table => {
-                let name = &plan.field_list(columns).get(position)?.name;
+                let Some(field) = plan.field_list(columns).get(position) else {
+                    return Stat::Unknown;
+                };
                 let catalog = plan.string(catalog);
                 let schema = plan.string(schema);
                 let table = plan.string(table);
-                let distinct = stats.get(&Key::Distinct { catalog, schema, table, column: name });
-                if let Stat::Known { value, .. } = distinct {
-                    return Some(value);
+                let distinct =
+                    stats.get(&Key::Distinct { catalog, schema, table, column: &field.name });
+                if matches!(distinct, Stat::Known { .. }) {
+                    return distinct;
                 }
                 if !rows {
-                    return None;
+                    return Stat::Unknown;
                 }
-                return match stats.get(&Key::Rows { catalog, schema, table }) {
-                    Stat::Known { value, .. } => Some(value),
-                    Stat::Unknown => None,
-                };
+                return ceiling(stats.get(&Key::Rows { catalog, schema, table }));
             }
             Node::TableFunction { index, columns, .. } if index == binding.table => {
-                let name = &plan.field_list(columns).get(position)?.name;
-                if let Some(distinct) = plan.distinct_measured(index, name) {
-                    return Some(distinct);
+                let Some(field) = plan.field_list(columns).get(position) else {
+                    return Stat::Unknown;
+                };
+                let distinct = plan.distinct_measured(index, &field.name);
+                if matches!(distinct, Stat::Known { .. }) {
+                    return distinct;
                 }
-                return if rows { plan.measured(index).read(CARDINALITY).copied() } else { None };
+                return if rows { ceiling(plan.measured(index)) } else { Stat::Unknown };
             }
             Node::Project { index, exprs, .. } if index == binding.table => {
-                let &carried = plan.expr_list(exprs).get(position)?;
+                let Some(&carried) = plan.expr_list(exprs).get(position) else {
+                    return Stat::Unknown;
+                };
                 let &Expr::Column(carried) = plan.expr(carried) else {
-                    return None;
+                    return Stat::Unknown;
                 };
                 return follow(plan, carried, stats, missing, depth);
             }
             _ => {}
         }
     }
-    None
+    Stat::Unknown
 }
 
 /// How many pairs of values the conditions of a join can match on, where every one is understood.
@@ -775,17 +841,34 @@ fn follow(
 /// unless every condition is an equality between two base columns that both have a count, because a
 /// condition nobody understood could be the one doing all the work and a divisor that left it out
 /// would claim more rows than the join can produce.
-fn keyspace(plan: &Plan, conditions: Slice, stats: &Facts) -> Option<u64> {
-    keyspace_of(plan, plan.expr_list(conditions), stats)
+fn keyspace(
+    plan: &Plan,
+    conditions: Slice,
+    stats: &Facts,
+    reads: &mut Vec<Stat<u64>>,
+) -> Option<u64> {
+    keyspace_into(plan, plan.expr_list(conditions), stats, reads)
 }
 
 /// `keyspace` over conditions the caller is holding rather than over a slice of the arena.
 ///
 /// Join ordering wants this. It is deciding which pair to join next and the conditions that would
 /// apply at that pair are the ones it has just worked out are testable there, which is a list it
-/// built and not a list any node in the arena holds.
+/// built and not a list any node in the arena holds. It is not counting its reads, because the
+/// orders it scores are candidates and most of them are thrown away, and a histogram that counted
+/// every discarded candidate would say more about the search than about the plan.
 #[must_use]
 pub fn keyspace_of(plan: &Plan, conditions: &[ExprRef], stats: &Facts) -> Option<u64> {
+    keyspace_into(plan, conditions, stats, &mut Vec::new())
+}
+
+/// [`keyspace_of`] with the distinct counts it read collected as it goes.
+fn keyspace_into(
+    plan: &Plan,
+    conditions: &[ExprRef],
+    stats: &Facts,
+    reads: &mut Vec<Stat<u64>>,
+) -> Option<u64> {
     if conditions.is_empty() {
         return None;
     }
@@ -800,7 +883,12 @@ pub fn keyspace_of(plan: &Plan, conditions: &[ExprRef], stats: &Facts) -> Option
         else {
             return None;
         };
-        let pair = distinct(plan, left, stats)?.max(distinct(plan, right, stats)?);
+        // Both sides are recorded before either is read, so that a condition one side of which
+        // nobody counted still shows up as two reads rather than one.
+        let (left, right) = (distinct(plan, left, stats), distinct(plan, right, stats));
+        reads.push(left);
+        reads.push(right);
+        let pair = (*left.read(DISTINCT)?).max(*right.read(DISTINCT)?);
         product = product.checked_mul(pair)?;
     }
     // A column with no distinct values at all is an empty column or a column of nothing but nulls,
@@ -1552,7 +1640,7 @@ mod tests {
         let one = filtered("(#0.0::INTEGER = 3::INTEGER)::BOOLEAN");
         assert_eq!(
             counted_stat(&one, tables, &[("t", "a", 50)]).provenance(),
-            Some(Provenance::Sketch)
+            Some(Provenance::Dictionary)
         );
         assert_eq!(counted_stat(&one, tables, &[]).provenance(), Some(Provenance::Default));
         let both = filtered(
@@ -1785,7 +1873,7 @@ mod tests {
         plan.set_zones(0, Stub::spreading(0.5) as Arc<dyn Zones>);
         assert_eq!(
             rows_stat(&plan, plan.root(), &stats),
-            Stat::estimated(125_000, Provenance::Sketch)
+            Stat::estimated(125_000, Provenance::Dictionary)
         );
     }
 
