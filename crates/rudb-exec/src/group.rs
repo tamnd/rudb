@@ -884,6 +884,7 @@ impl<'a> Aggregate<'a> {
         rows: &Rows,
         partitions: &mut [FixedPartition],
         memory: &mut Reservation,
+        blocks: &mut FixedBlocks,
     ) -> Result<()> {
         self.fixed.get_or_init(|| FixedExchange {
             keys: [
@@ -900,43 +901,39 @@ impl<'a> Aggregate<'a> {
         let mean = rows.arguments[2].first().expect("AVG has one argument");
         let before = partitions.iter().map(FixedPartition::footprint).sum::<usize>();
         let shift = u64::BITS - RADIX_PARTITIONS.ilog2();
+        // The four columns read once for the chunk rather than four times per row. See
+        // [`FixedBlocks`] for what that was costing.
+        blocks.read(rows.rows, [first, second, sum, mean])?;
+        let [held_first, held_second, held_sum, held_mean] = blocks.cut(rows.rows)?;
+        let [null_first, null_second, null_sum, null_mean] = blocks.nulled;
         for row in 0..rows.rows {
             let mut valid = 0;
-            let first_value = if first.is_null_at(row) {
+            let first_value = if null_first && first.is_null_at(row) {
                 0
             } else {
                 valid |= FixedRecord::FIRST;
-                i64::try_from(first.signed_at(row).ok_or_else(|| {
-                    Error::internal("a fixed first key has no signed representation")
-                })?)
-                .map_err(|_| Error::internal("a fixed first key is out of range"))?
+                held_first[row]
             };
-            let second_value = if second.is_null_at(row) {
+            let second_value = if null_second && second.is_null_at(row) {
                 0
             } else {
                 valid |= FixedRecord::SECOND;
-                i32::try_from(second.signed_at(row).ok_or_else(|| {
-                    Error::internal("a fixed second key has no signed representation")
-                })?)
-                .map_err(|_| Error::internal("a fixed second key is out of range"))?
+                i32::try_from(held_second[row])
+                    .map_err(|_| Error::internal("a fixed second key is out of range"))?
             };
-            let sum_value = if sum.is_null_at(row) {
+            let sum_value = if null_sum && sum.is_null_at(row) {
                 0
             } else {
                 valid |= FixedRecord::SUM;
-                i16::try_from(sum.signed_at(row).ok_or_else(|| {
-                    Error::internal("a fixed SMALLINT sum has no signed representation")
-                })?)
-                .map_err(|_| Error::internal("a fixed SMALLINT sum is out of range"))?
+                i16::try_from(held_sum[row])
+                    .map_err(|_| Error::internal("a fixed SMALLINT sum is out of range"))?
             };
-            let mean_value = if mean.is_null_at(row) {
+            let mean_value = if null_mean && mean.is_null_at(row) {
                 0
             } else {
                 valid |= FixedRecord::MEAN;
-                i16::try_from(mean.signed_at(row).ok_or_else(|| {
-                    Error::internal("a fixed SMALLINT mean has no signed representation")
-                })?)
-                .map_err(|_| Error::internal("a fixed SMALLINT mean is out of range"))?
+                i16::try_from(held_mean[row])
+                    .map_err(|_| Error::internal("a fixed SMALLINT mean is out of range"))?
             };
             let record = FixedRecord {
                 first: first_value,
@@ -2742,6 +2739,7 @@ pub(crate) struct Partitioned {
     fixed: bool,
     fixed_records: Vec<FixedPartition>,
     fixed_memory: Reservation,
+    fixed_blocks: FixedBlocks,
     dense: bool,
     dense_codes: Vec<Vec<u32>>,
     dense_nulls: i64,
@@ -2769,6 +2767,78 @@ pub(crate) struct Partitioned {
     /// until [`Aggregate::close`] merges the four, and what it buys is that the fold itself never
     /// waits for anybody.
     own: Vec<Option<Building>>,
+}
+
+/// The four columns a fixed width record is built from, read once per chunk rather than once per row.
+///
+/// `GROUP BY WatchID, ClientIP` with a `COUNT`, a `SUM` and an `AVG` over it reads four integer
+/// columns and builds one record per row. That used to be four `is_null_at` calls and four
+/// `signed_at` calls a row, and each of those matched on the vector's body, called into the data
+/// underneath and matched again on its layout, to read a number that was already sitting in a flat
+/// slice. Callgrind put the two of them together at a third of ClickBench 32.
+///
+/// So the columns are read as blocks. `Vector::signed_block` copies a flat `BIGINT` run and sign
+/// extends a narrower one, both of which the compiler widens, and the forms it will not hand over
+/// are filled here a row at a time exactly as the loop used to. Nulls are the same question asked
+/// once: a column with none in it costs the loop nothing, and a column with some is asked row by row
+/// the way it always was.
+///
+/// The buffers live for as long as the instance does, so a chunk allocates nothing for this.
+#[derive(Debug, Default)]
+struct FixedBlocks {
+    /// The first key, the second key, the SUM argument and the AVG argument, in that order.
+    held: [Vec<i64>; 4],
+    /// Whether each of those columns has a null anywhere in this chunk.
+    nulled: [bool; 4],
+}
+
+impl FixedBlocks {
+    /// Reads the four columns of one chunk into the buffers.
+    ///
+    /// # Errors
+    ///
+    /// A column that is not an integer in any form, which is a plan that should not have reached the
+    /// fixed width exchange at all.
+    fn read(&mut self, rows: usize, columns: [&Vector; 4]) -> Result<()> {
+        for (at, (held, column)) in self.held.iter_mut().zip(columns).enumerate() {
+            self.nulled[at] = !column.none_null();
+            if column.signed_block(held) {
+                continue;
+            }
+            held.clear();
+            held.reserve(rows);
+            // A dictionary or a run, which the vector does not hand over as a block, read the way
+            // every form was read before this. A null writes a zero, as it did, because the loop
+            // reads the null out of the column itself and not out of here.
+            for row in 0..rows {
+                held.push(match column.signed_at(row) {
+                    Some(value) => i64::try_from(value)
+                        .map_err(|_| Error::internal("a fixed column is out of range"))?,
+                    None if column.is_null_at(row) => 0,
+                    None => {
+                        return Err(Error::internal("a fixed column has no signed representation"));
+                    }
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The four buffers cut to the length of the chunk, so the loop over them checks no bounds.
+    ///
+    /// # Errors
+    ///
+    /// A buffer shorter than the chunk, which would be a vector whose length disagreed with the
+    /// chunk's.
+    fn cut(&self, rows: usize) -> Result<[&[i64]; 4]> {
+        let [first, second, sum, mean] = &self.held;
+        let (Some(first), Some(second), Some(sum), Some(mean)) =
+            (first.get(..rows), second.get(..rows), sum.get(..rows), mean.get(..rows))
+        else {
+            return Err(Error::internal("a fixed radix exchange read short of the chunk"));
+        };
+        Ok([first, second, sum, mean])
+    }
 }
 
 /// The scratch that splitting a chunk across the partitions needs, kept between chunks.
@@ -3237,6 +3307,7 @@ impl Sink for Aggregate<'_> {
             radix_distinct_memory: self.memory.reservation(),
             fixed: false,
             fixed_records: (0..RADIX_PARTITIONS).map(|_| FixedPartition::default()).collect(),
+            fixed_blocks: FixedBlocks::default(),
             fixed_memory: self.memory.reservation(),
             dense: false,
             dense_codes: vec![Vec::new(); DENSE_PARTITIONS],
@@ -3304,6 +3375,7 @@ impl Sink for Aggregate<'_> {
             fixed,
             fixed_records,
             fixed_memory,
+            fixed_blocks,
             dense,
             dense_codes,
             dense_nulls,
@@ -3408,7 +3480,7 @@ impl Sink for Aggregate<'_> {
         }
         if self.fixed_top_count() {
             let timing = stage::Timing::start(Stage::Scatter);
-            let buffered = self.buffer_fixed(&rows, fixed_records, fixed_memory);
+            let buffered = self.buffer_fixed(&rows, fixed_records, fixed_memory, fixed_blocks);
             timing.stop(0);
             buffered?;
             *fixed = true;
