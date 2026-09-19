@@ -202,7 +202,7 @@ fn collect_keys(plan: &Plan, at: NodeRef, outer: &TableSet, keys: &mut Vec<Key>)
 }
 
 /// Whether anything in the subtree reads an outer column.
-fn correlated(plan: &Plan, at: NodeRef, outer: &TableSet) -> bool {
+pub(crate) fn correlated(plan: &Plan, at: NodeRef, outer: &TableSet) -> bool {
     let mut yes = false;
     walk::node_columns(plan, at, &mut |_, binding| yes |= outer.contains(binding.table));
     yes || plan
