@@ -901,7 +901,7 @@ fn a_degree_of_one_is_the_serial_driver() {
 
     assert_eq!(*sink.global.lock().unwrap(), 55);
     assert_eq!(sink.combines.load(Ordering::Relaxed), 1);
-    assert_eq!(spent, 0, "nothing ran anywhere the caller's own clock could not see");
+    assert_eq!(spent.worker_cpu_ns, 0, "nothing ran anywhere the caller's own clock could not see");
 }
 
 #[test]
@@ -916,8 +916,12 @@ fn the_parallel_driver_reports_what_its_workers_burned() {
 
     if thread_cpu_ns().is_some() {
         assert!(
-            spent > 0,
+            spent.worker_cpu_ns > 0,
             "three of the four threads were not the caller's and they did something"
+        );
+        assert!(
+            spent.slowest_ns > 0,
+            "one of the four instances took the longest and it was not instant"
         );
     }
 }

@@ -121,12 +121,13 @@ impl<'a> Query<'a> {
         for (pipeline, driver) in self.pipelines.iter().zip(&self.drivers) {
             let lease = pool.lease(pipeline.degree(pool.threads()));
             let degree = lease.degree();
-            let spent = {
+            let spread = {
                 let _running = driver.running();
                 run_parallel(pipeline, cancel, &lease)?
             };
-            driver.ran(degree, spent);
-            self.worker_cpu_ns.fetch_add(spent, Ordering::Relaxed);
+            driver.ran(degree, spread.worker_cpu_ns);
+            driver.waited(spread.slowest_ns, spread.finalize_ns);
+            self.worker_cpu_ns.fetch_add(spread.worker_cpu_ns, Ordering::Relaxed);
             self.widest.fetch_max(degree, Ordering::Relaxed);
         }
         Ok(())
