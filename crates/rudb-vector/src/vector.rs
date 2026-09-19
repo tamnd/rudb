@@ -234,6 +234,25 @@ impl Data {
         crate::for_each_layout!(all, sizes)
     }
 
+    /// These values held as a page, so that copying or cutting them does not copy the values.
+    ///
+    /// For a producer that is going to hand the same values out many times, which is what a stored
+    /// column is. It costs one `Arc` per layout and moves the run into it without touching a value,
+    /// and after it a write through any reader copies out rather than writing the page, which is
+    /// [`Buffer::to_mut`]. A run that is already a page comes back as it was.
+    #[must_use]
+    pub fn into_pages(self) -> Self {
+        macro_rules! paged {
+            ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+                match self {
+                    Self::Empty => Self::Empty,
+                    $(Self::$variant(values) => Self::$variant(values.into_page()),)+
+                }
+            };
+        }
+        crate::for_each_layout!(all, paged)
+    }
+
     /// An integer at `index`, widened, for any of the signed integer layouts.
     ///
     /// Used by the decimal path, which needs the unscaled value out of whichever width the width
@@ -2020,6 +2039,26 @@ impl Vector {
         (0..self.len).map(|index| self.value_at(index))
     }
 
+    /// This vector with its payload held as a page, so that copying or cutting it is free.
+    ///
+    /// For a producer that means to hand the same values out many times, which is what a stored
+    /// column is. A flat body is the form this changes, because it is the only one that owns a run
+    /// of values a copy would have to copy. Every other form already shares what is expensive and
+    /// owns only what a cut has to rewrite, so it comes back as it was: a dictionary shares its
+    /// values, a packed body shares its words, a string body shares its arena, an FSST body shares
+    /// its codes and its table, and a constant and a sequence have nothing to share.
+    ///
+    /// Not recursive into a nested column's children, because a `LIST` or a `STRUCT` holds its
+    /// children behind an `Arc` already.
+    #[must_use]
+    pub fn into_pages(self) -> Self {
+        let body = match self.body {
+            Body::Flat(data) => Body::Flat(data.into_pages()),
+            other => other,
+        };
+        Self { body, ..self }
+    }
+
     /// A contiguous run of the values, in the form they are already in.
     ///
     /// This is the cut [`Self::gather`] cannot do. A gather walks a dictionary to its leaf and
@@ -2030,7 +2069,8 @@ impl Vector {
     ///
     /// So each form is cut as itself. A dictionary keeps its dictionary and slices its codes, a
     /// sequence stays arithmetic with its start moved along, a constant stays a shorter constant,
-    /// and a flat body is the one that genuinely has to copy its range.
+    /// and a flat body is a window into its page when it has one and a copy of its range when it
+    /// does not, which [`Self::into_pages`] is how a producer decides.
     ///
     /// The dictionary itself is shared rather than copied, so a cut is the codes and nothing else.
     /// It used to be copied, and on a read of a ClickBench partition that copy was ten percent of
@@ -3912,6 +3952,53 @@ mod tests {
         };
         assert!(!run.is_shared());
         assert_eq!(run.as_slice(), &(16i64..24).collect::<Vec<_>>()[..]);
+    }
+
+    /// `into_pages` is how a producer says its values will be handed out many times. A flat body is
+    /// the form it changes, and after it a copy of the vector is a reference count bump.
+    #[test]
+    fn a_vector_over_pages_is_copied_and_cut_without_its_values_moving() {
+        let vector = integers(&[1, 2, 3, 4, 5, 6, 7, 8]).into_pages();
+        let address = |vector: &Vector| match vector.data() {
+            Some(Data::Int32(values)) => values.as_slice().as_ptr() as usize,
+            _ => panic!("the layout changed under the test"),
+        };
+        let stored = address(&vector);
+        assert_eq!(address(&vector.clone()), stored, "a copy moved the values");
+        assert_eq!(address(&vector.slice(2, 4).unwrap()), stored + 2 * 4, "a cut moved the values");
+        assert_eq!(
+            vector.slice(2, 4).unwrap().iter().collect::<Vec<_>>(),
+            [Value::Integer(3), Value::Integer(4), Value::Integer(5), Value::Integer(6)]
+        );
+        // Twice is not two pages.
+        assert_eq!(address(&vector.clone().into_pages()), stored);
+    }
+
+    /// Every form that is not flat already shares what is expensive, so this is a no op on them and
+    /// in particular does not flatten anything. A form that came back flat would be a column that
+    /// lost its encoding on the way into a table.
+    #[test]
+    fn putting_a_vector_on_pages_does_not_change_any_other_form() {
+        let dictionary = Vector::dictionary(
+            vec![0, 1, 0, 1],
+            Vector::from_values(
+                LogicalType::Varchar,
+                &[Value::Varchar("a".into()), Value::Varchar("b".into())],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let cases = [
+            Vector::constant(LogicalType::Integer, Value::Integer(9), 4),
+            Vector::sequence(4, 0, 1),
+            dictionary,
+        ];
+        for vector in cases {
+            let form = vector.form();
+            let paged = vector.clone().into_pages();
+            assert_eq!(paged.form(), form, "{form:?} changed form");
+            assert_eq!(paged.iter().collect::<Vec<_>>(), vector.iter().collect::<Vec<_>>());
+        }
     }
 
     #[test]

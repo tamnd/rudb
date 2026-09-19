@@ -97,7 +97,9 @@ impl MemoryTable {
         self.stats_ns += started.elapsed().as_nanos() as u64;
         self.rows += chunk.len();
         self.zones.push(zone);
-        self.chunks.push(chunk);
+        // Stored as pages, because a stored chunk is read once per scan of the table and a page is
+        // what makes that read a reference count bump rather than a copy. See `read`.
+        self.chunks.push(chunk.into_pages());
         Ok(())
     }
 
@@ -156,11 +158,23 @@ impl MemoryTable {
 
     /// One chunk's worth of the named columns, in the order they are named.
     ///
-    /// The columns are copied, because a vector owns its buffer and there is nothing to borrow
-    /// from yet. Borrowed buffers with a pin are the M2 item in `spec/07-execution.md` section 7.1,
-    /// and this is the call that will stop copying when they arrive. Asking for the columns rather
-    /// than taking them all is what makes that copy proportional to the query instead of to the
-    /// table, which is the same reason projection pushdown exists.
+    /// The columns are shared rather than copied. `append` stores every chunk as pages, so the
+    /// vector handed back here points at the stored values and the cost of this call is one atomic
+    /// increment per column. It used to copy, and `spec/perf/12-the-chunk-and-the-page.md` measured
+    /// what that cost: 1,803 instructions a chunk of memcpy and 1,869 of malloc and free on a `sum`
+    /// over a twenty million row table, which is 27 percent of the chunk and none of it the query's
+    /// work.
+    ///
+    /// Nothing downstream can tell, because a write through a shared buffer copies it out first,
+    /// which is `Buffer::to_mut`, so an operator that means to modify a column it was handed pays
+    /// the copy there instead and one that does not pays nothing. Asking for the columns rather than
+    /// taking them all still matters, because the atomic increments and the validity masks are per
+    /// column, and it is the same reason projection pushdown exists.
+    ///
+    /// What is still copied is the parts a cut has to rewrite: a string column's views, a
+    /// dictionary's codes, and a validity mask that is not all valid or all invalid. Those are
+    /// sixteen, four and an eighth of a byte a row against the payload, and each of them is a `Vec`
+    /// where the payload is a page.
     ///
     /// # Errors
     ///
@@ -229,6 +243,40 @@ mod tests {
         let chunk = table.read(0, &[]).expect("no columns");
         assert_eq!(chunk.width(), 0);
         assert_eq!(chunk.len(), 3);
+    }
+
+    /// The point of storing a chunk as pages. A read points at the stored values rather than copying
+    /// them, asserted on the address, because the values are the same either way.
+    #[test]
+    fn a_read_points_at_the_stored_values_rather_than_copying_them() {
+        use rudb_vector::vector::Data;
+
+        let mut table = MemoryTable::new(vec![LogicalType::BigInt]);
+        let rows: Vec<Vec<Value>> = (0..64).map(|n| vec![Value::BigInt(n)]).collect();
+        table.append_rows(&rows).expect("bigints");
+
+        let address = |chunk: &Chunk| match chunk.column(0).expect("one column").data() {
+            Some(Data::Int64(values)) => values.as_slice().as_ptr() as usize,
+            _ => panic!("a BIGINT column is not a run of i64"),
+        };
+        let stored = address(table.chunk(0).expect("the only chunk"));
+        let first = table.read(0, &[0]).expect("the only chunk");
+        let second = table.read(0, &[0]).expect("the only chunk again");
+        assert_eq!(address(&first), stored, "the read copied the column out");
+        assert_eq!(address(&second), stored, "the second read copied the column out");
+        assert_eq!(first.value_at(7, 0), Value::BigInt(7));
+        assert_eq!(second.value_at(63, 0), Value::BigInt(63));
+
+        // Nothing can write through what it was handed, because a vector has no mutating method at
+        // all and the only way at the values is `Buffer::to_mut`, which copies the page out first.
+        // So the sharing is safe without a rule anybody has to remember.
+
+        // The memory limit is not told about the page twice. Three holders of one 512 byte page add
+        // up to the page rather than to three of it, which is the rule in `Buffer::footprint`.
+        let charged = table.chunk(0).expect("the only chunk").footprint()
+            + first.footprint()
+            + second.footprint();
+        assert!(charged < 512 * 2, "{charged} charged for one 512 byte page held three times");
     }
 
     #[test]

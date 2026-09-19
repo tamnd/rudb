@@ -273,6 +273,17 @@ impl StringColumn {
         Self { views: Vec::new(), arena }
     }
 
+    /// This column with its arena held as a page, so that a copy of it does not copy the bytes.
+    ///
+    /// The views are still copied, because they are a `Vec` and a run of them is what a cut of the
+    /// column is. Sixteen bytes a row rather than every byte of every string, which is the same
+    /// split the [`StringView`](crate::vector::Form::StringView) form already makes for the same
+    /// reason.
+    #[must_use]
+    pub fn into_page(self) -> Self {
+        Self { views: self.views, arena: self.arena.into_page() }
+    }
+
     /// How many strings are in the column.
     #[must_use]
     pub fn len(&self) -> usize {
