@@ -31,7 +31,7 @@
 //! What is missing is every part of estimation that needs data rather than shape. There are no
 //! column histograms, no distinct counts, no correlation between predicates, and no sample. A
 //! filter on a primary key and a filter on a boolean get the same selectivity here. That is the
-//! part `spec/09-optimizer.md` section 9.3 actually specifies and it needs the statistics that
+//! part `spec/09-optimizer.md` section 9.3 actually specifies and it needs the facts that
 //! M3's storage layer collects, so it waits for them.
 
 use std::collections::BTreeMap;
@@ -64,13 +64,64 @@ const KEPT_BY_A_CONDITION: f64 = 0.2;
 /// this is a middle that is wrong for both rather than a guess that favours one.
 const KEPT_BY_A_GROUP_BY: f64 = 0.1;
 
-/// The row counts the optimizer was handed, by table.
+/// What one column of one table is known by, which is the whole key space of [`Facts`].
+///
+/// One key type and one `get` rather than a reader per kind of number, because the rule about what
+/// a missing answer means has to be in one place. Two accessors are two chances to write `0` where
+/// `Unknown` belongs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Key<'a> {
+    /// How many rows that table holds.
+    Rows {
+        /// The database it is attached in.
+        catalog: &'a str,
+        /// The schema it is in.
+        schema: &'a str,
+        /// The table.
+        table: &'a str,
+    },
+    /// How many distinct values that column of that table holds.
+    Distinct {
+        /// The database it is attached in.
+        catalog: &'a str,
+        /// The schema it is in.
+        schema: &'a str,
+        /// The table.
+        table: &'a str,
+        /// The column, by name, because the position a column has in a scan is whatever column
+        /// pruning left and the name is not moved by anything.
+        column: &'a str,
+    },
+}
+
+/// Everything counted that the optimizer was handed, by table and by column.
+///
+/// Called facts rather than statistics because that is what these are. Every number in here was
+/// counted rather than sampled or guessed, the estimates are what this module makes out of them,
+/// and the two want different names or a reader has to work out which one a variable holds.
 ///
 /// A side table rather than a field on [`Node::Get`], and a plain count rather than a handle on the
 /// catalog. Both of those are so that a plan stays a value: the optimizer's own tests build plans
 /// out of text with no database anywhere near them, `Plan::parse` of a printed plan gives back the
 /// plan it was printed from, and neither of those survives a node that carries a number only a
 /// live catalog could have filled in.
+///
+/// # Reading it never waits
+///
+/// [`Facts::get`] is a lookup in a map this value owns, so there is no lock to take, nothing to
+/// fault in and nothing to wait for. That is the guarantee `spec/stats/04-in-memory.md` asks for and
+/// it is a property of the shape rather than of the code: a set of facts is built once, is never
+/// written to again, and is handed to a statement behind an [`std::sync::Arc`]. A key nobody filled
+/// in answers [`Stat::Unknown`], which every caller already has to handle, rather than going and
+/// finding out and making the planner wait while it does.
+///
+/// # One generation per plan
+///
+/// [`Facts::generation`] says which version of the catalog these were read from, and a plan is
+/// planned from exactly one of them. Two statements that see the same number are looking at the
+/// same catalog, so the second reuses what the first built instead of walking every table and every
+/// column again. That walk is what this used to cost per statement whether the query touched those
+/// tables or not.
 ///
 /// Files are not in here. What a Parquet call produces is counted by the binder, which is the only
 /// thing in the chain holding the file open, and it rides on the plan against the table index of
@@ -85,16 +136,56 @@ const KEPT_BY_A_GROUP_BY: f64 = 0.1;
 /// an empty table are not the same thing, and an optimizer that confuses them will happily build a
 /// hash table from the side it thinks has no rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Statistics {
+pub struct Facts {
     tables: BTreeMap<(String, String, String), u64>,
     columns: BTreeMap<(String, String, String, String), u64>,
+    generation: u64,
 }
 
-impl Statistics {
-    /// Nothing known about anything.
+impl Facts {
+    /// Nothing known about anything, and read from no catalog.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Nothing known about anything yet, to be filled in from that version of the catalog.
+    #[must_use]
+    pub fn at(generation: u64) -> Self {
+        Self { generation, ..Self::default() }
+    }
+
+    /// Which version of the catalog these were read from, or zero for a set built by hand.
+    ///
+    /// Zero never matches a real catalog, whose own count starts at one, so a set built in a test
+    /// can never be mistaken for one that is still current.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// What is known about one key, without waiting for anything.
+    ///
+    /// A number nobody recorded comes back [`Stat::Unknown`] rather than as a zero or as a guess,
+    /// which is the distinction `spec/stats/02-the-catalogue.md` section 2.1.1 exists to keep. A
+    /// scan of a table nobody measured and a scan of an empty table are not the same thing, and an
+    /// optimizer that confuses them will build a hash table from the side it thinks has no rows.
+    ///
+    /// What comes back is [`Class::Exact`], because these are counted rather than estimated, and
+    /// the provenance says which count it is so that a reader of `EXPLAIN` can tell the two apart.
+    /// A distinct count says [`Provenance::Dictionary`] because that is where it comes from: the
+    /// only tables that answer one are the ones holding a dictionary for the column.
+    #[must_use]
+    pub fn get(&self, key: &Key<'_>) -> Stat<u64> {
+        let (found, provenance) = match *key {
+            Key::Rows { catalog, schema, table } => {
+                (self.rows_in(catalog, schema, table), Provenance::RowCount)
+            }
+            Key::Distinct { catalog, schema, table, column } => {
+                (self.distinct_in(catalog, schema, table, column), Provenance::Dictionary)
+            }
+        };
+        found.map_or(Stat::Unknown, |value| Stat::exact(value, provenance))
     }
 
     /// Record what one table held.
@@ -103,8 +194,10 @@ impl Statistics {
     }
 
     /// What that table held, where anybody said.
-    #[must_use]
-    pub fn rows_in(&self, catalog: &str, schema: &str, table: &str) -> Option<u64> {
+    ///
+    /// Private, because [`Facts::get`] is the one reader and the rule about what a missing answer
+    /// means belongs in one place. This is the map lookup under it.
+    fn rows_in(&self, catalog: &str, schema: &str, table: &str) -> Option<u64> {
         self.tables.get(&(catalog.to_owned(), schema.to_owned(), table.to_owned())).copied()
     }
 
@@ -125,14 +218,9 @@ impl Statistics {
     }
 
     /// How many distinct values that column holds, where anybody counted.
-    #[must_use]
-    pub fn distinct_in(
-        &self,
-        catalog: &str,
-        schema: &str,
-        table: &str,
-        column: &str,
-    ) -> Option<u64> {
+    ///
+    /// Private for the same reason [`Facts::rows_in`] is.
+    fn distinct_in(&self, catalog: &str, schema: &str, table: &str, column: &str) -> Option<u64> {
         let key = (catalog.to_owned(), schema.to_owned(), table.to_owned(), column.to_owned());
         self.columns.get(&key).copied()
     }
@@ -176,7 +264,7 @@ const CEILING: Class = Class::Certified { bound: 1.0, direction: Direction::AtMo
 /// [`Stat::answer`] or [`Stat::enable`], and both of those will refuse almost everything this
 /// module produces. That is the point.
 #[must_use]
-pub fn rows(plan: &Plan, node: NodeRef, stats: &Statistics) -> Option<u64> {
+pub fn rows(plan: &Plan, node: NodeRef, stats: &Facts) -> Option<u64> {
     rows_stat(plan, node, stats).decide().copied()
 }
 
@@ -193,7 +281,7 @@ pub fn rows(plan: &Plan, node: NodeRef, stats: &Statistics) -> Option<u64> {
 /// plan deep enough for that to matter is a plan with other problems. The cache goes in when join
 /// ordering arrives and asks the same question about the same subtree a thousand times.
 #[must_use]
-pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
+pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Facts) -> Stat<u64> {
     let of = |child: NodeRef| rows_stat(plan, child, stats);
     match *plan.node(node) {
         // One row with no columns, which is what a `SELECT` with no `FROM` is bound against.
@@ -201,12 +289,11 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
         // The catalog counted these rather than estimating them, so the count is the count. That
         // is the one exact number a plan starts from today and it is why the histogram does not
         // read all unknown: a scan knows, and everything above it stops knowing.
-        Node::Get { catalog, schema, table, .. } => {
-            match stats.rows_in(plan.string(catalog), plan.string(schema), plan.string(table)) {
-                Some(rows) => Stat::exact(rows, Provenance::RowCount),
-                None => Stat::Unknown,
-            }
-        }
+        Node::Get { catalog, schema, table, .. } => stats.get(&Key::Rows {
+            catalog: plan.string(catalog),
+            schema: plan.string(schema),
+            table: plan.string(table),
+        }),
         // Counted rather than guessed. A literal row list is the one place in a plan where the
         // number of rows is written down.
         Node::Values { rows: list, .. } => u64::try_from(plan.row_list(list).len())
@@ -412,11 +499,11 @@ fn ceiling(stat: Stat<u64>) -> Stat<u64> {
 /// that two of them on one column are intersected into the interval they name instead of multiplied
 /// into a wider one. What is still multiplied is one condition against the next, and both numbers
 /// are the column's own taken where the column is read, so a filter above a join reads the base
-/// table's statistics and applies them to an input something else has already cut down. That is the
+/// table's facts and applies them to an input something else has already cut down. That is the
 /// standard reading and it is why this stays [`GUESSED`]: it assumes the conditions and whatever
 /// happened underneath are independent, which is the assumption every estimator makes and the one
 /// that fails first.
-fn kept(plan: &Plan, input: NodeRef, predicate: ExprRef, stats: &Statistics) -> (f64, Provenance) {
+fn kept(plan: &Plan, input: NodeRef, predicate: ExprRef, stats: &Facts) -> (f64, Provenance) {
     let mut fraction = 1.0;
     let mut counted = 0;
     let mut pending = Vec::new();
@@ -508,7 +595,7 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> Vec<ExprRef> {
 /// row instead of thirty thousand. The join can fall back because the row count put through its
 /// arithmetic gives the containment assumption back exactly. This has no such identity and has to
 /// refuse.
-fn values(plan: &Plan, conjunct: ExprRef, stats: &Statistics) -> Option<u64> {
+fn values(plan: &Plan, conjunct: ExprRef, stats: &Facts) -> Option<u64> {
     let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(conjunct) else {
         return None;
     };
@@ -577,12 +664,12 @@ fn asked<'a>(
 ///
 /// A column nobody counted falls back to the table's rows. See [`Missing::Rows`] for why, and
 /// [`stated`] for the caller that cannot take that answer.
-fn distinct(plan: &Plan, binding: ColumnBinding, stats: &Statistics) -> Option<u64> {
+fn distinct(plan: &Plan, binding: ColumnBinding, stats: &Facts) -> Option<u64> {
     follow(plan, binding, stats, Missing::Rows, 16)
 }
 
 /// [`distinct`] restricted to columns somebody actually counted.
-fn stated(plan: &Plan, binding: ColumnBinding, stats: &Statistics) -> Option<u64> {
+fn stated(plan: &Plan, binding: ColumnBinding, stats: &Facts) -> Option<u64> {
     follow(plan, binding, stats, Missing::Nothing, 16)
 }
 
@@ -619,7 +706,7 @@ enum Missing {
 fn follow(
     plan: &Plan,
     binding: ColumnBinding,
-    stats: &Statistics,
+    stats: &Facts,
     missing: Missing,
     depth: u32,
 ) -> Option<u64> {
@@ -633,10 +720,17 @@ fn follow(
                 let catalog = plan.string(catalog);
                 let schema = plan.string(schema);
                 let table = plan.string(table);
-                if let Some(distinct) = stats.distinct_in(catalog, schema, table, name) {
-                    return Some(distinct);
+                let distinct = stats.get(&Key::Distinct { catalog, schema, table, column: name });
+                if let Stat::Known { value, .. } = distinct {
+                    return Some(value);
                 }
-                return if rows { stats.rows_in(catalog, schema, table) } else { None };
+                if !rows {
+                    return None;
+                }
+                return match stats.get(&Key::Rows { catalog, schema, table }) {
+                    Stat::Known { value, .. } => Some(value),
+                    Stat::Unknown => None,
+                };
             }
             Node::TableFunction { index, columns, .. } if index == binding.table => {
                 let name = &plan.field_list(columns).get(position)?.name;
@@ -666,7 +760,7 @@ fn follow(
 /// unless every condition is an equality between two base columns that both have a count, because a
 /// condition nobody understood could be the one doing all the work and a divisor that left it out
 /// would claim more rows than the join can produce.
-fn keyspace(plan: &Plan, conditions: Slice, stats: &Statistics) -> Option<u64> {
+fn keyspace(plan: &Plan, conditions: Slice, stats: &Facts) -> Option<u64> {
     keyspace_of(plan, plan.expr_list(conditions), stats)
 }
 
@@ -676,7 +770,7 @@ fn keyspace(plan: &Plan, conditions: Slice, stats: &Statistics) -> Option<u64> {
 /// apply at that pair are the ones it has just worked out are testable there, which is a list it
 /// built and not a list any node in the arena holds.
 #[must_use]
-pub fn keyspace_of(plan: &Plan, conditions: &[ExprRef], stats: &Statistics) -> Option<u64> {
+pub fn keyspace_of(plan: &Plan, conditions: &[ExprRef], stats: &Facts) -> Option<u64> {
     if conditions.is_empty() {
         return None;
     }
@@ -814,7 +908,7 @@ mod tests {
     use rudb_common::stat::{Class, Direction, Provenance, Stat};
     use rudb_plan::Plan;
 
-    use super::{Statistics, rows, rows_stat};
+    use super::{Facts, Key, rows, rows_stat};
 
     /// A one column scan of the named table, which is what most of these sit on.
     fn scan(table: &str, index: u32) -> String {
@@ -822,8 +916,8 @@ mod tests {
     }
 
     /// The tables named here, sized as given, and nothing else measured.
-    fn statistics(tables: &[(&str, u64)]) -> Statistics {
-        let mut stats = Statistics::new();
+    fn facts(tables: &[(&str, u64)]) -> Facts {
+        let mut stats = Facts::new();
         for (table, count) in tables {
             stats.record("memory", "main", table, *count);
         }
@@ -832,7 +926,7 @@ mod tests {
 
     /// The estimate for the root of a plan written as text, against the given table sizes.
     fn estimate(text: &str, tables: &[(&str, u64)]) -> Option<u64> {
-        let stats = statistics(tables);
+        let stats = facts(tables);
         let plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         rows(&plan, plan.root(), &stats)
@@ -840,7 +934,7 @@ mod tests {
 
     /// The same estimate with the class still attached.
     fn stat(text: &str, tables: &[(&str, u64)]) -> Stat<u64> {
-        let stats = statistics(tables);
+        let stats = facts(tables);
         let plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         rows_stat(&plan, plan.root(), &stats)
@@ -848,7 +942,7 @@ mod tests {
 
     /// The estimate against table sizes and distinct counts, the counts named table then column.
     fn counted(text: &str, tables: &[(&str, u64)], columns: &[(&str, &str, u64)]) -> Option<u64> {
-        let mut stats = statistics(tables);
+        let mut stats = facts(tables);
         for (table, column, distinct) in columns {
             stats.record_distinct("memory", "main", table, column, *distinct);
         }
@@ -863,7 +957,7 @@ mod tests {
         tables: &[(&str, u64)],
         columns: &[(&str, &str, u64)],
     ) -> Stat<u64> {
-        let mut stats = statistics(tables);
+        let mut stats = facts(tables);
         for (table, column, distinct) in columns {
             stats.record_distinct("memory", "main", table, column, *distinct);
         }
@@ -910,7 +1004,7 @@ mod tests {
 
     #[test]
     fn an_ungrouped_aggregate_is_one_row_whatever_is_under_it() {
-        // The one answer here that is a fact rather than a guess, and it holds with no statistics
+        // The one answer here that is a fact rather than a guess, and it holds with no facts
         // at all, which is what makes it worth special casing.
         let text = format!("Aggregate #1 groups=[] aggregates=[]\n  {}", scan("t", 0));
         assert_eq!(estimate(&text, &[]), Some(1));
@@ -1137,7 +1231,7 @@ mod tests {
         let mut plan = Plan::parse(text).expect("a table function");
         plan.measure(0, Stat::exact(6_001_215, Provenance::RowCount));
         assert_eq!(
-            rows_stat(&plan, plan.root(), &Statistics::new()),
+            rows_stat(&plan, plan.root(), &Facts::new()),
             Stat::exact(6_001_215, Provenance::RowCount)
         );
     }
@@ -1156,7 +1250,7 @@ mod tests {
         plan.measure(0, Stat::exact(3, Provenance::RowCount));
         plan.measure(1, Stat::exact(5, Provenance::RowCount));
         assert_eq!(
-            rows_stat(&plan, plan.root(), &Statistics::new()),
+            rows_stat(&plan, plan.root(), &Facts::new()),
             Stat::exact(15, Provenance::RowCount)
         );
     }
@@ -1172,7 +1266,7 @@ mod tests {
         );
         let mut plan = Plan::parse(text).expect("two table functions");
         plan.measure(0, Stat::exact(3, Provenance::RowCount));
-        assert_eq!(rows_stat(&plan, plan.root(), &Statistics::new()), Stat::Unknown);
+        assert_eq!(rows_stat(&plan, plan.root(), &Facts::new()), Stat::Unknown);
     }
 
     #[test]
@@ -1185,9 +1279,9 @@ mod tests {
             "  TableFunction read_parquet args=[] #0 [a::BIGINT]\n"
         );
         let mut plan = Plan::parse(text).expect("a filter over a table function");
-        assert_eq!(rows_stat(&plan, plan.root(), &Statistics::new()), Stat::Unknown);
+        assert_eq!(rows_stat(&plan, plan.root(), &Facts::new()), Stat::Unknown);
         plan.measure(0, Stat::exact(1000, Provenance::RowCount));
-        let over = rows_stat(&plan, plan.root(), &Statistics::new());
+        let over = rows_stat(&plan, plan.root(), &Facts::new());
         assert_eq!(over.value().copied(), Some(200));
         assert_eq!(over.class(), Some(Class::Estimated));
         assert_eq!(over.provenance(), Some(Provenance::Default));
@@ -1203,18 +1297,44 @@ mod tests {
         );
         let mut plan = Plan::parse(text).expect("a lateral function");
         plan.measure(1, Stat::exact(4096, Provenance::RowCount));
-        assert_eq!(rows_stat(&plan, plan.root(), &Statistics::new()), Stat::Unknown);
+        assert_eq!(rows_stat(&plan, plan.root(), &Facts::new()), Stat::Unknown);
     }
 
     #[test]
-    fn statistics_that_nobody_filled_in_say_so() {
-        let mut stats = Statistics::new();
+    fn facts_that_nobody_filled_in_say_so() {
+        let mut stats = Facts::new();
         assert!(stats.is_empty());
         stats.record("memory", "main", "t", 7);
         assert!(!stats.is_empty());
-        assert_eq!(stats.rows_in("memory", "main", "t"), Some(7));
-        // The three names are one key. A table of the same name in another schema is another table.
-        assert_eq!(stats.rows_in("memory", "other", "t"), None);
+        assert_eq!(
+            stats.get(&Key::Rows { catalog: "memory", schema: "main", table: "t" }),
+            Stat::exact(7, Provenance::RowCount)
+        );
+        // The three names are one key. A table of the same name in another schema is another table,
+        // and what comes back for it is unknown rather than a zero, because a table nobody measured
+        // and an empty table are not the same thing.
+        assert_eq!(
+            stats.get(&Key::Rows { catalog: "memory", schema: "other", table: "t" }),
+            Stat::Unknown
+        );
+    }
+
+    #[test]
+    fn a_distinct_count_says_where_it_came_from_and_a_missing_one_says_nothing() {
+        let mut stats = Facts::new();
+        stats.record_distinct("memory", "main", "t", "a", 25);
+        let key = |column| Key::Distinct { catalog: "memory", schema: "main", table: "t", column };
+        assert_eq!(stats.get(&key("a")), Stat::exact(25, Provenance::Dictionary));
+        assert_eq!(stats.get(&key("b")), Stat::Unknown, "a column nobody counted");
+    }
+
+    #[test]
+    fn a_set_built_by_hand_can_never_be_mistaken_for_a_catalog_that_is_current() {
+        // A catalog counts from one, so a set nobody read one for answers a generation no catalog
+        // ever has. That is what stops a set assembled in a test from being reused as though it
+        // were the live one.
+        assert_eq!(Facts::new().generation(), 0);
+        assert_eq!(Facts::at(12).generation(), 12);
     }
 
     #[test]
@@ -1496,7 +1616,7 @@ mod tests {
 
     /// The estimate for a plan whose table zero is the given store.
     fn zoned(text: &str, rows: u64, zones: &Arc<Stub>) -> Stat<u64> {
-        let stats = statistics(&[("t", rows)]);
+        let stats = facts(&[("t", rows)]);
         let mut plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         plan.set_zones(0, Arc::clone(zones) as Arc<dyn Zones>);
@@ -1607,7 +1727,7 @@ mod tests {
             "Filter ((#0.0::INTEGER = 5::INTEGER)::BOOLEAN AND (#0.1::INTEGER < 9::INTEGER)::BOOLEAN)::BOOLEAN\n  {}",
             bounded_scan()
         );
-        let mut stats = statistics(&[("t", 1_000_000)]);
+        let mut stats = facts(&[("t", 1_000_000)]);
         stats.record_distinct("memory", "main", "t", "a", 10);
         let mut plan = Plan::parse(&text).expect("parses");
         let zones = Stub::spreading(0.5);
@@ -1640,7 +1760,7 @@ mod tests {
         // One value out of a range is not a fraction a range knows, so the store refuses equality
         // anyway, but the order is worth pinning: the count is the better number and goes first.
         let text = format!("Filter (#0.0::INTEGER = 5::INTEGER)::BOOLEAN\n  {}", bounded_scan());
-        let mut stats = statistics(&[("t", 1_000_000)]);
+        let mut stats = facts(&[("t", 1_000_000)]);
         stats.record_distinct("memory", "main", "t", "a", 8);
         let mut plan = Plan::parse(&text).expect("parses");
         plan.set_zones(0, Stub::spreading(0.5) as Arc<dyn Zones>);

@@ -91,7 +91,7 @@ use rudb_plan::{BuildSide, JoinKind, Node, Plan};
 
 use rudb_common::Result;
 
-use crate::estimate::{self, Statistics};
+use crate::estimate::{self, Facts};
 use crate::filter;
 use crate::pass::{Context, Pass, top_down};
 use crate::tables::{Tables, produced};
@@ -110,7 +110,7 @@ impl Pass for BuildSideProbeSide {
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        choose(plan, context.statistics());
+        choose(plan, context.facts());
         Ok(())
     }
 }
@@ -170,7 +170,7 @@ fn forced(kind: JoinKind, lookup: bool) -> Option<BuildSide> {
 ///
 /// Idempotent by construction: the answer is a function of the two estimates and the kind, none of
 /// which this pass touches, so a second run writes what is already there.
-fn choose(plan: &mut Plan, stats: &Statistics) {
+fn choose(plan: &mut Plan, stats: &Facts) {
     let mut tables = Tables::new();
     for node in top_down(plan) {
         let Node::Join { left, right, kind, conditions, .. } = *plan.node(node) else {
@@ -207,7 +207,7 @@ mod tests {
     use rudb_plan::{BuildSide, JoinKind, Node, Plan};
 
     use super::{BuildSideProbeSide, forced, prefers};
-    use crate::estimate::Statistics;
+    use crate::estimate::Facts;
     use crate::pass::{Context, Pass};
 
     /// A join of two scans, with the row counts named by the caller.
@@ -220,11 +220,11 @@ mod tests {
         );
         let plan =
             Plan::parse(&text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
-        let mut statistics = Statistics::new();
-        statistics.record("memory", "main", "l", left);
-        statistics.record("memory", "main", "r", right);
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "l", left);
+        facts.record("memory", "main", "r", right);
         let mut context = Context::new();
-        context.measure(statistics);
+        context.measure(std::sync::Arc::new(facts));
         (plan, context)
     }
 
@@ -250,11 +250,11 @@ mod tests {
     fn side(text: &str, left: u64, right: u64) -> BuildSide {
         let mut plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
-        let mut statistics = Statistics::new();
-        statistics.record("memory", "main", "l", left);
-        statistics.record("memory", "main", "r", right);
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "l", left);
+        facts.record("memory", "main", "r", right);
         let mut context = Context::new();
-        context.measure(statistics);
+        context.measure(std::sync::Arc::new(facts));
         BuildSideProbeSide.run(&mut plan, &context).expect("the pass does not fail");
         let Node::Join { build, .. } = *plan.node(plan.root()) else {
             panic!("the root stopped being a join");
@@ -363,13 +363,13 @@ mod tests {
     fn a_table_nobody_measured_leaves_the_join_as_it_was() {
         let text = "Join INNER on=[]\n  Get memory.main.l AS l #0 [a::BIGINT]\n  Get memory.main.r AS r #1 [b::BIGINT]\n";
         let mut plan = Plan::parse(text).expect("the plan parses");
-        let mut statistics = Statistics::new();
+        let mut facts = Facts::new();
         // Only one of the two sides, which is the case the module documentation calls out: one
         // number is not enough to choose with and a default in place of the other one would be a
         // guess wearing a measurement's name.
-        statistics.record("memory", "main", "l", 400_000);
+        facts.record("memory", "main", "l", 400_000);
         let mut context = Context::new();
-        context.measure(statistics);
+        context.measure(std::sync::Arc::new(facts));
         BuildSideProbeSide.run(&mut plan, &context).expect("the pass does not fail");
         let Node::Join { build, .. } = *plan.node(plan.root()) else {
             panic!("the root stopped being a join");

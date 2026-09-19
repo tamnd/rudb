@@ -73,7 +73,7 @@
 use rudb_common::Result;
 use rudb_plan::{BuildSide, ExprRef, JoinKind, Node, NodeRef, Plan};
 
-use crate::estimate::{self, Statistics};
+use crate::estimate::{self, Facts};
 use crate::pass::{Context, Pass};
 use crate::tables::{TableSet, Tables, produced};
 use crate::walk;
@@ -89,13 +89,13 @@ impl Pass for JoinOrder {
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        reorder(plan, context.statistics());
+        reorder(plan, context.facts());
         Ok(())
     }
 }
 
 /// Reorders every run of inner joins in `plan`.
-pub fn reorder(plan: &mut Plan, stats: &Statistics) {
+pub fn reorder(plan: &mut Plan, stats: &Facts) {
     let mut tables = Tables::new();
     let root = rebuild(plan, plan.root(), &mut tables, stats);
     plan.set_root(root);
@@ -124,7 +124,7 @@ enum Build {
 }
 
 /// Rewrites the plan under `at`, returning `at` itself where nothing under it changed.
-fn rebuild(plan: &mut Plan, at: NodeRef, tables: &mut Tables, stats: &Statistics) -> NodeRef {
+fn rebuild(plan: &mut Plan, at: NodeRef, tables: &mut Tables, stats: &Facts) -> NodeRef {
     if joining(plan, at) {
         let mut leaves = Vec::new();
         let mut conditions = Vec::new();
@@ -200,7 +200,7 @@ fn order(
     leaves: &[NodeRef],
     conditions: &[ExprRef],
     tables: &mut Tables,
-    stats: &Statistics,
+    stats: &Facts,
 ) -> Option<NodeRef> {
     let mut builds: Vec<Build> = leaves.iter().map(|&leaf| Build::Leaf(leaf)).collect();
     let mut parts = Vec::with_capacity(leaves.len());
@@ -306,7 +306,7 @@ fn cheapest(
     plan: &Plan,
     parts: &[Part],
     pending: &[(ExprRef, TableSet)],
-    stats: &Statistics,
+    stats: &Facts,
 ) -> (usize, usize, u64) {
     let mut best: Option<Pick> = None;
     for left in 0..parts.len() {
@@ -354,7 +354,7 @@ struct Pick {
 /// between their two sides. Scored with the same two rules the search uses rather than with
 /// [`crate::estimate`], because the two have to be the same measure for the comparison to mean
 /// anything, and because this is the measure the greedy step is minimising one pair at a time.
-fn cost(plan: &Plan, at: NodeRef, stats: &Statistics) -> Option<(u64, u64, usize)> {
+fn cost(plan: &Plan, at: NodeRef, stats: &Facts) -> Option<(u64, u64, usize)> {
     let (left, right, testable) = match *plan.node(at) {
         Node::CrossProduct { left, right } => (left, right, Vec::new()),
         Node::Join { left, right, kind: JoinKind::Inner, conditions, .. } => {
@@ -382,7 +382,7 @@ fn cost(plan: &Plan, at: NodeRef, stats: &Statistics) -> Option<(u64, u64, usize
 mod tests {
     use rudb_plan::Plan;
 
-    use crate::estimate::Statistics;
+    use crate::estimate::Facts;
 
     use super::reorder;
 
@@ -391,7 +391,7 @@ mod tests {
     /// The tables are counted here rather than in each test, because the pass refuses a region with
     /// an uncounted leaf in it and a test that forgot to count one would pass by being refused.
     fn ordered(text: &str) -> String {
-        let mut counts = Statistics::new();
+        let mut counts = Facts::new();
         for (table, rows) in [("t", 1000), ("u", 10), ("v", 100), ("w", 100_000)] {
             counts.record("memory", "main", table, rows);
         }
@@ -404,7 +404,7 @@ mod tests {
 
     /// The same with distinct counts handed in as well, the counts named table then column.
     fn counted(text: &str, columns: &[(&str, &str, u64)]) -> String {
-        let mut counts = Statistics::new();
+        let mut counts = Facts::new();
         for (table, rows) in [("t", 1000), ("u", 10), ("v", 100), ("w", 100_000)] {
             counts.record("memory", "main", table, rows);
         }

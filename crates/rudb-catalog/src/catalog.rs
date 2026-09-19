@@ -153,6 +153,18 @@ pub struct Catalog {
     databases: Vec<Database>,
     default_catalog: String,
     default_schema: String,
+    /// Which version of the contents this is, counted from one.
+    ///
+    /// Anything that can change what a query would read moves it on, which is every method here
+    /// that takes the catalog by mutable reference, including [`Catalog::table_mut`], because a
+    /// caller that asked for a table that way is about to append to it or replace it. Handing out
+    /// one number for two different states is the failure this has to avoid, so a method that might
+    /// not change anything moves it anyway. Counting a change that did not happen costs a rebuild
+    /// nobody needed. Missing one serves a plan facts about a table that is no longer there.
+    ///
+    /// Counted from one so that zero can mean no catalog was ever read, which is what a set of
+    /// facts assembled by hand in a test carries.
+    generation: u64,
     /// The next oid to hand out.
     ///
     /// A counter rather than a position, because a position changes when the thing before it is
@@ -201,7 +213,26 @@ impl Catalog {
             default_catalog: DEFAULT_CATALOG.to_string(),
             default_schema: DEFAULT_SCHEMA.to_string(),
             next,
+            generation: 1,
         }
+    }
+
+    /// Which version of the contents this is.
+    ///
+    /// Two reads that answer the same number are looking at the same catalog, so anything derived
+    /// from it can be kept between them instead of being built again. The row counts and distinct
+    /// counts the optimizer plans from are the caller this is for.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Says the contents have changed.
+    ///
+    /// Called by every method that takes the catalog by mutable reference rather than by the ones
+    /// that really wrote something, which is deliberate and the field's own comment says why.
+    fn changed(&mut self) {
+        self.generation += 1;
     }
 
     /// The next oid, and moves the counter on.
@@ -238,6 +269,7 @@ impl Catalog {
     ///
     /// If a database of that name is already attached.
     pub fn attach(&mut self, name: &str) -> Result<()> {
+        self.changed();
         if self.databases.iter().any(|held| same_name(&held.name, name)) {
             return Err(Error::catalog(format!("Database with name \"{name}\" already exists!")));
         }
@@ -258,6 +290,7 @@ impl Catalog {
     ///
     /// If the database is not attached, or a schema of that name is already in it.
     pub fn create_schema(&mut self, catalog: &str, name: &str) -> Result<()> {
+        self.changed();
         let oid = self.stamp();
         let database = self.database_mut(catalog)?;
         if database.internal {
@@ -277,6 +310,7 @@ impl Catalog {
     /// If the database or the schema is missing, if a table or a view of that name is already
     /// there, or if two columns have the same name.
     pub fn create_table(&mut self, name: QualifiedName, columns: Vec<Field>) -> Result<()> {
+        self.changed();
         let mut table = Table::new(name.clone(), columns)?;
         // Stamped before the name is checked, so a refused create burns an oid rather than handing
         // the next table the number the refused one would have had. A gap in the sequence costs
@@ -296,6 +330,7 @@ impl Catalog {
     ///
     /// If its name is already used or its stored schema is invalid.
     pub fn create_native_table(&mut self, reader: NativeReader) -> Result<()> {
+        self.changed();
         let name = QualifiedName::new(
             self.default_catalog.clone(),
             self.default_schema.clone(),
@@ -321,6 +356,7 @@ impl Catalog {
     /// If the database or the schema is missing, or if a table or a view of that name is already
     /// there.
     pub fn create_view(&mut self, mut view: View) -> Result<()> {
+        self.changed();
         let name = view.name().clone();
         view.stamp(self.stamp());
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
@@ -338,6 +374,7 @@ impl Catalog {
     /// If there is no such table, or if the name is a view, which is a different sentence because
     /// it is a different mistake.
     pub fn drop_table(&mut self, name: &QualifiedName) -> Result<()> {
+        self.changed();
         self.drop_entry(name, Entry::Table)
     }
 
@@ -347,6 +384,7 @@ impl Catalog {
     ///
     /// If there is no such view, or if the name is a table.
     pub fn drop_view(&mut self, name: &QualifiedName) -> Result<()> {
+        self.changed();
         self.drop_entry(name, Entry::View)
     }
 
@@ -423,6 +461,7 @@ impl Catalog {
     ///
     /// If the database, the schema or the table is missing.
     pub fn table_mut(&mut self, name: &QualifiedName) -> Result<&mut Table> {
+        self.changed();
         let table = name.table.clone();
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
         schema
@@ -931,5 +970,57 @@ mod tests {
         let name = catalog.resolve(&["other", "main", "hits"]).expect("the other one");
         assert_eq!(name.catalog, "other");
         assert!(catalog.attach("OTHER").is_err(), "attaching it twice does not work");
+    }
+
+    #[test]
+    fn the_generation_starts_at_one_and_moves_on_for_everything_that_can_change_a_read() {
+        // Zero is reserved for a set of facts nobody read a catalog for, so a fresh one is one.
+        let mut catalog = Catalog::new();
+        assert_eq!(catalog.generation(), 1);
+
+        let mut seen = vec![catalog.generation()];
+        catalog.attach("other").expect("a second database");
+        seen.push(catalog.generation());
+        catalog.create_schema("other", "extra").expect("a schema in it");
+        seen.push(catalog.generation());
+        catalog
+            .create_table(
+                QualifiedName::new("memory", "main", "hits"),
+                vec![Field::new("n", LogicalType::Integer)],
+            )
+            .expect("a table");
+        seen.push(catalog.generation());
+        let name = catalog.resolve(&["hits"]).expect("the table");
+        catalog.table_mut(&name).expect("it is there").rows_mut();
+        seen.push(catalog.generation());
+        catalog
+            .create_view(View::new(
+                QualifiedName::new("memory", "main", "recent"),
+                "SELECT * FROM hits".to_string(),
+                "CREATE VIEW recent AS SELECT * FROM hits;".to_string(),
+                Vec::new(),
+                Vec::new(),
+            ))
+            .expect("a view");
+        seen.push(catalog.generation());
+        catalog.drop_view(&catalog.resolve(&["recent"]).expect("the view").clone()).expect("gone");
+        seen.push(catalog.generation());
+        catalog.drop_table(&name).expect("gone too");
+        seen.push(catalog.generation());
+
+        // Every step is a number nobody else has. Handing the same number out for two different
+        // catalogs is the failure this has to avoid, and counting a step that changed nothing only
+        // costs a rebuild.
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "{seen:?}");
+
+        // Reading does not move it, which is the whole point: two statements that read the same
+        // catalog plan from the same counts.
+        let before = catalog.generation();
+        assert_eq!(catalog.tables().count(), 0);
+        assert_eq!(catalog.default_schema(), "main");
+        assert_eq!(catalog.generation(), before);
     }
 }
