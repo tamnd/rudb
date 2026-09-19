@@ -679,6 +679,17 @@ fn onto(
     over: Vec<ExprRef>,
     below: &(TableSet, TableSet),
 ) -> (Vec<ExprRef>, Vec<ExprRef>) {
+    // A predicate the join already states is neither added again nor left above it. Dropping it is
+    // safe for the same reason this function exists at all, that on an inner join a condition and a
+    // filter above mean the same thing, so a second copy of one the join holds decides nothing.
+    // Without this the pass is not idempotent: `shared` pulls the conjuncts common to every branch
+    // of an `OR` out beside it on every visit, and once one of those has been moved onto the join
+    // the next visit extracts it again and finds nothing in `over` stopping it. That is q19, whose
+    // condition list grew a fresh copy of the same equality every time anything looked at the plan.
+    let over: Vec<ExprRef> = over
+        .into_iter()
+        .filter(|&part| !held.iter().any(|&other| walk::same(plan, part, other)))
+        .collect();
     let (fit, unfit): (Vec<ExprRef>, Vec<ExprRef>) =
         over.into_iter().partition(|&part| answered(plan, tables, part, below));
     // A join with no conditions at all is a nested loop over every pair, so an empty `held` with
@@ -1527,6 +1538,12 @@ Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGE
     Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
 ";
         assert_eq!(pushed(before), after);
+        // And again on what came out, because the pass runs more than once and the plan it settles
+        // on has to be the one it already produced. `shared` extracts the equality out of the
+        // disjunction every visit, so on this one it extracts a conjunct the join below is already
+        // holding, and the join has to recognise it rather than write it down twice. The real q19
+        // failed the optimizer's own settle check with a condition list of the same equality twice.
+        assert_eq!(pushed(after), after);
     }
 
     #[test]
