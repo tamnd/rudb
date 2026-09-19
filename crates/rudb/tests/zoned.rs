@@ -2,15 +2,20 @@
 //!
 //! A Parquet writer records the smallest and the largest value of every column of every row group.
 //! `pruned.rs` is about a scan walking past the groups a filter rules out, which is the reading
-//! side. This is the planning side of the same two numbers: how many rows are left in the groups
-//! nothing ruled out, which is a ceiling the answer cannot exceed, and the estimator holds its
-//! constant guess under it.
+//! side. This is the planning side of the same two numbers, and the planner asks them two different
+//! questions.
 //!
-//! The ceiling is only ever applied downwards, so every test here has two halves. One says what the
-//! estimate came out as, and one says what the query actually answers, because an estimate below
-//! the truth is the failure mode this has and it does not look like anything until a plan is built
-//! on it. `sorted.parquet` is written in ascending key order on purpose, which is what makes a
-//! filter on that key rule groups out at all, and its README entry says so.
+//! The first is how many rows are left in the groups nothing ruled out. That is a ceiling the answer
+//! cannot exceed and the estimator holds its guess under it. The second is what fraction of each
+//! surviving group a range keeps, interpolated between that group's two ends. That is a guess and
+//! not a ceiling, so it replaces the constant rather than capping it, and it can be wrong in either
+//! direction.
+//!
+//! Every test here has two halves. One says what the estimate came out as, and one says what the
+//! query actually answers, because an estimate below the truth is the failure mode this has and it
+//! does not look like anything until a plan is built on it. `sorted.parquet` is written in ascending
+//! key order on purpose, which is what makes a filter on that key rule groups out at all and what
+//! makes each group's two ends narrow enough to interpolate between, and its README entry says so.
 
 use rudb::Database;
 use rudb_common::{LogicalType, Value};
@@ -68,27 +73,44 @@ fn a_filter_the_bounds_rule_every_group_out_of_is_exactly_no_rows() {
 
 #[test]
 fn a_ceiling_under_the_guess_is_what_the_planner_gets() {
-    // 16,384 rows, one condition, so the guess is 3,276. The bounds leave one group of 2,048,
-    // which is a number no answer to this filter can exceed, so that is the estimate and it is
-    // marked as a bound rather than as a guess. The truth is a hundred, so this is still four
-    // times too many and it is twenty times closer than the guess was.
+    // Equality is the case the ceiling is still the whole answer for. One value out of a range is
+    // not a fraction a range knows, so nothing interpolates, the guess stays the constant's 3,276,
+    // and the bounds leave one group of 2,048 that no answer to this filter can exceed. That is the
+    // estimate and it is marked as a bound rather than as a guess. The truth is one, so this is
+    // still enormously too many, and a distinct count is what would answer it: the footer does not
+    // state one for `k`.
+    let database = Database::new();
+    let line = estimated(&database, "k = 5000");
+    assert!(line.contains("[2048 rows certified at most 100.00% from zone map]"), "{line}");
+    assert_eq!(answered(&database, "k = 5000"), 1);
+}
+
+#[test]
+fn a_range_is_interpolated_inside_the_groups_that_survive() {
+    // The ceiling leaves one group of 2,048, which is twenty times the truth. Interpolating inside
+    // that group is what closes the rest of the gap: `k` runs from 0 to 2047 there, the constant
+    // cuts it at 100, and none of the other seven groups contributes anything. The answer is a
+    // hundred and so is the truth.
+    //
+    // It is reported as a guess and not as a bound, because the values being spread evenly between
+    // a group's two ends is an assumption about the data rather than something the footer states.
+    // Here the file happens to be exactly that, which is why it lands exactly.
     let database = Database::new();
     let line = estimated(&database, "k < 100");
-    assert!(line.contains("[2048 rows certified at most 100.00% from zone map]"), "{line}");
+    assert!(line.contains("[~100 rows estimated from zone map]"), "{line}");
     assert_eq!(answered(&database, "k < 100"), 100);
 }
 
 #[test]
-fn a_ceiling_over_the_guess_leaves_the_guess_where_it_was() {
-    // Half the groups survive, which is 8,192 rows, and the guess is 3,276. A ceiling says nothing
-    // about how far under it the answer sits, so trading a guess that is already below one for the
-    // bound itself would be trading a number for a worse one. Here the guess is the worse number,
-    // the truth being 8,192 exactly, and that is the trade being refused: the rule is that reading
-    // the bounds can never make an estimate worse, and a rule that is right on this query would
-    // have to be wrong on some other one.
+fn a_range_the_bounds_rule_no_group_out_of_is_still_interpolated() {
+    // Half the groups survive whole and the other four contribute nothing, so the ceiling is 8,192.
+    // A ceiling says nothing about how far under it the answer sits and is still never applied
+    // upwards, and it is not what gives the number here: the interpolation arrives at the same
+    // 8,192 on its own, which is the truth exactly. What this used to answer was the constant's
+    // 3,276, two and a half times under.
     let database = Database::new();
     let line = estimated(&database, "k >= 8192");
-    assert!(line.contains("[~3276 rows estimated from default]"), "{line}");
+    assert!(line.contains("[~8192 rows estimated from zone map]"), "{line}");
     assert_eq!(answered(&database, "k >= 8192"), 8192);
 }
 
@@ -109,14 +131,18 @@ fn a_column_whose_groups_all_look_alike_is_estimated_the_way_it_always_was() {
 
 #[test]
 fn the_conjuncts_of_one_filter_are_asked_together_rather_than_one_at_a_time() {
-    // A group survives only if no condition rules it out, so these two leave the two groups from 0
-    // to 4095, which is 4,096 rows. The guess for two conditions is a fifth of a fifth, 655, which
-    // is already under that, so the guess stands. It is six times under the truth of 3,900, which
-    // is the compounding this module's own comment calls the part most likely to be wrong, and no
-    // pair of bounds is going to fix it.
+    // A group survives only if no condition rules it out, so the ceiling is the two groups from 0
+    // to 4095, which is 4,096 rows. What this used to answer was a fifth of a fifth, 655, six times
+    // under the truth of 3,900, and that compounding is what the estimator's own comment calls the
+    // part most likely to be wrong.
+    //
+    // Two conditions on one column are one interval and not two independent events, so the pair is
+    // intersected into 100 up to 3999 and interpolated once. That is 3,900 and so is the truth.
+    // Multiplying them instead would have said 3,975, right here by luck because the interval covers
+    // most of both groups, and much too narrow over a `BETWEEN` that names a slice of one.
     let database = Database::new();
     let line = estimated(&database, "k >= 100 AND k < 4000");
-    assert!(line.contains("[~655 rows estimated from default]"), "{line}");
+    assert!(line.contains("[~3900 rows estimated from zone map]"), "{line}");
     assert_eq!(answered(&database, "k >= 100 AND k < 4000"), 3900);
 }
 

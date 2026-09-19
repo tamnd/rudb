@@ -35,8 +35,9 @@
 //! M3's storage layer collects, so it waits for them.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use rudb_common::bounds::Test;
+use rudb_common::bounds::{Spread, Test, Zones};
 use rudb_common::stat::{Class, Direction, Provenance, Stat};
 use rudb_plan::{
     ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
@@ -221,7 +222,7 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
         // how many the call gives back for each of them.
         Node::LateralFunction { .. } => Stat::Unknown,
         Node::Filter { input, predicate } => {
-            let (kept, from) = kept(plan, predicate, stats);
+            let (kept, from) = kept(plan, input, predicate, stats);
             // The bounds are a ceiling over the guess and not a new thing to guess about. A store
             // that keeps a minimum and a maximum per part can say which parts this filter rules
             // out, and the rows in the parts that survive is a number no answer to this filter can
@@ -392,45 +393,82 @@ fn ceiling(stat: Stat<u64>) -> Stat<u64> {
 
 /// What fraction of its input a filter is assumed to keep, and where that fraction came from.
 ///
-/// The product over the conditions. An equality against a constant on a column somebody counted
-/// keeps one value out of however many the column holds, which is the uniformity assumption and is
-/// the oldest textbook rule there is. Everything else keeps [`KEPT_BY_A_CONDITION`], which is the
-/// same constant this had for every condition before.
+/// The product over the conditions, with each condition answered by the best supplier that can
+/// answer it and by [`KEPT_BY_A_CONDITION`] where none can.
 ///
-/// One over the count is not always smaller than the constant and is not meant to be. A column of
-/// three values gives a third, which is above the fifth the constant guessed, and that is the
-/// direction the constant was wrong in for `o_orderstatus`. The rule is to use the number where
-/// there is one, not to make the answer smaller.
+/// An equality against a constant on a column somebody counted keeps one value out of however many
+/// the column holds. That is the uniformity assumption and is the oldest textbook rule there is. One
+/// over the count is not always smaller than the constant and is not meant to be: a column of three
+/// values gives a third, which is above the fifth the constant guessed, and that is the direction
+/// the constant was wrong in for `o_orderstatus`. The rule is to use the number where there is one,
+/// not to make the answer smaller.
 ///
-/// The count is the column's own, taken at the scan it comes from, so a filter above a join reads
-/// the base table's count and applies it to an input something else has already cut down. That is
-/// the standard reading and it is why this stays [`GUESSED`]: it assumes the filter and whatever
+/// A range against a constant is interpolated between the bounds the file already states, per part,
+/// by [`spread`]. `l_shipdate <= '1998-09-02'` keeps ninety eight percent of TPC-H's lineitem and
+/// the constant called it twenty, and the two ends of the column were sitting in the footer the
+/// whole time saying 1992 and 1998.
+///
+/// The conditions the count did not answer go to the bounds together rather than one at a time, so
+/// that two of them on one column are intersected into the interval they name instead of multiplied
+/// into a wider one. What is still multiplied is one condition against the next, and both numbers
+/// are the column's own taken where the column is read, so a filter above a join reads the base
+/// table's statistics and applies them to an input something else has already cut down. That is the
+/// standard reading and it is why this stays [`GUESSED`]: it assumes the conditions and whatever
 /// happened underneath are independent, which is the assumption every estimator makes and the one
 /// that fails first.
-fn kept(plan: &Plan, predicate: ExprRef, stats: &Statistics) -> (f64, Provenance) {
+fn kept(plan: &Plan, input: NodeRef, predicate: ExprRef, stats: &Statistics) -> (f64, Provenance) {
     let mut fraction = 1.0;
-    let (mut counted, mut guessed) = (0_u32, 0_u32);
+    let mut counted = 0;
+    let mut pending = Vec::new();
     for conjunct in conjuncts(plan, predicate) {
         match values(plan, conjunct, stats) {
             Some(values) => {
                 fraction /= widened(values);
                 counted += 1;
             }
-            None => {
-                fraction *= KEPT_BY_A_CONDITION;
-                guessed += 1;
-            }
+            None => pending.push(conjunct),
         }
     }
-    // A fraction that is part counted and part guessed came from the arithmetic over the two rather
+    let interpolated = spread(plan, input, &pending).map_or(0, |spread| {
+        fraction *= spread.fraction;
+        spread.read
+    });
+    // Every condition nobody could answer is still worth the constant, and there is one of them per
+    // condition rather than one for the lot, because the fifth is a guess about one condition.
+    let guessed = pending.len().saturating_sub(interpolated);
+    for _ in 0..guessed {
+        fraction *= KEPT_BY_A_CONDITION;
+    }
+    // A fraction two different suppliers contributed to came from the arithmetic over them rather
     // than from either, which is what `Propagation` is for. A reader chasing a bad estimate wants to
-    // know which of the three this was without reading the predicate.
-    let from = match (counted, guessed) {
-        (0, _) => FROM_A_CONSTANT,
-        (_, 0) => Provenance::Sketch,
+    // know which supplier to go and look at without reading the predicate back.
+    let from = match (counted, interpolated, guessed) {
+        (0, 0, _) => FROM_A_CONSTANT,
+        (_, 0, 0) => Provenance::Sketch,
+        (0, _, 0) => Provenance::ZoneMap,
         _ => Provenance::Propagation,
     };
     (fraction, from)
+}
+
+/// What fraction of a scan's rows these conditions are expected to keep, interpolated between bounds.
+///
+/// The same reading of the plan [`surviving`] makes, and the same refusals, for the same reasons:
+/// straight on a scan whose store kept bounds, positions turned into names before the store is
+/// asked, and a name the store does not have gives up rather than guessing.
+///
+/// What is different is which way the answer can be wrong. [`surviving`] proves parts hold nothing
+/// and its answer is a ceiling. This one assumes the values inside a part are spread evenly between
+/// its two ends, which is a guess that can land either side of the truth, so it multiplies into the
+/// guess rather than capping it.
+///
+/// Every condition at once, because two of them on one column are one interval and not two, and a
+/// store handed them separately has no way to know they belong together. [`Spread::read`] comes back
+/// with how many of them the store could read, which is what the caller charges its constant for the
+/// rest by.
+fn spread(plan: &Plan, input: NodeRef, conjuncts: &[ExprRef]) -> Option<Spread> {
+    let (zones, tests) = asked(plan, input, conjuncts)?;
+    zones.spread(&tests)
 }
 
 /// The conditions a predicate is made of, capped.
@@ -486,37 +524,49 @@ fn values(plan: &Plan, conjunct: ExprRef, stats: &Statistics) -> Option<u64> {
 
 /// How many rows sit in the parts of `input` that `predicate` cannot rule out.
 ///
+/// A ceiling and not an estimate, which is why the caller takes the smaller of this and its guess
+/// rather than multiplying the two together.
+fn surviving(plan: &Plan, input: NodeRef, predicate: ExprRef) -> Option<u64> {
+    let (zones, tests) = asked(plan, input, &[predicate])?;
+    zones.surviving(&tests)
+}
+
+/// The store under `input` and the tests `predicates` read as, named the way that store names them.
+///
 /// `None` unless the filter sits straight on a scan whose store kept bounds and at least one
 /// conjunct reads as a test. Straight on, with no projection in between, because a projection
 /// renames columns and the name is what the store is asked by, and following one through would be a
 /// second place that has to agree with the first about what a column is called.
 ///
 /// A conjunct that is not a test is not a refusal. Dropping it leaves parts in that a full reading
-/// would have ruled out, so the answer stays a ceiling, and the guess above it still applies. What
-/// is a refusal is a test naming a column the store does not have, which means this plan and this
-/// store disagree about what is being read, and a number worked out from that disagreement would
-/// rule out parts holding rows the query wants.
+/// would have ruled out, which is the safe direction for both callers: it leaves [`surviving`] with
+/// a looser ceiling and [`spread`] with a larger fraction, and the guess above either still applies.
+/// What is a refusal is a test naming a column the store does not have, which means this plan and
+/// this store disagree about what is being read, and a number worked out from that disagreement
+/// would rule out parts holding rows the query wants.
 ///
 /// The position is turned into a name and the name is given to the store, rather than the position
 /// being handed over directly. Column pruning moves a scan's positions and moves nothing else, so a
 /// position is about the plan and the store numbers its columns the way the file does.
-fn surviving(plan: &Plan, input: NodeRef, predicate: ExprRef) -> Option<u64> {
+fn asked<'a>(
+    plan: &'a Plan,
+    input: NodeRef,
+    predicates: &[ExprRef],
+) -> Option<(&'a Arc<dyn Zones>, Vec<Test>)> {
     let index = bounds::scanned(plan, input)?;
     let zones = plan.zones(index)?;
     let names = match *plan.node(input) {
         Node::Get { columns, .. } | Node::TableFunction { columns, .. } => plan.field_list(columns),
         _ => return None,
     };
-    let read = bounds::of(plan, input, predicate);
-    if read.is_empty() {
-        return None;
+    let mut tests = Vec::new();
+    for predicate in predicates {
+        for (position, op, value) in bounds::of(plan, input, *predicate) {
+            let name = &names.get(position)?.name;
+            tests.push(Test { column: zones.column(name)?, op, value });
+        }
     }
-    let mut tests = Vec::with_capacity(read.len());
-    for (position, op, value) in read {
-        let name = &names.get(position)?.name;
-        tests.push(Test { column: zones.column(name)?, op, value });
-    }
-    zones.surviving(&tests)
+    (!tests.is_empty()).then_some((zones, tests))
 }
 
 /// How many distinct values the column a binding names holds, where anybody counted.
@@ -760,7 +810,7 @@ fn scale(rows: u64, by: f64) -> u64 {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rudb_common::bounds::{Op, Test, Zones};
+    use rudb_common::bounds::{Op, Spread, Test, Zones};
     use rudb_common::stat::{Class, Direction, Provenance, Stat};
     use rudb_plan::Plan;
 
@@ -1401,13 +1451,21 @@ mod tests {
     struct Stub {
         /// What [`Zones::surviving`] answers, whatever it is asked.
         surviving: Option<u64>,
+        /// What [`Zones::spread`] answers, whatever it is asked.
+        spread: Option<f64>,
         /// Every test it was asked, so a test can check which column the estimator named.
         asked: Mutex<Vec<Test>>,
     }
 
     impl Stub {
+        /// A store that answers the ceiling and refuses to interpolate, which is most of these.
         fn new(surviving: Option<u64>) -> Arc<Self> {
-            Arc::new(Self { surviving, asked: Mutex::new(Vec::new()) })
+            Arc::new(Self { surviving, spread: None, asked: Mutex::new(Vec::new()) })
+        }
+
+        /// A store that interpolates and states no ceiling, which is the range case.
+        fn spreading(spread: f64) -> Arc<Self> {
+            Arc::new(Self { surviving: None, spread: Some(spread), asked: Mutex::new(Vec::new()) })
         }
     }
 
@@ -1423,6 +1481,11 @@ mod tests {
         fn surviving(&self, tests: &[Test]) -> Option<u64> {
             self.asked.lock().expect("no test panics while holding this").extend_from_slice(tests);
             self.surviving
+        }
+
+        fn spread(&self, tests: &[Test]) -> Option<Spread> {
+            self.asked.lock().expect("no test panics while holding this").extend_from_slice(tests);
+            self.spread.map(|fraction| Spread { fraction, read: tests.len() })
         }
     }
 
@@ -1507,18 +1570,105 @@ mod tests {
     }
 
     #[test]
+    fn a_range_the_store_can_interpolate_takes_its_fraction_rather_than_the_constant() {
+        // The number that matters most in this file. Every range in TPC-H took a fifth whatever it
+        // asked for, and `l_shipdate <= '1998-09-02'` keeps ninety eight percent of lineitem while
+        // the two ends of the column sit in the footer saying 1992 and 1998.
+        let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let zones = Stub::spreading(0.98);
+        assert_eq!(zoned(&text, 1_000_000, &zones), Stat::estimated(980_000, Provenance::ZoneMap));
+    }
+
+    #[test]
+    fn a_fraction_above_the_constant_is_taken_as_readily_as_one_below_it() {
+        // The rule is to use the number where there is one and not to make the answer smaller. All
+        // sixteen ranges measured on TPC-H were underestimates, so the fifth was too small far more
+        // often than it was too large, and a rule that only ever cut would have fixed none of them.
+        let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let narrow = Stub::spreading(0.01);
+        assert_eq!(zoned(&text, 1_000_000, &narrow), Stat::estimated(10_000, Provenance::ZoneMap));
+    }
+
+    #[test]
+    fn a_fraction_of_nothing_is_still_a_row_and_is_still_a_guess() {
+        // The floor the guess has always had. A relation estimated away is a subtree nobody reads,
+        // and an interpolated zero is an assumption about how values are spread rather than a fact
+        // that the file holds none, so it does not get the exactness the ceiling of zero gets.
+        let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let empty = Stub::spreading(0.0);
+        assert_eq!(zoned(&text, 1_000_000, &empty), Stat::estimated(1, Provenance::ZoneMap));
+    }
+
+    #[test]
+    fn a_counted_condition_and_an_interpolated_one_report_the_arithmetic_over_both() {
+        // Two suppliers answering two conditions of one filter. Neither name is the truth about
+        // where the fraction came from, so the reader gets told it was worked out rather than read.
+        let text = format!(
+            "Filter ((#0.0::INTEGER = 5::INTEGER)::BOOLEAN AND (#0.1::INTEGER < 9::INTEGER)::BOOLEAN)::BOOLEAN\n  {}",
+            bounded_scan()
+        );
+        let mut stats = statistics(&[("t", 1_000_000)]);
+        stats.record_distinct("memory", "main", "t", "a", 10);
+        let mut plan = Plan::parse(&text).expect("parses");
+        let zones = Stub::spreading(0.5);
+        plan.set_zones(0, Arc::clone(&zones) as Arc<dyn Zones>);
+        let stat = rows_stat(&plan, plan.root(), &stats);
+        // A tenth for the equality from the count, a half for the range from the bounds.
+        assert_eq!(stat, Stat::estimated(50_000, Provenance::Propagation));
+    }
+
+    #[test]
+    fn a_condition_the_store_could_not_read_still_costs_the_constant() {
+        // Two conditions, one of which is a comparison of two columns and reads as no test at all.
+        // The store answers for the one it was handed and says so, and the other is charged the
+        // fifth on its own. Charging nothing for it would say a condition nobody can estimate keeps
+        // every row, and charging the fifth twice would guess at a condition that was answered.
+        let text = format!(
+            "Filter ((#0.0::INTEGER < 9::INTEGER)::BOOLEAN AND (#0.0::INTEGER = #0.1::INTEGER)::BOOLEAN)::BOOLEAN\n  {}",
+            bounded_scan()
+        );
+        // A half from the store and a fifth for the other one, which is a tenth of a million.
+        let zones = Stub::spreading(0.5);
+        assert_eq!(
+            zoned(&text, 1_000_000, &zones),
+            Stat::estimated(100_000, Provenance::Propagation)
+        );
+    }
+
+    #[test]
+    fn the_count_answers_an_equality_before_the_bounds_are_asked_to_interpolate_it() {
+        // One value out of a range is not a fraction a range knows, so the store refuses equality
+        // anyway, but the order is worth pinning: the count is the better number and goes first.
+        let text = format!("Filter (#0.0::INTEGER = 5::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let mut stats = statistics(&[("t", 1_000_000)]);
+        stats.record_distinct("memory", "main", "t", "a", 8);
+        let mut plan = Plan::parse(&text).expect("parses");
+        plan.set_zones(0, Stub::spreading(0.5) as Arc<dyn Zones>);
+        assert_eq!(
+            rows_stat(&plan, plan.root(), &stats),
+            Stat::estimated(125_000, Provenance::Sketch)
+        );
+    }
+
+    #[test]
     fn the_column_the_store_is_asked_about_is_the_one_the_plan_named_and_not_the_position() {
         // The bug this mapping exists to stop. The plan's column zero is `a` and the store's
         // column zero is `b`, so a test handed straight through would rule out row groups on the
         // wrong column's bounds. That drops rows the query wanted, which is a wrong answer and not
         // a slow one.
+        //
+        // The store is asked twice for this filter, once for the ceiling and once for the
+        // fraction, and both have to name the same column. Checking every ask rather than the
+        // first means adding a third question later cannot quietly skip the mapping.
         let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
         let zones = Stub::new(Some(100));
         zoned(&text, 1_000_000, &zones);
         let asked = zones.asked.lock().expect("not poisoned");
-        assert_eq!(asked.len(), 1);
-        assert_eq!(asked[0].column, 1, "`a` is the store's column one");
-        assert_eq!(asked[0].op, Op::Less);
+        assert!(!asked.is_empty(), "it was asked");
+        for test in asked.iter() {
+            assert_eq!(test.column, 1, "`a` is the store's column one");
+            assert_eq!(test.op, Op::Less);
+        }
     }
 
     #[test]

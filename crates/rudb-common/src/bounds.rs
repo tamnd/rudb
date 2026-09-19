@@ -233,6 +233,23 @@ pub trait Zones: std::fmt::Debug + Send + Sync {
     /// `None` where the store cannot say, which is a count it cannot represent rather than a store
     /// with no bounds. No bounds means nothing is ruled out, which is a number.
     fn surviving(&self, tests: &[Test]) -> Option<u64>;
+
+    /// What fraction of the store's rows `tests` is expected to keep, and how many of them said so.
+    ///
+    /// An estimate and not a ceiling, which is the whole difference from [`Self::surviving`]. That
+    /// one proves a part holds nothing and its answer is an upper bound. This one interpolates
+    /// inside the parts that survive, by [`kept`], and its answer is a guess that can be wrong in
+    /// either direction. So a caller caps with the first and multiplies with the second.
+    ///
+    /// Asked with every test of the filter at once rather than one at a time, because two tests on
+    /// one column have to be intersected and a caller handing them over separately would have
+    /// multiplied them instead.
+    ///
+    /// `None` where no part could be interpolated at all, which is what a test [`kept`] refuses
+    /// looks like from here, and is the caller's signal to fall back to its constant for all of
+    /// them. Where some were read and some were not, [`Spread::read`] says how many, and the ones
+    /// left over are the caller's to guess at.
+    fn spread(&self, tests: &[Test]) -> Option<Spread>;
 }
 
 /// Whether `column op value` is false for every value between `low` and `high`.
@@ -277,9 +294,134 @@ fn holds(bound: Option<&Bound>, value: &Bound, wanted: &[Ordering]) -> bool {
     bound.and_then(|bound| bound.order(value)).is_some_and(|order| wanted.contains(&order))
 }
 
+/// What fraction of a stretch running from `low` to `high` the tests on one column keep.
+///
+/// This is the other question a minimum and a maximum can be asked and the only one in this module
+/// that is a guess. [`excluded`] proves a stretch holds nothing and is never wrong. This assumes the
+/// values are spread evenly between the two ends, which is not a fact about any column, and answers
+/// a number between zero and one.
+///
+/// It is still worth far more than a constant. Every range comparison in TPC-H took the same fifth
+/// whatever it asked for, and a fifth is what `l_shipdate <= '1998-09-02'` gets when the answer is
+/// ninety eight percent of the table. The bounds already say the column runs from 1992 to 1998 and
+/// the arithmetic from there is one subtraction.
+///
+/// # Every test on the column at once
+///
+/// `tests` is the whole filter and `column` picks the ones this call is about, because two tests on
+/// one column are not independent of each other and multiplying them is wrong. `x >= 100 AND x < 4000`
+/// over a stretch of 0 to 4095 names 3,900 of the 4,096 values in it, and two fractions multiplied
+/// give ninety seven percent of ninety eight, which is a different number for no reason. So the tests
+/// narrow one interval one after another and the fraction is measured once at the end.
+///
+/// What is still multiplied, by the caller, is tests on different columns. That assumes the columns
+/// are independent of each other, which is the assumption every estimator makes and the one that
+/// fails first, and it is not something a pair of bounds can do anything about.
+///
+/// # What it will not answer
+///
+/// `None` where no test on the column could be read at all, which is the caller's signal to fall
+/// back to whatever it does without a number. A test is unreadable when the two ends and the constant
+/// are not in one domain, when they are strings, or when it is `=`. Strings are out because the
+/// distance between two byte strings is not a number anybody agrees on and a prefix embedding would
+/// be a guess on top of a guess. `=` is out because one value out of a range is not a fraction a
+/// range knows: how many distinct values sit between the ends is the question, and a distinct count
+/// answers it.
+///
+/// The integers are counted and the reals are measured, which is the difference between six values
+/// in 10 to 15 and a sixth of the distance from 10 to 15. Dates are integers here and are counted,
+/// which is what makes a range of days come out right on a small table rather than only on a large
+/// one.
+#[must_use]
+pub fn kept(tests: &[Test], column: usize, low: &Bound, high: &Bound) -> Option<Spread> {
+    match (low, high) {
+        (&Bound::Int(low), &Bound::Int(high)) => counted(tests, column, low, high),
+        (&Bound::Real(low), &Bound::Real(high)) => measured(tests, column, low, high),
+        _ => None,
+    }
+}
+
+/// What a set of tests is expected to keep, and how many of them went into that.
+///
+/// The count is what lets a caller tell a test that was answered from one that was refused. The
+/// fraction is one number over the whole set, so without the count there is no way back to which
+/// conditions still need the caller's own guess applied to them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Spread {
+    /// The fraction of the rows the tests that were read are expected to keep.
+    pub fraction: f64,
+    /// How many tests were read.
+    pub read: usize,
+}
+
+/// [`kept`] over a dense stretch of integers, where the answer is a count of values.
+///
+/// The stretch starts as the whole of `low` to `high` and each test clips one end of it. `x < v`
+/// clips the top to `v - 1` and `x >= v` clips the bottom to `v`, and the fraction at the end is the
+/// integers left over the integers there were. An interval clipped past itself is a zero rather than
+/// a negative number.
+///
+/// A stretch of one value falls out of this without a case of its own, because `high - low + 1` is
+/// one rather than zero and there is nothing to divide by that is not there.
+#[expect(clippy::cast_precision_loss, reason = "a span past two to the fifty third is not a span")]
+fn counted(tests: &[Test], column: usize, low: i128, high: i128) -> Option<Spread> {
+    let whole = high.checked_sub(low)?.checked_add(1)?;
+    if whole <= 0 {
+        return None;
+    }
+    let (mut first, mut last) = (low, high);
+    let mut read = 0;
+    for test in tests.iter().filter(|test| test.column == column) {
+        let &Bound::Int(value) = &test.value else { continue };
+        match test.op {
+            Op::Less => last = last.min(value.saturating_sub(1)),
+            Op::LessOrEqual => last = last.min(value),
+            Op::Greater => first = first.max(value.saturating_add(1)),
+            Op::GreaterOrEqual => first = first.max(value),
+            Op::Equal => continue,
+        }
+        read += 1;
+    }
+    let passing = last.saturating_sub(first).saturating_add(1).max(0);
+    (read > 0).then(|| Spread { fraction: (passing as f64 / whole as f64).clamp(0.0, 1.0), read })
+}
+
+/// [`kept`] over a stretch of reals, where the answer is a length.
+///
+/// The two strict comparisons clip to the same point as the two loose ones, because the point they
+/// differ by has no width and a fraction of a continuous stretch cannot see it.
+fn measured(tests: &[Test], column: usize, low: f64, high: f64) -> Option<Spread> {
+    let whole = high - low;
+    if !whole.is_finite() || whole < 0.0 {
+        return None;
+    }
+    let (mut first, mut last) = (low, high);
+    let mut read = 0;
+    for test in tests.iter().filter(|test| test.column == column) {
+        let &Bound::Real(value) = &test.value else { continue };
+        if !value.is_finite() {
+            continue;
+        }
+        match test.op {
+            Op::Less | Op::LessOrEqual => last = last.min(value),
+            Op::Greater | Op::GreaterOrEqual => first = first.max(value),
+            Op::Equal => continue,
+        }
+        read += 1;
+    }
+    // A stretch of one value is not a range to interpolate over and cannot be divided by. It holds
+    // or it does not, which the clipped interval says by whether it is empty.
+    let fraction = if whole == 0.0 {
+        f64::from(u8::from(first <= last))
+    } else {
+        ((last - first).max(0.0) / whole).clamp(0.0, 1.0)
+    };
+    (read > 0 && fraction.is_finite()).then_some(Spread { fraction, read })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Bound, Op, excluded};
+    use super::{Bound, Op, Test, excluded, kept};
     use crate::Value;
 
     /// The range 10 to 20, which every test here asks about.
@@ -368,6 +510,138 @@ mod tests {
         assert_eq!(Op::Less.flipped(), Op::Greater);
         assert_eq!(Op::GreaterOrEqual.flipped(), Op::LessOrEqual);
         assert_eq!(Op::Equal.flipped(), Op::Equal);
+    }
+
+    /// One test on column zero, which is the only column these ask about.
+    fn one(op: Op, number: i128) -> Vec<Test> {
+        vec![Test { column: 0, op, value: Bound::Int(number) }]
+    }
+
+    /// What fraction of the range 10 to 20 a test keeps, written short because there are a lot.
+    fn fraction(op: Op, number: i128) -> Option<f64> {
+        let (low, high) = range();
+        kept(&one(op, number), 0, &low, &high).map(|spread| spread.fraction)
+    }
+
+    #[test]
+    fn a_range_of_integers_is_counted_and_not_measured() {
+        // Eleven integers sit in 10 to 20, so `x < 15` keeps the five from 10 to 14 and `x <= 15`
+        // keeps the six from 10 to 15. A length ratio would call both of them a half, which is off
+        // by a whole value on a stretch this size and is the difference between a range of days
+        // coming out right on a small table and only on a large one.
+        assert_eq!(fraction(Op::Less, 15), Some(5.0 / 11.0));
+        assert_eq!(fraction(Op::LessOrEqual, 15), Some(6.0 / 11.0));
+        assert_eq!(fraction(Op::Greater, 15), Some(5.0 / 11.0));
+        assert_eq!(fraction(Op::GreaterOrEqual, 15), Some(6.0 / 11.0));
+    }
+
+    #[test]
+    fn a_constant_outside_the_range_keeps_all_of_it_or_none_of_it() {
+        assert_eq!(fraction(Op::Less, 5), Some(0.0));
+        assert_eq!(fraction(Op::GreaterOrEqual, 5), Some(1.0));
+        assert_eq!(fraction(Op::Less, 50), Some(1.0));
+        assert_eq!(fraction(Op::Greater, 50), Some(0.0));
+    }
+
+    /// The edges again, where the two loose comparisons and the two strict ones part company.
+    #[test]
+    fn a_constant_at_either_end_keeps_one_value_or_all_but_one() {
+        assert_eq!(fraction(Op::Less, 10), Some(0.0), "nothing is below the stretch's own low");
+        assert_eq!(fraction(Op::LessOrEqual, 10), Some(1.0 / 11.0));
+        assert_eq!(fraction(Op::Greater, 20), Some(0.0));
+        assert_eq!(fraction(Op::GreaterOrEqual, 20), Some(1.0 / 11.0));
+    }
+
+    /// The whole reason this takes every test at once rather than one at a time.
+    #[test]
+    fn two_tests_on_one_column_are_intersected_and_not_multiplied() {
+        // `x >= 12 AND x < 15` names the three values 12, 13 and 14 out of the eleven in the
+        // stretch. Two fractions multiplied give nine elevenths times five elevenths, which is
+        // forty five over a hundred and twenty one and is a wider interval than the one asked for.
+        let (low, high) = range();
+        let mut both = one(Op::GreaterOrEqual, 12);
+        both.extend(one(Op::Less, 15));
+        let spread = kept(&both, 0, &low, &high).expect("both were read");
+        assert_eq!(spread.fraction, 3.0 / 11.0);
+        assert_eq!(spread.read, 2, "and it says both went into it");
+        // An interval clipped past itself is empty rather than negative.
+        let mut empty = one(Op::GreaterOrEqual, 18);
+        empty.extend(one(Op::Less, 12));
+        assert_eq!(kept(&empty, 0, &low, &high).map(|spread| spread.fraction), Some(0.0));
+    }
+
+    #[test]
+    fn a_test_on_another_column_is_not_this_columns_business() {
+        // The caller hands over the whole filter and names the column, because two tests on one
+        // column intersect and two on different columns do not. Picking the wrong ones out here
+        // would narrow a column by an interval belonging to some other column.
+        let (low, high) = range();
+        let mut mixed = one(Op::Less, 15);
+        mixed.push(Test { column: 1, op: Op::Less, value: Bound::Int(11) });
+        let spread = kept(&mixed, 0, &low, &high).expect("the first one was read");
+        assert_eq!(spread.fraction, 5.0 / 11.0);
+        assert_eq!(spread.read, 1);
+    }
+
+    #[test]
+    fn a_range_of_reals_is_measured_and_the_strict_comparisons_answer_the_same() {
+        // A point has no width, so a fraction of a continuous stretch cannot see the difference
+        // between `<` and `<=`. There is no counting to do here because there is nothing to count.
+        let (low, high) = (Bound::Real(0.0), Bound::Real(10.0));
+        let at = |op| {
+            let tests = vec![Test { column: 0, op, value: Bound::Real(2.5) }];
+            kept(&tests, 0, &low, &high).map(|spread| spread.fraction)
+        };
+        assert_eq!(at(Op::Less), Some(0.25));
+        assert_eq!(at(Op::LessOrEqual), Some(0.25));
+        assert_eq!(at(Op::Greater), Some(0.75));
+        assert_eq!(at(Op::GreaterOrEqual), Some(0.75));
+    }
+
+    #[test]
+    fn a_stretch_of_one_value_holds_or_does_not_and_is_not_interpolated() {
+        // Every row group of a sorted column looks like this at its edges, and dividing by a span
+        // of zero is how that turns into a number nobody can use.
+        let one_int = Bound::Int(7);
+        let at = |op, number| {
+            kept(&one(op, number), 0, &one_int, &one_int).map(|spread| spread.fraction)
+        };
+        assert_eq!(at(Op::LessOrEqual, 7), Some(1.0));
+        assert_eq!(at(Op::Less, 7), Some(0.0));
+        assert_eq!(at(Op::Greater, 6), Some(1.0));
+        // And the same for a real, where it is a case of its own because the division is not by a
+        // count of values but by a length, and that length is zero here.
+        let point = Bound::Real(7.0);
+        let real = |op, number| {
+            let tests = vec![Test { column: 0, op, value: Bound::Real(number) }];
+            kept(&tests, 0, &point, &point).map(|spread| spread.fraction)
+        };
+        assert_eq!(real(Op::LessOrEqual, 7.0), Some(1.0));
+        assert_eq!(real(Op::Less, 6.0), Some(0.0));
+    }
+
+    #[test]
+    fn what_a_range_cannot_answer_it_says_nothing_about() {
+        let (low, high) = range();
+        // One value out of a range is not a fraction a range knows. How many distinct values sit
+        // between the two ends is the question, and a distinct count is what answers it.
+        assert_eq!(fraction(Op::Equal, 15), None);
+        // No test on the column at all.
+        assert_eq!(kept(&[], 0, &low, &high), None);
+        // Two domains have no distance between them, and bytes have none anybody agrees on.
+        let real = vec![Test { column: 0, op: Op::Less, value: Bound::Real(15.0) }];
+        assert_eq!(kept(&real, 0, &low, &high), None);
+        let text = vec![Test { column: 0, op: Op::Less, value: Bound::Bytes(b"m".to_vec()) }];
+        let (first, last) = (Bound::Bytes(b"a".to_vec()), Bound::Bytes(b"z".to_vec()));
+        assert_eq!(kept(&text, 0, &first, &last), None);
+    }
+
+    /// A column of `NaN` has no minimum, so there is no span to interpolate along either.
+    #[test]
+    fn a_nan_bound_interpolates_nothing() {
+        let nan = Bound::Real(f64::NAN);
+        let tests = vec![Test { column: 0, op: Op::Less, value: Bound::Real(1.0) }];
+        assert_eq!(kept(&tests, 0, &nan, &nan), None);
     }
 
     #[test]
