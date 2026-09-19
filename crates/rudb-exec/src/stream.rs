@@ -156,9 +156,12 @@ fn reads(node: &Node) -> u32 {
         | Node::Fetch { .. }
         | Node::TableFetch { .. }
         | Node::LateralFunction { .. } => 1,
+        // A share of the input holds every chunk until the input has ended, writes them once and
+        // reads them back once, which is the same shape as the breakers beside it here.
         Node::Aggregate { .. }
         | Node::Window { .. }
         | Node::Distinct { .. }
+        | Node::LimitPercent { .. }
         | Node::SetOp { .. } => 2,
         Node::TopN { .. } | Node::CrossProduct { .. } => 2,
         Node::Join { .. } | Node::DependentJoin { .. } => 3,

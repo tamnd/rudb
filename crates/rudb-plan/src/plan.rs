@@ -856,7 +856,7 @@ impl Plan {
                     self.checked_expr(key.expr, reference)?;
                 }
             }
-            Node::Limit { .. } => {}
+            Node::Limit { .. } | Node::LimitPercent { .. } => {}
             Node::Distinct { on, .. } => {
                 self.checked_expr_list(on, reference)?;
             }
@@ -947,7 +947,8 @@ impl Plan {
             | Node::MaterializedCte { .. }
             | Node::CteScan { .. }
             | Node::SetOp { .. }
-            | Node::Limit { .. } => Vec::new(),
+            | Node::Limit { .. }
+            | Node::LimitPercent { .. } => Vec::new(),
             Node::Values { rows, .. } => {
                 self.row_list(rows).iter().flat_map(|row| plain(self.expr_list(*row))).collect()
             }

@@ -306,6 +306,7 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         Node::Filter { input, .. }
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
+        | Node::LimitPercent { input, .. }
         | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => output_columns(plan, input),
         // A materialisation returns what the query that reads it returns. The held columns are not

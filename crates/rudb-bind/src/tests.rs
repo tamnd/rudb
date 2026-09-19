@@ -456,10 +456,24 @@ fn identifiers_match_without_regard_to_case_and_keep_the_case_they_were_created_
 
 #[test]
 fn what_is_not_bound_yet_says_what_was_written_rather_than_producing_a_wrong_plan() {
-    for query in ["SELECT counter ** 2 FROM hits", "SELECT url FROM hits LIMIT 10 PERCENT"] {
+    for query in ["SELECT counter ** 2 FROM hits", "SELECT url FROM hits LIMIT (SELECT 3)"] {
         let message = failure(query);
         assert!(!message.is_empty(), "{query} should say what it cannot do");
     }
+}
+
+/// A limit written as a share of the input binds to a node of its own.
+///
+/// It is a separate node rather than a field on the ordinary limit because it cannot emit anything
+/// until it has counted the input, and the plan is where that difference is said.
+#[test]
+fn a_percentage_limit_binds_to_a_node_of_its_own() {
+    let text = plan("SELECT url FROM hits LIMIT 10 PERCENT OFFSET 5");
+    assert!(text.starts_with("LimitPercent 10% offset 5"), "{text}");
+    assert_eq!(
+        failure("SELECT url FROM hits LIMIT 101 PERCENT"),
+        "Limit percent out of range, should be between 0% and 100%"
+    );
 }
 
 /// `DESCRIBE` is answered while it is bound, so what comes out is a `VALUES` and nothing else.

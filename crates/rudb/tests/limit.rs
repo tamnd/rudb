@@ -7,6 +7,10 @@
 //! read, and that the value is then cast to `BIGINT` whatever it was written as. So `LIMIT 1 + 1`
 //! is two rows, `LIMIT '3'` is three, `LIMIT 2.5` is three because the conversion rounds, and
 //! `LIMIT DATE '2020-01-01'` is the cast refusing a date rather than a rule of its own.
+//!
+//! A percentage is the same evaluation with a different cast at the end of it and a different node
+//! under it. The value goes to `DOUBLE`, the row count is a share of the input rounded down, and
+//! the offset is applied after the share rather than to it.
 
 use rudb::Database;
 use rudb_common::Value;
@@ -150,12 +154,76 @@ fn a_row_count_naming_a_column_is_refused_like_any_other_unknown_name() {
     assert!(message.contains("Referenced column \"i\""), "{message}");
 }
 
+/// A share of the input rather than a row count, which is a node of its own.
+///
+/// The count rounds down, which is the whole of the arithmetic: three and a half rows is three, half
+/// a row is none, and a hundred percent is every row.
+#[test]
+fn a_limit_can_be_a_share_of_the_input_rather_than_a_row_count() {
+    let database = database();
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT 30 PERCENT"), vec![0, 1, 2]);
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT 35 PERCENT"), vec![0, 1, 2]);
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT 5 PERCENT"), Vec::<i32>::new());
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT 0 PERCENT"), Vec::<i32>::new());
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT 100 PERCENT").len(), 10);
+}
+
+/// The share is of the whole input and the offset is applied after it, not to it.
+///
+/// `LIMIT 30 PERCENT OFFSET 2` over ten rows is three rows starting at the third, so it runs past
+/// the point a share of the eight remaining rows would have stopped at.
+#[test]
+fn the_offset_of_a_share_is_applied_after_the_share_is_worked_out() {
+    let database = database();
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT 30 PERCENT OFFSET 2"), vec![2, 3, 4]);
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT 50 PERCENT OFFSET 8"), vec![8, 9]);
+    let sql = "SELECT i FROM t LIMIT 30 PERCENT OFFSET 20";
+    assert_eq!(numbers(&database, sql), Vec::<i32>::new());
+}
+
+/// The `%` sign takes an expression where the `PERCENT` word takes a literal, and the value is cast
+/// to `DOUBLE` rather than to `BIGINT`.
+///
+/// `LIMIT true%` is one percent and not one row, which is the shortest way to see that the two
+/// spellings go through different casts.
+#[test]
+fn a_share_written_with_a_percent_sign_is_worked_out_like_any_other_expression() {
+    let database = database();
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (10 + 20)%"), vec![0, 1, 2]);
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT '30'%"), vec![0, 1, 2]);
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT true%"), Vec::<i32>::new());
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT NULL%").len(), 10);
+}
+
+/// A share outside nought to a hundred is refused while the query is planned.
+///
+/// The pin fails an `EXPLAIN` of it, so this is a plan time refusal there too and not something the
+/// operator discovers when the rows arrive. `NAN` is outside the range like anything else that is
+/// not between the two ends.
+#[test]
+fn a_share_that_is_not_between_nought_and_a_hundred_is_refused() {
+    let database = database();
+    for sql in [
+        "SELECT i FROM t LIMIT 101 PERCENT",
+        "SELECT i FROM t LIMIT 100.5 PERCENT",
+        "SELECT i FROM t LIMIT -10%",
+        "SELECT i FROM t LIMIT ('nan'::DOUBLE)%",
+    ] {
+        let message = refused(&database, sql);
+        assert!(message.contains("Limit percent out of range"), "{sql}: {message}");
+    }
+}
+
 /// A subquery is the one shape left over, because the plan node holds a number and not an
 /// expression. The pin answers it by reading the value while the query runs.
 #[test]
 fn a_row_count_holding_a_subquery_says_so() {
     let database = database();
-    for sql in ["SELECT i FROM t LIMIT (SELECT 3)", "SELECT i FROM t OFFSET (SELECT 3)"] {
+    for sql in [
+        "SELECT i FROM t LIMIT (SELECT 3)",
+        "SELECT i FROM t OFFSET (SELECT 3)",
+        "SELECT i FROM t LIMIT (SELECT 30)%",
+    ] {
         let message = refused(&database, sql);
         assert!(message.contains("holding a subquery"), "{sql}: {message}");
     }
