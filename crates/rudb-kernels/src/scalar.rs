@@ -51,7 +51,7 @@
 use memchr::memmem;
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::cast;
@@ -1289,10 +1289,102 @@ pub(crate) struct Like {
     stable: OnceLock<StableLike>,
 }
 
+/// How many dictionary values one decision of the stable memo covers.
+///
+/// It is what the native format puts in a payload block, so deciding a group reads one block of the
+/// dictionary and reads all of it, in the order it decodes to. A dictionary that groups its values
+/// some other way still gets the locality, since what this is really buying is a run of consecutive
+/// values rather than a scatter, and it is a whole number of words either way.
+const LIKE_GROUP: usize = 1024;
+
+/// A `LIKE` answered once per distinct value, for a dictionary that outlives the chunk.
+///
+/// The memo used to be a byte a value holding unknown, no or yes, and the row loop probed it at a
+/// random position once a row. On ClickBench `URL` that is a byte array of 18.3 million probed a
+/// hundred million times, and eighteen megabytes across a dozen threads does not stay in the last
+/// level cache, so the loop was paying a miss a row to answer a question it had already answered.
+/// The substring search was not the cost: the same query with a pattern that matches nothing, and
+/// the same query written as a prefix, both cost what `%google%` costs to the hundredth of a
+/// second.
+///
+/// So the memo is two bits a value, one saying the value has been decided and one holding what was
+/// decided, which is 4.6 MB for `URL` against the eighteen a byte a value took. Both bits live in
+/// the same word of thirty two values, so the row loop reads one word and reads it once, and a
+/// reader that sees the decided bit is looking at the answer that was written with it.
+///
+/// The memo also decides a whole group at a time rather than a value at a time. Deciding a group is
+/// a walk over 1,024 consecutive dictionary values, which is one payload block read in the order it
+/// decodes to rather than a scatter across a gigabyte of them.
+///
+/// A group is only worth deciding whole where the chunk asking is a scan rather than what a
+/// selective filter left behind. A chunk of ten rows that happen to point at ten distant values has
+/// no use for the ten thousand values either side of them, so it decides the ten. The rule is the
+/// chunk holding at least a group's worth of rows, which is a guess about intent and not a fact
+/// about the query, and it is wrong in the cheap direction: deciding one value at a time is what
+/// this always did.
+///
+/// Two threads can decide the same value or the same group at the same time. They walk the same
+/// values with the same pattern and reach the same answer, so the race is benign: the group write
+/// and the single value write agree wherever they overlap, and neither can clear a bit the other
+/// set. A decision is one `fetch_or` carrying both bits, released by the thread that made it and
+/// acquired by the thread that skips the walk because of it.
 #[derive(Debug)]
 struct StableLike {
     dictionary: Arc<Vector>,
-    answers: Vec<AtomicU8>,
+    /// Two bits a value, the low one of the pair saying the value was decided and the high one
+    /// saying it matched, packed thirty two values to the word.
+    state: Vec<AtomicU64>,
+}
+
+/// How many dictionary values one word of the memo holds, at two bits each.
+const MEMO_VALUES: usize = 32;
+
+impl StableLike {
+    /// The word `code` lives in and how far into it the pair of bits sits.
+    fn slot(code: usize) -> (usize, usize) {
+        (code / MEMO_VALUES, code % MEMO_VALUES * 2)
+    }
+
+    /// Whether `code` matches, or `None` where nothing has decided it yet.
+    ///
+    /// One load for both bits, which is the whole point of packing them together: this runs once a
+    /// row over a memo too big to stay in the last level cache, so a second array would be a second
+    /// miss for a question the first one already answered.
+    fn peek(&self, code: usize) -> Option<bool> {
+        let (index, shift) = Self::slot(code);
+        let word = self.state.get(index)?.load(Ordering::Acquire);
+        ((word >> shift) & 1 == 1).then(|| (word >> (shift + 1)) & 1 == 1)
+    }
+
+    /// Decides one value, which is what a chunk too small to be a scan asks for.
+    fn decide_one(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
+        let held = like.holds_vector(&self.dictionary, code, characters)?;
+        let (index, shift) = Self::slot(code);
+        self.word(index)?.fetch_or((1 | u64::from(held) << 1) << shift, Ordering::Release);
+        Ok(())
+    }
+
+    /// Decides every value of the group holding `code`, which reads one payload block in order.
+    fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
+        let first = code / LIKE_GROUP * LIKE_GROUP;
+        let last = (first + LIKE_GROUP).min(self.dictionary.len());
+        for start in (first..last).step_by(MEMO_VALUES) {
+            let mut bits = 0_u64;
+            for step in 0..(last - start).min(MEMO_VALUES) {
+                let held = like.holds_vector(&self.dictionary, start + step, characters)?;
+                bits |= (1 | u64::from(held) << 1) << (step * 2);
+            }
+            self.word(start / MEMO_VALUES)?.fetch_or(bits, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// The word of the memo at `index`.
+    fn word(&self, index: usize) -> Result<&AtomicU64> {
+        self.state
+            .get(index)
+            .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))
+    }
 }
 
 impl Like {
@@ -1405,27 +1497,34 @@ fn like_stable(
     rows: usize,
     returns: &LogicalType,
 ) -> Result<Option<Vector>> {
-    let cache = like.stable.get_or_init(|| StableLike {
-        dictionary: Arc::clone(dictionary),
-        answers: (0..dictionary.len()).map(|_| AtomicU8::new(0)).collect(),
+    let cache = like.stable.get_or_init(|| {
+        let words = dictionary.len().div_ceil(MEMO_VALUES);
+        StableLike {
+            dictionary: Arc::clone(dictionary),
+            state: (0..words).map(|_| AtomicU64::new(0)).collect(),
+        }
     });
     if !Arc::ptr_eq(&cache.dictionary, dictionary) {
         return like_vector_run(dictionary, codes, like, base, rows, returns);
     }
+    let bulk = rows >= LIKE_GROUP;
     let mut out = vec![false; rows];
     let mut characters = Vec::new();
     let validity = over_valid(rows, base, |index| {
         let code = codes[index] as usize;
-        let answer = cache
-            .answers
-            .get(code)
-            .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?;
-        let mut state = answer.load(Ordering::Relaxed);
-        if state == 0 {
-            state = u8::from(like.holds_vector(dictionary, code, &mut characters)?) + 1;
-            answer.store(state, Ordering::Relaxed);
-        }
-        out[index] = state == 2;
+        out[index] = match cache.peek(code) {
+            Some(held) => held,
+            None => {
+                if bulk {
+                    cache.decide_group(code, like, &mut characters)?;
+                } else {
+                    cache.decide_one(code, like, &mut characters)?;
+                }
+                cache
+                    .peek(code)
+                    .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?
+            }
+        };
         Ok(())
     })?;
     finish(returns, Data::Bool(out.into()), validity)
@@ -2778,6 +2877,50 @@ mod tests {
                 let want = answer(flat);
                 assert_eq!(answer(short), want, "{name} {spelling} over a short dictionary");
                 assert_eq!(answer(long), want, "{name} {spelling} over a long one");
+            }
+        }
+    }
+
+    /// A stable dictionary `LIKE` answers the same whichever way the memo filled.
+    ///
+    /// The memo fills a whole group of `LIKE_GROUP` values where the chunk is big enough to be a
+    /// scan and fills the one value it was asked about where it is not, so the two have to agree
+    /// over the same dictionary, and a memo a scan filled has to answer for a chunk that comes after
+    /// it. The dictionary here is 2,500 values, which is two whole groups and a part of a third, and
+    /// the codes step by a prime so a chunk lands in every group without repeating a code in order.
+    /// The big chunk runs first so the small one reads decisions it did not make.
+    #[test]
+    fn a_stable_dictionary_like_agrees_whichever_way_the_memo_filled() {
+        let values: Vec<Value> = (0..2_500)
+            .map(|index| match index % 7 {
+                0 => Value::Null,
+                1 => Value::Varchar(format!("http://google.com/{index}")),
+                2 => Value::Varchar(format!("http://goggle.com/{index}")),
+                _ => Value::Varchar(format!("row {index}")),
+            })
+            .collect();
+        let dictionary =
+            Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("builds"));
+        let like = Like::of("~~", "%google%").expect("a literal pattern compiles");
+        for rows in [2_000_usize, 64] {
+            let codes: Vec<u32> =
+                (0..rows).map(|row| ((row * 991) % values.len()) as u32).collect();
+            let picked: Vec<Value> =
+                codes.iter().map(|&code| values[code as usize].clone()).collect();
+            let flat = Vector::from_values(LogicalType::Varchar, &picked).expect("builds");
+            let pattern =
+                Vector::constant(LogicalType::Varchar, Value::Varchar("%google%".into()), rows);
+            let answer = |text: &Vector| {
+                like_of("~~", Some(&like), text, &pattern, &LogicalType::Boolean, rows)
+                    .expect("the call is written")
+                    .expect("text in this form has a loop of its own")
+            };
+            let column = Vector::stable_dictionary(codes, Arc::clone(&dictionary))
+                .expect("codes are in range");
+            let want = answer(&flat);
+            let got = answer(&column);
+            for row in 0..rows {
+                assert_eq!(got.value_at(row), want.value_at(row), "{rows} rows, row {row}");
             }
         }
     }
