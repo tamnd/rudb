@@ -98,7 +98,7 @@ use crate::gather::{self, Gathering};
 use crate::lookup::{Lookup, MISS, Scratch};
 use crate::rows;
 use crate::schema::Schema;
-use crate::side::{Build, PAD};
+use crate::side::{Build, PAD, laid_out};
 
 /// A join with a condition.
 #[derive(Debug)]
@@ -271,10 +271,14 @@ impl<'a> Join<'a> {
             equalities(self.plan, &self.conditions, &self.left_schema, &self.right_schema)
         };
         let index = match &equalities {
+            // On one thread, because this is the row major path that `RIGHT` and `FULL` are still
+            // on and it has no lease to spend. The streaming operator next door has one and the
+            // build there is the one that matters.
             Some(equalities) => Some(lookup(
                 equalities.gathered(self.plan, &self.right_schema, self.time_zone),
                 right_chunks,
                 &self.cancel,
+                &Lease::alone(),
                 &mut scratch,
             )?),
             None => None,
@@ -521,7 +525,7 @@ impl<'a> Join<'a> {
         // One pass over the gathered side, asked once here rather than once per driving row,
         // because what it decides is the same for all of them.
         let undecided = !nulls_are_values && any_null_key(gathered, right_chunks, &self.cancel)?;
-        let index = lookup(gathered, right_chunks, &self.cancel, scratch)?;
+        let index = lookup(gathered, right_chunks, &self.cancel, &Lease::alone(), scratch)?;
         let types = self.left_schema.types();
         scratch.grow(u64::try_from(left_rows.len()).unwrap_or(u64::MAX))?;
         let mut marks = Vec::with_capacity(left_rows.len());
@@ -931,10 +935,10 @@ impl<'a> Probe<'a> {
 
     /// The same, on the threads the pipeline holding this operator leased.
     ///
-    /// One of the two pieces is perfectly parallel and neither was. A column of the gathered side
-    /// depends on that column alone, so laying the chunks end to end is a task per column. What is
-    /// left on one thread is the table, where two rows of one key have to reach their chain in the
-    /// order they arrived, and that is the next thing to take apart.
+    /// Both of the two pieces are parallel now. A column of the gathered side depends on that
+    /// column alone, so laying the chunks end to end is a task per column, and the table is built
+    /// in partitions of the hash, which is a task per partition. See [`laid_out`] and
+    /// [`Lookup::build`] for what each of them does with the lease.
     ///
     /// Evaluating the keys was tried as a task per chunk and taken out again. The keys of a TPC-H
     /// join are bare column references, so the work per chunk is close to nothing, and against that
@@ -946,7 +950,7 @@ impl<'a> Probe<'a> {
                 let keying =
                     self.equalities.gathered(self.plan, &self.right_schema, self.time_zone);
                 let mut charged = self.held.lock().map_err(poisoned)?;
-                let index = lookup(keying, &chunks, &self.cancel, &mut charged)?;
+                let index = lookup(keying, &chunks, &self.cancel, threads, &mut charged)?;
                 // The chunks laid end to end, which is a copy of the side and is charged as one.
                 // The chunks themselves are not charged again here: the keep that made them holds
                 // that reservation for as long as this operator can read them, and charging the
@@ -1419,43 +1423,46 @@ fn equalities(
 
 /// The gathered side's rows, in a table that finds them by the values the key expressions produce.
 ///
-/// A chunk at a time, and every part of what a chunk costs is a pass over a column rather than a
-/// walk over a row: the key expressions are evaluated through the vectorized evaluator the rest of
-/// this file uses, the hash is one pass per key column with the column's type matched on once, and
-/// the probe walks the rows of a chunk together so the cache misses on a table larger than the
-/// cache are outstanding at the same time. What this replaced built a `Vec<Value>` per gathered row
-/// and hashed it a tagged value at a time. See [`Lookup`] for the rest of the argument.
+/// Every part of what this costs is a pass over a column rather than a walk over a row: the key
+/// expressions are evaluated through the vectorized evaluator the rest of this file uses, the hash
+/// is one pass per key column with the column's type matched on once, and the probe walks the rows
+/// of a batch together so the cache misses on a table larger than the cache are outstanding at the
+/// same time. What this replaced built a `Vec<Value>` per gathered row and hashed it a tagged value
+/// at a time. See [`Lookup`] for the rest of the argument.
 ///
-/// The chunks are the chunks the pipeline on the other side of the dependency edge produced, held
-/// as they were given, so nothing is packed or unpacked here at all. What is charged is the table,
-/// after each chunk and by the difference, so a build that is going to be too large says so while
-/// it is building rather than at the last row.
+/// The keys are evaluated a chunk at a time and then laid end to end, because the table is built in
+/// partitions and a partition's rows are scattered through the side. Laying them out is a thread
+/// per column and the partitions are a thread each, so the only part of this left on one thread is
+/// the hash and the null test.
+///
+/// What is charged is the table, once it is built rather than as it builds. The partitions run at
+/// the same time and a reservation taken in the middle of one of them would be a lock the others
+/// wait on, which is the thing this whole arrangement exists to remove.
 fn lookup(
     keying: Keying<'_>,
     chunks: &[Chunk],
     cancel: &Cancel,
+    threads: &Lease<'_>,
     scratch: &mut Reservation,
 ) -> Result<Lookup> {
     let Keying { plan, exprs, schema, nulls, time_zone } = keying;
     let rows: usize = chunks.iter().map(Chunk::len).sum();
-    let mut lookup = Lookup::new(rows)?;
-    let mut charged = lookup.footprint();
-    scratch.grow(charged)?;
-    let mut base = 0;
+    let mut keyed: Vec<Chunk> = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         // Once per chunk rather than once per row. A build over a side nobody bounded is the one
         // part of this operator that can run long without producing anything, and a check every two
         // thousand rows is the same granularity the rest of the operator uses.
         cancel.check()?;
         let columns = evaluate_all_in_time_zone(plan, exprs, schema, chunk, time_zone)?;
-        lookup.add(&columns, chunk.len(), base, nulls)?;
-        let want = lookup.footprint();
-        scratch.grow(want.saturating_sub(charged))?;
-        charged = want;
-        base += chunk.len();
+        keyed.push(Chunk::with_rows(columns, chunk.len())?);
     }
-    lookup.seal();
-    scratch.shrink(charged.saturating_sub(lookup.footprint()));
+    let Some(types) = keyed.first().map(Chunk::types) else {
+        return Lookup::build(&[], 0, nulls, threads, cancel);
+    };
+    let keys = laid_out(&types, &keyed, threads)?;
+    drop(keyed);
+    let lookup = Lookup::build(&keys, rows, nulls, threads, cancel)?;
+    scratch.grow(lookup.footprint())?;
     Ok(lookup)
 }
 
