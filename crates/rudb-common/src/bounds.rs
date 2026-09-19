@@ -44,7 +44,7 @@
 
 use std::cmp::Ordering;
 
-use crate::{LogicalType, Value};
+use crate::{LogicalType, Stat, Value};
 
 /// The scale a microsecond count sits at, which is what every time and timestamp constant is.
 pub const MICROS: u8 = 6;
@@ -261,6 +261,46 @@ impl Bound {
     }
 }
 
+/// Which end of a range a bound is.
+///
+/// A named pair rather than a `bool`, because the two ends carry different flags, read different
+/// bytes and fold together the other way round, and a caller that passes `true` says nothing about
+/// which one it meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum End {
+    /// The smallest value, which `MIN` asks for.
+    Low,
+    /// The largest value, which `MAX` asks for.
+    High,
+}
+
+impl End {
+    /// The further of the two towards this end, which is how the parts of a store fold into one.
+    ///
+    /// `None` where the two do not compare, which [`Bound::smaller`] and [`Bound::larger`] answer
+    /// by keeping the left one. That is right for a skip, where an undecided comparison costs a
+    /// part being read, and wrong here, where the fold is producing an answer and keeping either
+    /// side of a pair nothing ordered would be picking one.
+    #[must_use]
+    pub fn further(self, one: &Bound, other: &Bound) -> Option<Bound> {
+        let wanted = match self {
+            Self::Low => Ordering::Less,
+            Self::High => Ordering::Greater,
+        };
+        let taken = if one.order(other)? == wanted { one } else { other };
+        Some(taken.clone())
+    }
+
+    /// The word `EXPLAIN` and an error message use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Low => "minimum",
+            Self::High => "maximum",
+        }
+    }
+}
+
 /// One comparison against one column, with the bound it is testing for.
 ///
 /// Here rather than beside whichever store answers it, for the same reason [`Op`] and [`Bound`] are
@@ -327,6 +367,30 @@ pub trait Zones: std::fmt::Debug + Send + Sync {
     /// them. Where some were read and some were not, [`Spread::read`] says how many, and the ones
     /// left over are the caller's to guess at.
     fn spread(&self, tests: &[Test]) -> Option<Spread>;
+
+    /// The smallest or the largest value that column holds anywhere in the store.
+    ///
+    /// The answer to `MIN(column)` and `MAX(column)` and not an input to a guess about one, which
+    /// is what makes this different from the other two. So it comes back as a [`Stat`] rather than
+    /// as an `Option<Bound>`: a caller that means to print the number as the query's result has to
+    /// be able to see that it is [`Class::Exact`] before it does, per the answer rule of
+    /// `spec/stats/05-every-query.md` section 5.1.1.
+    ///
+    /// [`Stat::Unknown`] wherever the store cannot fold every part into one exact value. A part
+    /// that stated no bound, a part whose writer shortened its bound, a part whose bound does not
+    /// read, and two parts whose bounds do not compare, all end here. Nulls do not: a part holding
+    /// only nulls has no smallest value to contribute and `MIN` skips nulls, so a store can leave
+    /// that part out and still answer, and a store where every part is null has no answer to give.
+    ///
+    /// A shortened bound is [`Stat::Unknown`] and not [`Class::Certified`] even though it is a
+    /// perfectly good one sided bound, because the certified class carries a relative error and a
+    /// string that lost its tail has no relative error to state. When something wants the one sided
+    /// bound it can have its own question.
+    ///
+    /// [`Class::Certified`]: crate::stat::Class::Certified
+    /// [`Class::Exact`]: crate::stat::Class::Exact
+    /// [`Stat`]: crate::Stat
+    fn extreme(&self, column: usize, end: End) -> Stat<Bound>;
 }
 
 /// Whether `column op value` is false for every value between `low` and `high`.

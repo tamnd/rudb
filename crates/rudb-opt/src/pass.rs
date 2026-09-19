@@ -247,10 +247,10 @@ mod tests {
     #[test]
     fn a_name_duckdb_has_and_rudb_has_not_built_turns_nothing_off_and_is_not_an_error() {
         let context =
-            Context::without("statistics_propagation,unused_columns").expect("both are names");
+            Context::without("compressed_materialization,unused_columns").expect("both are names");
         assert!(context.is_disabled("unused_columns"));
         assert!(
-            !context.is_disabled("statistics_propagation"),
+            !context.is_disabled("compressed_materialization"),
             "there is no such pass to have turned off"
         );
     }
