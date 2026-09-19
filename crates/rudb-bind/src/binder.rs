@@ -200,12 +200,25 @@ pub(crate) struct PendingSubquery {
     pub(crate) kind: JoinKind,
     pub(crate) conditions: Vec<ExprRef>,
     pub(crate) dependent: bool,
+    /// The outer columns the query's body read, which is what `dependent` counts.
+    ///
+    /// Kept rather than reduced to the flag because a join's `ON` has to decide which of its two
+    /// inputs the query is joined into, and the answer is the side those columns come from. A
+    /// query that reads neither side can go on either.
+    pub(crate) reads: Vec<ColumnBinding>,
     /// The table index this query's join adds to the rows it is joined into.
     ///
     /// Kept so that a `HAVING` which reads one of these can say which columns came from a query
     /// joined above the grouping rather than from the table underneath it. Those columns are not
     /// the table's and the grouping rule has nothing to say about them.
     pub(crate) index: u32,
+}
+
+/// Which input of a join a query written in that join's `ON` is joined into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
 }
 
 /// The state one binding run carries.
@@ -354,26 +367,35 @@ impl<'a> Binder<'a> {
     fn attach_scalar_subqueries(&mut self, mut input: NodeRef) -> NodeRef {
         let subqueries = std::mem::take(&mut self.scalar_subqueries);
         for pending in subqueries {
-            let PendingSubquery { node: mut right, kind, conditions, dependent, index: _ } =
-                pending;
-            if kind == JoinKind::Single && !self.semantics.scalar_subquery_error_on_multiple_rows()
-            {
-                right = self.add_node(Node::Limit { input: right, count: Some(1), offset: 0 });
-            }
-            let conditions = self.plan.add_expr_list(&conditions);
-            input = if dependent {
-                self.add_node(Node::DependentJoin { left: input, right, kind, conditions })
-            } else {
-                self.add_node(Node::Join {
-                    left: input,
-                    right,
-                    kind,
-                    conditions,
-                    build: BuildSide::default(),
-                })
-            };
+            input = self.attach_subquery(input, pending);
         }
         input
+    }
+
+    /// Joins one query's result into a row stream, which is where its columns come from.
+    ///
+    /// Split out from [`Self::attach_scalar_subqueries`] because a join's `ON` does not attach its
+    /// queries to the rows the whole `FROM` produced. It attaches them to one of the join's two
+    /// inputs, since a join condition is evaluated by the join and can only read what the join was
+    /// given.
+    fn attach_subquery(&mut self, input: NodeRef, pending: PendingSubquery) -> NodeRef {
+        let PendingSubquery { node: mut right, kind, conditions, dependent, reads: _, index: _ } =
+            pending;
+        if kind == JoinKind::Single && !self.semantics.scalar_subquery_error_on_multiple_rows() {
+            right = self.add_node(Node::Limit { input: right, count: Some(1), offset: 0 });
+        }
+        let conditions = self.plan.add_expr_list(&conditions);
+        if dependent {
+            self.add_node(Node::DependentJoin { left: input, right, kind, conditions })
+        } else {
+            self.add_node(Node::Join {
+                left: input,
+                right,
+                kind,
+                conditions,
+                build: BuildSide::default(),
+            })
+        }
     }
 
     // ---------------------------------------------------------------- queries
@@ -2176,6 +2198,52 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Which input of a join a query written in its `ON` has to be joined into.
+    ///
+    /// A join condition is evaluated by the join, over the rows its two inputs handed it, so a
+    /// column the condition reads has to be produced by one of those two. A query written in the
+    /// `ON` produces columns the condition reads, which means the query cannot be joined in above
+    /// the join the way one written in a `WHERE` or a `SELECT` is. It has to go underneath, into
+    /// one input or the other.
+    ///
+    /// Which input is decided by what the query reads. A query whose body reads the right side can
+    /// only be evaluated where those rows are, so it goes into the right input, and the same for
+    /// the left. A query that reads neither could go into either and goes into the left, which is
+    /// also where an `IN` puts one whose left hand side reads the left and whose body reads
+    /// nothing.
+    ///
+    /// The one that has no answer is a query that reads both sides. There is no single input that
+    /// produces what it needs, and the shape upstream calls a pair dependent join is what handles
+    /// it. `None` is that case, and the caller turns it into a refusal rather than a plan.
+    fn side_of(
+        &self,
+        pending: &PendingSubquery,
+        left_tables: &[u32],
+        right_tables: &[u32],
+    ) -> Option<Side> {
+        let mut needs_left = false;
+        let mut needs_right = false;
+        let mut note = |binding: ColumnBinding| {
+            needs_left |= left_tables.contains(&binding.table);
+            needs_right |= right_tables.contains(&binding.table);
+        };
+        for &binding in &pending.reads {
+            note(binding);
+        }
+        // A mark join carries the comparison rather than the condition carrying it, and that
+        // comparison is written over the join's own rows. `l.a IN (SELECT ...)` reads the left side
+        // there and nowhere else, so leaving it out would put the query on whichever side its body
+        // happened to name and let the comparison ask a join for a column it was not given.
+        for &condition in &pending.conditions {
+            self.plan.read_columns(condition, &mut |_, binding| note(binding));
+        }
+        match (needs_left, needs_right) {
+            (true, true) => None,
+            (_, true) => Some(Side::Right),
+            _ => Some(Side::Left),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn bind_join(
         &mut self,
@@ -2200,6 +2268,15 @@ impl<'a> Binder<'a> {
             ));
         }
         let split = left_scope.len();
+        // Which table index came from which side, kept before the two scopes become one. A query
+        // written in the `ON` is joined into one of the inputs rather than above the join, and this
+        // is what says which. A `USING` drops the right side's copy of a joined-on column out of
+        // the scope below, and dropping a column does not change the index it came from, so the
+        // answer this gives is still right afterwards.
+        let left_tables: Vec<u32> =
+            left_scope.columns.iter().map(|column| column.binding.table).collect();
+        let right_tables: Vec<u32> =
+            right_scope.columns.iter().map(|column| column.binding.table).collect();
         let mut scope = left_scope.concat(right_scope);
 
         // NATURAL is USING over whatever both sides happen to call the same thing, which is why it
@@ -2266,13 +2343,28 @@ impl<'a> Binder<'a> {
             scope.remove(at);
         }
 
+        let mut left_node = left_node;
+        let mut right_node = right_node;
         if on != NONE {
             if !merged.is_empty() {
                 return Err(Error::binder("a join cannot have both ON and USING"));
             }
             self.clause = "JOIN condition";
+            let waiting = self.scalar_subqueries.len();
             let predicate = self.bind_expr(ast, on, &scope)?;
             conditions.push(self.as_boolean(predicate, "JOIN")?);
+            for pending in self.scalar_subqueries.split_off(waiting) {
+                match self.side_of(&pending, &left_tables, &right_tables) {
+                    Some(Side::Right) => right_node = self.attach_subquery(right_node, pending),
+                    Some(Side::Left) => left_node = self.attach_subquery(left_node, pending),
+                    None => {
+                        return Err(Error::not_implemented(
+                            "a subquery in a join condition that reads both sides of that join"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
         }
 
         if kind == ast::JoinKind::Cross && !conditions.is_empty() {
