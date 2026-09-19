@@ -562,7 +562,7 @@ fn runs_of(
     // The biggest run allowed, and the size of the pieces an oversized stripe is cut into. They are
     // the same number in the piled case because there is nothing left to protect there.
     let (whole, piece) = if working >= instances {
-        (share, share.div_ceil(2).max(1))
+        (share.div_ceil(2).max(1), share.div_ceil(2).max(1))
     } else {
         let piece = share.div_ceil(4).max(1);
         (piece, piece)
