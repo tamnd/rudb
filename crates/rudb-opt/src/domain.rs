@@ -361,16 +361,17 @@ fn push(
         Node::Join {
             left,
             right,
-            kind: kind @ (JoinKind::Inner | JoinKind::Left | JoinKind::Right | JoinKind::Full),
+            kind:
+                kind @ (JoinKind::Inner
+                | JoinKind::Left
+                | JoinKind::Right
+                | JoinKind::Full
+                | JoinKind::Single),
             conditions,
             ..
         } => sides(plan, left, right, kind, conditions, domain, index, keys, outer),
-        // A positional join and a single join are what is left out. A positional join pairs the nth
-        // row of one side with the nth row of the other, and crossing either side with the domain
-        // changes what the nth row is. A single join is left out for a reason that is not about the
-        // domain at all: the rule that builds one for an `EXISTS` in a join condition writes a plan
-        // whose left side reads a column of its right side, and pushing a domain through that turns
-        // a query that was refused into a query that fails in the executor. That is #913.
+        // A positional join is what is left out. It pairs the nth row of one side with the nth row
+        // of the other, and crossing either side with the domain changes what the nth row is.
         Node::Join {
             left,
             right,
@@ -1008,7 +1009,10 @@ fn sides(
 ) -> Option<Pushed> {
     let left_reads = correlated(plan, left, outer);
     let right_reads = correlated(plan, right, outer);
-    let keeps_left = matches!(kind, JoinKind::Left | JoinKind::Full);
+    // A single join preserves its left side the same way a left join does. It is a left join that
+    // also insists the right side hand back at most one row, and that insistence is about the rows
+    // rather than about which of them survive, so it belongs here with the left join.
+    let keeps_left = matches!(kind, JoinKind::Left | JoinKind::Full | JoinKind::Single);
     let keeps_right = matches!(kind, JoinKind::Right | JoinKind::Full);
     let carry_right = right_reads || keeps_right;
     // Nothing forces the domain on to either side of an inner join whose condition is the only
@@ -1744,14 +1748,33 @@ mod tests {
     }
 
     #[test]
-    fn a_single_join_is_still_refused() {
+    fn a_single_join_carries_the_domain_the_way_a_left_join_does() {
         let mut plan = correlated_join("SINGLE", READS, QUIET);
         unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
         let after = plan.to_string();
-        // Not because of anything about the domain. The rule that writes a single join for an
-        // `EXISTS` in a join condition writes a plan whose left side reads a column of its right
-        // side, and pushing a domain through it turns a refusal into a failure. That is #913.
-        assert!(after.contains("DependentJoin"), "{after}");
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("Join SINGLE"), "{after}");
+        // Only the left side. A single join preserves its left rows and the right side asks nothing
+        // about the outer row here, so there is one copy of the domain and one equality above it.
+        assert_eq!(after.matches("CrossProduct").count(), 1, "{after}");
+        assert_eq!(after.matches("IS NOT DISTINCT FROM").count(), 1, "{after}");
+    }
+
+    #[test]
+    fn a_single_join_whose_right_side_reads_the_outer_row_carries_the_domain_on_both() {
+        let mut plan = correlated_join("SINGLE", QUIET, READS);
+        unnest::lower(&mut plan).expect("unnesting succeeds");
+        plan.validate().expect("the rewritten plan is valid");
+        let after = plan.to_string();
+        assert!(!after.contains("DependentJoin"), "{after}");
+        assert!(after.contains("Join SINGLE"), "{after}");
+        // The left side carries one because its rows are preserved and a preserved row that matched
+        // nothing is told nothing by the side it did not match. The right side carries one because
+        // it is the side reading the outer row.
+        assert_eq!(after.matches("CrossProduct").count(), 2, "{after}");
+        assert_eq!(after.matches("groups=[#0.0::INTEGER] aggregates=[]").count(), 2, "{after}");
+        assert_eq!(after.matches("IS NOT DISTINCT FROM").count(), 2, "{after}");
     }
 
     #[test]

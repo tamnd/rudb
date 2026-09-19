@@ -162,6 +162,18 @@ impl Binder<'_> {
     }
 
     /// Binds a query in its own aggregation and pending-subquery state.
+    ///
+    /// The columns it read from the query it sits in come back with it, and an uncorrelated query
+    /// read none. The rest are somebody else's: a name that resolved past the enclosing query
+    /// belongs to one further out still, so it is handed up to whichever frame is waiting for it
+    /// rather than counted here. Without that the query two levels out looks uncorrelated, is
+    /// planned as though it were, and the column it was supposed to feed down is asked for from an
+    /// operator that was never given it. [`Self::bind_lateral`] splits the same way for the same
+    /// reason.
+    ///
+    /// The query in between stays uncorrelated, which is right. It reads nothing of its own from
+    /// the outer row, and the dependent join the outer query gets pushes the domain down through
+    /// it to wherever the column is actually read.
     fn bind_isolated_subquery(
         &mut self,
         ast: &Ast,
@@ -177,8 +189,18 @@ impl Binder<'_> {
         self.outer_scopes.push(outer_scope.clone());
         self.correlations.push(Vec::new());
         let bound = self.bind_query(ast, query);
-        let correlations = self.correlations.pop().expect("correlation frame");
+        let read = self.correlations.pop().expect("correlation frame");
         self.outer_scopes.pop();
+        let mut correlations = Vec::new();
+        for binding in read {
+            if outer_scope.columns.iter().any(|column| column.binding == binding) {
+                correlations.push(binding);
+            } else if let Some(enclosing) = self.correlations.last_mut() {
+                if !enclosing.contains(&binding) {
+                    enclosing.push(binding);
+                }
+            }
+        }
         let nested_subqueries = std::mem::take(&mut self.scalar_subqueries);
         self.aggregation = outer_aggregation;
         self.in_aggregate = outer_in_aggregate;
