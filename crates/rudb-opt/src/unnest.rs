@@ -81,6 +81,20 @@ fn scalar_correlated_filter(
     };
 
     let outer = produced(plan, left);
+    // The projection becomes the right side of an ordinary join, where a column of the left side is
+    // not in scope. A projection that reads one cannot go there, so this rule stands aside and the
+    // general domain rule takes the query, which hands the outer column to the right side properly.
+    // Without this, `SELECT (SELECT s1.i FROM t WHERE s1.i = i) FROM t s1` came out as an internal
+    // error about a column not being in a schema: the outer column is a column expression, so it
+    // was taken below as an output the condition's own reference to it could be rewritten against,
+    // and the join condition ended up comparing the right side with itself. That is #993.
+    let mut reads_outer = false;
+    for expr in plan.expr_list(exprs).to_vec() {
+        walk::columns(plan, expr, &mut |binding| reads_outer |= outer.contains(binding.table));
+    }
+    if reads_outer {
+        return None;
+    }
     let inner = produced(plan, input);
     let mut correlated = Vec::new();
     let mut local = Vec::new();
