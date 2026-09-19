@@ -3635,17 +3635,72 @@ fn widened(data: &Data) -> Option<Vec<i64>> {
     }
 }
 
+/// An integer type a cascaded page can be read back into, and the range that fits in it.
+///
+/// This exists so that the check and the conversion can be two loops instead of one. `TryFrom` puts
+/// them together, which is the right shape for one value and the wrong one for a page: a fallible
+/// conversion a value at a time is a branch a value at a time, the branch decides whether the loop
+/// keeps going, and a loop like that is one no compiler will widen.
+trait Narrow: Copy {
+    /// The smallest and the largest `i64` this type holds.
+    const RANGE: (i64, i64);
+
+    /// The value narrowed, which the caller has already shown fits.
+    fn narrow(value: i64) -> Self;
+}
+
+/// Says a primitive integer holds the range its own bounds describe and narrows with `as`.
+///
+/// `as` is a truncation and is the right operation here only because [`fit`] has already compared
+/// against [`Narrow::RANGE`], and it is what makes the second loop a widening store with no branch
+/// in it.
+macro_rules! narrows {
+    ($($ty:ty),*) => {$(
+        impl Narrow for $ty {
+            const RANGE: (i64, i64) = (<$ty>::MIN as i64, <$ty>::MAX as i64);
+
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "the caller has checked the range this truncates to"
+            )]
+            fn narrow(value: i64) -> Self {
+                value as Self
+            }
+        }
+    )*};
+}
+
+narrows!(i8, u8, i16, u16, i32, u32);
+
+/// Narrows a page's values, refusing the page if any of them does not fit.
+///
+/// The extremes first and the conversion second, rather than a fallible conversion a value at a
+/// time. Both loops here are ones a compiler widens: a running minimum and maximum is two
+/// instructions a lane, and a narrowing store is one. The version this replaces was a `TryFrom` and
+/// a `collect` into a `Result`, which is a compare, a branch and a short circuit a value at a time,
+/// and on ClickBench 39 it was seven percent of the query.
+///
+/// An empty page has no extremes and nothing to refuse, which falls out of the fold's starting
+/// values being the wrong way round rather than needing a case of its own.
+fn fit<T: Narrow>(values: &[i64]) -> Result<Vec<T>> {
+    let (mut low, mut high) = (i64::MAX, i64::MIN);
+    for value in values {
+        low = low.min(*value);
+        high = high.max(*value);
+    }
+    let (floor, ceiling) = T::RANGE;
+    if low < floor || high > ceiling {
+        return Err(invalid("page value is not of its type"));
+    }
+    Ok(values.iter().map(|value| T::narrow(*value)).collect())
+}
+
 /// The same values back in the width the column is declared at.
 ///
 /// A value that does not fit is a page that disagrees with the directory about what the column is,
 /// which is a damaged file rather than a caller error, so it is refused rather than truncated.
 fn narrowed(ty: &LogicalType, values: Vec<i64>) -> Result<Data> {
-    fn fit<T: TryFrom<i64>>(values: &[i64]) -> Result<Vec<T>> {
-        values
-            .iter()
-            .map(|value| T::try_from(*value).map_err(|_| invalid("page value is not of its type")))
-            .collect()
-    }
     Ok(match ty {
         LogicalType::TinyInt => Data::Int8(fit::<i8>(&values)?.into()),
         LogicalType::UTinyInt => Data::UInt8(fit::<u8>(&values)?.into()),
@@ -6106,6 +6161,30 @@ mod tests {
         assert_eq!(swept, read, "a sweep answers what a point read answers");
         assert_eq!(dictionary.footprint(), after, "a point read of a kept block decodes nothing");
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Narrowing a page takes what fits and refuses the page for anything that does not.
+    ///
+    /// The edges of the range on both sides and one step past each of them, because checking the
+    /// extremes of a page separately from converting it is only right if the comparison is the one
+    /// `TryFrom` would have made, and off by one there is a file that reads back a different number
+    /// than it was given. The empty page is here because the fold that finds the extremes starts
+    /// with them the wrong way round, and a check written the obvious way would refuse it.
+    #[test]
+    fn narrowing_a_page_takes_what_fits_and_refuses_what_does_not() {
+        assert_eq!(fit::<i8>(&[]).expect("an empty page fits anything"), Vec::<i8>::new());
+        assert_eq!(fit::<i8>(&[-128, 0, 127]).expect("the edges fit"), vec![-128_i8, 0, 127]);
+        fit::<i8>(&[128]).expect_err("one past the top does not fit");
+        fit::<i8>(&[-129]).expect_err("one past the bottom does not fit");
+        assert_eq!(fit::<u8>(&[0, 255]).expect("the edges fit"), vec![0_u8, 255]);
+        fit::<u8>(&[-1]).expect_err("a negative does not fit an unsigned page");
+        assert_eq!(
+            fit::<u32>(&[0, 4_294_967_295]).expect("the edges fit"),
+            vec![0_u32, 4_294_967_295]
+        );
+        fit::<u32>(&[4_294_967_296]).expect_err("one past the top does not fit");
+        assert_eq!(fit::<i32>(&[i64::from(i32::MIN)]).expect("the edge fits"), vec![i32::MIN]);
+        fit::<i32>(&[i64::from(i32::MIN) - 1]).expect_err("one past the bottom does not fit");
     }
 
     /// A dictionary at its budget sweeps without keeping, and still answers what it answered.
