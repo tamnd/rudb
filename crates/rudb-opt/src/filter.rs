@@ -88,6 +88,25 @@
 //! in all three as well. Without this the equality is buried where nothing can see it and six million
 //! rows against two hundred thousand do not finish. With it the query answers in 3.0 seconds.
 //!
+//! # What a disjunction implies about one table
+//!
+//! The branches of an `OR` usually do not agree word for word, and `shared` then finds nothing. A
+//! weaker reading still gets something. Take what each branch says about one table, conjoin it
+//! within the branch, and disjoin that across the branches: a row satisfying the whole disjunction
+//! took one of those branches and so satisfies what that branch said about the table. Every branch
+//! has to say something about it, because a branch that mentions the table nowhere lets every value
+//! of it through and the disjunction then implies nothing. `narrowed` is that rule, and it applies
+//! only when the disjunction reads more than one table, since over a single table the derived
+//! predicate is a weaker copy of one that was already going to the same place.
+//!
+//! TPC-H q7 is the query that needs it: two copies of nation under `(n1.n_name = 'FRANCE' AND
+//! n2.n_name = 'GERMANY') OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')`. Nothing there is
+//! common to both branches, so the whole disjunction waits above a join of lineitem to orders and
+//! the plan carries 1,828,450 rows up to a filter that keeps 5,924 of them. The rule derives
+//! `n_name = 'FRANCE' OR n_name = 'GERMANY'` for each copy, ordinary pushdown carries it to the
+//! scan, and 25 rows become 2 before anything is joined to either one. On SF1 the query goes from
+//! 0.303 seconds to 0.104.
+//!
 //! # A cross product that is a join
 //!
 //! A cross product under a filter that equates a column of one side with a column of the other is an
@@ -343,7 +362,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             // loop while the same query with the second equality in a `WHERE` did not. That is
             // tamnd/rudb#845.
             let mut held = Vec::new();
-            for &condition in plan.expr_list(conditions) {
+            for condition in plan.expr_list(conditions).to_vec() {
                 split(plan, condition, &mut held);
             }
             let (extra_left, extra_right) =
@@ -813,15 +832,16 @@ fn never(plan: &Plan, predicate: ExprRef) -> bool {
 ///
 /// Only `AND` splits a predicate into parts that each stand on their own. An `OR` is one predicate
 /// however it is written, since a row that fails one side of it may still be a row the query wants,
-/// but it is not silent either: see `shared`.
-fn split(plan: &Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
+/// but it is not silent either: see `shared` and `narrowed`.
+fn split(plan: &mut Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
     if let Expr::Conjunction { op: ConjunctionOp::And, children } = *plan.expr(predicate) {
-        for &child in plan.expr_list(children) {
+        for child in plan.expr_list(children).to_vec() {
             split(plan, child, into);
         }
     } else {
         into.push(predicate);
         shared(plan, predicate, into);
+        narrowed(plan, predicate, into);
     }
 }
 
@@ -844,11 +864,12 @@ fn split(plan: &Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
 /// A volatile branch is left alone. `(random() < 0.5 AND X) OR (random() < 0.5 AND Y)` has two calls
 /// that are allowed to disagree, so neither branch promises anything about a third call made on its
 /// own, and `same` compares how an expression is written rather than what it will answer.
-fn shared(plan: &Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
+fn shared(plan: &mut Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
     let Expr::Conjunction { op: ConjunctionOp::Or, children } = *plan.expr(predicate) else {
         return;
     };
-    let Some((&first, rest)) = plan.expr_list(children).split_first() else {
+    let branches = plan.expr_list(children).to_vec();
+    let Some((&first, rest)) = branches.split_first() else {
         return;
     };
     let mut common = Vec::new();
@@ -870,6 +891,138 @@ fn shared(plan: &Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
             into.push(part);
         }
     }
+}
+
+/// Adds, for each table every branch of a disjunction restricts, what the disjunction implies about
+/// that table on its own.
+///
+/// `shared` is the same idea for the case where the branches agree word for word. They usually do
+/// not. A row satisfying `(a = 1 AND b = 2) OR (a = 3 AND b = 4)` satisfies neither `a = 1` nor
+/// `a = 3`, so `shared` finds nothing, and it does satisfy `a = 1 OR a = 3`, which is a predicate
+/// about `a` alone and therefore a predicate this pass can move. The rule is to collect what each
+/// branch says about one table, conjoin it within the branch, and disjoin that across the branches.
+/// Every branch has to say something about the table, because a branch that says nothing about it
+/// lets every value of it through and the disjunction then implies nothing at all.
+///
+/// Only when the disjunction reads more than one table. Over a single table the derived predicate
+/// is weaker than the one it came from and lands in the same place, which is an extra evaluation
+/// per row that removes no row, and the disjunction was already going wherever it was going.
+///
+/// TPC-H q7 is the query that needs it. Two copies of nation, one joined to supplier and one to
+/// customer, under `(n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') OR (n1.n_name = 'GERMANY' AND
+/// n2.n_name = 'FRANCE')`. Nothing in that is common to both branches, so without this the whole
+/// disjunction waits above a join of lineitem to orders and the plan carries 1,828,450 rows up to a
+/// filter that keeps 5,924 of them. With it each copy of nation is cut from 25 rows to 2 before
+/// anything is joined to it, and the query goes from 0.303 seconds to 0.104.
+///
+/// A volatile branch is left alone for the reason `shared` gives, and here it is worse: the derived
+/// predicate is evaluated somewhere else in the plan entirely, so a second call to `random()` would
+/// be deciding about a row the first call never saw.
+fn narrowed(plan: &mut Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
+    let Expr::Conjunction { op: ConjunctionOp::Or, children } = *plan.expr(predicate) else {
+        return;
+    };
+    let branches = plan.expr_list(children).to_vec();
+    if branches.len() < 2 {
+        return;
+    }
+    // What each branch says about each table, one list per branch. A branch is taken apart with
+    // `split` rather than by looking at its top level `AND`, so what a nested disjunction of its
+    // own implies counts as something the branch says.
+    let mut said: Vec<Vec<(u32, ExprRef)>> = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let mut atoms = Vec::new();
+        split(plan, branch, &mut atoms);
+        let mut here: Vec<(u32, ExprRef)> = Vec::new();
+        for atom in atoms {
+            if walk::volatile(plan, atom) {
+                continue;
+            }
+            if let Some(table) = reads_one(plan, atom) {
+                here.push((table, atom));
+            }
+        }
+        if here.is_empty() {
+            return;
+        }
+        said.push(here);
+    }
+    // Only the tables every branch restricts, and only when there is another table in the
+    // disjunction for the derived predicate to be separated from.
+    let Some((first, rest)) = said.split_first() else {
+        return;
+    };
+    let mut wanted: Vec<u32> = Vec::new();
+    for &(table, _) in first {
+        let everywhere = rest.iter().all(|branch| branch.iter().any(|&(at, _)| at == table));
+        if everywhere && !wanted.contains(&table) {
+            wanted.push(table);
+        }
+    }
+    // Over one table the derived predicate is a weaker copy of the disjunction that lands in the
+    // same place, which is an evaluation per row that removes no row. It takes two tables for
+    // there to be somewhere better for the derived half to go.
+    if reads_one(plan, predicate).is_some() {
+        return;
+    }
+    for table in wanted {
+        let each: Vec<Vec<ExprRef>> = said
+            .iter()
+            .map(|branch| {
+                branch.iter().filter(|&&(at, _)| at == table).map(|&(_, atom)| atom).collect()
+            })
+            .collect();
+        let mut per: Vec<ExprRef> = Vec::with_capacity(each.len());
+        for atoms in each {
+            per.push(joined_with(plan, ConjunctionOp::And, &atoms));
+        }
+        // Two branches that say the same thing about this table say it once. `l_shipinstruct =
+        // 'DELIVER IN PERSON'` is written into all three branches of q19 and the disjunction of
+        // three copies of it is the one copy.
+        let mut folded: Vec<ExprRef> = Vec::with_capacity(per.len());
+        for part in per {
+            if !folded.iter().any(|&other| walk::same(plan, part, other)) {
+                folded.push(part);
+            }
+        }
+        let derived = joined_with(plan, ConjunctionOp::Or, &folded);
+        // Not the disjunction itself, which `split` has already put in the list, and not something
+        // another branch of this walk has derived already. Both are found by comparing how the
+        // predicate is written, which is what makes a second run of this pass leave the plan alone.
+        if into.iter().any(|&other| walk::same(plan, derived, other)) {
+            continue;
+        }
+        into.push(derived);
+    }
+}
+
+/// The one table an expression reads, or nothing when it reads none or more than one.
+///
+/// Nothing for a constant as well as for a predicate across two tables, and for the same reason in
+/// both cases: there is no side to push it into. A constant conjunct is the expression rewriter's
+/// business rather than this one's.
+fn reads_one(plan: &Plan, expr: ExprRef) -> Option<u32> {
+    let mut found: Option<u32> = None;
+    let mut several = false;
+    walk::columns(plan, expr, &mut |binding| match found {
+        Some(table) if table != binding.table => several = true,
+        Some(_) => {}
+        None => found = Some(binding.table),
+    });
+    if several { None } else { found }
+}
+
+/// The parts joined by `op`, or the one part when there is one.
+///
+/// A conjunction of one is the thing itself, and writing it as a one entry `AND` would be a node
+/// the executor has to look inside and a shape `walk::same` tells apart from the bare predicate,
+/// which is what the deduplication in `narrowed` and in `filter` compares.
+fn joined_with(plan: &mut Plan, op: ConjunctionOp, parts: &[ExprRef]) -> ExprRef {
+    if let [only] = parts {
+        return *only;
+    }
+    let children = plan.add_expr_list(parts);
+    plan.add_expr(Expr::Conjunction { op, children }, LogicalType::Boolean)
 }
 
 /// Sorts `pending` into the parts that can be written in terms of `held` and the parts that cannot.
@@ -1524,7 +1677,8 @@ Join INNER on=[(#0.0::INTEGER < #1.0::INTEGER)::BOOLEAN, (#0.1::INTEGER < #1.1::
     fn a_conjunct_every_branch_of_a_disjunction_has_is_stated_beside_it() {
         // TPC-H q19 in miniature. The disjunction reads both sides and does nothing for the plan.
         // The equality it implies is what turns the cross product into a join, and the disjunction
-        // stays because it still tells the two branches apart.
+        // stays because it still tells the two branches apart. The filter over `a` alone is
+        // `narrowed`, reading the same disjunction for what it says about one table.
         let before = "\
 Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
   CrossProduct
@@ -1534,7 +1688,8 @@ Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGE
         let after = "\
 Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
   Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]
-    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Filter ((#0.1::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.1::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
 ";
         assert_eq!(pushed(before), after);
@@ -1548,10 +1703,12 @@ Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGE
 
     #[test]
     fn a_conjunct_only_one_branch_of_a_disjunction_has_is_not_stated() {
-        // `b = 1` holds of the rows the first branch lets through and says nothing about the rows the
-        // second one does, so the query does not imply it and neither does this pass.
+        // `a.b = 1` holds of the rows the first branch lets through and says nothing about the rows
+        // the second one does, so the query does not imply it and neither does this pass. The
+        // second branch reads `b` rather than `a` so that `narrowed` has nothing to say either:
+        // neither table is restricted by both branches.
         let before = "\
-Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN OR (#0.1::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN
+Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN OR (#1.1::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN
   CrossProduct
     Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
@@ -1562,7 +1719,10 @@ Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGE
     #[test]
     fn a_shared_conjunct_over_one_side_of_a_disjunction_goes_into_that_side() {
         // The other half of what q19 needs. Two of the three predicates common to its branches read
-        // lineitem alone, and this is the rewrite that gets them to the scan.
+        // lineitem alone, and this is the rewrite that gets them to the scan. The filter over `b`
+        // is `narrowed` on the same disjunction. `shared` says nothing about `b` because the two
+        // branches disagree there, and the derived predicate over `a` is the one `shared` already
+        // stated, so it is not stated a second time.
         let before = "\
 Filter (((#0.1::INTEGER = 7::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.1::INTEGER = 7::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
   CrossProduct
@@ -1574,7 +1734,128 @@ Filter (((#0.1::INTEGER = 7::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 1::INTEGER):
   CrossProduct
     Filter (#0.1::INTEGER = 7::INTEGER)::BOOLEAN
       Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Filter ((#1.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_disjunction_across_two_tables_says_something_about_each_of_them() {
+        // TPC-H q7 in miniature. Neither branch agrees with the other about anything, so `shared`
+        // finds nothing, and both tables are restricted by both branches, so each gets the two
+        // values its two branches allow. That is nation cut from 25 rows to 2 on each side.
+        let before = "\
+Filter (((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
     Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Filter (((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Filter ((#1.0::INTEGER = 2::INTEGER)::BOOLEAN OR (#1.0::INTEGER = 1::INTEGER)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+        // The pass runs more than once and has to settle. Every visit reads the disjunction back
+        // and derives the same two predicates, and both times they are predicates the filters below
+        // already hold.
+        assert_eq!(pushed(after), after);
+    }
+
+    #[test]
+    fn a_table_only_one_branch_of_a_disjunction_restricts_gets_nothing() {
+        // The second branch lets every row of `b` through, so the disjunction as a whole does too
+        // and there is nothing about `b` to state. `a` is restricted by both and gets its pair.
+        let before = "\
+Filter (((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Filter (((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_disjunction_over_one_table_is_left_as_it_is() {
+        // Everything in here reads `a`, so the whole disjunction already lands on the scan and the
+        // predicate this rule would derive is a weaker copy of it evaluated in the same place.
+        let before = "\
+Filter (((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = 3::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 4::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), before);
+    }
+
+    #[test]
+    fn a_volatile_branch_of_a_disjunction_derives_nothing() {
+        // The derived predicate would be evaluated somewhere else in the plan, so the second call
+        // to `random` would be deciding about a row the first call never saw.
+        let before = "\
+Filter (((#0.0::DOUBLE < random()::DOUBLE)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::DOUBLE < random()::DOUBLE)::BOOLEAN AND (#1.0::INTEGER = 3::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::DOUBLE, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Filter (((#0.0::DOUBLE < random()::DOUBLE)::BOOLEAN AND (#1.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::DOUBLE < random()::DOUBLE)::BOOLEAN AND (#1.0::INTEGER = 3::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::DOUBLE, b::INTEGER]
+    Filter ((#1.0::INTEGER = 2::INTEGER)::BOOLEAN OR (#1.0::INTEGER = 3::INTEGER)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_branch_saying_two_things_about_a_table_says_both_of_them() {
+        // What one branch says about a table is a conjunction of its atoms, not the first of them.
+        // q19 writes three predicates over part into each of its branches.
+        let before = "\
+Filter ((((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN OR (((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 7::INTEGER)::BOOLEAN)::BOOLEAN AND (#1.0::INTEGER = 8::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Filter ((((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN OR (((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 7::INTEGER)::BOOLEAN)::BOOLEAN AND (#1.0::INTEGER = 8::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Filter (((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 7::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Filter ((#1.0::INTEGER = 9::INTEGER)::BOOLEAN OR (#1.0::INTEGER = 8::INTEGER)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn two_branches_saying_the_same_thing_about_a_table_say_it_once() {
+        // Three branches with one predicate over `b` written into all of them, which is q19 again.
+        // The disjunction of three copies is one copy, and writing it three times would be three
+        // evaluations of the same comparison per row.
+        let before = "\
+Filter (((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = 3::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Filter (((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = 3::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Filter ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 2::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Filter (#1.0::INTEGER = 9::INTEGER)::BOOLEAN
+      Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
 ";
         assert_eq!(pushed(before), after);
     }
