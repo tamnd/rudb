@@ -99,8 +99,9 @@ fn scalar_correlated_filter(
     // of the outer row for the same reason the projection does. A `HAVING` that reads the outer row
     // is the shape that reaches this: it binds as a filter above the aggregate, so the filter this
     // rule matches is the `HAVING` one and the correlated filter the query really has is two nodes
-    // further down, where nothing here was looking. That is #995.
-    if domain::correlated(plan, input, &outer) {
+    // further down, where nothing here was looking. That is #995. [`relation_correlated`] is the
+    // same check in the rules below and its note is the general version of this paragraph.
+    if relation_correlated(plan, input, &outer) {
         return None;
     }
     let inner = produced(plan, input);
@@ -291,6 +292,9 @@ fn exists_domain(
     };
 
     let outer = produced(plan, left);
+    if relation_correlated(plan, input, &outer) {
+        return None;
+    }
     let mut correlated = Vec::new();
     let mut local = Vec::new();
     split(plan, predicate, &mut |part| {
@@ -424,6 +428,9 @@ fn scalar_aggregate_domain(
         _ if independent_leaf(plan, filtered, &outer) => (filtered, None),
         _ => return None,
     };
+    if relation_correlated(plan, input, &outer) {
+        return None;
+    }
     let inner = produced(plan, input);
     let mut correlated = Vec::new();
     let mut local = Vec::new();
@@ -678,6 +685,9 @@ fn scalar_count_aggregate(
     if plan.expr_list(exprs).to_vec().iter().any(|&expr| reads(plan, expr, &outer)) {
         return None;
     }
+    if relation_correlated(plan, input, &outer) {
+        return None;
+    }
     let inner = produced(plan, input);
     let mut correlated = Vec::new();
     let mut local = Vec::new();
@@ -890,6 +900,9 @@ fn scalar_aggregate(
     if plan.expr_list(exprs).to_vec().iter().any(|&expr| reads(plan, expr, &outer)) {
         return None;
     }
+    if relation_correlated(plan, input, &outer) {
+        return None;
+    }
     let inner = produced(plan, input);
     let mut correlated = Vec::new();
     let mut local = Vec::new();
@@ -1018,6 +1031,9 @@ fn mark(
     };
 
     let outer = produced(plan, left);
+    if relation_correlated(plan, input, &outer) {
+        return None;
+    }
     let inner = produced(plan, input);
     let mut correlated = Vec::new();
     let mut local = Vec::new();
@@ -1143,6 +1159,9 @@ fn exists(
     };
 
     let outer = produced(plan, left);
+    if relation_correlated(plan, input, &outer) {
+        return None;
+    }
     let inner = produced(plan, input);
     let mut correlated = Vec::new();
     let mut local = Vec::new();
@@ -1233,6 +1252,25 @@ fn reads(plan: &Plan, expr: ExprRef, tables: &crate::tables::TableSet) -> bool {
     let mut yes = false;
     walk::columns(plan, expr, &mut |binding| yes |= tables.contains(binding.table));
     yes
+}
+
+/// Whether the subquery's own relation reads the outer row, which is not a correlation these rules
+/// can see.
+///
+/// Each rule here reads the correlation out of one place, a filter's predicate or a projection's
+/// expressions, and builds the domain over the outer columns it finds there. A column of the outer
+/// row read anywhere else is invisible to it, and the commonest way to write one is a second
+/// subquery nested inside this one whose name resolved past this query to the one above it. The
+/// binder hands such a name up to the query that owns it, which is right, so the query in between
+/// is not correlated by it and plants its own relation with the reference still sitting in it.
+/// These rules then put that relation under a join with the domain, where the outer side is not in
+/// scope, and the column is asked of an operator that was never given it.
+///
+/// The general rule in [`crate::domain`] collects every outer column the whole subtree reads and
+/// pushes a domain down to where each one is read, so the answer is to stand aside and let it take
+/// the query. That is #999.
+fn relation_correlated(plan: &Plan, input: NodeRef, outer: &crate::tables::TableSet) -> bool {
+    domain::correlated(plan, input, outer)
 }
 
 fn independent_leaf(plan: &Plan, input: NodeRef, outer: &crate::tables::TableSet) -> bool {

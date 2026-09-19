@@ -475,3 +475,113 @@ fn an_ungrouped_count_still_answers_zero_with_no_match() {
         [Value::BigInt(2), Value::BigInt(1), Value::BigInt(0), Value::BigInt(0)]
     );
 }
+
+/// A second subquery nested inside a correlated one, reading a table the query two levels out joins.
+///
+/// `o2` is not in scope for the subquery over `i`, so the name resolves past it to the query above
+/// that, and the binder hands it up to the query that owns it. The subquery over `i` is then
+/// correlated on `o1.k` alone, and the rule that unnests it builds a domain over that one column
+/// and puts the relation, `o2` reference and all, under a join with the domain where `o2` is not in
+/// scope. The general rule collects every outer column the subtree reads, so standing aside is the
+/// whole of the answer. That is #999.
+#[test]
+fn a_nested_exists_reading_the_other_side_of_a_join_answers() {
+    let database = database();
+    assert_eq!(
+        keys(
+            &database,
+            "SELECT o1.k FROM o o1 JOIN o o2 ON (o1.k = o2.k) WHERE EXISTS (SELECT 1 FROM i WHERE \
+             o1.k < 3 AND EXISTS (SELECT o2.k)) ORDER BY o1.k"
+        ),
+        [Value::Integer(1), Value::Integer(2)]
+    );
+}
+
+/// The same with the outer column tested rather than selected, so no later pass can drop it.
+#[test]
+fn a_nested_exists_testing_the_other_side_of_a_join_answers() {
+    let database = database();
+    assert_eq!(
+        keys(
+            &database,
+            "SELECT o1.k FROM o o1 JOIN o o2 ON (o1.k = o2.k) WHERE EXISTS (SELECT 1 FROM i WHERE \
+             o1.k < 3 AND EXISTS (SELECT 1 WHERE o2.k > 1)) ORDER BY o1.k"
+        ),
+        [Value::Integer(2)]
+    );
+}
+
+/// The nested test reads both the middle relation and the far side of the join at once.
+#[test]
+fn a_nested_exists_comparing_both_sides_answers() {
+    let database = database();
+    assert_eq!(
+        keys(
+            &database,
+            "SELECT o1.k FROM o o1 JOIN o o2 ON (o1.k = o2.k) WHERE EXISTS (SELECT 1 FROM i WHERE \
+             o1.k < 3 AND EXISTS (SELECT 1 WHERE i.w > o2.k)) ORDER BY o1.k"
+        ),
+        [Value::Integer(1), Value::Integer(2)]
+    );
+}
+
+/// The same correlation under a scalar aggregate rather than an existence test.
+#[test]
+fn a_nested_exists_under_a_scalar_aggregate_answers() {
+    let database = database();
+    assert_eq!(
+        keys(
+            &database,
+            "SELECT (SELECT max(w) FROM i WHERE i.k = o1.k AND EXISTS (SELECT 1 WHERE o2.k > 1)) \
+             FROM o o1 JOIN o o2 ON (o1.k = o2.k) ORDER BY o1.k"
+        ),
+        [Value::Null, Value::Integer(300), Value::Null]
+    );
+}
+
+/// The same under a scalar count, which is a rule of its own because of the empty input.
+#[test]
+fn a_nested_exists_under_a_scalar_count_answers() {
+    let database = database();
+    assert_eq!(
+        keys(
+            &database,
+            "SELECT (SELECT count(*) FROM i WHERE i.k = o1.k AND EXISTS (SELECT 1 WHERE o2.k > 1)) \
+             FROM o o1 JOIN o o2 ON (o1.k = o2.k) ORDER BY o1.k"
+        ),
+        counts(&[0, 1, 0])
+    );
+}
+
+/// The same under an `IN`, which binds as a mark join and has a rule of its own as well.
+#[test]
+fn a_nested_exists_under_an_in_list_answers() {
+    let database = database();
+    assert_eq!(
+        keys(
+            &database,
+            "SELECT o1.k FROM o o1 JOIN o o2 ON (o1.k = o2.k) WHERE o1.k IN (SELECT i.k FROM i \
+             WHERE i.w > o1.k AND EXISTS (SELECT 1 WHERE o2.k > 1)) ORDER BY o1.k"
+        ),
+        [Value::Integer(2)]
+    );
+}
+
+/// The outer column read where nothing ends up reading the subquery's answer.
+///
+/// This one answered before the guards above were written, and it answered by luck: the column
+/// pruning pass deletes a projection nobody reads, which deleted the reference, which happened to
+/// leave a valid plan behind. The three above have the reference in a place pruning cannot touch,
+/// and they are the same bug with the luck taken away.
+#[test]
+fn a_nested_exists_whose_outer_column_nothing_reads_answers() {
+    let database = database();
+    assert_eq!(
+        keys(
+            &database,
+            "SELECT (SELECT max(w) FROM i WHERE i.k = o1.k AND EXISTS (SELECT o2.t)) FROM o o1 \
+             JOIN o o2 ON (o1.k = o2.k) ORDER BY o1.k"
+        ),
+        [Value::Integer(200), Value::Integer(300), Value::Null]
+    );
+}
