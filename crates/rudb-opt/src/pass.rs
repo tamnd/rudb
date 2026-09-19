@@ -44,20 +44,26 @@ pub trait Pass {
 
 /// What the passes are given besides the plan.
 ///
-/// The settings and the statistics. The catalog and the planning deadline are the other two things
+/// The settings and the facts. The catalog and the planning deadline are the other two things
 /// `spec/engine/11-optimizer.md` puts in here, and each arrives with the first pass that reads it:
 /// the deadline with join ordering, which is the only search in the plan and so the only thing
 /// that can spend real time. A field that no pass reads is a field whose meaning nobody has had to
 /// decide yet, and deciding it early is how it ends up wrong.
 ///
-/// The statistics are a copy of the row counts rather than a handle on the catalog, which keeps a
-/// lifetime out of this type and out of everything that builds one. What it costs is that a
-/// context built before a table grows estimates against the size the table was, and a context is
-/// built per statement, so the window is one statement wide.
+/// The facts are a shared set of counts rather than a handle on the catalog, which keeps a lifetime
+/// out of this type and out of everything that builds one. What it costs is that a context built
+/// before a table grows plans against the size the table was, and a context is built per statement,
+/// so the window is one statement wide.
+///
+/// They are shared rather than copied, and the version they were read at is the thing that says
+/// whether they are still current. A plan is a function of exactly one generation of the catalog,
+/// which is what `spec/stats/04-in-memory.md` asks for, and it is also what lets two statements over
+/// an unchanged catalog plan from the same set instead of walking every table and column twice. See
+/// [`crate::estimate::Facts::generation`].
 #[derive(Debug, Clone, Default)]
 pub struct Context {
     disabled: Vec<&'static str>,
-    statistics: crate::estimate::Statistics,
+    facts: std::sync::Arc<crate::estimate::Facts>,
 }
 
 impl Context {
@@ -168,14 +174,18 @@ impl Context {
     /// and is not going to be reached from inside it. A context nobody told is a context that
     /// estimates nothing, which is the right answer for the optimizer's own tests and for a plan
     /// that arrived as text.
-    pub fn measure(&mut self, statistics: crate::estimate::Statistics) {
-        self.statistics = statistics;
+    ///
+    /// It takes the set by handle rather than by value so that the caller can keep the one it built
+    /// and hand the same one to the next statement. The set itself is never written to after it is
+    /// built, which is what makes sharing it safe to do without a lock.
+    pub fn measure(&mut self, facts: std::sync::Arc<crate::estimate::Facts>) {
+        self.facts = facts;
     }
 
     /// What is known about how large the tables are.
     #[must_use]
-    pub fn statistics(&self) -> &crate::estimate::Statistics {
-        &self.statistics
+    pub fn facts(&self) -> &crate::estimate::Facts {
+        &self.facts
     }
 }
 

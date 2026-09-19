@@ -52,6 +52,16 @@ struct Inner {
     settings: Settings,
     memory: Memory,
     pool: Pool,
+    /// The counts the last statement planned from, kept for the next one.
+    ///
+    /// What is stored carries the catalog generation it was read at, so the next statement can tell
+    /// whether it is still current by comparing two numbers rather than by walking every table and
+    /// every column again. A set that is out of date is replaced, and one that is not is handed on
+    /// as it is, which is safe to do because nothing writes to a set after it is built.
+    ///
+    /// The lock is its own rather than the catalog's because this is not part of the catalog, and it
+    /// is never contended: every caller is already holding the catalog lock when it gets here.
+    facts: Mutex<Arc<rudb_opt::estimate::Facts>>,
 }
 
 impl Default for Database {
@@ -85,8 +95,14 @@ impl Database {
         let memory = Memory::new(config.memory_limit());
         let pool = runtime(&config);
         let settings = Settings::new(config);
-        let inner =
-            Inner { catalog: RwLock::new(Catalog::new()), path: None, settings, memory, pool };
+        let inner = Inner {
+            catalog: RwLock::new(Catalog::new()),
+            path: None,
+            settings,
+            memory,
+            pool,
+            facts: Mutex::default(),
+        };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
 
@@ -184,8 +200,14 @@ impl Database {
         let memory = Memory::new(config.memory_limit());
         let pool = runtime(&config);
         let settings = Settings::new(config);
-        let inner =
-            Inner { catalog: RwLock::new(catalog), path: Some(path), settings, memory, pool };
+        let inner = Inner {
+            catalog: RwLock::new(catalog),
+            path: Some(path),
+            settings,
+            memory,
+            pool,
+            facts: Mutex::default(),
+        };
         Ok(Self { shared: Shared { inner: Arc::new(inner) } })
     }
 
@@ -583,9 +605,8 @@ impl Shared {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let budget = self.budget();
-                let under =
-                    Under::new(budget, context.statistics(), &seams, &session, Rows::ForACaller)
-                        .after(Planning { parse_ns, bind_ns, optimize_ns });
+                let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
+                    .after(Planning { parse_ns, bind_ns, optimize_ns });
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
@@ -626,23 +647,53 @@ impl Shared {
     /// The passes this database's queries run, as `SET disabled_optimizers` has left them, with
     /// the row counts the catalog holds.
     ///
-    /// Rebuilt for each statement rather than held, because the statement before this one may have
-    /// been the `SET` and the statement before that may have been an `INSERT`. It cannot fail: the
-    /// names were checked when they were set, and the `?` is here because nothing stops a later
-    /// version from having a pass that goes away.
+    /// The passes are rebuilt for each statement, because the statement before this one may have
+    /// been the `SET`. It cannot fail: the names were checked when they were set, and the `?` is
+    /// here because nothing stops a later version from having a pass that goes away.
+    ///
+    /// The counts are not rebuilt for each statement. They were, and on a catalog of two hundred
+    /// tables of twenty columns that was about forty five microseconds a statement spent walking every
+    /// table and asking every column for a distinct count, whether or not the query named any of
+    /// them. What replaces it is the catalog's own generation: a set of counts carries the version
+    /// it was read at, and a statement that finds that version still current plans from the set the
+    /// last one built. Anything that can change what a query would read moves the generation on, so
+    /// a stale set is replaced rather than used, and a plan is a function of exactly one generation.
     ///
     /// The catalog comes in as an argument rather than being read from the lock here, because
     /// every caller is already holding that lock and one of them is holding it for writing. This
     /// is also the seam that stops the optimizer from reaching the catalog on its own: what it
-    /// gets is a copy of the counts, which is the whole of what estimation reads today.
+    /// gets is a set of counts, which is the whole of what estimation reads today.
     fn optimizer(&self, catalog: &Catalog) -> Result<rudb_opt::pass::Context> {
         let mut context =
             rudb_opt::pass::Context::without(&self.inner.settings.disabled_optimizers())?;
-        let mut statistics = rudb_opt::estimate::Statistics::new();
+        context.measure(self.facts(catalog));
+        Ok(context)
+    }
+
+    /// The counts for this catalog, built if the ones in hand are out of date and reused if not.
+    ///
+    /// A poisoned lock is treated as a cache that is not there rather than as a failure, because
+    /// what is behind it is a set of numbers that can always be built again and a statement that
+    /// refused to run over it would be refusing for no reason.
+    fn facts(&self, catalog: &Catalog) -> Arc<rudb_opt::estimate::Facts> {
+        let generation = catalog.generation();
+        let mut held = match self.inner.facts.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if held.generation() != generation {
+            *held = Arc::new(Self::measured(catalog, generation));
+        }
+        Arc::clone(&held)
+    }
+
+    /// Everything the optimizer is told about that catalog, read once.
+    fn measured(catalog: &Catalog, generation: u64) -> rudb_opt::estimate::Facts {
+        let mut facts = rudb_opt::estimate::Facts::at(generation);
         for table in catalog.tables() {
             let name = table.name();
             let rows = u64::try_from(table.rows().len()).unwrap_or(u64::MAX);
-            statistics.record(&name.catalog, &name.schema, &name.table, rows);
+            facts.record(&name.catalog, &name.schema, &name.table, rows);
             for (at, column) in table.columns().iter().enumerate() {
                 // A table that cannot answer leaves the column out, which is every in memory table
                 // and every column of a native one that has no dictionary. The estimate falls back
@@ -650,7 +701,7 @@ impl Shared {
                 let Ok(Some(distinct)) = table.rows().distinct_values(at) else {
                     continue;
                 };
-                statistics.record_distinct(
+                facts.record_distinct(
                     &name.catalog,
                     &name.schema,
                     &name.table,
@@ -659,8 +710,7 @@ impl Shared {
                 );
             }
         }
-        context.measure(statistics);
-        Ok(context)
+        facts
     }
 
     /// The query timeout this database was opened with.
@@ -727,9 +777,8 @@ impl Shared {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 let budget = self.budget();
-                let under =
-                    Under::new(budget, context.statistics(), &seams, &session, Rows::ForACaller)
-                        .after(Planning { parse_ns, bind_ns, optimize_ns });
+                let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
+                    .after(Planning { parse_ns, bind_ns, optimize_ns });
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze } => {
@@ -826,10 +875,9 @@ impl Shared {
                         return Ok(QueryResult::empty());
                     }
                 }
-                let statistics = context.statistics();
-                let under =
-                    Under::new(self.budget(), statistics, &seams, &session, Rows::ForATable)
-                        .after(Planning { parse_ns, bind_ns, optimize_ns });
+                let facts = context.facts();
+                let under = Under::new(self.budget(), facts, &seams, &session, Rows::ForATable)
+                    .after(Planning { parse_ns, bind_ns, optimize_ns });
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let table = catalog.table_mut(&insert.name)?;
                 for chunk in result.into_chunks() {
@@ -958,7 +1006,7 @@ fn timed<T>(what: impl FnOnce() -> Result<T>) -> Result<(T, u64)> {
 #[derive(Clone, Copy)]
 struct Under<'a> {
     budget: Budget<'a>,
-    statistics: &'a rudb_opt::estimate::Statistics,
+    facts: &'a rudb_opt::estimate::Facts,
     seams: &'a rudb_seam::Settings,
     session: &'a Session,
     going: Rows,
@@ -968,12 +1016,12 @@ struct Under<'a> {
 impl<'a> Under<'a> {
     fn new(
         budget: Budget<'a>,
-        statistics: &'a rudb_opt::estimate::Statistics,
+        facts: &'a rudb_opt::estimate::Facts,
         seams: &'a rudb_seam::Settings,
         session: &'a Session,
         going: Rows,
     ) -> Self {
-        Self { budget, statistics, seams, session, going, planning: Planning::default() }
+        Self { budget, facts, seams, session, going, planning: Planning::default() }
     }
 
     /// What the statement path spent getting to this plan.
@@ -997,8 +1045,7 @@ fn run(
     cancel: &Cancel,
     under: Under<'_>,
 ) -> Result<QueryResult> {
-    let Under { budget: Budget { memory, pool }, statistics, seams, session, going, planning } =
-        under;
+    let Under { budget: Budget { memory, pool }, facts, seams, session, going, planning } = under;
     // The budget is shared by the database and its high-water mark survives a query. Reset it to
     // what is live now before measuring this execution, otherwise a metrics document either says
     // zero forever (when nobody copies the mark) or inherits the largest earlier query. A caller
@@ -1060,7 +1107,7 @@ fn run(
     metrics.resource.build_cpu_ns = built_cpu;
     metrics.resource.peak_bytes = memory.peak();
     report.fill(&mut metrics);
-    rudb_opt::explain::record_estimates(plan, statistics, &mut metrics);
+    rudb_opt::explain::record_estimates(plan, facts, &mut metrics);
     Ok(QueryResult::new(names, types, chunks, held).in_session(session.clone()).measured(metrics))
 }
 
@@ -1087,12 +1134,9 @@ fn explaining(
     sql: &str,
     planning: Planning,
 ) -> Result<QueryResult> {
-    let statistics = context.statistics();
+    let facts = context.facts();
     if !analyze {
-        return explained(
-            "logical_plan",
-            &rudb_opt::explain::explain_with(plan, statistics, seams),
-        );
+        return explained("logical_plan", &rudb_opt::explain::explain_with(plan, facts, seams));
     }
     // `EXPLAIN ANALYZE` is the one place a person reads these numbers with their own eyes rather
     // than through the harness, so the planning that produced the plan being printed has to reach
@@ -1105,11 +1149,11 @@ fn explaining(
     // after an `EXPLAIN ANALYZE`. The word is the same one `PRAGMA enable_profiling` writes.
     let mut profiled = session.clone();
     profiled.set("enable_profiling", "query_tree");
-    let under = Under::new(budget, statistics, seams.settings(), &profiled, Rows::ForACaller)
-        .after(planning);
+    let under =
+        Under::new(budget, facts, seams.settings(), &profiled, Rows::ForACaller).after(planning);
     let result = run(sql, plan, catalog, cancel, under)?;
     let measured = result.metrics().expect("a query that ran reports what it did");
-    let text = rudb_opt::explain::analyzed(plan, statistics, seams, measured);
+    let text = rudb_opt::explain::analyzed(plan, facts, seams, measured);
     explained("analyzed_plan", &text)
 }
 
@@ -1174,7 +1218,7 @@ fn create_table(
     let rows = match &mut create.source {
         Some(plan) => {
             rudb_opt::optimize_with(plan, context)?;
-            let under = Under::new(budget, context.statistics(), seams, session, Rows::ForATable);
+            let under = Under::new(budget, context.facts(), seams, session, Rows::ForATable);
             Some(run(sql, plan, catalog, cancel, under)?)
         }
         None => None,
@@ -1190,4 +1234,44 @@ fn create_table(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+
+    #[test]
+    fn two_statements_over_one_catalog_plan_from_the_same_counts() {
+        // The counts used to be rebuilt for every statement, which on a catalog of two hundred
+        // tables of twenty columns was about forty five microseconds a statement spent walking tables
+        // the query never named. What stops that is the catalog's generation: the second statement
+        // finds the version it read at still current and plans from the set the first one built.
+        let database = Database::new();
+        database.execute("CREATE TABLE t (a INTEGER)").expect("a table");
+        database.execute("INSERT INTO t VALUES (1), (2), (3)").expect("three rows");
+        let shared = &database.shared;
+
+        let first = shared.facts(&shared.read());
+        let again = shared.facts(&shared.read());
+        assert!(std::sync::Arc::ptr_eq(&first, &again), "nothing changed, so nothing was rebuilt");
+
+        // And a write moves the generation on, so the next statement does not plan against the
+        // size the table used to be. Serving one number for two different catalogs is the failure
+        // this has to avoid, and it is the reason the count moves for anything that took the
+        // catalog by mutable reference rather than for the ones that really wrote something.
+        database.execute("INSERT INTO t VALUES (4)").expect("a fourth row");
+        let after = shared.facts(&shared.read());
+        assert!(!std::sync::Arc::ptr_eq(&first, &after), "the catalog changed under it");
+        assert!(after.generation() > first.generation(), "and it says which version it is");
+
+        let rows = |facts: &rudb_opt::estimate::Facts| {
+            facts.get(&rudb_opt::estimate::Key::Rows {
+                catalog: "memory",
+                schema: "main",
+                table: "t",
+            })
+        };
+        assert_eq!(rows(&first), rudb_common::Stat::exact(3, rudb_common::Provenance::RowCount));
+        assert_eq!(rows(&after), rudb_common::Stat::exact(4, rudb_common::Provenance::RowCount));
+    }
 }
