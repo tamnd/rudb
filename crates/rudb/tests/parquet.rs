@@ -81,16 +81,16 @@ fn a_file_written_where_a_table_goes_knows_how_tall_it_is_too() {
 
 #[test]
 fn a_filter_over_a_file_is_a_guess_that_says_it_is_one() {
-    // A fifth of a counted number rather than an unknown over an unknown. The value is the
-    // constant's and is wrong for this predicate, and the point is that it now exists and admits
-    // where it came from.
+    // A guess made out of the file's own numbers rather than out of a constant, and it still says
+    // it is a guess. The ceiling the bounds give is the whole 4096, because this file is one row
+    // group and `a < 10` does not rule it out, so what moves the number is the interpolation
+    // inside that group: `a` runs from 0 to 96, the ten values below 10 are ten of the ninety
+    // seven, and ten ninety sevenths of 4096 is 422.
     //
-    // The zone maps do not change this one, which is the point of how they are applied. They are a
-    // ceiling over the guess rather than a replacement for it, this file is one row group that
-    // `a < 10` does not rule out, so the ceiling is the whole 4096 and the guess is already under
-    // it. A file the bounds do rule groups out of is what `zoned.rs` covers.
+    // The truth is 430, so the constant's fifth was out by a factor of 1.90 and this is out by
+    // 1.02. A file the bounds rule whole groups out of is what `zoned.rs` covers.
     let text = explained(&format!("EXPLAIN SELECT a FROM {} WHERE a < 10", fixture()));
-    assert!(text.contains("[~819 rows estimated from default]"), "{text}");
+    assert!(text.contains("[~422 rows estimated from zone map]"), "{text}");
 }
 
 #[test]
