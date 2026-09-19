@@ -53,6 +53,13 @@ pub struct Plan {
     /// has the Parquet footer open in its hand and the optimizer does not, and by the time anything
     /// wants the number the file is closed.
     measured: BTreeMap<u32, Stat<u64>>,
+    /// How many distinct values the binder measured in one column behind a table index.
+    ///
+    /// Here for the same reason as `measured` and out of the same footer read. By column name and
+    /// not by the position the column has in the scan, because column pruning moves the position
+    /// and moves nothing else, and a number keyed to a position a pass has since changed is worse
+    /// than no number.
+    distincts: BTreeMap<(u32, String), u64>,
 }
 
 impl Default for Plan {
@@ -92,6 +99,7 @@ impl Plan {
             rows: Vec::new(),
             root: 0,
             measured: BTreeMap::new(),
+            distincts: BTreeMap::new(),
         }
     }
 
@@ -125,6 +133,27 @@ impl Plan {
     #[must_use]
     pub fn measured_count(&self) -> usize {
         self.measured.len()
+    }
+
+    /// Records how many distinct values the column called `column` of the table bound at `index`
+    /// holds.
+    ///
+    /// Called only for the columns somebody counted, which behind a Parquet scan is the columns
+    /// the writer stated a count for and is usually a handful of the low cardinality ones.
+    pub fn measure_distinct(&mut self, index: u32, column: &str, distinct: u64) {
+        self.distincts.insert((index, column.to_owned()), distinct);
+    }
+
+    /// How many distinct values that column holds, where the binder counted.
+    #[must_use]
+    pub fn distinct_measured(&self, index: u32, column: &str) -> Option<u64> {
+        self.distincts.get(&(index, column.to_owned())).copied()
+    }
+
+    /// How many columns anybody counted, which is what a test about this asks.
+    #[must_use]
+    pub fn distinct_count(&self) -> usize {
+        self.distincts.len()
     }
 
     /// How many nodes are in the arena, reachable or not.
@@ -1218,6 +1247,18 @@ mod tests {
         assert_eq!(plan.measured(4), Stat::exact(4096, rudb_common::Provenance::RowCount));
         assert_eq!(plan.measured(5), Stat::Unknown);
         assert_eq!(plan.measured_count(), 1);
+    }
+
+    #[test]
+    fn a_counted_column_comes_back_by_name_and_an_uncounted_one_comes_back_as_nothing() {
+        // The name and the index both have to match, because two scans in one query can produce a
+        // column of the same name and they are not the same column.
+        let mut plan = Plan::new();
+        plan.measure_distinct(4, "n_nationkey", 25);
+        assert_eq!(plan.distinct_measured(4, "n_nationkey"), Some(25));
+        assert_eq!(plan.distinct_measured(4, "n_name"), None);
+        assert_eq!(plan.distinct_measured(5, "n_nationkey"), None);
+        assert_eq!(plan.distinct_count(), 1);
     }
 
     #[test]

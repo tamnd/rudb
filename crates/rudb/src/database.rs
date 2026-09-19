@@ -643,6 +643,21 @@ impl Shared {
             let name = table.name();
             let rows = u64::try_from(table.rows().len()).unwrap_or(u64::MAX);
             statistics.record(&name.catalog, &name.schema, &name.table, rows);
+            for (at, column) in table.columns().iter().enumerate() {
+                // A table that cannot answer leaves the column out, which is every in memory table
+                // and every column of a native one that has no dictionary. The estimate falls back
+                // to the shape it used before there were any of these.
+                let Ok(Some(distinct)) = table.rows().distinct_values(at) else {
+                    continue;
+                };
+                statistics.record_distinct(
+                    &name.catalog,
+                    &name.schema,
+                    &name.table,
+                    &column.name,
+                    distinct,
+                );
+            }
         }
         context.measure(statistics);
         Ok(context)

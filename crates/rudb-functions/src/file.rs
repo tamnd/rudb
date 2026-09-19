@@ -148,12 +148,29 @@ fn open_file(path: &str) -> Result<Box<dyn File>> {
     filesystem.open(at, OpenMode::Read)
 }
 
-/// The columns a `read_parquet` of `paths` produces, and how many rows all of them hold.
+/// What the footers of the Parquet files behind one call said about them.
 ///
-/// Both answers come out of the same footer, which is why this is one function and not two. A
-/// Parquet footer states the schema and the row count in the same few kilobytes at the end of the
-/// file, the binder has to read it for the schema before the rest of the statement can bind, and
-/// the count was being read and dropped. Taking it here costs an extra open of nothing.
+/// Three answers out of the one read. A Parquet footer states the schema, the row count and
+/// whatever statistics the writer kept in the same few kilobytes at the end of the file, so a
+/// binder that has read one has read all of it, and splitting them into three functions would mean
+/// three ways to open the same file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Footers {
+    /// The columns the call produces, which are the first file's.
+    pub fields: Vec<Field>,
+    /// How many rows all of the files hold.
+    pub rows: Stat<u64>,
+    /// How many distinct values each column holds, by name, for the columns that were stated.
+    pub distincts: Vec<(String, u64)>,
+}
+
+/// The columns a `read_parquet` of `paths` produces, how many rows all of them hold, and how many
+/// distinct values their columns hold.
+///
+/// All of it comes out of the same footer, which is why this is one function and not three. The
+/// binder has to read the footer for the schema before the rest of the statement can bind, and the
+/// rest of what is in there was being read and dropped. Taking it here costs an extra open of
+/// nothing.
 ///
 /// The columns are the first file's, which is the rule for Parquet and is not a choice made here.
 /// See [`csv_fields`] for the format where it goes the other way.
@@ -165,6 +182,18 @@ fn open_file(path: &str) -> Result<Box<dyn File>> {
 /// is consulted only to choose between two plans. The first file is the exception, because its
 /// footer has to be read for the schema whatever happens to the count.
 ///
+/// A column has a distinct count here only when every row group of every file stated one. Most
+/// writers state none, because counting it costs a pass the rest of the statistics do not. DuckDB
+/// states one for the columns it already knew the number for, which in practice is the low
+/// cardinality ones, which are the ones joins are written on. The number is the largest any one row
+/// group stated, capped at the rows. That is the count exactly when the values recur across row
+/// groups, which is the ordinary case, and an undercount when the file is sorted on the column and
+/// each group holds its own stretch of values. The caller is the optimizer deciding whether a join
+/// key is low enough cardinality to make a join produce more rows than its larger side, and an
+/// undercount there makes the estimate too large rather than too small. Adding the row groups up
+/// would be the other bound and it is useless: a column with the same ten thousand values in every
+/// one of fifty groups would come out at five hundred thousand.
+///
 /// A pattern pays one footer per file for this, against a scan that is about to read all of them in
 /// full. The alternative is the first file's count multiplied by the number of files, which is a
 /// sample wearing the word exact, and the files of a partitioned export are not the same size.
@@ -172,18 +201,56 @@ fn open_file(path: &str) -> Result<Box<dyn File>> {
 /// # Errors
 ///
 /// Everything [`open_parquet`] reports about the first file.
-pub fn parquet_footers(paths: &[String]) -> Result<(Vec<Field>, Stat<u64>)> {
+pub fn parquet_footers(paths: &[String]) -> Result<Footers> {
     let first = paths.first().map_or("", String::as_str);
     let reader = open_parquet(first)?;
     let fields = reader.fields();
-    let Some(mut total) = reader.rows() else { return Ok((fields, Stat::Unknown)) };
+    let mut largest: Vec<(String, Option<u64>)> =
+        reader.metadata().schema.iter().map(|column| (column.name.clone(), Some(0))).collect();
+    largest_distincts(&reader, &mut largest);
+    let counted = |rows: Option<u64>, largest: Vec<(String, Option<u64>)>| {
+        let Some(rows) = rows else {
+            // Nothing is capped and nothing is claimed. A count that covers some of the files is
+            // worse than no count, and a total that did not add up says the set of files is not
+            // what this read them as.
+            return Footers { fields: fields.clone(), rows: Stat::Unknown, distincts: Vec::new() };
+        };
+        let distincts = largest
+            .into_iter()
+            .filter_map(|(name, count)| count.map(|count| (name, count.min(rows))))
+            .collect();
+        Footers { fields: fields.clone(), rows: Stat::exact(rows, Provenance::RowCount), distincts }
+    };
+    let Some(mut total) = reader.rows() else { return Ok(counted(None, largest)) };
     for path in paths.iter().skip(1) {
-        let Ok(reader) = open_parquet(path) else { return Ok((fields, Stat::Unknown)) };
-        let Some(rows) = reader.rows() else { return Ok((fields, Stat::Unknown)) };
-        let Some(sum) = total.checked_add(rows) else { return Ok((fields, Stat::Unknown)) };
+        let Ok(reader) = open_parquet(path) else { return Ok(counted(None, largest)) };
+        let Some(rows) = reader.rows() else { return Ok(counted(None, largest)) };
+        let Some(sum) = total.checked_add(rows) else { return Ok(counted(None, largest)) };
         total = sum;
+        largest_distincts(&reader, &mut largest);
     }
-    Ok((fields, Stat::exact(total, Provenance::RowCount)))
+    Ok(counted(Some(total), largest))
+}
+
+/// Folds one file's stated distinct counts into the largest seen for each column so far.
+///
+/// A column starts at zero and stays a number for as long as every row group of every file states
+/// one. One that did not say leaves it at nothing however many others did, because the ones that
+/// said nothing could hold anything.
+fn largest_distincts(reader: &Reader, largest: &mut [(String, Option<u64>)]) {
+    for group in &reader.metadata().row_groups {
+        for chunk in &group.columns {
+            let Some(held) = largest.get_mut(chunk.column) else {
+                continue;
+            };
+            let stated = chunk.stats.as_ref().and_then(|stats| stats.distinct);
+            let stated = stated.and_then(|count| u64::try_from(count).ok());
+            held.1 = match (held.1, stated) {
+                (Some(held), Some(stated)) => Some(held.max(stated)),
+                _ => None,
+            };
+        }
+    }
 }
 
 /// The columns a `read_csv` of `paths` produces, sniffed out of the front of every one of them.
@@ -233,5 +300,19 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
         let error = open_parquet(path).unwrap_err();
         assert!(!error.message().contains("No files found"), "{error}");
+    }
+
+    #[test]
+    fn the_rows_and_the_counts_the_writer_stated_come_out_of_the_one_read() {
+        // The fixture is DuckDB written and has two row groups, and DuckDB stated a count for
+        // three of its seven columns and nothing for the other four. A column one row group left
+        // unstated is left out here however many others stated one.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../rudb-parquet/testdata/mixed.parquet");
+        let footers = parquet_footers(&[path.to_string()]).expect("the fixture");
+        assert_eq!(footers.rows, Stat::exact(4096, Provenance::RowCount));
+        assert_eq!(
+            footers.distincts,
+            vec![("a".to_string(), 97), ("s".to_string(), 5), ("d".to_string(), 64)]
+        );
     }
 }
