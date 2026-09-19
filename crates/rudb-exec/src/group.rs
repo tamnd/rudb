@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use rudb_common::{
     Error, Field, LogicalType, Memory, Reservation, Result, Session, Stage, Value, stage,
 };
-use rudb_kernels::{Accumulator, NOWHERE, is_true, update_scattered};
+use rudb_kernels::{Accumulator, NOWHERE, is_true, settle_extremes, update_scattered};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, Form, VECTOR_SIZE, Validity, Vector};
@@ -1473,7 +1473,7 @@ impl<'a> Aggregate<'a> {
             mut scratch,
             mut containers,
             table,
-            states,
+            mut states,
             counts,
             compact,
             overflow,
@@ -1543,6 +1543,13 @@ impl<'a> Aggregate<'a> {
             _ => None,
         };
         let output_groups = selected.as_ref().map_or(groups, Vec::len);
+        // A min or a max over a dictionary column is holding a code rather than a string, and the
+        // strings come out of the payload in one ordered sweep here rather than one point read per
+        // group down in the loop. Only the groups that are going to be emitted, since the selection
+        // above has already thrown the rest away.
+        if !self.count_only && !self.compact_numeric {
+            settle_extremes(&mut states, selected.as_deref(), groups, calls)?;
+        }
         // The one buffer the results of a call go through on their way into a vector, kept between
         // chunks and charged once.
         scratch.grow(width_of(VECTOR_SIZE.min(output_groups) * size_of::<Value>()))?;

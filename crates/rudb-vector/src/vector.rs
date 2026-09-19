@@ -1760,6 +1760,15 @@ impl Vector {
         }
     }
 
+    /// One value of this vector's type, built out of bytes the caller already holds.
+    ///
+    /// [`try_value_at`](Self::try_value_at) finds the bytes itself, which over a dictionary that
+    /// keeps its payload in a file means a read. A caller that swept the values out has the bytes in
+    /// hand already and wants nothing from here but the type.
+    pub fn value_of(&self, bytes: &[u8]) -> Value {
+        bytes_as(&self.ty, bytes)
+    }
+
     /// The value at `index`, preserving storage read and validation failures.
     pub fn try_value_at(&self, index: usize) -> Result<Value> {
         if index >= self.len || !self.validity.is_valid(index) {

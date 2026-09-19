@@ -945,6 +945,108 @@ fn ranked_extremes(
     Ok(true)
 }
 
+/// Turns the ranks a set of groups is holding into the values they stand for, in one ordered pass.
+///
+/// A group that won on a rank holds a dictionary code and nothing else, so the string it answers
+/// with still has to come out of the payload. Asked for one group at a time that is a point read
+/// per group, and a point read into a dictionary that lives in a file decodes the block its value
+/// sits in and keeps it, so a query whose winners are spread over the dictionary ends up holding
+/// most of the payload decoded in order to answer a few thousand strings. On the ClickBench file the
+/// `MIN(Title)` of query 23 kept four hundred megabytes that way.
+///
+/// So the codes are gathered first, sorted, and read in one sweep that hands over a block at a time
+/// and keeps none of it. Every group wanting a value out of a block gets it while that block is in
+/// hand, and a block no group wants is never decoded at all.
+///
+/// The accumulators settled are the ones the caller is about to emit and not every accumulator it
+/// holds, because a `HAVING` or a bound on the group count throws most of them away and reading the
+/// values for those would be work for nothing. `slots` names them when the caller has made that
+/// choice already, and `groups` with no slots means all of them; `stride` is how many aggregates
+/// there are per group, the same layout [`update_scattered`] folds into.
+pub fn settle_extremes(
+    states: &mut [Accumulator],
+    slots: Option<&[usize]>,
+    groups: usize,
+    stride: usize,
+) -> Result<()> {
+    /// Which dictionary, which code, and which accumulator wants it.
+    type Wanted = (usize, u32, usize);
+
+    let mut dictionaries: Vec<Arc<Vector>> = Vec::new();
+    let mut wanted: Vec<Wanted> = Vec::new();
+    let emitted = slots.map_or(groups, <[usize]>::len);
+    for index in 0..emitted {
+        let slot = slots.map_or(index, |slots| slots[index]);
+        for call in 0..stride {
+            let at = slot * stride + call;
+            let Some(state) = states.get(at) else {
+                return Err(Error::internal("an extreme to settle is out of range".to_string()));
+            };
+            let State::Extreme { held: Some(held), .. } = &state.state else { continue };
+            let Extremum::Ranked { dictionary, code, .. } = held.as_ref() else { continue };
+            let which = match dictionaries.iter().position(|kept| Arc::ptr_eq(kept, dictionary)) {
+                Some(found) => found,
+                None => {
+                    dictionaries.push(Arc::clone(dictionary));
+                    dictionaries.len() - 1
+                }
+            };
+            wanted.push((which, *code, at));
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    wanted.sort_unstable();
+    let mut start = 0;
+    while start < wanted.len() {
+        let mut end = start;
+        while end < wanted.len() && wanted[end].0 == wanted[start].0 {
+            end += 1;
+        }
+        let dictionary = Arc::clone(&dictionaries[wanted[start].0]);
+        settle_swept(states, &dictionary, &wanted[start..end])?;
+        start = end;
+    }
+    Ok(())
+}
+
+/// The sweep behind [`settle_extremes`], over the codes wanted out of one dictionary in code order.
+fn settle_swept(
+    states: &mut [Accumulator],
+    dictionary: &Vector,
+    wanted: &[(usize, u32, usize)],
+) -> Result<()> {
+    let mut at = 0;
+    let mut found: Vec<(usize, Value)> = Vec::new();
+    while at < wanted.len() {
+        let first = wanted[at].1 as usize;
+        let mut cursor = at;
+        found.clear();
+        dictionary.sweep_text(first, dictionary.len(), &mut |index: usize, text: &[u8]| {
+            while cursor < wanted.len() && wanted[cursor].1 as usize == index {
+                found.push((wanted[cursor].2, dictionary.value_of(text)));
+                cursor += 1;
+            }
+            Ok(())
+        })?;
+        if cursor <= at {
+            return Err(Error::internal(
+                "a dictionary sweep passed the code it began at".to_string(),
+            ));
+        }
+        for (slot, value) in found.drain(..) {
+            let Some(state) = states.get_mut(slot) else {
+                return Err(Error::internal("an extreme to settle is out of range".to_string()));
+            };
+            let State::Extreme { held: Some(held), .. } = &mut state.state else { continue };
+            **held = Extremum::Held(value);
+        }
+        at = cursor;
+    }
+    Ok(())
+}
+
 /// The text a row holds, checked once for the row that is going to be kept.
 ///
 /// The same message [`Vector::try_text_at`] gives, because it is the same failure and a caller
