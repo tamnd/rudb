@@ -82,6 +82,7 @@
 
 mod buffer;
 mod build;
+mod cutoff;
 mod enginenames;
 mod entrynames;
 mod expr;

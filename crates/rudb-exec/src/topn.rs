@@ -65,8 +65,9 @@
 //! candidate and the bound is ten.
 
 use std::cmp::Ordering;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use rudb_common::bounds::Bound;
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_kernels::{Comparison, compare as compare_vectors, selection};
 use rudb_pipeline::{Lease, Progress, Sink};
@@ -74,6 +75,7 @@ use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::{Chunk, Selection, Vector};
 
 use crate::buffer::Buffered;
+use crate::cutoff::Cutoff;
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
@@ -106,6 +108,11 @@ pub(crate) struct TopN {
     charged: Mutex<Vec<Reservation>>,
     /// What the finished chunks are charged, held for as long as they are readable.
     held: Mutex<Reservation>,
+    /// How good a row has to be to still be wanted, told to the scan below as this fills up.
+    ///
+    /// Empty for a top N with nothing under it that could use one, which is every shape but a scan
+    /// under a filter under a projection. See [`crate::cutoff`].
+    cutoff: Option<Arc<Cutoff>>,
     out: Buffered,
 }
 
@@ -168,9 +175,36 @@ impl TopN {
             rows: Mutex::new(Vec::new()),
             charged: Mutex::new(Vec::new()),
             held: Mutex::new(memory.reservation()),
+            cutoff: None,
             out: out.clone(),
         };
         Ok((top, out))
+    }
+
+    /// Tells this to publish its worst candidate to `cutoff` as it goes.
+    ///
+    /// Taken whether the cutoff was armed or not, because the builder makes one before it walks into
+    /// the input and only finds out afterwards whether the walk reached a scan. An unarmed one costs
+    /// a load and a branch per chunk and is never read by anybody.
+    #[must_use]
+    pub(crate) fn telling(mut self, cutoff: Arc<Cutoff>) -> Self {
+        self.cutoff = Some(cutoff);
+        self
+    }
+
+    /// Says how good a row now has to be, given the worst of a full set of candidates.
+    ///
+    /// Only the first key, because a part of the file whose first key is all worse than this is worse
+    /// whatever its later keys hold, and one that ties on the first key says nothing. A null first
+    /// key publishes nothing, which under the `NULLS LAST` this is only ever armed for means the
+    /// candidates do not yet rule out any value at all.
+    ///
+    /// The arming is checked before the key is turned into a bound rather than after, because a
+    /// string key would be copied to find out that nobody was listening.
+    fn reached(&self, worst: &[Value]) {
+        let Some(cutoff) = self.cutoff.as_ref().filter(|cutoff| cutoff.armed()) else { return };
+        let Some(bound) = worst.first().and_then(Bound::of_value) else { return };
+        cutoff.reached(bound);
     }
 }
 
@@ -234,6 +268,9 @@ impl Sink for TopN {
             }
             local.place.past(chunk.len());
             recharge(&local.kept, &mut local.charged)?;
+            if self.bound > 0 && local.kept.len() == self.bound {
+                self.reached(&local.kept[self.bound - 1].0);
+            }
             return Ok(Progress::More);
         }
         // The same question the sorted path asks, asked once the running is full rather than on
@@ -271,6 +308,9 @@ impl Sink for TopN {
             recharge(&local.kept, &mut local.charged)?;
             local.cut = (local.kept.len() == self.bound && self.bound > 0)
                 .then(|| local.kept[self.bound - 1].0.clone());
+            if let Some(cut) = local.cut.as_ref() {
+                self.reached(cut);
+            }
         }
         Ok(Progress::More)
     }
