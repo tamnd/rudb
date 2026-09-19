@@ -95,6 +95,14 @@ fn scalar_correlated_filter(
     if reads_outer {
         return None;
     }
+    // Everything under the filter goes to the right side of that join as well, so it has to be free
+    // of the outer row for the same reason the projection does. A `HAVING` that reads the outer row
+    // is the shape that reaches this: it binds as a filter above the aggregate, so the filter this
+    // rule matches is the `HAVING` one and the correlated filter the query really has is two nodes
+    // further down, where nothing here was looking. That is #995.
+    if domain::correlated(plan, input, &outer) {
+        return None;
+    }
     let inner = produced(plan, input);
     let mut correlated = Vec::new();
     let mut local = Vec::new();
@@ -445,6 +453,12 @@ fn scalar_aggregate_domain(
     let mut relevant = correlated.clone();
     relevant.extend_from_slice(plan.expr_list(groups));
     relevant.extend_from_slice(plan.expr_list(aggregates));
+    // The projection is in here so that an outer column it reads becomes a domain key too. It ends
+    // up on the right side of an ordinary join where a column of the left side is not in scope, so
+    // it has to read the domain instead, and it can only do that if the domain carries it. It does
+    // not decide whether this rule takes the query, because a projection that reads the outer row
+    // and nothing else is a query the rules below answer better. That is #995.
+    relevant.extend_from_slice(plan.expr_list(exprs));
     for &expr in &relevant {
         walk::columns(plan, expr, &mut |binding| {
             if outer.contains(binding.table) && !outer_keys.contains(&binding) {
@@ -544,12 +558,23 @@ fn scalar_aggregate_domain(
         .collect();
 
     let added = outer_exprs.len();
+    // Every outer column the projection reads is one of the domain keys, and the regrouped aggregate
+    // carries each of those as a group of its own, so the read is pointed at that group rather than
+    // left reading a side of the join that is no longer underneath it.
+    let regrouped: HashMap<ColumnBinding, usize> = outer_keys
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(position, key)| (key, original_groups.len() + position))
+        .collect();
     let mut projected: Vec<ExprRef> = plan
         .expr_list(exprs)
         .to_vec()
         .into_iter()
         .map(|expr| {
-            shift_aggregate_outputs(plan, expr, aggregate_index, original_groups.len(), added)
+            let expr =
+                shift_aggregate_outputs(plan, expr, aggregate_index, original_groups.len(), added);
+            replace_inner(plan, expr, aggregate_index, &regrouped)
         })
         .collect();
     let mut projected_names = plan.name_list(names).to_vec();
@@ -631,6 +656,12 @@ fn scalar_count_aggregate(
     };
 
     let outer = produced(plan, left);
+    // The same argument as in `scalar_correlated_filter` and `scalar_aggregate`. The projection ends
+    // up on the right side of an ordinary join and a column of the left side is not in scope there,
+    // so a projection that reads the outer row sends the query to the general domain rule. #995.
+    if plan.expr_list(exprs).to_vec().iter().any(|&expr| reads(plan, expr, &outer)) {
+        return None;
+    }
     let inner = produced(plan, input);
     let mut correlated = Vec::new();
     let mut local = Vec::new();
@@ -835,6 +866,14 @@ fn scalar_aggregate(
     };
 
     let outer = produced(plan, left);
+    // The projection becomes the right side of an ordinary join, where a column of the left side is
+    // not in scope, so a projection that reads one cannot go there. This rule stands aside and the
+    // general domain rule takes the query, which hands the outer column to the right side properly.
+    // `SELECT (SELECT max(w) + o.k FROM i WHERE i.k = o.k) FROM o` is the shape, and it is the same
+    // argument the guard in `scalar_correlated_filter` makes. That is #995.
+    if plan.expr_list(exprs).to_vec().iter().any(|&expr| reads(plan, expr, &outer)) {
+        return None;
+    }
     let inner = produced(plan, input);
     let mut correlated = Vec::new();
     let mut local = Vec::new();

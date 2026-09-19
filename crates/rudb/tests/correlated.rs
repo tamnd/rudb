@@ -303,3 +303,127 @@ fn a_select_list_that_reads_a_second_outer_column_is_answered() {
         [Value::Null, Value::Varchar("b".into()), Value::Null, Value::Null]
     );
 }
+
+/// An outer column beside an aggregate, which the grouping rule used to refuse.
+///
+/// An outer column is one value for the whole of the subquery, because the subquery is evaluated
+/// once per outer row, so it is allowed wherever a grouped column is and needs no group of its own.
+/// The binder was applying the grouping rule to it as though it came from the subquery's own `FROM`,
+/// and the message it produced named no column at all. That is #995.
+#[test]
+fn an_outer_column_beside_an_aggregate_is_answered() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT max(w) + o.k FROM i WHERE i.k = o.k) AS c FROM o ORDER BY k"
+        ),
+        [Value::Integer(201), Value::Integer(302), Value::Null, Value::Null]
+    );
+}
+
+/// An outer column alone in the select list of a query that groups by one of its own.
+#[test]
+fn an_outer_column_beside_a_group_by_is_answered() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT o.k FROM i WHERE i.k = o.k GROUP BY i.k) AS c FROM o ORDER BY k"
+        ),
+        [Value::Integer(1), Value::Integer(2), Value::Null, Value::Null]
+    );
+}
+
+/// The same with no correlation in the `WHERE` at all, so the aggregate is over the whole table.
+///
+/// This one says the gap was the grouping check rather than the correlated rewrite: there is
+/// nothing here for a rewrite to key on and it was refused all the same.
+#[test]
+fn an_outer_column_beside_an_uncorrelated_aggregate_is_answered() {
+    let database = database();
+    assert_eq!(
+        answers(&database, "SELECT k, (SELECT max(w) + o.k FROM i) AS c FROM o ORDER BY k"),
+        [Value::Integer(401), Value::Integer(402), Value::Integer(403), Value::Null]
+    );
+}
+
+/// An outer column in a `HAVING`, which binds as a filter above the subquery's own aggregate.
+///
+/// That filter is the one the correlated filter rule matches, so the correlated filter the query
+/// really has sits two nodes further down where nothing was looking, and the rule moved a subtree
+/// that still read the outer row to the right side of an ordinary join.
+#[test]
+fn an_outer_column_in_a_having_is_answered() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT max(w) FROM i WHERE i.k = o.k HAVING max(w) > o.k) AS c \
+             FROM o ORDER BY k"
+        ),
+        [Value::Integer(200), Value::Integer(300), Value::Null, Value::Null]
+    );
+}
+
+/// An outer column beside a count, which takes a different rule again.
+#[test]
+fn an_outer_column_beside_a_count_is_answered() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT count(*) + o.k FROM i WHERE i.k = o.k) AS c FROM o ORDER BY k"
+        ),
+        [Value::BigInt(3), Value::BigInt(3), Value::BigInt(3), Value::Null]
+    );
+}
+
+/// An outer column inside the aggregate's argument and again beside it.
+///
+/// The argument reading it is what sends this to the domain rule, and the projection reading it is
+/// what that rule then has to carry, because the domain it builds is the only thing on the right
+/// side of the join that knows the outer value.
+#[test]
+fn an_outer_column_inside_and_outside_an_aggregate_is_answered() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT max(i.w + o.k) + o.k FROM i WHERE i.k = o.k) AS c \
+             FROM o ORDER BY k"
+        ),
+        [Value::Integer(202), Value::Integer(304), Value::Null, Value::Null]
+    );
+}
+
+/// An outer column inside the aggregate's own argument, which never reached the check.
+///
+/// This one always answered, and it is here so that the tests above are read as the rest of a rule
+/// rather than as a new one.
+#[test]
+fn an_outer_column_inside_an_aggregate_argument_is_answered() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT max(w + o.k) FROM i WHERE i.k = o.k) AS c FROM o ORDER BY k"
+        ),
+        [Value::Integer(201), Value::Integer(302), Value::Null, Value::Null]
+    );
+}
+
+/// A column of this query's own `FROM` is still refused, and the message names it.
+///
+/// The slot for the column's name used to be filled with the words `a column` whenever the binding
+/// was not in this query's scope, which is every outer column and is how `column a column must
+/// appear in the GROUP BY clause` came to be a sentence this engine printed.
+#[test]
+fn an_ungrouped_column_of_this_query_is_still_refused_by_name() {
+    let database = database();
+    let error = database
+        .query("SELECT t FROM o GROUP BY k")
+        .expect_err("t is neither grouped nor aggregated");
+    let text = error.to_string();
+    assert!(text.contains("column \"t\" must appear in the GROUP BY clause"), "{text}");
+}

@@ -2814,6 +2814,28 @@ impl<'a> Binder<'a> {
         self.windows.iter().any(|run| run.index == binding.table)
     }
 
+    /// Whether a column was resolved in an enclosing query rather than in this one.
+    ///
+    /// Every such read is written into the frame of the query being bound as it is resolved, and
+    /// the frame is only handed up once that query's body is done, so while a select list or a
+    /// `HAVING` is being bound the frame still holds everything this query read from outside it.
+    fn is_correlation(&self, binding: ColumnBinding) -> bool {
+        self.correlations.last().is_some_and(|frame| frame.contains(&binding))
+    }
+
+    /// The name a column is written under, for an error message to say which one it means.
+    ///
+    /// A column of an enclosing query is not in this query's scope, so the outer scopes are searched
+    /// as well. Without that the message names no column at all, which is how `column a column must
+    /// appear in the GROUP BY clause` came to be a sentence this engine printed.
+    fn name_of(&self, binding: ColumnBinding, scope: &Scope) -> String {
+        std::iter::once(scope)
+            .chain(self.outer_scopes.iter().rev())
+            .flat_map(|visible| visible.columns.iter())
+            .find(|column| column.binding == binding)
+            .map_or_else(|| "a column".to_string(), |column| format!("\"{}\"", column.name))
+    }
+
     /// Rewrites a bound expression into one the aggregate's output can answer.
     ///
     /// A subexpression that is one of the group expressions becomes a reference to that group. A
@@ -2844,12 +2866,14 @@ impl<'a> Binder<'a> {
             // join that produces it sits on top of the `Aggregate`, so what it produces is not one
             // of the grouped table's columns either.
             Expr::Column(binding) if self.joined_above.contains(&binding.table) => Ok(expr),
+            // A column of an enclosing query is one value for the whole of this one, because this
+            // query is evaluated once per outer row. It is a constant here in the sense the grouping
+            // rule cares about, so it is allowed wherever a grouped column is and needs no group of
+            // its own. The grouping rule is about columns of this query's own `FROM`, and a name
+            // that resolved past it is not one of those. That is #995.
+            Expr::Column(binding) if self.is_correlation(binding) => Ok(expr),
             Expr::Column(binding) => {
-                let name =
-                    scope.columns.iter().find(|column| column.binding == binding).map_or_else(
-                        || "a column".to_string(),
-                        |column| format!("\"{}\"", column.name),
-                    );
+                let name = self.name_of(binding, scope);
                 Err(Error::binder(format!(
                     "column {name} must appear in the GROUP BY clause or must be part of an aggregate function"
                 )))
