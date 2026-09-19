@@ -1286,7 +1286,11 @@ fn mapping(keys: &[Key], below: &Pushed) -> HashMap<ColumnBinding, ColumnBinding
 }
 
 /// Rewrites every column reference the map has an entry for.
-fn remap(plan: &mut Plan, expr: ExprRef, map: &HashMap<ColumnBinding, ColumnBinding>) -> ExprRef {
+pub(crate) fn remap(
+    plan: &mut Plan,
+    expr: ExprRef,
+    map: &HashMap<ColumnBinding, ColumnBinding>,
+) -> ExprRef {
     if map.is_empty() {
         return expr;
     }
