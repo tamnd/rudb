@@ -1,23 +1,34 @@
 //! A table that lives in memory, which is what M0 stores rows in.
 //!
-//! This is not the storage format. There are no blocks, no row groups, no statistics, no
-//! compression and no buffer manager in here, and every one of those is what the rest of this crate
-//! becomes at M2. What this is, is somewhere for rows to be so that the binder and the executor can
-//! be written and tested against something real, and a shape that the real thing can replace
-//! without the layers above it noticing: a table is a sequence of chunks, a scan reads them in
-//! order, and a scan asks for the columns it wants rather than all of them.
+//! This is not the storage format. There are no blocks, no row groups, no compression and no buffer
+//! manager in here, and every one of those is what the rest of this crate becomes at M2. What this
+//! is, is somewhere for rows to be so that the binder and the executor can be written and tested
+//! against something real, and a shape that the real thing can replace without the layers above it
+//! noticing: a table is a sequence of chunks, a scan reads them in order, and a scan asks for the
+//! columns it wants rather than all of them.
 //!
 //! The one thing it does get right on purpose is that a read is by chunk and by column, and not by
 //! row. A row-at-a-time interface here would be an interface every operator above would grow
 //! against, and unwinding that later is the rewrite this project exists to avoid.
+//!
+//! # It does have statistics
+//!
+//! A zone map per chunk, built on the way in, which is `zone.rs`. They were put here to skip a chunk
+//! a filter rules out, and they hold more than that: an exact null count for every column whatever
+//! form it arrived in, the two ends, and the total of an integer column. So a `COUNT`, a `MIN`, a
+//! `MAX`, a `SUM` and an `AVG` over a whole table are questions this can answer out of numbers it
+//! already has rather than by reading twenty million rows, which is what `null_count`,
+//! `exact_extremes` and `exact_sum` are for and what a native file has always done from its
+//! directory. The load already paid for them, and [`MemoryTable::stats_ns`] is what it paid.
 
 use std::time::Instant;
 
+use rudb_common::bounds::Bound;
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::vector::VECTOR_SIZE;
 use rudb_vector::{Chunk, Vector};
 
-use crate::zone::{Probe, Zone};
+use crate::zone::{Probe, Range, Zone};
 
 /// A table held in memory as a sequence of chunks.
 #[derive(Debug, Clone)]
@@ -127,6 +138,109 @@ impl MemoryTable {
         self.zones.get(index).is_some_and(|zone| zone.skips(probes))
     }
 
+    /// How many rows of one column are null, added up over the chunks.
+    ///
+    /// Always an answer, because a zone's null count is the one number in it that never comes from a
+    /// summary somebody else wrote: `Range::of` counts the validity mask whatever form the column
+    /// arrived in. That is what makes it exact for a dictionary and a bit packed column too, where
+    /// the two ends are allowed to be wider than the rows.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the table.
+    pub fn null_count(&self, column: usize) -> Result<usize> {
+        let mut nulls = 0;
+        for (range, _) in self.ranges(column)? {
+            nulls += range.nulls;
+        }
+        Ok(nulls)
+    }
+
+    /// The smallest and the largest value of one column, when every chunk walked its rows.
+    ///
+    /// A zone's ends are allowed to be wider than the truth, because ends that rule out a chunk that
+    /// could not match are still right when they rule out nothing. That is what makes them cheap for
+    /// a form this cannot read, and it is also what stops them answering a `MIN`, so each range says
+    /// which of the two it is and this answers only when all of them looked.
+    ///
+    /// A chunk of nothing but nulls has no ends and says nothing about the column's, so it is
+    /// skipped rather than given up on. A chunk that has rows and still has no ends is a form this
+    /// cannot see into, and answering from the other chunks would answer with ends that do not cover
+    /// its rows, so that one gives up.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the table.
+    pub fn exact_extremes(&self, column: usize) -> Result<Option<(Bound, Bound)>> {
+        let mut low: Option<Bound> = None;
+        let mut high: Option<Bound> = None;
+        for (range, rows) in self.ranges(column)? {
+            if !range.exact {
+                return Ok(None);
+            }
+            let (Some(small), Some(large)) = (range.low.as_ref(), range.high.as_ref()) else {
+                if rows > range.nulls {
+                    return Ok(None);
+                }
+                continue;
+            };
+            low = Some(low.map_or_else(|| small.clone(), |held| held.smaller(small.clone())));
+            high = Some(high.map_or_else(|| large.clone(), |held| held.larger(large.clone())));
+        }
+        Ok(low.zip(high))
+    }
+
+    /// The total of one integer column and how many rows went into it, when every chunk has a total.
+    ///
+    /// The count beside the total is the rows that are not null, because that is what a `SUM` adds up
+    /// and what an `AVG` divides by, and working it out from the row count and the null count
+    /// afterwards would walk the same zones twice.
+    ///
+    /// `None` for a column no chunk of which could be added up, which is every column that is not an
+    /// integer one, and for a table so large that adding the chunks together overflows an `i128`.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the table.
+    pub fn exact_sum(&self, column: usize) -> Result<Option<(i128, u64)>> {
+        let mut total = 0_i128;
+        let mut rows = 0_u64;
+        for (range, held) in self.ranges(column)? {
+            let Some(part) = range.sum else { return Ok(None) };
+            let Some(sum) = total.checked_add(part) else { return Ok(None) };
+            total = sum;
+            rows = rows.saturating_add((held - range.nulls) as u64);
+        }
+        Ok(Some((total, rows)))
+    }
+
+    /// The range of one column of every chunk, beside how many rows that chunk has.
+    ///
+    /// Collected rather than returned as an iterator so that a zone narrower than the table is an
+    /// error here instead of a chunk quietly dropped out of the middle of a fold, which would answer
+    /// a total over some of the rows as though it were over all of them.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the table, or if a chunk has no range for it, which `append` makes
+    /// impossible by building the zone from the chunk it has already checked the width of.
+    fn ranges(&self, column: usize) -> Result<Vec<(&Range, usize)>> {
+        if column >= self.types.len() {
+            return Err(Error::internal(format!(
+                "column {column} of a table that has {}",
+                self.types.len()
+            )));
+        }
+        let mut found = Vec::with_capacity(self.zones.len());
+        for (zone, chunk) in self.zones.iter().zip(&self.chunks) {
+            let range = zone
+                .column(column)
+                .ok_or_else(|| Error::internal("a chunk's zone is narrower than the table"))?;
+            found.push((range, chunk.len()));
+        }
+        Ok(found)
+    }
+
     /// Appends rows given one at a time, splitting them into chunks.
     ///
     /// The slow way in, for an `INSERT` and for a test. It transposes, which is the whole cost:
@@ -214,6 +328,85 @@ mod tests {
             ])
             .expect("three rows of the table's own types");
         table
+    }
+
+    /// A table of one integer column over several chunks, so the folds have something to fold.
+    fn counted(rows: usize) -> MemoryTable {
+        let mut table = MemoryTable::new(vec![LogicalType::Integer]);
+        let values: Vec<Vec<Value>> = (0..rows)
+            .map(|row| {
+                vec![if row % 5 == 0 { Value::Null } else { Value::Integer(row as i32 % 7) }]
+            })
+            .collect();
+        table.append_rows(&values).expect("one integer a row");
+        table
+    }
+
+    #[test]
+    fn the_nulls_of_a_column_are_added_up_over_the_chunks() {
+        let table = counted(VECTOR_SIZE * 2 + 10);
+        assert!(table.chunk_count() > 1, "one chunk would not test the fold");
+        let rows = table.len();
+        let wanted = (0..rows).filter(|row| row % 5 == 0).count();
+        assert_eq!(table.null_count(0).expect("the only column"), wanted);
+        // A string column that never had a null still answers, with zero.
+        let mut words = MemoryTable::new(vec![LogicalType::Varchar]);
+        words
+            .append_rows(&[vec![Value::Varchar("a".to_string())]])
+            .expect("one string");
+        assert_eq!(words.null_count(0).expect("the only column"), 0);
+    }
+
+    #[test]
+    fn an_empty_table_has_no_nulls_no_ends_and_a_total_of_nothing() {
+        let table = MemoryTable::new(vec![LogicalType::Integer]);
+        assert_eq!(table.null_count(0).expect("the only column"), 0);
+        assert_eq!(table.exact_extremes(0).expect("the only column"), None);
+        // Zero over no rows rather than no answer, which is what a `SUM` of nothing finishes to
+        // `NULL` from, because the count beside it is what says there were no rows.
+        assert_eq!(table.exact_sum(0).expect("the only column"), Some((0, 0)));
+    }
+
+    #[test]
+    fn the_ends_and_the_total_are_the_chunks_put_together() {
+        let table = counted(VECTOR_SIZE * 2 + 10);
+        let rows = table.len();
+        let kept: Vec<i128> =
+            (0..rows).filter(|row| row % 5 != 0).map(|row| (row % 7) as i128).collect();
+        let (total, counted_rows) = table.exact_sum(0).expect("the only column").expect("integers");
+        assert_eq!(total, kept.iter().sum::<i128>());
+        assert_eq!(counted_rows as usize, kept.len());
+        let (low, high) = table.exact_extremes(0).expect("the only column").expect("integers");
+        assert_eq!(low, Bound::Int(*kept.iter().min().expect("some rows")));
+        assert_eq!(high, Bound::Int(*kept.iter().max().expect("some rows")));
+        // The nulls are left out of both, the same way `MIN` and `SUM` leave them out.
+        assert_eq!(counted_rows as usize + table.null_count(0).expect("the column"), rows);
+    }
+
+    #[test]
+    fn a_column_that_cannot_be_added_up_has_no_total_and_still_has_ends() {
+        let mut table = MemoryTable::new(vec![LogicalType::Varchar]);
+        table
+            .append_rows(&[
+                vec![Value::Varchar("pear".to_string())],
+                vec![Value::Null],
+                vec![Value::Varchar("apple".to_string())],
+            ])
+            .expect("three strings");
+        assert_eq!(table.exact_sum(0).expect("the only column"), None);
+        let (low, high) = table.exact_extremes(0).expect("the only column").expect("strings");
+        assert_eq!(low, Bound::of_value(&Value::Varchar("apple".to_string())).expect("a bound"));
+        assert_eq!(high, Bound::of_value(&Value::Varchar("pear".to_string())).expect("a bound"));
+    }
+
+    #[test]
+    fn a_column_the_table_does_not_have_is_an_error_rather_than_an_empty_answer() {
+        let table = people();
+        // Two columns, so index two is one past the end. An answer of `None` here would read as the
+        // column having no statistics, and the caller would go and read rows that are not there.
+        assert!(table.null_count(2).is_err());
+        assert!(table.exact_extremes(2).is_err());
+        assert!(table.exact_sum(2).is_err());
     }
 
     #[test]

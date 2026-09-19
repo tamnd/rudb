@@ -5515,10 +5515,14 @@ fn a_statement_that_runs_no_plan_has_nothing_to_report() {
 #[test]
 fn the_document_a_query_produces_is_the_json_a_harness_reads() {
     let db = database();
-    let result = db.query("SELECT count(*) FROM t").unwrap();
+    // Filtered so that the query actually reads the rows. `SELECT count(*) FROM t` is answered out
+    // of the table's statistics and has no scan in it to report, which is a different thing for this
+    // test to be about.
+    let sql = "SELECT count(*) FROM t WHERE x > 1";
+    let result = db.query(sql).unwrap();
     let written = result.metrics().expect("a query that ran has metrics").render();
     assert!(written.starts_with("{\n  \"schema\": 1,"), "{written}");
-    assert!(written.contains("\"sql\": \"SELECT count(*) FROM t\""), "{written}");
+    assert!(written.contains(&format!("\"sql\": \"{sql}\"")), "{written}");
     assert!(written.contains("\"kind\": \"Scan\""), "{written}");
     assert!(written.contains("\"reference_impl\": true"), "{written}");
 }
