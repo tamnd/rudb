@@ -74,6 +74,13 @@ pub trait DynStream: Send + Sync + fmt::Debug {
     /// Whether more than one instance of this operator may run at once.
     fn parallel(&self) -> bool;
 
+    /// Do whatever this operator needs doing once, before any instance of it runs.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the typed operator reports.
+    fn prepare_once(&self, threads: &Lease<'_>) -> Result<()>;
+
     /// Transform `chunk` in place.
     ///
     /// # Errors
@@ -89,6 +96,10 @@ impl<S: Stream> DynStream for S {
 
     fn parallel(&self) -> bool {
         Stream::parallel(self)
+    }
+
+    fn prepare_once(&self, threads: &Lease<'_>) -> Result<()> {
+        self.prepare(threads)
     }
 
     fn push_state(&self, chunk: &mut Chunk, local: &mut LocalState) -> Result<Progress> {

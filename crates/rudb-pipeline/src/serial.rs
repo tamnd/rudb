@@ -48,10 +48,14 @@ impl Stop {
 /// returns `Blocked` yet.
 pub fn run_serial(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
     let stop = Stop::default();
+    let alone = Lease::alone();
+    for stream in pipeline.streams() {
+        stream.prepare_once(&alone)?;
+    }
     let mut locals = pipeline.locals();
     instance(pipeline, cancel, &stop, &mut locals)?;
     pipeline.sink().combine_state(locals.sink)?;
-    pipeline.sink().finalize_state(&Lease::alone())
+    pipeline.sink().finalize_state(&alone)
 }
 
 /// One instance of a pipeline, reading morsels until there are none left or somebody says stop.
