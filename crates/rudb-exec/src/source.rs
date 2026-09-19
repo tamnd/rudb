@@ -27,6 +27,7 @@ use rudb_seam::{Context, SeamId, Settings};
 use rudb_storage::Probe;
 use rudb_vector::{Chunk, Data, Selection, VECTOR_SIZE, Vector};
 
+use crate::cutoff::Cutoff;
 use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
 use crate::prepared::{Prepared, Scratch};
 use crate::register::compaction;
@@ -232,6 +233,9 @@ fn poisoned<T>(_: T) -> Error {
 /// `sideways` is the other source of the same kind of test, and it is one a plan cannot carry: the
 /// range of the key a join above this scan is about to look every one of these rows up by, which is
 /// not known until that join's other side has finished. See [`crate::sideways`].
+///
+/// `cutoff` is a third, and it is the only one that keeps changing while the scan runs: how good a
+/// row has to be to still be wanted by the top N above. See [`crate::cutoff`].
 #[derive(Debug)]
 pub(crate) struct Scan<'a> {
     table: &'a Table,
@@ -240,6 +244,8 @@ pub(crate) struct Scan<'a> {
     probes: Vec<Probe>,
     /// The runtime filter of the join this scan drives, empty for a scan that drives no join.
     sideways: Option<Arc<Sideways<'a>>>,
+    /// The cutoff of the top N above this scan, empty for a scan with no top N that could use one.
+    cutoff: Option<Arc<Cutoff>>,
     /// Which table index this scan's columns bind against, which is how the runtime filter knows
     /// whether it is about one of them.
     index: u32,
@@ -357,12 +363,13 @@ pub(crate) struct Pushdown {
 
 /// Everything the builder hands a scan that narrows what it reads.
 ///
-/// Three things rather than one because they arrive from three places and are used at three moments.
+/// Four things rather than one because they arrive from four places and are used at four moments.
 /// The pruning tests come from the predicate and are asked of a zone before a chunk is read. The
 /// pushed filter is that same predicate again, kept whole, and is applied to the chunks that were
 /// read. The sideways filter comes from a join that has already built its side and is asked while the
-/// scan is running. They are gathered into one argument because a scan takes all three and a
-/// constructor of nine parameters is a constructor nobody reads.
+/// scan is running. The cutoff comes from the top N above and is asked again for every part, because
+/// it tightens as the query runs. They are gathered into one argument because a scan takes all four
+/// and a constructor of ten parameters is a constructor nobody reads.
 #[derive(Debug, Default)]
 pub(crate) struct Filters<'a> {
     /// Tests a zone map can rule a chunk out with, which is as many of the conjuncts as could be
@@ -372,6 +379,8 @@ pub(crate) struct Filters<'a> {
     pub(crate) pushed: Option<Pushdown>,
     /// What a join built and handed back down after the plan was already running.
     pub(crate) sideways: Option<Arc<Sideways<'a>>>,
+    /// How good a row has to be to still interest the top N above, which moves while the scan runs.
+    pub(crate) cutoff: Option<Arc<Cutoff>>,
 }
 
 /// The filter a scan applies itself, once it has been prepared against the scan's own columns.
@@ -493,7 +502,7 @@ impl<'a> Scan<'a> {
         seams: &Settings,
         session: &Session,
     ) -> Result<Self> {
-        let Filters { pruning, pushed: pushdown, sideways } = filters;
+        let Filters { pruning, pushed: pushdown, sideways, cutoff } = filters;
         let fields = plan.field_list(projection).to_vec();
         let mut columns = Vec::with_capacity(fields.len());
         for field in &fields {
@@ -530,6 +539,7 @@ impl<'a> Scan<'a> {
             offsets,
             probes,
             sideways,
+            cutoff,
             index,
             testing: OnceLock::new(),
             schema,
@@ -627,6 +637,28 @@ impl<'a> Scan<'a> {
             probes.extend(onto(&self.columns, sideways.tests(self.index)));
             probes
         })
+    }
+
+    /// How good a row has to be for the top N above to still want it, as a test on one column.
+    ///
+    /// Empty for a scan with no top N above it, and empty until some instance of that top N has held
+    /// a full set of candidates. It is one test at most, because only the first sort key says
+    /// anything about a whole part. See [`crate::cutoff`].
+    fn cutoff(&self) -> Vec<Probe> {
+        let Some(cutoff) = self.cutoff.as_ref() else { return Vec::new() };
+        let Some(test) = cutoff.probe(self.index) else { return Vec::new() };
+        onto(&self.columns, vec![test])
+    }
+
+    /// Whether part `at` holds nothing anything above this scan could want.
+    ///
+    /// The two sets of tests are asked separately rather than joined into one, so that a scan with no
+    /// top N above it does what it always did and a scan with one pays an allocation per part it
+    /// hands back and nothing per part it walks past.
+    fn ruled(&self, at: usize, probes: &[Probe], cutoff: &[Probe]) -> bool {
+        let rows = self.table.rows();
+        (!probes.is_empty() && rows.skips(at, probes))
+            || (!cutoff.is_empty() && rows.skips(at, cutoff))
     }
 
     /// The parts the statistics leave alive, by stripe, and how many rows they hold between them.
@@ -844,6 +876,11 @@ impl Source for Scan<'_> {
         // could want, so the only thing the old return said that this does not is how far the
         // morsel had got, and nothing outside asks that between one part and the next.
         let probes = self.testing();
+        // Asked again for every part this hands back, rather than settled once the way `testing` is,
+        // because the top N above fills it while this runs and it only ever tightens. Once per part
+        // rather than once per call, since a call that walks a long run of ruled out parts is a call
+        // during which the other workers are still reading and improving it. See [`crate::cutoff`].
+        let cutoff = self.cutoff();
         let at = loop {
             let at = position(morsel);
             if at >= self.table.rows().chunk_count() || morsel.is_drained() {
@@ -851,7 +888,7 @@ impl Source for Scan<'_> {
                 return Ok(Progress::Done);
             }
             morsel.advance(1);
-            if probes.is_empty() || !self.table.rows().skips(at, probes) {
+            if !self.ruled(at, probes, &cutoff) {
                 break at;
             }
             self.skipped.fetch_add(1, Ordering::Relaxed);
@@ -2027,9 +2064,9 @@ mod tests {
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Across, Bound, FileScan, Filters, Handout, OnceLock, Op, Paying, Probe, Pushdown, RUN,
-        Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE, WARMUP, cut_rows, hash,
-        native_instances, next_piece, parts, runs_of, worth_sifting,
+        Across, Bound, Cutoff, FileScan, Filters, Handout, OnceLock, Op, Paying, Probe, Pushdown,
+        RUN, Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE, WARMUP, cut_rows,
+        hash, native_instances, next_piece, parts, runs_of, worth_sifting,
     };
     use crate::sideways::Found;
 
@@ -2494,6 +2531,7 @@ mod tests {
             offsets: vec![0],
             probes,
             sideways: None,
+            cutoff: None,
             index: 0,
             testing: OnceLock::new(),
             schema: Schema::numbered(fields, 0),
@@ -2505,6 +2543,20 @@ mod tests {
             skipped: AtomicUsize::new(0),
             paying: Paying::default(),
         }
+    }
+
+    /// A scan of that table under a top N that has filled its candidates and reached `bound`.
+    ///
+    /// No tests of its own, so the only thing that can rule a part out here is the cutoff.
+    fn beaten(table: &Table, op: Op, bound: Option<Bound>) -> Scan<'_> {
+        let cutoff = Cutoff::new();
+        cutoff.about(ColumnBinding::new(0, 0), op);
+        if let Some(bound) = bound {
+            cutoff.reached(bound);
+        }
+        let mut scan = scanning(table, Vec::new());
+        scan.cutoff = Some(cutoff);
+        scan
     }
 
     /// A scan of `counted` applying `predicate` itself, the way the builder hands one over.
@@ -2600,6 +2652,49 @@ mod tests {
 
         assert_eq!(counted_rows(&scan), VECTOR_SIZE, "one chunk's worth");
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
+    }
+
+    /// The point of the cutoff. Five chunks hold 0 to 5119 and the top N above already holds ten
+    /// rows whose worst key is 100, so every chunk but the first holds nothing that can still win.
+    #[test]
+    fn a_scan_skips_the_parts_the_top_n_above_it_has_already_beaten() {
+        let table = counted(VECTOR_SIZE * 5);
+        let scan = beaten(&table, Op::LessOrEqual, Some(Bound::Int(100)));
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE, "only the chunk holding 0 to 1023");
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
+    }
+
+    /// The same read the other way up, which is the other comparison the ordering can give.
+    #[test]
+    fn a_descending_top_n_skips_the_parts_below_its_cutoff() {
+        let table = counted(VECTOR_SIZE * 5);
+        let scan = beaten(&table, Op::GreaterOrEqual, Some(Bound::Int(4_500)));
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE, "only the chunk holding 4096 to 5119");
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
+    }
+
+    /// A part that ties the cutoff is read like any other, which is what keeps ties settled the way
+    /// they were. The chunk holding 2048 to 3071 starts exactly at the cutoff and is read.
+    #[test]
+    fn a_part_that_only_ties_the_cutoff_is_still_read() {
+        let table = counted(VECTOR_SIZE * 5);
+        let scan = beaten(&table, Op::LessOrEqual, Some(Bound::Int(2_048)));
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 3);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 2);
+    }
+
+    /// Before the top N has filled its candidates there is nothing it can rule out, which is the
+    /// first chunks of every query and the whole of a query whose limit is never reached.
+    #[test]
+    fn a_top_n_that_has_not_filled_its_candidates_rules_nothing_out() {
+        let table = counted(VECTOR_SIZE * 3);
+        let scan = beaten(&table, Op::LessOrEqual, None);
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 3);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 0);
     }
 
     /// A scan with nothing to go on reads everything, which is the case that must not regress.

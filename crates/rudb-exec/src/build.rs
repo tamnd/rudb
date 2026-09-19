@@ -60,6 +60,7 @@ use rudb_plan::{
 use rudb_seam::Settings;
 
 use crate::buffer::Buffered;
+use crate::cutoff::{self, Cutoff};
 use crate::enginenames::{
     database_size, dialects, extensions, grammar_extensions, optimizers, platform, user_agent,
     version,
@@ -244,6 +245,7 @@ fn build_measured_with_sink<'a>(
         pruning: Vec::new(),
         pushing: None,
         sideways: None,
+        cutoff: None,
         top_counts: Vec::new(),
         held: Vec::new(),
     };
@@ -912,6 +914,12 @@ struct Building<'a, 'b> {
     /// that drops rows under a `LIMIT` changes which rows reach the limit. [`Builder::node`] clears
     /// it for every node that is not a scan, a filter or a projection.
     sideways: Option<Arc<Sideways<'a>>>,
+    /// The cutoff of the TopN whose input is being walked into, for the scan at the bottom of it.
+    ///
+    /// The same walk `sideways` survives, minus the table function: a file scan prunes by row group
+    /// of somebody else's file rather than by part of ours, so there is nothing down there for a
+    /// cutoff to be measured against yet. See [`crate::cutoff`].
+    cutoff: Option<Arc<Cutoff>>,
     /// Aggregates whose parent TopN orders by COUNT descending, its count plus offset, and which
     /// call of the aggregate that count is.
     top_counts: Vec<(NodeRef, usize, usize)>,
@@ -1097,6 +1105,13 @@ impl<'a> Building<'a, '_> {
         ) {
             self.sideways = None;
         }
+        // A cutoff travels the same way and stops one node short of it, for the reason on the field.
+        if !matches!(
+            *plan.node(reference),
+            Node::Get { .. } | Node::Filter { .. } | Node::Project { .. }
+        ) {
+            self.cutoff = None;
+        }
         let segment = match *plan.node(reference) {
             Node::Get { catalog: database, schema, table, index, columns, .. } => {
                 let name = QualifiedName::new(
@@ -1108,6 +1123,7 @@ impl<'a> Building<'a, '_> {
                     pruning: std::mem::take(&mut self.pruning),
                     pushed: self.pushing.take(),
                     sideways: self.sideways.take(),
+                    cutoff: self.cutoff.take(),
                 };
                 let scan = Scan::new(
                     plan,
@@ -1400,10 +1416,25 @@ impl<'a> Building<'a, '_> {
                         self.top_counts.push((aggregate, bound, call));
                     }
                 }
+                // Made before the input is walked into, because the scan at the bottom of it takes
+                // a reader on this while it is built and the top N only fills it while the query
+                // runs. It stays inert unless the arming below finds a scan column the ordering is
+                // on, which is a scan that reads everything exactly as it did before.
+                let cutoff = Cutoff::new();
+                self.cutoff = Some(Arc::clone(&cutoff));
                 let below = self.node(input)?;
+                self.cutoff = None;
+                // Armed afterwards, like the join's own filter and for the same reason: the binding
+                // the top N knows is the one the projection above the scan hands it, so it has to be
+                // walked down to the scan's own before the scan can be asked about it.
+                if let Some((binding, op)) = cutoff::ordering(plan, keys) {
+                    if let Some(binding) = sideways::beneath(plan, input, binding) {
+                        cutoff.about(binding, op);
+                    }
+                }
                 let schema = below.schema.clone();
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
-                let top = top.in_session(self.session);
+                let top = top.telling(cutoff).in_session(self.session);
                 let counters = self.watch(reference, id, pipeline, "TopN", None);
                 let reading = Arc::clone(&counters);
                 self.close(below, pipeline, Arc::new(Watched::new(top, counters)));
