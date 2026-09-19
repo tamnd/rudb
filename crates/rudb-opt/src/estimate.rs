@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rudb_common::bounds::{Spread, Test, Zones};
-use rudb_common::stat::{Class, Direction, Provenance, Stat};
+use rudb_common::stat::{Class, Direction, Provenance, Stat, Use};
 use rudb_plan::{
     ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
     SetOpKind, Slice,
@@ -250,6 +250,21 @@ const FROM_A_CONSTANT: Provenance = Provenance::Default;
 /// can be exceeded and this cannot.
 const CEILING: Class = Class::Certified { bound: 1.0, direction: Direction::AtMost };
 
+/// What a row count in a plan is read for, in the vocabulary of `spec/stats/05-every-query.md`
+/// section 5.1.1.
+///
+/// One constant rather than a `.decide()` written out at each call site, because that section asks
+/// `EXPLAIN` to print which use happened, and a word printed in one file about a call made in
+/// another is a word that goes stale the first time somebody changes the call.
+///
+/// It is [`Use::Decide`] for every cardinality the optimizer reads today and that is not a gap.
+/// The three passes that read one, join order in `crate::order`, build side in `crate::sides` and
+/// semi lowering in `crate::semi`, each choose between plans that produce the same rows, which is
+/// exactly what Decide means. The worst a wrong number does there is a slow query. The day a pass
+/// reads a cardinality to license a rewrite instead, that read declares [`Use::Enable`], the class
+/// rule refuses everything but an exact count, and the statistics section says an enable happened.
+pub const CARDINALITY: Use = Use::Decide;
+
 /// How many rows this node is guessed to produce, where a guess can be made at all.
 ///
 /// `None` means nothing downstream of here should pretend to know, which is the answer for a scan
@@ -265,7 +280,7 @@ const CEILING: Class = Class::Certified { bound: 1.0, direction: Direction::AtMo
 /// module produces. That is the point.
 #[must_use]
 pub fn rows(plan: &Plan, node: NodeRef, stats: &Facts) -> Option<u64> {
-    rows_stat(plan, node, stats).decide().copied()
+    rows_stat(plan, node, stats).read(CARDINALITY).copied()
 }
 
 /// How many rows this node produces, and how much of that is knowledge.
@@ -737,7 +752,7 @@ fn follow(
                 if let Some(distinct) = plan.distinct_measured(index, name) {
                     return Some(distinct);
                 }
-                return if rows { plan.measured(index).decide().copied() } else { None };
+                return if rows { plan.measured(index).read(CARDINALITY).copied() } else { None };
             }
             Node::Project { index, exprs, .. } if index == binding.table => {
                 let &carried = plan.expr_list(exprs).get(position)?;

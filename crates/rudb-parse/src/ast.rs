@@ -101,7 +101,12 @@ pub enum Statement {
     /// a flag on the same statement rather than a statement of its own. Everything between the
     /// parser and the printer is the same either way, which is the point: the analyzed plan has to
     /// be the plan that ran.
-    Explain { query: QueryRef, analyze: bool },
+    ///
+    /// `STATISTICS` asks for the section that says what the planner knew, which is what
+    /// `spec/stats/05-every-query.md` section 5.1.1 asks `EXPLAIN` to print. It is a flag for the
+    /// same reason `ANALYZE` is: it changes what goes on the end of the output and nothing before
+    /// it.
+    Explain { query: QueryRef, analyze: bool, statistics: bool },
 }
 
 /// `SET name = value` and `RESET name`.

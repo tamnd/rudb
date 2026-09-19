@@ -44,12 +44,29 @@
 
 use std::fmt::Write as _;
 
-use rudb_common::stat::{Class, Stat};
+use rudb_common::stat::{Class, Classes, Stat, Use};
 use rudb_metrics::{Document, Operator};
 use rudb_plan::{Node, NodeRef, OperatorRef, PipelineRef, Plan, Shape, seams_of};
 use rudb_seam::{Registries, SeamId, Settings};
 
-use crate::estimate::{Facts, rows_stat};
+use crate::estimate::{CARDINALITY, Facts, rows_stat};
+
+/// Whether `EXPLAIN` was asked what the planner knew.
+///
+/// A named pair rather than a `bool`, because `explain_with(plan, facts, seams, true)` at a call
+/// site says nothing about what is true.
+///
+/// It is off by default because the plan is what somebody reading `EXPLAIN` came for, and a use and
+/// a class on every line is a second sentence per line for a question most readers are not asking.
+/// `EXPLAIN (STATISTICS)` is the question, and `spec/stats/05-every-query.md` section 5.1.1 is what
+/// it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Statistics {
+    /// Say what each estimate was read for, and count the classes underneath.
+    Asked,
+    /// The plan, the pipelines and the seams, which is what a plain `EXPLAIN` prints.
+    NotAsked,
+}
 
 /// What `EXPLAIN` needs to know about the seams to print the last section.
 ///
@@ -104,7 +121,7 @@ impl<'a> Seams<'a> {
 pub fn explain(plan: &Plan, facts: &Facts) -> String {
     let settings = Settings::new();
     let registries = Registries::new();
-    explain_with(plan, facts, Seams::new(&settings, &registries))
+    explain_with(plan, facts, Seams::new(&settings, &registries), Statistics::NotAsked)
 }
 
 /// The plan as `EXPLAIN` prints it: the tree, then the pipelines, then the seams.
@@ -117,8 +134,13 @@ pub fn explain(plan: &Plan, facts: &Facts) -> String {
 /// zero, and the difference between "no rows" and "nobody knows" is the whole of what
 /// [`crate::estimate`] is careful about.
 #[must_use]
-pub fn explain_with(plan: &Plan, facts: &Facts, seams: Seams<'_>) -> String {
-    printed(plan, facts, seams, None)
+pub fn explain_with(
+    plan: &Plan,
+    facts: &Facts,
+    seams: Seams<'_>,
+    statistics: Statistics,
+) -> String {
+    printed(plan, facts, seams, None, statistics)
 }
 
 /// The plan as `EXPLAIN ANALYZE` prints it, which is the same three sections with what happened
@@ -129,8 +151,14 @@ pub fn explain_with(plan: &Plan, facts: &Facts, seams: Seams<'_>) -> String {
 /// counters with, so a document from a different query lines nothing up rather than lining the
 /// wrong things up.
 #[must_use]
-pub fn analyzed(plan: &Plan, facts: &Facts, seams: Seams<'_>, measured: &Document) -> String {
-    printed(plan, facts, seams, Some(measured))
+pub fn analyzed(
+    plan: &Plan,
+    facts: &Facts,
+    seams: Seams<'_>,
+    measured: &Document,
+    statistics: Statistics,
+) -> String {
+    printed(plan, facts, seams, Some(measured), statistics)
 }
 
 /// Writes the estimated row count of every node onto the operator row that node became, and the
@@ -164,13 +192,22 @@ pub fn record_estimates(plan: &Plan, facts: &Facts, document: &mut Document) {
 }
 
 /// The three sections, with the measured numbers in them if there are any.
-fn printed(plan: &Plan, facts: &Facts, seams: Seams<'_>, measured: Option<&Document>) -> String {
+fn printed(
+    plan: &Plan,
+    facts: &Facts,
+    seams: Seams<'_>,
+    measured: Option<&Document>,
+    statistics: Statistics,
+) -> String {
     let shape = Shape::of(plan);
-    let printing = Printing { plan, facts, shape: &shape, seams, measured };
+    let printing = Printing { plan, facts, shape: &shape, seams, measured, statistics };
     let mut out = String::new();
     printing.write_node(plan.root(), 0, &mut out);
     write_pipelines(&shape, measured, &mut out);
     write_seams(seams, &mut out);
+    if statistics == Statistics::Asked {
+        write_statistics(reads(plan, facts, &shape), &mut out);
+    }
     if let Some(measured) = measured {
         write_totals(measured, &mut out);
     }
@@ -189,12 +226,20 @@ fn printed(plan: &Plan, facts: &Facts, seams: Seams<'_>, measured: Option<&Docum
 /// The provenance is printed next to an exact number too, per `spec/stats/02-the-catalogue.md`
 /// section 2.1.1. An exact count out of the catalog and an exact join cardinality out of a link
 /// header are different kinds of exact and a reader has to be able to tell them apart.
-fn estimate(stat: Stat<u64>) -> String {
+/// With the statistics asked for, the use the number was read for goes on the end of the same
+/// bracket. It belongs next to the class and not in a section of its own, because the question it
+/// answers is about this line: a guess read to decide is a slow query at worst, and the same guess
+/// read to enable would be a wrong answer, so the pair is what says whether a line is safe.
+fn estimate(stat: Stat<u64>, statistics: Statistics) -> String {
+    let read = match statistics {
+        Statistics::Asked => format!(", read to {CARDINALITY}"),
+        Statistics::NotAsked => String::new(),
+    };
     match stat {
-        Stat::Unknown => "rows unknown".to_owned(),
+        Stat::Unknown => format!("rows unknown{read}"),
         Stat::Known { value, class, provenance } => match class {
-            Class::Estimated => format!("~{value} rows {class} from {provenance}"),
-            class => format!("{value} rows {class} from {provenance}"),
+            Class::Estimated => format!("~{value} rows {class} from {provenance}{read}"),
+            class => format!("{value} rows {class} from {provenance}{read}"),
         },
     }
 }
@@ -210,12 +255,13 @@ struct Printing<'a> {
     shape: &'a Shape,
     seams: Seams<'a>,
     measured: Option<&'a Document>,
+    statistics: Statistics,
 }
 
 impl Printing<'_> {
     fn write_node(self, node: NodeRef, depth: usize, out: &mut String) {
         let printed = self.plan.operator(node);
-        let estimate = estimate(rows_stat(self.plan, node, self.facts));
+        let estimate = estimate(rows_stat(self.plan, node, self.facts), self.statistics);
         let pipeline = self.shape.pipeline(node);
         let marker =
             if self.seams.all_reference(self.plan.node(node)) { " [reference]" } else { "" };
@@ -294,6 +340,80 @@ fn write_pipelines(shape: &Shape, measured: Option<&Document>, out: &mut String)
             .map(|row| format!("  [{} wall, {} cpu]", duration(row.wall_ns), duration(row.cpu_ns)))
             .unwrap_or_default();
         let _ = writeln!(out, "  pipeline {pipeline} {waiting}{root}{took}");
+    }
+}
+
+/// How many numbers were read for each of the three uses, and what class each read got.
+///
+/// Three histograms rather than one, because the class that matters depends on the use. Half the
+/// decisions being guesses is a planner with thin statistics and a slow query at the end of it,
+/// and one enable on a guess would be a bug the class rule is there to make impossible. A single
+/// count could not tell those apart.
+#[derive(Debug, Clone, Copy, Default)]
+struct Reads {
+    answer: Classes,
+    enable: Classes,
+    decide: Classes,
+}
+
+impl Reads {
+    /// Counts one read made for that use.
+    fn record(&mut self, use_: Use, stat: &Stat<u64>) {
+        match use_ {
+            Use::Answer => self.answer.record(stat),
+            Use::Enable => self.enable.record(stat),
+            Use::Decide => self.decide.record(stat),
+        }
+    }
+
+    /// The histogram for one use.
+    const fn of(self, use_: Use) -> Classes {
+        match use_ {
+            Use::Answer => self.answer,
+            Use::Enable => self.enable,
+            Use::Decide => self.decide,
+        }
+    }
+}
+
+/// Every statistic this plan was built out of, counted by what it was read for.
+///
+/// One read per operator and not per node, the same rule [`record_estimates`] counts by and for the
+/// same reason: a node the plan folded away is not a decision anybody acted on.
+fn reads(plan: &Plan, facts: &Facts, shape: &Shape) -> Reads {
+    let mut reads = Reads::default();
+    for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        if shape.operator_of(node).is_some() {
+            reads.record(CARDINALITY, &rows_stat(plan, node, facts));
+        }
+    }
+    reads
+}
+
+/// What the planner knew, which is the section `EXPLAIN (STATISTICS)` is asked for.
+///
+/// A line per use that happened and one line for the uses that did not, rather than three lines of
+/// zeroes. The uses that did not happen are named instead of being left out, because the line
+/// saying nothing was read to enable is the reassuring half of this section and a reader cannot get
+/// it from an absence.
+fn write_statistics(reads: Reads, out: &mut String) {
+    let _ = writeln!(out, "\nStatistics");
+    let mut silent = Vec::new();
+    for use_ in [Use::Answer, Use::Enable, Use::Decide] {
+        let classes = reads.of(use_);
+        if classes.total() == 0 {
+            silent.push(format!("to {}", use_.name()));
+            continue;
+        }
+        let share = classes.known_share() * 100.0;
+        let _ = writeln!(
+            out,
+            "  {} read to {use_}: {classes}, {share:.0}% of them with a number behind them",
+            classes.total()
+        );
+    }
+    if !silent.is_empty() {
+        let _ = writeln!(out, "  nothing was read {}", among(&silent, "or"));
     }
 }
 
@@ -382,11 +502,19 @@ const ROOT: PipelineRef = 0;
 
 /// A list of pipeline numbers, as somebody would say it out loud.
 fn listed(pipelines: &[PipelineRef]) -> String {
-    let numbers: Vec<String> = pipelines.iter().map(u32::to_string).collect();
-    match numbers.split_last() {
+    among(&pipelines.iter().map(u32::to_string).collect::<Vec<String>>(), "and")
+}
+
+/// A list of anything, as somebody would say it out loud.
+///
+/// The conjunction is given rather than always being `and`, because a list of things that did not
+/// happen reads as `or` and a reader who is told two uses happened when neither did has been told
+/// the opposite of the truth.
+fn among(words: &[String], conjunction: &str) -> String {
+    match words.split_last() {
         None => String::new(),
         Some((last, [])) => last.clone(),
-        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        Some((last, rest)) => format!("{} {conjunction} {last}", rest.join(", ")),
     }
 }
 
@@ -401,7 +529,7 @@ mod tests {
     use rudb_plan::Plan;
     use rudb_seam::{Registries, Settings};
 
-    use super::{Seams, Shape, explain, explain_with, record_estimates};
+    use super::{Seams, Shape, Statistics, explain, explain_with, record_estimates};
     use crate::estimate::Facts;
 
     fn parsed(text: &str) -> Plan {
@@ -414,6 +542,17 @@ mod tests {
             facts.record("memory", "main", table, *count);
         }
         explain(&parsed(text), &facts)
+    }
+
+    /// The same thing with the statistics asked for, which is `EXPLAIN (STATISTICS)`.
+    fn asked(text: &str, tables: &[(&str, u64)]) -> String {
+        let mut facts = Facts::new();
+        for (table, count) in tables {
+            facts.record("memory", "main", table, *count);
+        }
+        let settings = Settings::new();
+        let registries = Registries::new();
+        explain_with(&parsed(text), &facts, Seams::new(&settings, &registries), Statistics::Asked)
     }
 
     /// The tree, without the sections under it, which is the part most tests are about.
@@ -441,6 +580,63 @@ mod tests {
                 "  Get memory.main.t AS t #0 [a::INTEGER]  [1000 rows exact from row count] [pipeline 0] \
                  [reference]",
             )
+        );
+    }
+
+    #[test]
+    fn a_plain_explain_says_nothing_about_uses_and_asking_for_the_statistics_says_it_on_every_line()
+    {
+        let plan = concat!(
+            "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER]\n",
+        );
+        let quiet = printed(plan, &[("t", 1000)]);
+        assert!(!quiet.contains("read to"), "{quiet}");
+        assert!(!quiet.contains("\nStatistics\n"), "{quiet}");
+
+        // Every number in a plan is read to choose between plans that produce the same rows, so
+        // every line says decide. A line that said enable over a guess would be a bug, and the
+        // point of printing the use is that it would be a visible one.
+        let out = asked(plan, &[("t", 1000)]);
+        for line in tree(&out) {
+            assert!(line.contains(", read to decide]"), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_statistics_section_counts_the_classes_and_says_which_uses_never_happened() {
+        let out = asked(
+            concat!(
+                "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n",
+                "  Get memory.main.t AS t #0 [a::INTEGER]\n",
+            ),
+            &[("t", 1000)],
+        );
+        assert!(out.contains("\nStatistics\n"), "{out}");
+        // Two operators, so two reads: the scan off a counted row count and the filter off a
+        // constant. Both had a number behind them, which is what the share is counting.
+        assert!(
+            out.contains(
+                "  2 read to decide: exact 1, certified 0, estimated 1, unknown 0, \
+                 100% of them with a number behind them\n"
+            ),
+            "{out}"
+        );
+        // The uses that did not happen are said out loud. An absence would read as an oversight,
+        // and the whole value of this line is that nobody licensed a rewrite off a guess.
+        assert!(out.contains("  nothing was read to answer or to enable\n"), "{out}");
+    }
+
+    #[test]
+    fn a_plan_nobody_measured_says_so_in_the_section_as_well_as_on_the_lines() {
+        let out = asked("Get memory.main.t AS t #0 [a::INTEGER]\n", &[]);
+        assert!(out.contains("[rows unknown, read to decide]"), "{out}");
+        assert!(
+            out.contains(
+                "  1 read to decide: exact 0, certified 0, estimated 0, unknown 1, \
+                 0% of them with a number behind them\n"
+            ),
+            "{out}"
         );
     }
 
@@ -591,7 +787,12 @@ mod tests {
         let plan = parsed(
             "Sort [#0.0::INTEGER ASC NULLS LAST]\n  Get memory.main.t AS t #0 [a::INTEGER]\n",
         );
-        let out = explain_with(&plan, &Facts::new(), Seams::new(&settings, &registries));
+        let out = explain_with(
+            &plan,
+            &Facts::new(),
+            Seams::new(&settings, &registries),
+            Statistics::NotAsked,
+        );
         assert!(out.contains("[reference]"), "{out}");
         assert!(!out.contains("sort = "), "{out}");
     }
