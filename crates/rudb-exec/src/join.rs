@@ -794,6 +794,134 @@ struct Built {
     undecided: bool,
 }
 
+/// How many pairs a residual is evaluated over in one go, at most.
+///
+/// A cap rather than the whole driving chunk, because a chunk of a thousand driving rows against a
+/// key a thousand gathered rows share is a million pairs and holding them all would be a burst of
+/// memory nothing asked for. Sixteen vectors is large enough that the fixed cost of an evaluation
+/// is spread over a full batch even when the pairs come from one driving row at a time, and small
+/// enough to stay in cache.
+///
+/// One driving row is never split across two fills. The cap is checked after a row's candidates
+/// have gone in, so a row with more candidates than this produces an oversized batch on its own,
+/// which is the same thing the code this replaces did with that row.
+const RESIDUAL_BATCH: usize = 16 * VECTOR_SIZE;
+
+/// The candidates a residual kept, for a run of driving rows rather than for one of them.
+///
+/// The reason this exists is that a residual used to be evaluated once per driving row. Each of
+/// those evaluations gathered that row's candidates into a chunk, built a constant vector per
+/// driving column to repeat the row across them, ran the expression tree, combined the flags and
+/// read the result back. All of that is a fixed cost paid per driving row, and on TPC-H q21 the
+/// two joins that carry a residual have about four candidates per driving row, so the fixed cost
+/// was paid once per four pairs and the vectors it built were four rows long.
+///
+/// So the pairs of many driving rows are collected first and the residual is run over a full batch
+/// of them. What comes back is the same answer per driving row, held as one run of gathered rows
+/// with an index saying where each driving row's share of it begins. The row loop then reads a
+/// slice out of that instead of calling the evaluator.
+#[derive(Debug, Default)]
+struct Candidates {
+    /// The gathered rows that survived, every driving row's share laid end to end.
+    right: Vec<u32>,
+    /// Where each driving row's share of `right` begins, with a last entry for the end.
+    ///
+    /// Indexed by the driving row less [`Candidates::from`], so it is one longer than the run of
+    /// driving rows this covers.
+    start: Vec<u32>,
+    /// The first driving row this covers.
+    from: usize,
+    /// One past the last driving row this covers, so `from == to` is nothing.
+    to: usize,
+    /// The candidates before the residual was asked about them.
+    raw: Vec<u32>,
+    /// Which driving row each entry of `raw` belongs to, which is what the pairs are gathered at.
+    driving: Vec<u32>,
+    /// Whether the residual kept each entry of `raw`.
+    pass: Vec<bool>,
+    /// One driving row's chain, refilled per row while the batch is being collected.
+    chain: Vec<u32>,
+}
+
+impl Candidates {
+    /// Whether `row` is a driving row this already has the answer for.
+    fn holds(&self, row: usize) -> bool {
+        row >= self.from && row < self.to
+    }
+
+    /// The gathered rows the residual kept for driving row `row`.
+    ///
+    /// Empty for a row this does not cover, which a caller avoids by asking [`Candidates::holds`]
+    /// first. It is empty rather than an error because an empty list is what a driving row that
+    /// matched nothing has, so a caller that got the range wrong would see a wrong answer either
+    /// way and the check belongs where the fill is decided.
+    fn of(&self, row: usize) -> &[u32] {
+        let Some(index) = row.checked_sub(self.from) else {
+            return &[];
+        };
+        let (Some(&begin), Some(&end)) = (self.start.get(index), self.start.get(index + 1)) else {
+            return &[];
+        };
+        self.right.get(begin as usize..end as usize).unwrap_or_default()
+    }
+
+    /// Nothing covered, which is what a new driving chunk means.
+    fn forget(&mut self) {
+        self.from = 0;
+        self.to = 0;
+    }
+
+    /// Answers the residual for as many driving rows from `from` as fit in one batch.
+    fn fill(
+        &mut self,
+        residual: &Residual<'_>,
+        left: &Chunk,
+        built: &Built,
+        slots: &[usize],
+    ) -> Result<()> {
+        self.raw.clear();
+        self.driving.clear();
+        self.start.clear();
+        self.right.clear();
+        self.start.push(0);
+        let mut row = self.from;
+        while row < left.len() {
+            let slot = slots.get(row).copied().unwrap_or(MISS);
+            built.index.matches(slot, &mut self.chain);
+            let at = u32::try_from(row).map_err(|_| too_many_rows())?;
+            self.raw.extend_from_slice(&self.chain);
+            self.driving.extend(std::iter::repeat_n(at, self.chain.len()));
+            row += 1;
+            self.start.push(u32::try_from(self.raw.len()).map_err(|_| too_many_rows())?);
+            if self.raw.len() >= RESIDUAL_BATCH {
+                break;
+            }
+        }
+        self.to = row;
+        residual.keeps(left, &built.rows, &self.driving, &self.raw, &mut self.pass)?;
+        // The offsets are into `raw` and they become offsets into `right`, which holds a subset of
+        // the same entries in the same order and so is never longer. That is what lets the rewrite
+        // run in place: an entry is read before the slot it came from is written, and the slot for
+        // the next driving row is not touched until the row after it.
+        let mut kept: usize = 0;
+        for index in 0..self.to - self.from {
+            let begin = self.start[index] as usize;
+            let end = self.start[index + 1] as usize;
+            self.start[index] = u32::try_from(kept).map_err(|_| too_many_rows())?;
+            for at in begin..end {
+                if self.pass.get(at).copied().unwrap_or(false) {
+                    self.right.push(self.raw[at]);
+                    kept += 1;
+                }
+            }
+        }
+        if let Some(last) = self.start.last_mut() {
+            *last = u32::try_from(kept).map_err(|_| too_many_rows())?;
+        }
+        Ok(())
+    }
+}
+
 /// Where one instance of a probe is in the driving chunk it was given.
 #[derive(Debug)]
 pub(crate) struct Probing {
@@ -815,8 +943,11 @@ pub(crate) struct Probing {
     scratch: Scratch,
     /// The gathered rows the current driving row matches, refilled per row from its chain.
     chain: Vec<u32>,
-    /// The ones of those a residual condition kept, when there is a residual condition.
-    kept: Vec<u32>,
+    /// The candidates a residual condition kept, when there is a residual condition.
+    ///
+    /// Filled for a run of driving rows rather than for one of them, which is why it is a structure
+    /// rather than a list. See [`Candidates`].
+    cand: Candidates,
     /// Which driving row each output row reads from, one entry per output row.
     ///
     /// This and the one below it are the answer. A pair is two numbers, so the row loop writes two
@@ -1080,7 +1211,7 @@ impl Stream for Probe<'_> {
             slots: Vec::new(),
             scratch: Scratch::default(),
             chain: Vec::new(),
-            kept: Vec::new(),
+            cand: Candidates::default(),
             left_at: Vec::new(),
             right_at: Vec::new(),
             row: 0,
@@ -1108,6 +1239,9 @@ impl Stream for Probe<'_> {
             None => {
                 local.row = 0;
                 local.hit = 0;
+                // What a residual answered about the chunk before this one says nothing about this
+                // one, and the row numbers it is held under would be read as if it did.
+                local.cand.forget();
                 let left = chunk.clone();
                 // Once per driving chunk rather than once per driving row, which is what keeps the
                 // evaluator on its batch interface here as well. Nothing at all against an empty
@@ -1146,70 +1280,80 @@ impl Stream for Probe<'_> {
             return self.marked(chunk, &left, &built, local);
         }
         let residual = self.residual();
-        // The two halves of the answer, one entry per output row. Nothing is built here but a pair
-        // of numbers per pair of rows, and the columns are gathered at those numbers below.
-        local.left_at.clear();
-        local.right_at.clear();
-        while local.row < left.len() && local.left_at.len() < VECTOR_SIZE {
-            // Once per driving row, the same granularity the nested loop checks at, and the only
-            // place in this operator that runs long once the table is built.
-            self.cancel.check()?;
-            // The chain the lookup above left for this row, which is one walk of a run of `u32`
-            // rather than a hash and a map lookup.
-            let slot = local.slots.get(local.row).copied().unwrap_or(MISS);
-            built.index.matches(slot, &mut local.chain);
-            // The driving row as values only when there is a conjunct left to evaluate on it, which
-            // is what makes an ordinary equi join cost no boxed row at all. A residual still gets
-            // one per driving row, because the pairs it evaluates over are one row repeated across
-            // its candidates and a constant vector is built out of a value.
-            let found: &[u32] = if residual.exprs.is_empty() {
-                &local.chain
-            } else {
-                let values: Vec<Value> = left.row(local.row).collect();
-                residual.keep(&values, &built.rows, &local.chain, &mut local.kept)?
-            };
-            let at = u32::try_from(local.row).map_err(|_| too_many_rows())?;
-            match self.kind {
-                JoinKind::Semi => {
-                    if !found.is_empty() {
-                        local.left_at.push(at);
+        {
+            // The fields this loop touches, taken apart so that the candidates a residual answered
+            // can be held across a push to the answer. They are separate fields and nothing reads
+            // two of them at once, but a `local.cand` borrowed while `local.left_at` is written is
+            // one borrow of the whole state twice over as far as the compiler is concerned.
+            let Probing { slots, chain, cand, left_at, right_at, row, hit, .. } = &mut *local;
+            // The two halves of the answer, one entry per output row. Nothing is built here but a
+            // pair of numbers per pair of rows, and the columns are gathered at those numbers below.
+            left_at.clear();
+            right_at.clear();
+            while *row < left.len() && left_at.len() < VECTOR_SIZE {
+                // Once per driving row, the same granularity the nested loop checks at, and the
+                // only place in this operator that runs long once the table is built.
+                self.cancel.check()?;
+                let found: &[u32] = if residual.exprs.is_empty() {
+                    // The chain the lookup above left for this row, which is one walk of a run of
+                    // `u32` rather than a hash and a map lookup. An ordinary equi join answers out
+                    // of it directly and so costs no boxed row and no second pass at all.
+                    let slot = slots.get(*row).copied().unwrap_or(MISS);
+                    built.index.matches(slot, chain);
+                    chain
+                } else {
+                    // A residual is answered for a batch of driving rows at a time and read back
+                    // here a row at a time. The refill covers this row and as many after it as fit,
+                    // so the test fails once per batch rather than once per row. See [`Candidates`].
+                    if !cand.holds(*row) {
+                        cand.from = *row;
+                        cand.fill(&residual, &left, &built, slots)?;
+                    }
+                    cand.of(*row)
+                };
+                let at = u32::try_from(*row).map_err(|_| too_many_rows())?;
+                match self.kind {
+                    JoinKind::Semi => {
+                        if !found.is_empty() {
+                            left_at.push(at);
+                        }
+                    }
+                    JoinKind::Anti => {
+                        if found.is_empty() {
+                            left_at.push(at);
+                        }
+                    }
+                    JoinKind::Single => {
+                        if found.len() > 1 {
+                            return Err(too_many_rows());
+                        }
+                        left_at.push(at);
+                        right_at.push(found.first().copied().unwrap_or(PAD));
+                    }
+                    JoinKind::Left if found.is_empty() => {
+                        left_at.push(at);
+                        right_at.push(PAD);
+                    }
+                    // An inner join with no match produces nothing, which is this arm with an empty
+                    // list, and the rest of it is one output row per match.
+                    _ => {
+                        let room = VECTOR_SIZE - left_at.len();
+                        let end = (*hit + room).min(found.len());
+                        for &found_at in &found[*hit..end] {
+                            left_at.push(at);
+                            right_at.push(found_at);
+                        }
+                        if end < found.len() {
+                            // A key with more matches than fit in a chunk. The row stays where it
+                            // is and the next call picks up from the match this one stopped at.
+                            *hit = end;
+                            break;
+                        }
+                        *hit = 0;
                     }
                 }
-                JoinKind::Anti => {
-                    if found.is_empty() {
-                        local.left_at.push(at);
-                    }
-                }
-                JoinKind::Single => {
-                    if found.len() > 1 {
-                        return Err(too_many_rows());
-                    }
-                    local.left_at.push(at);
-                    local.right_at.push(found.first().copied().unwrap_or(PAD));
-                }
-                JoinKind::Left if found.is_empty() => {
-                    local.left_at.push(at);
-                    local.right_at.push(PAD);
-                }
-                // An inner join with no match produces nothing, which is this arm with an empty
-                // list, and the rest of it is one output row per match.
-                _ => {
-                    let room = VECTOR_SIZE - local.left_at.len();
-                    let end = (local.hit + room).min(found.len());
-                    for &hit in &found[local.hit..end] {
-                        local.left_at.push(at);
-                        local.right_at.push(hit);
-                    }
-                    if end < found.len() {
-                        // A key with more matches than fit in a chunk. The row stays where it is and
-                        // the next call picks up from the match this one stopped at.
-                        local.hit = end;
-                        break;
-                    }
-                    local.hit = 0;
-                }
+                *row += 1;
             }
-            local.row += 1;
         }
         let mut columns: Vec<Vector> = left
             .columns()
@@ -1379,6 +1523,72 @@ impl Residual<'_> {
             }
         }
         Ok(into)
+    }
+
+    /// Whether each of a list of pairs holds, for pairs that came from more than one driving row.
+    ///
+    /// The pairs are two lists of the same length read side by side: `driving` says which row of
+    /// `left` each pair uses and `gathered` says which row of `rows`. `into` comes back with one
+    /// answer per pair, in the same order.
+    ///
+    /// This is [`Residual::keep`] with the driving row no longer fixed, and that is the whole point
+    /// of it. Fixing the driving row means the vectors are as long as one key's candidate list,
+    /// which on a join between two large tables is a handful of rows, and then the cost of walking
+    /// an expression tree and allocating a vector per node is paid once per handful. Here the batch
+    /// is full whatever the candidate lists look like. What it costs in exchange is a gather of the
+    /// driving columns, where the fixed version repeated one row across the batch as constants.
+    /// That is a real cost and it is per pair rather than per driving row, but it is one pass of the
+    /// same kernel the answer itself is built with, and on TPC-H q21 the two joins that carry a
+    /// residual average about four candidates per driving row, so the fixed costs it removes are
+    /// paid two hundred thousand times and the gather it adds reads the same rows the evaluation
+    /// was going to read anyway.
+    fn keeps(
+        &self,
+        left: &Chunk,
+        rows: &Build,
+        driving: &[u32],
+        gathered: &[u32],
+        into: &mut Vec<bool>,
+    ) -> Result<()> {
+        into.clear();
+        if self.exprs.is_empty() {
+            // Nothing left to say keeps every pair, and saying so here rather than at the call site
+            // is what lets a caller treat a join with a residual and one without it the same way.
+            into.resize(gathered.len(), true);
+            return Ok(());
+        }
+        into.reserve(gathered.len());
+        let mut at = 0;
+        while at < gathered.len() {
+            // A vector at a time, which is the size the evaluator is written for. The batch above
+            // this is larger so that a batch is full, and this is what it is broken back down into.
+            let end = (at + VECTOR_SIZE).min(gathered.len());
+            let mut columns: Vec<Vector> = left
+                .columns()
+                .iter()
+                .map(|column| column.gather(&driving[at..end]))
+                .collect::<Result<Vec<_>>>()?;
+            columns.extend(rows.gather(&gathered[at..end])?);
+            // Driving columns and then gathered ones, which is the order this operator holds a pair
+            // in and so the order `self.combined` resolves a conjunct against. See [`widen`], which
+            // builds the same layout out of a single row.
+            let combined = Chunk::with_rows(columns, end - at)?;
+            let flags = evaluate_all_in_time_zone(
+                self.plan,
+                self.exprs,
+                self.combined,
+                &combined,
+                self.time_zone,
+            )?;
+            let merged = combine(Connective::And, &flags)?;
+            // row at a time: the flags are already a vector here, so what this wants is the
+            // selection that 2c (#57) threads.
+            for row in 0..end - at {
+                into.push(is_true(&merged.value_at(row)));
+            }
+            at = end;
+        }
+        Ok(())
     }
 }
 
@@ -2357,6 +2567,59 @@ mod tests {
                 vec![Value::Integer(2), Value::Integer(10), Value::Integer(2), Value::Integer(5)],
                 vec![Value::Integer(3), Value::Integer(10), Value::Integer(3), Value::Integer(5)],
             ]
+        );
+    }
+
+    /// A residual is answered a batch of pairs at a time and a batch that fills up in the middle of
+    /// a driving chunk has to pick up from the row it stopped at. See [`RESIDUAL_BATCH`], which is
+    /// what decides where that happens, and [`Candidates`] for what is held across it.
+    #[test]
+    fn a_residual_over_more_pairs_than_fit_in_a_batch_answers_the_same() {
+        let mut plan = Plan::new();
+        let (left, right) = (pair_schema(0), pair_schema(1));
+        let key = {
+            let one = column_at(&mut plan, 0, 0, LogicalType::Integer);
+            let other = column_at(&mut plan, 1, 0, LogicalType::Integer);
+            equal(&mut plan, one, other)
+        };
+        let beside = {
+            let one = column_at(&mut plan, 0, 1, LogicalType::Integer);
+            let other = column_at(&mut plan, 1, 1, LogicalType::Integer);
+            greater(&mut plan, one, other)
+        };
+        let conditions = plan.add_expr_list(&[key, beside]);
+
+        // One key on both sides, so every driving row is a candidate for every gathered row. Two
+        // hundred of each is forty thousand pairs, which is more than one batch holds, and the
+        // answer crosses the boundary in the middle of a driving row rather than between two.
+        let side: Vec<(i32, i32)> = (0..200).map(|at| (7, at)).collect();
+        let memory = Memory::unlimited();
+        let (keep, rows) = Keep::new(&memory);
+        let mut local = keep.local();
+        keep.sink(&pair_chunk(&side), &mut local).expect("the gathered rows");
+        keep.combine(local).expect("the one instance");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
+        let probe = Probe::new(
+            &plan,
+            &left,
+            &Gathered { schema: &right, chunks: rows, marker: None, swapped: false },
+            JoinKind::Inner,
+            conditions,
+            &Cancel::new(),
+            &memory,
+        )
+        .expect("one equality is enough to look up");
+
+        // A driving row pairs with the gathered rows numbered below it, so the whole answer is the
+        // number of ordered pairs of two hundred things.
+        let answer = probed(&probe, &pair_chunk(&side), 4);
+        assert_eq!(answer.len(), 200 * 199 / 2);
+        assert!(
+            answer.iter().all(|row| match (&row[1], &row[3]) {
+                (Value::Integer(driving), Value::Integer(gathered)) => driving > gathered,
+                _ => false,
+            }),
+            "every pair the residual kept is one it should have"
         );
     }
 
