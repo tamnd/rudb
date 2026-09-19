@@ -254,34 +254,14 @@ pub(crate) fn finish(
 /// here meant every one of these functions fell out of its loop and took the row at a time path on
 /// the only files anybody runs. That was the second half of #288, and on the ClickBench file it is
 /// `length`, `strlen` and the `lower` in front of a `LIKE`.
+///
+/// A column read out of a native table is a third shape: its bytes are in the file, so there is no
+/// run of them to index into and `Vector::data` answers `None` whether it is asked of the vector or
+/// of a dictionary's values. Every string function here used to decline on that and fall to the row
+/// at a time path, which reads the same value and then pays for a `Value` and the boxed string
+/// inside it as well. They go through [`Text`] now, which reads it either way.
 fn unary(name: &str, arg: &Vector, returns: &LogicalType, rows: usize) -> Result<Option<Vector>> {
     let base = nulls_of(arg);
-    if matches!(name, "length" | "strlen")
-        && arg.logical_type() == &LogicalType::Varchar
-        && returns == &LogicalType::BigInt
-        && arg.data().is_none()
-    {
-        let mut out = vec![0_i64; rows];
-        // `strlen` counts bytes and a source that keeps its values end to end knows how many a value
-        // has without reading any of them, because the two offsets that say where the value starts
-        // and stops are what it would read the value through anyway. `length` counts characters and
-        // has to look, since how many bytes a character took is in the bytes.
-        let validity = if name == "strlen" {
-            over_valid(rows, base, |index| {
-                let size = arg.try_bytes_len_at(index)?.unwrap_or_default();
-                out[index] = i64::try_from(size).unwrap_or(i64::MAX);
-                Ok(())
-            })?
-        } else {
-            over_valid(rows, base, |index| {
-                let bytes = arg.try_bytes_at(index)?.unwrap_or_default();
-                let size = bytes.iter().filter(|byte| (**byte as i8) >= -0x40).count();
-                out[index] = i64::try_from(size).unwrap_or(i64::MAX);
-                Ok(())
-            })?
-        };
-        return finish(returns, Data::Int64(out.into()), validity);
-    }
     match arg.form() {
         Form::Flat => {
             let Some(data) = arg.data() else {
@@ -289,6 +269,9 @@ fn unary(name: &str, arg: &Vector, returns: &LogicalType, rows: usize) -> Result
             };
             one_of(name, data, identity, base, rows, returns, arg)
         }
+        // Text held as views into an arena, or read out of a file. Neither keeps a `Data` to index
+        // into, so the vector is asked for the row and finds the bytes whichever way it holds them.
+        Form::StringView => read_text(name, arg, base, rows, returns),
         Form::Dictionary | Form::Rle => {
             let Some((codes, values)) = arg.positions() else {
                 return Ok(None);
@@ -296,12 +279,18 @@ fn unary(name: &str, arg: &Vector, returns: &LogicalType, rows: usize) -> Result
             if codes.len() < rows {
                 return Ok(None);
             }
-            let Some(data) = values.data() else {
-                return Ok(None);
-            };
-            // Every code is inside the dictionary because `Vector::dictionary` checks that on the
-            // way in, so the gather needs no bound of its own.
-            one_of(name, data, move |index| codes[index] as usize, base, rows, returns, arg)
+            match values.data() {
+                // Every code is inside the dictionary because `Vector::dictionary` checks that on
+                // the way in, so the gather needs no bound of its own.
+                Some(data) => {
+                    one_of(name, data, move |index| codes[index] as usize, base, rows, returns, arg)
+                }
+                // A dictionary whose values are read out of a file, which is what every string
+                // column of a native table is. Following the code here would mean reading the
+                // dictionary's row rather than the vector's, so the vector is asked for the row
+                // instead and does the lookup on the way.
+                None => read_text(name, arg, base, rows, returns),
+            }
         }
         // There is no constant arm, and there is no point in one. A function whose every argument is
         // constant is answered by `call` in a single row before it reaches here, and a one argument
@@ -333,11 +322,120 @@ fn one_of<A: Fn(usize) -> usize>(
         "-" | "abs" if arg.logical_type() == returns => {
             sign_of(name, data, at, base, rows, returns, arg)
         }
-        "length" => length_of(data, at, base, rows, returns),
-        "strlen" => bytes_of(data, at, base, rows, returns),
-        "lower" | "upper" => fold_of(name, data, at, base, rows, returns),
+        "length" | "strlen" | "lower" | "upper" => match data {
+            Data::Varlen(column) => text_of(name, &Text::Held { column, at }, base, rows, returns),
+            _ => Ok(None),
+        },
         "make_date" => made_date(data, at, base, rows, returns),
         "epoch_ms" => made_timestamp(data, at, base, rows, returns),
+        _ => Ok(None),
+    }
+}
+
+/// Where a one argument string function reads its argument.
+///
+/// A string column that lives in a buffer is a run of bytes and an index into it, and a string
+/// column that lives in a file is neither. `Vector::data` answers `None` for the second one, because
+/// the bytes are in the file and the only way to a value is to ask the vector to read it, and every
+/// string function here used to give up the moment it saw that. That is the form every column of a
+/// native table arrives in, so all of them fell to the row at a time path, which does the same read
+/// and then pays for a `Value` and the boxed string inside it on top of it. Measured on `Referer`
+/// under `WHERE Referer <> ''`, which is eighty one million rows, `COUNT(LOWER(Referer))` took 1.98
+/// seconds against 1.11 for `COUNT(LENGTH(Referer))`, and the only difference between the two was
+/// that `length` had a special case written for this shape and `lower` did not. This is that special
+/// case, written once for the shape rather than again for each function.
+enum Text<'a, A> {
+    /// The bytes are in a column, and `at` says which of its values a row wants.
+    Held { column: &'a StringColumn, at: A },
+    /// The bytes are behind a reader, and the vector follows a row to them itself.
+    Read(&'a Vector),
+}
+
+impl<'a> Text<'a, fn(usize) -> usize> {
+    /// Reading through the vector, for the forms that keep no bytes of their own.
+    ///
+    /// `None` for anything that is not text, because a vector holding no `Data` need not be holding
+    /// bytes either, and `Vector::try_bytes_at` answers `None` for every row of one of those rather
+    /// than failing, which would turn a length into a plausible looking zero.
+    ///
+    /// The mapping is a function pointer that nothing ever calls, since the `Read` arm has no
+    /// mapping. It is here so the enum has a type to be, and naming it once here beats a turbofish
+    /// at the call.
+    fn read(vector: &'a Vector) -> Option<Self> {
+        matches!(vector.logical_type(), LogicalType::Varchar).then_some(Text::Read(vector))
+    }
+}
+
+impl<A: Fn(usize) -> usize> Text<'_, A> {
+    /// The bytes of the value at `index`, and nothing where there is no value.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the value out of storage raises.
+    fn bytes(&self, index: usize) -> Result<&[u8]> {
+        match self {
+            Text::Held { column, at } => Ok(column.bytes(at(index)).unwrap_or_default()),
+            Text::Read(vector) => Ok(vector.try_bytes_at(index)?.unwrap_or_default()),
+        }
+    }
+
+    /// The value at `index` as text, and nothing where it is not valid UTF-8.
+    ///
+    /// `StringColumn::get` answers nothing for that too, so a kernel reading through here writes
+    /// what one reading through a held column writes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the value out of storage raises.
+    fn get(&self, index: usize) -> Result<&str> {
+        Ok(std::str::from_utf8(self.bytes(index)?).unwrap_or_default())
+    }
+
+    /// How many bytes the value at `index` has, without reading them where that can be avoided.
+    ///
+    /// A source that keeps its values end to end knows the length from the two offsets that say
+    /// where the value starts and stops, and those are what it would read the value through anyway.
+    /// On `Referer` that is the difference between `COUNT(STRLEN(Referer))` costing 0.28 seconds and
+    /// 147 MB and `COUNT(LENGTH(Referer))` costing 1.11 and 3,213 MB, because the second one has to
+    /// look at the bytes to count characters and the first one does not.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the length out of storage raises.
+    fn len(&self, index: usize) -> Result<usize> {
+        match self {
+            Text::Held { column, at } => Ok(column.bytes(at(index)).unwrap_or_default().len()),
+            Text::Read(vector) => Ok(vector.try_bytes_len_at(index)?.unwrap_or_default()),
+        }
+    }
+}
+
+/// The string functions, over a vector that reads its own values.
+fn read_text(
+    name: &str,
+    arg: &Vector,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    match Text::read(arg) {
+        Some(text) => text_of(name, &text, base, rows, returns),
+        None => Ok(None),
+    }
+}
+
+/// Which one argument string function this is, once its argument has been turned into a source.
+fn text_of<A: Fn(usize) -> usize>(
+    name: &str,
+    text: &Text<'_, A>,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    match name {
+        "length" => length_of(text, base, rows, returns),
+        "strlen" => bytes_of(text, base, rows, returns),
+        "lower" | "upper" => fold_of(name, text, base, rows, returns),
         _ => Ok(None),
     }
 }
@@ -476,18 +574,17 @@ fn sign_of<A: Fn(usize) -> usize>(
 
 /// `length`, which counts characters rather than bytes.
 fn length_of<A: Fn(usize) -> usize>(
-    data: &Data,
-    at: A,
+    text: &Text<'_, A>,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
 ) -> Result<Option<Vector>> {
-    let (Data::Varlen(column), LogicalType::BigInt) = (data, returns) else {
+    if returns != &LogicalType::BigInt {
         return Ok(None);
-    };
+    }
     let mut out = vec![0i64; rows];
     let validity = over_valid(rows, base, |index| {
-        let bytes = column.bytes(at(index)).unwrap_or_default();
+        let bytes = text.bytes(index)?;
         // A character in UTF-8 is one lead byte and some continuation bytes, and a continuation
         // byte is the ones matching `0b10xx_xxxx`. Counting the bytes that are not continuations is
         // the same number `chars().count()` reaches and it never decodes anything.
@@ -505,19 +602,17 @@ fn length_of<A: Fn(usize) -> usize>(
 /// ClickBench queries 28 and 29 are `AVG(STRLEN(URL))` and `AVG(STRLEN(Referer))` over a hundred
 /// million rows, so it gets the vectorized path for the same reason `length` has one.
 fn bytes_of<A: Fn(usize) -> usize>(
-    data: &Data,
-    at: A,
+    text: &Text<'_, A>,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
 ) -> Result<Option<Vector>> {
-    let (Data::Varlen(column), LogicalType::BigInt) = (data, returns) else {
+    if returns != &LogicalType::BigInt {
         return Ok(None);
-    };
+    }
     let mut out = vec![0i64; rows];
     let validity = over_valid(rows, base, |index| {
-        let bytes = column.bytes(at(index)).unwrap_or_default();
-        out[index] = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+        out[index] = i64::try_from(text.len(index)?).unwrap_or(i64::MAX);
         Ok(())
     })?;
     finish(returns, Data::Int64(out.into()), validity)
@@ -526,27 +621,27 @@ fn bytes_of<A: Fn(usize) -> usize>(
 /// `lower` and `upper`.
 fn fold_of<A: Fn(usize) -> usize>(
     name: &str,
-    data: &Data,
-    at: A,
+    text: &Text<'_, A>,
     base: Validity,
     rows: usize,
     returns: &LogicalType,
 ) -> Result<Option<Vector>> {
-    let (Data::Varlen(column), LogicalType::Varchar) = (data, returns) else {
+    if returns != &LogicalType::Varchar {
         return Ok(None);
-    };
+    }
     let lowering = name == "lower";
-    let out = each_string(rows, &base, |index, into| {
-        let text = column.get(at(index)).unwrap_or_default();
+    let out = try_each_string(rows, &base, |index, into| {
+        let value = text.get(index)?;
         // `str::to_lowercase` rather than folding the characters into a buffer that is reused
         // across the vector, which would save the allocation. It is not the same function: the
         // string form knows that a final sigma lowercases to a different letter than a medial one
         // does, and the character form cannot know that. A saved allocation is not worth being
         // wrong about Greek. What the vectorized path removes here is the `Value` clone, the second
         // `to_string` and the packing pass, which was three allocations of the four.
-        let folded = if lowering { text.to_lowercase() } else { text.to_uppercase() };
+        let folded = if lowering { value.to_lowercase() } else { value.to_uppercase() };
         into.push(&folded);
-    });
+        Ok(())
+    })?;
     finish(returns, Data::Varlen(out), base.normalize(rows))
 }
 
@@ -570,6 +665,27 @@ pub(crate) fn each_string(
         }
     }
     out
+}
+
+/// [`each_string`], for a body that reads its values out of storage and can fail doing it.
+///
+/// # Errors
+///
+/// Whatever `body` raises, at the first row that raises it.
+fn try_each_string(
+    rows: usize,
+    base: &Validity,
+    mut body: impl FnMut(usize, &mut StringColumn) -> Result<()>,
+) -> Result<StringColumn> {
+    let mut out = StringColumn::with_capacity(rows);
+    for index in 0..rows {
+        if base.is_valid(index) {
+            body(index, &mut out)?;
+        } else {
+            out.push("");
+        }
+    }
+    Ok(out)
 }
 
 /// A two argument call, for the functions with a loop.
@@ -3258,6 +3374,65 @@ mod tests {
                         agrees("/", &[one, other], ty);
                     }
                 }
+            }
+        }
+    }
+
+    /// A string column whose bytes are behind a reader rather than in a buffer.
+    ///
+    /// Which is what every string column of a native table is. What matters about it here is what
+    /// it does not have: `Vector::data` answers `None` for a vector over one of these, and that is
+    /// the whole of why the string functions used to decline on a real file.
+    #[derive(Debug)]
+    struct Kept(Vec<Vec<u8>>);
+
+    impl rudb_vector::TextSource for Kept {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
+            Ok(self.0.get(index).map(Vec::as_slice))
+        }
+
+        fn footprint(&self) -> usize {
+            self.0.iter().map(Vec::len).sum()
+        }
+    }
+
+    /// The string functions take the vectorized path over a column that is read rather than held.
+    ///
+    /// Per #1019. `agrees` cannot make this assertion, because a function that declines is answered
+    /// by the row at a time path and the row at a time path is the oracle, so the two agree exactly
+    /// when nothing is specialized at all. What has to be checked is that `unary` hands back a
+    /// vector rather than `None`, and then separately that the vector it hands back is the right
+    /// one.
+    ///
+    /// Both shapes a file gives, since a native table writes a column either way: the values read
+    /// straight through, and the values behind a dictionary of codes, which is the one ClickBench
+    /// produces and the one that was falling through ninety seven thousand times a query.
+    #[test]
+    fn a_string_function_over_a_column_that_is_read_rather_than_held_stays_vectorized() {
+        let values = ["Ärger", "b", "", "Straße", "http://EXAMPLE.com/Q"];
+        let kept = Kept(values.iter().map(|text| text.as_bytes().to_vec()).collect());
+        let read = Vector::external_text(LogicalType::Varchar, Arc::new(kept))
+            .expect("the source is text");
+        let coded = Vector::dictionary(vec![4, 0, 2, 1, 3, 0, 4], read.clone())
+            .expect("every code names a value");
+        for arg in [read, coded] {
+            for (name, returns) in [
+                ("lower", LogicalType::Varchar),
+                ("upper", LogicalType::Varchar),
+                ("length", LogicalType::BigInt),
+                ("strlen", LogicalType::BigInt),
+            ] {
+                let form = arg.form();
+                let taken = unary(name, &arg, &returns, arg.len())
+                    .expect("the call is written")
+                    .unwrap_or_else(|| panic!("{name} on {form:?} took the row at a time path"));
+                let want = oracle(name, std::slice::from_ref(&arg), &returns)
+                    .expect("the row at a time path answers");
+                assert_eq!(format!("{taken:?}"), format!("{want:?}"), "{name} on {form:?}");
             }
         }
     }
