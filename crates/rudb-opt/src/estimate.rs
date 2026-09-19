@@ -37,7 +37,10 @@
 use std::collections::BTreeMap;
 
 use rudb_common::stat::{Class, Direction, Provenance, Stat};
-use rudb_plan::{ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind};
+use rudb_plan::{
+    ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+    SetOpKind, Slice,
+};
 
 use crate::walk;
 
@@ -69,7 +72,11 @@ const KEPT_BY_A_GROUP_BY: f64 = 0.1;
 ///
 /// Files are not in here. What a Parquet call produces is counted by the binder, which is the only
 /// thing in the chain holding the file open, and it rides on the plan against the table index of
-/// the call. See [`Plan::measured`].
+/// the call. See [`Plan::measured`] and [`Plan::distinct_measured`].
+///
+/// The distinct counts are here beside the row counts and not somewhere else, because the two are
+/// asked together: `join` divides one by the other and a divisor that arrived by a different road
+/// than the dividend is a divisor nobody can keep in step.
 ///
 /// Empty is the ordinary state for anything that is not a real query, and an empty one makes every
 /// scan unknown rather than making every scan zero. A scan of a table nobody measured and a scan of
@@ -78,6 +85,7 @@ const KEPT_BY_A_GROUP_BY: f64 = 0.1;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Statistics {
     tables: BTreeMap<(String, String, String), u64>,
+    columns: BTreeMap<(String, String, String, String), u64>,
 }
 
 impl Statistics {
@@ -98,10 +106,39 @@ impl Statistics {
         self.tables.get(&(catalog.to_owned(), schema.to_owned(), table.to_owned())).copied()
     }
 
+    /// Record how many distinct values one column of one table holds.
+    ///
+    /// By name and not by position, because the position a column has in a scan is whatever is left
+    /// after column pruning moved it and the name is not moved by anything.
+    pub fn record_distinct(
+        &mut self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        column: &str,
+        distinct: u64,
+    ) {
+        let key = (catalog.to_owned(), schema.to_owned(), table.to_owned(), column.to_owned());
+        self.columns.insert(key, distinct);
+    }
+
+    /// How many distinct values that column holds, where anybody counted.
+    #[must_use]
+    pub fn distinct_in(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Option<u64> {
+        let key = (catalog.to_owned(), schema.to_owned(), table.to_owned(), column.to_owned());
+        self.columns.get(&key).copied()
+    }
+
     /// Whether anything at all was recorded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
+        self.tables.is_empty() && self.columns.is_empty()
     }
 }
 
@@ -230,9 +267,13 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
             }
             known => known.map(|n| n.saturating_sub(offset).min(count)),
         },
-        Node::Join { left, right, kind, conditions, .. } => {
-            join(of(left), of(right), kind, plan.expr_list(conditions).len())
-        }
+        Node::Join { left, right, kind, conditions, .. } => join(
+            of(left),
+            of(right),
+            kind,
+            plan.expr_list(conditions).len(),
+            keyspace(plan, conditions, stats),
+        ),
         // The right cardinality is a function of each left row until decorrelation, so treating it
         // as one independently measured input would be a made-up estimate.
         Node::DependentJoin { .. } => Stat::Unknown,
@@ -314,8 +355,110 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> i32 {
     i32::try_from(counted.min(8)).unwrap_or(8)
 }
 
+/// How many distinct values the column a binding names holds, where anybody counted.
+///
+/// A binding names the operator that produces the column and the position it has there, so this
+/// finds the operator and asks what the column at that position is called. Only a scan has an
+/// answer, and a projection is followed through to one.
+fn distinct(plan: &Plan, binding: ColumnBinding, stats: &Statistics) -> Option<u64> {
+    follow(plan, binding, stats, 16)
+}
+
+/// `distinct` with the budget it spends going through projections.
+///
+/// A projection is followed when the expression at the position is nothing but a reference to a
+/// column underneath, because a projection that carries a column through unchanged carries its
+/// distinct values through unchanged as well. Every query written against a view goes through one
+/// of those, so without this the counts would be read by almost nothing.
+///
+/// A column that came out of an expression, an aggregate or a set operation stops the search. What
+/// a function or a group by did to the number of distinct values under it is not something this
+/// knows, and the count of the input is a wrong answer rather than an approximate one. A cast is
+/// not followed either: a widening one keeps the distinct values and a narrowing one can merge
+/// them, and telling those apart is more than this needs.
+///
+/// The budget is against a plan that is malformed rather than against one that is deep. A
+/// projection over a projection over a projection is ordinary and sixteen of them is not, and the
+/// arena invariant means a well formed plan cannot cycle here anyway.
+fn follow(plan: &Plan, binding: ColumnBinding, stats: &Statistics, depth: u32) -> Option<u64> {
+    let depth = depth.checked_sub(1)?;
+    let position = binding.column as usize;
+    for at in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        match *plan.node(at) {
+            Node::Get { catalog, schema, table, index, columns, .. } if index == binding.table => {
+                let name = &plan.field_list(columns).get(position)?.name;
+                let catalog = plan.string(catalog);
+                let schema = plan.string(schema);
+                let table = plan.string(table);
+                // A column cannot hold more distinct values than the table has rows, so the rows
+                // are a bound rather than a guess, and put through the arithmetic in `join` they
+                // give back the containment assumption exactly. That is why an uncounted column
+                // falls back rather than refusing: a refusal on one side would throw away a stated
+                // count on the other, and that is most of TPC-H, where the low cardinality column
+                // is stated and the key it joins against is not.
+                return stats
+                    .distinct_in(catalog, schema, table, name)
+                    .or_else(|| stats.rows_in(catalog, schema, table));
+            }
+            Node::TableFunction { index, columns, .. } if index == binding.table => {
+                let name = &plan.field_list(columns).get(position)?.name;
+                return plan
+                    .distinct_measured(index, name)
+                    .or_else(|| plan.measured(index).decide().copied());
+            }
+            Node::Project { index, exprs, .. } if index == binding.table => {
+                let &carried = plan.expr_list(exprs).get(position)?;
+                let &Expr::Column(carried) = plan.expr(carried) else {
+                    return None;
+                };
+                return follow(plan, carried, stats, depth);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// How many pairs of values the conditions of a join can match on, where every one is understood.
+///
+/// The product over the conditions of the larger of the two sides' distinct counts, which is the
+/// standard reading of an equijoin: the two columns draw from a shared set of values, the larger
+/// count is how big that set is, and the values are assumed to be spread evenly over it. `None`
+/// unless every condition is an equality between two base columns that both have a count, because a
+/// condition nobody understood could be the one doing all the work and a divisor that left it out
+/// would claim more rows than the join can produce.
+fn keyspace(plan: &Plan, conditions: Slice, stats: &Statistics) -> Option<u64> {
+    let conditions = plan.expr_list(conditions);
+    if conditions.is_empty() {
+        return None;
+    }
+    let mut product: u64 = 1;
+    for &condition in conditions {
+        let Expr::Compare { op: CompareOp::Equal | CompareOp::NotDistinctFrom, left, right } =
+            *plan.expr(condition)
+        else {
+            return None;
+        };
+        let (&Expr::Column(left), &Expr::Column(right)) = (plan.expr(left), plan.expr(right))
+        else {
+            return None;
+        };
+        let pair = distinct(plan, left, stats)?.max(distinct(plan, right, stats)?);
+        product = product.checked_mul(pair)?;
+    }
+    // A column with no distinct values at all is an empty column or a column of nothing but nulls,
+    // and neither is something to divide by.
+    (product > 0).then_some(product)
+}
+
 /// The join kinds, each of which is a different question.
-fn join(left: Stat<u64>, right: Stat<u64>, kind: JoinKind, conditions: usize) -> Stat<u64> {
+fn join(
+    left: Stat<u64>,
+    right: Stat<u64>,
+    kind: JoinKind,
+    conditions: usize,
+    keys: Option<u64>,
+) -> Stat<u64> {
     match kind {
         // Left rows, filtered by whether a match exists. Never more than the left side, and the
         // right side's size does not enter into it.
@@ -349,9 +492,25 @@ fn join(left: Stat<u64>, right: Stat<u64>, kind: JoinKind, conditions: usize) ->
             // The containment assumption: every row of the smaller side finds a match, so an
             // equijoin produces about as many rows as its larger side. It is the standard guess and
             // it is right whenever one side of the condition is a key, which is most joins anybody
-            // writes and none of the joins that hurt. A many to many join on a low cardinality
-            // column produces far more than this, and finding that out needs distinct counts.
-            let matched = left.max(right);
+            // writes and none of the joins that hurt.
+            //
+            // Where the key has a distinct count, the join can also be counted directly. Each side
+            // spreads its rows over the same set of key values, so a value gets `left / keys` rows
+            // from one side and `right / keys` from the other, and the pairs come to
+            // `left * right / keys`. On a key that is a key the two agree: a thousand rows joined
+            // to a million on a column with a million values is a million rows either way. On a
+            // column with twenty five values in it they do not agree at all, and the second one is
+            // right. TPC-H q5 joins a hundred and fifty thousand customers to ten thousand
+            // suppliers on a nation, and the containment assumption calls that a hundred and fifty
+            // thousand rows when it is sixty million.
+            //
+            // The larger of the two is taken rather than the second one outright, so this can only
+            // ever raise an estimate above what shape alone said. A distinct count larger than the
+            // rows on the smaller side is the case where it would lower one, and that happens when
+            // the count came from a table that a filter underneath has already cut down, which
+            // makes the count stale rather than the join small.
+            let counted = keys.map_or(0, |keys| left.saturating_mul(right) / keys);
+            let matched = left.max(right).max(counted);
             let value = match kind {
                 // An outer join emits every row of the preserved side whether it matched or not,
                 // so the estimate cannot fall below that side.
@@ -416,6 +575,26 @@ mod tests {
         let plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         rows_stat(&plan, plan.root(), &stats)
+    }
+
+    /// The estimate against table sizes and distinct counts, the counts named table then column.
+    fn counted(text: &str, tables: &[(&str, u64)], columns: &[(&str, &str, u64)]) -> Option<u64> {
+        let mut stats = statistics(tables);
+        for (table, column, distinct) in columns {
+            stats.record_distinct("memory", "main", table, column, *distinct);
+        }
+        let plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        rows(&plan, plan.root(), &stats)
+    }
+
+    /// A join of two one column scans on their one column, which is what the counted tests sit on.
+    fn joined(left: &str, right: &str) -> String {
+        format!(
+            "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n  {}  {}",
+            scan(left, 0),
+            scan(right, 1)
+        )
     }
 
     /// The guess this module has always made, spelled out.
@@ -747,5 +926,112 @@ mod tests {
         assert_eq!(stats.rows_in("memory", "main", "t"), Some(7));
         // The three names are one key. A table of the same name in another schema is another table.
         assert_eq!(stats.rows_in("memory", "other", "t"), None);
+    }
+
+    #[test]
+    fn a_join_on_a_column_with_few_values_in_it_produces_more_rows_than_its_larger_side() {
+        // TPC-H q5 written small: customers joined to suppliers on a nation key with twenty five
+        // values in it. The containment assumption calls this a hundred and fifty thousand rows
+        // and the real answer is sixty million, which is the estimate that made the join ordering
+        // pass pick the worst order it could find.
+        let text = joined("customer", "supplier");
+        let tables = &[("customer", 150_000), ("supplier", 10_000)];
+        assert_eq!(counted(&text, tables, &[]), Some(150_000));
+        let counts = &[("customer", "a", 25), ("supplier", "a", 25)];
+        assert_eq!(counted(&text, tables, counts), Some(60_000_000));
+    }
+
+    #[test]
+    fn a_join_on_a_key_is_the_containment_assumption_and_a_count_does_not_change_it() {
+        // Every order belongs to one customer, so the join is as tall as the orders however the
+        // number is arrived at. The two readings agree here, which is why the containment
+        // assumption survived as long as it did.
+        let text = joined("customer", "orders");
+        let tables = &[("customer", 150_000), ("orders", 1_500_000)];
+        assert_eq!(counted(&text, tables, &[]), Some(1_500_000));
+        let counts = &[("customer", "a", 150_000), ("orders", "a", 150_000)];
+        assert_eq!(counted(&text, tables, counts), Some(1_500_000));
+    }
+
+    #[test]
+    fn a_count_larger_than_the_rows_on_the_smaller_side_does_not_shrink_the_estimate() {
+        // A count that big means the table it was taken on has been cut down by something
+        // underneath since anybody counted, which makes the count stale rather than the join
+        // small. The larger of the two readings is taken so a stale count cannot lower anything.
+        let text = joined("small", "big");
+        let tables = &[("small", 10), ("big", 1_000)];
+        let counts = &[("small", "a", 1_000_000), ("big", "a", 1_000_000)];
+        assert_eq!(counted(&text, tables, counts), Some(1_000));
+    }
+
+    #[test]
+    fn two_conditions_match_on_the_pairs_of_values_and_not_on_either_column() {
+        // Ten values on one column and ten on the other is a hundred pairs, and the rows spread
+        // over the pairs rather than over either column alone.
+        let text = concat!(
+            "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, ",
+            "(#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN]\n",
+            "  Get memory.main.l AS l #0 [a::INTEGER, b::INTEGER]\n",
+            "  Get memory.main.r AS r #1 [a::INTEGER, b::INTEGER]\n"
+        );
+        let tables = &[("l", 1_000_000), ("r", 1_000_000)];
+        let counts = &[("l", "a", 10), ("l", "b", 10), ("r", "a", 10), ("r", "b", 10)];
+        assert_eq!(counted(text, tables, counts), Some(10_000_000_000));
+    }
+
+    #[test]
+    fn a_condition_that_is_not_an_equality_between_two_columns_leaves_the_counts_unread() {
+        // A range condition could be the one doing all the work, and a divisor that left it out
+        // would claim more rows than the join can produce. Nothing is divided by at all here.
+        let text = concat!(
+            "Join INNER on=[(#0.0::INTEGER < #1.0::INTEGER)::BOOLEAN]\n",
+            "  Get memory.main.l AS l #0 [a::INTEGER]\n",
+            "  Get memory.main.r AS r #1 [a::INTEGER]\n"
+        );
+        let tables = &[("l", 150_000), ("r", 10_000)];
+        let counts = &[("l", "a", 25), ("r", "a", 25)];
+        assert_eq!(counted(text, tables, counts), Some(150_000));
+    }
+
+    #[test]
+    fn a_projection_that_carries_a_column_through_carries_its_count_through_as_well() {
+        // Every query written against a view goes through one of these, so without this the
+        // counts would be read by almost nothing.
+        let text = concat!(
+            "Join INNER on=[(#1.0::INTEGER = #3.0::INTEGER)::BOOLEAN]\n",
+            "  Project #1 [#0.0::INTEGER AS a]\n",
+            "    Get memory.main.customer AS customer #0 [a::INTEGER]\n",
+            "  Project #3 [#2.0::INTEGER AS a]\n",
+            "    Get memory.main.supplier AS supplier #2 [a::INTEGER]\n"
+        );
+        let tables = &[("customer", 150_000), ("supplier", 10_000)];
+        let counts = &[("customer", "a", 25), ("supplier", "a", 25)];
+        assert_eq!(counted(text, tables, counts), Some(60_000_000));
+    }
+
+    #[test]
+    fn a_projection_that_computes_something_is_where_the_count_stops() {
+        // What the addition did to the number of distinct values under it is not something this
+        // knows, and the count of the input is a wrong answer rather than an approximate one.
+        let text = concat!(
+            "Join INNER on=[(#1.0::INTEGER = #3.0::INTEGER)::BOOLEAN]\n",
+            "  Project #1 [\"+\"(#0.0::INTEGER, 1::INTEGER)::INTEGER AS a]\n",
+            "    Get memory.main.customer AS customer #0 [a::INTEGER]\n",
+            "  Project #3 [#2.0::INTEGER AS a]\n",
+            "    Get memory.main.supplier AS supplier #2 [a::INTEGER]\n"
+        );
+        let tables = &[("customer", 150_000), ("supplier", 10_000)];
+        let counts = &[("customer", "a", 25), ("supplier", "a", 25)];
+        assert_eq!(counted(text, tables, counts), Some(150_000));
+    }
+
+    #[test]
+    fn a_column_with_no_distinct_values_at_all_is_not_divided_by() {
+        // An empty column or a column of nothing but nulls. Neither is something to divide by, and
+        // the estimate falls back to the shape it used before there were any counts.
+        let text = joined("l", "r");
+        let tables = &[("l", 1_000), ("r", 1_000)];
+        let counts = &[("l", "a", 0), ("r", "a", 0)];
+        assert_eq!(counted(&text, tables, counts), Some(1_000));
     }
 }

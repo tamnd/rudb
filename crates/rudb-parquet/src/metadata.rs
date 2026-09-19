@@ -175,6 +175,13 @@ pub struct SchemaColumn {
 pub struct Stats {
     /// How many values in the chunk are null, when the writer counted them.
     pub nulls: Option<i64>,
+    /// How many distinct values the chunk holds, when the writer counted them.
+    ///
+    /// Most writers leave this out, because counting it costs a pass that the rest of the statistics
+    /// do not. DuckDB writes it for the columns it already has the number for, which in practice is
+    /// the dictionary encoded ones, and those are the low cardinality columns that joins are written
+    /// on. Nulls are not counted here, the same way `COUNT(DISTINCT)` does not count them.
+    pub distinct: Option<i64>,
     /// The smallest value, in the column's plain encoding.
     pub min: Option<Vec<u8>>,
     /// The largest value, in the column's plain encoding.
@@ -899,6 +906,7 @@ pub(crate) fn read_stats(reader: &mut Reader<'_>) -> Result<Stats> {
     while let Some(field) = reader.field_begin()? {
         match field.id {
             3 => stats.nulls = Some(reader.read_int()?),
+            4 => stats.distinct = Some(reader.read_int()?),
             5 => stats.max = Some(reader.read_binary()?.to_vec()),
             6 => stats.min = Some(reader.read_binary()?.to_vec()),
             _ => reader.skip(field.kind)?,
@@ -958,6 +966,23 @@ mod tests {
         let fs = RealFilesystem::new();
         let file = fs.open(&fixture(), OpenMode::Read).expect("opens the fixture");
         Metadata::read(file.as_ref()).expect("reads the footer")
+    }
+
+    #[test]
+    fn the_distinct_counts_the_writer_stated_come_back_and_the_ones_it_did_not_are_absent() {
+        // DuckDB states this for the columns it already knew the number for and leaves it off the
+        // rest, so a reader has to carry the difference rather than filling one in. The two row
+        // groups agree here because both hold the same values.
+        let metadata = read();
+        for group in &metadata.row_groups {
+            let stated: Vec<Option<i64>> = group
+                .columns
+                .iter()
+                .map(|chunk| chunk.stats.as_ref().and_then(|stats| stats.distinct))
+                .collect();
+            // a, b, s, d, flag, day, t.
+            assert_eq!(stated, vec![Some(97), None, Some(5), Some(64), None, None, None]);
+        }
     }
 
     #[test]

@@ -155,22 +155,24 @@ struct WindowParts {
 
 /// What opening the files behind a table function call said about them.
 ///
-/// The two answers travel together because they come out of the same footer. A Parquet file states
-/// its columns and its row count in the same few kilobytes at the end of it, so a binder that has
-/// read one has read the other, and splitting them into two arguments would mean two ways to
-/// forget one.
+/// The answers travel together because they come out of the same footer. A Parquet file states its
+/// columns, its row count and its statistics in the same few kilobytes at the end of it, so a
+/// binder that has read one has read all of them, and splitting them into three arguments would
+/// mean three ways to forget one.
 #[derive(Debug)]
 struct Read {
     /// The columns the call produces, in the order the file stores them.
     fields: Vec<Field>,
     /// How many rows all of the files hold, where anybody counted.
     rows: Stat<u64>,
+    /// How many distinct values a column holds, by name, for the columns anybody counted.
+    distincts: Vec<(String, u64)>,
 }
 
 impl Read {
-    /// Columns that came from somewhere other than a file, so nothing counted the rows.
+    /// Columns that came from somewhere other than a file, so nothing counted anything.
     fn uncounted(fields: Vec<Field>) -> Self {
-        Self { fields, rows: Stat::Unknown }
+        Self { fields, rows: Stat::Unknown, distincts: Vec::new() }
     }
 }
 
@@ -1696,6 +1698,7 @@ impl<'a> Binder<'a> {
         // Filled in by the arm below that has the file names, and left alone by a function whose
         // columns are fixed, because none of those reads a file to find out how tall it is.
         let mut measured = Stat::Unknown;
+        let mut counted: Vec<(String, u64)> = Vec::new();
         let fields = match resolved.columns {
             Columns::Fixed(fields) => fields,
             columns => {
@@ -1709,9 +1712,10 @@ impl<'a> Binder<'a> {
                     // them, which is not a choice made here. See `csv_fields`.
                     Columns::Csv => csv_fields(&paths, options.given)?,
                     _ => {
-                        let (fields, rows) = parquet_footers(&paths)?;
-                        measured = rows;
-                        fields
+                        let footers = parquet_footers(&paths)?;
+                        measured = footers.rows;
+                        counted = footers.distincts;
+                        footers.fields
                     }
                 };
                 if options.all_varchar {
@@ -1762,7 +1766,7 @@ impl<'a> Binder<'a> {
             resolved.function,
             &cast,
             &written_options,
-            Read { fields, rows: measured },
+            Read { fields, rows: measured, distincts: counted },
             &label,
             &names,
         )
@@ -1996,8 +2000,8 @@ impl<'a> Binder<'a> {
         let paths = files(path)?;
         let read = match function {
             TableFunction::ReadParquet => {
-                let (fields, rows) = parquet_footers(&paths)?;
-                Read { fields, rows }
+                let footers = parquet_footers(&paths)?;
+                Read { fields: footers.fields, rows: footers.rows, distincts: footers.distincts }
             }
             _ => Read::uncounted(csv_fields(&paths, Given::default())?),
         };
@@ -2061,7 +2065,7 @@ impl<'a> Binder<'a> {
         label: &str,
         names: &[&str],
     ) -> Result<(NodeRef, Scope)> {
-        let Read { fields, rows } = read;
+        let Read { fields, rows, distincts } = read;
         let index = self.fresh_index();
         // Against the table index rather than against the node, because a pass is free to move the
         // node and none of them can move an index: an index is what a column reference names and
@@ -2069,6 +2073,9 @@ impl<'a> Binder<'a> {
         // function nobody measured, since an absent entry already reads back as unknown.
         if rows.is_known() {
             self.plan.measure(index, rows);
+        }
+        for (column, distinct) in distincts {
+            self.plan.measure_distinct(index, &column, distinct);
         }
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {
