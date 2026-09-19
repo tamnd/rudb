@@ -940,9 +940,9 @@ impl Vector {
     /// that then had a single holder. On a ClickBench scan that copy was sixteen percent of the
     /// instructions the query ran.
     ///
-    /// Composing a dictionary over a dictionary still needs the values by value, so that case takes
-    /// them out of the handle and copies if anybody else is still reading them. Nothing that shares
-    /// a dictionary builds a stacked one, so the two paths do not meet in practice.
+    /// Composing a dictionary over a dictionary keeps the handle too. The leaf of the stack is what
+    /// the composed dictionary points at and neither its values nor anything about it changes, so
+    /// there is nothing to own and the new dictionary shares the same leaf the old one did.
     ///
     /// The range check takes the highest code rather than stopping at the first bad one. Stopping
     /// early sounds cheaper and is not, because a loop that can exit anywhere cannot be vectorized
@@ -961,14 +961,7 @@ impl Vector {
                 values.len()
             )));
         }
-        let stacked = matches!(values.validity, Validity::AllValid)
-            && matches!(values.body, Body::Dictionary { .. });
-        let (codes, values) = if stacked {
-            let (codes, values) = compose(codes, Arc::unwrap_or_clone(values));
-            (codes, Arc::new(values))
-        } else {
-            (codes, values)
-        };
+        let (codes, values) = compose(codes, values);
         Ok(Self {
             ty: values.ty.clone(),
             len: codes.len(),
@@ -2758,28 +2751,29 @@ fn write_code(words: &mut [u64], bit: usize, width: u32, code: u64) {
 /// The codes are indexed rather than fetched with `get`, because the caller has already walked the
 /// whole outer array to check that every code is in range and the inner array is exactly as long as
 /// the vector those codes were checked against.
-fn compose(codes: Vec<u32>, values: Vector) -> (Vec<u32>, Vector) {
+fn compose(codes: Vec<u32>, values: Arc<Vector>) -> (Vec<u32>, Arc<Vector>) {
     // A dictionary carrying a validity of its own is one whose nulls live at this level rather than
     // in the values, which is the one thing composition cannot carry down with it.
     if !matches!(values.validity, Validity::AllValid) {
         return (codes, values);
     }
-    let Vector { ty, len, validity, body } = values;
-    match body {
-        Body::Dictionary { codes: inner, values: leaf, .. } => {
-            debug_assert!(
-                !matches!(leaf.body, Body::Dictionary { .. })
-                    || !matches!(leaf.validity, Validity::AllValid),
-                "a dictionary was stacked on a dictionary without going through the constructor"
-            );
-            // The leaf is shared, so taking it out of the `Arc` copies it when something else is
-            // still holding the same dictionary. That is the rare path: a dictionary over a
-            // dictionary only arrives from a caller that built one that way, and the cut that made
-            // sharing worth doing produces neither.
-            (codes.iter().map(|&code| inner[code as usize]).collect(), Arc::unwrap_or_clone(leaf))
-        }
-        body => (codes, Vector { ty, len, validity, body }),
-    }
+    let Body::Dictionary { codes: inner, values: leaf, .. } = &values.body else {
+        return (codes, values);
+    };
+    debug_assert!(
+        !matches!(leaf.body, Body::Dictionary { .. })
+            || !matches!(leaf.validity, Validity::AllValid),
+        "a dictionary was stacked on a dictionary without going through the constructor"
+    );
+    // The leaf is handed on as the handle it already is. Nothing here reads it and nothing here
+    // changes it, so the composed dictionary points at the same values the stacked one did and
+    // whoever else is holding them keeps holding them. This used to take them out of the `Arc`,
+    // which copied the whole leaf whenever anybody else was still reading it, and a scan selecting
+    // rows out of a chunk whose column came from a shared page dictionary is exactly that: the page
+    // holds the leaf, every chunk cut from the page composes through it, and every one of those
+    // cuts copied the page's dictionary. TPC-H q21 does it once per thousand rows of `lineitem`.
+    let composed = codes.iter().map(|&code| inner[code as usize]).collect();
+    (composed, Arc::clone(leaf))
 }
 
 /// How many rows a run has to cover on average before run length encoding is smaller.

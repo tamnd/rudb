@@ -1097,74 +1097,70 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
         }
     }
     if let Some(packed) = column.packed_parts() {
+        // What the unpacked integer is read as, decided once for the column rather than once for
+        // every row of it. The match was inside the loop, which made a pass over a packed column a
+        // logical type comparison per row on top of the unpack.
+        let wide = matches!(
+            column.logical_type(),
+            rudb_common::LogicalType::HugeInt
+                | rudb_common::LogicalType::UHugeInt
+                | rudb_common::LogicalType::Decimal { .. }
+        );
         for (row, state) in hashes.iter_mut().enumerate().take(rows) {
             if !validity.is_valid(row) {
                 *state = mix(*state, NOTHING);
                 continue;
             }
             let value = packed.base() + i128::from(packed.code(row));
-            *state = match column.logical_type() {
-                rudb_common::LogicalType::HugeInt | rudb_common::LogicalType::Decimal { .. } => {
-                    mix(mix(*state, value as u64), (value >> 64) as u64)
-                }
-                rudb_common::LogicalType::UHugeInt => {
-                    let value = value as u128;
-                    mix(mix(*state, value as u64), (value >> 64) as u64)
-                }
-                _ => mix(*state, value as u64),
+            *state = if wide {
+                mix(mix(*state, value as u64), (value >> 64) as u64)
+            } else {
+                mix(*state, value as u64)
             };
         }
         return;
     }
-    /// One pass over a run of values, turning each into a word the same way the general path does.
-    macro_rules! run {
-        ($values:expr, $word:expr) => {{
-            let values = $values.as_slice();
-            let word = $word;
-            for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-                let one = match values.get(row) {
-                    Some(value) if validity.is_valid(row) => word(*value),
-                    _ => NOTHING,
-                };
-                *state = mix(*state, one);
-            }
-            return;
-        }};
-    }
     if let Some(data) = column.data() {
-        match data {
-            Data::Bool(values) => run!(values, |x: bool| u64::from(x)),
-            Data::Int8(values) => run!(values, |x: i8| i64::from(x) as u64),
-            Data::Int16(values) => run!(values, |x: i16| i64::from(x) as u64),
-            Data::Int32(values) => run!(values, |x: i32| i64::from(x) as u64),
-            Data::Int64(values) => run!(values, |x: i64| x as u64),
-            Data::UInt8(values) => run!(values, |x: u8| u64::from(x)),
-            Data::UInt16(values) => run!(values, |x: u16| u64::from(x)),
-            Data::UInt32(values) => run!(values, |x: u32| u64::from(x)),
-            Data::UInt64(values) => run!(values, |x: u64| x),
-            Data::Float32(values) => run!(values, |x: f32| canonical(f64::from(x))),
-            Data::Float64(values) => run!(values, canonical),
-            // The bytes and not the string, so that a `BLOB` whose bytes are not text hashes as
-            // what it is rather than as a null.
-            Data::Varlen(strings) => {
-                for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-                    let one = match strings.bytes(row) {
-                        Some(bytes) if validity.is_valid(row) => bytes_word(bytes),
-                        _ => NOTHING,
-                    };
-                    *state = mix(*state, one);
-                }
-                return;
-            }
-            _ => {}
+        if fold_data(data, rows, hashes, |row| validity.is_valid(row).then_some(row)) {
+            return;
         }
     }
+    // The same pass with one indirection in it, for a dictionary or a run length column. Without it
+    // a dictionary of `BIGINT`, which is what the Parquet reader hands back for a join key the
+    // writer found worth coding, went to the row at a time path below and built a `Value` per row.
+    // TPC-H q21's runtime filter reads `l_orderkey` in exactly that form, and hashing six million
+    // rows of it a `Value` at a time was most of what the filter cost.
+    //
+    // Reading through the codes rather than hashing the dictionary once and gathering is deliberate.
+    // A dictionary a Parquet reader hands over covers a whole column chunk and can hold far more
+    // values than the thousand rows being hashed, so hashing it whole would be the slower of the two
+    // exactly when the dictionary is doing its job.
+    if let Some((at, values)) = column.positions() {
+        if let Some(data) = values.data() {
+            // A dictionary keeps its nulls in the vector it points at, so a row is null when either
+            // the column says so or the value its code points at does.
+            let inner = values.validity();
+            let pick = |row: usize| {
+                if !validity.is_valid(row) {
+                    return None;
+                }
+                let code = *at.get(row)? as usize;
+                inner.is_valid(code).then_some(code)
+            };
+            if fold_data(data, rows, hashes, pick) {
+                return;
+            }
+        }
+    }
+    // Whether the bytes are a string, asked once for the column rather than once for every row of
+    // it, which is what it was.
+    let text = column.logical_type() == &rudb_common::LogicalType::Varchar;
     // row at a time: every other form and every type without an arm above. A dictionary string is
     // read as bytes because the input reader already validated the column and validating the same
     // bytes again for every row was most of the string group path. What is left after that is the
     // nested types and the intervals, which have no run of fixed width words to walk at all.
     for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-        *state = if column.logical_type() == &rudb_common::LogicalType::Varchar {
+        *state = if text {
             match column.bytes_at(row) {
                 Some(bytes) => mix(*state, bytes_word(bytes)),
                 None => mix(*state, NOTHING),
@@ -1172,6 +1168,62 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
         } else {
             fold_value(*state, &column.value_at(row))
         };
+    }
+}
+
+/// Folds one word per row into `hashes`, reading the values through `pick`.
+///
+/// `pick` says which index of `data` a row reads, and `None` says the row is null. That is what
+/// makes this one copy of the type arms rather than two: a flat column picks the row itself, a
+/// dictionary or a run length column picks the code, and the eleven arms below are written once.
+/// The answer is whether there was an arm for the data at all, which is `false` for the nested
+/// types and leaves the caller to fall through to whatever it has after this.
+fn fold_data(
+    data: &Data,
+    rows: usize,
+    hashes: &mut [u64],
+    pick: impl Fn(usize) -> Option<usize>,
+) -> bool {
+    /// One pass over the rows, turning each into a word the same way the general path does.
+    macro_rules! run {
+        ($values:expr, $word:expr) => {{
+            let values = $values.as_slice();
+            let word = $word;
+            for (row, state) in hashes.iter_mut().enumerate().take(rows) {
+                let one = match pick(row).and_then(|at| values.get(at)) {
+                    Some(value) => word(*value),
+                    None => NOTHING,
+                };
+                *state = mix(*state, one);
+            }
+            return true;
+        }};
+    }
+    match data {
+        Data::Bool(values) => run!(values, |x: bool| u64::from(x)),
+        Data::Int8(values) => run!(values, |x: i8| i64::from(x) as u64),
+        Data::Int16(values) => run!(values, |x: i16| i64::from(x) as u64),
+        Data::Int32(values) => run!(values, |x: i32| i64::from(x) as u64),
+        Data::Int64(values) => run!(values, |x: i64| x as u64),
+        Data::UInt8(values) => run!(values, |x: u8| u64::from(x)),
+        Data::UInt16(values) => run!(values, |x: u16| u64::from(x)),
+        Data::UInt32(values) => run!(values, |x: u32| u64::from(x)),
+        Data::UInt64(values) => run!(values, |x: u64| x),
+        Data::Float32(values) => run!(values, |x: f32| canonical(f64::from(x))),
+        Data::Float64(values) => run!(values, canonical),
+        // The bytes and not the string, so that a `BLOB` whose bytes are not text hashes as what it
+        // is rather than as a null.
+        Data::Varlen(strings) => {
+            for (row, state) in hashes.iter_mut().enumerate().take(rows) {
+                let one = match pick(row).and_then(|at| strings.bytes(at)) {
+                    Some(bytes) => bytes_word(bytes),
+                    None => NOTHING,
+                };
+                *state = mix(*state, one);
+            }
+            true
+        }
+        _ => false,
     }
 }
 
