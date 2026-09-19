@@ -193,7 +193,16 @@ pub(crate) fn rebuild(
     total: usize,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(total);
-    replay(literals.len(), |index| &literals[index], lengths, offsets, &mut out)?;
+    replay(
+        literals.len(),
+        |index, into: &mut Vec<u8>| {
+            into.extend_from_slice(&literals[index]);
+            Ok(())
+        },
+        lengths,
+        offsets,
+        &mut out,
+    )?;
     Ok(out)
 }
 
@@ -213,12 +222,35 @@ pub(crate) fn rebuild_into(
     offsets: &[i64],
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    replay(literals.len(), |index| literals.get(index).expect("in range"), lengths, offsets, out)
+    replay(
+        literals.len(),
+        |index, into: &mut Vec<u8>| {
+            into.extend_from_slice(literals.get(index).expect("in range"));
+            Ok(())
+        },
+        lengths,
+        offsets,
+        out,
+    )
 }
 
-fn replay<'a>(
+/// Replays the tokens, with the caller saying how a literal run reaches the output.
+///
+/// The run is appended by a callback rather than handed over as a slice, and that is what lets the
+/// thing holding the literals be something other than a buffer of them. A matched chunk's literals
+/// are themselves a chunk, and on the ClickBench `URL` column that chunk is FSST compressed, so
+/// decoding it into a buffer and then copying every run out of that buffer reads and writes each
+/// literal byte twice. With this the decompression writes where the byte belongs the first time.
+///
+/// Runs are asked for in order, from zero, exactly once each, which is what lets a caller answer
+/// from a cursor rather than from an index.
+///
+/// # Errors
+///
+/// Whatever the callback reports, on top of what [`rebuild`] reports.
+pub(crate) fn replay(
     runs: usize,
-    run: impl Fn(usize) -> &'a [u8],
+    mut run: impl FnMut(usize, &mut Vec<u8>) -> Result<()>,
     lengths: &[i64],
     offsets: &[i64],
     out: &mut Vec<u8>,
@@ -232,7 +264,7 @@ fn replay<'a>(
     }
     let base = out.len();
     for index in 0..runs {
-        out.extend_from_slice(run(index));
+        run(index, out)?;
         let length = usize::try_from(lengths[index])
             .map_err(|_| Error::internal("a negative copy length"))?;
         if length == 0 {
