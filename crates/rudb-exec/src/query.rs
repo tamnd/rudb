@@ -126,7 +126,7 @@ impl<'a> Query<'a> {
                 run_parallel(pipeline, cancel, &lease)?
             };
             driver.ran(degree, spread.worker_cpu_ns);
-            driver.waited(spread.slowest_ns, spread.finalize_ns);
+            driver.waited(spread.slowest_ns, spread.slowest_cpu_ns, spread.finalize_ns);
             self.worker_cpu_ns.fetch_add(spread.worker_cpu_ns, Ordering::Relaxed);
             self.widest.fetch_max(degree, Ordering::Relaxed);
         }

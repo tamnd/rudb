@@ -55,6 +55,16 @@ pub struct Spread {
     /// What sits between this and the average instance is the imbalance.
     pub slowest_ns: u64,
 
+    /// The CPU of that same instance, which is the one thing [`Spread::slowest_ns`] cannot say alone.
+    ///
+    /// An instance that took twice as long as the average did it for one of two reasons and the fixes
+    /// are opposites. Either it was given twice the work, in which case the work wants dividing more
+    /// finely, or it was given its share and spent half the time waiting for a lock the others held,
+    /// in which case dividing more finely makes it worse and the sharing is what has to go. The wall
+    /// on its own cannot tell those apart. The CPU of the same instance can: near its wall is work
+    /// and far below it is waiting.
+    pub slowest_cpu_ns: u64,
+
     /// The wall of the sink's finalize, which runs once after every instance has combined.
     ///
     /// One thread by definition, whatever it does inside. A grouped aggregate does most of its work
@@ -84,15 +94,31 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>)
     if degree <= 1 {
         let measured = Span::start();
         run_serial(pipeline, cancel)?;
-        let (wall, _) = measured.stop();
-        return Ok(Spread { worker_cpu_ns: 0, slowest_ns: wall, finalize_ns: 0 });
+        let (wall, cpu) = measured.stop();
+        return Ok(Spread {
+            worker_cpu_ns: 0,
+            slowest_ns: wall,
+            slowest_cpu_ns: cpu,
+            finalize_ns: 0,
+        });
     }
 
     let stop = Stop::default();
     let failed = AtomicBool::new(false);
     let spent = AtomicU64::new(0);
-    let slowest = AtomicU64::new(0);
+    let longest = Mutex::new((0, 0));
     let failure = Mutex::new(None);
+
+    // The wall and the CPU of whichever instance ran longest, kept as a pair because the pair is the
+    // reading. Two separate maxima would give the longest wall of one instance beside the largest CPU
+    // of another and say nothing about either. A lock rather than an atomic because it is taken once
+    // per instance, after that instance has finished everything it was going to do.
+    let record = |wall: u64, cpu: u64| {
+        let mut held = longest.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if wall > held.0 {
+            *held = (wall, cpu);
+        }
+    };
 
     // What a borrowed worker runs. It is the caller's own instance with a clock around it, because
     // the CPU clock this engine reads is per thread and the caller cannot see a worker's, and
@@ -102,14 +128,14 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>)
         let ran = one(pipeline, cancel, &stop, &failed);
         let (wall, cpu) = measured.stop();
         spent.fetch_add(cpu, Ordering::Relaxed);
-        slowest.fetch_max(wall, Ordering::Relaxed);
+        record(wall, cpu);
         keep(&failure, ran);
     };
     let caller = || {
         let measured = Span::start();
         let ran = one(pipeline, cancel, &stop, &failed);
-        let (wall, _) = measured.stop();
-        slowest.fetch_max(wall, Ordering::Relaxed);
+        let (wall, cpu) = measured.stop();
+        record(wall, cpu);
         ran
     };
     let (mine, panicked) = lease.scatter(&task, caller);
@@ -126,9 +152,12 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>)
     let finalized = pipeline.sink().finalize_state();
     let (finalize_ns, _) = measured.stop();
     finalized?;
+    let (slowest_ns, slowest_cpu_ns) =
+        longest.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
     Ok(Spread {
         worker_cpu_ns: spent.load(Ordering::Relaxed),
-        slowest_ns: slowest.load(Ordering::Relaxed),
+        slowest_ns,
+        slowest_cpu_ns,
         finalize_ns,
     })
 }
