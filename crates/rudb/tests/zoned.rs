@@ -16,6 +16,8 @@
 //! does not look like anything until a plan is built on it. `sorted.parquet` is written in ascending
 //! key order on purpose, which is what makes a filter on that key rule groups out at all and what
 //! makes each group's two ends narrow enough to interpolate between, and its README entry says so.
+//! `scaled.parquet` is the same idea over a decimal and two timestamps, which are the columns whose
+//! two ends are an integer and a power of ten under it rather than an integer on its own.
 
 use rudb::Database;
 use rudb_common::{LogicalType, Value};
@@ -44,9 +46,25 @@ fn filter_line(text: &str) -> String {
         .to_string()
 }
 
+/// The other fixture, eight row groups of 1024 rows with a decimal and two timestamps ascending.
+fn scaled() -> String {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../rudb-parquet/testdata/scaled.parquet");
+    format!("'{path}'")
+}
+
 /// How many rows the filter really keeps.
 fn answered(database: &Database, predicate: &str) -> i64 {
-    let sql = format!("SELECT count(*) FROM read_parquet({}) WHERE {predicate}", fixture());
+    counted(database, &fixture(), predicate)
+}
+
+/// The estimate the planner prints for that filter.
+fn estimated(database: &Database, predicate: &str) -> String {
+    planned(database, &fixture(), predicate)
+}
+
+/// How many rows the filter really keeps in `file`.
+fn counted(database: &Database, file: &str, predicate: &str) -> i64 {
+    let sql = format!("SELECT count(*) FROM read_parquet({file}) WHERE {predicate}");
     let result = database.query(&sql).expect("the count ran");
     match result.value_at(0, 0) {
         Value::BigInt(count) => count,
@@ -54,9 +72,9 @@ fn answered(database: &Database, predicate: &str) -> i64 {
     }
 }
 
-/// The estimate the planner prints for that filter.
-fn estimated(database: &Database, predicate: &str) -> String {
-    let sql = format!("EXPLAIN SELECT k FROM read_parquet({}) WHERE {predicate}", fixture());
+/// The estimate the planner prints for that filter over `file`.
+fn planned(database: &Database, file: &str, predicate: &str) -> String {
+    let sql = format!("EXPLAIN SELECT 1 FROM read_parquet({file}) WHERE {predicate}");
     filter_line(&explained(database, &sql))
 }
 
@@ -144,6 +162,70 @@ fn the_conjuncts_of_one_filter_are_asked_together_rather_than_one_at_a_time() {
     let line = estimated(&database, "k >= 100 AND k < 4000");
     assert!(line.contains("[~3900 rows estimated from zone map]"), "{line}");
     assert_eq!(answered(&database, "k >= 100 AND k < 4000"), 3900);
+}
+
+#[test]
+fn a_decimal_column_is_interpolated_over_the_hundredths_it_holds() {
+    // `d` is stored as an `INT64` of hundredths, so the footer's 1000 is 10.00 and comparing the
+    // two integers as they are would be comparing 10.00 against 0.10. All three of these come out
+    // exactly, because the column is one row per hundredth and the interpolation's assumption that
+    // the values are spread evenly between a group's ends is true here rather than assumed.
+    let database = Database::new();
+    for (predicate, rows) in
+        [("d < 10.00", 1000), ("d >= 50.00", 3192), ("d BETWEEN 20.00 AND 30.00", 1001)]
+    {
+        let line = planned(&database, &scaled(), predicate);
+        assert!(line.contains(&format!("[~{rows} rows estimated from zone map]")), "{line}");
+        assert_eq!(counted(&database, &scaled(), predicate), rows, "{predicate}");
+    }
+}
+
+#[test]
+fn a_decimal_past_every_group_is_exactly_no_rows() {
+    // The other half of what the bounds answer, on a decimal rather than an integer. `d` stops at
+    // 81.91 and the constant is past every group, which is a fact about the file and not a guess.
+    let database = Database::new();
+    let line = planned(&database, &scaled(), "d > 999.00");
+    assert!(line.contains("[0 rows exact from zone map]"), "{line}");
+    assert_eq!(counted(&database, &scaled(), "d > 999.00"), 0, "and it is right");
+}
+
+#[test]
+fn a_timestamp_column_is_interpolated_over_the_unit_the_file_chose() {
+    // One row a minute from 2020-01-01, so a day is 1,440 rows and the rest of the file is 2,432.
+    // The second is out by one, which is the boundary landing between two groups rather than on a
+    // group's edge, and one row in two thousand is not what a q-error notices.
+    let database = Database::new();
+    let day = "t < TIMESTAMP '2020-01-02 00:00:00'";
+    let line = planned(&database, &scaled(), day);
+    assert!(line.contains("[~1440 rows estimated from zone map]"), "{line}");
+    assert_eq!(counted(&database, &scaled(), day), 1440);
+
+    let rest = "t >= TIMESTAMP '2020-01-05 00:00:00'";
+    let line = planned(&database, &scaled(), rest);
+    assert!(line.contains("[~2431 rows estimated from zone map]"), "{line}");
+    assert_eq!(counted(&database, &scaled(), rest), 2432);
+}
+
+#[test]
+fn a_millisecond_column_is_reached_through_a_cast_and_the_bounds_are_not_asked_through_one() {
+    // `ms` holds the same instants as `t` in a different unit and its bounds carry that unit, so
+    // this would interpolate as well as `t` does if it were asked. It is not asked. The column is a
+    // `TIMESTAMP_MS` and the constant is a `TIMESTAMP`, so the binder puts a cast around the column,
+    // and what the estimator is handed is that cast rather than a column it has two ends for. The
+    // estimate falls back to the constant's fifth.
+    //
+    // The count on the right should be 1440 and is the whole file, which is issue #959. A count of
+    // milliseconds out of Parquet is read here as a count of microseconds, so every value in the
+    // column sits in 1970 and every one of them is under a constant in 2020. That is a wrong answer
+    // rather than an estimate, it predates the bounds and the binary from before them answers the
+    // same, and fixing it is cast kernel work. This pins what the engine does today, and the number
+    // becomes 1440 when #959 closes.
+    let database = Database::new();
+    let predicate = "ms < TIMESTAMP '2020-01-02 00:00:00'";
+    let line = planned(&database, &scaled(), predicate);
+    assert!(line.contains("[~1638 rows estimated from default]"), "{line}");
+    assert_eq!(counted(&database, &scaled(), predicate), 8192, "issue #959, it should be 1440");
 }
 
 #[test]

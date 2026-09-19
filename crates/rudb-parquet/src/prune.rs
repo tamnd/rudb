@@ -46,7 +46,7 @@
 use std::sync::Arc;
 
 use rudb_common::LogicalType;
-use rudb_common::bounds::{Spread, Zones, kept};
+use rudb_common::bounds::{MICROS, Spread, Zones, kept};
 
 use crate::metadata::{ColumnChunk, Metadata, Physical, RowGroup, SchemaColumn};
 
@@ -208,6 +208,19 @@ fn read_bound(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
             | LogicalType::UBigInt
             | LogicalType::UHugeInt
     );
+    if let Some(scale) = scale(&column.ty) {
+        let unscaled = match column.physical {
+            Physical::Int32 => i128::from(i32::from_le_bytes(bytes.try_into().ok()?)),
+            Physical::Int64 => i128::from(i64::from_le_bytes(bytes.try_into().ok()?)),
+            // A decimal too wide for a word is two's complement big endian and of whatever length
+            // the writer needed, which is the one place in this format the bytes run the other way.
+            Physical::FixedLenByteArray | Physical::ByteArray => big_endian(bytes)?,
+            Physical::Boolean | Physical::Float | Physical::Double | Physical::Int96 => {
+                return None;
+            }
+        };
+        return Some(Bound::Scaled { unscaled, scale });
+    }
     match column.physical {
         Physical::Boolean => bytes.first().map(|byte| Bound::Int(i128::from(*byte != 0))),
         Physical::Int32 if unsigned => {
@@ -222,9 +235,43 @@ fn read_bound(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
         Physical::Double => Some(Bound::Real(f64::from_le_bytes(bytes.try_into().ok()?))),
         Physical::ByteArray => Some(Bound::Bytes(bytes.to_vec())),
         // An INT96 has no ordering this reader agrees with anybody about, and a fixed length byte
-        // array is a decimal or a UUID depending on the annotation, neither of which is read yet.
+        // array that is not a decimal is a UUID, which is not read yet.
         Physical::Int96 | Physical::FixedLenByteArray => None,
     }
+}
+
+/// The power of ten under a column stored as an integer, and `None` for a column that is not one.
+///
+/// A decimal's scale is its own. A time or a timestamp is a count of seconds at the unit the file
+/// chose, and the unit is in the type because the schema reader put it there. The two zoned types
+/// are the same count as their unzoned twins, and what makes them different types is not something a
+/// minimum and a maximum can see.
+fn scale(ty: &LogicalType) -> Option<u8> {
+    Some(match *ty {
+        LogicalType::Decimal { scale, .. } => scale,
+        LogicalType::TimestampS => 0,
+        LogicalType::TimestampMs => 3,
+        LogicalType::Time | LogicalType::TimeTz => MICROS,
+        LogicalType::Timestamp | LogicalType::TimestampTz => MICROS,
+        LogicalType::TimestampNs => 9,
+        _ => return None,
+    })
+}
+
+/// A two's complement big endian integer of up to sixteen bytes, which is how a wide decimal is
+/// written.
+///
+/// Longer than sixteen is a decimal this reader cannot hold, and answering `None` for it keeps the
+/// row group. Shorter is sign extended, which is what makes a negative one byte bound negative
+/// rather than a number over a hundred.
+fn big_endian(bytes: &[u8]) -> Option<i128> {
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+    let sign = if bytes[0] & 0x80 == 0 { 0 } else { u8::MAX };
+    let mut whole = [sign; 16];
+    whole[16 - bytes.len()..].copy_from_slice(bytes);
+    Some(i128::from_be_bytes(whole))
 }
 
 #[cfg(test)]
@@ -234,7 +281,7 @@ mod tests {
     use rudb_common::LogicalType;
     use rudb_common::bounds::Zones;
 
-    use super::{Bound, Footer, Op, Test, skips};
+    use super::{Bound, Footer, MICROS, Op, Test, read_bound, skips};
     use crate::metadata::{
         ColumnChunk, Encoding, Metadata, Physical, RowGroup, SchemaColumn, Stats,
     };
@@ -491,5 +538,122 @@ mod tests {
         let fraction = spread(&footer, &both).expect("both were read");
         assert!((fraction - 3.0 / 11.0).abs() < 1e-9, "{fraction}");
         assert_eq!(footer.spread(&both).map(|spread| spread.read), Some(2));
+    }
+
+    /// One `DECIMAL(15, 2)` column stored the way DuckDB stores `l_discount`, as an `INT64` of
+    /// hundredths, with a group running from `low` to `high` in those hundredths.
+    fn decimal_group(low: i64, high: i64) -> (Vec<SchemaColumn>, RowGroup) {
+        let schema = vec![SchemaColumn {
+            name: "d".to_string(),
+            physical: Physical::Int64,
+            ty: LogicalType::Decimal { width: 15, scale: 2 },
+            optional: false,
+            width: 0,
+        }];
+        let mut group = group(None, None);
+        group.columns[0].physical = Physical::Int64;
+        group.columns[0].stats = Some(Stats {
+            nulls: Some(0),
+            distinct: None,
+            min: Some(low.to_le_bytes().to_vec()),
+            max: Some(high.to_le_bytes().to_vec()),
+        });
+        (schema, group)
+    }
+
+    #[test]
+    fn a_decimal_columns_bounds_are_read_as_the_scale_the_schema_states() {
+        let (schema, group) = decimal_group(0, 10);
+        let bytes = 7_i64.to_le_bytes();
+        assert_eq!(
+            read_bound(&bytes, &schema[0]),
+            Some(Bound::Scaled { unscaled: 7, scale: 2 }),
+            "the footer's 7 is 0.07 and not 7"
+        );
+        // And the whole path: `d > 0.10` rules the group out and `d > 0.07` does not, where reading
+        // the bound as a plain integer would have made both of them 7 and 10 against a 0.
+        let above = vec![Test {
+            column: 0,
+            op: Op::Greater,
+            value: Bound::Scaled { unscaled: 10, scale: 2 },
+        }];
+        assert!(skips(&above, &group, &schema));
+        let inside = vec![Test {
+            column: 0,
+            op: Op::Greater,
+            value: Bound::Scaled { unscaled: 7, scale: 2 },
+        }];
+        assert!(!skips(&inside, &group, &schema));
+    }
+
+    #[test]
+    fn a_decimal_group_is_interpolated_over_the_hundredths_it_holds() {
+        // The constant arrives at scale 3 and the column is at scale 2, so the counting is over the
+        // finer of the two: 0.000 to 0.100 is 101 thousandths and `d <= 0.070` keeps 71 of them.
+        // Over the column's own hundredths it would be 8 of 11, which is the same fraction to
+        // within one step, and taking the finer grid is what keeps a constant between two of the
+        // column's values from being rounded onto one of them.
+        let (schema, group) = decimal_group(0, 10);
+        let footer = Footer::new(Arc::new(Metadata {
+            version: 2,
+            rows: group.rows,
+            schema,
+            row_groups: vec![group],
+            created_by: None,
+        }));
+        let tests = vec![Test {
+            column: 0,
+            op: Op::LessOrEqual,
+            value: Bound::Scaled { unscaled: 70, scale: 3 },
+        }];
+        let fraction = spread(&footer, &tests).expect("a decimal group interpolates");
+        assert!((fraction - 71.0 / 101.0).abs() < 1e-9, "{fraction}");
+    }
+
+    #[test]
+    fn a_wide_decimal_is_read_from_its_bytes_the_way_it_was_written() {
+        // A `DECIMAL(38, 4)` goes in a fixed length byte array, two's complement and big endian,
+        // which is the one place in this format the bytes run the other way round.
+        let column = SchemaColumn {
+            name: "d".to_string(),
+            physical: Physical::FixedLenByteArray,
+            ty: LogicalType::Decimal { width: 38, scale: 4 },
+            optional: false,
+            width: 16,
+        };
+        let positive = 123_456_i128.to_be_bytes();
+        assert_eq!(
+            read_bound(&positive, &column),
+            Some(Bound::Scaled { unscaled: 123_456, scale: 4 })
+        );
+        // Shorter than sixteen bytes is sign extended, so a one byte negative stays negative rather
+        // than reading as a number over a hundred.
+        assert_eq!(read_bound(&[0xff], &column), Some(Bound::Scaled { unscaled: -1, scale: 4 }));
+        assert_eq!(read_bound(&[], &column), None, "no bytes is no bound");
+        assert_eq!(read_bound(&[0; 17], &column), None, "wider than this reader holds");
+    }
+
+    #[test]
+    fn a_timestamp_columns_bounds_are_read_at_the_files_own_unit() {
+        // The same instant in the three units a file may choose, each of which has to come back as
+        // the same quantity so that the microseconds every constant arrives as compares with it.
+        for (ty, unscaled, scale) in [
+            (LogicalType::TimestampMs, 1_700_000_000_000_i64, 3),
+            (LogicalType::Timestamp, 1_700_000_000_000_000, MICROS),
+            (LogicalType::TimestampNs, 1_700_000_000_000_000_000, 9),
+        ] {
+            let column = SchemaColumn {
+                name: "t".to_string(),
+                physical: Physical::Int64,
+                ty,
+                optional: false,
+                width: 0,
+            };
+            let bytes = unscaled.to_le_bytes();
+            let read = read_bound(&bytes, &column).expect("a timestamp bound is read");
+            assert_eq!(read, Bound::Scaled { unscaled: i128::from(unscaled), scale });
+            let micros = Bound::Scaled { unscaled: 1_700_000_000_000_000, scale: MICROS };
+            assert_eq!(read.order(&micros), Some(std::cmp::Ordering::Equal), "{read:?}");
+        }
     }
 }
