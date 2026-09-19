@@ -143,6 +143,18 @@ impl Chunk {
         size_of::<Self>() + self.columns.iter().map(Vector::footprint).sum::<usize>()
     }
 
+    /// This chunk with every column's payload held as a page, so that a copy of it is free.
+    ///
+    /// For a chunk that is going to be stored and handed out many times, which is what an in memory
+    /// table's chunks are. See [`Vector::into_pages`] for what it does to each form.
+    #[must_use]
+    pub fn into_pages(self) -> Self {
+        Self {
+            columns: self.columns.into_iter().map(Vector::into_pages).collect(),
+            rows: self.rows,
+        }
+    }
+
     /// The type of each column.
     #[must_use]
     pub fn types(&self) -> Vec<LogicalType> {
