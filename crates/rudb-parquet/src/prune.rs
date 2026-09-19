@@ -163,6 +163,7 @@ mod tests {
                 dictionary_page_offset: None,
                 stats: Some(Stats {
                     nulls: Some(0),
+                    distinct: None,
                     min: low.map(|number| number.to_le_bytes().to_vec()),
                     max: high.map(|number| number.to_le_bytes().to_vec()),
                 }),
