@@ -169,3 +169,39 @@ The floor in section 2 is worth restating as a limit. On `sum(v)` DuckDB is 2.1 
 It is reachable on the other three queries in section 3, and by a lot more than ten times, because DuckDB answers those without reading anything and rudb reads everything. That is the shape of the goal: the wins are in not touching the data, through facts that reach the planner, zone maps that prune, dictionaries that make a group key an integer and execution that runs on the encoded form. Those are what [`../engine-v2/05-data-model.md`](../engine-v2/05-data-model.md) sections 6 and 7 and [`../engine-v2/13-encoded-execution.md`](../engine-v2/13-encoded-execution.md) are for, and they are what milestones P0 and P2 are about.
 
 The work in section 9 is not that. It is the floor under it: a data model in which a scan can hand an operator a window into stored memory, so that the engine is paying for the work the query asks for and nothing else. It is worth doing first because everything above it is measured through it.
+
+## 11. What the first two changes measured, and the one that was not on the list
+
+Written on 19 September 2026, after the first two items of section 9 landed. server2 was not idle for these, so they are internal comparisons: the same tree built twice, differing only in the change under test, run alternately and best of each. Nanoseconds per row over the same twenty million rows.
+
+The buffer window, #971, is a type change and measures nothing on its own, which is why it landed on its own. The pages, #972, took the copy out of `MemoryTable::read`.
+
+| query | before pages | after pages | |
+| --- | ---: | ---: | ---: |
+| `count(*)` | 0.70 | 0.64 | -9% |
+| `count(v)` | 2.18 | 1.26 | -42% |
+| `count(*) WHERE v >= 0` | 2.85 | 2.56 | -10% |
+| `sum(v)` | 2.88 | 2.55 | -11% |
+
+The spread is the right shape. `count(v)` reads the validity and never touches a value, so the copy was pure waste and all of it went. `sum(v)` reads every value out of RAM either way, so what came off is the copy's own cost and not the read it was feeding. The copy was worth between a third of a nanosecond and nine tenths of one per row depending on whether the query was going to look at the bytes.
+
+Then the box went idle and the four queries were run again against DuckDB, and that measurement found something section 9 had not listed. DuckDB answered three of the four out of metadata with no operators at all, `EXPLAIN ANALYZE` reporting a total time of zero and an empty plan, and only `sum(v)` scanned its 163 row groups. rudb scanned all four. The gap on those three was not the scan loop, it was that rudb was scanning at all.
+
+rudb had the numbers already. A table in memory builds a zone map for every chunk as it arrives, and a zone holds an exact null count for every column whatever form it is in, the two ends, and the total of an integer column. A native file had been answering `COUNT`, `MIN`, `MAX`, `SUM` and `AVG` over a whole table out of its directory since the format was written. The in memory table answered `None` to all of it, and `whole_table` in the builder turned away anything that was not a file, so the whole apparatus was there and switched off for the tables most queries actually run against.
+
+Turning it on, with the answers checked against DuckDB value for value:
+
+| query | reading rows | out of the zone maps |
+| --- | ---: | ---: |
+| `count(*)` | 0.72 | 0.00 |
+| `count(v)` | 1.32 | 0.01 |
+| `count(*) WHERE v >= 0` | 3.01 | 0.05 |
+| `sum(v)` | 2.72 | 0.02 |
+
+The filtered count is in there because the optimizer folds a predicate the statistics prove is true for every row, which left a bare read of the whole table for the counting to be answered from. `sum(v)` is the one DuckDB still scans for, so on that query rudb is now faster than DuckDB by about two orders of magnitude rather than slower by 1.6 times.
+
+This is a load time cost being spent rather than a query getting faster, and the load was already paying it. Building the table takes 1.0 seconds either way, because the zone maps were always built. What changed is that somebody finally asked them.
+
+Queries that have to read rows are unaffected, which is the thing worth checking about a change like this. `count(*) WHERE v >= 10` is 4.32 before and 4.48 after, `sum(v) WHERE v >= 10` is 4.15 and 4.19, `sum(k + v)` is 1.56 and 1.49, `count(*) WHERE k = 7` is 1.54 and 1.45. That is noise in both directions.
+
+The lesson to carry out of this is the one section 10 stated and then did not act on. The wins are in not touching the data, and the cheapest of those are the ones where the engine already computed the fact and never wired it to the question. It is worth going looking for the others.

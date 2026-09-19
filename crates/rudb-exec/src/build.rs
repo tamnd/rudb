@@ -506,10 +506,11 @@ fn native_frequencies(
 /// them has to stop the search here. A `Get` is the only node that reads a table and changes
 /// nothing about it.
 ///
-/// A table still being built in memory is passed over even though it could count its own rows,
-/// because everything else below needs a directory and a table with no file behind it has none.
-/// Answering one of these from memory and the rest from a file would mean two paths to keep
-/// agreeing with each other for one count that is already cheap.
+/// Either kind of table, because both keep statistics now. A file has a directory per stripe and a
+/// table in memory has a zone map per chunk, and the questions below are asked of `Rows` rather than
+/// of one or the other, so a table that cannot answer one of them says so and the caller goes and
+/// reads the rows. What only a file answers is the questions that need a persisted synopsis, which
+/// are the distinct count and the frequencies.
 fn whole_table<'a>(
     plan: &Plan,
     catalog: &'a Catalog,
@@ -521,7 +522,7 @@ fn whole_table<'a>(
     };
     let name = QualifiedName::new(plan.string(database), plan.string(schema), plan.string(table));
     let table = catalog.table(&name)?;
-    Ok(table.rows().is_native().then_some((table, index, columns)))
+    Ok(Some((table, index, columns)))
 }
 
 /// Which column of the stored table a binding into `index` names, by name rather than by position.
@@ -690,20 +691,25 @@ fn known_rows(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Option<u6
     Ok(Some(distinct.saturating_add(u64::from(nulls > 0))))
 }
 
-/// Every aggregate of a whole table aggregation, answered from the directory of a native file.
+/// Every aggregate of a whole table aggregation, answered from the statistics of the table.
 ///
 /// `None` the moment one of them cannot be, because a query that reads the rows for one aggregate
 /// may as well read them for all of them. What is answerable here is deliberately small and exact.
-/// A count is a number the file wrote down, a distinct count is the size of a dictionary that holds
+/// A count is a number the table wrote down, a distinct count is the size of a dictionary that holds
 /// every distinct value once, the extremes of a string column are the two ends of the order written
-/// beside that dictionary, and the extremes and the total of an integer column are the stripe
-/// ranges added up. None of these is a sketch and none of them is a bound that is allowed to be
-/// wide, so none of them can be off by one.
+/// beside that dictionary, and the extremes and the total of an integer column are the per chunk or
+/// per stripe ranges added up. None of these is a sketch and none of them is a bound that is allowed
+/// to be wide, so none of them can be off by one.
+///
+/// A table in memory answers the counts, the extremes and the total out of the zone map it builds as
+/// each chunk arrives, and a native file answers all of those and the two that need a persisted
+/// synopsis. Neither path decides anything here: the question goes to `Rows` and a table that cannot
+/// answer it says so, which is what sends the query off to read the rows.
 ///
 /// The one thing this does not do is decide differently from the operators. A sum and an average
 /// finish through the state a grouped aggregation would have built, so the rounding, the overflow
 /// and the answer for a column with no rows in it are the operator's rather than a second opinion.
-fn native_summary(
+fn stored_summary(
     plan: &Plan,
     catalog: &Catalog,
     input: NodeRef,
@@ -998,14 +1004,14 @@ impl<'a> Building<'a, '_> {
         // underneath it would answer in no time and take exactly as long as it always did.
         if bound.max_groups.is_none() && bound.having_count.is_none() {
             if let Some(values) =
-                native_summary(self.plan, self.catalog, input, groups, aggregates)?
+                stored_summary(self.plan, self.catalog, input, groups, aggregates)?
             {
                 let schema = summary_schema(self.plan, index, aggregates)?;
                 let source = Summary::new(&schema, &values)?;
                 let id = self.shape.operator(reference);
                 let pipeline = self.shape.pipeline(reference);
                 let counters =
-                    self.watch(reference, id, pipeline, "Aggregate", Some("native summary"));
+                    self.watch(reference, id, pipeline, "Aggregate", Some("stored summary"));
                 return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
             }
         }

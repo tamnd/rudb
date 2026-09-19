@@ -1,9 +1,18 @@
-//! Aggregates over a whole table that the storage format answers out of its directory.
+//! Aggregates over a whole table that are answered out of statistics rather than out of the rows.
 //!
 //! Every one of these has the same shape: the same question is asked of a table held in memory and
 //! of the same table written to a file, and the two have to agree. The file is allowed to be faster
-//! and it is not allowed to be different, so the in-memory answer is the oracle and the test is
-//! whether owning the format bought speed or bought a wrong answer.
+//! and it is not allowed to be different, so the test is whether owning the format bought speed or
+//! bought a wrong answer.
+//!
+//! The in-memory side used to be the oracle here, because it read every row and the file read a
+//! directory. It is not any more. A table in memory keeps a zone map per chunk and now answers a
+//! `COUNT`, a `MIN`, a `MAX`, a `SUM` and an `AVG` over a whole table out of that, so for those five
+//! this compares two statistics paths against each other and against a number written out in the
+//! test. Where a number is asserted below it is the answer worked out by hand, and that is the
+//! oracle. What memory still reads the rows for is everything that needs a persisted synopsis, which
+//! is the distinct count and the frequencies, and those are the cases where the two sides really do
+//! take different routes to the same answer.
 //!
 //! The one that matters most is the nullable column. A null row is written as the code for the
 //! empty string, so the dictionary of a nullable column can hold an empty string that no row of it
@@ -65,7 +74,12 @@ impl Pair {
     /// text cannot tell the two apart. A scan is folded into the operator above it either way, so
     /// the `Get` line says the same thing whether the rows were read or never looked at.
     fn summarised(&self, query: &str) -> bool {
-        self.answered(query, "native summary")
+        self.answered(&self.file, query, "stored summary")
+    }
+
+    /// Whether the table in memory answered this without reading any rows, out of its zone maps.
+    fn in_memory(&self, query: &str) -> bool {
+        self.answered(&self.memory, query, "stored summary")
     }
 
     /// Whether the file built the groups of this out of the synopsis rather than out of the rows.
@@ -74,12 +88,12 @@ impl Pair {
     /// list of groups out of the file and an ungrouped one by adding a few numbers up, so the two
     /// say different things about themselves.
     fn grouped(&self, query: &str) -> bool {
-        self.answered(query, "native frequencies")
+        self.answered(&self.file, query, "native frequencies")
     }
 
-    /// Whether any operator of this query is the one named.
-    fn answered(&self, query: &str, detail: &str) -> bool {
-        let result = self.file.query(query).expect("the query ran");
+    /// Whether any operator of this query on this database is the one named.
+    fn answered(&self, db: &Database, query: &str, detail: &str) -> bool {
+        let result = db.query(query).expect("the query ran");
         let metrics = result.metrics().expect("the query was measured");
         metrics.operators.iter().any(|operator| operator.detail.as_deref() == Some(detail))
     }
@@ -336,8 +350,22 @@ fn an_integer_column_with_nulls_in_it_is_still_answered_because_the_null_count_i
     );
     assert_eq!(pair.agree("SELECT MIN(n) FROM t"), Value::BigInt(0));
     assert_eq!(pair.agree("SELECT COUNT(n) FROM t"), Value::BigInt(4545));
-    pair.agree("SELECT SUM(n) FROM t");
-    pair.agree("SELECT AVG(n) FROM t");
+    // Worked out here rather than taken from whichever side answered first, because both sides
+    // answer this one out of statistics now and a test where the two paths only have to agree with
+    // each other would pass if they were wrong in the same way. The 4545 rows that are not null hold
+    // `i % 7` and add up to 13630.
+    let (mut total, mut rows) = (0_i64, 0_i64);
+    for i in 0..5000 {
+        if i % 11 != 0 {
+            total += i % 7;
+            rows += 1;
+        }
+    }
+    assert_eq!((total, rows), (13630, 4545), "the rows this table was built from");
+    assert_eq!(pair.agree("SELECT SUM(n) FROM t"), Value::HugeInt(i128::from(total)));
+    #[expect(clippy::cast_precision_loss, reason = "13630 over 4545 is exact in a double")]
+    let average = total as f64 / rows as f64;
+    assert_eq!(pair.agree("SELECT AVG(n) FROM t"), Value::Double(average));
     assert!(pair.summarised("SELECT SUM(n), AVG(n) FROM t"), "the rows were read anyway");
 }
 
@@ -355,4 +383,37 @@ fn an_empty_table_still_answers_what_an_aggregate_over_nothing_answers() {
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t"), Value::BigInt(0));
     assert_eq!(pair.agree("SELECT COUNT(DISTINCT s) FROM t"), Value::BigInt(0));
     assert_eq!(pair.agree("SELECT MIN(s) FROM t"), Value::Null);
+}
+
+#[test]
+fn a_table_in_memory_answers_out_of_its_zone_maps_without_reading_its_rows() {
+    let pair = Pair::new(
+        "memzones",
+        "SELECT i % 7 AS n, CASE WHEN i % 11 = 0 THEN NULL ELSE i % 5 END AS m FROM range(5000) r(i)",
+    );
+    // The five a zone map holds: a row count, an exact null count, the two ends and a total.
+    assert!(pair.in_memory("SELECT COUNT(*) FROM t"), "the rows were counted");
+    assert!(pair.in_memory("SELECT COUNT(m) FROM t"), "the nulls were counted");
+    assert!(pair.in_memory("SELECT MIN(n), MAX(n) FROM t"), "the ends were walked");
+    assert!(pair.in_memory("SELECT SUM(n), AVG(n) FROM t"), "the rows were added up");
+    assert_eq!(pair.agree("SELECT COUNT(m) FROM t"), Value::BigInt(4545));
+    assert_eq!(pair.agree("SELECT SUM(n) FROM t"), Value::HugeInt(14995));
+}
+
+#[test]
+fn a_table_in_memory_reads_its_rows_for_what_a_zone_map_does_not_hold() {
+    let pair =
+        Pair::new("memrows", "SELECT i % 7 AS n, 'v' || (i % 13) AS s FROM range(5000) r(i)");
+    // A distinct count needs every value once and a zone map holds two of them, so this is the case
+    // the file answers and memory does not. Both still say seven.
+    assert!(!pair.in_memory("SELECT COUNT(DISTINCT n) FROM t"), "a zone map counted the values");
+    assert_eq!(pair.agree("SELECT COUNT(DISTINCT n) FROM t"), Value::BigInt(7));
+    // A filter puts a node between the aggregate and the table, and what is above a filter is a
+    // question about some of the rows rather than about all of them.
+    assert!(!pair.in_memory("SELECT COUNT(*) FROM t WHERE n > 1"), "a filter was ignored");
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n > 1"), Value::BigInt(3570));
+    // A string column's ends are exact in a zone map, so this one memory does answer, which is worth
+    // asserting beside the two above so that the line between them is drawn by a test.
+    assert!(pair.in_memory("SELECT MIN(s), MAX(s) FROM t"), "the strings were walked");
+    assert_eq!(pair.agree("SELECT MAX(s) FROM t"), Value::Varchar("v9".to_owned()));
 }

@@ -76,10 +76,13 @@ impl Rows {
         }
     }
 
-    /// How many rows of one column are null, when the rows are stored somewhere that already knows.
+    /// How many rows of one column are null, which both kinds of table already know.
+    ///
+    /// An in memory table counts the validity mask of every chunk as it arrives, so this is exact for
+    /// a column in any form. See `MemoryTable::null_count`.
     pub fn null_count(&self, column: usize) -> Result<Option<u64>> {
         match self {
-            Self::Memory(_) => Ok(None),
+            Self::Memory(rows) => Ok(Some(rows.null_count(column)? as u64)),
             Self::Native(reader) => reader.null_count(column).map(Some),
         }
     }
@@ -93,18 +96,20 @@ impl Rows {
         }
     }
 
-    /// The smallest and the largest value of one column, when every stripe of it wrote exact ends.
+    /// The smallest and the largest value of one column, when every chunk or stripe of it wrote ends
+    /// it had really looked at.
     pub fn exact_extremes(&self, column: usize) -> Result<Option<(Bound, Bound)>> {
         match self {
-            Self::Memory(_) => Ok(None),
+            Self::Memory(rows) => rows.exact_extremes(column),
             Self::Native(reader) => reader.exact_extremes(column),
         }
     }
 
-    /// The sum of one integer column and the rows that went into it, when the file wrote them down.
+    /// The sum of one integer column and the rows that went into it, from the zone maps of an in
+    /// memory table or the directory of a file.
     pub fn exact_sum(&self, column: usize) -> Result<Option<(i128, u64)>> {
         match self {
-            Self::Memory(_) => Ok(None),
+            Self::Memory(rows) => rows.exact_sum(column),
             Self::Native(reader) => reader.exact_sum(column),
         }
     }
