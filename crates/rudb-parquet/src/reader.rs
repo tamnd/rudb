@@ -589,11 +589,13 @@ impl Reader {
     /// how large the input is before anything has been split, and a footer is counted rather than
     /// sampled, so this is exact.
     ///
-    /// Negative is impossible in a file anybody wrote and is taken as zero rather than as an error,
-    /// because a row count is not what a corrupt file should be reported through.
+    /// `None` for a file whose footer states a negative count, which no writer produces. That is
+    /// not zero rows and it is not an error either: a corrupt footer should be reported by whatever
+    /// tries to read the data, in the words it already has, and not through a row count the planner
+    /// asked for. The planner's answer for it is that nobody counted.
     #[must_use]
-    pub fn rows(&self) -> u64 {
-        u64::try_from(self.metadata.rows).unwrap_or(0)
+    pub fn rows(&self) -> Option<u64> {
+        u64::try_from(self.metadata.rows).ok()
     }
 
     /// How many bytes of column data have been read.

@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use rudb_common::{Error, Field, Result, Value};
+use rudb_common::{Error, Field, Provenance, Result, Stat, Value};
 use rudb_csv::{Given, Reader as CsvReader};
 use rudb_io::glob::has_magic;
 use rudb_io::{File, Filesystem, OpenMode, RealFilesystem, expand};
@@ -148,34 +148,42 @@ fn open_file(path: &str) -> Result<Box<dyn File>> {
     filesystem.open(at, OpenMode::Read)
 }
 
-/// The columns of the Parquet file at `path`, in the order the file stores them.
+/// The columns a `read_parquet` of `paths` produces, and how many rows all of them hold.
+///
+/// Both answers come out of the same footer, which is why this is one function and not two. A
+/// Parquet footer states the schema and the row count in the same few kilobytes at the end of the
+/// file, the binder has to read it for the schema before the rest of the statement can bind, and
+/// the count was being read and dropped. Taking it here costs an extra open of nothing.
+///
+/// The columns are the first file's, which is the rule for Parquet and is not a choice made here.
+/// See [`csv_fields`] for the format where it goes the other way.
+///
+/// The count is [`Stat::Unknown`] rather than an error when one of the files after the first will
+/// not open or the total will not add up. This is the planner's number and not the query's answer:
+/// the scan is about to open the same files and will report whatever is wrong with them in the
+/// words it has always used, and a bind that began failing here would be a new error on a path that
+/// is consulted only to choose between two plans. The first file is the exception, because its
+/// footer has to be read for the schema whatever happens to the count.
+///
+/// A pattern pays one footer per file for this, against a scan that is about to read all of them in
+/// full. The alternative is the first file's count multiplied by the number of files, which is a
+/// sample wearing the word exact, and the files of a partitioned export are not the same size.
 ///
 /// # Errors
 ///
-/// Everything [`open_parquet`] reports.
-pub fn parquet_fields(path: &str) -> Result<Vec<Field>> {
-    Ok(open_parquet(path)?.fields())
-}
-
-/// How many rows the Parquet files `pattern` names hold, added up.
-///
-/// The footer of every one of them, which is two small reads a file and no column data at all. The
-/// planner asks this, so it is worth being clear about what it costs: a query over one file pays
-/// one footer read it was going to pay anyway when the scan opened, and a query over a directory of
-/// a thousand files pays a thousand small reads before it starts. That is the same shape as what
-/// the CSV reader already does at bind time, where every file is opened and sampled.
-///
-/// `None` rather than an error for anything that goes wrong, because the caller is deciding which
-/// side of a join to gather and a missing number is an answer it already handles. A file that
-/// cannot be opened here is a file the scan is about to fail on for the same reason, with a better
-/// message than this could give.
-#[must_use]
-pub fn parquet_rows(pattern: &str) -> Option<u64> {
-    let mut total: u64 = 0;
-    for path in files(pattern).ok()? {
-        total = total.checked_add(open_parquet(&path).ok()?.rows())?;
+/// Everything [`open_parquet`] reports about the first file.
+pub fn parquet_footers(paths: &[String]) -> Result<(Vec<Field>, Stat<u64>)> {
+    let first = paths.first().map_or("", String::as_str);
+    let reader = open_parquet(first)?;
+    let fields = reader.fields();
+    let Some(mut total) = reader.rows() else { return Ok((fields, Stat::Unknown)) };
+    for path in paths.iter().skip(1) {
+        let Ok(reader) = open_parquet(path) else { return Ok((fields, Stat::Unknown)) };
+        let Some(rows) = reader.rows() else { return Ok((fields, Stat::Unknown)) };
+        let Some(sum) = total.checked_add(rows) else { return Ok((fields, Stat::Unknown)) };
+        total = sum;
     }
-    Some(total)
+    Ok((fields, Stat::exact(total, Provenance::RowCount)))
 }
 
 /// The columns a `read_csv` of `paths` produces, sniffed out of the front of every one of them.

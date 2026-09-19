@@ -46,9 +46,46 @@ fn word_type(call: &str) -> String {
     result.types()[0].to_string()
 }
 
+/// The plan tree `EXPLAIN` prints for `sql`, which is everything above the first blank line.
+fn explained(sql: &str) -> String {
+    let database = Database::new();
+    let result = database.query(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    match result.value_at(0, 1) {
+        Value::Varchar(text) => text.lines().take_while(|line| !line.is_empty()).collect(),
+        other => panic!("the plan came back as {other:?}"),
+    }
+}
+
 #[test]
 fn counting_the_rows_of_a_file_is_the_number_of_rows_in_it() {
     assert_eq!(one("count(*)"), Value::BigInt(4096));
+}
+
+#[test]
+fn a_file_read_knows_how_tall_it_is_because_its_footer_says_so() {
+    // The binder already has the footer open to read the schema out of it and the row count is in
+    // the same few kilobytes, so this is free. It matters out of all proportion to its size: it is
+    // the only real number a query over a file starts from, and without it every node above the
+    // scan is unknown and the selectivity constants never get anything to multiply.
+    let text = explained(&format!("EXPLAIN SELECT a FROM read_parquet({})", fixture()));
+    assert!(text.contains("[4096 rows exact from row count]"), "{text}");
+}
+
+#[test]
+fn a_file_written_where_a_table_goes_knows_how_tall_it_is_too() {
+    // The replacement scan is the spelling ClickBench uses and it takes a different road through
+    // the binder, so it is measured separately rather than assumed to follow.
+    let text = explained(&format!("EXPLAIN SELECT a FROM {}", fixture()));
+    assert!(text.contains("[4096 rows exact from row count]"), "{text}");
+}
+
+#[test]
+fn a_filter_over_a_file_is_a_guess_that_says_it_is_one() {
+    // A fifth of a counted number rather than an unknown over an unknown. The value is the
+    // constant's and is wrong for this predicate, and the point is that it now exists and admits
+    // where it came from.
+    let text = explained(&format!("EXPLAIN SELECT a FROM {} WHERE a < 10", fixture()));
+    assert!(text.contains("[~819 rows estimated from default]"), "{text}");
 }
 
 #[test]
