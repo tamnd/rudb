@@ -208,6 +208,9 @@ impl Shape {
             | Node::Window { input, .. }
             | Node::Sort { input, .. }
             | Node::TopN { input, .. }
+            // A share of the input is not known until the input has ended, so this holds its rows
+            // and is a sink, where a plain limit hands each chunk on and stays in the pipeline.
+            | Node::LimitPercent { input, .. }
             | Node::Distinct { input, .. } => {
                 let below = self.fresh();
                 self.waits_on(pipeline, below);

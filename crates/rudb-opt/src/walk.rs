@@ -74,6 +74,7 @@ pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
         | Node::Window { input, .. }
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
+        | Node::LimitPercent { input, .. }
         | Node::TopN { input, .. }
         | Node::Fetch { input, .. }
         | Node::TableFetch { input, .. }
@@ -153,6 +154,7 @@ pub(crate) fn outputs(plan: &Plan, at: NodeRef) -> Option<Vec<(ColumnBinding, Lo
         Node::Filter { input, .. }
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
+        | Node::LimitPercent { input, .. }
         | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => outputs(plan, input),
         // A materialisation produces what the query reading it produces. The held columns go to the
@@ -359,7 +361,8 @@ pub(crate) fn node_columns(
         | Node::MaterializedCte { .. }
         | Node::CrossProduct { .. }
         | Node::SetOp { .. }
-        | Node::Limit { .. } => {}
+        | Node::Limit { .. }
+        | Node::LimitPercent { .. } => {}
         Node::Values { rows, .. } => {
             for &row in plan.row_list(rows) {
                 each(plan, row, found);

@@ -306,6 +306,12 @@ impl Reader<'_> {
                 let offset = read_count(c)?;
                 Ok(Built::unary(move |input| Node::Limit { input, count, offset }))
             }
+            "LimitPercent" => {
+                let percent = read_percent(c)?;
+                c.expect_word("offset")?;
+                let offset = read_count(c)?;
+                Ok(Built::unary(move |input| Node::LimitPercent { input, percent, offset }))
+            }
             "TopN" => {
                 let count = read_count(c)?;
                 c.expect_word("offset")?;
@@ -430,6 +436,29 @@ fn read_count(c: &mut Cursor<'_>) -> Result<u64> {
         return Err(c.error("expected a row count"));
     }
     c.text[start..c.at].parse().map_err(|_| c.error("that row count does not fit in 64 bits"))
+}
+
+/// A share of the input, written the way `Display` for a `f64` writes it and ended by a `%`.
+///
+/// Anything outside nought to a hundred is refused here as well as in the binder, because a plan
+/// that was typed rather than bound goes through this and a share of two hundred percent has no
+/// meaning further down.
+fn read_percent(c: &mut Cursor<'_>) -> Result<f64> {
+    c.skip_space();
+    let start = c.at;
+    while c.peek().is_some_and(|ch| ch.is_ascii_digit() || ch == '.' || ch == 'e' || ch == '-') {
+        c.at += 1;
+    }
+    if c.at == start {
+        return Err(c.error("expected a percentage"));
+    }
+    let percent: f64 =
+        c.text[start..c.at].parse().map_err(|_| c.error("that percentage is not a number"))?;
+    c.expect("%")?;
+    if !(0.0..=100.0).contains(&percent) {
+        return Err(c.error("a percentage is between 0 and 100"));
+    }
+    Ok(percent)
 }
 
 fn read_number(c: &mut Cursor<'_>) -> Result<u32> {

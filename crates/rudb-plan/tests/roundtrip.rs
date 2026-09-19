@@ -338,6 +338,40 @@ fn the_keyword_operators_survive_the_round_trip() {
     assert!(dump.contains("Limit ALL offset 25"), "the open limit is not in\n{dump}");
 }
 
+/// A limit written as a share of the input, which is the one node that holds a fraction.
+///
+/// The percentage goes out through `Display` for a `f64` and comes back through a parse, so a
+/// share that is not a whole number is where the two would stop agreeing if either side rounded.
+#[test]
+fn a_percentage_limit_survives_the_round_trip() {
+    for (percent, offset, printed) in [
+        (30.0, 0, "LimitPercent 30% offset 0"),
+        (2.5, 7, "LimitPercent 2.5% offset 7"),
+        (0.0625, 0, "LimitPercent 0.0625% offset 0"),
+        (100.0, 0, "LimitPercent 100% offset 0"),
+    ] {
+        let mut plan = Plan::new();
+        let scan = get(&mut plan, "a", 0, &[("x", LogicalType::Integer)]);
+        let limit = plan.add_node(Node::LimitPercent { input: scan, percent, offset });
+        plan.set_root(limit);
+
+        let dump = round_trips(&plan);
+        assert!(dump.contains(printed), "{printed} is not in\n{dump}");
+    }
+}
+
+/// A share outside nought to a hundred is refused by the reader as well as by the binder.
+#[test]
+fn a_percentage_the_binder_would_refuse_is_not_readable_either() {
+    for text in [
+        "LimitPercent 101% offset 0\n  Get memory.main.a AS a #0 [x::INTEGER]\n",
+        "LimitPercent -1% offset 0\n  Get memory.main.a AS a #0 [x::INTEGER]\n",
+        "LimitPercent 30 offset 0\n  Get memory.main.a AS a #0 [x::INTEGER]\n",
+    ] {
+        assert!(Plan::parse(text).is_err(), "it was accepted:\n{text}");
+    }
+}
+
 /// Every aggregate feature at once, in the one slot an aggregate is allowed to appear in.
 #[test]
 fn a_distinct_aggregate_with_a_filter_survives_the_round_trip() {

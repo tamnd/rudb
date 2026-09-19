@@ -325,6 +325,10 @@ fn push(
             let below = push(plan, input, domain, index, keys, outer)?;
             limited(plan, below, None, count, offset, keys)
         }
+        // A share cannot be pushed the way a row count can. Crossing the input with the domain
+        // makes it as many times longer as there are domain values, and a fixed share of the long
+        // input is not the share each value would have got on its own.
+        Node::LimitPercent { .. } => None,
         Node::TopN { input, keys: order, count, offset } => {
             let below = push(plan, input, domain, index, keys, outer)?;
             limited(plan, below, Some(order), Some(count), offset, keys)
