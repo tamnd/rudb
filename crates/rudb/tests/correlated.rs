@@ -427,3 +427,51 @@ fn an_ungrouped_column_of_this_query_is_still_refused_by_name() {
     let text = error.to_string();
     assert!(text.contains("column \"t\" must appear in the GROUP BY clause"), "{text}");
 }
+
+/// A grouped count answers NULL for an outer row that matches no inner row, not zero.
+///
+/// The rule that puts a zero there exists because a scalar count over an empty input really is
+/// zero, which an ordinary left join would get wrong. With a `GROUP BY` in the subquery that is not
+/// what the query means: an empty input produces no groups at all, so the subquery returns no row
+/// and a scalar subquery that returns no row is NULL. That is #1013.
+#[test]
+fn a_grouped_count_answers_null_for_an_outer_row_with_no_match() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT count(*) FROM i WHERE i.k = o.k GROUP BY i.k) AS c FROM o ORDER BY k"
+        ),
+        [Value::BigInt(2), Value::BigInt(1), Value::Null, Value::Null]
+    );
+}
+
+/// The same with the group written on the outer column, where the invented group looked real.
+///
+/// The group expressions are rewritten to read the domain, so a group written on an outer column
+/// takes the outer value even on a row the domain padded, which makes the group indistinguishable
+/// from one the inner rows produced.
+#[test]
+fn a_count_grouped_on_the_outer_column_answers_null_with_no_match() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT count(*) FROM i WHERE i.k = o.k GROUP BY o.t) AS c FROM o ORDER BY k"
+        ),
+        [Value::BigInt(2), Value::BigInt(1), Value::Null, Value::Null]
+    );
+}
+
+/// An ungrouped count still answers zero, which is the case the padded row is for.
+#[test]
+fn an_ungrouped_count_still_answers_zero_with_no_match() {
+    let database = database();
+    assert_eq!(
+        answers(
+            &database,
+            "SELECT k, (SELECT count(*) FROM i WHERE i.k = o.k) AS c FROM o ORDER BY k"
+        ),
+        [Value::BigInt(2), Value::BigInt(1), Value::BigInt(0), Value::BigInt(0)]
+    );
+}
