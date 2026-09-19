@@ -77,6 +77,8 @@ pub struct Driver {
     cpu_ns: AtomicU64,
     /// The longest single instance, which is what the pipeline waited for. See [`Driver::waited`].
     slowest_ns: AtomicU64,
+    /// The CPU of that same instance, which says whether it worked or waited. See [`Driver::waited`].
+    slowest_cpu_ns: AtomicU64,
     /// The sink's finalize, which is one thread whatever it does inside. See [`Driver::waited`].
     finalize_ns: AtomicU64,
     charged: Arc<Charged>,
@@ -91,6 +93,7 @@ impl Driver {
             wall_ns: AtomicU64::new(0),
             cpu_ns: AtomicU64::new(0),
             slowest_ns: AtomicU64::new(0),
+            slowest_cpu_ns: AtomicU64::new(0),
             finalize_ns: AtomicU64::new(0),
             charged,
         }
@@ -140,18 +143,31 @@ impl Driver {
     /// grouped aggregate is most of the query and used to be charged to the operator and then
     /// divided by the instance count, so it read as a sixteenth of what it was.
     ///
+    /// The slowest instance's own CPU comes with its wall because the pair is the reading. Half the
+    /// wall spent off the CPU is an instance that waited for a lock and wants the sharing taken away,
+    /// and a CPU up against its wall is an instance that was handed too much and wants the work cut
+    /// more finely. The two fixes make each other worse, so the number that tells them apart is not
+    /// optional.
+    ///
     /// The slowest is a maximum across runs rather than a sum, because a pipeline drained twice
     /// waited for the slower of the two and not for both. The finalize adds, because there were two
-    /// of them and both happened.
-    pub fn waited(&self, slowest_ns: u64, finalize_ns: u64) {
-        self.slowest_ns.fetch_max(slowest_ns, Ordering::Relaxed);
+    /// of them and both happened. The CPU follows whichever run held the maximum, so it is stored
+    /// unconditionally when the wall is and left alone when it is not.
+    pub fn waited(&self, slowest_ns: u64, slowest_cpu_ns: u64, finalize_ns: u64) {
+        if self.slowest_ns.fetch_max(slowest_ns, Ordering::Relaxed) < slowest_ns {
+            self.slowest_cpu_ns.store(slowest_cpu_ns, Ordering::Relaxed);
+        }
         self.finalize_ns.fetch_add(finalize_ns, Ordering::Relaxed);
     }
 
-    /// The longest single instance and the total finalize this driver has been told about.
+    /// The longest single instance, its own CPU, and the total finalize this driver was told about.
     #[must_use]
-    pub fn waits(&self) -> (u64, u64) {
-        (self.slowest_ns.load(Ordering::Relaxed), self.finalize_ns.load(Ordering::Relaxed))
+    pub fn waits(&self) -> (u64, u64, u64) {
+        (
+            self.slowest_ns.load(Ordering::Relaxed),
+            self.slowest_cpu_ns.load(Ordering::Relaxed),
+            self.finalize_ns.load(Ordering::Relaxed),
+        )
     }
 
     /// How many instances of this pipeline have run.
