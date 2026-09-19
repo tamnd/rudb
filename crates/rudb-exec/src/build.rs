@@ -82,7 +82,9 @@ use crate::setop::SetOp;
 use crate::settingnames::settingnames;
 use crate::sideways::{self, Keyed, Sideways};
 use crate::sort::Sort;
-use crate::source::{Dummy, FileScan, Frequencies, Scan, Series, Summary, Values};
+use crate::source::{
+    Dummy, FileScan, Filters, Frequencies, Pushdown, Scan, Series, Summary, Values,
+};
 use crate::strategies::strategies;
 use crate::stream::{Filter, Limit, Project};
 use crate::topn::TopN;
@@ -240,6 +242,7 @@ fn build_measured_with_sink<'a>(
         done: Vec::new(),
         drivers: Vec::new(),
         pruning: Vec::new(),
+        pushing: None,
         sideways: None,
         top_counts: Vec::new(),
         held: Vec::new(),
@@ -890,6 +893,16 @@ struct Building<'a, 'b> {
     /// own input, and the scan arm takes them. It is empty every other time it is read, and empty
     /// means hand out every row group, which is what every scan did before pruning existed.
     pruning: Vec<(usize, Op, Bound)>,
+    /// The whole filter, offered to the scan directly below it to apply rather than only to prune
+    /// with.
+    ///
+    /// Travels the same one step down as `pruning` and answers a different question. Pruning is
+    /// always worth handing over, because a test the scan cannot use costs nothing. This is only
+    /// handed over when the scan can apply all of it, since a scan applying some of a filter and no
+    /// filter running above it is rows that should have gone and did not, so the filter arm offers it
+    /// and then reads whether it was taken. Taken is the scan arm leaving `None` here, and that is
+    /// the arm's way of saying the operator above it is not needed.
+    pushing: Option<Pushdown>,
     /// The runtime filter of the join whose driving side is being walked into, for the scan at the
     /// bottom of it.
     ///
@@ -1091,10 +1104,20 @@ impl<'a> Building<'a, '_> {
                     plan.string(schema),
                     plan.string(table),
                 );
-                let tests = std::mem::take(&mut self.pruning);
-                let runtime = self.sideways.take();
-                let scan =
-                    Scan::new(plan, self.catalog.table(&name)?, index, columns, tests, runtime)?;
+                let filters = Filters {
+                    pruning: std::mem::take(&mut self.pruning),
+                    pushed: self.pushing.take(),
+                    sideways: self.sideways.take(),
+                };
+                let scan = Scan::new(
+                    plan,
+                    self.catalog.table(&name)?,
+                    index,
+                    columns,
+                    filters,
+                    self.seams,
+                    self.session,
+                )?;
                 let schema = scan.schema().clone();
                 let counters =
                     self.watch(reference, id, pipeline, "Scan", Some(plan.string(table)));
@@ -1260,6 +1283,18 @@ impl<'a> Building<'a, '_> {
             }
             Node::Filter { input, predicate } => {
                 self.pruning = rudb_opt::bounds::of(plan, input, predicate);
+                // Which filters can go is not decided here, because `EXPLAIN` has to say the same
+                // thing about the same plan and a second copy of the condition is a second chance
+                // to answer it differently.
+                self.pushing = rudb_opt::bounds::into_scan(plan, reference).map(|tests| Pushdown {
+                    node: reference,
+                    predicate,
+                    tests,
+                });
+                // Whether there was an offer at all, held here because afterwards the field says
+                // only whether there is one now. Gone can mean taken or it can mean never made, and
+                // reading the second as the first is this filter deleting itself.
+                let offered = self.pushing.is_some();
                 let below = match count_having_aggregate(plan, input, predicate) {
                     Some((aggregate, call, minimum)) => {
                         let Node::Aggregate { input: under, index, groups, aggregates } =
@@ -1285,6 +1320,15 @@ impl<'a> Building<'a, '_> {
                 // Cleared whether or not the scan arm took them, because a filter over anything
                 // else leaves them sitting there for whatever scan the walk reaches next.
                 self.pruning = Vec::new();
+                // And the offer taken back, for the same reason. An offer that was made and is no
+                // longer there is one the scan below took, which means it is applying this predicate
+                // itself and there is no operator to build here. Anything else and the filter runs
+                // where it always did.
+                let taken = offered && self.pushing.take().is_none();
+                self.pushing = None;
+                if taken {
+                    return Ok(below);
+                }
                 let schema = below.schema.clone();
                 let filter = Filter::new(plan, reference, predicate, &schema, self.seams)?
                     .in_session(self.session);

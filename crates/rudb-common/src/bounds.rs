@@ -19,6 +19,12 @@
 //! no 50 at all. So the caller skips on `true` and reads on `false`, and every case this cannot
 //! decide answers `false`, which costs time and never costs rows.
 //!
+//! [`certain`] is the same shape pointing the other way. It says every row of a stretch passes, or
+//! it says nothing, and it never says a row fails. The caller hands the chunk on untouched on
+//! `true` and runs the comparison on `false`, and again the undecidable cases answer `false` and
+//! cost time rather than rows. Between the two of them a chunk is skipped, waved through, or
+//! compared, which is the three way decision a scan makes before it looks at a single value.
+//!
 //! # What has no bound
 //!
 //! A null answers `None` from [`Bound::of_value`]. A comparison against null is null, so a filter
@@ -427,6 +433,52 @@ pub fn excluded(op: Op, value: &Bound, low: Option<&Bound>, high: Option<&Bound>
     }
 }
 
+/// Whether `column op value` is true for every value between `low` and `high`.
+///
+/// The other half of [`excluded`], and the one that lets a caller skip the comparison rather than
+/// skip the rows. Where `excluded` proves a stretch holds nothing the filter wants, this proves it
+/// holds nothing the filter would throw away, so a chunk it answers `true` for goes past untouched
+/// and the per row work on it is none.
+///
+/// Each arm is the mirror of the one above it. `x < c` is true everywhere when the largest value in
+/// the stretch is below `c`, where `excluded` asked about the smallest, and the same swap holds for
+/// the other three. `x = c` needs both ends to be `c`, which is a stretch holding one distinct value
+/// and the constant being it.
+///
+/// # A bound that is too wide is still sound
+///
+/// This is worth saying because it is not obvious and it is the thing that would be a wrong answer
+/// if it were false. A chunk that arrived dictionary encoded records the ends of the dictionary
+/// rather than the ends of the rows, so the stretch this is asked about can be wider than the rows
+/// really are. Everything in a wider stretch passing means everything in the narrower stretch inside
+/// it passes too, exactly as nothing in a wider stretch matching means nothing in the narrower one
+/// does. So `exact` is a question for `MIN`, `MAX` and `SUM` and not for either of these two.
+///
+/// # Nulls are not this function's to know
+///
+/// `v >= 10` over a null row is unknown rather than true, and a filter keeps the rows where its
+/// predicate is true, so one null anywhere in the stretch means the comparison cannot be skipped
+/// however the values fall. The null count is not here, it is beside the bounds in whatever recorded
+/// them, so the caller is the one that has to ask. `Range::certain` in `rudb-storage` is the caller
+/// that does, and it answers `false` the moment the chunk holds a null.
+#[must_use]
+pub fn certain(op: Op, value: &Bound, low: Option<&Bound>, high: Option<&Bound>) -> bool {
+    match op {
+        // Everything is below `c` when even the largest value is.
+        Op::Less => holds(high, value, &[Ordering::Less]),
+        // Everything is at or below `c` when the largest value is.
+        Op::LessOrEqual => holds(high, value, &[Ordering::Less, Ordering::Equal]),
+        // Everything is above `c` when even the smallest value is.
+        Op::Greater => holds(low, value, &[Ordering::Greater]),
+        // Everything is at or above `c` when the smallest value is.
+        Op::GreaterOrEqual => holds(low, value, &[Ordering::Greater, Ordering::Equal]),
+        // Both ends have to be `c`, which leaves nothing in between that is not.
+        Op::Equal => {
+            holds(low, value, &[Ordering::Equal]) && holds(high, value, &[Ordering::Equal])
+        }
+    }
+}
+
 /// Whether `bound` is present and stands in one of `wanted` to `value`.
 ///
 /// Absent, or ordered against `value` in no direction at all, answers `false`, which is the answer
@@ -598,12 +650,86 @@ fn measured(tests: &[Test], column: usize, low: f64, high: f64) -> Option<Spread
 mod tests {
     use std::cmp::Ordering;
 
-    use super::{Bound, MICROS, Op, Test, excluded, kept};
+    use super::{Bound, MICROS, Op, Test, certain, excluded, kept};
     use crate::{LogicalType, Value};
 
     /// The range 10 to 20, which every test here asks about.
     fn range() -> (Bound, Bound) {
         (Bound::Int(10), Bound::Int(20))
+    }
+
+    #[test]
+    fn a_constant_below_the_range_passes_every_row_of_the_two_ordered_the_other_way() {
+        let (low, high) = range();
+        let five = Bound::Int(5);
+        assert!(certain(Op::Greater, &five, Some(&low), Some(&high)), "10 to 20 is all above 5");
+        assert!(certain(Op::GreaterOrEqual, &five, Some(&low), Some(&high)));
+        assert!(!certain(Op::Less, &five, Some(&low), Some(&high)));
+        assert!(!certain(Op::LessOrEqual, &five, Some(&low), Some(&high)));
+        assert!(!certain(Op::Equal, &five, Some(&low), Some(&high)));
+    }
+
+    #[test]
+    fn a_constant_above_the_range_passes_every_row_of_the_other_two() {
+        let (low, high) = range();
+        let fifty = Bound::Int(50);
+        assert!(certain(Op::Less, &fifty, Some(&low), Some(&high)), "10 to 20 is all below 50");
+        assert!(certain(Op::LessOrEqual, &fifty, Some(&low), Some(&high)));
+        assert!(!certain(Op::Greater, &fifty, Some(&low), Some(&high)));
+        assert!(!certain(Op::GreaterOrEqual, &fifty, Some(&low), Some(&high)));
+    }
+
+    /// The same edges [`a_constant_at_either_end_of_the_range_is_kept`] checks, from the other side.
+    #[test]
+    fn a_constant_at_either_end_of_the_range_passes_only_where_the_end_is_included() {
+        let (low, high) = range();
+        // Every value from 10 to 20 is at or above 10, and not every one of them is above it.
+        assert!(certain(Op::GreaterOrEqual, &Bound::Int(10), Some(&low), Some(&high)));
+        assert!(!certain(Op::Greater, &Bound::Int(10), Some(&low), Some(&high)));
+        assert!(certain(Op::LessOrEqual, &Bound::Int(20), Some(&low), Some(&high)));
+        assert!(!certain(Op::Less, &Bound::Int(20), Some(&low), Some(&high)));
+    }
+
+    /// One distinct value is the only stretch an equality can pass whole.
+    #[test]
+    fn equality_passes_every_row_only_when_both_ends_are_the_constant() {
+        let ten = Bound::Int(10);
+        assert!(certain(Op::Equal, &ten, Some(&ten), Some(&ten)));
+        assert!(!certain(Op::Equal, &ten, Some(&ten), Some(&Bound::Int(20))));
+        assert!(!certain(Op::Equal, &ten, Some(&Bound::Int(5)), Some(&ten)));
+    }
+
+    /// The undecidable cases answer the way that costs a comparison rather than the way that keeps
+    /// rows the filter wanted gone.
+    #[test]
+    fn a_bound_that_says_nothing_passes_nothing() {
+        let (low, high) = range();
+        let nan = Bound::Real(f64::NAN);
+        let text = Bound::Bytes(b"x".to_vec());
+        for op in [Op::Equal, Op::Less, Op::LessOrEqual, Op::Greater, Op::GreaterOrEqual] {
+            assert!(!certain(op, &Bound::Int(5), None, None), "no bounds at all");
+            assert!(!certain(op, &Bound::Real(1.0), Some(&nan), Some(&nan)), "a NaN end");
+            assert!(!certain(op, &text, Some(&low), Some(&high)), "another domain");
+        }
+        assert!(!certain(Op::Less, &Bound::Int(50), Some(&low), None), "no largest value");
+        assert!(!certain(Op::Greater, &Bound::Int(5), None, Some(&high)), "no smallest value");
+    }
+
+    /// The property that makes a dictionary's ends safe to ask, checked rather than only argued.
+    #[test]
+    fn widening_the_ends_never_turns_a_false_into_a_true() {
+        let (low, high) = range();
+        let (wide_low, wide_high) = (Bound::Int(0), Bound::Int(30));
+        for op in [Op::Equal, Op::Less, Op::LessOrEqual, Op::Greater, Op::GreaterOrEqual] {
+            for value in [0, 5, 10, 15, 20, 25, 30].map(Bound::Int) {
+                if certain(op, &value, Some(&wide_low), Some(&wide_high)) {
+                    assert!(
+                        certain(op, &value, Some(&low), Some(&high)),
+                        "{op:?} against {value:?} passes 0 to 30 and not 10 to 20"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

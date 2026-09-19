@@ -110,7 +110,7 @@ impl Stream for Filter {
 /// over the kept rows and wins at every selectivity when there are sixteen. A filter that cannot
 /// find itself in the plan is treated as having one pass above it, which is the answer that makes
 /// the gain function say no.
-fn later_passes(plan: &Plan, filter: NodeRef) -> u32 {
+pub(crate) fn later_passes(plan: &Plan, filter: NodeRef) -> u32 {
     passes_between(plan, plan.root(), filter).unwrap_or(1)
 }
 
