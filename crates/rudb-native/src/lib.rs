@@ -4541,9 +4541,22 @@ fn decode(
             if wide.len() != rows {
                 return Err(invalid("encoded code page holds the wrong number of rows"));
             }
-            wide.into_iter()
-                .map(|code| u32::try_from(code).map_err(|_| invalid("code is not a code")))
-                .collect::<Result<Vec<u32>>>()?
+            // Converted in one pass and checked in the same one, rather than a fallible conversion
+            // per code. A `Result` an element is a short circuit the loop cannot be vectorized past,
+            // and it was costing about twelve instructions a row to narrow a number that already
+            // fits. Every code a file holds is inside a `u32` or the file is corrupt, so the check
+            // belongs once at the end: or the codes together and the answer has a bit set above the
+            // low thirty two, or the sign bit, exactly when one of them did.
+            let mut codes = Vec::with_capacity(wide.len());
+            let mut seen = 0_i64;
+            for &code in &wide {
+                seen |= code;
+                codes.push(code as u32);
+            }
+            if seen < 0 || seen > i64::from(u32::MAX) {
+                return Err(invalid("code is not a code"));
+            }
+            codes
         } else {
             let mut codes = Vec::with_capacity(rows);
             for _ in 0..rows {
