@@ -1616,6 +1616,40 @@ impl NativeText {
         u32::try_from(end).map_err(|_| invalid("global dictionary offset is past the payload"))
     }
 
+    /// Where every value in `first..last` ends inside its payload block, in one pass over the runs.
+    ///
+    /// [`Self::end_within`] answers for one value and pays for it twice over: it shifts a window to
+    /// the bit the value starts at, and the copy that fills that window is a length the compiler does
+    /// not know, so it is a call to `memcpy` rather than a load. A sweep asked for two of those per
+    /// value, one for the end and one for the start that is the end before it, and on the ClickBench
+    /// `URL` dictionary of eighteen million that was most of the half second a `LIKE` over it took.
+    ///
+    /// [`bitpack::unpack_tail`] walks the run instead, which makes the window a fixed sixteen bytes
+    /// and so an unaligned load, and reads the bit position off a counter. A run is five hundred and
+    /// twelve values and a block is two of them, so a block of a thousand and twenty four values
+    /// costs two calls here and nothing per value.
+    fn ends_within(&self, first: usize, last: usize) -> Result<Vec<u64>> {
+        let mut ends = Vec::with_capacity(last.saturating_sub(first));
+        let mut at = first;
+        while at < last {
+            let run = at / TEXT_OFFSET_RUN;
+            let stop = ((run + 1) * TEXT_OFFSET_RUN).min(last);
+            let held = self.values.saturating_sub(run * TEXT_OFFSET_RUN).min(TEXT_OFFSET_RUN);
+            let bytes = self
+                .offsets
+                .get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)
+                .ok_or_else(|| invalid("global dictionary offsets are short"))?;
+            let run_ends = bitpack::unpack_tail(bytes, self.offset_bits, held)
+                .map_err(|_| invalid("global dictionary offsets are short"))?;
+            let within = run_ends
+                .get(at % TEXT_OFFSET_RUN..stop - run * TEXT_OFFSET_RUN)
+                .ok_or_else(|| invalid("global dictionary offsets are short"))?;
+            ends.extend_from_slice(within);
+            at = stop;
+        }
+        Ok(ends)
+    }
+
     /// Where the value at `index` starts inside its payload block, which is where the value before
     /// it ended unless it is the first of the block.
     fn start_within(&self, index: usize) -> Result<u32> {
@@ -1816,12 +1850,21 @@ impl TextSource for NativeText {
                 &decoded
             }
         };
-        for index in first..last {
-            let (start, end) = self.span_within(index)?;
-            let value = bytes
-                .get(start as usize..end as usize)
+        let ends = self.ends_within(first, last)?;
+        if ends.len() != last - first {
+            return Err(invalid("global dictionary offsets are short"));
+        }
+        let mut start = u64::from(self.start_within(first)?);
+        // row at a time: the caller is handed one value after another, and what it does with one is
+        // its own business, so there is no shape here for anything but a walk.
+        for (index, &end) in (first..last).zip(&ends) {
+            let value = usize::try_from(start)
+                .ok()
+                .zip(usize::try_from(end).ok())
+                .and_then(|(from, to)| bytes.get(from..to))
                 .ok_or_else(|| invalid("global dictionary value is past its block"))?;
             body(index, value)?;
+            start = end;
         }
         Ok(last)
     }
@@ -6191,6 +6234,64 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a sweep answers what a point read answers");
         assert_eq!(dictionary.footprint(), after, "a point read of a kept block decodes nothing");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A sweep over a block whose second run of offsets is short reads the same values as a point
+    /// read does.
+    ///
+    /// The sweep decodes the offsets of a whole run at a time rather than a value at a time, and a
+    /// run holds half a block, so the count it asks for is the run length everywhere but at the end
+    /// of the dictionary. Two thousand five hundred values, which is what the test above writes,
+    /// never puts a short run second in its block: the last block there begins on a run boundary and
+    /// holds one run. Two thousand eight hundred does, so the last block is a whole run of five
+    /// hundred and twelve followed by two hundred and forty, and an off by one in either the count
+    /// asked for or the slice taken out of the answer shows up as a wrong value or a refusal.
+    #[test]
+    fn a_sweep_over_a_block_with_a_short_second_run_reads_what_a_point_read_reads() {
+        let path = path("dictionary-sweep-short-run");
+        let spellings = (0..2_800)
+            .map(|index| Value::Varchar(format!("value {index:08} {}", "x".repeat(index % 40))))
+            .collect::<Vec<_>>();
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in spellings.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("stripe written");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        assert_eq!(dictionary.len(), spellings.len(), "every value is distinct");
+        let last = dictionary.len() % TEXT_PAYLOAD_VALUES;
+        assert!(last > TEXT_OFFSET_RUN, "the last block has to reach into a second run of offsets");
+        assert!(last < TEXT_PAYLOAD_VALUES, "and that second run has to be short of a whole one");
+
+        let mut swept: Vec<Vec<u8>> = Vec::new();
+        let mut at = 0;
+        while at < dictionary.len() {
+            let stopped = dictionary
+                .sweep_text(at, dictionary.len(), &mut |index: usize, text: &[u8]| {
+                    assert_eq!(index, swept.len(), "a sweep hands its values over in order");
+                    swept.push(text.to_vec());
+                    Ok(())
+                })
+                .expect("a sweep reads");
+            assert!(stopped > at, "a sweep moves");
+            at = stopped;
+        }
+        let read = (0..dictionary.len())
+            .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(swept, read, "a sweep answers what a point read answers");
         fs::remove_file(path).expect("remove scratch file");
     }
 
