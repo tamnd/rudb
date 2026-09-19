@@ -541,8 +541,49 @@ where
         return None;
     }
 
-    if let (Some(one), Some(other)) = (left.data(), right.data()) {
-        return dispatch(op, len, one, map, other, map, left_valid, right_valid, map);
+    // Where each side keeps its values and how a row of it is reached, which is what turns flat,
+    // dictionary and run length into one branch below rather than nine. See [`Through`].
+    let (one, other) = (through(left), through(right));
+
+    if let (Some(one), Some(other)) = (&one, &other) {
+        return match (one, other) {
+            (Through::Direct(a), Through::Direct(b)) => {
+                dispatch(op, len, a, map, b, map, left_valid, right_valid, map)
+            }
+            (Through::Coded(codes, a), Through::Direct(b)) => dispatch(
+                op,
+                len,
+                a,
+                |slot| codes[map(slot)] as usize,
+                b,
+                map,
+                left_valid,
+                right_valid,
+                map,
+            ),
+            (Through::Direct(a), Through::Coded(codes, b)) => dispatch(
+                op,
+                len,
+                a,
+                map,
+                b,
+                |slot| codes[map(slot)] as usize,
+                left_valid,
+                right_valid,
+                map,
+            ),
+            (Through::Coded(left_codes, a), Through::Coded(right_codes, b)) => dispatch(
+                op,
+                len,
+                a,
+                |slot| left_codes[map(slot)] as usize,
+                b,
+                |slot| right_codes[map(slot)] as usize,
+                left_valid,
+                right_valid,
+                map,
+            ),
+        };
     }
     // A bit packed column against a literal, which is the pair the form was added for. The literal
     // is turned into a code once and then the loop compares codes, so nothing is unpacked at all,
@@ -559,16 +600,46 @@ where
             return Some(packed_against(op.swapped(), &packed, wanted, len, map));
         }
     }
-    if let (Some(one), Some(value)) = (left.data(), right.constant_value()) {
+    if let (Some(one), Some(value)) = (&one, right.constant_value()) {
         let column = readied(held, left.logical_type(), value)?;
         let other = column.data()?;
-        return dispatch(op, len, one, map, other, first, left_valid, right_valid, map);
+        return match one {
+            Through::Direct(a) => {
+                dispatch(op, len, a, map, other, first, left_valid, right_valid, map)
+            }
+            Through::Coded(codes, a) => dispatch(
+                op,
+                len,
+                a,
+                |slot| codes[map(slot)] as usize,
+                other,
+                first,
+                left_valid,
+                right_valid,
+                map,
+            ),
+        };
     }
-    if let (Some(value), Some(other)) = (left.constant_value(), right.data()) {
+    if let (Some(value), Some(other)) = (left.constant_value(), &other) {
         // The same loop with the comparison turned around, rather than a second loop.
         let column = readied(held, right.logical_type(), value)?;
         let one = column.data()?;
-        return dispatch(op.swapped(), len, other, map, one, first, right_valid, left_valid, map);
+        return match other {
+            Through::Direct(b) => {
+                dispatch(op.swapped(), len, b, map, one, first, right_valid, left_valid, map)
+            }
+            Through::Coded(codes, b) => dispatch(
+                op.swapped(),
+                len,
+                b,
+                |slot| codes[map(slot)] as usize,
+                one,
+                first,
+                right_valid,
+                left_valid,
+                map,
+            ),
+        };
     }
     // A compressed column against a literal, tested in the code space the column is already in.
     // Only equality, because a symbol code says nothing about where its symbol sorts, so an ordering
@@ -756,6 +827,40 @@ where
         answers.push(test(packed.code(map(row)), code));
     }
     answers
+}
+
+/// Where a side keeps its values, for the forms that reach them through a run of them.
+///
+/// A flat vector holds its values itself and row `n` is at position `n`. A dictionary holds them
+/// somewhere else and a code per row, so row `n` is at position `codes[n]` of that. A run length
+/// vector is the same shape with the run index standing in for the code, which is why both come
+/// from `Vector::positions` rather than from an accessor per form: from here there is no difference
+/// between them and writing two branches would only be two chances to write one of them wrong.
+///
+/// The point of naming it is that the loop underneath does not change. A comparison of two
+/// dictionary columns is the flat loop with a different index mapping, so it costs one extra load
+/// per row per coded side against a path that was allocating a `Value` per row and calling the
+/// generic comparison on it. On TPC-H that path was `l_commitdate < l_receiptdate`, two dictionary
+/// encoded date columns of six million rows, which is q4, q12 and q21.
+enum Through<'a> {
+    /// The values are this vector's own and row `n` is at position `n`.
+    Direct(&'a Data),
+    /// The values are somewhere else and row `n` is at the position this run names for it.
+    Coded(Cow<'a, [u32]>, &'a Data),
+}
+
+/// How `vector` reaches its values, or `None` for a form that does not reach them through a run.
+///
+/// A constant, a bit packed column and a compressed one all answer `None` here, and each has a
+/// branch of its own further down [`specialized`] that does something better than reading a run
+/// would. A dictionary whose values are themselves not flat answers `None` too, because then there
+/// is no run to index and the only thing left is the row at a time path.
+fn through(vector: &Vector) -> Option<Through<'_>> {
+    if let Some(data) = vector.data() {
+        return Some(Through::Direct(data));
+    }
+    let (codes, values) = vector.positions()?;
+    Some(Through::Coded(codes, values.data()?))
 }
 
 /// One loop per physical layout, generated rather than written out.
@@ -1354,7 +1459,16 @@ mod tests {
                 let ends: Vec<u32> = (1..=left.len())
                     .map(|run| ((run * len) / left.len()).max(run) as u32)
                     .collect();
-                let runs = Vector::runs(ends, left.clone()).expect("one value for each run");
+                let runs =
+                    Vector::runs(ends.clone(), left.clone()).expect("one value for each run");
+                // A second pair over the other column's values, so that a coded side against a
+                // coded side is two different runs of values reached through two different sets of
+                // codes rather than one set read twice.
+                let other_codes: Vec<u32> =
+                    (0..len).map(|_| rng.below(right.len() as u64) as u32).collect();
+                let other_dictionary =
+                    Vector::dictionary(other_codes, right.clone()).expect("codes are in range");
+                let other_runs = Vector::runs(ends, right.clone()).expect("one value for each run");
 
                 for op in EVERY {
                     agrees(op, &left, &right);
@@ -1376,6 +1490,15 @@ mod tests {
                     agrees(op, &constant, &runs);
                     agrees(op, &runs, &right);
                     agrees(op, &right, &runs);
+                    // Both sides reached through codes, which is the pair TPC-H actually hits:
+                    // `l_commitdate < l_receiptdate` is two dictionary encoded columns of one
+                    // table. A null here can be in four places at once, the two dictionaries' own
+                    // masks and the two value vectors, and the answer has to be null if it is in
+                    // any of them.
+                    agrees(op, &dictionary, &other_dictionary);
+                    agrees(op, &runs, &other_runs);
+                    agrees(op, &dictionary, &other_runs);
+                    agrees(op, &runs, &other_dictionary);
                 }
             }
         }
@@ -1647,6 +1770,42 @@ mod tests {
             .expect("refines");
         assert_eq!(kept.indices(), [2]);
         assert_eq!(fallback::count(Kernel::Compare, Form::Dictionary, Form::Constant), before);
+    }
+
+    /// Two dictionary columns compared with each other, which is the pair the TPC-H suite spends
+    /// the most row at a time calls on and had no loop until it was counted.
+    ///
+    /// `l_commitdate < l_receiptdate` in q4, q12 and q21 is two dictionary encoded date columns of
+    /// six million rows each, and every one of those rows was going through the generic comparison
+    /// on a pair of freshly allocated `Value`s. The shape here is the same one: different codes,
+    /// different values, and a null reached through the codes rather than sitting at the row.
+    #[test]
+    fn two_dictionary_columns_compared_with_each_other_do_not_fall_back() {
+        let before = fallback::count(Kernel::Compare, Form::Dictionary, Form::Dictionary);
+        let dates = |values: &[Value]| {
+            Vector::from_values(LogicalType::Date, values).expect("a flat date column")
+        };
+        // 10, 20, 10, 30 against 15, null, 5, 15.
+        let committed = Vector::dictionary(
+            vec![0, 1, 0, 2],
+            dates(&[Value::Date(10), Value::Date(20), Value::Date(30)]),
+        )
+        .expect("codes are in range");
+        let received = Vector::dictionary(
+            vec![0, 1, 2, 0],
+            dates(&[Value::Date(15), Value::Null, Value::Date(5)]),
+        )
+        .expect("codes are in range");
+        let result = compare(Comparison::Less, &committed, &received).expect("compares");
+        assert_eq!(result.value_at(0), Value::Boolean(true), "10 < 15");
+        assert_eq!(result.value_at(1), Value::Null, "20 against a null");
+        assert_eq!(result.value_at(2), Value::Boolean(false), "10 against 5");
+        assert_eq!(result.value_at(3), Value::Boolean(false), "30 against 15");
+        // The selection entry point, which is the one the filter reaches and the one q4 is made of.
+        let kept = refine(Comparison::Less, &committed, &received, &Selection::identity(4))
+            .expect("refines");
+        assert_eq!(kept.indices(), [0]);
+        assert_eq!(fallback::count(Kernel::Compare, Form::Dictionary, Form::Dictionary), before);
     }
 
     /// A form pair with no loop is answered correctly and counted, which is the whole contract of
