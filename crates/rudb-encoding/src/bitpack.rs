@@ -566,6 +566,7 @@ pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>>
 /// # Errors
 ///
 /// If `width` exceeds 64, or if the value would run past the end of `input`.
+#[inline]
 pub fn tail_at(input: &[u8], width: usize, index: usize) -> Result<u64> {
     if width > 64 {
         return Err(Error::internal(format!("a width of {width} is past what a u64 holds")));
@@ -594,6 +595,36 @@ pub fn tail_at(input: &[u8], width: usize, index: usize) -> Result<u64> {
     window[..=last - first].copy_from_slice(&input[first..=last]);
     let word = u128::from_le_bytes(window);
     Ok(((word >> (start % 8)) & u128::from(low_mask(width))) as u64)
+}
+
+/// Two neighbouring values of a run, read from one load where the pair fits inside it.
+///
+/// `index` is the later of the two and the answer is the pair at `index - 1` and `index`. A text
+/// column asks for exactly this once per string it hands out, because a value starts where the one
+/// before it ended. Two calls to [`tail_at`] read the same eight bytes twice and do the bounds
+/// arithmetic twice, where a pair of seventeen bit offsets, which is what a block of text carries,
+/// both lie inside one load.
+///
+/// # Errors
+///
+/// If `index` is zero, if `width` exceeds 64, or if the pair would run past the end of `input`.
+#[inline]
+pub fn tail_pair(input: &[u8], width: usize, index: usize) -> Result<(u64, u64)> {
+    let Some(before) = index.checked_sub(1) else {
+        return Err(Error::internal("a tail pair has nothing before its first value"));
+    };
+    if width == 0 {
+        return Ok((0, 0));
+    }
+    let start = before * width;
+    let shift = start % 8;
+    let first = start / 8;
+    if shift + 2 * width <= u64::BITS as usize && first + 8 <= input.len() {
+        let word = word_at(input, first) >> shift;
+        let mask = low_mask(width);
+        return Ok((word & mask, (word >> width) & mask));
+    }
+    Ok((tail_at(input, width, before)?, tail_at(input, width, index)?))
 }
 
 /// The bytes a single tail value can span, which is a shift of at most seven plus a width of at
@@ -953,6 +984,30 @@ mod tests {
                     "{count} at {width}"
                 );
             }
+        }
+    }
+
+    /// The pair read agrees with two single reads, at every width and every position.
+    ///
+    /// The pair has its own arithmetic for the case where both values fit one load, so the thing to
+    /// check is that it falls back to the same answer everywhere that does not hold, which is every
+    /// width past thirty two and every value near the end of the buffer.
+    #[test]
+    fn a_pair_of_tail_values_reads_the_same_as_the_two_of_them_apart() {
+        let mut random = Random::new();
+        for width in 0..=64usize {
+            let count = 37;
+            let values: Vec<u64> = (0..count).map(|_| random.next() & low_mask(width)).collect();
+            let mut bytes = Vec::new();
+            pack_tail(&values, width, &mut bytes).unwrap();
+            for index in 1..count {
+                assert_eq!(
+                    tail_pair(&bytes, width, index).unwrap(),
+                    (values[index - 1], values[index]),
+                    "{index} at {width}"
+                );
+            }
+            assert!(tail_pair(&bytes, width, 0).is_err(), "nothing before the first at {width}");
         }
     }
 
