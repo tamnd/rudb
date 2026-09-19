@@ -9,7 +9,7 @@ use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Va
 use rudb_metrics::{Document, Report, Span};
 
 use rudb_parse::ast::Ast;
-use rudb_pipeline::{Morsel, Pool, Progress, Sink, keep_pages};
+use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_vector::{Chunk, Form, Vector};
 
 use crate::config::Config;
@@ -514,7 +514,7 @@ impl Sink for NativeSink {
         self.hand_over(&mut local)
     }
 
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         let writer = self
             .writer
             .lock()

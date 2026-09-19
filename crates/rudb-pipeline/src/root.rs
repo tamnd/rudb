@@ -27,6 +27,7 @@ use rudb_common::{Error, Result};
 use rudb_vector::Chunk;
 
 use crate::morsel::Morsel;
+use crate::pool::Lease;
 use crate::progress::{Blocked, BufferId, Progress};
 use crate::traits::Sink;
 
@@ -242,7 +243,7 @@ impl Sink for RootSink {
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         {
             // Every instance has combined by now, so nothing is being read and everything still
             // held is in order. Doing it here as well as in `combine` is what makes a root with no

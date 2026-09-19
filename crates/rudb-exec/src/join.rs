@@ -88,7 +88,7 @@ use rudb_common::{
     Cancel, Error, LogicalType, Memory, Reservation, Result, Session, SessionTimeZone, Value,
 };
 use rudb_kernels::{Connective, combine, is_true};
-use rudb_pipeline::{Progress, Sink, Stream};
+use rudb_pipeline::{Lease, Progress, Sink, Stream};
 use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Plan, Slice};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
@@ -577,7 +577,7 @@ impl Sink for Join<'_> {
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         let left_rows = std::mem::take(&mut *self.left.lock().map_err(poisoned)?);
         let right_chunks = held(&self.right)?;
         let mut out = self.joined(&left_rows, &right_chunks)?;
@@ -1668,7 +1668,7 @@ mod tests {
             keep.sink(&chunk(values), &mut local).expect("the right rows");
         }
         keep.combine(local).expect("the one instance");
-        keep.finalize().expect("the chunks");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
         (keep, chunks)
     }
 
@@ -1679,7 +1679,7 @@ mod tests {
             join.sink(&chunk(left), &mut local).expect("the left rows");
         }
         join.combine(local).expect("the one instance");
-        join.finalize().expect("the answer");
+        join.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
     }
 
     fn rows(out: &Buffered, width: usize) -> Vec<Vec<Value>> {
@@ -1866,7 +1866,7 @@ mod tests {
         keep.sink(&chunk(first), &mut local).expect("the first right chunk");
         keep.sink(&chunk(second), &mut local).expect("the second");
         keep.combine(local).expect("the one instance");
-        keep.finalize().expect("the chunks");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
         (keep, out)
     }
 
@@ -1896,7 +1896,7 @@ mod tests {
         let memory = Memory::unlimited();
         let (keep, right) = Keep::new(&memory);
         keep.combine(keep.local()).expect("an instance that saw nothing");
-        keep.finalize().expect("no chunks");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("no chunks");
         let cross = CrossProduct::new(&schema("a", 0), &schema("b", 1), right);
 
         let mut local = cross.local();
@@ -2053,7 +2053,7 @@ mod tests {
         let mut local = keep.local();
         keep.sink(&pair_chunk(&[(2, 5), (2, 50), (3, 5)]), &mut local).expect("the gathered rows");
         keep.combine(local).expect("the one instance");
-        keep.finalize().expect("the chunks");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
         let probe = Probe::new(
             &plan,
             &left,
@@ -2098,7 +2098,7 @@ mod tests {
         let mut local = keep.local();
         keep.sink(&pair_chunk(&[(2, 50)]), &mut local).expect("the gathered rows");
         keep.combine(local).expect("the one instance");
-        keep.finalize().expect("the chunks");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
         let probe = Probe::new(
             &plan,
             &left,
@@ -2128,7 +2128,7 @@ mod tests {
         let (keep, rows) = Keep::new(&memory);
         let local = keep.local();
         keep.combine(local).expect("the one instance");
-        keep.finalize().expect("the chunks");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
         let probe = Probe::new(
             plan,
             left,
@@ -2239,7 +2239,7 @@ mod tests {
         let mut local = keep.local();
         keep.sink(&pair_chunk(&[(2, 50), (4, 1)]), &mut local).expect("the gathered rows");
         keep.combine(local).expect("the one instance");
-        keep.finalize().expect("the chunks");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
         let (join, out) = Join::new(
             &plan,
             &left,
@@ -2253,7 +2253,7 @@ mod tests {
         let mut local = join.local();
         join.sink(&pair_chunk(&[(2, 10)]), &mut local).expect("the driving rows");
         join.combine(local).expect("the one instance");
-        join.finalize().expect("the answer");
+        join.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         assert_eq!(
             rows(&out, 4),
@@ -2282,7 +2282,7 @@ mod tests {
         let mut local = keep.local();
         keep.sink(&wide_chunk(&[2, 3, 4]), &mut local).expect("the gathered rows");
         keep.combine(local).expect("the one instance");
-        keep.finalize().expect("the chunks");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
         let probe = Probe::new(
             &plan,
             &left,

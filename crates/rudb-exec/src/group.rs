@@ -26,10 +26,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use rudb_common::{
-    Error, Field, LogicalType, Memory, Reservation, Result, Session, Spent, Stage, Value, stage,
+    Error, Field, LogicalType, Memory, Reservation, Result, Session, Stage, Value, stage,
 };
 use rudb_kernels::{Accumulator, NOWHERE, is_true, update_scattered};
-use rudb_pipeline::{Progress, Sink};
+use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, Form, VECTOR_SIZE, Validity, Vector};
 
@@ -37,6 +37,7 @@ use crate::buffer::Buffered;
 use crate::group_distinct;
 use crate::group_mixed;
 use crate::key::{BigIntSet, Key, RowSet, mix, spread};
+use crate::pairs::together;
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
@@ -3573,9 +3574,10 @@ impl Sink for Aggregate<'_> {
     /// which is an empty answer and not an error. An ungrouped aggregate never gets there, because
     /// its one group is made when the instance is, and an instance is made whether or not a row
     /// arrives.
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
         if let Some(mixed) = self.mixed.get() {
             let chunks = mixed.finish(
+                threads,
                 self.top_counts.expect("a mixed exchange has a TopN bound"),
                 &self.memory,
             )?;
@@ -3583,6 +3585,7 @@ impl Sink for Aggregate<'_> {
         }
         if let Some(Some(distinct)) = self.grouped_distinct.get() {
             let chunks = distinct.finish(
+                threads,
                 self.top_counts.expect("a grouped distinct exchange has a TopN bound"),
                 &self.memory,
             )?;
@@ -3602,46 +3605,17 @@ impl Sink for Aggregate<'_> {
                         .map_err(poisoned)
                 })
                 .sum::<Result<usize>>()?;
-            let degree = input.div_ceil(65_536).clamp(1, RADIX_PARTITIONS);
-            let parts = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(degree - 1);
-                for _ in 1..degree {
-                    handles.push(scope.spawn(|| {
-                        finish_encoded_count(
-                            &next,
-                            &slots,
-                            encoded,
-                            self.top_counts.expect("an encoded exchange has a TopN bound"),
-                            &self.memory,
-                        );
-                        stage::here()
-                    }));
-                }
-                finish_encoded_count(
-                    &next,
-                    &slots,
-                    encoded,
-                    self.top_counts.expect("an encoded exchange has a TopN bound"),
-                    &self.memory,
-                );
-                let mut theirs = Spent::none();
-                for handle in handles {
-                    let spent = handle
-                        .join()
-                        .map_err(|_| Error::internal("an encoded radix worker panicked"))?;
-                    theirs.add(spent);
-                }
-                stage::gained(theirs);
-                let mut parts = Vec::with_capacity(slots.len());
-                for (at, slot) in slots.iter().enumerate() {
-                    parts.push(slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
-                        Err(Error::internal(format!(
-                            "nothing finished encoded radix partition {at}"
-                        )))
-                    })?);
-                }
-                Ok::<_, Error>(parts)
+            let degree = degree_for(input, threads);
+            let bound = self.top_counts.expect("an encoded exchange has a TopN bound");
+            together(threads, degree, &|| {
+                finish_encoded_count(&next, &slots, encoded, bound, &self.memory);
             })?;
+            let mut parts = Vec::with_capacity(slots.len());
+            for (at, slot) in slots.iter().enumerate() {
+                parts.push(slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
+                    Err(Error::internal(format!("nothing finished encoded radix partition {at}")))
+                })?);
+            }
             let mut chunks = Vec::new();
             let mut held = encoded.held.lock().map_err(poisoned)?;
             held.clear();
@@ -3666,37 +3640,19 @@ impl Sink for Aggregate<'_> {
                         .map_err(poisoned)
                 })
                 .sum::<Result<usize>>()?;
-            let degree = input.div_ceil(65_536).clamp(1, RADIX_PARTITIONS);
-            let total = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(degree - 1);
-                for _ in 1..degree {
-                    handles.push(scope.spawn(|| {
-                        finish_bigint_distinct(&next, &slots, distinct, &self.memory);
-                        stage::here()
-                    }));
-                }
+            let degree = degree_for(input, threads);
+            together(threads, degree, &|| {
                 finish_bigint_distinct(&next, &slots, distinct, &self.memory);
-                let mut theirs = Spent::none();
-                for handle in handles {
-                    let spent = handle
-                        .join()
-                        .map_err(|_| Error::internal("a distinct radix worker panicked"))?;
-                    theirs.add(spent);
-                }
-                stage::gained(theirs);
-                let mut total = 0_i64;
-                for (at, slot) in slots.iter().enumerate() {
-                    let count = slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
-                        Err(Error::internal(format!(
-                            "nothing finished distinct radix partition {at}"
-                        )))
-                    })?;
-                    total = total
-                        .checked_add(count)
-                        .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
-                }
-                Ok::<_, Error>(total)
             })?;
+            let mut total = 0_i64;
+            for (at, slot) in slots.iter().enumerate() {
+                let count = slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
+                    Err(Error::internal(format!("nothing finished distinct radix partition {at}")))
+                })?;
+                total = total
+                    .checked_add(count)
+                    .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
+            }
             let mut held = distinct.held.lock().map_err(poisoned)?;
             held.clear();
             let values = [vec![Value::BigInt(total)]];
@@ -3711,35 +3667,16 @@ impl Sink for Aggregate<'_> {
             let next = AtomicUsize::new(0);
             let slots: Vec<Mutex<Option<Result<Part>>>> =
                 (0..RADIX_PARTITIONS).map(|_| Mutex::new(None)).collect();
-            let parts = std::thread::scope(|scope| {
-                let next = &next;
-                let slots = &slots;
-                let calls = &self.calls;
-                let memory = &self.memory;
-                let mut handles = Vec::with_capacity(RADIX_PARTITIONS - 1);
-                for _ in 1..RADIX_PARTITIONS {
-                    handles.push(scope.spawn(move || {
-                        finish_fixed(next, slots, fixed, bound, calls, memory);
-                        stage::here()
-                    }));
-                }
-                finish_fixed(next, slots, fixed, bound, calls, memory);
-                let mut theirs = Spent::none();
-                for handle in handles {
-                    let spent = handle
-                        .join()
-                        .map_err(|_| Error::internal("a fixed radix worker panicked"))?;
-                    theirs.add(spent);
-                }
-                stage::gained(theirs);
-                let mut parts = Vec::with_capacity(slots.len());
-                for (at, slot) in slots.iter().enumerate() {
-                    parts.push(slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
-                        Err(Error::internal(format!("nothing finished fixed radix partition {at}")))
-                    })?);
-                }
-                Ok::<_, Error>(parts)
+            let degree = threads.degree().clamp(1, RADIX_PARTITIONS);
+            together(threads, degree, &|| {
+                finish_fixed(&next, &slots, fixed, bound, &self.calls, &self.memory);
             })?;
+            let mut parts = Vec::with_capacity(slots.len());
+            for (at, slot) in slots.iter().enumerate() {
+                parts.push(slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
+                    Err(Error::internal(format!("nothing finished fixed radix partition {at}")))
+                })?);
+            }
             let mut chunks = Vec::new();
             let mut held = fixed.held.lock().map_err(poisoned)?;
             held.clear();
@@ -3755,31 +3692,34 @@ impl Sink for Aggregate<'_> {
             working.grow(width_of(dense.dictionary.len() * size_of::<i64>()))?;
             let types = self.schema.types();
             let group_types = &types[..self.groups.len()];
-            let chunks = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(DENSE_PARTITIONS);
-                for (number, partition) in dense.partitions.iter().enumerate() {
-                    let dictionary = Arc::clone(&dense.dictionary);
-                    handles.push(scope.spawn(move || {
-                        let mut partition = partition.lock().map_err(poisoned)?;
+            let next = AtomicUsize::new(0);
+            let slots: Vec<Mutex<Option<Result<Vec<Chunk>>>>> =
+                (0..dense.partitions.len()).map(|_| Mutex::new(None)).collect();
+            let degree = threads.degree().clamp(1, slots.len().max(1));
+            together(threads, degree, &|| {
+                loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(partition) = dense.partitions.get(at) else { return };
+                    let done = partition.lock().map_err(poisoned).and_then(|mut held| {
                         dense_partition(
-                            &dictionary,
-                            number,
-                            &mut partition,
+                            &dense.dictionary,
+                            at,
+                            &mut held,
                             &self.constants,
                             group_types,
                         )
-                    }));
+                    });
+                    if let Ok(mut slot) = slots[at].lock() {
+                        *slot = Some(done);
+                    }
                 }
-                let mut chunks = Vec::new();
-                for handle in handles {
-                    chunks.extend(
-                        handle
-                            .join()
-                            .map_err(|_| Error::internal("a dense count worker panicked"))??,
-                    );
-                }
-                Ok::<_, Error>(chunks)
             })?;
+            let mut chunks = Vec::new();
+            for (at, slot) in slots.iter().enumerate() {
+                chunks.extend(slot.lock().map_err(poisoned)?.take().unwrap_or_else(|| {
+                    Err(Error::internal(format!("nothing finished dense partition {at}")))
+                })?);
+            }
             let mut output = self.memory.reservation();
             let shared = dense.dictionary.footprint();
             let output_bytes = chunks
@@ -3796,8 +3736,9 @@ impl Sink for Aggregate<'_> {
             return self.out.fill(chunks);
         }
         let mut built = self.built.lock().map_err(poisoned)?;
-        let degree = built.instances.clamp(1, self.merged.len());
-        let closed = if degree > 1 { self.close_together(degree)? } else { self.close_in_turn()? };
+        let degree = built.instances.min(threads.degree()).clamp(1, self.merged.len());
+        let closed =
+            if degree > 1 { self.close_together(threads, degree)? } else { self.close_in_turn()? };
         for part in closed {
             let Part { mut chunks, held } = part?;
             built.chunks.append(&mut chunks);
@@ -4349,6 +4290,17 @@ struct Part {
     held: Reservation,
 }
 
+/// How many threads to finish `input` rows of radix partitions on.
+///
+/// Two bounds and both of them matter. There is no point starting a thread for every partition when
+/// there are sixty five thousand rows between all of them, because the wake and the join cost more
+/// than the rows do, and that is what the divisor says. And there is no point asking for more
+/// threads than the query was given, which is what the lease says and what this used to ignore: a
+/// session that set the thread count to one still finished an aggregate on sixteen.
+fn degree_for(input: usize, threads: &Lease<'_>) -> usize {
+    input.div_ceil(65_536).clamp(1, RADIX_PARTITIONS).min(threads.degree())
+}
+
 impl Aggregate<'_> {
     /// Every partition finished on this thread, which is what one instance means.
     fn close_in_turn(&self) -> Result<Vec<Result<Part>>> {
@@ -4357,9 +4309,15 @@ impl Aggregate<'_> {
 
     /// Every partition finished across `degree` threads, each thread taking whichever is next.
     ///
-    /// The threads are scoped and started here rather than taken from the driver's, because by the
-    /// time a sink finalises the driver has already joined every instance and there is nothing else
-    /// running. It is the same mechanism the parallel driver uses for the instances themselves.
+    /// The threads are the driver's own, borrowed a second time. By the time a sink finalises the
+    /// driver has already joined every instance, so the threads its lease covers are parked with
+    /// nothing to do, and the close is the largest single thing left in several ClickBench queries.
+    /// Starting fresh ones instead cost a thread creation apiece, which is about sixteen
+    /// microseconds on the bench machine and a quarter of a millisecond for sixteen of them, paid
+    /// before the first partition is looked at. That is what the pool exists to stop paying.
+    ///
+    /// The lease is asked for no more threads than there are partitions, because a thread handed
+    /// none of them is a wake and a join spent to find out there is nothing to do.
     ///
     /// The results go into a slot apiece and are read back in partition order, so which thread got
     /// which partition and which finished first change nothing about the answer. That is what makes
@@ -4367,40 +4325,17 @@ impl Aggregate<'_> {
     /// that panics leaves its slot empty, and an empty slot is reported rather than silently
     /// dropping a partition.
     ///
-    /// Each of these threads hands its stage clock back on the way out and the thread that started
-    /// them adds the readings to its own, so that merging and emitting are charged to the aggregate
-    /// that did them. Without it they are charged to nobody: the instrumentation shim reads the
-    /// clock on the thread that called `finalize`, these are not that thread, and they are not pool
-    /// workers either, so their CPU misses the worker total as well. On ClickBench at a million rows
-    /// that was a third of a `GROUP BY URL` sitting in wall time with no counter anywhere to say
-    /// what it was.
-    fn close_together(&self, degree: usize) -> Result<Vec<Result<Part>>> {
+    /// Each of these threads hands its stage clock back on the way out and the thread that asked
+    /// adds the readings to its own, so that merging and emitting are charged to the aggregate that
+    /// did them. Without it they are charged to nobody: the instrumentation shim reads the clock on
+    /// the thread that called `finalize` and these are not that thread. On ClickBench at a million
+    /// rows that was a third of a `GROUP BY URL` sitting in wall time with no counter anywhere to
+    /// say what it was.
+    fn close_together(&self, threads: &Lease<'_>, degree: usize) -> Result<Vec<Result<Part>>> {
         let next = AtomicUsize::new(0);
         let slots: Vec<Mutex<Option<Result<Part>>>> =
             (0..self.merged.len()).map(|_| Mutex::new(None)).collect();
-        let mut theirs = Spent::none();
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(degree - 1);
-            for _ in 1..degree {
-                handles.push(scope.spawn(|| {
-                    self.closing(&next, &slots);
-                    // The whole of this thread's reading rather than a difference, because the
-                    // thread was made a line ago and has spent nothing else.
-                    stage::here()
-                }));
-            }
-            // The thread that asked finishes partitions too rather than waiting on the ones it
-            // started, for the reason the parallel driver gives for doing the same.
-            self.closing(&next, &slots);
-            for handle in handles {
-                // A thread that panicked closed no partition, which the empty slot reports below.
-                // It also has no reading to add, and losing it matters less than the panic does.
-                if let Ok(spent) = handle.join() {
-                    theirs.add(spent);
-                }
-            }
-        });
-        stage::gained(theirs);
+        together(threads, degree, &|| self.closing(&next, &slots))?;
         let mut closed = Vec::with_capacity(slots.len());
         for (at, slot) in slots.into_iter().enumerate() {
             closed.push(slot.into_inner().map_err(poisoned)?.unwrap_or_else(|| {
@@ -4923,7 +4858,7 @@ impl Sink for Distinct {
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         let mut global = self.global.lock().map_err(poisoned)?;
         let kept = std::mem::take(&mut global.kept);
         // The table is not needed to build the chunks and the rows are, so it goes first and its
@@ -4987,7 +4922,7 @@ mod tests {
         let mut local = distinct.local();
         distinct.sink(&chunk(&[1, 2, 1, 3, 2]), &mut local).expect("five rows");
         distinct.combine(local).expect("the one instance");
-        distinct.finalize().expect("the answer");
+        distinct.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         assert_eq!(column(&out), [Value::Integer(1), Value::Integer(2), Value::Integer(3)]);
     }
@@ -5003,7 +4938,7 @@ mod tests {
         distinct.sink(&chunk(&[2, 3]), &mut right).expect("two rows");
         distinct.combine(left).expect("the first instance");
         distinct.combine(right).expect("the second instance");
-        distinct.finalize().expect("the answer");
+        distinct.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         assert_eq!(column(&out), [Value::Integer(1), Value::Integer(2), Value::Integer(3)]);
     }
@@ -5019,7 +4954,7 @@ mod tests {
                 .expect("no aggregates to take apart");
 
         aggregate.combine(aggregate.local()).expect("the one instance");
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         assert_eq!(out.at(0).expect("readable").expect("one chunk").len(), 1);
     }
@@ -5086,7 +5021,7 @@ mod tests {
             .expect("the right values");
         aggregate.combine(left).expect("the left instance");
         aggregate.combine(right).expect("the right instance");
-        aggregate.finalize().expect("the distinct count");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the distinct count");
         assert_eq!(answer(&out), [vec![Value::BigInt(3)]]);
     }
 
@@ -5105,7 +5040,7 @@ mod tests {
             Aggregate::new(&plan, &schema, 1, groups, aggregates, &Memory::unlimited())
                 .expect("a distinct count aggregate");
         aggregate.combine(aggregate.local()).expect("an empty instance");
-        aggregate.finalize().expect("the zero count");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the zero count");
         assert_eq!(answer(&out), [vec![Value::BigInt(0)]]);
     }
 
@@ -5121,7 +5056,7 @@ mod tests {
         aggregate.sink(&chunk(&[2, 3, 2]), &mut right).expect("three rows");
         aggregate.combine(left).expect("the first instance");
         aggregate.combine(right).expect("the second instance");
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         let mut rows = answer(&out);
         rows.sort_by_key(|row| format!("{:?}", row[0]));
@@ -5152,7 +5087,7 @@ mod tests {
         aggregate.sink(&chunk(&[3, 4, 1, 2]), &mut right).expect("the right rows");
         aggregate.combine(left).expect("the left instance");
         aggregate.combine(right).expect("the right instance");
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         let mut rows = answer(&out);
         rows.sort_by_key(|row| format!("{:?}", row[0]));
@@ -5177,7 +5112,7 @@ mod tests {
         aggregate.sink(&chunk(&[2, 3]), &mut right).expect("the right rows");
         aggregate.combine(left).expect("the left instance");
         aggregate.combine(right).expect("the right instance");
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         let mut rows = answer(&out);
         rows.sort_by_key(|row| format!("{:?}", row[0]));
@@ -5215,7 +5150,7 @@ mod tests {
             aggregate.built.lock().expect("readable").partitioning,
             "five thousand groups on two instances is meant to take the partitioned path"
         );
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         let mut seen: Vec<i32> = Vec::new();
         for row in answer(&out) {
@@ -5255,7 +5190,7 @@ mod tests {
             !aggregate.built.lock().expect("readable").partitioning,
             "sixteen partitions of three hundred groups would let the bound through untouched"
         );
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         assert_eq!(
             answer(&out).len(),
@@ -5278,7 +5213,7 @@ mod tests {
         aggregate.sink(&chunk(&[2, 9]), &mut right).expect("two rows");
         aggregate.combine(left).expect("the first instance");
         aggregate.combine(right).expect("the second instance");
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         assert_eq!(
             answer(&out),
@@ -5297,7 +5232,7 @@ mod tests {
         aggregate.combine(aggregate.local()).expect("an instance that saw nothing");
         aggregate.combine(seen).expect("the one that saw something");
         aggregate.combine(aggregate.local()).expect("another that saw nothing");
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         assert_eq!(answer(&out), [vec![Value::Integer(5), Value::BigInt(2)]]);
     }
@@ -5316,7 +5251,7 @@ mod tests {
         aggregate.sink(&chunk(&[3, 4]), &mut right).expect("the same group and another");
         aggregate.combine(left).expect("the first instance");
         aggregate.combine(right).expect("the second instance");
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         let mut rows = answer(&out);
         rows.sort_by_key(|row| format!("{:?}", row[0]));
@@ -5330,7 +5265,7 @@ mod tests {
     fn a_distinct_over_nothing_produces_nothing() {
         let (distinct, out) = distinct();
         distinct.combine(distinct.local()).expect("an instance that saw no chunks");
-        distinct.finalize().expect("the answer");
+        distinct.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         assert_eq!(out.len().expect("readable"), 0);
     }
@@ -5569,7 +5504,7 @@ mod tests {
         aggregate.sink(&input, &mut local).expect("three rows");
         aggregate.combine(local).expect("the one instance");
         assert!(aggregate.encoded_count.get().is_some(), "the compact path was selected");
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
         let mut rows = answer(&out);
         rows.sort_by_key(|row| format!("{row:?}"));
         let mut expected = vec![
@@ -5625,7 +5560,7 @@ mod tests {
         aggregate.sink(&input, &mut local).expect("the chunk");
         aggregate.combine(local).expect("the one instance");
         assert!(aggregate.encoded_count.get().is_some(), "the compact path was selected");
-        aggregate.finalize().expect("the answer");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
         let mut rows = answer(&out);
         rows.sort_by_key(|row| format!("{row:?}"));
         rows

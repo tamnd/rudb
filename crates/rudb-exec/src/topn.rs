@@ -69,7 +69,7 @@ use std::sync::Mutex;
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_kernels::{Comparison, refine};
-use rudb_pipeline::{Progress, Sink};
+use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::{Chunk, Selection, Vector};
 
@@ -293,7 +293,7 @@ impl Sink for TopN {
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         let kept = std::mem::take(&mut *self.rows.lock().map_err(poisoned)?);
         let wanted = kept.into_iter().skip(self.offset).take(self.count);
         let ordered: Vec<Vec<Value>> = wanted.map(|(_, row, _)| row).collect();

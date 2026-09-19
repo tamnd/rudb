@@ -11,6 +11,7 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Stage, Value, stage};
+use rudb_pipeline::Lease;
 use rudb_vector::{Chunk, Vector};
 
 use crate::pairs::{
@@ -200,7 +201,12 @@ impl Exchange {
     /// group's deduplicating to one thread. On the million row ClickBench file one region holds
     /// eighteen percent of the distinct pairs, so one of sixteen partitions did three times the
     /// average share and the other fifteen waited for it.
-    pub(crate) fn finish(&self, bound: usize, memory: &Memory) -> Result<Vec<Chunk>> {
+    pub(crate) fn finish(
+        &self,
+        threads: &Lease<'_>,
+        bound: usize,
+        memory: &Memory,
+    ) -> Result<Vec<Chunk>> {
         let input = self
             .partitions
             .iter()
@@ -213,19 +219,24 @@ impl Exchange {
         // the million row ClickBench file, dropping the ask from sixty five thousand to sixteen took
         // twelve percent off the two queries it moves and left the rest where they were, and asking
         // for less than sixteen thousand bought nothing back.
-        let degree = input.div_ceil(16_384).clamp(1, PARTITIONS);
+        let degree = input.div_ceil(16_384).clamp(1, PARTITIONS).min(threads.degree());
         // Either every split or one of it. A split is a vector per pair partition, so there are as
         // many of them as the two counts multiplied, and a query that is going to finish on one
         // thread should not be paying for a hundred vectors to hand itself its own rows. Anything
         // that is worth a second thread is worth the full spread, because the counting pass is
         // skewed by the grouping column in a way the deduplicating pass no longer is.
         let splits = if degree > 1 { PARTITIONS } else { 1 };
-        let counted =
-            in_parallel(PARTITIONS, degree, "deduplicated the pairs of radix partition", |at| {
+        let counted = in_parallel(
+            threads,
+            PARTITIONS,
+            degree,
+            "deduplicated the pairs of radix partition",
+            |at| {
                 let mut partition = self.partitions[at].lock().map_err(poisoned)?;
                 distinct_pairs(&mut partition, splits, memory)
-            })?;
-        let merged = in_parallel(splits, degree, "counted the groups of split", |at| {
+            },
+        )?;
+        let merged = in_parallel(threads, splits, degree, "counted the groups of split", |at| {
             count_groups(&counted, at, self.dictionary.as_ref(), bound, memory)
         })?;
         // The distinct pairs are read for the last time by the pass above, so the room they took

@@ -203,7 +203,7 @@ impl Sink for Total {
         Ok(())
     }
 
-    fn finalize(&self) -> rudb_common::Result<()> {
+    fn finalize(&self, _threads: &crate::Lease<'_>) -> rudb_common::Result<()> {
         self.finalizes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -453,7 +453,7 @@ fn an_ordered_root_puts_the_morsels_back_the_way_the_source_cut_them() {
     sink.sink_state(&numbers(&[10]), &mut first).unwrap();
     sink.sink_state(&numbers(&[20]), &mut first).unwrap();
     sink.combine_state(first).unwrap();
-    sink.finalize_state().unwrap();
+    sink.finalize_state(&crate::Lease::alone()).unwrap();
 
     assert_eq!(rows(&reader.drain().unwrap()), vec![10, 20, 30, 40]);
 }
@@ -479,7 +479,7 @@ fn an_ordered_root_waits_for_a_morsel_that_was_taken_but_not_registered() {
     sink.combine_state(first).unwrap();
     sink.sink_state(&numbers(&[30]), &mut later).unwrap();
     sink.combine_state(later).unwrap();
-    sink.finalize_state().unwrap();
+    sink.finalize_state(&crate::Lease::alone()).unwrap();
 
     assert_eq!(rows(&reader.drain().unwrap()), vec![10, 20, 30]);
 }
@@ -501,7 +501,7 @@ fn a_plain_root_hands_chunks_on_in_the_order_they_arrive() {
     sink.combine_state(second).unwrap();
     sink.sink_state(&numbers(&[10, 20]), &mut first).unwrap();
     sink.combine_state(first).unwrap();
-    sink.finalize_state().unwrap();
+    sink.finalize_state(&crate::Lease::alone()).unwrap();
 
     assert_eq!(rows(&reader.drain().unwrap()), vec![30, 40, 10, 20]);
 }
@@ -571,7 +571,7 @@ fn the_earliest_morsel_is_never_told_to_wait_for_the_ones_behind_it() {
     // Morsel one is the earliest being read now, so the chunk it was told to wait with goes through.
     assert_eq!(sink.sink_state(&numbers(&[40]), &mut second).unwrap(), Progress::More);
     sink.combine_state(second).unwrap();
-    sink.finalize_state().unwrap();
+    sink.finalize_state(&crate::Lease::alone()).unwrap();
 
     assert_eq!(rows(&reader.drain().unwrap()), vec![30, 40]);
 }
@@ -798,6 +798,43 @@ fn a_lease_gives_its_threads_back_when_it_goes_away() {
 fn a_pool_of_one_lends_one_however_many_are_asked_for() {
     let pool = Pool::default();
     assert_eq!(pool.lease(32).degree(), 1);
+}
+
+#[test]
+fn a_lease_of_nobody_runs_the_caller_and_starts_nothing() {
+    let alone = crate::Lease::alone();
+    assert_eq!(alone.degree(), 1, "a caller with no pool to ask is still a thread");
+    let ran = AtomicUsize::new(0);
+    let (mine, panicked) = alone.scatter(
+        &|| {
+            ran.fetch_add(1, Ordering::Relaxed);
+        },
+        || 7,
+    );
+    assert_eq!(mine, 7, "the caller's own work is what comes back");
+    assert_eq!(ran.load(Ordering::Relaxed), 0, "and nothing else ran it");
+    assert!(!panicked);
+}
+
+#[test]
+fn a_scatter_takes_no_more_threads_than_the_work_has_pieces() {
+    let pool = Pool::new(8);
+    let lease = pool.lease(8);
+    assert_eq!(lease.degree(), 8);
+    let ran = AtomicUsize::new(0);
+    let count = || {
+        ran.fetch_add(1, Ordering::Relaxed);
+    };
+    lease.scatter_at_most(3, &count, count);
+    assert_eq!(ran.load(Ordering::Relaxed), 3, "two borrowed threads and the caller, not eight");
+
+    ran.store(0, Ordering::Relaxed);
+    lease.scatter_at_most(1, &count, count);
+    assert_eq!(ran.load(Ordering::Relaxed), 1, "one piece is the caller and nobody woken");
+
+    ran.store(0, Ordering::Relaxed);
+    lease.scatter_at_most(99, &count, count);
+    assert_eq!(ran.load(Ordering::Relaxed), 8, "asking for more than the lease gets the lease");
 }
 
 #[test]

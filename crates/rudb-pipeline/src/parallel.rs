@@ -149,7 +149,7 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>)
     }
 
     let measured = Span::start();
-    let finalized = pipeline.sink().finalize_state();
+    let finalized = pipeline.sink().finalize_state(lease);
     let (finalize_ns, _) = measured.stop();
     finalized?;
     let (slowest_ns, slowest_cpu_ns) =
