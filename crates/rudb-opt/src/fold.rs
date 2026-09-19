@@ -24,8 +24,9 @@
 //!
 //! A volatile function is not folded. There are none in rudb yet, so [`VOLATILE`] is a list of names
 //! nothing answers to, and that is on purpose. The day `random()` lands, a pass that folded it would
-//! give every row the same number, and the version of this file that grows the list at the same time
-//! as the function is the version where somebody has to remember.
+//! give every row the same number, and the version of that list that grows at the same time as the
+//! function is the version where somebody has to remember. The list lives in `rudb-bind` with the
+//! evaluation it belongs to, and is named here because this is the pass that has to respect it.
 //!
 //! A fold whose value does not have the type the plan recorded for the expression is abandoned too.
 //! That cannot happen if the kernels and the binder agree, which is the point: it is a disagreement
@@ -39,39 +40,13 @@
 
 use std::collections::HashMap;
 
+pub use rudb_bind::fold::VOLATILE;
+use rudb_bind::fold::value_of;
 use rudb_common::{LogicalType, Result, Value};
-use rudb_kernels::{Comparison, Connective, call_values, cast_value, combine, compare_values};
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice, SortKey};
-use rudb_vector::Vector;
 
 use crate::pass::{Context, Pass, top_down};
 use crate::walk;
-
-/// The functions whose value is not decided by their arguments.
-///
-/// `SELECT DISTINCT function_name FROM duckdb_functions() WHERE has_side_effects` on the pinned
-/// binary, which is the list at the commit the grammar is vendored from. rudb implements none of
-/// them today and the list is here anyway, so that the first one to land is refused by a pass that
-/// already knew about it rather than folded by a pass that had never heard of it.
-pub const VOLATILE: [&str; 17] = [
-    "current_connection_id",
-    "current_query",
-    "current_query_id",
-    "current_transaction_id",
-    "currval",
-    "error",
-    "gen_random_uuid",
-    "nextval",
-    "random",
-    "setseed",
-    "setval",
-    "sleep_ms",
-    "stats",
-    "uuid",
-    "uuidv4",
-    "uuidv7",
-    "write_log",
-];
 
 /// Folds what can be folded and simplifies what folding exposes.
 #[derive(Debug, Clone, Copy)]
@@ -448,49 +423,25 @@ fn integer_of(ty: &LogicalType, value: i128) -> Option<Value> {
 
 /// The value of an expression all of whose operands are constants, if it has one.
 ///
-/// One level deep, because the operands have already been through this and a foldable one is
-/// already a constant. The kernels it calls are the ones the executor calls for the same
-/// expression, which is what makes a folded answer and a computed answer the same answer by
-/// construction rather than by testing every function twice.
+/// The evaluation itself is [`value_of`], which the binder also calls, because it needs the row
+/// count a `LIMIT` comes to before there is a plan for this pass to run over. What is left here is
+/// the part that is about folding rather than about evaluating: which expressions are offered at
+/// all, and what happens when one of them raises.
+///
+/// Only the four kinds whose operands are already constants by the time this sees them are offered.
+/// A `CASE` is not, even though [`value_of`] can evaluate one, because [`case`] is what reduces a
+/// `CASE` here and giving the job to two rules is how two rules come to disagree.
+///
+/// An error is thrown away and the expression is left exactly as it was written, which the module
+/// documentation explains: a call that fails is a call that does not fold, the node stays in the
+/// plan, and the executor raises the same failure later with the expression to hand. `7 // 0` is
+/// that, and the message a user sees for it comes from the executor and not from here.
 fn fold(plan: &Plan, expr: ExprRef) -> Option<Value> {
     match *plan.expr(expr) {
-        Expr::Cast { input, try_cast } => {
-            // Text for a zoned timestamp depends on the session zone at the timestamp's instant.
-            // The optimizer has no session by design, so leaving this cast in the plan is what
-            // lets the prepared executor use the parsed zone without making optimization stateful.
-            if plan.expr_type(input) == &LogicalType::TimestampTz
-                && plan.expr_type(expr) == &LogicalType::Varchar
-            {
-                return None;
-            }
-            let inner = constant(plan, input)?;
-            cast_value(&inner, plan.expr_type(expr), try_cast).ok()
-        }
-        Expr::Compare { op, left, right } => {
-            let left = constant(plan, left)?;
-            let right = constant(plan, right)?;
-            compare_values(comparison(op), &left, &right).ok()
-        }
-        Expr::Conjunction { op, children } => {
-            let values = constants(plan, children)?;
-            let vectors: Vec<Vector> = values
-                .into_iter()
-                .map(|value| Vector::constant(LogicalType::Boolean, value, 1))
-                .collect();
-            Some(combine(connective(op), &vectors).ok()?.value_at(0))
-        }
-        Expr::Function { name, args } => {
-            let name = plan.string(name);
-            if VOLATILE.contains(&name) {
-                return None;
-            }
-            let values = constants(plan, args)?;
-            // No expression to name, because nothing here keeps the error: a call that fails is a
-            // call that does not fold, the node stays in the plan, and the executor raises the same
-            // failure later with the expression to hand. `7 // 0` is that, and the message a user
-            // sees for it comes from the executor and not from here.
-            call_values(name, &values, plan.expr_type(expr), None).ok()
-        }
+        Expr::Cast { .. }
+        | Expr::Compare { .. }
+        | Expr::Conjunction { .. }
+        | Expr::Function { .. } => value_of(plan, expr).ok().flatten(),
         _ => None,
     }
 }
@@ -501,11 +452,6 @@ fn constant(plan: &Plan, expr: ExprRef) -> Option<Value> {
         Expr::Constant(value) => Some(plan.value(value).clone()),
         _ => None,
     }
-}
-
-/// The values behind a run of expressions, if every one of them is a constant.
-fn constants(plan: &Plan, slice: Slice) -> Option<Vec<Value>> {
-    plan.expr_list(slice).iter().map(|&expr| constant(plan, expr)).collect()
 }
 
 /// A constant expression holding `value`, keeping the type the expression already had.
@@ -673,35 +619,6 @@ fn null_comparison(
         constant_of(plan, expr, Value::Null).unwrap_or(expr)
     } else {
         expr
-    }
-}
-
-/// The kernels' comparison for the plan's.
-///
-/// The same eight arms as the copy in `rudb-exec`, which is where the executor's is. One copy would
-/// have to live in the crate both can see, and that is `rudb-plan`, which does not depend on the
-/// kernels and should not: a plan is a data structure and the day it needs a kernel library to be
-/// constructed is the day nothing can hold a plan without linking the arithmetic. Both matches are
-/// exhaustive, so a ninth comparison stops both of them compiling rather than quietly folding to
-/// the wrong answer in one.
-fn comparison(op: CompareOp) -> Comparison {
-    match op {
-        CompareOp::Equal => Comparison::Equal,
-        CompareOp::NotEqual => Comparison::NotEqual,
-        CompareOp::Less => Comparison::Less,
-        CompareOp::LessOrEqual => Comparison::LessOrEqual,
-        CompareOp::Greater => Comparison::Greater,
-        CompareOp::GreaterOrEqual => Comparison::GreaterOrEqual,
-        CompareOp::DistinctFrom => Comparison::DistinctFrom,
-        CompareOp::NotDistinctFrom => Comparison::NotDistinctFrom,
-    }
-}
-
-/// The kernels' connective for the plan's.
-fn connective(op: ConjunctionOp) -> Connective {
-    match op {
-        ConjunctionOp::And => Connective::And,
-        ConjunctionOp::Or => Connective::Or,
     }
 }
 

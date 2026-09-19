@@ -23,6 +23,7 @@ use rudb_functions::{
     Columns, FILE_ROW_NUMBER, FunctionKind, Given, Resolved, TableFunction, csv_fields, csv_given,
     files, is_file, is_pattern, kind_of, parquet_footers, resolve, resolve_pragma, resolve_table,
 };
+use rudb_kernels::cast_value;
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, identifier_parts, parse_ast_with_case};
 use rudb_plan::{
@@ -31,6 +32,7 @@ use rudb_plan::{
 };
 
 use crate::expr::{describe, has_aggregate};
+use crate::fold;
 use crate::parameters::Parameters;
 use crate::scope::{Scope, Visible};
 
@@ -1378,7 +1380,19 @@ impl<'a> Binder<'a> {
         Ok(self.add_node(Node::Limit { input, count, offset }))
     }
 
-    /// The row count a `LIMIT` or an `OFFSET` names, which has to be a constant.
+    /// The row count a `LIMIT` or an `OFFSET` names.
+    ///
+    /// It does not have to be a literal. Anything whose value is settled before the first row is
+    /// read will do, so `LIMIT 1 + 1` and `LIMIT CAST(3 AS BIGINT)` are both two, and that is what
+    /// the pin does with them: its binder evaluates the expression and writes the number down. What
+    /// is left over is a subquery, which the pin answers by reading the value while the query runs
+    /// and this node has nowhere to keep.
+    ///
+    /// The value is cast to `BIGINT` whatever it was written as, which is the whole of the type
+    /// rule. `LIMIT '3'` is three rows because the string converts, `LIMIT 2.5` is three rows
+    /// because the conversion rounds, `LIMIT true` is one row, and `LIMIT DATE '2020-01-01'` is the
+    /// cast refusing a date. Every one of those messages is the cast's own, which is why there is
+    /// no type check here to write a worse one.
     fn constant_count(
         &mut self,
         ast: &Ast,
@@ -1391,26 +1405,23 @@ impl<'a> Binder<'a> {
         self.clause = "LIMIT clause";
         let scope = Scope::empty();
         let bound = self.bind_expr(ast, written, &scope)?;
-        let Expr::Constant(value) = *self.plan.expr(bound) else {
-            return Err(Error::not_implemented(format!("a {clause} that is not a constant")));
+        let Some(value) = fold::value_of(&self.plan, bound)? else {
+            return Err(Error::not_implemented(format!("a {clause} holding a subquery")));
         };
-        let count = match self.plan.value(value) {
-            Value::Null => return Ok(None),
-            Value::TinyInt(count) => i128::from(*count),
-            Value::SmallInt(count) => i128::from(*count),
-            Value::Integer(count) => i128::from(*count),
-            Value::BigInt(count) => i128::from(*count),
-            Value::HugeInt(count) => *count,
-            other => {
-                return Err(Error::binder(format!(
-                    "{clause} takes a whole number of rows, not a value of type {}",
-                    other.logical_type()
-                )));
-            }
-        };
-        u64::try_from(count)
-            .map(Some)
-            .map_err(|_| Error::binder(format!("{clause} must not be negative")))
+        // A null is no limit at all, the same as leaving the clause off, and the pin agrees:
+        // `LIMIT NULL` and `LIMIT CAST(NULL AS INTEGER)` both answer every row.
+        if value.is_null() {
+            return Ok(None);
+        }
+        let count = cast_value(&value, &LogicalType::BigInt, false)?.as_i64().ok_or_else(|| {
+            Error::binder(format!(
+                "{clause} takes a whole number of rows, not a value of type {}",
+                value.logical_type()
+            ))
+        })?;
+        // One message for both clauses, spelled the way the pin spells it, which names the clause
+        // it did not get rather than the one it did.
+        u64::try_from(count).map(Some).map_err(|_| Error::binder("LIMIT/OFFSET cannot be negative"))
     }
 
     // ------------------------------------------------------------------- from
