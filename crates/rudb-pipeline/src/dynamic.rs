@@ -81,6 +81,16 @@ pub trait DynStream: Send + Sync + fmt::Debug {
     /// Whatever the typed operator reports.
     fn prepare_once(&self, threads: &Lease<'_>) -> Result<()>;
 
+    /// Whether this operator owes chunks once every instance has finished reading.
+    fn drains_once(&self) -> bool;
+
+    /// The chunks this operator owes, once every instance has finished reading.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the typed operator reports, and whatever `out` reports from below it.
+    fn drain_once(&self, out: &mut dyn FnMut(&mut Chunk) -> Result<Progress>) -> Result<()>;
+
     /// Transform `chunk` in place.
     ///
     /// # Errors
@@ -100,6 +110,14 @@ impl<S: Stream> DynStream for S {
 
     fn prepare_once(&self, threads: &Lease<'_>) -> Result<()> {
         self.prepare(threads)
+    }
+
+    fn drains_once(&self) -> bool {
+        self.drains()
+    }
+
+    fn drain_once(&self, out: &mut dyn FnMut(&mut Chunk) -> Result<Progress>) -> Result<()> {
+        self.drain(out)
     }
 
     fn push_state(&self, chunk: &mut Chunk, local: &mut LocalState) -> Result<Progress> {
