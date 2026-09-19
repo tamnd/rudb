@@ -1454,7 +1454,13 @@ impl<'a> Building<'a, '_> {
                 // position, to build its table and then once per match, so taking it apart into a
                 // `Vec<Value>` per row here would be an allocation per row for a layout the join
                 // then has to transpose back into columns. See `crate::side::Build`.
-                let (gather, gathered) = Keep::watching(memory, Some(Arc::clone(&sideways)));
+                // A positional join pairs row `n` of one side with row `n` of the other, so for that
+                // one the order this side is kept in is the answer and the pipeline under it runs
+                // on one thread. Every other kind reads this side through a table or by position
+                // and the order only decides which of two equal rows comes out first.
+                let ordered = kind == JoinKind::Positional;
+                let (gather, gathered) =
+                    Keep::watching(memory, Some(Arc::clone(&sideways)), ordered);
                 let watched = self.watch(reference, gather_id, gathering, "Gather", None);
                 self.close(held, gathering, Arc::new(Watched::new(gather, watched)));
                 // Offered to the driving side while it is built, which is how it reaches the scan

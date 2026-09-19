@@ -167,6 +167,12 @@ pub(crate) struct Keep<'a> {
     /// the other side of the dependency edge is a join that can use one. Empty for everything else,
     /// including every cross product, which is the other operator that keeps its side this way.
     sideways: Option<Arc<Sideways<'a>>>,
+    /// Whether the order the chunks arrive in is part of what the operator above reads out of them.
+    ///
+    /// It decides whether the pipeline that fills this may run on more than one thread, because the
+    /// order chunks are kept in is the order the threads finished in and one thread is the only way
+    /// to make that the order they were produced in.
+    ordered: bool,
 }
 
 /// What one instance of a keep is holding.
@@ -177,15 +183,17 @@ pub(crate) struct Kept {
 }
 
 impl<'a> Keep<'a> {
-    /// A keep and the source its chunks come out of.
+    /// A keep and the source its chunks come out of, for an operator that replays them in order.
     pub(crate) fn new(memory: &Memory) -> (Self, Buffered) {
-        Self::watching(memory, None)
+        Self::watching(memory, None, true)
     }
 
-    /// The same, with a join's runtime filter to fill on the way past.
+    /// The same, with a join's runtime filter to fill on the way past, and with the order the
+    /// chunks arrive in said either way.
     pub(crate) fn watching(
         memory: &Memory,
         sideways: Option<Arc<Sideways<'a>>>,
+        ordered: bool,
     ) -> (Self, Buffered) {
         let out = Buffered::new();
         let keep = Self {
@@ -194,6 +202,7 @@ impl<'a> Keep<'a> {
             charged: Mutex::new(Vec::new()),
             out: out.clone(),
             sideways,
+            ordered,
         };
         (keep, out)
     }
@@ -223,11 +232,22 @@ impl Sink for Keep<'_> {
         Kept { chunks: Vec::new(), charged: self.memory.reservation() }
     }
 
-    /// Not yet, for the reason the gather above gives. A cross product replays these chunks in the
-    /// order they were kept, so the order they were kept in is part of the answer, and a join
-    /// produces a key's matches in the order its side holds them for the same reason.
+    /// Whichever the caller said, because the two operators that keep a side this way want opposite
+    /// things from it.
+    ///
+    /// A cross product pairs each left row with these chunks one after another and a positional
+    /// join pairs row `n` with row `n`, so for those the order the chunks arrive in is the answer
+    /// and one thread is what keeps it the order they were produced in. A hash join reads them by
+    /// position through a table it built itself, so the order decides which of two equal rows comes
+    /// out first and nothing else, which is a thing SQL does not promise and which the driving side
+    /// of the same join has been deciding on several threads all along.
+    ///
+    /// The difference this makes is the whole build side of a hash join, because a sink that refuses
+    /// to run twice pins the pipeline it ends, and that pipeline is a scan and a filter over the
+    /// larger part of a fact table. On TPC-H at SF1 it was 60 ms of a 65 ms query, on one core of
+    /// ten, doing work the same scan does in 6 ms when nothing is asking it for a hash table.
     fn parallel(&self) -> bool {
-        false
+        !self.ordered
     }
 
     fn sink(&self, chunk: &Chunk, local: &mut Kept) -> Result<Progress> {
@@ -351,5 +371,20 @@ mod tests {
         assert_eq!(out.len().expect("readable"), 2);
         assert_eq!(out.at(0).expect("readable").expect("the first").len(), 2);
         assert_eq!(out.at(1).expect("readable").expect("the second").len(), 1);
+    }
+
+    /// The pipeline asks its sink whether it may run twice, and a keep answers with what the
+    /// operator above it does with the order. The one that replays the chunks in order says no, and
+    /// saying no pins a whole scan to one thread, so the two answers are worth pinning down here
+    /// rather than only in the builder that chooses between them.
+    #[test]
+    fn a_keep_runs_on_one_thread_only_where_the_order_it_keeps_is_the_answer() {
+        let memory = Memory::unlimited();
+
+        let (replayed, _) = Keep::new(&memory);
+        assert!(!replayed.parallel(), "a cross product pairs a row with these chunks in order");
+
+        let (looked_up, _) = Keep::watching(&memory, None, false);
+        assert!(looked_up.parallel(), "a hash join reads these through a table of its own");
     }
 }
