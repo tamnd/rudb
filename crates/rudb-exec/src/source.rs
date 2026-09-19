@@ -537,6 +537,17 @@ fn worth_sifting(working: usize, threads: usize, rows: usize) -> bool {
 /// than into shares, because by then its page is being shared whatever happens and the only thing left
 /// to play for is letting a worker that drew a slow piece be overtaken instead of waited for.
 ///
+/// Dividing by rows is not the same as dividing by work, and when the statistics have piled the live
+/// parts into fewer stripes than there are workers it is not even close. Equal rows go to every worker
+/// and then a filter above the scan keeps six percent of them, and if the survivors sit together, which
+/// on a file in key order they do, whichever worker holds them does all of the aggregate work above the
+/// scan while the rest finish and stop. No division by rows can see that, because the rows are already
+/// equal. What can survive it is having more pieces than workers, so that the worker holding the dense
+/// piece is overtaken rather than waited for, and the piled case is exactly the case where cutting
+/// finer is free: the stripes are already being shared, so the page ownership that argues for a whole
+/// stripe has already been given up. A quarter of a share there, a whole share when there are as many
+/// working stripes as workers.
+///
 /// Runs never cross a stripe either way. One that did would own two pages, which is the thing all of
 /// this is avoiding.
 fn runs_of(
@@ -546,15 +557,23 @@ fn runs_of(
 ) -> Vec<Range<usize>> {
     let held = |parts: &[usize]| parts.iter().map(|&at| rows(at)).sum::<usize>();
     let total: usize = live.iter().map(|parts| held(parts)).sum();
+    let working = live.iter().filter(|parts| !parts.is_empty()).count();
     let share = total.div_ceil(instances.max(1)).max(1);
+    // The biggest run allowed, and the size of the pieces an oversized stripe is cut into. They are
+    // the same number in the piled case because there is nothing left to protect there.
+    let (whole, piece) = if working >= instances {
+        (share, share.div_ceil(2).max(1))
+    } else {
+        let piece = share.div_ceil(4).max(1);
+        (piece, piece)
+    };
     let mut runs: Vec<Range<usize>> = Vec::with_capacity(instances.saturating_mul(2));
     for parts in live {
         let Some((&first, &last)) = parts.first().zip(parts.last()) else { continue };
-        if held(parts) <= share {
+        if held(parts) <= whole {
             runs.push(first..last + 1);
             continue;
         }
-        let piece = share.div_ceil(2).max(1);
         let mut taken = 0;
         let mut open = false;
         for &at in parts {
@@ -2020,7 +2039,9 @@ mod tests {
         assert!(!worth_sifting(1, 32, 1_000), "a thousand rows pay for one worker either way");
     }
 
-    /// The cutting rule on its own. A stripe holding no more than a share stays one morsel.
+    /// The cutting rule on its own. A stripe holding no more than a share stays one morsel while
+    /// there are as many stripes with work in them as there are workers, and once there are fewer the
+    /// stripes are shared anyway and the cut gets finer.
     #[test]
     fn a_stripe_holding_no_more_than_a_share_stays_one_run() {
         let live = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]];
@@ -2028,7 +2049,9 @@ mod tests {
         assert_eq!(runs_of(&live, 1, |_| 1), [0..4, 4..8, 8..12], "one worker, one run a stripe");
         assert_eq!(runs_of(&live, 3, |_| 1), [0..4, 4..8, 8..12], "a stripe is a share exactly");
         let four = runs_of(&live, 4, |_| 1);
-        assert_eq!(four, [0..2, 2..4, 4..6, 6..8, 8..10, 10..12], "over a share, so half shares");
+        assert_eq!(four.len(), 12, "three stripes for four workers, so a part apiece");
+        assert_eq!(four.first(), Some(&(0..1)));
+        assert_eq!(four.last(), Some(&(11..12)));
     }
 
     /// The reason the cut is by rows. Three stripes with work in them are not three pieces of work
