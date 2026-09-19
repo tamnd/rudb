@@ -52,7 +52,10 @@ pub enum Bound {
     ///
     /// With `analyze` set the layer above runs it as well and prints what happened on it. Still the
     /// same plan, for the same reason.
-    Explain { plan: Plan, analyze: bool },
+    ///
+    /// With `statistics` set it prints what the planner knew as well, which is the use and the class
+    /// behind every number in the plan. That one changes nothing about the plan or the run either.
+    Explain { plan: Plan, analyze: bool, statistics: bool },
 }
 
 /// A bound `SET` or `RESET`.
@@ -193,10 +196,10 @@ pub fn bind_statement_with(
             setting(ast, catalog, parameters, session, index)
         }
         ast::Statement::Checkpoint => Ok(Bound::Checkpoint),
-        ast::Statement::Explain { query, analyze } => {
+        ast::Statement::Explain { query, analyze, statistics } => {
             let mut binder = Binder::with(catalog, parameters, session);
             let (root, _) = binder.bind_query(ast, query)?;
-            Ok(Bound::Explain { plan: finish(binder, root)?, analyze })
+            Ok(Bound::Explain { plan: finish(binder, root)?, analyze, statistics })
         }
     }
 }

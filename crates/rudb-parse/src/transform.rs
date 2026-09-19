@@ -433,21 +433,51 @@ impl<'a> Transform<'a> {
     /// prints, and a `SET` has no plan. An `INSERT` has a plan for its source and showing that
     /// would answer a question nobody asked, since the source is not what the statement does.
     ///
-    /// The option list is a refusal. `EXPLAIN (FORMAT JSON)` asks for the plan in a shape nothing
-    /// here writes, and answering it with the text form would be answering a different question
-    /// quietly.
+    /// Three of the option names are answered and the rest are refused. `ANALYZE` in the list is
+    /// the keyword written the other way and DuckDB takes both, `LOGICAL` names the plan this
+    /// already prints, and `STATISTICS` asks for the section that says what the planner knew, which
+    /// is what `spec/stats/05-every-query.md` section 5.1.1 asks `EXPLAIN` to print. Anything else,
+    /// `FORMAT JSON` above all, asks for the plan in a shape nothing here writes, and answering it
+    /// with the text form would be answering a different question quietly.
+    ///
+    /// The refusal is `Unimplemented explain type` with the name in lower case, which is word for
+    /// word what DuckDB 1.5 says for an option name it parses and does not answer. It says it for
+    /// `LOGICAL` and `STATISTICS` as well, so those two are a divergence in the direction of doing
+    /// something: a query that errors there runs here, and nothing that works there stops working.
+    /// `FORMAT` is a divergence the other way, since DuckDB answers it and this does not, which is
+    /// the same refusal as before this could read an option list at all.
     fn explain_statement(&mut self, node: u32) -> Result<Statement> {
-        let analyze = self.find(node, "AnalyzeKeyword") != NONE;
-        let options = self.find(node, "ExplainOptionList");
-        if options != NONE {
-            return self.unsupported(options);
+        let mut analyze = self.find(node, "AnalyzeKeyword") != NONE;
+        let mut statistics = false;
+        let list = self.find(node, "ExplainOptionList");
+        if list != NONE {
+            for option in self.kids(list).filter(|&kid| self.name(kid) == "ExplainOption") {
+                let name = self.text(self.find(option, "ExplainOptionName"));
+                match name.to_ascii_lowercase().as_str() {
+                    "analyze" => analyze = true,
+                    "logical" => {}
+                    "statistics" => statistics = true,
+                    lowered => {
+                        return Err(Error::not_implemented(format!(
+                            "Unimplemented explain type: {lowered}"
+                        )));
+                    }
+                }
+                // An option carries a value in the grammar and none of these three has one to
+                // carry, so an option with one is refused rather than read for its name alone.
+                // DuckDB takes `(ANALYZE false)` and analyzes anyway, and doing the opposite of
+                // what somebody wrote is worse than saying no to it.
+                if self.count(option) != 1 {
+                    return self.unsupported(option);
+                }
+            }
         }
         let inner = self.first(self.find(node, "ExplainableStatements"));
         if self.name(inner) != "ExplainSelectStatement" {
             return self.unsupported(inner);
         }
         let query = self.query(self.find(inner, "SelectStatementInternal"))?;
-        Ok(Statement::Explain { query, analyze })
+        Ok(Statement::Explain { query, analyze, statistics })
     }
 
     /// `SetStatement <- 'SET' SetAssignmentOrTimeZone`.
@@ -3739,9 +3769,10 @@ mod tests {
                 format!("RESET{scope} {}", ast.string(setting.name))
             }
             Statement::Checkpoint => "CHECKPOINT".to_string(),
-            Statement::Explain { query, analyze } => {
+            Statement::Explain { query, analyze, statistics } => {
                 let analyze = if analyze { "ANALYZE " } else { "" };
-                format!("EXPLAIN {analyze}{}", show_query(&ast, query))
+                let statistics = if statistics { "(STATISTICS) " } else { "" };
+                format!("EXPLAIN {analyze}{statistics}{}", show_query(&ast, query))
             }
         }
     }
@@ -3777,11 +3808,39 @@ mod tests {
     }
 
     #[test]
+    fn the_three_explain_options_this_answers_mean_what_their_names_say() {
+        // `ANALYZE` in the list is the keyword written the other way, so the two spellings have to
+        // land on the same statement rather than on two that happen to print alike.
+        assert_eq!(round_statement("EXPLAIN (ANALYZE) SELECT 1"), "EXPLAIN ANALYZE SELECT 1");
+        assert_eq!(
+            round_statement("explain (analyze) select 1"),
+            round_statement("explain analyze select 1")
+        );
+        // `LOGICAL` names the plan this already prints, so asking for it changes nothing.
+        assert_eq!(round_statement("EXPLAIN (LOGICAL) SELECT 1"), "EXPLAIN SELECT 1");
+        assert_eq!(
+            round_statement("EXPLAIN (STATISTICS) SELECT 1"),
+            "EXPLAIN (STATISTICS) SELECT 1"
+        );
+        assert_eq!(
+            round_statement("EXPLAIN (ANALYZE, STATISTICS) SELECT 1"),
+            "EXPLAIN ANALYZE (STATISTICS) SELECT 1"
+        );
+        assert_eq!(
+            round_statement("EXPLAIN ANALYZE (STATISTICS) SELECT 1"),
+            "EXPLAIN ANALYZE (STATISTICS) SELECT 1"
+        );
+    }
+
+    #[test]
     fn the_parts_of_an_explain_that_are_not_the_query_are_refused_by_name() {
-        // An option list that chooses a format is a promise about the output this does not keep,
-        // and a statement that is not a query has no plan to show.
+        // An option name this does not answer is refused in DuckDB's own words, an option that
+        // carries a value is refused by its grammar rule because none of the three takes one, and a
+        // statement that is not a query has no plan to show.
         for (query, named) in [
-            ("EXPLAIN (FORMAT JSON) SELECT 1", "ExplainOptionList"),
+            ("EXPLAIN (FORMAT JSON) SELECT 1", "Unimplemented explain type: format"),
+            ("EXPLAIN (NONSENSE) SELECT 1", "Unimplemented explain type: nonsense"),
+            ("EXPLAIN (ANALYZE false) SELECT 1", "ExplainOption"),
             ("EXPLAIN INSERT INTO t VALUES (1)", "InsertStatement"),
             ("EXPLAIN CREATE TABLE u (a INTEGER)", "CreateStatement"),
         ] {
