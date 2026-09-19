@@ -61,7 +61,7 @@
 //! [`MemoryTable::stats_ns`] is what a load reports it spent here.
 
 use rudb_common::Value;
-use rudb_common::bounds::{Bound, Op, certain, excluded};
+use rudb_common::bounds::{Bound, Op, certain, excluded, scaled_as};
 use rudb_vector::{Chunk, Data, Form, Packed, Vector};
 
 #[cfg(doc)]
@@ -232,10 +232,24 @@ impl Walked {
 /// Public through [`Range::of`] because a writer that encodes a stripe one column at a time across
 /// threads needs the range of the column it was handed, and building a whole [`Zone`] to read one
 /// entry out of it would walk every other column on that thread as well.
+///
+/// The walk below compares the integers the column holds, because that is the only thing fast enough
+/// to run over every column of a load. A decimal and a timestamp hold an integer with a power of ten
+/// under it, and the walk cannot see that power: it sees an `INT64` either way. So the type puts it
+/// back here, once per column rather than once per row. Without it the ends of every timestamp, time
+/// and decimal column came out as a bare integer, which is a domain no constant of those types is
+/// ever in, and every test against them answered nothing. See [`scaled_as`].
 fn range(vector: &Vector) -> Range {
     let nulls = vector.len() - vector.validity().count_valid(vector.len());
     let walked = walk(vector);
-    Range { low: walked.low, high: walked.high, nulls, exact: walked.exact, sum: walked.sum }
+    let ty = vector.logical_type();
+    Range {
+        low: walked.low.map(|bound| scaled_as(bound, ty)),
+        high: walked.high.map(|bound| scaled_as(bound, ty)),
+        nulls,
+        exact: walked.exact,
+        sum: walked.sum,
+    }
 }
 
 /// One pass over one column, one arm per form.
@@ -953,5 +967,47 @@ mod tests {
         let range = only(LogicalType::BigInt, &[Value::Null, Value::Null]);
         assert!(range.exact, "there is no end here to be wrong about");
         assert_eq!(range.sum, Some(0));
+    }
+
+    /// A timestamp is an `INT64` of microseconds, so the walk hands back the integer and nothing
+    /// else. The ends have to say what that integer is a count of, because the constant a query
+    /// compares them against says so, and two bounds that disagree about their domain do not
+    /// compare at all.
+    #[test]
+    fn a_timestamp_column_reports_its_ends_in_the_domain_a_timestamp_constant_arrives_in() {
+        let values = vec![Value::Timestamp(1_000_000), Value::Timestamp(3_000_000)];
+        let range = only(LogicalType::Timestamp, &values);
+        assert_eq!(range.low, Some(Bound::Scaled { unscaled: 1_000_000, scale: 6 }));
+        assert_eq!(range.high, Some(Bound::Scaled { unscaled: 3_000_000, scale: 6 }));
+    }
+
+    /// The reason the domain matters: before this, a timestamp probe answered nothing at all and
+    /// every ClickBench query with an `EventTime` range read all nine hundred and seventy four
+    /// parts of the file.
+    #[test]
+    fn a_timestamp_probe_past_the_end_of_the_column_skips_it() {
+        let values = vec![Value::Timestamp(1_000_000), Value::Timestamp(3_000_000)];
+        let vector = Vector::from_values(LogicalType::Timestamp, &values).expect("a column");
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        let past = Bound::of_value(&Value::Timestamp(9_000_000)).expect("a bound");
+        let inside = Bound::of_value(&Value::Timestamp(2_000_000)).expect("a bound");
+        assert!(zone.skips(&[Probe { column: 0, op: Op::Equal, value: past }]));
+        assert!(!zone.skips(&[Probe { column: 0, op: Op::Equal, value: inside }]));
+    }
+
+    /// A decimal is the same story with a scale the type carries rather than one the unit names.
+    #[test]
+    fn a_decimal_column_reports_its_ends_at_the_scale_of_its_type() {
+        let ty = LogicalType::Decimal { width: 10, scale: 2 };
+        let values = vec![Value::Decimal { unscaled: 150, width: 10, scale: 2 }];
+        let range = only(ty, &values);
+        assert_eq!(range.low, Some(Bound::Scaled { unscaled: 150, scale: 2 }));
+    }
+
+    /// A date is a count of days with no power of ten under it, so it stays the integer it was.
+    #[test]
+    fn a_date_column_is_left_as_the_plain_integer_it_counts_in() {
+        let range = only(LogicalType::Date, &[Value::Date(19_000)]);
+        assert_eq!(range.low, Some(Bound::Int(19_000)));
     }
 }

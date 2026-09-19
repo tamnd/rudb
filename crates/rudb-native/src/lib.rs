@@ -36,7 +36,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rudb_common::bounds::{Bound, Op};
+use rudb_common::bounds::{Bound, Op, scaled_as};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_encoding::{bitpack, chooser, integer, string};
 use rudb_storage::sieve::Sieve;
@@ -3415,7 +3415,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             *sieve = Some(page);
         }
         let mut ranges = Vec::with_capacity(width);
-        for _ in 0..width {
+        for column in 0..width {
             let low = cur.bound()?;
             let high = cur.bound()?;
             let nulls = cur.u32()? as usize;
@@ -3430,6 +3430,14 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
                 )),
                 _ => return Err(invalid("a stripe sum has an unknown tag")),
             };
+            // Files written before the ends of a decimal or a timestamp column carried their power
+            // of ten hold a bare integer here, and that integer is the one the column holds, which
+            // is what the power is over. So the type puts it back on the way in and an old file
+            // prunes as well as a new one. A file that already wrote the power keeps it, because
+            // this leaves anything that is not an integer alone.
+            let ty = &fields.get(column).ok_or_else(|| invalid("a stripe range has no column"))?.ty;
+            let low = low.map(|bound| scaled_as(bound, ty));
+            let high = high.map(|bound| scaled_as(bound, ty));
             ranges.push(Range { low, high, nulls, exact, sum });
         }
         stripes.push(Stripe {
