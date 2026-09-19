@@ -6,6 +6,12 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.57
+
+A patch release of one pull request in the join, which takes the last serial part of a hash join and spreads it over every thread the query already has. The storage format version is unchanged at 9 and the native directory format is unchanged at 19.
+
+- The hash table a join finds its gathered rows in is built in partitions, one per thread, split by the top bits of the key's hash. #954. The build was the last part of a hash join running on one core, and after #952 handed it the threads up front it was the thing the other nine were waiting for: on q21 it was 78 percent of the query's serial time with the workers asleep for most of it. A key lands in exactly one partition, so no two threads ever touch one bucket, one stored key or one chain, and the chain array all of them write is safe because an entry belongs to a gathered row and a row belongs to one partition. The split is on the top bits because the bottom ones are the bucket number inside a partition's own table. Below 64k rows nothing is split, because on a join against `nation` the partitioning costs more than the build. The order a chain comes out in is unchanged, so a join's output is the same rows in the same order. At SF1 on ten threads q8 is 1.64x, q4 1.54x, q21 1.53x, q9 1.39x and the suite is 1.20x, with the queries that have no join in them flat as the control.
+
 ## 0.3.56
 
 A patch release of two pull requests, one in the optimizer and one in the driver, both of them replacing something that was written when nothing better was available. The storage format version is unchanged at 9 and the native directory format is unchanged at 19.
