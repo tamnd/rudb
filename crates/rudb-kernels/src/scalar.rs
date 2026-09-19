@@ -58,7 +58,7 @@ use crate::cast;
 use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
-use crate::number::{approximate, digits, fit, integral, pow10, rescale};
+use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
 use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
 use crate::shape::{first, identity, nulls_of, single};
@@ -1039,6 +1039,9 @@ where
     }
     let rows = left.len();
     let guarding = matches!(op, Op::Divide | Op::Modulo);
+    // What the answer's width will not hold, worked out once for the whole run rather than by
+    // counting the digits of every row. See [`number::beyond`], which is the whole argument.
+    let limit = beyond(width);
     macro_rules! runs {
         ($($variant:ident => $native:ty),+ $(,)?) => {
             $(
@@ -1071,7 +1074,7 @@ where
                             }
                         };
                         let fits = unscaled
-                            .filter(|value| digits(*value) <= width)
+                            .filter(|value| value.unsigned_abs() < limit)
                             .and_then(|value| <$native>::try_from(value).ok());
                         match fits {
                             Some(answer) => {
