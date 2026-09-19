@@ -117,13 +117,86 @@ fn a_scalar_query_in_a_join_condition_is_answered() {
     assert_eq!(answer, vec!["1|20", "1|20", "2|20"], "{answer:?}");
 }
 
-/// A query that reads both sides is the pair dependent shape, which nothing here plans.
+/// A query that reads both sides, over an inner join, which is a product and a filter.
 ///
 /// It used to reach the executor as a plan whose join condition read a column produced above that
-/// join, and came back as an internal error about a column not being in a schema. A refusal that
-/// names what was written is the answer until the shape is planned, which is #913.
+/// join, and came back as an internal error about a column not being in a schema. There is no input
+/// that produces a pair of rows, so the join becomes the thing that produces them and the condition
+/// moves above it, which is the same query for an inner join and for no other kind.
 #[test]
-fn a_query_in_a_join_condition_that_reads_both_sides_is_refused_by_name() {
+fn a_query_in_an_inner_join_condition_that_reads_both_sides_is_answered() {
+    let database = tables();
+    let answer = rows(
+        &database,
+        "SELECT l.a, r.b FROM pair_l l JOIN pair_r r \
+         ON EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b)",
+    );
+    assert_eq!(answer, vec!["1|10", "1|10", "1|20", "1|20", "2|20"], "{answer:?}");
+}
+
+/// The same through an `IN`, where it is the comparison and not the body that reads the left side.
+#[test]
+fn an_in_query_split_across_both_sides_of_an_inner_join_is_answered() {
+    let database = tables();
+    let answer = rows(
+        &database,
+        "SELECT l.a, r.b FROM pair_l l JOIN pair_r r \
+         ON l.a IN (SELECT s.a FROM pair_s s WHERE s.b = r.b)",
+    );
+    assert_eq!(answer, vec!["1|10", "1|10", "1|20", "1|20", "2|20"], "{answer:?}");
+}
+
+/// The negation, which is the pairs the one above dropped rather than a smaller answer.
+#[test]
+fn a_not_exists_that_reads_both_sides_of_an_inner_join_is_answered() {
+    let database = tables();
+    let answer = rows(
+        &database,
+        "SELECT l.a, r.b FROM pair_l l JOIN pair_r r \
+         ON NOT EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b)",
+    );
+    assert_eq!(answer.len(), 11, "{answer:?}");
+    assert_eq!(answer.iter().filter(|row| row.starts_with("3|")).count(), 4, "{answer:?}");
+}
+
+/// A scalar query reading both sides, compared against a column of the right side.
+#[test]
+fn a_scalar_query_that_reads_both_sides_of_an_inner_join_is_answered() {
+    let database = tables();
+    let answer = rows(
+        &database,
+        "SELECT l.a, r.b FROM pair_l l JOIN pair_r r \
+         ON r.b = (SELECT max(s.b) FROM pair_s s WHERE s.a = l.a AND s.b <= r.b)",
+    );
+    assert_eq!(answer, vec!["1|10", "1|10", "1|20", "1|20", "2|20"], "{answer:?}");
+}
+
+/// An equality written beside the query, which has to stay an equality the join can build on.
+///
+/// The product is what the binder writes and not what runs. Filter pushdown already turns a filter
+/// over an inner join back into a join condition, so the part of the `ON` that reads a column from
+/// each side goes back down and only the part reading the query's output stays above.
+#[test]
+fn an_equality_beside_a_query_that_reads_both_sides_is_still_a_join_condition() {
+    let database = tables();
+    let sql = "SELECT l.a, r.b FROM pair_l l JOIN pair_r r \
+               ON l.x = r.b AND EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b)";
+    let answer = rows(&database, sql);
+    assert_eq!(answer, vec!["1|10", "2|20"], "{answer:?}");
+
+    let plan = rows(&database, &format!("EXPLAIN {sql}")).join("\n");
+    assert!(plan.contains("Join INNER on="), "{plan}");
+    assert!(!plan.contains("CrossProduct"), "{plan}");
+}
+
+/// A query that reads both sides is still refused over a join that is not an inner one.
+///
+/// A left join pads the pairs its condition dropped, and a filter above a product has already
+/// thrown away which left row a dropped pair came from, so the rewrite the inner join gets is not
+/// this query. Upstream plans it as a pair dependent join, which rudb does not have, and #913 stays
+/// open for it.
+#[test]
+fn a_query_that_reads_both_sides_of_an_outer_join_is_refused_by_name() {
     let database = tables();
     let error = database
         .query(
@@ -138,7 +211,7 @@ fn a_query_in_a_join_condition_that_reads_both_sides_is_refused_by_name() {
 
 /// The same refusal through an `IN`, where it is the comparison and not the body that reads a side.
 #[test]
-fn an_in_query_split_across_both_sides_of_a_join_is_refused_by_name() {
+fn an_in_query_split_across_both_sides_of_an_outer_join_is_refused_by_name() {
     let database = tables();
     let error = database
         .query(

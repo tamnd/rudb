@@ -26,8 +26,8 @@ use rudb_functions::{
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, identifier_parts, parse_ast_with_case};
 use rudb_plan::{
-    BuildSide, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, SetOpKind, SortKey,
-    WindowBound, WindowExclude, WindowFrame, WindowUnit,
+    BuildSide, ColumnBinding, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+    SetOpKind, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
 use crate::expr::{describe, has_aggregate};
@@ -2244,6 +2244,71 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// A join whose condition holds a query that reads rows from both of its inputs.
+    ///
+    /// This is the one [`Binder::side_of`] has no side for. The query has to be evaluated once per
+    /// pair of rows, and there is no input that produces a pair, so it cannot go into either input
+    /// the way the other two cases do. What produces a pair is the join itself, so the join becomes
+    /// a product, the query is joined into the product's rows the way a query in a `WHERE` is joined
+    /// into the rows the whole `FROM` produced, and the condition becomes a filter above that.
+    ///
+    /// That rewrite is only the same query for an inner join. An inner join keeps the pairs its
+    /// condition holds and drops the rest, which is what a product and a filter do. Every other kind
+    /// does something with the pairs it dropped, a left join pads them, a semi join counts them, and
+    /// a filter above a product has already thrown away which left row a dropped pair came from, so
+    /// those are refused by name. Upstream plans them as a pair dependent join and rudb does not
+    /// have one yet, which is what tamnd/rudb#913 stays open for.
+    ///
+    /// The product is not the plan that runs. The condition goes back into the join as a condition
+    /// when filter pushdown looks at it, which is the pass that already turns a filter over an inner
+    /// join into a join condition, so an equality in the `ON` is still an equality the hash join can
+    /// build on. What cannot be pushed back down is the part that reads the query's output, and that
+    /// part could not have been a join condition in the first place.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_pair_dependent_join(
+        &mut self,
+        kind: ast::JoinKind,
+        independent: bool,
+        left: NodeRef,
+        right: NodeRef,
+        pair: Vec<PendingSubquery>,
+        conditions: Vec<ExprRef>,
+        scope: Scope,
+    ) -> Result<(NodeRef, Scope)> {
+        if kind != ast::JoinKind::Inner {
+            return Err(Error::not_implemented(
+                "a subquery that reads both sides of that join, written in the condition of a join \
+                 that is not an inner join"
+                    .to_string(),
+            ));
+        }
+        // A lateral right side is already evaluated per left row, so the product this would build is
+        // not the product the query means.
+        if !independent {
+            return Err(Error::not_implemented(
+                "a subquery that reads both sides of that join, written in the condition of a join \
+                 whose right side is lateral"
+                    .to_string(),
+            ));
+        }
+        let mut node = self.add_node(Node::CrossProduct { left, right });
+        for pending in pair {
+            node = self.attach_subquery(node, pending);
+        }
+        // `ON` and `USING` cannot both be written, and this is only reached from the `ON` path, so
+        // the list is the one bound condition. The fold is here so that it stays right if that stops
+        // being true rather than for a case that exists today.
+        let mut conditions = conditions.into_iter();
+        let mut predicate = conditions.next().expect("a join condition was bound");
+        for next in conditions {
+            let children = self.plan.add_expr_list(&[predicate, next]);
+            let conjunction = Expr::Conjunction { op: ConjunctionOp::And, children };
+            predicate = self.plan.add_expr(conjunction, LogicalType::Boolean);
+        }
+        let node = self.add_node(Node::Filter { input: node, predicate });
+        Ok((node, scope))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn bind_join(
         &mut self,
@@ -2345,6 +2410,7 @@ impl<'a> Binder<'a> {
 
         let mut left_node = left_node;
         let mut right_node = right_node;
+        let mut pair = Vec::new();
         if on != NONE {
             if !merged.is_empty() {
                 return Err(Error::binder("a join cannot have both ON and USING"));
@@ -2357,18 +2423,24 @@ impl<'a> Binder<'a> {
                 match self.side_of(&pending, &left_tables, &right_tables) {
                     Some(Side::Right) => right_node = self.attach_subquery(right_node, pending),
                     Some(Side::Left) => left_node = self.attach_subquery(left_node, pending),
-                    None => {
-                        return Err(Error::not_implemented(
-                            "a subquery in a join condition that reads both sides of that join"
-                                .to_string(),
-                        ));
-                    }
+                    None => pair.push(pending),
                 }
             }
         }
 
         if kind == ast::JoinKind::Cross && !conditions.is_empty() {
             return Err(Error::binder("a CROSS JOIN cannot have a condition"));
+        }
+        if !pair.is_empty() {
+            return self.bind_pair_dependent_join(
+                kind,
+                correlated.is_empty(),
+                left_node,
+                right_node,
+                pair,
+                conditions,
+                scope,
+            );
         }
         // A product is the join with nothing to join on, and it is not one when the right side has
         // to be evaluated per left row, because then there is a dependency to lower even though
