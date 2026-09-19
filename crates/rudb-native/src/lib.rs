@@ -1466,6 +1466,17 @@ struct NativeText {
     hashes: Vec<u64>,
     /// The payload, read and decoded a block at a time and kept after that.
     blocks: Vec<OnceLock<Result<Vec<u8>>>>,
+    /// How many decoded payload bytes this column keeps before a sweep stops keeping what it reads.
+    /// [`TEXT_KEEP_BUDGET`] everywhere but in the test of the ceiling.
+    keep_budget: usize,
+    /// Roughly how many decoded payload bytes are being kept, which is what [`TEXT_KEEP_BUDGET`]
+    /// is measured against.
+    ///
+    /// Roughly, because two threads that keep the same block at the same time both add its length
+    /// while [`OnceLock`] keeps one of the two. That makes the count read high and the budget bind
+    /// a little early, which is the harmless direction, and it costs one relaxed add a block rather
+    /// than a lock on the path every scan of a string column goes through.
+    payload_kept: AtomicUsize,
 }
 
 /// How many values of a dictionary go in one block of the payload.
@@ -1484,6 +1495,28 @@ struct NativeText {
 /// 2.3 to 4.5. Going up to 4,096 buys two to six percent more and makes a block as much as 1.5 MB.
 /// Going down to 512 gives up five to nine percent.
 const TEXT_PAYLOAD_VALUES: usize = 1024;
+
+/// How many decoded payload bytes one dictionary keeps before a sweep stops keeping what it reads.
+///
+/// A sweep of the whole dictionary decodes every block whatever it does, and the only question is
+/// whether it hangs on to them. Keeping all of them is 4.2 GB on ClickBench `URL` at a hundred
+/// million rows, which is what #997 was right to stop. Keeping none of them means the next query
+/// asking the same thing decodes all of it again, and on the same column at a million rows that
+/// took a `LIKE` from 2.7 ms to 16.2 ms, because the decode used to be paid once by a session and
+/// is now paid by every statement in it. Neither end is the answer. A bound is.
+///
+/// So a sweep keeps what it decodes until the column is holding this much and decodes without
+/// keeping after that. At a million rows the five ClickBench string columns decode to between 8 MB
+/// and 85 MB, so they sit inside it and a repeated `LIKE` reads a decoded block rather than a
+/// stored one. At a hundred million rows `URL` fills it and the rest of that column is read and
+/// dropped, which is the old cost on the part that does not fit and none of the old footprint.
+///
+/// Two hundred and fifty six megabytes a column is a number and not a policy, and the policy is
+/// what should replace it: this wants to be a buffer pool over the whole database, sized against
+/// the memory limit the session was given, with the blocks of every column competing for it and the
+/// least useful one evicted. That is F2 work. What is here is the part of it that can be written
+/// without an eviction order, which is a ceiling.
+const TEXT_KEEP_BUDGET: usize = 256 * 1024 * 1024;
 
 /// How many offsets go in one packed run.
 ///
@@ -1744,17 +1777,18 @@ impl TextSource for NativeText {
         Ok(Some((end - start) as usize))
     }
 
-    /// The rest of the block holding `first`, decoded into a buffer that dies with the call.
+    /// The rest of the block holding `first`, decoded into a buffer that may die with the call.
     ///
-    /// A block is the unit this format decodes, so a walk that wants every value is going to
-    /// decode every block whatever it does. What it does not have to do is keep them, and
-    /// [`Self::payload_block`] keeps every block it is asked for, so the reader that walks the
-    /// whole dictionary through `bytes_at` ends up holding the whole dictionary decoded. On
-    /// ClickBench `URL` that is 4.2 GB resident to answer one `LIKE`, and nothing reads a byte of
-    /// it twice.
+    /// A block is the unit this format decodes, so a walk that wants every value is going to decode
+    /// every block whatever it does. The question is whether it keeps them, and both answers are
+    /// wrong on their own. [`Self::payload_block`] keeps every block it is asked for, so a reader
+    /// that walked the whole dictionary through `bytes_at` ended up holding the whole dictionary
+    /// decoded, 4.2 GB on ClickBench `URL`. Keeping none of them makes the next statement asking
+    /// the same question decode all of it again, which on the same column at a million rows is a
+    /// `LIKE` going from 2.7 ms to 16.2 ms.
     ///
-    /// A block already in hand is used where it is there, since decoding it again to avoid keeping
-    /// what is already kept would be the wrong trade in both directions.
+    /// So a sweep keeps what it decodes while the column is under [`TEXT_KEEP_BUDGET`] and drops it
+    /// after that. A block already in hand is used where it is there and costs nothing either way.
     fn sweep(
         &self,
         first: usize,
@@ -1770,6 +1804,13 @@ impl TextSource for NativeText {
         let decoded;
         let bytes: &[u8] = match self.blocks.get(block).and_then(OnceLock::get) {
             Some(Ok(kept)) => kept,
+            _ if self.payload_kept.load(Atomic::Relaxed) < self.keep_budget => {
+                let kept = self
+                    .payload_block(block)?
+                    .ok_or_else(|| invalid("global dictionary block is past the payload"))?;
+                self.payload_kept.fetch_add(kept.len(), Atomic::Relaxed);
+                kept
+            }
             _ => {
                 decoded = self.decode_block(block)?;
                 &decoded
@@ -2499,6 +2540,7 @@ impl Reader {
             Arc::clone(&self.file),
             page,
             &self.table.fields[column].ty,
+            TEXT_KEEP_BUDGET,
         )?);
         let _ = self.dictionaries[column].set(Arc::clone(&dictionary));
         Ok(Some(dictionary))
@@ -4422,7 +4464,18 @@ fn encode_ranks(order: &[(u64, u32)], code_bits: usize) -> Result<(Vec<u8>, Vec<
     Ok((out, ends))
 }
 
-fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Result<Vector> {
+/// Opens a column's global dictionary, which reads its index and none of its payload.
+///
+/// `keep_budget` is how many decoded payload bytes this dictionary may hold on to, and every
+/// caller bar the test of the ceiling passes [`TEXT_KEEP_BUDGET`]. It is a parameter rather than
+/// the constant read where it is used because a test of a ceiling that cannot be moved has to build
+/// a quarter of a gigabyte of dictionary to reach it.
+fn open_global_dictionary(
+    file: Arc<File>,
+    page: Page,
+    ty: &LogicalType,
+    keep_budget: usize,
+) -> Result<Vector> {
     if ty != &LogicalType::Varchar {
         return Err(invalid("global dictionary belongs to a non-string column"));
     }
@@ -4515,6 +4568,8 @@ fn open_global_dictionary(file: Arc<File>, page: Page, ty: &LogicalType) -> Resu
             ends,
             hashes,
             blocks: (0..blocks).map(|_| OnceLock::new()).collect(),
+            keep_budget,
+            payload_kept: AtomicUsize::new(0),
         }),
     )
 }
@@ -5989,16 +6044,15 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A sweep of the dictionary reads every value and keeps none of the blocks it read.
+    /// A sweep of the dictionary reads every value and keeps what it read, up to the budget.
     ///
     /// The point of the sweep is the resident size rather than the answer, so both are checked
-    /// here. The values come back through `try_bytes_at` afterwards rather than before, because
-    /// asking that first would decode every block and leave the footprint check with nothing to
-    /// say. The last assertion is the other half of it: a point read still keeps what it decoded,
-    /// which is what a query that reads a handful of values wants and is why the sweep is a second
-    /// way in rather than a change to the first.
+    /// here. A dictionary this small is well under [`TEXT_KEEP_BUDGET`], so it keeps everything and
+    /// a second sweep decodes nothing, which is what makes the second statement of a session asking
+    /// the same question cost what it should. The ceiling is the other half of it and it has its own
+    /// test below, because a ceiling that never binds is not a ceiling anybody checked.
     #[test]
-    fn a_dictionary_sweep_reads_every_value_and_keeps_no_block() {
+    fn a_dictionary_sweep_reads_every_value_and_keeps_it_under_the_budget() {
         let path = path("dictionary-sweep");
         // Two thousand five hundred distinct values is two whole payload blocks and a part of a
         // third, so the sweep has to be called more than once and the last call has to stop short.
@@ -6043,13 +6097,70 @@ mod tests {
             calls += 1;
         }
         assert_eq!(calls, 3, "a sweep hands over one block at a time");
-        assert_eq!(dictionary.footprint(), resting, "a sweep keeps no block it decoded");
+        let after = dictionary.footprint();
+        assert!(after > resting, "a sweep under the budget keeps what it decoded");
 
         let read = (0..dictionary.len())
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a sweep answers what a point read answers");
-        assert!(dictionary.footprint() > resting, "a point read keeps the block it decoded");
+        assert_eq!(dictionary.footprint(), after, "a point read of a kept block decodes nothing");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A dictionary at its budget sweeps without keeping, and still answers what it answered.
+    ///
+    /// The budget is a quarter of a gigabyte in a running database, which is a fine size for a real
+    /// column and no size at all for a test, so this opens the same dictionary a second time with a
+    /// budget of zero. That is the shape of the hundred million row case: `URL` fills the budget
+    /// somewhere in the middle of itself and everything past that point is read and dropped, which
+    /// costs the decode again and holds none of it.
+    #[test]
+    fn a_dictionary_at_its_budget_sweeps_without_keeping() {
+        let path = path("dictionary-budget");
+        let spellings = (0..2_500)
+            .map(|index| Value::Varchar(format!("value {index:08} {}", "y".repeat(index % 40))))
+            .collect::<Vec<_>>();
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in spellings.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("stripe written");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let page = reader.table.dictionaries[0].expect("a string column has one");
+        let file = Arc::clone(&reader.file);
+        let starved = open_global_dictionary(file, page, &LogicalType::Varchar, 0)
+            .expect("a dictionary opens whatever it may keep");
+
+        let resting = starved.footprint();
+        let mut swept: Vec<Vec<u8>> = Vec::new();
+        let mut at = 0;
+        while at < starved.len() {
+            at = starved
+                .sweep_text(at, starved.len(), &mut |_index: usize, text: &[u8]| {
+                    swept.push(text.to_vec());
+                    Ok(())
+                })
+                .expect("a sweep reads");
+        }
+        assert_eq!(swept.len(), spellings.len(), "a starved sweep still reads every value");
+        assert_eq!(starved.footprint(), resting, "and keeps no block it decoded");
+
+        let generous = reader.dictionary(0).expect("read").expect("a string column has one");
+        let read = (0..generous.len())
+            .map(|code| generous.try_bytes_at(code).expect("read").expect("a value").to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(swept, read, "a starved sweep answers what a point read answers");
         fs::remove_file(path).expect("remove scratch file");
     }
 
