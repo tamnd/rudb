@@ -190,11 +190,16 @@ impl Document {
     /// it is what the driving cost. Saying so once for the whole query rather than once per
     /// pipeline, because the answer is about how chunks move through a tree and that is the same
     /// answer for every pipeline in it.
+    ///
+    /// Nothing is said when no operator charged itself any CPU, because that is the ordinary case
+    /// rather than a finding: the clock behind the operator column is a system call and it is only
+    /// read for a statement that asked for the column. A subtraction against a column of zeroes
+    /// would report the whole of the query as driving cost on every query that did not ask.
     fn driving(&self, warnings: &mut Vec<String>) {
         let pipelines = self.pipelines.iter().fold(0u64, |sum, at| sum.saturating_add(at.cpu_ns));
         let operators = self.operators.iter().fold(0u64, |sum, at| sum.saturating_add(at.cpu_ns));
         let driving = pipelines.saturating_sub(operators);
-        if pipelines == 0 || driving <= pipelines / 100 * DRIVING_SHARE {
+        if pipelines == 0 || operators == 0 || driving <= pipelines / 100 * DRIVING_SHARE {
             return;
         }
         warnings.push(format!(
@@ -484,6 +489,22 @@ mod tests {
                 "4.000s of the 10.000s of CPU in the pipelines went on driving them rather than on the operators in them"
             ]
         );
+    }
+
+    /// The ordinary case, since the operator CPU column is only filled for a statement that asked
+    /// for it. Every one of those operators ran, and none of them charged itself anything, so there
+    /// is nothing to subtract and nothing to say.
+    #[test]
+    fn operators_that_were_not_timed_on_the_thread_clock_are_not_reported_as_driving_cost() {
+        let mut metrics = document();
+        metrics.resource.cpu_ns = 10_000_000_000;
+        let mut scan = Operator::new(0, 0, "Scan");
+        scan.wall_ns = 9_000_000_000;
+        metrics.operators.push(scan);
+        let mut pipeline = Pipeline::new(0);
+        pipeline.cpu_ns = 10_000_000_000;
+        metrics.pipelines.push(pipeline);
+        assert!(metrics.warnings().is_empty());
     }
 
     #[test]

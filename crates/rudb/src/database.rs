@@ -1098,8 +1098,15 @@ fn explaining(
     // than through the harness, so the planning that produced the plan being printed has to reach
     // the document. It is the planning of the inner query and not of the `EXPLAIN`: the bind above
     // is what turned the statement into this plan and the optimize above is what ran on it.
-    let under =
-        Under::new(budget, statistics, seams.settings(), session, Rows::ForACaller).after(planning);
+    // Somebody is about to read a CPU number per operator with their own eyes, so this run is the
+    // one that pays for them. The shim only reads the thread clock when the statement asked, and
+    // asking is this setting, so the run is given a session that has it on. The copy goes away with
+    // the rows, which means a connection that never turned profiling on does not find it turned on
+    // after an `EXPLAIN ANALYZE`. The word is the same one `PRAGMA enable_profiling` writes.
+    let mut profiled = session.clone();
+    profiled.set("enable_profiling", "query_tree");
+    let under = Under::new(budget, statistics, seams.settings(), &profiled, Rows::ForACaller)
+        .after(planning);
     let result = run(sql, plan, catalog, cancel, under)?;
     let measured = result.metrics().expect("a query that ran reports what it did");
     let text = rudb_opt::explain::analyzed(plan, statistics, seams, measured);
