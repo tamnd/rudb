@@ -221,7 +221,7 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
         // how many the call gives back for each of them.
         Node::LateralFunction { .. } => Stat::Unknown,
         Node::Filter { input, predicate } => {
-            let kept = KEPT_BY_A_CONDITION.powi(conjuncts(plan, predicate));
+            let (kept, from) = kept(plan, predicate, stats);
             // The bounds are a ceiling over the guess and not a new thing to guess about. A store
             // that keeps a minimum and a maximum per part can say which parts this filter rules
             // out, and the rows in the parts that survive is a number no answer to this filter can
@@ -240,8 +240,8 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
                 // direction, so this is a fact and not an estimate, and it is the one answer here
                 // that is allowed below the one row floor `guess` puts in.
                 Some(0) => Stat::exact(0, Provenance::ZoneMap),
-                Some(ceiling) => capped(guess(of(input), kept), ceiling),
-                None => guess(of(input), kept),
+                Some(ceiling) => capped(guess_from(of(input), kept, from), ceiling),
+                None => guess_from(of(input), kept, from),
             }
         }
         // A projection changes the width and not the height, and a sort changes neither.
@@ -330,12 +330,23 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
 /// class combines with [`GUESSED`], so an exact scan under a filter is an estimate and stays one all
 /// the way up.
 fn guess(input: Stat<u64>, kept: f64) -> Stat<u64> {
+    guess_from(input, kept, FROM_A_CONSTANT)
+}
+
+/// [`guess`] where the fraction did not come from a constant.
+///
+/// The class is [`GUESSED`] either way. A fraction worked out from a distinct count is still a
+/// guess, because it assumes the rows are spread evenly over the values and nothing here has
+/// checked that, and a column where they are not is exactly the column somebody wants to find.
+/// What changes is the provenance, so that `EXPLAIN` distinguishes a node where a number was read
+/// from one where nobody had a number at all, which is the whole reason the field is printed.
+fn guess_from(input: Stat<u64>, kept: f64, from: Provenance) -> Stat<u64> {
     match input {
         Stat::Unknown => Stat::Unknown,
         Stat::Known { value, class, .. } => Stat::Known {
             value: scale(value, kept).max(1),
             class: class.combine(GUESSED),
-            provenance: FROM_A_CONSTANT,
+            provenance: from,
         },
     }
 }
@@ -379,14 +390,57 @@ fn ceiling(stat: Stat<u64>) -> Stat<u64> {
     }
 }
 
-/// How many independent conditions a predicate is made of, capped.
+/// What fraction of its input a filter is assumed to keep, and where that fraction came from.
+///
+/// The product over the conditions. An equality against a constant on a column somebody counted
+/// keeps one value out of however many the column holds, which is the uniformity assumption and is
+/// the oldest textbook rule there is. Everything else keeps [`KEPT_BY_A_CONDITION`], which is the
+/// same constant this had for every condition before.
+///
+/// One over the count is not always smaller than the constant and is not meant to be. A column of
+/// three values gives a third, which is above the fifth the constant guessed, and that is the
+/// direction the constant was wrong in for `o_orderstatus`. The rule is to use the number where
+/// there is one, not to make the answer smaller.
+///
+/// The count is the column's own, taken at the scan it comes from, so a filter above a join reads
+/// the base table's count and applies it to an input something else has already cut down. That is
+/// the standard reading and it is why this stays [`GUESSED`]: it assumes the filter and whatever
+/// happened underneath are independent, which is the assumption every estimator makes and the one
+/// that fails first.
+fn kept(plan: &Plan, predicate: ExprRef, stats: &Statistics) -> (f64, Provenance) {
+    let mut fraction = 1.0;
+    let (mut counted, mut guessed) = (0_u32, 0_u32);
+    for conjunct in conjuncts(plan, predicate) {
+        match values(plan, conjunct, stats) {
+            Some(values) => {
+                fraction /= widened(values);
+                counted += 1;
+            }
+            None => {
+                fraction *= KEPT_BY_A_CONDITION;
+                guessed += 1;
+            }
+        }
+    }
+    // A fraction that is part counted and part guessed came from the arithmetic over the two rather
+    // than from either, which is what `Propagation` is for. A reader chasing a bad estimate wants to
+    // know which of the three this was without reading the predicate.
+    let from = match (counted, guessed) {
+        (0, _) => FROM_A_CONSTANT,
+        (_, 0) => Provenance::Sketch,
+        _ => Provenance::Propagation,
+    };
+    (fraction, from)
+}
+
+/// The conditions a predicate is made of, capped.
 ///
 /// A top level `AND` is the only thing that splits, which is the same split filter pushdown makes
 /// and for the same reason: those are the parts that each have to hold. An `OR` is one condition
 /// however many branches it has, and something inside a function call is not reached, because
 /// `f(a AND b)` is one predicate about whatever `f` does.
 ///
-/// A conjunct with the same value for every row is not counted. The selectivity constant is a guess
+/// A conjunct with the same value for every row is not here. The selectivity constant is a guess
 /// about a predicate over data, and a condition that does not read the data keeps every row or none
 /// of them rather than a fifth of them. Most of those are folded away before this ever sees them,
 /// and the one that survives is the fold that was abandoned so that the error still comes from
@@ -395,14 +449,39 @@ fn ceiling(stat: Stat<u64>) -> Stat<u64> {
 /// Capped at eight so that a query written by a generator does not compound its way to a factor of
 /// a million. Past a handful of conditions the product has stopped meaning anything anyway, and the
 /// cap is where it stops pretending to.
-fn conjuncts(plan: &Plan, predicate: ExprRef) -> i32 {
-    let counted = match *plan.expr(predicate) {
-        Expr::Conjunction { op: ConjunctionOp::And, children } => {
-            plan.expr_list(children).iter().filter(|&&part| !walk::constant(plan, part)).count()
-        }
-        _ => usize::from(!walk::constant(plan, predicate)),
+fn conjuncts(plan: &Plan, predicate: ExprRef) -> Vec<ExprRef> {
+    let parts = match *plan.expr(predicate) {
+        Expr::Conjunction { op: ConjunctionOp::And, children } => plan.expr_list(children).to_vec(),
+        _ => vec![predicate],
     };
-    i32::try_from(counted.min(8)).unwrap_or(8)
+    parts.into_iter().filter(|&part| !walk::constant(plan, part)).take(8).collect()
+}
+
+/// How many values an equality against a constant picks one of, where anybody counted them.
+///
+/// Only `=`. The other comparisons are about order rather than about one value, `<>` picks all but
+/// one and is the complement of this rather than this, and the two distinctness operators are about
+/// nulls, where a distinct count says nothing because the Parquet footer does not count the null as
+/// a value.
+///
+/// `None` rather than a fallback to the row count, which is the fallback [`distinct`] makes for the
+/// join arithmetic. One over the rows is one row, so a filter that took it would call every equality
+/// on an uncounted column a single row lookup, and `c_mktsegment = 'BUILDING'` would come out at one
+/// row instead of thirty thousand. The join can fall back because the row count put through its
+/// arithmetic gives the containment assumption back exactly. This has no such identity and has to
+/// refuse.
+fn values(plan: &Plan, conjunct: ExprRef, stats: &Statistics) -> Option<u64> {
+    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(conjunct) else {
+        return None;
+    };
+    let binding = match (plan.expr(left), plan.expr(right)) {
+        (&Expr::Column(binding), _) if walk::constant(plan, right) => binding,
+        (_, &Expr::Column(binding)) if walk::constant(plan, left) => binding,
+        _ => return None,
+    };
+    // A column with no values in it is an empty column or a column of nothing but nulls, and
+    // neither is something to divide by.
+    stated(plan, binding, stats).filter(|&values| values > 0)
 }
 
 /// How many rows sit in the parts of `input` that `predicate` cannot rule out.
@@ -445,8 +524,30 @@ fn surviving(plan: &Plan, input: NodeRef, predicate: ExprRef) -> Option<u64> {
 /// A binding names the operator that produces the column and the position it has there, so this
 /// finds the operator and asks what the column at that position is called. Only a scan has an
 /// answer, and a projection is followed through to one.
+///
+/// A column nobody counted falls back to the table's rows. See [`Missing::Rows`] for why, and
+/// [`stated`] for the caller that cannot take that answer.
 fn distinct(plan: &Plan, binding: ColumnBinding, stats: &Statistics) -> Option<u64> {
-    follow(plan, binding, stats, 16)
+    follow(plan, binding, stats, Missing::Rows, 16)
+}
+
+/// [`distinct`] restricted to columns somebody actually counted.
+fn stated(plan: &Plan, binding: ColumnBinding, stats: &Statistics) -> Option<u64> {
+    follow(plan, binding, stats, Missing::Nothing, 16)
+}
+
+/// What to answer at a scan for a column nobody counted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Missing {
+    /// The table's rows. A column cannot hold more distinct values than the table has rows, so this
+    /// is a bound rather than a guess, and put through the arithmetic in [`join`] it gives back the
+    /// containment assumption exactly. That is why the join can fall back rather than refusing: a
+    /// refusal on one side would throw away a stated count on the other, and that is most of TPC-H,
+    /// where the low cardinality column is stated and the key it joins against is not.
+    Rows,
+    /// Nothing. For a caller with no such identity, where the row count would come out as a claim
+    /// rather than as a fallback.
+    Nothing,
 }
 
 /// `distinct` with the budget it spends going through projections.
@@ -465,9 +566,16 @@ fn distinct(plan: &Plan, binding: ColumnBinding, stats: &Statistics) -> Option<u
 /// The budget is against a plan that is malformed rather than against one that is deep. A
 /// projection over a projection over a projection is ordinary and sixteen of them is not, and the
 /// arena invariant means a well formed plan cannot cycle here anyway.
-fn follow(plan: &Plan, binding: ColumnBinding, stats: &Statistics, depth: u32) -> Option<u64> {
+fn follow(
+    plan: &Plan,
+    binding: ColumnBinding,
+    stats: &Statistics,
+    missing: Missing,
+    depth: u32,
+) -> Option<u64> {
     let depth = depth.checked_sub(1)?;
     let position = binding.column as usize;
+    let rows = missing == Missing::Rows;
     for at in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
         match *plan.node(at) {
             Node::Get { catalog, schema, table, index, columns, .. } if index == binding.table => {
@@ -475,28 +583,22 @@ fn follow(plan: &Plan, binding: ColumnBinding, stats: &Statistics, depth: u32) -
                 let catalog = plan.string(catalog);
                 let schema = plan.string(schema);
                 let table = plan.string(table);
-                // A column cannot hold more distinct values than the table has rows, so the rows
-                // are a bound rather than a guess, and put through the arithmetic in `join` they
-                // give back the containment assumption exactly. That is why an uncounted column
-                // falls back rather than refusing: a refusal on one side would throw away a stated
-                // count on the other, and that is most of TPC-H, where the low cardinality column
-                // is stated and the key it joins against is not.
                 return stats
                     .distinct_in(catalog, schema, table, name)
-                    .or_else(|| stats.rows_in(catalog, schema, table));
+                    .or_else(|| rows.then(|| stats.rows_in(catalog, schema, table)).flatten());
             }
             Node::TableFunction { index, columns, .. } if index == binding.table => {
                 let name = &plan.field_list(columns).get(position)?.name;
                 return plan
                     .distinct_measured(index, name)
-                    .or_else(|| plan.measured(index).decide().copied());
+                    .or_else(|| rows.then(|| plan.measured(index).decide().copied()).flatten());
             }
             Node::Project { index, exprs, .. } if index == binding.table => {
                 let &carried = plan.expr_list(exprs).get(position)?;
                 let &Expr::Column(carried) = plan.expr(carried) else {
                     return None;
                 };
-                return follow(plan, carried, stats, depth);
+                return follow(plan, carried, stats, missing, depth);
             }
             _ => {}
         }
@@ -629,6 +731,15 @@ fn join(
             Stat::Known { value, class: both.combine(GUESSED), provenance: FROM_A_CONSTANT }
         }
     }
+}
+
+/// A count as a divisor, at least one so that nothing divides by zero or grows.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a count past two to the fifty third is not a count anybody measured"
+)]
+fn widened(count: u64) -> f64 {
+    (count as f64).max(1.0)
 }
 
 /// A row count times a fraction, without letting the float arithmetic invent anything.
