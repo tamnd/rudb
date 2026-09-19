@@ -112,6 +112,44 @@ impl Stream for Evens {
     }
 }
 
+/// An operator with something to do before it runs, which is what a hash join is.
+///
+/// It records how many times it was prepared, how many threads it was offered when it was, and
+/// whether any push reached it before the preparing did. The last of those is the whole point: an
+/// operator that builds a shared table in `prepare` and reads it in `push` is broken the moment
+/// something in the middle drops the call, and [`Watched`] dropping it is exactly how that
+/// happened once.
+#[derive(Debug, Default)]
+struct Preparing {
+    prepared: AtomicUsize,
+    offered: AtomicUsize,
+    pushed_unprepared: AtomicUsize,
+}
+
+/// The operator itself, which is a handle on the numbers above so that a test can still read them
+/// once the pipeline owns the operator.
+#[derive(Debug)]
+struct Prepares(Arc<Preparing>);
+
+impl Stream for Prepares {
+    type Local = ();
+
+    fn local(&self) {}
+
+    fn prepare(&self, threads: &crate::Lease<'_>) -> rudb_common::Result<()> {
+        self.0.prepared.fetch_add(1, Ordering::Relaxed);
+        self.0.offered.store(threads.degree(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn push(&self, _chunk: &mut Chunk, (): &mut ()) -> rudb_common::Result<Progress> {
+        if self.0.prepared.load(Ordering::Relaxed) == 0 {
+            self.0.pushed_unprepared.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Progress::More)
+    }
+}
+
 /// Hands every chunk it is given on `copies` times, which is the smallest operator whose one input
 /// chunk is several output chunks. A cross product is this with the other side of the join in it.
 #[derive(Debug)]
@@ -658,6 +696,75 @@ fn a_watched_pipeline_counts_the_rows_and_the_time_at_every_operator() {
     assert_eq!(summed.rows_in, 5);
     assert!(read.wall_ns > 0, "reading ten rows took longer than nothing");
     assert!(kept.wall_ns > 0, "filtering them took longer than nothing");
+}
+
+#[test]
+fn an_operator_is_prepared_once_before_anything_is_pushed_at_it() {
+    let ready = Arc::new(Preparing::default());
+    let sink = Arc::new(Total::default());
+    let built = pipeline(
+        Arc::new(Counting::new((1..=10).collect(), 4, 4)) as Arc<dyn Source>,
+        Arc::clone(&sink),
+    )
+    .then(Arc::new(Prepares(Arc::clone(&ready))) as Arc<dyn DynStream>);
+
+    run_serial(&built, &Cancel::new()).expect("the pipeline runs");
+
+    assert_eq!(ready.prepared.load(Ordering::Relaxed), 1, "once for the run, not once per chunk");
+    assert_eq!(ready.pushed_unprepared.load(Ordering::Relaxed), 0);
+    assert_eq!(ready.offered.load(Ordering::Relaxed), 1, "the serial driver has the one thread");
+}
+
+#[test]
+fn the_parallel_driver_prepares_once_for_all_its_instances_and_offers_them_all() {
+    let ready = Arc::new(Preparing::default());
+    let sink = Arc::new(Total::default());
+    let built = pipeline(
+        Arc::new(Counting::new((1..=10_000).collect(), 100, 100)) as Arc<dyn Source>,
+        Arc::clone(&sink),
+    )
+    .then(Arc::new(Prepares(Arc::clone(&ready))) as Arc<dyn DynStream>);
+
+    run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4)).expect("the pipeline runs");
+
+    assert_eq!(
+        ready.prepared.load(Ordering::Relaxed),
+        1,
+        "the preparing happens before the instances are handed out, not inside each of them"
+    );
+    assert_eq!(ready.pushed_unprepared.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        ready.offered.load(Ordering::Relaxed),
+        4,
+        "a shared table is built on the lease the pipeline already holds"
+    );
+}
+
+/// Every operator in a real plan is wrapped for its counters, so a wrapper that forgets to pass
+/// something on has turned that thing off everywhere without any test failing. That is what
+/// happened to the preparing, and it cost a whole round of measurement before anybody noticed the
+/// numbers had not moved.
+#[test]
+fn the_watching_wrapper_passes_the_preparing_on() {
+    let ready = Arc::new(Preparing::default());
+    let counters = Arc::new(Counters::new(1, 0, "Prepares"));
+    let watched = Arc::new(Watched::new(Prepares(Arc::clone(&ready)), Arc::clone(&counters)));
+    let sink = Arc::new(Total::default());
+    let built = pipeline(
+        Arc::new(Counting::new((1..=10).collect(), 4, 4)) as Arc<dyn Source>,
+        Arc::clone(&sink),
+    )
+    .then(watched as Arc<dyn DynStream>);
+
+    run_serial(&built, &Cancel::new()).expect("the pipeline runs");
+
+    assert_eq!(
+        ready.prepared.load(Ordering::Relaxed),
+        1,
+        "through the wrapper rather than past it"
+    );
+    assert_eq!(ready.pushed_unprepared.load(Ordering::Relaxed), 0);
+    assert!(counters.snapshot().wall_ns > 0, "and the time it took is charged to the operator");
 }
 
 /// A stream that gives up on the compact form of every chunk it is handed, and says so.

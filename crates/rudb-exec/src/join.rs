@@ -234,7 +234,12 @@ impl<'a> Join<'a> {
     }
 
     /// The joined rows, before they are turned back into chunks.
-    fn joined(&self, left_rows: &[Vec<Value>], right_chunks: &[Chunk]) -> Result<Vec<Vec<Value>>> {
+    fn joined(
+        &self,
+        left_rows: &[Vec<Value>],
+        right_chunks: &[Chunk],
+        threads: &Lease<'_>,
+    ) -> Result<Vec<Vec<Value>>> {
         // The rows being paired up, charged apart from the chunks that come out, because a nested
         // loop join holds all of it at once and gives back everything but the output when it is
         // done.
@@ -245,7 +250,7 @@ impl<'a> Join<'a> {
         // operator still pair rows up one at a time, so what they take out of it is a row, but the
         // side itself is held the way the stream next door holds it and the residual reads it by
         // gathering. See [`Build`] and #880 for the rest of the way.
-        let right = Build::new(&right_types, right_chunks)?;
+        let right = Build::new(&right_types, right_chunks, threads)?;
         scratch.grow(right.footprint())?;
         let right_rows = right.rows();
         if self.kind == JoinKind::Positional {
@@ -577,10 +582,10 @@ impl Sink for Join<'_> {
         Ok(())
     }
 
-    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
+    fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
         let left_rows = std::mem::take(&mut *self.left.lock().map_err(poisoned)?);
         let right_chunks = held(&self.right)?;
-        let mut out = self.joined(&left_rows, &right_chunks)?;
+        let mut out = self.joined(&left_rows, &right_chunks, threads)?;
         if self.swapped {
             // Back into the plan's order. Every row here is this operator's left half followed by
             // its right half, and the plan asked for the other way round, so one rotation by the
@@ -915,22 +920,38 @@ impl<'a> Probe<'a> {
     /// and is why the table is here rather than in the instance state. A failure is remembered the
     /// same way: the thing that fails is running out of memory building the table, and an instance
     /// that retried it would be retrying it against a budget that has not got any larger.
+    ///
+    /// In a parallel run nobody reaches this with anything to do, because [`Stream::prepare`] has
+    /// already filled it with the whole lease rather than with one instance. It is still here and
+    /// still correct on its own, because a `Probe` reached any other way, which is what every test
+    /// in this file does, has no lease to be given.
     fn built(&self) -> Result<Arc<Built>> {
+        self.built_with(&Lease::alone())
+    }
+
+    /// The same, on the threads the pipeline holding this operator leased.
+    ///
+    /// One of the two pieces is perfectly parallel and neither was. A column of the gathered side
+    /// depends on that column alone, so laying the chunks end to end is a task per column. What is
+    /// left on one thread is the table, where two rows of one key have to reach their chain in the
+    /// order they arrived, and that is the next thing to take apart.
+    ///
+    /// Evaluating the keys was tried as a task per chunk and taken out again. The keys of a TPC-H
+    /// join are bare column references, so the work per chunk is close to nothing, and against that
+    /// a lock per chunk plus every chunk's keys held at once was slower than doing it in the loop.
+    fn built_with(&self, threads: &Lease<'_>) -> Result<Arc<Built>> {
         self.built
             .get_or_init(|| {
                 let chunks = held(&self.gathered)?;
+                let keying =
+                    self.equalities.gathered(self.plan, &self.right_schema, self.time_zone);
                 let mut charged = self.held.lock().map_err(poisoned)?;
-                let index = lookup(
-                    self.equalities.gathered(self.plan, &self.right_schema, self.time_zone),
-                    &chunks,
-                    &self.cancel,
-                    &mut charged,
-                )?;
+                let index = lookup(keying, &chunks, &self.cancel, &mut charged)?;
                 // The chunks laid end to end, which is a copy of the side and is charged as one.
                 // The chunks themselves are not charged again here: the keep that made them holds
                 // that reservation for as long as this operator can read them, and charging the
                 // same bytes twice would be a limit half the size it says it is.
-                let rows = Build::new(&self.right_types, &chunks)?;
+                let rows = Build::new(&self.right_types, &chunks, threads)?;
                 charged.grow(rows.footprint())?;
                 Ok(Arc::new(Built { rows, index }))
             })
@@ -954,6 +975,16 @@ impl Stream for Probe<'_> {
             row: 0,
             hit: 0,
         }
+    }
+
+    /// Builds the table here, where the whole lease is free, rather than inside an instance.
+    ///
+    /// Before this the first instance to call [`Probe::built`] built it and the rest of the lease
+    /// slept on the lock. On TPC-H q9 that was 5169 of 11254 worker samples in `semaphore_wait_trap`
+    /// and 46 percent of all worker thread time, for a build that is 17 percent of the query.
+    fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
+        self.built_with(threads)?;
+        Ok(())
     }
 
     fn push(&self, chunk: &mut Chunk, local: &mut Probing) -> Result<Progress> {
