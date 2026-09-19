@@ -494,6 +494,53 @@ impl Plan {
         }
     }
 
+    /// Calls `found` for every column one expression reads, with the reference that reads it.
+    ///
+    /// The reference and not only the binding, because a caller that has to write one of these
+    /// columns down somewhere else needs its type and its span, and the plan records both per
+    /// expression rather than per binding.
+    ///
+    /// This lives here rather than in a pass because more than one crate asks the question and
+    /// there is one match arm per `Expr` variant, so a variant added and forgotten about should be
+    /// a compile error in one file instead of several.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the arena.
+    pub fn read_columns(&self, reference: ExprRef, found: &mut impl FnMut(ExprRef, ColumnBinding)) {
+        match *self.expr(reference) {
+            Expr::Column(binding) => found(reference, binding),
+            Expr::Constant(_) => {}
+            Expr::Cast { input, .. } => self.read_columns(input, found),
+            Expr::Compare { left, right, .. } => {
+                self.read_columns(left, found);
+                self.read_columns(right, found);
+            }
+            Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
+                for &child in self.expr_list(children) {
+                    self.read_columns(child, found);
+                }
+            }
+            Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
+                for &arg in self.expr_list(args) {
+                    self.read_columns(arg, found);
+                }
+                if let Some(inner) = filter {
+                    self.read_columns(inner, found);
+                }
+            }
+            Expr::Case { arms, otherwise } => {
+                for arm in self.arm_list(arms) {
+                    self.read_columns(arm.when, found);
+                    self.read_columns(arm.then, found);
+                }
+                if let Some(inner) = otherwise {
+                    self.read_columns(inner, found);
+                }
+            }
+        }
+    }
+
     /// The node at `reference`, to be rewritten in place.
     ///
     /// # Panics
